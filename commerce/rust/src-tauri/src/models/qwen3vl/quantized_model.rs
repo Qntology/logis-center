@@ -499,7 +499,7 @@ impl QuantizedQwen3VLTextAttention {
         let (query_states, key_states) =
             apply_rotary_pos_emb(&query_states, &key_states, &cos, &sin, false)?;
         
-        // 3. [BLOCK-ALLOCATION] Append or Create New (Enforced 1024 block size)
+        // 3. [BLOCK-ALLOCATION] Append or Create New (Enforced 512 block size)
         let current_chunk_len = key_states.dim(2)?;
         let mut start_pos_in_chunk = 0;
         while start_pos_in_chunk < current_chunk_len {
@@ -508,8 +508,8 @@ impl QuantizedQwen3VLTextAttention {
 
             if let Some(last_block) = self.kv_blocks.last_mut() {
                 let mut inner = last_block.inner.write().unwrap();
-                if inner.location == KVLocation::VRAM && inner.len < 1024 {
-                    let can_take = 1024 - inner.len;
+                if inner.location == KVLocation::VRAM && inner.len < 512 {
+                    let can_take = 512 - inner.len;
                     let to_take = remaining_in_chunk.min(can_take);
                     
                     if let (Some(prev_k), Some(prev_v)) = (inner.k_cache.take(), inner.v_cache.take()) {
@@ -525,9 +525,9 @@ impl QuantizedQwen3VLTextAttention {
             }
 
             if !appended {
-                let to_take = remaining_in_chunk.min(1024);
+                let to_take = remaining_in_chunk.min(512);
                 let current_total = seqlen_offset + start_pos_in_chunk;
-                let index = current_total / 1024; // [FIX] 토큰 위치 기반 인덱싱
+                let index = current_total / 512; // [FIX] 512 단위 토큰 위치 기반 인덱싱
                 let new_block = KVBlock::new(KVLocation::VRAM, index, to_take, current_total);
                 
                 let k_slice = key_states.narrow(2, start_pos_in_chunk, to_take)?;
@@ -561,7 +561,7 @@ impl QuantizedQwen3VLTextAttention {
         }
 
         // [PREFETCH-TRIGGER] Optimized Look-ahead Prefetching (N to N+8 layers)
-        let current_block_idx = seqlen_offset / 1024; // Approximate
+        let current_block_idx = seqlen_offset / 512; // Approximate
         if let Some(block) = self.kv_blocks.get(current_block_idx) {
             let index = { block.inner.read().unwrap().index };
             
@@ -629,7 +629,7 @@ impl QuantizedQwen3VLTextAttention {
         let mut vram_total_len = 0;
 
         // [LOGIC-UPGRADE] Registry 중심의 전체 블록 스캔
-        let num_historic_blocks = seqlen_offset / 1024;
+        let num_historic_blocks = seqlen_offset / 512;
         let mut processed_indices = std::collections::HashSet::new();
 
         // 1. [BULK-TRIGGER] 필요한 모든 SSD 블록에 대해 로드 요청을 미리 병렬로 던짐
@@ -1078,10 +1078,12 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, _offset: usize, kv_name: Option<&str>) -> Result<()> {
-        let filename = match kv_name {
-            Some(name) => format!("layer_{}_{}_kv.safetensors", name, self.layer_idx),
-            None => format!("layer_{}_kv.safetensors", self.layer_idx),
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> {
+        let filename = match (kv_name, offset) {
+            (Some(name), 0) => format!("layer_{}_{}_kv.safetensors", name, self.layer_idx),
+            (Some(name), off) => format!("layer_{}_{}_kv_{}.safetensors", name, self.layer_idx, off),
+            (None, 0) => format!("layer_{}_kv.safetensors", self.layer_idx),
+            (None, off) => format!("layer_{}_kv_{}.safetensors", self.layer_idx, off),
         };
         let file = path.join(filename);
         let mut map = HashMap::new();
@@ -1780,10 +1782,13 @@ impl QuantizedQwen3VLTextModel {
         };
 
         // [SMART-SEQUENTIAL-LOOP]
+        let layer_count = self.layers.len();
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            // [FLOW-CONTROL] 임계값을 4개로 낮춰 VRAM 압박 최소화
-            while ACTIVE_BAKE_TASKS.load(Ordering::SeqCst) >= 4 {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+            // [DYNAMIC-FLOW-CONTROL] 모드별 최적화된 흐름 제어
+            // 0.6B(1개 레이어)는 2개 제한, 2B(28개 레이어)는 28개까지 개방하여 병렬성 확보
+            let max_active = if layer_count <= 1 { 2 } else { 28 };
+            while ACTIVE_BAKE_TASKS.load(Ordering::SeqCst) >= max_active {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
 
             let is_pinned = layer_idx < self.pinned_layer_count;

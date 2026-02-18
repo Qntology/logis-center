@@ -194,7 +194,7 @@ impl SlotManager {
                 if i < 3 { base_info.push(format!("L{}:S{}", i, state)); }
             }
         }
-        println!("[SLOT-STATS] Base: {}/28 ({:?}) | Sub: {}/14 Active", active_base_count, base_info, active_sub);
+        println!("[SLOT-STATS] Base: {}/28 ({:?}) | Sub: {}/56 Active", active_base_count, base_info, active_sub);
     }
 
     pub async fn wait_all_sub_slots(&self) {
@@ -211,6 +211,15 @@ impl SlotManager {
             tokio::time::timeout(std::time::Duration::from_millis(100), self.handoff_notifier.notified()).await.ok();
         }
         println!("[SLOT-MANAGER] All sub-slots cleared.");
+    }
+
+    pub async fn wait_for_base_slot_capacity(&self, layer_idx: usize) {
+        if layer_idx >= self.base_slots.len() { return; }
+        let slot = &self.base_slots[layer_idx];
+        // 0: Free, other values mean occupied/busy
+        while slot.state.load(Ordering::SeqCst) != 0 {
+            slot.ready_signal.notified().await;
+        }
     }
 
     pub fn get_counts(&self) -> (usize, usize) {
@@ -317,11 +326,23 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             } else {
                 if let Some(reg_obj) = &task.registry {
                     let mut reg = reg_obj.entries.write().unwrap();
-                    let block_index = task.offset / 1024;
+                    let block_index = task.offset / 512; // [FIX] Match 512 block unit
                     if block_index < reg.len() && task.layer_idx < 28 {
                         reg[block_index].location[task.layer_idx] = KVLocation::SSD;
                         reg[block_index].slot_ids[task.layer_idx] = None;
                     }
+                }
+                
+                // [BASE-SLOT-NOTIFY] SSD 저장이 완료되었으므로 해당 레이어의 Base Slot을 해제하고 대기 중인 GPU를 깨웁니다.
+                if task.layer_idx < 28 {
+                    let base_slot = SLOT_MANAGER.get_base_slot(task.layer_idx);
+                    // 데이터 포인터 해제 (이미 BakeTask 처리 시 클론되었으므로 여기선 상태만 변경하면 됨)
+                    // 하지만 메모리 안전을 위해 명시적으로 비웁니다.
+                    if let Ok(mut k) = base_slot.k_layers[0].try_lock() { *k = None; }
+                    if let Ok(mut v) = base_slot.v_layers[0].try_lock() { *v = None; }
+                    
+                    base_slot.state.store(0, Ordering::SeqCst);
+                    base_slot.ready_signal.notify_waiters();
                 }
             }
             
@@ -362,7 +383,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     slot.remaining_layers.store(total_layers, Ordering::SeqCst);
                     
                     for layer in bake.layers {
-                        // ... existing layer processing ...
                         {
                             if let Ok(mut k_guard) = slot.k_layers[layer.layer_idx].try_lock() { *k_guard = Some(layer.k.clone()); }
                             if let Ok(mut v_guard) = slot.v_layers[layer.layer_idx].try_lock() { *v_guard = Some(layer.v.clone()); }
@@ -382,6 +402,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         if let Ok(dims) = layer.k.dims4() {
                             let (b, h, s, d) = dims;
                             if let Ok(t_f32) = layer.k.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)) {
+                                // [EXPLICIT-NOTIFY] VRAM에서 RAM으로 복사가 완료됨을 알림
+                                SLOT_MANAGER.handoff_notifier.notify_waiters();
                                 if let Ok(t_data) = t_f32.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
                                     let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
                                     let mut anchors = vec![0.0f32; b * h * anchor_count * d];
@@ -966,13 +988,22 @@ impl Qwen3VLGenerateModel {
         SLOT_MANAGER.reset_all_slots().await;
         self.clear_kv_cache();
 
+        // [SSD-CLEANUP] 이전 작업의 잔재 파일 충돌 방지를 위해 세션 디렉토리 정리
+        if let Some(sid) = &session_id {
+            let path = crate::utils::paths::get_kv_dir(None).join(sid);
+            if path.exists() {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            let _ = std::fs::create_dir_all(&path);
+        }
+
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_tokens = full_input_ids_vec.len();
         
-        // [증분 저장] 2048 토큰 단위로 기억 조각을 생성
-        let prefill_chunk_size = 2048;
+        // [증분 저장] 512 토큰 단위로 기억 조각을 생성 (VRAM 안정성 확보)
+        let prefill_chunk_size = 512;
         let mut current_pos = self.get_kv_len();
         if current_pos > 0 { println!("[RESUME] Resuming from token {}.", current_pos); }
 
@@ -1007,8 +1038,10 @@ impl Qwen3VLGenerateModel {
                         return Err(anyhow!("No KV data to offload."));
                     }
 
-                    // [MULTI-BLOCK-FIX] 청크 내의 모든 블록을 순회하며 등록
-                    let num_blocks_in_chunk = (chunk_len + 1023) / 1024;
+                    // [MULTI-BLOCK-FIX] 512 단위로 블록 관리
+                    let block_unit = 512;
+                    let num_blocks_in_chunk = (chunk_len + (block_unit - 1)) / block_unit;
+                    let layer_count = ks.len();
                     
                     // [REGISTRY-SYNC] Get Registry
                     let registry = match self.qwen3_vl {
@@ -1018,13 +1051,16 @@ impl Qwen3VLGenerateModel {
                     };
 
                     for b_idx in 0..num_blocks_in_chunk {
-                        let block_offset_in_chunk = b_idx * 1024;
-                        let current_block_len = (chunk_len - block_offset_in_chunk).min(1024);
-                        let global_block_index = (current_pos + block_offset_in_chunk) / 1024;
+                        let block_offset_in_chunk = b_idx * block_unit;
+                        let current_block_len = (chunk_len - block_offset_in_chunk).min(block_unit);
+                        let global_block_index = (current_pos + block_offset_in_chunk) / block_unit;
 
-                        // [BASE-SLOT-APPEND] 데이터를 Base Slot(4096)에 누적
+                        // [BASE-SLOT-APPEND] 28개 레이어가 각각 자기 슬롯(0-27)에 1:1 매칭
                         for (l_idx, (k, v)) in ks.iter().zip(vs.iter()).enumerate() {
                             if l_idx < 28 {
+                                // [FLOW-CONTROL] Base Slot이 비워질 때까지 대기 (SSD Write 완료 신호 대기)
+                                SLOT_MANAGER.wait_for_base_slot_capacity(l_idx).await;
+
                                 let s_len = k.dim(2)?;
                                 let k_slice = k.narrow(2, s_len - chunk_len + block_offset_in_chunk, current_block_len)?.contiguous()?;
                                 let v_slice = v.narrow(2, s_len - chunk_len + block_offset_in_chunk, current_block_len)?.contiguous()?;
@@ -1033,11 +1069,9 @@ impl Qwen3VLGenerateModel {
                                 let mut k_guard = base_slot.k_layers[0].lock().await;
                                 let mut v_guard = base_slot.v_layers[0].lock().await;
                                 
-                                // 기존 데이터가 있으면 이어 붙임 (최대 4096까지)
                                 let new_k = match k_guard.take() {
                                     Some(prev) => {
                                         let combined = Tensor::cat(&[prev, k_slice], 2)?;
-                                        // 4096 넘어가면 앞부분은 SSD에 이미 있을테니 잘라냄 (Rolling Window)
                                         let c_len = combined.dim(2)?;
                                         if c_len > 4096 { combined.narrow(2, c_len - 4096, 4096)?.contiguous()? } else { combined }
                                     },
@@ -1057,8 +1091,6 @@ impl Qwen3VLGenerateModel {
                                 base_slot.state.store(2, Ordering::SeqCst);
                                 base_slot.ready_signal.notify_waiters();
 
-                                // [FIX] RAM에 적재되었으므로 즉시 장부(Registry) 업데이트
-                                // 이제 clear_temporal_kv_caches가 이 블록을 VRAM에서 즉시 지울 수 있음
                                 if let Some(reg_obj) = &registry {
                                     let mut reg = reg_obj.entries.write().unwrap();
                                     if global_block_index < reg.len() {
@@ -1069,20 +1101,18 @@ impl Qwen3VLGenerateModel {
                             }
                         }
 
-                        // [SSD-OFFLOAD-TRIGGER] 1024 단위 블록이 완성될 때마다 Sub Slot을 통해 SSD로 전송
+                        // [SSD-OFFLOAD-TRIGGER] Sub Slot을 통해 SSD로 전송 (2B 모드에서는 파이프라인 형성)
                         let sub_slot_id = SLOT_MANAGER.acquire_sub_slot().await;
                         let mut layer_dumps = Vec::new();
                         for (l_idx, (k, v)) in ks.iter().zip(vs.iter()).enumerate() {
                             let s_len = k.dim(2)?;
                             let k_slice = k.narrow(2, s_len - chunk_len + block_offset_in_chunk, current_block_len)?.contiguous()?;
                             let v_slice = v.narrow(2, s_len - chunk_len + block_offset_in_chunk, current_block_len)?.contiguous()?;
-                            
                             layer_dumps.push(LayerKVDump { layer_idx: l_idx, k: k_slice, v: v_slice });
                         }
 
                         match get_worker_channel().await {
                             Ok(tx) => {
-                                // [FIX] 작업 시작 시 카운트 증가
                                 ACTIVE_BAKE_TASKS.fetch_add(1, Ordering::SeqCst);
                                 tx.send(SlotTask::Bake(BakeTask {
                                     slot_id: sub_slot_id,
@@ -1099,11 +1129,26 @@ impl Qwen3VLGenerateModel {
                     Ok(())
                 }.await;
 
-                if let Err(e) = result {
-                    println!("[BAKE-ERROR] Failed to handoff to shuttle: {}", e);
-                }
+                if let Err(e) = result { println!("[BAKE-ERROR] Failed to handoff to shuttle: {}", e); }
 
+                // [DYNAMIC-SYNC] 0.6B 모드(레이어 1개)일 때만 매 청크마다 엄격하게 대기하여 OOM 방지
+                // 2B 모드(레이어 28개)에서는 슬롯 관리자가 병렬로 흐르게 두되, VRAM 부족 시에만 제어합니다.
+                let layer_count_check = match self.qwen3_vl {
+                    ModelVariant::QuantizedVL(ref m) => m.language_model.layers.len(),
+                    ModelVariant::QuantizedText(ref m) => m.language_model.layers.len(),
+                    _ => 1,
+                };
+                
+                // 0.6B 모드는 리소스가 적으므로 안전하게 동기화 유지
+                if layer_count_check <= 1 {
+                    SLOT_MANAGER.wait_all_sub_slots().await;
+                }
+                
                 self.clear_temporal_kv_caches();
+                
+                if self.text_device.is_cuda() && layer_count_check <= 1 {
+                    let _ = self.text_device.synchronize();
+                }
             }
 
             current_pos = end;
