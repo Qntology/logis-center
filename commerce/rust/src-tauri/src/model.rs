@@ -275,10 +275,6 @@ impl LogisModel {
         }
 
         println!("[MEMORY] Factory Reset Complete. All AI resources released to OS.");
-        
-        // [SIGNAL] 명시적으로 초기화 완료를 알림
-        crate::models::qwen3vl::generate::SLOT_MANAGER.purge_signal.notify_waiters();
-        
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
@@ -302,28 +298,9 @@ impl LogisModel {
                 }
             }
 
-            // [NEW] 만약 VRAM이 부족하면, Purge 신호가 올 때까지 대기
+            // 2. Measure VRAM
             let mut current_free = 0;
             use nvml_wrapper::Nvml;
-            if let Ok(nvml) = Nvml::init() {
-                if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
-                    if let Ok(mem) = dev.memory_info() {
-                        current_free = mem.free;
-                    }
-                }
-            }
-
-            if current_free < target_bytes {
-                println!("[VRAM-WATCH] Insufficient VRAM ({:.2} GB). Waiting for Purge signal...", current_free as f64 / 1e9);
-                // 최대 2초간 신호를 기다림
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(2), 
-                    crate::models::qwen3vl::generate::SLOT_MANAGER.purge_signal.notified()
-                ).await;
-            }
-
-            // 2. Measure VRAM Again after signal/wait
-            let mut current_free = 0;
             if let Ok(nvml) = Nvml::init() {
                 if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
                     if let Ok(mem) = dev.memory_info() {
@@ -421,20 +398,13 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let kv_dir = crate::utils::paths::get_kv_dir(None);
-                let file_path = kv_dir.join(format!("{}.safetensors", task_id_str));
-                let dir_path = kv_dir.join(&task_id_str);
-
-                if file_path.exists() {
-                    println!("[SSD-BRIDGE] Loading single-file snapshot from {:?}", file_path);
-                    gen.load_kv_from_disk(&file_path, kv_name.as_deref())?;
-                    Ok(())
-                } else if dir_path.exists() && dir_path.is_dir() {
-                    println!("[SSD-BRIDGE] Loading directory-based snapshot from {:?}", dir_path);
-                    gen.load_kv_from_disk(&dir_path, kv_name.as_deref())?;
+                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
+                if path.exists() {
+                    println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
+                    gen.load_kv_from_disk(&path, kv_name.as_deref())?;
                     Ok(())
                 } else {
-                    println!("[SSD-BRIDGE] No snapshot found for {} in {:?}", task_id_str, kv_dir);
+                    println!("[SSD-BRIDGE] No snapshot found for {}", task_id_str);
                     Ok(())
                 }
             } else {
