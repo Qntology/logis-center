@@ -442,7 +442,7 @@ impl QuantizedQwen3VLTextAttention {
         })
     }
 
-    pub fn forward(
+    pub async fn forward(
         &mut self,
         xs: &Tensor,
         cos: &Tensor,
@@ -657,10 +657,20 @@ impl QuantizedQwen3VLTextAttention {
                     let registry_clone = self.registry.clone();
                     let layer_to_load = self.layer_idx;
                     let current_kv_name = self.kv_name.read().unwrap().clone();
+                    let block_index = index; // Capture index
                     
                     tauri::async_runtime::spawn(async move {
                         use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_worker_channel};
                         let slot_id = SLOT_MANAGER.acquire_sub_slot().await;
+                        
+                        // [EARLY-REGISTER] 슬롯 ID를 미리 등록하여 메인 스레드가 대기할 수 있게 함
+                        {
+                            let mut reg = registry_clone.entries.write().unwrap();
+                            if block_index < reg.len() {
+                                reg[block_index].slot_ids[layer_to_load] = Some(slot_id);
+                            }
+                        }
+
                         if let Ok(tx) = get_worker_channel().await {
                             let _ = tx.send(SlotTask::Load(LoadTask {
                                 slot_id, path, layer_idx: layer_to_load,
@@ -696,34 +706,40 @@ impl QuantizedQwen3VLTextAttention {
 
             // [STEP B] VRAM에 없으면 대기 (이미 위에서 Trigger됨)
             if k_final.is_none() {
+                // [EXPLICIT-WAIT] Polling 제거하고 신호 대기
                 let mut attempts = 0;
-                while attempts < 1000 && k_final.is_none() {
-                    let (current_loc, current_sid) = {
+                loop {
+                    let sid_opt = {
                         let reg = self.registry.entries.read().unwrap();
-                        if index < reg.len() { (reg[index].location[self.layer_idx], reg[index].slot_ids[self.layer_idx]) } 
-                        else { (KVLocation::SSD, None) }
+                        if index < reg.len() { reg[index].slot_ids[self.layer_idx] } else { None }
                     };
 
-                    if current_loc == KVLocation::RAM && current_sid.is_some() {
-                        let sid = current_sid.unwrap();
+                    if let Some(sid) = sid_opt {
                         if let Some(slot) = crate::models::qwen3vl::generate::SLOT_MANAGER.get_slot(sid) {
-                            // [FIX] 슬롯 용량이 1이므로 0번 인덱스 잠금
-                            if let (Ok(kg), Ok(vg)) = (slot.k_layers[0].try_lock(), slot.v_layers[0].try_lock()) {
-                                if let (Some(tk), Some(tv)) = (kg.as_ref(), vg.as_ref()) {
-                                    k_final = Some(tk.to_device(dev)?.to_dtype(target_dtype)?);
-                                    v_final = Some(tv.to_device(dev)?.to_dtype(target_dtype)?);
-                                    
-                                    if sid >= 28 { crate::models::qwen3vl::generate::SLOT_MANAGER.sync_release_sub_slot(sid); }
-                                    break;
+                            // 데이터가 준비될 때까지(State=2) 대기
+                            // 이미 준비되었으면 루프 탈출
+                            if slot.state.load(Ordering::SeqCst) == 2 {
+                                if let (Ok(kg), Ok(vg)) = (slot.k_layers[0].try_lock(), slot.v_layers[0].try_lock()) {
+                                    if let (Some(tk), Some(tv)) = (kg.as_ref(), vg.as_ref()) {
+                                        k_final = Some(tk.to_device(dev)?.to_dtype(target_dtype)?);
+                                        v_final = Some(tv.to_device(dev)?.to_dtype(target_dtype)?);
+                                        if sid >= 28 { crate::models::qwen3vl::generate::SLOT_MANAGER.sync_release_sub_slot(sid); }
+                                        break; 
+                                    }
                                 }
                             }
-                            let lock_guard = slot.lock.lock().unwrap();
-                            let _ = slot.condvar.wait_timeout(lock_guard, std::time::Duration::from_millis(5)).unwrap();
+                            // 아직 준비 안 됐으면 신호 대기
+                            slot.ready_signal.notified().await;
+                        } else {
+                            break; // Invalid slot
                         }
                     } else {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        // 아직 슬롯 할당도 안 된 상태 (극히 드묾, 잠시 대기)
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
+                    
                     attempts += 1;
+                    if attempts > 5000 { break; } // Safety break
                 }
             }
 
@@ -1334,7 +1350,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
         })
     }
 
-    pub fn forward(
+    pub async fn forward(
         &mut self,
         xs: &Tensor,
         cos: &Tensor,
@@ -1363,7 +1379,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
         let residual = xs.clone();
         let xs = self.input_layernorm.forward(&xs)?;
-        let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref(), seqlen_offset)?;
+        let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref(), seqlen_offset).await?;
         
         // [HARDENING] Residual Addition DType Guard
         let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
@@ -1713,7 +1729,7 @@ impl QuantizedQwen3VLTextModel {
         })
     }
 
-    pub fn forward(
+    pub async fn forward(
         &mut self,
         inputs_embeds: &Tensor,
         position_ids_in: Option<&Tensor>,
@@ -1797,7 +1813,7 @@ impl QuantizedQwen3VLTextModel {
                 layer.to_device(&target_device)?;
             }
 
-            xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref(), seqlen_offset)?;
+            xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref(), seqlen_offset).await?;
             
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
@@ -2295,7 +2311,7 @@ impl QuantizedQwen3VLModel {
         
         self.language_model.active_session_id = session_id.clone();
         // [SYNC] 동기 forward 호출
-        let outputs = self.language_model.forward(&inputs_embeds, Some(&position_ids), seqlen_offset, total_len, session_id, 0, None, None)?;
+        let outputs = self.language_model.forward(&inputs_embeds, Some(&position_ids), seqlen_offset, total_len, session_id, 0, None, None).await?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         
         let head_dev = self.lm_head.device();
@@ -2380,7 +2396,7 @@ impl QuantizedQwen3TextModel {
         
         self.language_model.active_session_id = session_id.clone();
         // [SYNC] 동기 forward 호출
-        let outputs = self.language_model.forward(&inputs_embeds, Some(&position_ids), seqlen_offset, total_len, session_id, 0, None, None)?;
+        let outputs = self.language_model.forward(&inputs_embeds, Some(&position_ids), seqlen_offset, total_len, session_id, 0, None, None).await?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         if let Some(head) = &self.lm_head {
             let hidden_state = if !hidden_state.device().same_device(head.device()) { hidden_state.to_device(head.device())? } else { hidden_state };
