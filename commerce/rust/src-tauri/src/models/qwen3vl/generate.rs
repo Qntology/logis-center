@@ -959,8 +959,9 @@ impl Qwen3VLGenerateModel {
     }
 
     pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut Qwen3VLGenerateModel>, kv_name: Option<String>) -> Result<usize> {
-        // [STAGE-RESET] 작업 시작 전 슬롯 초기화
+        // [STAGE-RESET] 작업 시작 전 슬롯 및 모델 캐시 초기화
         SLOT_MANAGER.reset_all_slots().await;
+        self.clear_kv_cache();
 
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;

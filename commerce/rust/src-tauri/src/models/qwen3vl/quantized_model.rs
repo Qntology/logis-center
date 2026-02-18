@@ -408,11 +408,11 @@ impl QuantizedQwen3VLTextAttention {
 
         if num_attention_heads != config.num_attention_heads || num_key_value_heads != config.num_key_value_heads {
             if layer_idx == 0 {
-                println!("[MODEL-ARCH] GGUF: {}/{} heads. Config: {}/{} heads.",
+                println!("[MODEL-ARCH] GGUF: {}/{} heads. Config: {}/{} heads. (Mismatch Resolved)",
                     num_attention_heads, num_key_value_heads, config.num_attention_heads, config.num_key_value_heads);
             }
         } else if layer_idx == 0 {
-            println!("[MODEL-ARCH] Config confirmed: {}/{} heads.", num_attention_heads, num_key_value_heads);
+            println!("[MODEL-ARCH] Architecture Verified: {}/{} heads.", num_attention_heads, num_key_value_heads);
         }
 
         let q_proj = get_qlinear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
@@ -798,10 +798,14 @@ impl QuantizedQwen3VLTextAttention {
 
             if let Some(mask) = attention_mask {
                 let mask_len = mask.dim(D::Minus1)?;
-                let vram_start = seqlen_offset.saturating_sub(vram_total_len); // [FIX] seqlen_offset 기준 계산
-                if vram_start + vram_total_len <= mask_len {
+                let vram_start = seqlen_offset.saturating_sub(vram_total_len); 
+                
+                // [FIX] 마스크와 텐서의 길이가 정확히 일치할 때만 연산 수행
+                if vram_start + vram_total_len <= mask_len && vram_total_len <= mask_len {
                     let sub_mask = mask.narrow(D::Minus1, vram_start, vram_total_len)?.to_dtype(target_dtype)?;
-                    attn_weights = attn_weights.broadcast_add(&sub_mask)?;
+                    if sub_mask.dim(D::Minus1)? == attn_weights.dim(D::Minus1)? {
+                        attn_weights = attn_weights.broadcast_add(&sub_mask)?;
+                    }
                 }
             }
 
@@ -1029,6 +1033,11 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
         self.kv_blocks.clear();
+        
+        // [FIX] 중앙 장부(Registry)도 함께 비워서 다음 작업과의 간섭 차단
+        if let Ok(mut reg) = self.registry.entries.write() {
+            reg.clear();
+        }
     }
 
     pub fn get_kv_len(&self) -> usize {
