@@ -274,46 +274,137 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 SlotTask::Load(load) => {
                     let ((off, b_idx), l_idx, s_id) = ({ let inner = load.shared_block.inner.read().unwrap(); (inner.offset, inner.index) }, load.layer_idx, load.slot_id);
                     let fname = if off == 0 { format!("layer_{}_kv.safetensors", l_idx) } else { format!("layer_{}_kv_{}.safetensors", l_idx, off) };
-                    let path = load.path.join(fname);
+                    let relay_fname = if off == 0 { "layer_relay_kv.safetensors".to_string() } else { format!("layer_relay_kv_{}.safetensors", off) };
+                    
+                    let path = load.path.join(&fname);
+                    let relay_path = load.path.join(&relay_fname);
+                    let target_path = if relay_path.exists() { relay_path } else { path };
+                    
                     let registry = load.registry.clone();
                     let shared_block = load.shared_block.clone();
+                    
+                    println!("[WORKER] >> Starting LOAD for Layer {} Block {} (Slot {}) from {:?}", l_idx, b_idx, s_id, target_path);
+                    
                     tokio::spawn(async move {
-                        if let Ok(content) = tokio::fs::read(&path).await {
-                            if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                let ex_v = |name: &str| -> Option<Vec<f32>> { st.tensor(name).ok().map(|v| unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec() }) };
-                                if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ex_v("k_anchors"), st.tensor("k_packed").ok(), ex_v("k_scales"), ex_v("v_anchors"), st.tensor("v_packed").ok(), ex_v("v_scales")) {
-                                    let o_s = if let Ok(view) = st.tensor("k_shape") { let s_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) }; s_u32.iter().map(|&x| x as usize).collect() } else { vec![1, 8, 128, 128] };
-                                    let mut inner = shared_block.inner.write().unwrap();
-                                    inner.bitkv_metadata = Some(crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], (o_s[2] + 7) / 8 + 4, o_s[3]), &Device::Cpu).unwrap(), k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), k_scales: Tensor::from_vec(ks, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), v_anchors: Tensor::from_vec(va, (o_s[0], o_s[1], (o_s[2] + 7) / 8 + 4, o_s[3]), &Device::Cpu).unwrap(), v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), v_scales: Tensor::from_vec(vs, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), original_shape: o_s });
-                                    let mut reg = registry.entries.write().unwrap();
-                                    if b_idx < reg.len() { reg[b_idx].location[l_idx] = KVLocation::RAM; }
+                        match tokio::fs::read(&target_path).await {
+                            Ok(content) => {
+                                match safetensors::SafeTensors::deserialize(&content) {
+                                    Ok(st) => {
+                                        let ex_v = |name: &str| -> Option<Vec<f32>> { 
+                                            st.tensor(name).ok().map(|v| unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec() }) 
+                                        };
+                                        if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ex_v("k_anchors"), st.tensor("k_packed").ok(), ex_v("k_scales"), ex_v("v_anchors"), st.tensor("v_packed").ok(), ex_v("v_scales")) {
+                                            let o_s = if let Ok(view) = st.tensor("k_shape") { 
+                                                let s_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) }; 
+                                                s_u32.iter().map(|&x| x as usize).collect() 
+                                            } else { vec![1, 8, 128, 128] };
+                                            
+                                            let mut inner = shared_block.inner.write().unwrap();
+                                            inner.bitkv_metadata = Some(crate::models::qwen3vl::quantized_model::BitKVMetadata { 
+                                                k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], (o_s[2] + 7) / 8 + 4, o_s[3]), &Device::Cpu).unwrap(), 
+                                                k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
+                                                k_scales: Tensor::from_vec(ks, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                v_anchors: Tensor::from_vec(va, (o_s[0], o_s[1], (o_s[2] + 7) / 8 + 4, o_s[3]), &Device::Cpu).unwrap(), 
+                                                v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
+                                                v_scales: Tensor::from_vec(vs, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                original_shape: o_s 
+                                            });
+                                            
+                                            let mut reg = registry.entries.write().unwrap();
+                                            if b_idx < reg.len() { 
+                                                reg[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
+                                                println!("[WORKER] << Successfully loaded Layer {} Block {}.", l_idx, b_idx);
+                                            }
+                                        } else {
+                                            println!("[WORKER] !! Failed to extract tensors from {:?}", target_path);
+                                        }
+                                    },
+                                    Err(e) => println!("[WORKER] !! Safetensors Deserialization Error: {:?}", e),
                                 }
-                            }
+                            },
+                            Err(e) => println!("[WORKER] !! File Read Error ({:?}): {:?}", target_path, e),
                         }
                         SLOT_MANAGER.release_slot(s_id).await;
                     });
                 }
                 SlotTask::ChunkedLoad(chunk) => {
                     let registry = chunk.registry.clone();
-                    let path_base = chunk.path.clone();
-                    for i in 0..chunk.layer_indices.len() {
+                    let num_blocks = chunk.layer_indices.len();
+                    println!("[WORKER] >> Starting CHUNKED LOAD for {} blocks.", num_blocks);
+                    
+                    for i in 0..num_blocks {
                         let (l_idx, s_id, block) = (chunk.layer_indices[i], chunk.slot_ids[i], chunk.shared_blocks[i].clone());
-                        let (off, b_idx) = { let inner = block.inner.read().unwrap(); (inner.offset, inner.index) };
-                        let fname = if off == 0 { format!("layer_{}_kv.safetensors", l_idx) } else { format!("layer_{}_kv_{}.safetensors", l_idx, off) };
-                        let path = path_base.join(fname);
+                        
+                        // [FIX] Robust metadata retrieval without panicking. Handle poisoned locks.
+                        let (off, b_idx, block_ssd_path) = match block.inner.read() {
+                            Ok(inner) => (inner.offset, inner.index, inner.ssd_path.clone()),
+                            Err(e) => {
+                                println!("[WORKER] !! Block {} Lock poisoned: {:?}", i, e);
+                                SLOT_MANAGER.release_slot(s_id).await;
+                                continue;
+                            }
+                        };
+                        
+                        // [FIX] Path Fallback: Block First, then Registry
+                        let target_path = block_ssd_path.or_else(|| {
+                            if let Ok(reg) = registry.entries.read() {
+                                if b_idx < reg.len() { reg[b_idx].ssd_path.clone() } else { None }
+                            } else { None }
+                        });
+
+                        if target_path.is_none() {
+                            println!("[WORKER] !! Block {} (Index {}) has no SSD path. Skipping.", i, b_idx);
+                            SLOT_MANAGER.release_slot(s_id).await;
+                            continue;
+                        }
+                        
+                        let target_path = target_path.unwrap();
                         let reg_inner = registry.clone();
+
                         tokio::spawn(async move {
-                            if let Ok(content) = tokio::fs::read(&path).await {
-                                if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                    let ex_v = |name: &str| -> Option<Vec<f32>> { st.tensor(name).ok().map(|v| unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec() }) };
-                                    if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ex_v("k_anchors"), st.tensor("k_packed").ok(), ex_v("k_scales"), ex_v("v_anchors"), st.tensor("v_packed").ok(), ex_v("v_scales")) {
-                                        let o_s = if let Ok(view) = st.tensor("k_shape") { let s_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) }; s_u32.iter().map(|&x| x as usize).collect() } else { vec![1, 8, 128, 128] };
-                                        let mut inner = block.inner.write().unwrap();
-                                        inner.bitkv_metadata = Some(crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], (o_s[2] + 7) / 8 + 4, o_s[3]), &Device::Cpu).unwrap(), k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), k_scales: Tensor::from_vec(ks, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), v_anchors: Tensor::from_vec(va, (o_s[0], o_s[1], (o_s[2] + 7) / 8 + 4, o_s[3]), &Device::Cpu).unwrap(), v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), v_scales: Tensor::from_vec(vs, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), original_shape: o_s });
-                                        let mut reg = reg_inner.entries.write().unwrap();
-                                        if b_idx < reg.len() { reg[b_idx].location[l_idx] = KVLocation::RAM; }
+                            match tokio::fs::read(&target_path).await {
+                                Ok(content) => {
+                                    match safetensors::SafeTensors::deserialize(&content) {
+                                        Ok(st) => {
+                                            // [FIX] DYNAMIC SHAPE DETECTION: Trust the file metadata
+                                            let (ka_data, o_s) = if let Ok(t_view) = st.tensor("k_anchors") {
+                                                let dims = t_view.shape(); // e.g., [1, 16, 35, 64]
+                                                let data = unsafe { std::slice::from_raw_parts(t_view.data().as_ptr() as *const f32, t_view.data().len() / 4).to_vec() };
+                                                let s_len = if let Ok(v) = st.tensor("k_shape") {
+                                                    let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const u32, v.data().len() / 4) };
+                                                    v_u32[2] as usize
+                                                } else { 256 };
+                                                (Some(data), vec![dims[0], dims[1], s_len, dims[3]])
+                                            } else { (None, vec![1, 16, 256, 128]) };
+
+                                            let ex_v = |name: &str| -> Option<Vec<f32>> { 
+                                                st.tensor(name).ok().map(|v| unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec() }) 
+                                            };
+                                            
+                                            if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ka_data, st.tensor("k_packed").ok(), ex_v("k_scales"), ex_v("v_anchors"), st.tensor("v_packed").ok(), ex_v("v_scales")) {
+                                                if let Ok(mut inner) = block.inner.write() {
+                                                    inner.bitkv_metadata = Some(crate::models::qwen3vl::quantized_model::BitKVMetadata { 
+                                                        k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], (o_s[2] + 7) / 8 + 4, o_s[3]), &Device::Cpu).unwrap(), 
+                                                        k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
+                                                        k_scales: Tensor::from_vec(ks, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                        v_anchors: Tensor::from_vec(va, (o_s[0], o_s[1], (o_s[2] + 7) / 8 + 4, o_s[3]), &Device::Cpu).unwrap(), 
+                                                        v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
+                                                        v_scales: Tensor::from_vec(vs, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                        original_shape: o_s 
+                                                    });
+                                                    
+                                                    if let Ok(mut reg) = reg_inner.entries.write() {
+                                                        if b_idx < reg.len() { 
+                                                            reg[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        Err(e) => println!("[WORKER] !! Deserialization Error for Layer {} Block {}: {:?}", l_idx, b_idx, e),
                                     }
-                                }
+                                },
+                                Err(e) => println!("[WORKER] !! IO Error for Layer {} Block {} at {:?}: {:?}", l_idx, b_idx, target_path, e),
                             }
                             SLOT_MANAGER.release_slot(s_id).await;
                         });
