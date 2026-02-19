@@ -1710,10 +1710,6 @@ impl QuantizedQwen3VLTextModel {
                 
                             if !blocks_to_load.is_empty() && !chunk_path.as_os_str().is_empty() {
                                 let load_count = blocks_to_load.len();
-                                let (r, w, f) = SLOT_MANAGER.get_counts();
-                                println!("[HORIZONTAL] Layer {:2} | Requesting {} blocks from SSD | Slots: R={}, W={}, F={}", 
-                                    layer_idx, load_count, r, w, f);
-                
                                 {
                                     let mut reg_w = self.registry.entries.write().unwrap();
                                     let current_layer_blocks = &self.layers[layer_idx].self_attn.kv_blocks;
@@ -1737,32 +1733,53 @@ impl QuantizedQwen3VLTextModel {
                                         })).await;
                                     }
                                 });
+
+                                // [STRICT-WAIT] Wait for all blocks of THIS layer to reach RAM
+                                let mut ready = false;
+                                let mut attempts = 0;
+                                println!("[HORIZONTAL] Layer {:2} | Waiting for {} SSD blocks...", layer_idx, load_count);
+                                while !ready && attempts < 10000 {
+                                    let reg = self.registry.entries.read().unwrap();
+                                    let mut all_ok = true;
+                                    for b_idx in 0..self.layers[layer_idx].self_attn.kv_blocks.len() {
+                                        if b_idx < reg.len() {
+                                            let loc = reg[b_idx].location[layer_idx];
+                                            if loc != KVLocation::RAM && loc != KVLocation::RAM_Sticky && loc != KVLocation::VRAM { all_ok = false; break; }
+                                        }
+                                    }
+                                    if all_ok { ready = true; }
+                                    else { std::thread::sleep(std::time::Duration::from_millis(1)); attempts += 1; }
+                                }
+                                println!("[HORIZONTAL] Layer {:2} | All blocks ready in RAM.", layer_idx);
                             }
                 
                             // 3. [INNER-CHUNK-LOOP] 전체 시퀀스를 현재 레이어에 통과시킴
                             let mut next_xs = Vec::new();
                             let total_chunks = (seq_len + chunk_size - 1) / chunk_size;
                             
+                            println!("[HORIZONTAL] Layer {:2} ({:3}) | START full pass ({} tokens)", layer_idx, dev_type, seq_len);
+
                             for (c_idx, i) in (0..seq_len).step_by(chunk_size).enumerate() {
                                 let take = (seq_len - i).min(chunk_size);
                                 let current_offset = seqlen_offset + i;
                                 
                                 let xs_chunk = xs.narrow(1, i, take)?;
-                                let cos_chunk = cos.narrow(2, i, take)?;
-                                let sin_chunk = sin.narrow(2, i, take)?;
+                                let cos_chunk = cos.narrow(1, i, take)?;
+                                let sin_chunk = sin.narrow(1, i, take)?;
                                 
                                 let mask = prepare_causal_attention_mask(b_size, take, current_offset, xs.device())?;
                                 let mask = mask.to_dtype(DType::F32)?.contiguous()?;
                 
                                 if c_idx == 0 || c_idx == total_chunks - 1 {
-                                    println!("[HORIZONTAL] Layer {:2} ({:3}) | Chunk {}/{} | Tokens: {}..{}", 
-                                        layer_idx, dev_type, c_idx + 1, total_chunks, current_offset, current_offset + take);
+                                    println!("[HORIZONTAL] Layer {:2} | Chunk {}/{} | Tokens: {}..{}", 
+                                        layer_idx, c_idx + 1, total_chunks, current_offset, current_offset + take);
                                 }
                 
                                 let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, Some(&mask), current_offset)?;
                                 next_xs.push(out);
                             }
                             xs = Tensor::cat(&next_xs, 1)?;
+                            println!("[HORIZONTAL] Layer {:2} | FINISHED full pass.", layer_idx);
                 
                             // 4. [SNAPSHOT]
                             if let Some(sid) = &self.active_session_id {
