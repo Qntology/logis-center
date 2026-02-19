@@ -591,11 +591,10 @@ impl QuantizedQwen3VLTextAttention {
                 }
             }
 
-            // 2. [ASYNC-WAIT] Loading 중이라면 대기 (잠금 해제 후 대기하여 워커에게 기회 제공)
+            // 2. [ASYNC-WAIT] Loading 중이라면 대기
             if loc == KVLocation::Loading {
                 let mut attempts = 0;
-                while attempts < 2000 {
-                    // 잠금을 아주 짧게만 유지하고 즉시 해제
+                while attempts < 3000 {
                     let current = {
                         let reg = self.registry.entries.read().unwrap();
                         reg[index].location[self.layer_idx]
@@ -603,13 +602,17 @@ impl QuantizedQwen3VLTextAttention {
                     
                     if current == KVLocation::RAM { break; }
                     
-                    // [CRITICAL] 잠금을 풀고 워커가 Write Lock을 잡을 수 있도록 1ms 대기
+                    // 만약 다시 SSD로 돌아갔다면 로딩 실패로 간주하고 중단
+                    if current == KVLocation::SSD {
+                        println!("[WARN] Layer {} Block {} loading failed. Retrying in next pass.", self.layer_idx, index);
+                        break;
+                    }
+                    
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     attempts += 1;
                     
-                    // 100번 시도마다 정체 보고
-                    if attempts % 100 == 0 {
-                        println!("[TRACE] Layer {} Block {} still loading... (Attempt {})", self.layer_idx, index, attempts);
+                    if attempts % 500 == 0 {
+                        println!("[TRACE] Still waiting for Layer {} Block {}... ({}ms)", self.layer_idx, index, attempts);
                     }
                 }
             }
@@ -917,7 +920,7 @@ impl QuantizedQwen3VLTextAttention {
             if let Some(id) = slot_id {
                 // 비동기 호출을 위해 spawn 사용 (clear_kv_cache는 동기 함수)
                 tauri::async_runtime::spawn(async move {
-                    SLOT_MANAGER.release_slot(id).await;
+                    SLOT_MANAGER.release_slot(id, true).await;
                 });
             }
         }

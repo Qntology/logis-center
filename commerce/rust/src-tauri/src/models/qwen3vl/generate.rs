@@ -36,7 +36,7 @@ use rayon::prelude::*;
 pub enum SlotRequest {
     AcquireRead { response: oneshot::Sender<usize> },
     AcquireWrite { response: oneshot::Sender<usize>, total_tokens: usize },
-    Release { idx: usize }, 
+    Release { idx: usize, success: bool }, 
     Flush { response: oneshot::Sender<()> },
 }
 
@@ -49,6 +49,7 @@ pub struct SlotManager {
     pub count_reads: Arc<AtomicUsize>,
     pub count_writes: Arc<AtomicUsize>,
     pub count_free: Arc<AtomicUsize>,
+    pub is_flushing: Arc<AtomicBool>,
 }
 
 impl SlotManager {
@@ -59,61 +60,56 @@ impl SlotManager {
         let cr = Arc::new(AtomicUsize::new(0));
         let cw = Arc::new(AtomicUsize::new(0));
         let cf = Arc::new(AtomicUsize::new(count));
-        let (cr_c, cw_c, cf_c) = (cr.clone(), cw.clone(), cf.clone());
-        tauri::async_runtime::spawn(async move { Self::slot_dispatcher(rx, cr_c, cw_c, cf_c, count).await; });
-        Self { slots, request_tx: tx, count_reads: cr, count_writes: cw, count_free: cf }
+        let flush_flag = Arc::new(AtomicBool::new(false));
+        let (cr_c, cw_c, cf_c, ff_c) = (cr.clone(), cw.clone(), cf.clone(), flush_flag.clone());
+        tauri::async_runtime::spawn(async move { Self::slot_dispatcher(rx, cr_c, cw_c, cf_c, ff_c, count).await; });
+        Self { slots, request_tx: tx, count_reads: cr, count_writes: cw, count_free: cf, is_flushing: flush_flag }
     }
 
-    async fn slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>, cr: Arc<AtomicUsize>, cw: Arc<AtomicUsize>, cf: Arc<AtomicUsize>, max_slots: usize) {
+    async fn slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>, cr: Arc<AtomicUsize>, cw: Arc<AtomicUsize>, cf: Arc<AtomicUsize>, is_flushing: Arc<AtomicBool>, max_slots: usize) {
         let mut states = vec![InternalState::Free; max_slots];
         let mut free_p: VecDeque<usize> = (0..max_slots).collect();
         let mut p_writes: VecDeque<(oneshot::Sender<usize>, usize)> = VecDeque::new();
         let mut p_reads: VecDeque<oneshot::Sender<usize>> = VecDeque::new();
-        let mut flushers: Vec<oneshot::Sender<()>> = Vec::new();
+        let mut flush_waiters: Vec<oneshot::Sender<()>> = Vec::new();
         let mut sys = sysinfo::System::new_all();
-
-        println!("[SLOT-DISPATCHER] 방안 A: Strict Immediate Free 모드 가동.");
 
         while let Some(req) = rx.recv().await {
             match req {
                 SlotRequest::AcquireWrite { response, total_tokens } => {
+                    if is_flushing.load(Ordering::SeqCst) { continue; }
                     sys.refresh_memory();
                     let max_c = Self::calculate_dynamic_budget(&sys, total_tokens, max_slots);
                     if cw.load(Ordering::SeqCst) < max_c && !free_p.is_empty() {
-                        let idx = free_p.pop_front().unwrap();
-                        states[idx] = InternalState::Writing;
-                        cf.fetch_sub(1, Ordering::SeqCst);
-                        cw.fetch_add(1, Ordering::SeqCst);
+                        let idx = free_p.pop_front().unwrap(); states[idx] = InternalState::Writing;
+                        cf.fetch_sub(1, Ordering::SeqCst); cw.fetch_add(1, Ordering::SeqCst);
                         let _ = response.send(idx);
                     } else { p_writes.push_back((response, total_tokens)); }
                 }
                 SlotRequest::AcquireRead { response } => {
+                    if is_flushing.load(Ordering::SeqCst) { continue; }
                     if !free_p.is_empty() {
-                        let idx = free_p.pop_front().unwrap();
-                        states[idx] = InternalState::Reading;
-                        cf.fetch_sub(1, Ordering::SeqCst);
-                        cr.fetch_add(1, Ordering::SeqCst);
+                        let idx = free_p.pop_front().unwrap(); states[idx] = InternalState::Reading;
+                        cf.fetch_sub(1, Ordering::SeqCst); cr.fetch_add(1, Ordering::SeqCst);
                         let _ = response.send(idx);
                     } else { p_reads.push_back(response); }
                 }
-                SlotRequest::Release { idx } => {
+                SlotRequest::Release { idx, success: _ } => {
                     if idx < max_slots && states[idx] != InternalState::Free {
-                        let old = states[idx];
-                        states[idx] = InternalState::Free;
-                        free_p.push_back(idx);
-                        cf.fetch_add(1, Ordering::SeqCst);
-                        if old == InternalState::Writing { cw.fetch_sub(1, Ordering::SeqCst); }
-                        else { cr.fetch_sub(1, Ordering::SeqCst); }
-                        
-                        // [TRACE] 해제 알림 수신 확인
-                        println!("[DISPATCHER] 슬롯 {} 해제 완료. (남은 빈 슬롯: {})", idx, cf.load(Ordering::SeqCst));
+                        let old = states[idx]; states[idx] = InternalState::Free;
+                        free_p.push_back(idx); cf.fetch_add(1, Ordering::SeqCst);
+                        if old == InternalState::Writing { cw.fetch_sub(1, Ordering::SeqCst); } else { cr.fetch_sub(1, Ordering::SeqCst); }
                     }
-                    if cw.load(Ordering::SeqCst) == 0 && cr.load(Ordering::SeqCst) == 0 { while let Some(w) = flushers.pop() { let _ = w.send(()); } }
-                    Self::process_queues_robust(&sys, &mut free_p, &mut p_writes, &mut p_reads, &mut states, &cf, &cw, &cr, max_slots);
+                    if cw.load(Ordering::SeqCst) == 0 && cr.load(Ordering::SeqCst) == 0 {
+                        while let Some(res) = flush_waiters.pop() { let _ = res.send(()); }
+                    } else {
+                        Self::process_queues_robust(&sys, &mut free_p, &mut p_writes, &mut p_reads, &mut states, &cf, &cw, &cr, max_slots);
+                    }
                 }
                 SlotRequest::Flush { response } => {
+                    is_flushing.store(true, Ordering::SeqCst);
                     if cw.load(Ordering::SeqCst) == 0 && cr.load(Ordering::SeqCst) == 0 { let _ = response.send(()); } 
-                    else { flushers.push(response); }
+                    else { flush_waiters.push(response); }
                 }
             }
         }
@@ -123,19 +119,13 @@ impl SlotManager {
         while !free_p.is_empty() && !p_writes.is_empty() {
             let max_c = Self::calculate_dynamic_budget(sys, p_writes.front().unwrap().1, max_slots);
             if cw.load(Ordering::SeqCst) < max_c {
-                let idx = free_p.pop_front().unwrap();
-                let (res, _) = p_writes.pop_front().unwrap();
-                states[idx] = InternalState::Writing;
-                cf.fetch_sub(1, Ordering::SeqCst); cw.fetch_add(1, Ordering::SeqCst);
-                let _ = res.send(idx);
+                let idx = free_p.pop_front().unwrap(); let (res, _) = p_writes.pop_front().unwrap();
+                states[idx] = InternalState::Writing; cf.fetch_sub(1, Ordering::SeqCst); cw.fetch_add(1, Ordering::SeqCst); let _ = res.send(idx);
             } else { break; }
         }
         while !free_p.is_empty() && !p_reads.is_empty() {
-            let idx = free_p.pop_front().unwrap();
-            let res = p_reads.pop_front().unwrap();
-            states[idx] = InternalState::Reading;
-            cf.fetch_sub(1, Ordering::SeqCst); cr.fetch_add(1, Ordering::SeqCst);
-            let _ = res.send(idx);
+            let idx = free_p.pop_front().unwrap(); let res = p_reads.pop_front().unwrap();
+            states[idx] = InternalState::Reading; cf.fetch_sub(1, Ordering::SeqCst); cr.fetch_add(1, Ordering::SeqCst); let _ = res.send(idx);
         }
     }
 
@@ -148,17 +138,19 @@ impl SlotManager {
     pub async fn wait_for_all_tasks(&self) {
         let (tx, rx) = oneshot::channel();
         if self.request_tx.send(SlotRequest::Flush { response: tx }).await.is_ok() { let _ = rx.await; }
+        self.is_flushing.store(false, Ordering::SeqCst);
     }
 
-    pub async fn reset_all_slots(&self) { for i in 0..self.slots.len() { self.release_slot(i).await; } }
+    pub async fn reset_all_slots(&self) { for i in 0..self.slots.len() { self.release_slot(i, true).await; } }
     pub async fn acquire_read_slot(&self) -> usize { let (tx, rx) = oneshot::channel(); let _ = self.request_tx.send(SlotRequest::AcquireRead { response: tx }).await; rx.await.unwrap_or(0) }
     pub async fn acquire_write_slot(&self, total_tokens: usize) -> usize { let (tx, rx) = oneshot::channel(); let _ = self.request_tx.send(SlotRequest::AcquireWrite { response: tx, total_tokens }).await; rx.await.unwrap_or(0) }
-    pub async fn release_slot(&self, id: usize) {
+    
+    pub async fn release_slot(&self, id: usize, success: bool) {
         if id < self.slots.len() {
             for l in &self.slots[id].k_layers { if let Ok(mut g) = l.try_lock() { *g = None; } }
             for l in &self.slots[id].v_layers { if let Ok(mut g) = l.try_lock() { *g = None; } }
             self.slots[id].state.store(0, Ordering::SeqCst);
-            let _ = self.request_tx.send(SlotRequest::Release { idx: id }).await;
+            let _ = self.request_tx.send(SlotRequest::Release { idx: id, success }).await;
         }
     }
     pub fn get_counts(&self) -> (usize, usize, usize) { (self.count_reads.load(Ordering::Relaxed), self.count_writes.load(Ordering::Relaxed), self.count_free.load(Ordering::Relaxed)) }
@@ -187,11 +179,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             if let Some(parent) = task.path.parent() { if !parent.exists() { let _ = std::fs::create_dir_all(parent); } }
             let res = candle_core::safetensors::save(&task.tensors, &task.path);
             let slot = &SLOT_MANAGER.slots[task.slot_id];
-            
-            // [EXPLICIT-FREE] 쓰기 성공/실패 상관없이 즉시 보고
             if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 || task.is_last {
-                println!("[WORKER -> DISPATCHER] Reporting Release for Bake Slot {} (Success: {})", task.slot_id, res.is_ok());
-                SLOT_MANAGER.release_slot(task.slot_id).await;
+                SLOT_MANAGER.release_slot(task.slot_id, res.is_ok()).await;
             }
         }
     });
@@ -202,10 +191,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let io_tx_inner = io_tx.clone();
                     tokio::task::spawn_blocking(move || {
                         let (sid, t_dir, kv_n, off, is_relay) = (bake.slot_id, bake.task_dir, bake.kv_name, bake.offset, bake.is_relay_baking);
-                        if bake.layers.is_empty() { 
-                            let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid }); 
-                            return; 
-                        }
+                        if bake.layers.is_empty() { let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, success: false }); return; }
                         let loop_count = if is_relay { 1 } else { bake.layers.len() };
                         let slot = &SLOT_MANAGER.slots[sid];
                         slot.remaining_layers.store(loop_count, Ordering::SeqCst);
@@ -267,11 +253,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             }
                         }
                     }
-                    // [EXPLICIT-FREE] 읽기 성공/실패 상관없이 즉시 해제 보고
-                    if success { { let mut reg = load.registry.entries.write().unwrap(); if idx < reg.len() { reg[idx].location[load.layer_idx] = KVLocation::RAM; } } } 
-                    
-                    println!("[WORKER -> DISPATCHER] Reporting Release for Load Slot {} (Success: {})", load.slot_id, success);
-                    SLOT_MANAGER.release_slot(load.slot_id).await;
+                    // [IMPORTANT] 읽기 완료 시점에 즉시 해제하지 않음. 모델이 다 쓸 때까지 슬롯을 점유함.
+                    if success { { let mut reg = load.registry.entries.write().unwrap(); if idx < reg.len() { reg[idx].location[load.layer_idx] = KVLocation::RAM; reg[idx].slot_ids[load.layer_idx] = Some(load.slot_id); } } } 
+                    else { { let mut reg = load.registry.entries.write().unwrap(); if idx < reg.len() { reg[idx].location[load.layer_idx] = KVLocation::SSD; } } SLOT_MANAGER.release_slot(load.slot_id, false).await; }
                 }
             }
         }
@@ -354,7 +338,7 @@ impl Qwen3VLGenerateModel {
                     }
                     self.clear_temporal_kv_caches(); let dev = self.text_device.clone(); if dev.is_cuda() { let _ = dev.synchronize(); }
                     if let Ok(tx) = get_worker_channel().await { let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: path, kv_name: kv_n.clone(), offset: end, layers: dumps, is_relay_baking: is_06b })).await; }
-                } else { SLOT_MANAGER.release_slot(slot_id).await; }
+                } else { SLOT_MANAGER.release_slot(slot_id, false).await; }
                 self.clear_temporal_kv_caches();
             }
             c_pos = end;
@@ -385,7 +369,7 @@ impl Qwen3VLGenerateModel {
                         dumps.push(LayerKVDump { layer_idx: idx, k_data: k_vec, v_data: v_vec, shape: vec![1, heads, chunk_size, h_dim] });
                     }
                     if let Ok(tx) = get_worker_channel().await { let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(sid.as_ref().unwrap()), kv_name: kv_n.clone(), offset: s_off, layers: dumps, is_relay_baking: false })).await; }
-                } else { SLOT_MANAGER.release_slot(slot_id).await; }
+                } else { SLOT_MANAGER.release_slot(slot_id, false).await; }
             }
             self.clear_temporal_kv_caches();
         }
