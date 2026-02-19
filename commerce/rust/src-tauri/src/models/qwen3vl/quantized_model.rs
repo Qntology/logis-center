@@ -591,17 +591,26 @@ impl QuantizedQwen3VLTextAttention {
                 }
             }
 
-            // 2. [ASYNC-WAIT] Loading 중이라면 잠시 대기
+            // 2. [ASYNC-WAIT] Loading 중이라면 대기 (잠금 해제 후 대기하여 워커에게 기회 제공)
             if loc == KVLocation::Loading {
                 let mut attempts = 0;
                 while attempts < 2000 {
+                    // 잠금을 아주 짧게만 유지하고 즉시 해제
                     let current = {
                         let reg = self.registry.entries.read().unwrap();
                         reg[index].location[self.layer_idx]
                     };
+                    
                     if current == KVLocation::RAM { break; }
-                    std::thread::sleep(std::time::Duration::from_micros(100));
+                    
+                    // [CRITICAL] 잠금을 풀고 워커가 Write Lock을 잡을 수 있도록 1ms 대기
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                     attempts += 1;
+                    
+                    // 100번 시도마다 정체 보고
+                    if attempts % 100 == 0 {
+                        println!("[TRACE] Layer {} Block {} still loading... (Attempt {})", self.layer_idx, index, attempts);
+                    }
                 }
             }
 
@@ -721,7 +730,7 @@ impl QuantizedQwen3VLTextAttention {
             .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
         let attn_output = self.o_proj.forward(&attn_output)?;
 
-        // [STRICT-PURGE] 레이어 연산 직후 모든 VRAM 조각 해제
+        // [SMART-PURGE] 레이어 연산 직후 VRAM(BF16)만 비우고 RAM(BitKV)은 유지
         for block in &mut self.kv_blocks {
             let (index, current_inner_loc) = {
                 let inner = block.inner.read().unwrap();
@@ -733,15 +742,16 @@ impl QuantizedQwen3VLTextAttention {
                 if index < reg.len() { reg[index].location[self.layer_idx] } else { KVLocation::VRAM }
             };
 
-            // VRAM에만 있거나 새로 로드된 데이터를 연산 직후 비움
-            if reg_loc != KVLocation::VRAM || current_inner_loc != KVLocation::VRAM {
-                let mut inner = block.inner.write().unwrap();
-                inner.k_cache = None;
-                inner.v_cache = None;
-                // 상태 동기화 (SSD나 RAM 상태로 되돌림)
-                if inner.location == KVLocation::VRAM {
-                    inner.location = reg_loc;
-                }
+            // VRAM 캐시(BF16)는 메모리 절약을 위해 즉시 비움
+            let mut inner = block.inner.write().unwrap();
+            inner.k_cache = None;
+            inner.v_cache = None;
+
+            // 상태 동기화: 만약 RAM에 메타데이터가 있다면 상태를 RAM으로 유지
+            if inner.bitkv_metadata.is_some() {
+                inner.location = KVLocation::RAM;
+            } else if inner.location == KVLocation::VRAM && reg_loc != KVLocation::VRAM {
+                inner.location = reg_loc;
             }
         }
 
@@ -919,7 +929,14 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn drop_kv_storage(&mut self) -> Result<()> {
-        self.clear_kv_cache();
+        for block in &mut self.kv_blocks {
+            let mut inner = block.inner.write().unwrap();
+            inner.k_cache = None;
+            inner.v_cache = None;
+            inner.bitkv_metadata = None;
+            inner.location = KVLocation::SSD;
+        }
+        self.kv_blocks.clear();
         Ok(())
     }
 
@@ -1638,9 +1655,14 @@ impl QuantizedQwen3VLTextModel {
 
         // [SMART-SEQUENTIAL-LOOP]
         let num_layers = self.layers.len();
-        println!("[TRACE] Entering layer loop. Total layers: {}", num_layers);
+        println!("[TRACE] Starting Layer Loop: 0 to {}", num_layers - 1);
+        
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             if layer_idx < start_layer { continue; }
+            
+            if layer_idx % 7 == 0 {
+                println!("[TRACE] Processing Layer {}/{}", layer_idx, num_layers);
+            }
 
             let is_pinned = layer_idx < self.pinned_layer_count;
             
@@ -1727,9 +1749,24 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn drop_kv_storage(&mut self) -> Result<()> {
+        println!("[MEMORY] Hard Resetting Language Model Registry & Layers...");
+        
+        // 1. Registry (중앙 통제실 TOC) 완전 리셋
+        {
+            let mut reg = self.registry.entries.write().unwrap();
+            for entry in reg.iter_mut() {
+                for loc in entry.location.iter_mut() { *loc = KVLocation::SSD; }
+                for sid in entry.slot_ids.iter_mut() { *sid = None; }
+            }
+        }
+
+        // 2. 각 레이어의 물리적 메모리 점유 해제
         for layer in self.layers.iter_mut() {
             layer.drop_kv_storage()?;
         }
+
+        self.current_kv_len = 0;
+        println!("[MEMORY] Registry Reset Complete.");
         Ok(())
     }
 
