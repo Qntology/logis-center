@@ -335,22 +335,24 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     for i in 0..num_blocks {
                         let (l_idx, s_id, block) = (chunk.layer_indices[i], chunk.slot_ids[i], chunk.shared_blocks[i].clone());
                         
-                        // [FIX] Robust metadata retrieval without panicking. Handle poisoned locks.
-                        let (off, b_idx, block_ssd_path) = match block.inner.read() {
-                            Ok(inner) => (inner.offset, inner.index, inner.ssd_path.clone()),
-                            Err(e) => {
-                                println!("[WORKER] !! Block {} Lock poisoned: {:?}", i, e);
-                                SLOT_MANAGER.release_slot(s_id).await;
-                                continue;
+                        // [FIX] Explicitly scope the ReadGuard to ensure it's dropped before any await
+                        let (b_idx, target_path) = {
+                            let read_res = block.inner.read();
+                            match read_res {
+                                Ok(inner) => {
+                                    let path = inner.ssd_path.clone().or_else(|| {
+                                        if let Ok(reg) = registry.entries.read() {
+                                            if inner.index < reg.len() { reg[inner.index].ssd_path.clone() } else { None }
+                                        } else { None }
+                                    });
+                                    (inner.index, path)
+                                },
+                                Err(e) => {
+                                    println!("[WORKER] !! Block {} Lock Poisoned: {:?}", i, e);
+                                    (999, None)
+                                }
                             }
                         };
-                        
-                        // [FIX] Path Fallback: Block First, then Registry
-                        let target_path = block_ssd_path.or_else(|| {
-                            if let Ok(reg) = registry.entries.read() {
-                                if b_idx < reg.len() { reg[b_idx].ssd_path.clone() } else { None }
-                            } else { None }
-                        });
 
                         if target_path.is_none() {
                             println!("[WORKER] !! Block {} (Index {}) has no SSD path. Skipping.", i, b_idx);
@@ -368,7 +370,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         Ok(st) => {
                                             // [FIX] DYNAMIC SHAPE DETECTION: Trust the file metadata
                                             let (ka_data, o_s) = if let Ok(t_view) = st.tensor("k_anchors") {
-                                                let dims = t_view.shape(); // e.g., [1, 16, 35, 64]
+                                                let dims = t_view.shape(); // e.g. [1, 16, 35, 64]
                                                 let data = unsafe { std::slice::from_raw_parts(t_view.data().as_ptr() as *const f32, t_view.data().len() / 4).to_vec() };
                                                 let s_len = if let Ok(v) = st.tensor("k_shape") {
                                                     let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const u32, v.data().len() / 4) };
