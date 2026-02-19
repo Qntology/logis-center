@@ -1091,23 +1091,21 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
+    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, _expected_len: usize, _upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
         let base_filename = match kv_name {
             Some(name) => format!("layer_{}_kv", name),
             None => format!("layer_{}_kv", self.layer_idx),
         };
 
-        // 1. Try to find all fragments (e.g., base_0.safetensors, base_1024.safetensors)
         let mut fragments = Vec::new();
         if let Ok(entries) = std::fs::read_dir(path) {
             for entry in entries.flatten() {
                 let fname = entry.file_name().to_string_lossy().to_string();
-                if fname.starts_with(&base_filename) && fname.ends_with(".safetensors") {
-                    // Extract offset from filename: "layer_pug_kv_1024.safetensors" -> 1024
-                    let offset = if fname == format!("{}.safetensors", base_filename) {
+                if (fname.starts_with(&base_filename) || fname.starts_with("layer_relay_kv")) && fname.ends_with(".safetensors") {
+                    let offset = if fname == format!("{}.safetensors", base_filename) || fname == "layer_relay_kv.safetensors" {
                         0
                     } else {
-                        fname.strip_prefix(&format!("{}_", base_filename))
+                        fname.split('_').last()
                              .and_then(|s| s.strip_suffix(".safetensors"))
                              .and_then(|s| s.parse::<usize>().ok())
                              .unwrap_or(0)
@@ -1118,110 +1116,44 @@ impl QuantizedQwen3VLTextAttention {
         }
         
         if fragments.is_empty() { return Ok(()); }
-        fragments.sort_by_key(|f| f.0); // Ensure correct order
+        fragments.sort_by_key(|f| f.0);
+        fragments.dedup_by_key(|f| f.0);
 
-        let mut all_k = Vec::new();
-        let mut all_v = Vec::new();
-        let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-
-        for (_, file_path) in fragments {
-            let file = std::fs::File::open(&file_path)?;
-            let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-            let st = safetensors::SafeTensors::deserialize(&mmap)?;
-            
-            let mode = if let Ok(view) = st.tensor("mode") {
-                u32::from_le_bytes(view.data()[0..4].try_into().unwrap())
-            } else { 1 };
-
-            let (k, v) = if mode == 3 {
-                let dequantize_bitkv = |prefix: &str| -> Result<Tensor> {
-                    let anchors_view = st.tensor(&format!("{}_anchors", prefix))?;
-                    let anchors = Tensor::from_slice(unsafe { std::slice::from_raw_parts(anchors_view.data().as_ptr() as *const f32, anchors_view.data().len() / 4) }, anchors_view.shape(), device)?;
-                    let packed_view = st.tensor(&format!("{}_packed", prefix))?;
-                    let packed = Tensor::from_slice(packed_view.data(), packed_view.shape(), device)?;
-                    let scales_view = st.tensor(&format!("{}_scales", prefix))?;
-                    let scales = Tensor::from_slice(unsafe { std::slice::from_raw_parts(scales_view.data().as_ptr() as *const f32, scales_view.data().len() / 4) }, scales_view.shape(), device)?;
-                    let shape_view = st.tensor("k_shape")?;
-                    let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(shape_view.data().as_ptr() as *const u32, shape_view.data().len() / 4) };
-                    let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
-                    let t = self.decompress_from_bitkv(&anchors, &packed, &scales, &shape, device)?;
-                    Ok(t.to_dtype(target_dtype)?)
-                };
-                (dequantize_bitkv("k")?, dequantize_bitkv("v")?)
-            } else {
-                let dequantize_legacy = |prefix: &str| -> Result<Tensor> {
-                    let packed_view = st.tensor(&format!("{}_packed", prefix))?;
-                    let packed = Tensor::from_slice(packed_view.data(), packed_view.shape(), device)?;
-                    let scales_view = st.tensor(&format!("{}_scales", prefix))?;
-                    let scales = Tensor::from_slice(unsafe { std::slice::from_raw_parts(scales_view.data().as_ptr() as *const f32, scales_view.data().len() / 4) }, scales_view.shape(), device)?;
-                    let shape_view = st.tensor("k_shape")?;
-                    let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(shape_view.data().as_ptr() as *const u32, shape_view.data().len() / 4) };
-                    let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
-                    let t = if mode == 2 { self.decompress_from_1bit(&packed, &scales, &shape)? } 
-                            else { self.decompress_from_8bit(&packed, &scales, &shape)? };
-                    Ok(t.to_dtype(target_dtype)?)
-                };
-                (dequantize_legacy("k")?, dequantize_legacy("v")?)
-            };
-            all_k.push(k);
-            all_v.push(v);
-        }
-
-        // Stitch all blocks back together
-        let mut k = Tensor::cat(&all_k, 2)?;
-        let mut v = Tensor::cat(&all_v, 2)?;
-
-        // [LINEAR-BRIDGE] Convert 0.6B (512) cache to 2B (2048) cache
-        let (_b, h, _s, d) = k.dims4()?;
-        let target_heads = self.num_key_value_heads;
-        let target_dim = self.head_dim;
-
-        if h != target_heads || d != target_dim {
-            if self.layer_idx == 0 {
-                println!("[LINEAR-BRIDGE] Convert 0.6B (512) cache to 2B (2048) cache via BitKV");
-            }
-            if d < target_dim {
-                k = Tensor::cat(&[&k, &k], D::Minus1)?;
-                v = Tensor::cat(&[&v, &v], D::Minus1)?;
-            }
-            if h != target_heads {
-                let mut k_heads = vec![];
-                let mut v_heads = vec![];
-                for i in 0..target_heads {
-                    let source_idx = i % h;
-                    k_heads.push(k.narrow(1, source_idx, 1)?);
-                    v_heads.push(v.narrow(1, source_idx, 1)?);
-                }
-                k = Tensor::cat(&k_heads, 1)?;
-                v = Tensor::cat(&v_heads, 1)?;
-            }
-        }
-
-        let actual_k_len = k.dim(2)?;
-        let use_len = if expected_len == 0 { actual_k_len } else { expected_len };
-        let final_len = if use_len > upscale_refill_len { use_len - upscale_refill_len } else { use_len };
-
-        if final_len > 0 {
-            let safe_len = final_len.min(actual_k_len);
-            let k_final = k.narrow(2, 0, safe_len)?.contiguous()?;
-            let v_final = v.narrow(2, 0, safe_len)?.contiguous()?;
-            
-            self.kv_blocks.clear();
-            let new_block = KVBlock::new(KVLocation::VRAM, 0, safe_len, 0);
+        self.kv_blocks.clear();
+        let mut total_len = 0;
+        
+        for (i, (offset, _)) in fragments.iter().enumerate() {
+            let b_len = 128; 
+            let new_block = KVBlock::new(KVLocation::SSD, i, b_len, *offset);
             {
                 let mut inner = new_block.inner.write().unwrap();
-                inner.k_cache = Some(k_final);
-                inner.v_cache = Some(v_final);
                 inner.ssd_path = Some(path.to_path_buf());
             }
             self.kv_blocks.push(new_block);
+            total_len = offset + b_len;
+
+            let mut reg = self.registry.entries.write().unwrap();
+            if i >= reg.len() {
+                reg.push(crate::models::qwen3vl::quantized_model::RegistryEntry {
+                    location: vec![KVLocation::SSD; 28],
+                    slot_ids: vec![None; 28],
+                    token_start: *offset,
+                    token_len: b_len,
+                    ssd_path: Some(path.to_path_buf()),
+                });
+            }
+            reg[i].location[self.layer_idx] = KVLocation::SSD;
+            reg[i].ssd_path = Some(path.to_path_buf());
         }
-        Ok(())
-    }
 
-                        pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
-
-                            self.save_kv_cache(path, true, block_size, None)
+        if self.layer_idx == 0 {
+            println!("[SSD-LOAD] Registered {} blocks from SSD context.", fragments.len());
+        }
+                Ok(())
+            }
+        
+            pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
+                                    self.save_kv_cache(path, true, block_size, None)
 
                         }
 
