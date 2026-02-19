@@ -162,7 +162,7 @@ impl SlotManager {
     pub fn get_counts(&self) -> (usize, usize, usize) { (self.count_reads.load(Ordering::Relaxed), self.count_writes.load(Ordering::Relaxed), self.count_free.load(Ordering::Relaxed)) }
 }
 
-pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(65));
+pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(256));
 
 struct LayerKVDump { layer_idx: usize, k_tensor: Tensor, v_tensor: Tensor }
 struct BakeTask { slot_id: usize, task_dir: PathBuf, kv_name: Option<String>, offset: usize, layers: Vec<LayerKVDump>, is_relay_baking: bool }
@@ -217,6 +217,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         while let Some(task) = rx.recv().await {
             match task {
                 SlotTask::Bake(bake) => {
+                    println!("[SLOT-WORKER] >> Received instruction: BAKE for Slot {}", bake.slot_id);
                     let io_tx_inner = io_tx.clone();
                     tokio::task::spawn_blocking(move || {
                         let sid = bake.slot_id;
@@ -271,7 +272,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     }).await.ok();
                 }
                 SlotTask::Load(load) => {
-                    let (off, idx, l_idx, s_id) = ({ let inner = load.shared_block.inner.read().unwrap(); (inner.offset, inner.index) }, load.layer_idx, load.slot_id);
+                    let ((off, b_idx), l_idx, s_id) = ({ let inner = load.shared_block.inner.read().unwrap(); (inner.offset, inner.index) }, load.layer_idx, load.slot_id);
                     let fname = if off == 0 { format!("layer_{}_kv.safetensors", l_idx) } else { format!("layer_{}_kv_{}.safetensors", l_idx, off) };
                     let path = load.path.join(fname);
                     let registry = load.registry.clone();
@@ -285,7 +286,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     let mut inner = shared_block.inner.write().unwrap();
                                     inner.bitkv_metadata = Some(crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], (o_s[2] + 7) / 8 + 4, o_s[3]), &Device::Cpu).unwrap(), k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), k_scales: Tensor::from_vec(ks, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), v_anchors: Tensor::from_vec(va, (o_s[0], o_s[1], (o_s[2] + 7) / 8 + 4, o_s[3]), &Device::Cpu).unwrap(), v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), v_scales: Tensor::from_vec(vs, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), original_shape: o_s });
                                     let mut reg = registry.entries.write().unwrap();
-                                    if idx < reg.len() { reg[idx].location[l_idx] = KVLocation::RAM; }
+                                    if b_idx < reg.len() { reg[b_idx].location[l_idx] = KVLocation::RAM; }
                                 }
                             }
                         }
@@ -390,13 +391,16 @@ impl Qwen3VLGenerateModel {
                 let unbaked_blocks = self.get_all_unbaked_kv_blocks();
                 for (ks, vs, block_offset) in unbaked_blocks {
                     let slot_id = SLOT_MANAGER.acquire_write_slot(t_toks).await;
+                    let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+                    if !path.exists() { let _ = fs::create_dir_all(&path); }
+                    
                     let mut dumps = Vec::new();
                     for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
                         let k: Tensor = k; let v: Tensor = v;
                         dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v });
                     }
                     if let Ok(tx) = get_bake_worker().await {
-                        let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: block_offset, layers: dumps, is_relay_baking: is_06b })).await;
+                        let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, layers: dumps, is_relay_baking: is_06b })).await;
                     }
                 }
                 self.clear_temporal_kv_caches();
