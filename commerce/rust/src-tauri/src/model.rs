@@ -401,10 +401,19 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
-                if path.exists() {
-                    println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
-                    gen.load_kv_from_disk(&path, kv_name.as_deref())?;
+                let kv_dir = crate::utils::paths::get_kv_dir(None);
+                let path_file = kv_dir.join(format!("{}.safetensors", task_id_str));
+                let path_dir = kv_dir.join(&task_id_str); 
+                
+                let target_path = if path_dir.exists() && path_dir.is_dir() {
+                    path_dir
+                } else {
+                    path_file
+                };
+
+                if target_path.exists() {
+                    println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", target_path);
+                    gen.load_kv_from_disk(&target_path, kv_name.as_deref())?;
                     Ok(())
                 } else {
                     println!("[SSD-BRIDGE] No snapshot found for {}", task_id_str);
