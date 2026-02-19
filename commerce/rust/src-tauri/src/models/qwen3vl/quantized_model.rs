@@ -1578,9 +1578,9 @@ impl QuantizedQwen3VLTextModel {
                                                             if let Ok(dev) = nvml.device_by_index(0) {
                                                                 if let Ok(mem) = dev.memory_info() {
                                                                     let current_progress = (seqlen_offset + seq_len).min(total_len);
-                                                                    let (reads, writes, free) = SLOT_MANAGER.get_counts();
-                                                                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Slots: R={}, W={}, F={}", 
-                                                                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len, reads, writes, free);
+                                                                    let (reads, writes, cached, free) = SLOT_MANAGER.get_counts();
+                                                                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Slots: R={}, W={}, C={}, F={}", 
+                                                                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len, reads, writes, cached, free);
                                                                 }
                                                             }        }
 
@@ -1706,34 +1706,6 @@ impl QuantizedQwen3VLTextModel {
                     }
                 });
             }
-        }
-
-        println!("[TRACE] All layers done. Finalizing Slots...");
-        
-        // [FORWARD-BARRIER] 2B 추론 시에만 사용한 RAM 슬롯 일괄 해제 (베이킹 시에는 캐시 유지를 위해 생략)
-        if !self.is_baking {
-            let reg_obj = self.registry.clone();
-            tauri::async_runtime::spawn(async move {
-                let mut used_slots = Vec::new();
-                {
-                    let mut reg = reg_obj.entries.write().unwrap();
-                    for entry in reg.iter_mut() {
-                        for sid_opt in entry.slot_ids.iter_mut() {
-                            if let Some(sid) = *sid_opt {
-                                if !used_slots.contains(&sid) { used_slots.push(sid); }
-                                *sid_opt = None;
-                            }
-                        }
-                        for loc in entry.location.iter_mut() {
-                            if *loc == KVLocation::RAM { *loc = KVLocation::SSD; }
-                        }
-                    }
-                }
-                use crate::models::qwen3vl::generate::SLOT_MANAGER;
-                for sid in used_slots {
-                    SLOT_MANAGER.release_slot(sid, true).await;
-                }
-            });
         }
 
         self.current_kv_len = seqlen_offset + seq_len;
