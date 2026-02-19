@@ -1105,17 +1105,16 @@ impl QuantizedQwen3VLTextAttention {
         fragments.dedup_by_key(|f| f.0);
 
         self.kv_blocks.clear();
-        let mut total_len = 0;
         
         for (i, (offset, _)) in fragments.iter().enumerate() {
-            let b_len = 128; 
+            // [FIX] Block size must match 0.6B baking unit (256)
+            let b_len = 256; 
             let new_block = KVBlock::new(KVLocation::SSD, i, b_len, *offset);
             {
                 let mut inner = new_block.inner.write().unwrap();
                 inner.ssd_path = Some(path.to_path_buf());
             }
             self.kv_blocks.push(new_block);
-            total_len = offset + b_len;
 
             let mut reg = self.registry.entries.write().unwrap();
             if i >= reg.len() {
@@ -1132,10 +1131,10 @@ impl QuantizedQwen3VLTextAttention {
         }
 
         if self.layer_idx == 0 {
-            println!("[SSD-LOAD] Registered {} blocks from SSD context.", fragments.len());
+            println!("[SSD-LOAD] Registered {} blocks (256 tokens each) from SSD context.", fragments.len());
         }
-                Ok(())
-            }
+        Ok(())
+    }
         
             pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
                                     self.save_kv_cache(path, true, block_size, None)
@@ -1683,14 +1682,12 @@ impl QuantizedQwen3VLTextModel {
                         
                         println!("[TRACE] Starting Horizontal Pass: Layer-by-Layer execution (Total Seq: {})", seq_len);
                 
-                        for layer_idx in 0..num_layers {
-                            if layer_idx < start_layer { continue; }
-                            
-                            // 1. [REBALANCE] 점진적 업로드 시도
-                            let _ = self.rebalance_layers(0);
-                            
-                            let dev_type = if self.layers[layer_idx].device().is_cuda() { "GPU" } else { "CPU" };
-                            
+                                for layer_idx in 0..num_layers {
+                                    if layer_idx < start_layer { continue; }
+                                    
+                                    // 1. [TARGET-REBALANCE] Ensure THIS specific layer is on GPU
+                                    let _ = self.rebalance_layers(0, layer_idx);
+                                    let dev_type = if self.layers[layer_idx].device().is_cuda() { "GPU" } else { "CPU" };                            
                             // 2. [MASS-LOAD] 현재 레이어에 필요한 모든 블록을 SSD에서 한꺼번에 로드 요청
                             let mut blocks_to_load: Vec<KVBlock> = Vec::new();
                             let mut chunk_path = std::path::PathBuf::new();
@@ -2010,12 +2007,10 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> {
-        if self.is_forced_cpu { return Ok(()); } // [FIX] Never move to GPU if user wants CPU
+    pub fn rebalance_layers(&mut self, device_id: usize, target_idx: usize) -> Result<()> {
+        if self.is_forced_cpu { return Ok(()); }
         
         use nvml_wrapper::Nvml;
-        
-        // VRAM 체크 (NVML 사용)
         let nvml = Nvml::init().ok();
         let mut free_vram = 0;
         
@@ -2027,53 +2022,22 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
-        // 임계값 설정
-        let danger_zone = 600_000_000; // 300MB -> 600MB 상향 (안전 마진 확보)
-        let safe_zone = 1_000_000_000; // 1GB 이상 여유 시 업로드 시도
+        let danger_zone = 600_000_000;
+        let safe_zone = 1_000_000_000;
 
-        if free_vram > 0 && free_vram < danger_zone {
-            // [OFFLOAD] GPU -> CPU (뒤쪽 레이어부터)
-            for layer in self.layers.iter_mut().rev() {
-                if layer.device().is_cuda() {
-                    println!("[REBALANCE] Low VRAM ({:.2} MB). Offloading Layer {} to CPU.", free_vram as f64 / 1e6, layer.self_attn.layer_idx);
-                    let _ = layer.to_device(&Device::Cpu);
-                    return Ok(()); // 한 번에 하나만 처리하고 즉시 복귀
-                }
-            }
-        } else if free_vram > safe_zone {
-            // [UPLOAD] CPU -> GPU (Sequential Verified Batch: 4 layers)
+        // [STRICT-TARGETING] Only handle the specific layer requested
+        if target_idx >= self.layers.len() { return Ok(()); }
+        let layer = &mut self.layers[target_idx];
+
+        if free_vram > 0 && free_vram < danger_zone && layer.device().is_cuda() {
+            println!("[REBALANCE] Emergency Offload: Layer {} -> CPU (Free: {}MB)", target_idx, free_vram / 1024 / 1024);
+            let _ = layer.to_device(&Device::Cpu);
+        } else if free_vram > safe_zone && layer.device().is_cpu() {
+            println!("[REBALANCE] Targeted Upload: Layer {} -> GPU (Free: {}MB)", target_idx, free_vram / 1024 / 1024);
             let target_device = Device::new_cuda(device_id)?;
-            let mut uploaded_count = 0;
-            let mut current_free = free_vram;
-            
-            for layer in self.layers.iter_mut() {
-                if layer.device().is_cpu() {
-                    // Check if we still have enough room for one more layer (~100MB + margin)
-                    if current_free < danger_zone + 150_000_000 { break; }
-
-                    println!("[REBALANCE] Starting upload: Layer {} (Current Free: {:.2} GB)", layer.self_attn.layer_idx, current_free as f64 / 1e9);
-                    
-                    // 1. Start transfer
-                    let _ = layer.to_device(&target_device);
-                    
-                    // 2. CRITICAL: Synchronize to ensure the transfer is physically complete
-                    let _ = target_device.synchronize();
-                    
-                    // 3. Re-measure VRAM using NVML to get the actual state
-                    if let Some(ref nvml_inst) = nvml {
-                        if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
-                            if let Ok(mem) = dev.memory_info() {
-                                current_free = mem.free;
-                            }
-                        }
-                    }
-                    
-                    uploaded_count += 1;
-                    if uploaded_count >= 4 { break; } // Limit per forward pass to maintain responsiveness
-                }
-            }
-            if uploaded_count > 0 { println!("[REBALANCE] Sequential upload finished. Managed {} layers.", uploaded_count); }
-            return Ok(()); 
+            let _ = layer.to_device(&target_device);
+            // CRITICAL: Ensure physical completion before proceeding
+            let _ = target_device.synchronize();
         }
         Ok(())
     }
@@ -2286,7 +2250,7 @@ impl QuantizedQwen3VLModel {
 
     pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
         // [OPTION A] 실시간 VRAM 재배치 활성화
-        let _ = self.rebalance_layers(0);
+        let _ = self.rebalance_layers(0, 0);
 
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
         let (b_sz, seq_len) = input_ids.dims2()?;
@@ -2337,7 +2301,7 @@ impl QuantizedQwen3VLModel {
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; self.text_device = device.clone(); self.vision_device = device.clone(); Ok(()) }
-    pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> { self.language_model.rebalance_layers(device_id) }
+    pub fn rebalance_layers(&mut self, device_id: usize, target_idx: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, target_idx) }
 }
 
 #[derive(Clone)]
@@ -2383,7 +2347,7 @@ impl QuantizedQwen3TextModel {
 
     pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
         // [OPTION A] 실시간 VRAM 재배치 활성화
-        let _ = self.rebalance_layers(0);
+        let _ = self.rebalance_layers(0, 0);
 
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
         
@@ -2420,7 +2384,7 @@ impl QuantizedQwen3TextModel {
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
-    pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> { self.language_model.rebalance_layers(device_id) }
+    pub fn rebalance_layers(&mut self, device_id: usize, target_idx: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, target_idx) }
 }
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {

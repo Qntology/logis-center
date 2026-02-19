@@ -324,6 +324,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     });
 }
 
+#[derive(Clone)]
+pub enum ModelVariant { Standard(crate::models::qwen3vl::model::Qwen3VLModel), QuantizedVL(QuantizedQwen3VLModel), QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel) }
+
 impl ModelVariant {
     pub fn forward(&mut self, i: &Tensor, pv: Option<&Tensor>, ithw: Option<&Tensor>, vpv: Option<&Tensor>, vthw: Option<&Tensor>, cp: Option<&Tensor>, off: usize, tl: usize, sid: Option<String>) -> Result<Tensor> {
         match self { 
@@ -332,13 +335,20 @@ impl ModelVariant {
             Self::QuantizedText(m) => m.forward(i, cp, off, tl, sid) 
         }
     }
-    pub fn rebalance_layers(&mut self, d: usize) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.rebalance_layers(d), Self::QuantizedText(m) => m.rebalance_layers(d) } }
+    pub fn rebalance_layers(&mut self, d: usize, target_idx: usize) -> Result<()> { 
+        match self { 
+            Self::Standard(_) => Ok(()), 
+            Self::QuantizedVL(m) => m.rebalance_layers(d, target_idx), 
+            Self::QuantizedText(m) => m.rebalance_layers(d, target_idx) 
+        } 
+    }
     pub fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage() } }
     pub fn inject_kv_bitkv(&mut self, ka: &[Tensor], kp: &[Tensor], ks: &[Tensor], va: &[Tensor], vp: &[Tensor], vs: &[Tensor], os: &[usize]) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.inject_live_kv_bitkv(ka, kp, ks, va, vp, vs, os), Self::QuantizedText(m) => m.language_model.inject_live_kv_bitkv(ka, kp, ks, va, vp, vs, os), _ => Ok(()) } }
     pub fn is_cpu(&self) -> bool { match self { Self::Standard(m) => m.device().is_cpu(), Self::QuantizedVL(m) => m.language_model.is_forced_cpu, Self::QuantizedText(m) => m.language_model.is_forced_cpu } }
 }
 
 pub struct Qwen3VLGenerateModel { pub chat_template: ChatTemplate, pub tokenizer: TokenizerModel, pub pre_processor: Qwen3VLProcessor, pub qwen3_vl: ModelVariant, pub text_device: Device, pub vision_device: Device, pub eos_token_id1: u32, pub eos_token_id2: u32, pub generation_config: Qwen3VLGenerationConfig, pub model_name: String, pub hard_token_limit: Option<usize>, pub kv_root: std::path::PathBuf }
+
 impl Qwen3VLGenerateModel {
     pub fn init_with_config(path: &str, tokenizer_path: Option<&str>, config_path: Option<&str>, text_device: Option<&Device>, text_device_id: usize, vision_device: Option<&Device>, vision_device_id: usize, dtype: Option<DType>, hard_token_limit: Option<usize>, force_text_only: bool, baking_only: bool, _is_disk_swap: bool, kv_root: std::path::PathBuf) -> Result<Self> {
         let path = if let Some(s) = path.strip_prefix(r"\\?\") { s } else { path };
@@ -488,8 +498,8 @@ impl Qwen3VLGenerateModel {
 
     pub fn get_kv_len(&self) -> usize { match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.get_kv_len(), ModelVariant::QuantizedText(m) => m.language_model.get_kv_len(), _ => 0 } }
     pub fn get_all_unbaked_kv_blocks(&self) -> Vec<(Vec<Tensor>, Vec<Tensor>, usize)> {
-        let mut all_blocks = Vec::new();
-        let layers = match &self.qwen3_vl {
+        let mut all_blocks: Vec<(Vec<Tensor>, Vec<Tensor>, usize)> = Vec::new();
+        let layers: Option<&Vec<crate::models::qwen3vl::quantized_model::QuantizedQwen3VLTextDecoderLayer>> = match &self.qwen3_vl {
             ModelVariant::QuantizedVL(m) => Some(&m.language_model.layers),
             ModelVariant::QuantizedText(m) => Some(&m.language_model.layers),
             _ => None
@@ -498,8 +508,8 @@ impl Qwen3VLGenerateModel {
             if layers.is_empty() { return vec![]; }
             let num_blocks = layers[0].self_attn.kv_blocks.len();
             for b_idx in 0..num_blocks {
-                let mut ks = Vec::new();
-                let mut vs = Vec::new();
+                let mut ks: Vec<Tensor> = Vec::new();
+                let mut vs: Vec<Tensor> = Vec::new();
                 let mut has_data = false;
                 let mut end_offset = 0;
                 for l in layers {
