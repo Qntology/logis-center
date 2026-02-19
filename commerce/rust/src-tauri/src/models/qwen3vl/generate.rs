@@ -53,6 +53,7 @@ pub struct SlotManager {
 
 impl SlotManager {
     pub fn new(count: usize) -> Self {
+        println!("[INIT] SlotManager initialized with {} slots (256-token units).", count);
         let mut slots = Vec::new();
         for i in 0..count { slots.push(crate::models::qwen3vl::quantized_model::MemorySlot::new(i, 28)); }
         let (tx, rx) = mpsc::channel(1000); 
@@ -105,8 +106,7 @@ impl SlotManager {
                         if old == InternalState::Writing { cw.fetch_sub(1, Ordering::SeqCst); }
                         else { cr.fetch_sub(1, Ordering::SeqCst); }
                         
-                        // [TRACE] 해제 알림 수신 확인
-                        println!("[DISPATCHER] 슬롯 {} 해제 완료. (남은 빈 슬롯: {})", idx, cf.load(Ordering::SeqCst));
+                        println!("[CENTRAL-CONTROL] << Received RELEASE notification for Slot {}. (Free slots: {})", idx, cf.load(Ordering::SeqCst));
                     }
                     if cw.load(Ordering::SeqCst) == 0 && cr.load(Ordering::SeqCst) == 0 { while let Some(w) = flushers.pop() { let _ = w.send(()); } }
                     Self::process_queues_robust(&sys, &mut free_p, &mut p_writes, &mut p_reads, &mut states, &cf, &cw, &cr, max_slots);
@@ -142,10 +142,9 @@ impl SlotManager {
     fn calculate_dynamic_budget(sys: &sysinfo::System, total_tokens: usize, max_slots: usize) -> usize {
         let avail = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
         
-        // [OPTIMIZATION] 0.6B Baking & High-Throughput Mode
-        // If total_tokens is small (< 4096), it implies 0.6B model or small context.
-        // We boost base_min from 4 to 56 to saturate SSD I/O and CPU pipelines.
-        let base_min = if total_tokens < 4096 { 56 } else { 4 };
+        // [OPTIMIZATION] High-Throughput Mode for both Baking and 2B Inference Prefill.
+        // We set base_min to 56 to support large 2048 chunks and maximize I/O utilization.
+        let base_min = 56;
         
         let budget = ((avail - 1.5).max(0.0) / 0.02) as usize;
         budget.min((total_tokens / 1024).saturating_add(2)).min(max_slots).max(base_min).min(max_slots)
@@ -170,7 +169,7 @@ impl SlotManager {
     pub fn get_counts(&self) -> (usize, usize, usize) { (self.count_reads.load(Ordering::Relaxed), self.count_writes.load(Ordering::Relaxed), self.count_free.load(Ordering::Relaxed)) }
 }
 
-pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(65));
+pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(256));
 
 struct LayerKVDump { layer_idx: usize, k_data: Vec<f32>, v_data: Vec<f32>, shape: Vec<usize> }
 struct BakeTask { slot_id: usize, task_dir: PathBuf, kv_name: Option<String>, offset: usize, layers: Vec<LayerKVDump>, is_relay_baking: bool }
@@ -213,9 +212,11 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         while let Some(task) = rx.recv().await {
             match task {
                 SlotTask::Bake(bake) => {
+                    println!("[SLOT-WORKER] >> Received instruction: BAKE for Slot {}", bake.slot_id);
                     let io_tx_inner = io_tx.clone();
                     tokio::task::spawn_blocking(move || {
                         let (sid, t_dir, kv_n, off, is_relay) = (bake.slot_id, bake.task_dir, bake.kv_name, bake.offset, bake.is_relay_baking);
+                        println!("[SLOT-WORKER] Starting BAKE operation for Slot {} at offset {}...", sid, off);
                         if bake.layers.is_empty() { 
                             let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid }); 
                             return; 
@@ -371,8 +372,10 @@ impl Qwen3VLGenerateModel {
     pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel: Option<Arc<AtomicBool>>, sid: Option<String>, _relay: Option<&mut Qwen3VLGenerateModel>, kv_n: Option<String>) -> Result<usize> {
         if sid.is_none() { SLOT_MANAGER.reset_all_slots().await; }
         let f_ids = self.tokenizer.text_encode_vec(self.pre_processor.process_info(&mes, &self.chat_template.apply_chat_template(&mes)?)?.replace_text, false)?;
-        // [OPTIMIZATION] Chunk Size: 128 -> 1024 for 0.6B Baking speed
-        let (t_toks, c_size, is_06b) = (f_ids.len(), 1024, self.model_name.contains("0.6B"));
+        
+        let is_06b = self.model_name.contains("0.6B");
+        // [OPTIMIZATION] 0.6B: 2048 chunk (2 slots, ~256MB Attn), 2B: 1024 chunk (1 slot)
+        let (t_toks, c_size) = (f_ids.len(), if is_06b { 2048 } else { 1024 });
         let mut c_pos = self.get_kv_len();
         while c_pos < t_toks {
             if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
@@ -380,20 +383,26 @@ impl Qwen3VLGenerateModel {
             println!("[BAKING] {} to {} / Total: {}", c_pos, end, t_toks);
             self.qwen3_vl.forward(&Tensor::from_vec(f_ids[c_pos..end].to_vec(), (1, c_len), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(c_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?), c_pos, t_toks, sid.clone())?;
             if let Some(s_id) = &sid {
-                let slot_id = SLOT_MANAGER.acquire_write_slot(t_toks).await;
-                let path = crate::utils::paths::get_kv_dir(None).join(s_id); if !path.exists() { let _ = fs::create_dir_all(&path); }
-                let (ks, vs) = self.get_current_kv();
-                if !ks.is_empty() {
+                let unbaked_blocks = self.get_all_unbaked_kv_blocks();
+                for (ks, vs, block_offset) in unbaked_blocks {
+                    let slot_id = SLOT_MANAGER.acquire_write_slot(t_toks).await;
+                    let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+                    if !path.exists() { let _ = fs::create_dir_all(&path); }
+                    
                     let mut dumps = Vec::new();
                     for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                        let dims = k.dims(); let heads = dims[1]; let h_dim = dims[3]; let s_len = dims[2];
-                        let k_v = k.narrow(2, s_len.saturating_sub(c_len), c_len)?.contiguous()?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-                        let v_v = v.narrow(2, s_len.saturating_sub(c_len), c_len)?.contiguous()?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-                        dumps.push(LayerKVDump { layer_idx: idx, k_data: k_v, v_data: v_v, shape: vec![1, heads, c_len, h_dim] });
+                        let k: Tensor = k; let v: Tensor = v;
+                        let dims = k.dims();
+                        let k_v = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                        let v_v = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                        dumps.push(LayerKVDump { layer_idx: idx, k_data: k_v, v_data: v_v, shape: vec![dims[0], dims[1], dims[2], dims[3]] });
                     }
-                    self.clear_temporal_kv_caches(); let dev = self.text_device.clone(); if dev.is_cuda() { let _ = dev.synchronize(); }
-                    if let Ok(tx) = get_worker_channel().await { let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: path, kv_name: kv_n.clone(), offset: end, layers: dumps, is_relay_baking: is_06b })).await; }
-                } else { SLOT_MANAGER.release_slot(slot_id).await; }
+                    if let Ok(tx) = get_worker_channel().await {
+                        let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, layers: dumps, is_relay_baking: is_06b })).await;
+                    }
+                }
+                // [SYNC-WAIT] Wait for parallel slots to finish
+                SLOT_MANAGER.wait_for_all_tasks().await;
                 self.clear_temporal_kv_caches();
             }
             c_pos = end;
@@ -414,18 +423,23 @@ impl Qwen3VLGenerateModel {
             self.qwen3_vl.forward(&Tensor::from_vec(f_ids[l_pos..l_pos+chunk_size].to_vec(), (1, chunk_size), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(s_off as u32, (s_off + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?), s_off, t_toks, sid.clone())?;
             l_pos += chunk_size; s_off += chunk_size;
             if let Some(s_id) = &sid {
-                let slot_id = SLOT_MANAGER.acquire_write_slot(t_toks).await;
-                let (ks, vs) = self.get_current_kv();
-                if !ks.is_empty() {
+                let unbaked_blocks = self.get_all_unbaked_kv_blocks();
+                for (ks, vs, block_offset) in unbaked_blocks {
+                    let slot_id = SLOT_MANAGER.acquire_write_slot(t_toks).await;
                     let mut dumps = Vec::new();
                     for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                        let dims = k.dims(); let heads = dims[1]; let h_dim = dims[3];
-                        let k_vec = k.contiguous()?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-                        let v_vec = v.contiguous()?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-                        dumps.push(LayerKVDump { layer_idx: idx, k_data: k_vec, v_data: v_vec, shape: vec![1, heads, chunk_size, h_dim] });
+                        let k: Tensor = k; let v: Tensor = v;
+                        let dims = k.dims();
+                        let k_v = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                        let v_v = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                        dumps.push(LayerKVDump { layer_idx: idx, k_data: k_v, v_data: v_v, shape: vec![dims[0], dims[1], dims[2], dims[3]] });
                     }
-                    if let Ok(tx) = get_worker_channel().await { let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(sid.as_ref().unwrap()), kv_name: kv_n.clone(), offset: s_off, layers: dumps, is_relay_baking: false })).await; }
-                } else { SLOT_MANAGER.release_slot(slot_id).await; }
+                    if let Ok(tx) = get_worker_channel().await {
+                        let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: block_offset, layers: dumps, is_relay_baking: false })).await;
+                    }
+                }
+                // [SYNC-WAIT] Wait for parallel slots to finish
+                SLOT_MANAGER.wait_for_all_tasks().await;
             }
             self.clear_temporal_kv_caches();
         }
@@ -459,17 +473,37 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn get_kv_len(&self) -> usize { match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.get_kv_len(), ModelVariant::QuantizedText(m) => m.language_model.get_kv_len(), _ => 0 } }
-    pub fn get_current_kv(&self) -> (Vec<Tensor>, Vec<Tensor>) {
-        let (mut ks, mut vs) = (vec![], vec![]);
-        let layers = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(&m.language_model.layers), ModelVariant::QuantizedText(m) => Some(&m.language_model.layers), _ => None };
+    pub fn get_all_unbaked_kv_blocks(&self) -> Vec<(Vec<Tensor>, Vec<Tensor>, usize)> {
+        let mut all_blocks = Vec::new();
+        let layers = match &self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => Some(&m.language_model.layers),
+            ModelVariant::QuantizedText(m) => Some(&m.language_model.layers),
+            _ => None
+        };
+
         if let Some(layers) = layers {
-            for l in layers {
-                let (mut lk, mut lv) = (vec![], vec![]);
-                for b in &l.self_attn.kv_blocks { let inner = b.inner.read().unwrap(); if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) { lk.push(k.clone()); lv.push(v.clone()); } }
-                if !lk.is_empty() { if let (Ok(k), Ok(v)) = (Tensor::cat(&lk, 2), Tensor::cat(&lv, 2)) { ks.push(k); vs.push(v); } }
+            if layers.is_empty() { return vec![]; }
+            let num_blocks = layers[0].self_attn.kv_blocks.len();
+            for b_idx in 0..num_blocks {
+                let mut ks = Vec::new();
+                let mut vs = Vec::new();
+                let mut has_data = false;
+                let mut end_offset = 0;
+                for l in layers {
+                    if b_idx < l.self_attn.kv_blocks.len() {
+                        let inner = l.self_attn.kv_blocks[b_idx].inner.read().unwrap();
+                        if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                            ks.push(k.clone());
+                            vs.push(v.clone());
+                            end_offset = inner.offset + inner.len;
+                            has_data = true;
+                        }
+                    }
+                }
+                if has_data { all_blocks.push((ks, vs, end_offset)); }
             }
         }
-        (ks, vs)
+        all_blocks
     }
     pub fn save_kv_to_disk(&mut self, p: &Path, n: Option<&str>, o: usize) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.save_kv_cache(p, false, o, n), ModelVariant::QuantizedText(m) => m.save_kv_cache(p, false, o, n), _ => Ok(()) } }
     pub fn to_device(&mut self, d: &Device) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.to_device(d)?, ModelVariant::QuantizedText(m) => m.to_device(d)?, _ => {} } self.text_device = d.clone(); self.vision_device = d.clone(); Ok(()) }

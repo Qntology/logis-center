@@ -628,6 +628,8 @@ async fn process_task(
                         ..Default::default()
                     };
                     worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
+                    // [CRITICAL] Flush I/O before relay
+                    crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
                 }
             }
         } else {
@@ -719,6 +721,8 @@ async fn process_task(
                         ..Default::default()
                     };
                     worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
+                    // [CRITICAL] Flush I/O before relay
+                    crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
                 }
             }
         } else {
@@ -869,6 +873,8 @@ async fn process_task(
                             ..Default::default()
                         };
                         worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
+                        // [CRITICAL] Flush I/O before relay
+                        crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
                     }
                 }
             } else {

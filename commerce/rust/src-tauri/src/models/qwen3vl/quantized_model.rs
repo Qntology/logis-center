@@ -448,43 +448,62 @@ impl QuantizedQwen3VLTextAttention {
         // 3. [BLOCK-ALLOCATION] Append or Create New
         let current_chunk_len = key_states.dim(2)?;
         let mut appended = false;
-        if let Some(last_block) = self.kv_blocks.last_mut() {
-            let mut inner = last_block.inner.write().unwrap();
-            if inner.location == KVLocation::VRAM && inner.len + current_chunk_len <= 1024 {
-                if let (Some(prev_k), Some(prev_v)) = (inner.k_cache.take(), inner.v_cache.take()) {
-                    inner.k_cache = Some(Tensor::cat(&[prev_k, key_states.clone()], 2)?.contiguous()?);
-                    inner.v_cache = Some(Tensor::cat(&[prev_v, value_states.clone()], 2)?.contiguous()?);
-                    inner.len += current_chunk_len;
-                    appended = true;
-                }
-            }
+        // [BLOCK-ALLOCATION] Split large KV results into multiple 256-token slots for high throughput
+        let mut tokens_to_process = current_chunk_len;
+        let mut chunk_offset = 0;
+        
+        if current_chunk_len > 256 {
+            println!("[DEBUG-KV] Splitting {} tokens into 256-unit slots...", current_chunk_len);
         }
 
-        if !appended {
-            let index = self.kv_blocks.len();
-            let current_total = self.get_kv_len();
-            let new_block = KVBlock::new(KVLocation::VRAM, index, current_chunk_len, current_total);
-            {
-                let mut inner = new_block.inner.write().unwrap();
-                inner.k_cache = Some(key_states);
-                inner.v_cache = Some(value_states);
-            }
-            
-            // [REGISTRY-REGISTER] Immediately register this block in the central TOC
-            // This ensures Layer 1-27 will find the entry even if Layer 0 just created it.
-            {
-                let mut reg = self.registry.entries.write().unwrap();
-                if reg.len() <= index {
-                    reg.push(RegistryEntry {
-                        location: vec![KVLocation::VRAM; 28], // 초기에는 모든 레이어가 VRAM
-                        slot_ids: vec![None; 28],
-                        token_start: current_total,
-                        token_len: current_chunk_len,
-                        ssd_path: None,
-                    });
+        while tokens_to_process > 0 {
+            let mut appended = false;
+            if let Some(last_block) = self.kv_blocks.last_mut() {
+                let mut inner = last_block.inner.write().unwrap();
+                let free_space = 256usize.saturating_sub(inner.len);
+                if inner.location == KVLocation::VRAM && free_space > 0 {
+                    let take = tokens_to_process.min(free_space);
+                    let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
+                    let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
+                    if let (Some(prev_k), Some(prev_v)) = (inner.k_cache.take(), inner.v_cache.take()) {
+                        inner.k_cache = Some(Tensor::cat(&[prev_k, k_piece], 2)?.contiguous()?);
+                        inner.v_cache = Some(Tensor::cat(&[prev_v, v_piece], 2)?.contiguous()?);
+                        inner.len += take;
+                        tokens_to_process -= take;
+                        chunk_offset += take;
+                        appended = true;
+                    }
                 }
             }
-            self.kv_blocks.push(new_block);
+
+            if !appended {
+                let take = tokens_to_process.min(256);
+                let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
+                let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
+                let index = self.kv_blocks.len();
+                let current_total = self.get_kv_len();
+                let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
+                {
+                    let mut inner = new_block.inner.write().unwrap();
+                    inner.k_cache = Some(k_piece);
+                    inner.v_cache = Some(v_piece);
+                }
+                {
+                    let mut reg = self.registry.entries.write().unwrap();
+                    if reg.len() <= index {
+                        reg.push(RegistryEntry {
+                            location: vec![KVLocation::VRAM; 28],
+                            slot_ids: vec![None; 28],
+                            token_start: current_total,
+                            token_len: take,
+                            ssd_path: None,
+                        });
+                    }
+                }
+                self.kv_blocks.push(new_block);
+                tokens_to_process -= take;
+                chunk_offset += take;
+            }
         }
 
         // [PREFETCH-TRIGGER] Look-ahead Chunked Prefetching (8-layer chunk ~ 100MB)
@@ -746,15 +765,17 @@ impl QuantizedQwen3VLTextAttention {
                 if index < reg.len() { reg[index].location[self.layer_idx] } else { KVLocation::VRAM }
             };
 
-            // VRAM 캐시(BF16)는 메모리 절약을 위해 즉시 비움
+            // [SMART-PURGE-PREVENTION] 
+            // If we are in VRAM, we only purge if we're NOT in a state that needs to export this data (like baking).
+            // For now, if metadata is missing and we are in VRAM, we keep the data until generate.rs explicitly clears it.
             let mut inner = block.inner.write().unwrap();
-            inner.k_cache = None;
-            inner.v_cache = None;
-
-            // 상태 동기화: 만약 RAM에 메타데이터가 있다면 상태를 RAM으로 유지
             if inner.bitkv_metadata.is_some() {
+                inner.k_cache = None;
+                inner.v_cache = None;
                 inner.location = KVLocation::RAM;
-            } else if inner.location == KVLocation::VRAM && reg_loc != KVLocation::VRAM {
+            } else if reg_loc != KVLocation::VRAM {
+                inner.k_cache = None;
+                inner.v_cache = None;
                 inner.location = reg_loc;
             }
         }
@@ -1586,9 +1607,6 @@ impl QuantizedQwen3VLTextModel {
         visual_pos_masks: Option<&Tensor>,
         deepstack_visual_embeds: Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
-        // [OPTION A] 실시간 VRAM 재배치 활성화
-        let _ = self.rebalance_layers(0);
-
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         
         use nvml_wrapper::Nvml;
@@ -1661,18 +1679,35 @@ impl QuantizedQwen3VLTextModel {
             }
         };
 
+        // [INCREMENTAL-UPLOAD] Try to upload exactly one layer to GPU at the start of each forward pass
+        let _ = self.rebalance_layers(0);
+
         // [SMART-SEQUENTIAL-LOOP]
         let num_layers = self.layers.len();
         println!("[TRACE] Starting Layer Loop: 0 to {}", num_layers - 1);
         
-        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+        for layer_idx in 0..num_layers {
             if layer_idx < start_layer { continue; }
-            
-            if layer_idx % 7 == 0 {
-                println!("[TRACE] Processing Layer {}/{}", layer_idx, num_layers);
+
+            if layer_idx % 7 == 0 || layer_idx == 0 {
+                let dev_type = if self.layers[layer_idx].device().is_cuda() { "GPU" } else { "CPU" };
+                let mut v_count = 0;
+                let mut r_count = 0;
+                let mut s_count = 0;
+                for b in &self.layers[layer_idx].self_attn.kv_blocks {
+                    match b.inner.read().unwrap().location {
+                        KVLocation::VRAM => v_count += 1,
+                        KVLocation::RAM | KVLocation::RAM_Sticky => r_count += 1,
+                        _ => s_count += 1,
+                    }
+                }
+                let (r, w, f) = SLOT_MANAGER.get_counts();
+                println!("[TRACE] Layer {:2}/{} on {:3} | KV: V={}, R={}, S={} | Slots: R={}, W={}, F={}", 
+                    layer_idx, num_layers, dev_type, v_count, r_count, s_count, r, w, f);
             }
 
             let is_pinned = layer_idx < self.pinned_layer_count;
+            let layer = &mut self.layers[layer_idx];
             
             // 1. [C: Computing] Prepare and Run Layer
             if !is_pinned {
@@ -1950,38 +1985,32 @@ impl QuantizedQwen3VLTextModel {
         }
 
         // 임계값 설정
-        let danger_zone = 300_000_000; // 300MB 이하: 위험 (내리기)
-        let safe_zone = 800_000_000;   // 800MB 이상: 여유 (올리기)
+        let danger_zone = 600_000_000; // 300MB -> 600MB 상향 (안전 마진 확보)
+        let safe_zone = 1_000_000_000; // 1GB 이상 여유 시 업로드 시도
 
         if free_vram > 0 && free_vram < danger_zone {
             // [OFFLOAD] GPU -> CPU (뒤쪽 레이어부터)
             for layer in self.layers.iter_mut().rev() {
                 if layer.device().is_cuda() {
                     println!("[REBALANCE] Low VRAM ({:.2} MB). Offloading Layer {} to CPU.", free_vram as f64 / 1e6, layer.self_attn.layer_idx);
-                    layer.to_device(&Device::Cpu)?;
-                    // Continue to offload more if needed, but for safety in offload we can be gradual
-                    break; 
+                    let _ = layer.to_device(&Device::Cpu);
+                    return Ok(()); // 한 번에 하나만 처리하고 즉시 복귀
                 }
             }
         } else if free_vram > safe_zone {
-            // [UPLOAD] CPU -> GPU (Batch Upload)
+            // [UPLOAD] CPU -> GPU (Incremental Upload: 4 layers at a time)
             let target_device = Device::new_cuda(device_id)?;
             let mut uploaded_count = 0;
-            let mut current_free = free_vram;
             
             for layer in self.layers.iter_mut() {
                 if layer.device().is_cpu() {
-                    // Approximate cost: 100MB per layer
-                    if current_free > danger_zone + 100_000_000 {
-                        println!("[REBALANCE] Free VRAM ({:.2} GB). Uploading Layer {} to GPU.", current_free as f64 / 1e9, layer.self_attn.layer_idx);
-                        if layer.to_device(&target_device).is_ok() {
-                            uploaded_count += 1;
-                            current_free = current_free.saturating_sub(100_000_000); 
-                        }
-                    } else { break; }
+                    println!("[REBALANCE] Free VRAM ({:.2} GB). Uploading Layer {} to GPU.", free_vram as f64 / 1e9, layer.self_attn.layer_idx);
+                    let _ = layer.to_device(&target_device);
+                    uploaded_count += 1;
+                    if uploaded_count >= 4 { break; } // 한 번에 4개씩 끊어서 업로드
                 }
             }
-            if uploaded_count > 0 { println!("[REBALANCE] Batch upload complete: {} layers moved to GPU.", uploaded_count); }
+            return Ok(()); 
         }
         Ok(())
     }
