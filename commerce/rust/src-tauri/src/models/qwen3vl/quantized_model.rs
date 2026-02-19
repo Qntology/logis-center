@@ -890,24 +890,29 @@ impl QuantizedQwen3VLTextAttention {
             
             for s_idx in 0..seq_len {
                 let scale = if bh_idx * seq_len + s_idx < scales_vec.len() { scales_vec[bh_idx * seq_len + s_idx] } else { 0.0 };
-                let token_out = &mut head_out[s_idx * head_dim .. (s_idx + 1) * head_dim];
+                let token_out_start = s_idx * head_dim;
+                let token_out_end = token_out_start + head_dim;
                 
-                // 1. Bit-to-Sign restoration
-                for d_idx in 0..head_dim {
-                    let global_bit_idx = bh_offset + s_idx * head_dim + d_idx;
-                    if global_bit_idx / 8 < packed_vec.len() {
-                        let is_set = (packed_vec[global_bit_idx / 8] & (1 << (global_bit_idx % 8))) != 0;
-                        token_out[d_idx] = if is_set { scale } else { -scale };
+                if token_out_end <= head_out.len() {
+                    let token_out = &mut head_out[token_out_start .. token_out_end];
+                    
+                    // 1. Bit-to-Sign restoration
+                    for d_idx in 0..head_dim {
+                        let global_bit_idx = bh_offset + s_idx * head_dim + d_idx;
+                        if global_bit_idx / 8 < packed_vec.len() {
+                            let is_set = (packed_vec[global_bit_idx / 8] & (1 << (global_bit_idx % 8))) != 0;
+                            token_out[d_idx] = if is_set { scale } else { -scale };
+                        }
                     }
-                }
-                
-                // 2. Anchor Refinement
-                if s_idx < 4 || s_idx % 8 == 0 {
-                    let a_pos = if s_idx < 4 { s_idx } else { 4 + (s_idx - 4) / 8 };
-                    if a_pos < anchor_count {
+                    
+                    // 2. Anchor Refinement
+                    if s_idx < 4 || s_idx % 8 == 0 {
+                        let a_pos = if s_idx < 4 { s_idx } else { 4 + (s_idx - 4) / 8 };
                         let src_start = anchor_offset + a_pos * head_dim;
-                        if src_start + head_dim <= anchors_vec.len() {
-                            let anchor_data = &anchors_vec[src_start .. src_start + head_dim];
+                        let src_end = src_start + head_dim;
+                        
+                        if src_end <= anchors_vec.len() {
+                            let anchor_data = &anchors_vec[src_start .. src_end];
                             token_out.copy_from_slice(anchor_data);
                         }
                     }
