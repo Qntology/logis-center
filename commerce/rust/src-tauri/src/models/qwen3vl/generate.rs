@@ -415,7 +415,7 @@ impl Qwen3VLGenerateModel {
             }
             c_pos = end;
             let (reads, writes, cached, free) = SLOT_MANAGER.get_counts();
-            println!("[STAT-PREFILL] {}/{} | Slots: W={}, C={}, F={}", c_pos, t_toks, writes, cached, free);
+            println!("[STAT-PREFILL] {}/{} | Slots: R={}, W={}, C={}, F={}", c_pos, t_toks, reads, writes, cached, free);
             tokio::task::yield_now().await;
         }
         SLOT_MANAGER.wait_for_all_tasks().await;
@@ -465,7 +465,7 @@ impl Qwen3VLGenerateModel {
             l_pos += chunk_size; s_off += chunk_size;
             
             let (reads, writes, cached, free) = SLOT_MANAGER.get_counts();
-            println!("[STAT-GEN-PREFILL] {}/{} | Slots: W={}, C={}, F={}", l_pos, t_toks, reads, writes, cached, free);
+            println!("[STAT-GEN-PREFILL] {}/{} | Slots: R={}, W={}, C={}, F={}", l_pos, t_toks, reads, writes, cached, free);
             tokio::task::yield_now().await;
         }
         
