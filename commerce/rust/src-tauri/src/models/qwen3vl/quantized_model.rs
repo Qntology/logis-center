@@ -448,11 +448,12 @@ impl QuantizedQwen3VLTextAttention {
         // 3. [BLOCK-ALLOCATION] Append or Create New
         let current_chunk_len = key_states.dim(2)?;
         let mut appended = false;
-        // [BLOCK-ALLOCATION] Split large KV results into multiple 256-token slots for high throughput
+        // [BLOCK-ALLOCATION] Split large KV results into multiple 256-token slots
+        // [CRITICAL-FIX] Only Layer 0 should manage the Registry to prevent slot explosion in 2B model
         let mut tokens_to_process = current_chunk_len;
         let mut chunk_offset = 0;
         
-        if current_chunk_len > 256 {
+        if self.layer_idx == 0 && current_chunk_len > 256 {
             println!("[DEBUG-KV] Splitting {} tokens into 256-unit slots...", current_chunk_len);
         }
 
@@ -488,7 +489,9 @@ impl QuantizedQwen3VLTextAttention {
                     inner.k_cache = Some(k_piece);
                     inner.v_cache = Some(v_piece);
                 }
-                {
+                
+                // Registry entry management only on Layer 0
+                if self.layer_idx == 0 {
                     let mut reg = self.registry.entries.write().unwrap();
                     if reg.len() <= index {
                         reg.push(RegistryEntry {
@@ -500,68 +503,67 @@ impl QuantizedQwen3VLTextAttention {
                         });
                     }
                 }
+                
                 self.kv_blocks.push(new_block);
                 tokens_to_process -= take;
                 chunk_offset += take;
             }
         }
 
-        // [PREFETCH-TRIGGER] Look-ahead Chunked Prefetching (8-layer chunk ~ 100MB)
-        for block in &self.kv_blocks {
-            let (index, _) = { let inner = block.inner.read().unwrap(); (inner.index, inner.offset) };
-            
-            let mut chunk_layer_indices = Vec::new();
-            let mut chunk_path = std::path::PathBuf::new();
-            
-            {
-                let reg = self.registry.entries.read().unwrap();
-                if index < reg.len() { 
-                    // [CHUNK-DETECTION] Check next 8 layers for SSD residency
-                    for i in 1..=8 {
-                        let target_layer = self.layer_idx + i;
-                        if target_layer >= 28 { break; }
-                        if reg[index].location[target_layer] == KVLocation::SSD {
-                            chunk_layer_indices.push(target_layer);
-                            if chunk_path.as_os_str().is_empty() {
-                                chunk_path = reg[index].ssd_path.clone().unwrap_or_default();
+        // [PREFETCH-TRIGGER-THROTTLED] Look-ahead (2 layers ~ 25MB) only every 4 layers to reduce overhead
+        if self.layer_idx % 4 == 0 {
+            for block in &self.kv_blocks {
+                let (index, _) = { let inner = block.inner.read().unwrap(); (inner.index, inner.offset) };
+                
+                let mut layers_to_load = Vec::new();
+                let mut chunk_path = std::path::PathBuf::new();
+                
+                {
+                    let reg = self.registry.entries.read().unwrap();
+                    if index < reg.len() { 
+                        for i in 1..=2 {
+                            let target_layer = self.layer_idx + i;
+                            if target_layer >= 28 { break; }
+                            if reg[index].location[target_layer] == KVLocation::SSD {
+                                layers_to_load.push(target_layer);
+                                if chunk_path.as_os_str().is_empty() {
+                                    chunk_path = reg[index].ssd_path.clone().unwrap_or_default();
+                                }
                             }
                         }
                     }
-                }
-            };
+                };
 
-            if !chunk_layer_indices.is_empty() && !chunk_path.as_os_str().is_empty() {
-                // [MARK-LOADING] Immediately mark all in registry to prevent duplicate tasks
-                {
-                    let mut reg = self.registry.entries.write().unwrap();
-                    if index < reg.len() {
-                        for &l_idx in &chunk_layer_indices { reg[index].location[l_idx] = KVLocation::Loading; }
+                if !layers_to_load.is_empty() && !chunk_path.as_os_str().is_empty() {
+                    {
+                        let mut reg = self.registry.entries.write().unwrap();
+                        for &l_idx in &layers_to_load { reg[index].location[l_idx] = KVLocation::Loading; }
                     }
-                }
 
-                let registry_clone = self.registry.clone();
-                let shared_block_clone = block.clone();
-                
-                tauri::async_runtime::spawn(async move {
-                    use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, ChunkedLoadTask, get_worker_channel};
+                    let registry_clone = self.registry.clone();
+                    let shared_block_clone = block.clone();
                     
-                    let mut slot_ids = Vec::new();
-                    let mut blocks = Vec::new();
-                    for _ in 0..chunk_layer_indices.len() {
-                        slot_ids.push(SLOT_MANAGER.acquire_read_slot().await);
-                        blocks.push(shared_block_clone.clone());
-                    }
+                    tauri::async_runtime::spawn(async move {
+                        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, ChunkedLoadTask, get_load_worker};
+                        
+                        let mut slot_ids = Vec::new();
+                        let mut blocks = Vec::new();
+                        for _ in 0..layers_to_load.len() {
+                            slot_ids.push(SLOT_MANAGER.acquire_read_slot().await);
+                            blocks.push(shared_block_clone.clone());
+                        }
 
-                    if let Ok(tx) = get_worker_channel().await {
-                        let _ = tx.send(SlotTask::ChunkedLoad(ChunkedLoadTask {
-                            slot_ids,
-                            path: chunk_path,
-                            layer_indices: chunk_layer_indices,
-                            shared_blocks: blocks,
-                            registry: registry_clone,
-                        })).await;
-                    }
-                });
+                        if let Ok(tx) = get_load_worker().await {
+                            let _ = tx.send(SlotTask::ChunkedLoad(ChunkedLoadTask {
+                                slot_ids,
+                                path: chunk_path,
+                                layer_indices: layers_to_load,
+                                shared_blocks: blocks,
+                                registry: registry_clone,
+                            })).await;
+                        }
+                    });
+                }
             }
         }
 
@@ -602,9 +604,9 @@ impl QuantizedQwen3VLTextAttention {
                     let reg_clone = self.registry.clone();
                     let l_idx = self.layer_idx;
                     tauri::async_runtime::spawn(async move {
-                        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_worker_channel};
+                        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
                         let sid = SLOT_MANAGER.acquire_read_slot().await;
-                        if let Ok(tx) = get_worker_channel().await {
+                        if let Ok(tx) = get_load_worker().await {
                             let _ = tx.send(SlotTask::Load(LoadTask {
                                 slot_id: sid, path, layer_idx: l_idx, kv_name: None, shared_block, registry: reg_clone
                             })).await;
