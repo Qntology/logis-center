@@ -150,6 +150,7 @@ impl QLinear {
 pub enum KVLocation {
     VRAM,
     RAM,
+    RAM_Sticky, // [NEW] Persistent RAM Cache (Sticky)
     SSD,
     Loading,   // New: Block is being prefetched
     Streaming, 
@@ -486,59 +487,62 @@ impl QuantizedQwen3VLTextAttention {
             self.kv_blocks.push(new_block);
         }
 
-        // [PREFETCH-TRIGGER] Look-ahead Prefetching (N+1 to N+4 layers)
+        // [PREFETCH-TRIGGER] Look-ahead Chunked Prefetching (8-layer chunk ~ 100MB)
         for block in &self.kv_blocks {
-            let (index, offset) = {
-                let inner = block.inner.read().unwrap();
-                (inner.index, inner.offset)
-            };
+            let (index, _) = { let inner = block.inner.read().unwrap(); (inner.index, inner.offset) };
             
-            let look_ahead = 8; // 더 공격적으로 예독 (14개 슬롯 활용)
-            for i in 1..=look_ahead {
-                let target_layer = self.layer_idx + i;
-                if target_layer >= 28 { break; }
-
-                let should_trigger = {
-                    let reg = self.registry.entries.read().unwrap();
-                    if index < reg.len() { 
-                        // [2D-CHECK] 이 블록의 '특정 대상 레이어'가 SSD에 있는지 확인
-                        reg[index].location[target_layer] == KVLocation::SSD 
-                    } else { false }
-                };
-
-                if should_trigger {
-                    let path = {
-                        let reg = self.registry.entries.read().unwrap();
-                        reg[index].ssd_path.clone().unwrap_or_default()
-                    };
-                    
-                    if !path.as_os_str().is_empty() {
-                        // [PRE-EMPTIVE] 해당 레이어만 Loading으로 마크
-                        {
-                            let mut reg = self.registry.entries.write().unwrap();
-                            if index < reg.len() { reg[index].location[target_layer] = KVLocation::Loading; }
-                        }
-
-                        let shared_block = block.clone();
-                        let registry_clone = self.registry.clone();
-                        let layer_to_load = target_layer;
-                        
-                        tauri::async_runtime::spawn(async move {
-                            use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_worker_channel};
-                            let slot_id = SLOT_MANAGER.acquire_read_slot().await;
-                            if let Ok(tx) = get_worker_channel().await {
-                                let _ = tx.send(SlotTask::Load(LoadTask {
-                                    slot_id,
-                                    path,
-                                    layer_idx: layer_to_load,
-                                    kv_name: None,
-                                    shared_block,
-                                    registry: registry_clone,
-                                })).await;
+            let mut chunk_layer_indices = Vec::new();
+            let mut chunk_path = std::path::PathBuf::new();
+            
+            {
+                let reg = self.registry.entries.read().unwrap();
+                if index < reg.len() { 
+                    // [CHUNK-DETECTION] Check next 8 layers for SSD residency
+                    for i in 1..=8 {
+                        let target_layer = self.layer_idx + i;
+                        if target_layer >= 28 { break; }
+                        if reg[index].location[target_layer] == KVLocation::SSD {
+                            chunk_layer_indices.push(target_layer);
+                            if chunk_path.as_os_str().is_empty() {
+                                chunk_path = reg[index].ssd_path.clone().unwrap_or_default();
                             }
-                        });
+                        }
                     }
                 }
+            };
+
+            if !chunk_layer_indices.is_empty() && !chunk_path.as_os_str().is_empty() {
+                // [MARK-LOADING] Immediately mark all in registry to prevent duplicate tasks
+                {
+                    let mut reg = self.registry.entries.write().unwrap();
+                    if index < reg.len() {
+                        for &l_idx in &chunk_layer_indices { reg[index].location[l_idx] = KVLocation::Loading; }
+                    }
+                }
+
+                let registry_clone = self.registry.clone();
+                let shared_block_clone = block.clone();
+                
+                tauri::async_runtime::spawn(async move {
+                    use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, ChunkedLoadTask, get_worker_channel};
+                    
+                    let mut slot_ids = Vec::new();
+                    let mut blocks = Vec::new();
+                    for _ in 0..chunk_layer_indices.len() {
+                        slot_ids.push(SLOT_MANAGER.acquire_read_slot().await);
+                        blocks.push(shared_block_clone.clone());
+                    }
+
+                    if let Ok(tx) = get_worker_channel().await {
+                        let _ = tx.send(SlotTask::ChunkedLoad(ChunkedLoadTask {
+                            slot_ids,
+                            path: chunk_path,
+                            layer_indices: chunk_layer_indices,
+                            shared_blocks: blocks,
+                            registry: registry_clone,
+                        })).await;
+                    }
+                });
             }
         }
 
@@ -548,19 +552,24 @@ impl QuantizedQwen3VLTextAttention {
         let mut running_o = None; 
         let mut global_start_idx = 0;
 
-        let mut vram_ks: Vec<Tensor> = Vec::new();
-        let mut vram_vs: Vec<Tensor> = Vec::new();
+        let mut vram_ks = Vec::new();
+        let mut vram_vs = Vec::new();
         let mut vram_total_len = 0;
 
-        // 1. [PARALLEL-TRIGGER] 이번 레이어에 필요한 모든 SSD 블록을 병렬로 로드 명령
+        // [STRICT-STREAMING] 현재 레이어 연산을 위한 조각 모음 (방안 A: 비동기 기반)
         for block in &self.kv_blocks {
-            let index = block.inner.read().unwrap().index;
-            let current_loc = {
+            let (mut k, mut v, b_len, index) = {
+                let inner = block.inner.read().unwrap();
+                (inner.k_cache.clone(), inner.v_cache.clone(), inner.len, inner.index)
+            };
+
+            let mut loc = {
                 let reg = self.registry.entries.read().unwrap();
                 reg[index].location[self.layer_idx]
             };
-            
-            if current_loc == KVLocation::SSD {
+
+            // 1. [ASYNC-TRIGGER] SSD 상태라면 즉시 워커에게 로드 명령 전달
+            if loc == KVLocation::SSD {
                 let spath = {
                     let reg = self.registry.entries.read().unwrap();
                     reg[index].ssd_path.clone()
@@ -582,45 +591,31 @@ impl QuantizedQwen3VLTextAttention {
                             })).await;
                         }
                     });
+                    loc = KVLocation::Loading;
                 }
             }
-        }
 
-        // 2. [STRICT-STREAMING] 현재 레이어 연산을 위한 조각 모음 (방안 A: 비동기 기반)
-        for block in &self.kv_blocks {
-            let (mut k, mut v, b_len, index) = {
-                let inner = block.inner.read().unwrap();
-                (inner.k_cache.clone(), inner.v_cache.clone(), inner.len, inner.index)
-            };
-            
-            // [FIX] 위치 인덱스 누적 (계산 전 수행하여 언더플로우 방지)
-            global_start_idx += b_len;
-            let current_block_start = global_start_idx - b_len;
-
-            // [ASYNC-WAIT] 이미 위에서 트리거했으므로, 여기서는 준비된 것부터 차례로 처리 (병렬 효과)
-            let mut attempts = 0;
-            while k.is_none() && attempts < 2000 {
-                let current_loc = {
-                    let reg = self.registry.entries.read().unwrap();
-                    reg[index].location[self.layer_idx]
-                };
-                
-                if current_loc == KVLocation::RAM {
-                    let mut inner = block.inner.write().unwrap();
-                    if let Some(meta) = &inner.bitkv_metadata {
-                        let k_raw = self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?;
-                        let v_raw = self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?;
-                        inner.k_cache = Some(k_raw.clone());
-                        inner.v_cache = Some(v_raw.clone());
-                        k = Some(k_raw); v = Some(v_raw);
-                        break;
+            // 2. [ASYNC-WAIT] Loading 중이라면 대기 (잠금 해제 후 대기하여 워커에게 기회 제공)
+            if loc == KVLocation::Loading {
+                let mut attempts = 0;
+                while attempts < 2000 {
+                    // 잠금을 아주 짧게만 유지하고 즉시 해제
+                    let current = {
+                        let reg = self.registry.entries.read().unwrap();
+                        reg[index].location[self.layer_idx]
+                    };
+                    
+                    if current == KVLocation::RAM { break; }
+                    
+                    // [CRITICAL] 잠금을 풀고 워커가 Write Lock을 잡을 수 있도록 1ms 대기
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    attempts += 1;
+                    
+                    // 100번 시도마다 정체 보고
+                    if attempts % 100 == 0 {
+                        println!("[TRACE] Layer {} Block {} still loading... (Attempt {})", self.layer_idx, index, attempts);
                     }
                 }
-                
-                if current_loc == KVLocation::SSD { break; } // 로딩 실패 시 탈출
-                
-                std::thread::sleep(std::time::Duration::from_micros(100));
-                attempts += 1;
             }
 
             let final_loc = {
@@ -628,13 +623,28 @@ impl QuantizedQwen3VLTextAttention {
                 reg[index].location[self.layer_idx]
             };
 
-            if k.is_none() {
-                if final_loc == KVLocation::VRAM {
-                    vram_ks.push(Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
-                    vram_vs.push(Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
+            match final_loc {
+                KVLocation::VRAM => {
+                    vram_ks.push(k.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
+                    vram_vs.push(v.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
                     vram_total_len += b_len;
+                    global_start_idx += b_len;
+                    continue;
                 }
-                continue;
+                KVLocation::RAM | KVLocation::RAM_Sticky => {
+                    let mut inner = block.inner.write().unwrap();
+                    if k.is_none() {
+                        if let Some(meta) = &inner.bitkv_metadata {
+                            let k_raw = self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?;
+                            let v_raw = self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?;
+                            inner.k_cache = Some(k_raw.clone());
+                            inner.v_cache = Some(v_raw.clone());
+                            k = Some(k_raw);
+                            v = Some(v_raw);
+                        }
+                    }
+                }
+                _ => { global_start_idx += b_len; continue; }
             }
 
             let mut k = k.ok_or_else(|| candle_core::Error::Msg("KV Cache not ready after wait".to_string()))?;
@@ -651,6 +661,7 @@ impl QuantizedQwen3VLTextAttention {
 
             if let Some(mask) = attention_mask {
                 let mask_len = mask.dim(D::Minus1)?;
+                let current_block_start = global_start_idx - b_len;
                 if current_block_start + b_len <= mask_len {
                     let sub_mask = mask.narrow(D::Minus1, current_block_start, b_len)?.to_dtype(target_dtype)?;
                     attn_weights = attn_weights.broadcast_add(&sub_mask)?;
@@ -900,17 +911,22 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn clear_kv_cache(&mut self) {
-        // [CLEANUP] 슬롯 자원 명시적 반납
+        // [CLEANUP] Explicit Slot Release
         for block in &self.kv_blocks {
-            let slot_id = {
+            let (slot_id, loc) = {
                 let reg = self.registry.entries.read().unwrap();
                 let inner = block.inner.read().unwrap();
-                if inner.index < reg.len() { reg[inner.index].slot_ids[self.layer_idx] } else { None }
+                if inner.index < reg.len() { 
+                    (reg[inner.index].slot_ids[self.layer_idx], reg[inner.index].location[self.layer_idx]) 
+                } else { (None, KVLocation::VRAM) }
             };
+
+            // [STICKY-PROTECTION] Do not release persistent cache slots
+            if loc == KVLocation::RAM_Sticky { continue; }
+
             if let Some(id) = slot_id {
-                // 비동기 호출을 위해 spawn 사용 (clear_kv_cache는 동기 함수)
                 tauri::async_runtime::spawn(async move {
-                    SLOT_MANAGER.release_slot(id, true).await;
+                    SLOT_MANAGER.release_slot(id).await;
                 });
             }
         }
@@ -1099,12 +1115,15 @@ impl QuantizedQwen3VLTextAttention {
         if self.layer_idx == 0 {
             println!("[SSD-LOAD] Registered {} blocks from SSD context.", fragments.len());
         }
-        Ok(())
-    }
+                Ok(())
+            }
+        
+            pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
+                                    self.save_kv_cache(path, true, block_size, None)
 
-    pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
-        self.save_kv_cache(path, true, block_size, None)
-    }
+                        }
+
+                    
 }
 
 #[derive(Clone)]
@@ -1341,7 +1360,7 @@ impl QuantizedQwen3VLTextModel {
         
         // [OPTIMIZATION] If baking only (MLP 0%), we don't need MLP weights, so cost is much lower
         let cost_per_layer = if baking_only { layer_weight_size / 3 } else { layer_weight_size };
-        let estimated_activation_buffer = 200_000_000; // Increased to 200MB for 28-layer prefill
+        let estimated_activation_buffer = 100_000_000; // Reduced for more aggressive pinning
         let mut simulated_free_vram: u64 = 0;
         let mut is_vram_checked = false;
         let mut safety_floor: u64 = 0;
@@ -1352,8 +1371,8 @@ impl QuantizedQwen3VLTextModel {
                      if let Ok(mem) = dev.memory_info() {
                          simulated_free_vram = mem.free;
                          is_vram_checked = true;
-                         // [FIX] More realistic OS/Driver reserve (100MB)
-                         let os_reserve = 100_000_000; 
+                         // [FIX] Slimmer safety floor
+                         let os_reserve = 50_000_000; 
                          safety_floor = os_reserve + kv_reserve + estimated_activation_buffer;
                      }
                  }
@@ -1363,12 +1382,11 @@ impl QuantizedQwen3VLTextModel {
         let mut layer_devices = vec![];
         let mut pinned_layer_count = 0;
         
-        for layer_idx in 0..config.num_hidden_layers {
-            let actual_cost = cost_per_layer;
+        for _ in 0..config.num_hidden_layers {
             if current_device.is_cuda() && is_vram_checked {
-                 let buffer_factor = 1.2; 
-                 if simulated_free_vram > ( (actual_cost as f64 * buffer_factor) as u64 + safety_floor ) {
-                     simulated_free_vram = simulated_free_vram.saturating_sub(actual_cost);
+                 let buffer_factor = 1.05; // 1.2 -> 1.05
+                 if simulated_free_vram > ( (cost_per_layer as f64 * buffer_factor) as u64 + safety_floor ) {
+                     simulated_free_vram = simulated_free_vram.saturating_sub(cost_per_layer);
                      layer_devices.push(current_device.clone());
                      pinned_layer_count += 1;
                  } else {
@@ -1578,9 +1596,9 @@ impl QuantizedQwen3VLTextModel {
                                                             if let Ok(dev) = nvml.device_by_index(0) {
                                                                 if let Ok(mem) = dev.memory_info() {
                                                                     let current_progress = (seqlen_offset + seq_len).min(total_len);
-                                                                    let (reads, writes, cached, free) = SLOT_MANAGER.get_counts();
-                                                                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Slots: R={}, W={}, C={}, F={}", 
-                                                                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len, reads, writes, cached, free);
+                                                                    let (reads, writes, free) = SLOT_MANAGER.get_counts();
+                                                                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Slots: R={}, W={}, F={}", 
+                                                                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len, reads, writes, free);
                                                                 }
                                                             }        }
 
@@ -1708,6 +1726,8 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
+        println!("[TRACE] All layers done.");
+        
         self.current_kv_len = seqlen_offset + seq_len;
         println!("[TRACE] Final norm.forward starting...");
         let norm_dev = self.norm.weight().device();
@@ -1939,24 +1959,29 @@ impl QuantizedQwen3VLTextModel {
                 if layer.device().is_cuda() {
                     println!("[REBALANCE] Low VRAM ({:.2} MB). Offloading Layer {} to CPU.", free_vram as f64 / 1e6, layer.self_attn.layer_idx);
                     layer.to_device(&Device::Cpu)?;
-                    break; // 한 번에 하나씩만 이동 (급격한 변화 방지)
-                }
-            }
-        } else if free_vram > safe_zone {
-            // [UPLOAD] CPU -> GPU (앞쪽 레이어부터)
-            // 주의: self.layers[0]의 디바이스가 GPU여야 업로드 대상 장치를 알 수 있음
-            // 또는 generate 시점에 저장해둔 메인 디바이스 정보를 활용해야 함.
-            // 여기서는 첫 번째 레이어의 디바이스가 CPU일 경우를 대비해, 
-            // 외부에서 주입받거나, 혹은 임시로 CUDA:0 (또는 device_id)를 타겟으로 함.
-            let target_device = Device::new_cuda(device_id)?;
-            
-            for layer in self.layers.iter_mut() {
-                if layer.device().is_cpu() {
-                    println!("[REBALANCE] Free VRAM ({:.2} GB). Uploading Layer {} to GPU.", free_vram as f64 / 1e9, layer.self_attn.layer_idx);
-                    layer.to_device(&target_device)?;
+                    // Continue to offload more if needed, but for safety in offload we can be gradual
                     break; 
                 }
             }
+        } else if free_vram > safe_zone {
+            // [UPLOAD] CPU -> GPU (Batch Upload)
+            let target_device = Device::new_cuda(device_id)?;
+            let mut uploaded_count = 0;
+            let mut current_free = free_vram;
+            
+            for layer in self.layers.iter_mut() {
+                if layer.device().is_cpu() {
+                    // Approximate cost: 100MB per layer
+                    if current_free > danger_zone + 100_000_000 {
+                        println!("[REBALANCE] Free VRAM ({:.2} GB). Uploading Layer {} to GPU.", current_free as f64 / 1e9, layer.self_attn.layer_idx);
+                        if layer.to_device(&target_device).is_ok() {
+                            uploaded_count += 1;
+                            current_free = current_free.saturating_sub(100_000_000); 
+                        }
+                    } else { break; }
+                }
+            }
+            if uploaded_count > 0 { println!("[REBALANCE] Batch upload complete: {} layers moved to GPU.", uploaded_count); }
         }
         Ok(())
     }
