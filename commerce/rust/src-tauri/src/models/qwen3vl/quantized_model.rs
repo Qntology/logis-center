@@ -510,60 +510,56 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // [PREFETCH-TRIGGER-THROTTLED] Look-ahead (2 layers ~ 25MB) only every 4 layers to reduce overhead
-        if self.layer_idx % 4 == 0 {
-            for block in &self.kv_blocks {
-                let (index, _) = { let inner = block.inner.read().unwrap(); (inner.index, inner.offset) };
-                
-                let mut layers_to_load = Vec::new();
-                let mut chunk_path = std::path::PathBuf::new();
-                
+        // [PREFETCH-TRIGGER-VERTICAL] 
+        // Instead of per-block prefetching, we trigger ONE task for the next layer's needs
+        if self.layer_idx % 2 == 0 {
+            let mut layers_to_load: Vec<usize> = Vec::new();
+            let mut blocks_to_load: Vec<KVBlock> = Vec::new();
+            let mut chunk_path = std::path::PathBuf::new();
+            
+            // Collect all blocks that need the next layer
+            let next_layer = self.layer_idx + 1;
+            if next_layer < 28 {
+                let reg = self.registry.entries.read().unwrap();
+                for (b_idx, block) in self.kv_blocks.iter().enumerate() {
+                    if b_idx < reg.len() && reg[b_idx].location[next_layer] == KVLocation::SSD {
+                        layers_to_load.push(next_layer);
+                        blocks_to_load.push(block.clone());
+                        if chunk_path.as_os_str().is_empty() {
+                            chunk_path = reg[b_idx].ssd_path.clone().unwrap_or_default();
+                        }
+                    }
+                }
+            }
+
+            if !layers_to_load.is_empty() && !chunk_path.as_os_str().is_empty() {
+                // Mark all as loading at once
                 {
-                    let reg = self.registry.entries.read().unwrap();
-                    if index < reg.len() { 
-                        for i in 1..=2 {
-                            let target_layer = self.layer_idx + i;
-                            if target_layer >= 28 { break; }
-                            if reg[index].location[target_layer] == KVLocation::SSD {
-                                layers_to_load.push(target_layer);
-                                if chunk_path.as_os_str().is_empty() {
-                                    chunk_path = reg[index].ssd_path.clone().unwrap_or_default();
-                                }
+                    let mut reg = self.registry.entries.write().unwrap();
+                    for (i, &l_idx) in layers_to_load.iter().enumerate() {
+                        // Find the original block index
+                        for (b_idx, block) in self.kv_blocks.iter().enumerate() {
+                            if block.inner.read().unwrap().index == blocks_to_load[i].inner.read().unwrap().index {
+                                reg[b_idx].location[l_idx] = KVLocation::Loading;
                             }
                         }
                     }
-                };
-
-                if !layers_to_load.is_empty() && !chunk_path.as_os_str().is_empty() {
-                    {
-                        let mut reg = self.registry.entries.write().unwrap();
-                        for &l_idx in &layers_to_load { reg[index].location[l_idx] = KVLocation::Loading; }
-                    }
-
-                    let registry_clone = self.registry.clone();
-                    let shared_block_clone = block.clone();
-                    
-                    tauri::async_runtime::spawn(async move {
-                        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, ChunkedLoadTask, get_load_worker};
-                        
-                        let mut slot_ids = Vec::new();
-                        let mut blocks = Vec::new();
-                        for _ in 0..layers_to_load.len() {
-                            slot_ids.push(SLOT_MANAGER.acquire_read_slot().await);
-                            blocks.push(shared_block_clone.clone());
-                        }
-
-                        if let Ok(tx) = get_load_worker().await {
-                            let _ = tx.send(SlotTask::ChunkedLoad(ChunkedLoadTask {
-                                slot_ids,
-                                path: chunk_path,
-                                layer_indices: layers_to_load,
-                                shared_blocks: blocks,
-                                registry: registry_clone,
-                            })).await;
-                        }
-                    });
                 }
+
+                let registry_clone = self.registry.clone();
+                tauri::async_runtime::spawn(async move {
+                    use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, ChunkedLoadTask, get_load_worker};
+                    let mut s_ids = Vec::new();
+                    for _ in 0..layers_to_load.len() {
+                        s_ids.push(SLOT_MANAGER.acquire_read_slot().await);
+                    }
+                    if let Ok(tx) = get_load_worker().await {
+                        let _ = tx.send(SlotTask::ChunkedLoad(ChunkedLoadTask {
+                            slot_ids: s_ids, path: chunk_path, layer_indices: layers_to_load,
+                            shared_blocks: blocks_to_load, registry: registry_clone,
+                        })).await;
+                    }
+                });
             }
         }
 
@@ -2000,18 +1996,38 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
         } else if free_vram > safe_zone {
-            // [UPLOAD] CPU -> GPU (Incremental Upload: 4 layers at a time)
+            // [UPLOAD] CPU -> GPU (Sequential Verified Batch: 4 layers)
             let target_device = Device::new_cuda(device_id)?;
             let mut uploaded_count = 0;
+            let mut current_free = free_vram;
             
             for layer in self.layers.iter_mut() {
                 if layer.device().is_cpu() {
-                    println!("[REBALANCE] Free VRAM ({:.2} GB). Uploading Layer {} to GPU.", free_vram as f64 / 1e9, layer.self_attn.layer_idx);
+                    // Check if we still have enough room for one more layer (~100MB + margin)
+                    if current_free < danger_zone + 150_000_000 { break; }
+
+                    println!("[REBALANCE] Starting upload: Layer {} (Current Free: {:.2} GB)", layer.self_attn.layer_idx, current_free as f64 / 1e9);
+                    
+                    // 1. Start transfer
                     let _ = layer.to_device(&target_device);
+                    
+                    // 2. CRITICAL: Synchronize to ensure the transfer is physically complete
+                    let _ = target_device.synchronize();
+                    
+                    // 3. Re-measure VRAM using NVML to get the actual state
+                    if let Some(ref nvml_inst) = nvml {
+                        if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
+                            if let Ok(mem) = dev.memory_info() {
+                                current_free = mem.free;
+                            }
+                        }
+                    }
+                    
                     uploaded_count += 1;
-                    if uploaded_count >= 4 { break; } // 한 번에 4개씩 끊어서 업로드
+                    if uploaded_count >= 4 { break; } // Limit per forward pass to maintain responsiveness
                 }
             }
+            if uploaded_count > 0 { println!("[REBALANCE] Sequential upload finished. Managed {} layers.", uploaded_count); }
             return Ok(()); 
         }
         Ok(())
