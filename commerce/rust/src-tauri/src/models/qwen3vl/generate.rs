@@ -324,11 +324,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     });
 }
 
-#[derive(Clone)]
-pub enum ModelVariant { Standard(crate::models::qwen3vl::model::Qwen3VLModel), QuantizedVL(QuantizedQwen3VLModel), QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel) }
 impl ModelVariant {
     pub fn forward(&mut self, i: &Tensor, pv: Option<&Tensor>, ithw: Option<&Tensor>, vpv: Option<&Tensor>, vthw: Option<&Tensor>, cp: Option<&Tensor>, off: usize, tl: usize, sid: Option<String>) -> Result<Tensor> {
-        match self { Self::Standard(m) => m.forward(i, pv, ithw, vpv, vthw, cp, off), Self::QuantizedVL(m) => m.forward(i, pv, ithw, vpv, vthw, cp, off, tl, sid), Self::QuantizedText(m) => m.forward(i, cp, off, tl, sid) }
+        match self { 
+            Self::Standard(m) => m.forward(i, pv, ithw, vpv, vthw, cp, off), 
+            Self::QuantizedVL(m) => m.forward(i, pv, ithw, vpv, vthw, cp, off, tl, sid), 
+            Self::QuantizedText(m) => m.forward(i, cp, off, tl, sid) 
+        }
     }
     pub fn rebalance_layers(&mut self, d: usize) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.rebalance_layers(d), Self::QuantizedText(m) => m.rebalance_layers(d) } }
     pub fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage() } }
@@ -409,7 +411,10 @@ impl Qwen3VLGenerateModel {
                     let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, layers: dumps, is_relay_baking: is_06b })).await;
                 }
             }
+            // [STRICT-FLUSH] Clear the SSD road before 2B starts reading
+            println!("[BAKING] All blocks queued. Waiting for SSD Flush (Crucial for 2B Performance)...");
             SLOT_MANAGER.wait_for_all_tasks().await;
+            println!("[BAKING] SSD Flush Complete. Road cleared.");
             self.clear_temporal_kv_caches();
         }
         Ok(t_toks)

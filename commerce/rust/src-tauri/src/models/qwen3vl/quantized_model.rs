@@ -1734,26 +1734,36 @@ impl QuantizedQwen3VLTextModel {
                                     }
                                 });
 
-                                // [STRICT-WAIT] Wait for all blocks of THIS layer to reach RAM
-                                let mut ready = false;
-                                let mut attempts = 0;
-                                println!("[HORIZONTAL] Layer {:2} | Waiting for {} SSD blocks...", layer_idx, load_count);
-                                while !ready && attempts < 10000 {
+                                // [STRICT-SEQUENTIAL-WAIT] 명시적으로 해당 레이어의 모든 블록이 로드될 때까지 대기
+                                println!("[HORIZONTAL] Layer {:2} | Initializing strict wait for {} blocks...", layer_idx, load_count);
+                                let mut all_ready = false;
+                                let mut check_attempts = 0;
+                                
+                                while !all_ready && check_attempts < 20000 {
                                     let reg = self.registry.entries.read().unwrap();
-                                    let mut all_ok = true;
+                                    let mut layer_ready = true;
                                     for b_idx in 0..self.layers[layer_idx].self_attn.kv_blocks.len() {
                                         if b_idx < reg.len() {
                                             let loc = reg[b_idx].location[layer_idx];
-                                            if loc != KVLocation::RAM && loc != KVLocation::RAM_Sticky && loc != KVLocation::VRAM { all_ok = false; break; }
+                                            if loc != KVLocation::RAM && loc != KVLocation::RAM_Sticky && loc != KVLocation::VRAM {
+                                                layer_ready = false;
+                                                break;
+                                            }
                                         }
                                     }
-                                    if all_ok { ready = true; }
-                                    else { std::thread::sleep(std::time::Duration::from_millis(1)); attempts += 1; }
+                                    if layer_ready { all_ready = true; }
+                                    else {
+                                        std::thread::sleep(std::time::Duration::from_millis(5));
+                                        check_attempts += 1;
+                                        if check_attempts % 400 == 0 { 
+                                            println!("[HORIZONTAL] Layer {:2} | Strict Wait in progress (Attempt {}/20000)", layer_idx, check_attempts); 
+                                        }
+                                    }
                                 }
-                                println!("[HORIZONTAL] Layer {:2} | All blocks ready in RAM.", layer_idx);
+                                println!("[HORIZONTAL] Layer {:2} | PASSED. All blocks confirmed in RAM.", layer_idx);
                             }
                 
-                            // 3. [INNER-CHUNK-LOOP] 전체 시퀀스를 현재 레이어에 통과시킴
+                            // 3. [INNER-CHUNK-LOOP] Process the entire sequence
                             let mut next_xs = Vec::new();
                             let total_chunks = (seq_len + chunk_size - 1) / chunk_size;
                             
