@@ -379,36 +379,40 @@ impl Qwen3VLGenerateModel {
     pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel: Option<Arc<AtomicBool>>, sid: Option<String>, _relay: Option<&mut Qwen3VLGenerateModel>, kv_n: Option<String>) -> Result<usize> {
         if sid.is_none() { SLOT_MANAGER.reset_all_slots().await; }
         let f_ids = self.tokenizer.text_encode_vec(self.pre_processor.process_info(&mes, &self.chat_template.apply_chat_template(&mes)?)?.replace_text, false)?;
+        let t_toks = f_ids.len();
         let is_06b = self.model_name.contains("0.6B");
-        let (t_toks, c_size) = (f_ids.len(), if is_06b { 2048 } else { 1024 });
-        let mut c_pos = self.get_kv_len();
-        while c_pos < t_toks {
-            if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
-            let end = (c_pos + c_size).min(t_toks); let c_len = end - c_pos;
-            println!("[BAKING] {} to {} / Total: {}", c_pos, end, t_toks);
-            self.qwen3_vl.forward(&Tensor::from_vec(f_ids[c_pos..end].to_vec(), (1, c_len), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(c_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?), c_pos, t_toks, sid.clone())?;
-            if let Some(s_id) = &sid {
-                let unbaked_blocks = self.get_all_unbaked_kv_blocks();
-                for (ks, vs, block_offset) in unbaked_blocks {
-                    let slot_id = SLOT_MANAGER.acquire_write_slot(t_toks).await;
-                    let path = crate::utils::paths::get_kv_dir(None).join(s_id);
-                    if !path.exists() { let _ = fs::create_dir_all(&path); }
-                    
-                    let mut dumps = Vec::new();
-                    for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                        let k: Tensor = k; let v: Tensor = v;
-                        dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v });
-                    }
-                    if let Ok(tx) = get_bake_worker().await {
-                        let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, layers: dumps, is_relay_baking: is_06b })).await;
-                    }
+
+        if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+
+        // [HORIZONTAL-CALL] Entire sequence is now handled layer-by-layer internally
+        println!("[BAKING] Starting Horizontal Pass for {} tokens...", t_toks);
+        self.qwen3_vl.forward(
+            &Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, 
+            None, None, None, None, 
+            Some(&Tensor::arange(0u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 
+            0, t_toks, sid.clone()
+        )?;
+
+        if let Some(s_id) = &sid {
+            let unbaked_blocks = self.get_all_unbaked_kv_blocks();
+            for (ks, vs, block_offset) in unbaked_blocks {
+                let slot_id = SLOT_MANAGER.acquire_write_slot(t_toks).await;
+                let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+                if !path.exists() { let _ = fs::create_dir_all(&path); }
+                
+                let mut dumps = Vec::new();
+                for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
+                    let k: Tensor = k; let v: Tensor = v;
+                    dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v });
                 }
-                self.clear_temporal_kv_caches();
+                if let Ok(tx) = get_bake_worker().await {
+                    let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, layers: dumps, is_relay_baking: is_06b })).await;
+                }
             }
-            c_pos = end;
+            SLOT_MANAGER.wait_for_all_tasks().await;
+            self.clear_temporal_kv_caches();
         }
-        SLOT_MANAGER.wait_for_all_tasks().await;
-        Ok(c_pos)
+        Ok(t_toks)
     }
 
     pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel: Option<Arc<AtomicBool>>, sid: Option<String>, kv_n: Option<String>) -> Result<String> {
@@ -416,12 +420,19 @@ impl Qwen3VLGenerateModel {
         let mut l_proc = get_logit_processor(Some(mes.temperature.unwrap_or(0.7) as f32), Some(mes.top_p.unwrap_or(0.9) as f32), Some(40), mes.seed.unwrap_or(34562) as u64);
         let m_render = self.chat_template.apply_chat_template(&mes)?; let mut input = self.pre_processor.process_info(&mes, &m_render)?;
         let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?; let mut a_ids = f_ids.clone();
-        let (t_toks, mut s_off, c_size) = (f_ids.len(), self.get_kv_len(), 2048);
-        let mut l_pos = s_off;
-        while l_pos < t_toks {
-            let chunk_size = (t_toks - l_pos).min(c_size); if chunk_size == 0 { break; }
-            self.qwen3_vl.forward(&Tensor::from_vec(f_ids[l_pos..l_pos+chunk_size].to_vec(), (1, chunk_size), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(s_off as u32, (s_off + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?), s_off, t_toks, sid.clone())?;
-            l_pos += chunk_size; s_off += chunk_size;
+        let t_toks = f_ids.len();
+        let s_off = self.get_kv_len();
+
+        if t_toks > s_off {
+            let prefill_len = t_toks - s_off;
+            println!("[GENERATE] Starting Horizontal Prefill for {} tokens...", prefill_len);
+            self.qwen3_vl.forward(
+                &Tensor::from_vec(f_ids[s_off..].to_vec(), (1, prefill_len), &self.text_device)?, 
+                None, None, None, None, 
+                Some(&Tensor::arange(s_off as u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 
+                s_off, t_toks, sid.clone()
+            )?;
+
             if let Some(s_id) = &sid {
                 let unbaked_blocks = self.get_all_unbaked_kv_blocks();
                 for (ks, vs, block_offset) in unbaked_blocks {
@@ -435,18 +446,20 @@ impl Qwen3VLGenerateModel {
                         let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: block_offset, layers: dumps, is_relay_baking: false })).await;
                     }
                 }
+                SLOT_MANAGER.wait_for_all_tasks().await;
             }
             self.clear_temporal_kv_caches();
         }
-        SLOT_MANAGER.wait_for_all_tasks().await;
+        
+        let mut curr_s_off = t_toks;
         let (mut p_vals, i_grid, mut g_text) = (input.pixel_values.take(), input.image_grid_thw.take(), String::new());
         for _ in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
-            let logits = self.qwen3_vl.forward(&Tensor::new(vec![*a_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)?, p_vals.as_ref(), i_grid.as_ref(), None, None, Some(&Tensor::arange(s_off as u32, (s_off + 1) as u32, &self.text_device)?.unsqueeze(0)?), s_off, t_toks, sid.clone())?;
+            let logits = self.qwen3_vl.forward(&Tensor::new(vec![*a_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)?, p_vals.as_ref(), i_grid.as_ref(), None, None, Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + 1) as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, t_toks, sid.clone())?;
             let l_vec = apply_repeat_penalty(&logits.squeeze(0)?.i(logits.dim(1)? - 1)?.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
             let next_id = l_proc.sample(&l_vec)?; if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             a_ids.push(next_id); g_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
-            s_off += 1; p_vals = None; self.clear_temporal_kv_caches();
+            curr_s_off += 1; p_vals = None; self.clear_temporal_kv_caches();
         }
         Ok(g_text)
     }

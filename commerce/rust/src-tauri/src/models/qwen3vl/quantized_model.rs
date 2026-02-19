@@ -1677,91 +1677,109 @@ impl QuantizedQwen3VLTextModel {
             }
         };
 
-        // [INCREMENTAL-UPLOAD] Try to upload exactly one layer to GPU at the start of each forward pass
-        let _ = self.rebalance_layers(0);
-
-        // [SMART-SEQUENTIAL-LOOP]
-        let num_layers = self.layers.len();
-        println!("[TRACE] Starting Layer Loop: 0 to {}", num_layers - 1);
-        
-        for layer_idx in 0..num_layers {
-            if layer_idx < start_layer { continue; }
-
-            if layer_idx % 7 == 0 || layer_idx == 0 {
-                let dev_type = if self.layers[layer_idx].device().is_cuda() { "GPU" } else { "CPU" };
-                let mut v_count = 0;
-                let mut r_count = 0;
-                let mut s_count = 0;
-                for b in &self.layers[layer_idx].self_attn.kv_blocks {
-                    match b.inner.read().unwrap().location {
-                        KVLocation::VRAM => v_count += 1,
-                        KVLocation::RAM | KVLocation::RAM_Sticky => r_count += 1,
-                        _ => s_count += 1,
-                    }
-                }
-                let (r, w, f) = SLOT_MANAGER.get_counts();
-                println!("[TRACE] Layer {:2}/{} on {:3} | KV: V={}, R={}, S={} | Slots: R={}, W={}, F={}", 
-                    layer_idx, num_layers, dev_type, v_count, r_count, s_count, r, w, f);
-            }
-
-            let is_pinned = layer_idx < self.pinned_layer_count;
-            let layer = &mut self.layers[layer_idx];
-            
-            // 1. [C: Computing] Prepare and Run Layer
-            if !is_pinned {
-                layer.to_device(&target_device)?;
-            }
-
-            xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref(), seqlen_offset)?;
-            
-            if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
-                if layer_idx < deepstack_embeds.len() {
-                    let m_orig = visual_pos_masks.unwrap();
-                    let e_orig = &deepstack_embeds[layer_idx];
-                    let mask = if !m_orig.device().same_device(xs.device()) { m_orig.to_device(xs.device())? } else { m_orig.clone() };
-                    let embed = if !e_orig.device().same_device(xs.device()) { e_orig.to_device(xs.device())? } else { e_orig.clone() };
-                    let embed = if embed.dtype() != xs.dtype() { embed.to_dtype(xs.dtype())? } else { embed };
-                    xs = mask_index_add(&xs.squeeze(0)?, &mask.squeeze(0)?, &embed)?.unsqueeze(0)?;
-                }
-            }
-
-            // 2. 레이어 연산 직후 스냅샷 생성 및 비동기 워커로 오프로드
-            if let Some(sid) = &self.active_session_id {
-                let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
-                if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
+                        // [HORIZONTAL-PIPELINE-STRATEGY]
+                        let num_layers = self.layers.len();
+                        let chunk_size = 2048;
+                        
+                        println!("[TRACE] Starting Horizontal Pass: Layer-by-Layer execution (Total Seq: {})", seq_len);
                 
-                // [HANDOFF] GPU 연산 결과를 CPU로 고속 복사 (PCIe 전송)
-                if let Ok(xs_cpu) = xs.to_device(&Device::Cpu) {
-                    let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
-                    
-                    // [WORKER] 비동기 저장 워커 기동 (CPU RAM -> SSD)
-                    tokio::task::spawn_blocking(move || {
-                        let mut map = std::collections::HashMap::new();
-                        map.insert("hidden_states".to_string(), xs_cpu);
-                        let _ = candle_core::safetensors::save(&map, &final_path);
-                    });
-                }
-            }
-
-            // [CRITICAL] 3. 레이어 메모리 포지션 강제 초기화 (Async Await)
-            let dev_clone = target_device.clone();
-            
-            if !is_pinned {
-                layer.to_device(&Device::Cpu)?; 
+                        for layer_idx in 0..num_layers {
+                            if layer_idx < start_layer { continue; }
+                            
+                            // 1. [REBALANCE] 점진적 업로드 시도
+                            let _ = self.rebalance_layers(0);
+                            
+                            let dev_type = if self.layers[layer_idx].device().is_cuda() { "GPU" } else { "CPU" };
+                            
+                            // 2. [MASS-LOAD] 현재 레이어에 필요한 모든 블록을 SSD에서 한꺼번에 로드 요청
+                            let mut blocks_to_load: Vec<KVBlock> = Vec::new();
+                            let mut chunk_path = std::path::PathBuf::new();
+                            
+                            {
+                                let reg = self.registry.entries.read().unwrap();
+                                let current_layer_blocks = &self.layers[layer_idx].self_attn.kv_blocks;
+                                for (b_idx, block) in current_layer_blocks.iter().enumerate() {
+                                    if b_idx < reg.len() && reg[b_idx].location[layer_idx] == KVLocation::SSD {
+                                        blocks_to_load.push(block.clone());
+                                        if chunk_path.as_os_str().is_empty() {
+                                            chunk_path = reg[b_idx].ssd_path.clone().unwrap_or_default();
+                                        }
+                                    }
+                                }
+                            }
                 
-                let _ = tauri::async_runtime::spawn(async move {
-                    if dev_clone.is_cuda() {
-                        let _ = tokio::task::spawn_blocking(move || {
-                            let _ = dev_clone.synchronize();
-                        }).await;
-                    }
-                });
-            }
-        }
-
-        println!("[TRACE] All layers done.");
-        
-        self.current_kv_len = seqlen_offset + seq_len;
+                            if !blocks_to_load.is_empty() && !chunk_path.as_os_str().is_empty() {
+                                let load_count = blocks_to_load.len();
+                                let (r, w, f) = SLOT_MANAGER.get_counts();
+                                println!("[HORIZONTAL] Layer {:2} | Requesting {} blocks from SSD | Slots: R={}, W={}, F={}", 
+                                    layer_idx, load_count, r, w, f);
+                
+                                {
+                                    let mut reg_w = self.registry.entries.write().unwrap();
+                                    let current_layer_blocks = &self.layers[layer_idx].self_attn.kv_blocks;
+                                    for block in current_layer_blocks {
+                                        let idx = block.inner.read().unwrap().index;
+                                        if idx < reg_w.len() { reg_w[idx].location[layer_idx] = KVLocation::Loading; }
+                                    }
+                                }
+                                
+                                let registry_clone = self.registry.clone();
+                                let blocks_clone = blocks_to_load.clone();
+                                let l_idx_clone = layer_idx;
+                                tauri::async_runtime::spawn(async move {
+                                    use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, ChunkedLoadTask, get_load_worker};
+                                    let mut s_ids = Vec::new();
+                                    for _ in 0..blocks_clone.len() { s_ids.push(SLOT_MANAGER.acquire_read_slot().await); }
+                                    if let Ok(tx) = get_load_worker().await {
+                                        let _ = tx.send(SlotTask::ChunkedLoad(ChunkedLoadTask {
+                                            slot_ids: s_ids, path: chunk_path, layer_indices: vec![l_idx_clone; blocks_clone.len()],
+                                            shared_blocks: blocks_clone, registry: registry_clone,
+                                        })).await;
+                                    }
+                                });
+                            }
+                
+                            // 3. [INNER-CHUNK-LOOP] 전체 시퀀스를 현재 레이어에 통과시킴
+                            let mut next_xs = Vec::new();
+                            let total_chunks = (seq_len + chunk_size - 1) / chunk_size;
+                            
+                            for (c_idx, i) in (0..seq_len).step_by(chunk_size).enumerate() {
+                                let take = (seq_len - i).min(chunk_size);
+                                let current_offset = seqlen_offset + i;
+                                
+                                let xs_chunk = xs.narrow(1, i, take)?;
+                                let cos_chunk = cos.narrow(2, i, take)?;
+                                let sin_chunk = sin.narrow(2, i, take)?;
+                                
+                                let mask = prepare_causal_attention_mask(b_size, take, current_offset, xs.device())?;
+                                let mask = mask.to_dtype(DType::F32)?.contiguous()?;
+                
+                                if c_idx == 0 || c_idx == total_chunks - 1 {
+                                    println!("[HORIZONTAL] Layer {:2} ({:3}) | Chunk {}/{} | Tokens: {}..{}", 
+                                        layer_idx, dev_type, c_idx + 1, total_chunks, current_offset, current_offset + take);
+                                }
+                
+                                let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, Some(&mask), current_offset)?;
+                                next_xs.push(out);
+                            }
+                            xs = Tensor::cat(&next_xs, 1)?;
+                
+                            // 4. [SNAPSHOT]
+                            if let Some(sid) = &self.active_session_id {
+                                let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
+                                if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
+                                if let Ok(xs_cpu) = xs.to_device(&Device::Cpu) {
+                                    let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
+                                    tokio::task::spawn_blocking(move || {
+                                        let mut map = std::collections::HashMap::new();
+                                        map.insert("hidden_states".to_string(), xs_cpu);
+                                        let _ = candle_core::safetensors::save(&map, &final_path);
+                                    });
+                                }
+                            }
+                        }
+                
+                        println!("[TRACE] Horizontal Layer Pass Complete.");        self.current_kv_len = seqlen_offset + seq_len;
         println!("[TRACE] Final norm.forward starting...");
         let norm_dev = self.norm.weight().device();
         if !xs.device().same_device(norm_dev) {
