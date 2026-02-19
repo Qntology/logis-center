@@ -24,7 +24,7 @@ use crate::{
         prepare_causal_attention_mask, prod_tensor_last_dim, split_tensor,
     },
 };
-use crate::models::qwen3vl::generate::{ACTIVE_BAKE_TASKS, SLOT_MANAGER};
+use crate::models::qwen3vl::generate::SLOT_MANAGER;
 
 // Local RmsNorm implementation exposing weight and device
 #[derive(Clone, Debug)]
@@ -1631,9 +1631,9 @@ impl QuantizedQwen3VLTextModel {
                                                             if let Ok(dev) = nvml.device_by_index(0) {
                                                                 if let Ok(mem) = dev.memory_info() {
                                                                     let current_progress = (seqlen_offset + seq_len).min(total_len);
-                                                                    let (reads, writes, cached, free) = SLOT_MANAGER.get_counts();
-                                                                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Slots: R={}, W={}, C={}, F={}", 
-                                                                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len, reads, writes, cached, free);
+                                                                    let (reads, writes, free) = SLOT_MANAGER.get_counts();
+                                                                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Slots: R={}, W={}, F={}", 
+                                                                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len, reads, writes, free);
                                                                 }
                                                             }        }
 
@@ -1702,11 +1702,6 @@ impl QuantizedQwen3VLTextModel {
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             if layer_idx < start_layer { continue; }
 
-            // [FLOW-CONTROL] 대기열이 가득 차면 레이어 연산 전 일시 정지
-            while ACTIVE_BAKE_TASKS.load(Ordering::SeqCst) >= 20 {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-
             let is_pinned = layer_idx < self.pinned_layer_count;
             
             // 1. [C: Computing] Prepare and Run Layer
@@ -1734,20 +1729,13 @@ impl QuantizedQwen3VLTextModel {
                 
                 // [HANDOFF] GPU 연산 결과를 CPU로 고속 복사 (PCIe 전송)
                 if let Ok(xs_cpu) = xs.to_device(&Device::Cpu) {
-                    // CPU로 데이터가 넘어온 시점에서 GPU의 대기열 카운트는 해소된 것으로 간주
-                    // ACTIVE_BAKE_TASKS.fetch_sub(1, Ordering::SeqCst); // 이 시점은 워커에서 최종 관리하되, 
-                    // 아래 로직에서 GPU는 멈추지 않고 진행함.
-                    
                     let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
-                    
-                    ACTIVE_BAKE_TASKS.fetch_add(1, Ordering::SeqCst);
                     
                     // [WORKER] 비동기 저장 워커 기동 (CPU RAM -> SSD)
                     tokio::task::spawn_blocking(move || {
                         let mut map = std::collections::HashMap::new();
                         map.insert("hidden_states".to_string(), xs_cpu);
                         let _ = candle_core::safetensors::save(&map, &final_path);
-                        ACTIVE_BAKE_TASKS.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
             }
