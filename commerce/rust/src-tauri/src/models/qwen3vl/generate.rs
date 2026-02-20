@@ -289,9 +289,15 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: false }); 
                                 return; 
                             }
+                            /* 
+                               [BUNDLE-STRATEGY] 28개 레이어 통합 저장 로직
+                               - 기존: 레이어마다 개별 파일을 생성하여 SSD I/O 부하가 매우 컸음.
+                               - 변경: 28개 레이어 전체를 하나의 HashMap에 담아 'bundle_kv_{offset}.safetensors'로 한 번에 저장.
+                               - 효과: SSD 쓰기 횟수 28배 감소 및 순차 쓰기 효율 극대화.
+                            */
                             let loop_count = bake.layers.len();
                             let slot = &SLOT_MANAGER.slots[sid];
-                            slot.remaining_layers.store(1, Ordering::SeqCst); // Only 1 bundle task now
+                            slot.remaining_layers.store(1, Ordering::SeqCst); 
                             
                             let mut bundle_map = std::collections::HashMap::new();
                             let bundle_fname = if is_relay {
@@ -304,7 +310,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 
                             for l_idx in 0..loop_count {
                                 let source = &bake.layers[l_idx];
-                                let prefix = format!("l{}_", source.layer_idx);
+                                // [FIX] Relay 모드(0.6B)라면 레이어 인덱스에 상관없이 l0로 저장하여 2B가 쉽게 찾게 합니다.
+                                let prefix = if is_relay { "l0_".to_string() } else { format!("l{}_", source.layer_idx) };
                                 
                                 let k_res = source.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
                                 let v_res = source.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
@@ -462,51 +469,62 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                                                             if b_idx < reg.len() { 
                                                                                                                 let is_relay = target_path.file_name().map(|n| n.to_string_lossy().contains("bundle_relay_kv")).unwrap_or(false);
                                                                                                                 
-                                                                                                                // [ONE-READ-ALL-LAYERS]
-                                                                                                                let entry = &mut reg[b_idx];
-                                                                                                                for target_l in 0..28 {
-                                                                                                                    let prefix = format!("l{}_", target_l);
-                                                                                                                    let ka_name = format!("{}k_anchors", prefix);
-                                                                                                                    let kh_name = format!("{}k_shape", prefix);
-                                                                                                                    let kp_name = format!("{}k_packed", prefix);
-                                                                                                                    let ks_name = format!("{}k_scales", prefix);
-                                                                                                                    let va_name = format!("{}v_anchors", prefix);
-                                                                                                                    let vp_name = format!("{}v_packed", prefix);
-                                                                                                                    let vs_name = format!("{}v_scales", prefix);
-                                                    
-                                                                                                                    if let (Ok(ka), Ok(kh), Ok(kp), Ok(ks), Ok(va), Ok(vp), Ok(vs)) = (
-                                                                                                                        st.tensor(&ka_name), st.tensor(&kh_name), st.tensor(&kp_name), 
-                                                                                                                        st.tensor(&ks_name), st.tensor(&va_name), st.tensor(&vp_name), st.tensor(&vs_name)
-                                                                                                                    ) {
-                                                                                                                        let dims = ka.shape();
-                                                                                                                        let a_cnt = dims[2];
-                                                                                                                        let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(kh.data().as_ptr() as *const u32, kh.data().len() / 4) };
-                                                                                                                        let o_s = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
-                                                                                                                        
-                                                                                                                        let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
-                                                                                                                            k_anchors: Tensor::from_slice(unsafe { std::slice::from_raw_parts(ka.data().as_ptr() as *const f32, ka.data().len() / 4) }, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                                                                                            k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
-                                                                                                                            k_scales: Tensor::from_slice(unsafe { std::slice::from_raw_parts(ks.data().as_ptr() as *const f32, ks.data().len() / 4) }, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                                                                                            v_anchors: Tensor::from_slice(unsafe { std::slice::from_raw_parts(va.data().as_ptr() as *const f32, va.data().len() / 4) }, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                                                                                            v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
-                                                                                                                            v_scales: Tensor::from_slice(unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f32, vs.data().len() / 4) }, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                                                                                            original_shape: o_s 
-                                                                                                                        };
-                                                                                                                        
-                                                                                                                                                                                                                {
-                                                                                                                                                                                                                    let mut cache = entry.bitkv_cache.write().unwrap();
-                                                                                                                                                                                                                    cache[target_l] = Some(metadata);
-                                                                                                                                                                                                                }
-                                                                                                                                                                                                                
-                                                                                                                                                                                                                // [FIX] SSD와 Loading 상태 모두를 RAM으로 전환하여 대기 루프를 해제합니다.
-                                                                                                                                                                                                                let cur_loc = entry.location[target_l];
-                                                                                                                                                                                                                if cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::SSD || cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::Loading {
-                                                                                                                                                                                                                    entry.location[target_l] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
-                                                                                                                                                                                                                }
-                                                                                                                                                                                                            }
-                                                                                                                                                                                                        }
-                                                                                                                                                                                                        
-                                                                                                                                                                                                        println!("[WORKER-LOAD] << [RELEASE] Bundle Block {} transferred to RAM. Releasing Slot {}.", b_idx, s_id);
+                                                                                                                                                                            // [ONE-READ-ALL-LAYERS]
+                                                                                                                                                                            let entry = &mut reg[b_idx];
+                                                                                                                                                                            for target_l in 0..28 {
+                                                                                                                                                                                let prefix = format!("l{}_", target_l);
+                                                                                                                                                                                // ... (중략)
+                                                                                                                                                                                let ka_name = format!("{}k_anchors", prefix);
+                                                                                                                                                                                let kh_name = format!("{}k_shape", prefix);
+                                                                                                                                                                                let kp_name = format!("{}k_packed", prefix);
+                                                                                                                                                                                let ks_name = format!("{}k_scales", prefix);
+                                                                                                                                                                                let va_name = format!("{}v_anchors", prefix);
+                                                                                                                                                                                let vp_name = format!("{}v_packed", prefix);
+                                                                                                                                                                                let vs_name = format!("{}v_scales", prefix);
+                                                                                                                
+                                                                                                                                                                                if let (Ok(ka), Ok(kh), Ok(kp), Ok(ks), Ok(va), Ok(vp), Ok(vs)) = (
+                                                                                                                                                                                    st.tensor(&ka_name), st.tensor(&kh_name), st.tensor(&kp_name), 
+                                                                                                                                                                                    st.tensor(&ks_name), st.tensor(&va_name), st.tensor(&vp_name), st.tensor(&vs_name)
+                                                                                                                                                                                ) {
+                                                                                                                                                                                    let dims = ka.shape();
+                                                                                                                                                                                    let a_cnt = dims[2];
+                                                                                                                                                                                    let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(kh.data().as_ptr() as *const u32, kh.data().len() / 4) };
+                                                                                                                                                                                    let o_s = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
+                                                                                                                                                                                    
+                                                                                                                                                                                    let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
+                                                                                                                                                                                        k_anchors: Tensor::from_slice(unsafe { std::slice::from_raw_parts(ka.data().as_ptr() as *const f32, ka.data().len() / 4) }, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                                                                                                                                                        k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
+                                                                                                                                                                                        k_scales: Tensor::from_slice(unsafe { std::slice::from_raw_parts(ks.data().as_ptr() as *const f32, ks.data().len() / 4) }, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                                                                                                                                                        v_anchors: Tensor::from_slice(unsafe { std::slice::from_raw_parts(va.data().as_ptr() as *const f32, va.data().len() / 4) }, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                                                                                                                                                        v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
+                                                                                                                                                                                        v_scales: Tensor::from_slice(unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f32, vs.data().len() / 4) }, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                                                                                                                                                        original_shape: o_s 
+                                                                                                                                                                                    };
+                                                                                                                                                                                    
+                                                                                                                                                                                    {
+                                                                                                                                                                                        let mut cache = entry.bitkv_cache.write().unwrap();
+                                                                                                                                                                                        if is_relay {
+                                                                                                                                                                                            // [RELAY-BROADCAST]
+                                                                                                                                                                                            for i in 0..28 { 
+                                                                                                                                                                                                cache[i] = Some(metadata.clone()); 
+                                                                                                                                                                                                let cur_loc = entry.location[i];
+                                                                                                                                                                                                if cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::SSD || cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::Loading {
+                                                                                                                                                                                                    entry.location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
+                                                                                                                                                                                                }
+                                                                                                                                                                                            }
+                                                                                                                                                                                            println!("[WORKER-LOAD] << [SUCCESS] RELAY Bundle Block {} broadcasted to ALL layers.", b_idx);
+                                                                                                                                                                                            break;
+                                                                                                                                                                                        } else {
+                                                                                                                                                                                            cache[target_l] = Some(metadata);
+                                                                                                                                                                                            let cur_loc = entry.location[target_l];
+                                                                                                                                                                                            if cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::SSD || cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::Loading {
+                                                                                                                                                                                                entry.location[target_l] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
+                                                                                                                                                                                            }
+                                                                                                                                                                                        }
+                                                                                                                                                                                    }
+                                                                                                                                                                                }
+                                                                                                                                                                            }
+                                                                                                                                                                                                                                                                                                                        println!("[WORKER-LOAD] << [RELEASE] Bundle Block {} transferred to RAM. Releasing Slot {}.", b_idx, s_id);
                                                                                                                                                                                                     }
                                                                                                                                                                                                 }
                                                                                                                                                                             
@@ -607,7 +625,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                             if b_idx < reg.len() { 
                                                                 let is_relay = target_path.file_name().map(|n| n.to_string_lossy().contains("bundle_relay_kv")).unwrap_or(false);
                                                                 
-                                                                // [ONE-READ-ALL-LAYERS]
+                                                                // [ONE-SHOT-LOADING] 
+                                                                // 번들 파일을 한 번 읽었을 때, 파일 내 모든 레이어(0~27)의 데이터를 Registry(RAM)에 미리 채웁니다.
+                                                                // 덕분에 Layer 0만 SSD를 읽고, Layer 1~27은 SSD 접근 없이 RAM에서 즉시 연산됩니다.
                                                                 let entry = &mut reg[b_idx];
                                                                 for target_l in 0..28 {
                                                                     let prefix = format!("l{}_", target_l);
@@ -620,35 +640,45 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                     let vs_name = format!("{}v_scales", prefix);
 
                                                                     if let (Ok(ka), Ok(kh), Ok(kp), Ok(ks), Ok(va), Ok(vp), Ok(vs)) = (
-                                                                        st.tensor(&ka_name), st.tensor(&kh_name), st.tensor(&kp_name), 
-                                                                        st.tensor(&ks_name), st.tensor(&va_name), st.tensor(&vp_name), st.tensor(&vs_name)
-                                                                    ) {
-                                                                        let dims = ka.shape();
-                                                                        let a_cnt = dims[2];
-                                                                        let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(kh.data().as_ptr() as *const u32, kh.data().len() / 4) };
-                                                                        let o_s = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
-                                                                        
-                                                                        let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
-                                                                            k_anchors: Tensor::from_slice(unsafe { std::slice::from_raw_parts(ka.data().as_ptr() as *const f32, ka.data().len() / 4) }, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                                            k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
-                                                                            k_scales: Tensor::from_slice(unsafe { std::slice::from_raw_parts(ks.data().as_ptr() as *const f32, ks.data().len() / 4) }, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                                            v_anchors: Tensor::from_slice(unsafe { std::slice::from_raw_parts(va.data().as_ptr() as *const f32, va.data().len() / 4) }, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                                            v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
-                                                                            v_scales: Tensor::from_slice(unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f32, vs.data().len() / 4) }, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                                            original_shape: o_s 
-                                                                        };
-                                                                        
-                                                                        {
-                                                                            let mut cache = entry.bitkv_cache.write().unwrap();
+                                                                    st.tensor(&ka_name), st.tensor(&kh_name), st.tensor(&kp_name), 
+                                                                    st.tensor(&ks_name), st.tensor(&va_name), st.tensor(&vp_name), st.tensor(&vs_name)
+                                                                ) {
+                                                                    let dims = ka.shape();
+                                                                    let a_cnt = dims[2];
+                                                                    let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(kh.data().as_ptr() as *const u32, kh.data().len() / 4) };
+                                                                    let o_s = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
+                                                                    
+                                                                    let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
+                                                                        k_anchors: Tensor::from_slice(unsafe { std::slice::from_raw_parts(ka.data().as_ptr() as *const f32, ka.data().len() / 4) }, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                                        k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
+                                                                        k_scales: Tensor::from_slice(unsafe { std::slice::from_raw_parts(ks.data().as_ptr() as *const f32, ks.data().len() / 4) }, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                                        v_anchors: Tensor::from_slice(unsafe { std::slice::from_raw_parts(va.data().as_ptr() as *const f32, va.data().len() / 4) }, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                                        v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
+                                                                        v_scales: Tensor::from_slice(unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f32, vs.data().len() / 4) }, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                                        original_shape: o_s 
+                                                                    };
+                                                                    
+                                                                    {
+                                                                        let mut cache = entry.bitkv_cache.write().unwrap();
+                                                                        if is_relay {
+                                                                            // [RELAY-BROADCAST] 0.6B의 데이터를 2B의 모든 레이어(0~27)에 복사합니다.
+                                                                            for i in 0..28 { 
+                                                                                cache[i] = Some(metadata.clone()); 
+                                                                                if entry.location[i] == crate::models::qwen3vl::quantized_model::KVLocation::SSD || entry.location[i] == crate::models::qwen3vl::quantized_model::KVLocation::Loading {
+                                                                                    entry.location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
+                                                                                }
+                                                                            }
+                                                                            println!("[WORKER-CHUNK] << [SUCCESS] RELAY Bundle Block {} broadcasted to ALL layers.", b_idx);
+                                                                            break; // l0만 읽고 종료
+                                                                        } else {
                                                                             cache[target_l] = Some(metadata);
-                                                                        }
-                                                                        
-                                                                        // [FIX] SSD와 Loading 상태 모두를 RAM으로 전환하여 대기 루프를 해제합니다.
-                                                                        let cur_loc = entry.location[target_l];
-                                                                        if cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::SSD || cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::Loading {
-                                                                            entry.location[target_l] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
+                                                                            let cur_loc = entry.location[target_l];
+                                                                            if cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::SSD || cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::Loading {
+                                                                                entry.location[target_l] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
+                                                                            }
                                                                         }
                                                                     }
+                                                                }
                                                                 }
                                                                 
                                                                 println!("[WORKER-CHUNK] << [RELEASE] Bundle Block {} transferred to RAM Cache. Releasing Slot {}.", b_idx, s_id);

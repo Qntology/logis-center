@@ -955,13 +955,21 @@ impl QuantizedQwen3VLTextAttention {
            now releases slots immediately after transferring data to the RAM cache.
         */
 
-        // [SMART-PURGE-V3] Memory-Efficient Caching for 8GB RAM
+        /* 
+           [SMART-PURGE-V3] 8GB RAM 환경을 위한 지능형 자원 회수
+           - 원칙: 무거운 데이터(Raw BF16)는 즉시 비우고, 가벼운 데이터(Compressed BitKV)는 최대한 RAM에 유지.
+           - 이유: SSD 읽기 속도가 가장 큰 병목이므로, 압축 데이터만이라도 RAM에 들고 있으면 다음 레이어에서 CPU가 즉시 복원 가능.
+           - 결과: 5만 토큰 상황에서도 SSD 접근을 최소화하면서 8GB RAM 내에서 안정적인 추론 가능.
+        */
         for block in &mut self.kv_blocks {
             let mut inner = block.inner.write().unwrap();
             if inner.ssd_path.is_some() || inner.bitkv_metadata.is_some() {
                 if inner.location == KVLocation::VRAM || inner.location == KVLocation::RAM {
+                    // 무거운 BF16 텐서만 메모리에서 즉시 해제하여 RAM 공간 확보
                     inner.k_cache = None;
                     inner.v_cache = None;
+                    
+                    // 압축 메타데이터가 있다면 RAM 상태 유지 (다음 레이어에서 SSD 읽기 방지)
                     if inner.bitkv_metadata.is_some() { inner.location = KVLocation::RAM; }
                     else { inner.location = KVLocation::SSD; }
                 }
@@ -1938,7 +1946,12 @@ impl QuantizedQwen3VLTextModel {
                                                                 for b_idx in 0..self.layers[layer_idx].self_attn.kv_blocks.len() {
                                                                     if b_idx < reg.len() {
                                                                         let loc = reg[b_idx].location[layer_idx];
-                                                                        // [FIX] SSD_PENDING과 VRAM은 데이터가 이미 메모리에 있는 상태이므로 Missing에서 제외합니다.
+                                                                        /* 
+                                                                           [DEADLOCK-FIX] 
+                                                                           - SSD_PENDING과 VRAM은 데이터가 이미 RAM에 존재(저장 대기 중)하는 상태입니다.
+                                                                           - 이를 'Missing'으로 간주하면 로더는 무시하고 엔진은 대기하는 교착 상태가 발생합니다.
+                                                                           - 따라서 메모리 상주 상태(RAM/RamSticky/VRAM/SSD_PENDING)는 모두 '준비 완료'로 봅니다.
+                                                                        */
                                                                         if loc != KVLocation::RAM && loc != KVLocation::RamSticky && loc != KVLocation::VRAM && loc != KVLocation::SSD_PENDING {
                                                                             missing_count += 1;
                                                                         }
@@ -2240,12 +2253,11 @@ impl QuantizedQwen3VLTextModel {
                 for entry in entries.flatten() {
                     let fname = entry.file_name().to_string_lossy().to_string();
                     
-                    // Match pattern: layer_relay_kv_{offset}.safetensors OR layer_{any}_kv_{offset}.safetensors
-                    let is_relay = fname.contains("layer_relay_kv");
-                    let is_layer_specific = fname.starts_with("layer_") && fname.contains("_kv");
+                    // Match pattern: bundle_relay_kv_{offset}.safetensors OR bundle_inference_kv_{offset}.safetensors
+                    let is_bundle = fname.starts_with("bundle_");
                     
-                    if (is_relay || is_layer_specific) && fname.ends_with(".safetensors") {
-                        let offset = if fname == "layer_relay_kv.safetensors" || fname.ends_with("_kv.safetensors") {
+                    if is_bundle && fname.ends_with(".safetensors") {
+                        let offset = if fname == "bundle_relay_kv.safetensors" || fname == "bundle_inference_kv.safetensors" {
                             0
                         } else {
                             fname.strip_suffix(".safetensors")
