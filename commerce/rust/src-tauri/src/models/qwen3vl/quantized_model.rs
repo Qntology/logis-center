@@ -816,6 +816,12 @@ impl QuantizedQwen3VLTextAttention {
             let mut k = k.ok_or_else(|| candle_core::Error::Msg("KV Cache not ready after wait".to_string()))?;
             let mut v = v.ok_or_else(|| candle_core::Error::Msg("KV Cache not ready after wait".to_string()))?;
 
+            // [FIX] Ensure KV tensors are on the correct device AND have the correct DType before calculation
+            if !k.device().same_device(dev) { k = k.to_device(dev)?; }
+            if k.dtype() != target_dtype { k = k.to_dtype(target_dtype)?; }
+            if !v.device().same_device(dev) { v = v.to_device(dev)?; }
+            if v.dtype() != target_dtype { v = v.to_dtype(target_dtype)?; }
+
             // [FIX] Update b_len to actual tensor dimensions to prevent shape mismatch in broadcast_add
             // This handles the case where the last block (e.g. 205 tokens) is smaller than the standard 256.
             b_len = k.dim(2)?;
@@ -869,8 +875,22 @@ impl QuantizedQwen3VLTextAttention {
 
         // 5. [BATCH-VRAM] Fast single-pass for all VRAM blocks
         if !vram_ks.is_empty() {
-            let mut k = Tensor::cat(&vram_ks, 2)?;
-            let mut v = Tensor::cat(&vram_vs, 2)?;
+            // [FIX] Pre-verify device AND dtype alignment before cat to prevent panic
+            let mut final_ks = Vec::with_capacity(vram_ks.len());
+            let mut final_vs = Vec::with_capacity(vram_vs.len());
+            for mut tk in vram_ks { 
+                if !tk.device().same_device(dev) { tk = tk.to_device(dev)?; }
+                if tk.dtype() != target_dtype { tk = tk.to_dtype(target_dtype)?; }
+                final_ks.push(tk); 
+            }
+            for mut tv in vram_vs { 
+                if !tv.device().same_device(dev) { tv = tv.to_device(dev)?; }
+                if tv.dtype() != target_dtype { tv = tv.to_dtype(target_dtype)?; }
+                final_vs.push(tv); 
+            }
+
+            let mut k = Tensor::cat(&final_ks, 2)?;
+            let mut v = Tensor::cat(&final_vs, 2)?;
             
             if self.num_kv_groups > 1 {
                 let (b, h, s, d) = k.dims4()?;
