@@ -1938,7 +1938,8 @@ impl QuantizedQwen3VLTextModel {
                                                                 for b_idx in 0..self.layers[layer_idx].self_attn.kv_blocks.len() {
                                                                     if b_idx < reg.len() {
                                                                         let loc = reg[b_idx].location[layer_idx];
-                                                                        if loc != KVLocation::RAM && loc != KVLocation::RamSticky && loc != KVLocation::VRAM {
+                                                                        // [FIX] SSD_PENDING과 VRAM은 데이터가 이미 메모리에 있는 상태이므로 Missing에서 제외합니다.
+                                                                        if loc != KVLocation::RAM && loc != KVLocation::RamSticky && loc != KVLocation::VRAM && loc != KVLocation::SSD_PENDING {
                                                                             missing_count += 1;
                                                                         }
                                                                     }

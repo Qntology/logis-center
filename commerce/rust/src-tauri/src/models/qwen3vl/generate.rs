@@ -806,10 +806,11 @@ impl Qwen3VLGenerateModel {
                         ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()),
                         _ => None
                     };
+                    let b_idx = block_offset / 256;
                     let _ = tx.send(SlotTask::Bake(BakeTask { 
                         slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, 
                         layers: dumps, is_relay_baking: is_06b,
-                        block_idx: None,
+                        block_idx: Some(b_idx),
                         registry: reg_ref
                     })).await;
                 }
@@ -868,6 +869,12 @@ impl Qwen3VLGenerateModel {
                         let k: Tensor = k; let v: Tensor = v;
                         dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v });
                     }
+                    let b_idx = block_offset / 256;
+                    let reg_ref = match &self.qwen3_vl {
+                        ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()),
+                        ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()),
+                        _ => None
+                    };
                     if let Ok(tx) = get_bake_worker().await {
                         let _ = tx.send(SlotTask::Bake(BakeTask { 
                             slot_id, 
@@ -876,8 +883,8 @@ impl Qwen3VLGenerateModel {
                             offset: block_offset, 
                             layers: dumps, 
                             is_relay_baking: false,
-                            block_idx: None,
-                            registry: None
+                            block_idx: Some(b_idx),
+                            registry: reg_ref
                         })).await;
                     }
                 }
