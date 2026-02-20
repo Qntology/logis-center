@@ -2421,35 +2421,13 @@ impl QuantizedQwen3VLModel {
     }
 
     pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
-        // [OPTION A] 실시간 VRAM 재배치 활성화
-        let _ = self.rebalance_layers(0, 0);
-
-        // [SAFETY] KV Cache Consistency Check
-        let loaded_kv = self.language_model.get_kv_len();
-        let chunk_end = seqlen_offset + input_ids_in.dim(1)?;
-        let mut limit_len = chunk_end;
-        
-        if loaded_kv > 0 && chunk_end > loaded_kv {
-            println!("[SAFETY] KV Cache Mismatch! Expected end: {}, but only {} available. Truncating.", chunk_end, loaded_kv);
-            limit_len = loaded_kv;
-        }
-
-        if seqlen_offset >= limit_len {
-            println!("[SAFETY] Skipping chunk (Offset {} >= Limit {}). Returning dummy.", seqlen_offset, limit_len);
-            let dev = self.lm_head.device();
-            let dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
-            let v_size = self.config.text_config.as_ref().map(|tc| tc.vocab_size).unwrap_or(151936);
-            return Ok(Tensor::zeros((input_ids_in.dim(0)?, input_ids_in.dim(1)?, v_size), dtype, dev)?);
-        }
-
-        let valid_len = limit_len - seqlen_offset;
-        let input_ids_safe = if valid_len < input_ids_in.dim(1)? {
-            input_ids_in.narrow(1, 0, valid_len)?
-        } else {
-            input_ids_in.clone()
+        // [DEVICE-ALIGNMENT] 임베딩 레이어 장치와 입력 장치 맞춤
+        let emb_dev = self.language_model.embed_tokens.embeddings().device();
+        let input_ids = if !input_ids_in.device().same_device(emb_dev) { 
+            input_ids_in.to_device(emb_dev)? 
+        } else { 
+            input_ids_in.clone() 
         };
-
-        let input_ids = if !input_ids_safe.device().same_device(&self.text_device) { input_ids_safe.to_device(&self.text_device)? } else { input_ids_safe.clone() };
         let (b_sz, seq_len) = input_ids.dims2()?;
 
         // 1. Embedding & Vision Integration
@@ -2543,10 +2521,13 @@ impl QuantizedQwen3TextModel {
     }
 
     pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
-        // [OPTION A] 실시간 VRAM 재배치 활성화
-        let _ = self.rebalance_layers(0, 0);
-
-        let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
+        // [DEVICE-ALIGNMENT] 임베딩 레이어 장치와 입력 장치 맞춤
+        let emb_dev = self.language_model.embed_tokens.embeddings().device();
+        let input_ids = if !input_ids_in.device().same_device(emb_dev) { 
+            input_ids_in.to_device(emb_dev)? 
+        } else { 
+            input_ids_in.clone() 
+        };
         
         let cache_position = if let Some(cp) = cache_position_in { if !cp.device().same_device(&self.text_device) { Some(cp.to_device(&self.text_device)?) } else { Some(cp.clone()) } } else { None };
         let (b_sz, seq_len) = input_ids.dims2()?;
