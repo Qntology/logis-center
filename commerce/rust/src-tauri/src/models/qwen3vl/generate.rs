@@ -737,40 +737,31 @@ impl Qwen3VLGenerateModel {
             a_ids.push(next_id); g_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
             
             curr_s_off += 1; 
-            tokens_since_last_bake += 1;
             p_vals = None; 
 
-            // [ACTIVE-BAKING] 2048개 단위로 비동기 SSD 저장 트리거
-            if tokens_since_last_bake >= 2048 {
-                if let Some(s_id) = &sid {
-                    let unbaked_blocks = self.get_all_unbaked_kv_blocks();
-                    if !unbaked_blocks.is_empty() {
-                        println!("[GENERATE] >> [ASYNC-TRIGGER] 2048 tokens reached. Launching background bake...");
-                        for (ks, vs, block_offset) in unbaked_blocks {
-                            // [NON-BLOCKING] 슬롯 확보 및 작업 지시만 수행
-                            if let Ok(slot_id) = SLOT_MANAGER.request_tx.try_send(SlotRequest::AcquireWrite { 
-                                response: oneshot::channel().0, // 결과를 여기서 기다리지 않음
-                                total_tokens: curr_s_off 
-                            }) {
-                                // 실제 슬롯 할당과 작업은 SlotManager가 비동기로 처리하도록 구조화됨
-                                // (이 부분은 단순화를 위해 기존 AcquireWrite를 유지하되, 전체적인 Flush 대기를 루프 밖으로 뺌)
-                            }
-                            
-                            let slot_id = SLOT_MANAGER.acquire_write_slot(curr_s_off).await;
-                            let mut dumps = Vec::new();
-                            for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                                dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v });
-                            }
-                            if let Ok(tx) = get_bake_worker().await {
-                                let path = crate::utils::paths::get_kv_dir(None).join(s_id);
-                                let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, layers: dumps, is_relay_baking: false })).await;
-                            }
+            // [RELAY-BAKING] 릴레이 시스템에 의해 SSD_PENDING으로 분류된 블록들을 찾아 비동기 저장
+            if let Some(s_id) = &sid {
+                let pending_blocks = self.get_blocks_by_location(KVLocation::SSD_PENDING);
+                if !pending_blocks.is_empty() {
+                    println!("[GENERATE] >> [RELAY-TRIGGER] Pushing {} blocks to SSD Baker...", pending_blocks.len());
+                    for (ks, vs, block_offset, block_idx) in pending_blocks {
+                        let slot_id = SLOT_MANAGER.acquire_write_slot(curr_s_off).await;
+                        let mut dumps = Vec::new();
+                        for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
+                            dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v });
                         }
-                        // [OPTIMIZATION] 여기서 SLOT_MANAGER.wait_for_all_tasks().await를 호출하지 않습니다!
-                        // 작업을 던져두고 즉시 다음 토큰 연산으로 넘어갑니다.
+                        if let Ok(tx) = get_bake_worker().await {
+                            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+                            let _ = tx.send(SlotTask::Bake(BakeTask { 
+                                slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, 
+                                layers: dumps, is_relay_baking: false 
+                            })).await;
+                        }
+                        
+                        // 저장 요청을 보냈으므로 상태를 업데이트하여 중복 요청 방지
+                        self.mark_block_location(block_idx, KVLocation::Streaming); 
                     }
                 }
-                tokens_since_last_bake = 0;
             }
 
             self.clear_temporal_kv_caches();
@@ -795,7 +786,53 @@ impl Qwen3VLGenerateModel {
         }
     }
 
-    pub fn get_kv_len(&self) -> usize { match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.get_kv_len(), ModelVariant::QuantizedText(m) => m.language_model.get_kv_len(), _ => 0 } }
+        pub fn get_blocks_by_location(&self, target_loc: KVLocation) -> Vec<(Vec<Tensor>, Vec<Tensor>, usize, usize)> {
+            let mut results = Vec::new();
+            let layers = match &self.qwen3_vl {
+                ModelVariant::QuantizedVL(m) => Some(&m.language_model.layers),
+                ModelVariant::QuantizedText(m) => Some(&m.language_model.layers),
+                _ => None
+            };
+            if let Some(layers) = layers {
+                if layers.is_empty() { return vec![]; }
+                let num_blocks = layers[0].self_attn.kv_blocks.len();
+                for b_idx in 0..num_blocks {
+                    let mut ks = Vec::new();
+                    let mut vs = Vec::new();
+                    let mut match_found = false;
+                    let mut offset = 0;
+                    for l in layers {
+                        let inner = l.self_attn.kv_blocks[b_idx].inner.read().unwrap();
+                        if inner.location == target_loc {
+                            if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                                ks.push(k.clone()); vs.push(v.clone());
+                                offset = inner.offset + inner.len;
+                                match_found = true;
+                            }
+                        }
+                    }
+                    if match_found { results.push((ks, vs, offset, b_idx)); }
+                }
+            }
+            results
+        }
+    
+        pub fn mark_block_location(&mut self, block_idx: usize, new_loc: KVLocation) {
+            let layers = match self.qwen3_vl {
+                ModelVariant::QuantizedVL(ref mut m) => &mut m.language_model.layers,
+                ModelVariant::QuantizedText(ref mut m) => &mut m.language_model.layers,
+                _ => return
+            };
+            for l in layers {
+                if block_idx < l.self_attn.kv_blocks.len() {
+                    let mut inner = l.self_attn.kv_blocks[block_idx].inner.write().unwrap();
+                    inner.location = new_loc;
+                }
+            }
+        }
+    
+        pub fn get_kv_len(&self) -> usize { 
+     match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.get_kv_len(), ModelVariant::QuantizedText(m) => m.language_model.get_kv_len(), _ => 0 } }
     pub fn get_all_unbaked_kv_blocks(&self) -> Vec<(Vec<Tensor>, Vec<Tensor>, usize)> {
         let mut all_blocks: Vec<(Vec<Tensor>, Vec<Tensor>, usize)> = Vec::new();
         let layers: Option<&Vec<crate::models::qwen3vl::quantized_model::QuantizedQwen3VLTextDecoderLayer>> = match &self.qwen3_vl {

@@ -279,47 +279,56 @@ impl KVRegistry {
         }
     }
 
-    // [NEW] 티어드 컨테이너 관리 (2048 토큰 = 1 컨테이너 = 약 112MB)
-    pub fn enforce_tiered_management(&self, current_token_idx: usize) {
+    // [NEW] A-B-C 릴레이 순환 시스템 (VRAM & RAM 공통)
+    pub fn enforce_relay_relay(&self, current_token_idx: usize) {
         let mut entries = self.entries.write().unwrap();
-        let container_size = 2048;
-        let current_container_id = current_token_idx / container_size;
+        let threshold_bytes = 100 * 1024 * 1024; // 100MB
+        
+        // 1. 현재 각 그룹(컨테이너)의 용량 계산
+        // (단순화를 위해 100MB를 토큰 수로 환산하여 그룹핑하거나, 실제 바이트를 추적)
+        // 2B 모델 기준 BF16 KV 캐시는 토큰당 약 56KB (28레이어 합산)
+        // 100MB / 56KB  약 1800 토큰. 여기서는 안전하게 1800을 그룹 단위로 설정.
+        let group_size = 1800; 
+        let current_group_id = current_token_idx / group_size;
 
-        let mut vram_to_ram_count = 0;
-        let mut ram_to_ssd_count = 0;
+        let mut vram_to_ram = 0;
+        let mut ram_to_ssd = 0;
 
-        for (i, entry) in entries.iter_mut().enumerate() {
-            let block_container_id = (entry.token_start) / container_size;
-            
-            // 1. VRAM -> RAM: 현재 작업 중인 컨테이너가 아니라면 VRAM에서 즉시 퇴출
-            if block_container_id < current_container_id {
+        for entry in entries.iter_mut() {
+            let entry_group_id = entry.token_start / group_size;
+
+            // [VRAM 릴레이]
+            // 현재 그룹(B)과 직전 그룹(A)을 제외한 모든 과거 데이터는 RAM으로 밀어냄
+            if entry_group_id + 1 < current_group_id {
                 let has_vram = entry.location.iter().any(|&l| l == KVLocation::VRAM);
                 if has_vram {
-                    // 이 시점에서는 위치 표식만 변경하고, 실제 데이터 해제는 
-                    // 아래 Attention::forward의 SMART-PURGE-V2가 수행합니다.
                     for loc in entry.location.iter_mut() {
                         if *loc == KVLocation::VRAM { *loc = KVLocation::RAM; }
                     }
-                    vram_to_ram_count += 1;
+                    vram_to_ram += 1;
                 }
             }
 
-            // 2. RAM -> SSD: 현재 컨테이너보다 2단계 이상 뒤쳐진 컨테이너는 
-            // RAMSticky 한도(100MB)를 고려하여 일반 RAM으로 강등 (SSD 저장 대상)
-            if block_container_id + 1 < current_container_id {
-                let has_sticky = entry.location.iter().any(|&l| l == KVLocation::RamSticky);
-                if has_sticky {
+            // [RAM 릴레이]
+            // RAM에 있는 데이터 중 현재 그룹보다 2단계 이상 뒤쳐진 것은 SSD로 밀어냄
+            if entry_group_id + 2 < current_group_id {
+                let has_sticky = entry.location.iter().any(|&l| l == KVLocation::RamSticky || l == KVLocation::RAM);
+                if has_sticky && entry.ssd_path.is_none() {
+                    // SSD_PENDING 상태로 변경하여 generate.rs가 캐치하게 함
                     for loc in entry.location.iter_mut() {
-                        if *loc == KVLocation::RamSticky { *loc = KVLocation::RAM; }
+                        if *loc == KVLocation::RAM || *loc == KVLocation::RamSticky { 
+                            *loc = KVLocation::SSD_PENDING; 
+                        }
                     }
-                    ram_to_ssd_count += 1;
+                    entry.is_dirty = true;
+                    ram_to_ssd += 1;
                 }
             }
         }
 
-        if vram_to_ram_count > 0 || ram_to_ssd_count > 0 {
-            println!("[CONTAINER-MGMT] Container {}: Migrated {} blocks to RAM, {} to SSD-Queue.", 
-                current_container_id, vram_to_ram_count, ram_to_ssd_count);
+        if vram_to_ram > 0 || ram_to_ssd > 0 {
+            println!("[RELAY-SYSTEM] Group {}: VRAM->RAM: {} blocks, RAM->SSD-Queue: {} blocks", 
+                current_group_id, vram_to_ram, ram_to_ssd);
         }
     }
 
@@ -691,9 +700,9 @@ impl QuantizedQwen3VLTextAttention {
         let mut vram_vs = Vec::new();
         let mut vram_total_len = 0;
 
-        // [NEW] 통합 티어드 컨테이너 관리 (2048 단위 순환)
+        // [NEW] A-B-C 릴레이 순환 관리 (VRAM & RAM 공통)
         if self.layer_idx == 0 {
-            self.registry.enforce_tiered_management(global_start_idx);
+            self.registry.enforce_relay_relay(global_start_idx);
         }
 
         for block in &self.kv_blocks {
@@ -1754,8 +1763,10 @@ impl QuantizedQwen3VLTextModel {
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         
-        let target_device = if self.layers[0].device().is_cuda() { self.layers[0].device().clone() } else { Device::Cpu };
+        // [STRICT-GPU-COMPUTATION] 연산 장치는 무조건 첫 번째 레이어의 장치(GPU 권장)를 따릅니다.
+        let target_device = self.layers[0].device().clone();
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
+        
         let mut xs = if !inputs_embeds.device().same_device(&target_device) {
             inputs_embeds.to_device(&target_device)?
         } else {
@@ -2304,22 +2315,23 @@ impl QuantizedQwen3VLTextModel {
 
         // [ACTIVE-VRAM-MANAGEMENT] 
         // 현재 레이어를 GPU에 올리고 싶은데 공간이 부족하다면, 
-        // 이미 다른 레이어들이 점유하고 있는 VRAM 블록 중 가장 오래된 것들을 RAM으로 밀어냅니다.
+        // 이미 다른 레이어들이 점유하고 있는 VRAM 자원(블록 및 무게추) 중 가장 오래된 것들을 밀어냅니다.
         if free_vram < safe_zone {
-            println!("[REBALANCE] Low VRAM ({}MB). Evicting non-active containers...", free_vram / 1024 / 1024);
-            let mut total_freed = 0;
             let container_size = 2048;
-            let current_container_id = target_idx * 1000; // 임시: 현재 작업 위치 기반
+            let current_token_pos = self.get_kv_len();
+            let current_container_id = current_token_pos / container_size;
 
+            println!("[REBALANCE] Low VRAM ({}MB). Evicting oldest resources to GPU-pin Layer {}...", 
+                free_vram / 1024 / 1024, target_idx);
+
+            // 1단계: 모든 레이어의 '비활성 컨테이너' KV 블록을 RAM으로 밀어내기
+            let mut kv_freed = 0;
             for l_idx in 0..self.layers.len() {
                 if free_vram > safe_zone { break; }
-                
                 for block in &self.layers[l_idx].self_attn.kv_blocks {
                     let mut inner = block.inner.write().unwrap();
                     let block_container_id = inner.offset / container_size;
-
-                    // 현재 연산 중인 구역(Active Container)이 아닌 것만 RAM으로 보냄
-                    if inner.location == KVLocation::VRAM && block_container_id != current_container_id {
+                    if inner.location == KVLocation::VRAM && block_container_id < current_container_id {
                         if let (Some(k), Some(v)) = (inner.k_cache.take(), inner.v_cache.take()) {
                             let (ka, kp, ks, os) = self.layers[l_idx].self_attn.compress_to_bitkv(&k)?;
                             let (va, vp, vs, _) = self.layers[l_idx].self_attn.compress_to_bitkv(&v)?;
@@ -2328,22 +2340,37 @@ impl QuantizedQwen3VLTextModel {
                                 v_anchors: va, v_packed: vp, v_scales: vs, original_shape: os,
                             });
                             inner.location = KVLocation::RAM;
-                            total_freed += 1;
-                        }
-                    }
-                }
-                
-                // 각 레이어 검사 후 VRAM 상태 갱신
-                if let Some(nvml_inst) = &nvml {
-                    if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
-                        if let Ok(mem) = dev.memory_info() {
-                            free_vram = mem.free;
+                            kv_freed += 1;
                         }
                     }
                 }
             }
-            if total_freed > 0 {
-                println!("[REBALANCE] Proactively moved {} blocks to RAM. New Free VRAM: {}MB", total_freed, free_vram / 1024 / 1024);
+
+            // 2단계: 여전히 부족하다면, 가장 오래된 레이어 무게추(Weights)를 CPU로 오프로드
+            let mut weights_freed = 0;
+            if free_vram < safe_zone {
+                for l_idx in 0..self.layers.len() {
+                    // 현재 연산해야 할 레이어(target_idx)는 제외하고, 0번 레이어부터 순차적으로 퇴출
+                    if l_idx == target_idx { continue; }
+                    if free_vram > safe_zone { break; }
+                    
+                    if self.layers[l_idx].device().is_cuda() {
+                        self.layers[l_idx].to_device(&Device::Cpu)?;
+                        weights_freed += 1;
+                        
+                        // VRAM 상태 즉시 갱신
+                        if let Some(nvml_inst) = &nvml {
+                            if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
+                                if let Ok(mem) = dev.memory_info() { free_vram = mem.free; }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if kv_freed > 0 || weights_freed > 0 {
+                println!("[REBALANCE] Eviction Complete: {} KV-blocks, {} Layers moved to CPU/RAM. New Free VRAM: {}MB", 
+                    kv_freed, weights_freed, free_vram / 1024 / 1024);
             }
         }
         
@@ -2392,7 +2419,42 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
         } else if layer.device().is_cpu() {
-            println!("[REBALANCE] -- [SKIP] Layer {} stays on CPU (Free: {}MB, Safe Zone: {}MB)", target_idx, free_vram / 1024 / 1024, safe_zone / 1024 / 1024);
+            // [STRICT-GPU-POLICY] CPU 연산은 절대 허용하지 않습니다.
+            // 여유 공간이 safe_zone 미만이더라도, 실제 무게추를 올릴 공간이 있다면 즉시 업로드합니다.
+            // (이미 위에서 Eviction 로직이 실행되었으므로 최대한의 자리가 확보된 상태입니다.)
+            
+            let weight_size_mb = (layer.input_layernorm.weight().elem_count() * layer.input_layernorm.weight().dtype().size_in_bytes()) as f32 / 1024.0 / 1024.0;
+            let estimated_layer_size = (weight_size_mb * 5.0) as u64 * 1024 * 1024; // Approx LN + Attn + MLP
+
+            if free_vram > estimated_layer_size {
+                println!("[REBALANCE] >> [FORCE] Uploading Layer {} to GPU (Free: {}MB, Required: ~{}MB)", 
+                    target_idx, free_vram / 1024 / 1024, estimated_layer_size / 1024 / 1024);
+                
+                let target_device = Device::new_cuda(device_id)?;
+                let target_device_clone = target_device.clone();
+                let move_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    layer.to_device(&target_device_clone)
+                }));
+
+                match move_res {
+                    Ok(Ok(_)) => {
+                        let _ = target_device.synchronize();
+                        println!("[REBALANCE] << [DONE] Layer {} is now on GPU for computation.", target_idx);
+                    },
+                    Ok(Err(e)) => {
+                        println!("[REBALANCE] !! [ERROR] Failed to move Layer {} to GPU: {:?}", target_idx, e);
+                        return Err(e.into());
+                    },
+                    Err(p) => {
+                        return Err(anyhow::anyhow!("Panic during forced GPU upload"));
+                    }
+                }
+            } else {
+                // 공간이 정말로 부족하다면 잠시 기다리며 다시 한번 비우기를 시도하거나 에러를 냅니다.
+                // (CPU 연산을 시키는 것보다 자리가 날 때까지 에러를 내는 것이 사용자님 원칙에 맞습니다.)
+                println!("[REBALANCE] !! [CRITICAL] Insufficient VRAM for Layer {}. Free: {}MB", target_idx, free_vram / 1024 / 1024);
+                return Err(anyhow::anyhow!("VRAM Out of Memory - Cannot honor Always-GPU policy"));
+            }
         }
         Ok(())
     }
