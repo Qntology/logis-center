@@ -760,7 +760,16 @@ impl Qwen3VLGenerateModel {
                         dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v });
                     }
                     if let Ok(tx) = get_bake_worker().await {
-                        let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: block_offset, layers: dumps, is_relay_baking: false })).await;
+                        let _ = tx.send(SlotTask::Bake(BakeTask { 
+                            slot_id, 
+                            task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), 
+                            kv_name: kv_n.clone(), 
+                            offset: block_offset, 
+                            layers: dumps, 
+                            is_relay_baking: false,
+                            block_idx: None,
+                            registry: None
+                        })).await;
                     }
                 }
                 SLOT_MANAGER.wait_for_all_tasks().await;
