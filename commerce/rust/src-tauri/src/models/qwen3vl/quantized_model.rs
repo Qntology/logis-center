@@ -1982,13 +1982,20 @@ impl QuantizedQwen3VLTextModel {
                                                         // 레이어를 CPU로 밀어내기 전에, 현재 레이어의 KV 블록 데이터를 
                                                         // CPU 장치로 미리 복사하여 Worker가 안전하게 가져가게 함
                                                         for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
-                                                            let mut inner = block.inner.write().unwrap();
-                                                            if inner.location == KVLocation::VRAM {
-                                                                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                                                                    inner.k_cache = Some(k.to_device(&Device::Cpu)?);
-                                                                    inner.v_cache = Some(v.to_device(&Device::Cpu)?);
-                                                                    inner.location = KVLocation::RAM; 
-                                                                }
+                                                            let (k_cpu, v_cpu) = {
+                                                                let inner = block.inner.read().unwrap();
+                                                                if inner.location == KVLocation::VRAM {
+                                                                    if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                                                                        (Some(k.to_device(&Device::Cpu)?), Some(v.to_device(&Device::Cpu)?))
+                                                                    } else { (None, None) }
+                                                                } else { (None, None) }
+                                                            };
+
+                                                            if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
+                                                                let mut inner_w = block.inner.write().unwrap();
+                                                                inner_w.k_cache = Some(k);
+                                                                inner_w.v_cache = Some(v);
+                                                                inner_w.location = KVLocation::RAM;
                                                             }
                                                         }
 

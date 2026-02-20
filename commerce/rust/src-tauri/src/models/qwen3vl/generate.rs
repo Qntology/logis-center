@@ -802,21 +802,22 @@ impl Qwen3VLGenerateModel {
                         let mut vs = Vec::new();
                         let mut match_found = false;
                         let mut offset = 0;
-                        for l in layers {
-                            let inner = l.self_attn.kv_blocks[b_idx].inner.read().unwrap();
-                            // target_loc이거나, 혹은 이미 RAM으로 핸드오프된 데이터를 가져옵니다.
-                            if inner.location == target_loc || (target_loc == KVLocation::SSD_PENDING && inner.location == KVLocation::RAM && inner.ssd_path.is_none()) {
-                                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                                    // 이미 CPU에 있다면 그대로, GPU에 있다면 CPU로 가져옴
-                                    let k_cpu = if k.device().is_cpu() { k.clone() } else { k.to_device(&Device::Cpu)? };
-                                    let v_cpu = if v.device().is_cpu() { v.clone() } else { v.to_device(&Device::Cpu)? };
-                                    ks.push(k_cpu); 
-                                    vs.push(v_cpu);
-                                    offset = inner.offset + inner.len;
-                                    match_found = true;
-                                }
-                            }
-                        }
+                                        for l in layers {
+                                            let inner = l.self_attn.kv_blocks[b_idx].inner.read().unwrap();
+                                            // target_loc이거나, 혹은 이미 RAM으로 핸드오프된 데이터를 가져옵니다.
+                                            if inner.location == target_loc || (target_loc == KVLocation::SSD_PENDING && inner.location == KVLocation::RAM && inner.ssd_path.is_none()) {
+                                                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                                                    // 이미 CPU에 있다면 그대로, GPU에 있다면 CPU로 즉시 복사하여 Worker에게 전달
+                                                    let k_cpu = if k.device().is_cpu() { k.clone() } else { k.to_device(&Device::Cpu)? };
+                                                    let v_cpu = if v.device().is_cpu() { v.clone() } else { v.to_device(&Device::Cpu)? };
+                                                    ks.push(k_cpu); 
+                                                    vs.push(v_cpu);
+                                                    offset = inner.offset + inner.len;
+                                                    match_found = true;
+                                                }
+                                            }
+                                        }
+                        
                         if match_found { results.push((ks, vs, offset, b_idx)); }
                     }
                 }
