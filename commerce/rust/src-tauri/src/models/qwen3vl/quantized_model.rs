@@ -965,16 +965,20 @@ impl QuantizedQwen3VLTextAttention {
         let attn_output = self.o_proj.forward(&attn_output)?;
 
         // [SMART-PURGE-V2] 256개 단위 SSD 파이프라인 연동
-        for block in &mut self.kv_blocks {
-            let mut inner = block.inner.write().unwrap();
-            
-            // SSD에 이미 저장이 완료된 블록만 메모리(VRAM/RAM)에서 비웁니다.
-            // 아직 SSD 경로가 없는 최신 블록(추론 중인 데이터)은 Baker가 처리할 때까지 유지합니다.
-            if inner.ssd_path.is_some() {
-                if inner.location == KVLocation::VRAM || inner.location == KVLocation::RAM {
-                    inner.k_cache = None;
-                    inner.v_cache = None;
-                    inner.location = KVLocation::SSD;
+        // [EXCEPTION] 추론 단계(q_len == 1)에서는 성능을 위해 RAM 캐시를 유지합니다.
+        // 입력 단계(q_len > 1)에서만 SSD 백업 완료된 블록을 즉시 비워 메모리를 확보합니다.
+        if q_len > 1 {
+            for block in &mut self.kv_blocks {
+                let mut inner = block.inner.write().unwrap();
+                
+                // SSD에 이미 저장이 완료된 블록만 메모리(VRAM/RAM)에서 비웁니다.
+                // 아직 SSD 경로가 없는 최신 블록(추론 중인 데이터)은 Baker가 처리할 때까지 유지합니다.
+                if inner.ssd_path.is_some() {
+                    if inner.location == KVLocation::VRAM || inner.location == KVLocation::RAM {
+                        inner.k_cache = None;
+                        inner.v_cache = None;
+                        inner.location = KVLocation::SSD;
+                    }
                 }
             }
         }
