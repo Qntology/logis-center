@@ -952,18 +952,20 @@ impl QuantizedQwen3VLTextAttention {
 
         // [INTELLIGENT-RELEASE] 
         // Now that the GPU is done with this layer, release all slots associated with it.
-        // This keeps RAM usage stable while allowing parallel prefetch for upcoming layers.
         let l_idx = self.layer_idx;
-        let registry_clone = self.registry.clone();
-        tauri::async_runtime::spawn(async move {
-            let mut reg = registry_clone.entries.write().unwrap();
-            for entry in reg.iter_mut() {
-                if let Some(sid) = entry.slot_ids[l_idx].take() {
-                    use crate::models::qwen3vl::generate::SLOT_MANAGER;
+        let sids_to_release: Vec<usize> = {
+            let mut reg = self.registry.entries.write().unwrap();
+            reg.iter_mut().filter_map(|entry| entry.slot_ids[l_idx].take()).collect()
+        };
+
+        if !sids_to_release.is_empty() {
+            tauri::async_runtime::spawn(async move {
+                use crate::models::qwen3vl::generate::SLOT_MANAGER;
+                for sid in sids_to_release {
                     SLOT_MANAGER.release_slot(sid).await;
                 }
-            }
-        });
+            });
+        }
 
         // [SMART-PURGE-V3] Memory-Efficient Caching for 8GB RAM
         for block in &mut self.kv_blocks {
