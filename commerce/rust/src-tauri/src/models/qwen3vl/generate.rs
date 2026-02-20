@@ -359,9 +359,15 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                             if is_relay {
                                                                 // [BROADCAST] If it's a relay file, it's valid for ALL 28 layers
                                                                 println!("[WORKER] << Successfully loaded RELAY Block {} for ALL layers.", b_idx);
-                                                                let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
+                                                                
+                                                                // First update location (needs mutable access to reg)
                                                                 for i in 0..28 {
                                                                     reg[b_idx].location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
+                                                                }
+                                                                
+                                                                // Then update cache (needs access to the inner lock)
+                                                                let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
+                                                                for i in 0..28 {
                                                                     cache[i] = Some(metadata.clone());
                                                                 }
                                                             } else {
@@ -457,17 +463,22 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                                                                                                                                     if let Ok(mut reg) = reg_inner.entries.write() {
                                                                                                                                                                                         if b_idx < reg.len() { 
                                                                                                                                                                                             let is_relay = target_path.file_name().map(|n| n.to_string_lossy().contains("layer_relay_kv")).unwrap_or(false);
-                                                                                                                                                                                            if is_relay {
-                                                                                                                                                                                                let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
-                                                                                                                                                                                                for i in 0..28 {
-                                                                                                                                                                                                    reg[b_idx].location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
-                                                                                                                                                                                                    cache[i] = Some(metadata.clone());
-                                                                                                                                                                                                }
-                                                                                                                                                                                            } else {
-                                                                                                                                                                                                reg[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
-                                                                                                                                                                                                let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
-                                                                                                                                                                                                cache[l_idx] = Some(metadata);
-                                                                                                                                                                                            }
+                                                                                                                                                                                                                                                                    if is_relay {
+                                                                                                                                                                                                                                                                        // Update locations first
+                                                                                                                                                                                                                                                                        for i in 0..28 {
+                                                                                                                                                                                                                                                                            reg[b_idx].location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
+                                                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                                        // Update cache second
+                                                                                                                                                                                                                                                                        let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
+                                                                                                                                                                                                                                                                        for i in 0..28 {
+                                                                                                                                                                                                                                                                            cache[i] = Some(metadata.clone());
+                                                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                                    } else {
+                                                                                                                                                                                                                                                                        reg[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
+                                                                                                                                                                                                                                                                        let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
+                                                                                                                                                                                                                                                                        cache[l_idx] = Some(metadata);
+                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                            
                                                                                                                                                                                         }
                                                                                                                                                                                     }
                                                                                                                                                                                 }
