@@ -291,20 +291,15 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             slot.remaining_layers.store(loop_count, Ordering::SeqCst);
                             for l_idx in 0..loop_count {
                                                             let source = &bake.layers[l_idx];
-                                                            let fname = if is_relay { 
-                                                                // 0.6B Baking (Relay): 모든 레이어 공통 참조용 이름 유지
-                                                                if off == 0 { "layer_relay_kv.safetensors".to_string() } 
-                                                                else { format!("layer_relay_kv_{}.safetensors", off) } 
-                                                            } else { 
-                                                                // 2B Inference (Layer-Specific): 레이어 번호를 강제로 넣어 덮어쓰기 방지
-                                                                match (&kv_n, off) { 
-                                                                    (Some(n), 0) => format!("layer_{}_{}_kv.safetensors", source.layer_idx, n), 
-                                                                    (Some(n), o) => format!("layer_{}_{}_kv_{}.safetensors", source.layer_idx, n, o), 
-                                                                    (None, 0) => format!("layer_{}_kv.safetensors", source.layer_idx), 
-                                                                    (None, o) => format!("layer_{}_kv_{}.safetensors", source.layer_idx, o) 
-                                                                } 
-                                                            };
-                                                            
+                                                                                        let fname = if is_relay { 
+                                                                                            // PUG/Relay Baking: layer_{idx}_reference_kv_{off}.safetensors
+                                                                                            if off == 0 { format!("layer_{}_reference_kv.safetensors", source.layer_idx) } 
+                                                                                            else { format!("layer_{}_reference_kv_{}.safetensors", source.layer_idx, off) } 
+                                                                                        } else { 
+                                                                                            // 2B Inference: layer_{idx}_inference_kv_{off}.safetensors
+                                                                                            if off == 0 { format!("layer_{}_inference_kv.safetensors", source.layer_idx) } 
+                                                                                            else { format!("layer_{}_inference_kv_{}.safetensors", source.layer_idx, off) } 
+                                                                                        };                                                            
                                                             println!("[SLOT-WORKER] >> Processing Layer {} -> {} (Slot {})", source.layer_idx, fname, sid);
                                                                 let k_res = source.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
                                 let v_res = source.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
