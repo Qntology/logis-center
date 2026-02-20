@@ -2300,34 +2300,47 @@ impl QuantizedQwen3VLTextModel {
         // [ACTIVE-VRAM-MANAGEMENT] 
         // 현재 레이어를 GPU에 올리고 싶은데 공간이 부족하다면, 
         // 이미 다른 레이어들이 점유하고 있는 VRAM 블록 중 가장 오래된 것들을 RAM으로 밀어냅니다.
-                if free_vram < safe_zone {
-                    println!("[REBALANCE] Low VRAM ({}MB). Evicting non-active containers...", free_vram / 1024 / 1024);
-                    let mut total_freed = 0;
-                    let container_size = 2048;
-                    let current_container_id = target_idx * 1000; // 임시: 현재 작업 위치 기반
-        
-                    for l_idx in 0..self.layers.len() {
-                        if free_vram > safe_zone { break; }
-                        
-                        for block in &self.layers[l_idx].self_attn.kv_blocks {
-                            let mut inner = block.inner.write().unwrap();
-                            let block_container_id = inner.offset / container_size;
-        
-                            // 현재 연산 중인 구역(Active Container)이 아닌 것만 RAM으로 보냄
-                            if inner.location == KVLocation::VRAM && block_container_id != current_container_id {
-                                if let (Some(k), Some(v)) = (inner.k_cache.take(), inner.v_cache.take()) {
-                                    let (ka, kp, ks, os) = self.layers[l_idx].self_attn.compress_to_bitkv(&k)?;
-                                    let (va, vp, vs, _) = self.layers[l_idx].self_attn.compress_to_bitkv(&v)?;
-                                    inner.bitkv_metadata = Some(BitKVMetadata {
-                                        k_anchors: ka, k_packed: kp, k_scales: ks,
-                                        v_anchors: va, v_packed: vp, v_scales: vs, original_shape: os,
-                                    });
-                                    inner.location = KVLocation::RAM;
-                                    total_freed += 1;
-                                }
-                            }
+        if free_vram < safe_zone {
+            println!("[REBALANCE] Low VRAM ({}MB). Evicting non-active containers...", free_vram / 1024 / 1024);
+            let mut total_freed = 0;
+            let container_size = 2048;
+            let current_container_id = target_idx * 1000; // 임시: 현재 작업 위치 기반
+
+            for l_idx in 0..self.layers.len() {
+                if free_vram > safe_zone { break; }
+                
+                for block in &self.layers[l_idx].self_attn.kv_blocks {
+                    let mut inner = block.inner.write().unwrap();
+                    let block_container_id = inner.offset / container_size;
+
+                    // 현재 연산 중인 구역(Active Container)이 아닌 것만 RAM으로 보냄
+                    if inner.location == KVLocation::VRAM && block_container_id != current_container_id {
+                        if let (Some(k), Some(v)) = (inner.k_cache.take(), inner.v_cache.take()) {
+                            let (ka, kp, ks, os) = self.layers[l_idx].self_attn.compress_to_bitkv(&k)?;
+                            let (va, vp, vs, _) = self.layers[l_idx].self_attn.compress_to_bitkv(&v)?;
+                            inner.bitkv_metadata = Some(BitKVMetadata {
+                                k_anchors: ka, k_packed: kp, k_scales: ks,
+                                v_anchors: va, v_packed: vp, v_scales: vs, original_shape: os,
+                            });
+                            inner.location = KVLocation::RAM;
+                            total_freed += 1;
                         }
-                        // VRAM 갱신 ... ( nvml 로직 유지 )
+                    }
+                }
+                
+                // 각 레이어 검사 후 VRAM 상태 갱신
+                if let Some(nvml_inst) = &nvml {
+                    if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
+                        if let Ok(mem) = dev.memory_info() {
+                            free_vram = mem.free;
+                        }
+                    }
+                }
+            }
+            if total_freed > 0 {
+                println!("[REBALANCE] Proactively moved {} blocks to RAM. New Free VRAM: {}MB", total_freed, free_vram / 1024 / 1024);
+            }
+        }
         
 
         if target_idx >= self.layers.len() { return Ok(()); }
