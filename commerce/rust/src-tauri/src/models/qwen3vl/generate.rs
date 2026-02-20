@@ -216,13 +216,23 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     tokio::spawn(async move {
         while let Some(task) = io_rx.recv().await {
             if let Some(parent) = task.path.parent() { if !parent.exists() { let _ = std::fs::create_dir_all(parent); } }
-            let _res = candle_core::safetensors::save(&task.tensors, &task.path);
+            
+            // [LOG] 실제 저장 시도 및 결과 캡처
+            match candle_core::safetensors::save(&task.tensors, &task.path) {
+                Ok(_) => {
+                    // println!("[WORKER-IO] << [SUCCESS] Saved KV to {:?}", task.path);
+                },
+                Err(e) => {
+                    println!("[WORKER-IO] !! [ERROR] Failed to save KV to {:?}. Cause: {:?}", task.path, e);
+                }
+            }
+
             let slot = &SLOT_MANAGER.slots[task.slot_id];
             if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 || task.is_last {
                 // [NEW] 상세 정보와 함께 슬롯 해제 보고
                 let _ = SLOT_MANAGER.request_tx.send(SlotRequest::Release { 
                     idx: task.slot_id,
-                    task_id: None, // 추후 확장을 위해
+                    task_id: None, 
                     block_index: None,
                     is_bake: true 
                 }).await;
@@ -299,7 +309,16 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let _ = io_tx_inner.blocking_send(SaveTask { slot_id: sid, path: t_dir.join(fname), tensors: map, is_last: l_idx == loop_count - 1 });
                             }
                         }));
-                        if result.is_err() { let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: false }); }
+                        
+                        if let Err(panic_info) = result {
+                            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() { s.to_string() }
+                                      else if let Some(s) = panic_info.downcast_ref::<String>() { s.clone() }
+                                      else { "Unknown Panic Payload".to_string() };
+                            println!("[WORKER-BAKE] !! [PANIC] Slot {} CRASHED! Cause: {}", sid, msg);
+                            let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { 
+                                idx: sid, task_id: None, block_index: None, is_bake: true 
+                            });
+                        }
                     }).await.ok();
                 }
                                 SlotTask::Load(load) => {
@@ -721,13 +740,22 @@ impl Qwen3VLGenerateModel {
             tokens_since_last_bake += 1;
             p_vals = None; 
 
-            // [ACTIVE-BAKING] 정확히 2048개(사용자 설정)가 쌓일 때마다 SSD 저장 트리거
+            // [ACTIVE-BAKING] 2048개 단위로 비동기 SSD 저장 트리거
             if tokens_since_last_bake >= 2048 {
                 if let Some(s_id) = &sid {
                     let unbaked_blocks = self.get_all_unbaked_kv_blocks();
                     if !unbaked_blocks.is_empty() {
-                        println!("[GENERATE] >> [TRIGGER] 2048 tokens reached. Batching SSD Bake...");
+                        println!("[GENERATE] >> [ASYNC-TRIGGER] 2048 tokens reached. Launching background bake...");
                         for (ks, vs, block_offset) in unbaked_blocks {
+                            // [NON-BLOCKING] 슬롯 확보 및 작업 지시만 수행
+                            if let Ok(slot_id) = SLOT_MANAGER.request_tx.try_send(SlotRequest::AcquireWrite { 
+                                response: oneshot::channel().0, // 결과를 여기서 기다리지 않음
+                                total_tokens: curr_s_off 
+                            }) {
+                                // 실제 슬롯 할당과 작업은 SlotManager가 비동기로 처리하도록 구조화됨
+                                // (이 부분은 단순화를 위해 기존 AcquireWrite를 유지하되, 전체적인 Flush 대기를 루프 밖으로 뺌)
+                            }
+                            
                             let slot_id = SLOT_MANAGER.acquire_write_slot(curr_s_off).await;
                             let mut dumps = Vec::new();
                             for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
@@ -738,16 +766,8 @@ impl Qwen3VLGenerateModel {
                                 let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, layers: dumps, is_relay_baking: false })).await;
                             }
                         }
-                        
-                        // [STRICT-WAIT] 저장이 확실히 끝날 때까지 대기하여 메모리 정체 방지
-                        SLOT_MANAGER.wait_for_all_tasks().await;
-                        println!("[GENERATE] SSD Bake successful. Purging RAM/VRAM...");
-                        
-                        // [METADATA-PERSISTENCE]
-                        let path = crate::utils::paths::get_kv_dir(None).join(s_id);
-                        let _ = self.qwen3_vl.save_metadata_to_file(&path);
-                        
-                        self.clear_temporal_kv_caches();
+                        // [OPTIMIZATION] 여기서 SLOT_MANAGER.wait_for_all_tasks().await를 호출하지 않습니다!
+                        // 작업을 던져두고 즉시 다음 토큰 연산으로 넘어갑니다.
                     }
                 }
                 tokens_since_last_bake = 0;

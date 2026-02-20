@@ -146,14 +146,15 @@ impl QLinear {
     }
 }
 
-// [QUANTIZED-KV] Storage for 4-bit compressed KV cache in VRAM
+// [QUANTIZED-KV] 데이터의 생애주기를 추적하는 정밀 상태값
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KVLocation {
-    VRAM,
-    RAM,
-    RamSticky, // [NEW] Persistent RAM Cache (Sticky)
-    SSD,
-    Loading,   // New: Block is being prefetched
+    VRAM,          // GPU에서 실시간 연산 중
+    RAM,           // RAM에 BitKV로 압축되어 보관 중 (VRAM 비워짐)
+    SSD_PENDING,   // SSD로 저장 중인 상태
+    SSD,           // SSD 저장 완료 (메모리에서 완전히 삭제 가능)
+    RamSticky, 
+    Loading,
     Streaming, 
 }
 
@@ -208,6 +209,14 @@ pub struct BitKVMetadata {
     pub v_packed: Tensor,
     pub v_scales: Tensor,
     pub original_shape: Vec<usize>,
+}
+
+impl BitKVMetadata {
+    pub fn estimate_size_bytes(&self) -> usize {
+        let k_size = self.k_anchors.elem_count() * 4 + self.k_packed.elem_count() + self.k_scales.elem_count() * 4;
+        let v_size = self.v_anchors.elem_count() * 4 + self.v_packed.elem_count() + self.v_scales.elem_count() * 4;
+        k_size + v_size
+    }
 }
 
 fn default_bitkv_cache() -> Arc<std::sync::RwLock<Vec<Option<BitKVMetadata>>>> {
@@ -267,6 +276,50 @@ impl KVRegistry {
         let mut entries = self.entries.write().unwrap();
         if index < entries.len() {
             entries[index].last_accessed = std::time::Instant::now();
+        }
+    }
+
+    // [NEW] 티어드 컨테이너 관리 (2048 토큰 = 1 컨테이너 = 약 112MB)
+    pub fn enforce_tiered_management(&self, current_token_idx: usize) {
+        let mut entries = self.entries.write().unwrap();
+        let container_size = 2048;
+        let current_container_id = current_token_idx / container_size;
+
+        let mut vram_to_ram_count = 0;
+        let mut ram_to_ssd_count = 0;
+
+        for (i, entry) in entries.iter_mut().enumerate() {
+            let block_container_id = (entry.token_start) / container_size;
+            
+            // 1. VRAM -> RAM: 현재 작업 중인 컨테이너가 아니라면 VRAM에서 즉시 퇴출
+            if block_container_id < current_container_id {
+                let has_vram = entry.location.iter().any(|&l| l == KVLocation::VRAM);
+                if has_vram {
+                    // 이 시점에서는 위치 표식만 변경하고, 실제 데이터 해제는 
+                    // 아래 Attention::forward의 SMART-PURGE-V2가 수행합니다.
+                    for loc in entry.location.iter_mut() {
+                        if *loc == KVLocation::VRAM { *loc = KVLocation::RAM; }
+                    }
+                    vram_to_ram_count += 1;
+                }
+            }
+
+            // 2. RAM -> SSD: 현재 컨테이너보다 2단계 이상 뒤쳐진 컨테이너는 
+            // RAMSticky 한도(100MB)를 고려하여 일반 RAM으로 강등 (SSD 저장 대상)
+            if block_container_id + 1 < current_container_id {
+                let has_sticky = entry.location.iter().any(|&l| l == KVLocation::RamSticky);
+                if has_sticky {
+                    for loc in entry.location.iter_mut() {
+                        if *loc == KVLocation::RamSticky { *loc = KVLocation::RAM; }
+                    }
+                    ram_to_ssd_count += 1;
+                }
+            }
+        }
+
+        if vram_to_ram_count > 0 || ram_to_ssd_count > 0 {
+            println!("[CONTAINER-MGMT] Container {}: Migrated {} blocks to RAM, {} to SSD-Queue.", 
+                current_container_id, vram_to_ram_count, ram_to_ssd_count);
         }
     }
 
@@ -638,7 +691,15 @@ impl QuantizedQwen3VLTextAttention {
         let mut vram_vs = Vec::new();
         let mut vram_total_len = 0;
 
+        // [NEW] 통합 티어드 컨테이너 관리 (2048 단위 순환)
+        if self.layer_idx == 0 {
+            self.registry.enforce_tiered_management(global_start_idx);
+        }
+
         for block in &self.kv_blocks {
+            let index = block.inner.read().unwrap().index;
+            self.registry.mark_accessed(index); // 접근 시각 갱신
+            
             let (mut k, mut v, mut b_len, index) = {
                 let inner = block.inner.read().unwrap();
                 (inner.k_cache.clone(), inner.v_cache.clone(), inner.len, inner.index)
@@ -2235,6 +2296,39 @@ impl QuantizedQwen3VLTextModel {
 
         let danger_zone = 600_000_000;
         let safe_zone = 1_000_000_000;
+
+        // [ACTIVE-VRAM-MANAGEMENT] 
+        // 현재 레이어를 GPU에 올리고 싶은데 공간이 부족하다면, 
+        // 이미 다른 레이어들이 점유하고 있는 VRAM 블록 중 가장 오래된 것들을 RAM으로 밀어냅니다.
+                if free_vram < safe_zone {
+                    println!("[REBALANCE] Low VRAM ({}MB). Evicting non-active containers...", free_vram / 1024 / 1024);
+                    let mut total_freed = 0;
+                    let container_size = 2048;
+                    let current_container_id = target_idx * 1000; // 임시: 현재 작업 위치 기반
+        
+                    for l_idx in 0..self.layers.len() {
+                        if free_vram > safe_zone { break; }
+                        
+                        for block in &self.layers[l_idx].self_attn.kv_blocks {
+                            let mut inner = block.inner.write().unwrap();
+                            let block_container_id = inner.offset / container_size;
+        
+                            // 현재 연산 중인 구역(Active Container)이 아닌 것만 RAM으로 보냄
+                            if inner.location == KVLocation::VRAM && block_container_id != current_container_id {
+                                if let (Some(k), Some(v)) = (inner.k_cache.take(), inner.v_cache.take()) {
+                                    let (ka, kp, ks, os) = self.layers[l_idx].self_attn.compress_to_bitkv(&k)?;
+                                    let (va, vp, vs, _) = self.layers[l_idx].self_attn.compress_to_bitkv(&v)?;
+                                    inner.bitkv_metadata = Some(BitKVMetadata {
+                                        k_anchors: ka, k_packed: kp, k_scales: ks,
+                                        v_anchors: va, v_packed: vp, v_scales: vs, original_shape: os,
+                                    });
+                                    inner.location = KVLocation::RAM;
+                                    total_freed += 1;
+                                }
+                            }
+                        }
+                        // VRAM 갱신 ... ( nvml 로직 유지 )
+        
 
         if target_idx >= self.layers.len() { return Ok(()); }
         let layer = &mut self.layers[target_idx];
