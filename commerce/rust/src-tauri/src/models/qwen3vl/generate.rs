@@ -175,8 +175,24 @@ impl SlotManager {
 pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(256));
 
 struct LayerKVDump { layer_idx: usize, k_tensor: Tensor, v_tensor: Tensor }
-struct BakeTask { slot_id: usize, task_dir: PathBuf, kv_name: Option<String>, offset: usize, layers: Vec<LayerKVDump>, is_relay_baking: bool }
-struct SaveTask { slot_id: usize, path: PathBuf, tensors: std::collections::HashMap<String, Tensor>, is_last: bool }
+struct BakeTask { 
+    slot_id: usize, 
+    task_dir: PathBuf, 
+    kv_name: Option<String>, 
+    offset: usize, 
+    layers: Vec<LayerKVDump>, 
+    is_relay_baking: bool,
+    block_idx: Option<usize>, // [NEW] 추적용
+    registry: Option<crate::models::qwen3vl::quantized_model::KVRegistry> // [NEW] 장부 업데이트용
+}
+struct SaveTask { 
+    slot_id: usize, 
+    path: PathBuf, 
+    tensors: std::collections::HashMap<String, Tensor>, 
+    is_last: bool,
+    block_idx: Option<usize>,
+    registry: Option<crate::models::qwen3vl::quantized_model::KVRegistry>
+}
 pub struct ChunkedLoadTask {
     pub slot_ids: Vec<usize>,
     pub path: PathBuf,
@@ -217,14 +233,29 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         while let Some(task) = io_rx.recv().await {
             if let Some(parent) = task.path.parent() { if !parent.exists() { let _ = std::fs::create_dir_all(parent); } }
             
-            // [LOG] 실제 저장 시도 및 결과 캡처
+            let b_idx_str = task.block_idx.map(|i| i.to_string()).unwrap_or("?".into());
+            // println!("[WORKER-IO] << [RECEIVED] Slot {} starting save for Block {} to {:?}", task.slot_id, b_idx_str, task.path.file_name());
+
+            // [LOG] 3단계: 결과 기록
             match candle_core::safetensors::save(&task.tensors, &task.path) {
                 Ok(_) => {
-                    // [NEW] 저장 성공 시 해당 태스크의 메타데이터 업데이트 (생략된 경우를 대비해 block_index 활용 고민)
-                    // 현재 구조에서는 task.path를 통해 간접적으로 성공이 확인됩니다.
+                    println!("[WORKER-IO] [SUCCESS] Block {} saved. Updating Registry.", b_idx_str);
+                    
+                    // [REGISTRY-UPDATE] 장부에 저장 경로 기록
+                    if let (Some(reg), Some(idx)) = (task.registry, task.block_idx) {
+                        if let Ok(mut entries) = reg.entries.write() {
+                            if idx < entries.len() {
+                                entries[idx].ssd_path = Some(task.path.clone());
+                                // 최종적으로 SSD 상태로 확정
+                                for loc in entries[idx].location.iter_mut() {
+                                    *loc = crate::models::qwen3vl::quantized_model::KVLocation::SSD;
+                                }
+                            }
+                        }
+                    }
                 },
                 Err(e) => {
-                    println!("[WORKER-IO] !! [ERROR] Failed to save KV to {:?}. Cause: {:?}", task.path, e);
+                    println!("[WORKER-IO] !! [ERROR] Block {} save failed! Path: {:?}, Cause: {:?}", b_idx_str, task.path, e);
                 }
             }
 
@@ -259,21 +290,23 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             let slot = &SLOT_MANAGER.slots[sid];
                             slot.remaining_layers.store(loop_count, Ordering::SeqCst);
                             for l_idx in 0..loop_count {
-                                let source = &bake.layers[l_idx];
-                                let fname = if is_relay { 
-                                    if off == 0 { "layer_relay_kv.safetensors".to_string() } else { format!("layer_relay_kv_{}.safetensors", off) } 
-                                } else { 
-                                    match (&kv_n, off) { 
-                                        (Some(n), 0) => format!("layer_{}_kv.safetensors", n), 
-                                        (Some(n), o) => format!("layer_{}_kv_{}.safetensors", n, o), 
-                                        (None, 0) => format!("layer_{}_kv.safetensors", source.layer_idx), 
-                                        (None, o) => format!("layer_{}_kv_{}.safetensors", source.layer_idx, o) 
-                                    } 
-                                };
-                                
-                                println!("[SLOT-WORKER] >> Processing Layer {} -> {} (Slot {})", source.layer_idx, fname, sid);
-                                
-                                let k_res = source.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
+                                                            let source = &bake.layers[l_idx];
+                                                            let fname = if is_relay { 
+                                                                // 0.6B Baking (Relay): 모든 레이어 공통 참조용 이름 유지
+                                                                if off == 0 { "layer_relay_kv.safetensors".to_string() } 
+                                                                else { format!("layer_relay_kv_{}.safetensors", off) } 
+                                                            } else { 
+                                                                // 2B Inference (Layer-Specific): 레이어 번호를 강제로 넣어 덮어쓰기 방지
+                                                                match (&kv_n, off) { 
+                                                                    (Some(n), 0) => format!("layer_{}_{}_kv.safetensors", source.layer_idx, n), 
+                                                                    (Some(n), o) => format!("layer_{}_{}_kv_{}.safetensors", source.layer_idx, n, o), 
+                                                                    (None, 0) => format!("layer_{}_kv.safetensors", source.layer_idx), 
+                                                                    (None, o) => format!("layer_{}_kv_{}.safetensors", source.layer_idx, o) 
+                                                                } 
+                                                            };
+                                                            
+                                                            println!("[SLOT-WORKER] >> Processing Layer {} -> {} (Slot {})", source.layer_idx, fname, sid);
+                                                                let k_res = source.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
                                 let v_res = source.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
                                 let (k_data, v_data) = match (k_res, v_res) { (Ok(k), Ok(v)) => (k, v), _ => { if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 { let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: false }); } continue; } };
                                 let k_shape = source.k_tensor.dims(); let (b, h, s, d) = (k_shape[0], k_shape[1], k_shape[2], k_shape[3]);
@@ -305,10 +338,19 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 }
                                 map.insert("v_anchors".to_string(), Tensor::from_vec(va, vec![b, h, a_count, d], &Device::Cpu).unwrap());
                                 map.insert("v_packed".to_string(), Tensor::from_vec(vp, vec![(b * h * s * d + 7) / 8], &Device::Cpu).unwrap());
-                                map.insert("v_scales".to_string(), Tensor::from_vec(vs, vec![b, h, s, 1], &Device::Cpu).unwrap());
-                                map.insert("mode".to_string(), Tensor::from_vec(vec![3u32], (1,), &Device::Cpu).unwrap());
-                                let _ = io_tx_inner.blocking_send(SaveTask { slot_id: sid, path: t_dir.join(fname), tensors: map, is_last: l_idx == loop_count - 1 });
-                            }
+                                                                map.insert("v_scales".to_string(), Tensor::from_vec(vs, vec![b, h, s, 1], &Device::Cpu).unwrap());
+                                                                map.insert("mode".to_string(), Tensor::from_vec(vec![3u32], (1,), &Device::Cpu).unwrap());
+                                                                
+                                                                let _ = io_tx_inner.blocking_send(SaveTask { 
+                                                                    slot_id: sid, 
+                                                                    path: t_dir.join(fname), 
+                                                                    tensors: map, 
+                                                                    is_last: l_idx == loop_count - 1,
+                                                                    block_idx: bake.block_idx,
+                                                                    registry: bake.registry.clone()
+                                                                });
+                                                            }
+                                
                         }));
                         
                         if let Err(panic_info) = result {
@@ -650,7 +692,17 @@ impl Qwen3VLGenerateModel {
                     dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v });
                 }
                 if let Ok(tx) = get_bake_worker().await {
-                    let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, layers: dumps, is_relay_baking: is_06b })).await;
+                    let reg_ref = match &self.qwen3_vl {
+                        ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()),
+                        ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()),
+                        _ => None
+                    };
+                    let _ = tx.send(SlotTask::Bake(BakeTask { 
+                        slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, 
+                        layers: dumps, is_relay_baking: is_06b,
+                        block_idx: None,
+                        registry: reg_ref
+                    })).await;
                 }
             }
             // [STRICT-FLUSH] Clear the SSD road before 2B starts reading
@@ -744,8 +796,16 @@ impl Qwen3VLGenerateModel {
             if let Some(s_id) = &sid {
                 let pending_blocks = self.get_blocks_by_location(KVLocation::SSD_PENDING)?;
                 if !pending_blocks.is_empty() {
-                    println!("[GENERATE] >> [RELAY-TRIGGER] Pushing {} blocks to SSD Baker...", pending_blocks.len());
+                    let reg_ref = match &self.qwen3_vl {
+                        ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()),
+                        ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()),
+                        _ => None
+                    };
+
                     for (ks, vs, block_offset, block_idx) in pending_blocks {
+                        // [LOG] 1단계: 요청 기록
+                        println!("[GENERATE] >> [REQUEST] Sending Block {} to SSD Baker (Offset: {})", block_idx, block_offset);
+                        
                         let slot_id = SLOT_MANAGER.acquire_write_slot(curr_s_off).await;
                         let mut dumps = Vec::new();
                         for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
@@ -753,9 +813,16 @@ impl Qwen3VLGenerateModel {
                         }
                         if let Ok(tx) = get_bake_worker().await {
                             let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+                            let reg_ref = match &self.qwen3_vl {
+                                ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()),
+                                ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()),
+                                _ => None
+                            };
                             let _ = tx.send(SlotTask::Bake(BakeTask { 
                                 slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, 
-                                layers: dumps, is_relay_baking: false 
+                                layers: dumps, is_relay_baking: false,
+                                block_idx: Some(block_idx),
+                                registry: reg_ref
                             })).await;
                         }
                         
