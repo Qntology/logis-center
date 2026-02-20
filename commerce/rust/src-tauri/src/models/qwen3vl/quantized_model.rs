@@ -950,22 +950,10 @@ impl QuantizedQwen3VLTextAttention {
             .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
         let attn_output = self.o_proj.forward(&attn_output)?;
 
-        // [INTELLIGENT-RELEASE] 
-        // Now that the GPU is done with this layer, release all slots associated with it.
-        let l_idx = self.layer_idx;
-        let sids_to_release: Vec<usize> = {
-            let mut reg = self.registry.entries.write().unwrap();
-            reg.iter_mut().filter_map(|entry| entry.slot_ids[l_idx].take()).collect()
-        };
-
-        if !sids_to_release.is_empty() {
-            tauri::async_runtime::spawn(async move {
-                use crate::models::qwen3vl::generate::SLOT_MANAGER;
-                for sid in sids_to_release {
-                    SLOT_MANAGER.release_slot(sid).await;
-                }
-            });
-        }
+        /* [RECLAIMED-BY-WORKER] 
+           Manual slot release is no longer needed here as the IO worker 
+           now releases slots immediately after transferring data to the RAM cache.
+        */
 
         // [SMART-PURGE-V3] Memory-Efficient Caching for 8GB RAM
         for block in &mut self.kv_blocks {

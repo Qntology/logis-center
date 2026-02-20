@@ -493,39 +493,37 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                                                                             original_shape: o_s 
                                                                                                                         };
                                                                                                                         
-                                                                                                                        {
-                                                                                                                            let mut cache = entry.bitkv_cache.write().unwrap();
-                                                                                                                            cache[target_l] = Some(metadata);
-                                                                                                                        }
+                                                                                                                                                                                                                {
+                                                                                                                                                                                                                    let mut cache = entry.bitkv_cache.write().unwrap();
+                                                                                                                                                                                                                    cache[target_l] = Some(metadata);
+                                                                                                                                                                                                                }
+                                                                                                                                                                                                                
+                                                                                                                                                                                                                // [FIX] SSD와 Loading 상태 모두를 RAM으로 전환하여 대기 루프를 해제합니다.
+                                                                                                                                                                                                                let cur_loc = entry.location[target_l];
+                                                                                                                                                                                                                if cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::SSD || cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::Loading {
+                                                                                                                                                                                                                    entry.location[target_l] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
+                                                                                                                                                                                                                }
+                                                                                                                                                                                                            }
+                                                                                                                                                                                                        }
+                                                                                                                                                                                                        
+                                                                                                                                                                                                        println!("[WORKER-LOAD] << [RELEASE] Bundle Block {} transferred to RAM. Releasing Slot {}.", b_idx, s_id);
+                                                                                                                                                                                                    }
+                                                                                                                                                                                                }
+                                                                                                                                                                            
+                                                                                                                                                                        }
+                                                                                                                                                                        Ok(())
+                                                                                                                                                                    } else {
+                                                                                                                                                                        Err("Missing tensors in safetensors file".to_string())
+                                                                                                                                                                    }
+                                                                                                                                                                }.await;
+                                                                                                                                        
+                                                                                                                                                                if let Err(e) = res {
+                                                                                                                                                                    println!("[WORKER-LOAD] !! [ERROR] Layer {} Block {} failed: {} (Slot {})", l_idx, b_idx, e, s_id);
+                                                                                                                                                                }
+                                                                                                                                                                // [RECLAIM] 모든 작업이 끝났으므로 즉시 슬롯 반납
+                                                                                                                                                                SLOT_MANAGER.release_slot(s_id).await;
+                                                                                                                                                            });
                                                                                                                         
-                                                                                                                        if entry.location[target_l] == crate::models::qwen3vl::quantized_model::KVLocation::SSD {
-                                                                                                                            entry.location[target_l] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
-                                                                                                                        }
-                                                                                                                    }
-                                                                                                                }
-                                                                                                                
-                                                                                                                entry.slot_ids[l_idx] = Some(s_id);
-                                                                                                                if is_relay {
-                                                                                                                    println!("[WORKER-LOAD] << [SUCCESS] RELAY Bundle Block {} fully cached (Slot {}).", b_idx, s_id);
-                                                                                                                } else {
-                                                                                                                    println!("[WORKER-LOAD] << [SUCCESS] Bundle Block {} fully cached for ALL layers (Requested L{} in Slot {}).", b_idx, l_idx, s_id);
-                                                                                                                }
-                                                                                                            }
-                                                                                                        }
-                                                    
-                                                }
-                                                Ok(())
-                                            } else {
-                                                Err("Missing tensors in safetensors file".to_string())
-                                            }
-                                        }.await;
-                
-                                        if let Err(e) = res {
-                                            println!("[WORKER-LOAD] !! [ERROR] Layer {} Block {} failed: {} (Slot {})", l_idx, b_idx, e, s_id);
-                                            SLOT_MANAGER.release_slot(s_id).await;
-                                        }
-                                        // SLOT_MANAGER.release_slot(s_id).await; // Removed for Reservation
-                                    });
                                 }
                                 SlotTask::ChunkedLoad(chunk) => {
                                     let registry = chunk.registry.clone();
@@ -645,17 +643,15 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                             cache[target_l] = Some(metadata);
                                                                         }
                                                                         
-                                                                        if entry.location[target_l] == crate::models::qwen3vl::quantized_model::KVLocation::SSD {
+                                                                        // [FIX] SSD와 Loading 상태 모두를 RAM으로 전환하여 대기 루프를 해제합니다.
+                                                                        let cur_loc = entry.location[target_l];
+                                                                        if cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::SSD || cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::Loading {
                                                                             entry.location[target_l] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
                                                                         }
                                                                     }
                                                                 }
                                                                 
-                                                                if is_relay {
-                                                                    println!("[WORKER-CHUNK] << [SUCCESS] RELAY Bundle Block {} fully cached (Slot {}).", b_idx, s_id);
-                                                                } else {
-                                                                    println!("[WORKER-CHUNK] << [SUCCESS] Bundle Block {} fully cached into RAM for ALL layers (Requested L{} in Slot {}).", b_idx, l_idx, s_id);
-                                                                }
+                                                                println!("[WORKER-CHUNK] << [RELEASE] Bundle Block {} transferred to RAM Cache. Releasing Slot {}.", b_idx, s_id);
                                                             }
                                                         }
                                                     }
@@ -667,9 +663,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 
                                             if let Err(e) = res {
                                                 println!("[WORKER-CHUNK] !! [ERROR] Layer {} Block {} failed: {} (Slot {})", l_idx, b_idx, e, s_id);
-                                                SLOT_MANAGER.release_slot(s_id).await;
                                             }
-                                            // SLOT_MANAGER.release_slot(s_id).await; // Removed for Reservation
+                                            // [RECLAIM] 모든 작업(캐시 채우기)이 끝났으므로 즉시 슬롯 반납
+                                            SLOT_MANAGER.release_slot(s_id).await;
                                         });
                                     }
                                 }
