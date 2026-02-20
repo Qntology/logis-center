@@ -800,8 +800,15 @@ impl QuantizedQwen3VLTextAttention {
 
             match final_loc {
                 KVLocation::VRAM => {
-                    vram_ks.push(k.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
-                    vram_vs.push(v.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
+                    let k_vram = k.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
+                    let v_vram = v.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
+                    
+                    // [FIX] Device Alignment: VRAM 블록이라도 CPU에 있을 경우(Handoff 지연 등)를 대비해 현재 장치로 이동
+                    let k_aligned = if !k_vram.device().same_device(dev) { k_vram.to_device(dev)? } else { k_vram };
+                    let v_aligned = if !v_vram.device().same_device(dev) { v_vram.to_device(dev)? } else { v_vram };
+
+                    vram_ks.push(k_aligned);
+                    vram_vs.push(v_aligned);
                     vram_total_len += b_len;
                     global_start_idx += b_len;
                     continue;
@@ -843,8 +850,8 @@ impl QuantizedQwen3VLTextAttention {
             let mut v = v.ok_or_else(|| candle_core::Error::Msg("KV Cache not ready after wait".to_string()))?;
 
             // [FIX] Device Alignment: RAM(CPU)에 있는 데이터를 연산을 위해 현재 장치(GPU)로 이동
-            let k = if !k.device().same_device(dev) { k.to_device(dev)? } else { k };
-            let v = if !v.device().same_device(dev) { v.to_device(dev)? } else { v };
+            let mut k = if !k.device().same_device(dev) { k.to_device(dev)? } else { k };
+            let mut v = if !v.device().same_device(dev) { v.to_device(dev)? } else { v };
 
             // [FIX] Update b_len to actual tensor dimensions to prevent shape mismatch in broadcast_add
             // This handles the case where the last block (e.g. 205 tokens) is smaller than the standard 256.
@@ -2012,13 +2019,13 @@ impl QuantizedQwen3VLTextModel {
                                                         // 레이어를 CPU로 밀어내기 전에, 현재 레이어의 KV 블록 데이터를 
                                                         // CPU 장치로 미리 복사하여 Worker가 안전하게 가져가게 함
                                                         for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
-                                                            let (k_cpu, v_cpu) = {
+                                                            let (k_cpu, v_cpu, block_idx) = {
                                                                 let inner = block.inner.read().unwrap();
                                                                 if inner.location == KVLocation::VRAM {
                                                                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                                                                        (Some(k.to_device(&Device::Cpu)?), Some(v.to_device(&Device::Cpu)?))
-                                                                    } else { (None, None) }
-                                                                } else { (None, None) }
+                                                                        (Some(k.to_device(&Device::Cpu)?), Some(v.to_device(&Device::Cpu)?), inner.index)
+                                                                    } else { (None, None, inner.index) }
+                                                                } else { (None, None, inner.index) }
                                                             };
 
                                                             if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
@@ -2026,6 +2033,12 @@ impl QuantizedQwen3VLTextModel {
                                                                 inner_w.k_cache = Some(k);
                                                                 inner_w.v_cache = Some(v);
                                                                 inner_w.location = KVLocation::RAM;
+                                                                
+                                                                // [FIX] Registry와 local block 상태를 동기화하여 device mismatch 방지
+                                                                let mut reg = self.registry.entries.write().unwrap();
+                                                                if block_idx < reg.len() {
+                                                                    reg[block_idx].location[layer_idx] = KVLocation::RAM;
+                                                                }
                                                             }
                                                         }
 
