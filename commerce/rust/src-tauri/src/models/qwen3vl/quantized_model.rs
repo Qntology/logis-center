@@ -1967,8 +1967,9 @@ impl QuantizedQwen3VLTextModel {
 
                                                             let layer_ptr = &mut self.layers[layer_idx];
                                                             let dev_name = if layer_ptr.device().is_cuda() { "GPU" } else { "CPU" };
-                                                            println!("[HORIZONTAL] Layer {:2} | Chunk {} (Offset: {}, Size: {}) - START on {}", 
-                                                                layer_idx, chunk_idx, i, take, dev_name);
+                                                            let (reads, writes, free) = crate::models::qwen3vl::generate::SLOT_MANAGER.get_counts();
+                                                            println!("[HORIZONTAL] Layer {:2} | Chunk {} (Offset: {}, Size: {}) - START on {} [Read:{}, Write:{}, Idle:{}]", 
+                                                                layer_idx, chunk_idx, i, take, dev_name, reads, writes, free);
                                                             
                                                             let xs_chunk = xs.narrow(1, i, take)?;
                                                             let cos_chunk = cos.narrow(1, i, take)?;
