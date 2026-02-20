@@ -286,59 +286,61 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         if result.is_err() { let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid }); }
                     }).await.ok();
                 }
-                SlotTask::Load(load) => {
-                    let (off, b_idx, s_id, target_path) = {
-                        match load.shared_block.inner.read() {
-                            Ok(inner) => {
-                                let path = inner.ssd_path.clone().or_else(|| {
-                                    if let Ok(reg) = load.registry.entries.read() {
-                                        if inner.index < reg.len() { reg[inner.index].ssd_path.clone() } else { None }
-                                    } else { None }
-                                });
-                                (inner.offset, inner.index, load.slot_id, path)
-                            },
-                            Err(e) => {
-                                println!("[WORKER] !! Load Task Block Lock Poisoned: {:?}", e);
-                                (0, 999, load.slot_id, None)
-                            }
-                        }
-                    };
-
-                    if target_path.is_none() {
-                        SLOT_MANAGER.release_slot(s_id).await;
-                        continue;
-                    }
-                    
-                    let target_path = target_path.unwrap();
-                    let l_idx = load.layer_idx;
-                    let registry = load.registry.clone();
-                    let shared_block = load.shared_block.clone();
-                    
-                    println!("[WORKER] >> Starting LOAD for Layer {} Block {} (Slot {}) from {:?}", l_idx, b_idx, s_id, target_path);
-                    
-                    tokio::spawn(async move {
-                        match tokio::fs::read(&target_path).await {
-                            Ok(content) => {
-                                match safetensors::SafeTensors::deserialize(&content) {
-                                    Ok(st) => {
-                                        // [FIX] DYNAMIC SHAPE DETECTION
-                                        let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor("k_anchors") {
-                                            let dims = t_view.shape(); // [batch, heads, anchor_count, head_dim]
-                                            let data = unsafe { std::slice::from_raw_parts(t_view.data().as_ptr() as *const f32, t_view.data().len() / 4).to_vec() };
-                                            let s_len = if let Ok(v) = st.tensor("k_shape") {
-                                                let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const u32, v.data().len() / 4) };
-                                                v_u32[2] as usize
-                                            } else { 256 };
-                                            (Some(data), vec![dims[0], dims[1], s_len, dims[3]], dims[2])
-                                        } else { (None, vec![1, 16, 256, 128], 36) };
-
-                                        let ex_v = |name: &str| -> Option<Vec<f32>> { 
-                                            st.tensor(name).ok().map(|v| unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec() }) 
-                                        };
-                                        
-                                        if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ka_data, st.tensor("k_packed").ok(), ex_v("k_scales"), ex_v("v_anchors"), st.tensor("v_packed").ok(), ex_v("v_scales")) {
-                                            // [FIX] Explicit scope to drop write guards before .await
-                                            {
+                                SlotTask::Load(load) => {
+                                    let (off, b_idx, s_id, target_path) = {
+                                        match load.shared_block.inner.read() {
+                                            Ok(inner) => {
+                                                let path = inner.ssd_path.clone().or_else(|| {
+                                                    if let Ok(reg) = load.registry.entries.read() {
+                                                        if inner.index < reg.len() { reg[inner.index].ssd_path.clone() } else { None }
+                                                    } else { None }
+                                                });
+                                                (inner.offset, inner.index, load.slot_id, path)
+                                            },
+                                            Err(e) => {
+                                                println!("[WORKER-LOAD] !! Block Lock Poisoned: {:?}", e);
+                                                (0, 999, load.slot_id, None)
+                                            }
+                                        }
+                                    };
+                
+                                    if target_path.is_none() {
+                                        println!("[WORKER-LOAD] !! Target path is None for Block {}. Releasing Slot {}.", b_idx, s_id);
+                                        let _ = SLOT_MANAGER.request_tx.try_send(SlotRequest::Release { idx: s_id });
+                                        continue;
+                                    }
+                                    
+                                    let target_path = target_path.unwrap();
+                                    let l_idx = load.layer_idx;
+                                    let registry = load.registry.clone();
+                                    let shared_block = load.shared_block.clone();
+                                    
+                                    println!("[WORKER-LOAD] >> [START] Layer {} Block {} (Slot {}) from {:?}", l_idx, b_idx, s_id, target_path);
+                                    
+                                    tokio::spawn(async move {
+                                        let res = async {
+                                            let content = tokio::fs::read(&target_path).await
+                                                .map_err(|e| format!("IO Error: {:?}", e))?;
+                                            
+                                            let st = safetensors::SafeTensors::deserialize(&content)
+                                                .map_err(|e| format!("Deserialization Error: {:?}", e))?;
+                
+                                            // [FIX] DYNAMIC SHAPE DETECTION
+                                            let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor("k_anchors") {
+                                                let dims = t_view.shape(); 
+                                                let data = unsafe { std::slice::from_raw_parts(t_view.data().as_ptr() as *const f32, t_view.data().len() / 4).to_vec() };
+                                                let s_len = if let Ok(v) = st.tensor("k_shape") {
+                                                    let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const u32, v.data().len() / 4) };
+                                                    v_u32[2] as usize
+                                                } else { 256 };
+                                                (Some(data), vec![dims[0], dims[1], s_len, dims[3]], dims[2])
+                                            } else { (None, vec![1, 16, 256, 128], 36) };
+                
+                                            let ex_v = |name: &str| -> Option<Vec<f32>> { 
+                                                st.tensor(name).ok().map(|v| unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec() }) 
+                                            };
+                                            
+                                            if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ka_data, st.tensor("k_packed").ok(), ex_v("k_scales"), ex_v("v_anchors"), st.tensor("v_packed").ok(), ex_v("v_scales")) {
                                                 let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
                                                     k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
                                                     k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
@@ -348,7 +350,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                     v_scales: Tensor::from_vec(vs, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
                                                     original_shape: o_s 
                                                 };
-
+                
                                                 if let Ok(mut inner) = shared_block.inner.write() {
                                                     inner.bitkv_metadata = Some(metadata.clone());
                                                     
@@ -357,143 +359,130 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                             let is_relay = target_path.file_name().map(|n| n.to_string_lossy().contains("layer_relay_kv")).unwrap_or(false);
                                                             
                                                             if is_relay {
-                                                                // [BROADCAST] If it's a relay file, it's valid for ALL 28 layers
-                                                                println!("[WORKER] << Successfully loaded RELAY Block {} for ALL layers.", b_idx);
-                                                                
-                                                                // First update location (needs mutable access to reg)
-                                                                for i in 0..28 {
-                                                                    reg[b_idx].location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
-                                                                }
-                                                                
-                                                                // Then update cache (needs access to the inner lock)
+                                                                for i in 0..28 { reg[b_idx].location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; }
                                                                 let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
-                                                                for i in 0..28 {
-                                                                    cache[i] = Some(metadata.clone());
-                                                                }
+                                                                for i in 0..28 { cache[i] = Some(metadata.clone()); }
+                                                                println!("[WORKER-LOAD] << [SUCCESS] RELAY Block {} populated for ALL layers (Slot {}).", b_idx, s_id);
                                                             } else {
                                                                 reg[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
                                                                 let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
                                                                 cache[l_idx] = Some(metadata);
-                                                                println!("[WORKER] << Successfully loaded Layer {} Block {}.", l_idx, b_idx);
+                                                                println!("[WORKER-LOAD] << [SUCCESS] Layer {} Block {} loaded (Slot {}).", l_idx, b_idx, s_id);
                                                             }
                                                         }
                                                     }
                                                 }
+                                                Ok(())
+                                            } else {
+                                                Err("Missing tensors in safetensors file".to_string())
                                             }
+                                        }.await;
+                
+                                        if let Err(e) = res {
+                                            println!("[WORKER-LOAD] !! [ERROR] Layer {} Block {} failed: {} (Slot {})", l_idx, b_idx, e, s_id);
                                         }
-                                    },
-                                    Err(e) => println!("[WORKER] !! Deserialization Error: {:?}", e),
-                                }
-                            },
-                            Err(e) => println!("[WORKER] !! File Read Error ({:?}): {:?}", target_path, e),
-                        }
-                        SLOT_MANAGER.release_slot(s_id).await;
-                    });
-                }
-                SlotTask::ChunkedLoad(chunk) => {
-                    let registry = chunk.registry.clone();
-                    let num_blocks = chunk.layer_indices.len();
-                    println!("[WORKER] >> Starting CHUNKED LOAD for {} blocks.", num_blocks);
-                    
-                    for i in 0..num_blocks {
-                        let (l_idx, s_id, block) = (chunk.layer_indices[i], chunk.slot_ids[i], chunk.shared_blocks[i].clone());
-                        
-                        let (b_idx, target_path) = {
-                            match block.inner.read() {
-                                Ok(inner) => {
-                                    let path = inner.ssd_path.clone().or_else(|| {
-                                        if let Ok(reg) = registry.entries.read() {
-                                            if inner.index < reg.len() { reg[inner.index].ssd_path.clone() } else { None }
-                                        } else { None }
+                                        SLOT_MANAGER.release_slot(s_id).await;
                                     });
-                                    (inner.index, path)
-                                },
-                                Err(e) => {
-                                    println!("[WORKER] !! Block {} Lock Poisoned: {:?}", i, e);
-                                    (999, None)
                                 }
-                            }
-                        };
-
-                        if target_path.is_none() {
-                            println!("[WORKER] !! Block {} (Index {}) has no SSD path. Skipping.", i, b_idx);
-                            SLOT_MANAGER.release_slot(s_id).await;
-                            continue;
-                        }
-                        
-                        let target_path = target_path.unwrap();
-                        let reg_inner = registry.clone();
-
-                        tokio::spawn(async move {
-                            match tokio::fs::read(&target_path).await {
-                                Ok(content) => {
-                                    match safetensors::SafeTensors::deserialize(&content) {
-                                        Ok(st) => {
-                                            // [FIX] DYNAMIC SHAPE DETECTION
-                                            let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor("k_anchors") {
-                                                let dims = t_view.shape(); // [batch, heads, anchor_count, head_dim]
-                                                let data = unsafe { std::slice::from_raw_parts(t_view.data().as_ptr() as *const f32, t_view.data().len() / 4).to_vec() };
-                                                let s_len = if let Ok(v) = st.tensor("k_shape") {
-                                                    let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const u32, v.data().len() / 4) };
-                                                    v_u32[2] as usize
-                                                } else { 256 };
-                                                (Some(data), vec![dims[0], dims[1], s_len, dims[3]], dims[2])
-                                            } else { (None, vec![1, 16, 256, 128], 36) };
-
-                                            let ex_v = |name: &str| -> Option<Vec<f32>> { 
-                                                st.tensor(name).ok().map(|v| unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec() }) 
-                                            };
-                                            
-                                                                                                                                                                        if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ka_data, st.tensor("k_packed").ok(), ex_v("k_scales"), ex_v("v_anchors"), st.tensor("v_packed").ok(), ex_v("v_scales")) {
-                                                                                                                                                                            // [FIX] Explicit scope to drop write guards before .await
-                                                                                                                                                                            {
-                                                                                                                                                                                let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
-                                                                                                                                                                                    k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                                                                                                                                                    k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
-                                                                                                                                                                                    k_scales: Tensor::from_vec(ks, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                                                                                                                                                    v_anchors: Tensor::from_vec(va, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                                                                                                                                                    v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
-                                                                                                                                                                                    v_scales: Tensor::from_vec(vs, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                                                                                                                                                    original_shape: o_s 
-                                                                                                                                                                                };
-                                                                                    
-                                                                                                                                                                                if let Ok(mut inner) = block.inner.write() {
-                                                                                                                                                                                    inner.bitkv_metadata = Some(metadata.clone());
-                                                                                                                                                                                    
-                                                                                                                                                                                    if let Ok(mut reg) = reg_inner.entries.write() {
-                                                                                                                                                                                        if b_idx < reg.len() { 
-                                                                                                                                                                                            let is_relay = target_path.file_name().map(|n| n.to_string_lossy().contains("layer_relay_kv")).unwrap_or(false);
-                                                                                                                                                                                                                                                                    if is_relay {
-                                                                                                                                                                                                                                                                        // Update locations first
-                                                                                                                                                                                                                                                                        for i in 0..28 {
-                                                                                                                                                                                                                                                                            reg[b_idx].location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
-                                                                                                                                                                                                                                                                        }
-                                                                                                                                                                                                                                                                        // Update cache second
-                                                                                                                                                                                                                                                                        let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
-                                                                                                                                                                                                                                                                        for i in 0..28 {
-                                                                                                                                                                                                                                                                            cache[i] = Some(metadata.clone());
-                                                                                                                                                                                                                                                                        }
-                                                                                                                                                                                                                                                                    } else {
-                                                                                                                                                                                                                                                                        reg[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
-                                                                                                                                                                                                                                                                        let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
-                                                                                                                                                                                                                                                                        cache[l_idx] = Some(metadata);
-                                                                                                                                                                                                                                                                    }
-                                                                                                                                                                                            
-                                                                                                                                                                                        }
-                                                                                                                                                                                    }
-                                                                                                                                                                                }
-                                                                                                                                                                            }
-                                                                                                                                                                        }
-                                                                                                                            },
-                                        Err(e) => println!("[WORKER] !! Deserialization Error for Layer {} Block {}: {:?}", l_idx, b_idx, e),
+                                SlotTask::ChunkedLoad(chunk) => {
+                                    let registry = chunk.registry.clone();
+                                    let num_blocks = chunk.layer_indices.len();
+                                    println!("[WORKER-CHUNK] >> [START] CHUNKED LOAD for {} blocks.", num_blocks);
+                                    
+                                    for i in 0..num_blocks {
+                                        let (l_idx, s_id, block) = (chunk.layer_indices[i], chunk.slot_ids[i], chunk.shared_blocks[i].clone());
+                                        let (b_idx, target_path) = {
+                                            match block.inner.read() {
+                                                Ok(inner) => {
+                                                    let path = inner.ssd_path.clone().or_else(|| {
+                                                        if let Ok(reg) = registry.entries.read() {
+                                                            if inner.index < reg.len() { reg[inner.index].ssd_path.clone() } else { None }
+                                                        } else { None }
+                                                    });
+                                                    (inner.index, path)
+                                                },
+                                                Err(e) => {
+                                                    println!("[WORKER-CHUNK] !! Block {} Lock Poisoned: {:?}", i, e);
+                                                    (999, None)
+                                                }
+                                            }
+                                        };
+                
+                                        if target_path.is_none() {
+                                            println!("[WORKER-CHUNK] !! No path for Block {} Index {}. Releasing Slot {}.", i, b_idx, s_id);
+                                            SLOT_MANAGER.release_slot(s_id).await;
+                                            continue;
+                                        }
+                                        
+                                        let target_path = target_path.unwrap();
+                                        let reg_inner = registry.clone();
+                
+                                        tokio::spawn(async move {
+                                            let res = async {
+                                                let content = tokio::fs::read(&target_path).await
+                                                    .map_err(|e| format!("IO Error: {:?}", e))?;
+                                                
+                                                let st = safetensors::SafeTensors::deserialize(&content)
+                                                    .map_err(|e| format!("Deserialization Error: {:?}", e))?;
+                
+                                                let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor("k_anchors") {
+                                                    let dims = t_view.shape();
+                                                    let data = unsafe { std::slice::from_raw_parts(t_view.data().as_ptr() as *const f32, t_view.data().len() / 4).to_vec() };
+                                                    let s_len = if let Ok(v) = st.tensor("k_shape") {
+                                                        let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const u32, v.data().len() / 4) };
+                                                        v_u32[2] as usize
+                                                    } else { 256 };
+                                                    (Some(data), vec![dims[0], dims[1], s_len, dims[3]], dims[2])
+                                                } else { (None, vec![1, 16, 256, 128], 36) };
+                
+                                                let ex_v = |name: &str| -> Option<Vec<f32>> { 
+                                                    st.tensor(name).ok().map(|v| unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec() }) 
+                                                };
+                                                
+                                                if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ka_data, st.tensor("k_packed").ok(), ex_v("k_scales"), ex_v("v_anchors"), st.tensor("v_packed").ok(), ex_v("v_scales")) {
+                                                    let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
+                                                        k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                        k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
+                                                        k_scales: Tensor::from_vec(ks, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                        v_anchors: Tensor::from_vec(va, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                        v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
+                                                        v_scales: Tensor::from_vec(vs, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                        original_shape: o_s 
+                                                    };
+                
+                                                    if let Ok(mut inner) = block.inner.write() {
+                                                        inner.bitkv_metadata = Some(metadata.clone());
+                                                        if let Ok(mut reg) = reg_inner.entries.write() {
+                                                            if b_idx < reg.len() { 
+                                                                let is_relay = target_path.file_name().map(|n| n.to_string_lossy().contains("layer_relay_kv")).unwrap_or(false);
+                                                                if is_relay {
+                                                                    for i in 0..28 { reg[b_idx].location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; }
+                                                                    let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
+                                                                    for i in 0..28 { cache[i] = Some(metadata.clone()); }
+                                                                    println!("[WORKER-CHUNK] << [SUCCESS] RELAY Block {} populated (Slot {}).", b_idx, s_id);
+                                                                } else {
+                                                                    reg[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
+                                                                    let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
+                                                                    cache[l_idx] = Some(metadata);
+                                                                    println!("[WORKER-CHUNK] << [SUCCESS] Layer {} Block {} loaded (Slot {}).", l_idx, b_idx, s_id);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    Ok(())
+                                                } else {
+                                                    Err("Missing tensors".to_string())
+                                                }
+                                            }.await;
+                
+                                            if let Err(e) = res {
+                                                println!("[WORKER-CHUNK] !! [ERROR] Layer {} Block {} failed: {} (Slot {})", l_idx, b_idx, e, s_id);
+                                            }
+                                            SLOT_MANAGER.release_slot(s_id).await;
+                                        });
                                     }
-                                },
-                                Err(e) => println!("[WORKER] !! IO Error for Layer {} Block {} at {:?}: {:?}", l_idx, b_idx, target_path, e),
-                            }
-                            SLOT_MANAGER.release_slot(s_id).await;
-                        });
-                    }
-                }
+                                }
+                
             }
         }
     });
