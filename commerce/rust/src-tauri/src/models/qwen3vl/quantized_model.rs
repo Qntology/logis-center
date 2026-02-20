@@ -720,28 +720,34 @@ impl QuantizedQwen3VLTextAttention {
             };
 
             if loc == KVLocation::SSD {
-                let spath = {
+                let (spath, reserved_sid) = {
                     let reg = self.registry.entries.read().unwrap();
-                    reg[index].ssd_path.clone()
+                    (reg[index].ssd_path.clone(), reg[index].slot_ids[self.layer_idx])
                 };
+
                 if let Some(path) = spath {
-                    {
-                        let mut reg = self.registry.entries.write().unwrap();
-                        reg[index].location[self.layer_idx] = KVLocation::Loading;
-                    }
-                    let shared_block = block.clone();
-                    let reg_clone = self.registry.clone();
-                    let l_idx = self.layer_idx;
-                    tauri::async_runtime::spawn(async move {
-                        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
-                        let sid = SLOT_MANAGER.acquire_read_slot().await;
-                        if let Ok(tx) = get_load_worker().await {
-                            let _ = tx.send(SlotTask::Load(LoadTask {
-                                slot_id: sid, path, layer_idx: l_idx, kv_name: None, shared_block, registry: reg_clone
-                            })).await;
+                    // [REUSE-LOGIC] 이미 예약된 슬롯이 있다면 로딩 작업이 진행 중인 것으로 간주
+                    if reserved_sid.is_some() {
+                        loc = KVLocation::Loading;
+                    } else {
+                        {
+                            let mut reg = self.registry.entries.write().unwrap();
+                            reg[index].location[self.layer_idx] = KVLocation::Loading;
                         }
-                    });
-                    loc = KVLocation::Loading;
+                        let shared_block = block.clone();
+                        let reg_clone = self.registry.clone();
+                        let l_idx = self.layer_idx;
+                        tauri::async_runtime::spawn(async move {
+                            use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
+                            let sid = SLOT_MANAGER.acquire_read_slot().await;
+                            if let Ok(tx) = get_load_worker().await {
+                                let _ = tx.send(SlotTask::Load(LoadTask {
+                                    slot_id: sid, path, layer_idx: l_idx, kv_name: None, shared_block, registry: reg_clone
+                                })).await;
+                            }
+                        });
+                        loc = KVLocation::Loading;
+                    }
                 }
             }
 
@@ -944,17 +950,30 @@ impl QuantizedQwen3VLTextAttention {
             .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
         let attn_output = self.o_proj.forward(&attn_output)?;
 
-        // [SMART-PURGE-V2] 256개 단위 SSD 파이프라인 연동
+        // [INTELLIGENT-RELEASE] 
+        // Now that the GPU is done with this layer, release all slots associated with it.
+        // This keeps RAM usage stable while allowing parallel prefetch for upcoming layers.
+        let l_idx = self.layer_idx;
+        let registry_clone = self.registry.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut reg = registry_clone.entries.write().unwrap();
+            for entry in reg.iter_mut() {
+                if let Some(sid) = entry.slot_ids[l_idx].take() {
+                    use crate::models::qwen3vl::generate::SLOT_MANAGER;
+                    SLOT_MANAGER.release_slot(sid).await;
+                }
+            }
+        });
+
+        // [SMART-PURGE-V3] Memory-Efficient Caching for 8GB RAM
         for block in &mut self.kv_blocks {
             let mut inner = block.inner.write().unwrap();
-            
-            // SSD에 이미 저장이 완료된 블록만 메모리(VRAM/RAM)에서 비웁니다.
-            // 아직 SSD 경로가 없는 최신 블록(추론 중인 데이터)은 Baker가 처리할 때까지 유지합니다.
-            if inner.ssd_path.is_some() {
+            if inner.ssd_path.is_some() || inner.bitkv_metadata.is_some() {
                 if inner.location == KVLocation::VRAM || inner.location == KVLocation::RAM {
                     inner.k_cache = None;
                     inner.v_cache = None;
-                    inner.location = KVLocation::SSD;
+                    if inner.bitkv_metadata.is_some() { inner.location = KVLocation::RAM; }
+                    else { inner.location = KVLocation::SSD; }
                 }
             }
         }

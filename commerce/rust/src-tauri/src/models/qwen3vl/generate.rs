@@ -529,15 +529,19 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                             if b_idx < reg.len() { 
                                                                 let is_relay = target_path.file_name().map(|n| n.to_string_lossy().contains("layer_relay_kv")).unwrap_or(false);
                                                                 if is_relay {
-                                                                    for i in 0..28 { reg[b_idx].location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; }
+                                                                    for i in 0..28 { 
+                                                                        reg[b_idx].location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
+                                                                        reg[b_idx].slot_ids[i] = Some(s_id);
+                                                                    }
                                                                     let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
                                                                     for i in 0..28 { cache[i] = Some(metadata.clone()); }
-                                                                    println!("[WORKER-CHUNK] << [SUCCESS] RELAY Block {} populated (Slot {}).", b_idx, s_id);
+                                                                    println!("[WORKER-CHUNK] << [SUCCESS] RELAY Block {} populated into Slot {}.", b_idx, s_id);
                                                                 } else {
                                                                     reg[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
+                                                                    reg[b_idx].slot_ids[l_idx] = Some(s_id);
                                                                     let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
                                                                     cache[l_idx] = Some(metadata);
-                                                                    println!("[WORKER-CHUNK] << [SUCCESS] Layer {} Block {} loaded (Slot {}).", l_idx, b_idx, s_id);
+                                                                    println!("[WORKER-CHUNK] << [SUCCESS] Layer {} Block {} loaded into Slot {}.", l_idx, b_idx, s_id);
                                                                 }
                                                             }
                                                         }
@@ -550,8 +554,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 
                                             if let Err(e) = res {
                                                 println!("[WORKER-CHUNK] !! [ERROR] Layer {} Block {} failed: {} (Slot {})", l_idx, b_idx, e, s_id);
+                                                SLOT_MANAGER.release_slot(s_id).await;
                                             }
-                                            SLOT_MANAGER.release_slot(s_id).await;
+                                            // SLOT_MANAGER.release_slot(s_id).await; // Removed for Reservation
                                         });
                                     }
                                 }
