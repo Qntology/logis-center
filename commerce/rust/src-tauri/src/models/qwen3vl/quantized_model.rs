@@ -723,8 +723,8 @@ impl QuantizedQwen3VLTextAttention {
             };
 
             // [NEW] VRAM -> RAM 강제 동기화 (VRAM 부하 방지)
-            // 레지스트리가 RAM 상태라면, 실제 텐서가 아직 VRAM에 있더라도 즉시 CPU로 이동시킵니다.
-            if loc == KVLocation::RAM {
+            // 레지스트리가 RAM/SSD_PENDING/Streaming 상태라면, 실제 텐서가 아직 VRAM에 있더라도 즉시 CPU로 이동시킵니다.
+            if loc == KVLocation::RAM || loc == KVLocation::SSD_PENDING || loc == KVLocation::Streaming {
                 let mut inner = block.inner.write().unwrap();
                 if inner.location == KVLocation::VRAM {
                     if let (Some(k_vram), Some(v_vram)) = (inner.k_cache.take(), inner.v_cache.take()) {
@@ -732,10 +732,10 @@ impl QuantizedQwen3VLTextAttention {
                             let k_cpu = k_vram.to_device(&Device::Cpu)?;
                             let v_cpu = v_vram.to_device(&Device::Cpu)?;
                             inner.k_cache = Some(k_cpu.clone());
-                            inner.v_cache = Some(v_vram.to_device(&Device::Cpu)?); // v_cpu clone 대신 직접 변환
+                            inner.v_cache = Some(v_cpu.clone());
                             inner.location = KVLocation::RAM;
                             k = Some(k_cpu);
-                            v = Some(inner.v_cache.as_ref().unwrap().clone());
+                            v = Some(v_cpu);
                         } else {
                             inner.k_cache = Some(k_vram);
                             inner.v_cache = Some(v_vram);
@@ -813,7 +813,7 @@ impl QuantizedQwen3VLTextAttention {
                     global_start_idx += b_len;
                     continue;
                 }
-                KVLocation::RAM | KVLocation::RamSticky => {
+                KVLocation::RAM | KVLocation::RamSticky | KVLocation::SSD_PENDING | KVLocation::Streaming => {
                     let mut inner = block.inner.write().unwrap();
                     if inner.k_cache.is_none() {
                         // 1. Try local metadata
@@ -838,8 +838,8 @@ impl QuantizedQwen3VLTextAttention {
                             k = Some(k_raw);
                             v = Some(v_raw);
                         } else {
-                            println!("[ERROR] Layer {} Block {} location is RAM but NO metadata found! (Index: {})", 
-                                self.layer_idx, index, index);
+                            println!("[ERROR] Layer {} Block {} location is {:?} but NO metadata found! (Index: {})", 
+                                self.layer_idx, index, final_loc, index);
                         }
                     }
                 }
@@ -902,6 +902,9 @@ impl QuantizedQwen3VLTextAttention {
                 }
                 _ => unreachable!(),
             }
+            
+            // [FIX] RAM 블록 처리 후 인덱스 갱신
+            global_start_idx += b_len;
         }
 
         // 5. [BATCH-VRAM] Fast single-pass for all VRAM blocks
