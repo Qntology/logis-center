@@ -220,8 +220,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             // [LOG] 실제 저장 시도 및 결과 캡처
             match candle_core::safetensors::save(&task.tensors, &task.path) {
                 Ok(_) => {
-                    // [NEW] 저장 성공 시 해당 태스크의 메타데이터 업데이트 (생략된 경우를 대비해 block_index 활용 고민)
-                    // 현재 구조에서는 task.path를 통해 간접적으로 성공이 확인됩니다.
+                    // println!("[WORKER-IO] << [SUCCESS] Saved KV to {:?}", task.path);
                 },
                 Err(e) => {
                     println!("[WORKER-IO] !! [ERROR] Failed to save KV to {:?}. Cause: {:?}", task.path, e);
@@ -802,22 +801,16 @@ impl Qwen3VLGenerateModel {
                     let mut vs = Vec::new();
                     let mut match_found = false;
                     let mut offset = 0;
-                                    for l in layers {
-                                        let inner = l.self_attn.kv_blocks[b_idx].inner.read().unwrap();
-                                        // target_loc이거나, 혹은 이미 RAM으로 핸드오프된 데이터를 가져옵니다.
-                                        if inner.location == target_loc || (target_loc == KVLocation::SSD_PENDING && inner.location == KVLocation::RAM && inner.ssd_path.is_none()) {
-                                            if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                                                // 이미 CPU에 있다면 그대로, GPU에 있다면 CPU로 가져옴
-                                                let k_cpu = if k.device().is_cpu() { k.clone() } else { k.to_device(&Device::Cpu)? };
-                                                let v_cpu = if v.device().is_cpu() { v.clone() } else { v.to_device(&Device::Cpu)? };
-                                                ks.push(k_cpu); 
-                                                vs.push(v_cpu);
-                                                offset = inner.offset + inner.len;
-                                                match_found = true;
-                                            }
-                                        }
-                                    }
-                    
+                    for l in layers {
+                        let inner = l.self_attn.kv_blocks[b_idx].inner.read().unwrap();
+                        if inner.location == target_loc {
+                            if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                                ks.push(k.clone()); vs.push(v.clone());
+                                offset = inner.offset + inner.len;
+                                match_found = true;
+                            }
+                        }
+                    }
                     if match_found { results.push((ks, vs, offset, b_idx)); }
                 }
             }
