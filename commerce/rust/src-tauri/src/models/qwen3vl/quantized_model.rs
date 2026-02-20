@@ -222,6 +222,10 @@ pub struct RegistryEntry {
     pub token_start: usize,
     pub token_len: usize,
     pub ssd_path: Option<std::path::PathBuf>,
+    #[serde(skip)]
+    pub is_dirty: bool, // SSD 저장이 필요한지 여부
+    #[serde(skip, default = "std::time::Instant::now")]
+    pub last_accessed: std::time::Instant, // LRU 순위 결정을 위한 접근 시각
     #[serde(skip, default = "default_bitkv_cache")]
     pub bitkv_cache: Arc<std::sync::RwLock<Vec<Option<BitKVMetadata>>>>,
 }
@@ -236,6 +240,33 @@ impl KVRegistry {
     pub fn new() -> Self {
         Self {
             entries: Arc::new(std::sync::RwLock::new(Vec::new())),
+        }
+    }
+
+    // [NEW] 메모리 압박 시 비울 수 있는 가장 오래된 블록을 찾음
+    pub fn find_eviction_candidate(&self) -> Option<usize> {
+        let entries = self.entries.read().unwrap();
+        let mut oldest_idx = None;
+        let mut oldest_time = std::time::Instant::now();
+
+        for (i, entry) in entries.iter().enumerate() {
+            // 1. 이미 RAM이나 VRAM에 있고
+            // 2. SSD 저장이 완료되었거나(not dirty), 중요도가 낮은 경우
+            let in_memory = entry.location.iter().any(|&l| l == KVLocation::VRAM || l == KVLocation::RAM);
+            if in_memory && !entry.is_dirty {
+                if entry.last_accessed < oldest_time {
+                    oldest_time = entry.last_accessed;
+                    oldest_idx = Some(i);
+                }
+            }
+        }
+        oldest_idx
+    }
+
+    pub fn mark_accessed(&self, index: usize) {
+        let mut entries = self.entries.write().unwrap();
+        if index < entries.len() {
+            entries[index].last_accessed = std::time::Instant::now();
         }
     }
 
@@ -526,6 +557,8 @@ impl QuantizedQwen3VLTextAttention {
                             token_start: current_total,
                             token_len: take,
                             ssd_path: None,
+                            is_dirty: true, // [NEW] 백업 필요 표시
+                            last_accessed: std::time::Instant::now(),
                             bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; 28])),
                         });
                     }
@@ -821,30 +854,18 @@ impl QuantizedQwen3VLTextAttention {
             .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
         let attn_output = self.o_proj.forward(&attn_output)?;
 
-        // [SMART-PURGE] 레이어 연산 직후 VRAM(BF16)만 비우고 RAM(BitKV)은 유지
+        // [SMART-PURGE-V2] 256개 단위 SSD 파이프라인 연동
         for block in &mut self.kv_blocks {
-            let (index, _current_inner_loc) = {
-                let inner = block.inner.read().unwrap();
-                (inner.index, inner.location)
-            };
-
-            let reg_loc = {
-                let reg = self.registry.entries.read().unwrap();
-                if index < reg.len() { reg[index].location[self.layer_idx] } else { KVLocation::VRAM }
-            };
-
-            // [SMART-PURGE-PREVENTION] 
-            // If we are in VRAM, we only purge if we're NOT in a state that needs to export this data (like baking).
-            // For now, if metadata is missing and we are in VRAM, we keep the data until generate.rs explicitly clears it.
             let mut inner = block.inner.write().unwrap();
-            if inner.bitkv_metadata.is_some() {
-                inner.k_cache = None;
-                inner.v_cache = None;
-                inner.location = KVLocation::RAM;
-            } else if reg_loc != KVLocation::VRAM {
-                inner.k_cache = None;
-                inner.v_cache = None;
-                inner.location = reg_loc;
+            
+            // SSD에 이미 저장이 완료된 블록만 메모리(VRAM/RAM)에서 비웁니다.
+            // 아직 SSD 경로가 없는 최신 블록(추론 중인 데이터)은 Baker가 처리할 때까지 유지합니다.
+            if inner.ssd_path.is_some() {
+                if inner.location == KVLocation::VRAM || inner.location == KVLocation::RAM {
+                    inner.k_cache = None;
+                    inner.v_cache = None;
+                    inner.location = KVLocation::SSD;
+                }
             }
         }
 
@@ -1187,6 +1208,8 @@ impl QuantizedQwen3VLTextAttention {
                     token_start: *offset,
                     token_len: b_len,
                     ssd_path: Some(path.clone()),
+                    is_dirty: false, // SSD에 이미 있으므로 백업 불필요
+                    last_accessed: std::time::Instant::now(),
                     bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; 28])),
                 });
             }
@@ -1732,18 +1755,49 @@ impl QuantizedQwen3VLTextModel {
                         // [HORIZONTAL-PIPELINE-STRATEGY]
                         let num_layers = self.layers.len();
                         
-                        // [FIX] Dynamic chunk sizing to prevent OOM on long sequences (>15k tokens)
-                        // A 2048 chunk vs 24k history creates a 3.1GB attention matrix, exceeding 4GB VRAM.
-                        let chunk_size = if seq_len > 15000 { 512 } else if seq_len > 8000 { 1024 } else { 2048 };
+                        // [FIX] 모든 연산 단위를 사용자 요청에 따라 256으로 고정
+                        let chunk_size = 256;
                         
-                        println!("[TRACE] Starting Horizontal Pass: Layer-by-Layer execution (Total Seq: {}, Chunk: {})", seq_len, chunk_size);
+                        println!("[TRACE] Starting Horizontal Pass: Layer-by-Layer execution (Total Seq: {}, Chunk: {}, Pinned: {}/{})", 
+                            seq_len, chunk_size, self.pinned_layer_count, num_layers);
                 
                                 for layer_idx in 0..num_layers {
                                     if layer_idx < start_layer { continue; }
+                                    let start_layer_time = std::time::Instant::now();
                                     println!("[HORIZONTAL] >> [START] Layer {} Processing Loop...", layer_idx);
                                     
                                     // 1. [TARGET-REBALANCE] Ensure THIS specific layer is on GPU
                                     let _ = self.rebalance_layers(0, layer_idx);
+                                    
+                                    // [NEW] 능동적 메모리 비우기 (LRU Eviction)
+                                    // VRAM 여유가 600MB 이하로 떨어지면, 현재 레이어 이전의 모든 RAM/VRAM 블록 중 SSD 백업이 완료된 것을 해제
+                                    {
+                                        use nvml_wrapper::Nvml;
+                                        if let Ok(nvml) = Nvml::init() {
+                                            if let Ok(dev) = nvml.device_by_index(0) {
+                                                if let Ok(mem) = dev.memory_info() {
+                                                    if mem.free < 600_000_000 {
+                                                        println!("[EVICT] Low VRAM ({}MB). Purging old blocks...", mem.free / 1024 / 1024);
+                                                        let mut purged_count = 0;
+                                                        let reg = self.registry.entries.read().unwrap();
+                                                        for block in &self.layers[layer_idx].self_attn.kv_blocks {
+                                                            let mut inner = block.inner.write().unwrap();
+                                                            // SSD 경로가 있고 현재 RAM/VRAM에 있다면 해제
+                                                            if inner.ssd_path.is_some() && (inner.location == KVLocation::RAM || inner.location == KVLocation::VRAM) {
+                                                                inner.k_cache = None;
+                                                                inner.v_cache = None;
+                                                                inner.location = KVLocation::SSD;
+                                                                purged_count += 1;
+                                                            }
+                                                        }
+                                                        if purged_count > 0 {
+                                                            println!("[EVICT] Freed {} blocks for Layer {}.", purged_count, layer_idx);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     let dev_type = if self.layers[layer_idx].device().is_cuda() { "GPU" } else { "CPU" };                            
                             // 2. [MASS-LOAD] 현재 레이어에 필요한 모든 블록을 SSD에서 한꺼번에 로드 요청
                             let mut blocks_to_load: Vec<KVBlock> = Vec::new();
@@ -1855,13 +1909,16 @@ impl QuantizedQwen3VLTextModel {
                                                                 }
                                                             }
 
-                                                            println!("[HORIZONTAL] Layer {:2} | Chunk {} (Offset: {}, Size: {}) - START", layer_idx, chunk_idx, i, take);
-                                                            
                                                             let layer_ptr = &mut self.layers[layer_idx];
+                                                            let dev_name = if layer_ptr.device().is_cuda() { "GPU" } else { "CPU" };
+                                                            println!("[HORIZONTAL] Layer {:2} | Chunk {} (Offset: {}, Size: {}) - START on {}", 
+                                                                layer_idx, chunk_idx, i, take, dev_name);
+                                                            
                                                             let xs_chunk = xs.narrow(1, i, take)?;
                                                             let cos_chunk = cos.narrow(1, i, take)?;
                                                             let sin_chunk = sin.narrow(1, i, take)?;
                                                             
+                                                            // [RESTORED] out_res 정의 복구
                                                             let out_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                                                 layer_ptr.forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)
                                                             }));
@@ -1889,7 +1946,8 @@ impl QuantizedQwen3VLTextModel {
                                                         // [OPTIMIZATION] 강제 Aggressive Offload 제거
                                                         // 이제 rebalance_layers가 다음 루프 시작 시 VRAM이 부족할 때만 알아서 처리합니다.
                                                         
-                                                        println!("[HORIZONTAL] << [FINISH] Layer {} full loop complete.", layer_idx);
+                                                        println!("[HORIZONTAL] << [FINISH] Layer {} full loop complete in {:.2}s.", 
+                                                            layer_idx, start_layer_time.elapsed().as_secs_f32());
                                                     }
                 
                         println!("[TRACE] Horizontal Layer Pass Complete.");        self.current_kv_len = seqlen_offset + seq_len;
@@ -2137,6 +2195,14 @@ impl QuantizedQwen3VLTextModel {
 
         println!("[SSD-LOAD] Finalized fragment list with {} blocks. Distributing to {} layers.", fragments.len(), self.layers.len());
 
+        // [RELAY-JUMP] 마지막 블록의 오프셋 + 길이를 현재 진행 상태로 설정
+        if let Some((last_off, _)) = fragments.last() {
+            // 표준 블록 크기 256을 고려하여 전체 길이 계산
+            let total_loaded = *last_off + 256; 
+            self.current_kv_len = total_loaded;
+            println!("[SSD-LOAD] Relay Jump: Model progress synchronized to token index {}.", total_loaded);
+        }
+
         self.layers.iter_mut().try_for_each(|layer| {
             layer.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, &fragments)
         })
@@ -2174,7 +2240,7 @@ impl QuantizedQwen3VLTextModel {
         let layer = &mut self.layers[target_idx];
 
         if free_vram > 0 && free_vram < danger_zone && layer.device().is_cuda() {
-            println!("[REBALANCE] >> [START] Emergency Offload: Layer {} -> CPU (Free: {}MB)", target_idx, free_vram / 1024 / 1024);
+            println!("[REBALANCE] >> [START] Emergency Offload: Layer {} -> CPU (Free: {}MB < Danger: {}MB)", target_idx, free_vram / 1024 / 1024, danger_zone / 1024 / 1024);
             let offload_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 layer.to_device(&Device::Cpu)
             }));
@@ -2184,7 +2250,10 @@ impl QuantizedQwen3VLTextModel {
                 Err(_) => println!("[REBALANCE] !! [PANIC] Panic during offload of Layer {}", target_idx),
             }
         } else if free_vram > safe_zone && layer.device().is_cpu() {
-            println!("[REBALANCE] >> [START] Targeted Upload: Layer {} -> GPU (Free: {}MB)", target_idx, free_vram / 1024 / 1024);
+            // [LOG] 무게추 크기 계산
+            let weight_size_mb = (layer.input_layernorm.weight().elem_count() * layer.input_layernorm.weight().dtype().size_in_bytes()) as f32 / 1024.0 / 1024.0;
+            println!("[REBALANCE] >> [START] Targeted Upload: Layer {} -> GPU (Free: {}MB > Safe: {}MB, Weights: ~{:.1}MB)", target_idx, free_vram / 1024 / 1024, safe_zone / 1024 / 1024, weight_size_mb * 5.0); // LN + Attention + MLP(Approx)
+            
             let target_device = Device::new_cuda(device_id)?;
             
             let target_device_clone = target_device.clone();
@@ -2210,6 +2279,8 @@ impl QuantizedQwen3VLTextModel {
                     return Err(anyhow::anyhow!("Panic during rebalance upload: {}", panic_msg));
                 }
             }
+        } else if layer.device().is_cpu() {
+            println!("[REBALANCE] -- [SKIP] Layer {} stays on CPU (Free: {}MB, Safe Zone: {}MB)", target_idx, free_vram / 1024 / 1024, safe_zone / 1024 / 1024);
         }
         Ok(())
     }
@@ -2348,6 +2419,7 @@ impl QuantizedQwen3VLModel {
         _video_grid_thw: Option<&Tensor>,
         _mask: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
+        let start_time = std::time::Instant::now();
         // [ROPE-FIX] 이미지 격자 구조를 반영한 실제 3D mRoPE 인덱스 계산 로직
         let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
         let image_token_id = self.config.image_token_id.unwrap_or(0);
@@ -2417,6 +2489,7 @@ impl QuantizedQwen3VLModel {
         }
 
         let deltas = Tensor::from_vec(mrope_position_deltas, (b_sz, 1), input_ids.device())?.to_dtype(input_ids.dtype())?;
+        println!("[TIMER] RoPE index generation: {:.2}s for {} tokens", start_time.elapsed().as_secs_f32(), seq_len);
         Ok((position_ids, deltas))
     }
 
@@ -2431,10 +2504,13 @@ impl QuantizedQwen3VLModel {
         let (b_sz, seq_len) = input_ids.dims2()?;
 
         // 1. Embedding & Vision Integration
+        let start_init = std::time::Instant::now();
         let flat_input = input_ids.flatten_all()?;
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
+        println!("[TIMER] Embedding forward: {:.2}s", start_init.elapsed().as_secs_f32());
         
+        let start_vision = std::time::Instant::now();
         if let Some(pv) = pixel_values { 
             if let Some(thw) = image_grid_thw { 
                 let (image_embeds, _) = self.get_vision_features(pv, thw)?; 
@@ -2443,8 +2519,12 @@ impl QuantizedQwen3VLModel {
                 inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?; 
             } 
         }
+        if pixel_values.is_some() {
+            println!("[TIMER] Vision integration: {:.2}s", start_vision.elapsed().as_secs_f32());
+        }
         
         // 2. Position IDs calculation (Corrected for Long Context & Vision)
+        let start_rope = std::time::Instant::now();
         let (position_ids, _rope_deltas) = if (cache_position_in.is_some() && cache_position_in.unwrap().i(0)?.to_scalar::<u32>()? == 0) || self.rope_deltas.is_none() {
             let (p_ids, deltas) = self.get_rope_index(&input_ids, image_grid_thw, video_grid_thw, None)?;
             self.rope_deltas = Some(deltas);
@@ -2456,6 +2536,7 @@ impl QuantizedQwen3VLModel {
                 .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
             (p_ids, self.rope_deltas.as_ref().unwrap().clone())
         };
+        println!("[TIMER] RoPE index calculation: {:.2}s", start_rope.elapsed().as_secs_f32());
         
         self.language_model.active_session_id = session_id;
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;

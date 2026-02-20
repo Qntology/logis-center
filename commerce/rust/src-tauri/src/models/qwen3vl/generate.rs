@@ -36,7 +36,12 @@ use rayon::prelude::*;
 pub enum SlotRequest {
     AcquireRead { response: oneshot::Sender<usize> },
     AcquireWrite { response: oneshot::Sender<usize>, total_tokens: usize },
-    Release { idx: usize }, 
+    Release { 
+        idx: usize, 
+        task_id: Option<String>, 
+        block_index: Option<usize>,
+        is_bake: bool 
+    }, 
     Flush { response: oneshot::Sender<()> },
 }
 
@@ -95,7 +100,7 @@ impl SlotManager {
                         let _ = response.send(idx);
                     } else { p_reads.push_back(response); }
                 }
-                SlotRequest::Release { idx } => {
+                SlotRequest::Release { idx, .. } => {
                     if idx < max_slots && states[idx] != InternalState::Free {
                         let old = states[idx];
                         states[idx] = InternalState::Free;
@@ -156,7 +161,12 @@ impl SlotManager {
             for l in &self.slots[id].k_layers { if let Ok(mut g) = l.try_lock() { *g = None; } }
             for l in &self.slots[id].v_layers { if let Ok(mut g) = l.try_lock() { *g = None; } }
             self.slots[id].state.store(0, Ordering::SeqCst);
-            let _ = self.request_tx.send(SlotRequest::Release { idx: id }).await;
+            let _ = self.request_tx.send(SlotRequest::Release { 
+                idx: id, 
+                task_id: None, 
+                block_index: None, 
+                is_bake: false 
+            }).await;
         }
     }
     pub fn get_counts(&self) -> (usize, usize, usize) { (self.count_reads.load(Ordering::Relaxed), self.count_writes.load(Ordering::Relaxed), self.count_free.load(Ordering::Relaxed)) }
@@ -206,10 +216,16 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     tokio::spawn(async move {
         while let Some(task) = io_rx.recv().await {
             if let Some(parent) = task.path.parent() { if !parent.exists() { let _ = std::fs::create_dir_all(parent); } }
-            let res = candle_core::safetensors::save(&task.tensors, &task.path);
+            let _res = candle_core::safetensors::save(&task.tensors, &task.path);
             let slot = &SLOT_MANAGER.slots[task.slot_id];
             if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 || task.is_last {
-                let _ = SLOT_MANAGER.request_tx.send(SlotRequest::Release { idx: task.slot_id }).await;
+                // [NEW] 상세 정보와 함께 슬롯 해제 보고
+                let _ = SLOT_MANAGER.request_tx.send(SlotRequest::Release { 
+                    idx: task.slot_id,
+                    task_id: None, // 추후 확장을 위해
+                    block_index: None,
+                    is_bake: true 
+                }).await;
             }
         }
     });
@@ -225,7 +241,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             let (t_dir, kv_n, off, is_relay) = (bake.task_dir, bake.kv_name, bake.offset, bake.is_relay_baking);
                             if bake.layers.is_empty() { 
                                 println!("[SLOT-WORKER] !! Bake layers empty for Slot {}. Releasing.", sid);
-                                let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid }); 
+                                let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: false }); 
                                 return; 
                             }
                             let loop_count = if is_relay { 1 } else { bake.layers.len() };
@@ -248,7 +264,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 
                                 let k_res = source.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
                                 let v_res = source.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
-                                let (k_data, v_data) = match (k_res, v_res) { (Ok(k), Ok(v)) => (k, v), _ => { if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 { let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid }); } continue; } };
+                                let (k_data, v_data) = match (k_res, v_res) { (Ok(k), Ok(v)) => (k, v), _ => { if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 { let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: false }); } continue; } };
                                 let k_shape = source.k_tensor.dims(); let (b, h, s, d) = (k_shape[0], k_shape[1], k_shape[2], k_shape[3]);
                                 let head_size = s * d; let a_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
                                 let mut ka = vec![0.0f32; b * h * a_count * d]; let mut kp = vec![0u8; (b * h * s * d + 7) / 8]; let mut ks = vec![0.0f32; b * h * s];
@@ -283,7 +299,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let _ = io_tx_inner.blocking_send(SaveTask { slot_id: sid, path: t_dir.join(fname), tensors: map, is_last: l_idx == loop_count - 1 });
                             }
                         }));
-                        if result.is_err() { let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid }); }
+                        if result.is_err() { let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: false }); }
                     }).await.ok();
                 }
                                 SlotTask::Load(load) => {
@@ -306,7 +322,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 
                                     if target_path.is_none() {
                                         println!("[WORKER-LOAD] !! Target path is None for Block {}. Releasing Slot {}.", b_idx, s_id);
-                                        let _ = SLOT_MANAGER.request_tx.try_send(SlotRequest::Release { idx: s_id });
+                                        let _ = SLOT_MANAGER.request_tx.try_send(SlotRequest::Release { idx: s_id, task_id: None, block_index: None, is_bake: false });
                                         continue;
                                     }
                                     
@@ -567,9 +583,27 @@ impl Qwen3VLGenerateModel {
     }
 
     pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel: Option<Arc<AtomicBool>>, sid: Option<String>, _relay: Option<&mut Qwen3VLGenerateModel>, kv_n: Option<String>) -> Result<usize> {
+        let start_prep = std::time::Instant::now();
         if sid.is_none() { SLOT_MANAGER.reset_all_slots().await; }
-        let f_ids = self.tokenizer.text_encode_vec(self.pre_processor.process_info(&mes, &self.chat_template.apply_chat_template(&mes)?)?.replace_text, false)?;
+        
+        // [LOG] Start of processing
+        let raw_prompt_len = mes.messages.iter().map(|m| match m {
+            crate::openai_types::ChatCompletionRequestMessage::User(u) => match &u.content {
+                crate::openai_types::ChatCompletionRequestUserMessageContent::Text(t) => t.len(),
+                _ => 0,
+            },
+            crate::openai_types::ChatCompletionRequestMessage::System(s) => s.content.len(),
+            _ => 0,
+        }).sum::<usize>();
+        println!("[GENERATE] >> [START] Preparing input (Raw chars: {})...", raw_prompt_len);
+
+        let m_render = self.chat_template.apply_chat_template(&mes)?;
+        let input = self.pre_processor.process_info(&mes, &m_render)?;
+        let f_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?;
+        
         let t_toks = f_ids.len();
+        println!("[TIMER] Tokenization & Pre-processing: {:.2}s for {} tokens", start_prep.elapsed().as_secs_f32(), t_toks);
+        
         let is_06b = self.model_name.contains("0.6B");
 
         if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
@@ -618,11 +652,20 @@ impl Qwen3VLGenerateModel {
     }
 
     pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel: Option<Arc<AtomicBool>>, sid: Option<String>, kv_n: Option<String>) -> Result<String> {
+        let start_prep = std::time::Instant::now();
         if sid.is_none() { SLOT_MANAGER.reset_all_slots().await; }
+        
+        // [RESTORED] Logit processor for sampling next tokens
         let mut l_proc = get_logit_processor(Some(mes.temperature.unwrap_or(0.7) as f32), Some(mes.top_p.unwrap_or(0.9) as f32), Some(40), mes.seed.unwrap_or(34562) as u64);
-        let m_render = self.chat_template.apply_chat_template(&mes)?; let mut input = self.pre_processor.process_info(&mes, &m_render)?;
-        let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?; let mut a_ids = f_ids.clone();
+
+        let m_render = self.chat_template.apply_chat_template(&mes)?; 
+        let mut input = self.pre_processor.process_info(&mes, &m_render)?;
+        let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?; 
+        
         let t_toks = f_ids.len();
+        println!("[TIMER] Input Rendering & Tokenization: {:.2}s for {} tokens", start_prep.elapsed().as_secs_f32(), t_toks);
+        
+        let mut a_ids = f_ids.clone();
         let s_off = self.get_kv_len();
 
         if t_toks > s_off {
@@ -664,13 +707,53 @@ impl Qwen3VLGenerateModel {
         
         let mut curr_s_off = t_toks;
         let (mut p_vals, i_grid, mut g_text) = (input.pixel_values.take(), input.image_grid_thw.take(), String::new());
+        let mut tokens_since_last_bake = 0;
+
         for _ in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+            
             let logits = self.qwen3_vl.forward(&Tensor::new(vec![*a_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)?, p_vals.as_ref(), i_grid.as_ref(), None, None, Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + 1) as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, t_toks, sid.clone())?;
             let l_vec = apply_repeat_penalty(&logits.squeeze(0)?.i(logits.dim(1)? - 1)?.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
             let next_id = l_proc.sample(&l_vec)?; if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             a_ids.push(next_id); g_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
-            curr_s_off += 1; p_vals = None; self.clear_temporal_kv_caches();
+            
+            curr_s_off += 1; 
+            tokens_since_last_bake += 1;
+            p_vals = None; 
+
+            // [ACTIVE-BAKING] 정확히 2048개(사용자 설정)가 쌓일 때마다 SSD 저장 트리거
+            if tokens_since_last_bake >= 2048 {
+                if let Some(s_id) = &sid {
+                    let unbaked_blocks = self.get_all_unbaked_kv_blocks();
+                    if !unbaked_blocks.is_empty() {
+                        println!("[GENERATE] >> [TRIGGER] 2048 tokens reached. Batching SSD Bake...");
+                        for (ks, vs, block_offset) in unbaked_blocks {
+                            let slot_id = SLOT_MANAGER.acquire_write_slot(curr_s_off).await;
+                            let mut dumps = Vec::new();
+                            for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
+                                dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v });
+                            }
+                            if let Ok(tx) = get_bake_worker().await {
+                                let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+                                let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, layers: dumps, is_relay_baking: false })).await;
+                            }
+                        }
+                        
+                        // [STRICT-WAIT] 저장이 확실히 끝날 때까지 대기하여 메모리 정체 방지
+                        SLOT_MANAGER.wait_for_all_tasks().await;
+                        println!("[GENERATE] SSD Bake successful. Purging RAM/VRAM...");
+                        
+                        // [METADATA-PERSISTENCE]
+                        let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+                        let _ = self.qwen3_vl.save_metadata_to_file(&path);
+                        
+                        self.clear_temporal_kv_caches();
+                    }
+                }
+                tokens_since_last_bake = 0;
+            }
+
+            self.clear_temporal_kv_caches();
         }
         Ok(g_text)
     }
