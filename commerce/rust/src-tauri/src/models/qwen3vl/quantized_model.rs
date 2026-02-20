@@ -764,8 +764,8 @@ impl QuantizedQwen3VLTextAttention {
 
             match final_loc {
                 KVLocation::VRAM => {
-                    vram_ks.push(k.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
-                    vram_vs.push(v.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
+                    vram_ks.push(k.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, &dev).unwrap()));
+                    vram_vs.push(v.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, &dev).unwrap()));
                     vram_total_len += b_len;
                     global_start_idx += b_len;
                     continue;
@@ -788,8 +788,8 @@ impl QuantizedQwen3VLTextAttention {
                         let final_meta = meta.or(fallback_meta);
 
                         if let Some(meta) = final_meta {
-                            let k_raw = self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?;
-                            let v_raw = self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?;
+                            let k_raw = self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, &dev)?;
+                            let v_raw = self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, &dev)?;
                             inner.k_cache = Some(k_raw.clone());
                             inner.v_cache = Some(v_raw.clone());
                             k = Some(k_raw);
@@ -807,9 +807,9 @@ impl QuantizedQwen3VLTextAttention {
             let mut v = v.ok_or_else(|| candle_core::Error::Msg("KV Cache not ready after wait".to_string()))?;
 
             // [FIX] Ensure KV tensors are on the correct device AND have the correct DType before calculation
-            if !k.device().same_device(dev) { k = k.to_device(dev)?; }
+            if !k.device().same_device(&dev) { k = k.to_device(&dev)?; }
             if k.dtype() != target_dtype { k = k.to_dtype(target_dtype)?; }
-            if !v.device().same_device(dev) { v = v.to_device(dev)?; }
+            if !v.device().same_device(&dev) { v = v.to_device(&dev)?; }
             if v.dtype() != target_dtype { v = v.to_dtype(target_dtype)?; }
 
             // [FIX] Update b_len to actual tensor dimensions to prevent shape mismatch in broadcast_add
@@ -823,7 +823,7 @@ impl QuantizedQwen3VLTextAttention {
             }
 
             let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?
-                .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
+                .broadcast_mul(&Tensor::new(&[self.scaling as f32], &dev)?.to_dtype(target_dtype)?)?;
 
             if let Some(mask) = attention_mask {
                 let mask_len = mask.dim(D::Minus1)?;
@@ -869,12 +869,12 @@ impl QuantizedQwen3VLTextAttention {
             let mut final_ks = Vec::with_capacity(vram_ks.len());
             let mut final_vs = Vec::with_capacity(vram_vs.len());
             for mut tk in vram_ks { 
-                if !tk.device().same_device(dev) { tk = tk.to_device(dev)?; }
+                if !tk.device().same_device(&dev) { tk = tk.to_device(&dev)?; }
                 if tk.dtype() != target_dtype { tk = tk.to_dtype(target_dtype)?; }
                 final_ks.push(tk); 
             }
             for mut tv in vram_vs { 
-                if !tv.device().same_device(dev) { tv = tv.to_device(dev)?; }
+                if !tv.device().same_device(&dev) { tv = tv.to_device(&dev)?; }
                 if tv.dtype() != target_dtype { tv = tv.to_dtype(target_dtype)?; }
                 final_vs.push(tv); 
             }
@@ -889,7 +889,7 @@ impl QuantizedQwen3VLTextAttention {
             }
 
             let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?
-                .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
+                .broadcast_mul(&Tensor::new(&[self.scaling as f32], &dev)?.to_dtype(target_dtype)?)?;
 
             if let Some(mask) = attention_mask {
                 let mask_len = mask.dim(D::Minus1)?;
