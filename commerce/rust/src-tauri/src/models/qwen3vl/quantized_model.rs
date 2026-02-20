@@ -1538,7 +1538,7 @@ impl QuantizedQwen3VLTextModel {
                          simulated_free_vram = mem.free;
                          is_vram_checked = true;
                          // [FIX] Slimmer safety floor
-                         let os_reserve = 50_000_000; 
+                         let os_reserve = 100_000_000; 
                          safety_floor = os_reserve + kv_reserve + estimated_activation_buffer;
                      }
                  }
@@ -1671,7 +1671,7 @@ impl QuantizedQwen3VLTextModel {
         }
         
         let cost_per_layer = if baking_only { layer_weight_size / 3 } else { layer_weight_size };
-        let estimated_activation_buffer = 50_000_000; 
+        let estimated_activation_buffer = 100_000_000; 
 
         let mut simulated_free_vram: u64 = 0;
         let mut is_vram_checked = false;
@@ -1683,7 +1683,7 @@ impl QuantizedQwen3VLTextModel {
                      if let Ok(mem) = dev.memory_info() {
                          simulated_free_vram = mem.free;
                          is_vram_checked = true;
-                         let os_reserve = 50_000_000; 
+                         let os_reserve = 100_000_000; 
                          safety_floor = os_reserve + kv_reserve + estimated_activation_buffer;
                      }
                  }
@@ -1754,9 +1754,14 @@ impl QuantizedQwen3VLTextModel {
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         
-        let target_device = if self.layers[0].device().is_cuda() { Device::new_cuda(0)? } else { Device::Cpu };
+        let target_device = if self.layers[0].device().is_cuda() { self.layers[0].device().clone() } else { Device::Cpu };
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
-        let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
+        let mut xs = if !inputs_embeds.device().same_device(&target_device) {
+            inputs_embeds.to_device(&target_device)?
+        } else {
+            inputs_embeds.clone()
+        };
+        let mut xs = xs.to_dtype(target_dtype)?.contiguous()?;
 
         // --- [A-B-C WINDOW STRATEGY] ---
         // c: Computing (Current Layer)
@@ -2601,7 +2606,7 @@ impl QuantizedQwen3VLModel {
     }
 
     pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
-        // [DEVICE-ALIGNMENT] 임베딩 레이어 장치와 입력 장치 맞춤
+        // [DEVICE-ALIGNMENT] 임베딩 레이어의 장치로 입력 ID를 즉시 이동 (CUDA 보장)
         let emb_dev = self.language_model.embed_tokens.embeddings().device();
         let input_ids = if !input_ids_in.device().same_device(emb_dev) { 
             input_ids_in.to_device(emb_dev)? 
