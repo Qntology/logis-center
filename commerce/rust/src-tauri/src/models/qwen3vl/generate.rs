@@ -286,27 +286,40 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: false }); 
                                 return; 
                             }
-                            let loop_count = if is_relay { 1 } else { bake.layers.len() };
+                            let loop_count = bake.layers.len();
                             let slot = &SLOT_MANAGER.slots[sid];
-                            slot.remaining_layers.store(loop_count, Ordering::SeqCst);
+                            slot.remaining_layers.store(1, Ordering::SeqCst); // Only 1 bundle task now
+                            
+                            let mut bundle_map = std::collections::HashMap::new();
+                            let bundle_fname = if is_relay {
+                                if off == 0 { format!("bundle_relay_kv.safetensors") }
+                                else { format!("bundle_relay_kv_{}.safetensors", off) }
+                            } else {
+                                if off == 0 { format!("bundle_inference_kv.safetensors") }
+                                else { format!("bundle_inference_kv_{}.safetensors", off) }
+                            };
+
                             for l_idx in 0..loop_count {
-                                                            let source = &bake.layers[l_idx];
-                                                                                        let fname = if is_relay { 
-                                                                                            // PUG/Relay Baking: layer_{idx}_reference_kv_{off}.safetensors
-                                                                                            if off == 0 { format!("layer_{}_reference_kv.safetensors", source.layer_idx) } 
-                                                                                            else { format!("layer_{}_reference_kv_{}.safetensors", source.layer_idx, off) } 
-                                                                                        } else { 
-                                                                                            // 2B Inference: layer_{idx}_inference_kv_{off}.safetensors
-                                                                                            if off == 0 { format!("layer_{}_inference_kv.safetensors", source.layer_idx) } 
-                                                                                            else { format!("layer_{}_inference_kv_{}.safetensors", source.layer_idx, off) } 
-                                                                                        };                                                            
-                                                            println!("[SLOT-WORKER] >> Processing Layer {} -> {} (Slot {})", source.layer_idx, fname, sid);
-                                                                let k_res = source.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
+                                let source = &bake.layers[l_idx];
+                                let prefix = format!("l{}_", source.layer_idx);
+                                
+                                let k_res = source.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
                                 let v_res = source.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
-                                let (k_data, v_data) = match (k_res, v_res) { (Ok(k), Ok(v)) => (k, v), _ => { if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 { let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: false }); } continue; } };
-                                let k_shape = source.k_tensor.dims(); let (b, h, s, d) = (k_shape[0], k_shape[1], k_shape[2], k_shape[3]);
-                                let head_size = s * d; let a_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
-                                let mut ka = vec![0.0f32; b * h * a_count * d]; let mut kp = vec![0u8; (b * h * s * d + 7) / 8]; let mut ks = vec![0.0f32; b * h * s];
+                                
+                                let (k_data, v_data) = match (k_res, v_res) { 
+                                    (Ok(k), Ok(v)) => (k, v), 
+                                    _ => continue 
+                                };
+
+                                let k_shape = source.k_tensor.dims(); 
+                                let (b, h, s, d) = (k_shape[0], k_shape[1], k_shape[2], k_shape[3]);
+                                let head_size = s * d; 
+                                let a_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
+                                
+                                let mut ka = vec![0.0f32; b * h * a_count * d]; 
+                                let mut kp = vec![0u8; (b * h * s * d + 7) / 8]; 
+                                let mut ks = vec![0.0f32; b * h * s];
+                                
                                 for bh in 0..(b * h) {
                                     let bho = bh * head_size;
                                     for i in 0..head_size { if k_data[bho + i] >= 0.0 { kp[(bho + i) / 8] |= 1 << ((bho + i) % 8); } }
@@ -316,12 +329,16 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         let mut m = 0.0f32; for &v in td { let a = v.abs(); if a > m { m = a; } } ks[bh * s + ti] = m;
                                     }
                                 }
-                                let mut map = std::collections::HashMap::new();
-                                map.insert("k_anchors".to_string(), Tensor::from_vec(ka, vec![b, h, a_count, d], &Device::Cpu).unwrap());
-                                map.insert("k_packed".to_string(), Tensor::from_vec(kp, vec![(b * h * s * d + 7) / 8], &Device::Cpu).unwrap());
-                                map.insert("k_scales".to_string(), Tensor::from_vec(ks, vec![b, h, s, 1], &Device::Cpu).unwrap());
-                                map.insert("k_shape".to_string(), Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu).unwrap());
-                                let mut va = vec![0.0f32; b * h * a_count * d]; let mut vp = vec![0u8; (b * h * s * d + 7) / 8]; let mut vs = vec![0.0f32; b * h * s];
+                                
+                                bundle_map.insert(format!("{}k_anchors", prefix), Tensor::from_vec(ka, vec![b, h, a_count, d], &Device::Cpu).unwrap());
+                                bundle_map.insert(format!("{}k_packed", prefix), Tensor::from_vec(kp, vec![(b * h * s * d + 7) / 8], &Device::Cpu).unwrap());
+                                bundle_map.insert(format!("{}k_scales", prefix), Tensor::from_vec(ks, vec![b, h, s, 1], &Device::Cpu).unwrap());
+                                bundle_map.insert(format!("{}k_shape", prefix), Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu).unwrap());
+                                
+                                let mut va = vec![0.0f32; b * h * a_count * d]; 
+                                let mut vp = vec![0u8; (b * h * s * d + 7) / 8]; 
+                                let mut vs = vec![0.0f32; b * h * s];
+                                
                                 for bh in 0..(b * h) {
                                     let bho = bh * head_size;
                                     for i in 0..head_size { if v_data[bho + i] >= 0.0 { vp[(bho + i) / 8] |= 1 << ((bho + i) % 8); } }
@@ -331,20 +348,22 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         let mut m = 0.0f32; for &v in td { let a = v.abs(); if a > m { m = a; } } vs[bh * s + ti] = m;
                                     }
                                 }
-                                map.insert("v_anchors".to_string(), Tensor::from_vec(va, vec![b, h, a_count, d], &Device::Cpu).unwrap());
-                                map.insert("v_packed".to_string(), Tensor::from_vec(vp, vec![(b * h * s * d + 7) / 8], &Device::Cpu).unwrap());
-                                                                map.insert("v_scales".to_string(), Tensor::from_vec(vs, vec![b, h, s, 1], &Device::Cpu).unwrap());
-                                                                map.insert("mode".to_string(), Tensor::from_vec(vec![3u32], (1,), &Device::Cpu).unwrap());
-                                                                
-                                                                let _ = io_tx_inner.blocking_send(SaveTask { 
-                                                                    slot_id: sid, 
-                                                                    path: t_dir.join(fname), 
-                                                                    tensors: map, 
-                                                                    is_last: l_idx == loop_count - 1,
-                                                                    block_idx: bake.block_idx,
-                                                                    registry: bake.registry.clone()
-                                                                });
-                                                            }
+                                
+                                bundle_map.insert(format!("{}v_anchors", prefix), Tensor::from_vec(va, vec![b, h, a_count, d], &Device::Cpu).unwrap());
+                                bundle_map.insert(format!("{}v_packed", prefix), Tensor::from_vec(vp, vec![(b * h * s * d + 7) / 8], &Device::Cpu).unwrap());
+                                bundle_map.insert(format!("{}v_scales", prefix), Tensor::from_vec(vs, vec![b, h, s, 1], &Device::Cpu).unwrap());
+                            }
+                            
+                            bundle_map.insert("mode".to_string(), Tensor::from_vec(vec![3u32], (1,), &Device::Cpu).unwrap());
+                            
+                            let _ = io_tx_inner.blocking_send(SaveTask { 
+                                slot_id: sid, 
+                                path: t_dir.join(bundle_fname), 
+                                tensors: bundle_map, 
+                                is_last: true,
+                                block_idx: bake.block_idx,
+                                registry: bake.registry.clone()
+                            });
                                 
                         }));
                         
@@ -399,32 +418,41 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                 .map_err(|e| format!("Deserialization Error: {:?}", e))?;
                 
                                             // [FIX] DYNAMIC SHAPE DETECTION
-                                            let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor("k_anchors") {
-                                                let dims = t_view.shape(); 
-                                                let data = unsafe { std::slice::from_raw_parts(t_view.data().as_ptr() as *const f32, t_view.data().len() / 4).to_vec() };
-                                                let s_len = if let Ok(v) = st.tensor("k_shape") {
-                                                    let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const u32, v.data().len() / 4) };
-                                                    v_u32[2] as usize
-                                                } else { 256 };
-                                                (Some(data), vec![dims[0], dims[1], s_len, dims[3]], dims[2])
-                                            } else { (None, vec![1, 16, 256, 128], 36) };
-                
-                                            let ex_v = |name: &str| -> Option<Vec<f32>> { 
-                                                st.tensor(name).ok().map(|v| unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec() }) 
-                                            };
+                                                                                            // [BUNDLE-EXTRACT]
+                                                                                            let prefix = format!("l{}_", l_idx);
+                                                                                            let ka_name = format!("{}k_anchors", prefix);
+                                                                                            let kh_name = format!("{}k_shape", prefix);
+                                                                                            let kp_name = format!("{}k_packed", prefix);
+                                                                                            let ks_name = format!("{}k_scales", prefix);
+                                                                                            let va_name = format!("{}v_anchors", prefix);
+                                                                                            let vp_name = format!("{}v_packed", prefix);
+                                                                                            let vs_name = format!("{}v_scales", prefix);
                                             
-                                            if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ka_data, st.tensor("k_packed").ok(), ex_v("k_scales"), ex_v("v_anchors"), st.tensor("v_packed").ok(), ex_v("v_scales")) {
-                                                let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
-                                                    k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                    k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
-                                                    k_scales: Tensor::from_vec(ks, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                    v_anchors: Tensor::from_vec(va, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                    v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
-                                                    v_scales: Tensor::from_vec(vs, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                    original_shape: o_s 
-                                                };
-                
-                                                if let Ok(mut inner) = shared_block.inner.write() {
+                                                                                            let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor(&ka_name) {
+                                                                                                let dims = t_view.shape();
+                                                                                                let data = unsafe { std::slice::from_raw_parts(t_view.data().as_ptr() as *const f32, t_view.data().len() / 4).to_vec() };
+                                                                                                let s_len = if let Ok(v) = st.tensor(&kh_name) {
+                                                                                                    let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const u32, v.data().len() / 4) };
+                                                                                                    v_u32[2] as usize
+                                                                                                } else { 256 };
+                                                                                                (Some(data), vec![dims[0], dims[1], s_len, dims[3]], dims[2])
+                                                                                            } else { (None, vec![1, 16, 256, 128], 36) };
+                                                            
+                                                                                            let ex_v = |name: &str| -> Option<Vec<f32>> { 
+                                                                                                st.tensor(name).ok().map(|v| unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec() }) 
+                                                                                            };
+                                                                                            
+                                                                                            if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ka_data, st.tensor(&kp_name).ok(), ex_v(&ks_name), ex_v(&va_name), st.tensor(&vp_name).ok(), ex_v(&vs_name)) {
+                                                                                                let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
+                                                                                                    k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                                                                    k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
+                                                                                                    k_scales: Tensor::from_vec(ks, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                                                                    v_anchors: Tensor::from_vec(va, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                                                                    v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
+                                                                                                    v_scales: Tensor::from_vec(vs, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                                                                    original_shape: o_s 
+                                                                                                };
+                                                                                            if let Ok(mut inner) = shared_block.inner.write() {
                                                     inner.bitkv_metadata = Some(metadata.clone());
                                                     
                                                     if let Ok(mut reg) = registry.entries.write() {
@@ -453,8 +481,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 
                                         if let Err(e) = res {
                                             println!("[WORKER-LOAD] !! [ERROR] Layer {} Block {} failed: {} (Slot {})", l_idx, b_idx, e, s_id);
+                                            SLOT_MANAGER.release_slot(s_id).await;
                                         }
-                                        SLOT_MANAGER.release_slot(s_id).await;
+                                        // SLOT_MANAGER.release_slot(s_id).await; // Removed for Reservation
                                     });
                                 }
                                 SlotTask::ChunkedLoad(chunk) => {
@@ -498,10 +527,20 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                 let st = safetensors::SafeTensors::deserialize(&content)
                                                     .map_err(|e| format!("Deserialization Error: {:?}", e))?;
                 
-                                                let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor("k_anchors") {
+                                                // [BUNDLE-EXTRACT]
+                                                let prefix = format!("l{}_", l_idx);
+                                                let ka_name = format!("{}k_anchors", prefix);
+                                                let kh_name = format!("{}k_shape", prefix);
+                                                let kp_name = format!("{}k_packed", prefix);
+                                                let ks_name = format!("{}k_scales", prefix);
+                                                let va_name = format!("{}v_anchors", prefix);
+                                                let vp_name = format!("{}v_packed", prefix);
+                                                let vs_name = format!("{}v_scales", prefix);
+
+                                                let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor(&ka_name) {
                                                     let dims = t_view.shape();
                                                     let data = unsafe { std::slice::from_raw_parts(t_view.data().as_ptr() as *const f32, t_view.data().len() / 4).to_vec() };
-                                                    let s_len = if let Ok(v) = st.tensor("k_shape") {
+                                                    let s_len = if let Ok(v) = st.tensor(&kh_name) {
                                                         let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const u32, v.data().len() / 4) };
                                                         v_u32[2] as usize
                                                     } else { 256 };
@@ -512,7 +551,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                     st.tensor(name).ok().map(|v| unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec() }) 
                                                 };
                                                 
-                                                if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ka_data, st.tensor("k_packed").ok(), ex_v("k_scales"), ex_v("v_anchors"), st.tensor("v_packed").ok(), ex_v("v_scales")) {
+                                                if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ka_data, st.tensor(&kp_name).ok(), ex_v(&ks_name), ex_v(&va_name), st.tensor(&vp_name).ok(), ex_v(&vs_name)) {
                                                     let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
                                                         k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
                                                         k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
@@ -527,7 +566,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                         inner.bitkv_metadata = Some(metadata.clone());
                                                         if let Ok(mut reg) = reg_inner.entries.write() {
                                                             if b_idx < reg.len() { 
-                                                                let is_relay = target_path.file_name().map(|n| n.to_string_lossy().contains("layer_relay_kv")).unwrap_or(false);
+                                                                let is_relay = target_path.file_name().map(|n| n.to_string_lossy().contains("bundle_relay_kv")).unwrap_or(false);
                                                                 if is_relay {
                                                                     for i in 0..28 { 
                                                                         reg[b_idx].location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
@@ -535,20 +574,20 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                     }
                                                                     let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
                                                                     for i in 0..28 { cache[i] = Some(metadata.clone()); }
-                                                                    println!("[WORKER-CHUNK] << [SUCCESS] RELAY Block {} populated into Slot {}.", b_idx, s_id);
+                                                                    println!("[WORKER-CHUNK] << [SUCCESS] RELAY Block {} populated from Bundle (Slot {}).", b_idx, s_id);
                                                                 } else {
                                                                     reg[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
                                                                     reg[b_idx].slot_ids[l_idx] = Some(s_id);
                                                                     let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
                                                                     cache[l_idx] = Some(metadata);
-                                                                    println!("[WORKER-CHUNK] << [SUCCESS] Layer {} Block {} loaded into Slot {}.", l_idx, b_idx, s_id);
+                                                                    println!("[WORKER-CHUNK] << [SUCCESS] Layer {} Block {} extracted from Bundle (Slot {}).", l_idx, b_idx, s_id);
                                                                 }
                                                             }
                                                         }
                                                     }
                                                     Ok(())
                                                 } else {
-                                                    Err("Missing tensors".to_string())
+                                                    Err(format!("Missing Layer {} tensors in bundle", l_idx))
                                                 }
                                             }.await;
                 
