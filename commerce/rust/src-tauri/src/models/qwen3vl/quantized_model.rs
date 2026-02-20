@@ -147,7 +147,7 @@ impl QLinear {
 }
 
 // [QUANTIZED-KV] Storage for 4-bit compressed KV cache in VRAM
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KVLocation {
     VRAM,
     RAM,
@@ -199,14 +199,31 @@ pub struct KVBlock {
     pub inner: Arc<std::sync::RwLock<KVBlockInner>>,
 }
 
-// [NEW] 중앙 집중식 KV 목차의 각 항목 (별도 고정 슬롯 관리용)
 #[derive(Clone)]
+pub struct BitKVMetadata {
+    pub k_anchors: Tensor,
+    pub k_packed: Tensor,
+    pub k_scales: Tensor,
+    pub v_anchors: Tensor,
+    pub v_packed: Tensor,
+    pub v_scales: Tensor,
+    pub original_shape: Vec<usize>,
+}
+
+fn default_bitkv_cache() -> Arc<std::sync::RwLock<Vec<Option<BitKVMetadata>>>> {
+    Arc::new(std::sync::RwLock::new(vec![None; 28]))
+}
+
+// [NEW] 중앙 집중식 KV 목차의 각 항목 (별도 고정 슬롯 관리용)
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RegistryEntry {
     pub location: Vec<KVLocation>, // [Layer Index] -> Location
     pub slot_ids: Vec<Option<usize>>, // [Layer Index] -> Slot ID
     pub token_start: usize,
     pub token_len: usize,
     pub ssd_path: Option<std::path::PathBuf>,
+    #[serde(skip, default = "default_bitkv_cache")]
+    pub bitkv_cache: Arc<std::sync::RwLock<Vec<Option<BitKVMetadata>>>>,
 }
 
 // [NEW] 모델 전체가 공유하는 2차원 KV 목차
@@ -220,6 +237,23 @@ impl KVRegistry {
         Self {
             entries: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
+    }
+
+    pub fn save_to_file(&self, path: &std::path::Path) -> Result<()> {
+        let entries = self.entries.read().unwrap();
+        let json = serde_json::to_string_pretty(&*entries)?;
+        std::fs::write(path.join("metadata.json"), json)?;
+        Ok(())
+    }
+
+    pub fn load_from_file(&self, path: &std::path::Path) -> Result<()> {
+        let meta_path = path.join("metadata.json");
+        if !meta_path.exists() { return Ok(()); }
+        let json = std::fs::read_to_string(meta_path)?;
+        let loaded: Vec<RegistryEntry> = serde_json::from_str(&json)?;
+        let mut entries = self.entries.write().unwrap();
+        *entries = loaded;
+        Ok(())
     }
 }
 
@@ -249,17 +283,6 @@ impl KVBlock {
             })),
         }
     }
-}
-
-#[derive(Clone)]
-pub struct BitKVMetadata {
-    pub k_anchors: Tensor,
-    pub k_packed: Tensor,
-    pub k_scales: Tensor,
-    pub v_anchors: Tensor,
-    pub v_packed: Tensor,
-    pub v_scales: Tensor,
-    pub original_shape: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -500,6 +523,7 @@ impl QuantizedQwen3VLTextAttention {
                             token_start: current_total,
                             token_len: take,
                             ssd_path: None,
+                            bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; 28])),
                         });
                     }
                 }
@@ -652,14 +676,31 @@ impl QuantizedQwen3VLTextAttention {
                 }
                 KVLocation::RAM | KVLocation::RamSticky => {
                     let mut inner = block.inner.write().unwrap();
-                    if k.is_none() {
-                        if let Some(meta) = &inner.bitkv_metadata {
+                    if inner.k_cache.is_none() {
+                        // 1. Try local metadata
+                        let meta = inner.bitkv_metadata.clone();
+                        
+                        // 2. Try registry fallback if local is missing
+                        let fallback_meta = if meta.is_none() {
+                            let reg = self.registry.entries.read().unwrap();
+                            if index < reg.len() {
+                                let cache = reg[index].bitkv_cache.read().unwrap();
+                                cache[self.layer_idx].clone()
+                            } else { None }
+                        } else { None };
+
+                        let final_meta = meta.or(fallback_meta);
+
+                        if let Some(meta) = final_meta {
                             let k_raw = self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?;
                             let v_raw = self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?;
                             inner.k_cache = Some(k_raw.clone());
                             inner.v_cache = Some(v_raw.clone());
                             k = Some(k_raw);
                             v = Some(v_raw);
+                        } else {
+                            println!("[ERROR] Layer {} Block {} location is RAM but NO metadata found! (Index: {})", 
+                                self.layer_idx, index, index);
                         }
                     }
                 }
@@ -1143,6 +1184,7 @@ impl QuantizedQwen3VLTextAttention {
                     token_start: *offset,
                     token_len: b_len,
                     ssd_path: Some(path.clone()),
+                    bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; 28])),
                 });
             }
             reg[i].location[self.layer_idx] = KVLocation::SSD;

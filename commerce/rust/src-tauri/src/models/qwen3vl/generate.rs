@@ -217,20 +217,35 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         while let Some(task) = rx.recv().await {
             match task {
                 SlotTask::Bake(bake) => {
-                    println!("[SLOT-WORKER] >> Received instruction: BAKE for Slot {}", bake.slot_id);
+                    println!("[SLOT-WORKER] >> Received instruction: BAKE for Slot {}. TaskDir: {:?}, Offset: {}", bake.slot_id, bake.task_dir, bake.offset);
                     let io_tx_inner = io_tx.clone();
                     tokio::task::spawn_blocking(move || {
                         let sid = bake.slot_id;
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             let (t_dir, kv_n, off, is_relay) = (bake.task_dir, bake.kv_name, bake.offset, bake.is_relay_baking);
-                            if bake.layers.is_empty() { let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid }); return; }
+                            if bake.layers.is_empty() { 
+                                println!("[SLOT-WORKER] !! Bake layers empty for Slot {}. Releasing.", sid);
+                                let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid }); 
+                                return; 
+                            }
                             let loop_count = if is_relay { 1 } else { bake.layers.len() };
                             let slot = &SLOT_MANAGER.slots[sid];
                             slot.remaining_layers.store(loop_count, Ordering::SeqCst);
                             for l_idx in 0..loop_count {
                                 let source = &bake.layers[l_idx];
-                                let fname = if is_relay { if off == 0 { "layer_relay_kv.safetensors".to_string() } else { format!("layer_relay_kv_{}.safetensors", off) } }
-                                else { match (&kv_n, off) { (Some(n), 0) => format!("layer_{}_kv.safetensors", n), (Some(n), o) => format!("layer_{}_kv_{}.safetensors", n, o), (None, 0) => format!("layer_{}_kv.safetensors", source.layer_idx), (None, o) => format!("layer_{}_kv_{}.safetensors", source.layer_idx, o) } };
+                                let fname = if is_relay { 
+                                    if off == 0 { "layer_relay_kv.safetensors".to_string() } else { format!("layer_relay_kv_{}.safetensors", off) } 
+                                } else { 
+                                    match (&kv_n, off) { 
+                                        (Some(n), 0) => format!("layer_{}_kv.safetensors", n), 
+                                        (Some(n), o) => format!("layer_{}_kv_{}.safetensors", n, o), 
+                                        (None, 0) => format!("layer_{}_kv.safetensors", source.layer_idx), 
+                                        (None, o) => format!("layer_{}_kv_{}.safetensors", source.layer_idx, o) 
+                                    } 
+                                };
+                                
+                                println!("[SLOT-WORKER] >> Processing Layer {} -> {} (Slot {})", source.layer_idx, fname, sid);
+                                
                                 let k_res = source.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
                                 let v_res = source.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
                                 let (k_data, v_data) = match (k_res, v_res) { (Ok(k), Ok(v)) => (k, v), _ => { if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 { let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid }); } continue; } };
@@ -324,21 +339,37 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ka_data, st.tensor("k_packed").ok(), ex_v("k_scales"), ex_v("v_anchors"), st.tensor("v_packed").ok(), ex_v("v_scales")) {
                                             // [FIX] Explicit scope to drop write guards before .await
                                             {
+                                                let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
+                                                    k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                    k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
+                                                    k_scales: Tensor::from_vec(ks, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                    v_anchors: Tensor::from_vec(va, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                    v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
+                                                    v_scales: Tensor::from_vec(vs, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                    original_shape: o_s 
+                                                };
+
                                                 if let Ok(mut inner) = shared_block.inner.write() {
-                                                    inner.bitkv_metadata = Some(crate::models::qwen3vl::quantized_model::BitKVMetadata { 
-                                                        k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                        k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
-                                                        k_scales: Tensor::from_vec(ks, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                        v_anchors: Tensor::from_vec(va, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                        v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
-                                                        v_scales: Tensor::from_vec(vs, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                        original_shape: o_s 
-                                                    });
+                                                    inner.bitkv_metadata = Some(metadata.clone());
                                                     
                                                     if let Ok(mut reg) = registry.entries.write() {
                                                         if b_idx < reg.len() { 
-                                                            reg[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
-                                                            println!("[WORKER] << Successfully loaded Layer {} Block {}.", l_idx, b_idx);
+                                                            let is_relay = target_path.file_name().map(|n| n.to_string_lossy().contains("layer_relay_kv")).unwrap_or(false);
+                                                            
+                                                            if is_relay {
+                                                                // [BROADCAST] If it's a relay file, it's valid for ALL 28 layers
+                                                                println!("[WORKER] << Successfully loaded RELAY Block {} for ALL layers.", b_idx);
+                                                                let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
+                                                                for i in 0..28 {
+                                                                    reg[b_idx].location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
+                                                                    cache[i] = Some(metadata.clone());
+                                                                }
+                                                            } else {
+                                                                reg[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
+                                                                let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
+                                                                cache[l_idx] = Some(metadata);
+                                                                println!("[WORKER] << Successfully loaded Layer {} Block {}.", l_idx, b_idx);
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -407,28 +438,42 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                 st.tensor(name).ok().map(|v| unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec() }) 
                                             };
                                             
-                                                                                    if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ka_data, st.tensor("k_packed").ok(), ex_v("k_scales"), ex_v("v_anchors"), st.tensor("v_packed").ok(), ex_v("v_scales")) {
-                                                                                        // [FIX] Explicit scope to drop write guards before .await
-                                                                                        {
-                                                                                            if let Ok(mut inner) = block.inner.write() {
-                                                                                                inner.bitkv_metadata = Some(crate::models::qwen3vl::quantized_model::BitKVMetadata { 
-                                                                                                    k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                                                                    k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
-                                                                                                    k_scales: Tensor::from_vec(ks, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                                                                    v_anchors: Tensor::from_vec(va, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                                                                    v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
-                                                                                                    v_scales: Tensor::from_vec(vs, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                                                                    original_shape: o_s 
-                                                                                                });
-                                                                                                
-                                                                                                if let Ok(mut reg) = reg_inner.entries.write() {
-                                                                                                    if b_idx < reg.len() { 
-                                                                                                        reg[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
-                                                                                                    }
-                                                                                                }
-                                                                                            }
-                                                                                        }
-                                                                                    }                                        },
+                                                                                                                                                                        if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ka_data, st.tensor("k_packed").ok(), ex_v("k_scales"), ex_v("v_anchors"), st.tensor("v_packed").ok(), ex_v("v_scales")) {
+                                                                                                                                                                            // [FIX] Explicit scope to drop write guards before .await
+                                                                                                                                                                            {
+                                                                                                                                                                                let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
+                                                                                                                                                                                    k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                                                                                                                                                    k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
+                                                                                                                                                                                    k_scales: Tensor::from_vec(ks, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                                                                                                                                                    v_anchors: Tensor::from_vec(va, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                                                                                                                                                    v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
+                                                                                                                                                                                    v_scales: Tensor::from_vec(vs, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                                                                                                                                                    original_shape: o_s 
+                                                                                                                                                                                };
+                                                                                    
+                                                                                                                                                                                if let Ok(mut inner) = block.inner.write() {
+                                                                                                                                                                                    inner.bitkv_metadata = Some(metadata.clone());
+                                                                                                                                                                                    
+                                                                                                                                                                                    if let Ok(mut reg) = reg_inner.entries.write() {
+                                                                                                                                                                                        if b_idx < reg.len() { 
+                                                                                                                                                                                            let is_relay = target_path.file_name().map(|n| n.to_string_lossy().contains("layer_relay_kv")).unwrap_or(false);
+                                                                                                                                                                                            if is_relay {
+                                                                                                                                                                                                let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
+                                                                                                                                                                                                for i in 0..28 {
+                                                                                                                                                                                                    reg[b_idx].location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
+                                                                                                                                                                                                    cache[i] = Some(metadata.clone());
+                                                                                                                                                                                                }
+                                                                                                                                                                                            } else {
+                                                                                                                                                                                                reg[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; 
+                                                                                                                                                                                                let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
+                                                                                                                                                                                                cache[l_idx] = Some(metadata);
+                                                                                                                                                                                            }
+                                                                                                                                                                                        }
+                                                                                                                                                                                    }
+                                                                                                                                                                                }
+                                                                                                                                                                            }
+                                                                                                                                                                        }
+                                                                                                                            },
                                         Err(e) => println!("[WORKER] !! Deserialization Error for Layer {} Block {}: {:?}", l_idx, b_idx, e),
                                     }
                                 },
@@ -462,6 +507,20 @@ impl ModelVariant {
         } 
     }
     pub fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage() } }
+    pub fn save_metadata_to_file(&self, path: &Path) -> Result<()> {
+        match self {
+            Self::QuantizedVL(m) => m.language_model.registry.save_to_file(path),
+            Self::QuantizedText(m) => m.language_model.registry.save_to_file(path),
+            _ => Ok(())
+        }
+    }
+    pub fn load_metadata_from_file(&self, path: &Path) -> Result<()> {
+        match self {
+            Self::QuantizedVL(m) => m.language_model.registry.load_from_file(path),
+            Self::QuantizedText(m) => m.language_model.registry.load_from_file(path),
+            _ => Ok(())
+        }
+    }
     pub fn inject_kv_bitkv(&mut self, ka: &[Tensor], kp: &[Tensor], ks: &[Tensor], va: &[Tensor], vp: &[Tensor], vs: &[Tensor], os: &[usize]) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.inject_live_kv_bitkv(ka, kp, ks, va, vp, vs, os), Self::QuantizedText(m) => m.language_model.inject_live_kv_bitkv(ka, kp, ks, va, vp, vs, os), _ => Ok(()) } }
     pub fn is_cpu(&self) -> bool { match self { Self::Standard(m) => m.device().is_cpu(), Self::QuantizedVL(m) => m.language_model.is_forced_cpu, Self::QuantizedText(m) => m.language_model.is_forced_cpu } }
 }
@@ -543,6 +602,15 @@ impl Qwen3VLGenerateModel {
             // [STRICT-FLUSH] Clear the SSD road before 2B starts reading
             println!("[BAKING] All blocks queued. Waiting for SSD Flush (Crucial for 2B Performance)...");
             SLOT_MANAGER.wait_for_all_tasks().await;
+            
+            // [METADATA-PERSISTENCE] Save registry to file for cross-layer/cross-session reliability
+            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+            if let Err(e) = self.qwen3_vl.save_metadata_to_file(&path) {
+                println!("[BAKING] !! Metadata Save Failed: {:?}", e);
+            } else {
+                println!("[BAKING] Metadata persisted to {:?}", path.join("metadata.json"));
+            }
+
             println!("[BAKING] SSD Flush Complete. Road cleared.");
             self.clear_temporal_kv_caches();
         }
@@ -581,8 +649,17 @@ impl Qwen3VLGenerateModel {
                     }
                 }
                 SLOT_MANAGER.wait_for_all_tasks().await;
+
+                // [METADATA-PERSISTENCE] Save registry to file for cross-layer/cross-session reliability
+                let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+                if let Err(e) = self.qwen3_vl.save_metadata_to_file(&path) {
+                    println!("[GENERATE] !! Metadata Save Failed: {:?}", e);
+                } else {
+                    println!("[GENERATE] Metadata persisted to {:?}", path.join("metadata.json"));
+                }
+
+                self.clear_temporal_kv_caches();
             }
-            self.clear_temporal_kv_caches();
         }
         
         let mut curr_s_off = t_toks;
@@ -651,5 +728,12 @@ impl Qwen3VLGenerateModel {
     pub fn drop_kv_storage(&mut self) -> Result<()> { self.qwen3_vl.drop_kv_storage() }
     pub fn clear_kv_cache(&mut self) { self.clear_temporal_kv_caches(); }
     pub fn truncate_kv_cache(&mut self, l: usize) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.truncate_kv_cache(l), ModelVariant::QuantizedText(m) => m.truncate_kv_cache(l), _ => Ok(()) } }
-    pub fn load_kv_from_disk(&mut self, p: &Path, n: Option<&str>) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.load_kv_cache(p, &self.text_device, 0, 128, n), ModelVariant::QuantizedText(m) => m.load_kv_cache(p, &self.text_device, 0, 128, n), _ => Ok(()) } }
+    pub fn load_kv_from_disk(&mut self, p: &Path, n: Option<&str>) -> Result<()> { 
+        let _ = self.qwen3_vl.load_metadata_from_file(p);
+        match &mut self.qwen3_vl { 
+            ModelVariant::QuantizedVL(m) => m.load_kv_cache(p, &self.text_device, 0, 128, n), 
+            ModelVariant::QuantizedText(m) => m.load_kv_cache(p, &self.text_device, 0, 128, n), 
+            _ => Ok(()) 
+        } 
+    }
 }
