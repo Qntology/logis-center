@@ -720,34 +720,28 @@ impl QuantizedQwen3VLTextAttention {
             };
 
             if loc == KVLocation::SSD {
-                let (spath, reserved_sid) = {
+                let spath = {
                     let reg = self.registry.entries.read().unwrap();
-                    (reg[index].ssd_path.clone(), reg[index].slot_ids[self.layer_idx])
+                    reg[index].ssd_path.clone()
                 };
-
                 if let Some(path) = spath {
-                    // [REUSE-LOGIC] 이미 예약된 슬롯이 있다면 로딩 작업이 진행 중인 것으로 간주
-                    if reserved_sid.is_some() {
-                        loc = KVLocation::Loading;
-                    } else {
-                        {
-                            let mut reg = self.registry.entries.write().unwrap();
-                            reg[index].location[self.layer_idx] = KVLocation::Loading;
-                        }
-                        let shared_block = block.clone();
-                        let reg_clone = self.registry.clone();
-                        let l_idx = self.layer_idx;
-                        tauri::async_runtime::spawn(async move {
-                            use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
-                            let sid = SLOT_MANAGER.acquire_read_slot().await;
-                            if let Ok(tx) = get_load_worker().await {
-                                let _ = tx.send(SlotTask::Load(LoadTask {
-                                    slot_id: sid, path, layer_idx: l_idx, kv_name: None, shared_block, registry: reg_clone
-                                })).await;
-                            }
-                        });
-                        loc = KVLocation::Loading;
+                    {
+                        let mut reg = self.registry.entries.write().unwrap();
+                        reg[index].location[self.layer_idx] = KVLocation::Loading;
                     }
+                    let shared_block = block.clone();
+                    let reg_clone = self.registry.clone();
+                    let l_idx = self.layer_idx;
+                    tauri::async_runtime::spawn(async move {
+                        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
+                        let sid = SLOT_MANAGER.acquire_read_slot().await;
+                        if let Ok(tx) = get_load_worker().await {
+                            let _ = tx.send(SlotTask::Load(LoadTask {
+                                slot_id: sid, path, layer_idx: l_idx, kv_name: None, shared_block, registry: reg_clone
+                            })).await;
+                        }
+                    });
+                    loc = KVLocation::Loading;
                 }
             }
 
@@ -822,12 +816,6 @@ impl QuantizedQwen3VLTextAttention {
             let mut k = k.ok_or_else(|| candle_core::Error::Msg("KV Cache not ready after wait".to_string()))?;
             let mut v = v.ok_or_else(|| candle_core::Error::Msg("KV Cache not ready after wait".to_string()))?;
 
-            // [FIX] Ensure KV tensors are on the correct device AND have the correct DType before calculation
-            if !k.device().same_device(dev) { k = k.to_device(dev)?; }
-            if k.dtype() != target_dtype { k = k.to_dtype(target_dtype)?; }
-            if !v.device().same_device(dev) { v = v.to_device(dev)?; }
-            if v.dtype() != target_dtype { v = v.to_dtype(target_dtype)?; }
-
             // [FIX] Update b_len to actual tensor dimensions to prevent shape mismatch in broadcast_add
             // This handles the case where the last block (e.g. 205 tokens) is smaller than the standard 256.
             b_len = k.dim(2)?;
@@ -881,22 +869,8 @@ impl QuantizedQwen3VLTextAttention {
 
         // 5. [BATCH-VRAM] Fast single-pass for all VRAM blocks
         if !vram_ks.is_empty() {
-            // [FIX] Pre-verify device AND dtype alignment before cat to prevent panic
-            let mut final_ks = Vec::with_capacity(vram_ks.len());
-            let mut final_vs = Vec::with_capacity(vram_vs.len());
-            for mut tk in vram_ks { 
-                if !tk.device().same_device(dev) { tk = tk.to_device(dev)?; }
-                if tk.dtype() != target_dtype { tk = tk.to_dtype(target_dtype)?; }
-                final_ks.push(tk); 
-            }
-            for mut tv in vram_vs { 
-                if !tv.device().same_device(dev) { tv = tv.to_device(dev)?; }
-                if tv.dtype() != target_dtype { tv = tv.to_dtype(target_dtype)?; }
-                final_vs.push(tv); 
-            }
-
-            let mut k = Tensor::cat(&final_ks, 2)?;
-            let mut v = Tensor::cat(&final_vs, 2)?;
+            let mut k = Tensor::cat(&vram_ks, 2)?;
+            let mut v = Tensor::cat(&vram_vs, 2)?;
             
             if self.num_kv_groups > 1 {
                 let (b, h, s, d) = k.dims4()?;
@@ -950,32 +924,17 @@ impl QuantizedQwen3VLTextAttention {
             .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
         let attn_output = self.o_proj.forward(&attn_output)?;
 
-        // [INTELLIGENT-RELEASE] 
-        // Now that the GPU is done with this layer, release all slots associated with it.
-        let l_idx = self.layer_idx;
-        let sids_to_release: Vec<usize> = {
-            let mut reg = self.registry.entries.write().unwrap();
-            reg.iter_mut().filter_map(|entry| entry.slot_ids[l_idx].take()).collect()
-        };
-
-        if !sids_to_release.is_empty() {
-            tauri::async_runtime::spawn(async move {
-                use crate::models::qwen3vl::generate::SLOT_MANAGER;
-                for sid in sids_to_release {
-                    SLOT_MANAGER.release_slot(sid).await;
-                }
-            });
-        }
-
-        // [SMART-PURGE-V3] Memory-Efficient Caching for 8GB RAM
+        // [SMART-PURGE-V2] 256개 단위 SSD 파이프라인 연동
         for block in &mut self.kv_blocks {
             let mut inner = block.inner.write().unwrap();
-            if inner.ssd_path.is_some() || inner.bitkv_metadata.is_some() {
+            
+            // SSD에 이미 저장이 완료된 블록만 메모리(VRAM/RAM)에서 비웁니다.
+            // 아직 SSD 경로가 없는 최신 블록(추론 중인 데이터)은 Baker가 처리할 때까지 유지합니다.
+            if inner.ssd_path.is_some() {
                 if inner.location == KVLocation::VRAM || inner.location == KVLocation::RAM {
                     inner.k_cache = None;
                     inner.v_cache = None;
-                    if inner.bitkv_metadata.is_some() { inner.location = KVLocation::RAM; }
-                    else { inner.location = KVLocation::SSD; }
+                    inner.location = KVLocation::SSD;
                 }
             }
         }
@@ -1980,7 +1939,7 @@ impl QuantizedQwen3VLTextModel {
                                                                             let current_progress = seqlen_offset + i + take;
                                                                             let (reads, writes, free) = SLOT_MANAGER.get_counts();
                                                                             println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Chunk: {}", 
-                                                                                mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, seq_len, chunk_idx);
+                                                                                mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len, chunk_idx);
                                                                         }
                                                                     }
                                                                 }
@@ -1988,9 +1947,8 @@ impl QuantizedQwen3VLTextModel {
 
                                                             let layer_ptr = &mut self.layers[layer_idx];
                                                             let dev_name = if layer_ptr.device().is_cuda() { "GPU" } else { "CPU" };
-                                                            let (reads, writes, free) = crate::models::qwen3vl::generate::SLOT_MANAGER.get_counts();
-                                                            println!("[HORIZONTAL] Layer {:2} | Chunk {} (Offset: {}, Size: {}) - START on {} [Read:{}, Write:{}, Idle:{}]", 
-                                                                layer_idx, chunk_idx, i, take, dev_name, reads, writes, free);
+                                                            println!("[HORIZONTAL] Layer {:2} | Chunk {} (Offset: {}, Size: {}) - START on {}", 
+                                                                layer_idx, chunk_idx, i, take, dev_name);
                                                             
                                                             let xs_chunk = xs.narrow(1, i, take)?;
                                                             let cos_chunk = cos.narrow(1, i, take)?;
@@ -2252,12 +2210,11 @@ impl QuantizedQwen3VLTextModel {
                     let fname = entry.file_name().to_string_lossy().to_string();
                     
                     // Match pattern: layer_relay_kv_{offset}.safetensors OR layer_{any}_kv_{offset}.safetensors
-                    // [FIX] Baker uses 'bundle_' prefix, so we must include it in scan.
-                    let is_relay = fname.contains("layer_relay_kv") || fname.contains("bundle_relay_kv");
-                    let is_layer_specific = (fname.starts_with("layer_") || fname.starts_with("bundle_")) && fname.contains("_kv");
+                    let is_relay = fname.contains("layer_relay_kv");
+                    let is_layer_specific = fname.starts_with("layer_") && fname.contains("_kv");
                     
                     if (is_relay || is_layer_specific) && fname.ends_with(".safetensors") {
-                        let offset = if fname == "layer_relay_kv.safetensors" || fname == "bundle_relay_kv.safetensors" || fname.ends_with("_kv.safetensors") {
+                        let offset = if fname == "layer_relay_kv.safetensors" || fname.ends_with("_kv.safetensors") {
                             0
                         } else {
                             fname.strip_suffix(".safetensors")
