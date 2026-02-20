@@ -742,7 +742,7 @@ impl Qwen3VLGenerateModel {
 
             // [RELAY-BAKING] 릴레이 시스템에 의해 SSD_PENDING으로 분류된 블록들을 찾아 비동기 저장
             if let Some(s_id) = &sid {
-                let pending_blocks = self.get_blocks_by_location(KVLocation::SSD_PENDING);
+                let pending_blocks = self.get_blocks_by_location(KVLocation::SSD_PENDING)?;
                 if !pending_blocks.is_empty() {
                     println!("[GENERATE] >> [RELAY-TRIGGER] Pushing {} blocks to SSD Baker...", pending_blocks.len());
                     for (ks, vs, block_offset, block_idx) in pending_blocks {
@@ -787,42 +787,42 @@ impl Qwen3VLGenerateModel {
         }
     }
 
-        pub fn get_blocks_by_location(&self, target_loc: KVLocation) -> Vec<(Vec<Tensor>, Vec<Tensor>, usize, usize)> {
-            let mut results = Vec::new();
-            let layers = match &self.qwen3_vl {
-                ModelVariant::QuantizedVL(m) => Some(&m.language_model.layers),
-                ModelVariant::QuantizedText(m) => Some(&m.language_model.layers),
-                _ => None
-            };
-            if let Some(layers) = layers {
-                if layers.is_empty() { return vec![]; }
-                let num_blocks = layers[0].self_attn.kv_blocks.len();
-                for b_idx in 0..num_blocks {
-                    let mut ks = Vec::new();
-                    let mut vs = Vec::new();
-                    let mut match_found = false;
-                    let mut offset = 0;
-                                    for l in layers {
-                                        let inner = l.self_attn.kv_blocks[b_idx].inner.read().unwrap();
-                                        // target_loc이거나, 혹은 이미 RAM으로 핸드오프된 데이터를 가져옵니다.
-                                        if inner.location == target_loc || (target_loc == KVLocation::SSD_PENDING && inner.location == KVLocation::RAM && inner.ssd_path.is_none()) {
-                                            if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                                                // 이미 CPU에 있다면 그대로, GPU에 있다면 CPU로 가져옴
-                                                let k_cpu = if k.device().is_cpu() { k.clone() } else { k.to_device(&Device::Cpu)? };
-                                                let v_cpu = if v.device().is_cpu() { v.clone() } else { v.to_device(&Device::Cpu)? };
-                                                ks.push(k_cpu); 
-                                                vs.push(v_cpu);
-                                                offset = inner.offset + inner.len;
-                                                match_found = true;
-                                            }
-                                        }
-                                    }
-                    
-                    if match_found { results.push((ks, vs, offset, b_idx)); }
+            pub fn get_blocks_by_location(&self, target_loc: KVLocation) -> Result<Vec<(Vec<Tensor>, Vec<Tensor>, usize, usize)>> {
+                let mut results = Vec::new();
+                let layers = match &self.qwen3_vl {
+                    ModelVariant::QuantizedVL(m) => Some(&m.language_model.layers),
+                    ModelVariant::QuantizedText(m) => Some(&m.language_model.layers),
+                    _ => None
+                };
+                if let Some(layers) = layers {
+                    if layers.is_empty() { return Ok(vec![]); }
+                    let num_blocks = layers[0].self_attn.kv_blocks.len();
+                    for b_idx in 0..num_blocks {
+                        let mut ks = Vec::new();
+                        let mut vs = Vec::new();
+                        let mut match_found = false;
+                        let mut offset = 0;
+                        for l in layers {
+                            let inner = l.self_attn.kv_blocks[b_idx].inner.read().unwrap();
+                            // target_loc이거나, 혹은 이미 RAM으로 핸드오프된 데이터를 가져옵니다.
+                            if inner.location == target_loc || (target_loc == KVLocation::SSD_PENDING && inner.location == KVLocation::RAM && inner.ssd_path.is_none()) {
+                                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                                    // 이미 CPU에 있다면 그대로, GPU에 있다면 CPU로 가져옴
+                                    let k_cpu = if k.device().is_cpu() { k.clone() } else { k.to_device(&Device::Cpu)? };
+                                    let v_cpu = if v.device().is_cpu() { v.clone() } else { v.to_device(&Device::Cpu)? };
+                                    ks.push(k_cpu); 
+                                    vs.push(v_cpu);
+                                    offset = inner.offset + inner.len;
+                                    match_found = true;
+                                }
+                            }
+                        }
+                        if match_found { results.push((ks, vs, offset, b_idx)); }
+                    }
                 }
+                Ok(results)
             }
-            results
-        }
+        
     
         pub fn mark_block_location(&mut self, block_idx: usize, new_loc: KVLocation) {
             let layers = match self.qwen3_vl {

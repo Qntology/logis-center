@@ -1542,23 +1542,15 @@ impl QuantizedQwen3VLTextModel {
 
         let mut layer_devices = vec![];
         let mut pinned_layer_count = 0;
-        
-        // [HORIZONTAL-INIT] 수평적 추론을 위해 최소 1개 레이어의 GPU 점유를 보장합니다.
         for i in 0..config.num_hidden_layers {
-            if current_device.is_cuda() {
-                // 첫 번째 레이어만 GPU로 미리 할당하고, 나머지는 수평 루프에서 갈아 끼웁니다.
-                if i < 1 { 
-                    layer_devices.push(current_device.clone());
-                    pinned_layer_count += 1;
-                } else {
-                    layer_devices.push(Device::Cpu);
-                }
+            if current_device.is_cuda() && i < 1 {
+                layer_devices.push(current_device.clone());
+                pinned_layer_count += 1;
             } else {
                 layer_devices.push(Device::Cpu);
             }
         }
-
-        println!("[MODEL] Horizontal Engine Ready: {} GPU-active slots for sequential processing.", pinned_layer_count);
+        println!("[MODEL] Horizontal Engine Ready: {} GPU slot pinned.", pinned_layer_count);
 
         // [ORGANIC] Dynamic Threading for Parallel Loading
         let thread_config = crate::utils::resources::get_optimal_thread_config(current_device.is_cpu());
@@ -1672,34 +1664,30 @@ impl QuantizedQwen3VLTextModel {
         let mut is_vram_checked = false;
         let mut safety_floor: u64 = 0;
 
+        if current_device.is_cuda() {
+             if let Some(nvml_inst) = &nvml {
+                 if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
+                     if let Ok(mem) = dev.memory_info() {
+                         simulated_free_vram = mem.free;
+                         is_vram_checked = true;
+                         let os_reserve = 100_000_000; 
+                         safety_floor = os_reserve + kv_reserve + estimated_activation_buffer;
+                     }
+                 }
+             }
+        }
+
         let mut layers = vec![];
         let mut pinned_layer_count = 0;
         let num_layers_to_load = if baking_only { 1 } else { config.num_hidden_layers };
 
         for layer_idx in 0..num_layers_to_load {
             let mut layer_device = current_device.clone();
-            if current_device.is_cuda() {
-                 if layer_idx < 1 {
-                     pinned_layer_count += 1;
-                 } else {
-                     layer_device = Device::Cpu;
-                 }
+            if current_device.is_cuda() && layer_idx < 1 {
+                pinned_layer_count += 1;
             } else {
                 layer_device = Device::Cpu;
             }
-
-            let layer_dtype = if layer_device.is_cpu() { DType::F32 } else { dtype };
-            let standard = format!("{base_name}.layers.{layer_idx}");
-            let gguf_blk = format!("blk.{layer_idx}");
-            let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
-
-            let layer = QuantizedQwen3VLTextDecoderLayer::new(
-                config, ct, reader, &prefix, &layer_device, layer_dtype, layer_idx, baking_only, registry.clone()
-            )?;
-            layers.push(layer)
-        }
-        
-        println!("[MODEL] Horizontal Engine (Reader) Ready: {} GPU slots pinned.", pinned_layer_count);
 
             let layer_dtype = if layer_device.is_cpu() { DType::F32 } else { dtype };
             let standard = format!("{base_name}.layers.{layer_idx}");
@@ -1821,14 +1809,15 @@ impl QuantizedQwen3VLTextModel {
                         // [FIX] 모든 연산 단위를 사용자 요청에 따라 256으로 고정
                         let chunk_size = 256;
                         
-                        println!("[TRACE] Starting Horizontal Pass: Single-Layer Sequential Execution (Total Seq: {}, Chunk: {})", seq_len, chunk_size);
+                        println!("[TRACE] Starting Horizontal Pass: Layer-by-Layer execution (Total Seq: {}, Chunk: {}, Pinned: {}/{})", 
+                            seq_len, chunk_size, self.pinned_layer_count, num_layers);
                 
                                 for layer_idx in 0..num_layers {
                                     if layer_idx < start_layer { continue; }
                                     let start_layer_time = std::time::Instant::now();
                                     
                                     // [STEP 2-A: STRONG-PURGE] 
-                                    // 이전 레이어의 무게추가 VRAM에 남아있다면 즉시 CPU로 밀어내어 공간을 100% 확보합니다.
+                                    // 이전 레이어가 GPU에 남아있다면 즉시 CPU로 밀어내어 공간을 100% 확보합니다.
                                     if layer_idx > 0 {
                                         let prev_idx = layer_idx - 1;
                                         if self.layers[prev_idx].device().is_cuda() {
@@ -1837,20 +1826,14 @@ impl QuantizedQwen3VLTextModel {
                                     }
                                     
                                     // [STEP 2-B: SINGLE-LAYER-LOAD]
-                                    // 현재 레이어만 GPU로 로드합니다. (Always-GPU 원칙 준수)
+                                    // 현재 레이어만 GPU로 로드합니다. (Always-GPU 원칙)
                                     let target_device = Device::new_cuda(0)?;
                                     if !self.layers[layer_idx].device().same_device(&target_device) {
                                         self.layers[layer_idx].to_device(&target_device)?;
-                                        let _ = target_device.synchronize(); // 로드 완료 대기
+                                        let _ = target_device.synchronize(); 
                                     }
 
                                     println!("[HORIZONTAL] >> [RUN] Layer {} on GPU", layer_idx);
-                                    
-                                    // [NEW] A-B-C 릴레이 순환 관리 (VRAM & RAM 공통)
-                                    // 루프 최상단 레이어 0에서만 수행하여 오버헤드 최소화
-                                    if self.layer_idx == 0 {
-                                        // self.registry.enforce_relay_relay(global_start_idx); // 임시 주석 처리 (오버헤드 방지)
-                                    }
                             
                             // 2. [MASS-LOAD] 현재 레이어에 필요한 모든 블록을 SSD에서 한꺼번에 로드 요청
                             let mut blocks_to_load: Vec<KVBlock> = Vec::new();
@@ -1996,13 +1979,12 @@ impl QuantizedQwen3VLTextModel {
                                                         xs = Tensor::cat(&next_xs, 1)?;
                                                         
                                                         // [STEP 3-A: SAFE-HANDOFF]
-                                                        // 레이어를 CPU로 밀어내기 전에, 현재 레이어의 KV 블록 중 
-                                                        // SSD 저장이 필요한 데이터(is_dirty)를 미리 CPU 장치로 옮겨둡니다.
+                                                        // 레이어를 CPU로 밀어내기 전에, 현재 레이어의 KV 블록 데이터를 
+                                                        // CPU 장치로 미리 복사하여 Worker가 안전하게 가져가게 함
                                                         for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
                                                             let mut inner = block.inner.write().unwrap();
                                                             if inner.location == KVLocation::VRAM {
                                                                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                                                                    // CPU로 미리 복사본을 만들어두어 Worker가 안전하게 가져가게 함
                                                                     inner.k_cache = Some(k.to_device(&Device::Cpu)?);
                                                                     inner.v_cache = Some(v.to_device(&Device::Cpu)?);
                                                                     inner.location = KVLocation::RAM; 
