@@ -709,11 +709,11 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 pub enum ModelVariant { Standard(crate::models::qwen3vl::model::Qwen3VLModel), QuantizedVL(QuantizedQwen3VLModel), QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel) }
 
 impl ModelVariant {
-    pub fn forward(&mut self, i: &Tensor, pv: Option<&Tensor>, ithw: Option<&Tensor>, vpv: Option<&Tensor>, vthw: Option<&Tensor>, cp: Option<&Tensor>, off: usize, tl: usize, sid: Option<String>) -> Result<Tensor> {
+    pub async fn forward(&mut self, i: &Tensor, pv: Option<&Tensor>, ithw: Option<&Tensor>, vpv: Option<&Tensor>, vthw: Option<&Tensor>, cp: Option<&Tensor>, off: usize, tl: usize, sid: Option<String>) -> Result<Tensor> {
         match self { 
             Self::Standard(m) => m.forward(i, pv, ithw, vpv, vthw, cp, off), 
-            Self::QuantizedVL(m) => m.forward(i, pv, ithw, vpv, vthw, cp, off, tl, sid), 
-            Self::QuantizedText(m) => m.forward(i, cp, off, tl, sid) 
+            Self::QuantizedVL(m) => m.forward(i, pv, ithw, vpv, vthw, cp, off, tl, sid).await, 
+            Self::QuantizedText(m) => m.forward(i, cp, off, tl, sid).await 
         }
     }
     pub fn rebalance_layers(&mut self, d: usize, target_idx: usize) -> Result<()> { 
