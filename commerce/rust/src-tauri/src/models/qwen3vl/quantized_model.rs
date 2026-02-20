@@ -282,24 +282,26 @@ impl KVRegistry {
     // [NEW] A-B-C 릴레이 순환 시스템 (VRAM & RAM 공통)
     pub fn enforce_relay_relay(&self, current_token_idx: usize) {
         let mut entries = self.entries.write().unwrap();
-        let threshold_bytes = 100 * 1024 * 1024; // 100MB
         
-        // 1. 현재 각 그룹(컨테이너)의 용량 계산
-        // (단순화를 위해 100MB를 토큰 수로 환산하여 그룹핑하거나, 실제 바이트를 추적)
         // 2B 모델 기준 BF16 KV 캐시는 토큰당 약 56KB (28레이어 합산)
-        // 100MB / 56KB  약 1800 토큰. 여기서는 안전하게 1800을 그룹 단위로 설정.
-        let group_size = 1800; 
+        // 14MB / 56KB ≈ 256 토큰 (블록 단위)
+        // 140MB / 56KB ≈ 2500 토큰 (그룹 단위)
+        let block_size = 256;
+        let group_size = 2500; 
+        
+        let current_block_id = current_token_idx / block_size;
         let current_group_id = current_token_idx / group_size;
 
         let mut vram_to_ram = 0;
         let mut ram_to_ssd = 0;
 
         for entry in entries.iter_mut() {
+            let entry_block_id = entry.token_start / block_size;
             let entry_group_id = entry.token_start / group_size;
 
-            // [VRAM 릴레이]
-            // 현재 그룹(B)과 직전 그룹(A)을 제외한 모든 과거 데이터는 RAM으로 밀어냄
-            if entry_group_id + 1 < current_group_id {
+            // [VRAM 릴레이] 14MB 블록 단위
+            // A 완성, B 완성 시 A 이동 (현재 C(id=2)일 때 A(id=0) 이동)
+            if entry_block_id + 1 < current_block_id {
                 let has_vram = entry.location.iter().any(|&l| l == KVLocation::VRAM);
                 if has_vram {
                     for loc in entry.location.iter_mut() {
@@ -309,11 +311,11 @@ impl KVRegistry {
                 }
             }
 
-            // [RAM 릴레이]
-            // RAM에 있는 데이터 중 현재 그룹보다 2단계 이상 뒤쳐진 것은 SSD로 밀어냄
-            if entry_group_id + 2 < current_group_id {
-                let has_sticky = entry.location.iter().any(|&l| l == KVLocation::RamSticky || l == KVLocation::RAM);
-                if has_sticky && entry.ssd_path.is_none() {
+            // [RAM 릴레이] 100MB 그룹 단위
+            // A 완성, B 완성 시 A 이동 (현재 C(id=2)일 때 A(id=0) 이동)
+            if entry_group_id + 1 < current_group_id {
+                let has_ram = entry.location.iter().any(|&l| l == KVLocation::RAM || l == KVLocation::RamSticky);
+                if has_ram && entry.ssd_path.is_none() {
                     // SSD_PENDING 상태로 변경하여 generate.rs가 캐치하게 함
                     for loc in entry.location.iter_mut() {
                         if *loc == KVLocation::RAM || *loc == KVLocation::RamSticky { 
@@ -327,8 +329,8 @@ impl KVRegistry {
         }
 
         if vram_to_ram > 0 || ram_to_ssd > 0 {
-            println!("[RELAY-SYSTEM] Group {}: VRAM->RAM: {} blocks, RAM->SSD-Queue: {} blocks", 
-                current_group_id, vram_to_ram, ram_to_ssd);
+            println!("[RELAY-SYSTEM] Token {}: VRAM->RAM: {} blocks, RAM->SSD-Queue: {} blocks", 
+                current_token_idx, vram_to_ram, ram_to_ssd);
         }
     }
 
@@ -701,8 +703,9 @@ impl QuantizedQwen3VLTextAttention {
         let mut vram_total_len = 0;
 
         // [NEW] A-B-C 릴레이 순환 관리 (VRAM & RAM 공통)
+        // 현재 청크를 포함한 전체 토큰 위치(_seqlen_offset + q_len)를 기준으로 릴레이 트리거
         if self.layer_idx == 0 {
-            self.registry.enforce_relay_relay(global_start_idx);
+            self.registry.enforce_relay_relay(_seqlen_offset + q_len);
         }
 
         for block in &self.kv_blocks {
@@ -718,6 +721,29 @@ impl QuantizedQwen3VLTextAttention {
                 let reg = self.registry.entries.read().unwrap();
                 if index < reg.len() { reg[index].location[self.layer_idx] } else { KVLocation::VRAM }
             };
+
+            // [NEW] VRAM -> RAM 강제 동기화 (VRAM 부하 방지)
+            // 레지스트리가 RAM 상태라면, 실제 텐서가 아직 VRAM에 있더라도 즉시 CPU로 이동시킵니다.
+            if loc == KVLocation::RAM {
+                let mut inner = block.inner.write().unwrap();
+                if inner.location == KVLocation::VRAM {
+                    if let (Some(k_vram), Some(v_vram)) = (inner.k_cache.take(), inner.v_cache.take()) {
+                        if !k_vram.device().is_cpu() {
+                            let k_cpu = k_vram.to_device(&Device::Cpu)?;
+                            let v_cpu = v_vram.to_device(&Device::Cpu)?;
+                            inner.k_cache = Some(k_cpu.clone());
+                            inner.v_cache = Some(v_vram.to_device(&Device::Cpu)?); // v_cpu clone 대신 직접 변환
+                            inner.location = KVLocation::RAM;
+                            k = Some(k_cpu);
+                            v = Some(inner.v_cache.as_ref().unwrap().clone());
+                        } else {
+                            inner.k_cache = Some(k_vram);
+                            inner.v_cache = Some(v_vram);
+                            inner.location = KVLocation::RAM;
+                        }
+                    }
+                }
+            }
 
             if loc == KVLocation::SSD {
                 let spath = {
@@ -815,6 +841,10 @@ impl QuantizedQwen3VLTextAttention {
 
             let mut k = k.ok_or_else(|| candle_core::Error::Msg("KV Cache not ready after wait".to_string()))?;
             let mut v = v.ok_or_else(|| candle_core::Error::Msg("KV Cache not ready after wait".to_string()))?;
+
+            // [FIX] Device Alignment: RAM(CPU)에 있는 데이터를 연산을 위해 현재 장치(GPU)로 이동
+            let k = if !k.device().same_device(dev) { k.to_device(dev)? } else { k };
+            let v = if !v.device().same_device(dev) { v.to_device(dev)? } else { v };
 
             // [FIX] Update b_len to actual tensor dimensions to prevent shape mismatch in broadcast_add
             // This handles the case where the last block (e.g. 205 tokens) is smaller than the standard 256.
