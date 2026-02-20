@@ -505,7 +505,10 @@ impl QuantizedQwen3VLTextAttention {
                 let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
                 let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
                 let index = self.kv_blocks.len();
-                let current_total = self.get_kv_len();
+                
+                // [FIX] '곱하기 2' 방지: 논리적 시작 지점 + 현재 청크 내 오프셋을 직접 사용
+                let current_total = _seqlen_offset + chunk_offset;
+                
                 let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
                 {
                     let mut inner = new_block.inner.write().unwrap();
@@ -1667,17 +1670,6 @@ impl QuantizedQwen3VLTextModel {
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         
-        use nvml_wrapper::Nvml;
-        if let Ok(nvml) = Nvml::init() {
-                                                            if let Ok(dev) = nvml.device_by_index(0) {
-                                                                if let Ok(mem) = dev.memory_info() {
-                                                                    let current_progress = (seqlen_offset + seq_len).min(total_len);
-                                                                    let (reads, writes, free) = SLOT_MANAGER.get_counts();
-                                                                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Slots: R={}, W={}, F={}", 
-                                                                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len, reads, writes, free);
-                                                                }
-                                                            }        }
-
         let target_device = if self.layers[0].device().is_cuda() { Device::new_cuda(0)? } else { Device::Cpu };
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
@@ -1748,6 +1740,7 @@ impl QuantizedQwen3VLTextModel {
                 
                                 for layer_idx in 0..num_layers {
                                     if layer_idx < start_layer { continue; }
+                                    println!("[HORIZONTAL] >> [START] Layer {} Processing Loop...", layer_idx);
                                     
                                     // 1. [TARGET-REBALANCE] Ensure THIS specific layer is on GPU
                                     let _ = self.rebalance_layers(0, layer_idx);
@@ -1843,19 +1836,60 @@ impl QuantizedQwen3VLTextModel {
                                             
                                                         // 3. [INNER-CHUNK-LOOP] Process the entire sequence
                                                         let mut next_xs = Vec::new();
+                                                        let mut chunk_idx = 0;
                                                         for i in (0..seq_len).step_by(chunk_size) {
                                                             let take = (seq_len - i).min(chunk_size);
-                                                            let out = self.layers[layer_idx].forward(&xs.narrow(1, i, take)?, &cos.narrow(1, i, take)?, &sin.narrow(1, i, take)?, None, seqlen_offset + i)?;
-                                                            next_xs.push(out);
+                                                            
+                                                            // [REAL-TIME-STAT] 청크 단위로 실제 진행도 출력
+                                                            if layer_idx == 0 {
+                                                                use nvml_wrapper::Nvml;
+                                                                if let Ok(nvml) = Nvml::init() {
+                                                                    if let Ok(dev) = nvml.device_by_index(0) {
+                                                                        if let Ok(mem) = dev.memory_info() {
+                                                                            let current_progress = seqlen_offset + i + take;
+                                                                            let (reads, writes, free) = SLOT_MANAGER.get_counts();
+                                                                            println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Chunk: {}", 
+                                                                                mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len, chunk_idx);
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+
+                                                            println!("[HORIZONTAL] Layer {:2} | Chunk {} (Offset: {}, Size: {}) - START", layer_idx, chunk_idx, i, take);
+                                                            
+                                                            let layer_ptr = &mut self.layers[layer_idx];
+                                                            let xs_chunk = xs.narrow(1, i, take)?;
+                                                            let cos_chunk = cos.narrow(1, i, take)?;
+                                                            let sin_chunk = sin.narrow(1, i, take)?;
+                                                            
+                                                            let out_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                                layer_ptr.forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)
+                                                            }));
+
+                                                            match out_res {
+                                                                Ok(Ok(out)) => next_xs.push(out),
+                                                                Ok(Err(e)) => {
+                                                                    println!("[HORIZONTAL] !! [ERROR] Layer {} Chunk {} failed: {:?}", layer_idx, chunk_idx, e);
+                                                                    return Err(e.into());
+                                                                },
+                                                                Err(p) => {
+                                                                    let panic_msg = if let Some(s) = p.downcast_ref::<&str>() { s.to_string() }
+                                                                                    else if let Some(s) = p.downcast_ref::<String>() { s.clone() }
+                                                                                    else { "Unknown".to_string() };
+                                                                    println!("[HORIZONTAL] !! [PANIC] Layer {} Chunk {} crashed! Msg: {}", layer_idx, chunk_idx, panic_msg);
+                                                                    return Err(anyhow::anyhow!("Panic during chunk processing"));
+                                                                }
+                                                            }
+                                                            chunk_idx += 1;
                                                         }
+                                                        
+                                                        println!("[HORIZONTAL] Layer {:2} | Processing complete. Concatenating {} results...", layer_idx, next_xs.len());
                                                         xs = Tensor::cat(&next_xs, 1)?;
-                                                        println!("[HORIZONTAL] Layer {:2} | FINISHED full pass.", layer_idx);
-                                            
-                                                        // [AGGRESSIVE-CLEANUP] 무조건 VRAM에서 제거하여 다음 레이어를 위한 공간 확보
-                                                        if !self.is_forced_cpu && self.layers[layer_idx].device().is_cuda() {
-                                                            println!("[REBALANCE] Aggressive Offload: Layer {} -> CPU (Clearing VRAM)", layer_idx);
-                                                            let _ = self.layers[layer_idx].to_device(&Device::Cpu);
-                                                        }
+                                                        
+                                                        // [OPTIMIZATION] 강제 Aggressive Offload 제거
+                                                        // 이제 rebalance_layers가 다음 루프 시작 시 VRAM이 부족할 때만 알아서 처리합니다.
+                                                        
+                                                        println!("[HORIZONTAL] << [FINISH] Layer {} full loop complete.", layer_idx);
                                                     }
                 
                         println!("[TRACE] Horizontal Layer Pass Complete.");        self.current_kv_len = seqlen_offset + seq_len;
@@ -2136,19 +2170,46 @@ impl QuantizedQwen3VLTextModel {
         let danger_zone = 600_000_000;
         let safe_zone = 1_000_000_000;
 
-        // [STRICT-TARGETING] Only handle the specific layer requested
         if target_idx >= self.layers.len() { return Ok(()); }
         let layer = &mut self.layers[target_idx];
 
         if free_vram > 0 && free_vram < danger_zone && layer.device().is_cuda() {
-            println!("[REBALANCE] Emergency Offload: Layer {} -> CPU (Free: {}MB)", target_idx, free_vram / 1024 / 1024);
-            let _ = layer.to_device(&Device::Cpu);
+            println!("[REBALANCE] >> [START] Emergency Offload: Layer {} -> CPU (Free: {}MB)", target_idx, free_vram / 1024 / 1024);
+            let offload_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                layer.to_device(&Device::Cpu)
+            }));
+            match offload_res {
+                Ok(Ok(_)) => println!("[REBALANCE] << [DONE] Emergency Offload: Layer {} moved to CPU.", target_idx),
+                Ok(Err(e)) => println!("[REBALANCE] !! [ERROR] Failed to offload Layer {}: {:?}", target_idx, e),
+                Err(_) => println!("[REBALANCE] !! [PANIC] Panic during offload of Layer {}", target_idx),
+            }
         } else if free_vram > safe_zone && layer.device().is_cpu() {
-            println!("[REBALANCE] Targeted Upload: Layer {} -> GPU (Free: {}MB)", target_idx, free_vram / 1024 / 1024);
+            println!("[REBALANCE] >> [START] Targeted Upload: Layer {} -> GPU (Free: {}MB)", target_idx, free_vram / 1024 / 1024);
             let target_device = Device::new_cuda(device_id)?;
-            let _ = layer.to_device(&target_device);
-            // CRITICAL: Ensure physical completion before proceeding
-            let _ = target_device.synchronize();
+            
+            let target_device_clone = target_device.clone();
+            let move_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                layer.to_device(&target_device_clone)
+            }));
+
+            match move_res {
+                Ok(Ok(_)) => {
+                    println!("[REBALANCE] .. [SYNC] Synchronizing Device for Layer {}", target_idx);
+                    let _ = target_device.synchronize();
+                    println!("[REBALANCE] << [DONE] Targeted Upload: Layer {} moved to GPU.", target_idx);
+                },
+                Ok(Err(e)) => {
+                    println!("[REBALANCE] !! [ERROR] Failed to move Layer {} to GPU: {:?}", target_idx, e);
+                    return Err(e.into());
+                },
+                Err(p) => {
+                    let panic_msg = if let Some(s) = p.downcast_ref::<&str>() { s.to_string() }
+                                    else if let Some(s) = p.downcast_ref::<String>() { s.clone() }
+                                    else { "Unknown Panic".to_string() };
+                    println!("[REBALANCE] !! [PANIC] Critical failure while moving Layer {} to GPU. Panic: {}", target_idx, panic_msg);
+                    return Err(anyhow::anyhow!("Panic during rebalance upload: {}", panic_msg));
+                }
+            }
         }
         Ok(())
     }
