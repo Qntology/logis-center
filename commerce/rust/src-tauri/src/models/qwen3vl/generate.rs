@@ -779,7 +779,7 @@ impl Qwen3VLGenerateModel {
 
     pub async fn prefill_chunk(&mut self, text: String, _cancel: Option<Arc<AtomicBool>>, _relay: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
         let ids = self.tokenizer.text_encode_vec(text, false)?; let size = ids.len(); let pos = self.get_kv_len();
-        self.qwen3_vl.forward(&Tensor::from_vec(ids, (1, size), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(pos as u32, (pos + size) as u32, &self.text_device)?.unsqueeze(0)?), pos, size, None)?;
+        self.qwen3_vl.forward(&Tensor::from_vec(ids, (1, size), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(pos as u32, (pos + size) as u32, &self.text_device)?.unsqueeze(0)?), pos, size, None).await?;
         Ok(size)
     }
 
@@ -811,14 +811,13 @@ impl Qwen3VLGenerateModel {
 
         // [HORIZONTAL-CALL] Entire sequence is now handled layer-by-layer internally
         println!("[BAKING] Starting Horizontal Pass for {} tokens...", t_toks);
-        self.qwen3_vl.forward(
-            &Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, 
-            None, None, None, None, 
-            Some(&Tensor::arange(0u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 
-            0, t_toks, sid.clone()
-        )?;
-
-        if let Some(s_id) = &sid {
+                self.qwen3_vl.forward(
+                    &Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?,
+                    None, None, None, None,
+                    Some(&Tensor::arange(0u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?),
+                    0, t_toks, sid.clone()
+                ).await?;
+                if let Some(s_id) = &sid {
             let unbaked_blocks = self.get_all_unbaked_kv_blocks();
             for (ks, vs, block_offset) in unbaked_blocks {
                 let slot_id = SLOT_MANAGER.acquire_write_slot(t_toks).await;
@@ -883,14 +882,13 @@ impl Qwen3VLGenerateModel {
         if t_toks > s_off {
             let prefill_len = t_toks - s_off;
             println!("[GENERATE] Starting Horizontal Prefill for {} tokens...", prefill_len);
-            self.qwen3_vl.forward(
-                &Tensor::from_vec(f_ids[s_off..].to_vec(), (1, prefill_len), &self.text_device)?, 
-                None, None, None, None, 
-                Some(&Tensor::arange(s_off as u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 
-                s_off, t_toks, sid.clone()
-            )?;
-
-            if let Some(s_id) = &sid {
+                        self.qwen3_vl.forward(
+                            &Tensor::from_vec(f_ids[s_off..].to_vec(), (1, prefill_len), &self.text_device)?,
+                            None, None, None, None,
+                            Some(&Tensor::arange(s_off as u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?),
+                            s_off, t_toks, sid.clone()
+                        ).await?;
+                        if let Some(s_id) = &sid {
                 let unbaked_blocks = self.get_all_unbaked_kv_blocks();
                 for (ks, vs, block_offset) in unbaked_blocks {
                     let slot_id = SLOT_MANAGER.acquire_write_slot(t_toks).await;
@@ -939,7 +937,7 @@ impl Qwen3VLGenerateModel {
         for _ in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             
-            let logits = self.qwen3_vl.forward(&Tensor::new(vec![*a_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)?, p_vals.as_ref(), i_grid.as_ref(), None, None, Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + 1) as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, t_toks, sid.clone())?;
+            let logits: Tensor = self.qwen3_vl.forward(&Tensor::new(vec![*a_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)?, p_vals.as_ref(), i_grid.as_ref(), None, None, Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + 1) as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, t_toks, sid.clone()).await?;
             let l_vec = apply_repeat_penalty(&logits.squeeze(0)?.i(logits.dim(1)? - 1)?.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
             let next_id = l_proc.sample(&l_vec)?; if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             a_ids.push(next_id); g_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);

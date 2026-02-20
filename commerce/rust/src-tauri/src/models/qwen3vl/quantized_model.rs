@@ -1454,9 +1454,10 @@ impl QuantizedQwen3VLTextDecoderLayer {
         self.self_attn.clear_kv_cache();
     }
 
-    pub async fn prepare_layer_blocks_text(&self, layer_idx: usize, registry: &KVRegistry, device: &Device, model: &QuantizedQwen3TextModel) -> Result<()> {
+    pub async fn prepare_layer_blocks_text(&self, layer_idx: usize, registry: &KVRegistry, device: &Device) -> Result<()> {
         use rayon::prelude::*;
         let kv_blocks = &self.self_attn.kv_blocks;
+        let attn_ptr = &self.self_attn;
         
         kv_blocks.into_par_iter().for_each(|block| {
             let index = block.inner.read().unwrap().index;
@@ -1469,8 +1470,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
             if let Some(m) = meta {
                 if block.inner.read().unwrap().k_cache.is_none() {
-                    if let Ok(k_raw) = model.decompress_from_bitkv(&m.k_anchors, &m.k_packed, &m.k_scales, &m.original_shape, device) {
-                        if let Ok(v_raw) = model.decompress_from_bitkv(&m.v_anchors, &m.v_packed, &m.v_scales, &m.original_shape, device) {
+                    if let Ok(k_raw) = attn_ptr.decompress_from_bitkv(&m.k_anchors, &m.k_packed, &m.k_scales, &m.original_shape, device) {
+                        if let Ok(v_raw) = attn_ptr.decompress_from_bitkv(&m.v_anchors, &m.v_packed, &m.v_scales, &m.original_shape, device) {
                             let mut inner = block.inner.write().unwrap();
                             inner.k_cache = Some(k_raw);
                             inner.v_cache = Some(v_raw);
@@ -1482,9 +1483,10 @@ impl QuantizedQwen3VLTextDecoderLayer {
         Ok(())
     }
 
-    pub async fn prepare_layer_blocks_vl(&self, layer_idx: usize, registry: &KVRegistry, device: &Device, model: &QuantizedQwen3VLTextModel) -> Result<()> {
+    pub async fn prepare_layer_blocks_vl(&self, layer_idx: usize, registry: &KVRegistry, device: &Device) -> Result<()> {
         use rayon::prelude::*;
         let kv_blocks = &self.self_attn.kv_blocks;
+        let attn_ptr = &self.self_attn;
         
         kv_blocks.into_par_iter().for_each(|block| {
             let index = block.inner.read().unwrap().index;
@@ -1497,8 +1499,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
             if let Some(m) = meta {
                 if block.inner.read().unwrap().k_cache.is_none() {
-                    if let Ok(k_raw) = model.decompress_from_bitkv(&m.k_anchors, &m.k_packed, &m.k_scales, &m.original_shape, device) {
-                        if let Ok(v_raw) = model.decompress_from_bitkv(&m.v_anchors, &m.v_packed, &m.v_scales, &m.original_shape, device) {
+                    if let Ok(k_raw) = attn_ptr.decompress_from_bitkv(&m.k_anchors, &m.k_packed, &m.k_scales, &m.original_shape, device) {
+                        if let Ok(v_raw) = attn_ptr.decompress_from_bitkv(&m.v_anchors, &m.v_packed, &m.v_scales, &m.original_shape, device) {
                             let mut inner = block.inner.write().unwrap();
                             inner.k_cache = Some(k_raw);
                             inner.v_cache = Some(v_raw);
@@ -1857,8 +1859,14 @@ impl QuantizedQwen3VLTextModel {
                         println!("[TRACE] Starting Horizontal Pass: Parallel Pipeline (Total Seq: {}, Pinned: {}/{})", 
                             seq_len, self.pinned_layer_count, num_layers);
                 
-                        // 최초 레이어(0)는 미리 준비되어 있어야 함
-                        self.layers[0].prepare_layer_blocks_vl(0, &self.registry, &target_device, &model_clone).await?;
+                        // [SINGLE-LAYER-OPTIMIZATION] 0.6B 등 레이어가 1개인 경우, 모든 블록을 미리 병렬로 풀어버립니다.
+                        if num_layers == 1 {
+                            println!("[HORIZONTAL] Single-layer detected. Batch preparing all blocks...");
+                            self.layers[0].prepare_layer_blocks_vl(0, &self.registry, &target_device).await?;
+                        } else {
+                            // 최초 레이어(0)는 연산 전에 준비되어 있어야 함
+                            self.layers[0].prepare_layer_blocks_vl(0, &self.registry, &target_device).await?;
+                        }
 
                         for layer_idx in 0..num_layers {
                             if layer_idx < start_layer { continue; }
@@ -1878,7 +1886,7 @@ impl QuantizedQwen3VLTextModel {
                                         s_ids.push(crate::models::qwen3vl::generate::SLOT_MANAGER.acquire_read_slot().await);
                                     }
                                     
-                                    let _ = next_layer_ptr.prepare_layer_blocks_vl(next_layer, &reg_c, &dev_c, &model_c).await;
+                                    let _ = next_layer_ptr.prepare_layer_blocks_vl(next_layer, &reg_c, &dev_c).await;
                                     
                                     let mut reg = reg_c.entries.write().unwrap();
                                     for (i, entry) in reg.iter_mut().enumerate() {
@@ -2554,7 +2562,7 @@ impl QuantizedQwen3VLModel {
         Ok((position_ids, deltas))
     }
 
-    pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
+    pub async fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
         // [DEVICE-ALIGNMENT] 임베딩 레이어의 장치로 입력 ID를 즉시 이동 (CUDA 보장)
         let emb_dev = self.language_model.embed_tokens.embeddings().device();
         let input_ids = if !input_ids_in.device().same_device(emb_dev) { 
@@ -2600,7 +2608,7 @@ impl QuantizedQwen3VLModel {
         println!("[TIMER] RoPE index calculation: {:.2}s", start_rope.elapsed().as_secs_f32());
         
         self.language_model.active_session_id = session_id;
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
+        let outputs: Tensor = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None).await?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         
         let head_dev = self.lm_head.device();
@@ -2687,7 +2695,7 @@ impl QuantizedQwen3TextModel {
         };
         
         self.language_model.active_session_id = session_id;
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
+        let outputs: Tensor = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None).await?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         if let Some(head) = &self.lm_head {
             let hidden_state = if !hidden_state.device().same_device(head.device()) { hidden_state.to_device(head.device())? } else { hidden_state };
