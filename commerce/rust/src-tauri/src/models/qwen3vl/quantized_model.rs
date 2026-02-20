@@ -2252,11 +2252,12 @@ impl QuantizedQwen3VLTextModel {
                     let fname = entry.file_name().to_string_lossy().to_string();
                     
                     // Match pattern: layer_relay_kv_{offset}.safetensors OR layer_{any}_kv_{offset}.safetensors
-                    let is_relay = fname.contains("layer_relay_kv");
-                    let is_layer_specific = fname.starts_with("layer_") && fname.contains("_kv");
+                    // [FIX] Baker uses 'bundle_' prefix, so we must include it in scan.
+                    let is_relay = fname.contains("layer_relay_kv") || fname.contains("bundle_relay_kv");
+                    let is_layer_specific = (fname.starts_with("layer_") || fname.starts_with("bundle_")) && fname.contains("_kv");
                     
                     if (is_relay || is_layer_specific) && fname.ends_with(".safetensors") {
-                        let offset = if fname == "layer_relay_kv.safetensors" || fname.ends_with("_kv.safetensors") {
+                        let offset = if fname == "layer_relay_kv.safetensors" || fname == "bundle_relay_kv.safetensors" || fname.ends_with("_kv.safetensors") {
                             0
                         } else {
                             fname.strip_suffix(".safetensors")
