@@ -1935,41 +1935,40 @@ impl QuantizedQwen3VLTextModel {
             }
         };
 
-                        // [WINDOW-BURST-STRATEGY]
+                        // [LAYER-WISE-BURST-STRATEGY]
+                        // 사용자 요청: 각 레이어별로 전체 시퀀스를 모두 처리한 후 다음 레이어로 넘어가는 구조
+                        // 이 방식은 VRAM에 항상 단 하나의 레이어만 존재하게 하여 메모리 효율을 극대화합니다.
                         let num_layers = self.layers.len();
                         let chunk_size = 256;
-                        let window_size = 4; // [OPTIMIZATION] Batch 4 layers for efficient SSD loading, but execution is serialized
 
                         // [RAM-MONITOR]
                         use sysinfo::System;
                         let mut sys = System::new();
                         
-                        println!("[TRACE] Starting Window-Burst Pass: Total layers: {}, Window: {}, Pinned: {}", 
-                            num_layers, window_size, self.pinned_layer_count);
+                        println!("[TRACE] Starting Layer-Wise Burst Pass: Total layers: {}", num_layers);
 
-                        for w_start in (0..num_layers).step_by(window_size) {
-                            let w_end = (w_start + window_size).min(num_layers);
-                            if w_end <= start_layer { continue; }
-
-                            // --- [STEP 1: WINDOW PRE-FLIGHT LOAD] ---
+                        for layer_idx in 0..num_layers {
+                            if layer_idx < start_layer { continue; }
+                            
+                            // [STEP 1] Load Current Layer Resources
+                            // 이 시점에서 필요한 KV Block 등을 SSD에서 미리 로드해야 한다면 여기서 수행
                             let mut w_blocks_to_load = Vec::new();
                             let mut w_chunk_path = std::path::PathBuf::new();
                             
                             {
                                 let reg = self.registry.entries.read().unwrap();
-                                for l_idx in w_start..w_end {
-                                    let layer_kv_blocks = &self.layers[l_idx].self_attn.kv_blocks;
-                                    for (b_idx, block) in layer_kv_blocks.iter().enumerate() {
-                                        if b_idx < reg.len() {
-                                            let entry = &reg[b_idx];
-                                            if entry.token_start >= self.current_kv_len { continue; }
-                                            let loc = entry.location[l_idx];
-                                            if loc == KVLocation::SSD || loc == KVLocation::Loading {
-                                                // [FIX] Deadlock Prevention: Store b_idx explicitly
-                                                w_blocks_to_load.push((l_idx, b_idx, block.clone()));
-                                                if w_chunk_path.as_os_str().is_empty() {
-                                                    w_chunk_path = entry.ssd_path.clone().unwrap_or_default();
-                                                }
+                                // Layer Loop는 하나지만, 내부적으로 KV Block은 여러 개일 수 있음
+                                // 현재 레이어(layer_idx)에 해당하는 KV Block들만 검사
+                                let layer_kv_blocks = &self.layers[layer_idx].self_attn.kv_blocks;
+                                for (b_idx, block) in layer_kv_blocks.iter().enumerate() {
+                                    if b_idx < reg.len() {
+                                        let entry = &reg[b_idx];
+                                        if entry.token_start >= self.current_kv_len { continue; }
+                                        let loc = entry.location[layer_idx];
+                                        if loc == KVLocation::SSD || loc == KVLocation::Loading {
+                                            w_blocks_to_load.push((layer_idx, b_idx, block.clone()));
+                                            if w_chunk_path.as_os_str().is_empty() {
+                                                w_chunk_path = entry.ssd_path.clone().unwrap_or_default();
                                             }
                                         }
                                     }
@@ -1977,7 +1976,7 @@ impl QuantizedQwen3VLTextModel {
                             }
 
                             if !w_blocks_to_load.is_empty() && !w_chunk_path.as_os_str().is_empty() {
-                                println!("[BURST] Window {}-{}: Waiting for {} blocks from SSD...", w_start, w_end-1, w_blocks_to_load.len());
+                                // println!("[BURST] Layer {}: Waiting for {} blocks from SSD...", layer_idx, w_blocks_to_load.len());
                                 {
                                     let mut reg_w = self.registry.entries.write().unwrap();
                                     for (l_idx, b_idx, _block) in &w_blocks_to_load {
@@ -2001,17 +2000,14 @@ impl QuantizedQwen3VLTextModel {
                                             } else { break; } 
                                         }
 
-                                        // [FIX] Handle partial slot acquisition to prevent worker panic
                                         let acquired_count = s_ids.len();
                                         if acquired_count < blocks_vec.len() {
-                                            // println!("[BURST] Warning: Partial slot acquisition ({}/{}) - Reverting excess blocks to SSD.", acquired_count, blocks_vec.len());
                                             if let Ok(mut reg) = registry_clone.entries.write() {
                                                 for i in acquired_count..blocks_vec.len() {
                                                     if let Ok(inner) = blocks_vec[i].inner.read() {
                                                         let b_idx = inner.index;
                                                         let l_idx = layers_vec[i];
                                                         if b_idx < reg.len() {
-                                                            // Loading 상태로 두면 무한 대기하므로 SSD로 리셋하여 재시도 유도
                                                             reg[b_idx].location[l_idx] = KVLocation::SSD;
                                                         }
                                                     }
@@ -2021,7 +2017,6 @@ impl QuantizedQwen3VLTextModel {
 
                                         if !s_ids.is_empty() {
                                             if let Ok(tx) = get_load_worker().await {
-                                                // Truncate vectors to match acquired slots
                                                 let safe_blocks: Vec<KVBlock> = blocks_vec.into_iter().take(acquired_count).collect();
                                                 let safe_layers: Vec<usize> = layers_vec.into_iter().take(acquired_count).collect();
 
@@ -2039,7 +2034,6 @@ impl QuantizedQwen3VLTextModel {
                                 while !w_ready && w_attempts < 40 {
                                     let reg = self.registry.entries.read().unwrap();
                                     let mut missing = 0;
-                                    // [FIX] Deadlock: Use pre-stored b_idx to avoid locking block.inner while holding registry lock
                                     for (l_idx, b_idx, _block) in &w_blocks_to_load {
                                         if *b_idx < reg.len() {
                                             let loc = reg[*b_idx].location[*l_idx];
@@ -2054,109 +2048,94 @@ impl QuantizedQwen3VLTextModel {
                                         w_attempts += 1;
                                     }
                                 }
-                                println!("[BURST] Window {}-{} Ready.", w_start, w_end-1);
+                                // println!("[BURST] Layer {} Ready.", layer_idx);
                             }
 
-                            // --- [STEP 2: BURST EXECUTION] ---
-                            for layer_idx in w_start..w_end {
-                                if layer_idx < start_layer { continue; }
-                                let start_layer_time = std::time::Instant::now();
-                                
-                                let should_purge = true;
-                                // [USER REQUEST] Force purge every layer to ensure strict separation
-                                // Removed smart memory check to prevent accumulation
+                            let start_layer_time = std::time::Instant::now();
+                            
+                            // [STEP 2] Move Layer to GPU
+                            let target_device = Device::new_cuda(0)?;
+                            if !self.layers[layer_idx].device().same_device(&target_device) {
+                                self.layers[layer_idx].to_device(&target_device)?;
+                                let _ = target_device.synchronize(); 
+                            }
 
-                                if should_purge && layer_idx > 0 {
-                                    let prev_idx = layer_idx - 1;
-                                    if self.layers[prev_idx].device().is_cuda() {
-                                        let _ = self.layers[prev_idx].to_device(&Device::Cpu);
-                                    }
-                                }
-                                
-                                let target_device = Device::new_cuda(0)?;
-                                if !self.layers[layer_idx].device().same_device(&target_device) {
-                                    self.layers[layer_idx].to_device(&target_device)?;
-                                    let _ = target_device.synchronize(); 
-                                }
+                            println!("[BURST] >> [RUN] Layer {} on GPU (All Chunks)", layer_idx);
 
-                                println!("[BURST] >> [RUN] Layer {} on GPU", layer_idx);
+                            let mut next_xs_all = Vec::new(); // 전체 시퀀스에 대한 이 레이어의 출력 수집
+                            
+                            // [STEP 3] Process All Chunks for this Layer
+                            // 기존에는 layer 루프 안에 chunk 루프가 있었는데,
+                            // 지금은 layer 루프 안에서 chunk를 다 돌립니다.
+                            // 주의: xs는 이전 레이어의 전체 출력이어야 함.
+                            // 첫 레이어(0)일 때는 입력 임베딩(xs)이 들어오고,
+                            // 그 다음부터는 이전 레이어의 결과(next_xs_all 합친 것)가 xs가 되어야 함.
+                            
+                            let current_seq_len = xs.dim(1)?; // 현재 입력 텐서의 길이
+                            let mut chunk_idx = 0;
+
+                            for i in (0..current_seq_len).step_by(chunk_size) {
+                                let take = (current_seq_len - i).min(chunk_size);
                                 
-                                let mut next_xs = Vec::new();
-                                let mut chunk_idx = 0;
-                                for i in (0..seq_len).step_by(chunk_size) {
-                                    let take = (seq_len - i).min(chunk_size);
-                                    
-                                    if layer_idx == 0 {
-                                        use nvml_wrapper::Nvml;
-                                        if let Ok(nvml) = Nvml::init() {
-                                            if let Ok(dev) = nvml.device_by_index(0) {
-                                                if let Ok(mem) = dev.memory_info() {
-                                                    sys.refresh_memory();
-                                                    let free_ram_kb = sys.available_memory();
-                                                    let current_progress = seqlen_offset + i + take;
-                                                    println!("[STAT] VRAM: {}MB Used / {}MB Free | RAM: {}MB Free | Progress: {}/{}", 
-                                                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, free_ram_kb / 1024, current_progress, total_len);
-                                                }
+                                // 모니터링 (첫 레이어일 때만 상세 출력)
+                                if layer_idx == 0 && i == 0 {
+                                    use nvml_wrapper::Nvml;
+                                    if let Ok(nvml) = Nvml::init() {
+                                        if let Ok(dev) = nvml.device_by_index(0) {
+                                            if let Ok(mem) = dev.memory_info() {
+                                                sys.refresh_memory();
+                                                let free_ram_kb = sys.available_memory();
+                                                println!("[STAT] VRAM: {}MB Used / {}MB Free | RAM: {}MB Free | Layer: {}", 
+                                                    mem.used / 1024 / 1024, mem.free / 1024 / 1024, free_ram_kb / 1024, layer_idx);
                                             }
                                         }
                                     }
-
-                                    let layer_ptr = &mut self.layers[layer_idx];
-                                    let dev_name = if layer_ptr.device().is_cuda() { "GPU" } else { "CPU" };
-                                    
-                                    sys.refresh_memory();
-                                    let ram_free_kb = sys.available_memory();
-                                    let vram_free = if let Ok(nvml) = nvml_wrapper::Nvml::init() {
-                                        if let Ok(dev) = nvml.device_by_index(0) {
-                                            if let Ok(mem) = dev.memory_info() { mem.free / 1024 / 1024 } else { 0 }
-                                        } else { 0 }
-                                    } else { 0 };
-
-                                    println!("[BURST] Layer {:2} | Chunk {} - START on {} | RAM: {}MB Free | VRAM: {}MB Free", 
-                                        layer_idx, chunk_idx, dev_name, ram_free_kb / 1024, vram_free);
-                                    
-                                    let xs_chunk = xs.narrow(1, i, take)?;
-                                    let cos_chunk = cos.narrow(1, i, take)?;
-                                    let sin_chunk = sin.narrow(1, i, take)?;
-                                    
-                                    let out_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        layer_ptr.forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)
-                                    }));
-
-                                    match out_res {
-                                        Ok(Ok(out)) => next_xs.push(out),
-                                        Ok(Err(e)) => { return Err(e.into()); },
-                                        Err(_) => { return Err(anyhow::anyhow!("Panic during chunk processing")); }
-                                    }
-                                    chunk_idx += 1;
                                 }
+
+                                let xs_chunk = xs.narrow(1, i, take)?;
+                                let cos_chunk = cos.narrow(1, i, take)?;
+                                let sin_chunk = sin.narrow(1, i, take)?;
                                 
-                                xs = Tensor::cat(&next_xs, 1)?;
-                                
-                                if should_purge {
-                                    for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
-                                        let (k_cpu, v_cpu) = {
-                                            let inner = block.inner.read().unwrap();
-                                            if inner.location == KVLocation::VRAM {
-                                                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                                                    (Some(k.to_device(&Device::Cpu)?), Some(v.to_device(&Device::Cpu)?))
-                                                } else { (None, None) }
-                                            } else { (None, None) }
-                                        };
-                                        if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
-                                            let mut inner_w = block.inner.write().unwrap();
-                                            inner_w.k_cache = Some(k); inner_w.v_cache = Some(v);
-                                            inner_w.location = KVLocation::RAM;
-                                        }
-                                    }
-                                    if self.layers[layer_idx].device().is_cuda() {
-                                        let _ = self.layers[layer_idx].to_device(&Device::Cpu);
-                                    }
+                                let layer_ptr = &mut self.layers[layer_idx];
+                                let out_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    layer_ptr.forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)
+                                }));
+
+                                match out_res {
+                                    Ok(Ok(out)) => next_xs_all.push(out),
+                                    Ok(Err(e)) => { return Err(e.into()); },
+                                    Err(_) => { return Err(anyhow::anyhow!("Panic during chunk processing")); }
                                 }
-                                
-                                println!("[BURST] << [DONE] Layer {} loop complete in {:.2}s.", 
-                                    layer_idx, start_layer_time.elapsed().as_secs_f32());
+                                chunk_idx += 1;
                             }
+                            
+                            // [STEP 4] Update xs for next layer
+                            // 현재 레이어의 출력을 합쳐서 다음 레이어의 입력으로 만듦
+                            xs = Tensor::cat(&next_xs_all, 1)?;
+
+                            // [STEP 5] Unload Layer form GPU (Purge)
+                            // 다음 레이어를 위해 즉시 비움
+                            for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
+                                let (k_cpu, v_cpu) = {
+                                    let inner = block.inner.read().unwrap();
+                                    if inner.location == KVLocation::VRAM {
+                                        if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                                            (Some(k.to_device(&Device::Cpu)?), Some(v.to_device(&Device::Cpu)?))
+                                        } else { (None, None) }
+                                    } else { (None, None) }
+                                };
+                                if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
+                                    let mut inner_w = block.inner.write().unwrap();
+                                    inner_w.k_cache = Some(k); inner_w.v_cache = Some(v);
+                                    inner_w.location = KVLocation::RAM;
+                                }
+                            }
+                            if self.layers[layer_idx].device().is_cuda() {
+                                let _ = self.layers[layer_idx].to_device(&Device::Cpu);
+                            }
+
+                            println!("[BURST] << [DONE] Layer {} complete in {:.2}s.", 
+                                layer_idx, start_layer_time.elapsed().as_secs_f32());
                         }
                 
                         println!("[TRACE] Horizontal Layer Burst Complete.");
