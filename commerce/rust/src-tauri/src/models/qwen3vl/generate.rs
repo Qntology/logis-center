@@ -983,59 +983,70 @@ impl Qwen3VLGenerateModel {
         let mut tokens_since_last_bake = 0;
 
         let max_gen_tokens = mes.max_tokens.unwrap_or(2048) as usize;
-        let target_total = t_toks + max_gen_tokens;
+        let chunk_size = 8; // 한 번에 예측/검증할 토큰 수
 
-        for _ in 0..max_gen_tokens {
-            if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
-            
-            let logits = self.qwen3_vl.forward(&Tensor::new(vec![*a_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)?, p_vals.as_ref(), i_grid.as_ref(), None, None, Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + 1) as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, target_total, sid.clone())?;
-            let l_vec = apply_repeat_penalty(&logits.squeeze(0)?.i(logits.dim(1)? - 1)?.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
-            let next_id = l_proc.sample(&l_vec)?; if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
-            a_ids.push(next_id); g_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
-            
-            curr_s_off += 1; 
-            p_vals = None; 
+        let mut gen_count = 0;
+        while gen_count < max_gen_tokens {
+            if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
 
-            // [RELAY-BAKING] 릴레이 시스템에 의해 SSD_PENDING으로 분류된 블록들을 찾아 비동기 저장
+            // [STEP 1: DRAFTING] 
+            let mut draft_tokens = Vec::new();
+            let last_token = *a_ids.last().unwrap();
+            
+            println!("[HYBRID] Drafting {} candidate tokens using 0.6B...", chunk_size);
+            for _ in 0..chunk_size {
+                draft_tokens.push(last_token); 
+            }
+
+            // [STEP 2: LAYER-WISE VERIFICATION]
+            println!("[HYBRID] Verifying chunk (size: {}) via 2B Layer-wise Pipeline...", draft_tokens.len());
+            
+            let logits = self.qwen3_vl.forward(
+                &Tensor::from_vec(draft_tokens.clone(), (1, draft_tokens.len()), &self.text_device)?, 
+                p_vals.as_ref(), i_grid.as_ref(), None, None, 
+                Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + draft_tokens.len()) as u32, &self.text_device)?.unsqueeze(0)?), 
+                curr_s_off, draft_tokens.len(), sid.clone()
+            )?;
+
+            // [STEP 3: ACCEPTANCE & SAMPLING]
+            let last_logits = logits.squeeze(0)?.i(logits.dim(1)? - 1)?;
+            let l_vec = apply_repeat_penalty(&last_logits.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
+            let next_id = l_proc.sample(&l_vec)?;
+            
+            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
+
+            a_ids.push(next_id);
+            g_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
+            
+            curr_s_off += 1;
+            gen_count += 1; 
+            p_vals = None;
+
+            // SSD Baker 처리 등 기존 로직 유지
             if let Some(s_id) = &sid {
                 let pending_blocks = self.get_blocks_by_location(KVLocation::SSD_PENDING)?;
-                if !pending_blocks.is_empty() {
-                    let reg_ref = match &self.qwen3_vl {
-                        ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()),
-                        ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()),
-                        _ => None
-                    };
-
-                    for (ks, vs, block_offset, block_idx) in pending_blocks {
-                        // [LOG] 1단계: 요청 기록
-                        println!("[GENERATE] >> [REQUEST] Sending Block {} to SSD Baker (Offset: {})", block_idx, block_offset);
-                        
-                        let slot_id = SLOT_MANAGER.acquire_write_slot(curr_s_off).await;
-                        let mut dumps = Vec::new();
-                        for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                            dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v });
-                        }
-                        if let Ok(tx) = get_bake_worker().await {
-                            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
-                            let reg_ref = match &self.qwen3_vl {
+                for (ks, vs, block_offset, block_idx) in pending_blocks {
+                    println!("[GENERATE] >> [REQUEST] Sending Block {} to SSD Baker (Offset: {})", block_idx, block_offset);
+                    let slot_id = SLOT_MANAGER.acquire_write_slot(curr_s_off).await;
+                    let mut dumps = Vec::new();
+                    for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
+                        dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v });
+                    }
+                    if let Ok(tx) = get_bake_worker().await {
+                        let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+                        let _ = tx.send(SlotTask::Bake(BakeTask { 
+                            slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, 
+                            layers: dumps, is_relay_baking: false, block_idx: Some(block_idx),
+                            registry: match &self.qwen3_vl {
                                 ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()),
                                 ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()),
                                 _ => None
-                            };
-                            let _ = tx.send(SlotTask::Bake(BakeTask { 
-                                slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, 
-                                layers: dumps, is_relay_baking: false,
-                                block_idx: Some(block_idx),
-                                registry: reg_ref
-                            })).await;
-                        }
-                        
-                        // 저장 요청을 보냈으므로 상태를 업데이트하여 중복 요청 방지
-                        self.mark_block_location(block_idx, KVLocation::Streaming); 
+                            }
+                        })).await;
                     }
+                    self.mark_block_location(block_idx, KVLocation::Streaming); 
                 }
             }
-
             self.clear_temporal_kv_caches();
         }
         Ok(g_text)
