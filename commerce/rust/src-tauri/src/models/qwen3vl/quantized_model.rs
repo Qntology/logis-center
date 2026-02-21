@@ -861,6 +861,10 @@ impl QuantizedQwen3VLTextAttention {
             // [FIX] Update b_len to actual tensor dimensions to prevent shape mismatch in broadcast_add
             // This handles the case where the last block (e.g. 205 tokens) is smaller than the standard 256.
             b_len = k.dim(2)?;
+            if b_len == 0 {
+                global_start_idx += b_len;
+                continue;
+            }
 
             if self.num_kv_groups > 1 {
                 let (b, h, s, d) = k.dims4()?;
@@ -870,6 +874,13 @@ impl QuantizedQwen3VLTextAttention {
 
             let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?
                 .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
+
+            if attn_weights.elem_count() == 0 {
+                // If we're in the middle of a loop, we skip this block.
+                // If we're in the VRAM batch, we might need a more global skip but usually this shouldn't happen for batch.
+                global_start_idx += b_len;
+                continue;
+            }
 
             if let Some(mask) = attention_mask {
                 let mask_len = mask.dim(D::Minus1)?;
@@ -936,6 +947,13 @@ impl QuantizedQwen3VLTextAttention {
 
             let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?
                 .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
+
+            if attn_weights.elem_count() == 0 {
+                // If we're in the middle of a loop, we skip this block.
+                // If we're in the VRAM batch, we might need a more global skip but usually this shouldn't happen for batch.
+                global_start_idx += b_len;
+                continue;
+            }
 
             if let Some(mask) = attention_mask {
                 let mask_len = mask.dim(D::Minus1)?;
