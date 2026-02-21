@@ -172,7 +172,7 @@ impl SlotManager {
     pub fn get_counts(&self) -> (usize, usize, usize) { (self.count_reads.load(Ordering::Relaxed), self.count_writes.load(Ordering::Relaxed), self.count_free.load(Ordering::Relaxed)) }
 }
 
-pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(32));
+pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(64));
 
 struct LayerKVDump { layer_idx: usize, k_tensor: Tensor, v_tensor: Tensor }
 struct BakeTask { 
@@ -439,7 +439,18 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     // [LAYER-PATH-RESOLUTION] 레이어 독립 파일 경로 결정
                                     let is_relay_file = target_path.file_name().map(|n| n.to_string_lossy().contains("bundle_relay_chunk")).unwrap_or(false);
                                     let actual_load_path = if target_path.is_dir() {
-                                        target_path.join(format!("l{}.st", l_idx))
+                                        let layer_path = target_path.join(format!("l{}.st", l_idx));
+                                        if layer_path.exists() {
+                                            layer_path
+                                        } else {
+                                            // [RELAY-FALLBACK] 0.6B가 구운 데이터는 l0.st만 존재함. 이를 모든 레이어가 공유.
+                                            let fallback = target_path.join("l0.st");
+                                            if fallback.exists() {
+                                                fallback
+                                            } else {
+                                                layer_path // 최종적으로 원래 경로 시도 (에러 리포팅용)
+                                            }
+                                        }
                                     } else {
                                         // 하위 호환성: 기존 번들 파일 방식 대응
                                         target_path.clone()
@@ -604,10 +615,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     let num_blocks = chunk.layer_indices.len();
                                     println!("[WORKER-CHUNK] >> [START] CHUNKED LOAD for {} blocks.", num_blocks);
                                     
+                                    // [SAFETY-CHECK] 슬롯 ID와 블록 배열 크기 일치 확인
+                                    let safe_count = num_blocks.min(chunk.slot_ids.len()).min(chunk.shared_blocks.len());
+
                                     // [OPTIMIZATION] 경로별로 블록들을 그룹화하여 중복 로딩 방지
                                     let mut path_groups: std::collections::HashMap<std::path::PathBuf, Vec<(usize, usize, crate::models::qwen3vl::quantized_model::KVBlock)>> = std::collections::HashMap::new();
                                     
-                                    for i in 0..num_blocks {
+                                    for i in 0..safe_count {
                                         let (l_idx, s_id, block) = (chunk.layer_indices[i], chunk.slot_ids[i], chunk.shared_blocks[i].clone());
                                         let target_path = {
                                             match block.inner.read() {
@@ -624,7 +638,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         if let Some(p) = target_path {
                                             path_groups.entry(p).or_default().push((l_idx, s_id, block));
                                         } else {
-                                            SLOT_MANAGER.release_slot(s_id).await;
+                                            // 유효하지 않은 경로는 슬롯 즉시 반납
+                                            if s_id < SLOT_MANAGER.slots.len() {
+                                                SLOT_MANAGER.release_slot(s_id).await;
+                                            }
                                         }
                                     }
 
