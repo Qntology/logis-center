@@ -784,7 +784,7 @@ impl QuantizedQwen3VLTextAttention {
             // [OPTIMIZED-WAIT] Improved yielding during Loading wait
             if loc == KVLocation::Loading {
                 let mut attempts = 0;
-                while attempts < 5000 { // Increased timeout for CPU/SSD heavy loads
+                while attempts < 30000 { // Increased timeout (60s) for CPU/SSD heavy loads
                     let current = {
                         let reg = self.registry.entries.read().unwrap();
                         reg[index].location[self.layer_idx]
@@ -797,7 +797,7 @@ impl QuantizedQwen3VLTextAttention {
                     std::thread::sleep(std::time::Duration::from_millis(2));
                     attempts += 1;
                     
-                    if attempts % 500 == 0 {
+                    if attempts % 1000 == 0 {
                         println!("[TRACE] Layer {} Block {} still loading... ({} ms elapsed)", self.layer_idx, index, attempts * 2);
                     }
                 }
@@ -1918,12 +1918,36 @@ impl QuantizedQwen3VLTextModel {
                                     if layer_idx < start_layer { continue; }
                                     let start_layer_time = std::time::Instant::now();
                                     
-                                    // [STEP 2-A: STRONG-PURGE] 
-                                    // 이전 레이어가 GPU에 남아있다면 즉시 CPU로 밀어내어 공간을 100% 확보합니다.
-                                    if layer_idx > 0 {
+                                    // [STEP 2-A: SMART-RETENTION]
+                                    // Generation(seq_len=1)시 VRAM이 충분하다면 레이어를 해제하지 않고 유지합니다 (Vertical Mode 전환).
+                                    // Baking(seq_len>1)이거나 VRAM이 부족하면 해제하여 OOM을 방지합니다.
+                                    let mut should_purge = true;
+                                    
+                                    if seq_len == 1 {
+                                        use nvml_wrapper::Nvml;
+                                        if let Ok(nvml) = Nvml::init() {
+                                            if let Ok(dev) = nvml.device_by_index(0) {
+                                                if let Ok(mem) = dev.memory_info() {
+                                                    // 1.5GB 여유가 있다면 레이어를 유지 (2B 모델 전체 로드 유도)
+                                                    if mem.free > 1500 * 1024 * 1024 {
+                                                        should_purge = false;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if should_purge && layer_idx > 0 {
                                         let prev_idx = layer_idx - 1;
-                                        if self.layers[prev_idx].device().is_cuda() {
-                                            let _ = self.layers[prev_idx].to_device(&Device::Cpu);
+                                        // 윈도우 퍼지 (Window=6) 적용 (VRAM 부족 시에도 PCIe 대역폭 절약)
+                                        let purge_window = 6;
+                                        if (prev_idx + 1) % purge_window == 0 {
+                                            let start_purge = prev_idx.saturating_sub(purge_window - 1);
+                                            for p_i in start_purge..=prev_idx {
+                                                if self.layers[p_i].device().is_cuda() {
+                                                    let _ = self.layers[p_i].to_device(&Device::Cpu);
+                                                }
+                                            }
                                         }
                                     }
                                     
