@@ -1375,12 +1375,17 @@ impl QuantizedQwen3VLTextAttention {
                     token_start: *offset,
                     token_len: b_len,
                     ssd_path: Some(path.clone()),
-                    is_dirty: false, // SSD에 이미 있으므로 백업 불필요
+                    is_dirty: false, 
                     last_accessed: std::time::Instant::now(),
                     bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; 28])),
                 });
             }
-            reg[i].location[self.layer_idx] = KVLocation::SSD;
+            
+            // [FIX] 이미 RAM에 있거나 로딩 중이면 SSD로 덮어쓰지 않음
+            let current_loc = reg[i].location[self.layer_idx];
+            if current_loc != KVLocation::RAM && current_loc != KVLocation::RamSticky && current_loc != KVLocation::Loading {
+                reg[i].location[self.layer_idx] = KVLocation::SSD;
+            }
             reg[i].ssd_path = Some(path.clone());
         }
 

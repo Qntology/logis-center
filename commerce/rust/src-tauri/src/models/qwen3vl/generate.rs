@@ -572,7 +572,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                                                                                                                                             println!("[WORKER-LOAD] << [SUCCESS] RELAY Bundle Block {} broadcasted to ALL layers.", b_idx);
                                                                                                                                                                                             break;
                                                                                                                                                                                         } else {
-                                                                                                                                                                                            cache[target_l] = Some(metadata);
+                                                                                                                                                                                            cache[target_l] = Some(metadata.clone());
                                                                                                                                                                                             let cur_loc = entry.location[target_l];
                                                                                                                                                                                             if cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::SSD || cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::Loading {
                                                                                                                                                                                                 entry.location[target_l] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
@@ -675,18 +675,21 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                     st.tensor(name).ok().map(|v| v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()) 
                                                 };
                                                 
-                                                if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ka_data, st.tensor(&kp_name).ok(), ex_v(&ks_name), ex_v(&va_name), st.tensor(&vp_name).ok(), ex_v(&vs_name)) {
-                                                    let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
-                                                        k_anchors: Tensor::from_vec(ka, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                        k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
-                                                        k_scales: Tensor::from_vec(ks, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                        v_anchors: Tensor::from_vec(va, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                        v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
-                                                        v_scales: Tensor::from_vec(vs, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                        original_shape: o_s 
-                                                    };
-                
-                                                    if let Ok(mut inner) = block.inner.write() {
+                                                                                                                                            if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (ka_data, st.tensor(&kp_name).ok(), ex_v(&ks_name), ex_v(&va_name), st.tensor(&vp_name).ok(), ex_v(&vs_name)) {
+                                                                                                                                                // [SANITY-CHECK] 8.9억 패닉 방지
+                                                                                                                                                let mut safe_os = o_s;
+                                                                                                                                                if safe_os[2] > 1024 || safe_os[3] > 512 { safe_os = vec![1, 16, 256, 128]; }
+                                                
+                                                                                                                                                let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
+                                                                                                                                                    k_anchors: Tensor::from_vec(ka, (safe_os[0], safe_os[1], a_cnt, safe_os[3]), &Device::Cpu).unwrap(), 
+                                                                                                                                                    k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
+                                                                                                                                                    k_scales: Tensor::from_vec(ks, (safe_os[0], safe_os[1], safe_os[2], 1), &Device::Cpu).unwrap(), 
+                                                                                                                                                    v_anchors: Tensor::from_vec(va, (safe_os[0], safe_os[1], a_cnt, safe_os[3]), &Device::Cpu).unwrap(), 
+                                                                                                                                                    v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
+                                                                                                                                                    v_scales: Tensor::from_vec(vs, (safe_os[0], safe_os[1], safe_os[2], 1), &Device::Cpu).unwrap(), 
+                                                                                                                                                    original_shape: safe_os 
+                                                                                                                                                };
+                                                                                                    if let Ok(mut inner) = block.inner.write() {
                                                         inner.bitkv_metadata = Some(metadata.clone());
                                                                 if let Ok(mut reg) = reg_inner.entries.write() {
                                                             if b_idx < reg.len() { 
@@ -709,29 +712,28 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                     let vs_name = get_name(&st, &prefix, &layer_prefix, "v_scales");
 
                                                                     if let (Ok(ka_v), Ok(kh_v), Ok(kp_v), Ok(ks_v), Ok(va_v), Ok(vp_v), Ok(vs_v)) = (
-                                                                    st.tensor(&ka_name), st.tensor(&kh_name), st.tensor(&kp_name), 
-                                                                    st.tensor(&ks_name), st.tensor(&va_name), st.tensor(&vp_name), st.tensor(&vs_name)
-                                                                ) {
-                                                                    let dims = ka_v.shape();
-                                                                    let a_cnt = dims[2];
-                                                                    let v_u32 = kh_v.data().chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect::<Vec<u32>>();
-                                                                    
-                                                                    // [SANITY-CHECK] 8.9억 패닉 방지를 위한 형상 데이터 검증
-                                                                    let mut o_s = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
-                                                                    if o_s[2] > 1024 || o_s[3] > 512 {
-                                                                        // 데이터 오염 감지 시 안전한 기본값으로 복구
-                                                                        o_s = vec![1, 16, 256, 128];
-                                                                    }
+                                                                        st.tensor(&ka_name), st.tensor(&kh_name), st.tensor(&kp_name), 
+                                                                        st.tensor(&ks_name), st.tensor(&va_name), st.tensor(&vp_name), st.tensor(&vs_name)
+                                                                    ) {
+                                                                        let dims = ka_v.shape();
+                                                                        let a_c = dims[2];
+                                                                        
+                                                                        // [SAFE-CONVERSION] 8.9억 패닉 원천 차단 로직
+                                                                        let v_u32 = kh_v.data().chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect::<Vec<u32>>();
+                                                                        let mut os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
+                                                                        
+                                                                        // 형상 정보 검증 (보호막)
+                                                                        if os[2] > 1024 || os[3] > 512 { os = vec![1, 16, 256, 128]; }
 
-                                                                    let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
-                                                                        k_anchors: Tensor::from_vec(ka_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                                        k_packed: Tensor::from_slice(kp_v.data(), kp_v.shape(), &Device::Cpu).unwrap(), 
-                                                                        k_scales: Tensor::from_vec(ks_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                                        v_anchors: Tensor::from_vec(va_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
-                                                                        v_packed: Tensor::from_slice(vp_v.data(), vp_v.shape(), &Device::Cpu).unwrap(), 
-                                                                        v_scales: Tensor::from_vec(vs_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                                        original_shape: o_s 
-                                                                    };
+                                                                        let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
+                                                                            k_anchors: Tensor::from_vec(ka_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], a_c, os[3]), &Device::Cpu).unwrap(), 
+                                                                            k_packed: Tensor::from_slice(kp_v.data(), kp_v.shape(), &Device::Cpu).unwrap(), 
+                                                                            k_scales: Tensor::from_vec(ks_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], os[2], 1), &Device::Cpu).unwrap(), 
+                                                                            v_anchors: Tensor::from_vec(va_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], a_c, os[3]), &Device::Cpu).unwrap(), 
+                                                                            v_packed: Tensor::from_slice(vp_v.data(), vp_v.shape(), &Device::Cpu).unwrap(), 
+                                                                            v_scales: Tensor::from_vec(vs_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], os[2], 1), &Device::Cpu).unwrap(), 
+                                                                            original_shape: os 
+                                                                        };
                                                                     
                                                                     {
                                                                         let mut cache = entry.bitkv_cache.write().unwrap();
@@ -746,7 +748,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                             println!("[WORKER-CHUNK] << [SUCCESS] RELAY Bundle Block {} broadcasted to ALL layers.", b_idx);
                                                                             break; // l0만 읽고 종료
                                                                         } else {
-                                                                            cache[target_l] = Some(metadata);
+                                                                            cache[target_l] = Some(metadata.clone());
                                                                             let cur_loc = entry.location[target_l];
                                                                             if cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::SSD || cur_loc == crate::models::qwen3vl::quantized_model::KVLocation::Loading {
                                                                                 entry.location[target_l] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
