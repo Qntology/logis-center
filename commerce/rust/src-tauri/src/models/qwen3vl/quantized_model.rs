@@ -2283,19 +2283,36 @@ impl QuantizedQwen3VLTextModel {
                 for entry in entries.flatten() {
                     let fname = entry.file_name().to_string_lossy().to_string();
                     
-                    // Match pattern: bundle_relay_kv_{offset}.safetensors OR bundle_inference_kv_{offset}.safetensors
-                    let is_bundle = fname.starts_with("bundle_");
-                    
-                    if is_bundle && fname.ends_with(".safetensors") {
-                        let offset = if fname == "bundle_relay_kv.safetensors" || fname == "bundle_inference_kv.safetensors" {
-                            0
-                        } else {
-                            fname.strip_suffix(".safetensors")
-                                 .and_then(|s| s.split('_').last())
-                                 .and_then(|s| s.parse::<usize>().ok())
-                                 .unwrap_or(0)
-                        };
-                        fragments.push((offset, entry.path()));
+                    if fname.ends_with(".safetensors") {
+                        if fname.contains("_chunk_") {
+                            // [NEW-FORMAT] bundle_inference_chunk_{idx}.safetensors
+                            let chunk_idx = fname.strip_suffix(".safetensors")
+                                                 .and_then(|s| s.split('_').last())
+                                                 .and_then(|s| s.parse::<usize>().ok())
+                                                 .unwrap_or(0);
+                            
+                            let base_offset = chunk_idx * (256 * 64);
+                            
+                            // [SMART-SCAN] 파일 크기를 체크하여 대략적인 블록 개수 유추 (한 블록당 약 220KB)
+                            let f_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                            let estimated_blocks = if f_size > 0 { (f_size / 200_000).min(64) as usize } else { 64 };
+                            
+                            for b_in_chunk in 0..estimated_blocks {
+                                let block_offset = base_offset + (b_in_chunk * 256);
+                                fragments.push((block_offset, entry.path()));
+                            }
+                        } else if fname.starts_with("bundle_") {
+                            // [OLD-FORMAT] bundle_inference_kv_{offset}.safetensors
+                            let offset = if fname == "bundle_relay_kv.safetensors" || fname == "bundle_inference_kv.safetensors" {
+                                0
+                            } else {
+                                fname.strip_suffix(".safetensors")
+                                     .and_then(|s| s.split('_').last())
+                                     .and_then(|s| s.parse::<usize>().ok())
+                                     .unwrap_or(0)
+                            };
+                            fragments.push((offset, entry.path()));
+                        }
                     }
                 }
             }

@@ -235,33 +235,42 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             
             let b_idx_str = task.block_idx.map(|i| i.to_string()).unwrap_or("?".into());
             
-                            // [MERGE-LOGIC] 기존 파일이 있으면 불러와서 병합
-                            let mut final_tensors = task.tensors;
-                            if task.path.exists() {
-                                if let Ok(content) = std::fs::read(&task.path) {
-                                    if let Ok(existing_st) = safetensors::SafeTensors::deserialize(&content) {
-                                        for name in existing_st.names() {
-                                            // 현재 저장하려는 블록과 겹치지 않는 텐서들만 복사
-                                            let prefix = format!("b{}_", task.block_idx.map(|i| i * 256).unwrap_or(999999));
-                                            if !name.starts_with(&prefix) {
-                                                if let Ok(view) = existing_st.tensor(name) {
-                                                    let dtype = match view.dtype() {
-                                                        safetensors::Dtype::F32 => candle_core::DType::F32,
-                                                        safetensors::Dtype::BF16 => candle_core::DType::BF16,
-                                                        safetensors::Dtype::F16 => candle_core::DType::F16,
-                                                        safetensors::Dtype::U8 => candle_core::DType::U8,
-                                                        _ => candle_core::DType::F32,
-                                                    };
-                                                    if let Ok(t) = candle_core::Tensor::from_slice(view.data(), view.shape(), &candle_core::Device::Cpu) {
-                                                        let t = t.to_dtype(dtype).unwrap_or(t);
-                                                        final_tensors.insert(name.to_string(), t);
+                                            // [MERGE-LOGIC] 기존 파일이 있으면 불러와서 병합
+                                            let mut final_tensors = task.tensors;
+                                            let b_off = task.block_idx.map(|i| i * 256).unwrap_or(999999);
+                                            let current_prefix = format!("b{}_", b_off);
+                            
+                                            if task.path.exists() {
+                                                if let Ok(content) = std::fs::read(&task.path) {
+                                                    if let Ok(existing_st) = safetensors::SafeTensors::deserialize(&content) {
+                                                        let mut merged_count = 0;
+                                                        for name in existing_st.names() {
+                                                            // 현재 저장하려는 블록(prefix)과 겹치지 않는 텐서들만 기존 파일에서 복사
+                                                            if !name.starts_with(&current_prefix) {
+                                                                if let Ok(view) = existing_st.tensor(name) {
+                                                                    let dtype = match view.dtype() {
+                                                                        safetensors::Dtype::F32 => candle_core::DType::F32,
+                                                                        safetensors::Dtype::BF16 => candle_core::DType::BF16,
+                                                                        safetensors::Dtype::F16 => candle_core::DType::F16,
+                                                                        safetensors::Dtype::U8 => candle_core::DType::U8,
+                                                                        _ => candle_core::DType::F32,
+                                                                    };
+                                                                    // 주의: from_slice는 데이터를 복사하므로 안전함
+                                                                    if let Ok(t) = candle_core::Tensor::from_slice(view.data(), view.shape(), &candle_core::Device::Cpu) {
+                                                                        let t = t.to_dtype(dtype).unwrap_or(t);
+                                                                        final_tensors.insert(name.to_string(), t);
+                                                                        merged_count += 1;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        if merged_count > 0 {
+                                                            println!("[WORKER-IO] Merged {} tensors from existing chunk {:?}", merged_count, task.path.file_name());
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
-                                    }
-                                }
-                            }
+                            
                         // [LOG] 3단계: 결과 기록
             match candle_core::safetensors::save(&final_tensors, &task.path) {
                 Ok(_) => {
@@ -1134,18 +1143,19 @@ impl Qwen3VLGenerateModel {
                 let mut ks: Vec<Tensor> = Vec::new();
                 let mut vs: Vec<Tensor> = Vec::new();
                 let mut has_data = false;
-                let mut end_offset = 0;
+                let mut block_start_offset = 0;
                 for l in layers {
                     if b_idx < l.self_attn.kv_blocks.len() {
                         let inner = l.self_attn.kv_blocks[b_idx].inner.read().unwrap();
                         if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                             ks.push(k.clone()); vs.push(v.clone());
-                            end_offset = inner.offset + inner.len;
+                            // [FIX] 블록의 시작 오프셋을 사용해야 b0, b256 등으로 올바르게 명명됨
+                            block_start_offset = inner.offset; 
                             has_data = true;
                         }
                     }
                 }
-                if has_data { all_blocks.push((ks, vs, end_offset)); }
+                if has_data { all_blocks.push((ks, vs, block_start_offset)); }
             }
         }
         all_blocks
