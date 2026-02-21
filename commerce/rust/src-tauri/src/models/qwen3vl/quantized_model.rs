@@ -1975,13 +1975,11 @@ impl QuantizedQwen3VLTextModel {
                                                                 let mut missing_count = 0;
                                                                 for b_idx in 0..self.layers[layer_idx].self_attn.kv_blocks.len() {
                                                                     if b_idx < reg.len() {
-                                                                        let loc = reg[b_idx].location[layer_idx];
-                                                                        /* 
-                                                                           [DEADLOCK-FIX] 
-                                                                           - SSD_PENDING과 VRAM은 데이터가 이미 RAM에 존재(저장 대기 중)하는 상태입니다.
-                                                                           - 이를 'Missing'으로 간주하면 로더는 무시하고 엔진은 대기하는 교착 상태가 발생합니다.
-                                                                           - 따라서 메모리 상주 상태(RAM/RamSticky/VRAM/SSD_PENDING)는 모두 '준비 완료'로 봅니다.
-                                                                        */
+                                                                        let entry = &reg[b_idx];
+                                                                        // [CRITICAL-FIX] 현재 유효한 KV 길이 내에 있는 블록만 기다립니다.
+                                                                        if entry.token_start >= self.current_kv_len { continue; }
+                                                                        
+                                                                        let loc = entry.location[layer_idx];
                                                                         if loc != KVLocation::RAM && loc != KVLocation::RamSticky && loc != KVLocation::VRAM && loc != KVLocation::SSD_PENDING {
                                                                             missing_count += 1;
                                                                         }
@@ -2293,11 +2291,12 @@ impl QuantizedQwen3VLTextModel {
                             
                             let base_offset = chunk_idx * (256 * 64);
                             
-                            // [SMART-SCAN] 파일 크기를 체크하여 대략적인 블록 개수 유추 (한 블록당 약 220KB)
-                            let f_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                            let estimated_blocks = if f_size > 0 { (f_size / 200_000).min(64) as usize } else { 64 };
+                            // [STRICT-SCAN] 메타데이터에서 불러온 현재 토큰 길이(self.current_kv_len)를 기준으로 
+                            // 이 파일에 실제로 포함된 블록들만 등록합니다.
+                            let max_tokens_in_this_chunk = (self.current_kv_len).saturating_sub(base_offset);
+                            let actual_blocks_to_register = ((max_tokens_in_this_chunk + 255) / 256).min(64);
                             
-                            for b_in_chunk in 0..estimated_blocks {
+                            for b_in_chunk in 0..actual_blocks_to_register {
                                 let block_offset = base_offset + (b_in_chunk * 256);
                                 fragments.push((block_offset, entry.path()));
                             }
