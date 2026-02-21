@@ -490,13 +490,25 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                             
                                                                                             let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor(&ka_name) {
                                                                                                 let dims = t_view.shape();
-                                                                                                // Safe conversion using Candle's built-in loader
-                                                                                                let ka_t = candle_core::safetensors::load_tensor(t_view, &candle_core::Device::Cpu).unwrap();
+                                                                                                let dtype = match t_view.dtype() {
+                                                                                                    safetensors::Dtype::F32 => candle_core::DType::F32,
+                                                                                                    safetensors::Dtype::F16 => candle_core::DType::F16,
+                                                                                                    safetensors::Dtype::BF16 => candle_core::DType::BF16,
+                                                                                                    safetensors::Dtype::U32 => candle_core::DType::U32,
+                                                                                                    safetensors::Dtype::U8 => candle_core::DType::U8,
+                                                                                                    _ => candle_core::DType::F32,
+                                                                                                };
+                                                                                                // Safe conversion using the correct DType
+                                                                                                let ka_t = candle_core::Tensor::from_slice(t_view.data(), dims, &candle_core::Device::Cpu).unwrap().to_dtype(dtype).unwrap();
                                                                                                 let data = ka_t.to_dtype(candle_core::DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
                                                                                                 
                                                                                                 let s_len = if let Ok(v_view) = st.tensor(&kh_name) {
-                                                                                                    let vt = candle_core::safetensors::load_tensor(v_view, &candle_core::Device::Cpu).unwrap();
-                                                                                                    let v_vec = vt.to_dtype(candle_core::DType::U32).unwrap().to_vec1::<u32>().unwrap();
+                                                                                                    let v_dtype = match v_view.dtype() {
+                                                                                                        safetensors::Dtype::U32 => candle_core::DType::U32,
+                                                                                                        _ => candle_core::DType::U32,
+                                                                                                    };
+                                                                                                    let vt = candle_core::Tensor::from_slice(v_view.data(), v_view.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(v_dtype).unwrap();
+                                                                                                    let v_vec = vt.to_vec1::<u32>().unwrap();
                                                                                                     v_vec[2] as usize
                                                                                                 } else { 256 };
                                                                                                 (Some(data), vec![dims[0], dims[1], s_len, dims[3]], dims[2])
@@ -541,13 +553,22 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                                                                                                                                     st.tensor(&ka_name), st.tensor(&kh_name), st.tensor(&kp_name), 
                                                                                                                                                                                     st.tensor(&ks_name), st.tensor(&va_name), st.tensor(&vp_name), st.tensor(&vs_name)
                                                                                                                                                                                 ) {
-                                                                                                                                                                                    let ka = candle_core::safetensors::load_tensor(ka_v, &candle_core::Device::Cpu).unwrap();
-                                                                                                                                                                                    let kh = candle_core::safetensors::load_tensor(kh_v, &candle_core::Device::Cpu).unwrap();
-                                                                                                                                                                                    let kp = candle_core::safetensors::load_tensor(kp_v, &candle_core::Device::Cpu).unwrap();
-                                                                                                                                                                                    let ks = candle_core::safetensors::load_tensor(ks_v, &candle_core::Device::Cpu).unwrap();
-                                                                                                                                                                                    let va = candle_core::safetensors::load_tensor(va_v, &candle_core::Device::Cpu).unwrap();
-                                                                                                                                                                                    let vp = candle_core::safetensors::load_tensor(vp_v, &candle_core::Device::Cpu).unwrap();
-                                                                                                                                                                                    let vs = candle_core::safetensors::load_tensor(vs_v, &candle_core::Device::Cpu).unwrap();
+                                                                                                                                                                                    let map_dtype = |dt: safetensors::Dtype| match dt {
+                                                                                                                                                                                        safetensors::Dtype::F32 => candle_core::DType::F32,
+                                                                                                                                                                                        safetensors::Dtype::F16 => candle_core::DType::F16,
+                                                                                                                                                                                        safetensors::Dtype::BF16 => candle_core::DType::BF16,
+                                                                                                                                                                                        safetensors::Dtype::U32 => candle_core::DType::U32,
+                                                                                                                                                                                        safetensors::Dtype::U8 => candle_core::DType::U8,
+                                                                                                                                                                                        _ => candle_core::DType::F32,
+                                                                                                                                                                                    };
+
+                                                                                                                                                                                    let ka = candle_core::Tensor::from_slice(ka_v.data(), ka_v.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(map_dtype(ka_v.dtype())).unwrap();
+                                                                                                                                                                                    let kh = candle_core::Tensor::from_slice(kh_v.data(), kh_v.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(map_dtype(kh_v.dtype())).unwrap();
+                                                                                                                                                                                    let kp = candle_core::Tensor::from_slice(kp_v.data(), kp_v.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(map_dtype(kp_v.dtype())).unwrap();
+                                                                                                                                                                                    let ks = candle_core::Tensor::from_slice(ks_v.data(), ks_v.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(map_dtype(ks_v.dtype())).unwrap();
+                                                                                                                                                                                    let va = candle_core::Tensor::from_slice(va_v.data(), va_v.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(map_dtype(va_v.dtype())).unwrap();
+                                                                                                                                                                                    let vp = candle_core::Tensor::from_slice(vp_v.data(), vp_v.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(map_dtype(vp_v.dtype())).unwrap();
+                                                                                                                                                                                    let vs = candle_core::Tensor::from_slice(vs_v.data(), vs_v.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(map_dtype(vs_v.dtype())).unwrap();
 
                                                                                                                                                                                     let dims = ka.shape();
                                                                                                                                                                                     let a_cnt = dims[2];
@@ -670,12 +691,24 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 
                                                 let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor(&ka_name) {
                                                     let dims = t_view.shape();
-                                                    let ka_t = candle_core::safetensors::load_tensor(t_view, &candle_core::Device::Cpu).unwrap();
+                                                    let dtype = match t_view.dtype() {
+                                                        safetensors::Dtype::F32 => candle_core::DType::F32,
+                                                        safetensors::Dtype::F16 => candle_core::DType::F16,
+                                                        safetensors::Dtype::BF16 => candle_core::DType::BF16,
+                                                        safetensors::Dtype::U32 => candle_core::DType::U32,
+                                                        safetensors::Dtype::U8 => candle_core::DType::U8,
+                                                        _ => candle_core::DType::F32,
+                                                    };
+                                                    let ka_t = candle_core::Tensor::from_slice(t_view.data(), dims, &candle_core::Device::Cpu).unwrap().to_dtype(dtype).unwrap();
                                                     let data = ka_t.to_dtype(candle_core::DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
                                                     
                                                     let s_len = if let Ok(v_view) = st.tensor(&kh_name) {
-                                                        let vt = candle_core::safetensors::load_tensor(v_view, &candle_core::Device::Cpu).unwrap();
-                                                        let v_vec = vt.to_dtype(candle_core::DType::U32).unwrap().to_vec1::<u32>().unwrap();
+                                                        let v_dtype = match v_view.dtype() {
+                                                            safetensors::Dtype::U32 => candle_core::DType::U32,
+                                                            _ => candle_core::DType::U32,
+                                                        };
+                                                        let vt = candle_core::Tensor::from_slice(v_view.data(), v_view.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(v_dtype).unwrap();
+                                                        let v_vec = vt.to_vec1::<u32>().unwrap();
                                                         v_vec[2] as usize
                                                     } else { 256 };
                                                     (Some(data), vec![dims[0], dims[1], s_len, dims[3]], dims[2])
@@ -722,13 +755,22 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                     st.tensor(&ka_name), st.tensor(&kh_name), st.tensor(&kp_name), 
                                                                     st.tensor(&ks_name), st.tensor(&va_name), st.tensor(&vp_name), st.tensor(&vs_name)
                                                                 ) {
-                                                                    let ka = candle_core::safetensors::load_tensor(ka_v, &candle_core::Device::Cpu).unwrap();
-                                                                    let kh = candle_core::safetensors::load_tensor(kh_v, &candle_core::Device::Cpu).unwrap();
-                                                                    let kp = candle_core::safetensors::load_tensor(kp_v, &candle_core::Device::Cpu).unwrap();
-                                                                    let ks = candle_core::safetensors::load_tensor(ks_v, &candle_core::Device::Cpu).unwrap();
-                                                                    let va = candle_core::safetensors::load_tensor(va_v, &candle_core::Device::Cpu).unwrap();
-                                                                    let vp = candle_core::safetensors::load_tensor(vp_v, &candle_core::Device::Cpu).unwrap();
-                                                                    let vs = candle_core::safetensors::load_tensor(vs_v, &candle_core::Device::Cpu).unwrap();
+                                                                    let map_dtype = |dt: safetensors::Dtype| match dt {
+                                                                        safetensors::Dtype::F32 => candle_core::DType::F32,
+                                                                        safetensors::Dtype::F16 => candle_core::DType::F16,
+                                                                        safetensors::Dtype::BF16 => candle_core::DType::BF16,
+                                                                        safetensors::Dtype::U32 => candle_core::DType::U32,
+                                                                        safetensors::Dtype::U8 => candle_core::DType::U8,
+                                                                        _ => candle_core::DType::F32,
+                                                                    };
+
+                                                                    let ka = candle_core::Tensor::from_slice(ka_v.data(), ka_v.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(map_dtype(ka_v.dtype())).unwrap();
+                                                                    let kh = candle_core::Tensor::from_slice(kh_v.data(), kh_v.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(map_dtype(kh_v.dtype())).unwrap();
+                                                                    let kp = candle_core::Tensor::from_slice(kp_v.data(), kp_v.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(map_dtype(kp_v.dtype())).unwrap();
+                                                                    let ks = candle_core::Tensor::from_slice(ks_v.data(), ks_v.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(map_dtype(ks_v.dtype())).unwrap();
+                                                                    let va = candle_core::Tensor::from_slice(va_v.data(), va_v.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(map_dtype(va_v.dtype())).unwrap();
+                                                                    let vp = candle_core::Tensor::from_slice(vp_v.data(), vp_v.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(map_dtype(vp_v.dtype())).unwrap();
+                                                                    let vs = candle_core::Tensor::from_slice(vs_v.data(), vs_v.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(map_dtype(vs_v.dtype())).unwrap();
 
                                                                     let dims = ka.shape();
                                                                     let a_cnt = dims[2];
