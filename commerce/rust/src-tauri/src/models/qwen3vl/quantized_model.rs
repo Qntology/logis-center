@@ -2066,6 +2066,7 @@ impl QuantizedQwen3VLTextModel {
             xs = xs.to_device(norm_dev)?;
         }
         let xs = xs.apply(&self.norm)?;
+
         Ok(xs)
     }
 
@@ -2789,7 +2790,7 @@ impl QuantizedQwen3VLModel {
         
         self.language_model.active_session_id = session_id;
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
-        let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
+        let hidden_state = outputs; // [SPECULATIVE] 전체 시퀀스에 대한 히든 스테이트 유지
         
         let head_dev = self.lm_head.device();
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
@@ -2876,7 +2877,7 @@ impl QuantizedQwen3TextModel {
         
         self.language_model.active_session_id = session_id;
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
-        let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
+        let hidden_state = outputs; // [SPECULATIVE]
         if let Some(head) = &self.lm_head {
             let hidden_state = if !hidden_state.device().same_device(head.device()) { hidden_state.to_device(head.device())? } else { hidden_state };
             Ok(head.forward(&hidden_state)?)
