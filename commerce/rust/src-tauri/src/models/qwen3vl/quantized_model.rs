@@ -285,7 +285,7 @@ impl KVRegistry {
 
         let mut entries = self.entries.write().unwrap();
         // [RELAXED] 그룹 크기를 512 -> 1024로 확대하여 상태 전환 빈도 감소
-        let group_size = 1024; 
+        let group_size = 2048; 
         let current_group_id = current_token_idx / group_size;
 
         // [RAM-OPTIMIZATION] 시스템 메모리 상태 체크
@@ -2380,10 +2380,16 @@ impl QuantizedQwen3VLTextModel {
             if let Ok(entries) = std::fs::read_dir(path) {
                 for entry in entries.flatten() {
                     let fname = entry.file_name().to_string_lossy().to_string();
+                    let fpath = entry.path();
                     
-                    if fname.ends_with(".safetensors") {
+                    if fpath.is_dir() && fname.starts_with('b') {
+                        // [NEW-DIR-FORMAT] b{offset}/l{layer}.st
+                        if let Ok(offset) = fname[1..].parse::<usize>() {
+                            fragments.push((offset, fpath));
+                        }
+                    } else if fname.ends_with(".safetensors") {
                         if fname.contains("_chunk_") {
-                            // [NEW-FORMAT] bundle_inference_chunk_{idx}.safetensors
+                            // [NEW-BUNDLE-FORMAT] bundle_inference_chunk_{idx}.safetensors
                             let chunk_idx = fname.strip_suffix(".safetensors")
                                                  .and_then(|s| s.split('_').last())
                                                  .and_then(|s| s.parse::<usize>().ok())

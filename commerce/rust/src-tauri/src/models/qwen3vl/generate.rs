@@ -229,92 +229,63 @@ pub fn init_bake_worker() {
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(1000); 
+    
+    // [PARALLEL-IO-WORKER] SSD 쓰기 전용 병렬 워커
     tokio::spawn(async move {
         while let Some(task) = io_rx.recv().await {
-            if let Some(parent) = task.path.parent() { if !parent.exists() { let _ = std::fs::create_dir_all(parent); } }
-            
+            let task_path = task.path.clone();
+            let task_tensors = task.tensors;
             let b_idx_str = task.block_idx.map(|i| i.to_string()).unwrap_or("?".into());
-            
-                                            // [MERGE-LOGIC] 기존 파일이 있으면 불러와서 병합
-                                            let mut final_tensors = task.tensors;
-                                            let b_off = task.block_idx.map(|i| i * 256).unwrap_or(999999);
-                                            let current_prefix = format!("b{}_", b_off);
-                            
-                                            if task.path.exists() {
-                                                if let Ok(content) = std::fs::read(&task.path) {
-                                                    if let Ok(existing_st) = safetensors::SafeTensors::deserialize(&content) {
-                                                        let mut merged_count = 0;
-                                                        for name in existing_st.names() {
-                                                            // 현재 저장하려는 텐서 키와 겹치지 않는 것만 기존 파일에서 복사 (Merge)
-                                                            if !final_tensors.contains_key(name) {
-                                                                if let Ok(view) = existing_st.tensor(name) {
-                                                                    let dtype = match view.dtype() {
-                                                                        safetensors::Dtype::F32 => candle_core::DType::F32,
-                                                                        safetensors::Dtype::BF16 => candle_core::DType::BF16,
-                                                                        safetensors::Dtype::F16 => candle_core::DType::F16,
-                                                                        safetensors::Dtype::U32 => candle_core::DType::U32,
-                                                                        safetensors::Dtype::U8 => candle_core::DType::U8,
-                                                                        _ => candle_core::DType::F32,
-                                                                    };
-                                                                    // 주의: from_slice는 데이터를 복사하므로 안전함
-                                                                    if let Ok(t) = candle_core::Tensor::from_slice(view.data(), view.shape(), &candle_core::Device::Cpu) {
-                                                                        let t = t.to_dtype(dtype).unwrap_or(t);
-                                                                        final_tensors.insert(name.to_string(), t);
-                                                                        merged_count += 1;
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        if merged_count > 0 {
-                                                            println!("[WORKER-IO] Merged {} tensors from existing chunk {:?}", merged_count, task.path.file_name());
-                                                        }
-                                                    }
-                                                }
+            let registry = task.registry.clone();
+            let block_idx = task.block_idx;
+            let slot_id = task.slot_id;
+            let is_last = task.is_last;
+
+            // [PARALLEL-WRITE] 각 쓰기 작업을 독립적인 태스크로 실행 (SSD 대역폭 활용)
+            tokio::spawn(async move {
+                if let Some(parent) = task_path.parent() { 
+                    if !parent.exists() { let _ = std::fs::create_dir_all(parent); } 
+                }
+
+                let tmp_path = task_path.with_extension("tmp");
+                // [OPTIMIZATION] Merge 로직 제거 -> 순수 Atomic Write 수행
+                match candle_core::safetensors::save(&task_tensors, &tmp_path) {
+                    Ok(_) => {
+                        if let Err(e) = std::fs::rename(&tmp_path, &task_path) {
+                            println!("[WORKER-IO] !! [ERROR] Atomic rename failed: {:?}", e);
+                        } else {
+                            // [REGISTRY-UPDATE] 쓰기 성공 시에만 장부 업데이트
+                            if let (Some(reg), Some(idx)) = (registry, block_idx) {
+                                if let Ok(mut entries) = reg.entries.write() {
+                                    if idx < entries.len() {
+                                        entries[idx].ssd_path = Some(task_path.clone());
+                                        for loc in entries[idx].location.iter_mut() {
+                                            if *loc == crate::models::qwen3vl::quantized_model::KVLocation::SSD_PENDING || 
+                                               *loc == crate::models::qwen3vl::quantized_model::KVLocation::VRAM {
+                                                *loc = crate::models::qwen3vl::quantized_model::KVLocation::SSD;
                                             }
-                            
-                        // [LOG] 3단계: 결과 기록 (원자적 쓰기 방식 도입)
-            let tmp_path = task.path.with_extension("tmp");
-            match candle_core::safetensors::save(&final_tensors, &tmp_path) {
-                Ok(_) => {
-                    // 쓰기 성공 후 이름 변경 (Atomic Move)
-                    if let Err(e) = std::fs::rename(&tmp_path, &task.path) {
-                        println!("[WORKER-IO] !! [ERROR] Atomic rename failed: {:?}", e);
-                        // 실패 시 tmp 파일은 남겨두거나 삭제 시도
-                    } else {
-                        println!("[WORKER-IO] [SUCCESS] Block {} saved. Updating Registry.", b_idx_str);
-                        
-                        // [REGISTRY-UPDATE] 장부에 저장 경로 기록
-                        if let (Some(reg), Some(idx)) = (task.registry, task.block_idx) {
-                            if let Ok(mut entries) = reg.entries.write() {
-                                if idx < entries.len() {
-                                    entries[idx].ssd_path = Some(task.path.clone());
-                                    for loc in entries[idx].location.iter_mut() {
-                                        if *loc == crate::models::qwen3vl::quantized_model::KVLocation::SSD_PENDING || 
-                                           *loc == crate::models::qwen3vl::quantized_model::KVLocation::VRAM ||
-                                           *loc == crate::models::qwen3vl::quantized_model::KVLocation::Streaming {
-                                            *loc = crate::models::qwen3vl::quantized_model::KVLocation::SSD;
                                         }
                                     }
                                 }
                             }
                         }
+                    },
+                    Err(e) => {
+                        println!("[WORKER-IO] !! [ERROR] Block {} save failed! Path: {:?}, Cause: {:?}", b_idx_str, tmp_path, e);
                     }
-                },
-                Err(e) => {
-                    println!("[WORKER-IO] !! [ERROR] Block {} save failed! Path: {:?}, Cause: {:?}", b_idx_str, tmp_path, e);
                 }
-            }
 
-            let slot = &SLOT_MANAGER.slots[task.slot_id];
-            if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 || task.is_last {
-                // [NEW] 상세 정보와 함께 슬롯 해제 보고
-                let _ = SLOT_MANAGER.request_tx.send(SlotRequest::Release { 
-                    idx: task.slot_id,
-                    task_id: None, 
-                    block_index: None,
-                    is_bake: true 
-                }).await;
-            }
+                // [SLOT-RELEASE] 모든 레이어 쓰기가 완료되거나 마지막 작업인 경우 슬롯 해제
+                let slot = &SLOT_MANAGER.slots[slot_id];
+                if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 || is_last {
+                    let _ = SLOT_MANAGER.request_tx.send(SlotRequest::Release { 
+                        idx: slot_id,
+                        task_id: None, 
+                        block_index: None,
+                        is_bake: true 
+                    }).await;
+                }
+            });
         }
     });
     tokio::spawn(async move {
@@ -333,39 +304,38 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 return; 
                             }
                             /* 
-                               [BUNDLE-STRATEGY] 28개 레이어 통합 저장 로직
-                               - 기존: 레이어마다 개별 파일을 생성하여 SSD I/O 부하가 매우 컸음.
-                               - 변경: 28개 레이어 전체를 하나의 HashMap에 담아 'bundle_kv_{offset}.safetensors'로 한 번에 저장.
-                               - 효과: SSD 쓰기 횟수 28배 감소 및 순차 쓰기 효율 극대화.
+                               [LAYER-ISOLATION-STRATEGY] 레이어별 독립 저장 로직
+                               - 기존: 28개 레이어를 하나로 묶어(Merge) 저장하여 I/O 병목 발생.
+                               - 변경: 각 레이어를 독립 파일(l{layer}.st)로 저장하고, I/O 워커에서 병렬로 쓰기 수행.
+                               - 효과: SSD 대역폭 100% 활용 및 병합 오버헤드 0.
                             */
                             let loop_count = bake.layers.len();
                             let slot = &SLOT_MANAGER.slots[sid];
-                            slot.remaining_layers.store(1, Ordering::SeqCst); 
+                            // 전체 레이어 개수만큼 카운트 설정 (병렬 쓰기 완료 대기용)
+                            slot.remaining_layers.store(loop_count, Ordering::SeqCst); 
                             
-                            let mut bundle_map = std::collections::HashMap::new();
-                            let chunk_size_tokens = 256 * 64; // 16,384 tokens
-                            let chunk_idx = off / chunk_size_tokens;
-                            
-                            let bundle_fname = if is_relay {
-                                format!("bundle_relay_chunk_{}.safetensors", chunk_idx)
-                            } else {
-                                format!("bundle_inference_chunk_{}.safetensors", chunk_idx)
-                            };
-
+                            let block_dir = t_dir.join(format!("b{}", off));
                             let block_prefix = format!("b{}_", off);
 
                             for l_idx in 0..loop_count {
+                                let mut layer_map = std::collections::HashMap::new();
                                 let source = &bake.layers[l_idx];
-                                // [FIX] Relay 모드(0.6B)라면 레이어 인덱스에 상관없이 l0로 저장하여 2B가 쉽게 찾게 합니다.
+                                
+                                // Relay 모드(0.6B)와 일반 모드 레이어 구분
                                 let layer_prefix = if is_relay { "l0_".to_string() } else { format!("l{}_", source.layer_idx) };
                                 let prefix = format!("{}{}", block_prefix, layer_prefix);
-                                
+                                let layer_fname = format!("l{}.st", if is_relay { 0 } else { source.layer_idx });
+
                                 let k_res = source.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
                                 let v_res = source.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
                                 
                                 let (k_data, v_data) = match (k_res, v_res) { 
                                     (Ok(k), Ok(v)) => (k, v), 
-                                    _ => continue 
+                                    _ => {
+                                        // 실패 시 카운트 수동 감소
+                                        slot.remaining_layers.fetch_sub(1, Ordering::SeqCst);
+                                        continue;
+                                    }
                                 };
 
                                 let k_shape = source.k_tensor.dims(); 
@@ -373,6 +343,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let head_size = s * d; 
                                 let a_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
                                 
+                                // FP32 -> BitKV 변환 연산
                                 let mut ka = vec![0.0f32; b * h * a_count * d]; 
                                 let mut kp = vec![0u8; (b * h * s * d + 7) / 8]; 
                                 let mut ks = vec![0.0f32; b * h * s];
@@ -387,10 +358,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     }
                                 }
                                 
-                                bundle_map.insert(format!("{}k_anchors", prefix), Tensor::from_vec(ka, vec![b, h, a_count, d], &Device::Cpu).unwrap());
-                                bundle_map.insert(format!("{}k_packed", prefix), Tensor::from_vec(kp, vec![(b * h * s * d + 7) / 8], &Device::Cpu).unwrap());
-                                bundle_map.insert(format!("{}k_scales", prefix), Tensor::from_vec(ks, vec![b, h, s, 1], &Device::Cpu).unwrap());
-                                bundle_map.insert(format!("{}k_shape", prefix), Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu).unwrap());
+                                layer_map.insert(format!("{}k_anchors", prefix), Tensor::from_vec(ka, vec![b, h, a_count, d], &Device::Cpu).unwrap());
+                                layer_map.insert(format!("{}k_packed", prefix), Tensor::from_vec(kp, vec![(b * h * s * d + 7) / 8], &Device::Cpu).unwrap());
+                                layer_map.insert(format!("{}k_scales", prefix), Tensor::from_vec(ks, vec![b, h, s, 1], &Device::Cpu).unwrap());
+                                layer_map.insert(format!("{}k_shape", prefix), Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu).unwrap());
                                 
                                 let mut va = vec![0.0f32; b * h * a_count * d]; 
                                 let mut vp = vec![0u8; (b * h * s * d + 7) / 8]; 
@@ -406,21 +377,21 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     }
                                 }
                                 
-                                bundle_map.insert(format!("{}v_anchors", prefix), Tensor::from_vec(va, vec![b, h, a_count, d], &Device::Cpu).unwrap());
-                                bundle_map.insert(format!("{}v_packed", prefix), Tensor::from_vec(vp, vec![(b * h * s * d + 7) / 8], &Device::Cpu).unwrap());
-                                bundle_map.insert(format!("{}v_scales", prefix), Tensor::from_vec(vs, vec![b, h, s, 1], &Device::Cpu).unwrap());
+                                layer_map.insert(format!("{}v_anchors", prefix), Tensor::from_vec(va, vec![b, h, a_count, d], &Device::Cpu).unwrap());
+                                layer_map.insert(format!("{}v_packed", prefix), Tensor::from_vec(vp, vec![(b * h * s * d + 7) / 8], &Device::Cpu).unwrap());
+                                layer_map.insert(format!("{}v_scales", prefix), Tensor::from_vec(vs, vec![b, h, s, 1], &Device::Cpu).unwrap());
+                                layer_map.insert("mode".to_string(), Tensor::from_vec(vec![3u32], (1,), &Device::Cpu).unwrap());
+                                
+                                // 각 레이어 쓰기 작업을 개별적으로 워커에 전달 (병렬 처리 대상)
+                                let _ = io_tx_inner.blocking_send(SaveTask { 
+                                    slot_id: sid, 
+                                    path: block_dir.join(layer_fname), 
+                                    tensors: layer_map, 
+                                    is_last: l_idx == loop_count - 1,
+                                    block_idx: bake.block_idx,
+                                    registry: bake.registry.clone()
+                                });
                             }
-                            
-                            bundle_map.insert("mode".to_string(), Tensor::from_vec(vec![3u32], (1,), &Device::Cpu).unwrap());
-                            
-                            let _ = io_tx_inner.blocking_send(SaveTask { 
-                                slot_id: sid, 
-                                path: t_dir.join(bundle_fname), 
-                                tensors: bundle_map, 
-                                is_last: true,
-                                block_idx: bake.block_idx,
-                                registry: bake.registry.clone()
-                            });
                                 
                         }));
                         
@@ -464,29 +435,50 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     let registry = load.registry.clone();
                                     let shared_block = load.shared_block.clone();
                                     let off = b_idx_off;
-                                    let is_relay_file = target_path.file_name().map(|n| n.to_string_lossy().contains("bundle_relay_chunk")).unwrap_or(false);
                                     
-                                    println!("[WORKER-LOAD] >> [START] Layer {} Block {} (Slot {}) from {:?}", l_idx, b_idx, s_id, target_path);
+                                    // [LAYER-PATH-RESOLUTION] 레이어 독립 파일 경로 결정
+                                    let is_relay_file = target_path.file_name().map(|n| n.to_string_lossy().contains("bundle_relay_chunk")).unwrap_or(false);
+                                    let actual_load_path = if target_path.is_dir() {
+                                        target_path.join(format!("l{}.st", l_idx))
+                                    } else {
+                                        // 하위 호환성: 기존 번들 파일 방식 대응
+                                        target_path.clone()
+                                    };
+                                    
+                                    println!("[WORKER-LOAD] >> [START] Layer {} Block {} (Slot {}) from {:?}", l_idx, b_idx, s_id, actual_load_path);
                                     
                                     tokio::spawn(async move {
                                         let res = async {
-                                            let content = tokio::fs::read(&target_path).await
+                                            let content = tokio::fs::read(&actual_load_path).await
                                                 .map_err(|e| format!("IO Error: {:?}", e))?;
                                             
                                             let st = safetensors::SafeTensors::deserialize(&content)
                                                 .map_err(|e| format!("Deserialization Error: {:?}", e))?;
                 
                                             // [FIX] DYNAMIC SHAPE DETECTION
-                                                                                            // [BUNDLE-EXTRACT]
-                                                                                            let block_prefix = format!("b{}_", off);
-                                                                                            let layer_prefix = if is_relay_file { "l0_".to_string() } else { format!("l{}_", l_idx) };
-                                                                                            let prefix = format!("{}{}", block_prefix, layer_prefix);
+                                            // [LAYER-EXTRACT] 독립 파일 구조에서는 prefix 유연성 확보
+                                            let block_prefix = format!("b{}_", off);
+                                            let layer_prefix = if is_relay_file { "l0_".to_string() } else { format!("l{}_", l_idx) };
+                                            let prefix = format!("{}{}", block_prefix, layer_prefix);
 
-                                                                                            let get_tensor_name = |suffix: &str| -> String {
-                                                                                                let full = format!("{}{}", prefix, suffix);
-                                                                                                if st.tensor(&full).is_ok() { full } 
-                                                                                                else { format!("{}{}", layer_prefix, suffix) } // Fallback to no-block-prefix
-                                                                                            };
+                                            let get_tensor_name = |suffix: &str| -> String {
+                                                // 1순위: 전체 프리픽스 (b0_l0_k_anchors)
+                                                let full = format!("{}{}", prefix, suffix);
+                                                if st.tensor(&full).is_ok() { return full; } 
+                                                
+                                                // 2순위: 레이어 프리픽스 (l0_k_anchors)
+                                                let layer_only = format!("{}{}", layer_prefix, suffix);
+                                                if st.tensor(&layer_only).is_ok() { return layer_only; }
+
+                                                // 3순위: 순수 접미사 (k_anchors)
+                                                if st.tensor(suffix).is_ok() { return suffix.to_string(); }
+                                                
+                                                // 4순위: 블록 접미사 (b0_k_anchors)
+                                                let block_only = format!("{}{}", block_prefix, suffix);
+                                                if st.tensor(&block_only).is_ok() { return block_only; }
+
+                                                full // Fallback
+                                            };
 
                                                                                             let ka_name = get_tensor_name("k_anchors");
                                                                                             let kh_name = get_tensor_name("k_shape");
