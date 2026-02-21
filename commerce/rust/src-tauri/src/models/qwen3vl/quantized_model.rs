@@ -289,7 +289,8 @@ impl KVRegistry {
         let current_group_id = current_token_idx / group_size;
 
         // [RAM-OPTIMIZATION] 시스템 메모리 상태 체크
-        let mut sys = System::new_all();
+        // [OPTIMIZATION] System::new_all()은 너무 무거우므로 new()로 빈 객체 생성 후 메모리만 갱신
+        let mut sys = System::new();
         sys.refresh_memory();
         let available_ram = sys.available_memory(); // KB 단위
         let total_ram = sys.total_memory();
@@ -813,6 +814,17 @@ impl QuantizedQwen3VLTextAttention {
                     if attempts % 1000 == 0 {
                         println!("[TRACE] Layer {} Block {} still loading... ({} ms elapsed)", self.layer_idx, index, attempts * 2);
                     }
+
+                    // [TIMEOUT-SAFETY] 0.5초(250 * 2ms) 이상 대기 시 로딩 실패로 간주하고 SSD 상태로 리셋
+                    // 빠른 재시도를 위해 타임아웃을 단축했습니다.
+                    if attempts > 250 {
+                        println!("[TRACE] !! [TIMEOUT] Layer {} Block {} load hung. Resetting to SSD to force retry.", self.layer_idx, index);
+                        let mut reg = self.registry.entries.write().unwrap();
+                        if index < reg.len() {
+                            reg[index].location[self.layer_idx] = KVLocation::SSD;
+                        }
+                        break;
+                    }
                 }
             }
 
@@ -856,6 +868,12 @@ impl QuantizedQwen3VLTextAttention {
                         } else {
                             println!("[ERROR] Layer {} Block {} location is RAM but NO metadata found! (Index: {})", 
                                 self.layer_idx, index, index);
+                        }
+                    } else {
+                        // [FIX] Race Condition: k was None at top, but now Some (prefetch/other thread filled it)
+                        if k.is_none() {
+                            k = inner.k_cache.clone();
+                            v = inner.v_cache.clone();
                         }
                     }
                 }
@@ -1924,6 +1942,10 @@ impl QuantizedQwen3VLTextModel {
                         // [FIX] 모든 연산 단위를 사용자 요청에 따라 256으로 고정
                         let chunk_size = 256;
                         
+                        // [RAM-MONITOR]
+                        use sysinfo::System;
+                        let mut sys = System::new();
+                        
                         println!("[TRACE] Starting Horizontal Pass: Layer-by-Layer execution (Total Seq: {}, Chunk: {}, Pinned: {}/{})", 
                             seq_len, chunk_size, self.pinned_layer_count, num_layers);
                 
@@ -2054,6 +2076,8 @@ impl QuantizedQwen3VLTextModel {
                                                             while !all_ready && check_attempts < 10000 {
                                                                 let reg = self.registry.entries.read().unwrap();
                                                                 let mut missing_count = 0;
+                                                                let mut first_missing_info = String::new();
+
                                                                 for b_idx in 0..self.layers[layer_idx].self_attn.kv_blocks.len() {
                                                                     if b_idx < reg.len() {
                                                                         let entry = &reg[b_idx];
@@ -2063,6 +2087,9 @@ impl QuantizedQwen3VLTextModel {
                                                                         let loc = entry.location[layer_idx];
                                                                         if loc != KVLocation::RAM && loc != KVLocation::RamSticky && loc != KVLocation::VRAM && loc != KVLocation::SSD_PENDING {
                                                                             missing_count += 1;
+                                                                            if first_missing_info.is_empty() {
+                                                                                first_missing_info = format!("Block {} is {:?}", b_idx, loc);
+                                                                            }
                                                                         }
                                                                     }
                                                                 }
@@ -2070,7 +2097,17 @@ impl QuantizedQwen3VLTextModel {
                                                                 else {
                                                                     drop(reg); std::thread::yield_now(); std::thread::sleep(std::time::Duration::from_millis(50));
                                                                     check_attempts += 1;
-                                                                    if check_attempts % 20 == 0 { println!("[HORIZONTAL] Layer {:2} | Wait in progress (Missing: {}/{} blocks, Attempt {})", layer_idx, missing_count, load_count, check_attempts); }
+                                                                    
+                                                                    // [TIMEOUT-SAFETY] 30초(600 * 50ms) 이상 대기 시 강제 탈출
+                                                                    if check_attempts > 600 {
+                                                                        println!("[HORIZONTAL] !! [TIMEOUT] Force breaking wait loop at Layer {}. Stuck on: {}. Proceeding anyway...", layer_idx, first_missing_info);
+                                                                        break;
+                                                                    }
+
+                                                                    if check_attempts % 20 == 0 { 
+                                                                        println!("[HORIZONTAL] Layer {:2} | Wait in progress (Missing: {}/{} blocks, Attempt {}, Detail: {})", 
+                                                                            layer_idx, missing_count, load_count, check_attempts, first_missing_info); 
+                                                                    }
                                                                 }
                                                             }
                                                             if all_ready { println!("[HORIZONTAL] Layer {:2} | PASSED. All blocks confirmed in RAM.", layer_idx); }
@@ -2088,10 +2125,14 @@ impl QuantizedQwen3VLTextModel {
                                                                 if let Ok(nvml) = Nvml::init() {
                                                                     if let Ok(dev) = nvml.device_by_index(0) {
                                                                         if let Ok(mem) = dev.memory_info() {
+                                                                            // [RAM-MONITOR] Refresh and get RAM info
+                                                                            sys.refresh_memory();
+                                                                            let free_ram = sys.available_memory();
+                                                                            
                                                                             let current_progress = seqlen_offset + i + take;
                                                                             let (reads, writes, free) = SLOT_MANAGER.get_counts();
-                                                                            println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Chunk: {}", 
-                                                                                mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len, chunk_idx);
+                                                                            println!("[STAT] VRAM: {}MB Used / {}MB Free | RAM: {}MB Free | Progress: {}/{} | Chunk: {}", 
+                                                                                mem.used / 1024 / 1024, mem.free / 1024 / 1024, free_ram / 1024 / 1024, current_progress, total_len, chunk_idx);
                                                                         }
                                                                     }
                                                                 }
@@ -2100,8 +2141,18 @@ impl QuantizedQwen3VLTextModel {
                                                             let layer_ptr = &mut self.layers[layer_idx];
                                                             let dev_name = if layer_ptr.device().is_cuda() { "GPU" } else { "CPU" };
                                                             let (reads, writes, free) = crate::models::qwen3vl::generate::SLOT_MANAGER.get_counts();
-                                                            println!("[HORIZONTAL] Layer {:2} | Chunk {} (Offset: {}, Size: {}) - START on {} [Read:{}, Write:{}, Idle:{}]", 
-                                                                layer_idx, chunk_idx, i, take, dev_name, reads, writes, free);
+                                                            
+                                                            // [RAM-MONITOR]
+                                                            sys.refresh_memory();
+                                                            let ram_free = sys.available_memory() / 1024 / 1024;
+                                                            let vram_free = if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+                                                                if let Ok(dev) = nvml.device_by_index(0) {
+                                                                    if let Ok(mem) = dev.memory_info() { mem.free / 1024 / 1024 } else { 0 }
+                                                                } else { 0 }
+                                                            } else { 0 };
+
+                                                            println!("[HORIZONTAL] Layer {:2} | Chunk {} (Offset: {}, Size: {}) - START on {} [Read:{}, Write:{}, Idle:{}] | RAM: {}MB Free | VRAM: {}MB Free", 
+                                                                layer_idx, chunk_idx, i, take, dev_name, reads, writes, free, ram_free, vram_free);
                                                             
                                                             let xs_chunk = xs.narrow(1, i, take)?;
                                                             let cos_chunk = cos.narrow(1, i, take)?;
