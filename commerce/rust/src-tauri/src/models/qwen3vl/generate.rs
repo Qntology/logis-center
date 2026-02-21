@@ -648,40 +648,56 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     for (target_path, tasks) in path_groups {
                                         let reg_inner = registry.clone();
                                         tokio::spawn(async move {
-                                            let res: Result<(), String> = async {
-                                                let content = tokio::fs::read(&target_path).await
-                                                    .map_err(|e| format!("IO Error: {:?}", e))?;
-                                                let st = safetensors::SafeTensors::deserialize(&content)
-                                                    .map_err(|e| format!("Deserialization Error: {:?}", e))?;
-                                                
-                                                let is_relay_file = target_path.file_name().map(|n| n.to_string_lossy().contains("bundle_relay_chunk")).unwrap_or(false);
+                                            // [FIX] ChunkedLoad에서도 레이어별 독립 파일 읽기 대응
+                                            for (l_idx, s_id, block) in tasks {
+                                                let (b_idx, b_off) = {
+                                                    let inner = block.inner.read().unwrap();
+                                                    (inner.index, inner.offset)
+                                                };
 
-                                                // 이 파일에 속한 모든 블록/레이어 작업 처리
-                                                for (l_idx, s_id, block) in &tasks {
-                                                    let (b_idx, b_off) = {
-                                                        let inner = block.inner.read().unwrap();
-                                                        (inner.index, inner.offset)
-                                                    };
+                                                // 레이어별 실제 파일 경로 결정
+                                                let actual_load_path = if target_path.is_dir() {
+                                                    let layer_path = target_path.join(format!("l{}.st", l_idx));
+                                                    if layer_path.exists() { layer_path }
+                                                    else {
+                                                        let fallback = target_path.join("l0.st");
+                                                        if fallback.exists() { fallback } else { layer_path }
+                                                    }
+                                                } else {
+                                                    target_path.clone()
+                                                };
+
+                                                let res: Result<(), String> = async {
+                                                    let content = tokio::fs::read(&actual_load_path).await
+                                                        .map_err(|e| format!("File load failed: {:?} -> IO Error: {:?}", actual_load_path, e))?;
+                                                    let st = safetensors::SafeTensors::deserialize(&content)
+                                                        .map_err(|e| format!("Deserialization Error: {:?}", e))?;
+                                                    
+                                                    let is_relay_file = actual_load_path.file_name().map(|n| n.to_string_lossy().contains("bundle_relay_chunk")).unwrap_or(false) ||
+                                                                       actual_load_path.file_name().map(|n| n.to_string_lossy() == "l0.st").unwrap_or(false);
 
                                                     let block_prefix = format!("b{}_", b_off);
                                                     
-                                                    // [ONE-SHOT-LOADING] 파일 내 모든 레이어(0~27)를 미리 채움
                                                     if let Ok(mut reg) = reg_inner.entries.write() {
                                                         if b_idx < reg.len() {
                                                             let entry = &mut reg[b_idx];
                                                             
-                                                            // 이미 다른 레이어 요청에 의해 이 블록이 채워졌는지 확인 (선택 사항)
-                                                            for target_l in 0..28 {
-                                                                let layer_prefix = if is_relay_file { "l0_".to_string() } else { format!("l{}_", target_l) };
-                                                                let prefix = format!("{}{}", block_prefix, layer_prefix);
-                                                                
-                                                                let get_name = |st_ref: &safetensors::SafeTensors, p: &str, lp: &str, suffix: &str| -> String {
-                                                                    let full = format!("{}{}", p, suffix);
-                                                                    if st_ref.tensor(&full).is_ok() { full } else { format!("{}{}", lp, suffix) }
-                                                                };
+                                                            // [ONE-SHOT-LOADING] 
+                                                            // 현재 레이어(l_idx)뿐만 아니라 파일 내에 있는 모든 텐서 매칭 시도
+                                                            let layer_prefix = if is_relay_file { "l0_".to_string() } else { format!("l{}_", l_idx) };
+                                                            let prefix = format!("{}{}", block_prefix, layer_prefix);
+                                                            
+                                                            let get_name = |st_ref: &safetensors::SafeTensors, p: &str, lp: &str, suffix: &str| -> String {
+                                                                let full = format!("{}{}", p, suffix);
+                                                                if st_ref.tensor(&full).is_ok() { return full; }
+                                                                let l_only = format!("{}{}", lp, suffix);
+                                                                if st_ref.tensor(&l_only).is_ok() { return l_only; }
+                                                                if st_ref.tensor(suffix).is_ok() { return suffix.to_string(); }
+                                                                full
+                                                            };
 
-                                                                let ka_n = get_name(&st, &prefix, &layer_prefix, "k_anchors");
-                                                                if let Ok(ka_v) = st.tensor(&ka_n) {
+                                                            let ka_n = get_name(&st, &prefix, &layer_prefix, "k_anchors");
+                                                            if let Ok(ka_v) = st.tensor(&ka_n) {
                                                                     // 나머지 텐서들도 확인
                                                                     let kh_n = get_name(&st, &prefix, &layer_prefix, "k_shape");
                                                                     let kp_n = get_name(&st, &prefix, &layer_prefix, "k_packed");

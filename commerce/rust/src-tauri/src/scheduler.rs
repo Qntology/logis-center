@@ -640,9 +640,11 @@ async fn process_task(
         {
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
+            // [OPTIMIZATION] 이미 snapshot_id를 통해 PUG 컨텍스트가 로드되었습니다. 
+            // 2B 모델에게 전체 PUG를 다시 보내면 토큰이 중복(24k)되어 OOM이 발생하므로, 질문만 보냅니다.
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                    content: ChatCompletionRequestUserMessageContent::Text(format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", parsing::page_type_prompt())),
                     name: None,
                 })],
                 model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
@@ -732,9 +734,11 @@ async fn process_task(
         {
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
+            // [OPTIMIZATION] 이미 snapshot_id를 통해 PUG 컨텍스트가 로드되었습니다. 
+            // 2B 모델에게 전체 PUG를 다시 보내면 토큰이 중복(24k)되어 OOM이 발생하므로, 질문만 보냅니다.
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                    content: ChatCompletionRequestUserMessageContent::Text(format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", parsing::page_selectors_prompt(&page_type))),
                     name: None,
                 })],
                 model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),

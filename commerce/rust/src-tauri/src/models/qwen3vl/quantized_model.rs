@@ -2492,8 +2492,8 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
-        let danger_zone = 600_000_000;
-        let safe_zone = 1_000_000_000;
+        let danger_zone = 1_000_000_000; // 1.0GB 미만 시 비상 탈출
+        let safe_zone = 1_500_000_000;   // 1.5GB 미만 시 선제적 스왑 시작
 
         // [ACTIVE-VRAM-MANAGEMENT] 
         // 현재 레이어를 GPU에 올리고 싶은데 공간이 부족하다면, 
@@ -2506,22 +2506,29 @@ impl QuantizedQwen3VLTextModel {
             println!("[REBALANCE] Low VRAM ({}MB). Evicting oldest resources to GPU-pin Layer {}...", 
                 free_vram / 1024 / 1024, target_idx);
 
-            // 1단계: 모든 레이어의 '비활성 컨테이너' KV 블록을 RAM으로 밀어내기
+            // 1단계: 모든 레이어의 '비활성 컨테이너' KV 블록을 RAM/SSD로 밀어내기
             let mut kv_freed = 0;
             for l_idx in 0..self.layers.len() {
                 if free_vram > safe_zone { break; }
                 for block in &self.layers[l_idx].self_attn.kv_blocks {
                     let mut inner = block.inner.write().unwrap();
                     let block_container_id = inner.offset / container_size;
+                    
+                    // [AGGRESSIVE-EVICTION] 현재 작업 중인 컨테이너가 아니면 즉시 VRAM에서 제거
                     if inner.location == KVLocation::VRAM && block_container_id < current_container_id {
                         if let (Some(k), Some(v)) = (inner.k_cache.take(), inner.v_cache.take()) {
-                            let (ka, kp, ks, os) = self.layers[l_idx].self_attn.compress_to_bitkv(&k)?;
-                            let (va, vp, vs, _) = self.layers[l_idx].self_attn.compress_to_bitkv(&v)?;
-                            inner.bitkv_metadata = Some(BitKVMetadata {
-                                k_anchors: ka, k_packed: kp, k_scales: ks,
-                                v_anchors: va, v_packed: vp, v_scales: vs, original_shape: os,
-                            });
-                            inner.location = KVLocation::RAM;
+                            // [OPTIMIZATION] 이미 SSD에 경로가 있다면 RAM 복사(Bake) 없이 즉시 제거
+                            if inner.ssd_path.is_some() {
+                                inner.location = KVLocation::SSD;
+                            } else {
+                                let (ka, kp, ks, os) = self.layers[l_idx].self_attn.compress_to_bitkv(&k)?;
+                                let (va, vp, vs, _) = self.layers[l_idx].self_attn.compress_to_bitkv(&v)?;
+                                inner.bitkv_metadata = Some(BitKVMetadata {
+                                    k_anchors: ka, k_packed: kp, k_scales: ks,
+                                    v_anchors: va, v_packed: vp, v_scales: vs, original_shape: os,
+                                });
+                                inner.location = KVLocation::RAM;
+                            }
                             kv_freed += 1;
                         }
                     }
