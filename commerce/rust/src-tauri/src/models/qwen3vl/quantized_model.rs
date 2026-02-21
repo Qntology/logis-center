@@ -284,8 +284,8 @@ impl KVRegistry {
         use sysinfo::System; 
 
         let mut entries = self.entries.write().unwrap();
-        // [RELAXED] 그룹 크기를 512 -> 1024로 확대하여 상태 전환 빈도 감소
-        let group_size = 2048; 
+        
+        let group_size = 512; 
         let current_group_id = current_token_idx / group_size;
 
         // [RAM-OPTIMIZATION] 시스템 메모리 상태 체크
