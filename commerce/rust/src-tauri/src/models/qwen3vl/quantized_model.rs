@@ -1938,7 +1938,7 @@ impl QuantizedQwen3VLTextModel {
                         // [WINDOW-BURST-STRATEGY]
                         let num_layers = self.layers.len();
                         let chunk_size = 256;
-                        let window_size = 4; // 사용자 요청: 4개 레이어 단위 작업
+                        let window_size = 4; // [OPTIMIZATION] Batch 4 layers for efficient SSD loading, but execution is serialized
 
                         // [RAM-MONITOR]
                         use sysinfo::System;
@@ -2062,25 +2062,14 @@ impl QuantizedQwen3VLTextModel {
                                 if layer_idx < start_layer { continue; }
                                 let start_layer_time = std::time::Instant::now();
                                 
-                                let mut should_purge = true;
-                                if seq_len == 1 {
-                                    use nvml_wrapper::Nvml;
-                                    if let Ok(nvml) = Nvml::init() {
-                                        if let Ok(dev) = nvml.device_by_index(0) {
-                                            if let Ok(mem) = dev.memory_info() {
-                                                if mem.free > 600 * 1024 * 1024 { should_purge = false; }
-                                            }
-                                        }
-                                    }
-                                }
+                                let should_purge = true;
+                                // [USER REQUEST] Force purge every layer to ensure strict separation
+                                // Removed smart memory check to prevent accumulation
 
                                 if should_purge && layer_idx > 0 {
                                     let prev_idx = layer_idx - 1;
-                                    if (prev_idx + 1) % 4 == 0 {
-                                        let start_p = prev_idx.saturating_sub(3);
-                                        for p_i in start_p..=prev_idx {
-                                            if self.layers[p_i].device().is_cuda() { let _ = self.layers[p_i].to_device(&Device::Cpu); }
-                                        }
+                                    if self.layers[prev_idx].device().is_cuda() {
+                                        let _ = self.layers[prev_idx].to_device(&Device::Cpu);
                                     }
                                 }
                                 

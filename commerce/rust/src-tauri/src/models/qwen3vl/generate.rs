@@ -742,7 +742,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                 }.await;
                                                 if let Err(e) = res { println!("[WORKER-CHUNK] !! [ERROR] File load failed: {:?} -> {}", actual_load_path, e); }
                                             }
-                                            for (_, s_id, _) in tasks { SLOT_MANAGER.release_slot(*s_id).await; }
+                                            for (_, s_id, _) in tasks { SLOT_MANAGER.release_slot(s_id).await; }
                                         });
                                     }
                                 }
