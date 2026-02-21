@@ -816,12 +816,6 @@ impl QuantizedQwen3VLTextAttention {
             let mut k = k.ok_or_else(|| candle_core::Error::Msg("KV Cache not ready after wait".to_string()))?;
             let mut v = v.ok_or_else(|| candle_core::Error::Msg("KV Cache not ready after wait".to_string()))?;
 
-            // [FIX] Ensure KV tensors are on the correct device AND have the correct DType before calculation
-            if !k.device().same_device(dev) { k = k.to_device(dev)?; }
-            if k.dtype() != target_dtype { k = k.to_dtype(target_dtype)?; }
-            if !v.device().same_device(dev) { v = v.to_device(dev)?; }
-            if v.dtype() != target_dtype { v = v.to_dtype(target_dtype)?; }
-
             // [FIX] Update b_len to actual tensor dimensions to prevent shape mismatch in broadcast_add
             // This handles the case where the last block (e.g. 205 tokens) is smaller than the standard 256.
             b_len = k.dim(2)?;
@@ -875,22 +869,8 @@ impl QuantizedQwen3VLTextAttention {
 
         // 5. [BATCH-VRAM] Fast single-pass for all VRAM blocks
         if !vram_ks.is_empty() {
-            // [FIX] Pre-verify device AND dtype alignment before cat to prevent panic
-            let mut final_ks = Vec::with_capacity(vram_ks.len());
-            let mut final_vs = Vec::with_capacity(vram_vs.len());
-            for mut tk in vram_ks { 
-                if !tk.device().same_device(dev) { tk = tk.to_device(dev)?; }
-                if tk.dtype() != target_dtype { tk = tk.to_dtype(target_dtype)?; }
-                final_ks.push(tk); 
-            }
-            for mut tv in vram_vs { 
-                if !tv.device().same_device(dev) { tv = tv.to_device(dev)?; }
-                if tv.dtype() != target_dtype { tv = tv.to_dtype(target_dtype)?; }
-                final_vs.push(tv); 
-            }
-
-            let mut k = Tensor::cat(&final_ks, 2)?;
-            let mut v = Tensor::cat(&final_vs, 2)?;
+            let mut k = Tensor::cat(&vram_ks, 2)?;
+            let mut v = Tensor::cat(&vram_vs, 2)?;
             
             if self.num_kv_groups > 1 {
                 let (b, h, s, d) = k.dims4()?;
@@ -1560,17 +1540,39 @@ impl QuantizedQwen3VLTextModel {
         let mut is_vram_checked = false;
         let mut safety_floor: u64 = 0;
 
+        if current_device.is_cuda() {
+             if let Some(nvml_inst) = &nvml {
+                 if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
+                     if let Ok(mem) = dev.memory_info() {
+                         simulated_free_vram = mem.free;
+                         is_vram_checked = true;
+                         // [FIX] Slimmer safety floor
+                         let os_reserve = 100_000_000; 
+                         safety_floor = os_reserve + kv_reserve + estimated_activation_buffer;
+                     }
+                 }
+             }
+        }
+
         let mut layer_devices = vec![];
         let mut pinned_layer_count = 0;
-        for i in 0..config.num_hidden_layers {
-            if current_device.is_cuda() && i < 1 {
-                layer_devices.push(current_device.clone());
-                pinned_layer_count += 1;
+        
+        for _ in 0..config.num_hidden_layers {
+            if current_device.is_cuda() && is_vram_checked {
+                 let buffer_factor = 1.05; // 1.2 -> 1.05
+                 if simulated_free_vram > ( (cost_per_layer as f64 * buffer_factor) as u64 + safety_floor ) {
+                     simulated_free_vram = simulated_free_vram.saturating_sub(cost_per_layer);
+                     layer_devices.push(current_device.clone());
+                     pinned_layer_count += 1;
+                 } else {
+                     layer_devices.push(Device::Cpu);
+                 }
             } else {
-                layer_devices.push(Device::Cpu);
+                layer_devices.push(current_device.clone());
             }
         }
-        println!("[MODEL] Horizontal Engine Ready: {} GPU slot pinned.", pinned_layer_count);
+
+        println!("[MODEL] Configured with {} GPU-pinned layers out of {}.", pinned_layer_count, config.num_hidden_layers);
 
         // [ORGANIC] Dynamic Threading for Parallel Loading
         let thread_config = crate::utils::resources::get_optimal_thread_config(current_device.is_cpu());
@@ -1703,10 +1705,14 @@ impl QuantizedQwen3VLTextModel {
 
         for layer_idx in 0..num_layers_to_load {
             let mut layer_device = current_device.clone();
-            if current_device.is_cuda() && layer_idx < 1 {
-                pinned_layer_count += 1;
-            } else {
-                layer_device = Device::Cpu;
+            if current_device.is_cuda() && is_vram_checked {
+                 let buffer_factor = 1.1; 
+                 if simulated_free_vram > ( (cost_per_layer as f64 * buffer_factor) as u64 + safety_floor ) {
+                     simulated_free_vram = simulated_free_vram.saturating_sub(cost_per_layer);
+                     pinned_layer_count += 1;
+                 } else {
+                     layer_device = Device::Cpu;
+                 }
             }
 
             let layer_dtype = if layer_device.is_cpu() { DType::F32 } else { dtype };
@@ -1835,26 +1841,41 @@ impl QuantizedQwen3VLTextModel {
                                 for layer_idx in 0..num_layers {
                                     if layer_idx < start_layer { continue; }
                                     let start_layer_time = std::time::Instant::now();
+                                    println!("[HORIZONTAL] >> [START] Layer {} Processing Loop...", layer_idx);
                                     
-                                    // [STEP 2-A: STRONG-PURGE] 
-                                    // 이전 레이어가 GPU에 남아있다면 즉시 CPU로 밀어내어 공간을 100% 확보합니다.
-                                    if layer_idx > 0 {
-                                        let prev_idx = layer_idx - 1;
-                                        if self.layers[prev_idx].device().is_cuda() {
-                                            let _ = self.layers[prev_idx].to_device(&Device::Cpu);
+                                    // 1. [TARGET-REBALANCE] Ensure THIS specific layer is on GPU
+                                    let _ = self.rebalance_layers(0, layer_idx);
+                                    
+                                    // [NEW] 능동적 메모리 비우기 (LRU Eviction)
+                                    // VRAM 여유가 600MB 이하로 떨어지면, 현재 레이어 이전의 모든 RAM/VRAM 블록 중 SSD 백업이 완료된 것을 해제
+                                    {
+                                        use nvml_wrapper::Nvml;
+                                        if let Ok(nvml) = Nvml::init() {
+                                            if let Ok(dev) = nvml.device_by_index(0) {
+                                                if let Ok(mem) = dev.memory_info() {
+                                                    if mem.free < 600_000_000 {
+                                                        println!("[EVICT] Low VRAM ({}MB). Purging old blocks...", mem.free / 1024 / 1024);
+                                                        let mut purged_count = 0;
+                                                        let reg = self.registry.entries.read().unwrap();
+                                                        for block in &self.layers[layer_idx].self_attn.kv_blocks {
+                                                            let mut inner = block.inner.write().unwrap();
+                                                            // SSD 경로가 있고 현재 RAM/VRAM에 있다면 해제
+                                                            if inner.ssd_path.is_some() && (inner.location == KVLocation::RAM || inner.location == KVLocation::VRAM) {
+                                                                inner.k_cache = None;
+                                                                inner.v_cache = None;
+                                                                inner.location = KVLocation::SSD;
+                                                                purged_count += 1;
+                                                            }
+                                                        }
+                                                        if purged_count > 0 {
+                                                            println!("[EVICT] Freed {} blocks for Layer {}.", purged_count, layer_idx);
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
-                                    
-                                    // [STEP 2-B: SINGLE-LAYER-LOAD]
-                                    // 현재 레이어만 GPU로 로드합니다. (Always-GPU 원칙)
-                                    let target_device = Device::new_cuda(0)?;
-                                    if !self.layers[layer_idx].device().same_device(&target_device) {
-                                        self.layers[layer_idx].to_device(&target_device)?;
-                                        let _ = target_device.synchronize(); 
-                                    }
-
-                                    println!("[HORIZONTAL] >> [RUN] Layer {} on GPU", layer_idx);
-                            
+                                    let dev_type = if self.layers[layer_idx].device().is_cuda() { "GPU" } else { "CPU" };                            
                             // 2. [MASS-LOAD] 현재 레이어에 필요한 모든 블록을 SSD에서 한꺼번에 로드 요청
                             let mut blocks_to_load: Vec<KVBlock> = Vec::new();
                             let mut chunk_path = std::path::PathBuf::new();
@@ -1967,9 +1988,8 @@ impl QuantizedQwen3VLTextModel {
 
                                                             let layer_ptr = &mut self.layers[layer_idx];
                                                             let dev_name = if layer_ptr.device().is_cuda() { "GPU" } else { "CPU" };
-                                                            let (reads, writes, free) = crate::models::qwen3vl::generate::SLOT_MANAGER.get_counts();
-                                                            println!("[HORIZONTAL] Layer {:2} | Chunk {} (Offset: {}, Size: {}) - START on {} [Read:{}, Write:{}, Idle:{}]", 
-                                                                layer_idx, chunk_idx, i, take, dev_name, reads, writes, free);
+                                                            println!("[HORIZONTAL] Layer {:2} | Chunk {} (Offset: {}, Size: {}) - START on {}", 
+                                                                layer_idx, chunk_idx, i, take, dev_name);
                                                             
                                                             let xs_chunk = xs.narrow(1, i, take)?;
                                                             let cos_chunk = cos.narrow(1, i, take)?;
@@ -1997,35 +2017,13 @@ impl QuantizedQwen3VLTextModel {
                                                             chunk_idx += 1;
                                                         }
                                                         
+                                                        println!("[HORIZONTAL] Layer {:2} | Processing complete. Concatenating {} results...", layer_idx, next_xs.len());
                                                         xs = Tensor::cat(&next_xs, 1)?;
                                                         
-                                                        // [STEP 3-A: SAFE-HANDOFF]
-                                                        // 레이어를 CPU로 밀어내기 전에, 현재 레이어의 KV 블록 데이터를 
-                                                        // CPU 장치로 미리 복사하여 Worker가 안전하게 가져가게 함
-                                                        for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
-                                                            let (k_cpu, v_cpu) = {
-                                                                let inner = block.inner.read().unwrap();
-                                                                if inner.location == KVLocation::VRAM {
-                                                                    if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                                                                        (Some(k.to_device(&Device::Cpu)?), Some(v.to_device(&Device::Cpu)?))
-                                                                    } else { (None, None) }
-                                                                } else { (None, None) }
-                                                            };
-
-                                                            if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
-                                                                let mut inner_w = block.inner.write().unwrap();
-                                                                inner_w.k_cache = Some(k);
-                                                                inner_w.v_cache = Some(v);
-                                                                inner_w.location = KVLocation::RAM;
-                                                            }
-                                                        }
-
-                                                        // [STEP 2-C: IMMEDIATE-RELEASE] 
-                                                        if self.layers[layer_idx].device().is_cuda() {
-                                                            let _ = self.layers[layer_idx].to_device(&Device::Cpu);
-                                                        }
+                                                        // [OPTIMIZATION] 강제 Aggressive Offload 제거
+                                                        // 이제 rebalance_layers가 다음 루프 시작 시 VRAM이 부족할 때만 알아서 처리합니다.
                                                         
-                                                        println!("[HORIZONTAL] << [FINISH] Layer {} loop complete in {:.2}s. VRAM Freed.", 
+                                                        println!("[HORIZONTAL] << [FINISH] Layer {} full loop complete in {:.2}s.", 
                                                             layer_idx, start_layer_time.elapsed().as_secs_f32());
                                                     }
                 
