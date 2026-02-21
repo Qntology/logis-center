@@ -1936,19 +1936,6 @@ impl QuantizedQwen3VLTextModel {
             }
         };
 
-                        // [HORIZONTAL-PIPELINE-STRATEGY]
-                        let num_layers = self.layers.len();
-                        
-                        // [FIX] 모든 연산 단위를 사용자 요청에 따라 256으로 고정
-                        let chunk_size = 256;
-                        
-                        // [RAM-MONITOR]
-                        use sysinfo::System;
-                        let mut sys = System::new();
-                        
-                        println!("[TRACE] Starting Horizontal Pass: Layer-by-Layer execution (Total Seq: {}, Chunk: {}, Pinned: {}/{})", 
-                            seq_len, chunk_size, self.pinned_layer_count, num_layers);
-                
                         // [WINDOW-BURST-STRATEGY]
                         let num_layers = self.layers.len();
                         let chunk_size = 256;
@@ -1966,7 +1953,6 @@ impl QuantizedQwen3VLTextModel {
                             if w_end <= start_layer { continue; }
 
                             // --- [STEP 1: WINDOW PRE-FLIGHT LOAD] ---
-                            // 현재 윈도우(4개 레이어)에 필요한 모든 SSD 데이터를 연산 시작 전에 미리 확보합니다.
                             let mut w_blocks_to_load = Vec::new();
                             let mut w_chunk_path = std::path::PathBuf::new();
                             
@@ -1979,10 +1965,6 @@ impl QuantizedQwen3VLTextModel {
                                             let entry = &reg[b_idx];
                                             if entry.token_start >= self.current_kv_len { continue; }
                                             let loc = entry.location[l_idx];
-                                            
-                                            // [SAFETY] SSD_PENDING 상태는 저장 중이므로 로드하지 않음 (충돌 방지)
-                                            if loc == KVLocation::SSD_PENDING { continue; }
-
                                             if loc == KVLocation::SSD || loc == KVLocation::Loading {
                                                 w_blocks_to_load.push((l_idx, block.clone()));
                                                 if w_chunk_path.as_os_str().is_empty() {
@@ -1996,8 +1978,6 @@ impl QuantizedQwen3VLTextModel {
 
                             if !w_blocks_to_load.is_empty() && !w_chunk_path.as_os_str().is_empty() {
                                 println!("[BURST] Window {}-{}: Waiting for {} blocks from SSD...", w_start, w_end-1, w_blocks_to_load.len());
-                                
-                                // 로딩 트리거
                                 {
                                     let mut reg_w = self.registry.entries.write().unwrap();
                                     for (l_idx, block) in &w_blocks_to_load {
@@ -2032,10 +2012,9 @@ impl QuantizedQwen3VLTextModel {
                                     });
                                 });
 
-                                // [STRICT-WAIT] 모든 블록이 올 때까지 윈도우 전체 대기
                                 let mut w_ready = false;
                                 let mut w_attempts = 0;
-                                while !w_ready && w_attempts < 40 { // 최대 2초 (20ms * 40)
+                                while !w_ready && w_attempts < 40 {
                                     let reg = self.registry.entries.read().unwrap();
                                     let mut missing = 0;
                                     for (l_idx, block) in &w_blocks_to_load {
@@ -2051,7 +2030,7 @@ impl QuantizedQwen3VLTextModel {
                                         w_attempts += 1;
                                     }
                                 }
-                                println!("[BURST] Window {}-{} Ready. Starting burst execution.", w_start, w_end-1);
+                                println!("[BURST] Window {}-{} Ready.", w_start, w_end-1);
                             }
 
                             // --- [STEP 2: BURST EXECUTION] ---
@@ -2059,14 +2038,12 @@ impl QuantizedQwen3VLTextModel {
                                 if layer_idx < start_layer { continue; }
                                 let start_layer_time = std::time::Instant::now();
                                 
-                                // [STEP 2-A: SMART-RETENTION]
                                 let mut should_purge = true;
                                 if seq_len == 1 {
                                     use nvml_wrapper::Nvml;
                                     if let Ok(nvml) = Nvml::init() {
                                         if let Ok(dev) = nvml.device_by_index(0) {
                                             if let Ok(mem) = dev.memory_info() {
-                                                // 600MB 여유가 있다면 레이어를 유지
                                                 if mem.free > 600 * 1024 * 1024 { should_purge = false; }
                                             }
                                         }
@@ -2075,10 +2052,9 @@ impl QuantizedQwen3VLTextModel {
 
                                 if should_purge && layer_idx > 0 {
                                     let prev_idx = layer_idx - 1;
-                                    let purge_window = 4; // 윈도우 단위 해제
-                                    if (prev_idx + 1) % purge_window == 0 {
-                                        let start_purge = prev_idx.saturating_sub(purge_window - 1);
-                                        for p_i in start_purge..=prev_idx {
+                                    if (prev_idx + 1) % 4 == 0 {
+                                        let start_p = prev_idx.saturating_sub(3);
+                                        for p_i in start_p..=prev_idx {
                                             if self.layers[p_i].device().is_cuda() { let _ = self.layers[p_i].to_device(&Device::Cpu); }
                                         }
                                     }
@@ -2097,21 +2073,6 @@ impl QuantizedQwen3VLTextModel {
                                 for i in (0..seq_len).step_by(chunk_size) {
                                     let take = (seq_len - i).min(chunk_size);
                                     
-                                    if layer_idx == 0 {
-                                        use nvml_wrapper::Nvml;
-                                        if let Ok(nvml) = Nvml::init() {
-                                            if let Ok(dev) = nvml.device_by_index(0) {
-                                                if let Ok(mem) = dev.memory_info() {
-                                                    sys.refresh_memory();
-                                                    let free_ram = sys.available_memory();
-                                                    let current_progress = seqlen_offset + i + take;
-                                                    println!("[STAT] VRAM: {}MB Free | RAM: {}MB Free | Progress: {}/{}", 
-                                                        mem.free / 1024 / 1024, free_ram / 1024 / 1024, current_progress, total_len);
-                                                }
-                                            }
-                                        }
-                                    }
-
                                     let layer_ptr = &mut self.layers[layer_idx];
                                     let dev_name = if layer_ptr.device().is_cuda() { "GPU" } else { "CPU" };
                                     
@@ -2160,10 +2121,9 @@ impl QuantizedQwen3VLTextModel {
                                             inner_w.location = KVLocation::RAM;
                                         }
                                     }
-                                }
-
-                                if should_purge && self.layers[layer_idx].device().is_cuda() {
-                                    let _ = self.layers[layer_idx].to_device(&Device::Cpu);
+                                    if self.layers[layer_idx].device().is_cuda() {
+                                        let _ = self.layers[layer_idx].to_device(&Device::Cpu);
+                                    }
                                 }
                                 
                                 println!("[BURST] << [DONE] Layer {} loop complete in {:.2}s.", 
