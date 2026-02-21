@@ -1011,12 +1011,26 @@ impl Qwen3VLGenerateModel {
             // [STEP 3: ACCEPTANCE & SAMPLING]
             let last_logits = logits.squeeze(0)?.i(logits.dim(1)? - 1)?;
             let l_vec = apply_repeat_penalty(&last_logits.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
+            
+            // [DEBUG] 로그잇 유효성 검사
+            if let Ok(max_v) = l_vec.max(0)?.to_scalar::<f32>() {
+                if max_v == 0.0 { println!("[HYBRID] !! [ERROR] Logits are all zero. Math/Device sync error suspected."); }
+            }
+
             let next_id = l_proc.sample(&l_vec)?;
             
-            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
+            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
+                println!("[HYBRID] EOS detected.");
+                break; 
+            }
+
+            let token_text = self.tokenizer.token_decode(vec![next_id])?;
+            print!("{}", token_text); // 실시간 출력
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
 
             a_ids.push(next_id);
-            g_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
+            g_text.push_str(&token_text);
             
             curr_s_off += 1;
             gen_count += 1; 
