@@ -674,7 +674,7 @@ async fn process_task(
             return Ok(()); 
         }
     }
-                        
+
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     // [CRITICAL-CLEANUP] Clear the cache from Step A before Step B (git e8260c5 parity)

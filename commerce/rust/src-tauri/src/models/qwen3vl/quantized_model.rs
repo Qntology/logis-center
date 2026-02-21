@@ -2012,7 +2012,7 @@ impl QuantizedQwen3VLTextModel {
                                                                             let current_progress = seqlen_offset + i + take;
                                                                             let (reads, writes, free) = SLOT_MANAGER.get_counts();
                                                                             println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Chunk: {}", 
-                                                                                mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, seq_len, chunk_idx);
+                                                                                mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len, chunk_idx);
                                                                         }
                                                                     }
                                                                 }

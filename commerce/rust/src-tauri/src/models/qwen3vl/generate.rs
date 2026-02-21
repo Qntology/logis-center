@@ -300,18 +300,22 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             slot.remaining_layers.store(1, Ordering::SeqCst); 
                             
                             let mut bundle_map = std::collections::HashMap::new();
+                            let chunk_size_tokens = 256 * 64; // 16,384 tokens
+                            let chunk_idx = off / chunk_size_tokens;
+                            
                             let bundle_fname = if is_relay {
-                                if off == 0 { format!("bundle_relay_kv.safetensors") }
-                                else { format!("bundle_relay_kv_{}.safetensors", off) }
+                                format!("bundle_relay_chunk_{}.safetensors", chunk_idx)
                             } else {
-                                if off == 0 { format!("bundle_inference_kv.safetensors") }
-                                else { format!("bundle_inference_kv_{}.safetensors", off) }
+                                format!("bundle_inference_chunk_{}.safetensors", chunk_idx)
                             };
+
+                            let block_prefix = format!("b{}_", off);
 
                             for l_idx in 0..loop_count {
                                 let source = &bake.layers[l_idx];
                                 // [FIX] Relay 모드(0.6B)라면 레이어 인덱스에 상관없이 l0로 저장하여 2B가 쉽게 찾게 합니다.
-                                let prefix = if is_relay { "l0_".to_string() } else { format!("l{}_", source.layer_idx) };
+                                let layer_prefix = if is_relay { "l0_".to_string() } else { format!("l{}_", source.layer_idx) };
+                                let prefix = format!("{}{}", block_prefix, layer_prefix);
                                 
                                 let k_res = source.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
                                 let v_res = source.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
@@ -936,10 +940,13 @@ impl Qwen3VLGenerateModel {
         let (mut p_vals, i_grid, mut g_text) = (input.pixel_values.take(), input.image_grid_thw.take(), String::new());
         let mut tokens_since_last_bake = 0;
 
-        for _ in 0..mes.max_tokens.unwrap_or(2048) {
+        let max_gen_tokens = mes.max_tokens.unwrap_or(2048) as usize;
+        let target_total = t_toks + max_gen_tokens;
+
+        for _ in 0..max_gen_tokens {
             if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             
-            let logits = self.qwen3_vl.forward(&Tensor::new(vec![*a_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)?, p_vals.as_ref(), i_grid.as_ref(), None, None, Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + 1) as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, t_toks, sid.clone())?;
+            let logits = self.qwen3_vl.forward(&Tensor::new(vec![*a_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)?, p_vals.as_ref(), i_grid.as_ref(), None, None, Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + 1) as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, target_total, sid.clone())?;
             let l_vec = apply_repeat_penalty(&logits.squeeze(0)?.i(logits.dim(1)? - 1)?.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
             let next_id = l_proc.sample(&l_vec)?; if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             a_ids.push(next_id); g_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
