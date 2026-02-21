@@ -490,12 +490,12 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                             
                                                                                             let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor(&ka_name) {
                                                                                                 let dims = t_view.shape();
-                                                                                                // Safe conversion using Candle
-                                                                                                let t = candle_core::Tensor::from_slice(t_view.data(), dims, &candle_core::Device::Cpu).unwrap();
-                                                                                                let data = t.to_dtype(candle_core::DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                                                                                                // Safe conversion using Candle's built-in loader
+                                                                                                let ka_t = candle_core::safetensors::load_tensor(t_view, &candle_core::Device::Cpu).unwrap();
+                                                                                                let data = ka_t.to_dtype(candle_core::DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
                                                                                                 
-                                                                                                let s_len = if let Ok(v) = st.tensor(&kh_name) {
-                                                                                                    let vt = candle_core::Tensor::from_slice(v.data(), v.shape(), &candle_core::Device::Cpu).unwrap();
+                                                                                                let s_len = if let Ok(v_view) = st.tensor(&kh_name) {
+                                                                                                    let vt = candle_core::safetensors::load_tensor(v_view, &candle_core::Device::Cpu).unwrap();
                                                                                                     let v_vec = vt.to_dtype(candle_core::DType::U32).unwrap().to_vec1::<u32>().unwrap();
                                                                                                     v_vec[2] as usize
                                                                                                 } else { 256 };
@@ -537,24 +537,31 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                                                                                                                                 let vp_name = format!("{}v_packed", prefix);
                                                                                                                                                                                 let vs_name = format!("{}v_scales", prefix);
                                                                                                                 
-                                                                                                                                                                                if let (Ok(ka), Ok(kh), Ok(kp), Ok(ks), Ok(va), Ok(vp), Ok(vs)) = (
+                                                                                                                                                                                if let (Ok(ka_v), Ok(kh_v), Ok(kp_v), Ok(ks_v), Ok(va_v), Ok(vp_v), Ok(vs_v)) = (
                                                                                                                                                                                     st.tensor(&ka_name), st.tensor(&kh_name), st.tensor(&kp_name), 
                                                                                                                                                                                     st.tensor(&ks_name), st.tensor(&va_name), st.tensor(&vp_name), st.tensor(&vs_name)
                                                                                                                                                                                 ) {
+                                                                                                                                                                                    let ka = candle_core::safetensors::load_tensor(ka_v, &candle_core::Device::Cpu).unwrap();
+                                                                                                                                                                                    let kh = candle_core::safetensors::load_tensor(kh_v, &candle_core::Device::Cpu).unwrap();
+                                                                                                                                                                                    let kp = candle_core::safetensors::load_tensor(kp_v, &candle_core::Device::Cpu).unwrap();
+                                                                                                                                                                                    let ks = candle_core::safetensors::load_tensor(ks_v, &candle_core::Device::Cpu).unwrap();
+                                                                                                                                                                                    let va = candle_core::safetensors::load_tensor(va_v, &candle_core::Device::Cpu).unwrap();
+                                                                                                                                                                                    let vp = candle_core::safetensors::load_tensor(vp_v, &candle_core::Device::Cpu).unwrap();
+                                                                                                                                                                                    let vs = candle_core::safetensors::load_tensor(vs_v, &candle_core::Device::Cpu).unwrap();
+
                                                                                                                                                                                     let dims = ka.shape();
                                                                                                                                                                                     let a_cnt = dims[2];
                                                                                                                                                                                     
-                                                                                                                                                                                    let kh_t = candle_core::Tensor::from_slice(kh.data(), kh.shape(), &candle_core::Device::Cpu).unwrap();
-                                                                                                                                                                                    let v_u32 = kh_t.to_dtype(candle_core::DType::U32).unwrap().to_vec1::<u32>().unwrap();
+                                                                                                                                                                                    let v_u32 = kh.to_dtype(candle_core::DType::U32).unwrap().to_vec1::<u32>().unwrap();
                                                                                                                                                                                     let o_s = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
                                                                                                                                                                                     
                                                                                                                                                                                     let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
-                                                                                                                                                                                        k_anchors: candle_core::Tensor::from_slice(ka.data(), ka.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], a_cnt, o_s[3])).unwrap(), 
-                                                                                                                                                                                        k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
-                                                                                                                                                                                        k_scales: candle_core::Tensor::from_slice(ks.data(), ks.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], o_s[2], 1)).unwrap(), 
-                                                                                                                                                                                        v_anchors: candle_core::Tensor::from_slice(va.data(), va.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], a_cnt, o_s[3])).unwrap(), 
-                                                                                                                                                                                        v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
-                                                                                                                                                                                        v_scales: candle_core::Tensor::from_slice(vs.data(), vs.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], o_s[2], 1)).unwrap(), 
+                                                                                                                                                                                        k_anchors: ka.to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], a_cnt, o_s[3])).unwrap(), 
+                                                                                                                                                                                        k_packed: kp, 
+                                                                                                                                                                                        k_scales: ks.to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], o_s[2], 1)).unwrap(), 
+                                                                                                                                                                                        v_anchors: va.to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], a_cnt, o_s[3])).unwrap(), 
+                                                                                                                                                                                        v_packed: vp, 
+                                                                                                                                                                                        v_scales: vs.to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], o_s[2], 1)).unwrap(), 
                                                                                                                                                                                         original_shape: o_s 
                                                                                                                                                                                     };
                                                                                                                                                                                     
@@ -663,11 +670,11 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 
                                                 let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor(&ka_name) {
                                                     let dims = t_view.shape();
-                                                    let t = candle_core::Tensor::from_slice(t_view.data(), dims, &candle_core::Device::Cpu).unwrap();
-                                                    let data = t.to_dtype(candle_core::DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                                                    let ka_t = candle_core::safetensors::load_tensor(t_view, &candle_core::Device::Cpu).unwrap();
+                                                    let data = ka_t.to_dtype(candle_core::DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
                                                     
-                                                    let s_len = if let Ok(v) = st.tensor(&kh_name) {
-                                                        let vt = candle_core::Tensor::from_slice(v.data(), v.shape(), &candle_core::Device::Cpu).unwrap();
+                                                    let s_len = if let Ok(v_view) = st.tensor(&kh_name) {
+                                                        let vt = candle_core::safetensors::load_tensor(v_view, &candle_core::Device::Cpu).unwrap();
                                                         let v_vec = vt.to_dtype(candle_core::DType::U32).unwrap().to_vec1::<u32>().unwrap();
                                                         v_vec[2] as usize
                                                     } else { 256 };
@@ -711,23 +718,30 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                     let vp_name = get_name(&st, &prefix, &layer_prefix, "v_packed");
                                                                     let vs_name = get_name(&st, &prefix, &layer_prefix, "v_scales");
 
-                                                                    if let (Ok(ka), Ok(kh), Ok(kp), Ok(ks), Ok(va), Ok(vp), Ok(vs)) = (
+                                                                    if let (Ok(ka_v), Ok(kh_v), Ok(kp_v), Ok(ks_v), Ok(va_v), Ok(vp_v), Ok(vs_v)) = (
                                                                     st.tensor(&ka_name), st.tensor(&kh_name), st.tensor(&kp_name), 
                                                                     st.tensor(&ks_name), st.tensor(&va_name), st.tensor(&vp_name), st.tensor(&vs_name)
                                                                 ) {
+                                                                    let ka = candle_core::safetensors::load_tensor(ka_v, &candle_core::Device::Cpu).unwrap();
+                                                                    let kh = candle_core::safetensors::load_tensor(kh_v, &candle_core::Device::Cpu).unwrap();
+                                                                    let kp = candle_core::safetensors::load_tensor(kp_v, &candle_core::Device::Cpu).unwrap();
+                                                                    let ks = candle_core::safetensors::load_tensor(ks_v, &candle_core::Device::Cpu).unwrap();
+                                                                    let va = candle_core::safetensors::load_tensor(va_v, &candle_core::Device::Cpu).unwrap();
+                                                                    let vp = candle_core::safetensors::load_tensor(vp_v, &candle_core::Device::Cpu).unwrap();
+                                                                    let vs = candle_core::safetensors::load_tensor(vs_v, &candle_core::Device::Cpu).unwrap();
+
                                                                     let dims = ka.shape();
                                                                     let a_cnt = dims[2];
-                                                                    let kh_t = candle_core::Tensor::from_slice(kh.data(), kh.shape(), &candle_core::Device::Cpu).unwrap();
-                                                                    let v_u32 = kh_t.to_dtype(candle_core::DType::U32).unwrap().to_vec1::<u32>().unwrap();
+                                                                    let v_u32 = kh.to_dtype(candle_core::DType::U32).unwrap().to_vec1::<u32>().unwrap();
                                                                     let o_s = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
                                                                     
                                                                     let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
-                                                                        k_anchors: candle_core::Tensor::from_slice(ka.data(), ka.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], a_cnt, o_s[3])).unwrap(), 
-                                                                        k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
-                                                                        k_scales: candle_core::Tensor::from_slice(ks.data(), ks.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], o_s[2], 1)).unwrap(), 
-                                                                        v_anchors: candle_core::Tensor::from_slice(va.data(), va.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], a_cnt, o_s[3])).unwrap(), 
-                                                                        v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
-                                                                        v_scales: candle_core::Tensor::from_slice(vs.data(), vs.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], o_s[2], 1)).unwrap(), 
+                                                                        k_anchors: ka.to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], a_cnt, o_s[3])).unwrap(), 
+                                                                        k_packed: kp, 
+                                                                        k_scales: ks.to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], o_s[2], 1)).unwrap(), 
+                                                                        v_anchors: va.to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], a_cnt, o_s[3])).unwrap(), 
+                                                                        v_packed: vp, 
+                                                                        v_scales: vs.to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], o_s[2], 1)).unwrap(), 
                                                                         original_shape: o_s 
                                                                     };
                                                                     
