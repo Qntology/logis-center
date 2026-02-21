@@ -2016,7 +2016,9 @@ impl QuantizedQwen3VLTextModel {
                                                                     // [SAFETY] SSD_PENDING 상태는 저장 중이므로 로드하지 않음 (충돌 방지)
                                                                     if loc == KVLocation::SSD_PENDING { continue; }
 
-                                                                    if loc == KVLocation::SSD || loc == KVLocation::Loading {
+                                                                    // [OPTIMIZATION] 이미 로딩 중(Loading)인 블록은 여기서 기다리지 않고 
+                                                                    // 개별 레이어의 forward 루프 내에서 처리하도록 양보합니다.
+                                                                    if loc == KVLocation::SSD {
                                                                         blocks_to_load.push(block.clone());
                                                                         if chunk_path.as_os_str().is_empty() {
                                                                             chunk_path = entry.ssd_path.clone().unwrap_or_default();
@@ -2098,9 +2100,15 @@ impl QuantizedQwen3VLTextModel {
                                                                     drop(reg); std::thread::yield_now(); std::thread::sleep(std::time::Duration::from_millis(50));
                                                                     check_attempts += 1;
                                                                     
-                                                                    // [TIMEOUT-SAFETY] 30초(600 * 50ms) 이상 대기 시 강제 탈출
-                                                                    if check_attempts > 600 {
-                                                                        println!("[HORIZONTAL] !! [TIMEOUT] Force breaking wait loop at Layer {}. Stuck on: {}. Proceeding anyway...", layer_idx, first_missing_info);
+                                                                    // [TIMEOUT-SAFETY] 1초(20 * 50ms) 이상 대기 시 강제 탈출 및 자가 치유
+                                                                    if check_attempts > 20 {
+                                                                        println!("[HORIZONTAL] !! [TIMEOUT] Layer {} wait timed out (1s). Resetting to SSD for healing. Detail: {}", layer_idx, first_missing_info);
+                                                                        let mut reg_w = self.registry.entries.write().unwrap();
+                                                                        for b_idx in 0..self.layers[layer_idx].self_attn.kv_blocks.len() {
+                                                                            if b_idx < reg_w.len() && reg_w[b_idx].location[layer_idx] == KVLocation::Loading {
+                                                                                reg_w[b_idx].location[layer_idx] = KVLocation::SSD;
+                                                                            }
+                                                                        }
                                                                         break;
                                                                     }
 
