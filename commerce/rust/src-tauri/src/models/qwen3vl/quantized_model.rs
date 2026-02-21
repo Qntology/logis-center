@@ -1966,7 +1966,8 @@ impl QuantizedQwen3VLTextModel {
                                             if entry.token_start >= self.current_kv_len { continue; }
                                             let loc = entry.location[l_idx];
                                             if loc == KVLocation::SSD || loc == KVLocation::Loading {
-                                                w_blocks_to_load.push((l_idx, block.clone()));
+                                                // [FIX] Deadlock Prevention: Store b_idx explicitly
+                                                w_blocks_to_load.push((l_idx, b_idx, block.clone()));
                                                 if w_chunk_path.as_os_str().is_empty() {
                                                     w_chunk_path = entry.ssd_path.clone().unwrap_or_default();
                                                 }
@@ -1980,17 +1981,16 @@ impl QuantizedQwen3VLTextModel {
                                 println!("[BURST] Window {}-{}: Waiting for {} blocks from SSD...", w_start, w_end-1, w_blocks_to_load.len());
                                 {
                                     let mut reg_w = self.registry.entries.write().unwrap();
-                                    for (l_idx, block) in &w_blocks_to_load {
-                                        let b_idx = block.inner.read().unwrap().index;
-                                        if b_idx < reg_w.len() && reg_w[b_idx].location[*l_idx] == KVLocation::SSD {
-                                            reg_w[b_idx].location[*l_idx] = KVLocation::Loading;
+                                    for (l_idx, b_idx, _block) in &w_blocks_to_load {
+                                        if *b_idx < reg_w.len() && reg_w[*b_idx].location[*l_idx] == KVLocation::SSD {
+                                            reg_w[*b_idx].location[*l_idx] = KVLocation::Loading;
                                         }
                                     }
                                 }
 
                                 let registry_clone = self.registry.clone();
-                                let blocks_vec: Vec<KVBlock> = w_blocks_to_load.iter().map(|(_, b)| b.clone()).collect();
-                                let layers_vec: Vec<usize> = w_blocks_to_load.iter().map(|(l, _)| *l).collect();
+                                let blocks_vec: Vec<KVBlock> = w_blocks_to_load.iter().map(|(_, _, b)| b.clone()).collect();
+                                let layers_vec: Vec<usize> = w_blocks_to_load.iter().map(|(l, _, _)| *l).collect();
                                 
                                 tokio::task::block_in_place(move || {
                                     tokio::runtime::Handle::current().block_on(async move {
@@ -2001,11 +2001,34 @@ impl QuantizedQwen3VLTextModel {
                                                 s_ids.push(id);
                                             } else { break; } 
                                         }
+
+                                        // [FIX] Handle partial slot acquisition to prevent worker panic
+                                        let acquired_count = s_ids.len();
+                                        if acquired_count < blocks_vec.len() {
+                                            // println!("[BURST] Warning: Partial slot acquisition ({}/{}) - Reverting excess blocks to SSD.", acquired_count, blocks_vec.len());
+                                            if let Ok(mut reg) = registry_clone.entries.write() {
+                                                for i in acquired_count..blocks_vec.len() {
+                                                    if let Ok(inner) = blocks_vec[i].inner.read() {
+                                                        let b_idx = inner.index;
+                                                        let l_idx = layers_vec[i];
+                                                        if b_idx < reg.len() {
+                                                            // Loading 상태로 두면 무한 대기하므로 SSD로 리셋하여 재시도 유도
+                                                            reg[b_idx].location[l_idx] = KVLocation::SSD;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         if !s_ids.is_empty() {
                                             if let Ok(tx) = get_load_worker().await {
+                                                // Truncate vectors to match acquired slots
+                                                let safe_blocks: Vec<KVBlock> = blocks_vec.into_iter().take(acquired_count).collect();
+                                                let safe_layers: Vec<usize> = layers_vec.into_iter().take(acquired_count).collect();
+
                                                 let _ = tx.send(SlotTask::ChunkedLoad(ChunkedLoadTask {
-                                                    slot_ids: s_ids, path: w_chunk_path, layer_indices: layers_vec,
-                                                    shared_blocks: blocks_vec, registry: registry_clone,
+                                                    slot_ids: s_ids, path: w_chunk_path, layer_indices: safe_layers,
+                                                    shared_blocks: safe_blocks, registry: registry_clone,
                                                 })).await;
                                             }
                                         }
@@ -2017,11 +2040,13 @@ impl QuantizedQwen3VLTextModel {
                                 while !w_ready && w_attempts < 40 {
                                     let reg = self.registry.entries.read().unwrap();
                                     let mut missing = 0;
-                                    for (l_idx, block) in &w_blocks_to_load {
-                                        let b_idx = block.inner.read().unwrap().index;
-                                        let loc = reg[b_idx].location[*l_idx];
-                                        if loc != KVLocation::RAM && loc != KVLocation::RamSticky && loc != KVLocation::VRAM {
-                                            missing += 1;
+                                    // [FIX] Deadlock: Use pre-stored b_idx to avoid locking block.inner while holding registry lock
+                                    for (l_idx, b_idx, _block) in &w_blocks_to_load {
+                                        if *b_idx < reg.len() {
+                                            let loc = reg[*b_idx].location[*l_idx];
+                                            if loc != KVLocation::RAM && loc != KVLocation::RamSticky && loc != KVLocation::VRAM {
+                                                missing += 1;
+                                            }
                                         }
                                     }
                                     if missing == 0 { w_ready = true; }
