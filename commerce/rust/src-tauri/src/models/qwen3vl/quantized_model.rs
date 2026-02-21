@@ -289,20 +289,20 @@ impl KVRegistry {
         let current_group_id = current_token_idx / group_size;
 
         // [RAM-OPTIMIZATION] 시스템 메모리 상태 체크
-        // [OPTIMIZATION] System::new_all()은 너무 무거우므로 new()로 빈 객체 생성 후 메모리만 갱신
+        // [OPTIMIZATION] sysinfo::available_memory()는 KB 단위를 반환하므로 이에 맞춰 계산 교정
         let mut sys = System::new();
         sys.refresh_memory();
-        let available_ram = sys.available_memory(); // KB 단위
-        let total_ram = sys.total_memory();
+        let available_ram_kb = sys.available_memory(); 
+        let total_ram_kb = sys.total_memory();
         
-        // RAM 여유가 4GB 미만이거나 전체의 20% 미만이면 압박 상태로 간주
-        let is_ram_pressure = available_ram < 4 * 1024 * 1024 || available_ram < (total_ram / 5);
+        // RAM 여유가 4GB(4*1024*1024 KB) 미만이거나 전체의 20% 미만이면 압박 상태로 간주
+        let is_ram_pressure = available_ram_kb < 4 * 1024 * 1024 || available_ram_kb < (total_ram_kb / 5);
         
         // RAM 유지 윈도우 설정 (압박 시 1그룹, 평시 2그룹)
         let ram_window = if is_ram_pressure { 1 } else { 2 };
 
         if is_ram_pressure {
-            println!("[RELAY-SYSTEM] RAM Pressure Detected! Available: {} MB. Shrinking Window to {}.", available_ram / 1024 / 1024, ram_window);
+            println!("[RELAY-SYSTEM] RAM Pressure Detected! Available: {} MB. Shrinking Window to {}.", available_ram_kb / 1024, ram_window);
         }
 
         let mut vram_to_ram = 0;
@@ -2073,11 +2073,26 @@ impl QuantizedQwen3VLTextModel {
                                 for i in (0..seq_len).step_by(chunk_size) {
                                     let take = (seq_len - i).min(chunk_size);
                                     
+                                    if layer_idx == 0 {
+                                        use nvml_wrapper::Nvml;
+                                        if let Ok(nvml) = Nvml::init() {
+                                            if let Ok(dev) = nvml.device_by_index(0) {
+                                                if let Ok(mem) = dev.memory_info() {
+                                                    sys.refresh_memory();
+                                                    let free_ram_kb = sys.available_memory();
+                                                    let current_progress = seqlen_offset + i + take;
+                                                    println!("[STAT] VRAM: {}MB Used / {}MB Free | RAM: {}MB Free | Progress: {}/{}", 
+                                                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, free_ram_kb / 1024, current_progress, total_len);
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     let layer_ptr = &mut self.layers[layer_idx];
                                     let dev_name = if layer_ptr.device().is_cuda() { "GPU" } else { "CPU" };
                                     
                                     sys.refresh_memory();
-                                    let ram_free = sys.available_memory() / 1024 / 1024;
+                                    let ram_free_kb = sys.available_memory();
                                     let vram_free = if let Ok(nvml) = nvml_wrapper::Nvml::init() {
                                         if let Ok(dev) = nvml.device_by_index(0) {
                                             if let Ok(mem) = dev.memory_info() { mem.free / 1024 / 1024 } else { 0 }
@@ -2085,7 +2100,7 @@ impl QuantizedQwen3VLTextModel {
                                     } else { 0 };
 
                                     println!("[BURST] Layer {:2} | Chunk {} - START on {} | RAM: {}MB Free | VRAM: {}MB Free", 
-                                        layer_idx, chunk_idx, dev_name, ram_free, vram_free);
+                                        layer_idx, chunk_idx, dev_name, ram_free_kb / 1024, vram_free);
                                     
                                     let xs_chunk = xs.narrow(1, i, take)?;
                                     let cos_chunk = cos.narrow(1, i, take)?;
