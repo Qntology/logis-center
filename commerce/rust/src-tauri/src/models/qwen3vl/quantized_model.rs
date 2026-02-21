@@ -281,28 +281,27 @@ impl KVRegistry {
 
     // [NEW] A-B-C 릴레이 순환 시스템 (VRAM & RAM 공통)
     pub fn enforce_relay_relay(&self, current_token_idx: usize) {
-        use sysinfo::System; // sysinfo 크레이트 활용 (SystemExt trait removal for v0.30+)
+        use sysinfo::System; 
 
         let mut entries = self.entries.write().unwrap();
-        // [TUNING] 4GB VRAM 최적화: 그룹 크기를 1800 -> 512로 축소
-        let group_size = 512; 
+        // [RELAXED] 그룹 크기를 512 -> 1024로 확대하여 상태 전환 빈도 감소
+        let group_size = 1024; 
         let current_group_id = current_token_idx / group_size;
 
         // [RAM-OPTIMIZATION] 시스템 메모리 상태 체크
-        // [OPTIMIZATION] sysinfo::available_memory()는 KB 단위를 반환하므로 이에 맞춰 계산 교정
         let mut sys = System::new();
         sys.refresh_memory();
-        let available_ram_kb = sys.available_memory(); 
-        let total_ram_kb = sys.total_memory();
+        let available_ram_bytes = sys.available_memory(); 
+        let total_ram_bytes = sys.total_memory();
         
-        // RAM 여유가 4GB(4*1024*1024 KB) 미만이거나 전체의 20% 미만이면 압박 상태로 간주
-        let is_ram_pressure = available_ram_kb < 4 * 1024 * 1024 || available_ram_kb < (total_ram_kb / 5);
+        // RAM 여유 임계치를 조금 더 낮춰서(512MB) 웬만하면 RAM 윈도우를 유지하도록 변경
+        let is_ram_pressure = available_ram_bytes < 512 * 1024 * 1024;
         
-        // RAM 유지 윈도우 설정 (압박 시 1그룹, 평시 2그룹)
-        let ram_window = if is_ram_pressure { 1 } else { 2 };
+        // RAM 유지 윈도우 설정 (압박 시 2그룹, 평시 4그룹으로 확대)
+        let ram_window = if is_ram_pressure { 2 } else { 4 };
 
         if is_ram_pressure {
-            println!("[RELAY-SYSTEM] RAM Pressure Detected! Available: {} MB. Shrinking Window to {}.", available_ram_kb / 1024, ram_window);
+            println!("[RELAY-SYSTEM] RAM Pressure Detected (Low)! Available: {} MB. Window: {}.", available_ram_bytes / (1024 * 1024), ram_window);
         }
 
         let mut vram_to_ram = 0;
@@ -815,9 +814,9 @@ impl QuantizedQwen3VLTextAttention {
                         println!("[TRACE] Layer {} Block {} still loading... ({} ms elapsed)", self.layer_idx, index, attempts * 2);
                     }
 
-                    // [TIMEOUT-SAFETY] 0.5초(250 * 2ms) 이상 대기 시 로딩 실패로 간주하고 SSD 상태로 리셋
-                    // 빠른 재시도를 위해 타임아웃을 단축했습니다.
-                    if attempts > 250 {
+                    // [TIMEOUT-SAFETY] 5초(2500 * 2ms) 이상 대기 시 로딩 실패로 간주하고 SSD 상태로 리셋
+                    // SSD I/O가 바쁘거나 압축 해제 부하가 클 경우를 대비해 시간을 늘렸습니다.
+                    if attempts > 2500 {
                         println!("[TRACE] !! [TIMEOUT] Layer {} Block {} load hung. Resetting to SSD to force retry.", self.layer_idx, index);
                         let mut reg = self.registry.entries.write().unwrap();
                         if index < reg.len() {
