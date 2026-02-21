@@ -1970,12 +1970,16 @@ impl QuantizedQwen3VLTextModel {
                                                             let current_layer_blocks = &self.layers[layer_idx].self_attn.kv_blocks;
                                                             for (b_idx, block) in current_layer_blocks.iter().enumerate() {
                                                                 // [FIX] Wait for BOTH SSD (not started) and Loading (already started) blocks
+                                                                // [CRITICAL-FIX] Don't load future blocks (e.g. Block 40 when we are at 10190)
                                                                 if b_idx < reg.len() {
-                                                                    let loc = reg[b_idx].location[layer_idx];
+                                                                    let entry = &reg[b_idx];
+                                                                    if entry.token_start >= self.current_kv_len { continue; }
+
+                                                                    let loc = entry.location[layer_idx];
                                                                     if loc == KVLocation::SSD || loc == KVLocation::Loading {
                                                                         blocks_to_load.push(block.clone());
                                                                         if chunk_path.as_os_str().is_empty() {
-                                                                            chunk_path = reg[b_idx].ssd_path.clone().unwrap_or_default();
+                                                                            chunk_path = entry.ssd_path.clone().unwrap_or_default();
                                                                         }
                                                                     }
                                                                 }
@@ -2131,12 +2135,15 @@ impl QuantizedQwen3VLTextModel {
                                                         }
 
                                                         // [STEP 2-C: IMMEDIATE-RELEASE] 
-                                                        if self.layers[layer_idx].device().is_cuda() {
+                                                        // should_purge가 true일 때만 레이어를 해제합니다.
+                                                        if should_purge && self.layers[layer_idx].device().is_cuda() {
                                                             let _ = self.layers[layer_idx].to_device(&Device::Cpu);
+                                                            println!("[HORIZONTAL] << [FINISH] Layer {} loop complete in {:.2}s. VRAM Freed.", 
+                                                                layer_idx, start_layer_time.elapsed().as_secs_f32());
+                                                        } else {
+                                                            println!("[HORIZONTAL] << [FINISH] Layer {} loop complete in {:.2}s. VRAM Retained (Vertical Mode).", 
+                                                                layer_idx, start_layer_time.elapsed().as_secs_f32());
                                                         }
-                                                        
-                                                        println!("[HORIZONTAL] << [FINISH] Layer {} loop complete in {:.2}s. VRAM Freed.", 
-                                                            layer_idx, start_layer_time.elapsed().as_secs_f32());
                                                     }
                 
                         println!("[TRACE] Horizontal Layer Pass Complete.");        self.current_kv_len = seqlen_offset + seq_len;
