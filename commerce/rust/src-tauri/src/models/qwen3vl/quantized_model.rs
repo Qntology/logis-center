@@ -280,7 +280,7 @@ impl KVRegistry {
     }
 
     // [NEW] A-B-C 릴레이 순환 시스템 (VRAM & RAM 공통)
-    pub fn enforce_relay_relay(&self, current_token_idx: usize) {
+    pub fn enforce_relay_relay(&self, current_token_idx: usize, skip_ssd: bool) {
         let mut entries = self.entries.write().unwrap();
         
         // 2B 모델 기준 BF16 KV 캐시는 토큰당 약 56KB (28레이어 합산)
@@ -300,7 +300,6 @@ impl KVRegistry {
             let entry_group_id = entry.token_start / group_size;
 
             // [VRAM 릴레이] 14MB 블록 단위
-            // A 완성, B 완성 시 A 이동 (현재 C(id=2)일 때 A(id=0) 이동)
             if entry_block_id + 1 < current_block_id {
                 let has_vram = entry.location.iter().any(|&l| l == KVLocation::VRAM);
                 if has_vram {
@@ -311,12 +310,10 @@ impl KVRegistry {
                 }
             }
 
-            // [RAM 릴레이] 100MB 그룹 단위
-            // A 완성, B 완성 시 A 이동 (현재 C(id=2)일 때 A(id=0) 이동)
-            if entry_group_id + 1 < current_group_id {
+            // [RAM 릴레이] 디코딩 중(skip_ssd)에는 SSD 저장을 수행하지 않음
+            if !skip_ssd && entry_group_id + 1 < current_group_id {
                 let has_ram = entry.location.iter().any(|&l| l == KVLocation::RAM || l == KVLocation::RamSticky);
                 if has_ram && entry.ssd_path.is_none() {
-                    // SSD_PENDING 상태로 변경하여 generate.rs가 캐치하게 함
                     for loc in entry.location.iter_mut() {
                         if *loc == KVLocation::RAM || *loc == KVLocation::RamSticky { 
                             *loc = KVLocation::SSD_PENDING; 
@@ -703,9 +700,9 @@ impl QuantizedQwen3VLTextAttention {
         let mut vram_total_len = 0;
 
         // [NEW] A-B-C 릴레이 순환 관리 (VRAM & RAM 공통)
-        // 현재 청크를 포함한 전체 토큰 위치(_seqlen_offset + q_len)를 기준으로 릴레이 트리거
+        // 디코딩 중(q_len == 1)에는 SSD 저장을 중단하고 메모리 캐시를 최대한 유지합니다.
         if self.layer_idx == 0 {
-            self.registry.enforce_relay_relay(_seqlen_offset + q_len);
+            self.registry.enforce_relay_relay(_seqlen_offset + q_len, q_len == 1);
         }
 
         for block in &self.kv_blocks {
@@ -2023,28 +2020,28 @@ impl QuantizedQwen3VLTextModel {
                                                         xs = Tensor::cat(&next_xs, 1)?;
                                                         
                                                         // [STEP 3-A: SAFE-HANDOFF]
-                                                        // 레이어를 CPU로 밀어내기 전에, 현재 레이어의 KV 블록 데이터를 
-                                                        // CPU 장치로 미리 복사하여 Worker가 안전하게 가져가게 함
-                                                        for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
-                                                            let (k_cpu, v_cpu, block_idx) = {
-                                                                let inner = block.inner.read().unwrap();
-                                                                if inner.location == KVLocation::VRAM {
-                                                                    if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                                                                        (Some(k.to_device(&Device::Cpu)?), Some(v.to_device(&Device::Cpu)?), inner.index)
+                                                        // 디코딩 중(Size: 1)에는 KV를 RAM으로 밀어내지 않고 VRAM에 고정(Sticky)하여 성능을 극대화합니다.
+                                                        if seq_len > 1 {
+                                                            for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
+                                                                let (k_cpu, v_cpu, block_idx) = {
+                                                                    let inner = block.inner.read().unwrap();
+                                                                    if inner.location == KVLocation::VRAM {
+                                                                        if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                                                                            (Some(k.to_device(&Device::Cpu)?), Some(v.to_device(&Device::Cpu)?), inner.index)
+                                                                        } else { (None, None, inner.index) }
                                                                     } else { (None, None, inner.index) }
-                                                                } else { (None, None, inner.index) }
-                                                            };
+                                                                };
 
-                                                            if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
-                                                                let mut inner_w = block.inner.write().unwrap();
-                                                                inner_w.k_cache = Some(k);
-                                                                inner_w.v_cache = Some(v);
-                                                                inner_w.location = KVLocation::RAM;
-                                                                
-                                                                // [FIX] Registry와 local block 상태를 동기화하여 device mismatch 방지
-                                                                let mut reg = self.registry.entries.write().unwrap();
-                                                                if block_idx < reg.len() {
-                                                                    reg[block_idx].location[layer_idx] = KVLocation::RAM;
+                                                                if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
+                                                                    let mut inner_w = block.inner.write().unwrap();
+                                                                    inner_w.k_cache = Some(k);
+                                                                    inner_w.v_cache = Some(v);
+                                                                    inner_w.location = KVLocation::RAM;
+                                                                    
+                                                                    let mut reg = self.registry.entries.write().unwrap();
+                                                                    if block_idx < reg.len() {
+                                                                        reg[block_idx].location[layer_idx] = KVLocation::RAM;
+                                                                    }
                                                                 }
                                                             }
                                                         }
