@@ -234,10 +234,36 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             if let Some(parent) = task.path.parent() { if !parent.exists() { let _ = std::fs::create_dir_all(parent); } }
             
             let b_idx_str = task.block_idx.map(|i| i.to_string()).unwrap_or("?".into());
-            // println!("[WORKER-IO] << [RECEIVED] Slot {} starting save for Block {} to {:?}", task.slot_id, b_idx_str, task.path.file_name());
-
-            // [LOG] 3단계: 결과 기록
-            match candle_core::safetensors::save(&task.tensors, &task.path) {
+            
+                            // [MERGE-LOGIC] 기존 파일이 있으면 불러와서 병합
+                            let mut final_tensors = task.tensors;
+                            if task.path.exists() {
+                                if let Ok(content) = std::fs::read(&task.path) {
+                                    if let Ok(existing_st) = safetensors::SafeTensors::deserialize(&content) {
+                                        for name in existing_st.names() {
+                                            // 현재 저장하려는 블록과 겹치지 않는 텐서들만 복사
+                                            let prefix = format!("b{}_", task.block_idx.map(|i| i * 256).unwrap_or(999999));
+                                            if !name.starts_with(&prefix) {
+                                                if let Ok(view) = existing_st.tensor(name) {
+                                                    let dtype = match view.dtype() {
+                                                        safetensors::Dtype::F32 => candle_core::DType::F32,
+                                                        safetensors::Dtype::BF16 => candle_core::DType::BF16,
+                                                        safetensors::Dtype::F16 => candle_core::DType::F16,
+                                                        safetensors::Dtype::U8 => candle_core::DType::U8,
+                                                        _ => candle_core::DType::F32,
+                                                    };
+                                                    if let Ok(t) = candle_core::Tensor::from_slice(view.data(), view.shape(), &candle_core::Device::Cpu) {
+                                                        let t = t.to_dtype(dtype).unwrap_or(t);
+                                                        final_tensors.insert(name.to_string(), t);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        // [LOG] 3단계: 결과 기록
+            match candle_core::safetensors::save(&final_tensors, &task.path) {
                 Ok(_) => {
                     println!("[WORKER-IO] [SUCCESS] Block {} saved. Updating Registry.", b_idx_str);
                     
@@ -393,7 +419,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     }).await.ok();
                 }
                                 SlotTask::Load(load) => {
-                                    let (off, b_idx, s_id, target_path) = {
+                                    let (b_idx_off, b_idx, s_id, target_path) = {
                                         match load.shared_block.inner.read() {
                                             Ok(inner) => {
                                                 let path = inner.ssd_path.clone().or_else(|| {
@@ -420,6 +446,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     let l_idx = load.layer_idx;
                                     let registry = load.registry.clone();
                                     let shared_block = load.shared_block.clone();
+                                    let off = b_idx_off;
+                                    let is_relay_file = target_path.file_name().map(|n| n.to_string_lossy().contains("bundle_relay_chunk")).unwrap_or(false);
                                     
                                     println!("[WORKER-LOAD] >> [START] Layer {} Block {} (Slot {}) from {:?}", l_idx, b_idx, s_id, target_path);
                                     
@@ -433,14 +461,23 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 
                                             // [FIX] DYNAMIC SHAPE DETECTION
                                                                                             // [BUNDLE-EXTRACT]
-                                                                                            let prefix = format!("l{}_", l_idx);
-                                                                                            let ka_name = format!("{}k_anchors", prefix);
-                                                                                            let kh_name = format!("{}k_shape", prefix);
-                                                                                            let kp_name = format!("{}k_packed", prefix);
-                                                                                            let ks_name = format!("{}k_scales", prefix);
-                                                                                            let va_name = format!("{}v_anchors", prefix);
-                                                                                            let vp_name = format!("{}v_packed", prefix);
-                                                                                            let vs_name = format!("{}v_scales", prefix);
+                                                                                            let block_prefix = format!("b{}_", off);
+                                                                                            let layer_prefix = if is_relay_file { "l0_".to_string() } else { format!("l{}_", l_idx) };
+                                                                                            let prefix = format!("{}{}", block_prefix, layer_prefix);
+
+                                                                                            let get_tensor_name = |suffix: &str| -> String {
+                                                                                                let full = format!("{}{}", prefix, suffix);
+                                                                                                if st.tensor(&full).is_ok() { full } 
+                                                                                                else { format!("{}{}", layer_prefix, suffix) } // Fallback to no-block-prefix
+                                                                                            };
+
+                                                                                            let ka_name = get_tensor_name("k_anchors");
+                                                                                            let kh_name = get_tensor_name("k_shape");
+                                                                                            let kp_name = get_tensor_name("k_packed");
+                                                                                            let ks_name = get_tensor_name("k_scales");
+                                                                                            let va_name = get_tensor_name("v_anchors");
+                                                                                            let vp_name = get_tensor_name("v_packed");
+                                                                                            let vs_name = get_tensor_name("v_scales");
                                             
                                                                                             let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor(&ka_name) {
                                                                                                 let dims = t_view.shape();
@@ -471,13 +508,14 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                     
                                                                                                         if let Ok(mut reg) = registry.entries.write() {
                                                                                                             if b_idx < reg.len() { 
-                                                                                                                let is_relay = target_path.file_name().map(|n| n.to_string_lossy().contains("bundle_relay_kv")).unwrap_or(false);
+                                                                                                                let is_relay = target_path.file_name().map(|n| n.to_string_lossy().contains("bundle_relay_chunk")).unwrap_or(false);
                                                                                                                 
                                                                                                                                                                             // [ONE-READ-ALL-LAYERS]
                                                                                                                                                                             let entry = &mut reg[b_idx];
                                                                                                                                                                             for target_l in 0..28 {
-                                                                                                                                                                                let prefix = format!("l{}_", target_l);
-                                                                                                                                                                                // ... (중략)
+                                                                                                                                                                                let layer_prefix = format!("l{}_", target_l);
+                                                                                                                                                                                let prefix = format!("{}{}", block_prefix, layer_prefix);
+
                                                                                                                                                                                 let ka_name = format!("{}k_anchors", prefix);
                                                                                                                                                                                 let kh_name = format!("{}k_shape", prefix);
                                                                                                                                                                                 let kp_name = format!("{}k_packed", prefix);
@@ -554,7 +592,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     
                                     for i in 0..num_blocks {
                                         let (l_idx, s_id, block) = (chunk.layer_indices[i], chunk.slot_ids[i], chunk.shared_blocks[i].clone());
-                                        let (b_idx, target_path) = {
+                                        let (b_idx, b_off, target_path) = {
                                             match block.inner.read() {
                                                 Ok(inner) => {
                                                     let path = inner.ssd_path.clone().or_else(|| {
@@ -562,11 +600,11 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                             if inner.index < reg.len() { reg[inner.index].ssd_path.clone() } else { None }
                                                         } else { None }
                                                     });
-                                                    (inner.index, path)
+                                                    (inner.index, inner.offset, path)
                                                 },
                                                 Err(e) => {
                                                     println!("[WORKER-CHUNK] !! Block {} Lock Poisoned: {:?}", i, e);
-                                                    (999, None)
+                                                    (999, 0, None)
                                                 }
                                             }
                                         };
@@ -589,7 +627,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                     .map_err(|e| format!("Deserialization Error: {:?}", e))?;
                 
                                                 // [BUNDLE-EXTRACT]
-                                                let prefix = format!("l{}_", l_idx);
+                                                let block_prefix = format!("b{}_", b_off);
+                                                let layer_prefix = format!("l{}_", l_idx);
+                                                let prefix = format!("{}{}", block_prefix, layer_prefix);
+
                                                 let ka_name = format!("{}k_anchors", prefix);
                                                 let kh_name = format!("{}k_shape", prefix);
                                                 let kp_name = format!("{}k_packed", prefix);
@@ -627,14 +668,16 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                         inner.bitkv_metadata = Some(metadata.clone());
                                                                 if let Ok(mut reg) = reg_inner.entries.write() {
                                                             if b_idx < reg.len() { 
-                                                                let is_relay = target_path.file_name().map(|n| n.to_string_lossy().contains("bundle_relay_kv")).unwrap_or(false);
+                                                                let is_relay = target_path.file_name().map(|n| n.to_string_lossy().contains("bundle_relay_chunk")).unwrap_or(false);
                                                                 
                                                                 // [ONE-SHOT-LOADING] 
                                                                 // 번들 파일을 한 번 읽었을 때, 파일 내 모든 레이어(0~27)의 데이터를 Registry(RAM)에 미리 채웁니다.
                                                                 // 덕분에 Layer 0만 SSD를 읽고, Layer 1~27은 SSD 접근 없이 RAM에서 즉시 연산됩니다.
                                                                 let entry = &mut reg[b_idx];
                                                                 for target_l in 0..28 {
-                                                                    let prefix = format!("l{}_", target_l);
+                                                                    let layer_prefix = format!("l{}_", target_l);
+                                                                    let prefix = format!("{}{}", block_prefix, layer_prefix);
+
                                                                     let ka_name = format!("{}k_anchors", prefix);
                                                                     let kh_name = format!("{}k_shape", prefix);
                                                                     let kp_name = format!("{}k_packed", prefix);
