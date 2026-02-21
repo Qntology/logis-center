@@ -281,15 +281,28 @@ impl KVRegistry {
 
     // [NEW] A-B-C 릴레이 순환 시스템 (VRAM & RAM 공통)
     pub fn enforce_relay_relay(&self, current_token_idx: usize) {
+        use sysinfo::System; // sysinfo 크레이트 활용 (SystemExt trait removal for v0.30+)
+
         let mut entries = self.entries.write().unwrap();
-        let threshold_bytes = 100 * 1024 * 1024; // 100MB
-        
-        // 1. 현재 각 그룹(컨테이너)의 용량 계산
-        // (단순화를 위해 100MB를 토큰 수로 환산하여 그룹핑하거나, 실제 바이트를 추적)
-        // 2B 모델 기준 BF16 KV 캐시는 토큰당 약 56KB (28레이어 합산)
-        // 100MB / 56KB  약 1800 토큰. 여기서는 안전하게 1800을 그룹 단위로 설정.
-        let group_size = 1800; 
+        // [TUNING] 4GB VRAM 최적화: 그룹 크기를 1800 -> 512로 축소
+        let group_size = 512; 
         let current_group_id = current_token_idx / group_size;
+
+        // [RAM-OPTIMIZATION] 시스템 메모리 상태 체크
+        let mut sys = System::new_all();
+        sys.refresh_memory();
+        let available_ram = sys.available_memory(); // KB 단위
+        let total_ram = sys.total_memory();
+        
+        // RAM 여유가 4GB 미만이거나 전체의 20% 미만이면 압박 상태로 간주
+        let is_ram_pressure = available_ram < 4 * 1024 * 1024 || available_ram < (total_ram / 5);
+        
+        // RAM 유지 윈도우 설정 (압박 시 1그룹, 평시 2그룹)
+        let ram_window = if is_ram_pressure { 1 } else { 2 };
+
+        if is_ram_pressure {
+            println!("[RELAY-SYSTEM] RAM Pressure Detected! Available: {} MB. Shrinking Window to {}.", available_ram / 1024, ram_window);
+        }
 
         let mut vram_to_ram = 0;
         let mut ram_to_ssd = 0;
@@ -298,7 +311,7 @@ impl KVRegistry {
             let entry_group_id = entry.token_start / group_size;
 
             // [VRAM 릴레이]
-            // 현재 그룹(B)과 직전 그룹(A)을 제외한 모든 과거 데이터는 RAM으로 밀어냄
+            // 현재 그룹(0)과 직전 그룹(-1)만 VRAM 허용 (Hot Window = 1024 tokens)
             if entry_group_id + 1 < current_group_id {
                 let has_vram = entry.location.iter().any(|&l| l == KVLocation::VRAM);
                 if has_vram {
@@ -310,11 +323,11 @@ impl KVRegistry {
             }
 
             // [RAM 릴레이]
-            // RAM에 있는 데이터 중 현재 그룹보다 2단계 이상 뒤쳐진 것은 SSD로 밀어냄
-            if entry_group_id + 2 < current_group_id {
+            // RAM 상태에 따라 가변적인 윈도우 적용
+            // ram_window 이상 멀어지면 SSD로 직행
+            if entry_group_id + ram_window < current_group_id {
                 let has_sticky = entry.location.iter().any(|&l| l == KVLocation::RamSticky || l == KVLocation::RAM);
                 if has_sticky && entry.ssd_path.is_none() {
-                    // SSD_PENDING 상태로 변경하여 generate.rs가 캐치하게 함
                     for loc in entry.location.iter_mut() {
                         if *loc == KVLocation::RAM || *loc == KVLocation::RamSticky { 
                             *loc = KVLocation::SSD_PENDING; 
@@ -327,8 +340,8 @@ impl KVRegistry {
         }
 
         if vram_to_ram > 0 || ram_to_ssd > 0 {
-            println!("[RELAY-SYSTEM] Group {}: VRAM->RAM: {} blocks, RAM->SSD-Queue: {} blocks", 
-                current_group_id, vram_to_ram, ram_to_ssd);
+            println!("[RELAY-SYSTEM] Group {} (Size {}): VRAM->RAM: {} blocks, RAM->SSD-Queue: {} blocks", 
+                current_group_id, group_size, vram_to_ram, ram_to_ssd);
         }
     }
 
@@ -1928,7 +1941,8 @@ impl QuantizedQwen3VLTextModel {
                                         if let Ok(nvml) = Nvml::init() {
                                             if let Ok(dev) = nvml.device_by_index(0) {
                                                 if let Ok(mem) = dev.memory_info() {
-                                                    // 1.5GB 여유가 있다면 레이어를 유지 (2B 모델 전체 로드 유도)
+                                                    // 1500MB 여유가 있다면 레이어를 유지 (2B 모델 전체 로드 유도)
+                                                    // 4GB VRAM에서도 충분히 동작하도록 임계값 완화
                                                     if mem.free > 1500 * 1024 * 1024 {
                                                         should_purge = false;
                                                     }
@@ -1976,6 +1990,10 @@ impl QuantizedQwen3VLTextModel {
                                                                     if entry.token_start >= self.current_kv_len { continue; }
 
                                                                     let loc = entry.location[layer_idx];
+                                                                    
+                                                                    // [SAFETY] SSD_PENDING 상태는 저장 중이므로 로드하지 않음 (충돌 방지)
+                                                                    if loc == KVLocation::SSD_PENDING { continue; }
+
                                                                     if loc == KVLocation::SSD || loc == KVLocation::Loading {
                                                                         blocks_to_load.push(block.clone());
                                                                         if chunk_path.as_os_str().is_empty() {
