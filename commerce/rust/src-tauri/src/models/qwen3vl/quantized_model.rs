@@ -1642,7 +1642,7 @@ impl QuantizedQwen3VLTextModel {
             let _ = Device::new_cuda(0)?.synchronize();
         }
 
-        // [SLOT-RECLAMATION] 슬롯 반납이 이 레이어 작업 완료의 최종 마침표입니다.
+        // [SLOT-RECLAMATION] 슬롯 반납 시작
         use crate::models::qwen3vl::generate::SLOT_MANAGER;
         use std::sync::atomic::Ordering;
         
@@ -1657,24 +1657,39 @@ impl QuantizedQwen3VLTextModel {
             });
         }
 
-        // [PHYSICAL-WAIT-GATE] 사용자 요청: 슬롯 회수가 완료될 때까지 다음 단계 진행을 차단합니다.
+        // [PHYSICAL-WAIT-GATE] 슬롯 회수가 물리적으로 완료될 때까지 대기
+        // 이 대기가 끝나야만 Baker가 SSD 저장을 마쳤음을 보장할 수 있습니다.
         if num_to_release > 0 {
             let target_active = initial_active.saturating_sub(num_to_release);
             let mut wait_attempts = 0;
-            while wait_attempts < 500 { // 최대 5초 대기
+            while wait_attempts < 1000 { // 최대 10초 대기 (SSD 쓰기 부하 고려)
                 let current_active = SLOT_MANAGER.count_reads.load(Ordering::SeqCst) + SLOT_MANAGER.count_writes.load(Ordering::SeqCst);
-                if current_active <= target_active {
-                    break;
-                }
+                if current_active <= target_active { break; }
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 wait_attempts += 1;
-                if wait_attempts % 100 == 0 {
-                    println!("[TRACE] Waiting for physical slot reclamation... (Current: {}, Target: {})", current_active, target_active);
+            }
+        }
+
+        // [SAFE-PURGE] 이제 데이터가 SSD에 안전하게 저장되었으므로 RAM 참조를 완전히 제거합니다.
+        for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
+            let mut inner_w = block.inner.write().unwrap();
+            inner_w.k_cache = None;
+            inner_w.v_cache = None;
+            inner_w.bitkv_metadata = None; 
+            inner_w.location = KVLocation::SSD; 
+        }
+
+        {
+            let mut reg_w = self.registry.entries.write().unwrap();
+            for entry in reg_w.iter_mut() {
+                let mut cache_w = entry.bitkv_cache.write().unwrap();
+                if layer_idx < cache_w.len() {
+                    cache_w[layer_idx] = None;
                 }
             }
         }
         
-        println!("[BURST] << [DONE] Layer {} complete (Slots Reclaimed).", layer_idx);
+        println!("[BURST] << [DONE] Layer {} complete (RAM Purged Safely).", layer_idx);
         Ok(result_xs)
     }
 
@@ -2266,13 +2281,22 @@ impl QuantizedQwen3VLTextModel {
             fragments.clear();
             if let Ok(entries) = std::fs::read_dir(path) {
                 for entry in entries.flatten() {
-                    let fname = entry.file_name().to_string_lossy().to_string();
                     let fpath = entry.path();
+                    let fname = entry.file_name().to_string_lossy().to_string();
                     
                     if fpath.is_dir() && fname.starts_with('b') {
                         // [NEW-DIR-FORMAT] b{offset}/l{layer}.st
+                        // OS별 경로 구분자(\ or /)는 PathBuf가 자동으로 처리합니다.
                         if let Ok(offset) = fname[1..].parse::<usize>() {
-                            fragments.push((offset, fpath));
+                            // 해당 디렉토리 내부에 연산 가능한 .st 파일이 있는지 검증
+                            if let Ok(sub_entries) = std::fs::read_dir(&fpath) {
+                                let has_data = sub_entries.flatten().any(|se| {
+                                    se.path().extension().map_or(false, |ext| ext == "st")
+                                });
+                                if has_data {
+                                    fragments.push((offset, fpath));
+                                }
+                            }
                         }
                     } else if fname.ends_with(".safetensors") {
                         if fname.contains("_chunk_") {

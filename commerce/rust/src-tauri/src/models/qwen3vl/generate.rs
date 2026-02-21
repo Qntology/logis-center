@@ -143,9 +143,21 @@ impl SlotManager {
 
     fn calculate_dynamic_budget(sys: &sysinfo::System, _total_tokens: usize, max_slots: usize) -> usize {
         let avail = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-        let base_min = 56;
-        let budget = ((avail - 1.5).max(0.0) / 0.02) as usize;
-        budget.max(base_min).min(max_slots)
+        
+        // [STRICT-RAM-PRESSURE] 사용자 요청: RAM 리밋을 엄격하게 압박
+        // 레이어 1개(약 40블록)만 처리할 수 있도록 최대 예산을 제한합니다.
+        let base_min = 32; 
+        let max_cap = 48; // 레이어 1개 분량 + 약간의 여유
+        
+        let budget = if avail < 2.0 {
+            // RAM 여유가 2GB 미만이면 최소치로 압박
+            base_min
+        } else {
+            // 여유가 있어도 레이어 1개 수준을 넘지 못하게 캡을 씌움
+            ((avail - 2.0) / 0.05) as usize + base_min
+        };
+        
+        budget.min(max_cap).min(max_slots)
     }
 
     pub async fn wait_for_all_tasks(&self) {
@@ -897,6 +909,9 @@ impl Qwen3VLGenerateModel {
             
             // [METADATA-PERSISTENCE] Save registry to file for cross-layer/cross-session reliability
             let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+            // [FIX] Ensure the directory exists before saving metadata
+            if !path.exists() { let _ = std::fs::create_dir_all(&path); }
+            
             if let Err(e) = self.qwen3_vl.save_metadata_to_file(&path) {
                 println!("[BAKING] !! Metadata Save Failed: {:?}", e);
             } else {
