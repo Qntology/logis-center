@@ -649,13 +649,12 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         let reg_inner = registry.clone();
                                         tokio::spawn(async move {
                                             // [FIX] ChunkedLoad에서도 레이어별 독립 파일 읽기 대응
-                                            for (l_idx, s_id, block) in tasks {
+                                            for (l_idx, s_id, block) in &tasks {
                                                 let (b_idx, b_off) = {
                                                     let inner = block.inner.read().unwrap();
                                                     (inner.index, inner.offset)
                                                 };
 
-                                                // 레이어별 실제 파일 경로 결정
                                                 let actual_load_path = if target_path.is_dir() {
                                                     let layer_path = target_path.join(format!("l{}.st", l_idx));
                                                     if layer_path.exists() { layer_path }
@@ -681,9 +680,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                     if let Ok(mut reg) = reg_inner.entries.write() {
                                                         if b_idx < reg.len() {
                                                             let entry = &mut reg[b_idx];
-                                                            
-                                                            // [ONE-SHOT-LOADING] 
-                                                            // 현재 레이어(l_idx)뿐만 아니라 파일 내에 있는 모든 텐서 매칭 시도
                                                             let layer_prefix = if is_relay_file { "l0_".to_string() } else { format!("l{}_", l_idx) };
                                                             let prefix = format!("{}{}", block_prefix, layer_prefix);
                                                             
@@ -698,62 +694,58 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 
                                                             let ka_n = get_name(&st, &prefix, &layer_prefix, "k_anchors");
                                                             if let Ok(ka_v) = st.tensor(&ka_n) {
-                                                                    // 나머지 텐서들도 확인
-                                                                    let kh_n = get_name(&st, &prefix, &layer_prefix, "k_shape");
-                                                                    let kp_n = get_name(&st, &prefix, &layer_prefix, "k_packed");
-                                                                    let ks_n = get_name(&st, &prefix, &layer_prefix, "k_scales");
-                                                                    let va_n = get_name(&st, &prefix, &layer_prefix, "v_anchors");
-                                                                    let vp_n = get_name(&st, &prefix, &layer_prefix, "v_packed");
-                                                                    let vs_n = get_name(&st, &prefix, &layer_prefix, "v_scales");
+                                                                let kh_n = get_name(&st, &prefix, &layer_prefix, "k_shape");
+                                                                let kp_n = get_name(&st, &prefix, &layer_prefix, "k_packed");
+                                                                let ks_n = get_name(&st, &prefix, &layer_prefix, "k_scales");
+                                                                let va_n = get_name(&st, &prefix, &layer_prefix, "v_anchors");
+                                                                let vp_n = get_name(&st, &prefix, &layer_prefix, "v_packed");
+                                                                let vs_n = get_name(&st, &prefix, &layer_prefix, "v_scales");
 
-                                                                    if let (Ok(kh_v), Ok(kp_v), Ok(ks_v), Ok(va_v), Ok(vp_v), Ok(vs_v)) = (
-                                                                        st.tensor(&kh_n), st.tensor(&kp_n), st.tensor(&ks_n),
-                                                                        st.tensor(&va_n), st.tensor(&vp_n), st.tensor(&vs_n)
-                                                                    ) {
-                                                                        let dims = ka_v.shape();
-                                                                        let v_u32 = kh_v.data().chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect::<Vec<u32>>();
-                                                                        let mut os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
-                                                                        if os[2] > 1024 || os[3] > 512 { os = vec![1, 16, 256, 128]; }
+                                                                if let (Ok(kh_v), Ok(kp_v), Ok(ks_v), Ok(va_v), Ok(vp_v), Ok(vs_v)) = (
+                                                                    st.tensor(&kh_n), st.tensor(&kp_n), st.tensor(&ks_n),
+                                                                    st.tensor(&va_n), st.tensor(&vp_n), st.tensor(&vs_n)
+                                                                ) {
+                                                                    let dims = ka_v.shape();
+                                                                    let v_u32 = kh_v.data().chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect::<Vec<u32>>();
+                                                                    let mut os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
+                                                                    if os[2] > 1024 || os[3] > 512 { os = vec![1, 16, 256, 128]; }
 
-                                                                        let m = crate::models::qwen3vl::quantized_model::BitKVMetadata {
-                                                                            k_anchors: Tensor::from_vec(ka_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], dims[2], os[3]), &Device::Cpu).unwrap(),
-                                                                            k_packed: Tensor::from_slice(kp_v.data(), kp_v.shape(), &Device::Cpu).unwrap(),
-                                                                            k_scales: Tensor::from_vec(ks_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], os[2], 1), &Device::Cpu).unwrap(),
-                                                                            v_anchors: Tensor::from_vec(va_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], dims[2], os[3]), &Device::Cpu).unwrap(),
-                                                                            v_packed: Tensor::from_slice(vp_v.data(), vp_v.shape(), &Device::Cpu).unwrap(),
-                                                                            v_scales: Tensor::from_vec(vs_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], os[2], 1), &Device::Cpu).unwrap(),
-                                                                            original_shape: os
-                                                                        };
-                                                                        
-                                                                        let mut cache = entry.bitkv_cache.write().unwrap();
-                                                                        if is_relay_file {
-                                                                            for i in 0..28 {
-                                                                                cache[i] = Some(m.clone());
-                                                                                if entry.location[i] == crate::models::qwen3vl::quantized_model::KVLocation::SSD || entry.location[i] == crate::models::qwen3vl::quantized_model::KVLocation::Loading {
-                                                                                    entry.location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
-                                                                                }
+                                                                    let m = crate::models::qwen3vl::quantized_model::BitKVMetadata {
+                                                                        k_anchors: Tensor::from_vec(ka_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], dims[2], os[3]), &Device::Cpu).unwrap(),
+                                                                        k_packed: Tensor::from_slice(kp_v.data(), kp_v.shape(), &Device::Cpu).unwrap(),
+                                                                        k_scales: Tensor::from_vec(ks_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], os[2], 1), &Device::Cpu).unwrap(),
+                                                                        v_anchors: Tensor::from_vec(va_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], dims[2], os[3]), &Device::Cpu).unwrap(),
+                                                                        v_packed: Tensor::from_slice(vp_v.data(), vp_v.shape(), &Device::Cpu).unwrap(),
+                                                                        v_scales: Tensor::from_vec(vs_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], os[2], 1), &Device::Cpu).unwrap(),
+                                                                        original_shape: os
+                                                                    };
+                                                                    
+                                                                    let mut cache = entry.bitkv_cache.write().unwrap();
+                                                                    if is_relay_file {
+                                                                        for i in 0..28 {
+                                                                            cache[i] = Some(m.clone());
+                                                                            if entry.location[i] == crate::models::qwen3vl::quantized_model::KVLocation::SSD || entry.location[i] == crate::models::qwen3vl::quantized_model::KVLocation::Loading {
+                                                                                entry.location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
                                                                             }
-                                                                            break;
-                                                                        } else {
-                                                                            cache[target_l] = Some(m);
-                                                                            if entry.location[target_l] == crate::models::qwen3vl::quantized_model::KVLocation::SSD || entry.location[target_l] == crate::models::qwen3vl::quantized_model::KVLocation::Loading {
-                                                                                entry.location[target_l] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
-                                                                            }
+                                                                        }
+                                                                    } else {
+                                                                        cache[*l_idx] = Some(m);
+                                                                        if entry.location[*l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::SSD || entry.location[*l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::Loading {
+                                                                            entry.location[*l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM;
                                                                         }
                                                                     }
                                                                 }
                                                             }
                                                         }
                                                     }
-                                                }
-                                                Ok(())
-                                            }.await;
-                                            if let Err(e) = res { println!("[WORKER-CHUNK] !! [ERROR] File load failed: {} -> {}", target_path.display(), e); }
-                                            for (_, s_id, _) in tasks { SLOT_MANAGER.release_slot(s_id).await; }
+                                                    Ok(())
+                                                }.await;
+                                                if let Err(e) = res { println!("[WORKER-CHUNK] !! [ERROR] File load failed: {:?} -> {}", actual_load_path, e); }
+                                            }
+                                            for (_, s_id, _) in tasks { SLOT_MANAGER.release_slot(*s_id).await; }
                                         });
                                     }
                                 }
-                
             }
         }
     });
