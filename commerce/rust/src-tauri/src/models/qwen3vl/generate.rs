@@ -490,10 +490,14 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                             
                                                                                             let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor(&ka_name) {
                                                                                                 let dims = t_view.shape();
-                                                                                                let data = unsafe { std::slice::from_raw_parts(t_view.data().as_ptr() as *const f32, t_view.data().len() / 4).to_vec() };
+                                                                                                // Safe conversion using Candle
+                                                                                                let t = candle_core::Tensor::from_slice(t_view.data(), dims, &candle_core::Device::Cpu).unwrap();
+                                                                                                let data = t.to_dtype(candle_core::DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                                                                                                
                                                                                                 let s_len = if let Ok(v) = st.tensor(&kh_name) {
-                                                                                                    let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const u32, v.data().len() / 4) };
-                                                                                                    v_u32[2] as usize
+                                                                                                    let vt = candle_core::Tensor::from_slice(v.data(), v.shape(), &candle_core::Device::Cpu).unwrap();
+                                                                                                    let v_vec = vt.to_dtype(candle_core::DType::U32).unwrap().to_vec1::<u32>().unwrap();
+                                                                                                    v_vec[2] as usize
                                                                                                 } else { 256 };
                                                                                                 (Some(data), vec![dims[0], dims[1], s_len, dims[3]], dims[2])
                                                                                             } else { (None, vec![1, 16, 256, 128], 36) };
@@ -539,16 +543,18 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                                                                                                                                 ) {
                                                                                                                                                                                     let dims = ka.shape();
                                                                                                                                                                                     let a_cnt = dims[2];
-                                                                                                                                                                                    let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(kh.data().as_ptr() as *const u32, kh.data().len() / 4) };
+                                                                                                                                                                                    
+                                                                                                                                                                                    let kh_t = candle_core::Tensor::from_slice(kh.data(), kh.shape(), &candle_core::Device::Cpu).unwrap();
+                                                                                                                                                                                    let v_u32 = kh_t.to_dtype(candle_core::DType::U32).unwrap().to_vec1::<u32>().unwrap();
                                                                                                                                                                                     let o_s = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
                                                                                                                                                                                     
                                                                                                                                                                                     let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
-                                                                                                                                                                                        k_anchors: Tensor::from_slice(unsafe { std::slice::from_raw_parts(ka.data().as_ptr() as *const f32, ka.data().len() / 4) }, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                                                                                                                                                        k_anchors: candle_core::Tensor::from_slice(ka.data(), ka.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], a_cnt, o_s[3])).unwrap(), 
                                                                                                                                                                                         k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
-                                                                                                                                                                                        k_scales: Tensor::from_slice(unsafe { std::slice::from_raw_parts(ks.data().as_ptr() as *const f32, ks.data().len() / 4) }, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                                                                                                                                                        v_anchors: Tensor::from_slice(unsafe { std::slice::from_raw_parts(va.data().as_ptr() as *const f32, va.data().len() / 4) }, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                                                                                                                                                        k_scales: candle_core::Tensor::from_slice(ks.data(), ks.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], o_s[2], 1)).unwrap(), 
+                                                                                                                                                                                        v_anchors: candle_core::Tensor::from_slice(va.data(), va.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], a_cnt, o_s[3])).unwrap(), 
                                                                                                                                                                                         v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
-                                                                                                                                                                                        v_scales: Tensor::from_slice(unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f32, vs.data().len() / 4) }, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                                                                                                                                                        v_scales: candle_core::Tensor::from_slice(vs.data(), vs.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], o_s[2], 1)).unwrap(), 
                                                                                                                                                                                         original_shape: o_s 
                                                                                                                                                                                     };
                                                                                                                                                                                     
@@ -657,10 +663,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 
                                                 let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor(&ka_name) {
                                                     let dims = t_view.shape();
-                                                    let data = unsafe { std::slice::from_raw_parts(t_view.data().as_ptr() as *const f32, t_view.data().len() / 4).to_vec() };
+                                                    let t = candle_core::Tensor::from_slice(t_view.data(), dims, &candle_core::Device::Cpu).unwrap();
+                                                    let data = t.to_dtype(candle_core::DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                                                    
                                                     let s_len = if let Ok(v) = st.tensor(&kh_name) {
-                                                        let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const u32, v.data().len() / 4) };
-                                                        v_u32[2] as usize
+                                                        let vt = candle_core::Tensor::from_slice(v.data(), v.shape(), &candle_core::Device::Cpu).unwrap();
+                                                        let v_vec = vt.to_dtype(candle_core::DType::U32).unwrap().to_vec1::<u32>().unwrap();
+                                                        v_vec[2] as usize
                                                     } else { 256 };
                                                     (Some(data), vec![dims[0], dims[1], s_len, dims[3]], dims[2])
                                                 } else { (None, vec![1, 16, 256, 128], 36) };
@@ -708,16 +717,17 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                 ) {
                                                                     let dims = ka.shape();
                                                                     let a_cnt = dims[2];
-                                                                    let v_u32: &[u32] = unsafe { std::slice::from_raw_parts(kh.data().as_ptr() as *const u32, kh.data().len() / 4) };
+                                                                    let kh_t = candle_core::Tensor::from_slice(kh.data(), kh.shape(), &candle_core::Device::Cpu).unwrap();
+                                                                    let v_u32 = kh_t.to_dtype(candle_core::DType::U32).unwrap().to_vec1::<u32>().unwrap();
                                                                     let o_s = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
                                                                     
                                                                     let metadata = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
-                                                                        k_anchors: Tensor::from_slice(unsafe { std::slice::from_raw_parts(ka.data().as_ptr() as *const f32, ka.data().len() / 4) }, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                                        k_anchors: candle_core::Tensor::from_slice(ka.data(), ka.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], a_cnt, o_s[3])).unwrap(), 
                                                                         k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(), 
-                                                                        k_scales: Tensor::from_slice(unsafe { std::slice::from_raw_parts(ks.data().as_ptr() as *const f32, ks.data().len() / 4) }, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
-                                                                        v_anchors: Tensor::from_slice(unsafe { std::slice::from_raw_parts(va.data().as_ptr() as *const f32, va.data().len() / 4) }, (o_s[0], o_s[1], a_cnt, o_s[3]), &Device::Cpu).unwrap(), 
+                                                                        k_scales: candle_core::Tensor::from_slice(ks.data(), ks.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], o_s[2], 1)).unwrap(), 
+                                                                        v_anchors: candle_core::Tensor::from_slice(va.data(), va.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], a_cnt, o_s[3])).unwrap(), 
                                                                         v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(), 
-                                                                        v_scales: Tensor::from_slice(unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f32, vs.data().len() / 4) }, (o_s[0], o_s[1], o_s[2], 1), &Device::Cpu).unwrap(), 
+                                                                        v_scales: candle_core::Tensor::from_slice(vs.data(), vs.shape(), &candle_core::Device::Cpu).unwrap().to_dtype(candle_core::DType::F32).unwrap().reshape((o_s[0], o_s[1], o_s[2], 1)).unwrap(), 
                                                                         original_shape: o_s 
                                                                     };
                                                                     

@@ -860,11 +860,12 @@ impl QuantizedQwen3VLTextAttention {
 
             // [FIX] Update b_len to actual tensor dimensions to prevent shape mismatch in broadcast_add
             // This handles the case where the last block (e.g. 205 tokens) is smaller than the standard 256.
-            b_len = k.dim(2)?;
-            if b_len == 0 {
-                global_start_idx += b_len;
+            let actual_b_len = k.dim(2)?;
+            if actual_b_len == 0 {
+                global_start_idx += actual_b_len; // Still 0, but for consistency
                 continue;
             }
+            b_len = actual_b_len;
 
             if self.num_kv_groups > 1 {
                 let (b, h, s, d) = k.dims4()?;
@@ -988,6 +989,12 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
+        if running_o.is_none() || running_s.is_none() {
+            // [FIX] If no KV blocks were processed, return a zero output
+            let zero_out = Tensor::zeros((b_sz, q_len, self.num_attention_heads * self.head_dim), target_dtype, dev)?;
+            return self.o_proj.forward(&zero_out);
+        }
+
         let attn_output = running_o.unwrap().broadcast_div(&running_s.unwrap())?;
         let attn_output = attn_output.transpose(1, 2)?
             .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
@@ -1097,6 +1104,12 @@ impl QuantizedQwen3VLTextAttention {
         
         // original_shape[2] is the total sequence length (e.g. 256)
         let seq_len = original_shape[original_shape.len() - 2];
+        
+        // [SANITY-CHECK] Prevent allocation of massive vectors from corrupted metadata
+        if seq_len > 1024 || head_dim > 512 || num_heads > 128 {
+            return Err(candle_core::Error::Msg(format!("Corrupted original_shape in BitKV: seq={}, h_dim={}, heads={}", seq_len, head_dim, num_heads)).into());
+        }
+
         let total_elements: usize = batch_size * num_heads * seq_len * head_dim;
         let mut decoded = vec![0.0f32; total_elements];
         
@@ -1333,14 +1346,17 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn load_kv_cache(&mut self, _path: &Path, _device: &Device, _expected_len: usize, _upscale_refill_len: usize, _kv_name: Option<&str>, fragments: &[(usize, std::path::PathBuf)]) -> Result<()> {
+    pub fn load_kv_cache(&mut self, _path: &Path, _device: &Device, _expected_len: usize, _upscale_refill_len: usize, _kv_name: Option<&str>, fragments: &[(usize, std::path::PathBuf)], current_kv_len: usize) -> Result<()> {
         if fragments.is_empty() { return Ok(()); }
         
         self.kv_blocks.clear();
         
         for (i, (offset, path)) in fragments.iter().enumerate() {
-            // [FIX] Standard block size is 256 tokens per fragment
-            let b_len = 256; 
+            // [FIX] Calculate actual block length based on current total context
+            let b_len = if *offset < current_kv_len {
+                (current_kv_len - *offset).min(256)
+            } else { 256 };
+            
             let new_block = KVBlock::new(KVLocation::SSD, i, b_len, *offset);
             {
                 if let Ok(mut inner) = new_block.inner.write() {
@@ -1538,9 +1554,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
         self.self_attn.save_kv_cache(path, true, block_size, None)
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>, fragments: &[(usize, std::path::PathBuf)]) -> Result<()> {
+    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>, fragments: &[(usize, std::path::PathBuf)], current_kv_len: usize) -> Result<()> {
         let device = self.input_layernorm.weight().device();
-        self.self_attn.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, fragments)
+        self.self_attn.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, fragments, current_kv_len)
     }
 }
 
@@ -2377,8 +2393,9 @@ impl QuantizedQwen3VLTextModel {
             println!("[SSD-LOAD] Relay Jump: Model progress synchronized to token index {}.", total_loaded);
         }
 
+        let kv_len = self.current_kv_len;
         self.layers.iter_mut().try_for_each(|layer| {
-            layer.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, &fragments)
+            layer.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, &fragments, kv_len)
         })
     }
 
