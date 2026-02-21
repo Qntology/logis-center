@@ -517,7 +517,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                 SLOT_MANAGER.release_slot(s_id).await;
                                             }
                                         })
-                                        .buffer_unordered(4); // [LIMIT] Max 4 concurrent loads
+                                        .buffer_unordered(64); // [MAX-CAPACITY] Use all available slots for massive parallel load
 
                                     // Drain the stream
                                     while let Some(_) = futures.next().await {}
