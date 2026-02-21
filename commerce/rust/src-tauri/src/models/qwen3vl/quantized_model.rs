@@ -1088,6 +1088,7 @@ impl QuantizedQwen3VLTextAttention {
         let mut decoded = vec![0.0f32; total_elements];
         
         let head_tokens = seq_len * head_dim;
+        if head_tokens == 0 { return Ok(Tensor::zeros((batch_size, num_heads, seq_len, head_dim), target_dtype, device)?); }
 
         use rayon::prelude::*;
         decoded.par_chunks_mut(head_tokens).enumerate().for_each(|(bh_idx, head_out)| {
@@ -2267,6 +2268,14 @@ impl QuantizedQwen3VLTextModel {
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
         if !path.exists() { return Ok(()); }
 
+        // [FIX] 스캔 시작 전에 이미 복원된 메타데이터(Registry)가 있다면 길이를 동기화합니다.
+        if let Ok(entries) = self.registry.entries.read() {
+            if let Some(last) = entries.last() {
+                self.current_kv_len = last.token_start + last.token_len;
+                println!("[SSD-LOAD] Pre-scan Sync: current_kv_len set to {} from Registry.", self.current_kv_len);
+            }
+        }
+
         // [OPTIMIZATION] Scan once at Model level, then distribute to layers
         let mut fragments = Vec::new();
         let mut attempts = 0;
@@ -2291,12 +2300,17 @@ impl QuantizedQwen3VLTextModel {
                             
                             let base_offset = chunk_idx * (256 * 64);
                             
-                            // [STRICT-SCAN] 메타데이터에서 불러온 현재 토큰 길이(self.current_kv_len)를 기준으로 
-                            // 이 파일에 실제로 포함된 블록들만 등록합니다.
-                            let max_tokens_in_this_chunk = (self.current_kv_len).saturating_sub(base_offset);
-                            let actual_blocks_to_register = ((max_tokens_in_this_chunk + 255) / 256).min(64);
+                            // [STRICT-SCAN] 메타데이터의 길이와 파일 크기를 모두 고려합니다.
+                            let f_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                            let blocks_by_size = if f_size > 0 { (f_size / 200_000).max(1).min(64) as usize } else { 0 };
+                            let blocks_by_len = if self.current_kv_len > base_offset {
+                                ((self.current_kv_len - base_offset + 255) / 256).min(64)
+                            } else { 0 };
                             
-                            for b_in_chunk in 0..actual_blocks_to_register {
+                            // 두 지표 중 더 신뢰할 수 있는 것을 선택 (파일이 있는데 길이를 모르면 파일 크기 신뢰)
+                            let actual_blocks = if blocks_by_len > 0 { blocks_by_len } else { blocks_by_size };
+                            
+                            for b_in_chunk in 0..actual_blocks {
                                 let block_offset = base_offset + (b_in_chunk * 256);
                                 fragments.push((block_offset, entry.path()));
                             }
