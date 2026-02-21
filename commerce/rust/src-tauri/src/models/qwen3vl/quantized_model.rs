@@ -645,94 +645,6 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // [PREFETCH-TRIGGER-V4] IO 로딩 및 CPU 압축 해제 병렬화
-        let lookahead = 1; // 8GB RAM 안전을 위해 다음 1개 레이어만 미리 풀기
-        for offset in 1..=lookahead {
-            let next_layer = self.layer_idx + offset;
-            if next_layer >= 28 { break; }
-
-            let mut blocks_to_load: Vec<KVBlock> = Vec::new();
-            let mut blocks_to_decompress: Vec<KVBlock> = Vec::new();
-            let mut chunk_path = std::path::PathBuf::new();
-            
-            {
-                let reg = self.registry.entries.read().unwrap();
-                for (b_idx, block) in self.kv_blocks.iter().enumerate() {
-                    if b_idx < reg.len() {
-                        let loc = reg[b_idx].location[next_layer];
-                        if loc == KVLocation::SSD {
-                            blocks_to_load.push(block.clone());
-                            if chunk_path.as_os_str().is_empty() {
-                                chunk_path = reg[b_idx].ssd_path.clone().unwrap_or_default();
-                            }
-                        } else if (loc == KVLocation::RAM || loc == KVLocation::RamSticky) && block.inner.read().unwrap().k_cache.is_none() {
-                            blocks_to_decompress.push(block.clone());
-                        }
-                    }
-                }
-            }
-
-            // 1. SSD 로딩 (IO Worker)
-            if !blocks_to_load.is_empty() && !chunk_path.as_os_str().is_empty() {
-                {
-                    let mut reg = self.registry.entries.write().unwrap();
-                    for block in &blocks_to_load {
-                        let idx = block.inner.read().unwrap().index;
-                        if idx < reg.len() && reg[idx].location[next_layer] == KVLocation::SSD {
-                            reg[idx].location[next_layer] = KVLocation::Loading;
-                        }
-                    }
-                }
-                let registry_clone = self.registry.clone();
-                tauri::async_runtime::spawn(async move {
-                    use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, ChunkedLoadTask, get_load_worker};
-                    let mut s_ids = Vec::new();
-                    for _ in 0..blocks_to_load.len() {
-                        if let Ok(id) = tokio::time::timeout(std::time::Duration::from_millis(500), SLOT_MANAGER.acquire_read_slot()).await {
-                            s_ids.push(id);
-                        } else { break; }
-                    }
-                    if !s_ids.is_empty() {
-                        if let Ok(tx) = get_load_worker().await {
-                            let _ = tx.send(SlotTask::ChunkedLoad(ChunkedLoadTask {
-                                slot_ids: s_ids, path: chunk_path, layer_indices: vec![next_layer; blocks_to_load.len()],
-                                shared_blocks: blocks_to_load, registry: registry_clone,
-                            })).await;
-                        }
-                    }
-                });
-            }
-
-            // 2. 미리 압축 해제 (CPU Parallel Decompression)
-            if !blocks_to_decompress.is_empty() {
-                let registry_clone = self.registry.clone();
-                let l_idx = next_layer;
-                let dev = self.q_proj.device().clone();
-                let model_clone = self.clone(); 
-                tauri::async_runtime::spawn(async move {
-                    use rayon::prelude::*;
-                    blocks_to_decompress.into_par_iter().for_each(|block| {
-                        let index = block.inner.read().unwrap().index;
-                        let meta = {
-                            let reg = registry_clone.entries.read().unwrap();
-                            if index < reg.len() {
-                                reg[index].bitkv_cache.read().unwrap()[l_idx].clone()
-                            } else { None }
-                        };
-                        if let Some(m) = meta {
-                            if let Ok(k_raw) = model_clone.decompress_from_bitkv(&m.k_anchors, &m.k_packed, &m.k_scales, &m.original_shape, &dev) {
-                                if let Ok(v_raw) = model_clone.decompress_from_bitkv(&m.v_anchors, &m.v_packed, &m.v_scales, &m.original_shape, &dev) {
-                                    let mut inner = block.inner.write().unwrap();
-                                    inner.k_cache = Some(k_raw);
-                                    inner.v_cache = Some(v_raw);
-                                }
-                            }
-                        }
-                    });
-                });
-            }
-        }
-
         // 4. [LIGHTWEIGHT-HYBRID-ENGINE]
         let mut running_m = None; 
         let mut running_s = None; 
@@ -752,87 +664,21 @@ impl QuantizedQwen3VLTextAttention {
             let index = block.inner.read().unwrap().index;
             self.registry.mark_accessed(index); // 접근 시각 갱신
             
-            let (mut k, mut v, mut b_len, index) = {
+            let (k, v, mut b_len, index) = {
                 let inner = block.inner.read().unwrap();
                 (inner.k_cache.clone(), inner.v_cache.clone(), inner.len, inner.index)
             };
 
-            let mut loc = {
+            let loc = {
                 let reg = self.registry.entries.read().unwrap();
                 if index < reg.len() { reg[index].location[self.layer_idx] } else { KVLocation::VRAM }
             };
 
-            if loc == KVLocation::SSD {
-                let (spath, reserved_sid) = {
-                    let reg = self.registry.entries.read().unwrap();
-                    (reg[index].ssd_path.clone(), reg[index].slot_ids[self.layer_idx])
-                };
+            // [STRICT-SEQUENTIAL-LOADING] 
+            // 데이터 로딩은 이제 상위 루프에서 인라인으로 완료되었음을 보장합니다.
+            // 여기서는 오직 로드된 데이터를 사용하기만 합니다.
 
-                if let Some(path) = spath {
-                    // [REUSE-LOGIC] 이미 예약된 슬롯이 있다면 로딩 작업이 진행 중인 것으로 간주
-                    if reserved_sid.is_some() {
-                        loc = KVLocation::Loading;
-                    } else {
-                        {
-                            let mut reg = self.registry.entries.write().unwrap();
-                            reg[index].location[self.layer_idx] = KVLocation::Loading;
-                        }
-                        let shared_block = block.clone();
-                        let reg_clone = self.registry.clone();
-                        let l_idx = self.layer_idx;
-                        tauri::async_runtime::spawn(async move {
-                            use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
-                            let sid = SLOT_MANAGER.acquire_read_slot().await;
-                            if let Ok(tx) = get_load_worker().await {
-                                let _ = tx.send(SlotTask::Load(LoadTask {
-                                    slot_id: sid, path, layer_idx: l_idx, kv_name: None, shared_block, registry: reg_clone
-                                })).await;
-                            }
-                        });
-                        loc = KVLocation::Loading;
-                    }
-                }
-            }
-
-            // [OPTIMIZED-WAIT] Improved yielding during Loading wait
-            if loc == KVLocation::Loading {
-                let mut attempts = 0;
-                while attempts < 30000 { // Increased timeout (60s) for CPU/SSD heavy loads
-                    let current = {
-                        let reg = self.registry.entries.read().unwrap();
-                        reg[index].location[self.layer_idx]
-                    };
-                    
-                    if current == KVLocation::RAM || current == KVLocation::RamSticky || current == KVLocation::VRAM { break; }
-                    
-                    // Release CPU time to allow worker threads to finish IO and BitKV decoding
-                    std::thread::yield_now();
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                    attempts += 1;
-                    
-                    if attempts % 1000 == 0 {
-                        println!("[TRACE] Layer {} Block {} still loading... ({} ms elapsed)", self.layer_idx, index, attempts * 2);
-                    }
-
-                    // [TIMEOUT-SAFETY] 5초(2500 * 2ms) 이상 대기 시 로딩 실패로 간주하고 SSD 상태로 리셋
-                    // SSD I/O가 바쁘거나 압축 해제 부하가 클 경우를 대비해 시간을 늘렸습니다.
-                    if attempts > 2500 {
-                        println!("[TRACE] !! [TIMEOUT] Layer {} Block {} load hung. Resetting to SSD to force retry.", self.layer_idx, index);
-                        let mut reg = self.registry.entries.write().unwrap();
-                        if index < reg.len() {
-                            reg[index].location[self.layer_idx] = KVLocation::SSD;
-                        }
-                        break;
-                    }
-                }
-            }
-
-            let final_loc = {
-                let reg = self.registry.entries.read().unwrap();
-                reg[index].location[self.layer_idx]
-            };
-
-            match final_loc {
+            match loc {
                 KVLocation::VRAM => {
                     vram_ks.push(k.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
                     vram_vs.push(v.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
@@ -842,6 +688,9 @@ impl QuantizedQwen3VLTextAttention {
                 }
                 KVLocation::RAM | KVLocation::RamSticky => {
                     let mut inner = block.inner.write().unwrap();
+                    let mut k = k.clone();
+                    let mut v = v.clone();
+                    
                     if inner.k_cache.is_none() {
                         // 1. Try local metadata
                         let meta = inner.bitkv_metadata.clone();
@@ -1425,12 +1274,9 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
         
-            pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
-                                    self.save_kv_cache(path, true, block_size, None)
-
-                        }
-
-                    
+    pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
+        self.save_kv_cache(path, true, block_size, None)
+    }
 }
 
 #[derive(Clone)]
@@ -1612,6 +1458,226 @@ pub struct QuantizedQwen3VLTextModel {
 }
 
 impl QuantizedQwen3VLTextModel {
+    /// [CHUNK-RECURSIVE-PROCESSOR]
+    /// 레이어 내부의 청크들을 재귀적으로 처리하여 연산의 순차성을 보장합니다.
+    fn process_chunks_recursive(
+        &mut self,
+        layer_idx: usize,
+        chunk_idx: usize,
+        chunk_offsets: &[usize],
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        seqlen_offset: usize,
+        mut results: Vec<Tensor>,
+    ) -> Result<Vec<Tensor>> {
+        if chunk_idx >= chunk_offsets.len() {
+            return Ok(results);
+        }
+
+        let i = chunk_offsets[chunk_idx];
+        let chunk_size = 256;
+        let current_seq_len = xs.dim(1)?;
+        let take = (current_seq_len - i).min(chunk_size);
+
+        let xs_chunk = xs.narrow(1, i, take)?;
+        let cos_chunk = cos.narrow(1, i, take)?;
+        let sin_chunk = sin.narrow(1, i, take)?;
+
+        let out_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)
+        }));
+
+        match out_res {
+            Ok(Ok(out)) => {
+                results.push(out);
+                self.process_chunks_recursive(
+                    layer_idx,
+                    chunk_idx + 1,
+                    chunk_offsets,
+                    xs,
+                    cos,
+                    sin,
+                    seqlen_offset,
+                    results,
+                )
+            }
+            _ => Err(anyhow::anyhow!("Layer {} Chunk {} failed", layer_idx, chunk_idx)),
+        }
+    }
+
+    /// [LAYER-UNIT-OF-WORK]
+    /// 한 레이어의 모든 작업(파일 읽기, 디코딩, GPU 연산, 메모리 해제)을 완결하고 결과 xs를 반환합니다.
+    fn process_single_layer(
+        &mut self,
+        layer_idx: usize,
+        mut xs: Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        let start_layer_time = std::time::Instant::now();
+
+        // [STEP 1] Load & Decode (Inline & Strict Path Resolution)
+        let mut w_blocks_to_load = Vec::new();
+        let mut w_chunk_path = std::path::PathBuf::new();
+        {
+            let reg = self.registry.entries.read().unwrap();
+            let layer_kv_blocks = &self.layers[layer_idx].self_attn.kv_blocks;
+            for (b_idx, block) in layer_kv_blocks.iter().enumerate() {
+                if b_idx < reg.len() {
+                    let entry = &reg[b_idx];
+                    if entry.token_start >= self.current_kv_len { continue; }
+                    let loc = entry.location[layer_idx];
+                    if loc == KVLocation::SSD || loc == KVLocation::Loading {
+                        w_blocks_to_load.push((layer_idx, b_idx, block.clone()));
+                        if w_chunk_path.as_os_str().is_empty() {
+                            w_chunk_path = entry.ssd_path.clone().unwrap_or_default();
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut acquired_slots = Vec::new();
+        if !w_blocks_to_load.is_empty() && !w_chunk_path.as_os_str().is_empty() {
+            use crate::models::qwen3vl::generate::SLOT_MANAGER;
+            for _ in 0..w_blocks_to_load.len() {
+                let s_id = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        SLOT_MANAGER.acquire_read_slot().await
+                    })
+                });
+                acquired_slots.push(s_id);
+            }
+
+            for (i, (l_idx, b_idx, block)) in w_blocks_to_load.iter().enumerate() {
+                let block_offset = b_idx * 256;
+                let actual_path = if w_chunk_path.is_dir() {
+                    let block_dir = w_chunk_path.join(format!("b{}", block_offset));
+                    let lp = block_dir.join(format!("l{}.st", l_idx));
+                    if lp.exists() { lp } else { block_dir.join("l0.st") }
+                } else { w_chunk_path.clone() };
+
+                if let Ok(content) = std::fs::read(&actual_path) {
+                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                        let prefix = format!("b{}_l{}_", block_offset, l_idx);
+                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                        if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = 
+                            (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
+                            
+                            let metadata = BitKVMetadata {
+                                k_anchors: Tensor::from_slice(ka.data(), ka.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
+                                k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
+                                k_scales: Tensor::from_slice(ks.data(), ks.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
+                                v_anchors: Tensor::from_slice(va.data(), va.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
+                                v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
+                                v_scales: Tensor::from_slice(vs.data(), vs.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
+                                original_shape: vec![1, 16, 256, 128]
+                            };
+                            let mut inner = block.inner.write().unwrap();
+                            inner.bitkv_metadata = Some(metadata);
+                            inner.location = KVLocation::RAM;
+                            let mut reg_w = self.registry.entries.write().unwrap();
+                            reg_w[*b_idx].location[*l_idx] = KVLocation::RAM;
+                            reg_w[*b_idx].slot_ids[*l_idx] = Some(acquired_slots[i]);
+                        }
+                    }
+                }
+            }
+        }
+
+        // [STEP 2] Execute Layer on GPU
+        let target_device = Device::new_cuda(0)?;
+        if !self.layers[layer_idx].device().same_device(&target_device) {
+            self.layers[layer_idx].to_device(&target_device)?;
+            let _ = target_device.synchronize(); 
+        }
+        if !xs.device().is_cuda() {
+            xs = xs.to_device(&target_device)?;
+        }
+
+        println!("[BURST] >> [RUN] Layer {} on GPU (Recursive Chunks)", layer_idx);
+        
+        // 청크 오프셋 목록 생성
+        let current_seq_len = xs.dim(1)?;
+        let chunk_size = 256;
+        let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(chunk_size).collect();
+
+        // 청크 재귀 실행
+        let next_xs_all = self.process_chunks_recursive(
+            layer_idx,
+            0,
+            &chunk_offsets,
+            &xs,
+            cos,
+            sin,
+            seqlen_offset,
+            Vec::new(),
+        )?;
+        
+        // [STEP 3] Finalize & Purge (Ensure Slot Release is the LAST signal)
+        let _ = target_device.synchronize();
+        let next_xs = Tensor::cat(&next_xs_all, 1)?;
+        let result_xs = next_xs.to_device(&Device::Cpu)?; 
+        
+        // 레이어 Unload
+        for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
+            let (k_cpu, v_cpu) = {
+                let inner = block.inner.read().unwrap();
+                if inner.location == KVLocation::VRAM {
+                    if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                        (Some(k.to_device(&Device::Cpu)?), Some(v.to_device(&Device::Cpu)?))
+                    } else { (None, None) }
+                } else { (None, None) }
+            };
+            if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
+                let mut inner_w = block.inner.write().unwrap();
+                inner_w.k_cache = Some(k); inner_w.v_cache = Some(v);
+                inner_w.location = KVLocation::RAM;
+            }
+        }
+        if self.layers[layer_idx].device().is_cuda() {
+            self.layers[layer_idx].to_device(&Device::Cpu)?;
+            let _ = Device::new_cuda(0)?.synchronize();
+        }
+
+        // [SLOT-RECLAMATION] 슬롯 반납이 이 레이어 작업 완료의 최종 마침표입니다.
+        use crate::models::qwen3vl::generate::SLOT_MANAGER;
+        use std::sync::atomic::Ordering;
+        
+        let initial_active = SLOT_MANAGER.count_reads.load(Ordering::SeqCst) + SLOT_MANAGER.count_writes.load(Ordering::SeqCst);
+        let num_to_release = acquired_slots.len();
+
+        for s_id in acquired_slots {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async { 
+                    SLOT_MANAGER.release_slot(s_id).await; 
+                })
+            });
+        }
+
+        // [PHYSICAL-WAIT-GATE] 사용자 요청: 슬롯 회수가 완료될 때까지 다음 단계 진행을 차단합니다.
+        if num_to_release > 0 {
+            let target_active = initial_active.saturating_sub(num_to_release);
+            let mut wait_attempts = 0;
+            while wait_attempts < 500 { // 최대 5초 대기
+                let current_active = SLOT_MANAGER.count_reads.load(Ordering::SeqCst) + SLOT_MANAGER.count_writes.load(Ordering::SeqCst);
+                if current_active <= target_active {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                wait_attempts += 1;
+                if wait_attempts % 100 == 0 {
+                    println!("[TRACE] Waiting for physical slot reclamation... (Current: {}, Target: {})", current_active, target_active);
+                }
+            }
+        }
+        
+        println!("[BURST] << [DONE] Layer {} complete (Slots Reclaimed).", layer_idx);
+        Ok(result_xs)
+    }
+
     pub fn new_with_mmap(
         config: &Qwen3VLTextConfig,
         ct: &gguf_file::Content,
@@ -1858,6 +1924,57 @@ impl QuantizedQwen3VLTextModel {
         })
     }
 
+    /// [LAYER-RECURSIVE-PIPELINE]
+    /// 레이어들을 재귀적으로 하나씩 처리하여 동기화와 메모리 해제를 완벽히 보장합니다.
+    fn process_layers_recursive(
+        &mut self,
+        current_layer_idx: usize,
+        num_layers: usize,
+        xs: Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        seqlen_offset: usize,
+        start_layer: usize,
+    ) -> Result<Tensor> {
+        // 1. 종료 조건: 모든 레이어 완료
+        if current_layer_idx >= num_layers {
+            return Ok(xs);
+        }
+
+        // 2. Resume 체크: 아직 시작 레이어에 도달하지 않았으면 다음 레이어로 점프
+        if current_layer_idx < start_layer {
+            return self.process_layers_recursive(
+                current_layer_idx + 1,
+                num_layers,
+                xs,
+                cos,
+                sin,
+                seqlen_offset,
+                start_layer,
+            );
+        }
+
+        // 3. 현재 레이어 작업 수행 (인라인 디코딩 -> 연산 -> VRAM 즉시 해제)
+        let next_xs = self.process_single_layer(
+            current_layer_idx,
+            xs,
+            cos,
+            sin,
+            seqlen_offset,
+        )?;
+
+        // 4. 다음 레이어로 바톤 터치 (재귀 호출)
+        self.process_layers_recursive(
+            current_layer_idx + 1,
+            num_layers,
+            next_xs,
+            cos,
+            sin,
+            seqlen_offset,
+            start_layer,
+        )
+    }
+
     pub fn forward(
         &mut self,
         inputs_embeds: &Tensor,
@@ -1869,7 +1986,6 @@ impl QuantizedQwen3VLTextModel {
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         
-        // [STRICT-GPU-COMPUTATION] 연산 장치는 무조건 첫 번째 레이어의 장치(GPU 권장)를 따릅니다.
         let target_device = self.layers[0].device().clone();
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         
@@ -1880,13 +1996,7 @@ impl QuantizedQwen3VLTextModel {
         };
         let mut xs = xs.to_dtype(target_dtype)?.contiguous()?;
 
-        // --- [A-B-C WINDOW STRATEGY] ---
-        // c: Computing (Current Layer)
-        // b: Backing up (Save in progress, memory kept)
-        // a: Archived (Save confirmed, memory dropped)
-
         let mut start_layer = 0;
-        // [RESUME-LOGIC] Try to pick up from a saved layer checkpoint on disk
         if let Some(sid) = &self.active_session_id {
             let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
             for l_idx in (0..self.layers.len()).rev() {
@@ -1935,208 +2045,29 @@ impl QuantizedQwen3VLTextModel {
             }
         };
 
-                        // [LAYER-WISE-BURST-STRATEGY]
-                        // 사용자 요청: 각 레이어별로 전체 시퀀스를 모두 처리한 후 다음 레이어로 넘어가는 구조
-                        // 이 방식은 VRAM에 항상 단 하나의 레이어만 존재하게 하여 메모리 효율을 극대화합니다.
-                        let num_layers = self.layers.len();
-                        let chunk_size = 256;
+        // [RECURSIVE-EXECUTION]
+        // 루프 대신 재귀 호출을 사용하여 한 레이어씩 엄격하게 처리합니다.
+        let num_layers = self.layers.len();
+        println!("[TRACE] Starting Recursive-Style Layer Queue: Total layers: {}", num_layers);
+        
+        xs = self.process_layers_recursive(
+            0,
+            num_layers,
+            xs,
+            &cos,
+            &sin,
+            seqlen_offset,
+            start_layer
+        )?;
 
-                        // [RAM-MONITOR]
-                        use sysinfo::System;
-                        let mut sys = System::new();
-                        
-                        println!("[TRACE] Starting Layer-Wise Burst Pass: Total layers: {}", num_layers);
-
-                        for layer_idx in 0..num_layers {
-                            if layer_idx < start_layer { continue; }
-                            
-                            // [STEP 1] Load & Decode Current Layer Resources
-                            let mut w_blocks_to_load = Vec::new();
-                            let mut w_chunk_path = std::path::PathBuf::new();
-                            
-                            {
-                                let reg = self.registry.entries.read().unwrap();
-                                let layer_kv_blocks = &self.layers[layer_idx].self_attn.kv_blocks;
-                                for (b_idx, block) in layer_kv_blocks.iter().enumerate() {
-                                    if b_idx < reg.len() {
-                                        let entry = &reg[b_idx];
-                                        if entry.token_start >= self.current_kv_len { continue; }
-                                        let loc = entry.location[layer_idx];
-                                        if loc == KVLocation::SSD || loc == KVLocation::Loading {
-                                            w_blocks_to_load.push((layer_idx, b_idx, block.clone()));
-                                            if w_chunk_path.as_os_str().is_empty() {
-                                                w_chunk_path = entry.ssd_path.clone().unwrap_or_default();
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // [SLOT-AWARE-INLINE-DECODING]
-                            let mut acquired_slots = Vec::new();
-                            if !w_blocks_to_load.is_empty() && !w_chunk_path.as_os_str().is_empty() {
-                                use crate::models::qwen3vl::generate::SLOT_MANAGER;
-                                
-                                // 1. 슬롯 확보 (리소스 제한 준수)
-                                for _ in 0..w_blocks_to_load.len() {
-                                    let s_id = tokio::task::block_in_place(|| {
-                                        tokio::runtime::Handle::current().block_on(async {
-                                            SLOT_MANAGER.acquire_read_slot().await
-                                        })
-                                    });
-                                    acquired_slots.push(s_id);
-                                }
-
-                                // 2. 인라인 디코딩 실행
-                                for (i, (l_idx, b_idx, block)) in w_blocks_to_load.iter().enumerate() {
-                                    let actual_path = if w_chunk_path.is_dir() {
-                                        let lp = w_chunk_path.join(format!("l{}.st", l_idx));
-                                        if lp.exists() { lp } else { w_chunk_path.join("l0.st") }
-                                    } else { w_chunk_path.clone() };
-
-                                    if let Ok(content) = std::fs::read(&actual_path) {
-                                        if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                            let prefix = format!("b{}_l{}_", b_idx * 256, l_idx);
-                                            let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
-                                            
-                                            if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = 
-                                                (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
-                                                
-                                                let metadata = BitKVMetadata {
-                                                    k_anchors: Tensor::from_slice(ka.data(), ka.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
-                                                    k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
-                                                    k_scales: Tensor::from_slice(ks.data(), ks.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
-                                                    v_anchors: Tensor::from_slice(va.data(), va.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
-                                                    v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
-                                                    v_scales: Tensor::from_slice(vs.data(), vs.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
-                                                    original_shape: vec![1, 16, 256, 128]
-                                                };
-
-                                                let mut inner = block.inner.write().unwrap();
-                                                inner.bitkv_metadata = Some(metadata);
-                                                inner.location = KVLocation::RAM;
-                                                
-                                                let mut reg_w = self.registry.entries.write().unwrap();
-                                                reg_w[*b_idx].location[*l_idx] = KVLocation::RAM;
-                                                reg_w[*b_idx].slot_ids[*l_idx] = Some(acquired_slots[i]);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            let start_layer_time = std::time::Instant::now();
-                            
-                            // [STEP 2] Move Layer to GPU
-                            let target_device = Device::new_cuda(0)?;
-                            
-                            // [FIX] to_device()는 Result<()>를 반환하며 내부 상태를 변경하므로 할당하지 않습니다.
-                            if !self.layers[layer_idx].device().same_device(&target_device) {
-                                self.layers[layer_idx].to_device(&target_device)?;
-                                let _ = target_device.synchronize(); 
-                            }
-                            
-                            // [VRAM-OPTIMIZE] 입력 데이터도 GPU로 이동
-                            if !xs.device().is_cuda() {
-                                xs = xs.to_device(&target_device)?;
-                            }
-
-                            println!("[BURST] >> [RUN] Layer {} on GPU (All Chunks)", layer_idx);
-
-                            let mut next_xs_all = Vec::new(); 
-                            let current_seq_len = xs.dim(1)?; 
-                            let mut chunk_idx = 0;
-
-                            for i in (0..current_seq_len).step_by(chunk_size) {
-                                let take = (current_seq_len - i).min(chunk_size);
-                                
-                                // 모니터링 (모든 레이어의 시작 시점마다 출력하여 VRAM 해제 여부 검증)
-                                if i == 0 {
-                                    use nvml_wrapper::Nvml;
-                                    if let Ok(nvml) = Nvml::init() {
-                                        if let Ok(dev) = nvml.device_by_index(0) {
-                                            if let Ok(mem) = dev.memory_info() {
-                                                sys.refresh_memory();
-                                                let free_ram_kb = sys.available_memory();
-                                                println!("[STAT] Layer {:2} Start | VRAM: {}MB Used / {}MB Free | RAM: {}MB Free", 
-                                                    layer_idx, mem.used / 1024 / 1024, mem.free / 1024 / 1024, free_ram_kb / 1024);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                let xs_chunk = xs.narrow(1, i, take)?;
-                                let cos_chunk = cos.narrow(1, i, take)?;
-                                let sin_chunk = sin.narrow(1, i, take)?;
-                                
-                                let layer_ptr = &mut self.layers[layer_idx];
-                                let out_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    layer_ptr.forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)
-                                }));
-
-                                match out_res {
-                                    Ok(Ok(out)) => next_xs_all.push(out),
-                                    Ok(Err(e)) => { return Err(e.into()); },
-                                    Err(_) => { return Err(anyhow::anyhow!("Panic during chunk processing")); }
-                                }
-                                chunk_idx += 1;
-                            }
-                            
-                            // [STEP 4] Update xs for next layer
-                            xs = Tensor::cat(&next_xs_all, 1)?;
-                            
-                            // [VRAM-PURGE] 다음 레이어 로드 전 현재 데이터와 레이어를 CPU로 확실히 밀어냄
-                            xs = xs.to_device(&Device::Cpu)?; 
-
-                            // [STEP 5] Unload Layer form GPU (Purge)
-                            for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
-                                let (k_cpu, v_cpu) = {
-                                    let inner = block.inner.read().unwrap();
-                                    if inner.location == KVLocation::VRAM {
-                                        if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                                            (Some(k.to_device(&Device::Cpu)?), Some(v.to_device(&Device::Cpu)?))
-                                        } else { (None, None) }
-                                    } else { (None, None) }
-                                };
-                                if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
-                                    let mut inner_w = block.inner.write().unwrap();
-                                    inner_w.k_cache = Some(k); inner_w.v_cache = Some(v);
-                                    inner_w.location = KVLocation::RAM;
-                                }
-                            }
-                            
-                            // [FIX] CPU 이동 시에도 할당 로직을 제거합니다.
-                            if self.layers[layer_idx].device().is_cuda() {
-                                self.layers[layer_idx].to_device(&Device::Cpu)?;
-                                let _ = Device::new_cuda(0)?.synchronize();
-                            }
-
-                            // [SLOT-RELEASE] 레이어 작업 종료 후 즉시 슬롯 반납
-                            use crate::models::qwen3vl::generate::SLOT_MANAGER;
-                            for s_id in acquired_slots {
-                                tokio::task::block_in_place(|| {
-                                    tokio::runtime::Handle::current().block_on(async {
-                                        SLOT_MANAGER.release_slot(s_id).await;
-                                    })
-                                });
-                            }
-
-                            println!("[BURST] << [DONE] Layer {} complete in {:.2}s.", 
-                                layer_idx, start_layer_time.elapsed().as_secs_f32());
-                        }
-                
-                        println!("[TRACE] Horizontal Layer Burst Complete.");
-                        self.current_kv_len = seqlen_offset + seq_len;
-                        println!("[TRACE] Final norm.forward starting...");
-                        
-                        let norm_dev = self.norm.weight().device();
-                        if !xs.device().same_device(norm_dev) {
-                            xs = xs.to_device(norm_dev)?;
-                        }
-                        let xs = xs.apply(&self.norm)?;
-                        println!("[TRACE] All forward pass steps complete.");
-                        Ok(xs)
-                    }
+        self.current_kv_len = seqlen_offset + seq_len;
+        let norm_dev = self.norm.weight().device();
+        if !xs.device().same_device(norm_dev) {
+            xs = xs.to_device(norm_dev)?;
+        }
+        let xs = xs.apply(&self.norm)?;
+        Ok(xs)
+    }
 
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
