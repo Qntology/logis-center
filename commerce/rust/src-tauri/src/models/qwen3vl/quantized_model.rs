@@ -1657,12 +1657,11 @@ impl QuantizedQwen3VLTextModel {
             });
         }
 
-        // [PHYSICAL-WAIT-GATE] 슬롯 회수가 물리적으로 완료될 때까지 대기
-        // 이 대기가 끝나야만 Baker가 SSD 저장을 마쳤음을 보장할 수 있습니다.
+        // [PHYSICAL-WAIT-GATE] 슬롯 회수 대기
         if num_to_release > 0 {
             let target_active = initial_active.saturating_sub(num_to_release);
             let mut wait_attempts = 0;
-            while wait_attempts < 1000 { // 최대 10초 대기 (SSD 쓰기 부하 고려)
+            while wait_attempts < 1000 { 
                 let current_active = SLOT_MANAGER.count_reads.load(Ordering::SeqCst) + SLOT_MANAGER.count_writes.load(Ordering::SeqCst);
                 if current_active <= target_active { break; }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1670,26 +1669,31 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
-        // [SAFE-PURGE] 이제 데이터가 SSD에 안전하게 저장되었으므로 RAM 참조를 완전히 제거합니다.
-        for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
-            let mut inner_w = block.inner.write().unwrap();
-            inner_w.k_cache = None;
-            inner_w.v_cache = None;
-            inner_w.bitkv_metadata = None; 
-            inner_w.location = KVLocation::SSD; 
-        }
+        // [SAFE-PURGE] Baking 모드(0.6B)일 때는 데이터를 지우지 않고 유지하여 Baker가 안전하게 저장하게 합니다.
+        // Large 모델(baking_only=false)일 때만 즉시 RAM을 비웁니다.
+        if !self.baking_only {
+            for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
+                let mut inner_w = block.inner.write().unwrap();
+                inner_w.k_cache = None;
+                inner_w.v_cache = None;
+                inner_w.bitkv_metadata = None; 
+                inner_w.location = KVLocation::SSD; 
+            }
 
-        {
-            let mut reg_w = self.registry.entries.write().unwrap();
-            for entry in reg_w.iter_mut() {
-                let mut cache_w = entry.bitkv_cache.write().unwrap();
-                if layer_idx < cache_w.len() {
-                    cache_w[layer_idx] = None;
+            {
+                let mut reg_w = self.registry.entries.write().unwrap();
+                for entry in reg_w.iter_mut() {
+                    let mut cache_w = entry.bitkv_cache.write().unwrap();
+                    if layer_idx < cache_w.len() {
+                        cache_w[layer_idx] = None;
+                    }
                 }
             }
+            println!("[BURST] << [DONE] Layer {} complete (RAM Purged Safely).", layer_idx);
+        } else {
+            println!("[BURST] << [DONE] Layer {} complete (Data Preserved for Baking).", layer_idx);
         }
         
-        println!("[BURST] << [DONE] Layer {} complete (RAM Purged Safely).", layer_idx);
         Ok(result_xs)
     }
 
@@ -2280,79 +2284,76 @@ impl QuantizedQwen3VLTextModel {
         loop {
             fragments.clear();
             if let Ok(entries) = std::fs::read_dir(path) {
+                println!("[SSD-SCAN-DEBUG] Searching in root: {:?}", path);
                 for entry in entries.flatten() {
                     let fpath = entry.path();
-                    let fname = entry.file_name().to_string_lossy().to_string();
+                    let ftype = entry.file_type().ok();
+                    let is_dir = ftype.map(|t| t.is_dir()).unwrap_or(false);
+                    let fname = fpath.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
                     
-                    if fpath.is_dir() && fname.starts_with('b') {
-                        // [NEW-DIR-FORMAT] b{offset}/l{layer}.st
-                        // OS별 경로 구분자(\ or /)는 PathBuf가 자동으로 처리합니다.
-                        if let Ok(offset) = fname[1..].parse::<usize>() {
-                            // 해당 디렉토리 내부에 연산 가능한 .st 파일이 있는지 검증
-                            if let Ok(sub_entries) = std::fs::read_dir(&fpath) {
-                                let has_data = sub_entries.flatten().any(|se| {
-                                    se.path().extension().map_or(false, |ext| ext == "st")
-                                });
-                                if has_data {
-                                    fragments.push((offset, fpath));
+                    println!("[SSD-SCAN-DEBUG] Found entry: {} (Is_Dir: {})", fname, is_dir);
+
+                    if is_dir {
+                        if fname.starts_with('b') {
+                            if let Ok(offset) = fname[1..].parse::<usize>() {
+                                if let Ok(sub_entries) = std::fs::read_dir(&fpath) {
+                                    let has_st = sub_entries.flatten().any(|se| se.path().extension().map_or(false, |ext| ext == "st"));
+                                    if has_st {
+                                        println!("[SSD-SCAN-DEBUG] >> VALID BLOCK DIR: offset={}, path={:?}", offset, fpath);
+                                        fragments.push((offset, fpath.clone()));
+                                    }
                                 }
                             }
                         }
-                    } else if fname.ends_with(".safetensors") {
-                        if fname.contains("_chunk_") {
-                            // [NEW-BUNDLE-FORMAT] bundle_inference_chunk_{idx}.safetensors
-                            let chunk_idx = fname.strip_suffix(".safetensors")
-                                                 .and_then(|s| s.split('_').last())
-                                                 .and_then(|s| s.parse::<usize>().ok())
-                                                 .unwrap_or(0);
-                            
-                            let base_offset = chunk_idx * (256 * 64);
-                            
-                            // [STRICT-SCAN] 메타데이터의 길이와 파일 크기를 모두 고려합니다.
-                            let f_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                            let blocks_by_size = if f_size > 0 { (f_size / 200_000).max(1).min(64) as usize } else { 0 };
-                            let blocks_by_len = if self.current_kv_len > base_offset {
-                                ((self.current_kv_len - base_offset + 255) / 256).min(64)
-                            } else { 0 };
-                            
-                            // 두 지표 중 더 신뢰할 수 있는 것을 선택 (파일이 있는데 길이를 모르면 파일 크기 신뢰)
-                            let actual_blocks = if blocks_by_len > 0 { blocks_by_len } else { blocks_by_size };
-                            
-                            for b_in_chunk in 0..actual_blocks {
-                                let block_offset = base_offset + (b_in_chunk * 256);
-                                fragments.push((block_offset, entry.path()));
+                    } else {
+                        // [RESTORED-BUNDLE-LOGIC] 기존 번들 및 청크 파일 처리 로직 완벽 복구
+                        let extension = fpath.extension().and_then(|e| e.to_str()).unwrap_or("");
+                        if extension == "safetensors" || extension == "st" {
+                            if fname.contains("_chunk_") {
+                                let chunk_idx = fname.strip_suffix(".safetensors").or_else(|| fname.strip_suffix(".st"))
+                                                     .and_then(|s| s.split('_').last())
+                                                     .and_then(|s| s.parse::<usize>().ok())
+                                                     .unwrap_or(0);
+                                
+                                let base_offset = chunk_idx * (256 * 64);
+                                let f_size = fpath.metadata().map(|m| m.len()).unwrap_or(0);
+                                let blocks_by_size = if f_size > 0 { (f_size / 200_000).max(1).min(64) as usize } else { 0 };
+                                let blocks_by_len = if self.current_kv_len > base_offset {
+                                    ((self.current_kv_len - base_offset + 255) / 256).min(64)
+                                } else { 0 };
+                                
+                                let actual_blocks = if blocks_by_len > 0 { blocks_by_len } else { blocks_by_size };
+                                println!("[SSD-SCAN-DEBUG] >> VALID CHUNK BUNDLE: {} (Blocks: {})", fname, actual_blocks);
+                                
+                                for b_in_chunk in 0..actual_blocks {
+                                    let block_offset = base_offset + (b_in_chunk * 256);
+                                    fragments.push((block_offset, fpath.clone()));
+                                }
+                            } else if fname.starts_with("bundle_") {
+                                let offset = if fname.contains("relay") || fname == "bundle_inference_kv.safetensors" { 0 }
+                                             else { fname.strip_suffix(".safetensors").or_else(|| fname.strip_suffix(".st"))
+                                                         .and_then(|s| s.split('_').last()).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0) };
+                                println!("[SSD-SCAN-DEBUG] >> VALID BUNDLE FILE: {} (Offset: {})", fname, offset);
+                                fragments.push((offset, fpath.clone()));
                             }
-                        } else if fname.starts_with("bundle_") {
-                            // [OLD-FORMAT] bundle_inference_kv_{offset}.safetensors
-                            let offset = if fname == "bundle_relay_kv.safetensors" || fname == "bundle_inference_kv.safetensors" {
-                                0
-                            } else {
-                                fname.strip_suffix(".safetensors")
-                                     .and_then(|s| s.split('_').last())
-                                     .and_then(|s| s.parse::<usize>().ok())
-                                     .unwrap_or(0)
-                            };
-                            fragments.push((offset, entry.path()));
                         }
                     }
                 }
+            } else {
+                println!("[SSD-SCAN-DEBUG] !! CRITICAL: Failed to read root directory: {:?}", path);
             }
             
-            // Deduplicate based on offset only (prefer relay if mixed? usually won't mix)
+            // Deduplicate based on offset only
             fragments.sort_by_key(|f| f.0);
             fragments.dedup_by_key(|f| f.0);
             
             let current_count = fragments.len();
             if current_count > 0 {
-                if current_count == last_count {
-                    stable_ticks += 1;
-                } else {
-                    stable_ticks = 0;
-                }
+                if current_count == last_count { stable_ticks += 1; }
+                else { stable_ticks = 0; }
             }
             last_count = current_count;
 
-            // Wait for stability (at least 5 ticks stable, or 40 blocks stable for 2 ticks, or max attempts)
             if (stable_ticks >= 5 && current_count > 5) || (current_count >= 40 && stable_ticks >= 2) || attempts >= 15 {
                 break;
             }
