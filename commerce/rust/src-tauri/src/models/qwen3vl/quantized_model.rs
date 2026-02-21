@@ -632,60 +632,90 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // [PREFETCH-TRIGGER-VERTICAL] 
-        // Only trigger ONE prefetch task per layer to avoid choking the IO queue
-        if self.layer_idx % 2 == 0 {
-            let mut layers_to_load: Vec<usize> = Vec::new();
+        // [PREFETCH-TRIGGER-V4] IO 로딩 및 CPU 압축 해제 병렬화
+        let lookahead = 1; // 8GB RAM 안전을 위해 다음 1개 레이어만 미리 풀기
+        for offset in 1..=lookahead {
+            let next_layer = self.layer_idx + offset;
+            if next_layer >= 28 { break; }
+
             let mut blocks_to_load: Vec<KVBlock> = Vec::new();
+            let mut blocks_to_decompress: Vec<KVBlock> = Vec::new();
             let mut chunk_path = std::path::PathBuf::new();
             
-            let next_layer = self.layer_idx + 1;
-            if next_layer < 28 {
+            {
                 let reg = self.registry.entries.read().unwrap();
                 for (b_idx, block) in self.kv_blocks.iter().enumerate() {
-                    // [FIX] ONLY trigger if status is SSD (prevents re-triggering Loading/RAM blocks)
-                    if b_idx < reg.len() && reg[b_idx].location[next_layer] == KVLocation::SSD {
-                        layers_to_load.push(next_layer);
-                        blocks_to_load.push(block.clone());
-                        if chunk_path.as_os_str().is_empty() {
-                            chunk_path = reg[b_idx].ssd_path.clone().unwrap_or_default();
+                    if b_idx < reg.len() {
+                        let loc = reg[b_idx].location[next_layer];
+                        if loc == KVLocation::SSD {
+                            blocks_to_load.push(block.clone());
+                            if chunk_path.as_os_str().is_empty() {
+                                chunk_path = reg[b_idx].ssd_path.clone().unwrap_or_default();
+                            }
+                        } else if (loc == KVLocation::RAM || loc == KVLocation::RamSticky) && block.inner.read().unwrap().k_cache.is_none() {
+                            blocks_to_decompress.push(block.clone());
                         }
                     }
                 }
             }
 
-            if !layers_to_load.is_empty() && !chunk_path.as_os_str().is_empty() {
-                // Mark all as loading at once BEFORE spawning to prevent Race Conditions
+            // 1. SSD 로딩 (IO Worker)
+            if !blocks_to_load.is_empty() && !chunk_path.as_os_str().is_empty() {
                 {
                     let mut reg = self.registry.entries.write().unwrap();
-                    for (i, &l_idx) in layers_to_load.iter().enumerate() {
-                        for (b_idx, block) in self.kv_blocks.iter().enumerate() {
-                            if block.inner.read().unwrap().index == blocks_to_load[i].inner.read().unwrap().index {
-                                if reg[b_idx].location[l_idx] == KVLocation::SSD {
-                                    reg[b_idx].location[l_idx] = KVLocation::Loading;
-                                }
-                            }
+                    for block in &blocks_to_load {
+                        let idx = block.inner.read().unwrap().index;
+                        if idx < reg.len() && reg[idx].location[next_layer] == KVLocation::SSD {
+                            reg[idx].location[next_layer] = KVLocation::Loading;
                         }
                     }
                 }
-
                 let registry_clone = self.registry.clone();
                 tauri::async_runtime::spawn(async move {
                     use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, ChunkedLoadTask, get_load_worker};
                     let mut s_ids = Vec::new();
-                    for _ in 0..layers_to_load.len() {
-                        if let Ok(id) = tokio::time::timeout(Duration::from_millis(500), SLOT_MANAGER.acquire_read_slot()).await {
+                    for _ in 0..blocks_to_load.len() {
+                        if let Ok(id) = tokio::time::timeout(std::time::Duration::from_millis(500), SLOT_MANAGER.acquire_read_slot()).await {
                             s_ids.push(id);
-                        } else { break; } // Don't hang the worker if slots are full
+                        } else { break; }
                     }
                     if !s_ids.is_empty() {
                         if let Ok(tx) = get_load_worker().await {
                             let _ = tx.send(SlotTask::ChunkedLoad(ChunkedLoadTask {
-                                slot_ids: s_ids, path: chunk_path, layer_indices: layers_to_load,
+                                slot_ids: s_ids, path: chunk_path, layer_indices: vec![next_layer; blocks_to_load.len()],
                                 shared_blocks: blocks_to_load, registry: registry_clone,
                             })).await;
                         }
                     }
+                });
+            }
+
+            // 2. 미리 압축 해제 (CPU Parallel Decompression)
+            if !blocks_to_decompress.is_empty() {
+                let registry_clone = self.registry.clone();
+                let l_idx = next_layer;
+                let dev = self.q_proj.device().clone();
+                let model_clone = self.clone(); 
+                tauri::async_runtime::spawn(async move {
+                    use rayon::prelude::*;
+                    blocks_to_decompress.into_par_iter().for_each(|block| {
+                        let index = block.inner.read().unwrap().index;
+                        let meta = {
+                            let reg = registry_clone.entries.read().unwrap();
+                            if index < reg.len() {
+                                reg[index].bitkv_cache.read().unwrap()[l_idx].clone()
+                            } else { None }
+                        };
+                        if let Some(m) = meta {
+                            if let Ok(k_raw) = model_clone.decompress_from_bitkv(&m.k_anchors, &m.k_packed, &m.k_scales, &m.original_shape, &dev) {
+                                if let Ok(v_raw) = model_clone.decompress_from_bitkv(&m.v_anchors, &m.v_packed, &m.v_scales, &m.original_shape, &dev) {
+                                    let mut inner = block.inner.write().unwrap();
+                                    inner.k_cache = Some(k_raw);
+                                    inner.v_cache = Some(v_raw);
+                                }
+                            }
+                        }
+                    });
                 });
             }
         }
@@ -720,28 +750,34 @@ impl QuantizedQwen3VLTextAttention {
             };
 
             if loc == KVLocation::SSD {
-                let spath = {
+                let (spath, reserved_sid) = {
                     let reg = self.registry.entries.read().unwrap();
-                    reg[index].ssd_path.clone()
+                    (reg[index].ssd_path.clone(), reg[index].slot_ids[self.layer_idx])
                 };
+
                 if let Some(path) = spath {
-                    {
-                        let mut reg = self.registry.entries.write().unwrap();
-                        reg[index].location[self.layer_idx] = KVLocation::Loading;
-                    }
-                    let shared_block = block.clone();
-                    let reg_clone = self.registry.clone();
-                    let l_idx = self.layer_idx;
-                    tauri::async_runtime::spawn(async move {
-                        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
-                        let sid = SLOT_MANAGER.acquire_read_slot().await;
-                        if let Ok(tx) = get_load_worker().await {
-                            let _ = tx.send(SlotTask::Load(LoadTask {
-                                slot_id: sid, path, layer_idx: l_idx, kv_name: None, shared_block, registry: reg_clone
-                            })).await;
+                    // [REUSE-LOGIC] 이미 예약된 슬롯이 있다면 로딩 작업이 진행 중인 것으로 간주
+                    if reserved_sid.is_some() {
+                        loc = KVLocation::Loading;
+                    } else {
+                        {
+                            let mut reg = self.registry.entries.write().unwrap();
+                            reg[index].location[self.layer_idx] = KVLocation::Loading;
                         }
-                    });
-                    loc = KVLocation::Loading;
+                        let shared_block = block.clone();
+                        let reg_clone = self.registry.clone();
+                        let l_idx = self.layer_idx;
+                        tauri::async_runtime::spawn(async move {
+                            use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
+                            let sid = SLOT_MANAGER.acquire_read_slot().await;
+                            if let Ok(tx) = get_load_worker().await {
+                                let _ = tx.send(SlotTask::Load(LoadTask {
+                                    slot_id: sid, path, layer_idx: l_idx, kv_name: None, shared_block, registry: reg_clone
+                                })).await;
+                            }
+                        });
+                        loc = KVLocation::Loading;
+                    }
                 }
             }
 
@@ -944,17 +980,28 @@ impl QuantizedQwen3VLTextAttention {
             .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
         let attn_output = self.o_proj.forward(&attn_output)?;
 
-        // [SMART-PURGE-V2] 256개 단위 SSD 파이프라인 연동
+        /* [RECLAIMED-BY-WORKER] 
+           Manual slot release is no longer needed here as the IO worker 
+           now releases slots immediately after transferring data to the RAM cache.
+        */
+
+        /* 
+           [SMART-PURGE-V3] 8GB RAM 환경을 위한 지능형 자원 회수
+           - 원칙: 무거운 데이터(Raw BF16)는 즉시 비우고, 가벼운 데이터(Compressed BitKV)는 최대한 RAM에 유지.
+           - 이유: SSD 읽기 속도가 가장 큰 병목이므로, 압축 데이터만이라도 RAM에 들고 있으면 다음 레이어에서 CPU가 즉시 복원 가능.
+           - 결과: 5만 토큰 상황에서도 SSD 접근을 최소화하면서 8GB RAM 내에서 안정적인 추론 가능.
+        */
         for block in &mut self.kv_blocks {
             let mut inner = block.inner.write().unwrap();
-            
-            // SSD에 이미 저장이 완료된 블록만 메모리(VRAM/RAM)에서 비웁니다.
-            // 아직 SSD 경로가 없는 최신 블록(추론 중인 데이터)은 Baker가 처리할 때까지 유지합니다.
-            if inner.ssd_path.is_some() {
+            if inner.ssd_path.is_some() || inner.bitkv_metadata.is_some() {
                 if inner.location == KVLocation::VRAM || inner.location == KVLocation::RAM {
+                    // 무거운 BF16 텐서만 메모리에서 즉시 해제하여 RAM 공간 확보
                     inner.k_cache = None;
                     inner.v_cache = None;
-                    inner.location = KVLocation::SSD;
+                    
+                    // 압축 메타데이터가 있다면 RAM 상태 유지 (다음 레이어에서 SSD 읽기 방지)
+                    if inner.bitkv_metadata.is_some() { inner.location = KVLocation::RAM; }
+                    else { inner.location = KVLocation::SSD; }
                 }
             }
         }
@@ -1929,7 +1976,13 @@ impl QuantizedQwen3VLTextModel {
                                                                 for b_idx in 0..self.layers[layer_idx].self_attn.kv_blocks.len() {
                                                                     if b_idx < reg.len() {
                                                                         let loc = reg[b_idx].location[layer_idx];
-                                                                        if loc != KVLocation::RAM && loc != KVLocation::RamSticky && loc != KVLocation::VRAM {
+                                                                        /* 
+                                                                           [DEADLOCK-FIX] 
+                                                                           - SSD_PENDING과 VRAM은 데이터가 이미 RAM에 존재(저장 대기 중)하는 상태입니다.
+                                                                           - 이를 'Missing'으로 간주하면 로더는 무시하고 엔진은 대기하는 교착 상태가 발생합니다.
+                                                                           - 따라서 메모리 상주 상태(RAM/RamSticky/VRAM/SSD_PENDING)는 모두 '준비 완료'로 봅니다.
+                                                                        */
+                                                                        if loc != KVLocation::RAM && loc != KVLocation::RamSticky && loc != KVLocation::VRAM && loc != KVLocation::SSD_PENDING {
                                                                             missing_count += 1;
                                                                         }
                                                                     }
@@ -1959,7 +2012,7 @@ impl QuantizedQwen3VLTextModel {
                                                                             let current_progress = seqlen_offset + i + take;
                                                                             let (reads, writes, free) = SLOT_MANAGER.get_counts();
                                                                             println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Chunk: {}", 
-                                                                                mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len, chunk_idx);
+                                                                                mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, seq_len, chunk_idx);
                                                                         }
                                                                     }
                                                                 }
@@ -2230,12 +2283,11 @@ impl QuantizedQwen3VLTextModel {
                 for entry in entries.flatten() {
                     let fname = entry.file_name().to_string_lossy().to_string();
                     
-                    // Match pattern: layer_relay_kv_{offset}.safetensors OR layer_{any}_kv_{offset}.safetensors
-                    let is_relay = fname.contains("layer_relay_kv");
-                    let is_layer_specific = fname.starts_with("layer_") && fname.contains("_kv");
+                    // Match pattern: bundle_relay_kv_{offset}.safetensors OR bundle_inference_kv_{offset}.safetensors
+                    let is_bundle = fname.starts_with("bundle_");
                     
-                    if (is_relay || is_layer_specific) && fname.ends_with(".safetensors") {
-                        let offset = if fname == "layer_relay_kv.safetensors" || fname.ends_with("_kv.safetensors") {
+                    if is_bundle && fname.ends_with(".safetensors") {
+                        let offset = if fname == "bundle_relay_kv.safetensors" || fname == "bundle_inference_kv.safetensors" {
                             0
                         } else {
                             fname.strip_suffix(".safetensors")
