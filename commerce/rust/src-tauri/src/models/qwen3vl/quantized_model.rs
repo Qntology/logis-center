@@ -948,48 +948,43 @@ impl QuantizedQwen3VLTextAttention {
             let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?
                 .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
 
-            if attn_weights.elem_count() == 0 {
-                // If we're in the middle of a loop, we skip this block.
-                // If we're in the VRAM batch, we might need a more global skip but usually this shouldn't happen for batch.
-                global_start_idx += b_len;
-                continue;
-            }
-
-            if let Some(mask) = attention_mask {
-                let mask_len = mask.dim(D::Minus1)?;
-                let vram_start = global_start_idx.saturating_sub(vram_total_len);
-                if vram_start < mask_len {
-                    let take_mask = (mask_len - vram_start).min(vram_total_len);
-                    // [SAFETY-FIX] Double check narrow bounds to prevent slice panic
-                    let safe_take = take_mask.min(mask_len.saturating_sub(vram_start));
-                    if safe_take > 0 {
-                        let sub_mask = mask.narrow(D::Minus1, vram_start, safe_take)?.to_dtype(target_dtype)?;
-                        if safe_take < vram_total_len {
-                            let padded_mask = sub_mask.pad_with_zeros(D::Minus1, 0, vram_total_len - safe_take)?;
-                            attn_weights = attn_weights.broadcast_add(&padded_mask)?;
-                        } else {
-                            attn_weights = attn_weights.broadcast_add(&sub_mask)?;
+            if attn_weights.elem_count() > 0 {
+                if let Some(mask) = attention_mask {
+                    let mask_len = mask.dim(D::Minus1)?;
+                    let vram_start = global_start_idx.saturating_sub(vram_total_len);
+                    if vram_start < mask_len {
+                        let take_mask = (mask_len - vram_start).min(vram_total_len);
+                        // [SAFETY-FIX] Double check narrow bounds to prevent slice panic
+                        let safe_take = take_mask.min(mask_len.saturating_sub(vram_start));
+                        if safe_take > 0 {
+                            let sub_mask = mask.narrow(D::Minus1, vram_start, safe_take)?.to_dtype(target_dtype)?;
+                            if safe_take < vram_total_len {
+                                let padded_mask = sub_mask.pad_with_zeros(D::Minus1, 0, vram_total_len - safe_take)?;
+                                attn_weights = attn_weights.broadcast_add(&padded_mask)?;
+                            } else {
+                                attn_weights = attn_weights.broadcast_add(&sub_mask)?;
+                            }
                         }
                     }
                 }
-            }
 
-            let m_i = attn_weights.max_keepdim(D::Minus1)?;
-            let p_i = attn_weights.broadcast_sub(&m_i)?.exp()?;
-            let s_i = p_i.sum_keepdim(D::Minus1)?;
-            let o_i = p_i.matmul(&v)?;
+                let m_i = attn_weights.max_keepdim(D::Minus1)?;
+                let p_i = attn_weights.broadcast_sub(&m_i)?.exp()?;
+                let s_i = p_i.sum_keepdim(D::Minus1)?;
+                let o_i = p_i.matmul(&v)?;
 
-            match (running_m, running_s, running_o) {
-                (None, None, None) => { running_m = Some(m_i); running_s = Some(s_i); running_o = Some(o_i); }
-                (Some(m_prev), Some(s_prev), Some(o_prev)) => {
-                    let m_new = m_prev.maximum(&m_i)?;
-                    let alpha_prev = m_prev.sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
-                    let alpha_i = m_i.sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
-                    running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.add(&s_i.broadcast_mul(&alpha_i)?)?.to_dtype(target_dtype)?);
-                    running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.add(&o_i.broadcast_mul(&alpha_i)?)?.to_dtype(target_dtype)?);
-                    running_m = Some(m_new);
+                match (running_m, running_s, running_o) {
+                    (None, None, None) => { running_m = Some(m_i); running_s = Some(s_i); running_o = Some(o_i); }
+                    (Some(m_prev), Some(s_prev), Some(o_prev)) => {
+                        let m_new = m_prev.maximum(&m_i)?;
+                        let alpha_prev = m_prev.sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
+                        let alpha_i = m_i.sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
+                        running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.add(&s_i.broadcast_mul(&alpha_i)?)?.to_dtype(target_dtype)?);
+                        running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.add(&o_i.broadcast_mul(&alpha_i)?)?.to_dtype(target_dtype)?);
+                        running_m = Some(m_new);
+                    }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
             }
         }
 
