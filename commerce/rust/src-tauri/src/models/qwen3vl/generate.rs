@@ -617,6 +617,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         
                                         let target_path = target_path.unwrap();
                                         let reg_inner = registry.clone();
+                                        let is_relay_file = target_path.file_name().map(|n| n.to_string_lossy().contains("bundle_relay_chunk")).unwrap_or(false);
                 
                                         tokio::spawn(async move {
                                             let res = async {
@@ -628,16 +629,22 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 
                                                 // [BUNDLE-EXTRACT]
                                                 let block_prefix = format!("b{}_", b_off);
-                                                let layer_prefix = format!("l{}_", l_idx);
+                                                let layer_prefix = if is_relay_file { "l0_".to_string() } else { format!("l{}_", l_idx) };
                                                 let prefix = format!("{}{}", block_prefix, layer_prefix);
 
-                                                let ka_name = format!("{}k_anchors", prefix);
-                                                let kh_name = format!("{}k_shape", prefix);
-                                                let kp_name = format!("{}k_packed", prefix);
-                                                let ks_name = format!("{}k_scales", prefix);
-                                                let va_name = format!("{}v_anchors", prefix);
-                                                let vp_name = format!("{}v_packed", prefix);
-                                                let vs_name = format!("{}v_scales", prefix);
+                                                let get_name = |st_ref: &safetensors::SafeTensors, pref: &str, l_pref: &str, suffix: &str| -> String {
+                                                    let full = format!("{}{}", pref, suffix);
+                                                    if st_ref.tensor(&full).is_ok() { full }
+                                                    else { format!("{}{}", l_pref, suffix) }
+                                                };
+
+                                                let ka_name = get_name(&st, &prefix, &layer_prefix, "k_anchors");
+                                                let kh_name = get_name(&st, &prefix, &layer_prefix, "k_shape");
+                                                let kp_name = get_name(&st, &prefix, &layer_prefix, "k_packed");
+                                                let ks_name = get_name(&st, &prefix, &layer_prefix, "k_scales");
+                                                let va_name = get_name(&st, &prefix, &layer_prefix, "v_anchors");
+                                                let vp_name = get_name(&st, &prefix, &layer_prefix, "v_packed");
+                                                let vs_name = get_name(&st, &prefix, &layer_prefix, "v_scales");
 
                                                 let (ka_data, o_s, a_cnt) = if let Ok(t_view) = st.tensor(&ka_name) {
                                                     let dims = t_view.shape();
@@ -675,16 +682,16 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                                 // 덕분에 Layer 0만 SSD를 읽고, Layer 1~27은 SSD 접근 없이 RAM에서 즉시 연산됩니다.
                                                                 let entry = &mut reg[b_idx];
                                                                 for target_l in 0..28 {
-                                                                    let layer_prefix = format!("l{}_", target_l);
+                                                                    let layer_prefix = if is_relay_file { "l0_".to_string() } else { format!("l{}_", target_l) };
                                                                     let prefix = format!("{}{}", block_prefix, layer_prefix);
 
-                                                                    let ka_name = format!("{}k_anchors", prefix);
-                                                                    let kh_name = format!("{}k_shape", prefix);
-                                                                    let kp_name = format!("{}k_packed", prefix);
-                                                                    let ks_name = format!("{}k_scales", prefix);
-                                                                    let va_name = format!("{}v_anchors", prefix);
-                                                                    let vp_name = format!("{}v_packed", prefix);
-                                                                    let vs_name = format!("{}v_scales", prefix);
+                                                                    let ka_name = get_name(&st, &prefix, &layer_prefix, "k_anchors");
+                                                                    let kh_name = get_name(&st, &prefix, &layer_prefix, "k_shape");
+                                                                    let kp_name = get_name(&st, &prefix, &layer_prefix, "k_packed");
+                                                                    let ks_name = get_name(&st, &prefix, &layer_prefix, "k_scales");
+                                                                    let va_name = get_name(&st, &prefix, &layer_prefix, "v_anchors");
+                                                                    let vp_name = get_name(&st, &prefix, &layer_prefix, "v_packed");
+                                                                    let vs_name = get_name(&st, &prefix, &layer_prefix, "v_scales");
 
                                                                     if let (Ok(ka), Ok(kh), Ok(kp), Ok(ks), Ok(va), Ok(vp), Ok(vs)) = (
                                                                     st.tensor(&ka_name), st.tensor(&kh_name), st.tensor(&kp_name), 
