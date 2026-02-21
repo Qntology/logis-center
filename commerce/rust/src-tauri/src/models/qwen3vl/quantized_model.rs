@@ -2077,16 +2077,16 @@ impl QuantizedQwen3VLTextModel {
                             for i in (0..current_seq_len).step_by(chunk_size) {
                                 let take = (current_seq_len - i).min(chunk_size);
                                 
-                                // 모니터링 (첫 레이어일 때만 상세 출력)
-                                if layer_idx == 0 && i == 0 {
+                                // 모니터링 (모든 레이어의 시작 시점마다 출력하여 VRAM 해제 여부 검증)
+                                if i == 0 {
                                     use nvml_wrapper::Nvml;
                                     if let Ok(nvml) = Nvml::init() {
                                         if let Ok(dev) = nvml.device_by_index(0) {
                                             if let Ok(mem) = dev.memory_info() {
                                                 sys.refresh_memory();
                                                 let free_ram_kb = sys.available_memory();
-                                                println!("[STAT] VRAM: {}MB Used / {}MB Free | RAM: {}MB Free | Layer: {}", 
-                                                    mem.used / 1024 / 1024, mem.free / 1024 / 1024, free_ram_kb / 1024, layer_idx);
+                                                println!("[STAT] Layer {:2} Start | VRAM: {}MB Used / {}MB Free | RAM: {}MB Free", 
+                                                    layer_idx, mem.used / 1024 / 1024, mem.free / 1024 / 1024, free_ram_kb / 1024);
                                             }
                                         }
                                     }
