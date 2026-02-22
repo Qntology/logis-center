@@ -1585,6 +1585,12 @@ impl QuantizedQwen3VLTextModel {
         sin: &Tensor,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
+        // [PROGRESS-LOG] Concise real-time layer tracking
+        if layer_idx == 0 { print!("\n[Layers] "); }
+        print!("{}.", layer_idx);
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+
         let start_layer_time = std::time::Instant::now();
 
         // [STEP 1] Load & Decode (Inline & Strict Path Resolution)
