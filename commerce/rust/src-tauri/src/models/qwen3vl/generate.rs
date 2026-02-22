@@ -1041,40 +1041,46 @@ impl Qwen3VLGenerateModel {
 
         let max_gen_tokens = mes.max_tokens.unwrap_or(2048) as usize;
         let mut gen_count = 0;
-        let spec_window = if relay.is_some() { 8 } else { 1 }; // [HYBRID-SPECULATIVE] 한 번에 검증할 토큰 수
+        let spec_window = if relay.is_some() { 8 } else { 1 }; 
 
         while gen_count < max_gen_tokens {
             if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
 
             let mut draft_ids = Vec::new();
             
-            // [STEP 1] 0.6B Draft Generation (Fast, Single Layer)
+            // [STEP 1] 0.6B Draft Generation
             if let Some(ref mut r) = relay {
+                // 2B의 결정과 동기화하기 위해 0.6B의 캐시를 현재 확정 지점으로 정렬
+                let _ = r.truncate_kv_cache(curr_s_off);
+                
                 let mut temp_ids = a_ids.clone();
                 let mut temp_off = curr_s_off;
+                
                 for _ in 0..spec_window {
                     let last_id = *temp_ids.last().unwrap_or(&0);
-                    // 0.6B는 1개 레이어뿐이므로 레이어 회전 로그 없이 빠르게 전파
                     let logits = r.qwen3_vl.forward(
                         &Tensor::from_vec(vec![last_id], (1, 1), &r.text_device)?,
                         None, None, None, None,
                         Some(&Tensor::arange(temp_off as u32, (temp_off + 1) as u32, &r.text_device)?.unsqueeze(0)?),
                         temp_off, 1, sid.clone()
                     )?;
-                    let next_id = l_proc.sample(&logits.flatten_all()?)?;
+                    
+                    // Draft는 확률이 가장 높은 것(Greedy)을 선택하여 매칭률 극대화
+                    let next_id = logits.flatten_all()?.argmax(0)?.to_scalar::<u32>()?;
+                    
                     draft_ids.push(next_id);
                     temp_ids.push(next_id);
                     temp_off += 1;
+                    
+                    if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
                 }
             }
 
-            // [STEP 2] 2B Batch Verification (Crucial: One Rotation for N tokens)
-            // 검증 대상: [Draft 토큰들] - 단, 2B는 이전 문맥을 알고 있으므로 드래프트 토큰들만 한꺼번에 배치로 보냅니다.
+            // [STEP 2] 2B Batch Verification (One Rotation)
             let last_confirmed = *a_ids.last().unwrap_or(&0);
             let mut verify_tokens = vec![last_confirmed];
             verify_tokens.extend(&draft_ids);
 
-            // [ROTATION-START] 2B 모델이 SSD에서 28개 레이어를 한 바퀴 회전합니다. (이때 로그 0.1.2...27. 출력)
             let logits = self.qwen3_vl.forward(
                 &Tensor::from_vec(verify_tokens.clone(), (1, verify_tokens.len()), &self.text_device)?, 
                 p_vals.as_ref(), i_grid.as_ref(), None, None, 
@@ -1082,27 +1088,27 @@ impl Qwen3VLGenerateModel {
                 curr_s_off, verify_tokens.len(), sid.clone()
             )?;
 
-            // [STEP 3] Matching & Output (ONLY AFTER ROTATION)
+            // [STEP 3] Matching & Output
             let mut accepted_this_round = 0;
+            let mut draft_match_count = 0;
             
-            // 2B가 계산한 각 위치의 로짓과 0.6B의 Draft를 비교
-            for i in 0..draft_ids.len() {
-                // i번째 입력 토큰에 대한 2B의 실제 예측 결과 (i번째 위치의 로짓)
+            for i in 0..verify_tokens.len() - 1 {
                 let target_logits = logits.narrow(1, i, 1)?.flatten_all()?;
                 let l_vec = apply_repeat_penalty(&target_logits.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
                 let accepted_id = l_proc.sample(&l_vec)?;
 
-                if accepted_id == draft_ids[i] {
-                    // Draft 성공: 화면에 출력하고 다음 드래프트 확인
+                if i < draft_ids.len() && accepted_id == draft_ids[i] {
+                    // Draft 일치
                     let token_text = self.tokenizer.token_decode(vec![accepted_id])?;
                     print!("{}", token_text);
                     g_text.push_str(&token_text);
                     a_ids.push(accepted_id);
                     accepted_this_round += 1;
+                    draft_match_count += 1;
                     
                     if accepted_id == self.eos_token_id1 || accepted_id == self.eos_token_id2 { break; }
                 } else {
-                    // Draft 실패: 2B가 판단한 올바른 토큰을 넣고 이 배치 루프 종료
+                    // Draft 불일치: 2B의 수정안 채택 후 중단
                     let token_text = self.tokenizer.token_decode(vec![accepted_id])?;
                     print!("{}", token_text);
                     g_text.push_str(&token_text);
@@ -1112,7 +1118,13 @@ impl Qwen3VLGenerateModel {
                 }
             }
 
-            // 만약 드래프트가 없었을 경우 (window=1) 일반 토큰 1개 생성 보장
+            // [PROGRESS-LOG] Speculative decoding 성능 체감 로그
+            if !draft_ids.is_empty() {
+                use std::io::Write;
+                print!(" [SPEC] Accepted: {}/{}", draft_match_count, draft_ids.len());
+                let _ = std::io::stdout().flush();
+            }
+
             if accepted_this_round == 0 {
                 let target_logits = logits.narrow(1, 0, 1)?.flatten_all()?;
                 let next_id = l_proc.sample(&target_logits)?;
