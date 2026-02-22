@@ -1024,10 +1024,12 @@ impl Qwen3VLGenerateModel {
 
                 // [METADATA-PERSISTENCE] Save registry to file for cross-layer/cross-session reliability
                 let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+                if !path.exists() { let _ = fs::create_dir_all(&path); }
+                
                 if let Err(e) = self.qwen3_vl.save_metadata_to_file(&path) {
                     println!("[GENERATE] !! Metadata Save Failed: {:?}", e);
                 } else {
-                    println!("[GENERATE] Metadata persisted to {:?}", path.join("metadata.json"));
+                    // println!("[GENERATE] Metadata persisted to {:?}", path.join("metadata.json"));
                 }
 
                 self.clear_temporal_kv_caches();
@@ -1234,7 +1236,7 @@ impl Qwen3VLGenerateModel {
     pub fn load_kv_from_disk(&mut self, p: &Path, n: Option<&str>) -> Result<()> { 
         let _ = self.qwen3_vl.load_metadata_from_file(p);
         
-        // [FIX] 메타데이터 로드 후 모델의 current_kv_len을 즉시 동기화합니다.
+        // [FIX] Get the EXACT restored length from the Registry
         let mut restored_len = 0;
         let reg_ref = match &self.qwen3_vl {
             ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()),
@@ -1249,15 +1251,12 @@ impl Qwen3VLGenerateModel {
             }
         }
         if restored_len > 0 {
-            // rebalance_layers를 더미 파라미터로 호출하여 내부 current_kv_len을 갱신하게 유도하거나 
-            // ModelVariant에 set_kv_len 메서드를 추가할 수 있습니다. 
-            // 현재는 load_kv_cache 내부에서 fragments를 통해 갱신되므로 순서만 보장되면 됩니다.
-            println!("[SSD-LOAD] Metadata restored. Expected KV Length: {}", restored_len);
+            println!("[SSD-LOAD] Metadata restored. Exact KV Length: {}", restored_len);
         }
 
         match &mut self.qwen3_vl { 
-            ModelVariant::QuantizedVL(m) => m.load_kv_cache(p, &self.text_device, 0, 128, n), 
-            ModelVariant::QuantizedText(m) => m.load_kv_cache(p, &self.text_device, 0, 128, n), 
+            ModelVariant::QuantizedVL(m) => m.load_kv_cache(p, &self.text_device, restored_len, 128, n), 
+            ModelVariant::QuantizedText(m) => m.load_kv_cache(p, &self.text_device, restored_len, 128, n), 
             _ => Ok(()) 
         } 
     }

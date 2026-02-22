@@ -582,7 +582,7 @@ async fn process_task(
     // ...
     // ==================================================================================
 
-    // --- STEP A: CLASSIFICATION (Disk Bridge Relay) ---
+        // --- STEP A: CLASSIFICATION (Disk Bridge Relay) ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         println!("[Scheduler] Starting DISK BRIDGE RELAY (0.6B -> Disk -> 2B)");
@@ -594,17 +594,21 @@ async fn process_task(
         let snapshot_id = format!("{}_step_a", task.id);
         let kv_name = Some("step_a".to_string());
         
-        // [CHECKPOINT] Check if Step A snapshot already exists (Resume from OOM)
+        // [STRATEGY] We bake the context + the instruction in one go.
+        // The 2B model will then just start generating from the 'assistant' header.
+        let type_prompt = parsing::page_type_prompt();
+        let full_task_prompt = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, type_prompt);
+
+        // [CHECKPOINT] Check if Step A snapshot already exists
         let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
         let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
 
         if !has_snapshot {
-            // 1. [0.6B] Bake RAW context
+            // 1. [0.6B] Bake FULL context + task
             println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
             model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
             
             let model_clone = model.clone();
-            let pug_payload = format!("[PUG CONTENT]\n{}", pug_content);
             let token_clone = cancellation_token.clone();
             let session_clone = Some(snapshot_id.clone());
             let kv_name_clone = kv_name.clone();
@@ -615,13 +619,13 @@ async fn process_task(
                     worker.clear_kv_cache();
                     let params = crate::openai_types::ChatCompletionParameters {
                         messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(pug_payload),
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(full_task_prompt.clone()),
                             name: None,
                         })],
                         ..Default::default()
                     };
+                    // Bake everything including the prompt
                     worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
-                    // [CRITICAL] Flush I/O before relay
                     crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
                 }
             }
@@ -629,33 +633,24 @@ async fn process_task(
             println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
         }
 
-        // 2. [2B] Load Snapshot & Continue Task
+        // 2. [2B] Load Snapshot & Generate
         {
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
-            // [OPTIMIZATION] 0.6B baked the PUG message. 
-            // 2B now provides the task as a separate follow-up message to ensure cache alignment.
+            // [CRITICAL] 2B MUST use the EXACT same message to pick up the KV cache
             let params = ChatCompletionParameters {
-                messages: vec![
-                    // First message MUST match what was baked exactly to align KV cache
-                    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                        content: ChatCompletionRequestUserMessageContent::Text(format!("[PUG CONTENT]\n{}", pug_content)),
-                        name: None,
-                    }),
-                    // Second message is the actual task
-                    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                        content: ChatCompletionRequestUserMessageContent::Text(format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", parsing::page_type_prompt())),
-                        name: None,
-                    })
-                ],
+                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                    content: ChatCompletionRequestUserMessageContent::Text(full_task_prompt),
+                    name: None,
+                })],
                 model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
                 ..Default::default()
             };
 
                                     if let Some(gen) = model.generator.lock().await.as_mut() {
-                                        println!("[Scheduler] 2B Step A: Asking classification question...");
-                                        let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()), kv_name.clone()).await?;
-                                        println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);                            
+                                        println!("[Scheduler] 2B Step A: Requesting final classification...");
+                                        let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
+                                        println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);                                                        
                             // [DEBUG] AI 응답 저장
                             let _ = data_manager.offload(&res, "step_a_res");
             

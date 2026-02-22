@@ -233,6 +233,7 @@ pub struct RegistryEntry {
     pub token_start: usize,
     pub token_len: usize,
     pub ssd_path: Option<std::path::PathBuf>,
+    pub hidden_states_path: Vec<Option<std::path::PathBuf>>, // [Layer Index] -> SSD Path for Output
     #[serde(skip)]
     pub is_dirty: bool, // SSD 저장이 필요한지 여부
     #[serde(skip, default = "std::time::Instant::now")]
@@ -637,6 +638,7 @@ impl QuantizedQwen3VLTextAttention {
                             token_start: current_total,
                             token_len: take,
                             ssd_path: None,
+                            hidden_states_path: vec![None; 28],
                             is_dirty: true, // [NEW] 백업 필요 표시
                             last_accessed: std::time::Instant::now(),
                             bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; 28])),
@@ -1317,6 +1319,7 @@ impl QuantizedQwen3VLTextAttention {
                     token_start: *offset,
                     token_len: b_len,
                     ssd_path: Some(path.clone()),
+                    hidden_states_path: vec![None; 28],
                     is_dirty: false, 
                     last_accessed: std::time::Instant::now(),
                     bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; 28])),
@@ -1694,8 +1697,10 @@ impl QuantizedQwen3VLTextModel {
             self.layers[layer_idx].to_device(&target_device)?;
             let _ = target_device.synchronize(); 
         }
-        if !xs.device().is_cuda() {
-            xs = xs.to_device(&target_device)?;
+
+        // [SSD-PIPELINE] 만약 입력 xs가 비어있고(또는 초기 상태고) 장부에 이전 레이어 결과가 있다면 로드
+        if layer_idx > 0 && xs.dim(1).unwrap_or(0) > 0 {
+             // 현재는 메모리 전달 방식이나, 향후 여기서 SSD 로드 로직 추가 가능
         }
 
         // println!("[BURST] >> [RUN] Layer {} on GPU (Recursive Chunks)", layer_idx);
@@ -1720,6 +1725,31 @@ impl QuantizedQwen3VLTextModel {
         // [STEP 3] Finalize & Purge (Ensure Slot Release is the LAST signal)
         let _ = target_device.synchronize();
         let next_xs = Tensor::cat(&next_xs_all, 1)?;
+        
+        // [SSD-DUMP-PIPELINE] 사용자 제안 반영: 현재 레이어의 모든 결과를 SSD로 즉시 덤프
+        if let Some(sid) = &self.active_session_id {
+            let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
+            let layer_dir = task_dir.join(format!("layer_{}", layer_idx));
+            if !layer_dir.exists() { let _ = fs::create_dir_all(&layer_dir); }
+            
+            // [FIX] 절대 인덱스 계산 (seqlen_offset 반영)
+            let base_chunk_idx = seqlen_offset / 256;
+
+            for (c_offset, chunk_xs) in next_xs_all.iter().enumerate() {
+                let absolute_chunk_idx = base_chunk_idx + c_offset;
+                let chunk_path = layer_dir.join(format!("chunk_{}.st", absolute_chunk_idx));
+                let mut map = HashMap::new();
+                map.insert("hidden_states".to_string(), chunk_xs.clone());
+                let _ = candle_core::safetensors::save(&map, &chunk_path);
+                
+                // 장부 업데이트
+                let mut reg_w = self.registry.entries.write().unwrap();
+                if absolute_chunk_idx < reg_w.len() {
+                    reg_w[absolute_chunk_idx].hidden_states_path[layer_idx] = Some(chunk_path);
+                }
+            }
+        }
+
         let result_xs = next_xs.to_device(&Device::Cpu)?; 
         
         // 레이어 Unload
@@ -2449,12 +2479,15 @@ impl QuantizedQwen3VLTextModel {
 
         println!("[SSD-LOAD] Finalized fragment list with {} blocks. Distributing to {} layers.", fragments.len(), self.layers.len());
 
-        // [RELAY-JUMP] 마지막 블록의 오프셋 + 길이를 현재 진행 상태로 설정
-        if let Some((last_off, _)) = fragments.last() {
-            // 표준 블록 크기 256을 고려하여 전체 길이 계산
+        // [RELAY-JUMP] Use the EXACT expected length to prevent misalignment
+        if expected_len > 0 {
+            self.current_kv_len = expected_len;
+            println!("[SSD-LOAD] Relay Jump: Model progress synchronized to token index {}.", expected_len);
+        } else if let Some((last_off, _)) = fragments.last() {
+            // Fallback if expected_len is not provided
             let total_loaded = *last_off + 256; 
             self.current_kv_len = total_loaded;
-            println!("[SSD-LOAD] Relay Jump: Model progress synchronized to token index {}.", total_loaded);
+            println!("[SSD-LOAD] Relay Jump (Fallback): Model progress set to token index {}.", total_loaded);
         }
 
         let kv_len = self.current_kv_len;
@@ -2904,12 +2937,14 @@ impl QuantizedQwen3VLModel {
         let head_dev = self.lm_head.device();
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
         let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };
-        let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state };
+        let hidden_state = hidden_state.to_dtype(head_dtype)?;
         
-        // [DEBUG-SHAPE]
-        println!("[DEBUG-HEAD] hidden_state shape: {:?}", hidden_state.shape());
+        // [VRAM-OPTIMIZATION] Only process the LAST token through the expensive LM head.
+        // This saves GBs of VRAM when seq_len is large (e.g., 10k+ tokens).
+        let seq_len = hidden_state.dim(1)?;
+        let last_hidden = hidden_state.narrow(1, seq_len - 1, 1)?;
 
-        Ok(self.lm_head.forward(&hidden_state)?)
+        Ok(self.lm_head.forward(&last_hidden)?)
     }
 
     pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
@@ -2990,11 +3025,40 @@ impl QuantizedQwen3TextModel {
         
         self.language_model.active_session_id = session_id;
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
-        let hidden_state = outputs; // [SPECULATIVE]
+        let mut hidden_state = outputs; // [SPECULATIVE]
         
+        // [SSD-MERGE-INTERPRET] 사용자 제안 반영: SSD에서 조각별로 읽어와 최종 추론 (OOM 방지)
+        if self.lm_head.is_some() && self.language_model.active_session_id.is_some() {
+            let head = self.lm_head.as_ref().unwrap();
+            let target_dtype = if head.device().is_cuda() { DType::BF16 } else { DType::F32 };
+            
+            // 마지막 토큰의 인덱스 찾기
+            let reg = self.language_model.registry.entries.read().unwrap();
+            if !reg.is_empty() {
+                let last_entry_idx = reg.len() - 1;
+                if let Some(path) = &reg[last_entry_idx].hidden_states_path[27] {
+                    if let Ok(recovered) = crate::utils::tensor_utils::load_tensor(path, "hidden_states", head.device()) {
+                        let last_chunk = recovered.to_dtype(target_dtype)?;
+                        // 마지막 청크의 마지막 토큰만 추출
+                        let seq_len = last_chunk.dim(1)?;
+                        let last_token_hidden = last_chunk.narrow(1, seq_len - 1, 1)?;
+                        
+                        // SSD 조각을 직접 사용하여 최종 헤드 연산
+                        return Ok(head.forward(&last_token_hidden)?);
+                    }
+                }
+            }
+        }
+
         if let Some(head) = &self.lm_head {
             let hidden_state = if !hidden_state.device().same_device(head.device()) { hidden_state.to_device(head.device())? } else { hidden_state };
-            Ok(head.forward(&hidden_state)?)
+            let target_dtype = if head.device().is_cuda() { DType::BF16 } else { DType::F32 };
+            let hidden_state = hidden_state.to_dtype(target_dtype)?;
+            
+            // [VRAM-OPTIMIZATION] Only process the LAST token through the expensive LM head.
+            let seq_len = hidden_state.dim(1)?;
+            let last_hidden = hidden_state.narrow(1, seq_len - 1, 1)?;
+            Ok(head.forward(&last_hidden)?)
         } else { Ok(hidden_state) }
     }
 
