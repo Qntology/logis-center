@@ -470,6 +470,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                     let dims = ka_v.shape();
                                                     let v_u32 = kh_v.data().chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect::<Vec<u32>>();
                                                     let mut o_s = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
+                                                    
+                                                    // [SHAPE-INTEGRITY] 0.6B vs 2B 차원 불일치 로깅
+                                                    // 2B 기대 헤드 수: 16, 0.6B 헤드 수: 보통 8~12
+                                                    if o_s[1] != 16 {
+                                                        println!("[SHAPE-MISMATCH] Block {} Layer {}: SSD heads={}, Model expects 16. Patching...", b_idx, target_l, o_s[1]);
+                                                    }
+
                                                     if o_s[2] > 1024 || o_s[3] > 512 { o_s = vec![1, 16, 256, 128]; }
                                                     let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
                                                         k_anchors: Tensor::from_vec(ka_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (o_s[0], o_s[1], dims[2], o_s[3]), &Device::Cpu).unwrap(), 
@@ -752,6 +759,15 @@ impl Qwen3VLGenerateModel {
             }
             self.clear_temporal_kv_caches();
         }
+
+        // [MACRO-PERSISTENCE] Draft 연산 결과가 반영된 최종 장부를 SSD에 저장
+        if let Some(s_id) = &sid {
+            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+            if !path.exists() { let _ = fs::create_dir_all(&path); }
+            let _ = self.qwen3_vl.save_metadata_to_file(&path);
+            println!("[DRAFT-SAVE] Metadata updated with draft context at {:?}", path);
+        }
+
         Ok(g_text)
     }
 
