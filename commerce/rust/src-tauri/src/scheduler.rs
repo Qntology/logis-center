@@ -582,101 +582,97 @@ async fn process_task(
     // ...
     // ==================================================================================
 
-            // --- STEP A: CLASSIFICATION (Disk Bridge Relay) ---
+        // --- STEP A: CLASSIFICATION (Disk Bridge Relay) ---
+    {
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        println!("[Scheduler] Starting DISK BRIDGE RELAY (0.6B -> Disk -> 2B)");
+        
+        // [NEW] Log step A start for UI recovery
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
+
+        let pug_content = light_pug.clone();
+        let snapshot_id = format!("{}_step_a", task.id);
+        let kv_name = Some("step_a".to_string());
+        
+        // [STRATEGY] We bake the context + the instruction in one go.
+        // The 2B model will then just start generating from the 'assistant' header.
+        let type_prompt = parsing::page_type_prompt();
+        let full_task_prompt = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, type_prompt);
+
+        // [CHECKPOINT] Check if Step A snapshot already exists
+        let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
+        let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
+
+        if !has_snapshot {
+            // 1. [0.6B] Bake FULL context + task
+            println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
+            
+            let model_clone = model.clone();
+            let token_clone = cancellation_token.clone();
+            let session_clone = Some(snapshot_id.clone());
+            let kv_name_clone = kv_name.clone();
+
             {
-                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-                println!("[Scheduler] Starting SPECULATIVE RELAY (0.6B Draft -> 2B Verify)");
-                
-                // [NEW] Log step A start for UI recovery
-                log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Drafting classification...", "spinner": "⠋" }));
-        
-                let pug_content = light_pug.clone();
-                let snapshot_id = format!("{}_step_a", task.id);
-                let kv_name = Some("step_a".to_string());
-                
-                let type_prompt = parsing::page_type_prompt();
-                let full_task_prompt = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, type_prompt);
-        
-                // [CHECKPOINT] Check if Step A snapshot already exists
-                let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
-                let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
-        
-                let mut draft_res = String::new();
-        
-                if !has_snapshot {
-                    // 1. [0.6B] Generate DRAFT with Small Model
-                    println!("[Scheduler] Phase 1: Generating 0.6B Speculative Draft...");
-                    model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
-                    
+                let mut gen_guard = model_clone.generator.lock().await;
+                if let Some(worker) = gen_guard.as_mut() {
+                    worker.clear_kv_cache();
                     let params = crate::openai_types::ChatCompletionParameters {
-                        messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                            content: ChatCompletionRequestUserMessageContent::Text(full_task_prompt.clone()),
+                        messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(full_task_prompt.clone()),
                             name: None,
                         })],
-                        max_tokens: Some(64), temperature: Some(0.1),
                         ..Default::default()
                     };
-        
-                    if let Some(worker) = model.generator.lock().await.as_mut() {
-                        // Bake the prompt first
-                        worker.clear_kv_cache();
-                        worker.prefill_only(params.clone(), Some(cancellation_token.clone()), Some(snapshot_id.clone()), None, kv_name.clone()).await?;
-                        
-                        // Generate Draft
-                        draft_res = worker.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
-                        println!("[DEBUG-SCHED] 0.6B Draft: '{}'", draft_res);
-                        
-                        crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
-                    }
-                } else {
-                    println!("[Scheduler] Snapshot found. (Skip 0.6B phase)");
-                }
-        
-                // 2. [2B] Load Snapshot & Interpret Draft
-                {
-                    println!("[Scheduler] Phase 2: 2B Interpreting Draft in One Pass...");
-                    model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
-        
-                    let params = ChatCompletionParameters {
-                        messages: vec![
-                            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                                content: ChatCompletionRequestUserMessageContent::Text(full_task_prompt),
-                                name: None,
-                            }),
-                                                // Appending the draft for one-pass verification
-                                                ChatCompletionRequestMessage::Assistant(crate::openai_types::ChatCompletionRequestAssistantMessage {
-                                                    content: Some(draft_res),
-                                                    name: None, tool_calls: None,
-                                                })
-                                            ],                        model: "qwen3vl".to_string(), max_tokens: Some(1), 
-                        ..Default::default()
-                    };
-        
-                                            if let Some(gen) = model.generator.lock().await.as_mut() {
-                                                println!("[Scheduler] 2B Step A: Requesting final classification...");
-                                                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
-                                                println!("[DEBUG-SCHED] Step A Raw Result: '{}'", res);                            
-                                    // [DEBUG] AI 응답 저장
-                                    let _ = data_manager.offload(&res, "step_a_res");
-                    
-                                    let type_info = parsing::parse_json_from_llm(&res); 
-                                    page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
-                        if page_type.is_empty() {
-                            println!("[Scheduler] Warning: LLM returned empty type. Using task type fallback.");
-                            page_type = match task.r#type.as_str() {
-                                "image_extraction" => "tracking".to_string(),
-                                _ => "unknown".to_string(),
-                            };
-                        }
-                        println!("[Scheduler] Classified as: {}", page_type);
-                    }
-                }
-                
-                if page_type.is_empty() || page_type == "unknown" { 
-                    model.deep_purge_resources().await;
-                    return Ok(()); 
+                    // Bake everything including the prompt
+                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
+                    crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
                 }
             }
+        } else {
+            println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
+        }
+
+        // 2. [2B] Load Snapshot & Generate
+        {
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+
+            // [CRITICAL] 2B MUST use the EXACT same message to pick up the KV cache
+            let params = ChatCompletionParameters {
+                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                    content: ChatCompletionRequestUserMessageContent::Text(full_task_prompt),
+                    name: None,
+                })],
+                model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
+                ..Default::default()
+            };
+
+                                    if let Some(gen) = model.generator.lock().await.as_mut() {
+                                        println!("[Scheduler] 2B Step A: Requesting final classification...");
+                                        let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
+                                        println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);                                                        
+                            // [DEBUG] AI 응답 저장
+                            let _ = data_manager.offload(&res, "step_a_res");
+            
+                            let type_info = parsing::parse_json_from_llm(&res); 
+                            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
+                if page_type.is_empty() {
+                    println!("[Scheduler] Warning: LLM returned empty type. Using task type fallback.");
+                    page_type = match task.r#type.as_str() {
+                        "image_extraction" => "tracking".to_string(),
+                        _ => "unknown".to_string(),
+                    };
+                }
+                println!("[Scheduler] Classified as: {}", page_type);
+            }
+        }
+        
+        if page_type.is_empty() || page_type == "unknown" { 
+            model.deep_purge_resources().await;
+            return Ok(()); 
+        }
+    }
+
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     // [CRITICAL-CLEANUP] Clear the cache from Step A before Step B (git e8260c5 parity)
