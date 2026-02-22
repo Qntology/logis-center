@@ -1034,23 +1034,20 @@ impl Qwen3VLGenerateModel {
 
         let max_gen_tokens = mes.max_tokens.unwrap_or(2048) as usize;
         let mut gen_count = 0;
-        
-        // [HYBRID-SPECULATIVE-CONFIG]
-        // 0.6B Draft 모델이 있을 경우 한 번의 2B Rotation에 여러 토큰을 검증합니다.
-        let spec_window = if relay.is_some() { 6 } else { 1 }; 
+        let spec_window = if relay.is_some() { 8 } else { 1 }; // [HYBRID-SPECULATIVE] 한 번에 검증할 토큰 수
 
         while gen_count < max_gen_tokens {
             if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
 
             let mut draft_ids = Vec::new();
-            let mut input_tokens = Vec::new();
             
-            // [STEP 1] 0.6B Draft Generation (Fast)
+            // [STEP 1] 0.6B Draft Generation (Fast, Single Layer)
             if let Some(ref mut r) = relay {
                 let mut temp_ids = a_ids.clone();
                 let mut temp_off = curr_s_off;
                 for _ in 0..spec_window {
                     let last_id = *temp_ids.last().unwrap_or(&0);
+                    // 0.6B는 1개 레이어뿐이므로 레이어 회전 로그 없이 빠르게 전파
                     let logits = r.qwen3_vl.forward(
                         &Tensor::from_vec(vec![last_id], (1, 1), &r.text_device)?,
                         None, None, None, None,
@@ -1064,37 +1061,41 @@ impl Qwen3VLGenerateModel {
                 }
             }
 
-            // [STEP 2] 2B Batch Verification (One Rotation)
-            // 검증할 토큰들: [마지막 확정 토큰] + [Draft 토큰들]
-            input_tokens.push(*a_ids.last().unwrap_or(&0));
-            input_tokens.extend(&draft_ids);
+            // [STEP 2] 2B Batch Verification (Crucial: One Rotation for N tokens)
+            // 검증 대상: [Draft 토큰들] - 단, 2B는 이전 문맥을 알고 있으므로 드래프트 토큰들만 한꺼번에 배치로 보냅니다.
+            let last_confirmed = *a_ids.last().unwrap_or(&0);
+            let mut verify_tokens = vec![last_confirmed];
+            verify_tokens.extend(&draft_ids);
 
+            // [ROTATION-START] 2B 모델이 SSD에서 28개 레이어를 한 바퀴 회전합니다. (이때 로그 0.1.2...27. 출력)
             let logits = self.qwen3_vl.forward(
-                &Tensor::from_vec(input_tokens.clone(), (1, input_tokens.len()), &self.text_device)?, 
+                &Tensor::from_vec(verify_tokens.clone(), (1, verify_tokens.len()), &self.text_device)?, 
                 p_vals.as_ref(), i_grid.as_ref(), None, None, 
-                Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + input_tokens.len()) as u32, &self.text_device)?.unsqueeze(0)?), 
-                curr_s_off, input_tokens.len(), sid.clone()
+                Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + verify_tokens.len()) as u32, &self.text_device)?.unsqueeze(0)?), 
+                curr_s_off, verify_tokens.len(), sid.clone()
             )?;
 
-            // [STEP 3] Matching & Acceptance
+            // [STEP 3] Matching & Output (ONLY AFTER ROTATION)
             let mut accepted_this_round = 0;
             
-            // Forward 결과 로짓은 각 입력 토큰의 '다음' 토큰을 예측합니다.
-            // i번째 입력 토큰에 대한 로짓은 i번째 위치에 있습니다.
-            for i in 0..input_tokens.len() {
+            // 2B가 계산한 각 위치의 로짓과 0.6B의 Draft를 비교
+            for i in 0..draft_ids.len() {
+                // i번째 입력 토큰에 대한 2B의 실제 예측 결과 (i번째 위치의 로짓)
                 let target_logits = logits.narrow(1, i, 1)?.flatten_all()?;
                 let l_vec = apply_repeat_penalty(&target_logits.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
                 let accepted_id = l_proc.sample(&l_vec)?;
 
-                if i < draft_ids.len() && accepted_id == draft_ids[i] {
-                    // Draft 일치: 토큰 확정 및 계속 진행
+                if accepted_id == draft_ids[i] {
+                    // Draft 성공: 화면에 출력하고 다음 드래프트 확인
                     let token_text = self.tokenizer.token_decode(vec![accepted_id])?;
                     print!("{}", token_text);
                     g_text.push_str(&token_text);
                     a_ids.push(accepted_id);
                     accepted_this_round += 1;
+                    
+                    if accepted_id == self.eos_token_id1 || accepted_id == self.eos_token_id2 { break; }
                 } else {
-                    // Draft 불일치 또는 마지막 토큰: 2B가 판단한 올바른 토큰을 넣고 종료
+                    // Draft 실패: 2B가 판단한 올바른 토큰을 넣고 이 배치 루프 종료
                     let token_text = self.tokenizer.token_decode(vec![accepted_id])?;
                     print!("{}", token_text);
                     g_text.push_str(&token_text);
@@ -1104,13 +1105,24 @@ impl Qwen3VLGenerateModel {
                 }
             }
 
+            // 만약 드래프트가 없었을 경우 (window=1) 일반 토큰 1개 생성 보장
+            if accepted_this_round == 0 {
+                let target_logits = logits.narrow(1, 0, 1)?.flatten_all()?;
+                let next_id = l_proc.sample(&target_logits)?;
+                let token_text = self.tokenizer.token_decode(vec![next_id])?;
+                print!("{}", token_text);
+                g_text.push_str(&token_text);
+                a_ids.push(next_id);
+                accepted_this_round = 1;
+            }
+
             curr_s_off += accepted_this_round;
             gen_count += accepted_this_round; 
             p_vals = None;
             use std::io::Write;
             let _ = std::io::stdout().flush();
 
-            // SSD Baker 처리 로직 유지
+            // [POST-ROTATION] SSD Baker 등 기존 관리 로직
             if let Some(s_id) = &sid {
                 let pending_blocks = self.get_blocks_by_location(KVLocation::SSD_PENDING)?;
                 for (ks, vs, block_offset, block_idx) in pending_blocks {

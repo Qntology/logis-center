@@ -1588,11 +1588,13 @@ impl QuantizedQwen3VLTextModel {
         sin: &Tensor,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        // [PROGRESS-LOG] Concise real-time layer tracking
-        if layer_idx == 0 { print!("\n[Layers] "); }
-        print!("{}.", layer_idx);
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
+        // [PROGRESS-LOG] 2B 이상의 레이어 회전 모델에서만 진행률을 출력하여 드래프트 과정을 조용하게 유지
+        if self.layers.len() > 1 {
+            if layer_idx == 0 { print!("\n[Layers] "); }
+            print!("{}.", layer_idx);
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
 
         let start_layer_time = std::time::Instant::now();
 
