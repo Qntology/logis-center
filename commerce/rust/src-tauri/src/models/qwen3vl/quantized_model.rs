@@ -1329,9 +1329,22 @@ impl QuantizedQwen3VLTextAttention {
             // [FIX] 이미 RAM에 있거나 로딩 중이면 SSD로 덮어쓰지 않음
             let current_loc = reg[i].location[self.layer_idx];
             if current_loc != KVLocation::RAM && current_loc != KVLocation::RamSticky && current_loc != KVLocation::Loading {
-                reg[i].location[self.layer_idx] = KVLocation::SSD;
+                // [RELAY-FALLBACK] 파일이 l0.st라면(릴레이 데이터), 모든 레이어가 이를 참조하도록 허용
+                // 단, 자신의 전용 파일(l{idx}.st)이 있을 수 있으므로 path 자체가 l0.st인 경우에만 적용
+                let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let is_relay_source = fname == "l0.st";
+                
+                // 만약 현재 로드하는 파일이 릴레이 소스라면, 이 레이어의 데이터로 인정
+                // (2B 모델의 각 레이어가 l0.st를 자신의 소스로 등록)
+                if is_relay_source || fname.contains(&format!("l{}.st", self.layer_idx)) {
+                    reg[i].location[self.layer_idx] = KVLocation::SSD;
+                    reg[i].ssd_path = Some(path.clone());
+                }
             }
-            reg[i].ssd_path = Some(path.clone());
+            // 공용 경로는 항상 업데이트 (단, 덮어쓰기 주의)
+            if reg[i].ssd_path.is_none() {
+                reg[i].ssd_path = Some(path.clone());
+            }
         }
 
         if self.layer_idx == 0 {
