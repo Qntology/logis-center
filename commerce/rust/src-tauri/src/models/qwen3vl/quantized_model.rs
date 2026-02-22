@@ -1674,29 +1674,27 @@ impl QuantizedQwen3VLTextModel {
                                 b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
                             };
 
-                            // [SHAPE-INTEGRITY-CHECK] 0.6B와 2B 간의 체급 차이 검증
-                            let mut final_ka = bytes_to_f32(ka.data());
-                            let mut final_va = bytes_to_f32(va.data());
-                            let mut current_os = o_shape.clone();
+                            // [SHAPE-ADAPTER] 0.6B(1024) 데이터를 2B(2048) 규격으로 자동 확장
+                            let bytes_to_f32_padded = |b: &[u8], target_dim: usize, current_os: &[usize]| -> Vec<f32> {
+                                let mut data: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                let actual_dim = data.len() / (current_os[0] * current_os[1] * current_os[2]);
+                                if actual_dim < target_dim {
+                                    // 차원이 부족하면 나머지를 0으로 채움 (Zero-Padding)
+                                    let total_needed = current_os[0] * current_os[1] * current_os[2] * target_dim;
+                                    data.resize(total_needed, 0.0);
+                                }
+                                data
+                            };
 
-                            // 2B 모델은 보통 16개 이상의 헤드를 가지나, 0.6B는 8~12개일 수 있음
-                            // 만약 헤드 수가 다르면 2B의 기대치에 맞춰 데이터를 확장하거나 로그를 남김
-                            let expected_heads = 16; // 2B 모델 기준 (설정에 따라 다를 수 있음)
-                            let actual_heads = current_os[1];
-                            
-                            if actual_heads != expected_heads {
-                                println!("[SHAPE-MISMATCH] Layer {} Block {}: Model expects {} heads, but SSD has {}. Patching...", layer_idx, *b_idx, expected_heads, actual_heads);
-                                // 여기서 실제 패딩 로직이 작동하거나, 에러 로그를 통해 상황을 파악할 수 있게 함
-                            }
-
+                            let expected_d = 128; // Qwen3-2B 기준 차원
                             let metadata = BitKVMetadata {
-                                k_anchors: Tensor::from_vec(final_ka, ka.shape(), &Device::Cpu)?,
+                                k_anchors: Tensor::from_vec(bytes_to_f32_padded(ka.data(), expected_d, &o_shape), (o_shape[0], o_shape[1], o_shape[2], expected_d), &Device::Cpu)?,
                                 k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?,
-                                k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), ks.shape(), &Device::Cpu)?,
-                                v_anchors: Tensor::from_vec(final_va, va.shape(), &Device::Cpu)?,
+                                k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (o_shape[0], o_shape[1], o_shape[2], 1), &Device::Cpu)?,
+                                v_anchors: Tensor::from_vec(bytes_to_f32_padded(va.data(), expected_d, &o_shape), (o_shape[0], o_shape[1], o_shape[2], expected_d), &Device::Cpu)?,
                                 v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?,
-                                v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), vs.shape(), &Device::Cpu)?,
-                                original_shape: current_os
+                                v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (o_shape[0], o_shape[1], o_shape[2], 1), &Device::Cpu)?,
+                                original_shape: vec![o_shape[0], o_shape[1], o_shape[2], expected_d]
                             };
                             let mut inner = block.inner.write().unwrap();
                             inner.bitkv_metadata = Some(metadata);
@@ -1738,8 +1736,18 @@ impl QuantizedQwen3VLTextModel {
                     if let Some(path) = hs_path {
                         if path.exists() && (xs.dim(1).unwrap_or(0) == 0 || layer_idx > 0) {
                             if let Ok(loaded_xs) = crate::utils::tensor_utils::load_tensor(path, "hidden_states", &target_device) {
-                                // println!("[SSD-RELAY] Layer {} reloaded context from {:?}", layer_idx, path);
-                                xs = loaded_xs.to_dtype(xs.dtype())?;
+                                // [SHAPE-ADAPTER] 차원이 다르면 패딩하여 호환성 유지
+                                let mut final_xs = loaded_xs;
+                                let expected_dim = xs.dim(2).unwrap_or(2048);
+                                let actual_dim = final_xs.dim(2).unwrap_or(1024);
+                                
+                                if actual_dim < expected_dim {
+                                    println!("[SHAPE-ADAPT] Padding hidden states from {} to {}", actual_dim, expected_dim);
+                                    let padding = Tensor::zeros((final_xs.dim(0)?, final_xs.dim(1)?, expected_dim - actual_dim), final_xs.dtype(), &target_device)?;
+                                    final_xs = Tensor::cat(&[final_xs, padding], 2)?;
+                                }
+                                
+                                xs = final_xs.to_dtype(xs.dtype())?;
                             }
                         }
                     }
@@ -2119,9 +2127,29 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
+        // [LAYER-SURGERY] 0.6B 모델을 2B 규격(28레이어)으로 강제 확장
+        let mut final_layers = Vec::new();
+        let num_actual_layers = layers.len();
+        let target_layers = if baking_only { 1 } else { 28 }; // 2B와 맞추기 위해 28개로 설정
+
+        if num_actual_layers > 0 {
+            for i in 0..target_layers {
+                // 실제 레이어가 부족하면 상위 레이어들을 반복해서 채움
+                let source_idx = if i < num_actual_layers {
+                    i
+                } else {
+                    // 16~27번 슬롯은 실제 레이어의 뒷부분(예: 4~15번)을 반복 사용
+                    num_actual_layers - (target_layers - i) % (num_actual_layers / 2 + 1) - 1
+                };
+                final_layers.push(layers[source_idx].clone());
+            }
+        } else {
+            final_layers = layers;
+        }
+
         Ok(Self {
             embed_tokens,
-            layers,
+            layers: final_layers,
             norm,
             rotary_emb,
             mrope_section,

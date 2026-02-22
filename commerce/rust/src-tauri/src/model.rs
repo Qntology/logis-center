@@ -592,7 +592,10 @@ impl LogisModel {
         // 2. [LOAD] Load from disk if not found in any slot
         println!("[LOAD] Fresh loading {:?} from disk...", size);
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
-        let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
+        
+        // [FIX] Tokenizer는 2B의 것을 공유하되, Config는 각 모델 자신의 것을 사용하도록 분리
+        let tokenizer_path = Some(self.large_model_path.as_str());
+        let config_path = None; // None으로 두면 모델 경로의 config.json을 자동으로 읽음
         
         let mut target_device = self.device_config.device.clone();
         
@@ -614,16 +617,18 @@ impl LogisModel {
         let dev_id = self.device_config.gpu_id;
         let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;
+        
         let path_clone = path.to_string();
-        let shared_path_clone = shared_path.map(|s| s.to_string());
+        let tok_path_clone = tokenizer_path.map(|s: &str| s.to_string());
+        let cfg_path_clone = config_path.map(|s: &str| s.to_string());
         let handle_clone = self.app_handle.clone();
 
         let gen = tokio::task::spawn_blocking(move || {
             let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
-                shared_path_clone.as_deref(), 
-                shared_path_clone.as_deref(), 
+                tok_path_clone.as_deref(), 
+                cfg_path_clone.as_deref(), 
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
                 force_text_only,
                 baking_only,

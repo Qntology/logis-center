@@ -256,11 +256,22 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     if idx < entries.len() {
                                         let entry = &mut entries[idx];
                                         entry.ssd_path = Some(task_path.clone());
-                                        let is_relay_data = task_path.file_name().map(|n| n == "l0.st").unwrap_or(false);
-                                        for l_idx in 0..28 {
-                                            if is_relay_data || entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::SSD_PENDING || 
-                                               entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::VRAM {
-                                                entry.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD;
+                                        
+                                        let fname = task_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                                        if fname == "l0.st" {
+                                            // [RELAY-BROADCAST] Stage 1에서 생성된 0번 데이터를 모든 레이어에 전파
+                                            for l_idx in 0..28 {
+                                                if entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::SSD_PENDING || 
+                                                   entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::VRAM {
+                                                    entry.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD;
+                                                }
+                                            }
+                                        } else {
+                                            // [SURGICAL-UPDATE] Stage 2에서 생성된 레이어별 고유 데이터를 장부에 반영
+                                            if let Some(l_idx) = fname.strip_prefix('l').and_then(|s| s.strip_suffix(".st")).and_then(|s| s.parse::<usize>().ok()) {
+                                                if l_idx < 28 {
+                                                    entry.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD;
+                                                }
                                             }
                                         }
                                     }
@@ -707,7 +718,10 @@ impl Qwen3VLGenerateModel {
                     for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() { dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v }); }
                     if let Ok(tx) = get_bake_worker().await {
                         let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
-                        let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: off, layers: dumps, is_relay_baking: false, block_idx: Some(off / 256), registry: rr })).await;
+                        
+                        // [RELAY-BROADCAST-FIX] 0.6B 모델이 Draft를 쓸 때도 Relay 모드로 작동하여 모든 2B 레이어에 결과를 전파하게 함
+                        let is_small = self.model_name.contains("Small");
+                        let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: off, layers: dumps, is_relay_baking: is_small, block_idx: Some(off / 256), registry: rr })).await;
                     }
                 }
                 SLOT_MANAGER.wait_for_all_tasks().await;
