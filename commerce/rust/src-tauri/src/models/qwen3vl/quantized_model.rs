@@ -126,7 +126,17 @@ impl QLinear {
         let dev = &self.device;
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
         
-        let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
+        // [DEBUG] QLinear Entry
+        println!("[QLINEAR-DEBUG] Entry shape: {:?}", xs.shape());
+
+        let mut xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
+        
+        // [SHAPE-CORRECTION] Ensure Rank 3 for dims3()
+        if xs.rank() == 2 {
+            xs = xs.unsqueeze(0)?;
+            println!("[QLINEAR-FIX] Unsqueezed Rank 2 -> 3: {:?}", xs.shape());
+        }
+
         let (b, s, h) = xs.dims3()?;
         let xs_flat = xs.reshape((b * s, h))?;
 
@@ -153,6 +163,10 @@ impl QLinear {
 
         if let Some(bias) = &self.bias {
             let b = if bias.dtype() != target_dtype { bias.to_dtype(target_dtype)? } else { bias.clone() };
+            // [DEBUG] Bias add
+            if out.rank() != b.rank() && b.rank() != 1 && b.rank() != 0 {
+                 println!("[QLINEAR-ERROR] Bias rank mismatch. out: {:?}, bias: {:?}", out.shape(), b.shape());
+            }
             Ok(out.broadcast_add(&b)?)
         } else {
             Ok(out)
@@ -2218,6 +2232,8 @@ impl QuantizedQwen3VLTextModel {
         println!("[DEBUG-NORM] xs shape: {:?}, norm weight shape: {:?}", xs.shape(), self.norm.weight().shape());
         
         let xs = xs.apply(&self.norm)?;
+        
+        println!("[DEBUG-NORM-DONE] Final xs shape: {:?}", xs.shape());
 
         Ok(xs)
     }
