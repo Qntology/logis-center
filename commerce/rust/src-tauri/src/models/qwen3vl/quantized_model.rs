@@ -3078,8 +3078,8 @@ impl QuantizedQwen3VLModel {
         };
         println!("[TIMER] RoPE index calculation: {:.2}s", start_rope.elapsed().as_secs_f32());
         
-        self.language_model.active_session_id = session_id;
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
+        self.language_model.active_session_id = session_id.clone();
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, session_id)?;
         let hidden_state = outputs; // [SPECULATIVE] 전체 시퀀스에 대한 히든 스테이트 유지
         
         let head_dev = self.lm_head.device();
@@ -3171,8 +3171,8 @@ impl QuantizedQwen3TextModel {
             Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?
         };
         
-        self.language_model.active_session_id = session_id;
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
+        self.language_model.active_session_id = session_id.clone();
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, session_id)?;
         let mut hidden_state = outputs; // [SPECULATIVE]
         
         // [SSD-MERGE-INTERPRET] 사용자 제안 반영: SSD에서 조각별로 읽어와 최종 추론 (OOM 방지)
