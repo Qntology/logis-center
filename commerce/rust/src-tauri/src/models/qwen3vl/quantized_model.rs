@@ -711,18 +711,32 @@ impl QuantizedQwen3VLTextAttention {
                             let mut k_raw = self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?;
                             let mut v_raw = self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?;
                             
-                            // [RELAY-UPSCALE FIX] 0.6B의 텐서 크기를 2B의 크기에 맞게 동적으로 늘려줍니다.
+                            // [RELAY-UPSCALE FIX] 0.6B의 얇은 텐서를 2B의 두꺼운 텐서(차원 및 헤드)에 완벽하게 맞춰줍니다.
                             let target_heads = self.num_key_value_heads;
                             let target_dim = self.head_dim;
                             let (_b, h, _s, d) = k_raw.dims4().unwrap_or((1, 1, 256, 128));
 
-                            if d < target_dim {
+                            if d != target_dim {
                                 let repeats = target_dim / d;
+                                let remainder = target_dim % d;
+                                
                                 let mut k_cats = Vec::new();
                                 let mut v_cats = Vec::new();
-                                for _ in 0..repeats { k_cats.push(&k_raw); v_cats.push(&v_raw); }
-                                k_raw = Tensor::cat(&k_cats, candle_core::D::Minus1).unwrap_or(k_raw);
-                                v_raw = Tensor::cat(&v_cats, candle_core::D::Minus1).unwrap_or(v_raw);
+                                if repeats > 0 {
+                                    for _ in 0..repeats { k_cats.push(k_raw.clone()); v_cats.push(v_raw.clone()); }
+                                }
+                                
+                                let mut k_scaled = if !k_cats.is_empty() { Tensor::cat(&k_cats.iter().collect::<Vec<_>>(), candle_core::D::Minus1).unwrap_or(k_raw.clone()) } else { k_raw.clone() };
+                                let mut v_scaled = if !v_cats.is_empty() { Tensor::cat(&v_cats.iter().collect::<Vec<_>>(), candle_core::D::Minus1).unwrap_or(v_raw.clone()) } else { v_raw.clone() };
+
+                                if remainder > 0 {
+                                    let k_rem = k_raw.narrow(candle_core::D::Minus1, 0, remainder).unwrap();
+                                    let v_rem = v_raw.narrow(candle_core::D::Minus1, 0, remainder).unwrap();
+                                    k_scaled = if repeats > 0 { Tensor::cat(&[&k_scaled, &k_rem], candle_core::D::Minus1).unwrap_or(k_scaled) } else { k_rem };
+                                    v_scaled = if repeats > 0 { Tensor::cat(&[&v_scaled, &v_rem], candle_core::D::Minus1).unwrap_or(v_scaled) } else { v_rem };
+                                }
+                                k_raw = k_scaled;
+                                v_raw = v_scaled;
                             }
 
                             if h != target_heads {
@@ -1612,13 +1626,18 @@ impl QuantizedQwen3VLTextModel {
                                 }
                             }
 
+                            // [CRITICAL-FIX] Safetensors의 .data()는 &[u8]을 반환하므로, f32 텐서 생성 전 명시적 변환이 필수적입니다.
+                            let bytes_to_f32 = |b: &[u8]| -> Vec<f32> {
+                                b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+                            };
+
                             let metadata = BitKVMetadata {
-                                k_anchors: Tensor::from_slice(ka.data(), ka.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
-                                k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
-                                k_scales: Tensor::from_slice(ks.data(), ks.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
-                                v_anchors: Tensor::from_slice(va.data(), va.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
-                                v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
-                                v_scales: Tensor::from_slice(vs.data(), vs.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
+                                k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), ka.shape(), &Device::Cpu)?,
+                                k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?, // Packed는 u8이므로 그대로 유지
+                                k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), ks.shape(), &Device::Cpu)?,
+                                v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), va.shape(), &Device::Cpu)?,
+                                v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?, // Packed는 u8이므로 그대로 유지
+                                v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), vs.shape(), &Device::Cpu)?,
                                 original_shape: o_shape
                             };
                             let mut inner = block.inner.write().unwrap();
