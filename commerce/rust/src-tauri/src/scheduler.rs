@@ -648,15 +648,16 @@ async fn process_task(
                     };
                     
                     // 전체 레이어를 가진 0.6B가 고품질 가안을 작성합니다.
+                    // [IMPORTANT] 이미 SSD에 문맥이 로드되어 있으므로, generate() 내부에서 Prefill은 자동으로 생략됩니다.
                     let draft_text = worker.generate(params, Some(cancellation_token.clone()), session_clone, kv_name_clone, None).await?;
                     let ids = worker.tokenizer.text_encode_vec(draft_text, false)?;
                     draft_tokens = Some(ids);
                 }
             }
             
-            // [CLEANUP] 0.6B를 완전히 제거하여 2B를 위한 공간 확보
+            // [STRICT-UNLOAD] 0.6B를 메모리에서 즉시 해제하여 2B를 위한 완벽한 빈 공간 확보
             model.deep_purge_resources().await;
-            wait_for_resources_settled(2000, 1000, Some(&cancellation_token)).await?;
+            wait_for_resources_settled(2500, 1500, Some(&cancellation_token)).await?;
         } else {
             println!("[Scheduler] Found existing snapshot. Skipping 0.6B baking/drafting.");
         }
@@ -772,9 +773,9 @@ async fn process_task(
                 }
             }
             
-            // [UNLOAD] 0.6B 제거
+            // [STRICT-UNLOAD] 0.6B 제거
             model.deep_purge_resources().await;
-            wait_for_resources_settled(2000, 1000, Some(&cancellation_token)).await?;
+            wait_for_resources_settled(2500, 1500, Some(&cancellation_token)).await?;
         } else {
             println!("[Scheduler] Found existing snapshot. Skipping 0.6B drafting.");
         }
@@ -952,9 +953,9 @@ async fn process_task(
                     }
                 }
                 
-                // [UNLOAD] 0.6B 제거
+                // [STRICT-UNLOAD] 0.6B 제거
                 model.deep_purge_resources().await;
-                wait_for_resources_settled(2000, 1000, Some(&cancellation_token)).await?;
+                wait_for_resources_settled(2500, 1500, Some(&cancellation_token)).await?;
             } else {
                 println!("[Scheduler] Found existing snapshot. Skipping 0.6B drafting.");
             }

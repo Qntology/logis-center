@@ -623,12 +623,13 @@ impl Qwen3VLGenerateModel {
                 ModelVariant::QuantizedVL(QuantizedQwen3VLModel::new_with_mmap(&cfg, &gguf_file::Content::read(&mut std::io::Cursor::new(&m_mmap[..]))?, Some(Arc::new(m_mmap)), &gguf_file::Content::read(&mut std::io::Cursor::new(&mm_mmap[..]))?, Some(Arc::new(mm_mmap)), &t_dev, text_device_id, &v_dev, vision_device_id, dtype, kv_res, baking_only)?)
             } else {
                 let m_mmap = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(&m_p.unwrap())?)? };
-                ModelVariant::QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &gguf_file::Content::read(&mut std::io::Cursor::new(&m_mmap[..]))?, Some(Arc::new(m_mmap)), &t_dev, text_device_id, dtype, kv_res, baking_only || path.contains("0.6B"), baking_only || path.contains("0.6B"))?)
+                // [FIX] 강제 Baking-Only 모드 제거: baking_only 플래그를 그대로 존중합니다.
+                ModelVariant::QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &gguf_file::Content::read(&mut std::io::Cursor::new(&m_mmap[..]))?, Some(Arc::new(m_mmap)), &t_dev, text_device_id, dtype, kv_res, baking_only, baking_only)?)
             }
         } else { ModelVariant::Standard(Qwen3VLModel::new(cfg, unsafe { VarBuilder::from_mmaped_safetensors(&find_type_files(path, "safetensors")?, dtype, &t_dev)? })?) };
         let g_p = std::path::Path::new(cfg_p).join("generation_config.json"); let g_cfg: Qwen3VLGenerationConfig = if g_p.exists() { serde_json::from_slice(&std::fs::read(g_p)?)? } else { Qwen3VLGenerationConfig::default() };
         let (e1, e2) = match &g_cfg.eos_token_id { serde_json::Value::Number(n) => { let id = n.as_u64().unwrap_or(151645) as u32; (id, id) }, serde_json::Value::Array(arr) => { let id1 = arr.get(0).and_then(|v| v.as_u64()).unwrap_or(151643) as u32; let id2 = arr.get(1).and_then(|v| v.as_u64()).unwrap_or(id1 as u64) as u32; (id1, id2) }, _ => (151643, 151643) };
-        Ok(Self { chat_template: ChatTemplate::init(tok_p)?, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_p, &v_dev, dtype)?, qwen3_vl, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: if path.contains("0.6B") { "0.6B".into() } else { "2B".into() }, hard_token_limit, kv_root })
+        Ok(Self { chat_template: ChatTemplate::init(tok_p)?, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_p, &v_dev, dtype)?, qwen3_vl, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: if baking_only { "Small (Single-Layer)".into() } else if path.contains("0.6B") { "Small (Full-Layer)".into() } else { "2B (Full-Layer)".into() }, hard_token_limit, kv_root })
     }
 
     pub async fn prefill_chunk(&mut self, text: String, _cancel: Option<Arc<AtomicBool>>, _relay: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
@@ -646,7 +647,7 @@ impl Qwen3VLGenerateModel {
         let f_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?;
         let t_toks = f_ids.len();
         println!("[TIMER] Tokenization: {:.2}s for {} tokens", start_prep.elapsed().as_secs_f32(), t_toks);
-        let is_06b = self.model_name.contains("0.6B");
+        let is_06b = self.model_name.contains("Small");
         if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
         println!("[BAKING] Starting Horizontal Pass for {} tokens...", t_toks);
         self.qwen3_vl.forward(&Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(0u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 0, t_toks, sid.clone())?;
@@ -682,11 +683,13 @@ impl Qwen3VLGenerateModel {
         let t_toks = f_ids.len();
         let mut a_ids = f_ids.clone();
         let mut curr_s_off = self.get_kv_len();
+
+        // [OPTIMIZATION] 이미 SSD/RAM에서 복구된 오프셋이 프롬프트 길이와 같거나 크면 Prefill 생략
         if t_toks <= curr_s_off {
-            self.qwen3_vl.forward(&Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + t_toks) as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, t_toks, sid.clone())?;
-            curr_s_off += t_toks;
+            println!("[GENERATE] Skipping Prefill (Context already restored to offset {})", curr_s_off);
         } else if t_toks > curr_s_off {
             let prefill_len = t_toks - curr_s_off;
+            println!("[GENERATE] Prefilling remaining {} tokens at offset {}...", prefill_len, curr_s_off);
             self.qwen3_vl.forward(&Tensor::from_vec(f_ids[curr_s_off..].to_vec(), (1, prefill_len), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(curr_s_off as u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, prefill_len, sid.clone())?;
             curr_s_off = t_toks;
             if let Some(s_id) = &sid {
