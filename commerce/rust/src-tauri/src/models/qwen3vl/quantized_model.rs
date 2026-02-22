@@ -1687,8 +1687,15 @@ impl QuantizedQwen3VLTextModel {
                             };
 
                             let expected_d = 128; // Qwen3-2B 기준 차원
+                            let padded_k = bytes_to_f32_padded(ka.data(), expected_d, &o_shape);
+                            
+                            // [DEBUG-KV] 로드된 KV 캐시의 형상 확인
+                            if layer_idx == 0 && *b_idx == 0 {
+                                println!("[DEBUG-KV] Loaded L0 B0 K-Cache: Shape {:?}, Padded to 128 dim.", vec![o_shape[0], o_shape[1], o_shape[2], expected_d]);
+                            }
+
                             let metadata = BitKVMetadata {
-                                k_anchors: Tensor::from_vec(bytes_to_f32_padded(ka.data(), expected_d, &o_shape), (o_shape[0], o_shape[1], o_shape[2], expected_d), &Device::Cpu)?,
+                                k_anchors: Tensor::from_vec(padded_k, (o_shape[0], o_shape[1], o_shape[2], expected_d), &Device::Cpu)?,
                                 k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?,
                                 k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (o_shape[0], o_shape[1], o_shape[2], 1), &Device::Cpu)?,
                                 v_anchors: Tensor::from_vec(bytes_to_f32_padded(va.data(), expected_d, &o_shape), (o_shape[0], o_shape[1], o_shape[2], expected_d), &Device::Cpu)?,
