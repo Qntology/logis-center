@@ -966,26 +966,14 @@ impl Qwen3VLGenerateModel {
         let t_toks = f_ids.len();
         println!("[TIMER] Input Rendering & Tokenization: {:.2}s for {} tokens", start_prep.elapsed().as_secs_f32(), t_toks);
         
+        let mut a_ids = f_ids.clone();
         let s_off = self.get_kv_len();
         let mut curr_s_off = s_off;
 
-        // [FIX] Smart Alignment: Detect if we are appending to a large pre-baked cache (like PUG)
-        let is_appending_to_warm_cache = s_off > 1000 && t_toks < s_off;
-        
-        // [SPECULATIVE-FORCE] 만약 검증 모드(max_tokens=1)라면, 캐시가 있더라도 마지막 시퀀스를 강제로 재계산합니다.
-        let is_speculative_verification = mes.max_tokens.unwrap_or(2048) == 1;
-
-        if is_speculative_verification {
-            println!("[GENERATE] Speculative Verification Mode: Forcing Horizontal Pass for {} tokens.", t_toks);
-            self.qwen3_vl.forward(
-                &Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, 
-                input.pixel_values.as_ref(), input.image_grid_thw.as_ref(), None, None, 
-                Some(&Tensor::arange(0u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 
-                0, t_toks, sid.clone()
-            )?;
-            return self.interpret_all_ssd_sets().await;
-        } else if is_appending_to_warm_cache {
-            println!("[GENERATE] Warm Cache Detected ({} tokens). Appending instructions only.", s_off);
+        // [FIX] Relay 모드 최적화 대응: 입력된 토큰(t_toks)이 기존 캐시(s_off)보다 짧으면
+        // 생략된 프롬프트가 있다고 간주하고(Append Mode) 캐시 뒤에 이어서 연산합니다.
+        if t_toks <= s_off {
+            println!("[GENERATE] Append Mode: Prefilling {} new tokens at offset {}", t_toks, s_off);
             self.qwen3_vl.forward(
                 &Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, 
                 None, None, None, None, 
@@ -993,18 +981,14 @@ impl Qwen3VLGenerateModel {
                 s_off, t_toks, sid.clone()
             )?;
             curr_s_off = s_off + t_toks;
-        } else if t_toks < s_off {
-            println!("[GENERATE] Truncating stale cache: {} -> {}", s_off, t_toks);
-            self.truncate_kv_cache(t_toks)?;
-            curr_s_off = t_toks;
         } else if t_toks > s_off {
             let prefill_len = t_toks - s_off;
-            println!("[GENERATE] Prefilling delta: {} tokens at offset {}", prefill_len, s_off);
+            println!("[GENERATE] Starting Horizontal Prefill for {} tokens...", prefill_len);
             self.qwen3_vl.forward(
                 &Tensor::from_vec(f_ids[s_off..].to_vec(), (1, prefill_len), &self.text_device)?, 
                 None, None, None, None, 
                 Some(&Tensor::arange(s_off as u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 
-                s_off, prefill_len, sid.clone()
+                s_off, prefill_len, sid.clone() // t_toks -> prefill_len 수정
             )?;
             curr_s_off = t_toks;
 
@@ -1014,34 +998,53 @@ impl Qwen3VLGenerateModel {
                     let slot_id = SLOT_MANAGER.acquire_write_slot(t_toks).await;
                     let mut dumps = Vec::new();
                     for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
+                        let k: Tensor = k; let v: Tensor = v;
                         dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v });
                     }
+                    let b_idx = block_offset / 256;
+                    let reg_ref = match &self.qwen3_vl {
+                        ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()),
+                        ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()),
+                        _ => None
+                    };
                     if let Ok(tx) = get_bake_worker().await {
                         let _ = tx.send(SlotTask::Bake(BakeTask { 
-                            slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: block_offset, 
-                            layers: dumps, is_relay_baking: false, block_idx: Some(block_offset / 256),
-                            registry: match &self.qwen3_vl {
-                                ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()),
-                                ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()),
-                                _ => None
-                            }
+                            slot_id, 
+                            task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), 
+                            kv_name: kv_n.clone(), 
+                            offset: block_offset, 
+                            layers: dumps, 
+                            is_relay_baking: false,
+                            block_idx: Some(b_idx),
+                            registry: reg_ref
                         })).await;
                     }
                 }
                 SLOT_MANAGER.wait_for_all_tasks().await;
+
+                // [METADATA-PERSISTENCE] Save registry to file for cross-layer/cross-session reliability
                 let path = crate::utils::paths::get_kv_dir(None).join(s_id);
                 if !path.exists() { let _ = fs::create_dir_all(&path); }
-                let _ = self.qwen3_vl.save_metadata_to_file(&path);
+                
+                if let Err(e) = self.qwen3_vl.save_metadata_to_file(&path) {
+                    println!("[GENERATE] !! Metadata Save Failed: {:?}", e);
+                } else {
+                    // println!("[GENERATE] Metadata persisted to {:?}", path.join("metadata.json"));
+                }
+
                 self.clear_temporal_kv_caches();
             }
-        } else {
-            curr_s_off = s_off;
         }
         
-        let mut a_ids = f_ids.clone();
+        let mut curr_s_off = t_toks;
         let (mut p_vals, i_grid, mut g_text) = (input.pixel_values.take(), input.image_grid_thw.take(), String::new());
+        let mut tokens_since_last_bake = 0;
+
         let max_gen_tokens = mes.max_tokens.unwrap_or(2048) as usize;
+        let chunk_size = 8; // 한 번에 예측/검증할 토큰 수
+
         let mut gen_count = 0;
+        let chunk_size = 1; // [STABILITY] 1개씩 확실하게 생성
 
         while gen_count < max_gen_tokens {
             if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
@@ -1230,30 +1233,6 @@ impl Qwen3VLGenerateModel {
     pub fn drop_kv_storage(&mut self) -> Result<()> { self.qwen3_vl.drop_kv_storage() }
     pub fn clear_kv_cache(&mut self) { self.clear_temporal_kv_caches(); }
     pub fn truncate_kv_cache(&mut self, l: usize) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.truncate_kv_cache(l), ModelVariant::QuantizedText(m) => m.truncate_kv_cache(l), _ => Ok(()) } }
-
-    /// [NEW] [SSD-SET-INTERPRET] 사용자 제안: 레이어 인덱스 세트를 매칭하여 최종 결과 병합
-    pub async fn interpret_all_ssd_sets(&mut self) -> Result<String> {
-        let (tokens, _lm_head_device) = match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => (m.language_model.match_layer_indices_and_decode(&m.lm_head)?, m.lm_head.device().clone()),
-            ModelVariant::QuantizedText(m) => {
-                if let Some(head) = &m.lm_head {
-                    (m.language_model.match_layer_indices_and_decode(head)?, head.device().clone())
-                } else {
-                    return Err(anyhow!("LM Head missing in QuantizedText model"));
-                }
-            },
-            _ => return Err(anyhow!("SSD Interpretation not supported for this model variant")),
-        };
-
-        if tokens.is_empty() { return Ok(String::new()); }
-
-        let final_text = self.tokenizer.token_decode(tokens)?;
-        
-        // [CLEAN-OUTPUT] 사용자 요청: 해석 결과를 깔끔하게 출력
-        println!("\n{}", final_text);
-        Ok(final_text)
-    }
-
     pub fn load_kv_from_disk(&mut self, p: &Path, n: Option<&str>) -> Result<()> { 
         let _ = self.qwen3_vl.load_metadata_from_file(p);
         

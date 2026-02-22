@@ -1534,7 +1534,6 @@ impl QuantizedQwen3VLTextModel {
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         mut results: Vec<Tensor>,
     ) -> Result<Vec<Tensor>> {
@@ -1550,18 +1549,9 @@ impl QuantizedQwen3VLTextModel {
         let xs_chunk = xs.narrow(1, i, take)?;
         let cos_chunk = cos.narrow(1, i, take)?;
         let sin_chunk = sin.narrow(1, i, take)?;
-        
-        // [FIX] Slice attention mask for the current chunk if it exists
-        let mask_chunk = if let Some(mask) = attention_mask {
-            // Mask shape is typically (b, q_len, total_kv_len) or (1, q_len, total_kv_len)
-            // We need to narrow it along the q_len dimension (dimension 1)
-            Some(mask.narrow(1, i, take)?)
-        } else {
-            None
-        };
 
         let out_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, mask_chunk.as_ref(), seqlen_offset + i)
+            self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)
         }));
 
         match out_res {
@@ -1574,7 +1564,6 @@ impl QuantizedQwen3VLTextModel {
                     xs,
                     cos,
                     sin,
-                    attention_mask,
                     seqlen_offset,
                     results,
                 )
@@ -1597,15 +1586,11 @@ impl QuantizedQwen3VLTextModel {
         mut xs: Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
         // [PROGRESS-LOG] Concise real-time layer tracking
         if layer_idx == 0 { print!("\n[Layers] "); }
         print!("{}.", layer_idx);
-        if layer_idx == self.layers.len() - 1 {
-            print!(" // 추론하지 않음");
-        }
         use std::io::Write;
         let _ = std::io::stdout().flush();
 
@@ -1733,7 +1718,6 @@ impl QuantizedQwen3VLTextModel {
             &xs,
             cos,
             sin,
-            attention_mask,
             seqlen_offset,
             Vec::new(),
         )?;
@@ -2116,7 +2100,6 @@ impl QuantizedQwen3VLTextModel {
         xs: Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         start_layer: usize,
     ) -> Result<Tensor> {
@@ -2133,7 +2116,6 @@ impl QuantizedQwen3VLTextModel {
                 xs,
                 cos,
                 sin,
-                attention_mask,
                 seqlen_offset,
                 start_layer,
             );
@@ -2145,7 +2127,6 @@ impl QuantizedQwen3VLTextModel {
             xs,
             cos,
             sin,
-            attention_mask,
             seqlen_offset,
         )?;
 
@@ -2156,7 +2137,6 @@ impl QuantizedQwen3VLTextModel {
             next_xs,
             cos,
             sin,
-            attention_mask,
             seqlen_offset,
             start_layer,
         )
@@ -2243,7 +2223,6 @@ impl QuantizedQwen3VLTextModel {
             xs,
             &cos,
             &sin,
-            _attention_mask.as_ref(),
             seqlen_offset,
             start_layer
         )?;
@@ -2296,32 +2275,6 @@ impl QuantizedQwen3VLTextModel {
         self.current_kv_len = 0;
         println!("[MEMORY] Registry Reset Complete.");
         Ok(())
-    }
-
-    /// [NEW] [SSD-LAYER-MERGE] 레이어 인덱스 세트를 매칭하여 최종 텍스트 해석
-    pub fn match_layer_indices_and_decode(&mut self, lm_head: &QLinear) -> Result<Vec<u32>> {
-        let mut tokens = Vec::new();
-        let reg = self.registry.entries.read().unwrap();
-        let target_dtype = if lm_head.device().is_cuda() { DType::BF16 } else { DType::F32 };
-        
-        println!("\n[MERGE] Interpreting {} SSD sets.", reg.len());
-        
-        for entry in reg.iter() {
-            if let Some(path) = &entry.hidden_states_path[self.layers.len() - 1] { 
-                if path.exists() {
-                    let recovered = crate::utils::tensor_utils::load_tensor(path, "hidden_states", lm_head.device())?;
-                    let hidden = recovered.to_dtype(target_dtype)?;
-                    
-                    // [BATCH-DECODE] 청크 내의 모든 토큰에 대해 로짓 계산 및 Argmax 수행
-                    let logits = lm_head.forward(&hidden)?; // (1, seq_len, vocab_size)
-                    let logits = logits.squeeze(0)?; // (seq_len, vocab_size)
-                    let token_ids = logits.argmax(D::Minus1)?.to_vec1::<u32>()?;
-                    
-                    tokens.extend(token_ids);
-                }
-            }
-        }
-        Ok(tokens)
     }
 
     pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> {
@@ -3119,11 +3072,6 @@ impl QuantizedQwen3TextModel {
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize, target_idx: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, target_idx) }
-
-    /// [NEW] [SSD-LAYER-MERGE] 레이어 인덱스 세트를 매칭하여 최종 텍스트 해석
-    pub fn match_layer_indices_and_decode(&mut self, lm_head: &QLinear) -> Result<Vec<u32>> {
-        self.language_model.match_layer_indices_and_decode(lm_head)
-    }
 }
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
