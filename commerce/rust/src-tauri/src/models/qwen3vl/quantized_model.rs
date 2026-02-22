@@ -1534,6 +1534,7 @@ impl QuantizedQwen3VLTextModel {
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         mut results: Vec<Tensor>,
     ) -> Result<Vec<Tensor>> {
@@ -1549,9 +1550,18 @@ impl QuantizedQwen3VLTextModel {
         let xs_chunk = xs.narrow(1, i, take)?;
         let cos_chunk = cos.narrow(1, i, take)?;
         let sin_chunk = sin.narrow(1, i, take)?;
+        
+        // [FIX] Slice attention mask for the current chunk if it exists
+        let mask_chunk = if let Some(mask) = attention_mask {
+            // Mask shape is typically (b, q_len, total_kv_len) or (1, q_len, total_kv_len)
+            // We need to narrow it along the q_len dimension (dimension 1)
+            Some(mask.narrow(1, i, take)?)
+        } else {
+            None
+        };
 
         let out_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)
+            self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, mask_chunk.as_ref(), seqlen_offset + i)
         }));
 
         match out_res {
@@ -1564,6 +1574,7 @@ impl QuantizedQwen3VLTextModel {
                     xs,
                     cos,
                     sin,
+                    attention_mask,
                     seqlen_offset,
                     results,
                 )
@@ -1586,11 +1597,15 @@ impl QuantizedQwen3VLTextModel {
         mut xs: Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
         // [PROGRESS-LOG] Concise real-time layer tracking
         if layer_idx == 0 { print!("\n[Layers] "); }
         print!("{}.", layer_idx);
+        if layer_idx == self.layers.len() - 1 {
+            print!(" // 추론하지 않음");
+        }
         use std::io::Write;
         let _ = std::io::stdout().flush();
 
@@ -1718,6 +1733,7 @@ impl QuantizedQwen3VLTextModel {
             &xs,
             cos,
             sin,
+            attention_mask,
             seqlen_offset,
             Vec::new(),
         )?;
@@ -2100,6 +2116,7 @@ impl QuantizedQwen3VLTextModel {
         xs: Tensor,
         cos: &Tensor,
         sin: &Tensor,
+        attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         start_layer: usize,
     ) -> Result<Tensor> {
@@ -2116,6 +2133,7 @@ impl QuantizedQwen3VLTextModel {
                 xs,
                 cos,
                 sin,
+                attention_mask,
                 seqlen_offset,
                 start_layer,
             );
@@ -2127,6 +2145,7 @@ impl QuantizedQwen3VLTextModel {
             xs,
             cos,
             sin,
+            attention_mask,
             seqlen_offset,
         )?;
 
@@ -2137,6 +2156,7 @@ impl QuantizedQwen3VLTextModel {
             next_xs,
             cos,
             sin,
+            attention_mask,
             seqlen_offset,
             start_layer,
         )
@@ -2223,6 +2243,7 @@ impl QuantizedQwen3VLTextModel {
             xs,
             &cos,
             &sin,
+            _attention_mask.as_ref(),
             seqlen_offset,
             start_layer
         )?;
@@ -2283,17 +2304,20 @@ impl QuantizedQwen3VLTextModel {
         let reg = self.registry.entries.read().unwrap();
         let target_dtype = if lm_head.device().is_cuda() { DType::BF16 } else { DType::F32 };
         
-        println!("[MERGE] Interpreting {} SSD sets.", reg.len());
+        println!("\n[MERGE] Interpreting {} SSD sets.", reg.len());
         
         for entry in reg.iter() {
             if let Some(path) = &entry.hidden_states_path[self.layers.len() - 1] { 
                 if path.exists() {
                     let recovered = crate::utils::tensor_utils::load_tensor(path, "hidden_states", lm_head.device())?;
                     let hidden = recovered.to_dtype(target_dtype)?;
-                    let logits = lm_head.forward(&hidden)?;
-                    let last_logits = logits.squeeze(0)?.get(logits.dim(1)? - 1)?;
-                    let token_id = last_logits.argmax(0)?.to_scalar::<u32>()?;
-                    tokens.push(token_id);
+                    
+                    // [BATCH-DECODE] 청크 내의 모든 토큰에 대해 로짓 계산 및 Argmax 수행
+                    let logits = lm_head.forward(&hidden)?; // (1, seq_len, vocab_size)
+                    let logits = logits.squeeze(0)?; // (seq_len, vocab_size)
+                    let token_ids = logits.argmax(D::Minus1)?.to_vec1::<u32>()?;
+                    
+                    tokens.extend(token_ids);
                 }
             }
         }

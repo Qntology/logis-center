@@ -971,11 +971,21 @@ impl Qwen3VLGenerateModel {
 
         // [FIX] Smart Alignment: Detect if we are appending to a large pre-baked cache (like PUG)
         let is_appending_to_warm_cache = s_off > 1000 && t_toks < s_off;
+        
+        // [SPECULATIVE-FORCE] 만약 검증 모드(max_tokens=1)라면, 캐시가 있더라도 마지막 시퀀스를 강제로 재계산합니다.
+        let is_speculative_verification = mes.max_tokens.unwrap_or(2048) == 1;
 
-        if is_appending_to_warm_cache {
+        if is_speculative_verification {
+            println!("[GENERATE] Speculative Verification Mode: Forcing Horizontal Pass for {} tokens.", t_toks);
+            self.qwen3_vl.forward(
+                &Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, 
+                input.pixel_values.as_ref(), input.image_grid_thw.as_ref(), None, None, 
+                Some(&Tensor::arange(0u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 
+                0, t_toks, sid.clone()
+            )?;
+            return self.interpret_all_ssd_sets().await;
+        } else if is_appending_to_warm_cache {
             println!("[GENERATE] Warm Cache Detected ({} tokens). Appending instructions only.", s_off);
-            // In this mode, we assume f_ids already contains the instruction we want to append.
-            // We just need to ensure we don't truncate the PUG.
             self.qwen3_vl.forward(
                 &Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, 
                 None, None, None, None, 
@@ -1004,64 +1014,34 @@ impl Qwen3VLGenerateModel {
                     let slot_id = SLOT_MANAGER.acquire_write_slot(t_toks).await;
                     let mut dumps = Vec::new();
                     for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                        let k: Tensor = k; let v: Tensor = v;
                         dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v });
                     }
-                    let b_idx = block_offset / 256;
-                    let reg_ref = match &self.qwen3_vl {
-                        ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()),
-                        ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()),
-                        _ => None
-                    };
                     if let Ok(tx) = get_bake_worker().await {
                         let _ = tx.send(SlotTask::Bake(BakeTask { 
-                            slot_id, 
-                            task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), 
-                            kv_name: kv_n.clone(), 
-                            offset: block_offset, 
-                            layers: dumps, 
-                            is_relay_baking: false,
-                            block_idx: Some(b_idx),
-                            registry: reg_ref
+                            slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: block_offset, 
+                            layers: dumps, is_relay_baking: false, block_idx: Some(block_offset / 256),
+                            registry: match &self.qwen3_vl {
+                                ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()),
+                                ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()),
+                                _ => None
+                            }
                         })).await;
                     }
                 }
                 SLOT_MANAGER.wait_for_all_tasks().await;
-
-                // [METADATA-PERSISTENCE] Save registry to file for cross-layer/cross-session reliability
                 let path = crate::utils::paths::get_kv_dir(None).join(s_id);
                 if !path.exists() { let _ = fs::create_dir_all(&path); }
-                
-                if let Err(e) = self.qwen3_vl.save_metadata_to_file(&path) {
-                    println!("[GENERATE] !! Metadata Save Failed: {:?}", e);
-                } else {
-                    // println!("[GENERATE] Metadata persisted to {:?}", path.join("metadata.json"));
-                }
-
+                let _ = self.qwen3_vl.save_metadata_to_file(&path);
                 self.clear_temporal_kv_caches();
             }
         } else {
-            // [OPTIMIZATION] t_toks == s_off: Prompt is perfectly cached.
             curr_s_off = s_off;
         }
         
         let mut a_ids = f_ids.clone();
-        // curr_s_off is already set correctly by the if/else block above.
         let (mut p_vals, i_grid, mut g_text) = (input.pixel_values.take(), input.image_grid_thw.take(), String::new());
-        let mut tokens_since_last_bake = 0;
-
         let max_gen_tokens = mes.max_tokens.unwrap_or(2048) as usize;
-        let chunk_size = 8; // 한 번에 예측/검증할 토큰 수
-
-        // [SSD-SET-MERGE-TRIGGER]
-        // If max_tokens is 1, it implies we are in a speculative verification pass.
-        // After prefilling the draft tokens, we interpret the resulting SSD set.
-        if max_gen_tokens == 1 {
-            return self.interpret_all_ssd_sets().await;
-        }
-
         let mut gen_count = 0;
-        let chunk_size = 1; // [STABILITY] 1개씩 확실하게 생성
 
         while gen_count < max_gen_tokens {
             if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
@@ -1253,7 +1233,7 @@ impl Qwen3VLGenerateModel {
 
     /// [NEW] [SSD-SET-INTERPRET] 사용자 제안: 레이어 인덱스 세트를 매칭하여 최종 결과 병합
     pub async fn interpret_all_ssd_sets(&mut self) -> Result<String> {
-        let (tokens, lm_head_device) = match &mut self.qwen3_vl {
+        let (tokens, _lm_head_device) = match &mut self.qwen3_vl {
             ModelVariant::QuantizedVL(m) => (m.language_model.match_layer_indices_and_decode(&m.lm_head)?, m.lm_head.device().clone()),
             ModelVariant::QuantizedText(m) => {
                 if let Some(head) = &m.lm_head {
@@ -1268,7 +1248,9 @@ impl Qwen3VLGenerateModel {
         if tokens.is_empty() { return Ok(String::new()); }
 
         let final_text = self.tokenizer.token_decode(tokens)?;
-        println!("[INTERPRET] Merged Result: {}", final_text);
+        
+        // [CLEAN-OUTPUT] 사용자 요청: 해석 결과를 깔끔하게 출력
+        println!("\n{}", final_text);
         Ok(final_text)
     }
 
