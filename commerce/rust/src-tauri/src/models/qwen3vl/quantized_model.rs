@@ -55,15 +55,28 @@ impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let target_dtype = self.weight.dtype();
         
-        // if x.device().is_cpu() && (x.dtype() == DType::BF16 || target_dtype == DType::BF16) {
-        //     println!("[TRACE-NORM-VIOLATION] CPU Norm with BF16! x: {:?}, weight: {:?}", x.dtype(), target_dtype);
-        // }
+        println!("[RMS-DEBUG] Input x: {:?}, Weight: {:?}", x.shape(), self.weight.shape());
 
         let x = x.to_dtype(DType::F32)?;
-        let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-        let hidden_states = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        let x_sqr = x.sqr()?;
+        println!("[RMS-DEBUG] x_sqr: {:?}", x_sqr.shape());
+        
+        let variance = x_sqr.mean_keepdim(candle_core::D::Minus1)?;
+        println!("[RMS-DEBUG] variance: {:?}", variance.shape());
+        
+        let inv_std = (variance + self.eps)?.sqrt()?;
+        println!("[RMS-DEBUG] inv_std: {:?}", inv_std.shape());
+        
+        let hidden_states = x.broadcast_div(&inv_std)?;
+        println!("[RMS-DEBUG] hidden_states (div): {:?}", hidden_states.shape());
+        
         let hidden_states = hidden_states.to_dtype(target_dtype)?;
-        hidden_states.broadcast_mul(&self.weight)
+        let res = hidden_states.broadcast_mul(&self.weight);
+        
+        if res.is_err() {
+             println!("[RMS-ERROR] broadcast_mul failed. hidden: {:?}, weight: {:?}", hidden_states.shape(), self.weight.shape());
+        }
+        res
     }
 }
 
@@ -2200,6 +2213,10 @@ impl QuantizedQwen3VLTextModel {
         if !xs.device().same_device(norm_dev) {
             xs = xs.to_device(norm_dev)?;
         }
+        
+        // [DEBUG-SHAPE]
+        println!("[DEBUG-NORM] xs shape: {:?}, norm weight shape: {:?}", xs.shape(), self.norm.weight().shape());
+        
         let xs = xs.apply(&self.norm)?;
 
         Ok(xs)
@@ -2902,6 +2919,10 @@ impl QuantizedQwen3VLModel {
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
         let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };
         let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state };
+        
+        // [DEBUG-SHAPE]
+        println!("[DEBUG-HEAD] hidden_state shape: {:?}", hidden_state.shape());
+
         Ok(self.lm_head.forward(&hidden_state)?)
     }
 
