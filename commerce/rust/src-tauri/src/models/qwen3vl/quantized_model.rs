@@ -1669,8 +1669,9 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
-        // [SAFE-PURGE] Baking 모드(0.6B)일 때는 데이터를 지우지 않고 유지하여 Baker가 안전하게 저장하게 합니다.
-        // Large 모델(baking_only=false)일 때만 즉시 RAM을 비웁니다.
+        // [SAFE-PURGE-LOGIC] 
+        // 1. Baking 모드(0.6B): 데이터를 절대 지우지 않고 'VRAM' 또는 'RAM' 상태로 유지하여 Baker가 찾을 수 있게 함
+        // 2. Inference 모드(2B): 연산 직후 즉시 비워서 VRAM/RAM 리소스를 OS에 반납
         if !self.baking_only {
             for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
                 let mut inner_w = block.inner.write().unwrap();
@@ -1691,7 +1692,16 @@ impl QuantizedQwen3VLTextModel {
             }
             println!("[BURST] << [DONE] Layer {} complete (RAM Purged Safely).", layer_idx);
         } else {
-            println!("[BURST] << [DONE] Layer {} complete (Data Preserved for Baking).", layer_idx);
+            // [IMPORTANT] Baking 모드에서는 각 블록을 'Dirty' 상태로 명시하여 Baker가 인식하게 합니다.
+            let mut reg_w = self.registry.entries.write().unwrap();
+            for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
+                let inner = block.inner.read().unwrap();
+                let b_idx = inner.index;
+                if b_idx < reg_w.len() {
+                    reg_w[b_idx].is_dirty = true;
+                }
+            }
+            println!("[BURST] << [DONE] Layer {} complete (Data Ready for Baking).", layer_idx);
         }
         
         Ok(result_xs)

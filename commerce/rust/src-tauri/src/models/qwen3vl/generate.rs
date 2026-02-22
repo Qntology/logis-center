@@ -909,9 +909,31 @@ impl Qwen3VLGenerateModel {
             
             // [METADATA-PERSISTENCE] Save registry to file for cross-layer/cross-session reliability
             let path = crate::utils::paths::get_kv_dir(None).join(s_id);
-            // [FIX] Ensure the directory exists before saving metadata
-            if !path.exists() { let _ = std::fs::create_dir_all(&path); }
+            if !path.exists() { let _ = fs::create_dir_all(&path); }
             
+            // [SMART-INDEXING] 사용자 제안: 파편화된 파일들을 한 번에 참조할 수 있는 인덱스 파일 생성
+            let mut index_map = HashMap::new();
+            {
+                let reg = match &self.qwen3_vl {
+                    ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()),
+                    ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()),
+                    _ => None
+                };
+                if let Some(registry) = reg {
+                    let entries = registry.entries.read().unwrap();
+                    for entry in entries.iter() {
+                        if let Some(ssd_p) = &entry.ssd_path {
+                            index_map.insert(entry.token_start, ssd_p.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+            if !index_map.is_empty() {
+                let index_json = serde_json::to_string_pretty(&index_map).unwrap_or_default();
+                let _ = fs::write(path.join("index.json"), index_json);
+                println!("[BAKING] Smart Index created with {} block references.", index_map.len());
+            }
+
             if let Err(e) = self.qwen3_vl.save_metadata_to_file(&path) {
                 println!("[BAKING] !! Metadata Save Failed: {:?}", e);
             } else {
