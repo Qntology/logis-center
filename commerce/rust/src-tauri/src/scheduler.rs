@@ -647,9 +647,17 @@ async fn process_task(
                 ..Default::default()
             };
 
+                                    let mut small_guard = model.small_hibernation.lock().await;
                                     if let Some(gen) = model.generator.lock().await.as_mut() {
                                         println!("[Scheduler] 2B Step A: Requesting final classification...");
-                                        let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
+                                        
+                                        // [TYPE-FIX]
+                                        let size_guard = model.current_size.lock().await;
+                                        let is_large = *size_guard == Some(crate::model::ModelSize::Large);
+                                        drop(size_guard); // Release early to avoid deadlocks
+                                        
+                                        let relay = if is_large { small_guard.as_mut() } else { None };
+                                        let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone(), relay).await?;
                                         println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);                                                        
                             // [DEBUG] AI 응답 저장
                             let _ = data_manager.offload(&res, "step_a_res");
@@ -741,9 +749,11 @@ async fn process_task(
                 ..Default::default()
             };
 
+            let mut small_guard = model.small_hibernation.lock().await;
             if let Some(gen) = model.generator.lock().await.as_mut() {
                 println!("[Scheduler] 2B Step B: Asking selector question...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()), kv_name.clone()).await?;
+                let relay = if model.current_size.lock().await.as_ref() == Some(&crate::model::ModelSize::Large) { small_guard.as_mut() } else { None };
+                let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()), kv_name.clone(), relay).await?;
                 println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
 
                 // [DEBUG] AI 응답 저장
@@ -894,11 +904,13 @@ async fn process_task(
                 };
 
                 // 3. 2B Instant Inference
+                let mut small_guard = model.small_hibernation.lock().await;
                 if let Some(gen) = model.generator.lock().await.as_mut() {
                     println!("[Scheduler] 2B Step C: Asking extraction question...");
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running 2B Inference..." }));
                     
-                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()), kv_name.clone()).await?;
+                    let relay = if model.current_size.lock().await.as_ref() == Some(&crate::model::ModelSize::Large) { small_guard.as_mut() } else { None };
+                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()), kv_name.clone(), relay).await?;
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
 
                     // [DEBUG] AI 응답 저장

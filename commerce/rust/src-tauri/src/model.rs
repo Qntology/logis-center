@@ -153,7 +153,7 @@ pub struct LogisModel {
     device_config: utils::DeviceConfig,
     max_tokens_limit: u32,
     dtype: Option<DType>, 
-    current_size: Arc<TokioMutex<Option<ModelSize>>>,
+    pub current_size: Arc<TokioMutex<Option<ModelSize>>>,
 }
 
 impl LogisModel {
@@ -887,7 +887,13 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            let response = gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))?;
+            let mut small_guard = self.small_hibernation.lock().await;
+            let mut gen_guard = self.generator.lock().await;
+            let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
+            let is_large = self.current_size.lock().await.as_ref() == Some(&ModelSize::Large);
+            let relay = if is_large { small_guard.as_mut() } else { None };
+
+            let response = gen.generate(params, cancel_token, session_id, kv_name, relay).await.map_err(|e| anyhow!("Inference failed: {}", e))?;
             println!("[MODEL-CHAT] Raw Response: {}", response);
             Ok(response)
         }
@@ -970,9 +976,15 @@ impl LogisModel {
             crate::scheduler::log_task_progress(app_handle, task_id, &base_payload);
         }
 
+        // [HYBRID-SPECULATIVE] 2B 모델 실행 시 0.6B 모델(Small)을 릴레이로 사용
+        let mut small_guard = self.small_hibernation.lock().await;
         let mut gen_guard = self.generator.lock().await;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        
+        let is_large = self.current_size.lock().await.as_ref() == Some(&ModelSize::Large);
+        let relay = if is_large { small_guard.as_mut() } else { None };
+
+        gen.generate(params, cancel_token, session_id, kv_name, relay).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn chat_with_image_spinner(
@@ -1029,12 +1041,19 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        let mut small_guard = self.small_hibernation.lock().await;
+        let mut gen_guard = self.generator.lock().await;
+        let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
+        let is_large = self.current_size.lock().await.as_ref() == Some(&ModelSize::Large);
+        let relay = if is_large { small_guard.as_mut() } else { None };
+
+        gen.generate(params, cancel_token, session_id, kv_name, relay).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
         self.ensure_generator(ModelSize::Large).await?;
         
+        let mut small_guard = self.small_hibernation.lock().await;
         let mut gen_guard = self.generator.lock().await;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
         
@@ -1071,7 +1090,10 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        let is_large = self.current_size.lock().await.as_ref() == Some(&ModelSize::Large);
+        let relay = if is_large { small_guard.as_mut() } else { None };
+
+        gen.generate(params, cancel_token, session_id, kv_name, relay).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn run_inference_with_spinner(
@@ -1102,6 +1124,7 @@ impl LogisModel {
 
         let max_tok = self.max_tokens_limit;
         
+        let mut small_guard = self.small_hibernation.lock().await;
         let mut gen_guard = self.generator.lock().await;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
         
@@ -1137,7 +1160,10 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        let is_large = self.current_size.lock().await.as_ref() == Some(&ModelSize::Large);
+        let relay = if is_large { small_guard.as_mut() } else { None };
+
+        gen.generate(params, cancel_token, session_id, kv_name, relay).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn process_image_full(&self, image_path: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<Value> {

@@ -952,7 +952,7 @@ impl Qwen3VLGenerateModel {
         Ok(t_toks)
     }
 
-    pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel: Option<Arc<AtomicBool>>, sid: Option<String>, kv_n: Option<String>) -> Result<String> {
+    pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel: Option<Arc<AtomicBool>>, sid: Option<String>, kv_n: Option<String>, mut relay: Option<&mut Qwen3VLGenerateModel>) -> Result<String> {
         let start_prep = std::time::Instant::now();
         if sid.is_none() { SLOT_MANAGER.reset_all_slots().await; }
         
@@ -988,7 +988,7 @@ impl Qwen3VLGenerateModel {
                 &Tensor::from_vec(f_ids[s_off..].to_vec(), (1, prefill_len), &self.text_device)?, 
                 None, None, None, None, 
                 Some(&Tensor::arange(s_off as u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 
-                s_off, prefill_len, sid.clone() // t_toks -> prefill_len 수정
+                s_off, prefill_len, sid.clone()
             )?;
             curr_s_off = t_toks;
 
@@ -1022,38 +1022,53 @@ impl Qwen3VLGenerateModel {
                 }
                 SLOT_MANAGER.wait_for_all_tasks().await;
 
-                // [METADATA-PERSISTENCE] Save registry to file for cross-layer/cross-session reliability
                 let path = crate::utils::paths::get_kv_dir(None).join(s_id);
                 if !path.exists() { let _ = fs::create_dir_all(&path); }
-                
-                if let Err(e) = self.qwen3_vl.save_metadata_to_file(&path) {
-                    println!("[GENERATE] !! Metadata Save Failed: {:?}", e);
-                } else {
-                    // println!("[GENERATE] Metadata persisted to {:?}", path.join("metadata.json"));
-                }
-
+                let _ = self.qwen3_vl.save_metadata_to_file(&path);
                 self.clear_temporal_kv_caches();
             }
         }
         
         let mut curr_s_off = t_toks;
         let (mut p_vals, i_grid, mut g_text) = (input.pixel_values.take(), input.image_grid_thw.take(), String::new());
-        let mut tokens_since_last_bake = 0;
 
         let max_gen_tokens = mes.max_tokens.unwrap_or(2048) as usize;
-        let chunk_size = 8; // 한 번에 예측/검증할 토큰 수
-
         let mut gen_count = 0;
-        let chunk_size = 1; // [STABILITY] 1개씩 확실하게 생성
+        
+        // [HYBRID-SPECULATIVE-CONFIG]
+        // 0.6B Draft 모델이 있을 경우 한 번의 2B Rotation에 여러 토큰을 검증합니다.
+        let spec_window = if relay.is_some() { 6 } else { 1 }; 
 
         while gen_count < max_gen_tokens {
             if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
 
-            // [STEP 1] Prepare Input (Use last token)
-            let last_token = *a_ids.last().unwrap_or(&0);
-            let input_tokens = vec![last_token];
+            let mut draft_ids = Vec::new();
+            let mut input_tokens = Vec::new();
+            
+            // [STEP 1] 0.6B Draft Generation (Fast)
+            if let Some(ref mut r) = relay {
+                let mut temp_ids = a_ids.clone();
+                let mut temp_off = curr_s_off;
+                for _ in 0..spec_window {
+                    let last_id = *temp_ids.last().unwrap_or(&0);
+                    let logits = r.qwen3_vl.forward(
+                        &Tensor::from_vec(vec![last_id], (1, 1), &r.text_device)?,
+                        None, None, None, None,
+                        Some(&Tensor::arange(temp_off as u32, (temp_off + 1) as u32, &r.text_device)?.unsqueeze(0)?),
+                        temp_off, 1, sid.clone()
+                    )?;
+                    let next_id = l_proc.sample(&logits.flatten_all()?)?;
+                    draft_ids.push(next_id);
+                    temp_ids.push(next_id);
+                    temp_off += 1;
+                }
+            }
 
-            // [STEP 2] Forward Pass
+            // [STEP 2] 2B Batch Verification (One Rotation)
+            // 검증할 토큰들: [마지막 확정 토큰] + [Draft 토큰들]
+            input_tokens.push(*a_ids.last().unwrap_or(&0));
+            input_tokens.extend(&draft_ids);
+
             let logits = self.qwen3_vl.forward(
                 &Tensor::from_vec(input_tokens.clone(), (1, input_tokens.len()), &self.text_device)?, 
                 p_vals.as_ref(), i_grid.as_ref(), None, None, 
@@ -1061,39 +1076,44 @@ impl Qwen3VLGenerateModel {
                 curr_s_off, input_tokens.len(), sid.clone()
             )?;
 
-            // [STEP 3] Sampling
-            let last_logits = logits.flatten_all()?; // [FIX] Ensure Rank 1 vocab vector for sampling
-            let l_vec = apply_repeat_penalty(&last_logits.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
+            // [STEP 3] Matching & Acceptance
+            let mut accepted_this_round = 0;
             
-            // [DEBUG] 로그잇 유효성 검사
-            if let Ok(max_v) = l_vec.max(0)?.to_scalar::<f32>() {
-                if max_v == 0.0 { println!("[HYBRID] !! [ERROR] Logits are all zero. Math/Device sync error suspected."); }
+            // Forward 결과 로짓은 각 입력 토큰의 '다음' 토큰을 예측합니다.
+            // i번째 입력 토큰에 대한 로짓은 i번째 위치에 있습니다.
+            for i in 0..input_tokens.len() {
+                let target_logits = logits.narrow(1, i, 1)?.flatten_all()?;
+                let l_vec = apply_repeat_penalty(&target_logits.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
+                let accepted_id = l_proc.sample(&l_vec)?;
+
+                if i < draft_ids.len() && accepted_id == draft_ids[i] {
+                    // Draft 일치: 토큰 확정 및 계속 진행
+                    let token_text = self.tokenizer.token_decode(vec![accepted_id])?;
+                    print!("{}", token_text);
+                    g_text.push_str(&token_text);
+                    a_ids.push(accepted_id);
+                    accepted_this_round += 1;
+                } else {
+                    // Draft 불일치 또는 마지막 토큰: 2B가 판단한 올바른 토큰을 넣고 종료
+                    let token_text = self.tokenizer.token_decode(vec![accepted_id])?;
+                    print!("{}", token_text);
+                    g_text.push_str(&token_text);
+                    a_ids.push(accepted_id);
+                    accepted_this_round += 1;
+                    break; 
+                }
             }
 
-            let next_id = l_proc.sample(&l_vec)?;
-            
-            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
-                println!("[HYBRID] EOS detected.");
-                break; 
-            }
-
-            let token_text = self.tokenizer.token_decode(vec![next_id])?;
-            print!("{}", token_text); // 실시간 출력
+            curr_s_off += accepted_this_round;
+            gen_count += accepted_this_round; 
+            p_vals = None;
             use std::io::Write;
             let _ = std::io::stdout().flush();
 
-            a_ids.push(next_id);
-            g_text.push_str(&token_text);
-            
-            curr_s_off += 1;
-            gen_count += 1; 
-            p_vals = None;
-
-            // SSD Baker 처리 등 기존 로직 유지
+            // SSD Baker 처리 로직 유지
             if let Some(s_id) = &sid {
                 let pending_blocks = self.get_blocks_by_location(KVLocation::SSD_PENDING)?;
                 for (ks, vs, block_offset, block_idx) in pending_blocks {
-                    println!("[GENERATE] >> [REQUEST] Sending Block {} to SSD Baker (Offset: {})", block_idx, block_offset);
                     let slot_id = SLOT_MANAGER.acquire_write_slot(curr_s_off).await;
                     let mut dumps = Vec::new();
                     for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
@@ -1118,6 +1138,7 @@ impl Qwen3VLGenerateModel {
         }
         Ok(g_text)
     }
+
 
     pub fn clear_temporal_kv_caches(&mut self) {
         let reg_obj = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
