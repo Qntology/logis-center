@@ -1789,6 +1789,11 @@ impl QuantizedQwen3VLTextModel {
                     if layer_idx < cache_w.len() {
                         cache_w[layer_idx] = None;
                     }
+                    // [FIX] Registry sync: Mark as SSD so it reloads next time
+                    if layer_idx < entry.location.len() {
+                        entry.location[layer_idx] = KVLocation::SSD;
+                        entry.slot_ids[layer_idx] = None;
+                    }
                 }
             }
             println!("[BURST] << [DONE] Layer {} complete (RAM Purged Safely).", layer_idx);
