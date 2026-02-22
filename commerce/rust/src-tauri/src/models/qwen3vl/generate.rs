@@ -1053,6 +1053,13 @@ impl Qwen3VLGenerateModel {
         let max_gen_tokens = mes.max_tokens.unwrap_or(2048) as usize;
         let chunk_size = 8; // 한 번에 예측/검증할 토큰 수
 
+        // [SSD-SET-MERGE-TRIGGER]
+        // If max_tokens is 1, it implies we are in a speculative verification pass.
+        // After prefilling the draft tokens, we interpret the resulting SSD set.
+        if max_gen_tokens == 1 {
+            return self.interpret_all_ssd_sets().await;
+        }
+
         let mut gen_count = 0;
         let chunk_size = 1; // [STABILITY] 1개씩 확실하게 생성
 
@@ -1243,6 +1250,28 @@ impl Qwen3VLGenerateModel {
     pub fn drop_kv_storage(&mut self) -> Result<()> { self.qwen3_vl.drop_kv_storage() }
     pub fn clear_kv_cache(&mut self) { self.clear_temporal_kv_caches(); }
     pub fn truncate_kv_cache(&mut self, l: usize) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.truncate_kv_cache(l), ModelVariant::QuantizedText(m) => m.truncate_kv_cache(l), _ => Ok(()) } }
+
+    /// [NEW] [SSD-SET-INTERPRET] 사용자 제안: 레이어 인덱스 세트를 매칭하여 최종 결과 병합
+    pub async fn interpret_all_ssd_sets(&mut self) -> Result<String> {
+        let (tokens, lm_head_device) = match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => (m.language_model.match_layer_indices_and_decode(&m.lm_head)?, m.lm_head.device().clone()),
+            ModelVariant::QuantizedText(m) => {
+                if let Some(head) = &m.lm_head {
+                    (m.language_model.match_layer_indices_and_decode(head)?, head.device().clone())
+                } else {
+                    return Err(anyhow!("LM Head missing in QuantizedText model"));
+                }
+            },
+            _ => return Err(anyhow!("SSD Interpretation not supported for this model variant")),
+        };
+
+        if tokens.is_empty() { return Ok(String::new()); }
+
+        let final_text = self.tokenizer.token_decode(tokens)?;
+        println!("[INTERPRET] Merged Result: {}", final_text);
+        Ok(final_text)
+    }
+
     pub fn load_kv_from_disk(&mut self, p: &Path, n: Option<&str>) -> Result<()> { 
         let _ = self.qwen3_vl.load_metadata_from_file(p);
         

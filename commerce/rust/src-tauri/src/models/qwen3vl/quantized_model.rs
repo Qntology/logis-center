@@ -2277,6 +2277,29 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
+    /// [NEW] [SSD-LAYER-MERGE] 레이어 인덱스 세트를 매칭하여 최종 텍스트 해석
+    pub fn match_layer_indices_and_decode(&mut self, lm_head: &QLinear) -> Result<Vec<u32>> {
+        let mut tokens = Vec::new();
+        let reg = self.registry.entries.read().unwrap();
+        let target_dtype = if lm_head.device().is_cuda() { DType::BF16 } else { DType::F32 };
+        
+        println!("[MERGE] Interpreting {} SSD sets.", reg.len());
+        
+        for entry in reg.iter() {
+            if let Some(path) = &entry.hidden_states_path[self.layers.len() - 1] { 
+                if path.exists() {
+                    let recovered = crate::utils::tensor_utils::load_tensor(path, "hidden_states", lm_head.device())?;
+                    let hidden = recovered.to_dtype(target_dtype)?;
+                    let logits = lm_head.forward(&hidden)?;
+                    let last_logits = logits.squeeze(0)?.get(logits.dim(1)? - 1)?;
+                    let token_id = last_logits.argmax(0)?.to_scalar::<u32>()?;
+                    tokens.push(token_id);
+                }
+            }
+        }
+        Ok(tokens)
+    }
+
     pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> {
         for (i, layer) in self.layers.iter_mut().enumerate() {
             if i < k_list.len() {
@@ -3072,6 +3095,11 @@ impl QuantizedQwen3TextModel {
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize, target_idx: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, target_idx) }
+
+    /// [NEW] [SSD-LAYER-MERGE] 레이어 인덱스 세트를 매칭하여 최종 텍스트 해석
+    pub fn match_layer_indices_and_decode(&mut self, lm_head: &QLinear) -> Result<Vec<u32>> {
+        self.language_model.match_layer_indices_and_decode(lm_head)
+    }
 }
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
