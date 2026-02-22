@@ -109,7 +109,7 @@ impl SlotManager {
                         cf.fetch_add(1, Ordering::SeqCst);
                         if old == InternalState::Writing { cw.fetch_sub(1, Ordering::SeqCst); }
                         else { cr.fetch_sub(1, Ordering::SeqCst); }
-                        println!("[CENTRAL-CONTROL] << Received RELEASE notification for Slot {}. (Free slots: {})", idx, cf.load(Ordering::SeqCst));
+                        // println!("[CENTRAL-CONTROL] << Received RELEASE notification for Slot {}. (Free slots: {})", idx, cf.load(Ordering::SeqCst));
                     }
                     if cw.load(Ordering::SeqCst) == 0 && cr.load(Ordering::SeqCst) == 0 { while let Some(w) = flushers.pop() { let _ = w.send(()); } }
                     Self::process_queues_robust(&sys, &mut free_p, &mut p_writes, &mut p_reads, &mut states, &cf, &cw, &cr, max_slots);
@@ -305,7 +305,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         while let Some(task) = rx.recv().await {
             match task {
                 SlotTask::Bake(bake) => {
-                    println!("[SLOT-WORKER] >> Received instruction: BAKE for Slot {}. TaskDir: {:?}, Offset: {}", bake.slot_id, bake.task_dir, bake.offset);
+                    // println!("[SLOT-WORKER] >> Received instruction: BAKE for Slot {}. TaskDir: {:?}, Offset: {}", bake.slot_id, bake.task_dir, bake.offset);
                     let io_tx_inner = io_tx.clone();
                     tokio::task::spawn_blocking(move || {
                         let sid = bake.slot_id;
@@ -1060,7 +1060,7 @@ impl Qwen3VLGenerateModel {
             )?;
 
             // [STEP 3] Sampling
-            let last_logits = logits.squeeze(0)?.i((0, logits.dim(1)? - 1))?;
+            let last_logits = logits.flatten_all()?; // [FIX] Ensure Rank 1 vocab vector for sampling
             let l_vec = apply_repeat_penalty(&last_logits.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
             
             // [DEBUG] 로그잇 유효성 검사

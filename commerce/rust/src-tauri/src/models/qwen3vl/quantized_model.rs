@@ -54,29 +54,11 @@ impl RmsNorm {
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let target_dtype = self.weight.dtype();
-        
-        println!("[RMS-DEBUG] Input x: {:?}, Weight: {:?}", x.shape(), self.weight.shape());
-
         let x = x.to_dtype(DType::F32)?;
-        let x_sqr = x.sqr()?;
-        println!("[RMS-DEBUG] x_sqr: {:?}", x_sqr.shape());
-        
-        let variance = x_sqr.mean_keepdim(candle_core::D::Minus1)?;
-        println!("[RMS-DEBUG] variance: {:?}", variance.shape());
-        
-        let inv_std = (variance + self.eps)?.sqrt()?;
-        println!("[RMS-DEBUG] inv_std: {:?}", inv_std.shape());
-        
-        let hidden_states = x.broadcast_div(&inv_std)?;
-        println!("[RMS-DEBUG] hidden_states (div): {:?}", hidden_states.shape());
-        
+        let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        let hidden_states = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let hidden_states = hidden_states.to_dtype(target_dtype)?;
-        let res = hidden_states.broadcast_mul(&self.weight);
-        
-        if res.is_err() {
-             println!("[RMS-ERROR] broadcast_mul failed. hidden: {:?}, weight: {:?}", hidden_states.shape(), self.weight.shape());
-        }
-        res
+        hidden_states.broadcast_mul(&self.weight)
     }
 }
 
@@ -126,15 +108,11 @@ impl QLinear {
         let dev = &self.device;
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
         
-        // [DEBUG] QLinear Entry
-        println!("[QLINEAR-DEBUG] Entry shape: {:?}", xs.shape());
-
         let mut xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
         
         // [SHAPE-CORRECTION] Ensure Rank 3 for dims3()
         if xs.rank() == 2 {
             xs = xs.unsqueeze(0)?;
-            println!("[QLINEAR-FIX] Unsqueezed Rank 2 -> 3: {:?}", xs.shape());
         }
 
         let (b, s, h) = xs.dims3()?;
@@ -163,10 +141,6 @@ impl QLinear {
 
         if let Some(bias) = &self.bias {
             let b = if bias.dtype() != target_dtype { bias.to_dtype(target_dtype)? } else { bias.clone() };
-            // [DEBUG] Bias add
-            if out.rank() != b.rank() && b.rank() != 1 && b.rank() != 0 {
-                 println!("[QLINEAR-ERROR] Bias rank mismatch. out: {:?}, bias: {:?}", out.shape(), b.shape());
-            }
             Ok(out.broadcast_add(&b)?)
         } else {
             Ok(out)
@@ -320,17 +294,13 @@ impl KVRegistry {
         let mut sys = System::new();
         sys.refresh_memory();
         let available_ram_bytes = sys.available_memory(); 
-        let total_ram_bytes = sys.total_memory();
         
-        // RAM 여유 임계치를 조금 더 낮춰서(512MB) 웬만하면 RAM 윈도우를 유지하도록 변경
-        let is_ram_pressure = available_ram_bytes < 512 * 1024 * 1024;
+        // [ULTRA-AGGRESSIVE] 사용자 제안 반영: 1.5GB 지점부터 선제적 방어
+        let is_ram_pressure = available_ram_bytes < 1500 * 1024 * 1024;
+        let is_emergency = available_ram_bytes < 800 * 1024 * 1024;
         
-        // RAM 유지 윈도우 설정 (압박 시 2그룹, 평시 4그룹으로 확대)
-        let ram_window = if is_ram_pressure { 2 } else { 4 };
-
-        if is_ram_pressure {
-            println!("[RELAY-SYSTEM] RAM Pressure Detected (Low)! Available: {} MB. Window: {}.", available_ram_bytes / (1024 * 1024), ram_window);
-        }
+        // RAM 유지 윈도우 설정: 압박 시 1그룹, 비상 시 0그룹(즉시 이동)
+        let ram_window = if is_emergency { 0 } else if is_ram_pressure { 1 } else { 4 };
 
         let mut vram_to_ram = 0;
         let mut ram_to_ssd = 0;
@@ -338,8 +308,7 @@ impl KVRegistry {
         for entry in entries.iter_mut() {
             let entry_group_id = entry.token_start / group_size;
 
-            // [VRAM 릴레이]
-            // 현재 그룹(0)과 직전 그룹(-1)만 VRAM 허용 (Hot Window = 1024 tokens)
+            // [VRAM 릴레이] Hot Window 보존
             if entry_group_id + 1 < current_group_id {
                 let has_vram = entry.location.iter().any(|&l| l == KVLocation::VRAM);
                 if has_vram {
@@ -350,12 +319,10 @@ impl KVRegistry {
                 }
             }
 
-            // [RAM 릴레이]
-            // RAM 상태에 따라 가변적인 윈도우 적용
-            // ram_window 이상 멀어지면 SSD로 직행
+            // [RAM 릴레이] 초공격적 SSD 스왑 적용
             if entry_group_id + ram_window < current_group_id {
-                let has_sticky = entry.location.iter().any(|&l| l == KVLocation::RamSticky || l == KVLocation::RAM);
-                if has_sticky && entry.ssd_path.is_none() {
+                let has_memory_data = entry.location.iter().any(|&l| l == KVLocation::RamSticky || l == KVLocation::RAM);
+                if has_memory_data && entry.ssd_path.is_none() {
                     for loc in entry.location.iter_mut() {
                         if *loc == KVLocation::RAM || *loc == KVLocation::RamSticky { 
                             *loc = KVLocation::SSD_PENDING; 
@@ -367,9 +334,9 @@ impl KVRegistry {
             }
         }
 
-        if vram_to_ram > 0 || ram_to_ssd > 0 {
-            println!("[RELAY-SYSTEM] Group {} (Size {}): VRAM->RAM: {} blocks, RAM->SSD-Queue: {} blocks", 
-                current_group_id, group_size, vram_to_ram, ram_to_ssd);
+        // 비상 상황 로그만 제한적으로 출력
+        if is_emergency && (vram_to_ram > 0 || ram_to_ssd > 0) {
+            // println!("[RELAY-EMERGENCY] RAM Low ({}MB). Forced SSD Swap: {} blocks.", available_ram_bytes / (1024 * 1024), ram_to_ssd);
         }
     }
 
@@ -1703,8 +1670,8 @@ impl QuantizedQwen3VLTextModel {
                             let mut inner = block.inner.write().unwrap();
                             inner.bitkv_metadata = Some(metadata);
                             inner.location = KVLocation::RAM;
-                            // [DEBUG] Confirm Load
-                            println!("[DEBUG-LOAD] Layer {} Block {} loaded to RAM (Slot {:?}). Meta: {}", *l_idx, *b_idx, acquired_slots.get(i), inner.bitkv_metadata.is_some());
+        // [DEBUG-LOAD]
+        // println!("[DEBUG-LOAD] Layer {} Block {} loaded to RAM (Slot {:?}). Meta: {}", *l_idx, *b_idx, acquired_slots.get(i), inner.bitkv_metadata.is_some());
 
                             let mut reg_w = self.registry.entries.write().unwrap();
                             reg_w[*b_idx].location[*l_idx] = KVLocation::RAM;
@@ -1725,7 +1692,7 @@ impl QuantizedQwen3VLTextModel {
             xs = xs.to_device(&target_device)?;
         }
 
-        println!("[BURST] >> [RUN] Layer {} on GPU (Recursive Chunks)", layer_idx);
+        // println!("[BURST] >> [RUN] Layer {} on GPU (Recursive Chunks)", layer_idx);
         
         // 청크 오프셋 목록 생성
         let current_seq_len = xs.dim(1)?;
@@ -1799,14 +1766,19 @@ impl QuantizedQwen3VLTextModel {
 
         // [SAFE-PURGE-LOGIC] 
         // 1. Baking 모드(0.6B): 데이터를 절대 지우지 않고 'VRAM' 또는 'RAM' 상태로 유지하여 Baker가 찾을 수 있게 함
-        // 2. Inference 모드(2B): 연산 직후 즉시 비워서 VRAM/RAM 리소스를 OS에 반납
+        // 2. Inference 모드(2B): 연산 직후 무거운 텐서만 비우고, 압축 메타데이터는 RAM에 유지
         if !self.baking_only {
             for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
                 let mut inner_w = block.inner.write().unwrap();
                 inner_w.k_cache = None;
                 inner_w.v_cache = None;
-                inner_w.bitkv_metadata = None; 
-                inner_w.location = KVLocation::SSD; 
+                
+                // [FIX] Speed Optimization: Keep compressed BitKV in RAM
+                if inner_w.bitkv_metadata.is_some() {
+                    inner_w.location = KVLocation::RAM;
+                } else {
+                    inner_w.location = KVLocation::SSD;
+                }
             }
 
             {
@@ -1816,14 +1788,11 @@ impl QuantizedQwen3VLTextModel {
                     if layer_idx < cache_w.len() {
                         cache_w[layer_idx] = None;
                     }
-                    // [FIX] Registry sync: Mark as SSD so it reloads next time
-                    if layer_idx < entry.location.len() {
-                        entry.location[layer_idx] = KVLocation::SSD;
-                        entry.slot_ids[layer_idx] = None;
-                    }
+                    // [FIX] Registry sync: Keep RAM if we have local metadata in the block
+                    // Since we already set block.inner.location above, the registry will be checked in the next forward()
                 }
             }
-            println!("[BURST] << [DONE] Layer {} complete (RAM Purged Safely).", layer_idx);
+            // println!("[BURST] << [DONE] Layer {} complete (RAM Optimized).", layer_idx);
         } else {
             // [IMPORTANT] Baking 모드에서는 각 블록을 'Dirty' 상태로 명시하여 Baker가 인식하게 합니다.
             let mut reg_w = self.registry.entries.write().unwrap();
@@ -2210,7 +2179,7 @@ impl QuantizedQwen3VLTextModel {
         // [RECURSIVE-EXECUTION]
         // 루프 대신 재귀 호출을 사용하여 한 레이어씩 엄격하게 처리합니다.
         let num_layers = self.layers.len();
-        println!("[TRACE] Starting Recursive-Style Layer Queue: Total layers: {}", num_layers);
+        // println!("[TRACE] Starting Recursive-Style Layer Queue: Total layers: {}", num_layers);
         
         xs = self.process_layers_recursive(
             0,
@@ -2228,13 +2197,8 @@ impl QuantizedQwen3VLTextModel {
             xs = xs.to_device(norm_dev)?;
         }
         
-        // [DEBUG-SHAPE]
-        println!("[DEBUG-NORM] xs shape: {:?}, norm weight shape: {:?}", xs.shape(), self.norm.weight().shape());
-        
         let xs = xs.apply(&self.norm)?;
         
-        println!("[DEBUG-NORM-DONE] Final xs shape: {:?}", xs.shape());
-
         Ok(xs)
     }
 
@@ -3021,6 +2985,7 @@ impl QuantizedQwen3TextModel {
         self.language_model.active_session_id = session_id;
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
         let hidden_state = outputs; // [SPECULATIVE]
+        
         if let Some(head) = &self.lm_head {
             let hidden_state = if !hidden_state.device().same_device(head.device()) { hidden_state.to_device(head.device())? } else { hidden_state };
             Ok(head.forward(&hidden_state)?)
