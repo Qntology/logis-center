@@ -963,16 +963,29 @@ impl Qwen3VLGenerateModel {
         
         let mut a_ids = f_ids.clone();
         let s_off = self.get_kv_len();
+        let mut curr_s_off = s_off;
 
-        if t_toks > s_off {
+        // [FIX] Relay 모드 최적화 대응: 입력된 토큰(t_toks)이 기존 캐시(s_off)보다 짧으면
+        // 생략된 프롬프트가 있다고 간주하고(Append Mode) 캐시 뒤에 이어서 연산합니다.
+        if t_toks <= s_off {
+            println!("[GENERATE] Append Mode: Prefilling {} new tokens at offset {}", t_toks, s_off);
+            self.qwen3_vl.forward(
+                &Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, 
+                None, None, None, None, 
+                Some(&Tensor::arange(s_off as u32, (s_off + t_toks) as u32, &self.text_device)?.unsqueeze(0)?), 
+                s_off, t_toks, sid.clone()
+            )?;
+            curr_s_off = s_off + t_toks;
+        } else if t_toks > s_off {
             let prefill_len = t_toks - s_off;
             println!("[GENERATE] Starting Horizontal Prefill for {} tokens...", prefill_len);
             self.qwen3_vl.forward(
                 &Tensor::from_vec(f_ids[s_off..].to_vec(), (1, prefill_len), &self.text_device)?, 
                 None, None, None, None, 
                 Some(&Tensor::arange(s_off as u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 
-                s_off, t_toks, sid.clone()
+                s_off, prefill_len, sid.clone() // t_toks -> prefill_len 수정
             )?;
+            curr_s_off = t_toks;
 
             if let Some(s_id) = &sid {
                 let unbaked_blocks = self.get_all_unbaked_kv_blocks();
