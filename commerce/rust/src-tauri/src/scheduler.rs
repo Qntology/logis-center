@@ -267,49 +267,44 @@ pub async fn start_background_worker(
                             },
                             Err(e) => {
                                 let err_msg = e.to_string();
-        
-                                // [CRITICAL-CLEANUP] 작업 실패 시 즉시 모델을 메모리에서 해제하여 다음 작업 대비
-                                {
-                                    let mut model_lock = model.lock().await;
+                                println!("[Scheduler] Error detected during Task {}: {}", task.id, err_msg);
+
+                                // [FIX] 즉시 현재 스레드에서 잠금을 시도하지 않고, 비동기 태스크로 분리하여 0.5초 뒤 정리합니다.
+                                // 이렇게 하면 현재 함수(process_task)가 완전히 종료된 후 정리가 시작되어 안전합니다.
+                                let model_to_purge = model.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                    let mut model_lock = model_to_purge.lock().await;
                                     if let Some(m) = model_lock.as_ref() {
-                                        m.deep_purge_resources().await;
+                                        println!("[Scheduler] Executing delayed emergency memory release...");
+                                        let _ = m.deep_purge_resources().await;
                                     }
                                     *model_lock = None;
-                                    println!("[Scheduler] Error detected. Emergency memory release performed: {}", err_msg);
-                                }
-        
+                                    println!("[Scheduler] Delayed emergency memory release complete.");
+                                });
+
                                 if err_msg.contains("Task cancelled") {
-                                     println!("[Scheduler] Task cancelled: {}", task.id);
-                                     let store_guard = store.lock().await;
-                                     if let Some(db) = store_guard.as_ref() {
-                                         let _ = db.update_task_status(&task.id, crate::logic::parse_status("cancel")).await;
-                                         let _ = db.update_message_status(&task.id, crate::logic::parse_status("cancel"), Some("Cancelled by user")).await;
-                                     }
-                                     let _ = app_handle.emit("extraction-progress", json!({
+                                    println!("[Scheduler] Task cancelled: {}", task.id);
+                                    let store_guard = store.lock().await;
+                                    if let Some(db) = store_guard.as_ref() {
+                                        let _ = db.update_task_status(&task.id, crate::logic::parse_status("cancel")).await;
+                                        let _ = db.update_message_status(&task.id, crate::logic::parse_status("cancel"), Some("Cancelled by user")).await;
+                                    }
+                                    let _ = app_handle.emit("extraction-progress", json!({
                                         "task_id": task.id,
                                         "category": "Done", "summary": "Cancelled by user", "spinner": "🛑", "data": null 
-                                     }));
-                                     // [NEW] 취소 시 리소스 정리 및 모드 리셋
-                                     cleanup_task_resources(&task.id, Some(&app_handle));
-                                     current_device_pref = None;
-                                     break; 
+                                    }));
+                                    cleanup_task_resources(&task.id, Some(&app_handle));
+                                    current_device_pref = None;
+                                    break; 
                                 } else {
                                     println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, err_msg);
                                     
-                                    // [NEW] Automatic OOM Recovery Logic (Forcing SSD-Swap Mode)
                                     if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
                                         println!("[Scheduler] OOM Detected! Activating SSD-Swap Mode for retry.");
-                                        {
-                                            let mut model_lock = model.lock().await;
-                                            if let Some(m) = model_lock.as_ref() {
-                                                let _ = m.deep_purge_resources().await;
-                                            }
-                                            *model_lock = None; 
-                                        }
-                                        
-                                        // Use gpu_disk_swap instead of cpu for better performance during retry
+                                        // 위에서 비동기로 Purge를 예약했으므로 여기서 별도의 lock 시도는 하지 않습니다.
                                         current_device_pref = Some("gpu_disk_swap".to_string());
-        
+
                                         log_task_progress(&app_handle, &task.id, &json!({
                                             "category": "Warning", "summary": "Memory pressure detected. Retrying with SSD-Swap Mode...", "spinner": "💾"
                                         }));
@@ -317,14 +312,13 @@ pub async fn start_background_worker(
                                         tokio::time::sleep(Duration::from_secs(2)).await;
                                         continue; 
                                     }
-        
+
                                     let store_guard = store.lock().await;                            
                                     if let Some(db) = store_guard.as_ref() {
                                         let _ = db.update_task_status(&task.id, crate::logic::parse_status("error")).await;
                                         let _ = db.update_message_status(&task.id, crate::logic::parse_status("error"), Some(&format!("Error: {}", err_msg))).await;
                                     }
                                     
-                                    // [NEW] Explicitly notify UI of failure to stop spinner
                                     let _ = app_handle.emit("extraction-progress", json!({
                                         "task_id": task.id,
                                         "category": "Error", "summary": format!("Failed: {}", err_msg), "spinner": "❌"

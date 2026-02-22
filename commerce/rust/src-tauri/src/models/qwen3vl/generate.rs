@@ -482,7 +482,12 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                             // [FIX] DYNAMIC SHAPE DETECTION
                                             // [LAYER-EXTRACT] 독립 파일 구조에서는 prefix 유연성 확보
                                             let block_prefix = format!("b{}_", off);
-                                            let layer_prefix = if is_relay_file { "l0_".to_string() } else { format!("l{}_", l_idx) };
+                                            // [FIX] Relay 파일일 경우 레이어 인덱스에 상관없이 무조건 l0_ 데이터를 참조하도록 보장
+                                            let layer_prefix = if is_relay_file || actual_load_path.to_string_lossy().contains("l0.st") { 
+                                                "l0_".to_string() 
+                                            } else { 
+                                                format!("l{}_", l_idx) 
+                                            };
                                             let prefix = format!("{}{}", block_prefix, layer_prefix);
 
                                             let get_tensor_name = |suffix: &str| -> String {
