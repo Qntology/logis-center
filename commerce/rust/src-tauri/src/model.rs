@@ -548,26 +548,34 @@ impl LogisModel {
         }
 
         println!("[MODEL] Activating engine for size: {:?} (Text-Only: {}, Baking: {})...", size, force_text_only, baking_only);
-        // ... (rest of the switching logic remains similar but uses the new loading)
 
-        // 1. [SWITCH] If requested model is already in one of the slots, just move it to main
+        // 1. [SWITCH] 기존 캐시된 모델이 있고, 로딩 모드(Baking 여부)가 일치하면 즉시 전환
+        // (단, Baking 모드와 일반 모드는 내부 레이어 구조가 다르므로 일치 여부를 엄격히 체크)
         let found_in_slot = match size {
             ModelSize::Small => {
                 if let Some(m) = small_slot.take() {
-                    if let Some(old_m) = gen_guard.take() {
-                        if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
-                        else if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
+                    // 현재 캐시된 모델의 모드가 요청된 모드와 같은지 확인 (Single-Layer vs Full-Layer)
+                    let is_single = m.model_name.contains("Single-Layer");
+                    if is_single == baking_only {
+                        if let Some(old_m) = gen_guard.take() {
+                            if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
+                            else { *small_slot = Some(old_m); }
+                        }
+                        *gen_guard = Some(m);
+                        *current_size_guard = Some(ModelSize::Small);
+                        true
+                    } else {
+                        // 모드가 다르면 캐시된 모델을 버리고 새로 로드해야 함
+                        *small_slot = None;
+                        false
                     }
-                    *gen_guard = Some(m);
-                    *current_size_guard = Some(ModelSize::Small);
-                    true
                 } else { false }
             },
             ModelSize::Large => {
                 if let Some(m) = large_slot.take() {
                     if let Some(old_m) = gen_guard.take() {
                         if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
-                        else if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
+                        else { *large_slot = Some(old_m); }
                     }
                     *gen_guard = Some(m);
                     *current_size_guard = Some(ModelSize::Large);

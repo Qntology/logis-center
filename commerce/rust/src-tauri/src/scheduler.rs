@@ -606,19 +606,38 @@ async fn process_task(
         let mut draft_tokens = None;
 
         if !has_snapshot {
-            // 1. [0.6B] Bake FULL context + Generate MACRO DRAFT
-            println!("[Scheduler] Phase 1: Baking & Drafting with 0.6B...");
+            // [STAGE 1] 0.6B 1-Layer BAKING (Context Ingestion)
+            println!("[Scheduler] Stage 1: Baking Context with 0.6B (1-Layer)...");
             model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
             
-            let model_clone = model.clone();
-            let token_clone = cancellation_token.clone();
             let session_clone = Some(snapshot_id.clone());
             let kv_name_clone = kv_name.clone();
 
             {
-                let mut gen_guard = model_clone.generator.lock().await;
+                let mut gen_guard = model.generator.lock().await;
                 if let Some(worker) = gen_guard.as_mut() {
                     worker.clear_kv_cache();
+                    let params = crate::openai_types::ChatCompletionParameters {
+                        messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(full_task_prompt.clone()),
+                            name: None,
+                        })],
+                        ..Default::default()
+                    };
+                    // 1개 레이어로 SSD에 문맥을 굽습니다.
+                    worker.prefill_only(params, Some(cancellation_token.clone()), session_clone.clone(), None, kv_name_clone.clone()).await?;
+                    crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
+                }
+            }
+
+            // [STAGE 2] 0.6B Full-Layer DRAFTING (High Quality)
+            println!("[Scheduler] Stage 2: Generating Macro Draft with 0.6B (Full-Layers)...");
+            // is_baking: false로 설정하여 0.6B 전체 레이어를 로드합니다.
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name_clone.clone()).await?;
+
+            {
+                let mut gen_guard = model.generator.lock().await;
+                if let Some(worker) = gen_guard.as_mut() {
                     let params = crate::openai_types::ChatCompletionParameters {
                         messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
                             content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(full_task_prompt.clone()),
@@ -628,24 +647,23 @@ async fn process_task(
                         ..Default::default()
                     };
                     
-                    // 0.6B가 먼저 가안을 작성합니다. (메모리 독점)
-                    let draft_text = worker.generate(params, Some(token_clone), session_clone, kv_name_clone, None).await?;
+                    // 전체 레이어를 가진 0.6B가 고품질 가안을 작성합니다.
+                    let draft_text = worker.generate(params, Some(cancellation_token.clone()), session_clone, kv_name_clone, None).await?;
                     let ids = worker.tokenizer.text_encode_vec(draft_text, false)?;
                     draft_tokens = Some(ids);
-                    
-                    crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
                 }
             }
             
-            // [CRITICAL-UNLOAD] 0.6B를 메모리에서 완전히 제거하여 2B를 위한 공간 확보
+            // [CLEANUP] 0.6B를 완전히 제거하여 2B를 위한 공간 확보
             model.deep_purge_resources().await;
             wait_for_resources_settled(2000, 1000, Some(&cancellation_token)).await?;
         } else {
-            println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B drafting.");
+            println!("[Scheduler] Found existing snapshot. Skipping 0.6B baking/drafting.");
         }
 
-        // 2. [2B] Load Snapshot & Verify Draft in Isolation
+        // [STAGE 3] 2B Isolated VERIFICATION
         {
+            println!("[Scheduler] Stage 3: Verifying Draft with 2B (Isolated Rotation)...");
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
@@ -709,33 +727,48 @@ async fn process_task(
         let mut draft_tokens_b = None;
 
         if !has_snapshot {
-            // 1. [0.6B] Bake Full Context + MACRO DRAFT for selectors
-            println!("[Scheduler] Phase 1: Baking Selector Context with 0.6B...");
+            // [STAGE 1] 0.6B 1-Layer BAKING
+            println!("[Scheduler] Stage 1: Baking Selector Context with 0.6B (1-Layer)...");
             model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
-            let model_clone = model.clone();
-            let question_clone = task_question.clone();
-            let token_clone = cancellation_token.clone();
+            
             let session_clone = Some(snapshot_id.clone());
             let kv_name_clone = kv_name.clone();
 
             {
-                let mut gen_guard = model_clone.generator.lock().await;
+                let mut gen_guard = model.generator.lock().await;
                 if let Some(worker) = gen_guard.as_mut() {
                     worker.clear_kv_cache();
                     let params = crate::openai_types::ChatCompletionParameters {
                         messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                            name: None,
+                        })],
+                        ..Default::default()
+                    };
+                    worker.prefill_only(params, Some(cancellation_token.clone()), session_clone.clone(), None, kv_name_clone.clone()).await?;
+                    crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
+                }
+            }
+
+            // [STAGE 2] 0.6B Full-Layer DRAFTING
+            println!("[Scheduler] Stage 2: Drafting Selectors with 0.6B (Full-Layers)...");
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name_clone.clone()).await?;
+
+            {
+                let mut gen_guard = model.generator.lock().await;
+                if let Some(worker) = gen_guard.as_mut() {
+                    let params = crate::openai_types::ChatCompletionParameters {
+                        messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                             name: None,
                         })],
                         max_tokens: Some(512), temperature: Some(0.1),
                         ..Default::default()
                     };
                     
-                    let draft_text = worker.generate(params, Some(token_clone), session_clone, kv_name_clone, None).await?;
+                    let draft_text = worker.generate(params, Some(cancellation_token.clone()), session_clone, kv_name_clone, None).await?;
                     let ids = worker.tokenizer.text_encode_vec(draft_text, false)?;
                     draft_tokens_b = Some(ids);
-                    
-                    crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
                 }
             }
             
@@ -743,11 +776,12 @@ async fn process_task(
             model.deep_purge_resources().await;
             wait_for_resources_settled(2000, 1000, Some(&cancellation_token)).await?;
         } else {
-            println!("[Scheduler] Found existing snapshot for Step B. Skipping 0.6B drafting.");
+            println!("[Scheduler] Found existing snapshot. Skipping 0.6B drafting.");
         }
 
-        // 2. [2B] Load & Verify Draft in Isolation
+        // [STAGE 3] 2B Isolated VERIFICATION
         {
+            println!("[Scheduler] Stage 3: Verifying Selector Draft with 2B...");
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             // [OPTIMIZATION] 2B에게 질문만 보냅니다.
@@ -870,35 +904,51 @@ async fn process_task(
             let mut draft_tokens_c = None;
 
             if !has_snapshot {
-                // 1. [0.6B] Bake Detail Context + MACRO DRAFT
-                println!("[Scheduler] Phase 1: Baking Detail Context with 0.6B...");
-                log_task_progress(app_handle, &task.id, &json!({ "category": "Context Baking", "summary": "Baking & Drafting with 0.6B model..." }));
+                // [STAGE 1] 0.6B 1-Layer BAKING
+                println!("[Scheduler] Stage 1: Baking Detail Context with 0.6B (1-Layer)...");
+                log_task_progress(app_handle, &task.id, &json!({ "category": "Context Baking", "summary": "Baking content with 0.6B model..." }));
                 
                 model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
-                let model_clone = model.clone();
-                let question_clone = task_question.clone();
-                let token_clone = cancellation_token.clone();
+                
                 let session_clone = Some(snapshot_id.clone());
                 let kv_name_clone = kv_name.clone();
 
                 {
-                    let mut gen_guard = model_clone.generator.lock().await;
+                    let mut gen_guard = model.generator.lock().await;
                     if let Some(worker) = gen_guard.as_mut() {
                         worker.clear_kv_cache();
                         let params = crate::openai_types::ChatCompletionParameters {
                             messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
-                                content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
+                                content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                                name: None,
+                            })],
+                            ..Default::default()
+                        };
+                        worker.prefill_only(params, Some(cancellation_token.clone()), session_clone.clone(), None, kv_name_clone.clone()).await?;
+                        crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
+                    }
+                }
+
+                // [STAGE 2] 0.6B Full-Layer DRAFTING
+                println!("[Scheduler] Stage 2: Drafting Details with 0.6B (Full-Layers)...");
+                log_task_progress(app_handle, &task.id, &json!({ "category": "Context Baking", "summary": "Generating Macro Draft with 0.6B..." }));
+                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name_clone.clone()).await?;
+
+                {
+                    let mut gen_guard = model.generator.lock().await;
+                    if let Some(worker) = gen_guard.as_mut() {
+                        let params = crate::openai_types::ChatCompletionParameters {
+                            messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                                content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                                 name: None,
                             })],
                             max_tokens: Some(2048), temperature: Some(0.1),
                             ..Default::default()
                         };
                         
-                        let draft_text = worker.generate(params, Some(token_clone), session_clone, kv_name_clone, None).await?;
+                        let draft_text = worker.generate(params, Some(cancellation_token.clone()), session_clone, kv_name_clone, None).await?;
                         let ids = worker.tokenizer.text_encode_vec(draft_text, false)?;
                         draft_tokens_c = Some(ids);
-                        
-                        crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
                     }
                 }
                 
@@ -906,11 +956,12 @@ async fn process_task(
                 model.deep_purge_resources().await;
                 wait_for_resources_settled(2000, 1000, Some(&cancellation_token)).await?;
             } else {
-                println!("[Scheduler] Found existing snapshot for Detail Extraction. Skipping 0.6B drafting.");
+                println!("[Scheduler] Found existing snapshot. Skipping 0.6B drafting.");
             }
 
-            // 2. [2B] Load & Verify Draft
+            // [STAGE 3] 2B Isolated VERIFICATION
             {
+                println!("[Scheduler] Stage 3: Verifying Detail Draft with 2B...");
                 model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                 let params = ChatCompletionParameters {
