@@ -29,6 +29,7 @@ use std::path::Path;
 
 use std::path::PathBuf;
 use tokio::sync::mpsc;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use tokio::sync::oneshot;
 use rayon::prelude::*;
@@ -1023,30 +1024,25 @@ impl Qwen3VLGenerateModel {
         let chunk_size = 8; // 한 번에 예측/검증할 토큰 수
 
         let mut gen_count = 0;
+        let chunk_size = 1; // [STABILITY] 1개씩 확실하게 생성
+
         while gen_count < max_gen_tokens {
             if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
 
-            // [STEP 1: DRAFTING] 
-            let mut draft_tokens = Vec::new();
-            let last_token = *a_ids.last().unwrap();
-            
-            println!("[HYBRID] Drafting {} candidate tokens using 0.6B...", chunk_size);
-            for _ in 0..chunk_size {
-                draft_tokens.push(last_token); 
-            }
+            // [STEP 1] Prepare Input (Use last token)
+            let last_token = *a_ids.last().unwrap_or(&0);
+            let input_tokens = vec![last_token];
 
-            // [STEP 2: LAYER-WISE VERIFICATION]
-            println!("[HYBRID] Verifying chunk (size: {}) via 2B Layer-wise Pipeline...", draft_tokens.len());
-            
+            // [STEP 2] Forward Pass
             let logits = self.qwen3_vl.forward(
-                &Tensor::from_vec(draft_tokens.clone(), (1, draft_tokens.len()), &self.text_device)?, 
+                &Tensor::from_vec(input_tokens.clone(), (1, input_tokens.len()), &self.text_device)?, 
                 p_vals.as_ref(), i_grid.as_ref(), None, None, 
-                Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + draft_tokens.len()) as u32, &self.text_device)?.unsqueeze(0)?), 
-                curr_s_off, draft_tokens.len(), sid.clone()
+                Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + input_tokens.len()) as u32, &self.text_device)?.unsqueeze(0)?), 
+                curr_s_off, input_tokens.len(), sid.clone()
             )?;
 
-            // [STEP 3: ACCEPTANCE & SAMPLING]
-            let last_logits = logits.squeeze(0)?.i(logits.dim(1)? - 1)?;
+            // [STEP 3] Sampling
+            let last_logits = logits.squeeze(0)?.i((0, logits.dim(1)? - 1))?;
             let l_vec = apply_repeat_penalty(&last_logits.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
             
             // [DEBUG] 로그잇 유효성 검사

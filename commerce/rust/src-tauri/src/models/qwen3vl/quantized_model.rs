@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use memmap2::Mmap;
+use serde_json;
 
 use crate::{
     models::{
@@ -2188,69 +2189,6 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    fn compress_to_1bit(&self, t: &Tensor) -> Result<(Tensor, Tensor, Vec<usize>)> {
-        let original_shape = t.shape().dims().to_vec();
-        let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
-        
-        let last_dim = original_shape[original_shape.len() - 1];
-        let total_elements = t_data.len();
-        let num_vectors = total_elements / last_dim;
-        
-        let packed_size = (total_elements + 7) / 8;
-        let mut packed = vec![0u8; packed_size];
-        let mut scales = vec![0.0f32; num_vectors];
-        
-        for v_idx in 0..num_vectors {
-            let t_start = v_idx * last_dim;
-            let t_vector = &t_data[t_start..t_start + last_dim];
-            
-            let mut abs_sum = 0.0f32;
-            for &val in t_vector { abs_sum += val.abs(); }
-            let s = abs_sum / (last_dim as f32);
-            scales[v_idx] = s;
-            
-            for (i, &val) in t_vector.iter().enumerate() {
-                if val >= 0.0 {
-                    let bit_pos = (t_start + i) % 8;
-                    let byte_pos = (t_start + i) / 8;
-                    packed[byte_pos] |= 1 << bit_pos;
-                }
-            }
-        }
-            
-        let packed_tensor = Tensor::from_vec(packed, vec![packed_size], &Device::Cpu)?;
-        let scales_tensor = Tensor::from_vec(scales, vec![original_shape[0], original_shape[1], original_shape[2], 1], &Device::Cpu)?;
-        
-        Ok((packed_tensor, scales_tensor, original_shape))
-    }
-
-    fn decompress_from_1bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
-        let device = packed.device();
-        let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
-        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        
-        let last_dim = original_shape[original_shape.len() - 1];
-        let total_elements: usize = original_shape.iter().product();
-        let mut decoded = vec![0.0f32; total_elements];
-        
-        for v_idx in 0..(total_elements / last_dim) {
-            let s = scales_vec[v_idx];
-            let t_start = v_idx * last_dim;
-            
-            for i in 0..last_dim {
-                let global_idx = t_start + i;
-                let byte_pos = global_idx / 8;
-                let bit_pos = global_idx % 8;
-                let is_set = (packed_vec[byte_pos] & (1 << bit_pos)) != 0;
-                decoded[global_idx] = if is_set { s } else { -s };
-            }
-        }
-        
-        let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
-        Ok(t.to_device(device)?)
-    }
-
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> {
         if !path.exists() {
             fs::create_dir_all(path)?;
@@ -2292,6 +2230,34 @@ impl QuantizedQwen3VLTextModel {
         println!("[SSD-LOAD] Starting centralized scan for KV cache at {:?}", path);
 
         loop {
+            // [SMART-LOAD] Check for index.json first to bypass scan
+            let index_path = path.join("index.json");
+            if index_path.exists() {
+                 if let Ok(content) = std::fs::read_to_string(&index_path) {
+                     if let Ok(index_map) = serde_json::from_str::<std::collections::HashMap<usize, String>>(&content) {
+                         println!("[SSD-LOAD] Smart Index Found! Loading {} blocks directly...", index_map.len());
+                         fragments.clear();
+                         for (offset, p_str) in index_map {
+                             let p = std::path::PathBuf::from(&p_str);
+                             if p.exists() {
+                                 fragments.push((offset, p));
+                             } else {
+                                 // Try relative path or fallback
+                                 let p_joined = path.join(&p_str);
+                                 if p_joined.exists() {
+                                     fragments.push((offset, p_joined));
+                                 }
+                             }
+                         }
+                         if !fragments.is_empty() {
+                             fragments.sort_by_key(|f| f.0);
+                             println!("[SSD-LOAD] Smart Load successful. Skipping scan.");
+                             break;
+                         }
+                     }
+                 }
+            }
+
             fragments.clear();
             if let Ok(entries) = std::fs::read_dir(path) {
                 println!("[SSD-SCAN-DEBUG] Searching in root: {:?}", path);
