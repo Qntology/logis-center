@@ -590,22 +590,21 @@ async fn process_task(
         // [NEW] Log step A start for UI recovery
         log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
 
-        let type_prompt = parsing::page_type_prompt();
         let pug_content = light_pug.clone();
-        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, type_prompt);
         let snapshot_id = format!("{}_step_a", task.id);
+        let kv_name = Some("step_a".to_string());
         
         // [CHECKPOINT] Check if Step A snapshot already exists (Resume from OOM)
         let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
         let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
 
         if !has_snapshot {
-            // 1. [0.6B] Bake FULL Templated Prompt
+            // 1. [0.6B] Bake RAW context
             println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
             model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
             
             let model_clone = model.clone();
-            let question_clone = task_question.clone();
+            let pug_payload = format!("[PUG CONTENT]\n{}", pug_content);
             let token_clone = cancellation_token.clone();
             let session_clone = Some(snapshot_id.clone());
             let kv_name_clone = kv_name.clone();
@@ -616,7 +615,7 @@ async fn process_task(
                     worker.clear_kv_cache();
                     let params = crate::openai_types::ChatCompletionParameters {
                         messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(pug_payload),
                             name: None,
                         })],
                         ..Default::default()
@@ -630,17 +629,25 @@ async fn process_task(
             println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
         }
 
-        // 2. [2B] Load Snapshot & Bake Task
+        // 2. [2B] Load Snapshot & Continue Task
         {
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
-            // [OPTIMIZATION] 이미 snapshot_id를 통해 PUG 컨텍스트가 로드되었습니다. 
-            // 2B 모델에게 전체 PUG를 다시 보내면 토큰이 중복(24k)되어 OOM이 발생하므로, 질문만 보냅니다.
+            // [OPTIMIZATION] 0.6B baked the PUG message. 
+            // 2B now provides the task as a separate follow-up message to ensure cache alignment.
             let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", parsing::page_type_prompt())),
-                    name: None,
-                })],
+                messages: vec![
+                    // First message MUST match what was baked exactly to align KV cache
+                    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                        content: ChatCompletionRequestUserMessageContent::Text(format!("[PUG CONTENT]\n{}", pug_content)),
+                        name: None,
+                    }),
+                    // Second message is the actual task
+                    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                        content: ChatCompletionRequestUserMessageContent::Text(format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", parsing::page_type_prompt())),
+                        name: None,
+                    })
+                ],
                 model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
                 ..Default::default()
             };
