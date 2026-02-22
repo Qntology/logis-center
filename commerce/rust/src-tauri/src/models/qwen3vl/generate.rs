@@ -267,15 +267,22 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         if let Err(e) = std::fs::rename(&tmp_path, &task_path) {
                             println!("[WORKER-IO] !! [ERROR] Atomic rename failed: {:?}", e);
                         } else {
-                            // [REGISTRY-UPDATE] 쓰기 성공 시에만 장부 업데이트
+                            // [REGISTRY-UPDATE] 쓰기 성공 시 장부 업데이트
                             if let (Some(reg), Some(idx)) = (registry, block_idx) {
                                 if let Ok(mut entries) = reg.entries.write() {
                                     if idx < entries.len() {
-                                        entries[idx].ssd_path = Some(task_path.clone());
-                                        for loc in entries[idx].location.iter_mut() {
-                                            if *loc == crate::models::qwen3vl::quantized_model::KVLocation::SSD_PENDING || 
-                                               *loc == crate::models::qwen3vl::quantized_model::KVLocation::VRAM {
-                                                *loc = crate::models::qwen3vl::quantized_model::KVLocation::SSD;
+                                        let entry = &mut entries[idx];
+                                        entry.ssd_path = Some(task_path.clone());
+                                        
+                                        // [RELAY-BROADCASTING] 
+                                        // 만약 파일명이 l0.st라면(0.6B가 구운 공용 데이터), 
+                                        // 2B의 모든 28개 레이어가 이 파일을 자신의 데이터로 인식하도록 장부를 채웁니다.
+                                        let is_relay_data = task_path.file_name().map(|n| n == "l0.st").unwrap_or(false);
+                                        
+                                        for l_idx in 0..28 {
+                                            if is_relay_data || entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::SSD_PENDING || 
+                                               entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::VRAM {
+                                                entry.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD;
                                             }
                                         }
                                     }

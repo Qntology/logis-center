@@ -1701,8 +1701,29 @@ impl QuantizedQwen3VLTextModel {
         }
 
         // [SSD-PIPELINE] 만약 입력 xs가 비어있고(또는 초기 상태고) 장부에 이전 레이어 결과가 있다면 로드
+        let mut xs = xs;
         if layer_idx > 0 && xs.dim(1).unwrap_or(0) > 0 {
-             // 현재는 메모리 전달 방식이나, 향후 여기서 SSD 로드 로직 추가 가능
+            // [RELAY-HACK] 0.6B -> 2B 릴레이 시, 2B의 모든 레이어는 0.6B가 구운 레이어 0의 결과물을 문맥으로 공유합니다.
+            let reg = self.registry.entries.read().unwrap();
+            if !reg.is_empty() {
+                // 현재 시퀀스 위치에 해당하는 블록의 hidden_states_path를 확인
+                let block_idx = seqlen_offset / 256;
+                if block_idx < reg.len() {
+                    let entry = &reg[block_idx];
+                    // 자신의 레이어 데이터가 없으면 0번 레이어(릴레이 데이터)의 경로를 폴백으로 사용
+                    let hs_path = entry.hidden_states_path[layer_idx].as_ref()
+                        .or_else(|| entry.hidden_states_path[0].as_ref());
+                    
+                    if let Some(path) = hs_path {
+                        if path.exists() {
+                            if let Ok(loaded_xs) = crate::utils::tensor_utils::load_tensor(path, "hidden_states", &target_device) {
+                                // println!("[SSD-RELAY] Layer {} reloaded context from {:?}", layer_idx, path);
+                                xs = loaded_xs.to_dtype(xs.dtype())?;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // println!("[BURST] >> [RUN] Layer {} on GPU (Recursive Chunks)", layer_idx);
