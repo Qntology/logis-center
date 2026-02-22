@@ -1687,34 +1687,85 @@ impl QuantizedQwen3VLTextModel {
                                 b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
                             };
 
-                            // [SHAPE-ADAPTER] 0.6B(1024) 데이터를 2B(2048) 규격으로 자동 확장
-                            let bytes_to_f32_padded = |b: &[u8], target_dim: usize, current_os: &[usize]| -> Vec<f32> {
-                                let mut data: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                                let actual_dim = data.len() / (current_os[0] * current_os[1] * current_os[2]);
-                                if actual_dim < target_dim {
-                                    // 차원이 부족하면 나머지를 0으로 채움 (Zero-Padding)
-                                    let total_needed = current_os[0] * current_os[1] * current_os[2] * target_dim;
-                                    data.resize(total_needed, 0.0);
+                            // [SHAPE-ADAPTER] 0.6B(1024, H=8) -> 2B(2048, H=16) 규격 자동 변환
+                            // 1. 차원 패딩 (128 -> 128, 보통 동일함)
+                            // 2. 헤드 복제 (8 -> 16)
+                            let bytes_to_f32_adapted = |b: &[u8], target_head: usize, target_dim: usize, current_os: &[usize]| -> Vec<f32> {
+                                let source_head = current_os[1];
+                                let source_dim = current_os[3]; // [B, H, S, D]
+                                let seq_len = current_os[2];
+                                let batch = current_os[0];
+                                
+                                let raw_data: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                
+                                // 헤드 수와 차원이 모두 일치하면 그대로 반환
+                                if source_head == target_head && source_dim == target_dim {
+                                    return raw_data;
                                 }
-                                data
+
+                                // 복잡한 변환이 필요함 (Resize & Repeat)
+                                let mut new_data = Vec::with_capacity(batch * target_head * seq_len * target_dim);
+                                
+                                // 헤드 반복 비율 계산 (예: 8 -> 16이면 2배)
+                                let repeat_factor = target_head / source_head; 
+                                
+                                for b_i in 0..batch {
+                                    for h_i in 0..source_head {
+                                        // 원본 헤드 데이터 추출
+                                        let h_start = (b_i * source_head + h_i) * seq_len * source_dim;
+                                        let h_end = h_start + seq_len * source_dim;
+                                        let head_slice = &raw_data[h_start..h_end];
+                                        
+                                        // 필요한 횟수만큼 반복 (Broadcasting)
+                                        for _ in 0..repeat_factor {
+                                            if source_dim == target_dim {
+                                                new_data.extend_from_slice(head_slice);
+                                            } else {
+                                                // 차원 패딩이 필요한 경우 (토큰 단위로 패딩)
+                                                for s_i in 0..seq_len {
+                                                    let t_start = s_i * source_dim;
+                                                    let t_end = t_start + source_dim;
+                                                    new_data.extend_from_slice(&head_slice[t_start..t_end]);
+                                                    // Zero-padding
+                                                    new_data.extend(std::iter::repeat(0.0).take(target_dim - source_dim));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    // 남는 헤드 채우기 (나머지 처리)
+                                    let remaining_heads = target_head - (source_head * repeat_factor);
+                                    if remaining_heads > 0 {
+                                        let zeros = vec![0.0; remaining_heads * seq_len * target_dim];
+                                        new_data.extend(zeros);
+                                    }
+                                }
+                                new_data
                             };
 
                             let expected_d = 128; // Qwen3-2B 기준 차원
-                            let padded_k = bytes_to_f32_padded(ka.data(), expected_d, &o_shape);
+                            let expected_h = 16;  // Qwen3-2B 기준 헤드 수
+                            
+                            let padded_k = bytes_to_f32_adapted(ka.data(), expected_h, expected_d, &o_shape);
+                            let padded_v = bytes_to_f32_adapted(va.data(), expected_h, expected_d, &o_shape);
+                            
+                            // [FIX] Scales도 헤드 수 확장이 필요함 (Dimension은 1로 고정)
+                            let padded_ks = bytes_to_f32_adapted(ks.data(), expected_h, 1, &o_shape);
+                            let padded_vs = bytes_to_f32_adapted(vs.data(), expected_h, 1, &o_shape);
                             
                             // [DEBUG-KV] 로드된 KV 캐시의 형상 확인
                             if layer_idx == 0 && *b_idx == 0 {
-                                println!("[DEBUG-KV] Loaded L0 B0 K-Cache: Shape {:?}, Padded to 128 dim.", vec![o_shape[0], o_shape[1], o_shape[2], expected_d]);
+                                println!("[DEBUG-KV] Adapted L0 B0 K-Cache: Src[{},{}] -> Tgt[{},{}]", o_shape[1], o_shape[3], expected_h, expected_d);
                             }
 
                             let metadata = BitKVMetadata {
-                                k_anchors: Tensor::from_vec(padded_k, (o_shape[0], o_shape[1], o_shape[2], expected_d), &Device::Cpu)?,
+                                k_anchors: Tensor::from_vec(padded_k, (o_shape[0], expected_h, o_shape[2], expected_d), &Device::Cpu)?,
                                 k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?,
-                                k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (o_shape[0], o_shape[1], o_shape[2], 1), &Device::Cpu)?,
-                                v_anchors: Tensor::from_vec(bytes_to_f32_padded(va.data(), expected_d, &o_shape), (o_shape[0], o_shape[1], o_shape[2], expected_d), &Device::Cpu)?,
+                                k_scales: Tensor::from_vec(padded_ks, (o_shape[0], expected_h, o_shape[2], 1), &Device::Cpu)?, 
+                                v_anchors: Tensor::from_vec(padded_v, (o_shape[0], expected_h, o_shape[2], expected_d), &Device::Cpu)?,
                                 v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?,
-                                v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (o_shape[0], o_shape[1], o_shape[2], 1), &Device::Cpu)?,
-                                original_shape: vec![o_shape[0], o_shape[1], o_shape[2], expected_d]
+                                v_scales: Tensor::from_vec(padded_vs, (o_shape[0], expected_h, o_shape[2], 1), &Device::Cpu)?,
+                                original_shape: vec![o_shape[0], expected_h, o_shape[2], expected_d]
                             };
                             let mut inner = block.inner.write().unwrap();
                             inner.bitkv_metadata = Some(metadata);
@@ -2242,7 +2293,12 @@ impl QuantizedQwen3VLTextModel {
         position_ids_in: Option<&Tensor>,
         _visual_pos_masks: Option<&Tensor>,
         _deepstack_visual_embeds: Option<Vec<Tensor>>,
+        sid: Option<String>, // [NEW] Session ID Propagation
     ) -> Result<Tensor> {
+        if let Some(s) = sid {
+            self.active_session_id = Some(s);
+        }
+
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         
         let target_device = self.layers[0].device().clone();
