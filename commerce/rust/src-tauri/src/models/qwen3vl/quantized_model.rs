@@ -716,24 +716,34 @@ impl QuantizedQwen3VLTextAttention {
                             let target_dim = self.head_dim;
                             let (_b, h, _s, d) = k_raw.dims4().unwrap_or((1, 1, 256, 128));
 
+                            // [RELAY-UPSCALE FIX] 0.6B의 얇은 텐서를 2B의 두꺼운 텐서(차원 및 헤드)에 완벽하게 맞춰줍니다.
+                            let target_heads = self.num_key_value_heads;
+                            let target_dim = self.head_dim;
+                            let (_b, h, _s, d) = k_raw.dims4().unwrap_or((1, 1, 256, 128));
+
                             if d != target_dim {
                                 let repeats = target_dim / d;
                                 let remainder = target_dim % d;
                                 
-                                let mut k_cats = Vec::new();
-                                let mut v_cats = Vec::new();
-                                if repeats > 0 {
-                                    for _ in 0..repeats { k_cats.push(k_raw.clone()); v_cats.push(v_raw.clone()); }
-                                }
+                                let mut k_scaled = k_raw.clone();
+                                let mut v_scaled = v_raw.clone();
                                 
-                                let mut k_scaled = if !k_cats.is_empty() { Tensor::cat(&k_cats.iter().collect::<Vec<_>>(), candle_core::D::Minus1).unwrap_or(k_raw.clone()) } else { k_raw.clone() };
-                                let mut v_scaled = if !v_cats.is_empty() { Tensor::cat(&v_cats.iter().collect::<Vec<_>>(), candle_core::D::Minus1).unwrap_or(v_raw.clone()) } else { v_raw.clone() };
+                                if repeats > 1 {
+                                    // [FIX] `Vec<&Tensor>`를 사용하여 Candle의 Tensor::cat 요구사항을 정확히 충족시킵니다.
+                                    let k_refs: Vec<&Tensor> = std::iter::repeat(&k_raw).take(repeats).collect();
+                                    let v_refs: Vec<&Tensor> = std::iter::repeat(&v_raw).take(repeats).collect();
+                                    
+                                    k_scaled = Tensor::cat(&k_refs, 3).map_err(|e| anyhow::anyhow!("Upscale k_cat failed: {}", e))?;
+                                    v_scaled = Tensor::cat(&v_refs, 3).map_err(|e| anyhow::anyhow!("Upscale v_cat failed: {}", e))?;
+                                }
 
                                 if remainder > 0 {
-                                    let k_rem = k_raw.narrow(candle_core::D::Minus1, 0, remainder).unwrap();
-                                    let v_rem = v_raw.narrow(candle_core::D::Minus1, 0, remainder).unwrap();
-                                    k_scaled = if repeats > 0 { Tensor::cat(&[&k_scaled, &k_rem], candle_core::D::Minus1).unwrap_or(k_scaled) } else { k_rem };
-                                    v_scaled = if repeats > 0 { Tensor::cat(&[&v_scaled, &v_rem], candle_core::D::Minus1).unwrap_or(v_scaled) } else { v_rem };
+                                    let k_rem = k_raw.narrow(3, 0, remainder)?;
+                                    let v_rem = v_raw.narrow(3, 0, remainder)?;
+                                    
+                                    // [FIX] 여기서도 명확하게 배열 슬라이스를 참조(&[...])로 넘깁니다.
+                                    k_scaled = Tensor::cat(&[&k_scaled, &k_rem], 3)?;
+                                    v_scaled = Tensor::cat(&[&v_scaled, &v_rem], 3)?;
                                 }
                                 k_raw = k_scaled;
                                 v_raw = v_scaled;
@@ -744,11 +754,16 @@ impl QuantizedQwen3VLTextAttention {
                                 let mut v_heads = Vec::with_capacity(target_heads);
                                 for j in 0..target_heads {
                                     let src_idx = j % h;
-                                    k_heads.push(k_raw.narrow(1, src_idx, 1).unwrap());
-                                    v_heads.push(v_raw.narrow(1, src_idx, 1).unwrap());
+                                    k_heads.push(k_raw.narrow(1, src_idx, 1)?);
+                                    v_heads.push(v_raw.narrow(1, src_idx, 1)?);
                                 }
-                                k_raw = Tensor::cat(&k_heads, 1).unwrap_or(k_raw);
-                                v_raw = Tensor::cat(&v_heads, 1).unwrap_or(v_raw);
+                                
+                                // [FIX] Vec<Tensor>를 바로 넘기지 않고, 참조의 슬라이스로 변환하여 넘깁니다.
+                                let k_head_refs: Vec<&Tensor> = k_heads.iter().collect();
+                                let v_head_refs: Vec<&Tensor> = v_heads.iter().collect();
+                                
+                                k_raw = Tensor::cat(&k_head_refs, 1).map_err(|e| anyhow::anyhow!("Head cat failed: {}", e))?;
+                                v_raw = Tensor::cat(&v_head_refs, 1).map_err(|e| anyhow::anyhow!("Head cat failed: {}", e))?;
                             }
 
                             inner.k_cache = Some(k_raw.clone());
