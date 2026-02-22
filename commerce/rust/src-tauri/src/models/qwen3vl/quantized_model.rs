@@ -357,7 +357,17 @@ impl KVRegistry {
         let meta_path = path.join("metadata.json");
         if !meta_path.exists() { return Ok(()); }
         let json = std::fs::read_to_string(meta_path)?;
-        let loaded: Vec<RegistryEntry> = serde_json::from_str(&json)?;
+        let mut loaded: Vec<RegistryEntry> = serde_json::from_str(&json)?;
+        
+        // [FIX] Sanitize locations upon reload (RAM is volatile, reset to SSD)
+        for entry in loaded.iter_mut() {
+            if entry.ssd_path.is_some() {
+                for loc in entry.location.iter_mut() {
+                    *loc = KVLocation::SSD;
+                }
+            }
+        }
+
         let mut entries = self.entries.write().unwrap();
         *entries = loaded;
         Ok(())
@@ -665,7 +675,7 @@ impl QuantizedQwen3VLTextAttention {
             let index = block.inner.read().unwrap().index;
             self.registry.mark_accessed(index); // 접근 시각 갱신
             
-            let (k, v, mut b_len, index) = {
+            let (mut k, mut v, mut b_len, index) = {
                 let inner = block.inner.read().unwrap();
                 (inner.k_cache.clone(), inner.v_cache.clone(), inner.len, inner.index)
             };
@@ -689,8 +699,9 @@ impl QuantizedQwen3VLTextAttention {
                 }
                 KVLocation::RAM | KVLocation::RamSticky => {
                     let mut inner = block.inner.write().unwrap();
-                    let mut k = k.clone();
-                    let mut v = v.clone();
+                    // [FIX] Shadowing Removed: Update outer k/v if they are None (Sync with inner cache)
+                    if k.is_none() { k = inner.k_cache.clone(); }
+                    if v.is_none() { v = inner.v_cache.clone(); }
                     
                     if inner.k_cache.is_none() {
                         // 1. Try local metadata
@@ -771,8 +782,9 @@ impl QuantizedQwen3VLTextAttention {
                             k = Some(k_raw);
                             v = Some(v_raw);
                         } else {
-                            println!("[ERROR] Layer {} Block {} location is RAM but NO metadata found! (Index: {})", 
-                                self.layer_idx, index, index);
+                            // [ERROR-FATAL] No metadata found for RAM block
+                            return Err(anyhow::anyhow!("Layer {} Block {} location is RAM but NO metadata found! (Index: {})", 
+                                self.layer_idx, index, index).into());
                         }
                     } else {
                         // [FIX] Race Condition: k was None at top, but now Some (prefetch/other thread filled it)
@@ -1559,7 +1571,13 @@ impl QuantizedQwen3VLTextModel {
                     results,
                 )
             }
-            _ => Err(anyhow::anyhow!("Layer {} Chunk {} failed", layer_idx, chunk_idx)),
+            Ok(Err(e)) => Err(anyhow::anyhow!("Layer {} Chunk {} failed: {}", layer_idx, chunk_idx, e)),
+            Err(p) => {
+                let msg = if let Some(s) = p.downcast_ref::<&str>() { s.to_string() }
+                          else if let Some(s) = p.downcast_ref::<String>() { s.clone() }
+                          else { "Unknown Panic".to_string() };
+                Err(anyhow::anyhow!("Layer {} Chunk {} panicked: {}", layer_idx, chunk_idx, msg))
+            }
         }
     }
 
@@ -1658,6 +1676,9 @@ impl QuantizedQwen3VLTextModel {
                             let mut inner = block.inner.write().unwrap();
                             inner.bitkv_metadata = Some(metadata);
                             inner.location = KVLocation::RAM;
+                            // [DEBUG] Confirm Load
+                            println!("[DEBUG-LOAD] Layer {} Block {} loaded to RAM (Slot {:?}). Meta: {}", *l_idx, *b_idx, acquired_slots.get(i), inner.bitkv_metadata.is_some());
+
                             let mut reg_w = self.registry.entries.write().unwrap();
                             reg_w[*b_idx].location[*l_idx] = KVLocation::RAM;
                             reg_w[*b_idx].slot_ids[*l_idx] = Some(acquired_slots[i]);
