@@ -966,12 +966,24 @@ impl Qwen3VLGenerateModel {
         let t_toks = f_ids.len();
         println!("[TIMER] Input Rendering & Tokenization: {:.2}s for {} tokens", start_prep.elapsed().as_secs_f32(), t_toks);
         
-        let mut a_ids = f_ids.clone();
         let s_off = self.get_kv_len();
         let mut curr_s_off = s_off;
 
-        // [FIX] Prompt Alignment: Only process tokens that are not already in the KV cache.
-        if t_toks < s_off {
+        // [FIX] Smart Alignment: Detect if we are appending to a large pre-baked cache (like PUG)
+        let is_appending_to_warm_cache = s_off > 1000 && t_toks < s_off;
+
+        if is_appending_to_warm_cache {
+            println!("[GENERATE] Warm Cache Detected ({} tokens). Appending instructions only.", s_off);
+            // In this mode, we assume f_ids already contains the instruction we want to append.
+            // We just need to ensure we don't truncate the PUG.
+            self.qwen3_vl.forward(
+                &Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, 
+                None, None, None, None, 
+                Some(&Tensor::arange(s_off as u32, (s_off + t_toks) as u32, &self.text_device)?.unsqueeze(0)?), 
+                s_off, t_toks, sid.clone()
+            )?;
+            curr_s_off = s_off + t_toks;
+        } else if t_toks < s_off {
             println!("[GENERATE] Truncating stale cache: {} -> {}", s_off, t_toks);
             self.truncate_kv_cache(t_toks)?;
             curr_s_off = t_toks;
@@ -1033,7 +1045,8 @@ impl Qwen3VLGenerateModel {
             curr_s_off = s_off;
         }
         
-        let mut curr_s_off = t_toks;
+        let mut a_ids = f_ids.clone();
+        // curr_s_off is already set correctly by the if/else block above.
         let (mut p_vals, i_grid, mut g_text) = (input.pixel_values.take(), input.image_grid_thw.take(), String::new());
         let mut tokens_since_last_bake = 0;
 
