@@ -708,8 +708,35 @@ impl QuantizedQwen3VLTextAttention {
                         let final_meta = meta.or(fallback_meta);
 
                         if let Some(meta) = final_meta {
-                            let k_raw = self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?;
-                            let v_raw = self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?;
+                            let mut k_raw = self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?;
+                            let mut v_raw = self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?;
+                            
+                            // [RELAY-UPSCALE FIX] 0.6B의 텐서 크기를 2B의 크기에 맞게 동적으로 늘려줍니다.
+                            let target_heads = self.num_key_value_heads;
+                            let target_dim = self.head_dim;
+                            let (_b, h, _s, d) = k_raw.dims4().unwrap_or((1, 1, 256, 128));
+
+                            if d < target_dim {
+                                let repeats = target_dim / d;
+                                let mut k_cats = Vec::new();
+                                let mut v_cats = Vec::new();
+                                for _ in 0..repeats { k_cats.push(&k_raw); v_cats.push(&v_raw); }
+                                k_raw = Tensor::cat(&k_cats, candle_core::D::Minus1).unwrap_or(k_raw);
+                                v_raw = Tensor::cat(&v_cats, candle_core::D::Minus1).unwrap_or(v_raw);
+                            }
+
+                            if h != target_heads {
+                                let mut k_heads = Vec::with_capacity(target_heads);
+                                let mut v_heads = Vec::with_capacity(target_heads);
+                                for j in 0..target_heads {
+                                    let src_idx = j % h;
+                                    k_heads.push(k_raw.narrow(1, src_idx, 1).unwrap());
+                                    v_heads.push(v_raw.narrow(1, src_idx, 1).unwrap());
+                                }
+                                k_raw = Tensor::cat(&k_heads, 1).unwrap_or(k_raw);
+                                v_raw = Tensor::cat(&v_heads, 1).unwrap_or(v_raw);
+                            }
+
                             inner.k_cache = Some(k_raw.clone());
                             inner.v_cache = Some(v_raw.clone());
                             k = Some(k_raw);
@@ -1563,10 +1590,28 @@ impl QuantizedQwen3VLTextModel {
                 if let Ok(content) = std::fs::read(&actual_path) {
                     if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
                         let prefix = format!("b{}_l{}_", block_offset, l_idx);
-                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                        let l0_prefix = format!("b{}_l0_", block_offset); // [RELAY FALLBACK] 0.6B 데이터를 읽기 위한 폴백
+                        
+                        let get_t = |s: &str| {
+                            st.tensor(&format!("{}{}", prefix, s))
+                              .or_else(|_| st.tensor(&format!("{}{}", l0_prefix, s)))
+                              .or_else(|_| st.tensor(s))
+                              .ok()
+                        };
+                        
                         if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = 
                             (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
                             
+                            // [SHAPE FIX] 강제로 지정하던 1,16,256,128 대신 메타데이터를 기반으로 동적 파싱
+                            let mut o_shape = vec![1, 16, 256, 128];
+                            if let Some(kh) = get_t("k_shape") {
+                                let v_u32: Vec<u32> = kh.data().chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+                                if v_u32.len() >= 4 {
+                                    o_shape = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
+                                    if o_shape[2] > 1024 || o_shape[3] > 512 { o_shape = vec![1, 16, 256, 128]; }
+                                }
+                            }
+
                             let metadata = BitKVMetadata {
                                 k_anchors: Tensor::from_slice(ka.data(), ka.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
                                 k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
@@ -1574,7 +1619,7 @@ impl QuantizedQwen3VLTextModel {
                                 v_anchors: Tensor::from_slice(va.data(), va.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
                                 v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
                                 v_scales: Tensor::from_slice(vs.data(), vs.shape(), &Device::Cpu)?.to_device(&Device::Cpu)?,
-                                original_shape: vec![1, 16, 256, 128]
+                                original_shape: o_shape
                             };
                             let mut inner = block.inner.write().unwrap();
                             inner.bitkv_metadata = Some(metadata);
