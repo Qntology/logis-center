@@ -431,26 +431,28 @@ impl Qwen3VLGenerateModel {
                 if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             }
 
-            // [PHASE 2] Hybrid Horizontal Relay Pass (0..temp_off)
-            // 사용자 지시: 프롬프트는 청크 단위(백업본 기준 128)로 빠르게, 답변은 1토큰씩 정밀하게 릴레이합니다.
+            // [PHASE 2] High-Speed Hybrid Horizontal Relay (0..temp_off)
+            // 사용자 지시: 프롬프트는 청크 단위로 빠르게, 답변은 1토큰씩 정밀하게!
             if !a_ids.is_empty() {
-                println!("[RELAY-START] Hybrid Relay (128-Chunk Prompt / 1-Token Draft)");
+                println!("[RELAY-START] High-Speed Hybrid Relay (Prompt: 128-Chunk / Draft: 1-Token)");
                 
-                // --- Phase 2a: Prompt Catch-up (Chunks of 256) ---
-                let prompt_chunk_size = 256; 
+                // --- Phase 2a: Prompt Catch-up (Fast Chunk Mode) ---
+                let prompt_chunk_size = 128;
                 for chunk_start in (0..curr_s_off).step_by(prompt_chunk_size) {
                     let chunk_end = (chunk_start + prompt_chunk_size).min(curr_s_off);
                     let chunk_ids = &a_ids[chunk_start..chunk_end];
                     if chunk_ids.is_empty() { continue; }
 
+                    // 초기 임베딩 생성
+                    let chunk_tensor = Tensor::from_vec(chunk_ids.to_vec(), (1, chunk_ids.len()), &self.text_device)?;
                     let mut current_h = match &mut self.qwen3_vl {
-                        ModelVariant::QuantizedText(m) => m.language_model.embed_tokens.forward(&Tensor::from_vec(chunk_ids.to_vec(), (1, chunk_ids.len()), &self.text_device)?)?,
-                        ModelVariant::QuantizedVL(m) => m.language_model.embed_tokens.forward(&Tensor::from_vec(chunk_ids.to_vec(), (1, chunk_ids.len()), &self.text_device)?)?,
+                        ModelVariant::QuantizedText(m) => m.language_model.embed_tokens.forward(&chunk_tensor)?,
+                        ModelVariant::QuantizedVL(m) => m.language_model.embed_tokens.forward(&chunk_tensor)?,
                         _ => unreachable!(),
                     };
 
                     for l_idx in 0..28 {
-                        // [RELAY-CORE] embeds를 직접 다루는 forward_relay를 사용합니다.
+                        // [RELAY-CORE] 128개 뭉치를 한꺼번에 릴레이하여 속도를 극대화합니다.
                         current_h = self.qwen3_vl.forward_relay(
                             &current_h, 
                             chunk_start, 
@@ -460,10 +462,10 @@ impl Qwen3VLGenerateModel {
                             Some(1)
                         )?;
                     }
-                    if chunk_start % 1024 == 0 { println!("[PROMPT-CATCHUP] Tokens {}..{} processed.", chunk_start, chunk_end); }
+                    if chunk_start % 1024 == 0 { println!("[PROMPT-SPEED] Tokens {}/{} cached.", chunk_start, curr_s_off); }
                 }
 
-                // --- Phase 2b: Draft Relay (Token-by-token) ---
+                // --- Phase 2b: Draft Relay (Precision Token Mode) ---
                 for t_idx in curr_s_off..a_ids.len() {
                     let token_id = a_ids[t_idx];
                     let mut current_h = match &mut self.qwen3_vl {
@@ -473,22 +475,15 @@ impl Qwen3VLGenerateModel {
                     };
 
                     for l_idx in 0..28 {
-                        // [RELAY-CORE] embeds를 직접 다루는 forward_relay를 사용합니다.
-                        current_h = self.qwen3_vl.forward_relay(
-                            &current_h, 
-                            t_idx, 
-                            a_ids.len(), 
-                            sid.clone(), 
-                            Some(l_idx), 
-                            Some(1)
-                        )?;
+                        current_h = self.qwen3_vl.forward_relay(&current_h, t_idx, a_ids.len(), sid.clone(), Some(l_idx), Some(1))?;
                     }
                 }
-                println!("[RELAY-COMPLETE] All layers synchronized up to token {}.", temp_off);
+                println!("[RELAY-COMPLETE] Full context synchronized up to token {}.", temp_off - 1);
             }
 
             // [PHASE 3] Full Bundling (From Offset 0)
             if let Some(s_id) = &sid {
+                // 0번부터 전체 기억을 블록 단위로 제본하여 2B에게 넘길 준비를 마칩니다.
                 self.bundle_draft_fragments(s_id, 0, temp_off).await?;
             }
 
