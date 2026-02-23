@@ -1711,22 +1711,48 @@ impl QuantizedQwen3VLTextModel {
                                 
                                 for b_i in 0..batch {
                                     for h_i in 0..source_head {
-                                        // 원본 헤드 데이터 추출
+                                        // 원본 헤드 데이터 추출 (범위 체크 추가)
                                         let h_start = (b_i * source_head + h_i) * seq_len * source_dim;
                                         let h_end = h_start + seq_len * source_dim;
-                                        let head_slice = &raw_data[h_start..h_end];
+                                        
+                                        // 데이터 부족 시 안전 처리
+                                        let head_slice = if h_end <= raw_data.len() {
+                                            &raw_data[h_start..h_end]
+                                        } else if h_start < raw_data.len() {
+                                            &raw_data[h_start..]
+                                        } else {
+                                            &[] // 데이터가 아예 없음
+                                        };
                                         
                                         // 필요한 횟수만큼 반복 (Broadcasting)
                                         for _ in 0..repeat_factor {
+                                            if head_slice.is_empty() {
+                                                // 데이터가 없으면 0으로 채움
+                                                new_data.extend(std::iter::repeat(0.0).take(seq_len * target_dim));
+                                                continue;
+                                            }
+
                                             if source_dim == target_dim {
                                                 new_data.extend_from_slice(head_slice);
+                                                // 부족한 뒷부분 0으로 채움
+                                                if head_slice.len() < seq_len * source_dim {
+                                                    new_data.extend(std::iter::repeat(0.0).take(seq_len * source_dim - head_slice.len()));
+                                                }
                                             } else {
                                                 // 차원 패딩이 필요한 경우 (토큰 단위로 패딩)
                                                 for s_i in 0..seq_len {
                                                     let t_start = s_i * source_dim;
                                                     let t_end = t_start + source_dim;
-                                                    new_data.extend_from_slice(&head_slice[t_start..t_end]);
-                                                    // Zero-padding
+                                                    
+                                                    if t_end <= head_slice.len() {
+                                                        new_data.extend_from_slice(&head_slice[t_start..t_end]);
+                                                    } else if t_start < head_slice.len() {
+                                                        new_data.extend_from_slice(&head_slice[t_start..]);
+                                                        new_data.extend(std::iter::repeat(0.0).take(t_end - head_slice.len()));
+                                                    } else {
+                                                        new_data.extend(std::iter::repeat(0.0).take(source_dim));
+                                                    }
+                                                    // Zero-padding for dimension expansion
                                                     new_data.extend(std::iter::repeat(0.0).take(target_dim - source_dim));
                                                 }
                                             }
