@@ -257,7 +257,10 @@ impl LogisModel {
             let _ = tokio::task::spawn_blocking(move || {
                 if dev.is_cuda() { 
                     println!("[MEMORY] Synchronizing CUDA for purge...");
-                    let _ = dev.synchronize(); 
+                    // [FIX] Ignore potential invalid context errors during sync
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _ = dev.synchronize(); 
+                    }));
                 }
             }).await;
         }

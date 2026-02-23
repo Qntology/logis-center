@@ -169,8 +169,8 @@ pub enum SlotState {
 pub struct MemorySlot {
     pub id: usize,
     pub state: Arc<std::sync::atomic::AtomicU8>, // 0:Free, 1:Baking, 2:Ready, 3:Loading
-    pub k_layers: Vec<Arc<tokio::sync::Mutex<Option<Tensor>>>>, // Slave K tensors
-    pub v_layers: Vec<Arc<tokio::sync::Mutex<Option<Tensor>>>>, // Slave V tensors
+    pub k_layers: Vec<Arc<std::sync::Mutex<Option<Tensor>>>>, // Slave K tensors
+    pub v_layers: Vec<Arc<std::sync::Mutex<Option<Tensor>>>>, // Slave V tensors
     pub remaining_layers: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -179,8 +179,8 @@ impl MemorySlot {
         let mut k_layers = Vec::with_capacity(num_layers);
         let mut v_layers = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            k_layers.push(Arc::new(tokio::sync::Mutex::new(None)));
-            v_layers.push(Arc::new(tokio::sync::Mutex::new(None)));
+            k_layers.push(Arc::new(std::sync::Mutex::new(None)));
+            v_layers.push(Arc::new(std::sync::Mutex::new(None)));
         }
         Self {
             id,
@@ -246,17 +246,8 @@ impl KVRegistry {
         // 이를 통해 RoPE 오프셋이 32512로 점프하는 대참사를 막습니다.
         let mut entries = Vec::with_capacity(128);
         for i in 0..128 {
-            entries.push(RegistryEntry {
-                token_start: i * 256,
-                token_len: 0, // [CRITICAL] 0으로 설정하여 실제 추론 전까지는 길이에 포함되지 않게 함
-                location: vec![KVLocation::SSD; 28],
-                ssd_path: None,
-                slot_ids: vec![None; 28],
-                last_accessed: std::time::Instant::now(),
-                is_dirty: false,
-                hidden_states_path: vec![None; 28],
-                bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; 28])),
-            });
+            let entry = RegistryEntry::new(i * 256, 0, 28);
+            entries.push(entry);
         }
         Self {
             entries: Arc::new(std::sync::RwLock::new(entries)),
@@ -2024,10 +2015,11 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
-        // 임계값 설정 (더 공격적으로 변경)
-        let danger_zone = 200_000_000; // 200MB 이하일 때만 내림
-        let safe_zone = 400_000_000;   // 400MB 이상이면 적극적으로 올림
+        // 임계값 설정 (안전성 위주로 재조정)
+        let danger_zone = 500_000_000; // 500MB 이하: 위험 (내리기 시작)
+        let safe_zone = 1_000_000_000; // 1GB 이상: 여유 (올리기 시작)
 
+        // 2. 무게추(Weights) 리밸런싱
         if free_vram > 0 && free_vram < danger_zone {
             // [OFFLOAD] GPU -> CPU (뒤쪽 레이어부터)
             for layer in self.layers.iter_mut().rev() {
@@ -2038,14 +2030,14 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
         } else if free_vram > safe_zone {
-            // [UPLOAD] CPU -> GPU (한 번에 7개씩 초공격적으로 업로드)
+            // [UPLOAD] CPU -> GPU (한 번에 4개씩 안전하게 업로드)
             let target_device = Device::new_cuda(device_id)?;
             let mut upload_count = 0;
             for layer in self.layers.iter_mut() {
                 if layer.device().is_cpu() {
                     layer.to_device(&target_device)?;
                     upload_count += 1;
-                    if upload_count >= 7 { break; } // 사용자의 요청에 따라 7개로 상향
+                    if upload_count >= 4 { break; } 
                 }
             }
             if upload_count > 0 {

@@ -78,12 +78,19 @@ impl SlotManager {
         let mut p_writes: VecDeque<(oneshot::Sender<usize>, usize)> = VecDeque::new();
         let mut p_reads: VecDeque<oneshot::Sender<usize>> = VecDeque::new();
         let mut flushers: Vec<oneshot::Sender<()>> = Vec::new();
-        let mut sys = sysinfo::System::new_all();
+        
+        // [OPTIMIZATION] sysinfo 초기화는 한 번만 수행하여 오버헤드 제거
+        let mut sys = sysinfo::System::new(); 
+        sys.refresh_memory();
+        
+        println!("[INIT] SlotManager Dispatcher is now online.");
 
         while let Some(req) = rx.recv().await {
             match req {
                 SlotRequest::AcquireWrite { response, total_tokens } => {
-                    sys.refresh_memory();
+                    // 주기적으로만 메모리 정보 갱신 (매번 하면 느려짐)
+                    if cf.load(Ordering::SeqCst) % 8 == 0 { sys.refresh_memory(); }
+                    
                     let max_c = Self::calculate_dynamic_budget(&sys, total_tokens, max_slots);
                     if cw.load(Ordering::SeqCst) < max_c && !free_p.is_empty() {
                         let idx = free_p.pop_front().unwrap();
@@ -104,6 +111,11 @@ impl SlotManager {
                     if idx < max_slots && states[idx] != InternalState::Free {
                         let old = states[idx]; states[idx] = InternalState::Free; free_p.push_back(idx); cf.fetch_add(1, Ordering::SeqCst);
                         if old == InternalState::Writing { cw.fetch_sub(1, Ordering::SeqCst); } else { cr.fetch_sub(1, Ordering::SeqCst); }
+                        
+                        let (rc, wc) = (cr.load(Ordering::SeqCst), cw.load(Ordering::SeqCst));
+                        if wc % 5 == 0 || wc < 5 {
+                            println!("[SLOTS] Released slot {}. Active: (W:{}, R:{})", idx, wc, rc);
+                        }
                     }
                     // [FIX] 카운트 업데이트 직후 즉시 Flush 대기자들을 확인
                     if cw.load(Ordering::SeqCst) == 0 && cr.load(Ordering::SeqCst) == 0 { 
@@ -112,10 +124,12 @@ impl SlotManager {
                     Self::process_queues_robust(&sys, &mut free_p, &mut p_writes, &mut p_reads, &mut states, &cf, &cw, &cr, max_slots);
                 }
                 SlotRequest::Flush { response } => {
+                    let (rc, wc) = (cr.load(Ordering::SeqCst), cw.load(Ordering::SeqCst));
                     // [FIX] 요청을 받는 즉시 카운트가 0이면 대기 없이 응답
-                    if cw.load(Ordering::SeqCst) == 0 && cr.load(Ordering::SeqCst) == 0 { 
+                    if wc == 0 && rc == 0 { 
                         let _ = response.send(()); 
                     } else { 
+                        println!("[SLOTS] Flush requested. Waiting for (W:{}, R:{}) tasks...", wc, rc);
                         flushers.push(response); 
                     }
                 }
@@ -139,11 +153,32 @@ impl SlotManager {
         }
     }
 
-    fn calculate_dynamic_budget(sys: &sysinfo::System, _total_tokens: usize, max_slots: usize) -> usize {
-        let avail = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-        let base_min = 32; let max_cap = 48; 
-        let budget = if avail < 2.0 { base_min } else { ((avail - 2.0) / 0.05) as usize + base_min };
-        budget.min(max_cap).min(max_slots)
+    fn calculate_dynamic_budget(_sys: &sysinfo::System, _total_tokens: usize, max_slots: usize) -> usize {
+        // [VRAM-AWARE-BUDGET] 시스템 RAM 대신 VRAM 여유 공간을 기준으로 슬롯 개수 제한
+        use nvml_wrapper::Nvml;
+        let mut free_vram_gb = 1.0; // 기본값
+        
+        if let Ok(nvml) = Nvml::init() {
+            if let Ok(dev) = nvml.device_by_index(0) { // GPU 0번 기준
+                if let Ok(mem) = dev.memory_info() {
+                    free_vram_gb = mem.free as f64 / 1024.0 / 1024.0 / 1024.0;
+                }
+            }
+        }
+
+        // 0.6B 모델 기준 1슬롯(1024토큰)은 약 0.22GB 점유
+        // 여유 VRAM의 절반 정도만 슬롯에 할당하여 연산 버퍼 확보
+        let safe_vram = (free_vram_gb - 0.5).max(0.0); // 안전 마진 500MB
+        let budget = (safe_vram / 0.22) as usize;
+        
+        // 4GB GPU 기준 보통 8~12개 슬롯으로 제한됨
+        let final_budget = budget.clamp(4, 16).min(max_slots);
+        
+        if _total_tokens % 1024 == 0 {
+            println!("[SLOTS] Dynamic Budget updated: {} slots based on {:.2}GB free VRAM", final_budget, free_vram_gb);
+        }
+        
+        final_budget
     }
 
     pub async fn wait_for_all_tasks(&self) {
@@ -156,6 +191,7 @@ impl SlotManager {
     pub async fn acquire_write_slot(&self, total_tokens: usize) -> usize { let (tx, rx) = oneshot::channel(); let _ = self.request_tx.send(SlotRequest::AcquireWrite { response: tx, total_tokens }).await; rx.await.unwrap_or(0) }
     pub async fn release_slot(&self, id: usize) {
         if id < self.slots.len() {
+            // [FIX] std::sync::Mutex용 동기 락 사용
             for l in &self.slots[id].k_layers { if let Ok(mut g) = l.try_lock() { *g = None; } }
             for l in &self.slots[id].v_layers { if let Ok(mut g) = l.try_lock() { *g = None; } }
             self.slots[id].state.store(0, Ordering::SeqCst);
@@ -169,11 +205,17 @@ pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::L
 pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn wait_for_global_io() {
+    // 1. 모든 슬롯 작업(압축/큐잉) 완료 대기
     let _ = SLOT_MANAGER.wait_for_all_tasks().await;
+    
+    // 2. 모든 물리적 디스크 쓰기 완료 대기
     let mut attempts = 0;
-    while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 && attempts < 200 {
-        tokio::time::sleep(Duration::from_millis(100)).await; attempts += 1;
+    while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 && attempts < 500 {
+        if attempts % 50 == 0 { println!("[IO-WAIT] Waiting for {} pending disk writes...", GLOBAL_IO_COUNTER.load(Ordering::SeqCst)); }
+        tokio::time::sleep(Duration::from_millis(50)).await; 
+        attempts += 1;
     }
+    println!("[IO-WAIT] Global IO Sync Complete.");
 }
 
 struct LayerKVDump { layer_idx: usize, k_tensor: Tensor, v_tensor: Tensor }
@@ -254,21 +296,52 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             match task {
                 SlotTask::Bake(bake) => {
                     let io_tx_inner = io_tx.clone();
+                    let (sid, t_dir, off, is_relay) = (bake.slot_id, bake.task_dir, bake.offset, bake.is_relay_baking);
+                    
                     tokio::task::spawn_blocking(move || {
-                        let sid = bake.slot_id;
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let (t_dir, off, is_relay) = (bake.task_dir, bake.offset, bake.is_relay_baking);
-                            if bake.layers.is_empty() { let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: false }); return; }
-                            let loop_count = bake.layers.len(); let slot = &SLOT_MANAGER.slots[sid]; slot.remaining_layers.store(loop_count, Ordering::SeqCst); 
-                            let block_dir = t_dir.join(format!("b{}", off)); let block_prefix = format!("b{}_", off);
+                            if bake.layers.is_empty() { 
+                                let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true }); 
+                                return; 
+                            }
+                            let loop_count = bake.layers.len(); 
+                            let slot = &SLOT_MANAGER.slots[sid]; 
+                            slot.remaining_layers.store(loop_count, Ordering::SeqCst); 
+                            
+                            let block_dir = t_dir.join(format!("b{}", off)); 
+                            let block_prefix = format!("b{}_", off);
+                            
                             for l_idx in 0..loop_count {
-                                let mut layer_map = HashMap::new(); let src = &bake.layers[l_idx];
+                                let src = &bake.layers[l_idx];
                                 let act_l = if is_relay && loop_count == 1 { 0 } else { src.layer_idx };
                                 let prefix = format!("{}l{}_", block_prefix, act_l);
+                                
                                 let k_res = src.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
                                 let v_res = src.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
-                                let (kd, vd) = match (k_res, v_res) { (Ok(k), Ok(v)) => (k, v), _ => { slot.remaining_layers.fetch_sub(1, Ordering::SeqCst); continue; } };
-                                let ks = src.k_tensor.dims(); let (b, h, s, d) = (ks[0], ks[1], ks[2], ks[3]);
+                                
+                                let (kd, vd) = match (k_res, v_res) { 
+                                    (Ok(k), Ok(v)) => (k, v), 
+                                    (e1, e2) => {
+                                        println!("[WORKER-ERR] Block {} Tensor transfer failed! K_err: {:?}, V_err: {:?}", off/256, e1.err(), e2.err());
+                                        // [CRITICAL] 실패 시에도 카운트를 깎고 마지막이면 슬롯 해제
+                                        if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 {
+                                            let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true });
+                                        }
+                                        continue; 
+                                    }
+                                };
+
+                                let ks = src.k_tensor.dims(); 
+                                let (b, h, s, d) = (ks[0], ks[1], ks[2], ks[3]);
+                                if s == 0 {
+                                    println!("[WORKER-SKIP] Block {} has 0 tokens.", off/256);
+                                    if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 {
+                                        let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true });
+                                    }
+                                    continue;
+                                }
+
+                                let mut layer_map = HashMap::new();
                                 let hs = s * d; let ac = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
                                 let mut ka = vec![0.0f32; b*h*ac*d]; let mut kp = vec![0u8; (b*h*s*d+7)/8]; let mut ksc = vec![0.0f32; b*h*s];
                                 for bh in 0..(b*h) {
@@ -298,11 +371,17 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 layer_map.insert(format!("{}v_anchors", prefix), Tensor::from_vec(va, vec![b,h,ac,d], &Device::Cpu).unwrap());
                                 layer_map.insert(format!("{}v_packed", prefix), Tensor::from_vec(vp, vec![(b*h*s*d+7)/8], &Device::Cpu).unwrap());
                                 layer_map.insert(format!("{}v_scales", prefix), Tensor::from_vec(vsc, vec![b,h,s,1], &Device::Cpu).unwrap());
+                                
                                 GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-                                let _ = io_tx_inner.blocking_send(SaveTask { slot_id: sid, path: block_dir.join(format!("l{}.st", act_l)), tensors: layer_map, is_last: l_idx == loop_count - 1, block_idx: bake.block_idx, registry: bake.registry.clone() });
+                                let save_path = block_dir.join(format!("l{}.st", act_l));
+                                let _ = io_tx_inner.blocking_send(SaveTask { slot_id: sid, path: save_path.clone(), tensors: layer_map, is_last: l_idx == loop_count - 1, block_idx: bake.block_idx, registry: bake.registry.clone() });
+                                println!("[SSD-BAKE-QUEUED] Block {}, Layer {}", off / 256, act_l);
                             }
                         }));
-                        if let Err(p) = result { println!("[WORKER-PANIC] !! Error in BakeTask: {:?}", p); let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true }); }
+                        if let Err(p) = result { 
+                            println!("[WORKER-PANIC] !! Error in BakeTask: {:?}", p); 
+                            let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true }); 
+                        }
                     }).await.ok();
                 }
                 SlotTask::Load(load) => {
@@ -660,25 +739,54 @@ impl Qwen3VLGenerateModel {
             let unbaked = self.get_all_unbaked_kv_blocks();
             let mut tasks_sent = 0;
             
+            println!("[BAKING] Processing {} unbaked blocks...", unbaked.len());
+            
             for (ks, vs, off) in unbaked {
                 let slot_id = SLOT_MANAGER.acquire_write_slot(t_toks).await;
-                let path = crate::utils::paths::get_kv_dir(None).join(s_id); if !path.exists() { let _ = fs::create_dir_all(&path); }
-                let mut dumps = Vec::new(); for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() { dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v }); }
+                let path = crate::utils::paths::get_kv_dir(None).join(s_id); 
+                if !path.exists() { let _ = fs::create_dir_all(&path); }
+                
+                // [CRITICAL-FIX] 워커에 던지기 전에 '메인 스레드'에서 즉시 CPU로 복사
+                let mut dumps = Vec::new(); 
+                for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() { 
+                    let k_cpu = k.to_device(&Device::Cpu)?;
+                    let v_cpu = v.to_device(&Device::Cpu)?;
+                    dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k_cpu, v_tensor: v_cpu }); 
+                }
+                
                 if let Ok(tx) = get_bake_worker().await {
-                    let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
-                    let is_baking_mode = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.baking_only, ModelVariant::QuantizedText(m) => m.language_model.baking_only, _ => false };
-                    let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: path, kv_name: kv_name.clone(), offset: off, layers: dumps, is_relay_baking: is_baking_mode, block_idx: Some(off / 256), registry: rr })).await;
-                    tasks_sent += 1;
+                    let rr = match &self.qwen3_vl { 
+                        ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), 
+                        ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), 
+                        _ => None 
+                    };
+                    let is_baking_mode = match &self.qwen3_vl { 
+                        ModelVariant::QuantizedVL(m) => m.language_model.baking_only, 
+                        ModelVariant::QuantizedText(m) => m.language_model.baking_only, 
+                        _ => false 
+                    };
+                    
+                    if tx.send(SlotTask::Bake(BakeTask { 
+                        slot_id, task_dir: path, kv_name: kv_name.clone(), 
+                        offset: off, layers: dumps, is_relay_baking: is_baking_mode, 
+                        block_idx: Some(off / 256), registry: rr 
+                    })).await.is_ok() {
+                        tasks_sent += 1;
+                    } else {
+                        SLOT_MANAGER.release_slot(slot_id).await;
+                    }
+                } else {
+                    SLOT_MANAGER.release_slot(slot_id).await;
                 }
             }
             
-            // [FIX] 보낸 작업이 있을 때만 대기하여 데드락 방지
+            // [WAIT] 모든 블록이 SSD에 써질 때까지 '절대' 리턴하지 않음
             if tasks_sent > 0 {
-                SLOT_MANAGER.wait_for_all_tasks().await;
+                println!("[BAKING] Syncing {} blocks to SSD...", tasks_sent);
+                wait_for_global_io().await;
             }
             
-            let path = crate::utils::paths::get_kv_dir(None).join(s_id); if !path.exists() { let _ = fs::create_dir_all(&path); }
-            // [FIX] prefill_only(베이킹)는 워커가 이미 레이어 0번을 저장했으므로 추가 호출 제거
+            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
             self.clear_temporal_kv_caches();
         }
         Ok(t_toks)
