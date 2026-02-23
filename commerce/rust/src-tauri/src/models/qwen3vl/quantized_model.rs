@@ -1103,21 +1103,38 @@ impl QuantizedQwen3VLTextAttention {
 
         // 1. Try to find all fragments (e.g., base_0.safetensors, base_1024.safetensors)
         let mut fragments = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                let fname = entry.file_name().to_string_lossy().to_string();
-                if fname.starts_with(&base_filename) && fname.ends_with(".safetensors") {
-                    // Extract offset from filename: "layer_pug_kv_1024.safetensors" -> 1024
-                    let offset = if fname == format!("{}.safetensors", base_filename) {
-                        0
-                    } else {
-                        fname.strip_prefix(&format!("{}_", base_filename))
-                             .and_then(|s| s.strip_suffix(".safetensors"))
-                             .and_then(|s| s.parse::<usize>().ok())
-                             .unwrap_or(0)
-                    };
-                    fragments.push((offset, entry.path()));
+        
+        let find_fragments = |target_base: &str, frags: &mut Vec<(usize, std::path::PathBuf)>| {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let fname = entry.file_name().to_string_lossy().to_string();
+                    if fname.starts_with(target_base) && fname.ends_with(".safetensors") {
+                        let offset = if fname == format!("{}.safetensors", target_base) {
+                            0
+                        } else {
+                            fname.strip_prefix(&format!("{}_", target_base))
+                                 .and_then(|s| s.strip_suffix(".safetensors"))
+                                 .and_then(|s| s.parse::<usize>().ok())
+                                 .unwrap_or(0)
+                        };
+                        frags.push((offset, entry.path()));
+                    }
                 }
+            }
+        };
+
+        // First attempt: Look for specific layer files
+        find_fragments(&base_filename, &mut fragments);
+
+        // [FALLBACK] If specific layer files are missing, try to borrow from Layer 0 (Baking Broadcast)
+        if fragments.is_empty() && self.layer_idx != 0 {
+            let fallback_base = match kv_name {
+                Some(_name) => format!("layer_0_kv"), // If named, still try 0? Or maybe stick to name. Let's assume 0 is the universal prompt cache.
+                None => format!("layer_0_kv"),
+            };
+            find_fragments(&fallback_base, &mut fragments);
+            if !fragments.is_empty() {
+                // println!("[KV-BORROW] Layer {} is borrowing context from Layer 0", self.layer_idx);
             }
         }
         
