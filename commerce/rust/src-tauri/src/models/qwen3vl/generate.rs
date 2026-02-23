@@ -157,12 +157,23 @@ impl SlotManager {
 
     pub async fn reset_all_slots(&self) { for i in 0..self.slots.len() { self.release_slot(i).await; } }
     pub async fn acquire_read_slot(&self) -> usize { let (tx, rx) = oneshot::channel(); let _ = self.request_tx.send(SlotRequest::AcquireRead { response: tx }).await; rx.await.unwrap_or(0) }
-    pub async fn acquire_write_slot(&self, total_tokens: usize) -> usize { let (tx, rx) = oneshot::channel(); let _ = self.request_tx.send(SlotRequest::AcquireWrite { response: tx, total_tokens }).await; rx.await.unwrap_or(0) }
+    pub async fn acquire_write_slot(&self, total_tokens: usize) -> usize {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.request_tx.send(SlotRequest::AcquireWrite { response: tx, total_tokens }).await;
+        let id = rx.await.unwrap_or(0);
+        // [SLOT-TRACE] 슬롯 획득 모니터링
+        // println!("[SLOT-MGMT] >> Acquired Slot {} for tokens {}. Active Writes: {}", id, total_tokens, self.count_writes.load(Ordering::Relaxed));
+        id
+    }
     pub async fn release_slot(&self, id: usize) {
         if id < self.slots.len() {
             for l in &self.slots[id].k_layers { if let Ok(mut g) = l.try_lock() { *g = None; } }
             for l in &self.slots[id].v_layers { if let Ok(mut g) = l.try_lock() { *g = None; } }
             self.slots[id].state.store(0, Ordering::SeqCst);
+            
+            // [SLOT-TRACE] 슬롯 회수 모니터링
+            // println!("[SLOT-MGMT] << Released Slot {}. Now available for reuse.", id);
+
             let _ = self.request_tx.send(SlotRequest::Release { 
                 idx: id, 
                 task_id: None, 

@@ -250,13 +250,13 @@ pub struct KVRegistry {
 
 impl KVRegistry {
     pub fn new() -> Self {
-        // [FIX] 장부(Registry)를 처음부터 최대 슬롯 개수(128개)만큼 미리 할당합니다.
-        // 이렇게 해야 프롬프트가 40블록이더라도 Drafting 중 41번째 블록 진입 시 패닉이 발생하지 않습니다.
+        // [FIX] 장부를 128개 미리 할당하되, 실제 데이터 길이는 0으로 초기화합니다.
+        // 이를 통해 RoPE 오프셋이 32512로 점프하는 대참사를 막습니다.
         let mut entries = Vec::with_capacity(128);
         for i in 0..128 {
             entries.push(RegistryEntry {
                 token_start: i * 256,
-                token_len: 0,
+                token_len: 0, // [CRITICAL] 0으로 설정하여 실제 추론 전까지는 길이에 포함되지 않게 함
                 location: vec![KVLocation::SSD; 28],
                 ssd_path: None,
                 slot_ids: vec![None; 28],
