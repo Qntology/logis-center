@@ -1739,21 +1739,31 @@ impl QuantizedQwen3VLTextModel {
                                                     new_data.extend(std::iter::repeat(0.0).take(seq_len * source_dim - head_slice.len()));
                                                 }
                                             } else {
-                                                // 차원 패딩이 필요한 경우 (토큰 단위로 패딩)
+                                                // 차원 패딩 또는 자르기 (Truncation)
                                                 for s_i in 0..seq_len {
                                                     let t_start = s_i * source_dim;
                                                     let t_end = t_start + source_dim;
                                                     
-                                                    if t_end <= head_slice.len() {
-                                                        new_data.extend_from_slice(&head_slice[t_start..t_end]);
+                                                    // 복사할 길이 결정 (Truncation 고려)
+                                                    let copy_len = source_dim.min(target_dim);
+                                                    
+                                                    // 원본 데이터가 충분한지 확인 후 복사
+                                                    if t_start + copy_len <= head_slice.len() {
+                                                        new_data.extend_from_slice(&head_slice[t_start..t_start + copy_len]);
                                                     } else if t_start < head_slice.len() {
+                                                        // 원본 데이터가 중간에 끊긴 경우
+                                                        let available = head_slice.len() - t_start;
                                                         new_data.extend_from_slice(&head_slice[t_start..]);
-                                                        new_data.extend(std::iter::repeat(0.0).take(t_end - head_slice.len()));
+                                                        new_data.extend(std::iter::repeat(0.0).take(copy_len - available));
                                                     } else {
-                                                        new_data.extend(std::iter::repeat(0.0).take(source_dim));
+                                                        // 원본 데이터가 아예 없는 경우
+                                                        new_data.extend(std::iter::repeat(0.0).take(copy_len));
                                                     }
-                                                    // Zero-padding for dimension expansion
-                                                    new_data.extend(std::iter::repeat(0.0).take(target_dim - source_dim));
+
+                                                    // 부족한 부분 Zero-padding (source_dim < target_dim 인 경우)
+                                                    if target_dim > source_dim {
+                                                        new_data.extend(std::iter::repeat(0.0).take(target_dim - source_dim));
+                                                    }
                                                 }
                                             }
                                         }
