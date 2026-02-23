@@ -1,6 +1,6 @@
 use crate::models::qwen3vl::quantized_model::KVLocation;
 use anyhow::{Result, anyhow};
-use candle_core::{quantized::gguf_file, DType, Device, Tensor, IndexOp};
+use candle_core::{quantized::gguf_file, DType, Device, Tensor, IndexOp, Module};
 use candle_nn::VarBuilder;
 use candle_transformers::utils::apply_repeat_penalty;
 
@@ -423,13 +423,24 @@ impl Qwen3VLGenerateModel {
                 if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             }
 
-            // [PHASE 2] Full-Sequence Catch-up (0..temp_off)
-            // 사용자 지시: 모든 레이어가 0번 토큰부터 전체 구간을 다시 훑으며 데이터를 SSD에 주입합니다.
+            // [PHASE 2] Horizontal Relay Pass (0..temp_off)
+            // 사용자 지시: 0번 오프셋부터 전체 구간을 릴레이 방식으로 통과시켜 '지능의 고리'를 연결합니다.
             if !a_ids.is_empty() {
-                let full_sequence_tensor = Tensor::from_vec(a_ids.clone(), (1, a_ids.len()), &self.text_device)?;
+                // 1. 전체 시퀀스의 초기 임베딩을 생성합니다. (0..temp_off)
+                let mut current_h = match &mut self.qwen3_vl {
+                    ModelVariant::QuantizedText(m) => m.language_model.embed_tokens.forward(&Tensor::from_vec(a_ids.clone(), (1, a_ids.len()), &self.text_device)?)?,
+                    ModelVariant::QuantizedVL(m) => m.language_model.embed_tokens.forward(&Tensor::from_vec(a_ids.clone(), (1, a_ids.len()), &self.text_device)?)?,
+                    _ => unreachable!("Only Quantized models support relay for now"),
+                };
+
                 for l_idx in 0..28 {
-                    // 0번 오프셋부터 전체 길이를 각 레이어에 주입 (Inference 없이 데이터 생성만 수행)
-                    self.qwen3_vl.forward(&full_sequence_tensor, None, None, None, None, None, 0, a_ids.len(), sid.clone(), Some(l_idx), Some(1))?;
+                    // [RELAY-CORE] 이전 레이어의 결과(current_h)를 다음 레이어의 입력으로 주입합니다.
+                    current_h = self.qwen3_vl.forward(
+                        &current_h, 
+                        None, None, None, None, None, 
+                        0, a_ids.len(), sid.clone(), 
+                        Some(l_idx), Some(1)
+                    )?;
                 }
             }
 
