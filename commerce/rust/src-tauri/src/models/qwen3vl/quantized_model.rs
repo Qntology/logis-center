@@ -1647,17 +1647,8 @@ impl QuantizedQwen3VLTextModel {
         sin: &Tensor,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        // [PROGRESS-LOG] 모든 레이어 회전 모델(0.6B Drafting 포함)에서 진행률을 명시적으로 출력
-        if self.layers.len() > 1 {
-            if layer_idx == 0 { 
-                // [DEBUG-DRAFT] 매 토큰의 시작 레이어에서 오프셋 표시
-                print!("\n[Off:{}] Layers: ", seqlen_offset); 
-            }
-            print!("{}.", layer_idx);
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-        }
-
+        // [CLEANUP] 수직적 로그를 제거하고 generate.rs의 수평적 로그만 사용합니다.
+        
         let start_layer_time = std::time::Instant::now();
 
         // [STEP 1] Load & Decode (Inline & Strict Path Resolution)
@@ -1960,44 +1951,36 @@ impl QuantizedQwen3VLTextModel {
         let _ = target_device.synchronize();
         let next_xs = Tensor::cat(&next_xs_all, 1)?;
         
-        // [SSD-DUMP-PIPELINE] 사용자 제안 반영: 현재 레이어의 모든 결과를 SSD로 비동기 덤프
-        if let Some(sid) = &self.active_session_id {
-            let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
-            let layer_dir = task_dir.join(format!("layer_{}", layer_idx));
-            if !layer_dir.exists() { let _ = fs::create_dir_all(&layer_dir); }
+        // [SSD-DUMP-REFINED] 사용자 지시: 개별 디코딩 결과를 디스크로 즉시 기록 (JSON 매칭용)
+        if self.pinned_layer_count == 1 && self.active_session_id.is_some() {
+            let sid = self.active_session_id.as_ref().unwrap();
+            let frag_dir = crate::utils::paths::get_task_specific_dir(None, sid).join("fragments");
+            if !frag_dir.exists() { let _ = fs::create_dir_all(&frag_dir); }
             
-            let base_chunk_idx = seqlen_offset / 256;
-            let registry_clone = self.registry.clone();
+            let frag_path = frag_dir.join(format!("off_{}_layer_{}.st", seqlen_offset, layer_idx));
+            let mut map = HashMap::new();
             
-            for (c_offset, chunk_xs) in next_xs_all.iter().enumerate() {
-                let absolute_chunk_idx = base_chunk_idx + c_offset;
-                let chunk_path = layer_dir.join(format!("chunk_{}.st", absolute_chunk_idx));
-                
-                // [CRITICAL-FIX] 비동기 태스크로 넘기기 전에 메인 스레드에서 즉시 CPU로 복사합니다.
-                // GPU 컨텍스트 유실로 인한 패닉을 원천 차단합니다.
-                let chunk_xs_cpu = chunk_xs.to_device(&Device::Cpu).unwrap_or_else(|_| chunk_xs.clone());
-                
-                let layer_idx_fixed = layer_idx;
-                let registry_task_clone = self.registry.clone();
-
-                // [GLOBAL-SAFETY] 비동기 덤프 추적 시작
-                crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-
-                // [ASYNC-IO] 연산 흐름을 방해하지 않도록 별도 태스크로 파일 저장
-                tauri::async_runtime::spawn(async move {
-                    let mut map = HashMap::new();
-                    map.insert("hidden_states".to_string(), chunk_xs_cpu);
-                    let _ = candle_core::safetensors::save(&map, &chunk_path);
-                    
-                    if let Ok(mut reg_w) = registry_task_clone.entries.write() {
-                        if absolute_chunk_idx < reg_w.len() {
-                            reg_w[absolute_chunk_idx].hidden_states_path[layer_idx_fixed] = Some(chunk_path);
-                        }
+            // 현재 레이어의 KV Cache 추출 (마지막 1개 토큰분)
+            for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
+                let inner = block.inner.read().unwrap();
+                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                    if k.dim(2)? > 0 {
+                        let k_last = k.narrow(2, k.dim(2)? - 1, 1)?;
+                        let v_last = v.narrow(2, v.dim(2)? - 1, 1)?;
+                        map.insert("k".to_string(), k_last.to_device(&Device::Cpu)?);
+                        map.insert("v".to_string(), v_last.to_device(&Device::Cpu)?);
                     }
-                    
-                    // [GLOBAL-SAFETY] 비동기 덤프 완료
-                    crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
-                });
+                }
+            }
+            
+            if !map.is_empty() {
+                let _ = candle_core::safetensors::save(&map, &frag_path);
+                // [MAPPING-FILE] JSON에 개별 기록 (동기 방식)
+                let meta_path = frag_dir.join("metadata.json");
+                let entry = format!("{{\"off\": {}, \"layer\": {}, \"path\": {:?}}}\n", seqlen_offset, layer_idx, frag_path.to_string_lossy());
+                let mut file = fs::OpenOptions::new().create(true).append(true).open(meta_path).unwrap();
+                use std::io::Write;
+                let _ = file.write_all(entry.as_bytes());
             }
         }
 
@@ -2416,7 +2399,9 @@ impl QuantizedQwen3VLTextModel {
         position_ids_in: Option<&Tensor>,
         _visual_pos_masks: Option<&Tensor>,
         _deepstack_visual_embeds: Option<Vec<Tensor>>,
-        sid: Option<String>, // [NEW] Session ID Propagation
+        sid: Option<String>,
+        start_layer_override: Option<usize>, // [NEW] 수평적 추론을 위한 시작 레이어
+        num_layers_override: Option<usize>,  // [NEW] 수평적 추론을 위한 실행 레이어 수
     ) -> Result<Tensor> {
         if let Some(s) = sid {
             self.active_session_id = Some(s);
@@ -2434,18 +2419,22 @@ impl QuantizedQwen3VLTextModel {
         };
         let mut xs = xs.to_dtype(target_dtype)?.contiguous()?;
 
-        let mut start_layer = 0;
-        if let Some(sid) = &self.active_session_id {
-            let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
-            for l_idx in (0..self.layers.len()).rev() {
-                let checkpoint_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", l_idx, seqlen_offset));
-                if checkpoint_path.exists() {
-                    if let Ok(recovered_xs) = crate::utils::tensor_utils::load_tensor(&checkpoint_path, "hidden_states", &target_device) {
-                        println!("[SWAP-RESUME] Jumping to Layer {} for Offset {}.", l_idx + 1, seqlen_offset);
-                        let r_xs: Tensor = recovered_xs; 
-                        xs = r_xs.to_dtype(target_dtype)?;
-                        start_layer = l_idx + 1;
-                        break;
+        let mut start_layer = start_layer_override.unwrap_or(0);
+        
+        // [CHECKPOINT] Resume 로직은 Override가 없을 때만 작동
+        if start_layer_override.is_none() {
+            if let Some(sid) = &self.active_session_id {
+                let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
+                for l_idx in (0..self.layers.len()).rev() {
+                    let checkpoint_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", l_idx, seqlen_offset));
+                    if checkpoint_path.exists() {
+                        if let Ok(recovered_xs) = crate::utils::tensor_utils::load_tensor(&checkpoint_path, "hidden_states", &target_device) {
+                            println!("[SWAP-RESUME] Jumping to Layer {} for Offset {}.", l_idx + 1, seqlen_offset);
+                            let r_xs: Tensor = recovered_xs; 
+                            xs = r_xs.to_dtype(target_dtype)?;
+                            start_layer = l_idx + 1;
+                            break;
+                        }
                     }
                 }
             }
@@ -2484,13 +2473,13 @@ impl QuantizedQwen3VLTextModel {
         };
 
         // [RECURSIVE-EXECUTION]
-        // 루프 대신 재귀 호출을 사용하여 한 레이어씩 엄격하게 처리합니다.
-        let num_layers = self.layers.len();
-        // println!("[TRACE] Starting Recursive-Style Layer Queue: Total layers: {}", num_layers);
+        let total_layers = self.layers.len();
+        let num_layers_to_run = num_layers_override.unwrap_or(total_layers);
+        let end_layer = (start_layer + num_layers_to_run).min(total_layers);
         
         xs = self.process_layers_recursive(
-            0,
-            num_layers,
+            start_layer,
+            end_layer,
             xs,
             &cos,
             &sin,
@@ -2504,7 +2493,10 @@ impl QuantizedQwen3VLTextModel {
             xs = xs.to_device(norm_dev)?;
         }
         
-        let xs = xs.apply(&self.norm)?;
+        // 마지막 레이어까지 다 돌았을 때만 Norm 적용
+        if end_layer == total_layers {
+            xs = xs.apply(&self.norm)?;
+        }
         
         Ok(xs)
     }
@@ -2624,8 +2616,9 @@ impl QuantizedQwen3VLTextModel {
 
         // [FIX] 스캔 시작 전에 이미 복원된 메타데이터(Registry)가 있다면 길이를 동기화합니다.
         if let Ok(entries) = self.registry.entries.read() {
-            if let Some(last) = entries.last() {
-                self.current_kv_len = last.token_start + last.token_len;
+            // [FIX] 128개 사전 할당된 빈 칸을 무시하고, 실제로 데이터가 있는 마지막 블록을 찾습니다.
+            if let Some(last_valid) = entries.iter().rev().find(|e| e.token_len > 0) {
+                self.current_kv_len = last_valid.token_start + last_valid.token_len;
                 println!("[SSD-LOAD] Pre-scan Sync: current_kv_len set to {} from Registry.", self.current_kv_len);
             }
         }
@@ -2754,8 +2747,8 @@ impl QuantizedQwen3VLTextModel {
 
         // [RELAY-JUMP] Use the EXACT expected length to prevent misalignment
         if expected_len > 0 {
-            self.current_kv_len = expected_len;
-            println!("[SSD-LOAD] Relay Jump: Model progress synchronized to token index {}.", expected_len);
+            // [FIX] 32512 패닉 방지: 실제 로드된 블록의 데이터만 반영하여 로그를 출력합니다.
+            println!("[SSD-LOAD] Relay Jump: Model progress synchronized to token index {}.", self.current_kv_len);
         } else if let Some((last_off, _)) = fragments.last() {
             // Fallback if expected_len is not provided
             let total_loaded = *last_off + 256; 
@@ -3158,7 +3151,20 @@ impl QuantizedQwen3VLModel {
         Ok((position_ids, deltas))
     }
 
-    pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
+    pub fn forward(
+        &mut self,
+        input_ids_in: &Tensor,
+        pixel_values: Option<&Tensor>,
+        image_grid_thw: Option<&Tensor>,
+        _pixel_values_video: Option<&Tensor>,
+        video_grid_thw: Option<&Tensor>,
+        cache_position_in: Option<&Tensor>,
+        seqlen_offset: usize,
+        total_len: usize,
+        session_id: Option<String>,
+        start_layer_override: Option<usize>, // [NEW]
+        num_layers_override: Option<usize>,  // [NEW]
+    ) -> Result<Tensor> {
         // [DEVICE-ALIGNMENT] 임베딩 레이어의 장치로 입력 ID를 즉시 이동 (CUDA 보장)
         let emb_dev = self.language_model.embed_tokens.embeddings().device();
         let input_ids = if !input_ids_in.device().same_device(emb_dev) { 
@@ -3173,7 +3179,6 @@ impl QuantizedQwen3VLModel {
         let flat_input = input_ids.flatten_all()?;
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
-        println!("[TIMER] Embedding forward: {:.2}s", start_init.elapsed().as_secs_f32());
         
         let start_vision = std::time::Instant::now();
         if let Some(pv) = pixel_values { 
@@ -3184,12 +3189,8 @@ impl QuantizedQwen3VLModel {
                 inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?; 
             } 
         }
-        if pixel_values.is_some() {
-            println!("[TIMER] Vision integration: {:.2}s", start_vision.elapsed().as_secs_f32());
-        }
         
         // 2. Position IDs calculation (Corrected for Long Context & Vision)
-        let start_rope = std::time::Instant::now();
         let (position_ids, _rope_deltas) = if (cache_position_in.is_some() && cache_position_in.unwrap().i(0)?.to_scalar::<u32>()? == 0) || self.rope_deltas.is_none() {
             let (p_ids, deltas) = self.get_rope_index(&input_ids, image_grid_thw, video_grid_thw, None)?;
             self.rope_deltas = Some(deltas);
@@ -3201,19 +3202,17 @@ impl QuantizedQwen3VLModel {
                 .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
             (p_ids, self.rope_deltas.as_ref().unwrap().clone())
         };
-        println!("[TIMER] RoPE index calculation: {:.2}s", start_rope.elapsed().as_secs_f32());
         
         self.language_model.active_session_id = session_id.clone();
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, session_id)?;
-        let hidden_state = outputs; // [SPECULATIVE] 전체 시퀀스에 대한 히든 스테이트 유지
+        // [OVERRIDE-PROPAGATION] 하위 언어 모델로 레이어 제어 신호 전달
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, session_id, start_layer_override, num_layers_override)?;
+        let hidden_state = outputs; 
         
         let head_dev = self.lm_head.device();
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
         let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };
         let hidden_state = hidden_state.to_dtype(head_dtype)?;
         
-        // [VRAM-OPTIMIZATION] Only process the LAST token through the expensive LM head.
-        // This saves GBs of VRAM when seq_len is large (e.g., 10k+ tokens).
         let seq_len = hidden_state.dim(1)?;
         let last_hidden = hidden_state.narrow(1, seq_len - 1, 1)?;
 
@@ -3273,7 +3272,7 @@ impl QuantizedQwen3TextModel {
         Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: None })
     }
 
-    pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
+    pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, start_layer_override: Option<usize>, num_layers_override: Option<usize>) -> Result<Tensor> {
         // [DEVICE-ALIGNMENT] 임베딩 레이어 장치와 입력 장치 맞춤
         let emb_dev = self.language_model.embed_tokens.embeddings().device();
         let input_ids = if !input_ids_in.device().same_device(emb_dev) { 
@@ -3298,7 +3297,8 @@ impl QuantizedQwen3TextModel {
         };
         
         self.language_model.active_session_id = session_id.clone();
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, session_id)?;
+        // [OVERRIDE-PROPAGATION] 하위 레이어로 제어 신호 전달
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, session_id, start_layer_override, num_layers_override)?;
         let mut hidden_state = outputs; // [SPECULATIVE]
         
         // [SSD-MERGE-INTERPRET] 사용자 제안 반영: SSD에서 조각별로 읽어와 최종 추론 (OOM 방지)
