@@ -2689,7 +2689,9 @@ impl QuantizedQwen3VLTextModel {
             }
             last_count = current_count;
 
-            if (stable_ticks >= 5 && current_count > 5) || (current_count >= 40 && stable_ticks >= 2) || attempts >= 15 {
+            // [STRICT-STABILITY] 블록 개수와 상관없이 무조건 5번(약 2초) 안정화되었는지 확인합니다.
+            // 조기 종료 조건((current_count >= 40 && stable_ticks >= 2))을 제거하여 데이터 유실을 방지합니다.
+            if (stable_ticks >= 5 && current_count > 0) || attempts >= 20 {
                 break;
             }
 
