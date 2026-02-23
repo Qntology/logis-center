@@ -18,6 +18,7 @@ trade/model_offload/
 trade/conda_env/
 
 commerce/rust/backup-rust/
+commerce/rust/new-src-tauri/
 commerce/rust/backup-src-tauri/
 commerce/rust/before-src-tauri/
 commerce/rust/mobile/src-tauri/target/

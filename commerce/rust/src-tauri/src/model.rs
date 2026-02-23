@@ -153,7 +153,7 @@ pub struct LogisModel {
     device_config: utils::DeviceConfig,
     max_tokens_limit: u32,
     dtype: Option<DType>, 
-    pub current_size: Arc<TokioMutex<Option<ModelSize>>>,
+    current_size: Arc<TokioMutex<Option<ModelSize>>>,
 }
 
 impl LogisModel {
@@ -211,9 +211,6 @@ impl LogisModel {
     pub async fn deep_purge_resources(&self) {
         println!("[MEMORY] Initiating AGGRESSIVE Factory Reset Purge...");
         
-        // [SYNC-WAIT] 모든 백그라운드 슬롯 작업이 끝날 때까지 대기 (CUDA Context 보호)
-        crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
-
         // 1. Clear ALL Slots (Explicitly take and drop everything)
         {
             let mut gen = self.generator.lock().await;
@@ -401,19 +398,10 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let kv_dir = crate::utils::paths::get_kv_dir(None);
-                let path_file = kv_dir.join(format!("{}.safetensors", task_id_str));
-                let path_dir = kv_dir.join(&task_id_str); 
-                
-                let target_path = if path_dir.exists() && path_dir.is_dir() {
-                    path_dir
-                } else {
-                    path_file
-                };
-
-                if target_path.exists() {
-                    println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", target_path);
-                    gen.load_kv_from_disk(&target_path, kv_name.as_deref())?;
+                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
+                if path.exists() {
+                    println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
+                    gen.load_kv_from_disk(&path, kv_name.as_deref())?;
                     Ok(())
                 } else {
                     println!("[SSD-BRIDGE] No snapshot found for {}", task_id_str);
@@ -548,34 +536,26 @@ impl LogisModel {
         }
 
         println!("[MODEL] Activating engine for size: {:?} (Text-Only: {}, Baking: {})...", size, force_text_only, baking_only);
+        // ... (rest of the switching logic remains similar but uses the new loading)
 
-        // 1. [SWITCH] 기존 캐시된 모델이 있고, 로딩 모드(Baking 여부)가 일치하면 즉시 전환
-        // (단, Baking 모드와 일반 모드는 내부 레이어 구조가 다르므로 일치 여부를 엄격히 체크)
+        // 1. [SWITCH] If requested model is already in one of the slots, just move it to main
         let found_in_slot = match size {
             ModelSize::Small => {
                 if let Some(m) = small_slot.take() {
-                    // 현재 캐시된 모델의 모드가 요청된 모드와 같은지 확인 (Single-Layer vs Full-Layer)
-                    let is_single = m.model_name.contains("Single-Layer");
-                    if is_single == baking_only {
-                        if let Some(old_m) = gen_guard.take() {
-                            if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
-                            else { *small_slot = Some(old_m); }
-                        }
-                        *gen_guard = Some(m);
-                        *current_size_guard = Some(ModelSize::Small);
-                        true
-                    } else {
-                        // 모드가 다르면 캐시된 모델을 버리고 새로 로드해야 함
-                        *small_slot = None;
-                        false
+                    if let Some(old_m) = gen_guard.take() {
+                        if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
+                        else if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
                     }
+                    *gen_guard = Some(m);
+                    *current_size_guard = Some(ModelSize::Small);
+                    true
                 } else { false }
             },
             ModelSize::Large => {
                 if let Some(m) = large_slot.take() {
                     if let Some(old_m) = gen_guard.take() {
                         if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
-                        else { *large_slot = Some(old_m); }
+                        else if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
                     }
                     *gen_guard = Some(m);
                     *current_size_guard = Some(ModelSize::Large);
@@ -592,10 +572,7 @@ impl LogisModel {
         // 2. [LOAD] Load from disk if not found in any slot
         println!("[LOAD] Fresh loading {:?} from disk...", size);
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
-        
-        // [FIX] Tokenizer는 2B의 것을 공유하되, Config는 각 모델 자신의 것을 사용하도록 분리
-        let tokenizer_path = Some(self.large_model_path.as_str());
-        let config_path = None; // None으로 두면 모델 경로의 config.json을 자동으로 읽음
+        let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
         
         let mut target_device = self.device_config.device.clone();
         
@@ -617,18 +594,16 @@ impl LogisModel {
         let dev_id = self.device_config.gpu_id;
         let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;
-        
         let path_clone = path.to_string();
-        let tok_path_clone = tokenizer_path.map(|s: &str| s.to_string());
-        let cfg_path_clone = config_path.map(|s: &str| s.to_string());
+        let shared_path_clone = shared_path.map(|s| s.to_string());
         let handle_clone = self.app_handle.clone();
 
         let gen = tokio::task::spawn_blocking(move || {
             let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
-                tok_path_clone.as_deref(), 
-                cfg_path_clone.as_deref(), 
+                shared_path_clone.as_deref(), 
+                shared_path_clone.as_deref(), 
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
                 force_text_only,
                 baking_only,
@@ -900,10 +875,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            let mut gen_guard = self.generator.lock().await;
-            let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-
-            let response = gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))?;
+            let response = gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))?;
             println!("[MODEL-CHAT] Raw Response: {}", response);
             Ok(response)
         }
@@ -986,11 +958,9 @@ impl LogisModel {
             crate::scheduler::log_task_progress(app_handle, task_id, &base_payload);
         }
 
-        // [MACRO-ISOLATION] 모델 간 간섭 차단을 위해 릴레이 객체를 직접 전달하지 않습니다.
         let mut gen_guard = self.generator.lock().await;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-        
-        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn chat_with_image_spinner(
@@ -1047,10 +1017,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        let mut gen_guard = self.generator.lock().await;
-        let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-
-        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
@@ -1092,7 +1059,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn run_inference_with_spinner(
@@ -1158,7 +1125,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn process_image_full(&self, image_path: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<Value> {
