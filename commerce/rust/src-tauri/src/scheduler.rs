@@ -658,7 +658,7 @@ async fn process_task(
                     
                     // [VERIFY-FILES] 실제 파일 존재 여부 핑 체크
                     let last_block_idx = (worker.get_kv_len() - 1) / 256;
-                    let block_dir = crate::utils::paths::get_kv_dir(None).join(s_id).join(format!("b{}", last_block_idx * 256));
+                    let block_dir = crate::utils::paths::get_kv_dir(None).join(&snapshot_id).join(format!("b{}", last_block_idx * 256));
                     for i in 0..28 {
                         let path = block_dir.join(format!("l{}.st", i));
                         for _ in 0..10 { // 최대 1초 대기
@@ -791,7 +791,7 @@ async fn process_task(
                     crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
                     
                     let last_block_idx = (worker.get_kv_len() - 1) / 256;
-                    let block_dir = crate::utils::paths::get_kv_dir(None).join(s_id).join(format!("b{}", last_block_idx * 256));
+                    let block_dir = crate::utils::paths::get_kv_dir(None).join(&snapshot_id).join(format!("b{}", last_block_idx * 256));
                     for i in 0..28 {
                         let path = block_dir.join(format!("l{}.st", i));
                         for _ in 0..10 { if path.exists() { break; } tokio::time::sleep(Duration::from_millis(100)).await; }
@@ -983,7 +983,7 @@ async fn process_task(
                         crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
                         
                         let last_block_idx = (worker.get_kv_len() - 1) / 256;
-                        let block_dir = crate::utils::paths::get_kv_dir(None).join(s_id).join(format!("b{}", last_block_idx * 256));
+                        let block_dir = crate::utils::paths::get_kv_dir(None).join(&snapshot_id).join(format!("b{}", last_block_idx * 256));
                         for i in 0..28 {
                             let path = block_dir.join(format!("l{}.st", i));
                             for _ in 0..10 { if path.exists() { break; } tokio::time::sleep(Duration::from_millis(100)).await; }
