@@ -321,6 +321,14 @@ impl ModelVariant {
             Self::QuantizedText(m) => m.forward(i, cp, off, tl, sid, sl, nl) 
         }
     }
+
+    pub fn forward_relay(&mut self, embeds: &Tensor, off: usize, tl: usize, sid: Option<String>, sl: Option<usize>, nl: Option<usize>) -> Result<Tensor> {
+        match self {
+            Self::QuantizedText(m) => m.language_model.forward(embeds, off, tl, None, None, None, sid, sl, nl),
+            Self::QuantizedVL(m) => m.language_model.forward(embeds, off, tl, None, None, None, sid, sl, nl),
+            _ => Err(anyhow!("Relay not supported for this model variant")),
+        }
+    }
     pub fn rebalance_layers(&mut self, d: usize, target_idx: usize) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.rebalance_layers(d, target_idx), Self::QuantizedText(m) => m.rebalance_layers(d, target_idx) } }
     pub fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage() } }
     pub fn save_metadata_to_file(&self, path: &Path) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.registry.save_to_file(path), Self::QuantizedText(m) => m.language_model.registry.save_to_file(path), _ => Ok(()) } }
@@ -424,12 +432,12 @@ impl Qwen3VLGenerateModel {
             }
 
             // [PHASE 2] Hybrid Horizontal Relay Pass (0..temp_off)
-            // 사용자 지시: 프롬프트는 256 청크로 빠르게, 답변은 1토큰씩 정밀하게 릴레이합니다.
+            // 사용자 지시: 프롬프트는 청크 단위(백업본 기준 128)로 빠르게, 답변은 1토큰씩 정밀하게 릴레이합니다.
             if !a_ids.is_empty() {
-                println!("[RELAY-START] Hybrid processing: 0..{} (Prompt) / {}..{} (Draft)", curr_s_off, curr_s_off, temp_off);
+                println!("[RELAY-START] Hybrid Relay (128-Chunk Prompt / 1-Token Draft)");
                 
                 // --- Phase 2a: Prompt Catch-up (Chunks of 256) ---
-                let prompt_chunk_size = 256;
+                let prompt_chunk_size = 256; 
                 for chunk_start in (0..curr_s_off).step_by(prompt_chunk_size) {
                     let chunk_end = (chunk_start + prompt_chunk_size).min(curr_s_off);
                     let chunk_ids = &a_ids[chunk_start..chunk_end];
@@ -442,9 +450,17 @@ impl Qwen3VLGenerateModel {
                     };
 
                     for l_idx in 0..28 {
-                        current_h = self.qwen3_vl.forward(&current_h, None, None, None, None, None, chunk_start, a_ids.len(), sid.clone(), Some(l_idx), Some(1))?;
+                        // [RELAY-CORE] embeds를 직접 다루는 forward_relay를 사용합니다.
+                        current_h = self.qwen3_vl.forward_relay(
+                            &current_h, 
+                            chunk_start, 
+                            a_ids.len(), 
+                            sid.clone(), 
+                            Some(l_idx), 
+                            Some(1)
+                        )?;
                     }
-                    if chunk_start % 1024 == 0 { println!("[PROMPT-CATCHUP] Tokens {}..{} cached.", chunk_start, chunk_end); }
+                    if chunk_start % 1024 == 0 { println!("[PROMPT-CATCHUP] Tokens {}..{} processed.", chunk_start, chunk_end); }
                 }
 
                 // --- Phase 2b: Draft Relay (Token-by-token) ---
@@ -457,7 +473,15 @@ impl Qwen3VLGenerateModel {
                     };
 
                     for l_idx in 0..28 {
-                        current_h = self.qwen3_vl.forward(&current_h, None, None, None, None, None, t_idx, a_ids.len(), sid.clone(), Some(l_idx), Some(1))?;
+                        // [RELAY-CORE] embeds를 직접 다루는 forward_relay를 사용합니다.
+                        current_h = self.qwen3_vl.forward_relay(
+                            &current_h, 
+                            t_idx, 
+                            a_ids.len(), 
+                            sid.clone(), 
+                            Some(l_idx), 
+                            Some(1)
+                        )?;
                     }
                 }
                 println!("[RELAY-COMPLETE] All layers synchronized up to token {}.", temp_off);
@@ -504,30 +528,61 @@ impl Qwen3VLGenerateModel {
         let frag_dir = task_dir.join("fragments");
         let meta_path = frag_dir.join("metadata.json");
         if !meta_path.exists() { return Ok(()); }
+        
         let content = std::fs::read_to_string(&meta_path)?;
         let mut fragments: Vec<serde_json::Value> = Vec::new();
         for line in content.lines() { if let Ok(v) = serde_json::from_str(line) { fragments.push(v); } }
-        for l_idx in 0..28 {
-            let mut layer_frags = fragments.iter().filter(|f| f["layer"].as_u64().unwrap_or(999) == l_idx as u64).filter(|f| { let off = f["off"].as_u64().unwrap_or(0) as usize; off >= start_off && off < end_off }).collect::<Vec<_>>();
-            layer_frags.sort_by_key(|f| f["off"].as_u64().unwrap_or(0));
-            if layer_frags.is_empty() { continue; }
-            let mut ks = Vec::new(); let mut vs = Vec::new();
-            for frag in layer_frags {
-                let path_str = frag["path"].as_str().unwrap_or("");
-                if let Ok(st_map) = candle_core::safetensors::load(Path::new(path_str), &Device::Cpu) {
-                    if let (Some(k), Some(v)) = (st_map.get("k"), st_map.get("v")) { ks.push(k.clone()); vs.push(v.clone()); }
+
+        // [BLOCK-WISE-CONSOLIDATION] 256 토큰 단위로 블록을 나누어 묶습니다.
+        let block_size = 256;
+        let start_block = (start_off / block_size) * block_size;
+        let end_block = ((end_off + block_size - 1) / block_size) * block_size;
+
+        for b_off in (start_block..end_block).step_by(block_size) {
+            let b_end = b_off + block_size;
+            let block_dir = crate::utils::paths::get_kv_dir(None).join(session_id).join(format!("b{}", b_off));
+            if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
+
+            for l_idx in 0..28 {
+                // 현재 블록 범위(b_off..b_end)에 속하는 해당 레이어의 파편들을 모읍니다.
+                let mut layer_frags = fragments.iter()
+                    .filter(|f| f["layer"].as_u64().unwrap_or(999) == l_idx as u64)
+                    .filter(|f| {
+                        let off = f["off"].as_u64().unwrap_or(0) as usize;
+                        off >= b_off && off < b_end
+                    })
+                    .collect::<Vec<_>>();
+                
+                if layer_frags.is_empty() { continue; }
+                layer_frags.sort_by_key(|f| f["off"].as_u64().unwrap_or(0));
+
+                let mut ks = Vec::new();
+                let mut vs = Vec::new();
+                for frag in layer_frags {
+                    let path_str = frag["path"].as_str().unwrap_or("");
+                    if let Ok(st_map) = candle_core::safetensors::load(Path::new(path_str), &Device::Cpu) {
+                        if let (Some(k), Some(v)) = (st_map.get("k"), st_map.get("v")) {
+                            ks.push(k.clone());
+                            vs.push(v.clone());
+                        }
+                    }
+                }
+
+                if !ks.is_empty() {
+                    let k_combined = Tensor::cat(&ks, 2)?;
+                    let v_combined = Tensor::cat(&vs, 2)?;
+                    
+                    let mut map = HashMap::new();
+                    let prefix = format!("b{}_l{}_", b_off, l_idx);
+                    map.insert(format!("{}k_anchors", prefix), k_combined.clone());
+                    map.insert(format!("{}v_anchors", prefix), v_combined.clone());
+                    map.insert(format!("{}k_shape", prefix), Tensor::from_vec(vec![1u32, 16, k_combined.dim(2)? as u32, 128], (4,), &Device::Cpu)?);
+                    
+                    let save_path = block_dir.join(format!("l{}.st", l_idx));
+                    let _ = candle_core::safetensors::save(&map, &save_path);
                 }
             }
-            if !ks.is_empty() {
-                let k_combined = Tensor::cat(&ks, 2)?; let v_combined = Tensor::cat(&vs, 2)?;
-                let block_offset = (start_off / 256) * 256;
-                let block_dir = crate::utils::paths::get_kv_dir(None).join(session_id).join(format!("b{}", block_offset));
-                if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
-                let mut map = HashMap::new(); let prefix = format!("b{}_l{}_", block_offset, l_idx);
-                map.insert(format!("{}k_anchors", prefix), k_combined.clone()); map.insert(format!("{}v_anchors", prefix), v_combined.clone());
-                map.insert(format!("{}k_shape", prefix), Tensor::from_vec(vec![1u32, 16, k_combined.dim(2)? as u32, 128], (4,), &Device::Cpu)?);
-                let save_path = block_dir.join(format!("l{}.st", l_idx)); let _ = candle_core::safetensors::save(&map, &save_path);
-            }
+            println!("[BUNDLER] Block b{} consolidation complete.", b_off);
         }
         Ok(())
     }
