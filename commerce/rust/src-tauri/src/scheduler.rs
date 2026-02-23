@@ -626,7 +626,7 @@ async fn process_task(
                     };
                     // 1개 레이어로 SSD에 문맥을 굽습니다.
                     worker.prefill_only(params, Some(cancellation_token.clone()), session_clone.clone(), None, kv_name_clone.clone()).await?;
-                    crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
+                    crate::models::qwen3vl::generate::wait_for_global_io().await;
                 }
             }
 
@@ -654,7 +654,7 @@ async fn process_task(
                     
                     // [STRICT-SSD-FLUSH] Drafting 연산 결과가 SSD에 모두 기록될 때까지 대기
                     println!("[Scheduler] Finalizing Drafting SSD writes (Verifying 28 Layer files)...");
-                    crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
+                    crate::models::qwen3vl::generate::wait_for_global_io().await;
                     
                     // [VERIFY-FILES] 실제 파일 존재 여부 핑 체크
                     let last_block_idx = (worker.get_kv_len() - 1) / 256;
@@ -762,7 +762,7 @@ async fn process_task(
                         ..Default::default()
                     };
                     worker.prefill_only(params, Some(cancellation_token.clone()), session_clone.clone(), None, kv_name_clone.clone()).await?;
-                    crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
+                    crate::models::qwen3vl::generate::wait_for_global_io().await;
                 }
             }
 
@@ -788,7 +788,7 @@ async fn process_task(
 
                     // [STRICT-SSD-FLUSH] Drafting 연산 결과가 SSD에 모두 기록될 때까지 대기
                     println!("[Scheduler] Finalizing Selector Drafting SSD writes (Verifying 28 Layer files)...");
-                    crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
+                    crate::models::qwen3vl::generate::wait_for_global_io().await;
                     
                     let last_block_idx = (worker.get_kv_len() - 1) / 256;
                     let block_dir = crate::utils::paths::get_kv_dir(None).join(&snapshot_id).join(format!("b{}", last_block_idx * 256));
@@ -953,7 +953,7 @@ async fn process_task(
                             ..Default::default()
                         };
                         worker.prefill_only(params, Some(cancellation_token.clone()), session_clone.clone(), None, kv_name_clone.clone()).await?;
-                        crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
+                        crate::models::qwen3vl::generate::wait_for_global_io().await;
                     }
                 }
 
@@ -980,7 +980,7 @@ async fn process_task(
 
                         // [STRICT-SSD-FLUSH] Drafting 연산 결과가 SSD에 모두 기록될 때까지 대기
                         println!("[Scheduler] Finalizing Detail Drafting SSD writes (Verifying 28 Layer files)...");
-                        crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
+                        crate::models::qwen3vl::generate::wait_for_global_io().await;
                         
                         let last_block_idx = (worker.get_kv_len() - 1) / 256;
                         let block_dir = crate::utils::paths::get_kv_dir(None).join(&snapshot_id).join(format!("b{}", last_block_idx * 256));

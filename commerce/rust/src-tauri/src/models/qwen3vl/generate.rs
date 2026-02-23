@@ -28,6 +28,7 @@ use std::fs;
 use std::path::Path;
 
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -179,6 +180,10 @@ pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::L
 pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn wait_for_global_io() {
+    // 1. [CHANNEL-FLUSH] 먼저 슬롯 매니저의 명령 큐가 비워질 때까지 대기 (oneshot 방식)
+    let _ = SLOT_MANAGER.wait_for_all_tasks().await;
+
+    // 2. [PHYSICAL-FLUSH] 실제 물리적인 SSD 파일 쓰기가 끝날 때까지 카운터 체크 (Polling 방식)
     let mut attempts = 0;
     while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 && attempts < 200 {
         if attempts % 10 == 0 {
@@ -187,10 +192,11 @@ pub async fn wait_for_global_io() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         attempts += 1;
     }
+    
     if GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 {
         println!("[IO-SAFETY] !! Warning: IO wait timeout. Potential data loss.");
     } else {
-        println!("[IO-SAFETY] All SSD writes verified. Safe to proceed.");
+        println!("[IO-SAFETY] All software queues and physical writes cleared.");
     }
 }
 
@@ -303,6 +309,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     }
                 }
 
+                // [GLOBAL-SAFETY] 파일 쓰기 완료 후 카운터 감소
+                GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
+
                 let slot = &SLOT_MANAGER.slots[slot_id];
                 if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 || is_last {
                     let _ = SLOT_MANAGER.request_tx.send(SlotRequest::Release { 
@@ -408,6 +417,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 layer_map.insert(format!("{}v_scales", prefix), Tensor::from_vec(vs, vec![b, h, s, 1], &Device::Cpu).unwrap());
                                 layer_map.insert("mode".to_string(), Tensor::from_vec(vec![3u32], (1,), &Device::Cpu).unwrap());
                                 
+                                // [GLOBAL-SAFETY] 새로운 쓰기 작업 시작 전 카운터 증가
+                                GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
                                 let _ = io_tx_inner.blocking_send(SaveTask { 
                                     slot_id: sid, 
                                     path: block_dir.join(layer_fname), 

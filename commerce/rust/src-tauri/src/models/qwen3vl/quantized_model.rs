@@ -413,6 +413,7 @@ pub struct QuantizedQwen3VLTextAttention {
     pub kv_blocks: Vec<KVBlock>,
     pub registry: KVRegistry, // [NEW] 중앙 목차 참조
     pub layer_idx: usize,
+    pub baking_only: bool, // [NEW]
 }
 
 impl QuantizedQwen3VLTextAttention {
@@ -521,6 +522,7 @@ impl QuantizedQwen3VLTextAttention {
             kv_blocks: Vec::new(),
             registry,
             layer_idx,
+            baking_only,
         })
     }
 
@@ -1922,18 +1924,25 @@ impl QuantizedQwen3VLTextModel {
                 let chunk_path = layer_dir.join(format!("chunk_{}.st", absolute_chunk_idx));
                 let chunk_xs_clone = chunk_xs.clone();
                 let layer_idx_fixed = layer_idx;
+                let registry_task_clone = self.registry.clone();
+
+                // [GLOBAL-SAFETY] 비동기 덤프 추적 시작
+                crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
 
                 // [ASYNC-IO] 연산 흐름을 방해하지 않도록 별도 태스크로 파일 저장
                 tauri::async_runtime::spawn(async move {
                     let mut map = HashMap::new();
                     map.insert("hidden_states".to_string(), chunk_xs_clone);
-                    if candle_core::safetensors::save(&map, &chunk_path).is_ok() {
-                        if let Ok(mut reg_w) = registry_clone.entries.write() {
-                            if absolute_chunk_idx < reg_w.len() {
-                                reg_w[absolute_chunk_idx].hidden_states_path[layer_idx_fixed] = Some(chunk_path);
-                            }
+                    let _ = candle_core::safetensors::save(&map, &chunk_path);
+                    
+                    if let Ok(mut reg_w) = registry_task_clone.entries.write() {
+                        if absolute_chunk_idx < reg_w.len() {
+                            reg_w[absolute_chunk_idx].hidden_states_path[layer_idx_fixed] = Some(chunk_path);
                         }
                     }
+                    
+                    // [GLOBAL-SAFETY] 비동기 덤프 완료
+                    crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         }
