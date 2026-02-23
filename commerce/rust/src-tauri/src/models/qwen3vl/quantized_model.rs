@@ -1860,12 +1860,16 @@ impl QuantizedQwen3VLTextModel {
                         if path.exists() && (xs.dim(1).unwrap_or(0) == 0 || layer_idx > 0) {
                             if let Ok(loaded_xs) = crate::utils::tensor_utils::load_tensor(path, "hidden_states", &target_device) {
                                 let mut final_xs = loaded_xs;
-                                let expected_dim = 2048; // 2B 기준 (필요시 패딩)
+                                // [FIX] 모델의 실제 차원에 맞춰 타겟 차원 결정 (0.6B=1024, 2B=2048)
+                                let expected_dim = self.embed_tokens.embeddings().dim(1).unwrap_or(2048);
                                 let actual_dim = final_xs.dim(2).unwrap_or(1024);
                                 
                                 if actual_dim < expected_dim {
                                     let padding = Tensor::zeros((final_xs.dim(0)?, final_xs.dim(1)?, expected_dim - actual_dim), final_xs.dtype(), &target_device)?;
                                     final_xs = Tensor::cat(&[final_xs, padding], 2)?;
+                                } else if actual_dim > expected_dim {
+                                    // 만약 로드된 데이터가 더 크다면 자름 (Truncate)
+                                    final_xs = final_xs.narrow(2, 0, expected_dim)?;
                                 }
                                 xs = final_xs.to_dtype(xs.dtype())?;
                             }
