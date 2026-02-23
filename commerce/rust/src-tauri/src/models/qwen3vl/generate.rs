@@ -837,26 +837,35 @@ impl Qwen3VLGenerateModel {
                         curr_s_off += 1;
                         gen_count += 1;
         
-                        // [SSD-BAKING-DURING-DRAFT] Drafting 중에도 연산 결과(KV Cache)를 SSD로 전송
+                        // [SSD-BAKING-DURING-DRAFT-ASYNC] Drafting 중 SSD 저장이 연산을 방해하지 않도록 완전히 비동기로 처리합니다.
                         if let Some(s_id) = &sid {
-                            let pending = self.get_blocks_by_location(KVLocation::SSD_PENDING)?;
-                            for (ks, vs, off, idx) in pending {
-                                let slot_id = SLOT_MANAGER.acquire_write_slot(curr_s_off).await;
-                                let mut dumps = Vec::new();
-                                for (ix, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() { dumps.push(LayerKVDump { layer_idx: ix, k_tensor: k, v_tensor: v }); }
-                                if let Ok(tx) = get_bake_worker().await {
-                                    let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
-                                    
-                                    // [STAGE-2-STRICT] Drafting 단계(baking_only=false)에서는 무조건 개별 레이어 저장
-                                    let is_baking_mode = match &self.qwen3_vl {
-                                        ModelVariant::QuantizedVL(m) => m.language_model.baking_only,
-                                        ModelVariant::QuantizedText(m) => m.language_model.baking_only,
-                                        _ => false
-                                    };
+                            if let Ok(pending) = self.get_blocks_by_location(KVLocation::SSD_PENDING) {
+                                for (ks, vs, off, idx) in pending {
+                                    // [NON-BLOCKING-IO] 0.6B Drafting 속도를 위해 I/O 대기를 최소화(10ms)합니다.
+                                    // 슬롯이 없으면 과감히 이번 턴의 저장을 건너뛰고 연산을 이어갑니다.
+                                    let slot_id_res = tokio::time::timeout(
+                                        std::time::Duration::from_millis(10),
+                                        SLOT_MANAGER.acquire_write_slot(curr_s_off)
+                                    ).await;
 
-                                    let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: off, layers: dumps, is_relay_baking: is_baking_mode, block_idx: Some(idx), registry: rr })).await;
+                                    if let Ok(slot_id) = slot_id_res {
+                                        let mut dumps = Vec::new();
+                                        for (ix, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() { dumps.push(LayerKVDump { layer_idx: ix, k_tensor: k, v_tensor: v }); }
+                                        if let Ok(tx) = get_bake_worker().await {
+                                            let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
+                                            
+                                            // [STAGE-2-STRICT] Drafting 단계(baking_only=false)에서는 무조건 개별 레이어 저장
+                                            let is_baking_mode = match &self.qwen3_vl {
+                                                ModelVariant::QuantizedVL(m) => m.language_model.baking_only,
+                                                ModelVariant::QuantizedText(m) => m.language_model.baking_only,
+                                                _ => false
+                                            };
+
+                                            let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: off, layers: dumps, is_relay_baking: is_baking_mode, block_idx: Some(idx), registry: rr })).await;
+                                        }
+                                        self.mark_block_location(idx, KVLocation::Streaming); 
+                                    }
                                 }
-                                self.mark_block_location(idx, KVLocation::Streaming); 
                             }
                         }
         

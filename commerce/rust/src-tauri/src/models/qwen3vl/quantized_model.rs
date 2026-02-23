@@ -1657,9 +1657,20 @@ impl QuantizedQwen3VLTextModel {
                 let block_offset = b_idx * 256;
                 let actual_path = if w_chunk_path.is_dir() {
                     let block_dir = w_chunk_path.join(format!("b{}", block_offset));
-                    // [RELAY-FIX] 자신의 전용 레이어 파일(l{idx}.st)이 없으면 무조건 l0.st를 사용
-                    let lp = block_dir.join(format!("l{}.st", l_idx));
-                    if lp.exists() { lp } else { block_dir.join("l0.st") }
+                    
+                    // [SHADOW-COPY-STRATEGY]
+                    // Baking 단계에서 0번 레이어만 구웠기 때문에, Drafting(28레이어) 시 
+                    // 1~27번 레이어는 자신의 파일이 없습니다.
+                    // 이 경우 무조건 0번 레이어 파일(l0.st)을 로드하여 "기억의 복제"를 수행합니다.
+                    // 이렇게 해야 상위 레이어도 프롬프트 문맥을 이해하고 정상적인 추론을 할 수 있습니다.
+                    let target_layer_file = block_dir.join(format!("l{}.st", l_idx));
+                    
+                    if target_layer_file.exists() {
+                        target_layer_file
+                    } else {
+                        // 자신의 레이어 파일이 없으면 l0.st(공통 문맥)를 사용
+                        block_dir.join("l0.st")
+                    }
                 } else { w_chunk_path.clone() };
 
                 if let Ok(content) = std::fs::read(&actual_path) {
@@ -1698,7 +1709,8 @@ impl QuantizedQwen3VLTextModel {
 
                             // [SHAPE-ADAPTER] 0.6B(1024, H=8) -> 2B(2048, H=16) 규격 자동 변환
                             // 1. 차원 패딩 (128 -> 128, 보통 동일함)
-                            // 2. 헤드 복제 (8 -> 16)
+                            // [SHAPE-ADAPTER] 0.6B(1024, H=8) -> 2B(2048, H=16) 규격 자동 변환
+                            // [USER-REQUEST] Zero Padding 대신 데이터를 반복(Repeat)하여 빈 공간 없이 정보를 꽉 채웁니다.
                             let bytes_to_f32_adapted = |b: &[u8], target_head: usize, target_dim: usize, current_os: &[usize]| -> Vec<f32> {
                                 let source_head = current_os[1];
                                 let source_dim = current_os[3]; // [B, H, S, D]
@@ -1712,77 +1724,74 @@ impl QuantizedQwen3VLTextModel {
                                     return raw_data;
                                 }
 
-                                // 복잡한 변환이 필요함 (Resize & Repeat)
                                 let mut new_data = Vec::with_capacity(batch * target_head * seq_len * target_dim);
-                                
-                                // 헤드 반복 비율 계산 (예: 8 -> 16이면 2배)
                                 let repeat_factor = target_head / source_head; 
                                 
                                 for b_i in 0..batch {
                                     for h_i in 0..source_head {
-                                        // 원본 헤드 데이터 추출 (범위 체크 추가)
                                         let h_start = (b_i * source_head + h_i) * seq_len * source_dim;
                                         let h_end = h_start + seq_len * source_dim;
                                         
-                                        // 데이터 부족 시 안전 처리
                                         let head_slice = if h_end <= raw_data.len() {
                                             &raw_data[h_start..h_end]
                                         } else if h_start < raw_data.len() {
                                             &raw_data[h_start..]
                                         } else {
-                                            &[] // 데이터가 아예 없음
+                                            &[]
                                         };
                                         
                                         // 필요한 횟수만큼 반복 (Broadcasting)
                                         for _ in 0..repeat_factor {
                                             if head_slice.is_empty() {
-                                                // 데이터가 없으면 0으로 채움
                                                 new_data.extend(std::iter::repeat(0.0).take(seq_len * target_dim));
                                                 continue;
                                             }
 
                                             if source_dim == target_dim {
                                                 new_data.extend_from_slice(head_slice);
-                                                // 부족한 뒷부분 0으로 채움
+                                                // 길이 부족 시 0.6B 데이터 자체를 반복해서 채움 (Circular)
                                                 if head_slice.len() < seq_len * source_dim {
-                                                    new_data.extend(std::iter::repeat(0.0).take(seq_len * source_dim - head_slice.len()));
+                                                    let missing = seq_len * source_dim - head_slice.len();
+                                                    // head_slice가 비어있지 않으므로 cycle().take() 사용 가능
+                                                    new_data.extend(head_slice.iter().cycle().cloned().take(missing));
                                                 }
                                             } else {
-                                                // 차원 패딩 또는 자르기 (Truncation)
+                                                // 차원 불일치 처리
                                                 for s_i in 0..seq_len {
                                                     let t_start = s_i * source_dim;
-                                                    let t_end = t_start + source_dim;
-                                                    
-                                                    // 복사할 길이 결정 (Truncation 고려)
-                                                    let copy_len = source_dim.min(target_dim);
-                                                    
-                                                    // 원본 데이터가 충분한지 확인 후 복사
-                                                    if t_start + copy_len <= head_slice.len() {
-                                                        new_data.extend_from_slice(&head_slice[t_start..t_start + copy_len]);
-                                                    } else if t_start < head_slice.len() {
-                                                        // 원본 데이터가 중간에 끊긴 경우
-                                                        let available = head_slice.len() - t_start;
-                                                        new_data.extend_from_slice(&head_slice[t_start..]);
-                                                        new_data.extend(std::iter::repeat(0.0).take(copy_len - available));
+                                                    // 한 토큰의 벡터 추출
+                                                    let token_vec = if t_start < head_slice.len() {
+                                                        let t_end = (t_start + source_dim).min(head_slice.len());
+                                                        &head_slice[t_start..t_end]
                                                     } else {
-                                                        // 원본 데이터가 아예 없는 경우
-                                                        new_data.extend(std::iter::repeat(0.0).take(copy_len));
-                                                    }
-
-                                                    // 부족한 부분 Zero-padding (source_dim < target_dim 인 경우)
-                                                    if target_dim > source_dim {
-                                                        new_data.extend(std::iter::repeat(0.0).take(target_dim - source_dim));
+                                                        &[]
+                                                    };
+                                                    
+                                                    if token_vec.is_empty() {
+                                                        new_data.extend(std::iter::repeat(0.0).take(target_dim));
+                                                    } else {
+                                                        // [REPEAT-FILL] 차원이 부족하면 원본 벡터를 반복해서 채움
+                                                        new_data.extend(token_vec.iter().cycle().cloned().take(target_dim));
                                                     }
                                                 }
                                             }
                                         }
                                     }
                                     
-                                    // 남는 헤드 채우기 (나머지 처리)
+                                    // 남는 헤드 채우기 (나머지 처리) - 마지막 유효 데이터로 채움
                                     let remaining_heads = target_head - (source_head * repeat_factor);
                                     if remaining_heads > 0 {
-                                        let zeros = vec![0.0; remaining_heads * seq_len * target_dim];
-                                        new_data.extend(zeros);
+                                        // 방금 채운 마지막 헤드 데이터를 가져와서 복사 (없으면 0)
+                                        let last_head_len = seq_len * target_dim;
+                                        if new_data.len() >= last_head_len {
+                                            let last_head_data = new_data[new_data.len() - last_head_len..].to_vec();
+                                            for _ in 0..remaining_heads {
+                                                new_data.extend_from_slice(&last_head_data);
+                                            }
+                                        } else {
+                                            let zeros = vec![0.0; remaining_heads * seq_len * target_dim];
+                                            new_data.extend(zeros);
+                                        }
                                     }
                                 }
                                 new_data
@@ -1989,6 +1998,19 @@ impl QuantizedQwen3VLTextModel {
                 })
             });
         }
+
+        // [PHYSICAL-WAIT-GATE] 슬롯 회수 대기
+        if num_to_release > 0 {
+            let target_active = initial_active.saturating_sub(num_to_release);
+            let mut wait_attempts = 0;
+            while wait_attempts < 1000 { 
+                let current_active = SLOT_MANAGER.count_reads.load(Ordering::SeqCst) + SLOT_MANAGER.count_writes.load(Ordering::SeqCst);
+                if current_active <= target_active { break; }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                wait_attempts += 1;
+            }
+        }
+
 
         // [SAFE-PURGE-LOGIC] 
         // 1. Baking 모드(0.6B): 데이터를 절대 지우지 않고 'VRAM' 또는 'RAM' 상태로 유지하여 Baker가 찾을 수 있게 함
