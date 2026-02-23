@@ -335,6 +335,8 @@ impl ModelVariant {
     pub fn load_metadata_from_file(&self, path: &Path) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.registry.load_from_file(path), Self::QuantizedText(m) => m.language_model.registry.load_from_file(path), _ => Ok(()) } }
     pub fn inject_kv_bitkv(&mut self, ka: &[Tensor], kp: &[Tensor], ks: &[Tensor], va: &[Tensor], vp: &[Tensor], vs: &[Tensor], os: &[usize]) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.inject_live_kv_bitkv(ka, kp, ks, va, vp, vs, os), Self::QuantizedText(m) => m.language_model.inject_live_kv_bitkv(ka, kp, ks, va, vp, vs, os), _ => Ok(()) } }
     pub fn is_cpu(&self) -> bool { match self { Self::Standard(m) => m.device().is_cpu(), Self::QuantizedVL(m) => m.language_model.is_forced_cpu, Self::QuantizedText(m) => m.language_model.is_forced_cpu } }
+    pub fn get_registry(&self) -> Option<crate::models::qwen3vl::quantized_model::KVRegistry> { match self { Self::QuantizedText(m) => Some(m.language_model.registry.clone()), Self::QuantizedVL(m) => Some(m.language_model.registry.clone()), _ => None } }
+    pub fn set_kv_len(&mut self, len: usize) { match self { Self::QuantizedText(m) => m.language_model.current_kv_len = len, Self::QuantizedVL(m) => m.language_model.current_kv_len = len, _ => {}, } }
 }
 
 pub struct Qwen3VLGenerateModel { pub chat_template: ChatTemplate, pub tokenizer: TokenizerModel, pub pre_processor: Qwen3VLProcessor, pub qwen3_vl: ModelVariant, pub text_device: Device, pub vision_device: Device, pub eos_token_id1: u32, pub eos_token_id2: u32, pub generation_config: Qwen3VLGenerationConfig, pub model_name: String, pub hard_token_limit: Option<usize>, pub kv_root: std::path::PathBuf }
@@ -416,11 +418,10 @@ impl Qwen3VLGenerateModel {
         }
 
         if is_small {
-            println!("[DRAFTING] Small model starting FULL-SEQUENCE CATCH-UP (0..{})", t_toks + 24);
+            println!("[DRAFTING] Small model starting HIGH-SPEED RELAY (0..{})", t_toks + 24);
             let mut current_chunk_ids = Vec::new();
             let mut temp_off = curr_s_off;
 
-            // [PHASE 1] Layer 0 Pilot Pass (추측)
             for _ in 0..24 {
                 let last_c = *a_ids.last().unwrap_or(&0);
                 let logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![last_c], (1, 1), &self.text_device)?, None, None, None, None, None, temp_off, 1, sid.clone(), Some(0), Some(1))?;
@@ -431,41 +432,28 @@ impl Qwen3VLGenerateModel {
                 if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             }
 
-            // [PHASE 2] High-Speed Hybrid Horizontal Relay (0..temp_off)
-            // 사용자 지시: 프롬프트는 청크 단위로 빠르게, 답변은 1토큰씩 정밀하게!
             if !a_ids.is_empty() {
-                println!("[RELAY-START] High-Speed Hybrid Relay (Prompt: 128-Chunk / Draft: 1-Token)");
+                self.clear_kv_cache(); 
+                println!("[RELAY-START] High-Speed Hybrid Relay (Prompt: 32-Chunk / Draft: 1-Token)");
                 
-                // --- Phase 2a: Prompt Catch-up (Fast Chunk Mode) ---
-                let prompt_chunk_size = 128;
+                let prompt_chunk_size = 32; 
                 for chunk_start in (0..curr_s_off).step_by(prompt_chunk_size) {
                     let chunk_end = (chunk_start + prompt_chunk_size).min(curr_s_off);
                     let chunk_ids = &a_ids[chunk_start..chunk_end];
                     if chunk_ids.is_empty() { continue; }
 
-                    // 초기 임베딩 생성
-                    let chunk_tensor = Tensor::from_vec(chunk_ids.to_vec(), (1, chunk_ids.len()), &self.text_device)?;
                     let mut current_h = match &mut self.qwen3_vl {
-                        ModelVariant::QuantizedText(m) => m.language_model.embed_tokens.forward(&chunk_tensor)?,
-                        ModelVariant::QuantizedVL(m) => m.language_model.embed_tokens.forward(&chunk_tensor)?,
+                        ModelVariant::QuantizedText(m) => m.language_model.embed_tokens.forward(&Tensor::from_vec(chunk_ids.to_vec(), (1, chunk_ids.len()), &self.text_device)?)?,
+                        ModelVariant::QuantizedVL(m) => m.language_model.embed_tokens.forward(&Tensor::from_vec(chunk_ids.to_vec(), (1, chunk_ids.len()), &self.text_device)?)?,
                         _ => unreachable!(),
                     };
 
                     for l_idx in 0..28 {
-                        // [RELAY-CORE] 128개 뭉치를 한꺼번에 릴레이하여 속도를 극대화합니다.
-                        current_h = self.qwen3_vl.forward_relay(
-                            &current_h, 
-                            chunk_start, 
-                            a_ids.len(), 
-                            sid.clone(), 
-                            Some(l_idx), 
-                            Some(1)
-                        )?;
+                        current_h = self.qwen3_vl.forward_relay(&current_h, chunk_start, a_ids.len(), sid.clone(), Some(l_idx), Some(1))?;
                     }
-                    if chunk_start % 1024 == 0 { println!("[PROMPT-SPEED] Tokens {}/{} cached.", chunk_start, curr_s_off); }
+                    if chunk_start % 2048 == 0 { println!("[PROMPT-SPEED] Tokens {}/{} synced.", chunk_start, curr_s_off); }
                 }
 
-                // --- Phase 2b: Draft Relay (Precision Token Mode) ---
                 for t_idx in curr_s_off..a_ids.len() {
                     let token_id = a_ids[t_idx];
                     let mut current_h = match &mut self.qwen3_vl {
@@ -478,17 +466,16 @@ impl Qwen3VLGenerateModel {
                         current_h = self.qwen3_vl.forward_relay(&current_h, t_idx, a_ids.len(), sid.clone(), Some(l_idx), Some(1))?;
                     }
                 }
-                println!("[RELAY-COMPLETE] Full context synchronized up to token {}.", temp_off - 1);
+                println!("[RELAY-COMPLETE] All layers synchronized up to token {}.", temp_off - 1);
             }
 
-            // [PHASE 3] Full Bundling (From Offset 0)
             if let Some(s_id) = &sid {
-                // 0번부터 전체 기억을 블록 단위로 제본하여 2B에게 넘길 준비를 마칩니다.
                 self.bundle_draft_fragments(s_id, 0, temp_off).await?;
+                self.qwen3_vl.set_kv_len(temp_off);
             }
 
             let final_text = self.tokenizer.token_decode(current_chunk_ids)?;
-            println!("[FINAL-DRAFT] {}", final_text);
+            println!("[BURST-RESULT] {}", final_text);
             g_text = final_text;
         } else {
             while gen_count < max_gen {
@@ -528,7 +515,6 @@ impl Qwen3VLGenerateModel {
         let mut fragments: Vec<serde_json::Value> = Vec::new();
         for line in content.lines() { if let Ok(v) = serde_json::from_str(line) { fragments.push(v); } }
 
-        // [BLOCK-WISE-CONSOLIDATION] 256 토큰 단위로 블록을 나누어 묶습니다.
         let block_size = 256;
         let start_block = (start_off / block_size) * block_size;
         let end_block = ((end_off + block_size - 1) / block_size) * block_size;
@@ -539,7 +525,6 @@ impl Qwen3VLGenerateModel {
             if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
 
             for l_idx in 0..28 {
-                // 현재 블록 범위(b_off..b_end)에 속하는 해당 레이어의 파편들을 모읍니다.
                 let mut layer_frags = fragments.iter()
                     .filter(|f| f["layer"].as_u64().unwrap_or(999) == l_idx as u64)
                     .filter(|f| {
@@ -566,15 +551,24 @@ impl Qwen3VLGenerateModel {
                 if !ks.is_empty() {
                     let k_combined = Tensor::cat(&ks, 2)?;
                     let v_combined = Tensor::cat(&vs, 2)?;
-                    
                     let mut map = HashMap::new();
                     let prefix = format!("b{}_l{}_", b_off, l_idx);
                     map.insert(format!("{}k_anchors", prefix), k_combined.clone());
                     map.insert(format!("{}v_anchors", prefix), v_combined.clone());
                     map.insert(format!("{}k_shape", prefix), Tensor::from_vec(vec![1u32, 16, k_combined.dim(2)? as u32, 128], (4,), &Device::Cpu)?);
-                    
                     let save_path = block_dir.join(format!("l{}.st", l_idx));
                     let _ = candle_core::safetensors::save(&map, &save_path);
+
+                    if let Some(reg_obj) = self.qwen3_vl.get_registry() {
+                        let mut reg = reg_obj.entries.write().unwrap();
+                        let block_idx = b_off / block_size;
+                        if block_idx < reg.len() {
+                            let entry = &mut reg[block_idx];
+                            entry.ssd_path = Some(block_dir.clone());
+                            entry.location[l_idx] = KVLocation::SSD;
+                            entry.token_len = k_combined.dim(2)?;
+                        }
+                    }
                 }
             }
             println!("[BUNDLER] Block b{} consolidation complete.", b_off);
@@ -646,7 +640,13 @@ impl Qwen3VLGenerateModel {
     pub fn save_kv_to_disk(&mut self, p: &Path, n: Option<&str>, o: usize) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.save_kv_cache(p, false, o, n), ModelVariant::QuantizedText(m) => m.save_kv_cache(p, false, o, n), _ => Ok(()) } }
     pub fn to_device(&mut self, d: &Device) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.to_device(d)?, ModelVariant::QuantizedText(m) => m.to_device(d)?, _ => {} } self.text_device = d.clone(); self.vision_device = d.clone(); Ok(()) }
     pub fn drop_kv_storage(&mut self) -> Result<()> { self.qwen3_vl.drop_kv_storage() }
-    pub fn clear_kv_cache(&mut self) { self.clear_temporal_kv_caches(); }
+    pub fn clear_kv_cache(&mut self) { 
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.language_model.clear_kv_cache(),
+            ModelVariant::QuantizedText(m) => m.language_model.clear_kv_cache(),
+            _ => {},
+        }
+    }
     pub fn truncate_kv_cache(&mut self, l: usize) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.truncate_kv_cache(l), ModelVariant::QuantizedText(m) => m.truncate_kv_cache(l), _ => Ok(()) } }
     pub fn load_kv_from_disk(&mut self, p: &Path, n: Option<&str>) -> Result<()> { 
         let _ = self.qwen3_vl.load_metadata_from_file(p);
