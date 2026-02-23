@@ -384,19 +384,50 @@ impl Qwen3VLGenerateModel {
         self.qwen3_vl.forward(&Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(0u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 0, t_toks, sid.clone(), None, None)?;
         if let Some(s_id) = &sid {
             let unbaked = self.get_all_unbaked_kv_blocks();
+            println!("[BAKING] Found {} KV blocks to persist to SSD.", unbaked.len());
+            
             for (ks, vs, off) in unbaked {
                 let slot_id = SLOT_MANAGER.acquire_write_slot(t_toks).await;
-                let path = crate::utils::paths::get_kv_dir(None).join(s_id); if !path.exists() { let _ = fs::create_dir_all(&path); }
-                let mut dumps = Vec::new(); for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() { dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v }); }
+                let path = crate::utils::paths::get_kv_dir(None).join(s_id); 
+                if !path.exists() { let _ = fs::create_dir_all(&path); }
+                
+                let mut dumps = Vec::new(); 
+                for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() { 
+                    dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v }); 
+                }
+                
                 if let Ok(tx) = get_bake_worker().await {
-                    let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
-                    let is_baking_mode = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.baking_only, ModelVariant::QuantizedText(m) => m.language_model.baking_only, _ => false };
-                    let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: path, kv_name: kv_n.clone(), offset: off, layers: dumps, is_relay_baking: is_baking_mode, block_idx: Some(off / 256), registry: rr })).await;
+                    let rr = match &self.qwen3_vl { 
+                        ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), 
+                        ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), 
+                        _ => None 
+                    };
+                    let is_baking_mode = match &self.qwen3_vl { 
+                        ModelVariant::QuantizedVL(m) => m.language_model.baking_only, 
+                        ModelVariant::QuantizedText(m) => m.language_model.baking_only, 
+                        _ => false 
+                    };
+                    let _ = tx.send(SlotTask::Bake(BakeTask { 
+                        slot_id, 
+                        task_dir: path, 
+                        kv_name: kv_n.clone(), 
+                        offset: off, 
+                        layers: dumps, 
+                        is_relay_baking: is_baking_mode, 
+                        block_idx: Some(off / 256), 
+                        registry: rr 
+                    })).await;
                 }
             }
-            SLOT_MANAGER.wait_for_all_tasks().await;
-            let path = crate::utils::paths::get_kv_dir(None).join(s_id); if !path.exists() { let _ = fs::create_dir_all(&path); }
-            let _ = self.qwen3_vl.save_metadata_to_file(&path); self.clear_temporal_kv_caches();
+            
+            // [HARD-WAIT] 모든 SSD 쓰기가 끝날 때까지 확실히 기다립니다.
+            println!("[BAKING] Waiting for SSD persistence to complete...");
+            wait_for_global_io().await;
+            
+            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+            let _ = self.qwen3_vl.save_metadata_to_file(&path); 
+            self.clear_temporal_kv_caches();
+            println!("[BAKING] Stage 1 Context persistent at: {:?}", path);
         }
         Ok(t_toks)
     }
@@ -432,11 +463,15 @@ impl Qwen3VLGenerateModel {
                 if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             }
 
+            // [PHASE 2] Streaming Horizontal Relay (0..temp_off)
+            // 사용자 지시: 14MB(약 64토큰) 연산이 쌓일 때마다 SSD로 배출하고 메모리를 비웁니다.
             if !a_ids.is_empty() {
                 self.clear_kv_cache(); 
-                println!("[RELAY-START] High-Speed Hybrid Relay (Prompt: 32-Chunk / Draft: 1-Token)");
+                println!("[RELAY-START] Streaming 14MB-Flush Relay (64-Token Cycles)");
                 
+                let flush_interval = 64; 
                 let prompt_chunk_size = 32; 
+                
                 for chunk_start in (0..curr_s_off).step_by(prompt_chunk_size) {
                     let chunk_end = (chunk_start + prompt_chunk_size).min(curr_s_off);
                     let chunk_ids = &a_ids[chunk_start..chunk_end];
@@ -451,7 +486,14 @@ impl Qwen3VLGenerateModel {
                     for l_idx in 0..28 {
                         current_h = self.qwen3_vl.forward_relay(&current_h, chunk_start, a_ids.len(), sid.clone(), Some(l_idx), Some(1))?;
                     }
-                    if chunk_start % 2048 == 0 { println!("[PROMPT-SPEED] Tokens {}/{} synced.", chunk_start, curr_s_off); }
+
+                    // [14MB-FLUSH] 64토큰(14MB) 마다 SSD 저장 및 메모리 비우기
+                    if chunk_end % flush_interval == 0 || chunk_end == curr_s_off {
+                        if let Some(s_id) = &sid {
+                            self.bundle_draft_fragments(s_id, 0, chunk_end).await?;
+                            self.clear_kv_cache(); 
+                        }
+                    }
                 }
 
                 for t_idx in curr_s_off..a_ids.len() {
@@ -465,12 +507,18 @@ impl Qwen3VLGenerateModel {
                     for l_idx in 0..28 {
                         current_h = self.qwen3_vl.forward_relay(&current_h, t_idx, a_ids.len(), sid.clone(), Some(l_idx), Some(1))?;
                     }
+                    
+                    if (t_idx + 1) % flush_interval == 0 || t_idx == a_ids.len() - 1 {
+                        if let Some(s_id) = &sid {
+                            self.bundle_draft_fragments(s_id, 0, t_idx + 1).await?;
+                            self.clear_kv_cache();
+                        }
+                    }
                 }
-                println!("[RELAY-COMPLETE] All layers synchronized up to token {}.", temp_off - 1);
+                println!("[RELAY-COMPLETE] Streaming finished.");
             }
 
-            if let Some(s_id) = &sid {
-                self.bundle_draft_fragments(s_id, 0, temp_off).await?;
+            if let Some(_s_id) = &sid {
                 self.qwen3_vl.set_kv_len(temp_off);
             }
 
@@ -505,73 +553,48 @@ impl Qwen3VLGenerateModel {
         Ok(g_text)
     }
 
-    pub async fn bundle_draft_fragments(&mut self, session_id: &str, start_off: usize, end_off: usize) -> Result<()> {
-        let task_dir = crate::utils::paths::get_task_specific_dir(None, session_id);
-        let frag_dir = task_dir.join("fragments");
-        let meta_path = frag_dir.join("metadata.json");
-        if !meta_path.exists() { return Ok(()); }
-        
-        let content = std::fs::read_to_string(&meta_path)?;
-        let mut fragments: Vec<serde_json::Value> = Vec::new();
-        for line in content.lines() { if let Ok(v) = serde_json::from_str(line) { fragments.push(v); } }
+    pub async fn bundle_draft_fragments(&mut self, session_id: &str, _start_off: usize, _end_off: usize) -> Result<()> {
+        // [MEMORY-BUCKET-SAVING] 사용자 지시: 수천 개의 파편 대신 메모리에 쌓인 데이터를 뭉쳐서 한 방에 저장합니다.
+        let unbaked = self.get_all_unbaked_kv_blocks();
+        if unbaked.is_empty() { return Ok(()); }
 
-        let block_size = 256;
-        let start_block = (start_off / block_size) * block_size;
-        let end_block = ((end_off + block_size - 1) / block_size) * block_size;
+        let block_size = 64; // 14MB 배출 주기에 맞춰 블록 크기를 64로 최적화
+        let kv_dir = crate::utils::paths::get_kv_dir(None).join(session_id);
+        if !kv_dir.exists() { let _ = fs::create_dir_all(&kv_dir); }
 
-        for b_off in (start_block..end_block).step_by(block_size) {
-            let b_end = b_off + block_size;
-            let block_dir = crate::utils::paths::get_kv_dir(None).join(session_id).join(format!("b{}", b_off));
+        println!("[BUCKET-SAVE] Consolidating {} memory blocks into bulk SSD files...", unbaked.len());
+
+        for (ks, vs, b_off) in unbaked {
+            let block_dir = kv_dir.join(format!("b{}", b_off));
             if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
 
-            for l_idx in 0..28 {
-                let mut layer_frags = fragments.iter()
-                    .filter(|f| f["layer"].as_u64().unwrap_or(999) == l_idx as u64)
-                    .filter(|f| {
-                        let off = f["off"].as_u64().unwrap_or(0) as usize;
-                        off >= b_off && off < b_end
-                    })
-                    .collect::<Vec<_>>();
+            for l_idx in 0..ks.len() {
+                let mut map = HashMap::new();
+                let prefix = format!("b{}_l{}_", b_off, l_idx);
                 
-                if layer_frags.is_empty() { continue; }
-                layer_frags.sort_by_key(|f| f["off"].as_u64().unwrap_or(0));
+                let k_tensor = ks[l_idx].clone();
+                let v_tensor = vs[l_idx].clone();
 
-                let mut ks = Vec::new();
-                let mut vs = Vec::new();
-                for frag in layer_frags {
-                    let path_str = frag["path"].as_str().unwrap_or("");
-                    if let Ok(st_map) = candle_core::safetensors::load(Path::new(path_str), &Device::Cpu) {
-                        if let (Some(k), Some(v)) = (st_map.get("k"), st_map.get("v")) {
-                            ks.push(k.clone());
-                            vs.push(v.clone());
-                        }
-                    }
-                }
+                map.insert(format!("{}k_anchors", prefix), k_tensor.clone());
+                map.insert(format!("{}v_anchors", prefix), v_tensor.clone());
+                map.insert(format!("{}k_shape", prefix), Tensor::from_vec(vec![1u32, 16, k_tensor.dim(2)? as u32, 128], (4,), &Device::Cpu)?);
 
-                if !ks.is_empty() {
-                    let k_combined = Tensor::cat(&ks, 2)?;
-                    let v_combined = Tensor::cat(&vs, 2)?;
-                    let mut map = HashMap::new();
-                    let prefix = format!("b{}_l{}_", b_off, l_idx);
-                    map.insert(format!("{}k_anchors", prefix), k_combined.clone());
-                    map.insert(format!("{}v_anchors", prefix), v_combined.clone());
-                    map.insert(format!("{}k_shape", prefix), Tensor::from_vec(vec![1u32, 16, k_combined.dim(2)? as u32, 128], (4,), &Device::Cpu)?);
-                    let save_path = block_dir.join(format!("l{}.st", l_idx));
-                    let _ = candle_core::safetensors::save(&map, &save_path);
+                let save_path = block_dir.join(format!("l{}.st", l_idx));
+                let _ = candle_core::safetensors::save(&map, &save_path);
 
-                    if let Some(reg_obj) = self.qwen3_vl.get_registry() {
-                        let mut reg = reg_obj.entries.write().unwrap();
-                        let block_idx = b_off / block_size;
-                        if block_idx < reg.len() {
-                            let entry = &mut reg[block_idx];
-                            entry.ssd_path = Some(block_dir.clone());
-                            entry.location[l_idx] = KVLocation::SSD;
-                            entry.token_len = k_combined.dim(2)?;
-                        }
+                // [REGISTRY-SYNC] 장부 업데이트
+                if let Some(reg_obj) = self.qwen3_vl.get_registry() {
+                    let mut reg = reg_obj.entries.write().unwrap();
+                    let block_idx = b_off / block_size;
+                    if block_idx < reg.len() {
+                        let entry = &mut reg[block_idx];
+                        entry.ssd_path = Some(block_dir.clone());
+                        entry.location[l_idx] = KVLocation::SSD;
+                        entry.token_len = k_tensor.dim(2)?;
                     }
                 }
             }
-            println!("[BUNDLER] Block b{} consolidation complete.", b_off);
+            println!("[BUCKET-SAVE] Block b{} saved to SSD.", b_off);
         }
         Ok(())
     }

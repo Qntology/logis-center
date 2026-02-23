@@ -1943,63 +1943,14 @@ impl QuantizedQwen3VLTextModel {
         let _ = target_device.synchronize();
         let next_xs = Tensor::cat(&next_xs_all, 1)?;
         
-        // [SSD-DUMP-REFINED] 사용자 지시: 개별 디코딩 결과를 디스크로 즉시 기록 (JSON 매칭용)
-        if self.pinned_layer_count == 1 && self.active_session_id.is_some() {
-            let sid = self.active_session_id.as_ref().unwrap();
-            let frag_dir = crate::utils::paths::get_task_specific_dir(None, sid).join("fragments");
-            if !frag_dir.exists() { let _ = fs::create_dir_all(&frag_dir); }
-            
-            let frag_path = frag_dir.join(format!("off_{}_layer_{}.st", seqlen_offset, layer_idx));
-            let mut map = HashMap::new();
-            
-            // 현재 레이어의 KV Cache 추출 (마지막 1개 토큰분)
-            for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
-                let inner = block.inner.read().unwrap();
-                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    if k.dim(2)? > 0 {
-                        let k_last = k.narrow(2, k.dim(2)? - 1, 1)?;
-                        let v_last = v.narrow(2, v.dim(2)? - 1, 1)?;
-                        map.insert("k".to_string(), k_last.to_device(&Device::Cpu)?);
-                        map.insert("v".to_string(), v_last.to_device(&Device::Cpu)?);
-                    }
-                }
-            }
-            
-            if !map.is_empty() {
-                let _ = candle_core::safetensors::save(&map, &frag_path);
-                // [MAPPING-FILE] JSON에 개별 기록 (동기 방식)
-                let meta_path = frag_dir.join("metadata.json");
-                let entry = format!("{{\"off\": {}, \"layer\": {}, \"path\": {:?}}}\n", seqlen_offset, layer_idx, frag_path.to_string_lossy());
-                let mut file = fs::OpenOptions::new().create(true).append(true).open(meta_path).unwrap();
-                use std::io::Write;
-                let _ = file.write_all(entry.as_bytes());
-            }
-        }
-
         let result_xs = next_xs.to_device(&Device::Cpu)?; 
         
-        // 레이어 Unload
-        for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
-            let (k_cpu, v_cpu) = {
-                let inner = block.inner.read().unwrap();
-                if inner.location == KVLocation::VRAM {
-                    if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                        (Some(k.to_device(&Device::Cpu)?), Some(v.to_device(&Device::Cpu)?))
-                    } else { (None, None) }
-                } else { (None, None) }
-            };
-            if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
-                let mut inner_w = block.inner.write().unwrap();
-                inner_w.k_cache = Some(k); inner_w.v_cache = Some(v);
-                inner_w.location = KVLocation::RAM;
-            }
-        }
-        if self.layers[layer_idx].device().is_cuda() {
-            self.layers[layer_idx].to_device(&Device::Cpu)?;
-            let _ = Device::new_cuda(0)?.synchronize();
+        // [VRAM-PINNED] 레이어와 KV 캐시를 GPU에 상주시킵니다.
+        // Baking 모드일 때는 이 데이터를 Baker가 즉시 가져갈 수 있도록 상태를 유지합니다.
+        if self.baking_only {
+            println!("[BURST] << [READY] Layer {} KV Cache is stable in VRAM for Baking.", layer_idx);
         }
 
-        // [SLOT-RECLAMATION] 슬롯 반납 시작
         use crate::models::qwen3vl::generate::SLOT_MANAGER;
         use std::sync::atomic::Ordering;
         
@@ -2028,43 +1979,30 @@ impl QuantizedQwen3VLTextModel {
 
 
         // [SAFE-PURGE-LOGIC] 
-        // 1. Baking 모드(0.6B): 데이터를 절대 지우지 않고 'VRAM' 또는 'RAM' 상태로 유지하여 Baker가 찾을 수 있게 함
-        // 2. Inference 모드(2B): 연산 직후 무거운 텐서만 비우고, 압축 메타데이터는 RAM에 유지
         if !self.baking_only {
             for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
                 let mut inner_w = block.inner.write().unwrap();
                 inner_w.k_cache = None;
                 inner_w.v_cache = None;
                 
-                // [FIX] Speed Optimization: Keep compressed BitKV in RAM
                 if inner_w.bitkv_metadata.is_some() {
                     inner_w.location = KVLocation::RAM;
                 } else {
                     inner_w.location = KVLocation::SSD;
                 }
             }
-
-            {
-                let mut reg_w = self.registry.entries.write().unwrap();
-                for entry in reg_w.iter_mut() {
-                    let mut cache_w = entry.bitkv_cache.write().unwrap();
-                    if layer_idx < cache_w.len() {
-                        cache_w[layer_idx] = None;
-                    }
-                    // [FIX] Registry sync: Keep RAM if we have local metadata in the block
-                    // Since we already set block.inner.location above, the registry will be checked in the next forward()
-                }
+            let mut reg_w = self.registry.entries.write().unwrap();
+            for entry in reg_w.iter_mut() {
+                let mut cache_w = entry.bitkv_cache.write().unwrap();
+                if layer_idx < cache_w.len() { cache_w[layer_idx] = None; }
             }
-            // println!("[BURST] << [DONE] Layer {} complete (RAM Optimized).", layer_idx);
         } else {
-            // [IMPORTANT] Baking 모드에서는 각 블록을 'Dirty' 상태로 명시하여 Baker가 인식하게 합니다.
+            // Baking 모드: Baker가 인식하도록 Dirty 플래그 설정
             let mut reg_w = self.registry.entries.write().unwrap();
             for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
                 let inner = block.inner.read().unwrap();
                 let b_idx = inner.index;
-                if b_idx < reg_w.len() {
-                    reg_w[b_idx].is_dirty = true;
-                }
+                if b_idx < reg_w.len() { reg_w[b_idx].is_dirty = true; }
             }
             println!("[BURST] << [DONE] Layer {} complete (Data Ready for Baking).", layer_idx);
         }
@@ -2135,14 +2073,16 @@ impl QuantizedQwen3VLTextModel {
         let mut layer_devices = vec![];
         let mut pinned_layer_count = 0;
         for i in 0..config.num_hidden_layers {
-            if current_device.is_cuda() && i < 1 {
+            // [VRAM-OPTIMIZATION] 0.6B 모델은 매우 가볍기 때문에 28개 전 레이어를 GPU에 고정합니다.
+            // 이를 통해 레이어 스왑 오버헤드를 0으로 만듭니다.
+            if current_device.is_cuda() {
                 layer_devices.push(current_device.clone());
                 pinned_layer_count += 1;
             } else {
                 layer_devices.push(Device::Cpu);
             }
         }
-        println!("[MODEL] Horizontal Engine Ready: {} GPU slot pinned.", pinned_layer_count);
+        println!("[MODEL] High-Performance Engine Ready: {} GPU layers pinned.", pinned_layer_count);
 
         // [ORGANIC] Dynamic Threading for Parallel Loading
         let thread_config = crate::utils::resources::get_optimal_thread_config(current_device.is_cpu());
@@ -2546,7 +2486,7 @@ impl QuantizedQwen3VLTextModel {
         self.inject_live_kv(k_list, v_list, k_scales[0], v_scales[0])
     }
 
-        pub fn inject_live_kv_bitkv(&mut self, k_anchors: &[Tensor], k_packed: &[Tensor], k_scales: &[Tensor], v_anchors: &[Tensor], v_packed: &[Tensor], v_scales: &[Tensor], original_shape: &[usize]) -> Result<()> {
+    pub fn inject_live_kv_bitkv(&mut self, k_anchors: &[Tensor], k_packed: &[Tensor], k_scales: &[Tensor], v_anchors: &[Tensor], v_packed: &[Tensor], v_scales: &[Tensor], original_shape: &[usize]) -> Result<()> {
         let target_device = self.layers[0].device().clone();
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         
@@ -2561,6 +2501,7 @@ impl QuantizedQwen3VLTextModel {
                 let target_dim = layer.self_attn.head_dim;
                 let (_b, h, _s, d) = k_small.dims4()?;
 
+                use candle_core::D;
                 let mut k_aligned = if d < target_dim { Tensor::cat(&[&k_small, &k_small], D::Minus1)? } else { k_small };
                 let mut v_aligned = if d < target_dim { Tensor::cat(&[&v_small, &v_small], D::Minus1)? } else { v_small };
 
