@@ -456,7 +456,8 @@ impl QuantizedQwen3VLTextAttention {
         device: &Device,
         dtype: DType,
         layer_idx: usize,
-        registry: KVRegistry, // [NEW]
+        registry: KVRegistry,
+        baking_only: bool, // [NEW]
     ) -> Result<Self> {
         let _hidden_size = config.hidden_size;
         let head_dim = config.head_dim;
