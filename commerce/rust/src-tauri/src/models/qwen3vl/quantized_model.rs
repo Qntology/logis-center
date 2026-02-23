@@ -1886,7 +1886,7 @@ impl QuantizedQwen3VLTextModel {
                     // [INTELLIGENT-FALLBACK] 
                     // 1. 프롬프트 구간(Baking)은 데이터가 l0.st에만 있으므로 0번 레이어 데이터를 빌려옵니다.
                     // 2. 생성 구간(Drafting)은 각 레이어가 자기 데이터를 가지고 있어야 하므로 자신의 경로를 우선합니다.
-                    let is_drafting_zone = entry.token_start >= 10189; // Drafting 시작 지점 기준
+                    let is_drafting_zone = entry.token_start >= self.current_kv_len;
                     
                     let hs_path = if is_drafting_zone {
                         // 생성 구간: 자기 레이어 데이터가 없으면 환각 방지를 위해 빌려오지 않고 새로 계산하게 유도 (None)
