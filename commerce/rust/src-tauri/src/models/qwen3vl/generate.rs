@@ -423,41 +423,48 @@ impl Qwen3VLGenerateModel {
                 if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             }
 
-            // [PHASE 2] Chunked Horizontal Relay Pass (0..temp_off)
-            // 사용자 지시: 0번 오프셋부터 전체 구간을 256 청크 단위로 나누어 릴레이 방식으로 주입합니다.
-            // 이를 통해 Rank 에러를 방지하면서 전 구간의 SSD 파편을 완벽하게 생성합니다.
+            // [PHASE 2] Hybrid Horizontal Relay Pass (0..temp_off)
+            // 사용자 지시: 프롬프트는 256 청크로 빠르게, 답변은 1토큰씩 정밀하게 릴레이합니다.
             if !a_ids.is_empty() {
-                let chunk_size = 256;
-                for chunk_start in (0..a_ids.len()).step_by(chunk_size) {
-                    let chunk_end = (chunk_start + chunk_size).min(a_ids.len());
+                println!("[RELAY-START] Hybrid processing: 0..{} (Prompt) / {}..{} (Draft)", curr_s_off, curr_s_off, temp_off);
+                
+                // --- Phase 2a: Prompt Catch-up (Chunks of 256) ---
+                let prompt_chunk_size = 256;
+                for chunk_start in (0..curr_s_off).step_by(prompt_chunk_size) {
+                    let chunk_end = (chunk_start + prompt_chunk_size).min(curr_s_off);
                     let chunk_ids = &a_ids[chunk_start..chunk_end];
-                    
-                    // 1. 현재 청크의 초기 임베딩 생성
+                    if chunk_ids.is_empty() { continue; }
+
                     let mut current_h = match &mut self.qwen3_vl {
                         ModelVariant::QuantizedText(m) => m.language_model.embed_tokens.forward(&Tensor::from_vec(chunk_ids.to_vec(), (1, chunk_ids.len()), &self.text_device)?)?,
                         ModelVariant::QuantizedVL(m) => m.language_model.embed_tokens.forward(&Tensor::from_vec(chunk_ids.to_vec(), (1, chunk_ids.len()), &self.text_device)?)?,
                         _ => unreachable!(),
                     };
 
-                    println!("[RELAY-CHUNK] Processing tokens {}..{} across all layers...", chunk_start, chunk_end - 1);
+                    for l_idx in 0..28 {
+                        current_h = self.qwen3_vl.forward(&current_h, None, None, None, None, None, chunk_start, a_ids.len(), sid.clone(), Some(l_idx), Some(1))?;
+                    }
+                    if chunk_start % 1024 == 0 { println!("[PROMPT-CATCHUP] Tokens {}..{} cached.", chunk_start, chunk_end); }
+                }
+
+                // --- Phase 2b: Draft Relay (Token-by-token) ---
+                for t_idx in curr_s_off..a_ids.len() {
+                    let token_id = a_ids[t_idx];
+                    let mut current_h = match &mut self.qwen3_vl {
+                        ModelVariant::QuantizedText(m) => m.language_model.embed_tokens.forward(&Tensor::from_vec(vec![token_id], (1, 1), &self.text_device)?)?,
+                        ModelVariant::QuantizedVL(m) => m.language_model.embed_tokens.forward(&Tensor::from_vec(vec![token_id], (1, 1), &self.text_device)?)?,
+                        _ => unreachable!(),
+                    };
 
                     for l_idx in 0..28 {
-                        // [RELAY-CORE] 청크 단위로 지능을 전달하며 SSD 파편 생성
-                        current_h = self.qwen3_vl.forward(
-                            &current_h, 
-                            chunk_start, // 현재 청크의 시작 오프셋 전달
-                            a_ids.len(), 
-                            None, None, None,
-                            sid.clone(), 
-                            Some(l_idx), Some(1)
-                        )?;
+                        current_h = self.qwen3_vl.forward(&current_h, None, None, None, None, None, t_idx, a_ids.len(), sid.clone(), Some(l_idx), Some(1))?;
                     }
                 }
+                println!("[RELAY-COMPLETE] All layers synchronized up to token {}.", temp_off);
             }
 
             // [PHASE 3] Full Bundling (From Offset 0)
             if let Some(s_id) = &sid {
-                // 0번 오프셋부터 전체 기억을 하나의 완결된 책으로 묶습니다.
                 self.bundle_draft_fragments(s_id, 0, temp_off).await?;
             }
 
