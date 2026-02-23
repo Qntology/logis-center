@@ -283,16 +283,20 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     let entry = &mut entries[idx];
                                     entry.ssd_path = Some(task_path.clone());
                                     
-                                    let fname = task_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                                    if fname == "l0.st" {
-                                        // [RELAY-BROADCAST] Stage 1에서 생성된 0번 데이터를 모든 레이어에 전파
-                                        for l_idx in 0..28 {
-                                            if entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::SSD_PENDING || 
-                                               entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::VRAM {
-                                                entry.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD;
-                                            }
-                                        }
-                                    } else {
+                                                                            let fname = task_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                                                                            if fname == "l0.st" {
+                                                                                // [RELAY-BROADCAST-REINFORCED] 
+                                                                                // Stage 1(Baking) 뿐만 아니라 Stage 2(Drafting)에서도 
+                                                                                // 0.6B가 생성한 0번 레이어 데이터를 모든 레이어가 공유하도록 장부에 기록합니다.
+                                                                                // 이는 Plan B의 핵심인 '기억의 전파'를 완성합니다.
+                                                                                for l_idx in 0..28 {
+                                                                                    if entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::SSD_PENDING || 
+                                                                                       entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::VRAM ||
+                                                                                       entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::RAM {
+                                                                                        entry.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD;
+                                                                                    }
+                                                                                }
+                                                                            } else {
                                         // [SURGICAL-UPDATE] Stage 2에서 생성된 레이어별 고유 데이터를 장부에 반영
                                         if let Some(l_idx) = fname.strip_prefix('l').and_then(|s| s.strip_suffix(".st")).and_then(|s| s.parse::<usize>().ok()) {
                                             if l_idx < 28 {
@@ -367,7 +371,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 
                                 let (k_data, v_data) = match (k_res, v_res) { 
                                     (Ok(k), Ok(v)) => (k, v), 
-                                    _ => {
+                                    (k_err, v_err) => {
+                                        println!("[WORKER-BAKE] !! [ERROR] Tensor conversion failed for Layer {}. K-Err: {:?}, V-Err: {:?}", actual_layer_idx, k_err.err(), v_err.err());
                                         slot.remaining_layers.fetch_sub(1, Ordering::SeqCst);
                                         continue;
                                     }
@@ -429,6 +434,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             }
                         }));
                         if let Err(panic_info) = result {
+                            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() { s.to_string() }
+                                      else if let Some(s) = panic_info.downcast_ref::<String>() { s.clone() }
+                                      else { "Unknown Panic".to_string() };
+                            println!("[WORKER-PANIC] !! Critical failure in BakeTask for Slot {}. Cause: {}", sid, msg);
                             let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true });
                         }
                     }).await.ok();
@@ -837,34 +846,28 @@ impl Qwen3VLGenerateModel {
                         curr_s_off += 1;
                         gen_count += 1;
         
-                        // [SSD-BAKING-DURING-DRAFT-ASYNC] Drafting 중 SSD 저장이 연산을 방해하지 않도록 완전히 비동기로 처리합니다.
+                        // [SSD-BAKING-DURING-DRAFT-REINFORCED] 
+                        // [CRITICAL] 데이터 주입 실패를 막기 위해 슬롯이 확보될 때까지 무조건 대기합니다.
                         if let Some(s_id) = &sid {
                             if let Ok(pending) = self.get_blocks_by_location(KVLocation::SSD_PENDING) {
                                 for (ks, vs, off, idx) in pending {
-                                    // [NON-BLOCKING-IO] 0.6B Drafting 속도를 위해 I/O 대기를 최소화(10ms)합니다.
-                                    // 슬롯이 없으면 과감히 이번 턴의 저장을 건너뛰고 연산을 이어갑니다.
-                                    let slot_id_res = tokio::time::timeout(
-                                        std::time::Duration::from_millis(10),
-                                        SLOT_MANAGER.acquire_write_slot(curr_s_off)
-                                    ).await;
+                                    // 슬롯이 비워질 때까지 기다렸다가 확실하게 저장합니다.
+                                    let slot_id = SLOT_MANAGER.acquire_write_slot(curr_s_off).await;
 
-                                    if let Ok(slot_id) = slot_id_res {
-                                        let mut dumps = Vec::new();
-                                        for (ix, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() { dumps.push(LayerKVDump { layer_idx: ix, k_tensor: k, v_tensor: v }); }
-                                        if let Ok(tx) = get_bake_worker().await {
-                                            let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
-                                            
-                                            // [STAGE-2-STRICT] Drafting 단계(baking_only=false)에서는 무조건 개별 레이어 저장
-                                            let is_baking_mode = match &self.qwen3_vl {
-                                                ModelVariant::QuantizedVL(m) => m.language_model.baking_only,
-                                                ModelVariant::QuantizedText(m) => m.language_model.baking_only,
-                                                _ => false
-                                            };
+                                    let mut dumps = Vec::new();
+                                    for (ix, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() { dumps.push(LayerKVDump { layer_idx: ix, k_tensor: k, v_tensor: v }); }
+                                    if let Ok(tx) = get_bake_worker().await {
+                                        let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
+                                        
+                                        let is_baking_mode = match &self.qwen3_vl {
+                                            ModelVariant::QuantizedVL(m) => m.language_model.baking_only,
+                                            ModelVariant::QuantizedText(m) => m.language_model.baking_only,
+                                            _ => false
+                                        };
 
-                                            let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: off, layers: dumps, is_relay_baking: is_baking_mode, block_idx: Some(idx), registry: rr })).await;
-                                        }
-                                        self.mark_block_location(idx, KVLocation::Streaming); 
+                                        let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: off, layers: dumps, is_relay_baking: is_baking_mode, block_idx: Some(idx), registry: rr })).await;
                                     }
+                                    self.mark_block_location(idx, KVLocation::Streaming); 
                                 }
                             }
                         }
@@ -952,12 +955,15 @@ impl Qwen3VLGenerateModel {
             for b_idx in 0..num_blocks {
                 let mut ks = Vec::new(); let mut vs = Vec::new(); let mut match_found = false; let mut offset = 0;
                 for l in layers {
-                    let inner = l.self_attn.kv_blocks[b_idx].inner.read().unwrap();
-                    if inner.location == target_loc || (target_loc == KVLocation::SSD_PENDING && inner.location == KVLocation::RAM && inner.ssd_path.is_none()) {
-                        if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                            let k_cpu = if k.device().is_cpu() { k.clone() } else { k.to_device(&Device::Cpu)? };
-                            let v_cpu = if v.device().is_cpu() { v.clone() } else { v.to_device(&Device::Cpu)? };
-                            ks.push(k_cpu); vs.push(v_cpu); offset = inner.offset + inner.len; match_found = true;
+                    // [INDEX-SAFETY] Plan B(Skip)로 인해 레이어별 블록 개수가 다를 수 있으므로 안전하게 접근합니다.
+                    if b_idx < l.self_attn.kv_blocks.len() {
+                        let inner = l.self_attn.kv_blocks[b_idx].inner.read().unwrap();
+                        if inner.location == target_loc || (target_loc == KVLocation::SSD_PENDING && inner.location == KVLocation::RAM && inner.ssd_path.is_none()) {
+                            if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                                let k_cpu = if k.device().is_cpu() { k.clone() } else { k.to_device(&Device::Cpu)? };
+                                let v_cpu = if v.device().is_cpu() { v.clone() } else { v.to_device(&Device::Cpu)? };
+                                ks.push(k_cpu); vs.push(v_cpu); offset = inner.offset + inner.len; match_found = true;
+                            }
                         }
                     }
                 }

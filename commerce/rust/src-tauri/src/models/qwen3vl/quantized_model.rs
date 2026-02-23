@@ -250,8 +250,24 @@ pub struct KVRegistry {
 
 impl KVRegistry {
     pub fn new() -> Self {
+        // [FIX] 장부(Registry)를 처음부터 최대 슬롯 개수(128개)만큼 미리 할당합니다.
+        // 이렇게 해야 프롬프트가 40블록이더라도 Drafting 중 41번째 블록 진입 시 패닉이 발생하지 않습니다.
+        let mut entries = Vec::with_capacity(128);
+        for i in 0..128 {
+            entries.push(RegistryEntry {
+                token_start: i * 256,
+                token_len: 0,
+                location: vec![KVLocation::SSD; 28],
+                ssd_path: None,
+                slot_ids: vec![None; 28],
+                last_accessed: std::time::Instant::now(),
+                is_dirty: false,
+                hidden_states_path: vec![None; 28],
+                bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; 28])),
+            });
+        }
         Self {
-            entries: Arc::new(std::sync::RwLock::new(Vec::new())),
+            entries: Arc::new(std::sync::RwLock::new(entries)),
         }
     }
 
@@ -364,7 +380,12 @@ impl KVRegistry {
         }
 
         let mut entries = self.entries.write().unwrap();
-        *entries = loaded;
+        // [FIX] 기존 128개 사전 할당 공간을 유지하면서 로드된 데이터만 덮어씁니다.
+        for (i, entry) in loaded.into_iter().enumerate() {
+            if i < entries.len() {
+                entries[i] = entry;
+            }
+        }
         Ok(())
     }
 }
@@ -637,7 +658,16 @@ impl QuantizedQwen3VLTextAttention {
                 // Registry entry management only on Layer 0
                 if self.layer_idx == 0 {
                     let mut reg = self.registry.entries.write().unwrap();
-                    if reg.len() <= index {
+                    // [SLOT-RECLAMATION-LOGIC] 40개를 넘어 128개까지 슬롯을 재사용하고 장부를 업데이트합니다.
+                    if index < reg.len() {
+                        let entry = &mut reg[index];
+                        entry.token_start = current_total;
+                        entry.token_len = take;
+                        entry.is_dirty = true;
+                        for loc in entry.location.iter_mut() { *loc = initial_location; }
+                        entry.last_accessed = std::time::Instant::now();
+                    } else {
+                        // [EXPAND] 128개를 넘어서는 극한의 상황에서만 장부를 추가로 확장합니다.
                         reg.push(RegistryEntry {
                             location: vec![initial_location; 28],
                             slot_ids: vec![None; 28],
@@ -645,7 +675,7 @@ impl QuantizedQwen3VLTextAttention {
                             token_len: take,
                             ssd_path: None,
                             hidden_states_path: vec![None; 28],
-                            is_dirty: true, // [NEW] 백업 필요 표시
+                            is_dirty: true,
                             last_accessed: std::time::Instant::now(),
                             bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; 28])),
                         });
@@ -1569,9 +1599,19 @@ impl QuantizedQwen3VLTextModel {
         let cos_chunk = cos.narrow(1, i, take)?;
         let sin_chunk = sin.narrow(1, i, take)?;
 
-        let out_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)
-        }));
+        // [PLAN-B] Selective Skip Connection
+        // 0.6B 모델(pinned_layer_count == 1)의 경우, Drafting 단계(layer_idx > 0)에서
+        // 상위 레이어의 복잡한 연산을 건너뛰고 Layer 0의 직관적인 결과를 그대로 전달합니다.
+        // 이는 "빈 문맥"으로 인한 헛소리를 방지하고 속도를 비약적으로 높입니다.
+        let out_res = if layer_idx > 0 && self.pinned_layer_count == 1 {
+            // 연산 생략 (Skip)
+            Ok(Ok(xs_chunk.clone()))
+        } else {
+            // 정상 연산
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)
+            }))
+        };
 
         match out_res {
             Ok(Ok(out)) => {
