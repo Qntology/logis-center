@@ -1599,19 +1599,11 @@ impl QuantizedQwen3VLTextModel {
         let cos_chunk = cos.narrow(1, i, take)?;
         let sin_chunk = sin.narrow(1, i, take)?;
 
-        // [PLAN-B] Selective Skip Connection
-        // 0.6B 모델(pinned_layer_count == 1)의 경우, Drafting 단계(layer_idx > 0)에서
-        // 상위 레이어의 복잡한 연산을 건너뛰고 Layer 0의 직관적인 결과를 그대로 전달합니다.
-        // 이는 "빈 문맥"으로 인한 헛소리를 방지하고 속도를 비약적으로 높입니다.
-        let out_res = if layer_idx > 0 && self.pinned_layer_count == 1 {
-            // 연산 생략 (Skip)
-            Ok(Ok(xs_chunk.clone()))
-        } else {
-            // 정상 연산
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)
-            }))
-        };
+        // [FULL-INFERENCE] 사용자 지시에 따라 모든 레이어가 정상 연산을 수행합니다.
+        // 이를 통해 상위 레이어도 프롬프트 문맥을 이해하고 정상적인 결과를 도출합니다.
+        let out_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)
+        }));
 
         match out_res {
             Ok(Ok(out)) => {

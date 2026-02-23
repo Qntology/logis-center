@@ -408,32 +408,40 @@ impl Qwen3VLGenerateModel {
         }
 
         if is_small {
-            println!("[DRAFTING] Small model starting LAYER-WISE CHUNK generation");
-            let chunk_size = 24;
-            while gen_count < max_gen {
-                if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
-                let mut current_chunk_ids = Vec::new(); let mut temp_off = curr_s_off; let mut eos_hit = false;
-                for _ in 0..chunk_size {
-                    let last_c = *a_ids.last().unwrap_or(&0);
-                    let logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![last_c], (1, 1), &self.text_device)?, None, None, None, None, None, temp_off, 1, sid.clone(), Some(0), Some(1))?;
-                    let target_l = logits.flatten_all()?;
-                    let l_v = apply_repeat_penalty(&target_l.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
-                    let next_id = l_proc.sample(&l_v)?;
-                    a_ids.push(next_id); current_chunk_ids.push(next_id); temp_off += 1;
-                    if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { eos_hit = true; break; }
-                }
-                if !current_chunk_ids.is_empty() {
-                    let chunk_tensor = Tensor::from_vec(current_chunk_ids.clone(), (1, current_chunk_ids.len()), &self.text_device)?;
-                    for l_idx in 1..28 { self.qwen3_vl.forward(&chunk_tensor, None, None, None, None, None, curr_s_off, current_chunk_ids.len(), sid.clone(), Some(l_idx), Some(1))?; }
-                }
-                if let Some(s_id) = &sid { self.bundle_draft_fragments(s_id, curr_s_off, temp_off).await?; }
-                let delta = current_chunk_ids.len();
-                let final_text = self.tokenizer.token_decode(current_chunk_ids)?;
-                println!("[Off:{}..{}] Layers: 0..27. {}", curr_s_off, temp_off - 1, final_text);
-                curr_s_off += delta; gen_count += delta;
-                if eos_hit { break; }
+            println!("[DRAFTING] Small model starting FULL-SEQUENCE CATCH-UP (0..{})", t_toks + 24);
+            let mut current_chunk_ids = Vec::new();
+            let mut temp_off = curr_s_off;
+
+            // [PHASE 1] Layer 0 Pilot Pass (추측)
+            for _ in 0..24 {
+                let last_c = *a_ids.last().unwrap_or(&0);
+                let logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![last_c], (1, 1), &self.text_device)?, None, None, None, None, None, temp_off, 1, sid.clone(), Some(0), Some(1))?;
+                let next_id = l_proc.sample(&logits.flatten_all()?)?;
+                a_ids.push(next_id);
+                current_chunk_ids.push(next_id);
+                temp_off += 1;
+                if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             }
-            g_text = self.tokenizer.token_decode(a_ids[f_ids.len()..].to_vec())?;
+
+            // [PHASE 2] Full-Sequence Catch-up (0..temp_off)
+            // 사용자 지시: 모든 레이어가 0번 토큰부터 전체 구간을 다시 훑으며 데이터를 SSD에 주입합니다.
+            if !a_ids.is_empty() {
+                let full_sequence_tensor = Tensor::from_vec(a_ids.clone(), (1, a_ids.len()), &self.text_device)?;
+                for l_idx in 0..28 {
+                    // 0번 오프셋부터 전체 길이를 각 레이어에 주입 (Inference 없이 데이터 생성만 수행)
+                    self.qwen3_vl.forward(&full_sequence_tensor, None, None, None, None, None, 0, a_ids.len(), sid.clone(), Some(l_idx), Some(1))?;
+                }
+            }
+
+            // [PHASE 3] Full Bundling (From Offset 0)
+            if let Some(s_id) = &sid {
+                // 0번 오프셋부터 전체 기억을 하나의 완결된 책으로 묶습니다.
+                self.bundle_draft_fragments(s_id, 0, temp_off).await?;
+            }
+
+            let final_text = self.tokenizer.token_decode(current_chunk_ids)?;
+            println!("[FINAL-DRAFT] {}", final_text);
+            g_text = final_text;
         } else {
             while gen_count < max_gen {
                 if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
