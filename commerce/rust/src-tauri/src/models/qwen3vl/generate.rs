@@ -754,43 +754,68 @@ impl Qwen3VLGenerateModel {
         let max_gen = mes.max_tokens.unwrap_or(2048) as usize;
         let mut gen_count = 0;
         let mut active_draft = pre_draft.unwrap_or_default();
-        while gen_count < max_gen {
-            if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
-            let last_c = *a_ids.last().unwrap_or(&0);
-            let mut v_batch = vec![last_c]; v_batch.extend(&active_draft);
-            let logits = self.qwen3_vl.forward(&Tensor::from_vec(v_batch.clone(), (1, v_batch.len()), &self.text_device)?, p_vals.as_ref(), i_grid.as_ref(), None, None, Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + v_batch.len()) as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, v_batch.len(), sid.clone())?;
-            let mut acc_this = 0; let mut confirmed = Vec::new();
-            for i in 0..v_batch.len() - 1 {
-                let target_l = logits.narrow(1, i, 1)?.flatten_all()?;
-                let l_v = apply_repeat_penalty(&target_l.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
-                let acc_id = l_proc.sample(&l_v)?;
-                if i < active_draft.len() && acc_id == active_draft[i] { confirmed.push(acc_id); acc_this += 1; if acc_id == self.eos_token_id1 || acc_id == self.eos_token_id2 { break; } }
-                else { confirmed.push(acc_id); acc_this += 1; break; }
-            }
-            if acc_this == 0 {
-                let target_l = logits.narrow(1, 0, 1)?.flatten_all()?;
-                let next_id = l_proc.sample(&target_l)?; confirmed.push(next_id); acc_this = 1;
-            }
-            let chunk_txt = self.tokenizer.token_decode(confirmed.clone())?;
-            print!("{}", chunk_txt);
-            if !active_draft.is_empty() { print!(" [SPEC] Accepted: {}/{}", confirmed.len().min(active_draft.len()), active_draft.len()); }
-            use std::io::Write; let _ = std::io::stdout().flush();
-            g_text.push_str(&chunk_txt); a_ids.extend(confirmed); curr_s_off += acc_this; gen_count += acc_this; active_draft.clear(); p_vals = None;
-            if *a_ids.last().unwrap() == self.eos_token_id1 || *a_ids.last().unwrap() == self.eos_token_id2 { break; }
-            if let Some(s_id) = &sid {
-                let pending = self.get_blocks_by_location(KVLocation::SSD_PENDING)?;
-                for (ks, vs, off, idx) in pending {
-                    let slot_id = SLOT_MANAGER.acquire_write_slot(curr_s_off).await;
-                    let mut dumps = Vec::new();
-                    for (ix, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() { dumps.push(LayerKVDump { layer_idx: ix, k_tensor: k, v_tensor: v }); }
-                    if let Ok(tx) = get_bake_worker().await {
-                        let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
-                        let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: off, layers: dumps, is_relay_baking: false, block_idx: Some(idx), registry: rr })).await;
-                    }
-                    self.mark_block_location(idx, KVLocation::Streaming); 
+        let is_small = self.model_name.contains("Small");
+
+        // [STAGE-2-OPTIMIZATION] 0.6B 모델은 검증 없이 끝까지 빠르게 써내려갑니다.
+        if is_small {
+            println!("[DRAFTING] Small model starting full response generation in RAM...");
+            while gen_count < max_gen {
+                if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
+                
+                let last_c = *a_ids.last().unwrap_or(&0);
+                let logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![last_c], (1, 1), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + 1) as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, 1, sid.clone())?;
+                
+                let next_id = logits.flatten_all()?.argmax(0)?.to_scalar::<u32>()?;
+                a_ids.push(next_id);
+                curr_s_off += 1;
+                gen_count += 1;
+
+                if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
+                    println!("[DRAFTING] EOS reached at {} tokens.", gen_count);
+                    break; 
                 }
             }
-            self.clear_temporal_kv_caches();
+            g_text = self.tokenizer.token_decode(a_ids[t_toks..].to_vec())?;
+        } else {
+            // [STAGE-3-OPTIMIZATION] 2B 모델은 0.6B가 준 드래프트를 원샷으로 검증합니다.
+            while gen_count < max_gen {
+                if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
+                let last_c = *a_ids.last().unwrap_or(&0);
+                
+                // 드래프트가 비어있지 않다면 배치 검증 모드, 비어있다면 일반 생성 모드
+                let mut v_batch = vec![last_c];
+                let is_verifying_macro_draft = !active_draft.is_empty();
+                v_batch.extend(&active_draft);
+                
+                let logits = self.qwen3_vl.forward(&Tensor::from_vec(v_batch.clone(), (1, v_batch.len()), &self.text_device)?, p_vals.as_ref(), i_grid.as_ref(), None, None, Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + v_batch.len()) as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, v_batch.len(), sid.clone())?;
+                
+                let mut acc_this = 0; let mut confirmed = Vec::new();
+                for i in 0..v_batch.len() - 1 {
+                    let target_l = logits.narrow(1, i, 1)?.flatten_all()?;
+                    let l_v = apply_repeat_penalty(&target_l.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
+                    let acc_id = l_proc.sample(&l_v)?;
+                    if i < active_draft.len() && acc_id == active_draft[i] { confirmed.push(acc_id); acc_this += 1; if acc_id == self.eos_token_id1 || acc_id == self.eos_token_id2 { break; } }
+                    else { confirmed.push(acc_id); acc_this += 1; break; }
+                }
+                if acc_this == 0 {
+                    let target_l = logits.narrow(1, 0, 1)?.flatten_all()?;
+                    let next_id = l_proc.sample(&target_l)?; confirmed.push(next_id); acc_this = 1;
+                }
+                let chunk_txt = self.tokenizer.token_decode(confirmed.clone())?;
+                print!("{}", chunk_txt);
+                if !active_draft.is_empty() { print!(" [SPEC] Accepted: {}/{}", confirmed.len().min(active_draft.len()), active_draft.len()); }
+                use std::io::Write; let _ = std::io::stdout().flush();
+                g_text.push_str(&chunk_txt); a_ids.extend(confirmed); curr_s_off += acc_this; gen_count += acc_this; active_draft.clear(); p_vals = None;
+                
+                // [ONE-PASS-EXIT] 매크로 드래프트를 한 번 검증했다면 즉시 종료하여 2B 회전 최소화
+                if is_verifying_macro_draft {
+                    println!("\n[STAGE-3] Single-pass verification complete. Finalizing result.");
+                    break;
+                }
+
+                if *a_ids.last().unwrap() == self.eos_token_id1 || *a_ids.last().unwrap() == self.eos_token_id2 { break; }
+                self.clear_temporal_kv_caches();
+            }
         }
         if let Some(s_id) = &sid {
             let path = crate::utils::paths::get_kv_dir(None).join(s_id);

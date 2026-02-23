@@ -2237,17 +2237,11 @@ impl QuantizedQwen3VLTextModel {
         // [LAYER-SURGERY] 0.6B 모델을 2B 규격(28레이어)으로 강제 확장
         let mut final_layers = Vec::new();
         let num_actual_layers = layers.len();
-        let target_layers = if baking_only { 1 } else { 28 }; // 2B와 맞추기 위해 28개로 설정
+        let target_layers = if baking_only { 1 } else { 28 }; 
 
         if num_actual_layers > 0 {
             for i in 0..target_layers {
-                // 실제 레이어가 부족하면 상위 레이어들을 반복해서 채움
-                let source_idx = if i < num_actual_layers {
-                    i
-                } else {
-                    // 16~27번 슬롯은 실제 레이어의 뒷부분(예: 4~15번)을 반복 사용
-                    num_actual_layers - (target_layers - i) % (num_actual_layers / 2 + 1) - 1
-                };
+                let source_idx = if i < num_actual_layers { i } else { num_actual_layers - (target_layers - i) % (num_actual_layers / 2 + 1) - 1 };
                 final_layers.push(layers[source_idx].clone());
             }
         } else {

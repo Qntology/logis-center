@@ -643,12 +643,12 @@ async fn process_task(
                             content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(full_task_prompt.clone()),
                             name: None,
                         })],
-                        max_tokens: Some(128), temperature: Some(0.1),
+                        max_tokens: Some(512), temperature: Some(0.1),
                         ..Default::default()
                     };
                     
-                    // 전체 레이어를 가진 0.6B가 고품질 가안을 작성합니다.
-                    // [IMPORTANT] 이미 SSD에 문맥이 로드되어 있으므로, generate() 내부에서 Prefill은 자동으로 생략됩니다.
+                    // [STAGE 2] 0.6B Full-Layer Drafting (In RAM)
+                    // 0.6B 모델은 이제 RAM에 고정되어 로그 없이 매우 빠르게 문장을 완성합니다.
                     let draft_text = worker.generate(params, Some(cancellation_token.clone()), session_clone, kv_name_clone, None).await?;
                     let ids = worker.tokenizer.text_encode_vec(draft_text, false)?;
                     draft_tokens = Some(ids);
