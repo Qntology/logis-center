@@ -1990,18 +1990,6 @@ impl QuantizedQwen3VLTextModel {
             });
         }
 
-        // [PHYSICAL-WAIT-GATE] 슬롯 회수 대기
-        if num_to_release > 0 {
-            let target_active = initial_active.saturating_sub(num_to_release);
-            let mut wait_attempts = 0;
-            while wait_attempts < 1000 { 
-                let current_active = SLOT_MANAGER.count_reads.load(Ordering::SeqCst) + SLOT_MANAGER.count_writes.load(Ordering::SeqCst);
-                if current_active <= target_active { break; }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                wait_attempts += 1;
-            }
-        }
-
         // [SAFE-PURGE-LOGIC] 
         // 1. Baking 모드(0.6B): 데이터를 절대 지우지 않고 'VRAM' 또는 'RAM' 상태로 유지하여 Baker가 찾을 수 있게 함
         // 2. Inference 모드(2B): 연산 직후 무거운 텐서만 비우고, 압축 메타데이터는 RAM에 유지
