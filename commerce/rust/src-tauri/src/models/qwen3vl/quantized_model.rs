@@ -1923,7 +1923,11 @@ impl QuantizedQwen3VLTextModel {
             for (c_offset, chunk_xs) in next_xs_all.iter().enumerate() {
                 let absolute_chunk_idx = base_chunk_idx + c_offset;
                 let chunk_path = layer_dir.join(format!("chunk_{}.st", absolute_chunk_idx));
-                let chunk_xs_clone = chunk_xs.clone();
+                
+                // [CRITICAL-FIX] 비동기 태스크로 넘기기 전에 메인 스레드에서 즉시 CPU로 복사합니다.
+                // GPU 컨텍스트 유실로 인한 패닉을 원천 차단합니다.
+                let chunk_xs_cpu = chunk_xs.to_device(&Device::Cpu).unwrap_or_else(|_| chunk_xs.clone());
+                
                 let layer_idx_fixed = layer_idx;
                 let registry_task_clone = self.registry.clone();
 
@@ -1933,7 +1937,7 @@ impl QuantizedQwen3VLTextModel {
                 // [ASYNC-IO] 연산 흐름을 방해하지 않도록 별도 태스크로 파일 저장
                 tauri::async_runtime::spawn(async move {
                     let mut map = HashMap::new();
-                    map.insert("hidden_states".to_string(), chunk_xs_clone);
+                    map.insert("hidden_states".to_string(), chunk_xs_cpu);
                     let _ = candle_core::safetensors::save(&map, &chunk_path);
                     
                     if let Ok(mut reg_w) = registry_task_clone.entries.write() {

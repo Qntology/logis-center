@@ -271,45 +271,44 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 }
 
                 let tmp_path = task_path.with_extension("tmp");
-                match candle_core::safetensors::save(&task_tensors, &tmp_path) {
-                    Ok(_) => {
-                        if let Err(e) = std::fs::rename(&tmp_path, &task_path) {
-                            println!("[WORKER-IO] !! [ERROR] Atomic rename failed: {:?}", e);
-                        } else {
-                            if let (Some(reg), Some(idx)) = (registry, block_idx) {
-                                if let Ok(mut entries) = reg.entries.write() {
-                                    if idx < entries.len() {
-                                        let entry = &mut entries[idx];
-                                        entry.ssd_path = Some(task_path.clone());
-                                        
-                                        let fname = task_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                                        if fname == "l0.st" {
-                                            // [RELAY-BROADCAST] Stage 1에서 생성된 0번 데이터를 모든 레이어에 전파
-                                            for l_idx in 0..28 {
-                                                if entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::SSD_PENDING || 
-                                                   entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::VRAM {
-                                                    entry.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD;
-                                                }
+                let save_res = candle_core::safetensors::save(&task_tensors, &tmp_path);
+                
+                if let Ok(_) = save_res {
+                    if let Err(e) = std::fs::rename(&tmp_path, &task_path) {
+                        println!("[WORKER-IO] !! [ERROR] Atomic rename failed: {:?}", e);
+                    } else {
+                        if let (Some(reg), Some(idx)) = (registry, block_idx) {
+                            if let Ok(mut entries) = reg.entries.write() {
+                                if idx < entries.len() {
+                                    let entry = &mut entries[idx];
+                                    entry.ssd_path = Some(task_path.clone());
+                                    
+                                    let fname = task_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                                    if fname == "l0.st" {
+                                        // [RELAY-BROADCAST] Stage 1에서 생성된 0번 데이터를 모든 레이어에 전파
+                                        for l_idx in 0..28 {
+                                            if entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::SSD_PENDING || 
+                                               entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::VRAM {
+                                                entry.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD;
                                             }
-                                        } else {
-                                            // [SURGICAL-UPDATE] Stage 2에서 생성된 레이어별 고유 데이터를 장부에 반영
-                                            if let Some(l_idx) = fname.strip_prefix('l').and_then(|s| s.strip_suffix(".st")).and_then(|s| s.parse::<usize>().ok()) {
-                                                if l_idx < 28 {
-                                                    entry.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD;
-                                                }
+                                        }
+                                    } else {
+                                        // [SURGICAL-UPDATE] Stage 2에서 생성된 레이어별 고유 데이터를 장부에 반영
+                                        if let Some(l_idx) = fname.strip_prefix('l').and_then(|s| s.strip_suffix(".st")).and_then(|s| s.parse::<usize>().ok()) {
+                                            if l_idx < 28 {
+                                                entry.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD;
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                    },
-                    Err(e) => {
-                        println!("[WORKER-IO] !! [ERROR] Block save failed! Path: {:?}, Cause: {:?}", tmp_path, e);
                     }
+                } else if let Err(e) = save_res {
+                    println!("[WORKER-IO] !! [ERROR] Block save failed! Path: {:?}, Cause: {:?}", tmp_path, e);
                 }
 
-                // [GLOBAL-SAFETY] 파일 쓰기 완료 후 카운터 감소
+                // [GLOBAL-SAFETY] 무조건 카운터 감소 (Hanging 방지)
                 GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
 
                 let slot = &SLOT_MANAGER.slots[slot_id];
