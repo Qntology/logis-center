@@ -631,8 +631,7 @@ async fn process_task(
             }
 
             // [STAGE 2] 0.6B Full-Layer DRAFTING (High Quality)
-            println!("[Scheduler] Stage 2: Generating Macro Draft with 0.6B (Full-Layers)...");
-            // is_baking: false로 설정하여 0.6B 전체 레이어를 로드합니다.
+            println!("[Scheduler] Stage 2: Drafting with 0.6B (Full-Layers, SSD Rotation)...");
             model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name_clone.clone()).await?;
 
             {
@@ -654,13 +653,24 @@ async fn process_task(
                     draft_tokens = Some(ids);
                     
                     // [STRICT-SSD-FLUSH] Drafting 연산 결과가 SSD에 모두 기록될 때까지 대기
-                    println!("[Scheduler] Finalizing Drafting SSD writes (28 Layers)...");
+                    println!("[Scheduler] Finalizing Drafting SSD writes (Verifying 28 Layer files)...");
                     crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    
+                    // [VERIFY-FILES] 실제 파일 존재 여부 핑 체크
+                    let last_block_idx = (worker.get_kv_len() - 1) / 256;
+                    let block_dir = crate::utils::paths::get_kv_dir(None).join(s_id).join(format!("b{}", last_block_idx * 256));
+                    for i in 0..28 {
+                        let path = block_dir.join(format!("l{}.st", i));
+                        for _ in 0..10 { // 최대 1초 대기
+                            if path.exists() { break; }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
             
-            // [STRICT-UNLOAD] 0.6B를 메모리에서 즉시 해제하여 2B를 위한 완벽한 빈 공간 확보
+            // [STRICT-UNLOAD]
             model.deep_purge_resources().await;
             wait_for_resources_settled(2500, 1500, Some(&cancellation_token)).await?;
         } else {
@@ -757,7 +767,7 @@ async fn process_task(
             }
 
             // [STAGE 2] 0.6B Full-Layer DRAFTING
-            println!("[Scheduler] Stage 2: Drafting Selectors with 0.6B (Full-Layers)...");
+            println!("[Scheduler] Stage 2: Drafting Selectors with 0.6B (Full-Layers, SSD Rotation)...");
             model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name_clone.clone()).await?;
 
             {
@@ -777,9 +787,16 @@ async fn process_task(
                     draft_tokens_b = Some(ids);
 
                     // [STRICT-SSD-FLUSH] Drafting 연산 결과가 SSD에 모두 기록될 때까지 대기
-                    println!("[Scheduler] Finalizing Selector Drafting SSD writes (28 Layers)...");
+                    println!("[Scheduler] Finalizing Selector Drafting SSD writes (Verifying 28 Layer files)...");
                     crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    
+                    let last_block_idx = (worker.get_kv_len() - 1) / 256;
+                    let block_dir = crate::utils::paths::get_kv_dir(None).join(s_id).join(format!("b{}", last_block_idx * 256));
+                    for i in 0..28 {
+                        let path = block_dir.join(format!("l{}.st", i));
+                        for _ in 0..10 { if path.exists() { break; } tokio::time::sleep(Duration::from_millis(100)).await; }
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
             
@@ -941,7 +958,7 @@ async fn process_task(
                 }
 
                 // [STAGE 2] 0.6B Full-Layer DRAFTING
-                println!("[Scheduler] Stage 2: Drafting Details with 0.6B (Full-Layers)...");
+                println!("[Scheduler] Stage 2: Drafting Details with 0.6B (Full-Layers, SSD Rotation)...");
                 log_task_progress(app_handle, &task.id, &json!({ "category": "Context Baking", "summary": "Generating Macro Draft with 0.6B..." }));
                 model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name_clone.clone()).await?;
 
@@ -962,9 +979,16 @@ async fn process_task(
                         draft_tokens_c = Some(ids);
 
                         // [STRICT-SSD-FLUSH] Drafting 연산 결과가 SSD에 모두 기록될 때까지 대기
-                        println!("[Scheduler] Finalizing Detail Drafting SSD writes (28 Layers)...");
+                        println!("[Scheduler] Finalizing Detail Drafting SSD writes (Verifying 28 Layer files)...");
                         crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        
+                        let last_block_idx = (worker.get_kv_len() - 1) / 256;
+                        let block_dir = crate::utils::paths::get_kv_dir(None).join(s_id).join(format!("b{}", last_block_idx * 256));
+                        for i in 0..28 {
+                            let path = block_dir.join(format!("l{}.st", i));
+                            for _ in 0..10 { if path.exists() { break; } tokio::time::sleep(Duration::from_millis(100)).await; }
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
                     }
                 }
                 

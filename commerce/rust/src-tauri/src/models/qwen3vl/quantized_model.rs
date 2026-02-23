@@ -1779,11 +1779,19 @@ impl QuantizedQwen3VLTextModel {
                                 new_data
                             };
 
-                            let expected_d = 128; // Qwen3-2B 기준 차원
-                            let expected_h = 16;  // Qwen3-2B 기준 헤드 수
+                            // [DYNAMIC-SHAPE-ADAPTER] 모델의 실제 사양에 맞춰 타겟 형상 결정
+                            // 0.6B 모델은 8헤드(hidden=1024), 2B 모델은 16헤드(hidden=2048)를 사용함
+                            let expected_d = 128; 
+                            let hidden_size = self.embed_tokens.embeddings().dim(1).unwrap_or(2048);
+                            let expected_h = hidden_size / expected_d;
                             
-                            let padded_k = bytes_to_f32_adapted(ka.data(), expected_h, expected_d, &o_shape);
-                            let padded_v = bytes_to_f32_adapted(va.data(), expected_h, expected_d, &o_shape);
+                            // [FIX] 앵커 데이터의 실제 개수 파악 (o_shape[2]는 전체 블록 길이인 256임)
+                            let anchor_count = ka.shape()[2];
+                            let mut anchor_os = o_shape.clone();
+                            anchor_os[2] = anchor_count;
+
+                            let padded_k = bytes_to_f32_adapted(ka.data(), expected_h, expected_d, &anchor_os);
+                            let padded_v = bytes_to_f32_adapted(va.data(), expected_h, expected_d, &anchor_os);
                             
                             // [FIX] Scales도 헤드 수 확장이 필요함 (Dimension은 1로 고정)
                             let padded_ks = bytes_to_f32_adapted(ks.data(), expected_h, 1, &o_shape);
@@ -1795,10 +1803,10 @@ impl QuantizedQwen3VLTextModel {
                             }
 
                             let metadata = BitKVMetadata {
-                                k_anchors: Tensor::from_vec(padded_k, (o_shape[0], expected_h, o_shape[2], expected_d), &Device::Cpu)?,
+                                k_anchors: Tensor::from_vec(padded_k, (o_shape[0], expected_h, anchor_count, expected_d), &Device::Cpu)?,
                                 k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?,
                                 k_scales: Tensor::from_vec(padded_ks, (o_shape[0], expected_h, o_shape[2], 1), &Device::Cpu)?, 
-                                v_anchors: Tensor::from_vec(padded_v, (o_shape[0], expected_h, o_shape[2], expected_d), &Device::Cpu)?,
+                                v_anchors: Tensor::from_vec(padded_v, (o_shape[0], expected_h, anchor_count, expected_d), &Device::Cpu)?,
                                 v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?,
                                 v_scales: Tensor::from_vec(padded_vs, (o_shape[0], expected_h, o_shape[2], 1), &Device::Cpu)?,
                                 original_shape: vec![o_shape[0], expected_h, o_shape[2], expected_d]
@@ -1828,33 +1836,44 @@ impl QuantizedQwen3VLTextModel {
         // [SSD-PIPELINE] 만약 입력 xs가 비어있거나 장부에 이전 레이어 결과가 있다면 로드
         let mut xs = xs;
         if layer_idx > 0 {
-            // [RELAY-HACK] 0.6B -> 2B 릴레이 시, 2B의 모든 레이어는 0.6B가 구운 레이어 0의 결과물을 문맥으로 공유합니다.
             let reg = self.registry.entries.read().unwrap();
             if !reg.is_empty() {
-                // 현재 시퀀스 위치에 해당하는 블록의 hidden_states_path를 확인
                 let block_idx = seqlen_offset / 256;
                 if block_idx < reg.len() {
                     let entry = &reg[block_idx];
-                    // 자신의 레이어 데이터가 없으면 0번 레이어(릴레이 데이터)의 경로를 폴백으로 사용
-                    // xs가 비어있거나(dim=0), 혹은 레이어 전환 시점에 데이터 복구가 필요할 때 작동
-                    let hs_path = entry.hidden_states_path[layer_idx].as_ref()
-                        .or_else(|| entry.hidden_states_path[0].as_ref());
+                    
+                    // [INTELLIGENT-FALLBACK] 
+                    // 1. 프롬프트 구간(Baking)은 데이터가 l0.st에만 있으므로 0번 레이어 데이터를 빌려옵니다.
+                    // 2. 생성 구간(Drafting)은 각 레이어가 자기 데이터를 가지고 있어야 하므로 자신의 경로를 우선합니다.
+                    let is_drafting_zone = entry.token_start >= 10189; // Drafting 시작 지점 기준
+                    
+                    let hs_path = if is_drafting_zone {
+                        // 생성 구간: 자기 레이어 데이터가 없으면 환각 방지를 위해 빌려오지 않고 새로 계산하게 유도 (None)
+                        entry.hidden_states_path[layer_idx].as_ref()
+                    } else {
+                        // 프롬프트 구간: 0번 레이어 데이터를 공통 문맥으로 사용
+                        entry.hidden_states_path[layer_idx].as_ref()
+                            .or_else(|| entry.hidden_states_path[0].as_ref())
+                    };
                     
                     if let Some(path) = hs_path {
                         if path.exists() && (xs.dim(1).unwrap_or(0) == 0 || layer_idx > 0) {
                             if let Ok(loaded_xs) = crate::utils::tensor_utils::load_tensor(path, "hidden_states", &target_device) {
-                                // [SHAPE-ADAPTER] 차원이 다르면 패딩하여 호환성 유지
                                 let mut final_xs = loaded_xs;
-                                let expected_dim = xs.dim(2).unwrap_or(2048);
+                                let expected_dim = 2048; // 2B 기준 (필요시 패딩)
                                 let actual_dim = final_xs.dim(2).unwrap_or(1024);
                                 
                                 if actual_dim < expected_dim {
-                                    println!("[SHAPE-ADAPT] Padding hidden states from {} to {}", actual_dim, expected_dim);
                                     let padding = Tensor::zeros((final_xs.dim(0)?, final_xs.dim(1)?, expected_dim - actual_dim), final_xs.dtype(), &target_device)?;
                                     final_xs = Tensor::cat(&[final_xs, padding], 2)?;
                                 }
-                                
                                 xs = final_xs.to_dtype(xs.dtype())?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
                             }
                         }
                     }

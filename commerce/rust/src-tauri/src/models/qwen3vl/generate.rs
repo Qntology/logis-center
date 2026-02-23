@@ -326,9 +326,14 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             for l_idx in 0..loop_count {
                                 let mut layer_map = std::collections::HashMap::new();
                                 let source = &bake.layers[l_idx];
-                                let layer_prefix = if is_relay { "l0_".to_string() } else { format!("l{}_", source.layer_idx) };
+                                
+                                // [CRITICAL-FIX] 0.6B Drafting(Stage 2)에서는 각 레이어 번호를 고수해야 합니다.
+                                // Baking(Stage 1)에서만 l0으로 강제합니다.
+                                let actual_layer_idx = if is_relay && loop_count == 1 { 0 } else { source.layer_idx };
+                                
+                                let layer_prefix = format!("l{}_", actual_layer_idx);
                                 let prefix = format!("{}{}", block_prefix, layer_prefix);
-                                let layer_fname = format!("l{}.st", if is_relay { 0 } else { source.layer_idx });
+                                let layer_fname = format!("l{}.st", actual_layer_idx);
 
                                 let k_res = source.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
                                 let v_res = source.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
@@ -707,7 +712,14 @@ impl Qwen3VLGenerateModel {
                 for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() { dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k, v_tensor: v }); }
                 if let Ok(tx) = get_bake_worker().await {
                     let reg_ref = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
-                    let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, layers: dumps, is_relay_baking: is_06b, block_idx: Some(block_offset / 256), registry: reg_ref })).await;
+                    
+                    let is_baking_mode = match &self.qwen3_vl {
+                        ModelVariant::QuantizedVL(m) => m.language_model.baking_only,
+                        ModelVariant::QuantizedText(m) => m.language_model.baking_only,
+                        _ => false
+                    };
+
+                    let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: path, kv_name: kv_n.clone(), offset: block_offset, layers: dumps, is_relay_baking: is_baking_mode, block_idx: Some(block_offset / 256), registry: reg_ref })).await;
                 }
             }
             SLOT_MANAGER.wait_for_all_tasks().await;
@@ -731,7 +743,8 @@ impl Qwen3VLGenerateModel {
         let mut curr_s_off = self.get_kv_len();
 
         if t_toks <= curr_s_off {
-            println!("[GENERATE] Skipping Prefill (Context already restored to offset {})", curr_s_off);
+            println!("[GENERATE] Context covers prompt (Len: {}, Cache: {}). Jump to offset {}.", t_toks, curr_s_off, t_toks);
+            curr_s_off = t_toks; // [FIX] 프롬프트 끝지점부터 생성 시작
         } else if t_toks > curr_s_off {
             let prefill_len = t_toks - curr_s_off;
             println!("[GENERATE] Prefilling remaining {} tokens at offset {}...", prefill_len, curr_s_off);
@@ -746,8 +759,14 @@ impl Qwen3VLGenerateModel {
                     if let Ok(tx) = get_bake_worker().await {
                         let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
                         
-                        let is_small = self.model_name.contains("Small");
-                        let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: off, layers: dumps, is_relay_baking: is_small, block_idx: Some(off / 256), registry: rr })).await;
+                        // [FIX] 모델 크기가 아니라, 현재 'Baking 모드'인지 여부에 따라 저장 방식 결정
+                        let is_baking_mode = match &self.qwen3_vl {
+                            ModelVariant::QuantizedVL(m) => m.language_model.baking_only,
+                            ModelVariant::QuantizedText(m) => m.language_model.baking_only,
+                            _ => false
+                        };
+                        
+                        let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: off, layers: dumps, is_relay_baking: is_baking_mode, block_idx: Some(off / 256), registry: rr })).await;
                     }
                 }
                 SLOT_MANAGER.wait_for_all_tasks().await;
@@ -765,14 +784,23 @@ impl Qwen3VLGenerateModel {
 
                 // [STAGE-2-OPTIMIZATION] 0.6B 모델은 검증 없이 끝까지 빠르게 써내려갑니다.
                 if is_small {
-                    println!("[DRAFTING] Small model starting full response generation with SSD rotation...");
+                    println!("[DRAFTING] Small model starting full response generation...");
                     while gen_count < max_gen {
                         if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
                         
                         let last_c = *a_ids.last().unwrap_or(&0);
                         let logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![last_c], (1, 1), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + 1) as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, 1, sid.clone())?;
                         
-                        let next_id = logits.flatten_all()?.argmax(0)?.to_scalar::<u32>()?;
+                        let target_l = logits.flatten_all()?;
+                        // [SAMPLING-FOR-DRAFT] 0.6B 모델도 반복 페널티와 샘플링을 적용하여 품질 향상
+                        let l_v = apply_repeat_penalty(&target_l.to_dtype(DType::F32)?, 1.1, if a_ids.len() > 512 { &a_ids[a_ids.len()-512..] } else { &a_ids[..] })?;
+                        let next_id = l_proc.sample(&l_v)?;
+                        
+                        // [REALTIME-DRAFT-LOG]
+                        let chunk = self.tokenizer.token_decode(vec![next_id])?;
+                        print!("{}", chunk);
+                        use std::io::Write; let _ = std::io::stdout().flush();
+
                         a_ids.push(next_id);
                         curr_s_off += 1;
                         gen_count += 1;
@@ -786,14 +814,21 @@ impl Qwen3VLGenerateModel {
                                 for (ix, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() { dumps.push(LayerKVDump { layer_idx: ix, k_tensor: k, v_tensor: v }); }
                                 if let Ok(tx) = get_bake_worker().await {
                                     let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
-                                    let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: off, layers: dumps, is_relay_baking: true, block_idx: Some(idx), registry: rr })).await;
+                                    
+                                    let is_baking_mode = match &self.qwen3_vl {
+                                        ModelVariant::QuantizedVL(m) => m.language_model.baking_only,
+                                        ModelVariant::QuantizedText(m) => m.language_model.baking_only,
+                                        _ => false
+                                    };
+
+                                    let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: off, layers: dumps, is_relay_baking: is_baking_mode, block_idx: Some(idx), registry: rr })).await;
                                 }
                                 self.mark_block_location(idx, KVLocation::Streaming); 
                             }
                         }
         
                         if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
-                            println!("[DRAFTING] EOS reached at {} tokens.", gen_count);
+                            println!("\n[DRAFTING] EOS reached at {} tokens (Total Offset: {}).", gen_count, curr_s_off);
                             break; 
                         }
                     }
