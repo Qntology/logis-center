@@ -423,24 +423,35 @@ impl Qwen3VLGenerateModel {
                 if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             }
 
-            // [PHASE 2] Horizontal Relay Pass (0..temp_off)
-            // 사용자 지시: 0번 오프셋부터 전체 구간을 릴레이 방식으로 통과시켜 '지능의 고리'를 연결합니다.
+            // [PHASE 2] Chunked Horizontal Relay Pass (0..temp_off)
+            // 사용자 지시: 0번 오프셋부터 전체 구간을 256 청크 단위로 나누어 릴레이 방식으로 주입합니다.
+            // 이를 통해 Rank 에러를 방지하면서 전 구간의 SSD 파편을 완벽하게 생성합니다.
             if !a_ids.is_empty() {
-                // 1. 전체 시퀀스의 초기 임베딩을 생성합니다. (0..temp_off)
-                let mut current_h = match &mut self.qwen3_vl {
-                    ModelVariant::QuantizedText(m) => m.language_model.embed_tokens.forward(&Tensor::from_vec(a_ids.clone(), (1, a_ids.len()), &self.text_device)?)?,
-                    ModelVariant::QuantizedVL(m) => m.language_model.embed_tokens.forward(&Tensor::from_vec(a_ids.clone(), (1, a_ids.len()), &self.text_device)?)?,
-                    _ => unreachable!("Only Quantized models support relay for now"),
-                };
+                let chunk_size = 256;
+                for chunk_start in (0..a_ids.len()).step_by(chunk_size) {
+                    let chunk_end = (chunk_start + chunk_size).min(a_ids.len());
+                    let chunk_ids = &a_ids[chunk_start..chunk_end];
+                    
+                    // 1. 현재 청크의 초기 임베딩 생성
+                    let mut current_h = match &mut self.qwen3_vl {
+                        ModelVariant::QuantizedText(m) => m.language_model.embed_tokens.forward(&Tensor::from_vec(chunk_ids.to_vec(), (1, chunk_ids.len()), &self.text_device)?)?,
+                        ModelVariant::QuantizedVL(m) => m.language_model.embed_tokens.forward(&Tensor::from_vec(chunk_ids.to_vec(), (1, chunk_ids.len()), &self.text_device)?)?,
+                        _ => unreachable!(),
+                    };
 
-                for l_idx in 0..28 {
-                    // [RELAY-CORE] 이전 레이어의 결과(current_h)를 다음 레이어의 입력으로 주입합니다.
-                    current_h = self.qwen3_vl.forward(
-                        &current_h, 
-                        None, None, None, None, None, 
-                        0, a_ids.len(), sid.clone(), 
-                        Some(l_idx), Some(1)
-                    )?;
+                    println!("[RELAY-CHUNK] Processing tokens {}..{} across all layers...", chunk_start, chunk_end - 1);
+
+                    for l_idx in 0..28 {
+                        // [RELAY-CORE] 청크 단위로 지능을 전달하며 SSD 파편 생성
+                        current_h = self.qwen3_vl.forward(
+                            &current_h, 
+                            chunk_start, // 현재 청크의 시작 오프셋 전달
+                            a_ids.len(), 
+                            None, None, None,
+                            sid.clone(), 
+                            Some(l_idx), Some(1)
+                        )?;
+                    }
                 }
             }
 
