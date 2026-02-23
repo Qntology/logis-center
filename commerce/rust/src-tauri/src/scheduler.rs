@@ -652,6 +652,11 @@ async fn process_task(
                     let draft_text = worker.generate(params, Some(cancellation_token.clone()), session_clone, kv_name_clone, None).await?;
                     let ids = worker.tokenizer.text_encode_vec(draft_text, false)?;
                     draft_tokens = Some(ids);
+                    
+                    // [STRICT-SSD-FLUSH] Drafting 연산 결과가 SSD에 모두 기록될 때까지 대기
+                    println!("[Scheduler] Finalizing Drafting SSD writes (28 Layers)...");
+                    crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
             
@@ -770,6 +775,11 @@ async fn process_task(
                     let draft_text = worker.generate(params, Some(cancellation_token.clone()), session_clone, kv_name_clone, None).await?;
                     let ids = worker.tokenizer.text_encode_vec(draft_text, false)?;
                     draft_tokens_b = Some(ids);
+
+                    // [STRICT-SSD-FLUSH] Drafting 연산 결과가 SSD에 모두 기록될 때까지 대기
+                    println!("[Scheduler] Finalizing Selector Drafting SSD writes (28 Layers)...");
+                    crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
             
@@ -950,6 +960,11 @@ async fn process_task(
                         let draft_text = worker.generate(params, Some(cancellation_token.clone()), session_clone, kv_name_clone, None).await?;
                         let ids = worker.tokenizer.text_encode_vec(draft_text, false)?;
                         draft_tokens_c = Some(ids);
+
+                        // [STRICT-SSD-FLUSH] Drafting 연산 결과가 SSD에 모두 기록될 때까지 대기
+                        println!("[Scheduler] Finalizing Detail Drafting SSD writes (28 Layers)...");
+                        crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                 }
                 

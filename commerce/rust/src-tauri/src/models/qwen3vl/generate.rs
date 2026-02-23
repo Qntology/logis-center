@@ -313,6 +313,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             let slot = &SLOT_MANAGER.slots[sid];
                             slot.remaining_layers.store(loop_count, Ordering::SeqCst); 
                             
+                            // [SYNC-LOG] 레이어 저장 개수 명시
+                            if is_relay {
+                                println!("[WORKER-BAKE] >> Saving RELAY Layer 0 for Slot {} (Context Ingestion)", sid);
+                            } else {
+                                println!("[WORKER-BAKE] >> Saving {} Layers for Slot {} (Macro Drafting)", loop_count, sid);
+                            }
+                            
                             let block_dir = t_dir.join(format!("b{}", off));
                             let block_prefix = format!("b{}_", off);
 
@@ -756,27 +763,43 @@ impl Qwen3VLGenerateModel {
         let mut active_draft = pre_draft.unwrap_or_default();
         let is_small = self.model_name.contains("Small");
 
-        // [STAGE-2-OPTIMIZATION] 0.6B 모델은 검증 없이 끝까지 빠르게 써내려갑니다.
-        if is_small {
-            println!("[DRAFTING] Small model starting full response generation in RAM...");
-            while gen_count < max_gen {
-                if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
-                
-                let last_c = *a_ids.last().unwrap_or(&0);
-                let logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![last_c], (1, 1), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + 1) as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, 1, sid.clone())?;
-                
-                let next_id = logits.flatten_all()?.argmax(0)?.to_scalar::<u32>()?;
-                a_ids.push(next_id);
-                curr_s_off += 1;
-                gen_count += 1;
-
-                if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
-                    println!("[DRAFTING] EOS reached at {} tokens.", gen_count);
-                    break; 
+                // [STAGE-2-OPTIMIZATION] 0.6B 모델은 검증 없이 끝까지 빠르게 써내려갑니다.
+                if is_small {
+                    println!("[DRAFTING] Small model starting full response generation with SSD rotation...");
+                    while gen_count < max_gen {
+                        if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
+                        
+                        let last_c = *a_ids.last().unwrap_or(&0);
+                        let logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![last_c], (1, 1), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + 1) as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, 1, sid.clone())?;
+                        
+                        let next_id = logits.flatten_all()?.argmax(0)?.to_scalar::<u32>()?;
+                        a_ids.push(next_id);
+                        curr_s_off += 1;
+                        gen_count += 1;
+        
+                        // [SSD-BAKING-DURING-DRAFT] Drafting 중에도 연산 결과(KV Cache)를 SSD로 전송
+                        if let Some(s_id) = &sid {
+                            let pending = self.get_blocks_by_location(KVLocation::SSD_PENDING)?;
+                            for (ks, vs, off, idx) in pending {
+                                let slot_id = SLOT_MANAGER.acquire_write_slot(curr_s_off).await;
+                                let mut dumps = Vec::new();
+                                for (ix, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() { dumps.push(LayerKVDump { layer_idx: ix, k_tensor: k, v_tensor: v }); }
+                                if let Ok(tx) = get_bake_worker().await {
+                                    let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
+                                    let _ = tx.send(SlotTask::Bake(BakeTask { slot_id, task_dir: crate::utils::paths::get_kv_dir(None).join(s_id), kv_name: kv_n.clone(), offset: off, layers: dumps, is_relay_baking: true, block_idx: Some(idx), registry: rr })).await;
+                                }
+                                self.mark_block_location(idx, KVLocation::Streaming); 
+                            }
+                        }
+        
+                        if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
+                            println!("[DRAFTING] EOS reached at {} tokens.", gen_count);
+                            break; 
+                        }
+                    }
+                    g_text = self.tokenizer.token_decode(a_ids[f_ids.len()..].to_vec())?;
                 }
-            }
-            g_text = self.tokenizer.token_decode(a_ids[t_toks..].to_vec())?;
-        } else {
+         else {
             // [STAGE-3-OPTIMIZATION] 2B 모델은 0.6B가 준 드래프트를 원샷으로 검증합니다.
             while gen_count < max_gen {
                 if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
