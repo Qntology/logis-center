@@ -88,8 +88,7 @@ impl SlotManager {
                     if cw.load(Ordering::SeqCst) < max_c && !free_p.is_empty() {
                         let idx = free_p.pop_front().unwrap();
                         states[idx] = InternalState::Writing;
-                        cf.fetch_sub(1, Ordering::SeqCst);
-                        cw.fetch_add(1, Ordering::SeqCst);
+                        cf.fetch_sub(1, Ordering::SeqCst); cw.fetch_add(1, Ordering::SeqCst);
                         let _ = response.send(idx);
                     } else { p_writes.push_back((response, total_tokens)); }
                 }
@@ -97,19 +96,14 @@ impl SlotManager {
                     if !free_p.is_empty() {
                         let idx = free_p.pop_front().unwrap();
                         states[idx] = InternalState::Reading;
-                        cf.fetch_sub(1, Ordering::SeqCst);
-                        cr.fetch_add(1, Ordering::SeqCst);
+                        cf.fetch_sub(1, Ordering::SeqCst); cr.fetch_add(1, Ordering::SeqCst);
                         let _ = response.send(idx);
                     } else { p_reads.push_back(response); }
                 }
                 SlotRequest::Release { idx, .. } => {
                     if idx < max_slots && states[idx] != InternalState::Free {
-                        let old = states[idx];
-                        states[idx] = InternalState::Free;
-                        free_p.push_back(idx);
-                        cf.fetch_add(1, Ordering::SeqCst);
-                        if old == InternalState::Writing { cw.fetch_sub(1, Ordering::SeqCst); }
-                        else { cr.fetch_sub(1, Ordering::SeqCst); }
+                        let old = states[idx]; states[idx] = InternalState::Free; free_p.push_back(idx); cf.fetch_add(1, Ordering::SeqCst);
+                        if old == InternalState::Writing { cw.fetch_sub(1, Ordering::SeqCst); } else { cr.fetch_sub(1, Ordering::SeqCst); }
                     }
                     if cw.load(Ordering::SeqCst) == 0 && cr.load(Ordering::SeqCst) == 0 { while let Some(w) = flushers.pop() { let _ = w.send(()); } }
                     Self::process_queues_robust(&sys, &mut free_p, &mut p_writes, &mut p_reads, &mut states, &cf, &cw, &cr, max_slots);
@@ -126,26 +120,21 @@ impl SlotManager {
         while !free_p.is_empty() && !p_writes.is_empty() {
             let max_c = Self::calculate_dynamic_budget(sys, p_writes.front().unwrap().1, max_slots);
             if cw.load(Ordering::SeqCst) < max_c {
-                let idx = free_p.pop_front().unwrap();
-                let (res, _) = p_writes.pop_front().unwrap();
-                states[idx] = InternalState::Writing;
-                cf.fetch_sub(1, Ordering::SeqCst); cw.fetch_add(1, Ordering::SeqCst);
+                let idx = free_p.pop_front().unwrap(); let (res, _) = p_writes.pop_front().unwrap();
+                states[idx] = InternalState::Writing; cf.fetch_sub(1, Ordering::SeqCst); cw.fetch_add(1, Ordering::SeqCst);
                 let _ = res.send(idx);
             } else { break; }
         }
         while !free_p.is_empty() && !p_reads.is_empty() {
-            let idx = free_p.pop_front().unwrap();
-            let res = p_reads.pop_front().unwrap();
-            states[idx] = InternalState::Reading;
-            cf.fetch_sub(1, Ordering::SeqCst); cr.fetch_add(1, Ordering::SeqCst);
+            let idx = free_p.pop_front().unwrap(); let res = p_reads.pop_front().unwrap();
+            states[idx] = InternalState::Reading; cf.fetch_sub(1, Ordering::SeqCst); cr.fetch_add(1, Ordering::SeqCst);
             let _ = res.send(idx);
         }
     }
 
     fn calculate_dynamic_budget(sys: &sysinfo::System, _total_tokens: usize, max_slots: usize) -> usize {
         let avail = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-        let base_min = 32; 
-        let max_cap = 48; 
+        let base_min = 32; let max_cap = 48; 
         let budget = if avail < 2.0 { base_min } else { ((avail - 2.0) / 0.05) as usize + base_min };
         budget.min(max_cap).min(max_slots)
     }
@@ -157,78 +146,35 @@ impl SlotManager {
 
     pub async fn reset_all_slots(&self) { for i in 0..self.slots.len() { self.release_slot(i).await; } }
     pub async fn acquire_read_slot(&self) -> usize { let (tx, rx) = oneshot::channel(); let _ = self.request_tx.send(SlotRequest::AcquireRead { response: tx }).await; rx.await.unwrap_or(0) }
-    pub async fn acquire_write_slot(&self, total_tokens: usize) -> usize {
-        let (tx, rx) = oneshot::channel();
-        let _ = self.request_tx.send(SlotRequest::AcquireWrite { response: tx, total_tokens }).await;
-        let id = rx.await.unwrap_or(0);
-        id
-    }
+    pub async fn acquire_write_slot(&self, total_tokens: usize) -> usize { let (tx, rx) = oneshot::channel(); let _ = self.request_tx.send(SlotRequest::AcquireWrite { response: tx, total_tokens }).await; rx.await.unwrap_or(0) }
     pub async fn release_slot(&self, id: usize) {
         if id < self.slots.len() {
             for l in &self.slots[id].k_layers { if let Ok(mut g) = l.try_lock() { *g = None; } }
             for l in &self.slots[id].v_layers { if let Ok(mut g) = l.try_lock() { *g = None; } }
             self.slots[id].state.store(0, Ordering::SeqCst);
-            let _ = self.request_tx.send(SlotRequest::Release { 
-                idx: id, 
-                task_id: None, 
-                block_index: None, 
-                is_bake: false 
-            }).await;
+            let _ = self.request_tx.send(SlotRequest::Release { idx: id, task_id: None, block_index: None, is_bake: false }).await;
         }
     }
     pub fn get_counts(&self) -> (usize, usize, usize) { (self.count_reads.load(Ordering::Relaxed), self.count_writes.load(Ordering::Relaxed), self.count_free.load(Ordering::Relaxed)) }
 }
 
 pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(128));
-
 pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn wait_for_global_io() {
     let _ = SLOT_MANAGER.wait_for_all_tasks().await;
     let mut attempts = 0;
     while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 && attempts < 200 {
-        if attempts % 10 == 0 {
-            println!("[IO-SAFETY] Waiting for {} active SSD writes...", GLOBAL_IO_COUNTER.load(Ordering::SeqCst));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        attempts += 1;
-    }
-    if GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 {
-        println!("[IO-SAFETY] !! Warning: IO wait timeout. Potential data loss.");
-    } else {
-        println!("[IO-SAFETY] All software queues and physical writes cleared.");
+        tokio::time::sleep(Duration::from_millis(100)).await; attempts += 1;
     }
 }
 
 struct LayerKVDump { layer_idx: usize, k_tensor: Tensor, v_tensor: Tensor }
-struct BakeTask { 
-    slot_id: usize, 
-    task_dir: PathBuf, 
-    kv_name: Option<String>, 
-    offset: usize, 
-    layers: Vec<LayerKVDump>, 
-    is_relay_baking: bool,
-    block_idx: Option<usize>,
-    registry: Option<crate::models::qwen3vl::quantized_model::KVRegistry>
-}
-struct SaveTask { 
-    slot_id: usize, 
-    path: PathBuf, 
-    tensors: std::collections::HashMap<String, Tensor>, 
-    is_last: bool,
-    block_idx: Option<usize>,
-    registry: Option<crate::models::qwen3vl::quantized_model::KVRegistry>
-}
-pub struct ChunkedLoadTask {
-    pub slot_ids: Vec<usize>,
-    pub path: PathBuf,
-    pub layer_indices: Vec<usize>,
-    pub shared_blocks: Vec<crate::models::qwen3vl::quantized_model::KVBlock>,
-    pub registry: crate::models::qwen3vl::quantized_model::KVRegistry,
-}
-
+struct BakeTask { slot_id: usize, task_dir: PathBuf, kv_name: Option<String>, offset: usize, layers: Vec<LayerKVDump>, is_relay_baking: bool, block_idx: Option<usize>, registry: Option<crate::models::qwen3vl::quantized_model::KVRegistry> }
+struct SaveTask { slot_id: usize, path: PathBuf, tensors: std::collections::HashMap<String, Tensor>, is_last: bool, block_idx: Option<usize>, registry: Option<crate::models::qwen3vl::quantized_model::KVRegistry> }
 pub enum SlotTask { Bake(BakeTask), Load(LoadTask), ChunkedLoad(ChunkedLoadTask) }
 pub struct LoadTask { pub slot_id: usize, pub path: PathBuf, pub layer_idx: usize, pub kv_name: Option<String>, pub shared_block: crate::models::qwen3vl::quantized_model::KVBlock, pub registry: crate::models::qwen3vl::quantized_model::KVRegistry }
+pub struct ChunkedLoadTask { pub slot_ids: Vec<usize>, pub path: PathBuf, pub layer_indices: Vec<usize>, pub shared_blocks: Vec<crate::models::qwen3vl::quantized_model::KVBlock>, pub registry: crate::models::qwen3vl::quantized_model::KVRegistry }
 
 use tokio::sync::OnceCell;
 pub static BAKE_TX: OnceCell<mpsc::Sender<SlotTask>> = OnceCell::const_new();
@@ -245,54 +191,40 @@ pub async fn get_load_worker() -> Result<mpsc::Sender<SlotTask>> {
 }
 
 pub fn init_bake_worker() {
-    let (btx, brx) = mpsc::channel(1000);
-    let (ltx, lrx) = mpsc::channel(1000);
+    let (btx, brx) = mpsc::channel(1000); let (ltx, lrx) = mpsc::channel(1000);
     tauri::async_runtime::spawn(async move { spawn_slot_worker(brx); }); 
     tauri::async_runtime::spawn(async move { spawn_slot_worker(lrx); });
-    let _ = BAKE_TX.set(btx);
-    let _ = LOAD_TX.set(ltx);
+    let _ = BAKE_TX.set(btx); let _ = LOAD_TX.set(ltx);
 }
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(1000); 
     tokio::spawn(async move {
         while let Some(task) = io_rx.recv().await {
-            let task_path = task.path.clone();
-            let task_tensors = task.tensors;
-            let registry = task.registry.clone();
-            let block_idx = task.block_idx;
-            let slot_id = task.slot_id;
-            let is_last = task.is_last;
+            let tp = task.path.clone(); let ts = task.tensors; let reg = task.registry.clone(); let b_idx = task.block_idx; let sid = task.slot_id; let is_last = task.is_last;
             tokio::spawn(async move {
-                if let Some(parent) = task_path.parent() { if !parent.exists() { let _ = std::fs::create_dir_all(parent); } }
-                let tmp_path = task_path.with_extension("tmp");
-                let save_res = candle_core::safetensors::save(&task_tensors, &tmp_path);
-                if let Ok(_) = save_res {
-                    if let Err(e) = std::fs::rename(&tmp_path, &task_path) { println!("[WORKER-IO] !! [ERROR] Atomic rename failed: {:?}", e); }
-                    else if let (Some(reg), Some(idx)) = (registry, block_idx) {
-                        if let Ok(mut entries) = reg.entries.write() {
-                            if idx < entries.len() {
-                                let entry = &mut entries[idx]; entry.ssd_path = Some(task_path.clone());
-                                let fname = task_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                                if fname == "l0.st" {
-                                    for l_idx in 0..28 {
-                                        if entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::SSD_PENDING || 
-                                           entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::VRAM ||
-                                           entry.location[l_idx] == crate::models::qwen3vl::quantized_model::KVLocation::RAM {
-                                            entry.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD;
-                                        }
+                if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
+                let tmp = tp.with_extension("tmp");
+                if candle_core::safetensors::save(&ts, &tmp).is_ok() {
+                    if fs::rename(&tmp, &tp).is_ok() {
+                        if let (Some(r), Some(idx)) = (reg, b_idx) {
+                            if let Ok(mut entries) = r.entries.write() {
+                                if idx < entries.len() {
+                                    let e = &mut entries[idx]; e.ssd_path = Some(tp.clone());
+                                    if tp.file_name().map(|n| n == "l0.st").unwrap_or(false) {
+                                        for i in 0..28 { e.location[i] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; }
+                                    } else if let Some(l) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")).and_then(|s| s.parse::<usize>().ok()) {
+                                        if l < 28 { e.location[l] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; }
                                     }
-                                } else if let Some(l_idx) = fname.strip_prefix('l').and_then(|s| s.strip_suffix(".st")).and_then(|s| s.parse::<usize>().ok()) {
-                                    if l_idx < 28 { entry.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; }
                                 }
                             }
                         }
                     }
                 }
                 GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
-                let slot = &SLOT_MANAGER.slots[slot_id];
+                let slot = &SLOT_MANAGER.slots[sid];
                 if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 || is_last {
-                    let _ = SLOT_MANAGER.request_tx.send(SlotRequest::Release { idx: slot_id, task_id: None, block_index: None, is_bake: true }).await;
+                    let _ = SLOT_MANAGER.request_tx.send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true }).await;
                 }
             });
         }
@@ -307,109 +239,70 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             let (t_dir, off, is_relay) = (bake.task_dir, bake.offset, bake.is_relay_baking);
                             if bake.layers.is_empty() { let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: false }); return; }
-                            let loop_count = bake.layers.len();
-                            let slot = &SLOT_MANAGER.slots[sid];
-                            slot.remaining_layers.store(loop_count, Ordering::SeqCst); 
-                            let block_dir = t_dir.join(format!("b{}", off));
-                            let block_prefix = format!("b{}_", off);
+                            let loop_count = bake.layers.len(); let slot = &SLOT_MANAGER.slots[sid]; slot.remaining_layers.store(loop_count, Ordering::SeqCst); 
+                            let block_dir = t_dir.join(format!("b{}", off)); let block_prefix = format!("b{}_", off);
                             for l_idx in 0..loop_count {
-                                let mut layer_map = std::collections::HashMap::new();
-                                let source = &bake.layers[l_idx];
-                                let actual_layer_idx = if is_relay && loop_count == 1 { 0 } else { source.layer_idx };
-                                let layer_prefix = format!("l{}_", actual_layer_idx);
-                                let prefix = format!("{}{}", block_prefix, layer_prefix);
-                                let layer_fname = format!("l{}.st", actual_layer_idx);
-                                let k_res = source.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
-                                let v_res = source.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
-                                let (k_data, v_data) = match (k_res, v_res) { 
-                                    (Ok(k), Ok(v)) => (k, v), 
-                                    (ke, ve) => { println!("[WORKER-BAKE] Error: {:?}, {:?}", ke.err(), ve.err()); slot.remaining_layers.fetch_sub(1, Ordering::SeqCst); continue; }
-                                };
-                                let k_s = source.k_tensor.dims(); let (b, h, s, d) = (k_s[0], k_s[1], k_s[2], k_s[3]);
-                                let head_size = s * d; let a_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
-                                let mut ka = vec![0.0f32; b * h * a_count * d]; let mut kp = vec![0u8; (b * h * s * d + 7) / 8]; let mut ks = vec![0.0f32; b * h * s];
-                                for bh in 0..(b * h) {
-                                    let bho = bh * head_size;
-                                    for i in 0..head_size { if k_data[bho + i] >= 0.0 { kp[(bho + i) / 8] |= 1 << ((bho + i) % 8); } }
+                                let mut layer_map = HashMap::new(); let src = &bake.layers[l_idx];
+                                let act_l = if is_relay && loop_count == 1 { 0 } else { src.layer_idx };
+                                let prefix = format!("{}l{}_", block_prefix, act_l);
+                                let k_res = src.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
+                                let v_res = src.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()).and_then(|t| t.to_vec1::<f32>());
+                                let (kd, vd) = match (k_res, v_res) { (Ok(k), Ok(v)) => (k, v), _ => { slot.remaining_layers.fetch_sub(1, Ordering::SeqCst); continue; } };
+                                let ks = src.k_tensor.dims(); let (b, h, s, d) = (ks[0], ks[1], ks[2], ks[3]);
+                                let hs = s * d; let ac = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
+                                let mut ka = vec![0.0f32; b*h*ac*d]; let mut kp = vec![0u8; (b*h*s*d+7)/8]; let mut ksc = vec![0.0f32; b*h*s];
+                                for bh in 0..(b*h) {
+                                    let bho = bh*hs;
+                                    for i in 0..hs { if kd[bho+i] >= 0.0 { kp[(bho+i)/8] |= 1 << ((bho+i)%8); } }
                                     for ti in 0..s {
-                                        let td = &k_data[bho + ti * d .. bho + (ti + 1) * d];
-                                        if ti < 4 || ti % 8 == 0 { let ap = if ti < 4 { ti } else { 4 + (ti - 4) / 8 }; ka[(bh * a_count + ap) * d .. (bh * a_count + ap + 1) * d].copy_from_slice(td); }
-                                        let mut m = 0.0f32; for &v in td { let a = v.abs(); if a > m { m = a; } } ks[bh * s + ti] = m;
+                                        let td = &kd[bho+ti*d .. bho+(ti+1)*d];
+                                        if ti < 4 || ti % 8 == 0 { let ap = if ti < 4 { ti } else { 4+(ti-4)/8 }; ka[(bh*ac+ap)*d .. (bh*ac+ap+1)*d].copy_from_slice(td); }
+                                        let mut m = 0.0f32; for &v in td { let a = v.abs(); if a > m { m = a; } } ksc[bh*s+ti] = m;
                                     }
                                 }
-                                layer_map.insert(format!("{}k_anchors", prefix), Tensor::from_vec(ka, vec![b, h, a_count, d], &Device::Cpu).unwrap());
-                                layer_map.insert(format!("{}k_packed", prefix), Tensor::from_vec(kp, vec![(b * h * s * d + 7) / 8], &Device::Cpu).unwrap());
-                                layer_map.insert(format!("{}k_scales", prefix), Tensor::from_vec(ks, vec![b, h, s, 1], &Device::Cpu).unwrap());
+                                layer_map.insert(format!("{}k_anchors", prefix), Tensor::from_vec(ka, vec![b,h,ac,d], &Device::Cpu).unwrap());
+                                layer_map.insert(format!("{}k_packed", prefix), Tensor::from_vec(kp, vec![(b*h*s*d+7)/8], &Device::Cpu).unwrap());
+                                layer_map.insert(format!("{}k_scales", prefix), Tensor::from_vec(ksc, vec![b,h,s,1], &Device::Cpu).unwrap());
                                 layer_map.insert(format!("{}k_shape", prefix), Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu).unwrap());
-                                let mut va = vec![0.0f32; b * h * a_count * d]; let mut vp = vec![0u8; (b * h * s * d + 7) / 8]; let mut vs = vec![0.0f32; b * h * s];
-                                for bh in 0..(b * h) {
-                                    let bho = bh * head_size;
-                                    for i in 0..head_size { if v_data[bho + i] >= 0.0 { vp[(bho + i) / 8] |= 1 << ((bho + i) % 8); } }
+                                
+                                let mut va = vec![0.0f32; b*h*ac*d]; let mut vp = vec![0u8; (b*h*s*d+7)/8]; let mut vsc = vec![0.0f32; b*h*s];
+                                for bh in 0..(b*h) {
+                                    let bho = bh*hs;
+                                    for i in 0..hs { if vd[bho+i] >= 0.0 { vp[(bho+i)/8] |= 1 << ((bho+i)%8); } }
                                     for ti in 0..s {
-                                        let td = &v_data[bho + ti * d .. bho + (ti + 1) * d];
-                                        if ti < 4 || ti % 8 == 0 { let ap = if ti < 4 { ti } else { 4 + (ti - 4) / 8 }; va[(bh * a_count + ap) * d .. (bh * a_count + ap + 1) * d].copy_from_slice(td); }
-                                        let mut m = 0.0f32; for &v in td { let a = v.abs(); if a > m { m = a; } } vs[bh * s + ti] = m;
+                                        let td = &vd[bho+ti*d .. bho+(ti+1)*d];
+                                        if ti < 4 || ti % 8 == 0 { let ap = if ti < 4 { ti } else { 4+(ti-4)/8 }; va[(bh*ac+ap)*d .. (bh*ac+ap+1)*d].copy_from_slice(td); }
+                                        let mut m = 0.0f32; for &v in td { let a = v.abs(); if a > m { m = a; } } vsc[bh*s+ti] = m;
                                     }
                                 }
-                                layer_map.insert(format!("{}v_anchors", prefix), Tensor::from_vec(va, vec![b, h, a_count, d], &Device::Cpu).unwrap());
-                                layer_map.insert(format!("{}v_packed", prefix), Tensor::from_vec(vp, vec![(b * h * s * d + 7) / 8], &Device::Cpu).unwrap());
-                                layer_map.insert(format!("{}v_scales", prefix), Tensor::from_vec(vs, vec![b, h, s, 1], &Device::Cpu).unwrap());
-                                layer_map.insert("mode".to_string(), Tensor::from_vec(vec![3u32], (1,), &Device::Cpu).unwrap());
+                                layer_map.insert(format!("{}v_anchors", prefix), Tensor::from_vec(va, vec![b,h,ac,d], &Device::Cpu).unwrap());
+                                layer_map.insert(format!("{}v_packed", prefix), Tensor::from_vec(vp, vec![(b*h*s*d+7)/8], &Device::Cpu).unwrap());
+                                layer_map.insert(format!("{}v_scales", prefix), Tensor::from_vec(vsc, vec![b,h,s,1], &Device::Cpu).unwrap());
                                 GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-                                let _ = io_tx_inner.blocking_send(SaveTask { slot_id: sid, path: block_dir.join(layer_fname), tensors: layer_map, is_last: l_idx == loop_count - 1, block_idx: bake.block_idx, registry: bake.registry.clone() });
+                                let _ = io_tx_inner.blocking_send(SaveTask { slot_id: sid, path: block_dir.join(format!("l{}.st", act_l)), tensors: layer_map, is_last: l_idx == loop_count - 1, block_idx: bake.block_idx, registry: bake.registry.clone() });
                             }
                         }));
-                        if let Err(panic_info) = result {
-                            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() { s.to_string() } else if let Some(s) = panic_info.downcast_ref::<String>() { s.clone() } else { "Unknown Panic".to_string() };
-                            println!("[WORKER-PANIC] !! Critical failure: {}", msg);
-                            let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true });
-                        }
+                        if let Err(p) = result { println!("[WORKER-PANIC] !! Error in BakeTask: {:?}", p); let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true }); }
                     }).await.ok();
                 }
                 SlotTask::Load(load) => {
-                    let (b_idx_off, b_idx, s_id, target_path) = { match load.shared_block.inner.read() { Ok(inner) => { let path = inner.ssd_path.clone().or_else(|| { if let Ok(reg) = load.registry.entries.read() { if inner.index < reg.len() { reg[inner.index].ssd_path.clone() } else { None } } else { None } }); (inner.offset, inner.index, load.slot_id, path) }, _ => (0, 999, load.slot_id, None) } };
-                    if let Some(tp) = target_path {
-                        let l_idx = load.layer_idx; let registry = load.registry.clone(); let shared_block = load.shared_block.clone(); let off = b_idx_off;
+                    let (b_idx_off, b_idx, sid, tp) = { match load.shared_block.inner.read() { Ok(inner) => { let p = inner.ssd_path.clone().or_else(|| { if let Ok(reg) = load.registry.entries.read() { if inner.index < reg.len() { reg[inner.index].ssd_path.clone() } else { None } } else { None } }); (inner.offset, inner.index, load.slot_id, p) }, _ => (0, 999, load.slot_id, None) } };
+                    if let Some(path) = tp {
+                        let l_idx = load.layer_idx; let reg = load.registry.clone(); let b_off = b_idx_off;
                         tokio::spawn(async move {
-                            let actual_load_path = if tp.is_dir() { let lp = tp.join(format!("l{}.st", l_idx)); if lp.exists() { lp } else { let fallback = tp.join("l0.st"); if fallback.exists() { fallback } else { lp } } } else { tp.clone() };
-                            let res: Result<(), String> = async {
-                                let content = tokio::fs::read(&actual_load_path).await.map_err(|e| format!("{:?}", e))?;
-                                let st = safetensors::SafeTensors::deserialize(&content).map_err(|e| format!("{:?}", e))?;
-                                let block_prefix = format!("b{}_", off);
-                                let is_relay = actual_load_path.to_string_lossy().contains("l0.st");
-                                if let Ok(mut reg) = registry.entries.write() {
-                                    if b_idx < reg.len() {
-                                        let entry = &mut reg[b_idx]; let layer_prefix = if is_relay { "l0_".to_string() } else { format!("l{}_", l_idx) };
-                                        let prefix = format!("{}{}", block_prefix, layer_prefix);
-                                        let ka_n = format!("{}k_anchors", prefix);
-                                        if let Ok(ka_v) = st.tensor(&ka_n) {
-                                            let kh_n = format!("{}k_shape", prefix); let kp_n = format!("{}k_packed", prefix); let ks_n = format!("{}k_scales", prefix);
-                                            let va_n = format!("{}v_anchors", prefix); let vp_n = format!("{}v_packed", prefix); let vs_n = format!("{}v_scales", prefix);
-                                            if let (Ok(kh_v), Ok(kp_v), Ok(ks_v), Ok(va_v), Ok(vp_v), Ok(vs_v)) = (st.tensor(&kh_n), st.tensor(&kp_n), st.tensor(&ks_n), st.tensor(&va_n), st.tensor(&vp_n), st.tensor(&vs_n)) {
-                                                let v_u32 = kh_v.data().chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect::<Vec<u32>>();
-                                                let os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
-                                                let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
-                                                    k_anchors: Tensor::from_vec(ka_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], ka_v.shape()[2], os[3]), &Device::Cpu).unwrap(), 
-                                                    k_packed: Tensor::from_slice(kp_v.data(), kp_v.shape(), &Device::Cpu).unwrap(), 
-                                                    k_scales: Tensor::from_vec(ks_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], os[2], 1), &Device::Cpu).unwrap(), 
-                                                    v_anchors: Tensor::from_vec(va_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], va_v.shape()[2], os[3]), &Device::Cpu).unwrap(), 
-                                                    v_packed: Tensor::from_slice(vp_v.data(), vp_v.shape(), &Device::Cpu).unwrap(), 
-                                                    v_scales: Tensor::from_vec(vs_v.data().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(), (os[0], os[1], os[2], 1), &Device::Cpu).unwrap(), 
-                                                    original_shape: os 
-                                                };
-                                                let mut cache = entry.bitkv_cache.write().unwrap();
-                                                if is_relay { for i in 0..28 { cache[i] = Some(m.clone()); entry.location[i] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
-                                                else { cache[l_idx] = Some(m); entry.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; }
-                                            }
-                                        }
-                                    }
+                            let act_p = if path.is_dir() { let lp = path.join(format!("l{}.st", l_idx)); if lp.exists() { lp } else { let fallback = path.join("l0.st"); if fallback.exists() { fallback } else { lp } } } else { path.clone() };
+                            if let Ok(st) = candle_core::safetensors::load(&act_p, &Device::Cpu) {
+                                let prefix = format!("b{}_l{}_", b_off, if act_p.to_string_lossy().contains("l0.st") { 0 } else { l_idx });
+                                if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
+                                    let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
+                                    let os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
+                                    let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(), v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(), original_shape: os };
+                                    if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
                                 }
-                                Ok(())
-                            }.await;
-                            if let Err(e) = res { println!("[WORKER-LOAD] Error: {}", e); }
-                            SLOT_MANAGER.release_slot(s_id).await;
+                            }
+                            SLOT_MANAGER.release_slot(sid).await;
                         });
-                    } else { SLOT_MANAGER.release_slot(s_id).await; }
+                    } else { SLOT_MANAGER.release_slot(sid).await; }
                 }
                 _ => {}
             }
@@ -421,11 +314,11 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 pub enum ModelVariant { Standard(crate::models::qwen3vl::model::Qwen3VLModel), QuantizedVL(QuantizedQwen3VLModel), QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel) }
 
 impl ModelVariant {
-    pub fn forward(&mut self, i: &Tensor, pv: Option<&Tensor>, ithw: Option<&Tensor>, vpv: Option<&Tensor>, vthw: Option<&Tensor>, cp: Option<&Tensor>, off: usize, tl: usize, sid: Option<String>, start_l: Option<usize>, num_l: Option<usize>) -> Result<Tensor> {
+    pub fn forward(&mut self, i: &Tensor, pv: Option<&Tensor>, ithw: Option<&Tensor>, vpv: Option<&Tensor>, vthw: Option<&Tensor>, cp: Option<&Tensor>, off: usize, tl: usize, sid: Option<String>, sl: Option<usize>, nl: Option<usize>) -> Result<Tensor> {
         match self { 
             Self::Standard(m) => m.forward(i, pv, ithw, vpv, vthw, cp, off), 
-            Self::QuantizedVL(m) => m.forward(i, pv, ithw, vpv, vthw, cp, off, tl, sid, start_l, num_l), 
-            Self::QuantizedText(m) => m.forward(i, cp, off, tl, sid, start_l, num_l) 
+            Self::QuantizedVL(m) => m.forward(i, pv, ithw, vpv, vthw, cp, off, tl, sid, sl, nl), 
+            Self::QuantizedText(m) => m.forward(i, cp, off, tl, sid, sl, nl) 
         }
     }
     pub fn rebalance_layers(&mut self, d: usize, target_idx: usize) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.rebalance_layers(d, target_idx), Self::QuantizedText(m) => m.rebalance_layers(d, target_idx) } }
@@ -583,11 +476,9 @@ impl Qwen3VLGenerateModel {
             if layer_frags.is_empty() { continue; }
             let mut ks = Vec::new(); let mut vs = Vec::new();
             for frag in layer_frags {
-                let path = frag["path"].as_str().unwrap_or("");
-                if let Ok(content) = std::fs::read(path) {
-                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                        if let (Ok(k), Ok(v)) = (st.tensor("k"), st.tensor("v")) { ks.push(k.to_tensor(&Device::Cpu)?); vs.push(v.to_tensor(&Device::Cpu)?); }
-                    }
+                let path_str = frag["path"].as_str().unwrap_or("");
+                if let Ok(st_map) = candle_core::safetensors::load(Path::new(path_str), &Device::Cpu) {
+                    if let (Some(k), Some(v)) = (st_map.get("k"), st_map.get("v")) { ks.push(k.clone()); vs.push(v.clone()); }
                 }
             }
             if !ks.is_empty() {
