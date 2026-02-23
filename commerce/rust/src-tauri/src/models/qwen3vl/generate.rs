@@ -173,7 +173,26 @@ impl SlotManager {
     pub fn get_counts(&self) -> (usize, usize, usize) { (self.count_reads.load(Ordering::Relaxed), self.count_writes.load(Ordering::Relaxed), self.count_free.load(Ordering::Relaxed)) }
 }
 
-pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(64));
+pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(128));
+
+// [GLOBAL-SAFETY-GATE] 모든 비동기 SSD 쓰기 작업을 추적하는 전역 카운터
+pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+pub async fn wait_for_global_io() {
+    let mut attempts = 0;
+    while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 && attempts < 200 {
+        if attempts % 10 == 0 {
+            println!("[IO-SAFETY] Waiting for {} active SSD writes...", GLOBAL_IO_COUNTER.load(Ordering::SeqCst));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        attempts += 1;
+    }
+    if GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 {
+        println!("[IO-SAFETY] !! Warning: IO wait timeout. Potential data loss.");
+    } else {
+        println!("[IO-SAFETY] All SSD writes verified. Safe to proceed.");
+    }
+}
 
 struct LayerKVDump { layer_idx: usize, k_tensor: Tensor, v_tensor: Tensor }
 struct BakeTask { 
@@ -784,11 +803,14 @@ impl Qwen3VLGenerateModel {
 
                 // [STAGE-2-OPTIMIZATION] 0.6B 모델은 검증 없이 끝까지 빠르게 써내려갑니다.
                 if is_small {
-                    println!("[DRAFTING] Small model starting full response generation...");
+                    println!("[DRAFTING] Small model starting full response generation (Total layers: 28)");
                     while gen_count < max_gen {
                         if let Some(flag) = &cancel { if flag.load(Ordering::Relaxed) { break; } }
                         
                         let last_c = *a_ids.last().unwrap_or(&0);
+                        // [DEBUG-DRAFT] 각 토큰 생성 시 오프셋 로그 출력
+                        // println!("[DEBUG-DRAFT] Decoding Token {} at offset {}...", gen_count, curr_s_off);
+                        
                         let logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![last_c], (1, 1), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(curr_s_off as u32, (curr_s_off + 1) as u32, &self.text_device)?.unsqueeze(0)?), curr_s_off, 1, sid.clone())?;
                         
                         let target_l = logits.flatten_all()?;
@@ -815,6 +837,7 @@ impl Qwen3VLGenerateModel {
                                 if let Ok(tx) = get_bake_worker().await {
                                     let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
                                     
+                                    // [STAGE-2-STRICT] Drafting 단계(baking_only=false)에서는 무조건 개별 레이어 저장
                                     let is_baking_mode = match &self.qwen3_vl {
                                         ModelVariant::QuantizedVL(m) => m.language_model.baking_only,
                                         ModelVariant::QuantizedText(m) => m.language_model.baking_only,

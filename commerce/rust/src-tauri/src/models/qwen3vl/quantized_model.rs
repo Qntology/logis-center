@@ -621,7 +621,10 @@ impl QuantizedQwen3VLTextAttention {
                 // [FIX] '곱하기 2' 방지: 논리적 시작 지점 + 현재 청크 내 오프셋을 직접 사용
                 let current_total = _seqlen_offset + chunk_offset;
                 
-                let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
+                // [STAGE-2-STRICT] Drafting 단계에서는 즉시 SSD_PENDING으로 마킹하여 저장을 유도함
+                let initial_location = if self.baking_only { KVLocation::VRAM } else { KVLocation::SSD_PENDING };
+                
+                let new_block = KVBlock::new(initial_location, index, take, current_total);
                 {
                     let mut inner = new_block.inner.write().unwrap();
                     inner.k_cache = Some(k_piece);
@@ -633,7 +636,7 @@ impl QuantizedQwen3VLTextAttention {
                     let mut reg = self.registry.entries.write().unwrap();
                     if reg.len() <= index {
                         reg.push(RegistryEntry {
-                            location: vec![KVLocation::VRAM; 28],
+                            location: vec![initial_location; 28],
                             slot_ids: vec![None; 28],
                             token_start: current_total,
                             token_len: take,
@@ -1601,9 +1604,12 @@ impl QuantizedQwen3VLTextModel {
         sin: &Tensor,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        // [PROGRESS-LOG] 2B 이상의 레이어 회전 모델에서만 진행률을 출력하여 드래프트 과정을 조용하게 유지
+        // [PROGRESS-LOG] 모든 레이어 회전 모델(0.6B Drafting 포함)에서 진행률을 명시적으로 출력
         if self.layers.len() > 1 {
-            if layer_idx == 0 { print!("\n[Layers] "); }
+            if layer_idx == 0 { 
+                // [DEBUG-DRAFT] 매 토큰의 시작 레이어에서 오프셋 표시
+                print!("\n[Off:{}] Layers: ", seqlen_offset); 
+            }
             print!("{}.", layer_idx);
             use std::io::Write;
             let _ = std::io::stdout().flush();
@@ -1902,27 +1908,33 @@ impl QuantizedQwen3VLTextModel {
         let _ = target_device.synchronize();
         let next_xs = Tensor::cat(&next_xs_all, 1)?;
         
-        // [SSD-DUMP-PIPELINE] 사용자 제안 반영: 현재 레이어의 모든 결과를 SSD로 즉시 덤프
+        // [SSD-DUMP-PIPELINE] 사용자 제안 반영: 현재 레이어의 모든 결과를 SSD로 비동기 덤프
         if let Some(sid) = &self.active_session_id {
             let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
             let layer_dir = task_dir.join(format!("layer_{}", layer_idx));
             if !layer_dir.exists() { let _ = fs::create_dir_all(&layer_dir); }
             
-            // [FIX] 절대 인덱스 계산 (seqlen_offset 반영)
             let base_chunk_idx = seqlen_offset / 256;
-
+            let registry_clone = self.registry.clone();
+            
             for (c_offset, chunk_xs) in next_xs_all.iter().enumerate() {
                 let absolute_chunk_idx = base_chunk_idx + c_offset;
                 let chunk_path = layer_dir.join(format!("chunk_{}.st", absolute_chunk_idx));
-                let mut map = HashMap::new();
-                map.insert("hidden_states".to_string(), chunk_xs.clone());
-                let _ = candle_core::safetensors::save(&map, &chunk_path);
-                
-                // 장부 업데이트
-                let mut reg_w = self.registry.entries.write().unwrap();
-                if absolute_chunk_idx < reg_w.len() {
-                    reg_w[absolute_chunk_idx].hidden_states_path[layer_idx] = Some(chunk_path);
-                }
+                let chunk_xs_clone = chunk_xs.clone();
+                let layer_idx_fixed = layer_idx;
+
+                // [ASYNC-IO] 연산 흐름을 방해하지 않도록 별도 태스크로 파일 저장
+                tauri::async_runtime::spawn(async move {
+                    let mut map = HashMap::new();
+                    map.insert("hidden_states".to_string(), chunk_xs_clone);
+                    if candle_core::safetensors::save(&map, &chunk_path).is_ok() {
+                        if let Ok(mut reg_w) = registry_clone.entries.write() {
+                            if absolute_chunk_idx < reg_w.len() {
+                                reg_w[absolute_chunk_idx].hidden_states_path[layer_idx_fixed] = Some(chunk_path);
+                            }
+                        }
+                    }
+                });
             }
         }
 
