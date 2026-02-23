@@ -1874,12 +1874,6 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
         }
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         // println!("[BURST] >> [RUN] Layer {} on GPU (Recursive Chunks)", layer_idx);
         
