@@ -634,9 +634,9 @@ async fn process_task(
             println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
         }
 
-        // 2. [2B] Load Snapshot & Bake Task
+        // 2. [Small] Load Snapshot & Bake Task
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -648,7 +648,7 @@ async fn process_task(
             };
 
                         if let Some(gen) = model.generator.lock().await.as_mut() {
-                            println!("[Scheduler] 2B Step A: Asking classification question...");
+                            println!("[Scheduler] Small Step A: Asking classification question...");
                             let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone()).await?;
                             println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
                             
@@ -725,9 +725,9 @@ async fn process_task(
             println!("[Scheduler] Found existing snapshot for Step B. Skipping 0.6B baking.");
         }
 
-        // 2. [2B] Load & Generate
+        // 2. [Small] Load & Generate
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -739,7 +739,7 @@ async fn process_task(
             };
 
             if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 2B Step B: Asking selector question...");
+                println!("[Scheduler] Small Step B: Asking selector question...");
                 let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone()).await?;
                 println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
 
@@ -875,9 +875,9 @@ async fn process_task(
                 println!("[Scheduler] Found existing snapshot for Detail Extraction. Skipping 0.6B baking.");
             }
 
-            // 2. [2B] Load & Generate
+            // 2. [Small] Load & Generate
             {
-                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -888,10 +888,10 @@ async fn process_task(
                     ..Default::default()
                 };
 
-                // 3. 2B Instant Inference
+                // 3. Small Instant Inference
                 if let Some(gen) = model.generator.lock().await.as_mut() {
-                    println!("[Scheduler] 2B Step C: Asking extraction question...");
-                    log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running 2B Inference..." }));
+                    println!("[Scheduler] Small Step C: Asking extraction question...");
+                    log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Small Inference..." }));
                     
                     let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone()).await?;
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
@@ -907,12 +907,12 @@ async fn process_task(
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // --- PHASE 3: HANDOVER (Unload 2B -> Load Embedding) ---
+    // --- PHASE 3: HANDOVER (Unload -> Load Embedding) ---
     {
-        println!("[Scheduler] PHASE 3: Handover - Unloading 2B, Preparing for Embedding...");
+        println!("[Scheduler] PHASE 3: Handover - Unloading, Preparing for Embedding...");
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model..." }));
         
-        // 1. Explicitly Unload 2B to free VRAM for Embedding Model
+        // 1. Explicitly Unload to free VRAM for Embedding Model
         model.deep_purge_resources().await;
         
         // 2. Wait for VRAM to settle (Driver latency)
@@ -922,7 +922,7 @@ async fn process_task(
     // --- DB OPS & SIDE EFFECTS ---
     // [NOTE] Now we can safely load Embedding Model (via get_embedding inside logic)
     // The Store/Logic calls below will internally call model.get_embedding(), which calls ensure_embedding().
-    // Since 2B is unloaded, this is safe.
+    // Since is unloaded, this is safe.
 
     // Normalize Data
     if let Some(obj) = extracted_data.as_object_mut() {
@@ -979,7 +979,7 @@ async fn process_task(
 
     // Embedding & Final Upsert
     // Note: logic::relay and upsert_item will need embedding.
-    // Since 2B is unloaded, model.get_embedding() will load EmbeddingModel automatically.
+    // Since is unloaded, model.get_embedding() will load EmbeddingModel automatically.
     
     // ... (Standard Upsert Logic as per original file, referencing 'extracted_data')
     // For brevity in this replace block, I am simplifying the tail end to just the core upsert action 

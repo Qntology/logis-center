@@ -398,13 +398,19 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
-                if path.exists() {
-                    println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
-                    gen.load_kv_from_disk(&path, kv_name.as_deref())?;
+                let kv_dir = crate::utils::paths::get_kv_dir(None).join(&task_id_str);
+                let kv_file = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
+                
+                if kv_dir.exists() && kv_dir.is_dir() {
+                    println!("[SSD-BRIDGE] Loading Directory-based KV snapshot from {:?}", kv_dir);
+                    gen.load_kv_from_disk(&kv_dir, kv_name.as_deref())?;
+                    Ok(())
+                } else if kv_file.exists() {
+                    println!("[SSD-BRIDGE] Loading File-based KV snapshot from {:?}", kv_file);
+                    gen.load_kv_from_disk(&kv_file, kv_name.as_deref())?;
                     Ok(())
                 } else {
-                    println!("[SSD-BRIDGE] No snapshot found for {}", task_id_str);
+                    println!("[SSD-BRIDGE] No snapshot found for {} (Checked dir and file)", task_id_str);
                     Ok(())
                 }
             } else {
@@ -741,7 +747,7 @@ impl LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
-        // [FIX] Do NOT force reload. Use current generator (Large should be already loaded via relay)
+        // [VISION-FIX] 이미지 추출은 반드시 2B (Large) 모델을 사용해야 합니다.
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
@@ -754,13 +760,13 @@ impl LogisModel {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
             let prompt = get_image_extraction_prompt("kr", &language, "tracking", "");
             
-            // [IMPORTANT] Pass task_id as session_id to continue from the baked relay snapshot
+            // 이미지 분석은 Large 모델로 진행
             let result_str = self.chat_with_image_spinner(
                 prompt, 
                 Some(dynamic_image), 
                 app_handle, 
                 "extraction-progress", 
-                json!({ "category": "Vision Analysis", "summary": "Analyzing image with baked context..." }), 
+                json!({ "category": "Vision Analysis", "summary": "Analyzing image with 2B model..." }), 
                 1024, 
                 cancel_token.clone(), 
                 Some(task_id.clone()),
@@ -830,12 +836,12 @@ impl LogisModel {
     }
 
     pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        // [FIX] Use current generator if available, else default to Large
+        // [FIX] Default to Small (0.6B) for all chat tasks to align with 0.6B-focused architecture.
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
                 drop(gen_guard);
-                self.ensure_generator(ModelSize::Large).await?;
+                self.ensure_generator(ModelSize::Small).await?;
             }
         }
         
@@ -931,12 +937,12 @@ impl LogisModel {
         session_id: Option<String>,
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
-        // [FIX] Do not force reload Large. Use current if available, else default to Large.
+        // [FIX] Ensure we stay on Small (0.6B).
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
                 drop(gen_guard);
-                self.ensure_generator(ModelSize::Large).await?;
+                self.ensure_generator(ModelSize::Small).await?;
             }
         }
 
@@ -1021,7 +1027,9 @@ impl LogisModel {
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        self.ensure_generator(ModelSize::Large).await?;
+        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.6B (Small)
+        let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
+        self.ensure_generator(target_size).await?;
         
         let mut gen_guard = self.generator.lock().await;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
@@ -1073,8 +1081,9 @@ impl LogisModel {
         session_id: Option<String>,
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
-        // Ensure generator is loaded
-        self.ensure_generator(ModelSize::Large).await?;
+        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.6B (Small)
+        let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
+        self.ensure_generator(target_size).await?;
 
         // [FIX] Inject task_id from session_id if it's a task reference
         if let Some(ref sid) = session_id {
@@ -1085,8 +1094,10 @@ impl LogisModel {
             }
         }
 
-        // [FIX] Removed redundant emit. Only log the progress.
-        // let _ = app_handle.emit(event_name, base_payload);
+        // [LOG] Save to task history if task_id exists
+        if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
+            crate::scheduler::log_task_progress(_app_handle, task_id, &base_payload);
+        }
 
         let max_tok = self.max_tokens_limit;
         
