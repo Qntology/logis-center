@@ -674,15 +674,15 @@ impl QuantizedQwen3VLTextAttention {
                         let fallback_path = path.join("reference").join(format!("b{}", b_off)).join("l0.st");
                         
                         let act_path = if full_path.is_file() { 
-                            Some(&full_path) 
+                            Some(full_path) 
                         } else if fallback_path.is_file() {
-                            Some(&fallback_path)
+                            Some(fallback_path)
                         } else {
                             None
                         };
                         
                         if let Some(act_p) = act_path {
-                            if let Ok(content) = std::fs::read(act_p) {
+                            if let Ok(content) = std::fs::read(&act_p) {
                                 if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
                                     let block_offset = index * 256;
                                     let is_relay = act_p.file_name().map(|n| n == "l0.st").unwrap_or(false);
@@ -1733,9 +1733,21 @@ impl QuantizedQwen3VLTextModel {
 
                 for (dump, off) in dumps_to_send {
                     let sid = SLOT_MANAGER.acquire_write_slot(len).await;
+                    let block_dir = target_path.join(format!("b{}", off));
+                    if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
+                    
+                    // [REGISTRY-UPDATE] Registry에 최종 블록 디렉토리 경로 저장
+                    {
+                        let mut reg = self.registry.entries.write().unwrap();
+                        let b_idx = off / 256;
+                        if b_idx < reg.len() {
+                            reg[b_idx].ssd_path = Some(block_dir.clone());
+                        }
+                    }
+
                     let _ = tx.send(SlotTask::Bake(BakeTask {
                         slot_id: sid,
-                        task_dir: target_path.clone(), // 분리된 폴더로 전달
+                        task_dir: block_dir, // 블록 폴더 직접 전달
                         kv_name: Some(sub_folder.to_string()),
                         offset: off,
                         layers: vec![dump],
@@ -1796,22 +1808,19 @@ impl QuantizedQwen3VLTextModel {
             for (l_idx, b_idx, block) in w_blocks_to_load {
                 let block_offset = b_idx * 256;
                 
-                // [TIERED-PATH-RESOLUTION]
-                // 1. inference 폴더에서 해당 레이어 파일을 먼저 찾습니다.
-                // 2. 없으면 reference 폴더에서 l0.st를 공통 문맥으로 사용합니다.
+                // [PATH-ADAPTATION] 실제 저장된 b0/b0/l0.st 구조에 맞춤
                 let base_dir = w_chunk_path.clone();
-                let inf_path = base_dir.join("inference").join(format!("b{}", block_offset)).join(format!("l{}.st", l_idx));
-                let bak_path = base_dir.join("reference").join(format!("b{}", block_offset)).join("l0.st");
+                let inf_path = base_dir.join(format!("b{}", block_offset)).join(format!("l{}.st", l_idx));
+                let bak_path = base_dir.parent().unwrap_or(&base_dir).parent().unwrap_or(&base_dir).join("reference").join(format!("b{}", block_offset)).join(format!("b{}", block_offset)).join("l0.st");
 
                 let actual_path = if inf_path.is_file() { 
                     Some(inf_path) 
                 } else if bak_path.is_file() {
                     Some(bak_path)
                 } else {
-                    // 하위 호환성 및 레거시 경로 확인
-                    let legacy_p1 = base_dir.join(format!("b{}", block_offset)).join(format!("l{}.st", l_idx));
-                    let legacy_p2 = base_dir.join(format!("b{}", block_offset)).join("l0.st");
-                    if legacy_p1.is_file() { Some(legacy_p1) } else if legacy_p2.is_file() { Some(legacy_p2) } else { None }
+                    // 하위 호환성 (한 뎁스 더 깊게 확인)
+                    let legacy_p1 = base_dir.join(format!("b{}", block_offset)).join("l0.st");
+                    if legacy_p1.is_file() { Some(legacy_p1) } else { None }
                 };
 
                 if let Some(act_p) = actual_path {
@@ -1918,10 +1927,23 @@ impl QuantizedQwen3VLTextModel {
                         SLOT_MANAGER.acquire_write_slot(len).await
                     });
                     
+                    let sub_folder = if mode { "reference" } else { "inference" };
+                    let block_dir = path.join(sub_folder).join(format!("b{}", off));
+                    if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
+
+                    // [REGISTRY-UPDATE]
+                    {
+                        let mut reg_w = self.registry.entries.write().unwrap();
+                        let b_idx = off / 256;
+                        if b_idx < reg_w.len() {
+                            reg_w[b_idx].ssd_path = Some(block_dir.clone());
+                        }
+                    }
+
                     let _ = tx.blocking_send(SlotTask::Bake(BakeTask {
                         slot_id: sid,
-                        task_dir: path.clone(),
-                        kv_name: None,
+                        task_dir: block_dir, 
+                        kv_name: Some(sub_folder.to_string()),
                         offset: off,
                         layers: vec![dump],
                         is_relay_baking: mode,

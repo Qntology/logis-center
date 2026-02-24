@@ -309,7 +309,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 return; 
                             }
                             let loop_count = bake.layers.len(); let slot = &SLOT_MANAGER.slots[sid]; slot.remaining_layers.store(loop_count, Ordering::SeqCst); 
-                            let block_dir = t_dir.join(format!("b{}", off)); let block_prefix = format!("b{}_", off);
+                            let b_str = format!("b{}", off);
+                            let block_dir = if t_dir.to_string_lossy().ends_with(&b_str) || t_dir.to_string_lossy().contains(&format!("{}/{}", b_str, b_str).replace("/", &std::path::MAIN_SEPARATOR.to_string())) {
+                                t_dir.clone()
+                            } else {
+                                t_dir.join(&b_str)
+                            };
+                            let block_prefix = format!("{}_", b_str);
                             for l_idx in 0..loop_count {
                                 let src = &bake.layers[l_idx];
                                 let act_l = if is_relay && loop_count == 1 { 0 } else { src.layer_idx };
@@ -373,42 +379,40 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 }
                 SlotTask::Load(load) => {
                     let sid = load.slot_id; let reg = load.registry.clone(); let l_idx = load.layer_idx; let shared_block = load.shared_block.clone();
+                    let provided_path = load.path.clone(); 
                     tokio::spawn(async move {
-                        let (b_idx_off, b_idx, tp) = { match shared_block.inner.read() { Ok(inner) => (inner.offset, inner.index, inner.ssd_path.clone().or_else(|| { if let Ok(reg_r) = reg.entries.read() { if inner.index < reg_r.len() { reg_r[inner.index].ssd_path.clone() } else { None } } else { None } })), _ => (0, 999, None) } };
-                        if let Some(base_path) = tp {
-                            // [TIERED-LOAD] inference 먼저 확인, 없으면 reference 확인
-                            let filename = format!("l{}.st", l_idx);
-                            let inf_p = base_path.join("inference").join(format!("b{}", b_idx_off)).join(&filename);
-                            let ref_p = base_path.join("reference").join(format!("b{}", b_idx_off)).join("l0.st");
-                            
-                            let act_p = if inf_p.is_file() { 
-                                Some(&inf_p) 
-                            } else if ref_p.is_file() { 
-                                Some(&ref_p) 
-                            } else { 
-                                None 
-                            };
+                        let (b_idx_off, b_idx) = { match shared_block.inner.read() { Ok(inner) => (inner.offset, inner.index), _ => (0, 999) } };
+                        
+                        // [PATH-TRUST] provided_path (ssd_path)가 최종 블록 폴더임을 신뢰합니다.
+                        let filename = format!("l{}.st", l_idx);
+                        let act_p = provided_path.join(&filename);
+                        
+                        // reference는 구조상 상위-상위 폴더 아래에 존재
+                        let ref_p = provided_path.parent()
+                            .and_then(|p| p.parent())
+                            .map(|p| p.join("reference").join(format!("b{}", b_idx_off)).join("l0.st"))
+                            .unwrap_or_else(|| provided_path.join("l0.st"));
 
-                            if let Some(act_p) = act_p {
-                                let load_res = candle_core::safetensors::load(act_p, &Device::Cpu);
-                                if let Ok(st) = load_res {
-                                    let is_relay = act_p.to_string_lossy().contains("l0.st");
-                                    let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
-                                    if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
-                                        let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
-                                        let os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
-                                        let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(), v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(), original_shape: os };
-                                        if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
-                                    }
-                                } else {
-                                    println!("[SLOT-ERR] 데이터 로드 실패 (파일: {:?}): {:?}", act_p, load_res.err());
-                                    if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { r[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; } }
+                        let final_path = if act_p.is_file() { Some(&act_p) } else if ref_p.is_file() { Some(&ref_p) } else { None };
+
+                        if let Some(p) = final_path {
+                            let load_res = candle_core::safetensors::load(p, &Device::Cpu);
+                            if let Ok(st) = load_res {
+                                let is_relay = p.to_string_lossy().contains("l0.st");
+                                let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
+                                if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
+                                    let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
+                                    let os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
+                                    let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(), v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(), original_shape: os };
+                                    if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
                                 }
                             } else {
-                                // 파일이 없는 경우 SSD 상태로 유지
-                                println!("[SLOT-ERR] 로드할 파일을 찾을 수 없습니다 (b{} l{}). 확인 경로: {:?}, {:?}", b_idx_off, l_idx, inf_p, ref_p);
+                                println!("[SLOT-ERR] 로드 실패: {:?} ({:?})", p, load_res.err());
                                 if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { r[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; } }
                             }
+                        } else {
+                            println!("[SLOT-ERR] 파일 없음 (b{} l{}). 시도: {:?}", b_idx_off, l_idx, act_p);
+                            if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { r[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; } }
                         }
                         SLOT_MANAGER.release_slot(sid).await;
                     });
@@ -421,21 +425,26 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             let (b_idx_off, b_idx) = { let inner = block.inner.read().unwrap(); (inner.offset, inner.index) };
                             
                             let filename = format!("l{}.st", l_idx);
-                            let inf_p = base_path.join("inference").join(format!("b{}", b_idx_off)).join(&filename);
-                            let ref_p = base_path.join("reference").join(format!("b{}", b_idx_off)).join("l0.st");
+                            let b_str = format!("b{}", b_idx_off);
                             
-                            let act_p = if inf_p.is_file() { 
-                                Some(&inf_p) 
-                            } else if ref_p.is_file() { 
-                                Some(&ref_p) 
-                            } else { 
-                                None 
+                            // [PATH-TRUST] base_path가 이미 블록 폴더면 파일만, 아니면 블록폴더 붙임
+                            let act_p = if base_path.to_string_lossy().ends_with(&b_str) {
+                                base_path.join(&filename)
+                            } else {
+                                base_path.join(&b_str).join(&filename)
                             };
+                            
+                            let ref_p = act_p.parent()
+                                .and_then(|p| p.parent())
+                                .map(|p| p.join("reference").join(&b_str).join("l0.st"))
+                                .unwrap_or_else(|| act_p.clone());
+                            
+                            let final_path = if act_p.is_file() { Some(&act_p) } else if ref_p.is_file() { Some(&ref_p) } else { None };
 
-                            if let Some(act_p) = act_p {
-                                let load_res = candle_core::safetensors::load(act_p, &Device::Cpu);
+                            if let Some(p) = final_path {
+                                let load_res = candle_core::safetensors::load(p, &Device::Cpu);
                                 if let Ok(st) = load_res {
-                                    let is_relay = act_p.to_string_lossy().contains("l0.st");
+                                    let is_relay = p.to_string_lossy().contains("l0.st");
                                     let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
                                     if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
                                         let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
@@ -444,10 +453,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
                                     }
                                 } else {
-                                    println!("[SLOT-ERR] 청크 로드 실패 (파일: {:?}): {:?}", act_p, load_res.err());
+                                    println!("[SLOT-ERR] 청크 로드 실패 (파일: {:?}): {:?}", p, load_res.err());
                                 }
                             } else {
-                                println!("[SLOT-ERR] 청크 로드용 파일을 찾을 수 없습니다 (b{} l{}).", b_idx_off, l_idx);
+                                println!("[SLOT-ERR] 청크 로드용 파일을 찾을 수 없습니다 (b{} l{}). 시도: {:?}", b_idx_off, l_idx, act_p);
                             }
                             SLOT_MANAGER.release_slot(sid).await;
                         }
