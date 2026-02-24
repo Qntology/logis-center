@@ -687,141 +687,116 @@ impl QuantizedQwen3VLTextAttention {
                     continue;
                 }
                 KVLocation::RAM | KVLocation::SSD => {
-                    let mut inner = block.inner.write().unwrap();
-                    // [TEMPORAL-REUSE] If already decompressed by a previous layer (e.g. layer 0), use it immediately
-                    if let (Some(kc), Some(vc)) = (&inner.k_cache, &inner.v_cache) {
-                        k = Some(kc.clone());
-                        v = Some(vc.clone());
-                    } 
-                    
-                    // [SLOT-DIRECT-ACCESS] Try to get raw tensors from RAM slots if available
-                    if k.is_none() && loc == KVLocation::RAM {
+                    let mut k_active = None;
+                    let mut v_active = None;
+
+                    // 1. [TEMPORAL-REUSE] RAM에 이미 디코딩된 캐시가 있다면 사용
+                    {
+                        let inner = block.inner.read().unwrap();
+                        if let (Some(kc), Some(vc)) = (&inner.k_cache, &inner.v_cache) {
+                            k_active = Some(kc.clone());
+                            v_active = Some(vc.clone());
+                        }
+                    }
+
+                    // 2. [SLOT-DIRECT-ACCESS] RAM 슬롯에서 직접 가져오기
+                    if k_active.is_none() && loc == KVLocation::RAM {
                         if let Some(sid) = layer_slot_id {
                             let slot = &crate::models::qwen3vl::generate::SLOT_MANAGER.slots[sid];
-                            // [SMART-LOCK] Try to acquire tensors from the master slot
-                            if let Ok(k_guard) = slot.k_layers[self.layer_idx].try_lock() {
-                                if let Some(tk) = k_guard.as_ref() {
-                                    if let Ok(v_guard) = slot.v_layers[self.layer_idx].try_lock() {
-                                        if let Some(tv) = v_guard.as_ref() {
-                                            let tk_dev = tk.to_device(dev)?.to_dtype(target_dtype)?;
-                                            let tv_dev = tv.to_device(dev)?.to_dtype(target_dtype)?;
-                                            // Pin to VRAM for subsequent layers in this pass
-                                            inner.k_cache = Some(tk_dev.clone());
-                                            inner.v_cache = Some(tv_dev.clone());
-                                            k = Some(tk_dev);
-                                            v = Some(tv_dev);
-                                        }
-                                    }
+                            if let (Ok(k_guard), Ok(v_guard)) = (slot.k_layers[self.layer_idx].try_lock(), slot.v_layers[self.layer_idx].try_lock()) {
+                                if let (Some(tk), Some(tv)) = (k_guard.as_ref(), v_guard.as_ref()) {
+                                    k_active = Some(tk.to_device(dev)?.to_dtype(target_dtype)?);
+                                    v_active = Some(tv.to_device(dev)?.to_dtype(target_dtype)?);
                                 }
                             }
                         }
                     }
 
-                    if k.is_none() {
-                        if let Some(meta) = &inner.bitkv_metadata {
-                            let k_raw = self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?;
-                            let v_raw = self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?;
-                            // [PIN] Store for subsequent layers to reuse
-                            inner.k_cache = Some(k_raw.clone());
-                            inner.v_cache = Some(v_raw.clone());
-                            k = Some(k_raw);
-                            v = Some(v_raw);
-                        } else { 
-                            let spath = {
-                                let reg = self.registry.entries.read().unwrap();
-                                reg[index].ssd_path.clone()
-                            };
-                            if let Some(path) = &spath {
-                                let filename = if inner.offset == 0 { format!("layer_{}_kv.safetensors", self.layer_idx) } 
-                                               else { format!("layer_{}_kv_{}.safetensors", self.layer_idx, inner.offset) };
-                                let full_path = path.join(filename);
-                                if full_path.exists() {
-                                    if let Ok(content) = std::fs::read(&full_path) {
-                                        if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                            let extract_vec = |name: &str| -> Option<Vec<f32>> {
-                                                st.tensor(name).ok().map(|v| unsafe {
-                                                    std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec()
-                                                })
-                                            };
-                                            if let (Some(ka), Some(kp), Some(ks)) = (extract_vec("k_anchors"), st.tensor("k_packed").ok(), extract_vec("k_scales")) {
-                                                if let (Some(va), Some(vp), Some(vs)) = (extract_vec("v_anchors"), st.tensor("v_packed").ok(), extract_vec("v_scales")) {
-                                                    let original_shape = if let Ok(view) = st.tensor("k_shape") {
-                                                        let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };
-                                                        shape_u32.iter().map(|&x| x as usize).collect()
-                                                    } else { vec![1, 8, b_len, 128] };
-                                                    inner.bitkv_metadata = Some(BitKVMetadata {
-                                                        k_anchors: Tensor::from_vec(ka, (original_shape[0], original_shape[1], (b_len + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
-                                                        k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(),
-                                                        k_scales: Tensor::from_vec(ks, (original_shape[0], original_shape[1], b_len, 1), &Device::Cpu).unwrap(),
-                                                        v_anchors: Tensor::from_vec(va, (original_shape[0], original_shape[1], (b_len + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
-                                                        v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(),
-                                                        v_scales: Tensor::from_vec(vs, (original_shape[0], original_shape[1], b_len, 1), &Device::Cpu).unwrap(),
-                                                        original_shape,
-                                                    });
-                                                    
-                                                    // Update registry to RAM state for THIS layer
-                                                    {
-                                                        let mut reg = self.registry.entries.write().unwrap();
-                                                        if index < reg.len() { reg[index].location[self.layer_idx] = KVLocation::RAM; }
-                                                    }
-
-                                                    let kr = self.decompress_from_bitkv(&inner.bitkv_metadata.as_ref().unwrap().k_anchors, &inner.bitkv_metadata.as_ref().unwrap().k_packed, &inner.bitkv_metadata.as_ref().unwrap().k_scales, &inner.bitkv_metadata.as_ref().unwrap().original_shape, dev)?;
-                                                    let vr = self.decompress_from_bitkv(&inner.bitkv_metadata.as_ref().unwrap().v_anchors, &inner.bitkv_metadata.as_ref().unwrap().v_packed, &inner.bitkv_metadata.as_ref().unwrap().v_scales, &inner.bitkv_metadata.as_ref().unwrap().original_shape, dev)?;
-                                                    inner.k_cache = Some(kr.clone()); inner.v_cache = Some(vr.clone());
-                                                    k = Some(kr); v = Some(vr);
-                                                }
-                                            }
-                                        }
-                                    }
+                    // 3. [JUST-IN-TIME-LOAD] SSD에서 직접 읽어서 연산 후 버리기
+                    if k_active.is_none() {
+                        let path = ssd_path.clone().unwrap_or_default();
+                        let filename = format!("l{}.st", self.layer_idx);
+                        let fallback_name = "l0.st";
+                        let full_path = path.join(&filename);
+                        let fallback_path = path.join(fallback_name);
+                        
+                        let act_path = if full_path.exists() { full_path } else { fallback_path };
+                        
+                        if let Ok(content) = std::fs::read(&act_path) {
+                            if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                                let block_offset = index * 256;
+                                let is_relay = act_path.file_name().map(|n| n == "l0.st").unwrap_or(false);
+                                let prefix = if is_relay { format!("b{}_l0_", block_offset) } else { format!("b{}_l{}_", block_offset, self.layer_idx) };
+                                
+                                let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                                if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
+                                    let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
+                                    let expected_h = self.num_key_value_heads;
+                                    let expected_d = self.head_dim;
+                                    let anchor_count = ka.shape()[2];
+                                    
+                                    let meta = BitKVMetadata {
+                                        k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), (1, expected_h, anchor_count, expected_d), &Device::Cpu)?,
+                                        k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?,
+                                        k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (1, expected_h, 256, 1), &Device::Cpu)?,
+                                        v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), (1, expected_h, anchor_count, expected_d), &Device::Cpu)?,
+                                        v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?,
+                                        v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (1, expected_h, 256, 1), &Device::Cpu)?,
+                                        original_shape: vec![1, expected_h, 256, expected_d],
+                                    };
+                                    
+                                    k_active = Some(self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?);
+                                    v_active = Some(self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?);
                                 }
                             }
                         }
                     }
-                    if k.is_none() {
-                        println!("[WARNING] Block {} could not be loaded at Layer {}", index, self.layer_idx);
-                        global_start_idx += b_len; continue;
+
+                    if let (Some(mut k), Some(mut v)) = (k_active, v_active) {
+                        // [COMPUTE-PARTIAL-ATTENTION]
+                        if self.num_kv_groups > 1 {
+                            let (b, h, s, d) = k.dims4()?;
+                            k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                            v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                        }
+
+                        let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?
+                            .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
+
+                        if let Some(mask) = attention_mask {
+                            let mask_len = mask.dim(D::Minus1)?;
+                            let current_block_start = global_start_idx - b_len;
+                            if current_block_start + b_len <= mask_len {
+                                let sub_mask = mask.narrow(D::Minus1, current_block_start, b_len)?.to_dtype(target_dtype)?;
+                                attn_weights = attn_weights.broadcast_add(&sub_mask)?;
+                            }
+                        }
+
+                        let m_i = attn_weights.max_keepdim(D::Minus1)?;
+                        let p_i = attn_weights.broadcast_sub(&m_i)?.exp()?;
+                        let s_i = p_i.sum_keepdim(D::Minus1)?;
+                        let o_i = p_i.matmul(&v)?;
+
+                        match (running_m, running_s, running_o) {
+                            (None, None, None) => { running_m = Some(m_i); running_s = Some(s_i); running_o = Some(o_i); }
+                            (Some(m_prev), Some(s_prev), Some(o_prev)) => {
+                                let m_new = m_prev.maximum(&m_i)?;
+                                let alpha_prev = m_prev.sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
+                                let alpha_i = m_i.sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
+                                running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.add(&s_i.broadcast_mul(&alpha_i)?)?.to_dtype(target_dtype)?);
+                                running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.add(&o_i.broadcast_mul(&alpha_i)?)?.to_dtype(target_dtype)?);
+                                running_m = Some(m_new);
+                            }
+                            _ => unreachable!(),
+                        }
+                        
+                        // [EVICT-IMMEDIATELY] 연산 끝난 파편은 메모리에서 즉시 삭제
+                        drop(k); drop(v);
                     }
+                    
+                    global_start_idx += b_len;
                 }
                 _ => { global_start_idx += b_len; continue; }
-            }
-
-            let mut k = k.unwrap();
-            let mut v = v.unwrap();
-
-            if self.num_kv_groups > 1 {
-                let (b, h, s, d) = k.dims4()?;
-                k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-            }
-
-            let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?
-                .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
-
-            if let Some(mask) = attention_mask {
-                let mask_len = mask.dim(D::Minus1)?;
-                let current_block_start = global_start_idx - b_len;
-                if current_block_start + b_len <= mask_len {
-                    let sub_mask = mask.narrow(D::Minus1, current_block_start, b_len)?.to_dtype(target_dtype)?;
-                    attn_weights = attn_weights.broadcast_add(&sub_mask)?;
-                }
-            }
-
-            let m_i = attn_weights.max_keepdim(D::Minus1)?;
-            let p_i = attn_weights.broadcast_sub(&m_i)?.exp()?;
-            let s_i = p_i.sum_keepdim(D::Minus1)?;
-            let o_i = p_i.matmul(&v)?;
-
-            match (running_m, running_s, running_o) {
-                (None, None, None) => { running_m = Some(m_i); running_s = Some(s_i); running_o = Some(o_i); }
-                (Some(m_prev), Some(s_prev), Some(o_prev)) => {
-                    let m_new = m_prev.maximum(&m_i)?;
-                    let alpha_prev = m_prev.sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
-                    let alpha_i = m_i.sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
-                    running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.add(&s_i.broadcast_mul(&alpha_i)?)?.to_dtype(target_dtype)?);
-                    running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.add(&o_i.broadcast_mul(&alpha_i)?)?.to_dtype(target_dtype)?);
-                    running_m = Some(m_new);
-                }
-                _ => unreachable!(),
             }
         }
 
@@ -1723,9 +1698,17 @@ impl QuantizedQwen3VLTextModel {
         visual_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let start_layer_time = std::time::Instant::now();
-        println!("[ENGINE-TRACE] >> Start Layer {} | Input Tokens: {}", layer_idx, xs.dim(1).unwrap_or(0));
+        let input_token_count = xs.dim(1).unwrap_or(0);
+        println!("[ENGINE-TRACE] >> Start Layer {} | Input Tokens: {}", layer_idx, input_token_count);
 
-        // [STEP 1] Load & Decode (Inline & Strict Path Resolution)
+        // [STEP 1] Load Weights to GPU (싱글톤 장치 사용)
+        let target_device = crate::utils::get_cuda_device(0); 
+        if !self.layers[layer_idx].device().same_device(&target_device) {
+            self.layers[layer_idx].to_device(&target_device)?;
+            let _ = target_device.synchronize(); 
+        }
+
+        // [STEP 2] Load & Decode KV Cache 파편
         let mut w_blocks_to_load = Vec::new();
         let mut w_chunk_path = std::path::PathBuf::new();
         {
@@ -1752,35 +1735,24 @@ impl QuantizedQwen3VLTextModel {
                     let block_dir = w_chunk_path.join(format!("b{}", block_offset));
                     let target_layer_file = block_dir.join(format!("l{}.st", l_idx));
                     
-                    // [RELAY-BROADCAST-LOGIC] 
-                    // 자신의 레이어 파일이 없으면 0번 레이어 파일(공통 문맥)을 사용합니다.
                     if target_layer_file.exists() { 
                         target_layer_file 
                     } else { 
                         let fallback = block_dir.join("l0.st");
-                        if fallback.exists() {
-                            if l_idx == 1 { println!("[ENGINE-INFO] Layer {}-27 using L0 context broadcast.", l_idx); }
-                            fallback
-                        } else {
-                            target_layer_file // 둘 다 없으면 원래대로 (에러 처리됨)
-                        }
+                        if fallback.exists() { fallback } else { target_layer_file }
                     }
                 } else { w_chunk_path.clone() };
 
                 if let Ok(content) = std::fs::read(&actual_path) {
                     if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                        // 파일명이 l0.st라면 프리픽스도 l0로 맞춰야 합니다.
                         let is_relay_file = actual_path.file_name().map(|n| n == "l0.st").unwrap_or(false);
                         let prefix = if is_relay_file { format!("b{}_l0_", block_offset) } else { format!("b{}_l{}_", block_offset, l_idx) };
                         let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
                         
                         if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
                             let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
-                            
-                            let expected_d = 128; 
-                            let hidden_size = self.embed_tokens.embeddings().dim(1).unwrap_or(1024);
-                            let expected_h = hidden_size / expected_d;
-                            
+                            let expected_h = self.layers[layer_idx].self_attn.num_key_value_heads;
+                            let expected_d = self.layers[layer_idx].self_attn.head_dim;
                             let anchor_count = ka.shape()[2];
                             
                             let metadata = BitKVMetadata {
@@ -1803,26 +1775,87 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
-        // [STEP 2] Execute Layer on GPU
-        let target_device = xs.device().clone();
-        if target_device.is_cuda() && !self.layers[layer_idx].device().same_device(&target_device) {
-            self.layers[layer_idx].to_device(&target_device)?;
-            let _ = target_device.synchronize(); 
-        }
-
+        // [STEP 3] GPU 연산 실행
         let current_seq_len = xs.dim(1)?;
         let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(256).collect();
         let next_xs_all = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset)?;
         let mut next_xs = Tensor::cat(&next_xs_all, 1)?;
 
-        // Vision Integration
         if let (Some(embed), Some(mask)) = (deepstack_embed, visual_mask) {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [SPEED-OPTIMIZATION] 레이어를 CPU로 강제 반납하지 않습니다.
-        // rebalance_layers가 VRAM이 정말 부족할 때만 알아서 처리하도록 맡깁니다.
+        // [STEP 4] 실시간 VRAM 해제 및 CPU 대피
+        if target_device.is_cuda() { let _ = target_device.synchronize(); }
+        
+        // 1. KV 캐시 즉시 대피 및 VRAM 소각
+        if let Some(sid) = &self.active_session_id {
+            self.evacuate_layer_kv_to_cpu(layer_idx, sid, seqlen_offset, input_token_count)?;
+        }
+
+        // 2. 레이어 무게추 즉시 CPU 반납
+        self.layers[layer_idx].to_device(&Device::Cpu)?;
+        
+        println!("[ENGINE-TRACE] << End Layer {} | VRAM Freed. | Time: {:.2}s", layer_idx, start_layer_time.elapsed().as_secs_f32());
         Ok(next_xs)
+    }
+
+    /// [NEW-STRICT] 특정 레이어의 활성 KV 데이터를 CPU로 복사하고 VRAM에서 즉시 제거
+    fn evacuate_layer_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, start_off: usize, len: usize) -> Result<()> {
+        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
+        let mut dumps_to_send = Vec::new();
+        let block_start = (start_off / 256) * 256;
+        
+        // 현재 레이어의 KV 블록들 중 이번 연산에 참여한 블록들만 추출
+        for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
+            let mut inner = block.inner.write().unwrap();
+            if inner.offset >= block_start && inner.location == KVLocation::VRAM {
+                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                    let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                    let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                    
+                    dumps_to_send.push((LayerKVDump { 
+                        layer_idx, 
+                        k_tensor: k_cpu, 
+                        v_tensor: v_cpu 
+                    }, inner.offset));
+                    
+                    // [VRAM-소각] 복사했으니 즉시 삭제
+                    inner.k_cache = None;
+                    inner.v_cache = None;
+                    inner.location = KVLocation::RAM; 
+                }
+            }
+        }
+
+        // 백그라운드 작업자에게 SSD 저장 위임
+        if !dumps_to_send.is_empty() {
+            if let Some(tx) = BAKE_TX.get() {
+                let path = crate::utils::paths::get_kv_dir(None).join(session_id);
+                if !path.exists() { let _ = fs::create_dir_all(&path); }
+                let rr = Some(self.registry.clone());
+                let mode = self.baking_only;
+
+                for (dump, off) in dumps_to_send {
+                    let sid = tokio::runtime::Handle::current().block_on(async {
+                        SLOT_MANAGER.acquire_write_slot(len).await
+                    });
+                    
+                    let _ = tx.blocking_send(SlotTask::Bake(BakeTask {
+                        slot_id: sid,
+                        task_dir: path.clone(),
+                        kv_name: None,
+                        offset: off,
+                        layers: vec![dump],
+                        is_relay_baking: mode,
+                        block_idx: Some(off / 256),
+                        registry: rr.clone(),
+                    }));
+                }
+            }
+        }
+        Ok(())
+    }
     }
 
     pub fn forward(

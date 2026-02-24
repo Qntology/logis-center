@@ -261,31 +261,34 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 let tmp = tp.with_extension("tmp");
                 
-                // [DIAG-IO] 디스크 쓰기 시도 로그
+                // [DIAG-IO] SSD 물리적 기록
                 let save_res = candle_core::safetensors::save(&ts, &tmp);
-                if let Err(e) = &save_res { println!("[WORKER-ERR] SSD Save failed for {:?}: {:?}", tp, e); }
                 
                 if save_res.is_ok() && fs::rename(&tmp, &tp).is_ok() {
+                    // [REGISTRY-UPDATE] 저장 성공 시 장부 업데이트
                     if let (Some(r), Some(idx)) = (reg, b_idx) {
                         if let Ok(mut entries) = r.entries.write() {
                             if idx < entries.len() {
-                                let e = &mut entries[idx]; e.ssd_path = Some(tp.clone());
-                                if tp.file_name().map(|n| n == "l0.st").unwrap_or(false) {
-                                    for i in 0..28 { e.location[i] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; }
-                                } else if let Some(l) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")).and_then(|s| s.parse::<usize>().ok()) {
-                                    if l < 28 { e.location[l] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; }
+                                let e = &mut entries[idx]; e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                                // 파일명에서 레이어 인덱스 추출 (l0.st -> 0)
+                                if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
+                                    if let Ok(l_idx) = l_str.parse::<usize>() {
+                                        if l_idx < 28 { e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; }
+                                    }
                                 }
                             }
                         }
                     }
                 } else if save_res.is_ok() {
                     println!("[WORKER-ERR] SSD Rename failed for {:?}", tp);
+                } else {
+                    println!("[WORKER-ERR] SSD Save failed for {:?}: {:?}", tp, save_res.err());
                 }
                 
                 GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
                 let slot = &SLOT_MANAGER.slots[sid];
+                // [ZERO-RESIDENT-RAM] 모든 레이어의 저장이 끝나면 RAM 슬롯 즉시 비우기
                 if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 || is_last {
-                    // [CRITICAL] 상태를 즉시 0(Free)으로 리셋하여 진단 루프가 인식하게 함
                     slot.state.store(0, Ordering::SeqCst);
                     let _ = SLOT_MANAGER.request_tx.send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true }).await;
                 }
@@ -482,53 +485,45 @@ impl Qwen3VLGenerateModel {
         let f_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?; let t_toks = f_ids.len();
         if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
         self.qwen3_vl.forward(&Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(0u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 0, t_toks, session_id.clone())?;
-        if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
         
         if let Some(s_id) = &session_id {
-            let unbaked = self.get_all_unbaked_kv_blocks(); let mut sent = 0;
-            
-            // [CRITICAL-STABILITY] 
-            // 1. GPU 연산 결과를 즉시 CPU로 복사 (비동기 중단점 없이 실행하여 컨텍스트 유지)
-            if self.text_device.is_cuda() { 
-                println!("[BAKE-TRACE] 🔄 Synchronizing GPU for atomic copy pass...");
-                let _ = self.text_device.synchronize(); 
-            }
-
+            if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+            let unbaked = self.get_all_unbaked_kv_blocks();
             let mut cpu_batches = Vec::with_capacity(unbaked.len());
+            
+            // 1. [ATOMIC-EVACUATION] GPU -> CPU 복사 (중단점 없음)
             for (ks, vs, off) in unbaked {
                 let mut dumps = Vec::new();
                 for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                    // 복사 직전 디바이스 재확인 (절대 중단점 없음)
-                    let k_f32 = k.to_device(&Device::Cpu).map_err(|e| anyhow!("K-Copy L{}: {}", idx, e))?.to_dtype(DType::F32)?;
-                    let v_f32 = v.to_device(&Device::Cpu).map_err(|e| anyhow!("V-Copy L{}: {}", idx, e))?.to_dtype(DType::F32)?;
-                    dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k_f32, v_tensor: v_f32 });
+                    let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                    let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                    dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k_cpu, v_tensor: v_cpu });
                 }
                 cpu_batches.push((dumps, off));
             }
-            println!("[BAKE-TRACE] ✅ All GPU data safely evacuated to CPU RAM (Total Blocks: {}).", cpu_batches.len());
+            
+            // [VRAM-PURGE] 복사 완료 즉시 VRAM 비우기
+            self.clear_temporal_kv_caches();
+            println!("[BAKE] ✅ VRAM Evacuated & Purged. (Blocks: {})", cpu_batches.len());
 
-            // 2. 이제 데이터가 CPU에 있으므로, 느긋하게 슬롯을 기다리며 SSD로 저장 요청
+            // 2. 백그라운드 SSD 저장 요청
             let tx = get_bake_worker().await?;
+            let mut sent = 0;
             for (dumps, off) in cpu_batches {
                 let sid = SLOT_MANAGER.acquire_write_slot(t_toks).await;
                 let path = crate::utils::paths::get_kv_dir(None).join(s_id); 
                 if !path.exists() { let _ = fs::create_dir_all(&path); }
-                
                 let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
                 let mode = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.baking_only, ModelVariant::QuantizedText(m) => m.language_model.baking_only, _ => false };
-                
                 if tx.send(SlotTask::Bake(BakeTask { slot_id: sid, task_dir: path, kv_name: kv_name.clone(), offset: off, layers: dumps, is_relay_baking: mode, block_idx: Some(off / 256), registry: rr })).await.is_ok() { 
                     sent += 1; 
-                } else { 
-                    SLOT_MANAGER.release_slot(sid).await; 
-                }
+                } else { SLOT_MANAGER.release_slot(sid).await; }
             }
             
             if sent > 0 { 
-                println!("[BAKING] All {} blocks queued. Starting final SSD sync wait...", sent);
+                println!("[BAKING] All {} blocks queued. Waiting for SSD sync...", sent);
                 wait_for_global_io().await; 
             }
-            self.clear_temporal_kv_caches();
         }
         Ok(t_toks)
     }
@@ -541,13 +536,17 @@ impl Qwen3VLGenerateModel {
         let t_toks = f_ids.len(); let mut a_ids = f_ids.clone(); let mut cur_off = self.get_kv_len();
         let (mut p_vals, i_grid, mut g_text) = (input.pixel_values.take(), input.image_grid_thw.take(), String::new());
         let max_gen = mes.max_tokens.unwrap_or(2048) as usize;
+        
         if t_toks > cur_off {
             let p_len = t_toks - cur_off;
             self.qwen3_vl.forward(&Tensor::from_vec(f_ids[cur_off..].to_vec(), (1, p_len), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(cur_off as u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), cur_off, t_toks, session_id.clone())?;
             if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
             cur_off = t_toks;
         }
+
         let mut gen_count = 0;
+        let mut last_saved_off = cur_off;
+
         while g_text.len() < max_gen {
             let last_id = *a_ids.last().unwrap_or(&0);
             let logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![last_id], (1, 1), &self.text_device)?, p_vals.as_ref(), i_grid.as_ref(), None, None, None, cur_off, cur_off + 1, session_id.clone())?;
@@ -555,14 +554,18 @@ impl Qwen3VLGenerateModel {
             let txt = self.tokenizer.token_decode(vec![next_id])?;
             g_text.push_str(&txt); a_ids.push(next_id); cur_off += 1; p_vals = None; gen_count += 1;
             
-            // [STABILITY] 32토큰마다 안전하게 백그라운드 저장
+            // [INCREMENTAL-SAVE] 32토큰마다 새로 생성된 '꼬리'만 골라 대피 및 저장
             if gen_count % 32 == 0 && session_id.is_some() {
-                let _ = self.evacuate_and_save_kv(session_id.as_ref().unwrap(), kv_name.as_deref(), t_toks).await;
+                self.save_incremental_kv(session_id.as_ref().unwrap(), kv_name.as_deref(), last_saved_off, cur_off).await?;
+                last_saved_off = cur_off;
             }
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
         }
+
         if let Some(s_id) = &session_id {
-            let _ = self.evacuate_and_save_kv(s_id, kv_name.as_deref(), t_toks).await;
+            if cur_off > last_saved_off {
+                self.save_incremental_kv(s_id, kv_name.as_deref(), last_saved_off, cur_off).await?;
+            }
             let p = crate::utils::paths::get_kv_dir(None).join(s_id); 
             if !p.exists() { let _ = fs::create_dir_all(&p); }
             let _ = self.qwen3_vl.save_metadata_to_file(&p);
@@ -570,36 +573,38 @@ impl Qwen3VLGenerateModel {
         Ok(g_text)
     }
 
-    /// [NEW-STABILITY] GPU 데이터를 CPU로 원자적으로 복사한 후 백그라운드 저장소로 전달
-    async fn evacuate_and_save_kv(&mut self, s_id: &str, kv_name: Option<&str>, total_tokens: usize) -> Result<()> {
+    /// [STABILITY-INCREMENTAL] 새로 생성된 구간(Tail)만 CPU로 복사한 후 VRAM 즉시 해제
+    async fn save_incremental_kv(&mut self, s_id: &str, kv_name: Option<&str>, start_off: usize, _end_off: usize) -> Result<()> {
         let unbaked = self.get_all_unbaked_kv_blocks();
-        if unbaked.is_empty() { return Ok(()); }
+        // start_off 이후의 블록(새로 생성된 토큰이 포함된 블록)만 필터링
+        let target_blocks: Vec<_> = unbaked.into_iter().filter(|(_, _, off)| *off >= (start_off / 256) * 256).collect();
+        if target_blocks.is_empty() { return Ok(()); }
 
         if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
 
-        let mut cpu_batches = Vec::with_capacity(unbaked.len());
-        for (ks, vs, off) in unbaked {
+        let mut cpu_batches = Vec::new();
+        for (ks, vs, off) in target_blocks {
             let mut dumps = Vec::new();
             for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                let k_f32 = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                let v_f32 = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k_f32, v_tensor: v_f32 });
+                let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k_cpu, v_tensor: v_cpu });
             }
             cpu_batches.push((dumps, off));
         }
+
+        // [VRAM-PURGE] 대피 완료 후 즉시 VRAM 비우기
+        self.clear_temporal_kv_caches();
 
         let tx = get_bake_worker().await?;
         let path = crate::utils::paths::get_kv_dir(None).join(s_id);
         if !path.exists() { let _ = fs::create_dir_all(&path); }
 
         for (dumps, off) in cpu_batches {
-            let sid = SLOT_MANAGER.acquire_write_slot(total_tokens).await;
+            let sid = SLOT_MANAGER.acquire_write_slot(256).await; // 한 블록 단위 슬롯 요청
             let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
             let mode = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.baking_only, ModelVariant::QuantizedText(m) => m.language_model.baking_only, _ => false };
-            
-            if tx.send(SlotTask::Bake(BakeTask { slot_id: sid, task_dir: path.clone(), kv_name: kv_name.map(|s| s.to_string()), offset: off, layers: dumps, is_relay_baking: mode, block_idx: Some(off / 256), registry: rr })).await.is_err() {
-                SLOT_MANAGER.release_slot(sid).await;
-            }
+            let _ = tx.send(SlotTask::Bake(BakeTask { slot_id: sid, task_dir: path.clone(), kv_name: kv_name.map(|s| s.to_string()), offset: off, layers: dumps, is_relay_baking: mode, block_idx: Some(off / 256), registry: rr })).await;
         }
         Ok(())
     }
