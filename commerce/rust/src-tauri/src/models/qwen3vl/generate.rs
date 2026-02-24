@@ -372,14 +372,20 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     }).await.ok();
                 }
                 SlotTask::Load(load) => {
-                    let (b_idx_off, b_idx, sid, tp) = { match load.shared_block.inner.read() { Ok(inner) => { let p = inner.ssd_path.clone().or_else(|| { if let Ok(reg) = load.registry.entries.read() { if inner.index < reg.len() { reg[inner.index].ssd_path.clone() } else { None } } else { None } }); (inner.offset, inner.index, load.slot_id, p) }, _ => (0, 999, load.slot_id, None) } };
-                    if let Some(path) = tp {
-                        let l_idx = load.layer_idx; let reg = load.registry.clone(); let b_off = b_idx_off;
-                        tokio::spawn(async move {
-                            let act_p = if path.is_dir() { let lp = path.join(format!("l{}.st", l_idx)); if lp.exists() { lp } else { path.join("l0.st") } } else { path.clone() };
+                    let sid = load.slot_id; let reg = load.registry.clone(); let l_idx = load.layer_idx; let shared_block = load.shared_block.clone();
+                    tokio::spawn(async move {
+                        let (b_idx_off, b_idx, tp) = { match shared_block.inner.read() { Ok(inner) => (inner.offset, inner.index, inner.ssd_path.clone().or_else(|| { if let Ok(reg_r) = reg.entries.read() { if inner.index < reg_r.len() { reg_r[inner.index].ssd_path.clone() } else { None } } else { None } })), _ => (0, 999, None) } };
+                        if let Some(base_path) = tp {
+                            // [TIERED-LOAD] inference 먼저 확인, 없으면 reference 확인
+                            let filename = format!("l{}.st", l_idx);
+                            let inf_p = base_path.join("inference").join(format!("b{}", b_idx_off)).join(&filename);
+                            let ref_p = base_path.join("reference").join(format!("b{}", b_idx_off)).join("l0.st");
+                            let act_p = if inf_p.exists() { inf_p } else if ref_p.exists() { ref_p } else { base_path.clone() };
+
                             let load_res = candle_core::safetensors::load(&act_p, &Device::Cpu);
                             if let Ok(st) = load_res {
-                                let prefix = format!("b{}_l{}_", b_off, if act_p.to_string_lossy().contains("l0.st") { 0 } else { l_idx });
+                                let is_relay = act_p.to_string_lossy().contains("l0.st");
+                                let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
                                 if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
                                     let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
                                     let os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
@@ -387,24 +393,29 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
                                 }
                             } else {
-                                println!("[WORKER-ERR] SSD Load failed for {:?}: {:?}", act_p, load_res.err());
-                                // [FIX] 로드 실패 시 SSD 상태로 복구하여 엔진이 무한 대기하지 않게 함
+                                println!("[SLOT-ERR] Load failed for {:?}: {:?}", act_p, load_res.err());
                                 if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { r[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; } }
                             }
-                            SLOT_MANAGER.release_slot(sid).await;
-                        });
-                    } else { SLOT_MANAGER.release_slot(sid).await; }
+                        }
+                        SLOT_MANAGER.release_slot(sid).await;
+                    });
                 }
                 SlotTask::ChunkedLoad(load) => {
-                    let reg = load.registry.clone(); let sids = load.slot_ids; let l_indices = load.layer_indices; let blocks = load.shared_blocks; let path = load.path;
+                    let reg = load.registry.clone(); let sids = load.slot_ids; let l_indices = load.layer_indices; let blocks = load.shared_blocks; let base_path = load.path;
                     tokio::spawn(async move {
                         for i in 0..sids.len() {
                             let (sid, l_idx, block) = (sids[i], l_indices[i], &blocks[i]);
                             let (b_idx_off, b_idx) = { let inner = block.inner.read().unwrap(); (inner.offset, inner.index) };
-                            let act_p = if path.is_dir() { let lp = path.join(format!("l{}.st", l_idx)); if lp.exists() { lp } else { path.join("l0.st") } } else { path.clone() };
+                            
+                            let filename = format!("l{}.st", l_idx);
+                            let inf_p = base_path.join("inference").join(format!("b{}", b_idx_off)).join(&filename);
+                            let ref_p = base_path.join("reference").join(format!("b{}", b_idx_off)).join("l0.st");
+                            let act_p = if inf_p.exists() { inf_p } else if ref_p.exists() { ref_p } else { base_path.clone() };
+
                             let load_res = candle_core::safetensors::load(&act_p, &Device::Cpu);
                             if let Ok(st) = load_res {
-                                let prefix = format!("b{}_l{}_", b_idx_off, if act_p.to_string_lossy().contains("l0.st") { 0 } else { l_idx });
+                                let is_relay = act_p.to_string_lossy().contains("l0.st");
+                                let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
                                 if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
                                     let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
                                     let os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
@@ -412,7 +423,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
                                 }
                             } else {
-                                println!("[WORKER-ERR] SSD Chunked Load failed for {:?}: {:?}", act_p, load_res.err());
+                                println!("[SLOT-ERR] Chunked Load failed for {:?}: {:?}", act_p, load_res.err());
                             }
                             SLOT_MANAGER.release_slot(sid).await;
                         }
