@@ -380,20 +380,33 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             let filename = format!("l{}.st", l_idx);
                             let inf_p = base_path.join("inference").join(format!("b{}", b_idx_off)).join(&filename);
                             let ref_p = base_path.join("reference").join(format!("b{}", b_idx_off)).join("l0.st");
-                            let act_p = if inf_p.exists() { inf_p } else if ref_p.exists() { ref_p } else { base_path.clone() };
+                            
+                            let act_p = if inf_p.is_file() { 
+                                Some(&inf_p) 
+                            } else if ref_p.is_file() { 
+                                Some(&ref_p) 
+                            } else { 
+                                None 
+                            };
 
-                            let load_res = candle_core::safetensors::load(&act_p, &Device::Cpu);
-                            if let Ok(st) = load_res {
-                                let is_relay = act_p.to_string_lossy().contains("l0.st");
-                                let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
-                                if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
-                                    let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
-                                    let os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
-                                    let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(), v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(), original_shape: os };
-                                    if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
+                            if let Some(act_p) = act_p {
+                                let load_res = candle_core::safetensors::load(act_p, &Device::Cpu);
+                                if let Ok(st) = load_res {
+                                    let is_relay = act_p.to_string_lossy().contains("l0.st");
+                                    let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
+                                    if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
+                                        let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
+                                        let os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
+                                        let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(), v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(), original_shape: os };
+                                        if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
+                                    }
+                                } else {
+                                    println!("[SLOT-ERR] 데이터 로드 실패 (파일: {:?}): {:?}", act_p, load_res.err());
+                                    if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { r[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; } }
                                 }
                             } else {
-                                println!("[SLOT-ERR] Load failed for {:?}: {:?}", act_p, load_res.err());
+                                // 파일이 없는 경우 SSD 상태로 유지
+                                println!("[SLOT-ERR] 로드할 파일을 찾을 수 없습니다 (b{} l{}). 확인 경로: {:?}, {:?}", b_idx_off, l_idx, inf_p, ref_p);
                                 if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { r[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; } }
                             }
                         }
@@ -410,20 +423,31 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             let filename = format!("l{}.st", l_idx);
                             let inf_p = base_path.join("inference").join(format!("b{}", b_idx_off)).join(&filename);
                             let ref_p = base_path.join("reference").join(format!("b{}", b_idx_off)).join("l0.st");
-                            let act_p = if inf_p.exists() { inf_p } else if ref_p.exists() { ref_p } else { base_path.clone() };
+                            
+                            let act_p = if inf_p.is_file() { 
+                                Some(&inf_p) 
+                            } else if ref_p.is_file() { 
+                                Some(&ref_p) 
+                            } else { 
+                                None 
+                            };
 
-                            let load_res = candle_core::safetensors::load(&act_p, &Device::Cpu);
-                            if let Ok(st) = load_res {
-                                let is_relay = act_p.to_string_lossy().contains("l0.st");
-                                let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
-                                if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
-                                    let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
-                                    let os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
-                                    let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(), v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(), original_shape: os };
-                                    if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
+                            if let Some(act_p) = act_p {
+                                let load_res = candle_core::safetensors::load(act_p, &Device::Cpu);
+                                if let Ok(st) = load_res {
+                                    let is_relay = act_p.to_string_lossy().contains("l0.st");
+                                    let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
+                                    if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
+                                        let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
+                                        let os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
+                                        let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(), v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(), original_shape: os };
+                                        if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
+                                    }
+                                } else {
+                                    println!("[SLOT-ERR] 청크 로드 실패 (파일: {:?}): {:?}", act_p, load_res.err());
                                 }
                             } else {
-                                println!("[SLOT-ERR] Chunked Load failed for {:?}: {:?}", act_p, load_res.err());
+                                println!("[SLOT-ERR] 청크 로드용 파일을 찾을 수 없습니다 (b{} l{}).", b_idx_off, l_idx);
                             }
                             SLOT_MANAGER.release_slot(sid).await;
                         }

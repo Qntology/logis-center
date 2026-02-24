@@ -673,33 +673,41 @@ impl QuantizedQwen3VLTextAttention {
                         let full_path = path.join("inference").join(format!("b{}", b_off)).join(&filename);
                         let fallback_path = path.join("reference").join(format!("b{}", b_off)).join("l0.st");
                         
-                        let act_path = if full_path.exists() { full_path } else { fallback_path };
+                        let act_path = if full_path.is_file() { 
+                            Some(&full_path) 
+                        } else if fallback_path.is_file() {
+                            Some(&fallback_path)
+                        } else {
+                            None
+                        };
                         
-                        if let Ok(content) = std::fs::read(&act_path) {
-                            if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                let block_offset = index * 256;
-                                let is_relay = act_path.file_name().map(|n| n == "l0.st").unwrap_or(false);
-                                let prefix = if is_relay { format!("b{}_l0_", block_offset) } else { format!("b{}_l{}_", block_offset, self.layer_idx) };
-                                
-                                let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
-                                if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
-                                    let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
-                                    let expected_h = self.num_key_value_heads;
-                                    let expected_d = self.head_dim;
-                                    let anchor_count = ka.shape()[2];
+                        if let Some(act_p) = act_path {
+                            if let Ok(content) = std::fs::read(act_p) {
+                                if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                                    let block_offset = index * 256;
+                                    let is_relay = act_p.file_name().map(|n| n == "l0.st").unwrap_or(false);
+                                    let prefix = if is_relay { format!("b{}_l0_", block_offset) } else { format!("b{}_l{}_", block_offset, self.layer_idx) };
                                     
-                                    let meta = BitKVMetadata {
-                                        k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), (1, expected_h, anchor_count, expected_d), &Device::Cpu)?,
-                                        k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?,
-                                        k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (1, expected_h, b_len, 1), &Device::Cpu)?,
-                                        v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), (1, expected_h, anchor_count, expected_d), &Device::Cpu)?,
-                                        v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?,
-                                        v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (1, expected_h, b_len, 1), &Device::Cpu)?,
-                                        original_shape: vec![1, expected_h, b_len, expected_d],
-                                    };
-                                    
-                                    k_active = Some(self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?);
-                                    v_active = Some(self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?);
+                                    let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                                    if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
+                                        let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
+                                        let expected_h = self.num_key_value_heads;
+                                        let expected_d = self.head_dim;
+                                        let anchor_count = ka.shape()[2];
+                                        
+                                        let meta = BitKVMetadata {
+                                            k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), (1, expected_h, anchor_count, expected_d), &Device::Cpu)?,
+                                            k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?,
+                                            k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (1, expected_h, b_len, 1), &Device::Cpu)?,
+                                            v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), (1, expected_h, anchor_count, expected_d), &Device::Cpu)?,
+                                            v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?,
+                                            v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (1, expected_h, b_len, 1), &Device::Cpu)?,
+                                            original_shape: vec![1, expected_h, b_len, expected_d],
+                                        };
+                                        
+                                        k_active = Some(self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?);
+                                        v_active = Some(self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?);
+                                    }
                                 }
                             }
                         }
@@ -1603,6 +1611,50 @@ impl QuantizedQwen3VLTextModel {
         for (chunk_idx, &i) in chunk_offsets.iter().enumerate() {
             let take = (current_seq_len - i).min(chunk_size);
             
+            // [SLIDING-WINDOW-PREFETCH] 현재 청크 연산 중에 다음 레이어들의 대응하는 청크를 미리 로드
+            // 레이어 시작 시(chunk_idx == 0)에는 초기 윈도우(4개)를 한꺼번에 예독하고, 그 후에는 하나씩 전진하며 예독합니다.
+            let prefetch_window = 4;
+            let look_ahead_layers = 2;
+            let target_chunks = if chunk_idx == 0 { (0..=prefetch_window).collect::<Vec<_>>() } else { vec![chunk_idx + prefetch_window] };
+
+            for t_idx in target_chunks {
+                if t_idx < chunk_offsets.len() {
+                    for l_off in 1..=look_ahead_layers {
+                        let target_layer = layer_idx + l_off;
+                        if target_layer < 28 {
+                            if let Some(block) = self.layers[layer_idx].self_attn.kv_blocks.get(t_idx) {
+                                let (index, path_opt) = {
+                                    let reg = self.registry.entries.read().unwrap();
+                                    let inner = block.inner.read().unwrap();
+                                    if inner.index < reg.len() && reg[inner.index].location[target_layer] == KVLocation::SSD {
+                                        (inner.index, reg[inner.index].ssd_path.clone())
+                                    } else { (999, None) }
+                                };
+
+                                if index != 999 && path_opt.is_some() {
+                                    let path = path_opt.unwrap();
+                                    {
+                                        let mut reg = self.registry.entries.write().unwrap();
+                                        reg[index].location[target_layer] = KVLocation::Loading;
+                                    }
+                                    let shared_block = block.clone();
+                                    let reg_clone = self.registry.clone();
+                                    tauri::async_runtime::spawn(async move {
+                                        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
+                                        let sid = SLOT_MANAGER.acquire_read_slot().await;
+                                        if let Ok(tx) = get_load_worker().await {
+                                            let _ = tx.send(SlotTask::Load(LoadTask { slot_id: sid, path, layer_idx: target_layer, kv_name: None, shared_block, registry: reg_clone })).await;
+                                        } else {
+                                            SLOT_MANAGER.release_slot(sid).await;
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             println!("[DIAG-CHUNK] L{} | Chunk {}/{} (Tokens {}..{}) | Device: {:?}", 
                 layer_idx, chunk_idx + 1, chunk_offsets.len(), i, i + take, target_device);
 
@@ -1720,41 +1772,6 @@ impl QuantizedQwen3VLTextModel {
             let _ = target_device.synchronize(); 
         }
 
-        // [PRE-EMPTIVE-FETCH] 레이어 시작 시 다음 2개 레이어의 KV를 미리 읽어옵니다. (레이어당 1회)
-        let look_ahead = 2;
-        for i in 1..=look_ahead {
-            let target_layer = layer_idx + i;
-            if target_layer >= 28 { break; }
-            
-            // 모든 조각에 대해 미래 데이터를 미리 로드 예약
-            for block in self.layers[layer_idx].self_attn.kv_blocks.iter() {
-                let (index, path_opt) = {
-                    let reg = self.registry.entries.read().unwrap();
-                    let inner = block.inner.read().unwrap();
-                    if inner.index < reg.len() && reg[inner.index].location[target_layer] == KVLocation::SSD {
-                        (inner.index, reg[inner.index].ssd_path.clone())
-                    } else { (999, None) }
-                };
-
-                if index != 999 && path_opt.is_some() {
-                    let path = path_opt.unwrap();
-                    {
-                        let mut reg = self.registry.entries.write().unwrap();
-                        reg[index].location[target_layer] = KVLocation::Loading;
-                    }
-                    let shared_block = block.clone();
-                    let reg_clone = self.registry.clone();
-                    tauri::async_runtime::spawn(async move {
-                        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
-                        let sid = SLOT_MANAGER.acquire_read_slot().await;
-                        if let Ok(tx) = get_load_worker().await {
-                            let _ = tx.send(SlotTask::Load(LoadTask { slot_id: sid, path, layer_idx: target_layer, kv_name: None, shared_block, registry: reg_clone })).await;
-                        }
-                    });
-                }
-            }
-        }
-
         // [STEP 2] Load & Decode KV Cache 파편 (현재 레이어용)
         let mut w_blocks_to_load = Vec::new();
         let mut w_chunk_path = std::path::PathBuf::new();
@@ -1786,42 +1803,45 @@ impl QuantizedQwen3VLTextModel {
                 let inf_path = base_dir.join("inference").join(format!("b{}", block_offset)).join(format!("l{}.st", l_idx));
                 let bak_path = base_dir.join("reference").join(format!("b{}", block_offset)).join("l0.st");
 
-                let actual_path = if inf_path.exists() { 
-                    inf_path 
-                } else if bak_path.exists() {
-                    bak_path
+                let actual_path = if inf_path.is_file() { 
+                    Some(inf_path) 
+                } else if bak_path.is_file() {
+                    Some(bak_path)
                 } else {
                     // 하위 호환성 및 레거시 경로 확인
-                    let legacy_path = base_dir.join(format!("b{}", block_offset)).join(format!("l{}.st", l_idx));
-                    if legacy_path.exists() { legacy_path } else { base_dir.join(format!("b{}", block_offset)).join("l0.st") }
+                    let legacy_p1 = base_dir.join(format!("b{}", block_offset)).join(format!("l{}.st", l_idx));
+                    let legacy_p2 = base_dir.join(format!("b{}", block_offset)).join("l0.st");
+                    if legacy_p1.is_file() { Some(legacy_p1) } else if legacy_p2.is_file() { Some(legacy_p2) } else { None }
                 };
 
-                if let Ok(content) = std::fs::read(&actual_path) {
-                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                        let is_relay_file = actual_path.file_name().map(|n| n == "l0.st").unwrap_or(false);
-                        let prefix = if is_relay_file { format!("b{}_l0_", block_offset) } else { format!("b{}_l{}_", block_offset, l_idx) };
-                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
-                        
-                        if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
-                            let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
-                            let expected_h = self.layers[layer_idx].self_attn.num_key_value_heads;
-                            let expected_d = self.layers[layer_idx].self_attn.head_dim;
-                            let anchor_count = ka.shape()[2];
+                if let Some(act_p) = actual_path {
+                    if let Ok(content) = std::fs::read(&act_p) {
+                        if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                            let is_relay_file = act_p.file_name().map(|n| n == "l0.st").unwrap_or(false);
+                            let prefix = if is_relay_file { format!("b{}_l0_", block_offset) } else { format!("b{}_l{}_", block_offset, l_idx) };
+                            let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
                             
-                            let metadata = BitKVMetadata {
-                                k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), (1, expected_h, anchor_count, expected_d), &Device::Cpu)?,
-                                k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?,
-                                k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (1, expected_h, 256, 1), &Device::Cpu)?,
-                                v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), (1, expected_h, anchor_count, expected_d), &Device::Cpu)?,
-                                v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?,
-                                v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (1, expected_h, 256, 1), &Device::Cpu)?,
-                                original_shape: vec![1, expected_h, 256, expected_d],
-                            };
-                            let mut inner = block.inner.write().unwrap();
-                            inner.bitkv_metadata = Some(metadata);
-                            inner.location = KVLocation::RAM;
-                            let mut reg_w = self.registry.entries.write().unwrap();
-                            reg_w[b_idx].location[l_idx] = KVLocation::RAM;
+                            if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
+                                let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
+                                let expected_h = self.layers[layer_idx].self_attn.num_key_value_heads;
+                                let expected_d = self.layers[layer_idx].self_attn.head_dim;
+                                let anchor_count = ka.shape()[2];
+                                
+                                let metadata = BitKVMetadata {
+                                    k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), (1, expected_h, anchor_count, expected_d), &Device::Cpu)?,
+                                    k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?,
+                                    k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (1, expected_h, 256, 1), &Device::Cpu)?,
+                                    v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), (1, expected_h, anchor_count, expected_d), &Device::Cpu)?,
+                                    v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?,
+                                    v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (1, expected_h, 256, 1), &Device::Cpu)?,
+                                    original_shape: vec![1, expected_h, 256, expected_d],
+                                };
+                                let mut inner = block.inner.write().unwrap();
+                                inner.bitkv_metadata = Some(metadata);
+                                inner.location = KVLocation::RAM;
+                                let mut reg_w = self.registry.entries.write().unwrap();
+                                reg_w[b_idx].location[l_idx] = KVLocation::RAM;
+                            }
                         }
                     }
                 }
