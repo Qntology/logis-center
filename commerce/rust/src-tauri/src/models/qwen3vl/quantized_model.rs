@@ -1499,7 +1499,9 @@ impl QuantizedQwen3VLTextModel {
         for _ in 0..config.num_hidden_layers {
             if current_device.is_cuda() && is_vram_checked {
                  let buffer_factor = 1.2; 
-                 if simulated_free_vram > ( (cost_per_layer as f64 * buffer_factor) as u64 + safety_floor ) {
+                 // [FIX] 추론 모드(baking_only=false)일 때는 모든 레이어를 GPU에 배치하도록 강제합니다.
+                 // 0.6B 모델은 약 1.2GB로, 10k 토큰 KV Cache와 함께 있어도 4GB 미만에서 상주 가능합니다.
+                 if !baking_only || simulated_free_vram > ( (cost_per_layer as f64 * buffer_factor) as u64 + safety_floor ) {
                      simulated_free_vram = simulated_free_vram.saturating_sub(cost_per_layer);
                      layer_devices.push(current_device.clone());
                      pinned_layer_count += 1;
@@ -1609,7 +1611,8 @@ impl QuantizedQwen3VLTextModel {
             let mut layer_device = current_device.clone();
             if current_device.is_cuda() && is_vram_checked {
                  let buffer_factor = 1.1; 
-                 if simulated_free_vram > ( (cost_per_layer as f64 * buffer_factor) as u64 + safety_floor ) {
+                 // [FIX] 추론 모드일 때는 모든 레이어를 GPU에 배치하도록 강제합니다.
+                 if !baking_only || simulated_free_vram > ( (cost_per_layer as f64 * buffer_factor) as u64 + safety_floor ) {
                      simulated_free_vram = simulated_free_vram.saturating_sub(cost_per_layer);
                      pinned_layer_count += 1;
                  } else { layer_device = Device::Cpu; }
@@ -1702,8 +1705,9 @@ impl QuantizedQwen3VLTextModel {
             results.push(out);
 
             // [IMMEDIATE-EVACUATION] 패키징: 청크 하나 끝날 때마다 즉시 대피 (덮어쓰기 방지 포함)
-            if let Some(sid) = &sid_opt {
-                let session_clone = sid.clone();
+            // [FIX] Baking 모드이거나 세션 ID가 명시적으로 있을 때만 대피를 수행합니다.
+            if (self.baking_only || sid_opt.is_some()) && sid_opt.is_some() {
+                let session_clone = sid_opt.clone().unwrap();
                 let _ = self.evacuate_chunk_kv_to_cpu(layer_idx, &session_clone, seqlen_offset + i, take).await;
             }
             
@@ -1907,22 +1911,27 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [STEP 4] 실시간 VRAM 해제 및 자원 반납 (정석)
+        // [STEP 4] 실시간 VRAM 해제 및 자원 반납 (추론 시에는 VRAM 고정)
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
         
-        // 1. KV 캐시 즉시 대피 및 VRAM 삭제
-        let sid_opt = self.active_session_id.clone();
-        if let Some(sid) = sid_opt {
-            let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count);
-        }
+        // [STRICT-INFERENCE-LOCK] 추론 모드(baking_only=false)일 때는 절대 VRAM을 비우지 않습니다.
+        if self.baking_only {
+            // 1. KV 캐시 즉시 대피 및 VRAM 삭제
+            if let Some(sid) = self.active_session_id.clone() {
+                let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count);
+            }
 
-        // 2. 레이어 무게추 즉시 CPU로 반납 및 동기화 (VRAM 즉시 해방 강제)
-        if target_device.is_cuda() {
-            self.layers[layer_idx].to_device(&Device::Cpu)?;
-            let _ = target_device.synchronize(); // 드라이버에게 메모리 회수 기회 부여
+            // 2. 레이어 무게추 즉시 CPU로 반납 및 동기화 (VRAM 즉시 해방 강제)
+            if target_device.is_cuda() {
+                self.layers[layer_idx].to_device(&Device::Cpu)?;
+                let _ = target_device.synchronize(); 
+            }
+            println!("[ENGINE-TRACE] << End Layer {} | VRAM Evicted & Synchronized (Baking Mode).", layer_idx);
+        } else {
+            // 추론 모드에서는 VRAM에 그대로 둡니다.
+            // println!("[ENGINE-TRACE] << End Layer {} | Weights & KV kept in VRAM (Inference Mode).", layer_idx);
         }
         
-        println!("[ENGINE-TRACE] << End Layer {} | VRAM Evicted & Synchronized. | Time: {:.2}s", layer_idx, start_layer_time.elapsed().as_secs_f32());
         Ok(next_xs)
     }
 
@@ -2199,6 +2208,12 @@ impl QuantizedQwen3VLTextModel {
 
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> {
         if self.is_forced_cpu { return Ok(()); } // [FIX] Never move to GPU if user wants CPU
+        
+        // [FIX] 추론 모드(baking_only=false)일 때는 리밸런싱을 건너뛰고 기존 장치 구성을 유지합니다.
+        // 이는 0.6B 28레이어가 VRAM에 안정적으로 상주하도록 강제하여 속도를 높이고 OOM을 방지합니다.
+        if !self.baking_only {
+            return Ok(());
+        }
         
         use nvml_wrapper::Nvml;
         
