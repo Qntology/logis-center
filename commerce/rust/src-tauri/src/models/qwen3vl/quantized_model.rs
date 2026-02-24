@@ -590,6 +590,42 @@ impl QuantizedQwen3VLTextAttention {
         let mut vram_vs = Vec::new();
         let mut vram_total_len = 0;
 
+        // [PHYSICAL-SYNC-GATE] 연산 시작 전, 이 레이어에 필요한 모든 블록이 로드될 때까지 대기
+        let start_gate = std::time::Instant::now();
+        loop {
+            let mut pending_blocks = Vec::new();
+            {
+                let reg = self.registry.entries.read().unwrap();
+                for block in &self.kv_blocks {
+                    let inner = block.inner.read().unwrap();
+                    if inner.offset < total_len {
+                        let loc = if inner.index < reg.len() { reg[inner.index].location[self.layer_idx] } else { KVLocation::VRAM };
+                        // [GATE-FIX] Loading(읽기 진행 중)인 경우만 기다립니다. SSD는 이미 완료된 상태입니다.
+                        if loc == KVLocation::Loading {
+                            pending_blocks.push((inner.index, inner.offset, reg[inner.index].ssd_path.clone()));
+                        }
+                    }
+                }
+            }
+
+            if pending_blocks.is_empty() { break; }
+            
+            // 10초 이상 대기 시 강제 돌파 (데드락 방지)
+            if start_gate.elapsed().as_secs() > 10 {
+                println!("[GATE-TIMEOUT] 레이어 {} 연산 강제 시작 (미로드 블록 {}개)", self.layer_idx, pending_blocks.len());
+                break;
+            }
+
+            // 무엇을 기다리는지 상세 로깅 (1초마다)
+            if start_gate.elapsed().as_millis() % 1000 < 10 {
+                for (idx, off, path) in &pending_blocks {
+                    println!("[GATE-WAIT] 레이어 {} 블록 {} (Offset {}) 로딩 대기 중... 경로: {:?}", 
+                        self.layer_idx, idx, off, path.as_ref().map(|p| p.join(format!("l{}.st", self.layer_idx))));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
         for block in &self.kv_blocks {
             let (mut k, mut v, b_len, index, b_off) = {
                 let inner = block.inner.read().unwrap();
@@ -1747,7 +1783,7 @@ impl QuantizedQwen3VLTextModel {
 
                     let _ = tx.send(SlotTask::Bake(BakeTask {
                         slot_id: sid,
-                        task_dir: block_dir, // 블록 폴더 직접 전달
+                        task_dir: block_dir, // 최종 블록 폴더 전달
                         kv_name: Some(sub_folder.to_string()),
                         offset: off,
                         layers: vec![dump],
@@ -1808,18 +1844,16 @@ impl QuantizedQwen3VLTextModel {
             for (l_idx, b_idx, block) in w_blocks_to_load {
                 let block_offset = b_idx * 256;
                 
-                // [PATH-REBASING] 어떤 경로가 들어와도 세션 루트를 찾아 재조립합니다.
-                let mut root = w_chunk_path.clone();
-                while root.to_string_lossy().contains("inference") || root.to_string_lossy().contains("reference") || root.to_string_lossy().contains("b") {
-                    if let Some(parent) = root.parent() { 
-                        if parent.as_os_str().is_empty() || parent.to_string_lossy() == "tmp" || parent.to_string_lossy() == "kv" { break; }
-                        root = parent.to_path_buf(); 
-                    } else { break; }
-                }
-
-                let b_str = format!("b{}", block_offset);
-                let inf_path = root.join("inference").join(&b_str).join(format!("l{}.st", l_idx));
-                let bak_path = root.join("reference").join(&b_str).join("l0.st");
+                // [PATH-STRICT] w_chunk_path (ssd_path)는 이미 .../inference/b0 폴더임
+                let base_dir = w_chunk_path.clone();
+                let filename = format!("l{}.st", l_idx);
+                let inf_path = base_dir.join(&filename);
+                
+                // reference는 상위-상위 폴더/reference/b0/l0.st (필요시 조립)
+                let bak_path = base_dir.parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("reference").join(format!("b{}", block_offset)).join("l0.st"))
+                    .unwrap_or_else(|| base_dir.join("l0.st"));
 
                 let actual_path = if inf_path.is_file() { 
                     Some(inf_path) 
@@ -1948,7 +1982,7 @@ impl QuantizedQwen3VLTextModel {
 
                     let _ = tx.blocking_send(SlotTask::Bake(BakeTask {
                         slot_id: sid,
-                        task_dir: block_dir, 
+                        task_dir: block_dir, // 최종 블록 폴더 직접 전달
                         kv_name: Some(sub_folder.to_string()),
                         offset: off,
                         layers: vec![dump],

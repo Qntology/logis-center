@@ -218,8 +218,12 @@ pub async fn wait_for_global_io() {
             if SLOT_MANAGER.slots[i].state.load(Ordering::SeqCst) != 0 { busy_slots.push(i); }
         }
         
-        println!("[DIAG-IO] Waiting... Busy Slots: {:?}, Pending Disk IO: {}", busy_slots, pending_io);
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // [AUDIT-IO] 어떤 블록/레이어 작업 때문에 대기 중인지 상세 분석
+        println!("[DIAG-IO] 대기 중... 바쁜 슬롯: {:?}, 잔여 디스크 IO: {}", busy_slots, pending_io);
+        if !busy_slots.is_empty() {
+            println!("[DIAG-IO] 원인 분석: 현재 {}개의 슬롯이 여전히 읽기/쓰기 작업을 수행 중입니다.", busy_slots.len());
+        }
+        tokio::time::sleep(Duration::from_millis(1000)).await;
     }
     println!("[DIAG-IO] Global Sync Finished in {:.2}s.", start.elapsed().as_secs_f32());
 }
@@ -300,7 +304,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             match task {
                 SlotTask::Bake(bake) => {
                     let io_tx_inner = io_tx.clone();
-                    let (sid, t_dir, off, is_relay) = (bake.slot_id, bake.task_dir, bake.offset, bake.is_relay_baking);
+                    let (sid, block_dir, off, is_relay) = (bake.slot_id, bake.task_dir, bake.offset, bake.is_relay_baking);
                     tokio::task::spawn_blocking(move || {
                         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             if bake.layers.is_empty() { 
@@ -309,13 +313,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 return; 
                             }
                             let loop_count = bake.layers.len(); let slot = &SLOT_MANAGER.slots[sid]; slot.remaining_layers.store(loop_count, Ordering::SeqCst); 
-                            let b_str = format!("b{}", off);
-                            let block_dir = if t_dir.to_string_lossy().ends_with(&b_str) || t_dir.to_string_lossy().contains(&format!("{}/{}", b_str, b_str).replace("/", &std::path::MAIN_SEPARATOR.to_string())) {
-                                t_dir.clone()
-                            } else {
-                                t_dir.join(&b_str)
-                            };
-                            let block_prefix = format!("{}_", b_str);
+                            let block_prefix = format!("b{}_", off);
                             for l_idx in 0..loop_count {
                                 let src = &bake.layers[l_idx];
                                 let act_l = if is_relay && loop_count == 1 { 0 } else { src.layer_idx };
@@ -388,31 +386,24 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             } 
                         };
                         
-                        // [PATH-REBASING] 어떤 경로가 들어와도 세션 루트(task_...)를 찾아냅니다.
-                        let mut root = provided_path.clone();
-                        while root.to_string_lossy().contains("inference") || root.to_string_lossy().contains("reference") || root.to_string_lossy().contains("b") {
-                            if let Some(parent) = root.parent() { 
-                                if parent.as_os_str().is_empty() || parent.to_string_lossy() == "tmp" || parent.to_string_lossy() == "kv" { break; }
-                                root = parent.to_path_buf(); 
-                            } else { break; }
-                        }
-
                         let filename = format!("l{}.st", l_idx);
-                        let b_str = format!("b{}", b_idx_off);
-                        
-                        // 장부 기록이 있다면 우선 신뢰, 없으면 재조립된 루트에서 탐색
+                        // [PATH-TRUST] 이미 블록 폴더까지 포함된 경로라고 가정하고 파일명만 결합
                         let act_p = if let Some(path) = recorded_path {
-                            if path.is_file() { path } else { path.join(&filename) }
+                            path.join(&filename)
                         } else {
-                            root.join("inference").join(&b_str).join(&filename)
+                            provided_path.join(&filename)
                         };
                         
-                        let ref_p = root.join("reference").join(&b_str).join("l0.st");
+                        // reference 경로는 구조적 정석 위치 시도 (상위-상위 폴더/reference/b0/l0.st)
+                        let ref_p = act_p.parent()
+                            .and_then(|p| p.parent())
+                            .map(|p| p.join("reference").join(format!("b{}", b_idx_off)).join("l0.st"))
+                            .unwrap_or_else(|| act_p.clone());
 
-                        let final_path = if act_p.is_file() { Some(act_p) } else if ref_p.is_file() { Some(ref_p) } else { None };
+                        let final_path = if act_p.is_file() { Some(&act_p) } else if ref_p.is_file() { Some(&ref_p) } else { None };
 
                         if let Some(p) = final_path {
-                            let load_res = candle_core::safetensors::load(&p, &Device::Cpu);
+                            let load_res = candle_core::safetensors::load(p, &Device::Cpu);
                             if let Ok(st) = load_res {
                                 let is_relay = p.to_string_lossy().contains("l0.st");
                                 let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
@@ -427,7 +418,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { r[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; } }
                             }
                         } else {
-                            println!("[SLOT-ERR] 파일 없음 (b{} l{}). 시도: {:?}", b_idx_off, l_idx, root.join("inference").join(&b_str).join(&filename));
+                            // [DIAG-FAIL] 실제 시도한 경로를 명확히 출력
+                            println!("[SLOT-ERR] 파일 없음 (b{} l{}). 확인경로: {:?}", b_idx_off, l_idx, act_p);
                             if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { r[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; } }
                         }
                         SLOT_MANAGER.release_slot(sid).await;
