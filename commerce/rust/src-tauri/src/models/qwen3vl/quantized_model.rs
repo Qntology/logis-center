@@ -1666,7 +1666,8 @@ impl QuantizedQwen3VLTextModel {
         let mut results = Vec::with_capacity(chunk_offsets.len());
         let chunk_size = 256;
         let current_seq_len = xs.dim(1)?;
-        let target_device = xs.device().clone();
+        // [STABILITY] 텐서 장치가 아닌, 레이어에 고정된 싱글톤 장치 참조 사용
+        let target_device = self.layers[layer_idx].device().clone();
 
         for (chunk_idx, &i) in chunk_offsets.iter().enumerate() {
             let take = (current_seq_len - i).min(chunk_size);

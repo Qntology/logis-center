@@ -704,8 +704,8 @@ impl LogisModel {
                 gpu_id: 0,
             };
         } else {
-            // [STABILITY] Use persistent global CUDA device
-            let persistent_dev = utils::get_cuda_device(config.gpu_id).await;
+            // [STABILITY] Use persistent global CUDA device (Synchronous Singleton)
+            let persistent_dev = utils::get_cuda_device(config.gpu_id);
             config.device = persistent_dev;
             println!("🚀 [MODEL] Running in default mode ({})", config.name);
         }

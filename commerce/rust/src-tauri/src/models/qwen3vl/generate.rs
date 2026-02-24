@@ -483,39 +483,39 @@ impl Qwen3VLGenerateModel {
         
         if let Some(s_id) = &session_id {
             let unbaked = self.get_all_unbaked_kv_blocks(); let mut sent = 0;
+            
+            // [STABILITY] 드라이버 컨텍스트 혼선을 막기 위해 동일 스레드에서 순차 복사 수행
+            if self.text_device.is_cuda() { 
+                println!("[BAKE-TRACE] 🔄 Synchronizing GPU before copy pass...");
+                let _ = self.text_device.synchronize(); 
+            }
+
             for (ks, vs, off) in unbaked {
                 let sid = SLOT_MANAGER.acquire_write_slot(t_toks).await;
                 let path = crate::utils::paths::get_kv_dir(None).join(s_id); if !path.exists() { let _ = fs::create_dir_all(&path); }
                 
-                // [STABILITY] Offload heavy DtoH copy to blocking thread
-                let dumps_res = tokio::task::spawn_blocking(move || -> Result<Vec<LayerKVDump>> {
-                    let mut dumps = Vec::new();
-                    for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                        let k_f32 = k.to_device(&Device::Cpu).map_err(|e| anyhow!("K-Copy failed L{}: {}", idx, e))?.to_dtype(DType::F32)?;
-                        let v_f32 = v.to_device(&Device::Cpu).map_err(|e| anyhow!("V-Copy failed L{}: {}", idx, e))?.to_dtype(DType::F32)?;
-                        dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k_f32, v_tensor: v_f32 });
+                println!("[BAKE-TRACE] 📦 Starting Block (Offset: {}) | Layers: {}", off, ks.len());
+                let mut dumps = Vec::new();
+                for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
+                    // [VERBOSE-LOG]
+                    if idx % 14 == 0 || idx == 27 {
+                        println!("[BAKE-TRACE]   >> Copying L{} | Device: {:?}", idx, k.device());
                     }
-                    Ok(dumps)
-                }).await?;
 
-                let dumps = match dumps_res {
-                    Ok(d) => d,
-                    Err(e) => {
-                        println!("[BAKING-ERR] Copy failed for offset {}: {}", off, e);
-                        SLOT_MANAGER.release_slot(sid).await;
-                        return Err(e);
-                    }
-                };
+                    // [FIX] 복사 직전 디바이스 재확인 및 캐스팅
+                    let k_f32 = k.to_device(&Device::Cpu).map_err(|e| {
+                        println!("[FATAL-BAKE] K-Copy Failed at L{}! Error: {:?}", idx, e);
+                        anyhow!("K-Copy L{}: {}", idx, e)
+                    })?.to_dtype(DType::F32)?;
+                    
+                    let v_f32 = v.to_device(&Device::Cpu).map_err(|e| {
+                        println!("[FATAL-BAKE] V-Copy Failed at L{}! Error: {:?}", idx, e);
+                        anyhow!("V-Copy L{}: {}", idx, e)
+                    })?.to_dtype(DType::F32)?;
 
-                if let Ok(tx) = get_bake_worker().await {
-                    let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
-                    let mode = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.baking_only, ModelVariant::QuantizedText(m) => m.language_model.baking_only, _ => false };
-                    if tx.send(SlotTask::Bake(BakeTask { slot_id: sid, task_dir: path, kv_name: kv_name.clone(), offset: off, layers: dumps, is_relay_baking: mode, block_idx: Some(off / 256), registry: rr })).await.is_ok() { 
-                        sent += 1; 
-                    }
-                    else { SLOT_MANAGER.release_slot(sid).await; }
-                } else { SLOT_MANAGER.release_slot(sid).await; }
-            }
+                    dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k_f32, v_tensor: v_f32 });
+                }
+                println!("[BAKE-TRACE] ✅ Block (Offset: {}) Ready for Disk.", off);
             
             if sent > 0 { 
                 println!("[BAKING] All {} blocks queued. Starting final SSD sync wait...", sent);
