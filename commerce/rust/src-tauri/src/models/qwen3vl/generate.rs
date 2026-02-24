@@ -386,21 +386,29 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             } 
                         };
                         
+                        // [PATH-REBASING] 어떤 경로가 들어와도 세션 루트(task_...)를 찾아냅니다.
+                        let mut root = provided_path.clone();
+                        while root.to_string_lossy().contains("inference") || root.to_string_lossy().contains("reference") || root.to_string_lossy().contains("b") {
+                            if let Some(parent) = root.parent() { 
+                                if parent.as_os_str().is_empty() || parent.to_string_lossy() == "tmp" || parent.to_string_lossy() == "kv" { break; }
+                                root = parent.to_path_buf(); 
+                            } else { break; }
+                        }
+
                         let filename = format!("l{}.st", l_idx);
-                        // [PATH-TRUST] 이미 블록 폴더까지 포함된 경로라고 가정하고 파일명만 결합
+                        let b_str = format!("b{}", b_idx_off);
+                        
+                        // 장부 기록이 있다면 우선 신뢰하되, 중복 방지를 위해 파일명만 붙임
                         let act_p = if let Some(path) = recorded_path {
-                            path.join(&filename)
+                            if path.is_file() { path } else { path.join(&filename) }
                         } else {
-                            provided_path.join(&filename)
+                            root.join("inference").join(&b_str).join(&filename)
                         };
                         
-                        // reference 경로는 구조적 정석 위치 시도 (상위-상위 폴더/reference/b0/l0.st)
-                        let ref_p = act_p.parent()
-                            .and_then(|p| p.parent())
-                            .map(|p| p.join("reference").join(format!("b{}", b_idx_off)).join("l0.st"))
-                            .unwrap_or_else(|| act_p.clone());
+                        // reference는 무조건 세션루트/reference/b0/l0.st
+                        let ref_p = root.join("reference").join(&b_str).join("l0.st");
 
-                        let final_path = if act_p.is_file() { Some(&act_p) } else if ref_p.is_file() { Some(&ref_p) } else { None };
+                        let final_path = if act_p.is_file() { Some(act_p) } else if ref_p.is_file() { Some(ref_p) } else { None };
 
                         if let Some(p) = final_path {
                             let load_res = candle_core::safetensors::load(p, &Device::Cpu);
@@ -426,8 +434,17 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     });
                 }
                 SlotTask::ChunkedLoad(load) => {
-                    let reg = load.registry.clone(); let sids = load.slot_ids; let l_indices = load.layer_indices; let blocks = load.shared_blocks; let session_root = load.path;
+                    let reg = load.registry.clone(); let sids = load.slot_ids; let l_indices = load.layer_indices; let blocks = load.shared_blocks; let provided_path = load.path;
                     tokio::spawn(async move {
+                        // [PATH-REBASING]
+                        let mut root = provided_path.clone();
+                        while root.to_string_lossy().contains("inference") || root.to_string_lossy().contains("reference") || root.to_string_lossy().contains("b") {
+                            if let Some(parent) = root.parent() { 
+                                if parent.as_os_str().is_empty() || parent.to_string_lossy() == "tmp" || parent.to_string_lossy() == "kv" { break; }
+                                root = parent.to_path_buf(); 
+                            } else { break; }
+                        }
+
                         for i in 0..sids.len() {
                             let (sid, l_idx, block) = (sids[i], l_indices[i], &blocks[i]);
                             let (b_idx_off, b_idx, recorded_path) = { 
@@ -438,16 +455,15 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             let filename = format!("l{}.st", l_idx);
                             let b_str = format!("b{}", b_idx_off);
                             
-                            // 장부 기록 우선 사용
                             let act_p = if let Some(path) = recorded_path {
-                                path.join(&filename)
+                                if path.is_file() { path } else { path.join(&filename) }
                             } else {
-                                session_root.join("inference").join(&b_str).join(&filename)
+                                root.join("inference").join(&b_str).join(&filename)
                             };
                             
-                            let ref_p = session_root.join("reference").join(&b_str).join("l0.st");
+                            let ref_p = root.join("reference").join(&b_str).join("l0.st");
                             
-                            let final_path = if act_p.is_file() { Some(&act_p) } else if ref_p.is_file() { Some(&ref_p) } else { None };
+                            let final_path = if act_p.is_file() { Some(act_p) } else if ref_p.is_file() { Some(ref_p) } else { None };
 
                             if let Some(p) = final_path {
                                 let load_res = candle_core::safetensors::load(p, &Device::Cpu);
