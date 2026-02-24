@@ -634,6 +634,9 @@ async fn process_task(
             println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
         }
 
+        // [FIX] 베이킹 직후 모델을 파괴하지 않고 그대로 사용하여 다음 단계(추론)로 매끄럽게 연결합니다.
+        // model.deep_purge_resources().await; 제거됨
+        
         // 2. [Small] Load Snapshot & Bake Task
         {
             model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;

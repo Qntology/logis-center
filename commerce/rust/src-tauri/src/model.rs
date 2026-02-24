@@ -470,8 +470,8 @@ impl LogisModel {
         // 3. Save Base Snapshot
         self.save_kv_snapshot(&base_session, kv_name, 0).await?;
         
-        // 4. Unload immediately to free VRAM for 2B
-        self.unload_generator().await;
+        // [FIX] 베이킹 직후 모델을 파괴하지 않고 그대로 유지하여 컨텍스트 오류를 방지합니다.
+        // self.unload_generator().await; 제거됨
         
         Ok(())
     }

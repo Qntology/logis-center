@@ -81,7 +81,7 @@ impl SlotManager {
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
 
-        println!("[INIT] SlotManager Dispatcher is now online.");
+        println!("[INIT] SlotManager Dispatcher online.");
 
         while let Some(req) = rx.recv().await {
             match req {
@@ -137,7 +137,6 @@ impl SlotManager {
     }
 
     fn calculate_dynamic_budget(_sys: &sysinfo::System, _total_tokens: usize, max_slots: usize) -> usize {
-        // [VRAM-AWARE-BUDGET] 4GB GPU 환경에 맞춰 매우 보수적으로 슬롯 제한
         use nvml_wrapper::Nvml;
         let mut free_vram_gb = 1.0;
         if let Ok(nvml) = Nvml::init() {
@@ -145,10 +144,9 @@ impl SlotManager {
                 if let Ok(mem) = dev.memory_info() { free_vram_gb = mem.free as f64 / 1e9; }
             }
         }
-        // 안전 마진을 더 크게 잡고(800MB), 슬롯당 점유량 반영
         let safe_vram = (free_vram_gb - 0.8).max(0.0);
-        let budget = (safe_vram / 0.25) as usize; // 0.25GB per slot
-        budget.clamp(2, 8).min(max_slots) // 최대 8개 슬롯으로 제한하여 OOM 원천 방어
+        let budget = (safe_vram / 0.25) as usize; 
+        budget.clamp(2, 8).min(max_slots) 
     }
 
     pub async fn wait_for_all_tasks(&self) {
@@ -175,14 +173,11 @@ pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::L
 pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn wait_for_global_io() {
-    println!("[IO-SYNC] Waiting for all SSD operations to complete...");
     SLOT_MANAGER.wait_for_all_tasks().await;
     let mut attempts = 0;
     while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 && attempts < 200 {
-        if attempts % 20 == 0 { println!("[IO-SYNC] Pending writes: {}", GLOBAL_IO_COUNTER.load(Ordering::SeqCst)); }
         tokio::time::sleep(Duration::from_millis(100)).await; attempts += 1;
     }
-    println!("[IO-SYNC] All data persisted.");
 }
 
 struct LayerKVDump { layer_idx: usize, k_tensor: Tensor, v_tensor: Tensor }
@@ -261,19 +256,20 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let act_l = if is_relay && loop_count == 1 { 0 } else { src.layer_idx };
                                 let prefix = format!("{}l{}_", block_prefix, act_l);
                                 
-                                // [FIX] DType 호환성 보장 및 에러 처리 (F32 변환 확인)
-                                let k_res = src.k_tensor.flatten_all().and_then(|t| t.to_vec1::<f32>());
-                                let v_res = src.v_tensor.flatten_all().and_then(|t| t.to_vec1::<f32>());
-                                
-                                let (kd, vd) = match (k_res, v_res) { 
-                                    (Ok(k), Ok(v)) => (k, v),
-                                    _ => {
-                                        println!("[WORKER-ERR] Block {} data conversion failed.", off/256);
-                                        if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 {
-                                            let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true });
-                                        }
-                                        continue;
-                                    }
+                                // [SAFE-CONVERSION] flatten_all() returns Result, then use safe match instead of unwrap
+                                let kd = match src.k_tensor.flatten_all() {
+                                    Ok(t) => match t.to_vec1::<f32>() {
+                                        Ok(v) => v,
+                                        Err(e) => { println!("[WORKER-ERR] K DType mismatch: {:?}", e); slot.remaining_layers.fetch_sub(1, Ordering::SeqCst); continue; }
+                                    },
+                                    Err(_) => { slot.remaining_layers.fetch_sub(1, Ordering::SeqCst); continue; }
+                                };
+                                let vd = match src.v_tensor.flatten_all() {
+                                    Ok(t) => match t.to_vec1::<f32>() {
+                                        Ok(v) => v,
+                                        Err(e) => { println!("[WORKER-ERR] V DType mismatch: {:?}", e); slot.remaining_layers.fetch_sub(1, Ordering::SeqCst); continue; }
+                                    },
+                                    Err(_) => { slot.remaining_layers.fetch_sub(1, Ordering::SeqCst); continue; }
                                 };
 
                                 let ks = src.k_tensor.dims(); let (b, h, s, d) = (ks[0], ks[1], ks[2], ks[3]);
@@ -426,10 +422,10 @@ impl Qwen3VLGenerateModel {
                 let path = crate::utils::paths::get_kv_dir(None).join(s_id); if !path.exists() { let _ = fs::create_dir_all(&path); }
                 let mut dumps = Vec::new();
                 for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                    // [FIX] CPU 복사 시 명시적으로 F32 변환 수행
-                    let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                    let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                    dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k_cpu, v_tensor: v_cpu });
+                    // [FIX] Convert to F32 on CPU immediately
+                    let k_f32 = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                    let v_f32 = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                    dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k_f32, v_tensor: v_f32 });
                 }
                 if let Ok(tx) = get_bake_worker().await {
                     let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
