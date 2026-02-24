@@ -379,19 +379,28 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 }
                 SlotTask::Load(load) => {
                     let sid = load.slot_id; let reg = load.registry.clone(); let l_idx = load.layer_idx; let shared_block = load.shared_block.clone();
-                    let provided_path = load.path.clone(); 
+                    let session_root = load.path.clone(); 
                     tokio::spawn(async move {
-                        let (b_idx_off, b_idx) = { match shared_block.inner.read() { Ok(inner) => (inner.offset, inner.index), _ => (0, 999) } };
+                        let (b_idx_off, b_idx, recorded_path) = { 
+                            match shared_block.inner.read() { 
+                                Ok(inner) => (inner.offset, inner.index, inner.ssd_path.clone()), 
+                                _ => (0, 999, None) 
+                            } 
+                        };
                         
-                        // [PATH-TRUST] provided_path (ssd_path)가 최종 블록 폴더임을 신뢰합니다.
+                        // [PATH-STRICT] 장부에 기록된 경로(recorded_path)가 있으면 거기서 파일명만 붙임
+                        // 없으면 session_root/inference/b0 구조로 시도
                         let filename = format!("l{}.st", l_idx);
-                        let act_p = provided_path.join(&filename);
+                        let b_str = format!("b{}", b_idx_off);
                         
-                        // reference는 구조상 상위-상위 폴더 아래에 존재
-                        let ref_p = provided_path.parent()
-                            .and_then(|p| p.parent())
-                            .map(|p| p.join("reference").join(format!("b{}", b_idx_off)).join("l0.st"))
-                            .unwrap_or_else(|| provided_path.join("l0.st"));
+                        let act_p = if let Some(path) = recorded_path {
+                            path.join(&filename)
+                        } else {
+                            session_root.join("inference").join(&b_str).join(&filename)
+                        };
+                        
+                        // reference는 무조건 세션루트/reference/b0/l0.st
+                        let ref_p = session_root.join("reference").join(&b_str).join("l0.st");
 
                         let final_path = if act_p.is_file() { Some(&act_p) } else if ref_p.is_file() { Some(&ref_p) } else { None };
 
@@ -418,26 +427,26 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     });
                 }
                 SlotTask::ChunkedLoad(load) => {
-                    let reg = load.registry.clone(); let sids = load.slot_ids; let l_indices = load.layer_indices; let blocks = load.shared_blocks; let base_path = load.path;
+                    let reg = load.registry.clone(); let sids = load.slot_ids; let l_indices = load.layer_indices; let blocks = load.shared_blocks; let session_root = load.path;
                     tokio::spawn(async move {
                         for i in 0..sids.len() {
                             let (sid, l_idx, block) = (sids[i], l_indices[i], &blocks[i]);
-                            let (b_idx_off, b_idx) = { let inner = block.inner.read().unwrap(); (inner.offset, inner.index) };
+                            let (b_idx_off, b_idx, recorded_path) = { 
+                                let inner = block.inner.read().unwrap(); 
+                                (inner.offset, inner.index, inner.ssd_path.clone()) 
+                            };
                             
                             let filename = format!("l{}.st", l_idx);
                             let b_str = format!("b{}", b_idx_off);
                             
-                            // [PATH-TRUST] base_path가 이미 블록 폴더면 파일만, 아니면 블록폴더 붙임
-                            let act_p = if base_path.to_string_lossy().ends_with(&b_str) {
-                                base_path.join(&filename)
+                            // 장부 기록 우선 사용
+                            let act_p = if let Some(path) = recorded_path {
+                                path.join(&filename)
                             } else {
-                                base_path.join(&b_str).join(&filename)
+                                session_root.join("inference").join(&b_str).join(&filename)
                             };
                             
-                            let ref_p = act_p.parent()
-                                .and_then(|p| p.parent())
-                                .map(|p| p.join("reference").join(&b_str).join("l0.st"))
-                                .unwrap_or_else(|| act_p.clone());
+                            let ref_p = session_root.join("reference").join(&b_str).join("l0.st");
                             
                             let final_path = if act_p.is_file() { Some(&act_p) } else if ref_p.is_file() { Some(&ref_p) } else { None };
 
