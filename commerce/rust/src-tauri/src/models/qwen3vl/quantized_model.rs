@@ -657,17 +657,15 @@ impl QuantizedQwen3VLTextAttention {
                 (entry.location[self.layer_idx], entry.ssd_path.clone(), entry.slot_ids[self.layer_idx])
             };
 
-            // [WAIT-IF-LOADING] Safer wait with backoff and timeout
+            // [WAIT-IF-LOADING] 데이터가 로드될 때까지 무한 대기 (SSD 속도에 맞춰 자동 조절)
             if loc == KVLocation::Loading {
-                let mut attempts = 0;
-                while attempts < 100 { 
+                loop { 
                     let l = {
                         let reg = self.registry.entries.read().unwrap();
                         reg[index].location[self.layer_idx]
                     };
                     if l != KVLocation::Loading { break; }
                     std::thread::sleep(std::time::Duration::from_millis(1));
-                    attempts += 1;
                 }
             }
 

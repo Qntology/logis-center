@@ -173,11 +173,29 @@ pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::L
 pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn wait_for_global_io() {
+    println!("[IO-WAIT] Starting Comprehensive Sync. Waiting for all slots to be reclaimed...");
+    
+    // 1. 우선 모든 작업 완료 신호 대기
     SLOT_MANAGER.wait_for_all_tasks().await;
-    let mut attempts = 0;
-    while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 && attempts < 200 {
-        tokio::time::sleep(Duration::from_millis(100)).await; attempts += 1;
+    
+    // 2. 실제 슬롯 카운트가 초기값(128)으로 돌아올 때까지 무한 대기
+    // 모든 비동기 IO와 자원 해제가 끝났음을 물리적으로 보장합니다.
+    let total_slots = 128;
+    loop {
+        let current_free = SLOT_MANAGER.count_free.load(Ordering::SeqCst);
+        let pending_io = GLOBAL_IO_COUNTER.load(Ordering::SeqCst);
+        
+        if current_free >= total_slots && pending_io == 0 {
+            break;
+        }
+        
+        println!("[IO-WAIT] Resources active... Free Slots: {}/{}, Pending IO: {}", 
+            current_free, total_slots, pending_io);
+            
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    
+    println!("[IO-WAIT] Sync Complete. All 128 slots are clean.");
 }
 
 struct LayerKVDump { layer_idx: usize, k_tensor: Tensor, v_tensor: Tensor }
