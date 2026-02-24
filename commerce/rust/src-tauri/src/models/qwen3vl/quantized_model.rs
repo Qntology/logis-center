@@ -576,58 +576,37 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // [PREFETCH-TRIGGER] Look-ahead Prefetching (N+1 to N+4 layers)
-        for block in &self.kv_blocks {
-            let (index, offset) = {
-                let inner = block.inner.read().unwrap();
-                (inner.index, inner.offset)
-            };
+        // [PRE-EMPTIVE-FETCH] 레이어 시작 시 다음 2개 레이어를 미리 읽어옵니다. (루프 밖에서 한 번만 실행)
+        let look_ahead = 2;
+        for i in 1..=look_ahead {
+            let target_layer = self.layer_idx + i;
+            if target_layer >= 28 { break; }
             
-            let look_ahead = 2; // 슬롯 폭주 및 데이터 누락 방지를 위해 범위 축소
-            for i in 1..=look_ahead {
-                let target_layer = self.layer_idx + i;
-                if target_layer >= 28 { break; }
-
-                let should_trigger = {
+            // 첫 번째 블록부터 순차적으로 예독 트리거
+            for block in self.kv_blocks.iter().take(4) { 
+                let (index, path_opt) = {
                     let reg = self.registry.entries.read().unwrap();
-                    if index < reg.len() { 
-                        // [2D-CHECK] 이 블록의 '특정 대상 레이어'가 SSD에 있는지 확인
-                        reg[index].location[target_layer] == KVLocation::SSD 
-                    } else { false }
+                    let inner = block.inner.read().unwrap();
+                    if inner.index < reg.len() && reg[inner.index].location[target_layer] == KVLocation::SSD {
+                        (inner.index, reg[inner.index].ssd_path.clone())
+                    } else { (999, None) }
                 };
 
-                if should_trigger {
-                    let path = {
-                        let reg = self.registry.entries.read().unwrap();
-                        reg[index].ssd_path.clone().unwrap_or_default()
-                    };
-                    
-                    if !path.as_os_str().is_empty() {
-                        // [PRE-EMPTIVE] 해당 레이어만 Loading으로 마크
-                        {
-                            let mut reg = self.registry.entries.write().unwrap();
-                            if index < reg.len() { reg[index].location[target_layer] = KVLocation::Loading; }
-                        }
-
-                        let shared_block = block.clone();
-                        let registry_clone = self.registry.clone();
-                        let layer_to_load = target_layer;
-                        
-                        tauri::async_runtime::spawn(async move {
-                            use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
-                            let slot_id = SLOT_MANAGER.acquire_read_slot().await;
-                            if let Ok(tx) = get_load_worker().await {
-                                let _ = tx.send(SlotTask::Load(LoadTask {
-                                    slot_id,
-                                    path,
-                                    layer_idx: layer_to_load,
-                                    kv_name: None,
-                                    shared_block,
-                                    registry: registry_clone,
-                                })).await;
-                            }
-                        });
+                if index != 999 && path_opt.is_some() {
+                    let path = path_opt.unwrap();
+                    {
+                        let mut reg = self.registry.entries.write().unwrap();
+                        reg[index].location[target_layer] = KVLocation::Loading;
                     }
+                    let shared_block = block.clone();
+                    let reg_clone = self.registry.clone();
+                    tauri::async_runtime::spawn(async move {
+                        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
+                        let sid = SLOT_MANAGER.acquire_read_slot().await;
+                        if let Ok(tx) = get_load_worker().await {
+                            let _ = tx.send(SlotTask::Load(LoadTask { slot_id: sid, path, layer_idx: target_layer, kv_name: None, shared_block, registry: reg_clone })).await;
+                        }
+                    });
                 }
             }
         }
@@ -666,7 +645,7 @@ impl QuantizedQwen3VLTextAttention {
                 }
             };
 
-            // [WAIT-IF-LOADING] 데이터가 로드될 때까지 대기 (최대 10초 타임아웃)
+            // [WAIT-IF-LOADING] 데이터가 로드될 때까지 대기
             if loc == KVLocation::Loading {
                 let start_wait = std::time::Instant::now();
                 loop { 
@@ -675,10 +654,7 @@ impl QuantizedQwen3VLTextAttention {
                         reg[index].location[self.layer_idx]
                     };
                     if l != KVLocation::Loading { break; }
-                    if start_wait.elapsed().as_secs() > 10 {
-                        println!("[WARNING] KV Load Timeout at Layer {}, Block {}. Proceeding with fallback.", self.layer_idx, index);
-                        break;
-                    }
+                    if start_wait.elapsed().as_secs() > 10 { break; }
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
@@ -727,9 +703,8 @@ impl QuantizedQwen3VLTextAttention {
                     if k_active.is_none() {
                         let path = ssd_path.clone().unwrap_or_default();
                         let filename = format!("l{}.st", self.layer_idx);
-                        let fallback_name = "l0.st";
-                        let full_path = path.join(&filename);
-                        let fallback_path = path.join(fallback_name);
+                        let full_path = path.join("inference").join(format!("b{}", b_off)).join(&filename);
+                        let fallback_path = path.join("reference").join(format!("b{}", b_off)).join("l0.st");
                         
                         let act_path = if full_path.exists() { full_path } else { fallback_path };
                         
@@ -749,11 +724,11 @@ impl QuantizedQwen3VLTextAttention {
                                     let meta = BitKVMetadata {
                                         k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), (1, expected_h, anchor_count, expected_d), &Device::Cpu)?,
                                         k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?,
-                                        k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (1, expected_h, 256, 1), &Device::Cpu)?,
+                                        k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (1, expected_h, b_len, 1), &Device::Cpu)?,
                                         v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), (1, expected_h, anchor_count, expected_d), &Device::Cpu)?,
                                         v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?,
-                                        v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (1, expected_h, 256, 1), &Device::Cpu)?,
-                                        original_shape: vec![1, expected_h, 256, expected_d],
+                                        v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (1, expected_h, b_len, 1), &Device::Cpu)?,
+                                        original_shape: vec![1, expected_h, b_len, expected_d],
                                     };
                                     
                                     k_active = Some(self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?);

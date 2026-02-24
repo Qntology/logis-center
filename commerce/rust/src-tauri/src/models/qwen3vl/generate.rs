@@ -491,8 +491,13 @@ impl Qwen3VLGenerateModel {
         // [ASYNC-FORWARD] 내부에서 레이어별로 실시간 대피/소각/저장이 일어납니다.
         self.qwen3_vl.forward(&Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(0u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 0, t_toks, session_id.clone()).await?;
         
-        if session_id.is_some() {
-            println!("[BAKING] Layer-by-layer async evacuation complete. Waiting for sync...");
+        if let Some(s_id) = &session_id {
+            // [PHYSICAL-ISOLATION] 메타데이터를 reference 폴더 안에 저장합니다.
+            let p = crate::utils::paths::get_kv_dir(None).join(s_id).join("reference");
+            if !p.exists() { let _ = fs::create_dir_all(&p); }
+            let _ = self.qwen3_vl.save_metadata_to_file(&p);
+
+            println!("[BAKING] Layer-by-layer async evacuation to 'reference' complete.");
             wait_for_global_io().await; 
         }
         Ok(t_toks)
@@ -524,11 +529,12 @@ impl Qwen3VLGenerateModel {
         }
 
         if let Some(s_id) = &session_id {
-            let p = crate::utils::paths::get_kv_dir(None).join(s_id); 
+            // [PHYSICAL-ISOLATION] 메타데이터와 장부도 inference 폴더 안에 격리 저장합니다.
+            let p = crate::utils::paths::get_kv_dir(None).join(s_id).join("inference"); 
             if !p.exists() { let _ = fs::create_dir_all(&p); }
             let _ = self.qwen3_vl.save_metadata_to_file(&p);
             
-            println!("[GENERATE] Finalizing async SSD writes for response...");
+            println!("[GENERATE] Finalizing async SSD writes for inference response...");
             wait_for_global_io().await; 
         }
         Ok(g_text)
