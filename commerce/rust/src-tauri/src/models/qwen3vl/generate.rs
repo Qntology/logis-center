@@ -408,10 +408,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         // reference는 무조건 세션루트/reference/b0/l0.st
                         let ref_p = root.join("reference").join(&b_str).join("l0.st");
 
-                        let final_path = if act_p.is_file() { Some(act_p) } else if ref_p.is_file() { Some(ref_p) } else { None };
+                        let final_path = if act_p.is_file() { Some(act_p.clone()) } else if ref_p.is_file() { Some(ref_p.clone()) } else { None };
 
                         if let Some(p) = final_path {
-                            let load_res = candle_core::safetensors::load(p, &Device::Cpu);
+                            let load_res = candle_core::safetensors::load(&p, &Device::Cpu);
                             if let Ok(st) = load_res {
                                 let is_relay = p.to_string_lossy().contains("l0.st");
                                 let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
@@ -463,10 +463,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             
                             let ref_p = root.join("reference").join(&b_str).join("l0.st");
                             
-                            let final_path = if act_p.is_file() { Some(act_p) } else if ref_p.is_file() { Some(ref_p) } else { None };
+                            let final_path = if act_p.is_file() { Some(act_p.clone()) } else if ref_p.is_file() { Some(ref_p.clone()) } else { None };
 
                             if let Some(p) = final_path {
-                                let load_res = candle_core::safetensors::load(p, &Device::Cpu);
+                                let load_res = candle_core::safetensors::load(&p, &Device::Cpu);
                                 if let Ok(st) = load_res {
                                     let is_relay = p.to_string_lossy().contains("l0.st");
                                     let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
