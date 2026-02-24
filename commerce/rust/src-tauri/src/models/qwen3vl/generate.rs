@@ -379,7 +379,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 }
                 SlotTask::Load(load) => {
                     let sid = load.slot_id; let reg = load.registry.clone(); let l_idx = load.layer_idx; let shared_block = load.shared_block.clone();
-                    let session_root = load.path.clone(); 
+                    let provided_path = load.path.clone(); 
                     tokio::spawn(async move {
                         let (b_idx_off, b_idx, recorded_path) = { 
                             match shared_block.inner.read() { 
@@ -388,24 +388,31 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             } 
                         };
                         
-                        // [PATH-STRICT] 장부에 기록된 경로(recorded_path)가 있으면 거기서 파일명만 붙임
-                        // 없으면 session_root/inference/b0 구조로 시도
+                        // [PATH-REBASING] 어떤 경로가 들어와도 세션 루트(task_...)를 찾아냅니다.
+                        let mut root = provided_path.clone();
+                        while root.to_string_lossy().contains("inference") || root.to_string_lossy().contains("reference") || root.to_string_lossy().contains("b") {
+                            if let Some(parent) = root.parent() { 
+                                if parent.as_os_str().is_empty() || parent.to_string_lossy() == "tmp" || parent.to_string_lossy() == "kv" { break; }
+                                root = parent.to_path_buf(); 
+                            } else { break; }
+                        }
+
                         let filename = format!("l{}.st", l_idx);
                         let b_str = format!("b{}", b_idx_off);
                         
+                        // 장부 기록이 있다면 우선 신뢰, 없으면 재조립된 루트에서 탐색
                         let act_p = if let Some(path) = recorded_path {
-                            path.join(&filename)
+                            if path.is_file() { path } else { path.join(&filename) }
                         } else {
-                            session_root.join("inference").join(&b_str).join(&filename)
+                            root.join("inference").join(&b_str).join(&filename)
                         };
                         
-                        // reference는 무조건 세션루트/reference/b0/l0.st
-                        let ref_p = session_root.join("reference").join(&b_str).join("l0.st");
+                        let ref_p = root.join("reference").join(&b_str).join("l0.st");
 
-                        let final_path = if act_p.is_file() { Some(&act_p) } else if ref_p.is_file() { Some(&ref_p) } else { None };
+                        let final_path = if act_p.is_file() { Some(act_p) } else if ref_p.is_file() { Some(ref_p) } else { None };
 
                         if let Some(p) = final_path {
-                            let load_res = candle_core::safetensors::load(p, &Device::Cpu);
+                            let load_res = candle_core::safetensors::load(&p, &Device::Cpu);
                             if let Ok(st) = load_res {
                                 let is_relay = p.to_string_lossy().contains("l0.st");
                                 let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
@@ -420,7 +427,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { r[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; } }
                             }
                         } else {
-                            println!("[SLOT-ERR] 파일 없음 (b{} l{}). 시도: {:?}", b_idx_off, l_idx, act_p);
+                            println!("[SLOT-ERR] 파일 없음 (b{} l{}). 시도: {:?}", b_idx_off, l_idx, root.join("inference").join(&b_str).join(&filename));
                             if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { r[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; } }
                         }
                         SLOT_MANAGER.release_slot(sid).await;

@@ -1808,20 +1808,23 @@ impl QuantizedQwen3VLTextModel {
             for (l_idx, b_idx, block) in w_blocks_to_load {
                 let block_offset = b_idx * 256;
                 
-                // [PATH-STRICT] base_dir (ssd_path)는 이미 .../inference/b0 폴더임
-                let base_dir = w_chunk_path.clone();
-                let inf_path = base_dir.join(format!("l{}.st", l_idx));
-                
-                // reference는 상위-상위 폴더/reference/b0/l0.st
-                let bak_path = base_dir.parent()
-                    .and_then(|p| p.parent())
-                    .map(|p| p.join("reference").join(format!("b{}", block_offset)).join("l0.st"))
-                    .unwrap_or_else(|| base_dir.join("l0.st"));
+                // [PATH-REBASING] 어떤 경로가 들어와도 세션 루트를 찾아 재조립합니다.
+                let mut root = w_chunk_path.clone();
+                while root.to_string_lossy().contains("inference") || root.to_string_lossy().contains("reference") || root.to_string_lossy().contains("b") {
+                    if let Some(parent) = root.parent() { 
+                        if parent.as_os_str().is_empty() || parent.to_string_lossy() == "tmp" || parent.to_string_lossy() == "kv" { break; }
+                        root = parent.to_path_buf(); 
+                    } else { break; }
+                }
+
+                let b_str = format!("b{}", block_offset);
+                let inf_path = root.join("inference").join(&b_str).join(format!("l{}.st", l_idx));
+                let bak_path = root.join("reference").join(&b_str).join("l0.st");
 
                 let actual_path = if inf_path.is_file() { 
-                    Some(&inf_path) 
+                    Some(inf_path) 
                 } else if bak_path.is_file() {
-                    Some(&bak_path)
+                    Some(bak_path)
                 } else {
                     None
                 };
