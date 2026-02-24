@@ -176,6 +176,9 @@ impl SlotManager {
     pub async fn acquire_write_slot(&self, total_tokens: usize) -> usize { let (tx, rx) = oneshot::channel(); let _ = self.request_tx.send(SlotRequest::AcquireWrite { response: tx, total_tokens }).await; rx.await.unwrap_or(0) }
     pub async fn release_slot(&self, id: usize) {
         if id < self.slots.len() {
+            // [FIX] 이미 Free 상태인 경우 중복 반납 방지
+            if self.slots[id].state.load(Ordering::SeqCst) == 0 { return; }
+
             for l in &self.slots[id].k_layers { if let Ok(mut g) = l.try_lock() { *g = None; } }
             for l in &self.slots[id].v_layers { if let Ok(mut g) = l.try_lock() { *g = None; } }
             self.slots[id].state.store(0, Ordering::SeqCst);

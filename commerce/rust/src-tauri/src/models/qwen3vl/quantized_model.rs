@@ -1751,11 +1751,25 @@ impl QuantizedQwen3VLTextModel {
                 let actual_path = if w_chunk_path.is_dir() {
                     let block_dir = w_chunk_path.join(format!("b{}", block_offset));
                     let target_layer_file = block_dir.join(format!("l{}.st", l_idx));
-                    if target_layer_file.exists() { target_layer_file } else { block_dir.join("l0.st") }
+                    
+                    // [RELAY-BROADCAST-LOGIC] 
+                    // 자신의 레이어 파일이 없으면 0번 레이어 파일(공통 문맥)을 사용합니다.
+                    if target_layer_file.exists() { 
+                        target_layer_file 
+                    } else { 
+                        let fallback = block_dir.join("l0.st");
+                        if fallback.exists() {
+                            if l_idx == 1 { println!("[ENGINE-INFO] Layer {}-27 using L0 context broadcast.", l_idx); }
+                            fallback
+                        } else {
+                            target_layer_file // 둘 다 없으면 원래대로 (에러 처리됨)
+                        }
+                    }
                 } else { w_chunk_path.clone() };
 
                 if let Ok(content) = std::fs::read(&actual_path) {
                     if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                        // 파일명이 l0.st라면 프리픽스도 l0로 맞춰야 합니다.
                         let is_relay_file = actual_path.file_name().map(|n| n == "l0.st").unwrap_or(false);
                         let prefix = if is_relay_file { format!("b{}_l0_", block_offset) } else { format!("b{}_l{}_", block_offset, l_idx) };
                         let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
