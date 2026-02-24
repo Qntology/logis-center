@@ -583,7 +583,7 @@ impl QuantizedQwen3VLTextAttention {
                 (inner.index, inner.offset)
             };
             
-            let look_ahead = 8; // 더 공격적으로 예독 (14개 슬롯 활용)
+            let look_ahead = 2; // 슬롯 폭주 및 데이터 누락 방지를 위해 범위 축소
             for i in 1..=look_ahead {
                 let target_layer = self.layer_idx + i;
                 if target_layer >= 28 { break; }
@@ -854,8 +854,9 @@ impl QuantizedQwen3VLTextAttention {
         }
 
         let attn_output = running_o.unwrap().broadcast_div(&running_s.unwrap())?;
+        let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
         let attn_output = attn_output.transpose(1, 2)?
-            .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
+            .reshape((b_sz, q_len, n_h * d_h))?;
         let attn_output = self.o_proj.forward(&attn_output)?;
 
         // [OFFLOAD-WATCH] Manage VRAM residency
@@ -1432,6 +1433,7 @@ pub struct QuantizedQwen3VLTextModel {
     pub baking_only: bool,
     pub is_forced_cpu: bool,
     pub active_session_id: Option<String>,
+    pub active_kv_name: Option<String>,
     pub pinned_layer_count: usize,
     pub current_kv_len: usize,
 }
@@ -1546,7 +1548,7 @@ impl QuantizedQwen3VLTextModel {
         let norm_dtype = if last_device.is_cpu() { DType::F32 } else { dtype };
         let norm = get_rms_norm(ct, &mut reader, norm_prefix, config.rms_norm_eps, last_device, norm_dtype)?;
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default(), mmap: mmap_handle, registry, baking_only, is_forced_cpu, active_session_id: None, pinned_layer_count, current_kv_len: 0 })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default(), mmap: mmap_handle, registry, baking_only, is_forced_cpu, active_session_id: None, active_kv_name: None, pinned_layer_count, current_kv_len: 0 })
     }
 
     pub fn new<R: std::io::Seek + std::io::Read>(
@@ -1635,7 +1637,7 @@ impl QuantizedQwen3VLTextModel {
         let norm_device = layers.last().map(|l| l.device()).unwrap_or(&current_device);
         let norm = get_rms_norm(ct, reader, norm_prefix, config.rms_norm_eps, norm_device, if norm_device.is_cpu() { DType::F32 } else { dtype })?;
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default(), mmap: None, registry, baking_only, is_forced_cpu, active_session_id: None, pinned_layer_count, current_kv_len: 0 })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default(), mmap: None, registry, baking_only, is_forced_cpu, active_session_id: None, active_kv_name: None, pinned_layer_count, current_kv_len: 0 })
     }
 
     /// [CHUNK-ASYNC-PROCESSOR]
@@ -1669,9 +1671,10 @@ impl QuantizedQwen3VLTextModel {
             let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)?;
             results.push(out);
 
-            // [IMMEDIATE-EVACUATION] 청크 하나 끝날 때마다 즉시 대피
+            // [IMMEDIATE-EVACUATION] 패키징: 청크 하나 끝날 때마다 즉시 대피 (덮어쓰기 방지 포함)
             if let Some(sid) = &sid_opt {
-                self.evacuate_chunk_kv_to_cpu(layer_idx, sid, seqlen_offset + i, take).await?;
+                let session_clone = sid.clone();
+                let _ = self.evacuate_chunk_kv_to_cpu(layer_idx, &session_clone, seqlen_offset + i, take).await;
             }
             
             if target_device.is_cuda() { let _ = target_device.synchronize(); }
@@ -1688,6 +1691,22 @@ impl QuantizedQwen3VLTextModel {
             let mut inner = block.inner.write().unwrap();
             // 해당 오프셋을 포함하는 블록 찾기
             if inner.offset <= chunk_off && inner.offset + inner.len > chunk_off {
+                // [OVERWRITE-PROTECTION] 이미 SSD에 안전하게 구워졌다면 중복 저장하지 않습니다.
+                let is_already_on_ssd = {
+                    let reg = self.registry.entries.read().unwrap();
+                    if inner.index < reg.len() {
+                        reg[inner.index].location[layer_idx] == KVLocation::SSD
+                    } else { false }
+                };
+
+                if is_already_on_ssd {
+                    // SSD에 이미 있으니 VRAM만 비웁니다.
+                    inner.k_cache = None;
+                    inner.v_cache = None;
+                    inner.location = KVLocation::SSD;
+                    continue;
+                }
+
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                     let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
                     let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
@@ -1707,17 +1726,23 @@ impl QuantizedQwen3VLTextModel {
 
         if !dumps_to_send.is_empty() {
             if let Some(tx) = BAKE_TX.get() {
-                let path = crate::utils::paths::get_kv_dir(None).join(session_id);
-                if !path.exists() { let _ = fs::create_dir_all(&path); }
+                // [PHYSICAL-ISOLATION] session_id 아래에 kv_name 폴더를 별도로 생성합니다.
+                let mut base_path = crate::utils::paths::get_kv_dir(None).join(session_id);
+                
+                // 엔진의 현재 모드에 따라 서브 폴더 결정
+                let sub_folder = if self.baking_only { "reference" } else { "inference" };
+                let target_path = base_path.join(sub_folder);
+                
+                if !target_path.exists() { let _ = fs::create_dir_all(&target_path); }
                 let rr = Some(self.registry.clone());
                 let mode = self.baking_only;
 
                 for (dump, off) in dumps_to_send {
-                    let sid = SLOT_MANAGER.acquire_write_slot(len).await; // 이제 안전하게 await 가능
+                    let sid = SLOT_MANAGER.acquire_write_slot(len).await;
                     let _ = tx.send(SlotTask::Bake(BakeTask {
                         slot_id: sid,
-                        task_dir: path.clone(),
-                        kv_name: None,
+                        task_dir: target_path.clone(), // 분리된 폴더로 전달
+                        kv_name: Some(sub_folder.to_string()),
                         offset: off,
                         layers: vec![dump],
                         is_relay_baking: mode,
@@ -1776,17 +1801,23 @@ impl QuantizedQwen3VLTextModel {
         if !w_blocks_to_load.is_empty() && !w_chunk_path.as_os_str().is_empty() {
             for (l_idx, b_idx, block) in w_blocks_to_load {
                 let block_offset = b_idx * 256;
-                let actual_path = if w_chunk_path.is_dir() {
-                    let block_dir = w_chunk_path.join(format!("b{}", block_offset));
-                    let target_layer_file = block_dir.join(format!("l{}.st", l_idx));
-                    
-                    if target_layer_file.exists() { 
-                        target_layer_file 
-                    } else { 
-                        let fallback = block_dir.join("l0.st");
-                        if fallback.exists() { fallback } else { target_layer_file }
-                    }
-                } else { w_chunk_path.clone() };
+                
+                // [TIERED-PATH-RESOLUTION]
+                // 1. inference 폴더에서 해당 레이어 파일을 먼저 찾습니다.
+                // 2. 없으면 reference 폴더에서 l0.st를 공통 문맥으로 사용합니다.
+                let base_dir = w_chunk_path.clone();
+                let inf_path = base_dir.join("inference").join(format!("b{}", block_offset)).join(format!("l{}.st", l_idx));
+                let bak_path = base_dir.join("reference").join(format!("b{}", block_offset)).join("l0.st");
+
+                let actual_path = if inf_path.exists() { 
+                    inf_path 
+                } else if bak_path.exists() {
+                    bak_path
+                } else {
+                    // 하위 호환성 및 레거시 경로 확인
+                    let legacy_path = base_dir.join(format!("b{}", block_offset)).join(format!("l{}.st", l_idx));
+                    if legacy_path.exists() { legacy_path } else { base_dir.join(format!("b{}", block_offset)).join("l0.st") }
+                };
 
                 if let Ok(content) = std::fs::read(&actual_path) {
                     if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {

@@ -659,7 +659,7 @@ async fn process_task(
 
                         if let Some(gen) = model.generator.lock().await.as_mut() {
                             println!("[Scheduler] Small Step A: Asking classification question...");
-                            let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
+                            let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), Some("inference".to_string())).await?;
                             println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
                             
                             // [DEBUG] AI 응답 저장
@@ -737,7 +737,7 @@ async fn process_task(
 
         // 2. [Small] Load & Generate
         {
-            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -878,7 +878,7 @@ async fn process_task(
                             })],
                             ..Default::default()
                         };
-                        worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
+                        worker.prefill_only(params, Some(token_clone), session_clone, None, Some("reference".to_string())).await?;
                     }
                 }
             } else {
@@ -887,7 +887,7 @@ async fn process_task(
 
             // 2. [Small] Load & Generate
             {
-                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -903,7 +903,7 @@ async fn process_task(
                     println!("[Scheduler] Small Step C: Asking extraction question...");
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Small Inference..." }));
                     
-                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
+                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), Some("inference".to_string())).await?;
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
 
                     // [DEBUG] AI 응답 저장
