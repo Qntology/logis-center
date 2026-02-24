@@ -10,10 +10,23 @@ use anyhow::Result;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use std::process::Command;
 use nvml_wrapper::Nvml;
+use tokio::sync::OnceCell;
+
+static CUDA_DEVICE: OnceCell<Device> = OnceCell::const_new();
+
+pub async fn get_cuda_device(id: usize) -> Device {
+    let dev = CUDA_DEVICE.get_or_init(|| async {
+        println!("[CUDA] Initializing Persistent CUDA Device {}...", id);
+        Device::new_cuda(id).unwrap_or(Device::Cpu)
+    }).await;
+    dev.clone()
+}
 
 pub fn get_best_device() -> Device {
     #[cfg(feature = "cuda")]
     {
+        // ... (This function is synchronous, we might need a sync wrapper or just use the logic from LogisModel)
+        // For now, let's keep get_best_device but discourage its use in hot paths
         if let Ok(nvml) = Nvml::init() {
             if let Ok(count) = nvml.device_count() {
                 let mut best_id = 0;

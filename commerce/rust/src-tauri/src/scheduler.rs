@@ -267,15 +267,22 @@ pub async fn start_background_worker(
                             },
                             Err(e) => {
                                 let err_msg = e.to_string();
+                                println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, err_msg);
+                                
+                                // [PERSISTENT-ERROR-LOG] 작업 디렉토리에 에러 사유 기록
+                                let task_dir = utils::paths::get_task_specific_dir(Some(&app_handle), &task.id);
+                                if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
+                                let error_file = task_dir.join("error_reason.txt");
+                                let _ = std::fs::write(&error_file, format!("Timestamp: {}\nError: {}\n", chrono::Utc::now(), err_msg));
         
                                 // [CRITICAL-CLEANUP] 작업 실패 시 즉시 모델을 메모리에서 해제하여 다음 작업 대비
                                 {
-                                    let mut model_lock = model.lock().await;
+                                    let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
                                     if let Some(m) = model_lock.as_ref() {
+                                        println!("[Scheduler] Error detected. Performing emergency memory release...");
                                         m.deep_purge_resources().await;
                                     }
                                     *model_lock = None;
-                                    println!("[Scheduler] Error detected. Emergency memory release performed: {}", err_msg);
                                 }
         
                                 if err_msg.contains("Task cancelled") {
@@ -300,7 +307,7 @@ pub async fn start_background_worker(
                                     if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
                                         println!("[Scheduler] OOM Detected! Activating SSD-Swap Mode for retry.");
                                         {
-                                            let mut model_lock = model.lock().await;
+                                            let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
                                             if let Some(m) = model_lock.as_ref() {
                                                 let _ = m.deep_purge_resources().await;
                                             }

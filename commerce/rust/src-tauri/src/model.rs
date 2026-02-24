@@ -209,6 +209,9 @@ impl LogisModel {
 
     /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced with Diagnostics)
     pub async fn deep_purge_resources(&self) {
+        println!("[DIAG-PURGE] Step 0: Waiting for background IO to finish...");
+        crate::models::qwen3vl::generate::wait_for_global_io().await;
+
         println!("[DIAG-PURGE] Step 1: Clearing ALL Generation Slots...");
         
         {
@@ -250,18 +253,20 @@ impl LogisModel {
         println!("[DIAG-PURGE] Step 3: Synchronizing CUDA Context...");
         if !self.is_cpu_mode {
             let dev = self.device_config.device.clone();
-            let sync_res = tokio::task::spawn_blocking(move || {
+            let sync_res = tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(move || {
                 if dev.is_cuda() { 
                     println!("[DIAG-PURGE] Executing dev.synchronize()...");
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         dev.synchronize()
                     }))
                 } else { Ok(Ok(())) }
-            }).await;
+            })).await;
             
             match sync_res {
-                Ok(Ok(Ok(_))) => println!("[DIAG-PURGE] CUDA Synchronization Successful."),
-                Ok(Ok(Err(e))) => println!("[DIAG-PURGE] CUDA Sync Error: {:?}", e),
+                Ok(Ok(Ok(Ok(_)))) => println!("[DIAG-PURGE] CUDA Synchronization Successful."),
+                Ok(Ok(Ok(Err(e)))) => println!("[DIAG-PURGE] CUDA Sync Error: {:?}", e),
+                Ok(Err(_)) => println!("[DIAG-PURGE] CUDA Sync Task Join Error."),
+                Err(_) => println!("[DIAG-PURGE] CUDA Sync Timeout! Continuing purge."),
                 _ => println!("[DIAG-PURGE] CUDA Sync Panicked or Failed."),
             }
         }
@@ -699,6 +704,9 @@ impl LogisModel {
                 gpu_id: 0,
             };
         } else {
+            // [STABILITY] Use persistent global CUDA device
+            let persistent_dev = utils::get_cuda_device(config.gpu_id).await;
+            config.device = persistent_dev;
             println!("🚀 [MODEL] Running in default mode ({})", config.name);
         }
 

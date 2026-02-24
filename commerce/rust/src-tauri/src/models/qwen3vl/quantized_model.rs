@@ -3,12 +3,10 @@ use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder}; // Removed RmsNorm
 use candle_core::quantized::{gguf_file, QMatMul};
 use rayon::prelude::*;
-use nvml_wrapper::Nvml;
 use std::path::Path;
 use std::fs;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use memmap2::Mmap;
 
 use crate::{
@@ -21,10 +19,10 @@ use crate::{
     },
     utils::tensor_utils::{
         mask_index_add, masked_scatter_dim0,
-        prepare_causal_attention_mask, prod_tensor_last_dim, split_tensor,
+        prod_tensor_last_dim, split_tensor,
     },
 };
-use crate::models::qwen3vl::generate::{GLOBAL_IO_COUNTER, SLOT_MANAGER};
+use crate::models::qwen3vl::generate::SLOT_MANAGER;
 
 // Local RmsNorm implementation exposing weight and device
 #[derive(Clone, Debug)]
@@ -657,15 +655,20 @@ impl QuantizedQwen3VLTextAttention {
                 (entry.location[self.layer_idx], entry.ssd_path.clone(), entry.slot_ids[self.layer_idx])
             };
 
-            // [WAIT-IF-LOADING] 데이터가 로드될 때까지 무한 대기 (SSD 속도에 맞춰 자동 조절)
+            // [WAIT-IF-LOADING] 데이터가 로드될 때까지 대기 (최대 10초 타임아웃)
             if loc == KVLocation::Loading {
+                let start_wait = std::time::Instant::now();
                 loop { 
                     let l = {
                         let reg = self.registry.entries.read().unwrap();
                         reg[index].location[self.layer_idx]
                     };
                     if l != KVLocation::Loading { break; }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    if start_wait.elapsed().as_secs() > 10 {
+                        println!("[WARNING] KV Load Timeout at Layer {}, Block {}. Proceeding with fallback.", self.layer_idx, index);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
 
@@ -1649,53 +1652,61 @@ impl QuantizedQwen3VLTextModel {
         Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default(), mmap: None, registry, baking_only, is_forced_cpu, active_session_id: None, pinned_layer_count, current_kv_len: 0 })
     }
 
-    /// [CHUNK-RECURSIVE-PROCESSOR]
-    /// 레이어 내부의 청크들을 재귀적으로 처리하여 연산의 순차성을 보장합니다.
-    fn process_chunks_recursive(
+    /// [CHUNK-ITERATIVE-PROCESSOR]
+    /// 레이어 내부의 청크들을 루프로 처리하여 연산의 순차성을 보장하고 스택 오버플로우를 방지합니다.
+    fn process_chunks_iterative(
         &mut self,
         layer_idx: usize,
-        chunk_idx: usize,
         chunk_offsets: &[usize],
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
         seqlen_offset: usize,
-        mut results: Vec<Tensor>,
     ) -> Result<Vec<Tensor>> {
-        if chunk_idx >= chunk_offsets.len() {
-            return Ok(results);
-        }
-
-        let i = chunk_offsets[chunk_idx];
+        let mut results = Vec::with_capacity(chunk_offsets.len());
         let chunk_size = 256;
         let current_seq_len = xs.dim(1)?;
-        let take = (current_seq_len - i).min(chunk_size);
+        let target_device = xs.device().clone();
 
-        let xs_chunk = xs.narrow(1, i, take)?;
-        let cos_chunk = cos.narrow(1, i, take)?;
-        let sin_chunk = sin.narrow(1, i, take)?;
+        for (chunk_idx, &i) in chunk_offsets.iter().enumerate() {
+            let take = (current_seq_len - i).min(chunk_size);
+            
+            println!("[DIAG-CHUNK] L{} | Chunk {}/{} (Tokens {}..{}) | Device: {:?}", 
+                layer_idx, chunk_idx + 1, chunk_offsets.len(), i, i + take, target_device);
 
-        let out_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)
-        }));
-
-        match out_res {
-            Ok(Ok(out)) => {
-                results.push(out);
-                self.process_chunks_recursive(
-                    layer_idx,
-                    chunk_idx + 1,
-                    chunk_offsets,
-                    xs,
-                    cos,
-                    sin,
-                    seqlen_offset,
-                    results,
-                )
+            // [HEALTH-CHECK] CUDA 컨텍스트가 여전히 유효한지 확인
+            if target_device.is_cuda() {
+                if let Err(e) = target_device.synchronize() {
+                    println!("[FATAL-CUDA] Context lost before Chunk {}! Error: {:?}", chunk_idx, e);
+                    return Err(anyhow::anyhow!("CUDA Context Lost: {:?}", e));
+                }
             }
-            Ok(Err(e)) => Err(anyhow::anyhow!("Layer {} Chunk {} failed: {}", layer_idx, chunk_idx, e)),
-            Err(p) => Err(anyhow::anyhow!("Layer {} Chunk {} panicked", layer_idx, chunk_idx)),
+
+            let xs_chunk = xs.narrow(1, i, take)?;
+            let cos_chunk = cos.narrow(1, i, take)?;
+            let sin_chunk = sin.narrow(1, i, take)?;
+
+            let out_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)
+            }));
+
+            match out_res {
+                Ok(Ok(out)) => {
+                    results.push(out);
+                    // 연산 직후 동기화하여 에러 지점 특정
+                    if target_device.is_cuda() { let _ = target_device.synchronize(); }
+                }
+                Ok(Err(e)) => {
+                    println!("[DIAG-ERR] L{} Chunk {} Failed: {:?}", layer_idx, chunk_idx, e);
+                    return Err(anyhow::anyhow!("Layer {} Chunk {} failed: {}", layer_idx, chunk_idx, e));
+                }
+                Err(p) => {
+                    println!("[DIAG-PANIC] L{} Chunk {} Panicked!", layer_idx, chunk_idx);
+                    return Err(anyhow::anyhow!("Layer {} Chunk {} panicked", layer_idx, chunk_idx));
+                }
+            }
         }
+        Ok(results)
     }
 
     /// [LAYER-UNIT-OF-WORK]
@@ -1711,6 +1722,7 @@ impl QuantizedQwen3VLTextModel {
         visual_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let start_layer_time = std::time::Instant::now();
+        println!("[ENGINE-TRACE] >> Start Layer {} | Input Tokens: {}", layer_idx, xs.dim(1).unwrap_or(0));
 
         // [STEP 1] Load & Decode (Inline & Strict Path Resolution)
         let mut w_blocks_to_load = Vec::new();
@@ -1777,14 +1789,15 @@ impl QuantizedQwen3VLTextModel {
         }
 
         // [STEP 2] Execute Layer on GPU
-        let target_device = Device::new_cuda(0)?;
-        if !self.layers[layer_idx].device().same_device(&target_device) {
+        let target_device = xs.device().clone();
+        if target_device.is_cuda() && !self.layers[layer_idx].device().same_device(&target_device) {
             self.layers[layer_idx].to_device(&target_device)?;
+            let _ = target_device.synchronize(); 
         }
 
         let current_seq_len = xs.dim(1)?;
         let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(256).collect();
-        let next_xs_all = self.process_chunks_recursive(layer_idx, 0, &chunk_offsets, &xs, cos, sin, seqlen_offset, Vec::new())?;
+        let next_xs_all = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset)?;
         let mut next_xs = Tensor::cat(&next_xs_all, 1)?;
 
         // Vision Integration
@@ -1807,7 +1820,7 @@ impl QuantizedQwen3VLTextModel {
         deepstack_visual_embeds: Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
-        let target_device = if self.layers[0].device().is_cuda() { Device::new_cuda(0)? } else { Device::Cpu };
+        let target_device = self.layers[0].device().clone();
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
 
@@ -1829,6 +1842,8 @@ impl QuantizedQwen3VLTextModel {
             let deepstack_embed = deepstack_visual_embeds.as_ref().and_then(|v| v.get(layer_idx));
             xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks)?;
         }
+
+        if target_device.is_cuda() { let _ = target_device.synchronize(); }
 
         self.current_kv_len = seqlen_offset + seq_len;
         let norm_dev = self.norm.weight().device();
@@ -2029,17 +2044,21 @@ impl QuantizedQwen3VLTextModel {
             }
         } else if free_vram > safe_zone {
             // [UPLOAD] CPU -> GPU (한 번에 4개씩 안전하게 업로드)
-            let target_device = Device::new_cuda(device_id)?;
             let mut upload_count = 0;
-            for layer in self.layers.iter_mut() {
-                if layer.device().is_cpu() {
-                    layer.to_device(&target_device)?;
-                    upload_count += 1;
-                    if upload_count >= 4 { break; } 
+            let target_device = self.layers.iter().find(|l| l.device().is_cuda()).map(|l| l.device().clone());
+            
+            if let Some(target_dev) = target_device {
+                for layer in self.layers.iter_mut() {
+                    if layer.device().is_cpu() {
+                        layer.to_device(&target_dev)?;
+                        upload_count += 1;
+                        if upload_count >= 4 { break; } 
+                    }
                 }
-            }
-            if upload_count > 0 {
-                println!("[REBALANCE] (Offset: {}/{}) Free VRAM ({:.2} GB). Uploaded {} layers to GPU.", offset, total_len, free_vram as f64 / 1e9, upload_count);
+                if upload_count > 0 {
+                    println!("[REBALANCE] (Offset: {}/{}) Free VRAM ({:.2} GB). Uploaded {} layers to GPU.", offset, total_len, free_vram as f64 / 1e9, upload_count);
+                    let _ = target_dev.synchronize(); 
+                }
             }
         }
         Ok(())

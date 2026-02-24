@@ -1,8 +1,7 @@
 use crate::models::qwen3vl::quantized_model::KVLocation;
 use anyhow::{Result, anyhow};
-use candle_core::{quantized::gguf_file, DType, Device, Tensor, IndexOp, Module};
+use candle_core::{quantized::gguf_file, DType, Device, Tensor, Module};
 use candle_nn::VarBuilder;
-use candle_transformers::utils::apply_repeat_penalty;
 
 use crate::{
     chat_template::ChatTemplate,
@@ -189,43 +188,37 @@ pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::L
 pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn wait_for_global_io() {
-    println!("[DIAG-IO] Waiting for total system sync...");
+    println!("[DIAG-IO] Starting Global Sync. Waiting for all 128 slots to be free...");
     let start = std::time::Instant::now();
     
-    // 1. 우선 모든 작업 완료 신호 대기
+    // 1. 모든 비동기 작업 완료 신호 대기
     SLOT_MANAGER.wait_for_all_tasks().await;
     
-    let total_slots = 128;
+    // 2. 물리적 슬롯 상태 전수 조사 (최대 30초 대기)
     loop {
         let current_free = SLOT_MANAGER.count_free.load(Ordering::SeqCst);
-        let current_writes = SLOT_MANAGER.count_writes.load(Ordering::SeqCst);
         let pending_io = GLOBAL_IO_COUNTER.load(Ordering::SeqCst);
         
-        // 정밀 진단: 사용 중인 슬롯들의 상세 정보 출력
-        if current_free < total_slots {
-            let mut active_ids = Vec::new();
-            for i in 0..total_slots {
-                if SLOT_MANAGER.slots[i].state.load(Ordering::SeqCst) != 0 {
-                    active_ids.push(i);
-                }
-            }
-            println!("[DIAG-IO] Active Slots: {:?}, Writes: {}, Pending Disk IO: {}", 
-                active_ids, current_writes, pending_io);
-        }
-        
-        if current_free >= total_slots && pending_io == 0 {
+        if current_free >= 128 && pending_io == 0 {
             break;
         }
         
-        // 10초 이상 지체될 경우 강제 경보
-        if start.elapsed().as_secs() > 10 {
-            println!("[DIAG-IO] WARNING: IO Sync is taking too long (>10s). Potential resource leak!");
+        if start.elapsed().as_secs() > 30 {
+            println!("[DIAG-IO] STUCK DETECTED! Global Sync Timeout. Resetting IO counters for safety.");
+            GLOBAL_IO_COUNTER.store(0, Ordering::SeqCst);
+            break;
         }
-            
+        
+        // 사용 중인 슬롯 번호 출력
+        let mut busy_slots = Vec::new();
+        for i in 0..128 {
+            if SLOT_MANAGER.slots[i].state.load(Ordering::SeqCst) != 0 { busy_slots.push(i); }
+        }
+        
+        println!("[DIAG-IO] Waiting... Busy Slots: {:?}, Pending Disk IO: {}", busy_slots, pending_io);
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    
-    println!("[DIAG-IO] Sync Complete in {:.2}s. All resources released.", start.elapsed().as_secs_f32());
+    println!("[DIAG-IO] Global Sync Finished in {:.2}s.", start.elapsed().as_secs_f32());
 }
 
 struct LayerKVDump { layer_idx: usize, k_tensor: Tensor, v_tensor: Tensor }
@@ -289,6 +282,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
                 let slot = &SLOT_MANAGER.slots[sid];
                 if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 || is_last {
+                    // [CRITICAL] 상태를 즉시 0(Free)으로 리셋하여 진단 루프가 인식하게 함
+                    slot.state.store(0, Ordering::SeqCst);
                     let _ = SLOT_MANAGER.request_tx.send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true }).await;
                 }
             });
@@ -387,6 +382,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 }
                             } else {
                                 println!("[WORKER-ERR] SSD Load failed for {:?}: {:?}", act_p, load_res.err());
+                                // [FIX] 로드 실패 시 SSD 상태로 복구하여 엔진이 무한 대기하지 않게 함
+                                if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { r[b_idx].location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; } }
                             }
                             SLOT_MANAGER.release_slot(sid).await;
                         });
@@ -482,26 +479,48 @@ impl Qwen3VLGenerateModel {
         let f_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?; let t_toks = f_ids.len();
         if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
         self.qwen3_vl.forward(&Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(0u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 0, t_toks, session_id.clone())?;
+        if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+        
         if let Some(s_id) = &session_id {
             let unbaked = self.get_all_unbaked_kv_blocks(); let mut sent = 0;
             for (ks, vs, off) in unbaked {
                 let sid = SLOT_MANAGER.acquire_write_slot(t_toks).await;
                 let path = crate::utils::paths::get_kv_dir(None).join(s_id); if !path.exists() { let _ = fs::create_dir_all(&path); }
-                let mut dumps = Vec::new();
-                for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                    // [FIX] Convert to F32 on CPU immediately
-                    let k_f32 = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                    let v_f32 = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                    dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k_f32, v_tensor: v_f32 });
-                }
+                
+                // [STABILITY] Offload heavy DtoH copy to blocking thread
+                let dumps_res = tokio::task::spawn_blocking(move || -> Result<Vec<LayerKVDump>> {
+                    let mut dumps = Vec::new();
+                    for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
+                        let k_f32 = k.to_device(&Device::Cpu).map_err(|e| anyhow!("K-Copy failed L{}: {}", idx, e))?.to_dtype(DType::F32)?;
+                        let v_f32 = v.to_device(&Device::Cpu).map_err(|e| anyhow!("V-Copy failed L{}: {}", idx, e))?.to_dtype(DType::F32)?;
+                        dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k_f32, v_tensor: v_f32 });
+                    }
+                    Ok(dumps)
+                }).await?;
+
+                let dumps = match dumps_res {
+                    Ok(d) => d,
+                    Err(e) => {
+                        println!("[BAKING-ERR] Copy failed for offset {}: {}", off, e);
+                        SLOT_MANAGER.release_slot(sid).await;
+                        return Err(e);
+                    }
+                };
+
                 if let Ok(tx) = get_bake_worker().await {
                     let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
                     let mode = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.baking_only, ModelVariant::QuantizedText(m) => m.language_model.baking_only, _ => false };
-                    if tx.send(SlotTask::Bake(BakeTask { slot_id: sid, task_dir: path, kv_name: kv_name.clone(), offset: off, layers: dumps, is_relay_baking: mode, block_idx: Some(off / 256), registry: rr })).await.is_ok() { sent += 1; }
+                    if tx.send(SlotTask::Bake(BakeTask { slot_id: sid, task_dir: path, kv_name: kv_name.clone(), offset: off, layers: dumps, is_relay_baking: mode, block_idx: Some(off / 256), registry: rr })).await.is_ok() { 
+                        sent += 1; 
+                    }
                     else { SLOT_MANAGER.release_slot(sid).await; }
                 } else { SLOT_MANAGER.release_slot(sid).await; }
             }
-            if sent > 0 { wait_for_global_io().await; }
+            
+            if sent > 0 { 
+                println!("[BAKING] All {} blocks queued. Starting final SSD sync wait...", sent);
+                wait_for_global_io().await; 
+            }
             self.clear_temporal_kv_caches();
         }
         Ok(t_toks)
@@ -518,6 +537,7 @@ impl Qwen3VLGenerateModel {
         if t_toks > cur_off {
             let p_len = t_toks - cur_off;
             self.qwen3_vl.forward(&Tensor::from_vec(f_ids[cur_off..].to_vec(), (1, p_len), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(cur_off as u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), cur_off, t_toks, session_id.clone())?;
+            if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
             cur_off = t_toks;
         }
         let mut gen_count = 0;
