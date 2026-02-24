@@ -207,15 +207,14 @@ impl LogisModel {
         }
     }
 
-    /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced)
+    /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced with Diagnostics)
     pub async fn deep_purge_resources(&self) {
-        println!("[MEMORY] Initiating AGGRESSIVE Factory Reset Purge...");
+        println!("[DIAG-PURGE] Step 1: Clearing ALL Generation Slots...");
         
-        // 1. Clear ALL Slots (Explicitly take and drop everything)
         {
             let mut gen = self.generator.lock().await;
             if let Some(mut g) = gen.take() {
-                println!("[MEMORY] Purging Active Generator...");
+                println!("[DIAG-PURGE] Dropping Active Generator (0.6B/2B)...");
                 let _ = g.clear_kv_cache();
                 let _ = g.qwen3_vl.drop_kv_storage(); 
                 drop(g); 
@@ -224,7 +223,7 @@ impl LogisModel {
         {
             let mut s_hib = self.small_hibernation.lock().await;
             if let Some(mut g) = s_hib.take() { 
-                println!("[MEMORY] Purging Small Hibernation...");
+                println!("[DIAG-PURGE] Dropping Small Hibernation...");
                 let _ = g.clear_kv_cache();
                 let _ = g.qwen3_vl.drop_kv_storage();
                 drop(g); 
@@ -233,51 +232,50 @@ impl LogisModel {
         {
             let mut l_hib = self.large_hibernation.lock().await;
             if let Some(mut g) = l_hib.take() { 
-                println!("[MEMORY] Purging Large Hibernation...");
+                println!("[DIAG-PURGE] Dropping Large Hibernation...");
                 let _ = g.clear_kv_cache();
                 let _ = g.qwen3_vl.drop_kv_storage();
                 drop(g); 
             }
         }
+        
+        println!("[DIAG-PURGE] Step 2: Clearing Embedding Model...");
         {
             let mut emb = self.embedding_model.lock().await;
             if let Some(e) = emb.take() { 
-                println!("[MEMORY] Purging Embedding Model...");
                 drop(e); 
             }
         }
-        {
-            let mut size = self.current_size.lock().await;
-            *size = None;
-        }
-
-        // 2. CUDA Force Sync & Driver-level GC
+        
+        println!("[DIAG-PURGE] Step 3: Synchronizing CUDA Context...");
         if !self.is_cpu_mode {
             let dev = self.device_config.device.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            let sync_res = tokio::task::spawn_blocking(move || {
                 if dev.is_cuda() { 
-                    println!("[MEMORY] Synchronizing CUDA for purge...");
-                    // [FIX] Ignore potential invalid context errors during sync
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let _ = dev.synchronize(); 
-                    }));
-                }
+                    println!("[DIAG-PURGE] Executing dev.synchronize()...");
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        dev.synchronize()
+                    }))
+                } else { Ok(Ok(())) }
             }).await;
+            
+            match sync_res {
+                Ok(Ok(Ok(_))) => println!("[DIAG-PURGE] CUDA Synchronization Successful."),
+                Ok(Ok(Err(e))) => println!("[DIAG-PURGE] CUDA Sync Error: {:?}", e),
+                _ => println!("[DIAG-PURGE] CUDA Sync Panicked or Failed."),
+            }
         }
 
-        // 3. [CRITICAL] OS Working Set Flush (Windows API)
+        println!("[DIAG-PURGE] Step 4: Flushing OS Memory...");
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::*;
             use windows_sys::Win32::System::Memory::*;
             let current_process = GetCurrentProcess();
-            println!("[MEMORY] Flushing OS Working Set (Aggressive)...");
-            // Force return physical RAM back to OS
             let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-            std::thread::yield_now(); // Give OS time to react
         }
 
-        println!("[MEMORY] Factory Reset Complete. All AI resources released to OS.");
+        println!("[DIAG-PURGE] Aggressive Purge Complete.");
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 

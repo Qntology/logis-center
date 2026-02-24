@@ -87,12 +87,17 @@ impl SlotManager {
             match req {
                 SlotRequest::AcquireWrite { response, total_tokens } => {
                     let max_c = Self::calculate_dynamic_budget(&sys, total_tokens, max_slots);
-                    if cw.load(Ordering::SeqCst) < max_c && !free_p.is_empty() {
+                    let cw_val = cw.load(Ordering::SeqCst);
+                    if cw_val < max_c && !free_p.is_empty() {
                         let idx = free_p.pop_front().unwrap();
                         states[idx] = InternalState::Writing;
                         cf.fetch_sub(1, Ordering::SeqCst); cw.fetch_add(1, Ordering::SeqCst);
                         let _ = response.send(idx);
-                    } else { p_writes.push_back((response, total_tokens)); }
+                        println!("[SLOTS] Assigned Write-Slot {}. Active: (W:{}, R:{})", idx, cw_val + 1, cr.load(Ordering::SeqCst));
+                    } else { 
+                        if free_p.is_empty() { println!("[SLOTS-WARN] No free slots! Queuing write request..."); }
+                        p_writes.push_back((response, total_tokens)); 
+                    }
                 }
                 SlotRequest::AcquireRead { response } => {
                     if !free_p.is_empty() {
@@ -100,15 +105,26 @@ impl SlotManager {
                         states[idx] = InternalState::Reading;
                         cf.fetch_sub(1, Ordering::SeqCst); cr.fetch_add(1, Ordering::SeqCst);
                         let _ = response.send(idx);
+                        println!("[SLOTS] Assigned Read-Slot {}. Active: (W:{}, R:{})", idx, cw.load(Ordering::SeqCst), cr.load(Ordering::SeqCst));
                     } else { p_reads.push_back(response); }
                 }
-                SlotRequest::Release { idx, .. } => {
+                SlotRequest::Release { idx, is_bake, .. } => {
                     if idx < max_slots && states[idx] != InternalState::Free {
                         let old = states[idx]; states[idx] = InternalState::Free; free_p.push_back(idx); cf.fetch_add(1, Ordering::SeqCst);
                         if old == InternalState::Writing { cw.fetch_sub(1, Ordering::SeqCst); } else { cr.fetch_sub(1, Ordering::SeqCst); }
                         
-                        let wc = cw.load(Ordering::SeqCst);
+                        let (rc, wc, fc) = (cr.load(Ordering::SeqCst), cw.load(Ordering::SeqCst), cf.load(Ordering::SeqCst));
+                        println!("[SLOTS] Released Slot {} (Source: {}). Current: (Free:{}, W:{}, R:{})", 
+                            idx, if is_bake { "BakeWorker" } else { "Manual" }, fc, wc, rc);
+                        
+                        // [INTEGRITY-CHECK] 총합이 128인지 검증
+                        if fc + wc + rc != max_slots {
+                            println!("[SLOTS-FATAL] Integrity Corrupted! Total: {} (Expected: {})", fc + wc + rc, max_slots);
+                        }
+
                         if wc == 0 { while let Some(w) = flushers.pop() { let _ = w.send(()); } }
+                    } else {
+                        println!("[SLOTS-ERR] Attempted to release invalid or already free slot: {}", idx);
                     }
                     Self::process_queues_robust(&sys, &mut free_p, &mut p_writes, &mut p_reads, &mut states, &cf, &cw, &cr, max_slots);
                 }
@@ -173,29 +189,43 @@ pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::L
 pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn wait_for_global_io() {
-    println!("[IO-WAIT] Starting Comprehensive Sync. Waiting for all slots to be reclaimed...");
+    println!("[DIAG-IO] Waiting for total system sync...");
+    let start = std::time::Instant::now();
     
     // 1. 우선 모든 작업 완료 신호 대기
     SLOT_MANAGER.wait_for_all_tasks().await;
     
-    // 2. 실제 슬롯 카운트가 초기값(128)으로 돌아올 때까지 무한 대기
-    // 모든 비동기 IO와 자원 해제가 끝났음을 물리적으로 보장합니다.
     let total_slots = 128;
     loop {
         let current_free = SLOT_MANAGER.count_free.load(Ordering::SeqCst);
+        let current_writes = SLOT_MANAGER.count_writes.load(Ordering::SeqCst);
         let pending_io = GLOBAL_IO_COUNTER.load(Ordering::SeqCst);
+        
+        // 정밀 진단: 사용 중인 슬롯들의 상세 정보 출력
+        if current_free < total_slots {
+            let mut active_ids = Vec::new();
+            for i in 0..total_slots {
+                if SLOT_MANAGER.slots[i].state.load(Ordering::SeqCst) != 0 {
+                    active_ids.push(i);
+                }
+            }
+            println!("[DIAG-IO] Active Slots: {:?}, Writes: {}, Pending Disk IO: {}", 
+                active_ids, current_writes, pending_io);
+        }
         
         if current_free >= total_slots && pending_io == 0 {
             break;
         }
         
-        println!("[IO-WAIT] Resources active... Free Slots: {}/{}, Pending IO: {}", 
-            current_free, total_slots, pending_io);
+        // 10초 이상 지체될 경우 강제 경보
+        if start.elapsed().as_secs() > 10 {
+            println!("[DIAG-IO] WARNING: IO Sync is taking too long (>10s). Potential resource leak!");
+        }
             
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
     
-    println!("[IO-WAIT] Sync Complete. All 128 slots are clean.");
+    println!("[DIAG-IO] Sync Complete in {:.2}s. All resources released.", start.elapsed().as_secs_f32());
 }
 
 struct LayerKVDump { layer_idx: usize, k_tensor: Tensor, v_tensor: Tensor }
@@ -230,26 +260,32 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(1000); 
     tokio::spawn(async move {
         while let Some(task) = io_rx.recv().await {
-            let tp = task.path.clone(); let ts = task.tensors; let reg = task.registry.clone(); let b_idx = task.block_idx; let sid = task.slot_id; let is_last = task.is_last;
+            let (tp, ts, reg, b_idx, sid, is_last) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last);
             tokio::spawn(async move {
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 let tmp = tp.with_extension("tmp");
-                if candle_core::safetensors::save(&ts, &tmp).is_ok() {
-                    if fs::rename(&tmp, &tp).is_ok() {
-                        if let (Some(r), Some(idx)) = (reg, b_idx) {
-                            if let Ok(mut entries) = r.entries.write() {
-                                if idx < entries.len() {
-                                    let e = &mut entries[idx]; e.ssd_path = Some(tp.clone());
-                                    if tp.file_name().map(|n| n == "l0.st").unwrap_or(false) {
-                                        for i in 0..28 { e.location[i] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; }
-                                    } else if let Some(l) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")).and_then(|s| s.parse::<usize>().ok()) {
-                                        if l < 28 { e.location[l] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; }
-                                    }
+                
+                // [DIAG-IO] 디스크 쓰기 시도 로그
+                let save_res = candle_core::safetensors::save(&ts, &tmp);
+                if let Err(e) = &save_res { println!("[WORKER-ERR] SSD Save failed for {:?}: {:?}", tp, e); }
+                
+                if save_res.is_ok() && fs::rename(&tmp, &tp).is_ok() {
+                    if let (Some(r), Some(idx)) = (reg, b_idx) {
+                        if let Ok(mut entries) = r.entries.write() {
+                            if idx < entries.len() {
+                                let e = &mut entries[idx]; e.ssd_path = Some(tp.clone());
+                                if tp.file_name().map(|n| n == "l0.st").unwrap_or(false) {
+                                    for i in 0..28 { e.location[i] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; }
+                                } else if let Some(l) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")).and_then(|s| s.parse::<usize>().ok()) {
+                                    if l < 28 { e.location[l] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; }
                                 }
                             }
                         }
                     }
+                } else if save_res.is_ok() {
+                    println!("[WORKER-ERR] SSD Rename failed for {:?}", tp);
                 }
+                
                 GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
                 let slot = &SLOT_MANAGER.slots[sid];
                 if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 || is_last {
@@ -265,8 +301,12 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let io_tx_inner = io_tx.clone();
                     let (sid, t_dir, off, is_relay) = (bake.slot_id, bake.task_dir, bake.offset, bake.is_relay_baking);
                     tokio::task::spawn_blocking(move || {
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            if bake.layers.is_empty() { let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true }); return; }
+                        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if bake.layers.is_empty() { 
+                                println!("[WORKER-WARN] Bake task {} received with 0 layers.", sid);
+                                let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true }); 
+                                return; 
+                            }
                             let loop_count = bake.layers.len(); let slot = &SLOT_MANAGER.slots[sid]; slot.remaining_layers.store(loop_count, Ordering::SeqCst); 
                             let block_dir = t_dir.join(format!("b{}", off)); let block_prefix = format!("b{}_", off);
                             for l_idx in 0..loop_count {
@@ -274,20 +314,19 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let act_l = if is_relay && loop_count == 1 { 0 } else { src.layer_idx };
                                 let prefix = format!("{}l{}_", block_prefix, act_l);
                                 
-                                // [SAFE-CONVERSION] flatten_all() returns Result, then use safe match instead of unwrap
-                                let kd = match src.k_tensor.flatten_all() {
-                                    Ok(t) => match t.to_vec1::<f32>() {
-                                        Ok(v) => v,
-                                        Err(e) => { println!("[WORKER-ERR] K DType mismatch: {:?}", e); slot.remaining_layers.fetch_sub(1, Ordering::SeqCst); continue; }
-                                    },
-                                    Err(_) => { slot.remaining_layers.fetch_sub(1, Ordering::SeqCst); continue; }
-                                };
-                                let vd = match src.v_tensor.flatten_all() {
-                                    Ok(t) => match t.to_vec1::<f32>() {
-                                        Ok(v) => v,
-                                        Err(e) => { println!("[WORKER-ERR] V DType mismatch: {:?}", e); slot.remaining_layers.fetch_sub(1, Ordering::SeqCst); continue; }
-                                    },
-                                    Err(_) => { slot.remaining_layers.fetch_sub(1, Ordering::SeqCst); continue; }
+                                // [DIAG-BAKE] 텐서 변환 및 수집 시도
+                                let kd_res = src.k_tensor.flatten_all().and_then(|t| t.to_vec1::<f32>());
+                                let vd_res = src.v_tensor.flatten_all().and_then(|t| t.to_vec1::<f32>());
+                                
+                                let (kd, vd) = match (kd_res, vd_res) {
+                                    (Ok(k), Ok(v)) => (k, v),
+                                    (ek, ev) => {
+                                        println!("[WORKER-ERR] Bake failed at Block {}, Layer {}. K_err: {:?}, V_err: {:?}", off/256, act_l, ek.err(), ev.err());
+                                        if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 {
+                                            let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true });
+                                        }
+                                        continue;
+                                    }
                                 };
 
                                 let ks = src.k_tensor.dims(); let (b, h, s, d) = (ks[0], ks[1], ks[2], ks[3]);
@@ -325,6 +364,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let _ = io_tx_inner.blocking_send(SaveTask { slot_id: sid, path: block_dir.join(format!("l{}.st", act_l)), tensors: layer_map, is_last: l_idx == loop_count - 1, block_idx: bake.block_idx, registry: bake.registry.clone() });
                             }
                         }));
+                        if let Err(p) = res { 
+                            println!("[WORKER-PANIC] Bake worker crashed for slot {}: {:?}", sid, p);
+                            let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true });
+                        }
                     }).await.ok();
                 }
                 SlotTask::Load(load) => {
@@ -333,7 +376,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let l_idx = load.layer_idx; let reg = load.registry.clone(); let b_off = b_idx_off;
                         tokio::spawn(async move {
                             let act_p = if path.is_dir() { let lp = path.join(format!("l{}.st", l_idx)); if lp.exists() { lp } else { path.join("l0.st") } } else { path.clone() };
-                            if let Ok(st) = candle_core::safetensors::load(&act_p, &Device::Cpu) {
+                            let load_res = candle_core::safetensors::load(&act_p, &Device::Cpu);
+                            if let Ok(st) = load_res {
                                 let prefix = format!("b{}_l{}_", b_off, if act_p.to_string_lossy().contains("l0.st") { 0 } else { l_idx });
                                 if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
                                     let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
@@ -341,6 +385,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(), v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(), original_shape: os };
                                     if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
                                 }
+                            } else {
+                                println!("[WORKER-ERR] SSD Load failed for {:?}: {:?}", act_p, load_res.err());
                             }
                             SLOT_MANAGER.release_slot(sid).await;
                         });
@@ -353,7 +399,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             let (sid, l_idx, block) = (sids[i], l_indices[i], &blocks[i]);
                             let (b_idx_off, b_idx) = { let inner = block.inner.read().unwrap(); (inner.offset, inner.index) };
                             let act_p = if path.is_dir() { let lp = path.join(format!("l{}.st", l_idx)); if lp.exists() { lp } else { path.join("l0.st") } } else { path.clone() };
-                            if let Ok(st) = candle_core::safetensors::load(&act_p, &Device::Cpu) {
+                            let load_res = candle_core::safetensors::load(&act_p, &Device::Cpu);
+                            if let Ok(st) = load_res {
                                 let prefix = format!("b{}_l{}_", b_idx_off, if act_p.to_string_lossy().contains("l0.st") { 0 } else { l_idx });
                                 if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
                                     let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
@@ -361,6 +408,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(), v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(), original_shape: os };
                                     if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
                                 }
+                            } else {
+                                println!("[WORKER-ERR] SSD Chunked Load failed for {:?}: {:?}", act_p, load_res.err());
                             }
                             SLOT_MANAGER.release_slot(sid).await;
                         }
