@@ -260,9 +260,23 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let src = &bake.layers[l_idx];
                                 let act_l = if is_relay && loop_count == 1 { 0 } else { src.layer_idx };
                                 let prefix = format!("{}l{}_", block_prefix, act_l);
+                                
+                                // [FIX] DType 호환성 보장 및 에러 처리 (F32 변환 확인)
+                                let k_res = src.k_tensor.flatten_all().and_then(|t| t.to_vec1::<f32>());
+                                let v_res = src.v_tensor.flatten_all().and_then(|t| t.to_vec1::<f32>());
+                                
+                                let (kd, vd) = match (k_res, v_res) { 
+                                    (Ok(k), Ok(v)) => (k, v),
+                                    _ => {
+                                        println!("[WORKER-ERR] Block {} data conversion failed.", off/256);
+                                        if slot.remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 {
+                                            let _ = SLOT_MANAGER.request_tx.blocking_send(SlotRequest::Release { idx: sid, task_id: None, block_index: None, is_bake: true });
+                                        }
+                                        continue;
+                                    }
+                                };
+
                                 let ks = src.k_tensor.dims(); let (b, h, s, d) = (ks[0], ks[1], ks[2], ks[3]);
-                                let kd = src.k_tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-                                let vd = src.v_tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
                                 let mut layer_map = HashMap::new();
                                 let hs = s * d; let ac = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
                                 let mut ka = vec![0.0f32; b*h*ac*d]; let mut kp = vec![0u8; (b*h*s*d+7)/8]; let mut ksc = vec![0.0f32; b*h*s];
@@ -412,7 +426,10 @@ impl Qwen3VLGenerateModel {
                 let path = crate::utils::paths::get_kv_dir(None).join(s_id); if !path.exists() { let _ = fs::create_dir_all(&path); }
                 let mut dumps = Vec::new();
                 for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                    dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k.to_device(&Device::Cpu)?, v_tensor: v.to_device(&Device::Cpu)? });
+                    // [FIX] CPU 복사 시 명시적으로 F32 변환 수행
+                    let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                    let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                    dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k_cpu, v_tensor: v_cpu });
                 }
                 if let Ok(tx) = get_bake_worker().await {
                     let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
