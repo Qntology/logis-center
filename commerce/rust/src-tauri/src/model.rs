@@ -207,17 +207,15 @@ impl LogisModel {
         }
     }
 
-    /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced with Diagnostics)
+    /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced)
     pub async fn deep_purge_resources(&self) {
-        println!("[DIAG-PURGE] Step 0: Waiting for background IO to finish...");
-        crate::models::qwen3vl::generate::wait_for_global_io().await;
-
-        println!("[DIAG-PURGE] Step 1: Clearing ALL Generation Slots...");
+        println!("[MEMORY] Initiating AGGRESSIVE Factory Reset Purge...");
         
+        // 1. Clear ALL Slots (Explicitly take and drop everything)
         {
             let mut gen = self.generator.lock().await;
             if let Some(mut g) = gen.take() {
-                println!("[DIAG-PURGE] Dropping Active Generator (0.6B/2B)...");
+                println!("[MEMORY] Purging Active Generator...");
                 let _ = g.clear_kv_cache();
                 let _ = g.qwen3_vl.drop_kv_storage(); 
                 drop(g); 
@@ -226,7 +224,7 @@ impl LogisModel {
         {
             let mut s_hib = self.small_hibernation.lock().await;
             if let Some(mut g) = s_hib.take() { 
-                println!("[DIAG-PURGE] Dropping Small Hibernation...");
+                println!("[MEMORY] Purging Small Hibernation...");
                 let _ = g.clear_kv_cache();
                 let _ = g.qwen3_vl.drop_kv_storage();
                 drop(g); 
@@ -235,52 +233,48 @@ impl LogisModel {
         {
             let mut l_hib = self.large_hibernation.lock().await;
             if let Some(mut g) = l_hib.take() { 
-                println!("[DIAG-PURGE] Dropping Large Hibernation...");
+                println!("[MEMORY] Purging Large Hibernation...");
                 let _ = g.clear_kv_cache();
                 let _ = g.qwen3_vl.drop_kv_storage();
                 drop(g); 
             }
         }
-        
-        println!("[DIAG-PURGE] Step 2: Clearing Embedding Model...");
         {
             let mut emb = self.embedding_model.lock().await;
             if let Some(e) = emb.take() { 
+                println!("[MEMORY] Purging Embedding Model...");
                 drop(e); 
             }
         }
-        
-        println!("[DIAG-PURGE] Step 3: Synchronizing CUDA Context...");
-        if !self.is_cpu_mode {
-            let dev = self.device_config.device.clone();
-            let sync_res = tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(move || {
-                if dev.is_cuda() { 
-                    println!("[DIAG-PURGE] Executing dev.synchronize()...");
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        dev.synchronize()
-                    }))
-                } else { Ok(Ok(())) }
-            })).await;
-            
-            match sync_res {
-                Ok(Ok(Ok(Ok(_)))) => println!("[DIAG-PURGE] CUDA Synchronization Successful."),
-                Ok(Ok(Ok(Err(e)))) => println!("[DIAG-PURGE] CUDA Sync Error: {:?}", e),
-                Ok(Err(_)) => println!("[DIAG-PURGE] CUDA Sync Task Join Error."),
-                Err(_) => println!("[DIAG-PURGE] CUDA Sync Timeout! Continuing purge."),
-                _ => println!("[DIAG-PURGE] CUDA Sync Panicked or Failed."),
-            }
+        {
+            let mut size = self.current_size.lock().await;
+            *size = None;
         }
 
-        println!("[DIAG-PURGE] Step 4: Flushing OS Memory...");
+        // 2. CUDA Force Sync & Driver-level GC
+        if !self.is_cpu_mode {
+            let dev = self.device_config.device.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if dev.is_cuda() { 
+                    println!("[MEMORY] Synchronizing CUDA for purge...");
+                    let _ = dev.synchronize(); 
+                }
+            }).await;
+        }
+
+        // 3. [CRITICAL] OS Working Set Flush (Windows API)
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::*;
             use windows_sys::Win32::System::Memory::*;
             let current_process = GetCurrentProcess();
+            println!("[MEMORY] Flushing OS Working Set (Aggressive)...");
+            // Force return physical RAM back to OS
             let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+            std::thread::yield_now(); // Give OS time to react
         }
 
-        println!("[DIAG-PURGE] Aggressive Purge Complete.");
+        println!("[MEMORY] Factory Reset Complete. All AI resources released to OS.");
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
@@ -404,19 +398,13 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let kv_dir = crate::utils::paths::get_kv_dir(None).join(&task_id_str);
-                let kv_file = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
-                
-                if kv_dir.exists() && kv_dir.is_dir() {
-                    println!("[SSD-BRIDGE] Loading Directory-based KV snapshot from {:?}", kv_dir);
-                    gen.load_kv_from_disk(&kv_dir, kv_name.as_deref())?;
-                    Ok(())
-                } else if kv_file.exists() {
-                    println!("[SSD-BRIDGE] Loading File-based KV snapshot from {:?}", kv_file);
-                    gen.load_kv_from_disk(&kv_file, kv_name.as_deref())?;
+                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
+                if path.exists() {
+                    println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
+                    gen.load_kv_from_disk(&path, kv_name.as_deref())?;
                     Ok(())
                 } else {
-                    println!("[SSD-BRIDGE] No snapshot found for {} (Checked dir and file)", task_id_str);
+                    println!("[SSD-BRIDGE] No snapshot found for {}", task_id_str);
                     Ok(())
                 }
             } else {
@@ -473,8 +461,8 @@ impl LogisModel {
         // 3. Save Base Snapshot
         self.save_kv_snapshot(&base_session, kv_name, 0).await?;
         
-        // [FIX] 베이킹 직후 모델을 파괴하지 않고 그대로 유지하여 컨텍스트 오류를 방지합니다.
-        // self.unload_generator().await; 제거됨
+        // 4. Unload immediately to free VRAM for 2B
+        self.unload_generator().await;
         
         Ok(())
     }
@@ -704,9 +692,6 @@ impl LogisModel {
                 gpu_id: 0,
             };
         } else {
-            // [STABILITY] Use persistent global CUDA device (Synchronous Singleton)
-            let persistent_dev = utils::get_cuda_device(config.gpu_id);
-            config.device = persistent_dev;
             println!("🚀 [MODEL] Running in default mode ({})", config.name);
         }
 
@@ -756,7 +741,7 @@ impl LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
-        // [VISION-FIX] 이미지 추출은 반드시 2B (Large) 모델을 사용해야 합니다.
+        // [FIX] Do NOT force reload. Use current generator (Large should be already loaded via relay)
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
@@ -769,13 +754,13 @@ impl LogisModel {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
             let prompt = get_image_extraction_prompt("kr", &language, "tracking", "");
             
-            // 이미지 분석은 Large 모델로 진행
+            // [IMPORTANT] Pass task_id as session_id to continue from the baked relay snapshot
             let result_str = self.chat_with_image_spinner(
                 prompt, 
                 Some(dynamic_image), 
                 app_handle, 
                 "extraction-progress", 
-                json!({ "category": "Vision Analysis", "summary": "Analyzing image with 2B model..." }), 
+                json!({ "category": "Vision Analysis", "summary": "Analyzing image with baked context..." }), 
                 1024, 
                 cancel_token.clone(), 
                 Some(task_id.clone()),
@@ -845,12 +830,12 @@ impl LogisModel {
     }
 
     pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        // [FIX] Default to Small (0.6B) for all chat tasks to align with 0.6B-focused architecture.
+        // [FIX] Use current generator if available, else default to Large
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
                 drop(gen_guard);
-                self.ensure_generator(ModelSize::Small).await?;
+                self.ensure_generator(ModelSize::Large).await?;
             }
         }
         
@@ -946,12 +931,12 @@ impl LogisModel {
         session_id: Option<String>,
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
-        // [FIX] Ensure we stay on Small (0.6B).
+        // [FIX] Do not force reload Large. Use current if available, else default to Large.
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
                 drop(gen_guard);
-                self.ensure_generator(ModelSize::Small).await?;
+                self.ensure_generator(ModelSize::Large).await?;
             }
         }
 
@@ -1036,9 +1021,7 @@ impl LogisModel {
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.6B (Small)
-        let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
-        self.ensure_generator(target_size).await?;
+        self.ensure_generator(ModelSize::Large).await?;
         
         let mut gen_guard = self.generator.lock().await;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
@@ -1090,9 +1073,8 @@ impl LogisModel {
         session_id: Option<String>,
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
-        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.6B (Small)
-        let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
-        self.ensure_generator(target_size).await?;
+        // Ensure generator is loaded
+        self.ensure_generator(ModelSize::Large).await?;
 
         // [FIX] Inject task_id from session_id if it's a task reference
         if let Some(ref sid) = session_id {
@@ -1103,10 +1085,8 @@ impl LogisModel {
             }
         }
 
-        // [LOG] Save to task history if task_id exists
-        if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
-            crate::scheduler::log_task_progress(_app_handle, task_id, &base_payload);
-        }
+        // [FIX] Removed redundant emit. Only log the progress.
+        // let _ = app_handle.emit(event_name, base_payload);
 
         let max_tok = self.max_tokens_limit;
         
