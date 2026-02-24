@@ -1808,19 +1808,22 @@ impl QuantizedQwen3VLTextModel {
             for (l_idx, b_idx, block) in w_blocks_to_load {
                 let block_offset = b_idx * 256;
                 
-                // [PATH-ADAPTATION] 실제 저장된 b0/b0/l0.st 구조에 맞춤
+                // [PATH-STRICT] base_dir (ssd_path)는 이미 .../inference/b0 폴더임
                 let base_dir = w_chunk_path.clone();
-                let inf_path = base_dir.join(format!("b{}", block_offset)).join(format!("l{}.st", l_idx));
-                let bak_path = base_dir.parent().unwrap_or(&base_dir).parent().unwrap_or(&base_dir).join("reference").join(format!("b{}", block_offset)).join(format!("b{}", block_offset)).join("l0.st");
+                let inf_path = base_dir.join(format!("l{}.st", l_idx));
+                
+                // reference는 상위-상위 폴더/reference/b0/l0.st
+                let bak_path = base_dir.parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("reference").join(format!("b{}", block_offset)).join("l0.st"))
+                    .unwrap_or_else(|| base_dir.join("l0.st"));
 
                 let actual_path = if inf_path.is_file() { 
-                    Some(inf_path) 
+                    Some(&inf_path) 
                 } else if bak_path.is_file() {
-                    Some(bak_path)
+                    Some(&bak_path)
                 } else {
-                    // 하위 호환성 (한 뎁스 더 깊게 확인)
-                    let legacy_p1 = base_dir.join(format!("b{}", block_offset)).join("l0.st");
-                    if legacy_p1.is_file() { Some(legacy_p1) } else { None }
+                    None
                 };
 
                 if let Some(act_p) = actual_path {
