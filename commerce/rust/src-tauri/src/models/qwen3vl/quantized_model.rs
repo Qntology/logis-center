@@ -2046,20 +2046,18 @@ impl QuantizedQwen3VLTextModel {
         } else if free_vram > safe_zone {
             // [UPLOAD] CPU -> GPU (한 번에 4개씩 안전하게 업로드)
             let mut upload_count = 0;
-            let target_device = self.layers.iter().find(|l| l.device().is_cuda()).map(|l| l.device().clone());
+            let target_dev = crate::utils::get_cuda_device(device_id);
             
-            if let Some(target_dev) = target_device {
-                for layer in self.layers.iter_mut() {
-                    if layer.device().is_cpu() {
-                        layer.to_device(&target_dev)?;
-                        upload_count += 1;
-                        if upload_count >= 4 { break; } 
-                    }
+            for layer in self.layers.iter_mut() {
+                if layer.device().is_cpu() {
+                    layer.to_device(&target_dev)?;
+                    upload_count += 1;
+                    if upload_count >= 4 { break; } 
                 }
-                if upload_count > 0 {
-                    println!("[REBALANCE] (Offset: {}/{}) Free VRAM ({:.2} GB). Uploaded {} layers to GPU.", offset, total_len, free_vram as f64 / 1e9, upload_count);
-                    let _ = target_dev.synchronize(); 
-                }
+            }
+            if upload_count > 0 {
+                println!("[REBALANCE] (Offset: {}/{}) Free VRAM ({:.2} GB). Uploaded {} layers to GPU.", offset, total_len, free_vram as f64 / 1e9, upload_count);
+                let _ = target_dev.synchronize(); 
             }
         }
         Ok(())

@@ -131,7 +131,7 @@ pub fn get_optimal_device_config() -> DeviceConfig {
                 if max_free > 0 {
                     println!("🚀 [DEVICE-CONFIG] Selected GPU-{} with {:.2} GB Free.", best_id, max_free as f64 / 1e9);
                     return DeviceConfig {
-                        device: Device::new_cuda(best_id as usize).unwrap_or(Device::Cpu),
+                        device: get_cuda_device(best_id as usize),
                         is_cpu: false,
                         classify_chunk_size: 12_000, 
                         extract_chunk_size: 12_000,
