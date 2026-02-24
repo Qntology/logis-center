@@ -633,6 +633,8 @@ impl QuantizedQwen3VLTextAttention {
         }
 
         // 4. [LIGHTWEIGHT-HYBRID-ENGINE]
+        let q_len = query_states.dim(1)?;
+        let total_len = seqlen_offset + q_len;
         let mut running_m = None; 
         let mut running_s = None; 
         let mut running_o = None; 
@@ -643,16 +645,25 @@ impl QuantizedQwen3VLTextAttention {
         let mut vram_total_len = 0;
 
         for block in &self.kv_blocks {
-            let (mut k, mut v, b_len, index) = {
+            let (mut k, mut v, b_len, index, b_off) = {
                 let inner = block.inner.read().unwrap();
-                (inner.k_cache.clone(), inner.v_cache.clone(), inner.len, inner.index)
+                (inner.k_cache.clone(), inner.v_cache.clone(), inner.len, inner.index, inner.offset)
             };
+
+            // [STRICT-OFFSET-LIMIT] 현재 유효한 토큰 범위를 넘어서는 빈 블록은 무시합니다.
+            if b_off >= total_len {
+                global_start_idx += b_len;
+                continue;
+            }
 
             // [REGISTRY-LOOKUP] 2D 목차에서 이 레이어의 위치를 정확히 찾음
             let (loc, ssd_path, layer_slot_id) = {
                 let reg = self.registry.entries.read().unwrap();
-                let entry = &reg[index];
-                (entry.location[self.layer_idx], entry.ssd_path.clone(), entry.slot_ids[self.layer_idx])
+                if index >= reg.len() { (KVLocation::VRAM, None, None) }
+                else {
+                    let entry = &reg[index];
+                    (entry.location[self.layer_idx], entry.ssd_path.clone(), entry.slot_ids[self.layer_idx])
+                }
             };
 
             // [WAIT-IF-LOADING] 데이터가 로드될 때까지 대기 (최대 10초 타임아웃)
@@ -1627,9 +1638,9 @@ impl QuantizedQwen3VLTextModel {
         Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default(), mmap: None, registry, baking_only, is_forced_cpu, active_session_id: None, pinned_layer_count, current_kv_len: 0 })
     }
 
-    /// [CHUNK-ITERATIVE-PROCESSOR]
-    /// 레이어 내부의 청크들을 루프로 처리하여 연산의 순차성을 보장하고 스택 오버플로우를 방지합니다.
-    fn process_chunks_iterative(
+    /// [CHUNK-ASYNC-PROCESSOR]
+    /// 청크 단위로 연산 -> CPU 대피 -> VRAM 소각을 실시간으로 반복합니다.
+    async fn process_chunks_iterative(
         &mut self,
         layer_idx: usize,
         chunk_offsets: &[usize],
@@ -1643,6 +1654,7 @@ impl QuantizedQwen3VLTextModel {
         let current_seq_len = xs.dim(1)?;
         // [STABILITY] 텐서 장치가 아닌, 레이어에 고정된 싱글톤 장치 참조 사용
         let target_device = self.layers[layer_idx].device().clone();
+        let sid_opt = self.active_session_id.clone();
 
         for (chunk_idx, &i) in chunk_offsets.iter().enumerate() {
             let take = (current_seq_len - i).min(chunk_size);
@@ -1650,44 +1662,77 @@ impl QuantizedQwen3VLTextModel {
             println!("[DIAG-CHUNK] L{} | Chunk {}/{} (Tokens {}..{}) | Device: {:?}", 
                 layer_idx, chunk_idx + 1, chunk_offsets.len(), i, i + take, target_device);
 
-            // [HEALTH-CHECK] CUDA 컨텍스트가 여전히 유효한지 확인
-            if target_device.is_cuda() {
-                if let Err(e) = target_device.synchronize() {
-                    println!("[FATAL-CUDA] Context lost before Chunk {}! Error: {:?}", chunk_idx, e);
-                    return Err(anyhow::anyhow!("CUDA Context Lost: {:?}", e));
-                }
-            }
-
             let xs_chunk = xs.narrow(1, i, take)?;
             let cos_chunk = cos.narrow(1, i, take)?;
             let sin_chunk = sin.narrow(1, i, take)?;
 
-            let out_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)
-            }));
+            let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)?;
+            results.push(out);
 
-            match out_res {
-                Ok(Ok(out)) => {
-                    results.push(out);
-                    // 연산 직후 동기화하여 에러 지점 특정
-                    if target_device.is_cuda() { let _ = target_device.synchronize(); }
-                }
-                Ok(Err(e)) => {
-                    println!("[DIAG-ERR] L{} Chunk {} Failed: {:?}", layer_idx, chunk_idx, e);
-                    return Err(anyhow::anyhow!("Layer {} Chunk {} failed: {}", layer_idx, chunk_idx, e));
-                }
-                Err(p) => {
-                    println!("[DIAG-PANIC] L{} Chunk {} Panicked!", layer_idx, chunk_idx);
-                    return Err(anyhow::anyhow!("Layer {} Chunk {} panicked", layer_idx, chunk_idx));
-                }
+            // [IMMEDIATE-EVACUATION] 청크 하나 끝날 때마다 즉시 대피
+            if let Some(sid) = &sid_opt {
+                self.evacuate_chunk_kv_to_cpu(layer_idx, sid, seqlen_offset + i, take).await?;
             }
+            
+            if target_device.is_cuda() { let _ = target_device.synchronize(); }
         }
         Ok(results)
     }
 
+    /// [CHUNK-LEVEL-STRICT] 방금 연산된 특정 청크의 KV 데이터만 CPU로 던지고 VRAM에서 지웁니다.
+    async fn evacuate_chunk_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, chunk_off: usize, len: usize) -> Result<()> {
+        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
+        let mut dumps_to_send = Vec::new();
+        
+        for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
+            let mut inner = block.inner.write().unwrap();
+            // 해당 오프셋을 포함하는 블록 찾기
+            if inner.offset <= chunk_off && inner.offset + inner.len > chunk_off {
+                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                    let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                    let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                    
+                    dumps_to_send.push((LayerKVDump { 
+                        layer_idx, 
+                        k_tensor: k_cpu, 
+                        v_tensor: v_cpu 
+                    }, inner.offset));
+                    
+                    inner.k_cache = None;
+                    inner.v_cache = None;
+                    inner.location = KVLocation::RAM; 
+                }
+            }
+        }
+
+        if !dumps_to_send.is_empty() {
+            if let Some(tx) = BAKE_TX.get() {
+                let path = crate::utils::paths::get_kv_dir(None).join(session_id);
+                if !path.exists() { let _ = fs::create_dir_all(&path); }
+                let rr = Some(self.registry.clone());
+                let mode = self.baking_only;
+
+                for (dump, off) in dumps_to_send {
+                    let sid = SLOT_MANAGER.acquire_write_slot(len).await; // 이제 안전하게 await 가능
+                    let _ = tx.send(SlotTask::Bake(BakeTask {
+                        slot_id: sid,
+                        task_dir: path.clone(),
+                        kv_name: None,
+                        offset: off,
+                        layers: vec![dump],
+                        is_relay_baking: mode,
+                        block_idx: Some(off / 256),
+                        registry: rr.clone(),
+                    })).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// [LAYER-UNIT-OF-WORK]
     /// 한 레이어의 모든 작업(파일 읽기, 디코딩, GPU 연산, 메모리 해제)을 완결하고 결과 xs를 반환합니다.
-    fn process_single_layer(
+    async fn process_single_layer(
         &mut self,
         layer_idx: usize,
         xs: Tensor,
@@ -1778,25 +1823,29 @@ impl QuantizedQwen3VLTextModel {
         // [STEP 3] GPU 연산 실행
         let current_seq_len = xs.dim(1)?;
         let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(256).collect();
-        let next_xs_all = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset)?;
+        let next_xs_all = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset).await?;
         let mut next_xs = Tensor::cat(&next_xs_all, 1)?;
 
         if let (Some(embed), Some(mask)) = (deepstack_embed, visual_mask) {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [STEP 4] 실시간 VRAM 해제 및 CPU 대피
+        // [STEP 4] 실시간 VRAM 해제 및 자원 반납 (정석)
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
         
-        // 1. KV 캐시 즉시 대피 및 VRAM 소각
-        if let Some(sid) = &self.active_session_id {
-            self.evacuate_layer_kv_to_cpu(layer_idx, sid, seqlen_offset, input_token_count)?;
+        // 1. KV 캐시 즉시 대피 및 VRAM 삭제
+        let sid_opt = self.active_session_id.clone();
+        if let Some(sid) = sid_opt {
+            let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count);
         }
 
-        // 2. 레이어 무게추 즉시 CPU 반납
-        self.layers[layer_idx].to_device(&Device::Cpu)?;
+        // 2. 레이어 무게추 즉시 CPU로 반납 및 동기화 (VRAM 즉시 해방 강제)
+        if target_device.is_cuda() {
+            self.layers[layer_idx].to_device(&Device::Cpu)?;
+            let _ = target_device.synchronize(); // 드라이버에게 메모리 회수 기회 부여
+        }
         
-        println!("[ENGINE-TRACE] << End Layer {} | VRAM Freed. | Time: {:.2}s", layer_idx, start_layer_time.elapsed().as_secs_f32());
+        println!("[ENGINE-TRACE] << End Layer {} | VRAM Evicted & Synchronized. | Time: {:.2}s", layer_idx, start_layer_time.elapsed().as_secs_f32());
         Ok(next_xs)
     }
 
@@ -1856,9 +1905,8 @@ impl QuantizedQwen3VLTextModel {
         }
         Ok(())
     }
-    }
 
-    pub fn forward(
+    pub async fn forward(
         &mut self,
         inputs_embeds: &Tensor,
         seqlen_offset: usize,
@@ -1888,7 +1936,7 @@ impl QuantizedQwen3VLTextModel {
                 println!("[ENGINE] Running Layer {}/{}", layer_idx + 1, total_layers);
             }
             let deepstack_embed = deepstack_visual_embeds.as_ref().and_then(|v| v.get(layer_idx));
-            xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks)?;
+            xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks).await?;
         }
 
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
@@ -2316,7 +2364,7 @@ impl QuantizedQwen3VLModel {
         Ok((position_ids, deltas))
     }
 
-    pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
+    pub async fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
         // [OPTION A] 실시간 VRAM 재배치 활성화 (현재 위치 정보 포함)
         let _ = self.rebalance_layers(0, seqlen_offset, total_len);
 
@@ -2351,7 +2399,7 @@ impl QuantizedQwen3VLModel {
         };
         
         self.language_model.active_session_id = session_id;
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None).await?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         
         let head_dev = self.lm_head.device();
@@ -2413,7 +2461,7 @@ impl QuantizedQwen3TextModel {
         Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: None })
     }
 
-    pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
+    pub async fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
         // [OPTION A] 실시간 VRAM 재배치 활성화 (현재 위치 정보 포함)
         let _ = self.rebalance_layers(0, seqlen_offset, total_len);
 
@@ -2435,7 +2483,7 @@ impl QuantizedQwen3TextModel {
         };
         
         self.language_model.active_session_id = session_id;
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None).await?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         if let Some(head) = &self.lm_head {
             let hidden_state = if !hidden_state.device().same_device(head.device()) { hidden_state.to_device(head.device())? } else { hidden_state };

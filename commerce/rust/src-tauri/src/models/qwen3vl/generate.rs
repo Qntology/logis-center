@@ -224,8 +224,8 @@ pub async fn wait_for_global_io() {
     println!("[DIAG-IO] Global Sync Finished in {:.2}s.", start.elapsed().as_secs_f32());
 }
 
-struct LayerKVDump { layer_idx: usize, k_tensor: Tensor, v_tensor: Tensor }
-struct BakeTask { slot_id: usize, task_dir: PathBuf, kv_name: Option<String>, offset: usize, layers: Vec<LayerKVDump>, is_relay_baking: bool, block_idx: Option<usize>, registry: Option<crate::models::qwen3vl::quantized_model::KVRegistry> }
+pub struct LayerKVDump { pub layer_idx: usize, pub k_tensor: Tensor, pub v_tensor: Tensor }
+pub struct BakeTask { pub slot_id: usize, pub task_dir: PathBuf, pub kv_name: Option<String>, pub offset: usize, pub layers: Vec<LayerKVDump>, pub is_relay_baking: bool, pub block_idx: Option<usize>, pub registry: Option<crate::models::qwen3vl::quantized_model::KVRegistry> }
 struct SaveTask { slot_id: usize, path: PathBuf, tensors: std::collections::HashMap<String, Tensor>, is_last: bool, block_idx: Option<usize>, registry: Option<crate::models::qwen3vl::quantized_model::KVRegistry> }
 pub enum SlotTask { Bake(BakeTask), Load(LoadTask), ChunkedLoad(ChunkedLoadTask) }
 pub struct LoadTask { pub slot_id: usize, pub path: PathBuf, pub layer_idx: usize, pub kv_name: Option<String>, pub shared_block: crate::models::qwen3vl::quantized_model::KVBlock, pub registry: crate::models::qwen3vl::quantized_model::KVRegistry }
@@ -427,11 +427,14 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 pub enum ModelVariant { Standard(crate::models::qwen3vl::model::Qwen3VLModel), QuantizedVL(QuantizedQwen3VLModel), QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel) }
 
 impl ModelVariant {
-    pub fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
+    pub async fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
         match self {
-            Self::Standard(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),
-            Self::QuantizedVL(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset, total_len, session_id),
-            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset, total_len, session_id),
+            Self::Standard(m) => {
+                // 동기 함수를 비동기 인터페이스에 맞게 래핑
+                m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset)
+            },
+            Self::QuantizedVL(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset, total_len, session_id).await,
+            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset, total_len, session_id).await,
         }
     }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.rebalance_layers(device_id, offset, total_len), Self::QuantizedText(m) => m.rebalance_layers(device_id, offset, total_len) } }
@@ -479,56 +482,23 @@ impl Qwen3VLGenerateModel {
         Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_p, &v_dev, dtype)?, qwen3_vl, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: if baking_only { "Small".into() } else { "2B".into() }, hard_token_limit, kv_root })
     }
 
-    pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, mut _relay_target: Option<&mut Qwen3VLGenerateModel>, kv_name: Option<String>) -> Result<usize> {
+    pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, mut _relay_target: Option<&mut Qwen3VLGenerateModel>, _kv_name: Option<String>) -> Result<usize> {
         if session_id.is_none() { SLOT_MANAGER.reset_all_slots().await; }
         let m_render = self.chat_template.apply_chat_template(&mes)?; let input = self.pre_processor.process_info(&mes, &m_render)?;
         let f_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?; let t_toks = f_ids.len();
         if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
-        self.qwen3_vl.forward(&Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(0u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 0, t_toks, session_id.clone())?;
         
-        if let Some(s_id) = &session_id {
-            if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
-            let unbaked = self.get_all_unbaked_kv_blocks();
-            let mut cpu_batches = Vec::with_capacity(unbaked.len());
-            
-            // 1. [ATOMIC-EVACUATION] GPU -> CPU 복사 (중단점 없음)
-            for (ks, vs, off) in unbaked {
-                let mut dumps = Vec::new();
-                for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                    let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                    let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                    dumps.push(LayerKVDump { layer_idx: idx, k_tensor: k_cpu, v_tensor: v_cpu });
-                }
-                cpu_batches.push((dumps, off));
-            }
-            
-            // [VRAM-PURGE] 복사 완료 즉시 VRAM 비우기
-            self.clear_temporal_kv_caches();
-            println!("[BAKE] ✅ VRAM Evacuated & Purged. (Blocks: {})", cpu_batches.len());
-
-            // 2. 백그라운드 SSD 저장 요청
-            let tx = get_bake_worker().await?;
-            let mut sent = 0;
-            for (dumps, off) in cpu_batches {
-                let sid = SLOT_MANAGER.acquire_write_slot(t_toks).await;
-                let path = crate::utils::paths::get_kv_dir(None).join(s_id); 
-                if !path.exists() { let _ = fs::create_dir_all(&path); }
-                let rr = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => Some(m.language_model.registry.clone()), ModelVariant::QuantizedText(m) => Some(m.language_model.registry.clone()), _ => None };
-                let mode = match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.baking_only, ModelVariant::QuantizedText(m) => m.language_model.baking_only, _ => false };
-                if tx.send(SlotTask::Bake(BakeTask { slot_id: sid, task_dir: path, kv_name: kv_name.clone(), offset: off, layers: dumps, is_relay_baking: mode, block_idx: Some(off / 256), registry: rr })).await.is_ok() { 
-                    sent += 1; 
-                } else { SLOT_MANAGER.release_slot(sid).await; }
-            }
-            
-            if sent > 0 { 
-                println!("[BAKING] All {} blocks queued. Waiting for SSD sync...", sent);
-                wait_for_global_io().await; 
-            }
+        // [ASYNC-FORWARD] 내부에서 레이어별로 실시간 대피/소각/저장이 일어납니다.
+        self.qwen3_vl.forward(&Tensor::from_vec(f_ids.clone(), (1, t_toks), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(0u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), 0, t_toks, session_id.clone()).await?;
+        
+        if session_id.is_some() {
+            println!("[BAKING] Layer-by-layer async evacuation complete. Waiting for sync...");
+            wait_for_global_io().await; 
         }
         Ok(t_toks)
     }
 
-    pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> Result<String> {
+    pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
         SLOT_MANAGER.reset_all_slots().await;
         let mut lp = get_logit_processor(Some(mes.temperature.unwrap_or(0.7) as f32), Some(mes.top_p.unwrap_or(0.9) as f32), Some(40), mes.seed.unwrap_or(34562) as u64);
         let m_render = self.chat_template.apply_chat_template(&mes)?; let mut input = self.pre_processor.process_info(&mes, &m_render)?;
@@ -539,36 +509,27 @@ impl Qwen3VLGenerateModel {
         
         if t_toks > cur_off {
             let p_len = t_toks - cur_off;
-            self.qwen3_vl.forward(&Tensor::from_vec(f_ids[cur_off..].to_vec(), (1, p_len), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(cur_off as u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), cur_off, t_toks, session_id.clone())?;
-            if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+            self.qwen3_vl.forward(&Tensor::from_vec(f_ids[cur_off..].to_vec(), (1, p_len), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(cur_off as u32, t_toks as u32, &self.text_device)?.unsqueeze(0)?), cur_off, t_toks, session_id.clone()).await?;
             cur_off = t_toks;
         }
 
-        let mut gen_count = 0;
-        let mut last_saved_off = cur_off;
-
         while g_text.len() < max_gen {
             let last_id = *a_ids.last().unwrap_or(&0);
-            let logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![last_id], (1, 1), &self.text_device)?, p_vals.as_ref(), i_grid.as_ref(), None, None, None, cur_off, cur_off + 1, session_id.clone())?;
+            let logits: Tensor = self.qwen3_vl.forward(&Tensor::from_vec(vec![last_id], (1, 1), &self.text_device)?, p_vals.as_ref(), i_grid.as_ref(), None, None, None, cur_off, cur_off + 1, session_id.clone()).await?;
             let next_id = lp.sample(&logits.flatten_all()?)?;
             let txt = self.tokenizer.token_decode(vec![next_id])?;
-            g_text.push_str(&txt); a_ids.push(next_id); cur_off += 1; p_vals = None; gen_count += 1;
+            g_text.push_str(&txt); a_ids.push(next_id); cur_off += 1; p_vals = None;
             
-            // [INCREMENTAL-SAVE] 32토큰마다 새로 생성된 '꼬리'만 골라 대피 및 저장
-            if gen_count % 32 == 0 && session_id.is_some() {
-                self.save_incremental_kv(session_id.as_ref().unwrap(), kv_name.as_deref(), last_saved_off, cur_off).await?;
-                last_saved_off = cur_off;
-            }
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
         }
 
         if let Some(s_id) = &session_id {
-            if cur_off > last_saved_off {
-                self.save_incremental_kv(s_id, kv_name.as_deref(), last_saved_off, cur_off).await?;
-            }
             let p = crate::utils::paths::get_kv_dir(None).join(s_id); 
             if !p.exists() { let _ = fs::create_dir_all(&p); }
             let _ = self.qwen3_vl.save_metadata_to_file(&p);
+            
+            println!("[GENERATE] Finalizing async SSD writes for response...");
+            wait_for_global_io().await; 
         }
         Ok(g_text)
     }
@@ -631,7 +592,7 @@ impl Qwen3VLGenerateModel {
         let chunk_size = chunk_ids_vec.len(); let current_pos = self.get_kv_len();
         let chunk_ids = Tensor::from_vec(chunk_ids_vec, (1, chunk_size), &self.text_device)?;
         let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
-        self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, current_pos + chunk_size, None)?;
+        self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, current_pos + chunk_size, None).await?;
         Ok(chunk_size)
     }
     pub fn get_kv_len(&self) -> usize { match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.get_kv_len(), ModelVariant::QuantizedText(m) => m.language_model.get_kv_len(), _ => 0 } }
