@@ -1693,8 +1693,8 @@ impl QuantizedQwen3VLTextModel {
         visual_pos_masks: Option<&Tensor>,
         deepstack_visual_embeds: Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
-        // [OPTION A] 실시간 VRAM 재배치 비활성화 (정석 레이어 순환 방해 방지)
-        // let _ = self.rebalance_layers(0);
+        // [OPTION A] 실시간 VRAM 재배치 활성화
+        let _ = self.rebalance_layers(0);
 
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         
@@ -1901,8 +1901,27 @@ impl QuantizedQwen3VLTextModel {
                 let k_small = layer.self_attn.decompress_from_bitkv(&k_anchors[i].to_device(&target_device)?, &k_packed[i].to_device(&target_device)?, &k_scales[i].to_device(&target_device)?, original_shape, &target_device)?;
                 let v_small = layer.self_attn.decompress_from_bitkv(&v_anchors[i].to_device(&target_device)?, &v_packed[i].to_device(&target_device)?, &v_scales[i].to_device(&target_device)?, original_shape, &target_device)?;
                 
-                // [0.6B-DIRECT] 0.6B 베이킹 데이터를 0.6B 레이어에 직접 주입 (2B 정렬 제거)
-                layer.self_attn.inject_live_kv_direct(&k_small.to_dtype(target_dtype)?, &v_small.to_dtype(target_dtype)?)?;
+                // Align to 2B dimensions (Head/Dim upscale)
+                let target_heads = layer.self_attn.num_key_value_heads;
+                let target_dim = layer.self_attn.head_dim;
+                let (_b, h, _s, d) = k_small.dims4()?;
+
+                let mut k_aligned = if d < target_dim { Tensor::cat(&[&k_small, &k_small], D::Minus1)? } else { k_small };
+                let mut v_aligned = if d < target_dim { Tensor::cat(&[&v_small, &v_small], D::Minus1)? } else { v_small };
+
+                if h != target_heads {
+                    let mut k_heads = Vec::with_capacity(target_heads);
+                    let mut v_heads = Vec::with_capacity(target_heads);
+                    for j in 0..target_heads {
+                        let src_idx = j % h;
+                        k_heads.push(k_aligned.narrow(1, src_idx, 1)?);
+                        v_heads.push(v_aligned.narrow(1, src_idx, 1)?);
+                    }
+                    k_aligned = Tensor::cat(&k_heads, 1)?;
+                    v_aligned = Tensor::cat(&v_heads, 1)?;
+                }
+
+                layer.self_attn.inject_live_kv_direct(&k_aligned.to_dtype(target_dtype)?, &v_aligned.to_dtype(target_dtype)?)?;
             }
         }
         Ok(())
