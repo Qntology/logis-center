@@ -955,8 +955,6 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn decompress_from_bitkv(&self, anchors: &Tensor, packed: &Tensor, scales: &Tensor, original_shape: &[usize], device: &Device) -> Result<Tensor> {
-        // [OPTIMIZATION] If we are on GPU, we want to decompress quickly.
-        // For now, using a CPU-based multi-core decompression via rayon as a robust baseline.
         let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
         
         let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
@@ -965,26 +963,24 @@ impl QuantizedQwen3VLTextAttention {
         
         let last_dim = original_shape[original_shape.len() - 1];
         let seq_len = original_shape[original_shape.len() - 2];
-        let _num_heads = original_shape[1];
-        let _batch_size = original_shape[0];
-        
         let total_elements: usize = original_shape.iter().product();
         let mut decoded = vec![0.0f32; total_elements];
         
         let head_tokens = seq_len * last_dim;
-        let anchor_count = (0..seq_len).filter(|&i| i < 4 || i % 8 == 0).count();
+        let anchor_count_expected = (0..seq_len).filter(|&i| i < 4 || i % 8 == 0).count();
 
         use rayon::prelude::*;
         decoded.par_chunks_mut(head_tokens).enumerate().for_each(|(bh_idx, head_out)| {
             let bh_offset = bh_idx * head_tokens;
-            let anchor_offset = bh_idx * anchor_count * last_dim;
+            let anchor_offset = bh_idx * anchor_count_expected * last_dim;
             let num_bits = if packed_vec.len() > (total_elements + 7) / 8 * 2 { 4 } else { 1 };
             
             for s_idx in 0..seq_len {
-                let base_scale = scales_vec[bh_idx * seq_len + s_idx];
+                let scale_idx = bh_idx * seq_len + s_idx;
+                let base_scale = if scale_idx < scales_vec.len() { scales_vec[scale_idx] } else { 0.0 };
                 let token_out = &mut head_out[s_idx * last_dim .. (s_idx + 1) * last_dim];
                 
-                // 1. Multi-bit Residual Restoration (Mode 3)
+                // 1. Multi-bit Residual Restoration
                 for d_idx in 0..last_dim {
                     let mut val = 0.0f32;
                     let elem_idx = bh_offset + s_idx * last_dim + d_idx;
@@ -992,8 +988,6 @@ impl QuantizedQwen3VLTextAttention {
                     for b in 0..num_bits {
                         let bit_idx = elem_idx + b * total_elements;
                         let byte_idx = bit_idx / 8;
-                        
-                        // [STRICT-BOUNDARY-CHECK] 데이터 범위를 벗어나는 비트는 무시하여 패닉 방지
                         if byte_idx < packed_vec.len() {
                             let is_set = (packed_vec[byte_idx] & (1 << (bit_idx % 8))) != 0;
                             let bit_scale = base_scale / (2.0f32.powi(b as i32));
@@ -1003,11 +997,14 @@ impl QuantizedQwen3VLTextAttention {
                     token_out[d_idx] = val;
                 }
                 
-                // 2. Anchor Refinement (Always use Full Precision for anchors)
+                // 2. Anchor Refinement (Safety Check Added)
                 if s_idx < 4 || s_idx % 8 == 0 {
                     let a_pos = if s_idx < 4 { s_idx } else { 4 + (s_idx - 4) / 8 };
-                    let anchor_data = &anchors_vec[anchor_offset + a_pos * last_dim .. anchor_offset + (a_pos + 1) * last_dim];
-                    token_out.copy_from_slice(anchor_data);
+                    let src_start = anchor_offset + a_pos * last_dim;
+                    let src_end = src_start + last_dim;
+                    if src_end <= anchors_vec.len() {
+                        token_out.copy_from_slice(&anchors_vec[src_start..src_end]);
+                    }
                 }
             }
         });
@@ -2150,17 +2147,16 @@ impl QuantizedQwen3VLTextModel {
         
         let block_start = (start_off / 256) * 256;
 
-        // [DYNAMIC-LIMITS] 10k+ 문맥의 28개 레이어를 모두 RAM에 담기 위해 제한을 제거 수준으로 높입니다.
+        // [DYNAMIC-LIMITS] 0.6B 모델은 가벼우므로 10k 문맥 전체를 VRAM에 상주시켜 PCIe 병목을 제거합니다.
         let (vram_limit, ram_limit) = {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
             
-            // VRAM: 한 레이어의 전체 블록(40개)이 연산 중에는 VRAM에 상주해야 함. (최소 64개 허용)
-            let v_limit = 128; 
+            // VRAM: 28개 레이어 x 40개 블록 = 1,120개. 2,048개까지 VRAM 상주 허용 (속도 극대화)
+            let v_limit = 2048; 
             
-            // RAM: 28개 레이어 x 40개 블록 = 1,120개. 5,000개(1.2M 토큰)까지는 RAM에 그냥 둡니다.
-            // 4비트 압축 데이터라 5,000개여도 RAM 1GB도 안 씁니다.
+            // RAM: 만약 VRAM에서 쫓겨나더라도 RAM에 5,000개까지는 안전하게 보관
             let r_limit = if free_ram_gb > 4.0 { 5000 } else { 2048 };
             (v_limit, r_limit)
         };
@@ -2327,11 +2323,13 @@ impl QuantizedQwen3VLTextModel {
 
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
 
-        // [STRICT-COMMIT] 세션 ID가 있는 모든 추론(베이킹 및 Step A 분류)은 즉시 SSD로 데이터를 밀어냅니다.
-        // 이를 통해 RAM 부족으로 데이터가 증발하여 '외계어'가 출력되는 현상을 원천 방지합니다.
+        // [FLUSH-COMMIT] 베이킹 모드일 경우에만 즉시 SSD 저장을 실행합니다.
+        // Step A 추론 시에는 모든 데이터가 VRAM/RAM에 유지되므로 강제 저장이 불필요하며 속도를 위해 생략합니다.
         if let Some(sid) = session_id {
-            self.force_flush_all_active_blocks(&sid).await?;
-            if target_device.is_cuda() { let _ = target_device.synchronize(); }
+            if self.baking_only {
+                self.force_flush_all_active_blocks(&sid).await?;
+                if target_device.is_cuda() { let _ = target_device.synchronize(); }
+            }
         }
 
         self.current_kv_len = seqlen_offset + seq_len;
