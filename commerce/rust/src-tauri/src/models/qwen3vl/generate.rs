@@ -601,15 +601,32 @@ impl Qwen3VLGenerateModel {
             _ => {}
         }
 
+        println!("[GENERATE-START] Starting decoding loop. Base Offset: {}, Max Tokens: {}", cur_off, max_gen);
+
         while g_text.len() < max_gen {
             let last_id = *a_ids.last().unwrap_or(&0);
+            
+            // [LOG-PROGRESS] 현재 오프셋 및 진행 상황 출력
+            if (cur_off - t_toks) % 10 == 0 {
+                println!("[DEC-PROGRESS] Generated: {} tokens | Current Offset: {} | Target: {}", cur_off - t_toks, cur_off, t_toks + max_gen);
+            }
+
             let logits: Tensor = self.qwen3_vl.forward(&Tensor::from_vec(vec![last_id], (1, 1), &self.text_device)?, p_vals.as_ref(), i_grid.as_ref(), None, None, None, cur_off, cur_off + 1, session_id.clone()).await?;
             let next_id = lp.sample(&logits.flatten_all()?)?;
             let txt = self.tokenizer.token_decode(vec![next_id])?;
+            
+            // [LOG-TOKEN] 생성된 토큰 실시간 모니터링
+            // println!("[TOKEN] ID: {} | Text: {:?}", next_id, txt);
+            
             g_text.push_str(&txt); a_ids.push(next_id); cur_off += 1; p_vals = None;
             
-            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
+            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
+                println!("[GENERATE-END] EOS token detected at offset {}.", cur_off);
+                break; 
+            }
         }
+
+        println!("[GENERATE-DONE] Completed generation. Final Offset: {}. Total Length: {}", cur_off, g_text.len());
 
         // [DEC-CLEANUP] 디코딩 종료 후 VRAM 반납
         match &mut self.qwen3_vl {
