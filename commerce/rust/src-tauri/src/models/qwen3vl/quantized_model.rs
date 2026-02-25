@@ -645,7 +645,7 @@ impl QuantizedQwen3VLTextAttention {
                     vram_ks.push(k.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
                     vram_vs.push(v.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
                     vram_total_len += b_len;
-                    global_start_idx += b_len;
+                    global_start_idx += b_len; // [FIX]
                     continue;
                 }
                 KVLocation::RAM | KVLocation::SSD => {
@@ -665,16 +665,16 @@ impl QuantizedQwen3VLTextAttention {
                     if k_active.is_none() {
                         let path = ssd_path.clone().unwrap_or_default();
                         let filename = format!("l{}.st", self.layer_idx);
-                        let inf_path = path.join("inference").join(format!("b{}", b_off)).join(&filename);
-                        let bak_path = path.join("reference").join(format!("b{}", b_off)).join("l0.st");
-                        let act_path = if inf_path.is_file() { Some(inf_path) } else if bak_path.is_file() { Some(bak_path) } else { None };
+                        let inf_p = path.join("inference").join(format!("b{}", b_off)).join(&filename);
+                        let bak_p = path.join("reference").join(format!("b{}", b_off)).join("l0.st");
+                        let dir_p = path.join(&filename);
+                        let act_path = if inf_p.is_file() { Some(inf_p) } else if bak_p.is_file() { Some(bak_p) } else if dir_p.is_file() { Some(dir_p) } else { None };
                         
                         if let Some(act_p) = act_path {
                             if let Ok(content) = std::fs::read(&act_p) {
                                 if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                    let block_offset = index * 256;
-                                    let is_relay = act_p.file_name().map(|n| n == "l0.st").unwrap_or(false);
-                                    let prefix = if is_relay { format!("b{}_l0_", block_offset) } else { format!("b{}_l{}_", block_offset, self.layer_idx) };
+                                    let is_relay = act_p.to_string_lossy().contains("l0.st");
+                                    let prefix = if is_relay { format!("b{}_l0_", b_off) } else { format!("b{}_l{}_", b_off, self.layer_idx) };
                                     let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
                                     if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
                                         let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
@@ -702,12 +702,12 @@ impl QuantizedQwen3VLTextAttention {
                             k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
                             v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
                         }
-                        let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?
-                            .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
+                        let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
                         if let Some(mask) = attention_mask {
                             let mask_len = mask.dim(D::Minus1)?;
-                            if global_start_idx + b_len <= mask_len {
-                                let sub_mask = mask.narrow(D::Minus1, global_start_idx, b_len)?.to_dtype(target_dtype)?;
+                            let current_block_start = global_start_idx - b_len; // [FIX]
+                            if current_block_start + b_len <= mask_len {
+                                let sub_mask = mask.narrow(D::Minus1, current_block_start, b_len)?.to_dtype(target_dtype)?;
                                 attn_weights = attn_weights.broadcast_add(&sub_mask)?;
                             }
                         }
@@ -731,14 +731,14 @@ impl QuantizedQwen3VLTextAttention {
                     }
                     global_start_idx += b_len;
                 }
-                _ => { global_start_idx += b_len; continue; }
+                _ => { global_start_idx += b_len; }
             }
         }
 
-        // 5. [BATCH-VRAM-ACCUMULATOR] Fast single-pass using merged cache
+        // 5. [BATCH-VRAM-ACCUMULATOR]
+        let start_accum_ts = std::time::Instant::now();
         let mut final_vram_k = None;
         let mut final_vram_v = None;
-        let mut vram_total_len = 0;
 
         if !vram_ks.is_empty() {
             // [STRATEGY] 꽉 찬 블록들은 미리 합쳐서 캐싱하고, 마지막 활성 블록만 매번 합침

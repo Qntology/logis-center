@@ -198,6 +198,18 @@ fn log_slot_error(root: &Path, msg: &str) {
     let _ = fs::write(file_path, msg);
 }
 
+// [DIAG-PATH-TRACE] 파일 접근 흔적을 물리적으로 기록
+fn log_path_trace(root: &Path, b_str: &str, phase: &str, msg: &str) {
+    let target_dir = root.join("inference").join(b_str);
+    if !target_dir.exists() { let _ = fs::create_dir_all(&target_dir); }
+    let log_file = target_dir.join("read_log.txt");
+    let timestamp = chrono::Local::now().format("%H:%M:%S.%3f").to_string();
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(log_file) {
+        use std::io::Write;
+        let _ = writeln!(file, "[{}] Phase: {} | {}", timestamp, phase, msg);
+    }
+}
+
 pub async fn wait_for_global_io() {
     println!("[DIAG-IO] Starting Persistent Global Sync. Waiting for all slots to be free...");
     let start = std::time::Instant::now();
@@ -418,12 +430,17 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         };
                         
                         let ref_p = root.join("reference").join(&b_str).join("l0.st");
-                        let act_p_for_log = act_p.clone(); // [FIX] Clone before move
+                        let act_p_for_log = act_p.clone();
+                        let ref_p_for_log = ref_p.clone(); // [FIX]
                         let final_path = if act_p.is_file() { Some(act_p) } else if ref_p.is_file() { Some(ref_p) } else { None };
+
+                        // [DIAG-TRACE] 시도 기록
+                        log_path_trace(&root, &b_str, "LOAD", &format!("Layer {} seeking. Final: {:?}, Act: {:?}, Ref: {:?}", l_idx, final_path, act_p_for_log, ref_p_for_log));
 
                         if let Some(p) = final_path {
                             match candle_core::safetensors::load(&p, &Device::Cpu) {
                                 Ok(st) => {
+                                    log_path_trace(&root, &b_str, "LOAD", &format!("Layer {} SUCCESS load from {:?}", l_idx, p));
                                     let is_relay = p.to_string_lossy().contains("l0.st");
                                     let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
                                     if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
@@ -471,11 +488,16 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             };
                             let ref_p = root.join("reference").join(&b_str).join("l0.st");
                             let act_p_for_log = act_p.clone(); // [FIX]
+                            let ref_p_for_log = ref_p.clone(); // [FIX]
                             let final_path = if act_p.is_file() { Some(act_p) } else if ref_p.is_file() { Some(ref_p) } else { None };
+
+                            // [DIAG-TRACE]
+                            log_path_trace(&root, &b_str, "CHUNK", &format!("Layer {} seeking. Final: {:?}, Act: {:?}, Ref: {:?}", l_idx, final_path, act_p_for_log, ref_p_for_log));
 
                             if let Some(p) = final_path {
                                 match candle_core::safetensors::load(&p, &Device::Cpu) {
                                     Ok(st) => {
+                                        log_path_trace(&root, &b_str, "CHUNK", &format!("Layer {} SUCCESS load from {:?}", l_idx, p));
                                         let is_relay = p.to_string_lossy().contains("l0.st");
                                         let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
                                         if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
