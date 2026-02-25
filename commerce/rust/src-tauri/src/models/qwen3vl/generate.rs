@@ -1,8 +1,7 @@
 use crate::models::qwen3vl::quantized_model::KVLocation;
 use anyhow::{Result, anyhow};
-use candle_core::{quantized::gguf_file, DType, Device, Tensor, IndexOp};
+use candle_core::{quantized::gguf_file, DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::utils::apply_repeat_penalty;
 
 use crate::{
     chat_template::ChatTemplate,
@@ -23,7 +22,6 @@ use crate::{
     },
     openai_types::ChatCompletionParameters,
 };
-use rayon::prelude::*;
 use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
 use std::fs;
 use std::path::Path;
@@ -215,13 +213,10 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
             },
             SlotRequest::Release { idx, .. } => {
                 let slot = &SLOT_MANAGER.slots[idx];
-                
-                // [IO-SAFETY] 아직 파일 저장 중이라면 릴리즈를 거부하고 대기시킵니다.
                 if slot.remaining_layers.load(Ordering::SeqCst) > 0 {
                     println!("[SLOT-WARN] Release denied for Slot {}. IO still in progress.", idx);
                     continue; 
                 }
-
                 let prev = slot.state.swap(0, Ordering::SeqCst);
                 if prev != 0 {
                     SLOT_MANAGER.update_counters(prev, 0);
@@ -241,33 +236,22 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         while let Some(task) = io_rx.recv().await {
             let (tp, ts, reg, b_idx, sid, is_last) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last);
             if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
-            
-            // [IO-LOG]
             if let Ok(_) = candle_core::safetensors::save(&ts, &tp) {
                 println!("[BAKE-SAVE] Saved KV: {:?}", tp.file_name().unwrap_or_default());
-            } else {
-                println!("[BAKE-ERR] Failed to save KV: {:?}", tp);
             }
-
             if let (Some(r), Some(idx)) = (reg, b_idx) {
                 if let Ok(mut entries) = r.entries.write() {
                     if idx < entries.len() {
                         let e = &mut entries[idx]; e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
                         if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
-                            if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; } }
+                            if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = KVLocation::SSD; } }
                         }
                     }
                 }
             }
-            // [STRICT-IO-SYNC] 모든 레이어 저장이 확실히 끝났을 때만 슬롯을 준비 상태로 전환합니다.
             GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
             let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
-            
-            if rem == 1 { 
-                // rem이 1이었다면 fetch_sub 이후 0이 된 것이므로, 이 태스크가 진짜 마지막 태스크입니다.
-                SLOT_MANAGER.mark_ready(sid).await; 
-                println!("[SLOT-SYNC] Slot {} is now fully baked and ready.", sid);
-            }
+            if rem == 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; println!("[SLOT-SYNC] Slot {} is now fully baked and ready.", sid); }
         }
     });
 
@@ -284,12 +268,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let act_l = if is_relay && loop_count == 1 { 0 } else { src.layer_idx };
                         let mut map = std::collections::HashMap::new();
                         let prefix = if is_relay { format!("b{}_l0_", off) } else { format!("b{}_l{}_", off, act_l) };
-                        if let (Ok(ks_dims), Ok(vs_dims)) = (src.k_tensor.dims4(), src.v_tensor.dims4()) {
+                        if let Ok(ks_dims) = src.k_tensor.dims4() {
                             let (b, h, s, d) = (ks_dims.0, ks_dims.1, ks_dims.2, ks_dims.3);
                             let total_elements = b * h * s * d;
                             let ac = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
-                            
-                            // 1. Process K
                             if let Ok(t_f32) = src.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()) {
                                 if let Ok(t_data) = t_f32.to_vec1::<f32>() {
                                     let mut ka = vec![0.0f32; b * h * ac * d];
@@ -299,24 +281,15 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         let bho = bh * (s * d);
                                         for ti in 0..s {
                                             let td = &t_data[bho + ti * d .. bho + (ti + 1) * d];
-                                            if ti < 4 || ti % 8 == 0 {
-                                                let anchor_pos = if ti < 4 { ti } else { 4 + (ti - 4) / 8 };
-                                                ka[(bh * ac + anchor_pos) * d .. (bh * ac + anchor_pos + 1) * d].copy_from_slice(td);
-                                            }
-                                            
-                                            // [STABLE-REVERT] Max-Absolute Scaling
-                                            let mut max_abs = 0.0f32;
-                                            for &v in td { let a = v.abs(); if a > max_abs { max_abs = a; } }
-                                            let base_s = max_abs;
-                                            ksc[bh * s + ti] = base_s;
-
+                                            if ti < 4 || ti % 8 == 0 { let ap = if ti < 4 { ti } else { 4 + (ti - 4) / 8 }; ka[(bh * ac + ap) * d .. (bh * ac + ap + 1) * d].copy_from_slice(td); }
+                                            let mut max_abs = 0.0f32; for &v in td { let a = v.abs(); if a > max_abs { max_abs = a; } }
+                                            let base_s = max_abs; ksc[bh * s + ti] = base_s;
                                             let mut res = td.to_vec();
                                             for bit_l in 0..4 {
                                                 let cur_s = base_s / (2.0f32.powi(bit_l as i32));
                                                 for i in 0..d {
                                                     let bit_idx = (bho + ti * d + i) + bit_l * total_elements;
-                                                    if res[i] >= 0.0 { kp[bit_idx / 8] |= 1 << (bit_idx % 8); res[i] -= cur_s; }
-                                                    else { res[i] += cur_s; }
+                                                    if res[i] >= 0.0 { kp[bit_idx / 8] |= 1 << (bit_idx % 8); res[i] -= cur_s; } else { res[i] += cur_s; }
                                                 }
                                             }
                                         }
@@ -327,8 +300,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     if let Ok(t) = Tensor::from_vec(ksc, vec![b, h, s, 1], &Device::Cpu) { map.insert(format!("{}k_scales", prefix), t); }
                                 }
                             }
-                            
-                            // 2. Process V
                             if let Ok(t_f32) = src.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()) {
                                 if let Ok(t_data) = t_f32.to_vec1::<f32>() {
                                     let mut va = vec![0.0f32; b * h * ac * d];
@@ -338,24 +309,15 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         let bho = bh * (s * d);
                                         for ti in 0..s {
                                             let td = &t_data[bho + ti * d .. bho + (ti + 1) * d];
-                                            if ti < 4 || ti % 8 == 0 {
-                                                let anchor_pos = if ti < 4 { ti } else { 4 + (ti - 4) / 8 };
-                                                va[(bh * ac + anchor_pos) * d .. (bh * ac + anchor_pos + 1) * d].copy_from_slice(td);
-                                            }
-                                            
-                                            // [STABLE-REVERT] Max-Absolute Scaling
-                                            let mut max_abs = 0.0f32;
-                                            for &v in td { let a = v.abs(); if a > max_abs { max_abs = a; } }
-                                            let base_s = max_abs;
-                                            vsc[bh * s + ti] = base_s;
-
+                                            if ti < 4 || ti % 8 == 0 { let ap = if ti < 4 { ti } else { 4 + (ti - 4) / 8 }; va[(bh * ac + ap) * d .. (bh * ac + ap + 1) * d].copy_from_slice(td); }
+                                            let mut max_abs = 0.0f32; for &v in td { let a = v.abs(); if a > max_abs { max_abs = a; } }
+                                            let base_s = max_abs; vsc[bh * s + ti] = base_s;
                                             let mut res = td.to_vec();
                                             for bit_l in 0..4 {
                                                 let cur_s = base_s / (2.0f32.powi(bit_l as i32));
                                                 for i in 0..d {
                                                     let bit_idx = (bho + ti * d + i) + bit_l * total_elements;
-                                                    if res[i] >= 0.0 { vp[bit_idx / 8] |= 1 << (bit_idx % 8); res[i] -= cur_s; }
-                                                    else { res[i] += cur_s; }
+                                                    if res[i] >= 0.0 { vp[bit_idx / 8] |= 1 << (bit_idx % 8); res[i] -= cur_s; } else { res[i] += cur_s; }
                                                 }
                                             }
                                         }
@@ -366,7 +328,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     if let Ok(t) = Tensor::from_vec(vsc, vec![b, h, s, 1], &Device::Cpu) { map.insert(format!("{}v_scales", prefix), t); }
                                 }
                             }
-                            
                             if let Ok(t) = Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu) { map.insert(format!("{}k_shape", prefix), t); }
                             if let Ok(t) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) { map.insert(format!("{}mode", prefix), t); }
                         }
@@ -468,7 +429,6 @@ impl Qwen3VLGenerateModel {
                 ModelVariant::QuantizedVL(QuantizedQwen3VLModel::new_with_mmap(&cfg, &gguf_file::Content::read(&mut std::io::Cursor::new(&m_mmap[..]))?, Some(Arc::new(m_mmap)), &gguf_file::Content::read(&mut std::io::Cursor::new(&mm_mmap[..]))?, Some(Arc::new(mm_mmap)), &t_dev, text_device_id, &v_dev, vision_device_id, dtype, kv_res, baking_only)?)
             } else {
                 let m_mmap = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(m_p.as_ref().unwrap())?)? };
-                // [FIX] Single-layer mode ONLY for Baking. Inference (Step A) needs ALL layers.
                 let use_sl = baking_only;
                 ModelVariant::QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &gguf_file::Content::read(&mut std::io::Cursor::new(&m_mmap[..]))?, Some(Arc::new(m_mmap)), &t_dev, text_device_id, dtype, kv_res, baking_only, use_sl)?)
             }
@@ -484,7 +444,7 @@ impl Qwen3VLGenerateModel {
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_toks = full_ids.len();
-        self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(0u32, total_toks as u32, &self.text_device)?.unsqueeze(0)?), 0, total_toks, session_id.clone()).await?;
+        self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone()).await?;
         if let Some(s_id) = &session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(s_id);
             if !path.exists() { fs::create_dir_all(&path)?; }
@@ -496,13 +456,24 @@ impl Qwen3VLGenerateModel {
     pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
         let temperature = mes.temperature.unwrap_or(0.7) as f32;
         let seed = mes.seed.unwrap_or(34562) as u64;
-        let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(0.9) as f32), Some(9), seed);
+        let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(0.9) as f32), Some(40), seed);
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_toks = f_ids.len();
+        
+        let kv_len = self.get_kv_len();
+        let use_zero_prefill = kv_len >= total_toks && total_toks > 0;
         let mut gen_text = String::new();
-        let mut logits = self.qwen3_vl.forward(&Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, Some(&Tensor::arange(0u32, total_toks as u32, &self.text_device)?.unsqueeze(0)?), 0, total_toks, session_id.clone()).await?;
+        let (input_ids, offset) = if use_zero_prefill {
+            println!("[ZERO-PREFILL] Active cache found (Len: {}). Skipping full prompt prefill.", kv_len);
+            (Tensor::from_vec(vec![f_ids[total_toks - 1]], (1, 1), &self.text_device)?, total_toks - 1)
+        } else {
+            println!("[FULL-PREFILL] No valid cache. Computing entire context (Len: {}).", total_toks);
+            (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
+        };
+
+        let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_toks, session_id.clone()).await?;
         let mut gen_ids = vec![];
         for i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
@@ -510,7 +481,8 @@ impl Qwen3VLGenerateModel {
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             gen_ids.push(next_id);
             gen_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
-            logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, (total_toks as usize + i as usize), (total_toks as usize + i as usize + 1), session_id.clone()).await?;
+            let current_pos = total_toks + i as usize;
+            logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_pos, current_pos + 1, session_id.clone()).await?;
         }
         Ok(gen_text)
     }
@@ -526,8 +498,7 @@ impl Qwen3VLGenerateModel {
         let chunk_size = chunk_ids_vec.len();
         let current_pos = self.get_kv_len();
         let chunk_ids = Tensor::from_vec(chunk_ids_vec, (1, chunk_size), &self.text_device)?;
-        let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
-        self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, current_pos + chunk_size, None).await?;
+        self.qwen3_vl.forward(&chunk_ids, None, None, None, None, None, current_pos, current_pos + chunk_size, None).await?;
         Ok(chunk_size)
     }
 }

@@ -2134,16 +2134,18 @@ impl QuantizedQwen3VLTextModel {
         
         let block_start = (start_off / 256) * 256;
 
-        // [DYNAMIC-LIMITS] 10k+ 문맥을 위해 제한을 대폭 완화합니다.
+        // [DYNAMIC-LIMITS] 10k+ 문맥의 28개 레이어를 모두 RAM에 담기 위해 제한을 제거 수준으로 높입니다.
         let (vram_limit, ram_limit) = {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
             
-            // VRAM: 가급적 많이 올림 (최소 64개 = 16k 토큰)
-            let v_limit = if free_ram_gb > 4.0 { 128 } else { 64 };
-            // RAM: 10k 문맥은 약 40개 블록이므로, 256개(64k 토큰)까지는 넉넉히 허용
-            let r_limit = if free_ram_gb > 8.0 { 512 } else if free_ram_gb > 4.0 { 256 } else { 128 };
+            // VRAM: 한 레이어의 전체 블록(40개)이 연산 중에는 VRAM에 상주해야 함. (최소 64개 허용)
+            let v_limit = 128; 
+            
+            // RAM: 28개 레이어 x 40개 블록 = 1,120개. 5,000개(1.2M 토큰)까지는 RAM에 그냥 둡니다.
+            // 4비트 압축 데이터라 5,000개여도 RAM 1GB도 안 씁니다.
+            let r_limit = if free_ram_gb > 4.0 { 5000 } else { 2048 };
             (v_limit, r_limit)
         };
 
@@ -2309,13 +2311,11 @@ impl QuantizedQwen3VLTextModel {
 
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
 
-        // [FLUSH-COMMIT] 베이킹 모드(0.6B -> 2B Relay)일 경우에만 즉시 SSD 저장을 실행합니다.
-        // 일반 추론(Step A) 시에는 강제 플러시를 하지 않아 IO 오버헤드와 CUDA 컨텍스트 오류를 방지합니다.
+        // [STRICT-COMMIT] 세션 ID가 있는 모든 추론(베이킹 및 Step A 분류)은 즉시 SSD로 데이터를 밀어냅니다.
+        // 이를 통해 RAM 부족으로 데이터가 증발하여 '외계어'가 출력되는 현상을 원천 방지합니다.
         if let Some(sid) = session_id {
-            if self.baking_only {
-                self.force_flush_all_active_blocks(&sid).await?;
-                if target_device.is_cuda() { let _ = target_device.synchronize(); }
-            }
+            self.force_flush_all_active_blocks(&sid).await?;
+            if target_device.is_cuda() { let _ = target_device.synchronize(); }
         }
 
         self.current_kv_len = seqlen_offset + seq_len;
