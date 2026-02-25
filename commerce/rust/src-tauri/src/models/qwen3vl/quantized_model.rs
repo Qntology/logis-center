@@ -80,6 +80,14 @@ impl QLinear {
         &self.device
     }
 
+    pub fn shape(&self) -> candle_core::Shape {
+        match &self.inner {
+            QMatMul::QTensor(q) => q.shape().clone(),
+            QMatMul::Tensor(t) => t.shape().clone(),
+            QMatMul::TensorF16(t) => t.shape().clone(),
+        }
+    }
+
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         if !self.device.same_device(device) {
             let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
@@ -433,6 +441,11 @@ impl QuantizedQwen3VLTextAttention {
         }
 
         let q_proj = get_qlinear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
+        
+        if layer_idx == 0 {
+            println!("[DIAG-MODEL] Layer 0 Q-Proj Weight Shape: {:?}", q_proj.shape());
+        }
+
         let k_proj = get_qlinear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?;
         let v_proj = get_qlinear(ct, reader, &format!("{base_name}.{v}"), device, dtype)?;
         let o_proj = get_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
