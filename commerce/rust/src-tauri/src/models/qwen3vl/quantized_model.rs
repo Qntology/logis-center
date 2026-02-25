@@ -1508,9 +1508,7 @@ impl QuantizedQwen3VLTextModel {
 
         let pool = rayon::ThreadPoolBuilder::new().num_threads(crate::utils::resources::get_optimal_thread_config(current_device.is_cpu()).thread_count).build()?;
         let final_config = config; 
-        // [FIX] Always load all layers to ensure baking covers the full model depth.
-        // Previously: let num_layers_to_load = if baking_only { 1 } else { final_config.num_hidden_layers };
-        let num_layers_to_load = final_config.num_hidden_layers;
+        let num_layers_to_load = if baking_only { 1 } else { final_config.num_hidden_layers };
         let registry = KVRegistry::new();
 
         let layers: Result<Vec<_>> = pool.install(|| {
@@ -1600,8 +1598,7 @@ impl QuantizedQwen3VLTextModel {
 
         let mut layers = vec![];
         let mut pinned_layer_count = 0;
-        // [FIX] Always load all layers
-        let num_layers_to_load = config.num_hidden_layers;
+        let num_layers_to_load = if baking_only { 1 } else { config.num_hidden_layers };
 
         for layer_idx in 0..num_layers_to_load {
             let mut layer_device = current_device.clone();
@@ -2520,6 +2517,12 @@ impl QuantizedQwen3VLModel {
 
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
+        // [OPTIMIZATION] If baking only, limit to 1 layer to save massive VRAM/RAM
+        if baking_only {
+            println!("[MODEL] Vision Baker Mode: Reducing LLM to 1 layer.");
+            t_config.num_hidden_layers = 1;
+        }
+
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
             &t_config, ct_main, main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
         )?;
@@ -2559,6 +2562,12 @@ impl QuantizedQwen3VLModel {
         
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
+        // [OPTIMIZATION] If baking only, limit to 1 layer
+        if baking_only {
+            println!("[MODEL] Vision Baker Mode (Reader): Reducing LLM to 1 layer.");
+            t_config.num_hidden_layers = 1;
+        }
+
         let language_model = QuantizedQwen3VLTextModel::new(&t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
         
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
@@ -2782,8 +2791,7 @@ impl QuantizedQwen3TextModel {
     pub fn new_with_mmap(config: &Qwen3VLConfig, ct_main: &gguf_file::Content, mmap_handle: Option<Arc<Mmap>>, text_device: &Device, text_device_id: usize, dtype: DType, kv_reserve: u64, baking_only: bool, single_layer_mode: bool) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
-        // [FIX] Force full layers even in single_layer_mode to prevent mismatch
-        // if single_layer_mode { t_config.num_hidden_layers = 1; }
+        if single_layer_mode { t_config.num_hidden_layers = 1; }
         
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(&t_config, ct_main, mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
         let lm_head = if !baking_only {
@@ -2800,8 +2808,7 @@ impl QuantizedQwen3TextModel {
     pub fn new<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, ct_main: &gguf_file::Content, reader_main: &mut R, text_device: &Device, text_device_id: usize, dtype: DType, kv_reserve: u64, baking_only: bool, single_layer_mode: bool) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
-        // [FIX] Force full layers
-        // if single_layer_mode { t_config.num_hidden_layers = 1; }
+        if single_layer_mode { t_config.num_hidden_layers = 1; }
 
         let language_model = QuantizedQwen3VLTextModel::new(&t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
         let lm_head = if !baking_only {
