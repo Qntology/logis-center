@@ -431,16 +431,18 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         
                         let ref_p = root.join("reference").join(&b_str).join("l0.st");
                         let act_p_for_log = act_p.clone();
-                        let ref_p_for_log = ref_p.clone(); // [FIX]
+                        let ref_p_for_log = ref_p.clone();
                         let final_path = if act_p.is_file() { Some(act_p) } else if ref_p.is_file() { Some(ref_p) } else { None };
 
-                        // [DIAG-TRACE] 시도 기록
-                        log_path_trace(&root, &b_str, "LOAD", &format!("Layer {} seeking. Final: {:?}, Act: {:?}, Ref: {:?}", l_idx, final_path, act_p_for_log, ref_p_for_log));
+                        // [DIAG-TRACE] 터미널과 파일 양쪽에 경로 기록
+                        let trace_msg = format!("Layer {} seeking. Final: {:?}, Act: {:?}, Ref: {:?}", l_idx, final_path, act_p_for_log, ref_p_for_log);
+                        println!("[PATH-TRACE] {}", trace_msg); 
+                        log_path_trace(&root, &b_str, "LOAD", &trace_msg);
 
                         if let Some(p) = final_path {
                             match candle_core::safetensors::load(&p, &Device::Cpu) {
                                 Ok(st) => {
-                                    log_path_trace(&root, &b_str, "LOAD", &format!("Layer {} SUCCESS load from {:?}", l_idx, p));
+                                    log_path_trace(&root, &b_str, "LOAD", &format!("Layer {} SUCCESS load", l_idx));
                                     let is_relay = p.to_string_lossy().contains("l0.st");
                                     let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
                                     if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
@@ -487,17 +489,19 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 root.join("inference").join(&b_str).join(&filename)
                             };
                             let ref_p = root.join("reference").join(&b_str).join("l0.st");
-                            let act_p_for_log = act_p.clone(); // [FIX]
-                            let ref_p_for_log = ref_p.clone(); // [FIX]
+                            let act_p_for_log = act_p.clone();
+                            let ref_p_for_log = ref_p.clone();
                             let final_path = if act_p.is_file() { Some(act_p) } else if ref_p.is_file() { Some(ref_p) } else { None };
 
                             // [DIAG-TRACE]
-                            log_path_trace(&root, &b_str, "CHUNK", &format!("Layer {} seeking. Final: {:?}, Act: {:?}, Ref: {:?}", l_idx, final_path, act_p_for_log, ref_p_for_log));
+                            let trace_msg = format!("Layer {} seeking. Final: {:?}, Act: {:?}, Ref: {:?}", l_idx, final_path, act_p_for_log, ref_p_for_log);
+                            println!("[PATH-TRACE-CHUNK] {}", trace_msg);
+                            log_path_trace(&root, &b_str, "CHUNK", &trace_msg);
 
                             if let Some(p) = final_path {
                                 match candle_core::safetensors::load(&p, &Device::Cpu) {
                                     Ok(st) => {
-                                        log_path_trace(&root, &b_str, "CHUNK", &format!("Layer {} SUCCESS load from {:?}", l_idx, p));
+                                        log_path_trace(&root, &b_str, "CHUNK", &format!("Layer {} SUCCESS load", l_idx));
                                         let is_relay = p.to_string_lossy().contains("l0.st");
                                         let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
                                         if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {

@@ -705,9 +705,9 @@ impl QuantizedQwen3VLTextAttention {
                         let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
                         if let Some(mask) = attention_mask {
                             let mask_len = mask.dim(D::Minus1)?;
-                            let current_block_start = global_start_idx - b_len; // [FIX]
-                            if current_block_start + b_len <= mask_len {
-                                let sub_mask = mask.narrow(D::Minus1, current_block_start, b_len)?.to_dtype(target_dtype)?;
+                            // [FIX] 블록의 실제 오프셋(b_off)을 직접 사용하여 마스크 정렬
+                            if b_off + b_len <= mask_len {
+                                let sub_mask = mask.narrow(D::Minus1, b_off, b_len)?.to_dtype(target_dtype)?;
                                 attn_weights = attn_weights.broadcast_add(&sub_mask)?;
                             }
                         }
@@ -808,6 +808,8 @@ impl QuantizedQwen3VLTextAttention {
 
             if let Some(mask) = attention_mask {
                 let mask_len = mask.dim(D::Minus1)?;
+                // [FIX] VRAM 블록들은 시퀀스의 가장 뒤쪽에 위치하므로 누적된 인덱스에서 
+                // 본인들의 총 길이만큼 뺀 지점이 시작점입니다.
                 let vram_start = global_start_idx - vram_total_len;
                 if vram_start + vram_total_len <= mask_len {
                     let sub_mask = mask.narrow(D::Minus1, vram_start, vram_total_len)?.to_dtype(target_dtype)?;
@@ -838,8 +840,6 @@ impl QuantizedQwen3VLTextAttention {
         let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
         let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
         
-        global_start_idx += vram_total_len;
-
         if self.layer_idx == 0 {
             println!("[SPEED-LOG] Token {} | Total: {:?} | KV-Fetch: {:?} (R:{}, S:{}, V:{}) | Accum: {:?} | Attn: {:?}",
                 seqlen_offset + q_len, start_total.elapsed(), time_kv_fetch, ram_count, ssd_count, vram_count, time_accum, start_attn.elapsed());
