@@ -215,6 +215,13 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
             },
             SlotRequest::Release { idx, .. } => {
                 let slot = &SLOT_MANAGER.slots[idx];
+                
+                // [IO-SAFETY] 아직 파일 저장 중이라면 릴리즈를 거부하고 대기시킵니다.
+                if slot.remaining_layers.load(Ordering::SeqCst) > 0 {
+                    println!("[SLOT-WARN] Release denied for Slot {}. IO still in progress.", idx);
+                    continue; 
+                }
+
                 let prev = slot.state.swap(0, Ordering::SeqCst);
                 if prev != 0 {
                     SLOT_MANAGER.update_counters(prev, 0);
@@ -252,9 +259,15 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     }
                 }
             }
+            // [STRICT-IO-SYNC] 모든 레이어 저장이 확실히 끝났을 때만 슬롯을 준비 상태로 전환합니다.
             GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
             let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
-            if rem <= 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; }
+            
+            if rem == 1 { 
+                // rem이 1이었다면 fetch_sub 이후 0이 된 것이므로, 이 태스크가 진짜 마지막 태스크입니다.
+                SLOT_MANAGER.mark_ready(sid).await; 
+                println!("[SLOT-SYNC] Slot {} is now fully baked and ready.", sid);
+            }
         }
     });
 
@@ -483,7 +496,7 @@ impl Qwen3VLGenerateModel {
     pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
         let temperature = mes.temperature.unwrap_or(0.7) as f32;
         let seed = mes.seed.unwrap_or(34562) as u64;
-        let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(0.9) as f32), Some(40), seed);
+        let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(0.9) as f32), Some(20), seed);
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
