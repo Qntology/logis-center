@@ -1737,6 +1737,23 @@ impl QuantizedQwen3VLTextModel {
                     continue;
                 }
 
+                // [ACTIVE-BLOCK-PROTECTION] 꽉 차지 않은 블록(Active)은 SSD로 보내지 않고 RAM에 보존
+                if inner.len < 256 {
+                    if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                        // VRAM -> RAM 이동 (Keep in RAM)
+                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                        
+                        inner.k_cache = Some(k_cpu);
+                        inner.v_cache = Some(v_cpu);
+                        inner.location = KVLocation::RAM;
+                        
+                        // [LOG] Active Block RAM Eviction
+                        // println!("[EVICT-RAM] Layer {} Active Block {} kept in RAM.", layer_idx, inner.index);
+                    }
+                    continue; 
+                }
+
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                     let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
                     let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
@@ -1747,6 +1764,7 @@ impl QuantizedQwen3VLTextModel {
                         v_tensor: v_cpu 
                     }, inner.offset));
                     
+                    // [VRAM-PURGE] 복사했으니 즉시 삭제 (Frozen Block)
                     inner.k_cache = None;
                     inner.v_cache = None;
                     inner.location = KVLocation::RAM; 
@@ -1926,6 +1944,84 @@ impl QuantizedQwen3VLTextModel {
         Ok(next_xs)
     }
 
+    /// [MANUAL-FLUSH] 세션 종료 시 RAM에 남아있는 활성 블록(Active Block)을 강제로 SSD에 저장합니다.
+    pub async fn force_flush_all_active_blocks(&mut self, session_id: &str) -> Result<()> {
+        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
+        
+        let mut tasks = Vec::new();
+
+        // 1. 모든 레이어의 활성 블록 수집
+        for (l_idx, layer) in self.layers.iter_mut().enumerate() {
+            for block in &mut layer.self_attn.kv_blocks {
+                let mut inner = block.inner.write().unwrap();
+                
+                // RAM이나 VRAM에 데이터가 남아있다면 저장 대상
+                if (inner.location == KVLocation::RAM || inner.location == KVLocation::VRAM) && inner.k_cache.is_some() {
+                    if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                         // CPU로 이동 (이미 RAM이면 비용 없음)
+                         let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                         let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                         
+                         tasks.push((
+                             l_idx,
+                             inner.offset,
+                             inner.len,
+                             LayerKVDump { layer_idx: l_idx, k_tensor: k_cpu, v_tensor: v_cpu }
+                         ));
+                         
+                         // 메모리 해제
+                         inner.k_cache = None;
+                         inner.v_cache = None;
+                         inner.location = KVLocation::SSD; // 곧 저장될 것임
+                    }
+                }
+            }
+        }
+
+        if tasks.is_empty() { return Ok(()); }
+
+        // 2. 수집된 태스크를 베이킹 큐로 전송
+        if let Some(tx) = BAKE_TX.get() {
+            let path = crate::utils::paths::get_kv_dir(None).join(session_id);
+            if !path.exists() { let _ = fs::create_dir_all(&path); }
+            let rr = Some(self.registry.clone());
+            let mode = self.baking_only;
+            let task_count = tasks.len();
+
+            for (l_idx, off, len, dump) in tasks {
+                // [SLOT-ACQUIRE] 쓰기 슬롯 확보
+                let sid = SLOT_MANAGER.acquire_write_slot(len).await;
+                
+                let sub_folder = if mode { "reference" } else { "inference" };
+                let block_dir = path.join(sub_folder).join(format!("b{}", off));
+                if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
+
+                // [REGISTRY-UPDATE]
+                {
+                    let mut reg_w = self.registry.entries.write().unwrap();
+                    let b_idx = off / 256;
+                    if b_idx < reg_w.len() {
+                        reg_w[b_idx].ssd_path = Some(block_dir.clone());
+                        reg_w[b_idx].location[l_idx] = KVLocation::SSD;
+                    }
+                }
+
+                let _ = tx.send(SlotTask::Bake(BakeTask {
+                    slot_id: sid,
+                    task_dir: block_dir,
+                    kv_name: Some(sub_folder.to_string()),
+                    offset: off,
+                    layers: vec![dump],
+                    is_relay_baking: mode,
+                    block_idx: Some(off / 256),
+                    registry: rr.clone(),
+                })).await;
+            }
+            println!("[FLUSH-FORCE] Forced flushed {} active blocks to SSD.", task_count);
+        }
+        Ok(())
+    }
+
     /// [NEW-STRICT] 특정 레이어의 활성 KV 데이터를 CPU로 복사하고 VRAM에서 즉시 제거
     fn evacuate_layer_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, start_off: usize, len: usize) -> Result<()> {
         use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
@@ -1936,6 +2032,19 @@ impl QuantizedQwen3VLTextModel {
         for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
             let mut inner = block.inner.write().unwrap();
             if inner.offset >= block_start && inner.location == KVLocation::VRAM {
+                // [ACTIVE-BLOCK-PROTECTION] 꽉 차지 않은 블록(Active)은 SSD로 보내지 않고 RAM에 보존
+                if inner.len < 256 {
+                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                        
+                        inner.k_cache = Some(k_cpu);
+                        inner.v_cache = Some(v_cpu);
+                        inner.location = KVLocation::RAM;
+                     }
+                     continue;
+                }
+
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                     let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
                     let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;

@@ -506,6 +506,13 @@ impl ModelVariant {
         }
     }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.rebalance_layers(device_id, offset, total_len), Self::QuantizedText(m) => m.rebalance_layers(device_id, offset, total_len) } }
+    pub async fn force_flush_all_active_blocks(&mut self, session_id: &str) -> Result<()> {
+        match self {
+            Self::QuantizedVL(m) => m.language_model.force_flush_all_active_blocks(session_id).await,
+            Self::QuantizedText(m) => m.language_model.force_flush_all_active_blocks(session_id).await,
+            _ => Ok(()),
+        }
+    }
     pub fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage() } }
     pub fn save_metadata_to_file(&self, path: &Path) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.registry.save_to_file(path), Self::QuantizedText(m) => m.language_model.registry.save_to_file(path), _ => Ok(()) } }
     pub fn load_metadata_from_file(&self, path: &Path) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.registry.load_from_file(path), Self::QuantizedText(m) => m.language_model.registry.load_from_file(path), _ => Ok(()) } }
@@ -566,6 +573,7 @@ impl Qwen3VLGenerateModel {
             let _ = self.qwen3_vl.save_metadata_to_file(&p);
 
             println!("[BAKING] Layer-by-layer async evacuation to 'reference' complete.");
+            self.qwen3_vl.force_flush_all_active_blocks(s_id).await?;
             wait_for_global_io().await; 
         }
         Ok(t_toks)
@@ -603,6 +611,7 @@ impl Qwen3VLGenerateModel {
             let _ = self.qwen3_vl.save_metadata_to_file(&p);
             
             println!("[GENERATE] Finalizing async SSD writes for inference response...");
+            self.qwen3_vl.force_flush_all_active_blocks(s_id).await?;
             wait_for_global_io().await; 
         }
         Ok(g_text)
