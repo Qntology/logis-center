@@ -278,9 +278,17 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         let bho = bh * (s * d);
                                         for ti in 0..s {
                                             let td = &t_data[bho + ti * d .. bho + (ti + 1) * d];
-                                            if ti < 4 || ti % 8 == 0 { let ap = if ti < 4 { ti } else { 4 + (ti - 4) / 8 }; ka[(bh * ac + ap) * d .. (bh * ac + ap + 1) * d].copy_from_slice(td); }
-                                            let mut abs_sum = 0.0f32; for &v in td { abs_sum += v.abs(); }
-                                            let base_s = abs_sum / (d as f32); ksc[bh * s + ti] = base_s;
+                                            if ti < 4 || ti % 8 == 0 {
+                                                let anchor_pos = if ti < 4 { ti } else { 4 + (ti - 4) / 8 };
+                                                ka[(bh * ac + anchor_pos) * d .. (bh * ac + anchor_pos + 1) * d].copy_from_slice(td);
+                                            }
+                                            
+                                            // [STABLE-REVERT] Max-Absolute Scaling
+                                            let mut max_abs = 0.0f32;
+                                            for &v in td { let a = v.abs(); if a > max_abs { max_abs = a; } }
+                                            let base_s = max_abs;
+                                            ksc[bh * s + ti] = base_s;
+
                                             let mut res = td.to_vec();
                                             for bit_l in 0..4 {
                                                 let cur_s = base_s / (2.0f32.powi(bit_l as i32));
@@ -309,9 +317,17 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         let bho = bh * (s * d);
                                         for ti in 0..s {
                                             let td = &t_data[bho + ti * d .. bho + (ti + 1) * d];
-                                            if ti < 4 || ti % 8 == 0 { let ap = if ti < 4 { ti } else { 4 + (ti - 4) / 8 }; va[(bh * ac + ap) * d .. (bh * ac + ap + 1) * d].copy_from_slice(td); }
-                                            let mut abs_sum = 0.0f32; for &v in td { abs_sum += v.abs(); }
-                                            let base_s = abs_sum / (d as f32); vsc[bh * s + ti] = base_s;
+                                            if ti < 4 || ti % 8 == 0 {
+                                                let anchor_pos = if ti < 4 { ti } else { 4 + (ti - 4) / 8 };
+                                                va[(bh * ac + anchor_pos) * d .. (bh * ac + anchor_pos + 1) * d].copy_from_slice(td);
+                                            }
+                                            
+                                            // [STABLE-REVERT] Max-Absolute Scaling
+                                            let mut max_abs = 0.0f32;
+                                            for &v in td { let a = v.abs(); if a > max_abs { max_abs = a; } }
+                                            let base_s = max_abs;
+                                            vsc[bh * s + ti] = base_s;
+
                                             let mut res = td.to_vec();
                                             for bit_l in 0..4 {
                                                 let cur_s = base_s / (2.0f32.powi(bit_l as i32));
