@@ -594,6 +594,13 @@ impl Qwen3VLGenerateModel {
             cur_off = t_toks;
         }
 
+        // [DEC-VERTICAL-ACCELERATION] 디코딩 시작 전 모든 레이어를 GPU에 고정
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.language_model.pin_all_layers_to_gpu().await?,
+            ModelVariant::QuantizedText(m) => m.language_model.pin_all_layers_to_gpu().await?,
+            _ => {}
+        }
+
         while g_text.len() < max_gen {
             let last_id = *a_ids.last().unwrap_or(&0);
             let logits: Tensor = self.qwen3_vl.forward(&Tensor::from_vec(vec![last_id], (1, 1), &self.text_device)?, p_vals.as_ref(), i_grid.as_ref(), None, None, None, cur_off, cur_off + 1, session_id.clone()).await?;
@@ -602,6 +609,13 @@ impl Qwen3VLGenerateModel {
             g_text.push_str(&txt); a_ids.push(next_id); cur_off += 1; p_vals = None;
             
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
+        }
+
+        // [DEC-CLEANUP] 디코딩 종료 후 VRAM 반납
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.language_model.unpin_all_layers().await?,
+            ModelVariant::QuantizedText(m) => m.language_model.unpin_all_layers().await?,
+            _ => {}
         }
 
         if let Some(s_id) = &session_id {

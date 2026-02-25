@@ -1942,13 +1942,15 @@ impl QuantizedQwen3VLTextModel {
     ) -> Result<Tensor> {
         let start_layer_time = std::time::Instant::now();
         let input_token_count = xs.dim(1).unwrap_or(0);
-        println!("[ENGINE-TRACE] >> Start Layer {} | Input Tokens: {}", layer_idx, input_token_count);
+        let is_decoding = input_token_count <= 1;
 
-        // [STEP 1] Load Weights to GPU (싱글톤 장치 사용)
+        // [STEP 1] Load Weights to GPU (이미 있으면 건너뜀)
         let target_device = crate::utils::get_cuda_device(0); 
-        if !self.layers[layer_idx].device().same_device(&target_device) {
+        let current_device = self.layers[layer_idx].device();
+        
+        if !current_device.same_device(&target_device) {
             self.layers[layer_idx].to_device(&target_device)?;
-            let _ = target_device.synchronize(); 
+            if !is_decoding { let _ = target_device.synchronize(); }
         }
 
         // [STEP 2] Load & Decode KV Cache 파편 (현재 레이어용)
@@ -2038,7 +2040,7 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [STEP 4] 실시간 VRAM 해제 및 자원 반납 (정석)
+        // [STEP 4] 실시간 VRAM 해제 및 자원 반납
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
         
         // 1. KV 캐시 즉시 대피 및 VRAM 삭제
@@ -2047,14 +2049,37 @@ impl QuantizedQwen3VLTextModel {
             let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count).await;
         }
 
-        // 2. 레이어 무게추 즉시 CPU로 반납 및 동기화 (VRAM 즉시 해방 강제)
-        if target_device.is_cuda() {
+        // 2. [VRAM-PERSISTENCE] 디코딩 시에는 무게추를 GPU에 유지, 프리필 시에만 CPU로 반납
+        if !is_decoding && target_device.is_cuda() {
             self.layers[layer_idx].to_device(&Device::Cpu)?;
-            let _ = target_device.synchronize(); // 드라이버에게 메모리 회수 기회 부여
         }
         
-        println!("[ENGINE-TRACE] << End Layer {} | VRAM Evicted & Synchronized. | Time: {:.2}s", layer_idx, start_layer_time.elapsed().as_secs_f32());
+        if !is_decoding {
+            println!("[ENGINE-TRACE] << End Layer {} | VRAM Evicted. | Time: {:.2}s", layer_idx, start_layer_time.elapsed().as_secs_f32());
+        }
         Ok(next_xs)
+    }
+
+    /// [DEC-SPEED-UP] 디코딩 속도를 위해 모든 레이어를 GPU에 상주 시킴
+    pub async fn pin_all_layers_to_gpu(&mut self) -> Result<()> {
+        let target_device = crate::utils::get_cuda_device(0);
+        println!("[DEC-SPEED-UP] Pinning all layers to GPU for vertical inference...");
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if !layer.device().same_device(&target_device) {
+                layer.to_device(&target_device)?;
+            }
+        }
+        if target_device.is_cuda() { let _ = target_device.synchronize(); }
+        Ok(())
+    }
+
+    /// [DEC-CLEANUP] 디코딩이 끝나면 모든 레이어를 다시 CPU로 보냄
+    pub async fn unpin_all_layers(&mut self) -> Result<()> {
+        println!("[DEC-CLEANUP] Unpinning all layers from GPU...");
+        for layer in self.layers.iter_mut() {
+            layer.to_device(&Device::Cpu)?;
+        }
+        Ok(())
     }
 
     /// [MANUAL-FLUSH] 세션 종료 시 RAM에 남아있는 활성 블록(Active Block)을 강제로 SSD에 저장합니다.
