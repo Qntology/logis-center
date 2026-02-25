@@ -2306,9 +2306,13 @@ impl QuantizedQwen3VLTextModel {
 
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
 
-        // [FLUSH-COMMIT] 세션 ID가 있을 경우(Baking/Step-A) RAM에 남은 데이터를 강제로 SSD로 밀어냅니다.
+        // [FLUSH-COMMIT] 베이킹 모드(0.6B -> 2B Relay)일 경우에만 즉시 SSD 저장을 실행합니다.
+        // 일반 추론(Step A) 시에는 강제 플러시를 하지 않아 IO 오버헤드와 CUDA 컨텍스트 오류를 방지합니다.
         if let Some(sid) = session_id {
-            self.force_flush_all_active_blocks(&sid).await?;
+            if self.baking_only {
+                self.force_flush_all_active_blocks(&sid).await?;
+                if target_device.is_cuda() { let _ = target_device.synchronize(); }
+            }
         }
 
         self.current_kv_len = seqlen_offset + seq_len;
