@@ -190,14 +190,20 @@ impl SlotManager {
 pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(128));
 pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+// [DIAG-ERROR-LOG] 슬롯 작업 실패 시 물리 파일로 기록
+fn log_slot_error(root: &Path, msg: &str) {
+    let error_dir = root.join("error");
+    if !error_dir.exists() { let _ = fs::create_dir_all(&error_dir); }
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let file_path = error_dir.join(format!("err_{}.txt", timestamp));
+    let _ = fs::write(file_path, msg);
+}
+
 pub async fn wait_for_global_io() {
-    println!("[DIAG-IO] Starting Global Sync. Waiting for all 128 slots to be free...");
+    println!("[DIAG-IO] Starting Persistent Global Sync. Waiting for all slots to be free...");
     let start = std::time::Instant::now();
     
-    // 1. 모든 비동기 작업 완료 신호 대기
-    SLOT_MANAGER.wait_for_all_tasks().await;
-    
-    // 2. 물리적 슬롯 상태 전수 조사 (최대 30초 대기)
+    // [INFINITE-WAIT] 사용자 요청에 따라 슬롯이 완전히 비워질 때까지 무한 대기
     loop {
         let current_free = SLOT_MANAGER.count_free.load(Ordering::SeqCst);
         let pending_io = GLOBAL_IO_COUNTER.load(Ordering::SeqCst);
@@ -205,26 +211,20 @@ pub async fn wait_for_global_io() {
         if current_free >= 128 && pending_io == 0 {
             break;
         }
-        
-        if start.elapsed().as_secs() > 30 {
-            println!("[DIAG-IO] STUCK DETECTED! Global Sync Timeout. Resetting IO counters for safety.");
-            GLOBAL_IO_COUNTER.store(0, Ordering::SeqCst);
-            break;
-        }
-        
-        // 사용 중인 슬롯 번호 출력
+
+        // 사용 중인 슬롯 번호 출력 (진단용)
         let mut busy_slots = Vec::new();
         for i in 0..128 {
             if SLOT_MANAGER.slots[i].state.load(Ordering::SeqCst) != 0 { busy_slots.push(i); }
         }
         
-        // [AUDIT-IO] 어떤 블록/레이어 작업 때문에 대기 중인지 상세 분석
-        println!("[DIAG-IO] 대기 중... 바쁜 슬롯: {:?}, 잔여 디스크 IO: {}", busy_slots, pending_io);
-        if !busy_slots.is_empty() {
-            println!("[DIAG-IO] 원인 분석: 현재 {}개의 슬롯이 여전히 읽기/쓰기 작업을 수행 중입니다.", busy_slots.len());
+        if start.elapsed().as_secs() % 5 == 0 && start.elapsed().as_millis() % 1000 < 100 {
+            println!("[DIAG-IO] Still waiting... Busy slots: {:?}, Pending Disk IO: {}", busy_slots, pending_io);
         }
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    
     println!("[DIAG-IO] Global Sync Finished in {:.2}s.", start.elapsed().as_secs_f32());
 }
 
@@ -395,20 +395,17 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let sid = load.slot_id; let reg = load.registry.clone(); let l_idx = load.layer_idx; let shared_block = load.shared_block.clone();
                     let provided_path = load.path.clone(); 
                     tokio::spawn(async move {
-                        // [RAII-GUARD] 함수 종료 시 무조건 슬롯 반납
+                        // [RAII-GUARD]
                         let _guard = ReadSlotGuard { sid, active: true };
 
                         let (b_idx_off, b_idx, recorded_path) = { 
-                            match shared_block.inner.read() { 
-                                Ok(inner) => (inner.offset, inner.index, inner.ssd_path.clone()), 
-                                _ => (0, 999, None) 
-                            } 
+                            match shared_block.inner.read() { Ok(inner) => (inner.offset, inner.index, inner.ssd_path.clone()), _ => (0, 999, None) }
                         };
                         
                         let mut root = provided_path.clone();
                         while root.to_string_lossy().contains("inference") || root.to_string_lossy().contains("reference") || root.to_string_lossy().contains("b") {
                             if let Some(parent) = root.parent() { 
-                                if parent.as_os_str().is_empty() || parent.to_string_lossy() == "tmp" || parent.to_string_lossy() == "kv" { break; }
+                                if parent.to_string_lossy().ends_with("kv") || parent.to_string_lossy().ends_with("tmp") { break; }
                                 root = parent.to_path_buf(); 
                             } else { break; }
                         }
@@ -422,7 +419,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         };
                         
                         let ref_p = root.join("reference").join(&b_str).join("l0.st");
-                        let final_path = if act_p.is_file() { Some(act_p.clone()) } else if ref_p.is_file() { Some(ref_p.clone()) } else { None };
+                        let act_p_for_log = act_p.clone(); // [FIX] Clone before move
+                        let final_path = if act_p.is_file() { Some(act_p) } else if ref_p.is_file() { Some(ref_p) } else { None };
 
                         if let Some(p) = final_path {
                             match candle_core::safetensors::load(&p, &Device::Cpu) {
@@ -437,24 +435,24 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     }
                                 },
                                 Err(e) => {
-                                    println!("[SLOT-FAIL] Failed to load safetensor for Slot {} (Layer {}): {:?}", sid, l_idx, e);
+                                    log_slot_error(&root, &format!("[LOAD-FAIL] Layer {} Block {} file found but load failed: {:?}", l_idx, b_idx_off, e));
                                 }
                             }
                         } else {
-                            println!("[SLOT-FAIL] KV File not found for Slot {} (Layer {}). Expected: {:?}", sid, l_idx, act_p);
+                            log_slot_error(&root, &format!("[LOAD-FAIL] Layer {} Block {} file not found. Search path: {:?}", l_idx, b_idx_off, act_p_for_log));
                         }
                     });
                 }
                 SlotTask::ChunkedLoad(load) => {
                     let reg = load.registry.clone(); let sids = load.slot_ids; let l_indices = load.layer_indices; let blocks = load.shared_blocks; let provided_path = load.path;
                     tokio::spawn(async move {
-                        // [RAII-GUARDS] 청크 단위 반납 보장
-                        let _guards: Vec<ReadSlotGuard> = sids.iter().map(|&sid| ReadSlotGuard { sid, active: true }).collect();
+                        // [RAII-GUARDS]
+                        let _guards: Vec<_> = sids.iter().map(|&sid| ReadSlotGuard { sid, active: true }).collect();
 
                         let mut root = provided_path.clone();
                         while root.to_string_lossy().contains("inference") || root.to_string_lossy().contains("reference") || root.to_string_lossy().contains("b") {
                             if let Some(parent) = root.parent() { 
-                                if parent.as_os_str().is_empty() || parent.to_string_lossy() == "tmp" || parent.to_string_lossy() == "kv" { break; }
+                                if parent.to_string_lossy().ends_with("kv") || parent.to_string_lossy().ends_with("tmp") { break; }
                                 root = parent.to_path_buf(); 
                             } else { break; }
                         }
@@ -462,8 +460,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         for i in 0..sids.len() {
                             let (l_idx, block) = (l_indices[i], &blocks[i]);
                             let (b_idx_off, b_idx, recorded_path) = { 
-                                let inner = block.inner.read().unwrap(); 
-                                (inner.offset, inner.index, inner.ssd_path.clone()) 
+                                let inner = block.inner.read().unwrap(); (inner.offset, inner.index, inner.ssd_path.clone())
                             };
                             
                             let filename = format!("l{}.st", l_idx);
@@ -474,23 +471,27 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 root.join("inference").join(&b_str).join(&filename)
                             };
                             let ref_p = root.join("reference").join(&b_str).join("l0.st");
-                            let final_path = if act_p.is_file() { Some(act_p.clone()) } else if ref_p.is_file() { Some(ref_p.clone()) } else { None };
+                            let act_p_for_log = act_p.clone(); // [FIX]
+                            let final_path = if act_p.is_file() { Some(act_p) } else if ref_p.is_file() { Some(ref_p) } else { None };
 
                             if let Some(p) = final_path {
-                                if let Ok(st) = candle_core::safetensors::load(&p, &Device::Cpu) {
-                                    let is_relay = p.to_string_lossy().contains("l0.st");
-                                    let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
-                                    if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
-                                        let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
-                                        let os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
-                                        let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(), v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(), original_shape: os };
-                                        if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
+                                match candle_core::safetensors::load(&p, &Device::Cpu) {
+                                    Ok(st) => {
+                                        let is_relay = p.to_string_lossy().contains("l0.st");
+                                        let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
+                                        if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
+                                            let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
+                                            let os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
+                                            let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(), v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(), original_shape: os };
+                                            if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
+                                        }
+                                    },
+                                    Err(e) => {
+                                        log_slot_error(&root, &format!("[CHUNK-FAIL] Layer {} Block {} load failed: {:?}", l_idx, b_idx_off, e));
                                     }
-                                } else {
-                                    println!("[SLOT-FAIL] Chunked load error for Layer {} at {:?}", l_idx, p);
                                 }
                             } else {
-                                println!("[SLOT-FAIL] Chunked file not found for Layer {} at {:?}", l_idx, act_p);
+                                log_slot_error(&root, &format!("[CHUNK-FAIL] Layer {} Block {} file not found at {:?}", l_idx, b_idx_off, act_p_for_log));
                             }
                         }
                     });
