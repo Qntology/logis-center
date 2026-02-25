@@ -198,27 +198,6 @@ impl Qwen3VLTextRotaryEmbedding {
         Self { inv_freq }
     }
 
-    pub fn apply_interleaved_mrope(
-        &self,
-        freqs: &Tensor,
-        mrope_section: Vec<usize>,
-    ) -> Result<Tensor> {
-        let mut freqs_t = freqs.i(0)?.contiguous()?; 
-
-        for (dim, section) in mrope_section.iter().enumerate().skip(1) {
-            let length = section * 3;
-            let idx = Tensor::arange_step(dim as u32, length as u32, 3, freqs.device())?;
-            let src = freqs.i(dim)?.contiguous()?; 
-            let src = src.index_select(&idx, D::Minus1)?.contiguous()?;
-            let idx = idx
-                .unsqueeze(0)?
-                .unsqueeze(0)?
-                .broadcast_as(src.shape())?
-                .contiguous()?;
-            freqs_t = freqs_t.scatter(&idx, &src, D::Minus1)?;
-        }
-        Ok(freqs_t)
-    }
     pub fn forward(
         &self,
         position_ids: &Tensor,
@@ -231,10 +210,12 @@ impl Qwen3VLTextRotaryEmbedding {
         } else {
             position_ids.clone()
         };
+
         let position_ids_expanded = position_ids
             .unsqueeze(D::Minus2)?
             .to_dtype(DType::F32)?
             .contiguous()?;
+
         let inv_freq_expanded = Tensor::from_vec(
             self.inv_freq.clone(),
             (1, 1, self.inv_freq.len(), 1),
@@ -244,13 +225,46 @@ impl Qwen3VLTextRotaryEmbedding {
         .to_dtype(DType::F32)?
         .contiguous()?;
 
+        // Calculate frequencies for T, H, W dimensions
         let freqs = inv_freq_expanded
             .matmul(&position_ids_expanded)?
-            .transpose(2, 3)?;
-        let freqs = self.apply_interleaved_mrope(&freqs, mrope_section)?;
+            .transpose(2, 3)?; // (3, b_sz, seq_len, dim/2)
+
+        // Standard Qwen2-VL/Qwen3-VL block-based mRoPE assembly
         let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?.contiguous()?;
-        let cos = emb.cos()?;
-        let sin = emb.sin()?;
+        let cos_all = emb.cos()?;
+        let sin_all = emb.sin()?;
+
+        // If no sections defined, fallback to first dimension (Time)
+        if mrope_section.is_empty() {
+            let cos = cos_all.i(0)?.unsqueeze(1)?.to_dtype(dtype)?;
+            let sin = sin_all.i(0)?.unsqueeze(1)?.to_dtype(dtype)?;
+            return Ok((cos, sin));
+        }
+
+        // Split by sections and select based on dimension index
+        let mrope_section_doubled = mrope_section.iter().map(|&s| s * 2).collect::<Vec<_>>();
+        
+        let cos_select: Vec<Tensor> = cos_all
+            .split(&mrope_section_doubled, D::Minus1)?
+            .iter()
+            .enumerate()
+            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
+            .collect();
+        let cos = Tensor::cat(&cos_select, D::Minus1)?
+            .unsqueeze(1)?
+            .contiguous()?;
+
+        let sin_select: Vec<Tensor> = sin_all
+            .split(&mrope_section_doubled, D::Minus1)?
+            .iter()
+            .enumerate()
+            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
+            .collect();
+        let sin = Tensor::cat(&sin_select, D::Minus1)?
+            .unsqueeze(1)?
+            .contiguous()?;
+
         Ok((cos.to_dtype(dtype)?, sin.to_dtype(dtype)?))
     }
 }

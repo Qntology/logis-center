@@ -1516,7 +1516,7 @@ impl QuantizedQwen3VLTextModel {
         let norm_dtype = if last_device.is_cpu() { DType::F32 } else { dtype };
         let norm = get_rms_norm(ct, &mut reader, norm_prefix, config.rms_norm_eps, last_device, norm_dtype)?;
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default(), mmap: mmap_handle, registry, baking_only, is_forced_cpu, active_session_id: None, active_kv_name: None, pinned_layer_count, current_kv_len: 0 })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_else(|| if config.head_dim == 128 { vec![16, 24, 24] } else { vec![] }), mmap: mmap_handle, registry, baking_only, is_forced_cpu, active_session_id: None, active_kv_name: None, pinned_layer_count, current_kv_len: 0 })
     }
 
     pub fn new<R: std::io::Seek + std::io::Read>(
@@ -1605,7 +1605,7 @@ impl QuantizedQwen3VLTextModel {
         let norm_device = layers.last().map(|l| l.device()).unwrap_or(&current_device);
         let norm = get_rms_norm(ct, reader, norm_prefix, config.rms_norm_eps, norm_device, if norm_device.is_cpu() { DType::F32 } else { dtype })?;
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default(), mmap: None, registry, baking_only, is_forced_cpu, active_session_id: None, active_kv_name: None, pinned_layer_count, current_kv_len: 0 })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_else(|| if config.head_dim == 128 { vec![16, 24, 24] } else { vec![] }), mmap: None, registry, baking_only, is_forced_cpu, active_session_id: None, active_kv_name: None, pinned_layer_count, current_kv_len: 0 })
     }
 
     /// [CHUNK-ASYNC-PROCESSOR]
@@ -1677,8 +1677,8 @@ impl QuantizedQwen3VLTextModel {
                 layer_idx, chunk_idx + 1, chunk_offsets.len(), i, i + take, target_device);
 
             let xs_chunk = xs.narrow(1, i, take)?;
-            let cos_chunk = cos.narrow(1, i, take)?;
-            let sin_chunk = sin.narrow(1, i, take)?;
+            let cos_chunk = cos.narrow(cos.rank().saturating_sub(2), i, take)?;
+            let sin_chunk = sin.narrow(sin.rank().saturating_sub(2), i, take)?;
 
             let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)?;
             results.push(out);
@@ -2067,7 +2067,7 @@ impl QuantizedQwen3VLTextModel {
                     registry: rr.clone(),
                 })).await;
             }
-            println!("[FLUSH-FORCE] Forced flushed {} active blocks to SSD.", task_count);
+            println!("[FLUSH-FORCE] Submitted {} layers to Bake queue.", task_count);
         }
         Ok(())
     }
@@ -2227,6 +2227,13 @@ impl QuantizedQwen3VLTextModel {
                 .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_size, seq_len))?,
         };
         
+        // [DIAG-ROPE] 위치 정보 모니터링
+        if seqlen_offset % 10 == 0 || seq_len > 1 {
+            let p_min = position_ids.flatten_all()?.min(0)?.to_scalar::<u32>()?;
+            let p_max = position_ids.flatten_all()?.max(0)?.to_scalar::<u32>()?;
+            println!("[DIAG-ENGINE-INNER] Forward | Offset: {} | SeqLen: {} | PosRange: {}..{}", seqlen_offset, seq_len, p_min, p_max);
+        }
+
         let (cos, sin) = self.rotary_emb.forward(&position_ids, inputs_embeds.dtype(), self.mrope_section.clone())?;
         
         // [FAST-PATH] 0.6B 모델은 수직적(전체) 추론을 사용하여 속도를 극대화합니다.
@@ -2687,19 +2694,35 @@ impl QuantizedQwen3VLModel {
         }
         
         // 2. Position IDs calculation (Corrected for Long Context & Vision)
-        let (position_ids, rope_deltas) = if (cache_position_in.is_some() && cache_position_in.unwrap().i(0)?.to_scalar::<u32>()? == 0) || self.rope_deltas.is_none() {
+        let (position_ids, _rope_deltas) = if (cache_position_in.is_some() && cache_position_in.unwrap().i(0)?.to_scalar::<u32>()? == 0) || self.rope_deltas.is_none() {
             let (p_ids, deltas) = self.get_rope_index(&input_ids, image_grid_thw, video_grid_thw, None)?;
             self.rope_deltas = Some(deltas);
             (p_ids, self.rope_deltas.as_ref().unwrap().clone())
         } else {
             // Decoding/Incremental Step
-            let start = seqlen_offset as u32;
-            let p_ids = Tensor::arange(start, start + seq_len as u32, input_ids.device())?
-                .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
-            (p_ids, self.rope_deltas.as_ref().unwrap().clone())
+            let deltas = self.rope_deltas.as_ref().unwrap();
+            let mut p_ids_vec = Vec::new();
+            
+            for b in 0..b_sz {
+                let delta = deltas.i(b)?.to_scalar::<i64>()?;
+                let real_start = (seqlen_offset as i64 + delta) as u32;
+                let p_id = Tensor::arange(real_start, real_start + seq_len as u32, input_ids.device())?
+                    .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, seq_len))?;
+                p_ids_vec.push(p_id);
+            }
+            let p_ids = Tensor::cat(&p_ids_vec, 1)?;
+            (p_ids, deltas.clone())
         };
         
         self.language_model.active_session_id = session_id;
+        
+        // [DIAG-ROPE] 위치 정보 및 텐서 상태 모니터링
+        if seqlen_offset % 10 == 0 || seq_len > 1 {
+            let p_min = position_ids.flatten_all()?.min(0)?.to_scalar::<u32>()?;
+            let p_max = position_ids.flatten_all()?.max(0)?.to_scalar::<u32>()?;
+            println!("[DIAG-ENGINE] Forward | Offset: {} | SeqLen: {} | PosRange: {}..{}", seqlen_offset, seq_len, p_min, p_max);
+        }
+
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None).await?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         
@@ -2707,7 +2730,29 @@ impl QuantizedQwen3VLModel {
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
         let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };
         let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state };
-        Ok(self.lm_head.forward(&hidden_state)?)
+        
+        let logits = self.lm_head.forward(&hidden_state)?;
+        
+        // [DIAG-LOGITS] 결과값 폭주 여부 확인 및 파일 저장
+        if seqlen_offset % 5 == 0 {
+            let l_max = logits.flatten_all()?.abs()?.max(0)?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+            let p_min = position_ids.flatten_all()?.min(0)?.to_scalar::<u32>()?;
+            let p_max = position_ids.flatten_all()?.max(0)?.to_scalar::<u32>()?;
+            
+            let log_msg = format!("[DIAG-VL] Off: {} | Pos: {}..{} | MaxLogit: {:.4}\n", seqlen_offset, p_min, p_max, l_max);
+            let log_path = std::path::Path::new("tmp/logs/engine_diag.log");
+            if let Some(parent) = log_path.parent() { let _ = std::fs::create_dir_all(parent); }
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+                use std::io::Write;
+                let _ = writeln!(file, "{}", log_msg.trim());
+            }
+            
+            if l_max > 100.0 || l_max.is_nan() {
+                println!("[DIAG-WARN] Potential Tensor Explosion! Max Logit: {}", l_max);
+            }
+        }
+        
+        Ok(logits)
     }
 
     pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
@@ -2784,12 +2829,42 @@ impl QuantizedQwen3TextModel {
         };
         
         self.language_model.active_session_id = session_id;
+        
+        // [DIAG-ROPE-TEXT]
+        if seqlen_offset % 10 == 0 || seq_len > 1 {
+            let p_min = position_ids.flatten_all()?.min(0)?.to_scalar::<u32>()?;
+            let p_max = position_ids.flatten_all()?.max(0)?.to_scalar::<u32>()?;
+            println!("[DIAG-ENGINE-TEXT] Forward | Offset: {} | SeqLen: {} | PosRange: {}..{}", seqlen_offset, seq_len, p_min, p_max);
+        }
+
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None).await?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
-        if let Some(head) = &self.lm_head {
+        
+        let logits = if let Some(head) = &self.lm_head {
             let hidden_state = if !hidden_state.device().same_device(head.device()) { hidden_state.to_device(head.device())? } else { hidden_state };
-            Ok(head.forward(&hidden_state)?)
-        } else { Ok(hidden_state) }
+            head.forward(&hidden_state)?
+        } else { hidden_state };
+
+        // [DIAG-LOGITS-TEXT] 결과값 폭주 여부 확인 및 파일 저장
+        if seqlen_offset % 5 == 0 {
+            let l_max = logits.flatten_all()?.abs()?.max(0)?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+            let p_min = position_ids.flatten_all()?.min(0)?.to_scalar::<u32>()?;
+            let p_max = position_ids.flatten_all()?.max(0)?.to_scalar::<u32>()?;
+
+            let log_msg = format!("[DIAG-TEXT] Off: {} | Pos: {}..{} | MaxLogit: {:.4}\n", seqlen_offset, p_min, p_max, l_max);
+            let log_path = std::path::Path::new("tmp/logs/engine_diag.log");
+            if let Some(parent) = log_path.parent() { let _ = std::fs::create_dir_all(parent); }
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+                use std::io::Write;
+                let _ = writeln!(file, "{}", log_msg.trim());
+            }
+
+            if l_max > 100.0 || l_max.is_nan() {
+                println!("[DIAG-WARN-TEXT] Potential Tensor Explosion! Max Logit: {}", l_max);
+            }
+        }
+        
+        Ok(logits)
     }
 
     pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
