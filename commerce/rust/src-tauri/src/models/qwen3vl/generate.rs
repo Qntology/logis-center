@@ -240,7 +240,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     if idx < entries.len() {
                         let e = &mut entries[idx]; e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
                         if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
-                            if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; } }
+                            if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = KVLocation::SSD; } }
                         }
                     }
                 }
@@ -292,9 +292,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                             }
                                         }
                                     }
-                                    let kp_len = kp.len();
+                                    let kpl = kp.len();
                                     if let Ok(t) = Tensor::from_vec(ka, vec![b, h, ac, d], &Device::Cpu) { map.insert(format!("{}k_anchors", prefix), t); }
-                                    if let Ok(t) = Tensor::from_vec(kp, vec![kp_len], &Device::Cpu) { map.insert(format!("{}k_packed", prefix), t); }
+                                    if let Ok(t) = Tensor::from_vec(kp, vec![kpl], &Device::Cpu) { map.insert(format!("{}k_packed", prefix), t); }
                                     if let Ok(t) = Tensor::from_vec(ksc, vec![b, h, s, 1], &Device::Cpu) { map.insert(format!("{}k_scales", prefix), t); }
                                 }
                             }
@@ -323,9 +323,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                             }
                                         }
                                     }
-                                    let vp_len = vp.len();
+                                    let vpl = vp.len();
                                     if let Ok(t) = Tensor::from_vec(va, vec![b, h, ac, d], &Device::Cpu) { map.insert(format!("{}v_anchors", prefix), t); }
-                                    if let Ok(t) = Tensor::from_vec(vp, vec![vp_len], &Device::Cpu) { map.insert(format!("{}v_packed", prefix), t); }
+                                    if let Ok(t) = Tensor::from_vec(vp, vec![vpl], &Device::Cpu) { map.insert(format!("{}v_packed", prefix), t); }
                                     if let Ok(t) = Tensor::from_vec(vsc, vec![b, h, s, 1], &Device::Cpu) { map.insert(format!("{}v_scales", prefix), t); }
                                 }
                             }
@@ -472,7 +472,7 @@ impl Qwen3VLGenerateModel {
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             gen_ids.push(next_id);
             gen_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
-            logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, total_toks + i as usize, total_toks + i as usize + 1, session_id.clone()).await?;
+            logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, (total_toks as usize + i as usize), (total_toks as usize + i as usize + 1), session_id.clone()).await?;
         }
         Ok(gen_text)
     }
