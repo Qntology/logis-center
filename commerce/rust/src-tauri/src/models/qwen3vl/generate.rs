@@ -176,9 +176,7 @@ impl SlotManager {
     pub async fn acquire_write_slot(&self, total_tokens: usize) -> usize { let (tx, rx) = oneshot::channel(); let _ = self.request_tx.send(SlotRequest::AcquireWrite { response: tx, total_tokens }).await; rx.await.unwrap_or(0) }
     pub async fn release_slot(&self, id: usize) {
         if id < self.slots.len() {
-            // [FIX] 이미 Free 상태인 경우 중복 반납 방지
-            if self.slots[id].state.load(Ordering::SeqCst) == 0 { return; }
-
+            // [HARDENING] 리소스를 비우고 상태를 0으로 만들되, 메시지는 무조건 보냅니다.
             for l in &self.slots[id].k_layers { if let Ok(mut g) = l.try_lock() { *g = None; } }
             for l in &self.slots[id].v_layers { if let Ok(mut g) = l.try_lock() { *g = None; } }
             self.slots[id].state.store(0, Ordering::SeqCst);
@@ -192,6 +190,7 @@ pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 // [DIAG-ERROR-LOG] 슬롯 작업 실패 시 물리 파일로 기록
 fn log_slot_error(root: &Path, msg: &str) {
+    println!("{}", msg); // [FIX] 즉시 터미널 출력
     let error_dir = root.join("error");
     if !error_dir.exists() { let _ = fs::create_dir_all(&error_dir); }
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f").to_string();
