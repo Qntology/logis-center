@@ -991,10 +991,14 @@ impl QuantizedQwen3VLTextAttention {
                     
                     for b in 0..num_bits {
                         let bit_idx = elem_idx + b * total_elements;
-                        let is_set = (packed_vec[bit_idx / 8] & (1 << (bit_idx % 8))) != 0;
-                        // Each subsequent bit has half the scale of the previous one
-                        let bit_scale = base_scale / (2.0f32.powi(b as i32));
-                        val += if is_set { bit_scale } else { -bit_scale };
+                        let byte_idx = bit_idx / 8;
+                        
+                        // [STRICT-BOUNDARY-CHECK] 데이터 범위를 벗어나는 비트는 무시하여 패닉 방지
+                        if byte_idx < packed_vec.len() {
+                            let is_set = (packed_vec[byte_idx] & (1 << (bit_idx % 8))) != 0;
+                            let bit_scale = base_scale / (2.0f32.powi(b as i32));
+                            val += if is_set { bit_scale } else { -bit_scale };
+                        }
                     }
                     token_out[d_idx] = val;
                 }
