@@ -372,7 +372,6 @@ Return valid JSON only. No explanation.
     template.replace("{TYPE}", page_type)
 }
 
-
 pub fn para2graph(language: &str) -> String {
     let template = r###"convert the natural language content to fit the dataset JSON structure. no explanation.
 	{

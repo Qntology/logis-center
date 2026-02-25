@@ -153,7 +153,7 @@ pub struct LogisModel {
     device_config: utils::DeviceConfig,
     max_tokens_limit: u32,
     dtype: Option<DType>, 
-    pub current_size: Arc<TokioMutex<Option<ModelSize>>>,
+    current_size: Arc<TokioMutex<Option<ModelSize>>>,
 }
 
 impl LogisModel {
@@ -207,18 +207,17 @@ impl LogisModel {
         }
     }
 
-    /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced)
+    /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced with Diagnostics)
     pub async fn deep_purge_resources(&self) {
-        println!("[MEMORY] Initiating AGGRESSIVE Factory Reset Purge...");
-        
-        // [SYNC-WAIT] 모든 백그라운드 슬롯 작업이 끝날 때까지 대기 (CUDA Context 보호)
-        crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
+        println!("[DIAG-PURGE] Step 0: Waiting for background IO to finish...");
+        crate::models::qwen3vl::generate::wait_for_global_io().await;
 
-        // 1. Clear ALL Slots (Explicitly take and drop everything)
+        println!("[DIAG-PURGE] Step 1: Clearing ALL Generation Slots...");
+        
         {
             let mut gen = self.generator.lock().await;
             if let Some(mut g) = gen.take() {
-                println!("[MEMORY] Purging Active Generator...");
+                println!("[DIAG-PURGE] Dropping Active Generator (0.6B/2B)...");
                 let _ = g.clear_kv_cache();
                 let _ = g.qwen3_vl.drop_kv_storage(); 
                 drop(g); 
@@ -227,7 +226,7 @@ impl LogisModel {
         {
             let mut s_hib = self.small_hibernation.lock().await;
             if let Some(mut g) = s_hib.take() { 
-                println!("[MEMORY] Purging Small Hibernation...");
+                println!("[DIAG-PURGE] Dropping Small Hibernation...");
                 let _ = g.clear_kv_cache();
                 let _ = g.qwen3_vl.drop_kv_storage();
                 drop(g); 
@@ -236,48 +235,52 @@ impl LogisModel {
         {
             let mut l_hib = self.large_hibernation.lock().await;
             if let Some(mut g) = l_hib.take() { 
-                println!("[MEMORY] Purging Large Hibernation...");
+                println!("[DIAG-PURGE] Dropping Large Hibernation...");
                 let _ = g.clear_kv_cache();
                 let _ = g.qwen3_vl.drop_kv_storage();
                 drop(g); 
             }
         }
+        
+        println!("[DIAG-PURGE] Step 2: Clearing Embedding Model...");
         {
             let mut emb = self.embedding_model.lock().await;
             if let Some(e) = emb.take() { 
-                println!("[MEMORY] Purging Embedding Model...");
                 drop(e); 
             }
         }
-        {
-            let mut size = self.current_size.lock().await;
-            *size = None;
-        }
-
-        // 2. CUDA Force Sync & Driver-level GC
+        
+        println!("[DIAG-PURGE] Step 3: Synchronizing CUDA Context...");
         if !self.is_cpu_mode {
             let dev = self.device_config.device.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            let sync_res = tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(move || {
                 if dev.is_cuda() { 
-                    println!("[MEMORY] Synchronizing CUDA for purge...");
-                    let _ = dev.synchronize(); 
-                }
-            }).await;
+                    println!("[DIAG-PURGE] Executing dev.synchronize()...");
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        dev.synchronize()
+                    }))
+                } else { Ok(Ok(())) }
+            })).await;
+            
+            match sync_res {
+                Ok(Ok(Ok(Ok(_)))) => println!("[DIAG-PURGE] CUDA Synchronization Successful."),
+                Ok(Ok(Ok(Err(e)))) => println!("[DIAG-PURGE] CUDA Sync Error: {:?}", e),
+                Ok(Err(_)) => println!("[DIAG-PURGE] CUDA Sync Task Join Error."),
+                Err(_) => println!("[DIAG-PURGE] CUDA Sync Timeout! Continuing purge."),
+                _ => println!("[DIAG-PURGE] CUDA Sync Panicked or Failed."),
+            }
         }
 
-        // 3. [CRITICAL] OS Working Set Flush (Windows API)
+        println!("[DIAG-PURGE] Step 4: Flushing OS Memory...");
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::*;
             use windows_sys::Win32::System::Memory::*;
             let current_process = GetCurrentProcess();
-            println!("[MEMORY] Flushing OS Working Set (Aggressive)...");
-            // Force return physical RAM back to OS
             let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-            std::thread::yield_now(); // Give OS time to react
         }
 
-        println!("[MEMORY] Factory Reset Complete. All AI resources released to OS.");
+        println!("[DIAG-PURGE] Aggressive Purge Complete.");
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
@@ -401,22 +404,19 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let kv_dir = crate::utils::paths::get_kv_dir(None);
-                let path_file = kv_dir.join(format!("{}.safetensors", task_id_str));
-                let path_dir = kv_dir.join(&task_id_str); 
+                let kv_dir = crate::utils::paths::get_kv_dir(None).join(&task_id_str);
+                let kv_file = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
                 
-                let target_path = if path_dir.exists() && path_dir.is_dir() {
-                    path_dir
-                } else {
-                    path_file
-                };
-
-                if target_path.exists() {
-                    println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", target_path);
-                    gen.load_kv_from_disk(&target_path, kv_name.as_deref())?;
+                if kv_dir.exists() && kv_dir.is_dir() {
+                    println!("[SSD-BRIDGE] Loading Directory-based KV snapshot from {:?}", kv_dir);
+                    gen.load_kv_from_disk(&kv_dir, kv_name.as_deref())?;
+                    Ok(())
+                } else if kv_file.exists() {
+                    println!("[SSD-BRIDGE] Loading File-based KV snapshot from {:?}", kv_file);
+                    gen.load_kv_from_disk(&kv_file, kv_name.as_deref())?;
                     Ok(())
                 } else {
-                    println!("[SSD-BRIDGE] No snapshot found for {}", task_id_str);
+                    println!("[SSD-BRIDGE] No snapshot found for {} (Checked dir and file)", task_id_str);
                     Ok(())
                 }
             } else {
@@ -473,8 +473,8 @@ impl LogisModel {
         // 3. Save Base Snapshot
         self.save_kv_snapshot(&base_session, kv_name, 0).await?;
         
-        // 4. Unload immediately to free VRAM for 2B
-        self.unload_generator().await;
+        // [FIX] 베이킹 직후 모델을 파괴하지 않고 그대로 유지하여 컨텍스트 오류를 방지합니다.
+        // self.unload_generator().await; 제거됨
         
         Ok(())
     }
@@ -548,34 +548,26 @@ impl LogisModel {
         }
 
         println!("[MODEL] Activating engine for size: {:?} (Text-Only: {}, Baking: {})...", size, force_text_only, baking_only);
+        // ... (rest of the switching logic remains similar but uses the new loading)
 
-        // 1. [SWITCH] 기존 캐시된 모델이 있고, 로딩 모드(Baking 여부)가 일치하면 즉시 전환
-        // (단, Baking 모드와 일반 모드는 내부 레이어 구조가 다르므로 일치 여부를 엄격히 체크)
+        // 1. [SWITCH] If requested model is already in one of the slots, just move it to main
         let found_in_slot = match size {
             ModelSize::Small => {
                 if let Some(m) = small_slot.take() {
-                    // 현재 캐시된 모델의 모드가 요청된 모드와 같은지 확인 (Single-Layer vs Full-Layer)
-                    let is_single = m.model_name.contains("Single-Layer");
-                    if is_single == baking_only {
-                        if let Some(old_m) = gen_guard.take() {
-                            if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
-                            else { *small_slot = Some(old_m); }
-                        }
-                        *gen_guard = Some(m);
-                        *current_size_guard = Some(ModelSize::Small);
-                        true
-                    } else {
-                        // 모드가 다르면 캐시된 모델을 버리고 새로 로드해야 함
-                        *small_slot = None;
-                        false
+                    if let Some(old_m) = gen_guard.take() {
+                        if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
+                        else if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
                     }
+                    *gen_guard = Some(m);
+                    *current_size_guard = Some(ModelSize::Small);
+                    true
                 } else { false }
             },
             ModelSize::Large => {
                 if let Some(m) = large_slot.take() {
                     if let Some(old_m) = gen_guard.take() {
                         if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
-                        else { *large_slot = Some(old_m); }
+                        else if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
                     }
                     *gen_guard = Some(m);
                     *current_size_guard = Some(ModelSize::Large);
@@ -592,10 +584,7 @@ impl LogisModel {
         // 2. [LOAD] Load from disk if not found in any slot
         println!("[LOAD] Fresh loading {:?} from disk...", size);
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
-        
-        // [FIX] Tokenizer는 2B의 것을 공유하되, Config는 각 모델 자신의 것을 사용하도록 분리
-        let tokenizer_path = Some(self.large_model_path.as_str());
-        let config_path = None; // None으로 두면 모델 경로의 config.json을 자동으로 읽음
+        let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
         
         let mut target_device = self.device_config.device.clone();
         
@@ -617,18 +606,16 @@ impl LogisModel {
         let dev_id = self.device_config.gpu_id;
         let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;
-        
         let path_clone = path.to_string();
-        let tok_path_clone = tokenizer_path.map(|s: &str| s.to_string());
-        let cfg_path_clone = config_path.map(|s: &str| s.to_string());
+        let shared_path_clone = shared_path.map(|s| s.to_string());
         let handle_clone = self.app_handle.clone();
 
         let gen = tokio::task::spawn_blocking(move || {
             let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
-                tok_path_clone.as_deref(), 
-                cfg_path_clone.as_deref(), 
+                shared_path_clone.as_deref(), 
+                shared_path_clone.as_deref(), 
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
                 force_text_only,
                 baking_only,
@@ -717,6 +704,9 @@ impl LogisModel {
                 gpu_id: 0,
             };
         } else {
+            // [STABILITY] Use persistent global CUDA device (Synchronous Singleton)
+            let persistent_dev = utils::get_cuda_device(config.gpu_id);
+            config.device = persistent_dev;
             println!("🚀 [MODEL] Running in default mode ({})", config.name);
         }
 
@@ -766,7 +756,7 @@ impl LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
-        // [FIX] Do NOT force reload. Use current generator (Large should be already loaded via relay)
+        // [VISION-FIX] 이미지 추출은 반드시 2B (Large) 모델을 사용해야 합니다.
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
@@ -779,13 +769,13 @@ impl LogisModel {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
             let prompt = get_image_extraction_prompt("kr", &language, "tracking", "");
             
-            // [IMPORTANT] Pass task_id as session_id to continue from the baked relay snapshot
+            // 이미지 분석은 Large 모델로 진행
             let result_str = self.chat_with_image_spinner(
                 prompt, 
                 Some(dynamic_image), 
                 app_handle, 
                 "extraction-progress", 
-                json!({ "category": "Vision Analysis", "summary": "Analyzing image with baked context..." }), 
+                json!({ "category": "Vision Analysis", "summary": "Analyzing image with 2B model..." }), 
                 1024, 
                 cancel_token.clone(), 
                 Some(task_id.clone()),
@@ -855,12 +845,12 @@ impl LogisModel {
     }
 
     pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        // [FIX] Use current generator if available, else default to Large
+        // [FIX] Default to Small (0.6B) for all chat tasks to align with 0.6B-focused architecture.
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
                 drop(gen_guard);
-                self.ensure_generator(ModelSize::Large).await?;
+                self.ensure_generator(ModelSize::Small).await?;
             }
         }
         
@@ -900,10 +890,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            let mut gen_guard = self.generator.lock().await;
-            let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-
-            let response = gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))?;
+            let response = gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))?;
             println!("[MODEL-CHAT] Raw Response: {}", response);
             Ok(response)
         }
@@ -959,12 +946,12 @@ impl LogisModel {
         session_id: Option<String>,
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
-        // [FIX] Do not force reload Large. Use current if available, else default to Large.
+        // [FIX] Ensure we stay on Small (0.6B).
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
                 drop(gen_guard);
-                self.ensure_generator(ModelSize::Large).await?;
+                self.ensure_generator(ModelSize::Small).await?;
             }
         }
 
@@ -986,11 +973,9 @@ impl LogisModel {
             crate::scheduler::log_task_progress(app_handle, task_id, &base_payload);
         }
 
-        // [MACRO-ISOLATION] 모델 간 간섭 차단을 위해 릴레이 객체를 직접 전달하지 않습니다.
         let mut gen_guard = self.generator.lock().await;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-        
-        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn chat_with_image_spinner(
@@ -1047,14 +1032,13 @@ impl LogisModel {
             ..Default::default()
         };
         
-        let mut gen_guard = self.generator.lock().await;
-        let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-
-        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        self.ensure_generator(ModelSize::Large).await?;
+        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.6B (Small)
+        let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
+        self.ensure_generator(target_size).await?;
         
         let mut gen_guard = self.generator.lock().await;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
@@ -1092,7 +1076,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn run_inference_with_spinner(
@@ -1106,8 +1090,9 @@ impl LogisModel {
         session_id: Option<String>,
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
-        // Ensure generator is loaded
-        self.ensure_generator(ModelSize::Large).await?;
+        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.6B (Small)
+        let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
+        self.ensure_generator(target_size).await?;
 
         // [FIX] Inject task_id from session_id if it's a task reference
         if let Some(ref sid) = session_id {
@@ -1118,8 +1103,10 @@ impl LogisModel {
             }
         }
 
-        // [FIX] Removed redundant emit. Only log the progress.
-        // let _ = app_handle.emit(event_name, base_payload);
+        // [LOG] Save to task history if task_id exists
+        if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
+            crate::scheduler::log_task_progress(_app_handle, task_id, &base_payload);
+        }
 
         let max_tok = self.max_tokens_limit;
         
@@ -1158,7 +1145,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn process_image_full(&self, image_path: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<Value> {
