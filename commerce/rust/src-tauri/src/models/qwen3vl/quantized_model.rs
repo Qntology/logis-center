@@ -665,16 +665,22 @@ impl QuantizedQwen3VLTextAttention {
                     if k_active.is_none() {
                         let path = ssd_path.clone().unwrap_or_default();
                         let filename = format!("l{}.st", self.layer_idx);
+                        
                         let inf_p = path.join("inference").join(format!("b{}", b_off)).join(&filename);
                         let bak_p = path.join("reference").join(format!("b{}", b_off)).join("l0.st");
                         let dir_p = path.join(&filename);
-                        let act_path = if inf_p.is_file() { Some(inf_p) } else if bak_p.is_file() { Some(bak_p) } else if dir_p.is_file() { Some(dir_p) } else { None };
+                        let act_path = if inf_p.is_file() { Some(inf_p) } 
+                                   else if bak_p.is_file() { Some(bak_p) } 
+                                   else if dir_p.is_file() { Some(dir_p) }
+                                   else { None };
                         
-                        if let Some(act_p) = act_path {
-                            if let Ok(content) = std::fs::read(&act_p) {
+                        if let Some(p) = act_path {
+                            if let Ok(content) = std::fs::read(&p) {
                                 if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                    let is_relay = act_p.to_string_lossy().contains("l0.st");
+                                    let is_relay = p.to_string_lossy().contains("l0.st");
+                                    // [FIX] 저장된 파일의 오프셋(b_off)을 기반으로 정확한 Prefix 생성
                                     let prefix = if is_relay { format!("b{}_l0_", b_off) } else { format!("b{}_l{}_", b_off, self.layer_idx) };
+                                    
                                     let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
                                     if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
                                         let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
@@ -687,11 +693,17 @@ impl QuantizedQwen3VLTextAttention {
                                             v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (1, self.num_key_value_heads, b_len, 1), &Device::Cpu)?,
                                             original_shape: vec![1, self.num_key_value_heads, b_len, self.head_dim],
                                         };
+                                        
+                                        if self.layer_idx == 0 { println!("[JIT-LOAD] SUCCESS: Layer {} Block {} from {:?}", self.layer_idx, b_off, p); }
                                         k_active = Some(self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?);
                                         v_active = Some(self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?);
+                                    } else if self.layer_idx == 0 {
+                                        println!("[JIT-LOAD] PREFIX-FAIL: Layer {} Block {} has wrong prefix in {:?}", self.layer_idx, b_off, p);
                                     }
                                 }
                             }
+                        } else if self.layer_idx == 0 {
+                            println!("[JIT-LOAD] NOT-FOUND: Layer {} Block {} at {:?}", self.layer_idx, b_off, path);
                         }
                     }
                     time_kv_fetch += fetch_start.elapsed();
@@ -1052,18 +1064,18 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, _offset: usize, _kv_name: Option<&str>) -> Result<()> {
-        // [SSD-ALIGNMENT] 베이킹 시스템과 동일한 b0/lX.st 구조로 저장
-        let block_dir = path.join("b0");
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, _kv_name: Option<&str>) -> Result<()> {
+        // [SSD-ALIGNMENT] 실제 오프셋을 폴더명으로 사용
+        let b_str = format!("b{}", offset);
+        let block_dir = path.join(&b_str);
         if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
         
-        // [INFERENCE-STORAGE] 추론 시에는 각 레이어의 지능이 다르므로 본인의 인덱스(self.layer_idx)를 사용합니다.
         let structured_path = block_dir.join(format!("l{}.st", self.layer_idx));
         
         let mut map = HashMap::new();
-        let prefix = format!("b0_l{}_", self.layer_idx);
+        // [PREFIX-FIX] 저장 시에도 실제 오프셋 이름을 접두어로 사용
+        let prefix = format!("{}l{}_", b_str, self.layer_idx);
 
-        // [COLLECT-ALL] 위치와 상관없이 모든 유효한 데이터를 수집
         let mut ks = Vec::new();
         let mut vs = Vec::new();
         for block in &self.kv_blocks {
@@ -1078,7 +1090,6 @@ impl QuantizedQwen3VLTextAttention {
             let k = Tensor::cat(&ks, 2)?;
             let v = Tensor::cat(&vs, 2)?;
             
-            // [COMPRESS] 베이킹과 동일한 BitKV 압축 수행
             let (k_anchors, k_packed, k_scales, k_shape) = self.compress_to_bitkv(&k)?;
             let (v_anchors, v_packed, v_scales, _) = self.compress_to_bitkv(&v)?;
             
@@ -1091,20 +1102,21 @@ impl QuantizedQwen3VLTextAttention {
             map.insert(format!("{}k_shape", prefix), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?);
             
             candle_core::safetensors::save(&map, &structured_path)?;
-            println!("[SSD-SAVE] Layer {} backed up to {:?}", self.layer_idx, structured_path);
+            println!("[SSD-SAVE] Layer {} Block {} saved to {:?}", self.layer_idx, offset, structured_path);
             
-            // [REGISTRY-UPDATE] 저장된 위치를 모델 전역 목차(Registry)에 업데이트
             if let Ok(mut reg) = self.registry.entries.write() {
-                if reg.is_empty() { 
-                    let mut entry = crate::models::qwen3vl::quantized_model::RegistryEntry::new(0, k.dim(2)?, 28);
+                // 이 레이어의 세부 정보를 장부에 기록
+                let entry_idx = offset / 256;
+                if entry_idx < reg.len() {
+                    let entry = &mut reg[entry_idx];
+                    entry.ssd_path = Some(path.to_path_buf());
+                    entry.location[self.layer_idx] = KVLocation::SSD;
+                } else {
+                    // 장부가 비어있거나 부족하면 확장
+                    let mut entry = crate::models::qwen3vl::quantized_model::RegistryEntry::new(offset, k.dim(2)?, 28);
                     entry.ssd_path = Some(path.to_path_buf());
                     entry.location[self.layer_idx] = KVLocation::SSD;
                     reg.push(entry);
-                } else {
-                    let entry = &mut reg[0];
-                    entry.ssd_path = Some(path.to_path_buf());
-                    entry.location[self.layer_idx] = KVLocation::SSD;
-                    entry.token_len = k.dim(2)?;
                 }
             }
         }
