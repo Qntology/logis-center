@@ -2255,7 +2255,7 @@ impl QuantizedQwen3VLTextModel {
                         layers: vec![dump],
                         is_relay_baking: mode,
                         block_idx: Some(b_idx),
-                        registry: rr.clone(),
+                        registry: rr.clone().expect("registry"),
                     })).await;
                 }
             }
@@ -2447,18 +2447,57 @@ impl QuantizedQwen3VLTextModel {
         self.save_kv_cache(path, true, block_size, None)
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>, fragments: &[(usize, std::path::PathBuf)], current_kv_len: usize) -> Result<()> {
-        if path.exists() || !fragments.is_empty() {
-            // [ROPE-SYNC] 모델의 논리적 위치 포인터를 로드된 길이에 맞게 업데이트합니다.
-            // 이를 통해 Prefill 없이 즉시 다음 토큰부터 추론을 시작할 수 있습니다.
-            self.current_kv_len = current_kv_len;
-            
-            self.layers.iter_mut().try_for_each(|layer| {
-                layer.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, fragments, current_kv_len)
-            })
-        } else {
-            Ok(())
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
+        if !path.exists() { return Ok(()); }
+
+        let base_filename = match kv_name {
+            Some(name) => format!("layer_{}_kv", name),
+            None => format!("layer_{}_kv", self.layers[0].self_attn.layer_idx),
+        };
+
+        let mut fragments = Vec::new();
+        let mut max_offset = 0;
+        let mut last_chunk_len = 0;
+
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if fname.starts_with(&base_filename) && fname.ends_with(".st") {
+                    let offset = if fname == format!("{}.st", base_filename) { 0 }
+                                else { fname.strip_prefix(&format!("{}_", base_filename)).and_then(|s| s.strip_suffix(".st")).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0) };
+                    
+                    if offset >= max_offset {
+                        if let Ok(meta) = std::fs::metadata(entry.path()) {
+                            // 대략적인 토큰 수 계산 (safetensors 헤더 제외 대략적 추정 또는 실제 로드 필요)
+                            // 여기선 일단 offset 기반으로 최대 길이를 잡습니다.
+                            max_offset = offset;
+                        }
+                    }
+                    fragments.push((offset, entry.path()));
+                }
+            }
         }
+        
+        if fragments.is_empty() { return Ok(()); }
+        fragments.sort_by_key(|f| f.0);
+
+        // 마지막 프래그먼트에서 실제 길이를 읽어와 전체 길이를 확정합니다.
+        let (_, last_path) = fragments.last().unwrap();
+        if let Ok(content) = std::fs::read(last_path) {
+            if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                if let Ok(view) = st.tensor("k_shape") {
+                    let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };
+                    last_chunk_len = shape_u32[2] as usize;
+                }
+            }
+        }
+        
+        let total_kv_len = max_offset + last_chunk_len;
+        self.current_kv_len = total_kv_len;
+
+        self.layers.iter_mut().try_for_each(|layer| {
+            layer.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, &fragments, total_kv_len)
+        })
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
@@ -2817,7 +2856,7 @@ impl QuantizedQwen3VLModel {
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.save_kv_cache(path, clear, offset, kv_name) }
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>, fragments: &[(usize, std::path::PathBuf)], current_kv_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, fragments, current_kv_len) }
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; self.text_device = device.clone(); self.vision_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, total_len) }
 }
@@ -2930,7 +2969,7 @@ impl QuantizedQwen3TextModel {
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.save_kv_cache(path, clear, offset, kv_name) }
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>, fragments: &[(usize, std::path::PathBuf)], current_kv_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, fragments, current_kv_len) }
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, total_len) }
 }

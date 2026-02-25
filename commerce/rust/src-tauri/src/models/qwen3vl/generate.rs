@@ -240,7 +240,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     if idx < entries.len() {
                         let e = &mut entries[idx]; e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
                         if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
-                            if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = KVLocation::SSD; } }
+                            if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; } }
                         }
                     }
                 }
@@ -263,40 +263,75 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let act_l = if is_relay && loop_count == 1 { 0 } else { src.layer_idx };
                         let mut map = std::collections::HashMap::new();
                         let prefix = if is_relay { format!("b{}_l0_", off) } else { format!("b{}_l{}_", off, act_l) };
-                        if let (Ok(ks), Ok(vs)) = (src.k_tensor.dims4(), src.v_tensor.dims4()) {
-                            let (b, h, s, d) = (ks[0], ks[1], ks[2], ks[3]);
+                        if let (Ok(ks_dims), Ok(vs_dims)) = (src.k_tensor.dims4(), src.v_tensor.dims4()) {
+                            let (b, h, s, d) = (ks_dims.0, ks_dims.1, ks_dims.2, ks_dims.3);
                             let total_elements = b * h * s * d;
                             let ac = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
-                            let process_bitkv = |t: &Tensor, p_name: &str| -> Result<(Tensor, Tensor, Tensor)> {
-                                let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                                let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
-                                let mut ka = vec![0.0f32; b * h * ac * d];
-                                let mut kp = vec![0u8; (total_elements * 4 + 7) / 8];
-                                let mut ksc = vec![0.0f32; b * h * s];
-                                for bh in 0..(b*h) {
-                                    let bho = bh * (s * d);
-                                    for ti in 0..s {
-                                        let td = &t_data[bho + ti * d .. bho + (ti + 1) * d];
-                                        if ti < 4 || ti % 8 == 0 { let ap = if ti < 4 { ti } else { 4 + (ti - 4) / 8 }; ka[(bh * ac + ap) * d .. (bh * ac + ap + 1) * d].copy_from_slice(td); }
-                                        let mut abs_sum = 0.0f32; for &v in td { abs_sum += v.abs(); }
-                                        let base_s = abs_sum / (d as f32); ksc[bh * s + ti] = base_s;
-                                        let mut res = td.to_vec();
-                                        for bit_l in 0..4 {
-                                            let cur_s = base_s / (2.0f32.powi(bit_l as i32));
-                                            for i in 0..d {
-                                                let bit_idx = (bho + ti * d + i) + bit_l * total_elements;
-                                                if res[i] >= 0.0 { kp[bit_idx / 8] |= 1 << (bit_idx % 8); res[i] -= cur_s; }
-                                                else { res[i] += cur_s; }
+                            
+                            // 1. Process K
+                            if let Ok(t_f32) = src.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()) {
+                                if let Ok(t_data) = t_f32.to_vec1::<f32>() {
+                                    let mut ka = vec![0.0f32; b * h * ac * d];
+                                    let mut kp = vec![0u8; (total_elements * 4 + 7) / 8];
+                                    let mut ksc = vec![0.0f32; b * h * s];
+                                    for bh in 0..(b*h) {
+                                        let bho = bh * (s * d);
+                                        for ti in 0..s {
+                                            let td = &t_data[bho + ti * d .. bho + (ti + 1) * d];
+                                            if ti < 4 || ti % 8 == 0 { let ap = if ti < 4 { ti } else { 4 + (ti - 4) / 8 }; ka[(bh * ac + ap) * d .. (bh * ac + ap + 1) * d].copy_from_slice(td); }
+                                            let mut abs_sum = 0.0f32; for &v in td { abs_sum += v.abs(); }
+                                            let base_s = abs_sum / (d as f32); ksc[bh * s + ti] = base_s;
+                                            let mut res = td.to_vec();
+                                            for bit_l in 0..4 {
+                                                let cur_s = base_s / (2.0f32.powi(bit_l as i32));
+                                                for i in 0..d {
+                                                    let bit_idx = (bho + ti * d + i) + bit_l * total_elements;
+                                                    if res[i] >= 0.0 { kp[bit_idx / 8] |= 1 << (bit_idx % 8); res[i] -= cur_s; }
+                                                    else { res[i] += cur_s; }
+                                                }
                                             }
                                         }
                                     }
+                                    let kp_len = kp.len();
+                                    if let Ok(t) = Tensor::from_vec(ka, vec![b, h, ac, d], &Device::Cpu) { map.insert(format!("{}k_anchors", prefix), t); }
+                                    if let Ok(t) = Tensor::from_vec(kp, vec![kp_len], &Device::Cpu) { map.insert(format!("{}k_packed", prefix), t); }
+                                    if let Ok(t) = Tensor::from_vec(ksc, vec![b, h, s, 1], &Device::Cpu) { map.insert(format!("{}k_scales", prefix), t); }
                                 }
-                                Ok((Tensor::from_vec(ka, vec![b,h,ac,d], &Device::Cpu)?, Tensor::from_vec(kp, vec![kp.len()], &Device::Cpu)?, Tensor::from_vec(ksc, vec![b,h,s,1], &Device::Cpu)?))
-                            };
-                            if let Ok((ka, kp, ks)) = process_bitkv(&src.k_tensor, "k") { map.insert(format!("{}k_anchors", prefix), ka); map.insert(format!("{}k_packed", prefix), kp); map.insert(format!("{}k_scales", prefix), ks); }
-                            if let Ok((va, vp, vs)) = process_bitkv(&src.v_tensor, "v") { map.insert(format!("{}v_anchors", prefix), va); map.insert(format!("{}v_packed", prefix), vp); map.insert(format!("{}v_scales", prefix), vs); }
-                            map.insert(format!("{}k_shape", prefix), Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu)?);
-                            map.insert(format!("{}mode", prefix), Tensor::from_vec(vec![3u32], (1,), &Device::Cpu)?);
+                            }
+                            
+                            // 2. Process V
+                            if let Ok(t_f32) = src.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()) {
+                                if let Ok(t_data) = t_f32.to_vec1::<f32>() {
+                                    let mut va = vec![0.0f32; b * h * ac * d];
+                                    let mut vp = vec![0u8; (total_elements * 4 + 7) / 8];
+                                    let mut vsc = vec![0.0f32; b * h * s];
+                                    for bh in 0..(b*h) {
+                                        let bho = bh * (s * d);
+                                        for ti in 0..s {
+                                            let td = &t_data[bho + ti * d .. bho + (ti + 1) * d];
+                                            if ti < 4 || ti % 8 == 0 { let ap = if ti < 4 { ti } else { 4 + (ti - 4) / 8 }; va[(bh * ac + ap) * d .. (bh * ac + ap + 1) * d].copy_from_slice(td); }
+                                            let mut abs_sum = 0.0f32; for &v in td { abs_sum += v.abs(); }
+                                            let base_s = abs_sum / (d as f32); vsc[bh * s + ti] = base_s;
+                                            let mut res = td.to_vec();
+                                            for bit_l in 0..4 {
+                                                let cur_s = base_s / (2.0f32.powi(bit_l as i32));
+                                                for i in 0..d {
+                                                    let bit_idx = (bho + ti * d + i) + bit_l * total_elements;
+                                                    if res[i] >= 0.0 { vp[bit_idx / 8] |= 1 << (bit_idx % 8); res[i] -= cur_s; }
+                                                    else { res[i] += cur_s; }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let vp_len = vp.len();
+                                    if let Ok(t) = Tensor::from_vec(va, vec![b, h, ac, d], &Device::Cpu) { map.insert(format!("{}v_anchors", prefix), t); }
+                                    if let Ok(t) = Tensor::from_vec(vp, vec![vp_len], &Device::Cpu) { map.insert(format!("{}v_packed", prefix), t); }
+                                    if let Ok(t) = Tensor::from_vec(vsc, vec![b, h, s, 1], &Device::Cpu) { map.insert(format!("{}v_scales", prefix), t); }
+                                }
+                            }
+                            
+                            if let Ok(t) = Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu) { map.insert(format!("{}k_shape", prefix), t); }
+                            if let Ok(t) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) { map.insert(format!("{}mode", prefix), t); }
                         }
                         GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
                         let _ = io_tx_inner.send(SaveTask { slot_id: sid, path: bake.task_dir.join(format!("l{}.st", act_l)), tensors: map, is_last: l_idx == loop_count - 1, block_idx: bake.block_idx, registry: Some(bake.registry.clone()) }).await;
@@ -325,7 +360,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
                                     let os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
                                     let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(), v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(), original_shape: os };
-                                    if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = KVLocation::RAM; } }
+                                    if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
                                 }
                             }
                         }
@@ -353,7 +388,7 @@ impl ModelVariant {
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.rebalance_layers(device_id, offset, total_len), Self::QuantizedText(m) => m.rebalance_layers(device_id, offset, total_len) } }
     pub fn get_current_kv(&self) -> (Vec<Tensor>, Vec<Tensor>) { match self { Self::QuantizedVL(m) => m.language_model.get_current_kv(), Self::QuantizedText(m) => m.language_model.get_current_kv(), _ => (vec![], vec![]) } }
     pub fn inject_kv_bitkv(&mut self, ka: &[Tensor], kp: &[Tensor], ks: &[Tensor], va: &[Tensor], vp: &[Tensor], vs: &[Tensor], os: &[usize]) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.inject_live_kv_bitkv(ka, kp, ks, va, vp, vs, os), Self::QuantizedText(m) => m.language_model.inject_live_kv_bitkv(ka, kp, ks, va, vp, vs, os), _ => Ok(()) } }
-    pub fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage(), _ => Ok(()) } }
+    pub async fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage(), _ => Ok(()) } }
 }
 
 pub struct Qwen3VLGenerateModel {
@@ -437,7 +472,7 @@ impl Qwen3VLGenerateModel {
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             gen_ids.push(next_id);
             gen_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
-            logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, (total_toks + i) as usize, (total_toks + i + 1) as usize, session_id.clone()).await?;
+            logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, total_toks + i as usize, total_toks + i as usize + 1, session_id.clone()).await?;
         }
         Ok(gen_text)
     }
