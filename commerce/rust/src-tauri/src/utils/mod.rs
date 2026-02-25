@@ -10,21 +10,37 @@ use anyhow::Result;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use std::process::Command;
 use nvml_wrapper::Nvml;
+use once_cell::sync::Lazy;
+use std::sync::Mutex;
+
+static GLOBAL_CUDA_DEVICE: Lazy<Mutex<Option<Device>>> = Lazy::new(|| Mutex::new(None));
+
+pub fn get_cuda_device(id: usize) -> Device {
+    let mut cache = GLOBAL_CUDA_DEVICE.lock().unwrap();
+    if let Some(dev) = cache.as_ref() {
+        return dev.clone();
+    }
+    println!("[CUDA] 🚀 Initializing Primary Context on GPU {}...", id);
+    let dev = Device::new_cuda(id).unwrap_or(Device::Cpu);
+    *cache = Some(dev.clone());
+    dev
+}
 
 pub fn get_best_device() -> Device {
     #[cfg(feature = "cuda")]
     {
+        // 이미 초기화된 장치가 있다면 즉시 반환
+        if let Some(dev) = GLOBAL_CUDA_DEVICE.lock().unwrap().as_ref() {
+            return dev.clone();
+        }
+
         if let Ok(nvml) = Nvml::init() {
             if let Ok(count) = nvml.device_count() {
                 let mut best_id = 0;
                 let mut max_free = 0;
-                println!("[DEVICE-SCAN] Found {} NVIDIA GPUs.", count);
-                
                 for i in 0..count {
                     if let Ok(device) = nvml.device_by_index(i) {
                         if let Ok(mem) = device.memory_info() {
-                            println!("[DEVICE-SCAN] GPU {}: Free {:.2} GB / Total {:.2} GB", 
-                                i, mem.free as f64 / 1e9, mem.total as f64 / 1e9);
                             if mem.free > max_free {
                                 max_free = mem.free;
                                 best_id = i;
@@ -32,15 +48,12 @@ pub fn get_best_device() -> Device {
                         }
                     }
                 }
-                
                 if max_free > 0 {
-                    println!("✅ [DEVICE-SELECT] Best GPU is ID {} with {:.2} GB Free.", best_id, max_free as f64 / 1e9);
-                    return Device::new_cuda(best_id as usize).unwrap_or(Device::Cpu);
+                    return get_cuda_device(best_id as usize);
                 }
             }
         }
-        println!("[DEVICE-SCAN] NVML failed or no GPUs found. Trying default CUDA 0...");
-        Device::new_cuda(0).unwrap_or(Device::Cpu)
+        get_cuda_device(0)
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -118,7 +131,7 @@ pub fn get_optimal_device_config() -> DeviceConfig {
                 if max_free > 0 {
                     println!("🚀 [DEVICE-CONFIG] Selected GPU-{} with {:.2} GB Free.", best_id, max_free as f64 / 1e9);
                     return DeviceConfig {
-                        device: Device::new_cuda(best_id as usize).unwrap_or(Device::Cpu),
+                        device: get_cuda_device(best_id as usize),
                         is_cpu: false,
                         classify_chunk_size: 12_000, 
                         extract_chunk_size: 12_000,

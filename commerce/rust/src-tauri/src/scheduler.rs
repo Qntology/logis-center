@@ -267,15 +267,22 @@ pub async fn start_background_worker(
                             },
                             Err(e) => {
                                 let err_msg = e.to_string();
+                                println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, err_msg);
+                                
+                                // [PERSISTENT-ERROR-LOG] 작업 디렉토리에 에러 사유 기록
+                                let task_dir = utils::paths::get_task_specific_dir(Some(&app_handle), &task.id);
+                                if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
+                                let error_file = task_dir.join("error_reason.txt");
+                                let _ = std::fs::write(&error_file, format!("Timestamp: {}\nError: {}\n", chrono::Utc::now(), err_msg));
         
                                 // [CRITICAL-CLEANUP] 작업 실패 시 즉시 모델을 메모리에서 해제하여 다음 작업 대비
                                 {
-                                    let mut model_lock = model.lock().await;
+                                    let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
                                     if let Some(m) = model_lock.as_ref() {
+                                        println!("[Scheduler] Error detected. Performing emergency memory release...");
                                         m.deep_purge_resources().await;
                                     }
                                     *model_lock = None;
-                                    println!("[Scheduler] Error detected. Emergency memory release performed: {}", err_msg);
                                 }
         
                                 if err_msg.contains("Task cancelled") {
@@ -300,7 +307,7 @@ pub async fn start_background_worker(
                                     if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
                                         println!("[Scheduler] OOM Detected! Activating SSD-Swap Mode for retry.");
                                         {
-                                            let mut model_lock = model.lock().await;
+                                            let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
                                             if let Some(m) = model_lock.as_ref() {
                                                 let _ = m.deep_purge_resources().await;
                                             }
@@ -634,9 +641,12 @@ async fn process_task(
             println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
         }
 
-        // 2. [2B] Load Snapshot & Bake Task
+        // [FIX] 베이킹 직후 모델을 파괴하지 않고 그대로 사용하여 다음 단계(추론)로 매끄럽게 연결합니다.
+        // model.deep_purge_resources().await; 제거됨
+        
+        // 2. [Small] Load Snapshot & Bake Task
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -648,8 +658,9 @@ async fn process_task(
             };
 
                         if let Some(gen) = model.generator.lock().await.as_mut() {
-                            println!("[Scheduler] 2B Step A: Asking classification question...");
-                            let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone()).await?;
+                            println!("[Scheduler] Small Step A: Asking classification question...");
+                            // [FIX] 추론 시 SSD 쓰기를 방지하기 위해 session_id와 kv_name에 None 전달 (VRAM 전용)
+                            let res = gen.generate(params, Some(cancellation_token.clone()), None, None).await?;
                             println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
                             
                             // [DEBUG] AI 응답 저장
@@ -725,9 +736,9 @@ async fn process_task(
             println!("[Scheduler] Found existing snapshot for Step B. Skipping 0.6B baking.");
         }
 
-        // 2. [2B] Load & Generate
+        // 2. [Small] Load & Generate
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -739,8 +750,9 @@ async fn process_task(
             };
 
             if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 2B Step B: Asking selector question...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone()).await?;
+                println!("[Scheduler] Small Step B: Asking selector question...");
+                // [FIX] 추론 시 SSD 쓰기를 방지하기 위해 session_id와 kv_name에 None 전달 (VRAM 전용)
+                let res = gen.generate(params, Some(cancellation_token.clone()), None, None).await?;
                 println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
 
                 // [DEBUG] AI 응답 저장
@@ -868,16 +880,16 @@ async fn process_task(
                             })],
                             ..Default::default()
                         };
-                        worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
+                        worker.prefill_only(params, Some(token_clone), session_clone, None, Some("reference".to_string())).await?;
                     }
                 }
             } else {
                 println!("[Scheduler] Found existing snapshot for Detail Extraction. Skipping 0.6B baking.");
             }
 
-            // 2. [2B] Load & Generate
+            // 2. [Small] Load & Generate
             {
-                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -888,12 +900,13 @@ async fn process_task(
                     ..Default::default()
                 };
 
-                // 3. 2B Instant Inference
+                // 3. Small Instant Inference
                 if let Some(gen) = model.generator.lock().await.as_mut() {
-                    println!("[Scheduler] 2B Step C: Asking extraction question...");
-                    log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running 2B Inference..." }));
+                    println!("[Scheduler] Small Step C: Asking extraction question...");
+                    log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Small Inference..." }));
                     
-                    let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone()).await?;
+                    // [FIX] 추론 시 SSD 쓰기를 방지하기 위해 session_id와 kv_name에 None 전달 (VRAM 전용)
+                    let res = gen.generate(params, Some(cancellation_token.clone()), None, None).await?;
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
 
                     // [DEBUG] AI 응답 저장
@@ -907,12 +920,12 @@ async fn process_task(
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // --- PHASE 3: HANDOVER (Unload 2B -> Load Embedding) ---
+    // --- PHASE 3: HANDOVER (Unload -> Load Embedding) ---
     {
-        println!("[Scheduler] PHASE 3: Handover - Unloading 2B, Preparing for Embedding...");
+        println!("[Scheduler] PHASE 3: Handover - Unloading, Preparing for Embedding...");
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model..." }));
         
-        // 1. Explicitly Unload 2B to free VRAM for Embedding Model
+        // 1. Explicitly Unload to free VRAM for Embedding Model
         model.deep_purge_resources().await;
         
         // 2. Wait for VRAM to settle (Driver latency)
@@ -922,7 +935,7 @@ async fn process_task(
     // --- DB OPS & SIDE EFFECTS ---
     // [NOTE] Now we can safely load Embedding Model (via get_embedding inside logic)
     // The Store/Logic calls below will internally call model.get_embedding(), which calls ensure_embedding().
-    // Since 2B is unloaded, this is safe.
+    // Since is unloaded, this is safe.
 
     // Normalize Data
     if let Some(obj) = extracted_data.as_object_mut() {
@@ -979,7 +992,7 @@ async fn process_task(
 
     // Embedding & Final Upsert
     // Note: logic::relay and upsert_item will need embedding.
-    // Since 2B is unloaded, model.get_embedding() will load EmbeddingModel automatically.
+    // Since is unloaded, model.get_embedding() will load EmbeddingModel automatically.
     
     // ... (Standard Upsert Logic as per original file, referencing 'extracted_data')
     // For brevity in this replace block, I am simplifying the tail end to just the core upsert action 
