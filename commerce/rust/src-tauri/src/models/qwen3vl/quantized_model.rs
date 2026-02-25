@@ -479,7 +479,7 @@ impl QuantizedQwen3VLTextAttention {
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask_in: Option<&Tensor>,
         seqlen_offset: usize, // [NEW]
     ) -> Result<Tensor> {
         let start_total = std::time::Instant::now(); // [SPEED]
@@ -507,6 +507,18 @@ impl QuantizedQwen3VLTextAttention {
         } else { xs };
 
         let (b_sz, q_len, _) = xs.dims3()?;
+
+        // [FIX] Dynamic Causal Mask Generation for Prefill Chunks
+        let total_len = seqlen_offset + q_len;
+        let attention_mask = if q_len > 1 && attention_mask_in.is_none() {
+            let q_indices = Tensor::arange(0u32, q_len as u32, dev)?.unsqueeze(1)?;
+            let k_indices = Tensor::arange(0u32, total_len as u32, dev)?.unsqueeze(0)?;
+            let mask = k_indices.broadcast_gt(&(q_indices.broadcast_add(&Tensor::new(seqlen_offset as u32, dev)?)?))?;
+            let mask = mask.to_dtype(target_dtype)?.mul(&Tensor::new(-1e9f32, dev)?.to_dtype(target_dtype)?)?;
+            Some(mask.unsqueeze(0)?.unsqueeze(0)?)
+        } else {
+            attention_mask_in.map(|m| m.clone())
+        };
         
         let query_states = self.q_proj.forward(&xs)?.reshape((
             b_sz,
@@ -606,7 +618,7 @@ impl QuantizedQwen3VLTextAttention {
         }
 
         // 4. [LIGHTWEIGHT-HYBRID-ENGINE]
-        let q_len = query_states.dim(1)?;
+        let q_len = query_states.dim(2)?;
         let total_len = seqlen_offset + q_len;
         let mut running_m = None; 
         let mut running_s = None; 
@@ -728,7 +740,7 @@ impl QuantizedQwen3VLTextAttention {
                             v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
                         }
                         let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
-                        if let Some(mask) = attention_mask {
+                        if let Some(mask) = &attention_mask {
                             let mask_len = mask.dim(D::Minus1)?;
                             // [FIX] 블록의 실제 오프셋(b_off)을 직접 사용하여 마스크 정렬
                             if b_off + b_len <= mask_len {
@@ -831,7 +843,7 @@ impl QuantizedQwen3VLTextAttention {
             let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?
                 .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
 
-            if let Some(mask) = attention_mask {
+            if let Some(mask) = &attention_mask {
                 let mask_len = mask.dim(D::Minus1)?;
                 // [FIX] VRAM 블록들은 시퀀스의 가장 뒤쪽에 위치하므로 누적된 인덱스에서 
                 // 본인들의 총 길이만큼 뺀 지점이 시작점입니다.
