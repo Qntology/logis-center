@@ -684,8 +684,9 @@ impl QuantizedQwen3VLTextAttention {
                     {
                         let inner = block.inner.read().unwrap();
                         if let (Some(kc), Some(vc)) = (&inner.k_cache, &inner.v_cache) {
-                            k_active = Some(kc.clone());
-                            v_active = Some(vc.clone());
+                            // [FIX] RAM(CPU/F32)에서 가져온 텐서를 현재 연산 장치(GPU/BF16) 포맷으로 변환
+                            k_active = Some(kc.to_device(dev)?.to_dtype(target_dtype)?);
+                            v_active = Some(vc.to_device(dev)?.to_dtype(target_dtype)?);
                         }
                     }
 
@@ -1712,101 +1713,123 @@ impl QuantizedQwen3VLTextModel {
         Ok(results)
     }
 
-    /// [CHUNK-LEVEL-STRICT] 방금 연산된 특정 청크의 KV 데이터만 CPU로 던지고 VRAM에서 지웁니다.
-    async fn evacuate_chunk_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, chunk_off: usize, len: usize) -> Result<()> {
+    /// [CHUNK-LEVEL-STRICT] 계층형 메모리 관리 (VRAM 2048 -> RAM 4096 -> SSD)
+    async fn evacuate_chunk_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, _chunk_off: usize, _len: usize) -> Result<()> {
         use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
-        let mut dumps_to_send = Vec::new();
         
-        for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
-            let mut inner = block.inner.write().unwrap();
-            // 해당 오프셋을 포함하는 블록 찾기
-            if inner.offset <= chunk_off && inner.offset + inner.len > chunk_off {
-                // [OVERWRITE-PROTECTION] 이미 SSD에 안전하게 구워졌다면 중복 저장하지 않습니다.
-                let is_already_on_ssd = {
-                    let reg = self.registry.entries.read().unwrap();
-                    if inner.index < reg.len() {
-                        reg[inner.index].location[layer_idx] == KVLocation::SSD
-                    } else { false }
-                };
+        // 1. VRAM -> RAM 계층 관리 (최대 8개 블록 유지)
+        {
+            // 전역 장부 잠금 (Registry -> Inner 순서 준수)
+            let mut reg = self.registry.entries.write().unwrap();
+            let kv_blocks = &mut self.layers[layer_idx].self_attn.kv_blocks;
 
-                if is_already_on_ssd {
-                    // SSD에 이미 있으니 VRAM만 비웁니다.
-                    inner.k_cache = None;
-                    inner.v_cache = None;
-                    inner.location = KVLocation::SSD;
-                    continue;
+            let mut vram_indices = Vec::new();
+            for (idx, block) in kv_blocks.iter().enumerate() {
+                let inner = block.inner.read().unwrap();
+                if inner.location == KVLocation::VRAM && inner.len == 256 {
+                    vram_indices.push((idx, inner.offset));
                 }
+            }
 
-                // [ACTIVE-BLOCK-PROTECTION] 꽉 차지 않은 블록(Active)은 SSD로 보내지 않고 RAM에 보존
-                if inner.len < 256 {
+            if vram_indices.len() > 8 {
+                vram_indices.sort_by_key(|k| k.1); // 오래된 순 정렬
+                let num_to_evict = vram_indices.len() - 8;
+                for i in 0..num_to_evict {
+                    let (idx, _) = vram_indices[i];
+                    let mut inner = kv_blocks[idx].inner.write().unwrap();
                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                        // VRAM -> RAM 이동 (Keep in RAM)
                         let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
                         let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                        
                         inner.k_cache = Some(k_cpu);
                         inner.v_cache = Some(v_cpu);
                         inner.location = KVLocation::RAM;
-                        
-                        // [LOG] Active Block RAM Eviction
-                        // println!("[EVICT-RAM] Layer {} Active Block {} kept in RAM.", layer_idx, inner.index);
+                        // 장부 업데이트 (DType Mismatch 방지 핵심)
+                        if inner.index < reg.len() {
+                            reg[inner.index].location[layer_idx] = KVLocation::RAM;
+                        }
                     }
-                    continue; 
-                }
-
-                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                    let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                    
-                    dumps_to_send.push((LayerKVDump { 
-                        layer_idx, 
-                        k_tensor: k_cpu, 
-                        v_tensor: v_cpu 
-                    }, inner.offset));
-                    
-                    // [VRAM-PURGE] 복사했으니 즉시 삭제 (Frozen Block)
-                    inner.k_cache = None;
-                    inner.v_cache = None;
-                    inner.location = KVLocation::RAM; 
                 }
             }
-        }
+        } // Registry lock dropped here
 
+        // 2. RAM -> SSD 계층 관리 (최대 16개 블록 유지, 초과분 SSD행)
+        let mut dumps_to_send = Vec::new();
+        {
+            let mut reg = self.registry.entries.write().unwrap();
+            let kv_blocks = &mut self.layers[layer_idx].self_attn.kv_blocks;
+            
+            let mut ram_indices = Vec::new();
+            for (idx, block) in kv_blocks.iter().enumerate() {
+                let inner = block.inner.read().unwrap();
+                if inner.location == KVLocation::RAM && inner.len == 256 {
+                    ram_indices.push((idx, inner.offset));
+                }
+            }
+
+            if ram_indices.len() > 16 {
+                ram_indices.sort_by_key(|k| k.1);
+                let num_to_flush = ram_indices.len() - 16;
+                for i in 0..num_to_flush {
+                    let (idx, _) = ram_indices[i];
+                    let mut inner = kv_blocks[idx].inner.write().unwrap();
+                    
+                    // 이미 SSD에 백업되었는지 확인
+                    let is_safe = inner.index < reg.len() && reg[inner.index].location[layer_idx] == KVLocation::SSD;
+
+                    if is_safe {
+                        inner.k_cache = None;
+                        inner.v_cache = None;
+                        inner.location = KVLocation::SSD;
+                    } else if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                        dumps_to_send.push((
+                            LayerKVDump { layer_idx, k_tensor: k.clone(), v_tensor: v.clone() },
+                            inner.offset,
+                            inner.len
+                        ));
+                        inner.k_cache = None;
+                        inner.v_cache = None;
+                        inner.location = KVLocation::SSD;
+                        if inner.index < reg.len() {
+                            reg[inner.index].location[layer_idx] = KVLocation::SSD;
+                        }
+                    }
+                }
+            }
+        } // Registry lock dropped here
+
+        // 3. SSD 저장 실행 (Await points are safe now)
         if !dumps_to_send.is_empty() {
             if let Some(tx) = BAKE_TX.get() {
-                // [PHYSICAL-ISOLATION] session_id 아래에 kv_name 폴더를 별도로 생성합니다.
-                let mut base_path = crate::utils::paths::get_kv_dir(None).join(session_id);
-                
-                // 엔진의 현재 모드에 따라 서브 폴더 결정
+                let path = crate::utils::paths::get_kv_dir(None).join(session_id);
                 let sub_folder = if self.baking_only { "reference" } else { "inference" };
-                let target_path = base_path.join(sub_folder);
-                
+                let target_path = path.join(sub_folder);
                 if !target_path.exists() { let _ = fs::create_dir_all(&target_path); }
+                
                 let rr = Some(self.registry.clone());
                 let mode = self.baking_only;
 
-                for (dump, off) in dumps_to_send {
-                    let sid = SLOT_MANAGER.acquire_write_slot(len).await;
+                for (dump, off, b_len) in dumps_to_send {
+                    let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
                     let block_dir = target_path.join(format!("b{}", off));
                     if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
                     
-                    // [REGISTRY-UPDATE] Registry에 최종 블록 디렉토리 경로 저장
+                    let b_idx = off / 256;
+                    // Registry update needs a brief lock
                     {
-                        let mut reg = self.registry.entries.write().unwrap();
-                        let b_idx = off / 256;
-                        if b_idx < reg.len() {
-                            reg[b_idx].ssd_path = Some(block_dir.clone());
+                        let mut reg_w = self.registry.entries.write().unwrap();
+                        if b_idx < reg_w.len() {
+                            reg_w[b_idx].ssd_path = Some(block_dir.clone());
                         }
                     }
 
                     let _ = tx.send(SlotTask::Bake(BakeTask {
                         slot_id: sid,
-                        task_dir: block_dir, // 최종 블록 폴더 전달
+                        task_dir: block_dir,
                         kv_name: Some(sub_folder.to_string()),
                         offset: off,
                         layers: vec![dump],
                         is_relay_baking: mode,
-                        block_idx: Some(off / 256),
+                        block_idx: Some(b_idx),
                         registry: rr.clone(),
                     })).await;
                 }
@@ -1931,7 +1954,7 @@ impl QuantizedQwen3VLTextModel {
         // 1. KV 캐시 즉시 대피 및 VRAM 삭제
         let sid_opt = self.active_session_id.clone();
         if let Some(sid) = sid_opt {
-            let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count);
+            let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count).await;
         }
 
         // 2. 레이어 무게추 즉시 CPU로 반납 및 동기화 (VRAM 즉시 해방 강제)
@@ -2022,48 +2045,85 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    /// [NEW-STRICT] 특정 레이어의 활성 KV 데이터를 CPU로 복사하고 VRAM에서 즉시 제거
-    fn evacuate_layer_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, start_off: usize, len: usize) -> Result<()> {
+    /// [NEW-STRICT] 계층형 메모리 관리 (VRAM 2048 -> RAM 4096 -> SSD)
+    async fn evacuate_layer_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, start_off: usize, _len: usize) -> Result<()> {
         use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
-        let mut dumps_to_send = Vec::new();
-        let block_start = (start_off / 256) * 256;
         
-        // 현재 레이어의 KV 블록들 중 이번 연산에 참여한 블록들만 추출
-        for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
-            let mut inner = block.inner.write().unwrap();
-            if inner.offset >= block_start && inner.location == KVLocation::VRAM {
-                // [ACTIVE-BLOCK-PROTECTION] 꽉 차지 않은 블록(Active)은 SSD로 보내지 않고 RAM에 보존
-                if inner.len < 256 {
-                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+        let block_start = (start_off / 256) * 256;
+
+        // 1. VRAM -> RAM 계층 관리
+        {
+            let mut reg = self.registry.entries.write().unwrap();
+            let kv_blocks = &mut self.layers[layer_idx].self_attn.kv_blocks;
+
+            let mut vram_indices = Vec::new();
+            for (idx, block) in kv_blocks.iter().enumerate() {
+                let inner = block.inner.read().unwrap();
+                if inner.offset >= block_start && inner.location == KVLocation::VRAM && inner.len == 256 {
+                    vram_indices.push((idx, inner.offset));
+                }
+            }
+
+            if vram_indices.len() > 8 {
+                vram_indices.sort_by_key(|k| k.1);
+                let num_to_evict = vram_indices.len() - 8;
+                for i in 0..num_to_evict {
+                    let (idx, _) = vram_indices[i];
+                    let mut inner = kv_blocks[idx].inner.write().unwrap();
+                    if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                         let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
                         let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                        
                         inner.k_cache = Some(k_cpu);
                         inner.v_cache = Some(v_cpu);
                         inner.location = KVLocation::RAM;
-                     }
-                     continue;
-                }
-
-                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                    let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                    
-                    dumps_to_send.push((LayerKVDump { 
-                        layer_idx, 
-                        k_tensor: k_cpu, 
-                        v_tensor: v_cpu 
-                    }, inner.offset));
-                    
-                    // [VRAM-소각] 복사했으니 즉시 삭제
-                    inner.k_cache = None;
-                    inner.v_cache = None;
-                    inner.location = KVLocation::RAM; 
+                        if inner.index < reg.len() { reg[inner.index].location[layer_idx] = KVLocation::RAM; }
+                    }
                 }
             }
         }
 
-        // 백그라운드 작업자에게 SSD 저장 위임
+        // 2. RAM -> SSD 계층 관리
+        let mut dumps_to_send = Vec::new();
+        {
+            let mut reg = self.registry.entries.write().unwrap();
+            let kv_blocks = &mut self.layers[layer_idx].self_attn.kv_blocks;
+            
+            let mut ram_indices = Vec::new();
+            for (idx, block) in kv_blocks.iter().enumerate() {
+                let inner = block.inner.read().unwrap();
+                if inner.location == KVLocation::RAM && inner.len == 256 {
+                    ram_indices.push((idx, inner.offset));
+                }
+            }
+
+            if ram_indices.len() > 16 {
+                ram_indices.sort_by_key(|k| k.1);
+                let num_to_flush = ram_indices.len() - 16;
+                for i in 0..num_to_flush {
+                    let (idx, _) = ram_indices[i];
+                    let mut inner = kv_blocks[idx].inner.write().unwrap();
+                    
+                    let is_safe = inner.index < reg.len() && reg[inner.index].location[layer_idx] == KVLocation::SSD;
+                    if is_safe {
+                        inner.k_cache = None;
+                        inner.v_cache = None;
+                        inner.location = KVLocation::SSD;
+                    } else if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                        dumps_to_send.push((
+                            LayerKVDump { layer_idx, k_tensor: k.clone(), v_tensor: v.clone() },
+                            inner.offset,
+                            inner.len
+                        ));
+                        inner.k_cache = None;
+                        inner.v_cache = None;
+                        inner.location = KVLocation::SSD;
+                        if inner.index < reg.len() { reg[inner.index].location[layer_idx] = KVLocation::SSD; }
+                    }
+                }
+            }
+        }
+
+        // 3. SSD 저장 위임 (Safe await)
         if !dumps_to_send.is_empty() {
             if let Some(tx) = BAKE_TX.get() {
                 let path = crate::utils::paths::get_kv_dir(None).join(session_id);
@@ -2071,34 +2131,29 @@ impl QuantizedQwen3VLTextModel {
                 let rr = Some(self.registry.clone());
                 let mode = self.baking_only;
 
-                for (dump, off) in dumps_to_send {
-                    let sid = tokio::runtime::Handle::current().block_on(async {
-                        SLOT_MANAGER.acquire_write_slot(len).await
-                    });
+                for (dump, off, b_len) in dumps_to_send {
+                    let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
                     
                     let sub_folder = if mode { "reference" } else { "inference" };
                     let block_dir = path.join(sub_folder).join(format!("b{}", off));
                     if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
-
-                    // [REGISTRY-UPDATE]
+                    
+                    let b_idx = off / 256;
                     {
                         let mut reg_w = self.registry.entries.write().unwrap();
-                        let b_idx = off / 256;
-                        if b_idx < reg_w.len() {
-                            reg_w[b_idx].ssd_path = Some(block_dir.clone());
-                        }
+                        if b_idx < reg_w.len() { reg_w[b_idx].ssd_path = Some(block_dir.clone()); }
                     }
 
-                    let _ = tx.blocking_send(SlotTask::Bake(BakeTask {
+                    let _ = tx.send(SlotTask::Bake(BakeTask {
                         slot_id: sid,
-                        task_dir: block_dir, // 최종 블록 폴더 직접 전달
+                        task_dir: block_dir,
                         kv_name: Some(sub_folder.to_string()),
                         offset: off,
                         layers: vec![dump],
                         is_relay_baking: mode,
-                        block_idx: Some(off / 256),
+                        block_idx: Some(b_idx),
                         registry: rr.clone(),
-                    }));
+                    })).await;
                 }
             }
         }
