@@ -703,10 +703,22 @@ impl QuantizedQwen3VLTextAttention {
                             if let Ok(content) = std::fs::read(&p) {
                                 if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
                                     let is_relay = p.to_string_lossy().contains("l0.st");
-                                    // [FIX] 저장된 파일의 오프셋(b_off)을 기반으로 정확한 Prefix 생성
-                                    let prefix = if is_relay { format!("b{}_l0_", b_off) } else { format!("b{}_l{}_", b_off, self.layer_idx) };
+                                    // [STRICT-PREFIX] 기본적으로 현재 블록 오프셋에 맞는 프리픽스를 생성합니다.
+                                    let exact_prefix = if is_relay { format!("b{}_l0_", b_off) } else { format!("b{}_l{}_", b_off, self.layer_idx) };
                                     
-                                    let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                                    let mut act_prefix = exact_prefix.clone();
+                                    let mut found_data = st.tensor(&format!("{}k_anchors", act_prefix)).is_ok();
+
+                                    // [FLEXIBLE-FALLBACK] 만약 정확한 오프셋 프리픽스가 없다면, 파일 내에 존재하는 아무 프리픽스나 찾아봅니다.
+                                    if !found_data {
+                                        if let Some((k, _)) = st.tensors().iter().find(|(name, _)| name.contains("k_anchors")) {
+                                            act_prefix = k.strip_suffix("k_anchors").unwrap_or("").to_string();
+                                            found_data = true;
+                                            if self.layer_idx == 0 { println!("[JIT-RECOVER] Using discovered prefix '{}' for block {}", act_prefix, b_off); }
+                                        }
+                                    }
+
+                                    let get_t = |s: &str| st.tensor(&format!("{}{}", act_prefix, s)).ok();
                                     if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
                                         let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
                                         let meta = BitKVMetadata {
@@ -719,11 +731,11 @@ impl QuantizedQwen3VLTextAttention {
                                             original_shape: vec![1, self.num_key_value_heads, b_len, self.head_dim],
                                         };
                                         
-                                        if self.layer_idx == 0 { println!("[JIT-LOAD] SUCCESS: Layer {} Block {} from {:?}", self.layer_idx, b_off, p); }
+                                        if self.layer_idx == 0 { println!("[JIT-LOAD] SUCCESS: Layer {} Block {} (Prefix: {})", self.layer_idx, b_off, act_prefix); }
                                         k_active = Some(self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?);
                                         v_active = Some(self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?);
                                     } else if self.layer_idx == 0 {
-                                        println!("[JIT-LOAD] PREFIX-FAIL: Layer {} Block {} has wrong prefix in {:?}", self.layer_idx, b_off, p);
+                                        println!("[JIT-LOAD] ERROR: Valid tensors not found in {:?} even with discovery", p);
                                     }
                                 }
                             }
