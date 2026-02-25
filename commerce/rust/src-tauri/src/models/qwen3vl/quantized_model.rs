@@ -926,13 +926,12 @@ impl QuantizedQwen3VLTextAttention {
                     anchor_head[anchor_pos * d .. (anchor_pos + 1) * d].copy_from_slice(token_data);
                 }
                 
-                // Calculate Scale (Max Absolute)
-                let mut max_abs = 0.0f32;
+                // [FIX] Stable Mean Absolute Scaling (from previous source)
+                let mut abs_sum = 0.0f32;
                 for &v in token_data {
-                    let a = v.abs();
-                    if a > max_abs { max_abs = a; }
+                    abs_sum += v.abs();
                 }
-                head_scales[token_idx] = max_abs;
+                head_scales[token_idx] = abs_sum / (d as f32);
             }
         });
 
@@ -967,19 +966,28 @@ impl QuantizedQwen3VLTextAttention {
         decoded.par_chunks_mut(head_tokens).enumerate().for_each(|(bh_idx, head_out)| {
             let bh_offset = bh_idx * head_tokens;
             let anchor_offset = bh_idx * anchor_count * last_dim;
+            let num_bits = if packed_vec.len() > (total_elements + 7) / 8 * 2 { 4 } else { 1 };
             
             for s_idx in 0..seq_len {
-                let scale = scales_vec[bh_idx * seq_len + s_idx];
+                let base_scale = scales_vec[bh_idx * seq_len + s_idx];
                 let token_out = &mut head_out[s_idx * last_dim .. (s_idx + 1) * last_dim];
                 
-                // 1. Bit-to-Sign restoration
+                // 1. Multi-bit Residual Restoration (Mode 3)
                 for d_idx in 0..last_dim {
-                    let global_bit_idx = bh_offset + s_idx * last_dim + d_idx;
-                    let is_set = (packed_vec[global_bit_idx / 8] & (1 << (global_bit_idx % 8))) != 0;
-                    token_out[d_idx] = if is_set { scale } else { -scale };
+                    let mut val = 0.0f32;
+                    let elem_idx = bh_offset + s_idx * last_dim + d_idx;
+                    
+                    for b in 0..num_bits {
+                        let bit_idx = elem_idx + b * total_elements;
+                        let is_set = (packed_vec[bit_idx / 8] & (1 << (bit_idx % 8))) != 0;
+                        // Each subsequent bit has half the scale of the previous one
+                        let bit_scale = base_scale / (2.0f32.powi(b as i32));
+                        val += if is_set { bit_scale } else { -bit_scale };
+                    }
+                    token_out[d_idx] = val;
                 }
                 
-                // 2. Anchor Refinement
+                // 2. Anchor Refinement (Always use Full Precision for anchors)
                 if s_idx < 4 || s_idx % 8 == 0 {
                     let a_pos = if s_idx < 4 { s_idx } else { 4 + (s_idx - 4) / 8 };
                     let anchor_data = &anchors_vec[anchor_offset + a_pos * last_dim .. anchor_offset + (a_pos + 1) * last_dim];
@@ -1857,12 +1865,35 @@ impl QuantizedQwen3VLTextModel {
                         layers: vec![dump],
                         is_relay_baking: mode,
                         block_idx: Some(b_idx),
-                        registry: rr.clone(),
+                        registry: rr.clone().expect("registry"),
                     })).await;
                 }
             }
         }
         Ok(())
+    }
+
+    pub fn get_current_kv(&self) -> (Vec<Tensor>, Vec<Tensor>) {
+        let mut ks = vec![];
+        let mut vs = vec![];
+        for layer in &self.layers {
+            let mut l_ks = vec![];
+            let mut l_vs = vec![];
+            for block in &layer.self_attn.kv_blocks {
+                let inner = block.inner.read().unwrap();
+                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                    l_ks.push(k.clone());
+                    l_vs.push(v.clone());
+                }
+            }
+            if !l_ks.is_empty() {
+                if let (Ok(k), Ok(v)) = (Tensor::cat(&l_ks, 2), Tensor::cat(&l_vs, 2)) {
+                    ks.push(k);
+                    vs.push(v);
+                }
+            }
+        }
+        (ks, vs)
     }
 
     /// [LAYER-UNIT-OF-WORK]
@@ -2089,7 +2120,7 @@ impl QuantizedQwen3VLTextModel {
                     layers: vec![dump],
                     is_relay_baking: mode,
                     block_idx: Some(off / 256),
-                    registry: rr.clone(),
+                    registry: rr.clone().expect("registry"),
                 })).await;
             }
             println!("[FLUSH-FORCE] Submitted {} layers to Bake queue.", task_count);
