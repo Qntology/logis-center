@@ -338,6 +338,10 @@ pub struct QuantizedQwen3VLTextAttention {
     pub kv_blocks: Vec<KVBlock>,
     pub registry: KVRegistry, // [NEW] 중앙 목차 참조
     pub layer_idx: usize,
+    // [ACCUMULATOR] VRAM 내 병합 캐시: 매번 수십개의 블록을 cat하는 오버헤드 제거
+    pub vram_merged_k: Option<Tensor>,
+    pub vram_merged_v: Option<Tensor>,
+    pub merged_vram_block_count: usize,
 }
 
 impl QuantizedQwen3VLTextAttention {
@@ -349,6 +353,11 @@ impl QuantizedQwen3VLTextAttention {
         self.q_norm.to_device(device)?;
         self.k_norm.to_device(device)?;
         
+        // [ACCUMULATOR-RESET] 장치 이동 시 병합 캐시 초기화 (필요시 새로 생성)
+        self.vram_merged_k = None;
+        self.vram_merged_v = None;
+        self.merged_vram_block_count = 0;
+
         let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
         for block in &mut self.kv_blocks {
             let (index, mut inner) = {
@@ -446,6 +455,9 @@ impl QuantizedQwen3VLTextAttention {
             kv_blocks: Vec::new(),
             registry,
             layer_idx,
+            vram_merged_k: None,
+            vram_merged_v: None,
+            merged_vram_block_count: 0,
         })
     }
 
@@ -798,11 +810,68 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // 5. [BATCH-VRAM] Fast single-pass for all VRAM blocks
+        // 5. [BATCH-VRAM-ACCUMULATOR] Fast single-pass using merged cache
+        let mut final_vram_k = None;
+        let mut final_vram_v = None;
+        let mut vram_total_len = 0;
+
         if !vram_ks.is_empty() {
-            let mut k = Tensor::cat(&vram_ks, 2)?;
-            let mut v = Tensor::cat(&vram_vs, 2)?;
-            
+            // [STRATEGY] 꽉 찬 블록들은 미리 합쳐서 캐싱하고, 마지막 활성 블록만 매번 합침
+            let num_vram_blocks = vram_ks.len();
+            let has_active_block = vram_ks.last().map(|t| t.dim(2).unwrap_or(0) < 256).unwrap_or(false);
+            let full_block_count = if has_active_block { num_vram_blocks.saturating_sub(1) } else { num_vram_blocks };
+
+            // 캐시가 유효한지 확인 (개수가 줄었거나 장치가 바뀌었으면 리셋)
+            if self.merged_vram_block_count > full_block_count {
+                self.vram_merged_k = None;
+                self.vram_merged_v = None;
+                self.merged_vram_block_count = 0;
+            }
+
+            // 1. [ACCUMULATE] 꽉 찬 블록들 병합 및 업데이트
+            if full_block_count > 0 && self.merged_vram_block_count < full_block_count {
+                let start_idx = self.merged_vram_block_count;
+                let blocks_to_add_k: Vec<Tensor> = vram_ks[start_idx..full_block_count].iter().cloned().collect();
+                let blocks_to_add_v: Vec<Tensor> = vram_vs[start_idx..full_block_count].iter().cloned().collect();
+
+                if let Some(mk) = self.vram_merged_k.take() {
+                    let mut list = vec![mk];
+                    list.extend(blocks_to_add_k);
+                    self.vram_merged_k = Some(Tensor::cat(&list, 2)?);
+                } else {
+                    self.vram_merged_k = Some(Tensor::cat(&blocks_to_add_k, 2)?);
+                }
+
+                if let Some(mv) = self.vram_merged_v.take() {
+                    let mut list = vec![mv];
+                    list.extend(blocks_to_add_v);
+                    self.vram_merged_v = Some(Tensor::cat(&list, 2)?);
+                } else {
+                    self.vram_merged_v = Some(Tensor::cat(&blocks_to_add_v, 2)?);
+                }
+                self.merged_vram_block_count = full_block_count;
+            }
+
+            // 2. [FINAL-COMBINE] 병합된 덩어리 + 현재 활성 블록
+            if has_active_block {
+                let active_k = vram_ks.last().unwrap();
+                let active_v = vram_vs.last().unwrap();
+                if let (Some(mk), Some(mv)) = (&self.vram_merged_k, &self.vram_merged_v) {
+                    final_vram_k = Some(Tensor::cat(&[mk.clone(), active_k.clone()], 2)?);
+                    final_vram_v = Some(Tensor::cat(&[mv.clone(), active_v.clone()], 2)?);
+                } else {
+                    final_vram_k = Some(active_k.clone());
+                    final_vram_v = Some(active_v.clone());
+                }
+            } else {
+                final_vram_k = self.vram_merged_k.clone();
+                final_vram_v = self.vram_merged_v.clone();
+            }
+
+            vram_total_len = vram_ks.iter().map(|t| t.dim(2).unwrap_or(0)).sum();
+        }
+
+        if let (Some(mut k), Some(mut v)) = (final_vram_k, final_vram_v) {
             if self.num_kv_groups > 1 {
                 let (b, h, s, d) = k.dims4()?;
                 k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
@@ -1713,11 +1782,25 @@ impl QuantizedQwen3VLTextModel {
         Ok(results)
     }
 
-    /// [CHUNK-LEVEL-STRICT] 계층형 메모리 관리 (VRAM 2048 -> RAM 4096 -> SSD)
+    /// [CHUNK-LEVEL-STRICT] 계층형 메모리 관리 (VRAM -> RAM -> SSD)
     async fn evacuate_chunk_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, _chunk_off: usize, _len: usize) -> Result<()> {
         use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
         
-        // 1. VRAM -> RAM 계층 관리 (최대 8개 블록 유지)
+        // [DYNAMIC-LIMITS] 시스템 자원 상황에 따라 임계값 유동적 조절 (OOM 방지)
+        let (vram_limit, ram_limit) = {
+            let mut sys = sysinfo::System::new();
+            sys.refresh_memory();
+            let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+            
+            // VRAM 여유분 체크 (간단히 4.0GB 이상 여유 있으면 최대치 사용)
+            let v_limit = if free_ram_gb > 4.0 { 64 } else if free_ram_gb > 2.0 { 32 } else { 8 };
+            let r_limit = if free_ram_gb > 8.0 { 128 } else if free_ram_gb > 4.0 { 64 } else { 16 };
+            (v_limit, r_limit)
+        };
+
+        let mut vram_evicted = false;
+
+        // 1. VRAM -> RAM 계층 관리
         {
             // 전역 장부 잠금 (Registry -> Inner 순서 준수)
             let mut reg = self.registry.entries.write().unwrap();
@@ -1731,9 +1814,9 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
 
-            if vram_indices.len() > 8 {
+            if vram_indices.len() > vram_limit {
                 vram_indices.sort_by_key(|k| k.1); // 오래된 순 정렬
-                let num_to_evict = vram_indices.len() - 8;
+                let num_to_evict = vram_indices.len() - vram_limit;
                 for i in 0..num_to_evict {
                     let (idx, _) = vram_indices[i];
                     let mut inner = kv_blocks[idx].inner.write().unwrap();
@@ -1743,16 +1826,24 @@ impl QuantizedQwen3VLTextModel {
                         inner.k_cache = Some(k_cpu);
                         inner.v_cache = Some(v_cpu);
                         inner.location = KVLocation::RAM;
-                        // 장부 업데이트 (DType Mismatch 방지 핵심)
+                        // 장부 업데이트
                         if inner.index < reg.len() {
                             reg[inner.index].location[layer_idx] = KVLocation::RAM;
                         }
+                        vram_evicted = true;
                     }
                 }
             }
-        } // Registry lock dropped here
+        } // Registry lock dropped
 
-        // 2. RAM -> SSD 계층 관리 (최대 16개 블록 유지, 초과분 SSD행)
+        // [ACCUMULATOR-INVALIDATE] VRAM에서 방출이 일어났다면 병합 캐시 리셋
+        if vram_evicted {
+            self.layers[layer_idx].self_attn.vram_merged_k = None;
+            self.layers[layer_idx].self_attn.vram_merged_v = None;
+            self.layers[layer_idx].self_attn.merged_vram_block_count = 0;
+        }
+
+        // 2. RAM -> SSD 계층 관리
         let mut dumps_to_send = Vec::new();
         {
             let mut reg = self.registry.entries.write().unwrap();
@@ -1766,14 +1857,13 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
 
-            if ram_indices.len() > 16 {
+            if ram_indices.len() > ram_limit {
                 ram_indices.sort_by_key(|k| k.1);
-                let num_to_flush = ram_indices.len() - 16;
+                let num_to_flush = ram_indices.len() - ram_limit;
                 for i in 0..num_to_flush {
                     let (idx, _) = ram_indices[i];
                     let mut inner = kv_blocks[idx].inner.write().unwrap();
                     
-                    // 이미 SSD에 백업되었는지 확인
                     let is_safe = inner.index < reg.len() && reg[inner.index].location[layer_idx] == KVLocation::SSD;
 
                     if is_safe {
@@ -2045,11 +2135,23 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    /// [NEW-STRICT] 계층형 메모리 관리 (VRAM 2048 -> RAM 4096 -> SSD)
+    /// [NEW-STRICT] 계층형 메모리 관리 (VRAM -> RAM -> SSD)
     async fn evacuate_layer_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, start_off: usize, _len: usize) -> Result<()> {
         use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
         
         let block_start = (start_off / 256) * 256;
+
+        // [DYNAMIC-LIMITS]
+        let (vram_limit, ram_limit) = {
+            let mut sys = sysinfo::System::new();
+            sys.refresh_memory();
+            let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+            let v_limit = if free_ram_gb > 4.0 { 64 } else if free_ram_gb > 2.0 { 32 } else { 8 };
+            let r_limit = if free_ram_gb > 8.0 { 128 } else if free_ram_gb > 4.0 { 64 } else { 16 };
+            (v_limit, r_limit)
+        };
+
+        let mut vram_evicted = false;
 
         // 1. VRAM -> RAM 계층 관리
         {
@@ -2064,9 +2166,9 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
 
-            if vram_indices.len() > 8 {
+            if vram_indices.len() > vram_limit {
                 vram_indices.sort_by_key(|k| k.1);
-                let num_to_evict = vram_indices.len() - 8;
+                let num_to_evict = vram_indices.len() - vram_limit;
                 for i in 0..num_to_evict {
                     let (idx, _) = vram_indices[i];
                     let mut inner = kv_blocks[idx].inner.write().unwrap();
@@ -2077,9 +2179,17 @@ impl QuantizedQwen3VLTextModel {
                         inner.v_cache = Some(v_cpu);
                         inner.location = KVLocation::RAM;
                         if inner.index < reg.len() { reg[inner.index].location[layer_idx] = KVLocation::RAM; }
+                        vram_evicted = true;
                     }
                 }
             }
+        }
+
+        // [ACCUMULATOR-INVALIDATE]
+        if vram_evicted {
+            self.layers[layer_idx].self_attn.vram_merged_k = None;
+            self.layers[layer_idx].self_attn.vram_merged_v = None;
+            self.layers[layer_idx].self_attn.merged_vram_block_count = 0;
         }
 
         // 2. RAM -> SSD 계층 관리
@@ -2096,9 +2206,9 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
 
-            if ram_indices.len() > 16 {
+            if ram_indices.len() > ram_limit {
                 ram_indices.sort_by_key(|k| k.1);
-                let num_to_flush = ram_indices.len() - 16;
+                let num_to_flush = ram_indices.len() - ram_limit;
                 for i in 0..num_to_flush {
                     let (idx, _) = ram_indices[i];
                     let mut inner = kv_blocks[idx].inner.write().unwrap();
