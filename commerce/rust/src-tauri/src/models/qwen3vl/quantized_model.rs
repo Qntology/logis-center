@@ -2271,6 +2271,7 @@ impl QuantizedQwen3VLTextModel {
         position_ids_in: Option<&Tensor>,
         visual_pos_masks: Option<&Tensor>,
         deepstack_visual_embeds: Option<Vec<Tensor>>,
+        session_id: Option<String>,
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         let target_device = self.layers[0].device().clone();
@@ -2304,6 +2305,11 @@ impl QuantizedQwen3VLTextModel {
         }
 
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
+
+        // [FLUSH-COMMIT] 세션 ID가 있을 경우(Baking/Step-A) RAM에 남은 데이터를 강제로 SSD로 밀어냅니다.
+        if let Some(sid) = session_id {
+            self.force_flush_all_active_blocks(&sid).await?;
+        }
 
         self.current_kv_len = seqlen_offset + seq_len;
         let norm_dev = self.norm.weight().device();
@@ -2809,7 +2815,7 @@ impl QuantizedQwen3VLModel {
             (p_ids, deltas.clone())
         };
         
-        self.language_model.active_session_id = session_id;
+        self.language_model.active_session_id = session_id.clone();
         
         // [DIAG-ROPE] 위치 정보 및 텐서 상태 모니터링
         if seqlen_offset % 10 == 0 || seq_len > 1 {
@@ -2818,7 +2824,7 @@ impl QuantizedQwen3VLModel {
             println!("[DIAG-ENGINE] Forward | Offset: {} | SeqLen: {} | PosRange: {}..{}", seqlen_offset, seq_len, p_min, p_max);
         }
 
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None).await?;
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, session_id).await?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         
         let head_dev = self.lm_head.device();
@@ -2923,7 +2929,7 @@ impl QuantizedQwen3TextModel {
             Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?
         };
         
-        self.language_model.active_session_id = session_id;
+        self.language_model.active_session_id = session_id.clone();
         
         // [DIAG-ROPE-TEXT]
         if seqlen_offset % 10 == 0 || seq_len > 1 {
@@ -2932,7 +2938,7 @@ impl QuantizedQwen3TextModel {
             println!("[DIAG-ENGINE-TEXT] Forward | Offset: {} | SeqLen: {} | PosRange: {}..{}", seqlen_offset, seq_len, p_min, p_max);
         }
 
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None).await?;
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, session_id).await?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         
         let logits = if let Some(head) = &self.lm_head {

@@ -234,19 +234,27 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         while let Some(task) = io_rx.recv().await {
             let (tp, ts, reg, b_idx, sid, is_last) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last);
             if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
-            let _ = candle_core::safetensors::save(&ts, &tp);
+            
+            // [IO-LOG]
+            if let Ok(_) = candle_core::safetensors::save(&ts, &tp) {
+                println!("[BAKE-SAVE] Saved KV: {:?}", tp.file_name().unwrap_or_default());
+            } else {
+                println!("[BAKE-ERR] Failed to save KV: {:?}", tp);
+            }
+
             if let (Some(r), Some(idx)) = (reg, b_idx) {
                 if let Ok(mut entries) = r.entries.write() {
                     if idx < entries.len() {
                         let e = &mut entries[idx]; e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
                         if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
-                            if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = KVLocation::SSD; } }
+                            if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::SSD; } }
                         }
                     }
                 }
             }
             GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
-            if SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst) == 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; }
+            let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
+            if rem <= 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; }
         }
     });
 
@@ -447,7 +455,8 @@ impl Qwen3VLGenerateModel {
                 ModelVariant::QuantizedVL(QuantizedQwen3VLModel::new_with_mmap(&cfg, &gguf_file::Content::read(&mut std::io::Cursor::new(&m_mmap[..]))?, Some(Arc::new(m_mmap)), &gguf_file::Content::read(&mut std::io::Cursor::new(&mm_mmap[..]))?, Some(Arc::new(mm_mmap)), &t_dev, text_device_id, &v_dev, vision_device_id, dtype, kv_res, baking_only)?)
             } else {
                 let m_mmap = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(m_p.as_ref().unwrap())?)? };
-                let use_sl = baking_only || path.contains("0.6B");
+                // [FIX] Single-layer mode ONLY for Baking. Inference (Step A) needs ALL layers.
+                let use_sl = baking_only;
                 ModelVariant::QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &gguf_file::Content::read(&mut std::io::Cursor::new(&m_mmap[..]))?, Some(Arc::new(m_mmap)), &t_dev, text_device_id, dtype, kv_res, baking_only, use_sl)?)
             }
         } else { ModelVariant::Standard(Qwen3VLModel::new(cfg, unsafe { VarBuilder::from_mmaped_safetensors(&find_type_files(path, "safetensors")?, dtype, &t_dev)? })?) };
