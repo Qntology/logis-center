@@ -22,7 +22,7 @@ impl Default for Qwen3VLGenerationConfig {
             pad_token_id: 151643,
             repetition_penalty: 1.0,
             temperature: 0.9,
-            top_k: 20,
+            top_k: 9,
             top_p: 0.9,
             transformers_version: "4.45.0".to_string(),
         }

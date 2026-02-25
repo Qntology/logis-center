@@ -2134,13 +2134,16 @@ impl QuantizedQwen3VLTextModel {
         
         let block_start = (start_off / 256) * 256;
 
-        // [DYNAMIC-LIMITS]
+        // [DYNAMIC-LIMITS] 10k+ 문맥을 위해 제한을 대폭 완화합니다.
         let (vram_limit, ram_limit) = {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-            let v_limit = if free_ram_gb > 4.0 { 64 } else if free_ram_gb > 2.0 { 32 } else { 8 };
-            let r_limit = if free_ram_gb > 8.0 { 128 } else if free_ram_gb > 4.0 { 64 } else { 16 };
+            
+            // VRAM: 가급적 많이 올림 (최소 64개 = 16k 토큰)
+            let v_limit = if free_ram_gb > 4.0 { 128 } else { 64 };
+            // RAM: 10k 문맥은 약 40개 블록이므로, 256개(64k 토큰)까지는 넉넉히 허용
+            let r_limit = if free_ram_gb > 8.0 { 512 } else if free_ram_gb > 4.0 { 256 } else { 128 };
             (v_limit, r_limit)
         };
 

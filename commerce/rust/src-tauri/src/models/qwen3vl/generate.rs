@@ -496,7 +496,7 @@ impl Qwen3VLGenerateModel {
     pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
         let temperature = mes.temperature.unwrap_or(0.7) as f32;
         let seed = mes.seed.unwrap_or(34562) as u64;
-        let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(0.9) as f32), Some(20), seed);
+        let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(0.9) as f32), Some(9), seed);
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
