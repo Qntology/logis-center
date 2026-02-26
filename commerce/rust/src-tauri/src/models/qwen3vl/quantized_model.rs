@@ -1879,6 +1879,9 @@ impl QuantizedQwen3VLTextModel {
                 dumps.push(LayerKVDump { layer_idx: l_idx, k_tensor: k, v_tensor: v });
             }
 
+            // [JIT-DISPATCH-REPORT] 백그라운드 저장 작업을 던지기 전에 요약 보고
+            println!("[JIT-DISPATCH] Offset: {} | Layers: {} | Mode: {}", off, dumps.len(), if baking_only { "Baking" } else { "Inference" });
+
             // [FIRE-AND-FORGET]
             tokio::spawn(async move {
                 if let Some(tx) = BAKE_TX.get() {
@@ -2001,8 +2004,10 @@ impl QuantizedQwen3VLTextModel {
         let mut sys = self.sys_info.lock().unwrap();
         sys.refresh_memory();
         let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-        let v_limit = if free_ram_gb > 4.0 { 64 } else if free_ram_gb > 2.0 { 32 } else { 8 };
-        let r_limit = if free_ram_gb > 8.0 { 128 } else if free_ram_gb > 4.0 { 64 } else { 16 };
+        
+        // [FIX] 사무용 PC 사양을 고려하여 기본 한도를 하향 조정 (64/128 -> 16/32)
+        let v_limit = if free_ram_gb > 4.0 { 16 } else { 8 };
+        let r_limit = if free_ram_gb > 4.0 { 32 } else { 16 };
         (v_limit, r_limit)
     }
 

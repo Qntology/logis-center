@@ -194,8 +194,7 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {
         match req {
             SlotRequest::Acquire { total_tokens: _, tx } => {
-                // [FIX] 쓰기 슬롯 한도를 대폭 늘려 (4 -> 32) 모델 연산이 멈추는 병목을 제거합니다.
-                let max_writes = 32;
+                let max_writes = 8;
                 let mut found = None;
                 while found.is_none() {
                     if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
@@ -219,8 +218,8 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                         }
                     }
                     if found.is_none() { 
-                        // [FIX] 대기 시간을 10ms -> 1ms로 줄여 반응성 극대화
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await; 
+                        // [OPTIMIZATION] 1ms 폴링 대신 Notify 이벤트를 기다려 반응성 극대화
+                        SLOT_MANAGER.handoff_notifier.notified().await;
                     }
                 }
                 let _ = tx.send(found.unwrap());
@@ -228,7 +227,6 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
             SlotRequest::Release { idx, .. } => {
                 let slot = &SLOT_MANAGER.slots[idx];
                 if slot.remaining_layers.load(Ordering::SeqCst) > 0 {
-                    println!("[SLOT-WARN] Release denied for Slot {}. IO still in progress.", idx);
                     continue; 
                 }
                 let prev = slot.state.swap(0, Ordering::SeqCst);
@@ -238,6 +236,7 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                     for lk in &slot.k_layers { if let Ok(mut g) = lk.try_lock() { *g = None; } }
                     for lv in &slot.v_layers { if let Ok(mut g) = lv.try_lock() { *g = None; } }
                 }
+                // 대기 중인 Acquire 태스크들에게 알림
                 SLOT_MANAGER.handoff_notifier.notify_waiters();
             }
         }
@@ -255,32 +254,20 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             let save_res = (|| -> Result<()> {
                 use std::fs::OpenOptions;
                 use memmap2::MmapMut;
-                
-                // 1. 데이터 크기 계산
-                let tensors_vec: Vec<_> = ts.iter().collect();
                 let bytes = safetensors::serialize(&ts, &None)?;
                 let total_size = bytes.len();
 
-                // 2. 파일 생성 및 크기 할당
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&tp)?;
+                let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tp)?;
                 file.set_len(total_size as u64)?;
 
-                // 3. Memory Map 생성 및 데이터 복사 (OS가 직접 I/O 관리)
                 let mut mmap = unsafe { MmapMut::map_mut(&file)? };
                 mmap.copy_from_slice(&bytes);
-                mmap.flush()?; // 디스크 동기화 유도
-                
+                mmap.flush()?;
                 Ok(())
             })();
 
             if save_res.is_ok() {
-                println!("[BAKE-SAVE-ZERO] Saved KV (Mmap): {:?}", tp.file_name().unwrap_or_default());
-                // [CRITICAL-SYNC] 파일 쓰기가 완전히 성공한 직후에만 장부 상태를 SSD로 변경합니다.
+                println!("[BAKE-SAVE-ZERO] Saved KV (Mmap): {:?} | Slot: {}", tp.file_name().unwrap_or_default(), sid);
                 if let (Some(r), Some(idx)) = (reg, b_idx) {
                     if let Ok(mut entries) = r.entries.write() {
                         if idx < entries.len() {
@@ -293,10 +280,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     }
                 }
             } else {
-                // Mmap 실패 시 폴백 (기존 방식)
                 let _ = candle_core::safetensors::save(&ts, &tp);
                 println!("[BAKE-SAVE-FALLBACK] Saved KV: {:?}", tp.file_name().unwrap_or_default());
-                // 폴백 저장 후에도 상태 업데이트 시도
                 if let (Some(r), Some(idx)) = (reg, b_idx) {
                     if let Ok(mut entries) = r.entries.write() {
                         if idx < entries.len() {
@@ -313,10 +298,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
             let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
             if rem == 1 || is_last { 
-                // [CRITICAL-FIX] 슬롯을 완전히 해제하여 active_write_count를 복구합니다.
                 SLOT_MANAGER.slots[sid].remaining_layers.store(0, Ordering::SeqCst);
                 SLOT_MANAGER.release_slot(sid).await;
-                println!("[SLOT-SYNC] Slot {} is now fully baked and released.", sid); 
+                println!("[SLOT-SYNC] Slot {} released. Active Writes: {}", sid, SLOT_MANAGER.active_write_count.load(Ordering::SeqCst)); 
             }
         }
     });
