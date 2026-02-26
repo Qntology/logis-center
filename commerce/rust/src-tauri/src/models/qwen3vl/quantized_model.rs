@@ -722,28 +722,17 @@ impl QuantizedQwen3VLTextAttention {
 
                     if k_active.is_none() {
                         let path = ssd_path.clone().unwrap_or_default();
-                        let filename = format!("l{}.st", self.layer_idx);
-                        
-                        // [FIX] 중첩 폴더 구조(reference/{name}/b{off})를 지원하도록 경로 검색 로직 강화
                         let kv_name = self.active_kv_name.as_deref().unwrap_or("general");
                         
-                        // 1. Inference 경로 시도 (예: pug/b0/l0.st)
-                        let inf_p = path.join(kv_name).join(format!("b{}", b_off)).join(&filename);
-                        // 2. Reference 경로 시도 (예: reference/pug/b0/l0.st)
-                        let bak_p = path.join("reference").join(kv_name).join(format!("b{}", b_off)).join("l0.st");
-                        // 3. (Legacy) 직접 경로 시도
-                        let dir_p = path.join(&filename);
+                        let inf_p = path.join(kv_name).join(format!("b{}", b_off)).join(format!("l{}.st", self.layer_idx));
+                        let bak_p = path.join("reference").join(kv_name).join(format!("b{}", b_off)).join(format!("l{}.st", self.layer_idx));
                         
+                        // [RELAY-STRICT-FALLBACK] 본인 레이어 파일이 없으면 무조건 l0.st 시도
                         let act_path = if inf_p.is_file() { Some(inf_p) } 
                                    else if bak_p.is_file() { Some(bak_p) } 
-                                   else if dir_p.is_file() { Some(dir_p) }
                                    else {
-                                       // [DEEP-SEARCH] 혹시 이름이 general 등으로 저장되었을 경우를 위해 추가 시도
-                                       let gen_inf = path.join("inference").join(format!("b{}", b_off)).join(&filename);
-                                       let gen_bak = path.join("reference").join(format!("b{}", b_off)).join("l0.st");
-                                       if gen_inf.is_file() { Some(gen_inf) }
-                                       else if gen_bak.is_file() { Some(gen_bak) }
-                                       else { None }
+                                       let relay_p = path.join("reference").join(kv_name).join(format!("b{}", b_off)).join("l0.st");
+                                       if relay_p.is_file() { Some(relay_p) } else { None }
                                    };
                         
                                                                         // [OPTIMIZATION] RAM 캐시(bitkv_cache) 먼저 확인
@@ -1072,6 +1061,8 @@ impl QuantizedQwen3VLTextAttention {
             let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
             if let Some(mask) = &attention_mask {
                 let mask_len = mask.dim(D::Minus1)?;
+                // [FIX] VRAM 블록의 시작점은 RAM/SSD 블록들이 모두 끝난 지점입니다.
+                // global_start_idx가 루프를 돌며 RAM/SSD 토큰만큼 이미 증가했으므로 이를 활용합니다.
                 let vram_start = global_start_idx;
                 if vram_start + vram_total_len <= mask_len {
                     let sub_mask = mask.narrow(D::Minus1, vram_start, vram_total_len)?.to_dtype(target_dtype)?;
@@ -1348,22 +1339,37 @@ impl QuantizedQwen3VLTextAttention {
     pub fn batch_load_layer_kv(&mut self, kv_name: &str) -> Result<()> {
         use crate::models::qwen3vl::generate::LayerIndex;
         let kv_dir = crate::utils::paths::get_kv_dir(None);
-        let index_path = kv_dir.join(kv_name).join(format!("layer{}.json", self.layer_idx));
+        let mut index_path = kv_dir.join(kv_name).join(format!("layer{}.json", self.layer_idx));
         
-        if !index_path.exists() { return Ok(()); }
+        // [RELAY-FALLBACK] 만약 해당 레이어 인덱스 파일이 없으면 layer0.json을 공용 컨텍스트로 사용
+        if !index_path.exists() {
+            let fallback = kv_dir.join(kv_name).join("layer0.json");
+            if fallback.exists() {
+                if self.layer_idx == 0 { println!("[BATCH-LOAD] Specific index for L{} not found. Falling back to Layer 0 for Relay.", self.layer_idx); }
+                index_path = fallback;
+            } else {
+                return Ok(());
+            }
+        }
         
         let index_json = fs::read_to_string(&index_path)?;
         let index: LayerIndex = serde_json::from_str(&index_json)?;
         
         for block_info in index.blocks {
-            let file_path = kv_dir.join(kv_name).join(&block_info.file);
+            let block_parent = kv_dir.join(kv_name).join(format!("b{}", block_info.offset));
+            // 해당 레이어 전용 파일이 있으면 우선 사용, 없으면 l0.st 사용
+            let l_file = block_parent.join(format!("l{}.st", self.layer_idx));
+            let file_path = if l_file.exists() { l_file } else { block_parent.join("l0.st") };
+            
             if !file_path.exists() { continue; }
             
             let b_idx = block_info.offset / 256;
             
             if let Ok(content) = crate::utils::direct_loader::load_kv_block(&file_path) {
                 if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                    let prefix = if block_info.file.contains("l0.st") { format!("b{}_l0_", block_info.offset) } else { format!("b{}_l{}_", block_info.offset, self.layer_idx) };
+                    // 프리픽스도 파일명에 맞춰 유연하게 매칭
+                    let is_l0 = file_path.to_string_lossy().contains("l0.st");
+                    let prefix = if is_l0 { format!("b{}_l0_", block_info.offset) } else { format!("b{}_l{}_", block_info.offset, self.layer_idx) };
                     let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
                     
                     if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
@@ -2045,13 +2051,52 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn load_kv_cache_chunked(&mut self, kv_name: &str) -> Result<()> {
+        use crate::models::qwen3vl::generate::LayerIndex;
+        let kv_dir = crate::utils::paths::get_kv_dir(None);
+        let index_path = kv_dir.join(kv_name).join("layer0.json");
+        
+        if !index_path.exists() { return Ok(()); }
+        
+        // [FIX-REGISTRY-SIZE] 로딩 전 인덱스를 확인하여 레지스트리 공간 선제 확보
+        let index_json = fs::read_to_string(&index_path)?;
+        let index: LayerIndex = serde_json::from_str(&index_json)?;
+        let total_tokens = index.total_tokens;
+        
+        // 레지스트리 및 개별 레이어의 kv_blocks 동기화
+        {
+            let mut reg = self.registry.entries.write().unwrap();
+            let needed_blocks = (total_tokens + 255) / 256;
+            while reg.len() < needed_blocks {
+                let off = reg.len() * 256;
+                // RegistryEntry::new 생성자를 사용하여 모든 필드를 정확하게 초기화
+                reg.push(RegistryEntry::new(off, 0, 28));
+            }
+            // 전체 길이 업데이트
+            self.current_kv_len = total_tokens;
+        }
+
+        // 개별 레이어의 kv_blocks 도 확보된 레지스트리 길이에 맞춤
+        for layer in self.layers.iter_mut() {
+            let reg_len = self.registry.entries.read().unwrap().len();
+            while layer.self_attn.kv_blocks.len() < reg_len {
+                let idx = layer.self_attn.kv_blocks.len();
+                let off = idx * 256;
+                layer.self_attn.kv_blocks.push(KVBlock {
+                    inner: Arc::new(std::sync::RwLock::new(KVBlockInner {
+                        k_cache: None, v_cache: None,
+                        offset: off, len: 0, index: idx, location: KVLocation::SSD,
+                        bitkv_metadata: None,
+                        ssd_path: None,
+                    }))
+                });
+            }
+        }
+
         let mut sys = sysinfo::System::new_all();
         sys.refresh_memory();
         let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
         
-        // 가용 RAM에 따른 청크 크기 결정 (28개 레이어 기준)
         let chunk_size = if free_ram_gb > 8.0 { 28 } else if free_ram_gb > 4.0 { 14 } else { 7 };
-        
         println!("[PREFILL-RAM] Available RAM: {:.2} GB. Loading in chunks of {}.", free_ram_gb, chunk_size);
         
         for chunk_start in (0..self.layers.len()).step_by(chunk_size) {
@@ -2059,13 +2104,30 @@ impl QuantizedQwen3VLTextModel {
             for l_idx in chunk_start..chunk_end {
                 self.layers[l_idx].batch_load_kv(kv_name)?;
             }
-            // 청크 간 약간의 휴식 (OS I/O 안정화)
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         
-        // 전체 길이 업데이트 (인덱스에서 읽어온 정보 바탕으로 registry가 채워졌으므로)
-        let reg = self.registry.entries.read().unwrap();
-        self.current_kv_len = reg.iter().map(|e| e.token_len).sum();
+        // [FIX-BLOCK-LENGTHS] 인덱스에서 읽어온 정보를 바탕으로 각 블록의 실제 길이를 확정
+        {
+            let mut reg = self.registry.entries.write().unwrap();
+            let total_t = self.current_kv_len;
+            for (idx, entry) in reg.iter_mut().enumerate() {
+                let off = idx * 256;
+                let b_len = if off + 256 <= total_t { 256 } else { total_t.saturating_sub(off) };
+                entry.token_len = b_len;
+                
+                // 개별 레이어의 KVBlockInner 길이도 동기화
+                for layer in self.layers.iter_mut() {
+                    if let Some(block) = layer.self_attn.kv_blocks.get(idx) {
+                        let mut inner = block.inner.write().unwrap();
+                        inner.len = b_len;
+                        if entry.location[layer.self_attn.layer_idx] == KVLocation::RAM {
+                            inner.location = KVLocation::RAM;
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
