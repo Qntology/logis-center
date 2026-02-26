@@ -840,10 +840,14 @@ pub fn pack_bitkv_gpu(t: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
     
     let mut plane_bits = Vec::new();
     for bit_idx in 0..4 {
-        let cur_scale = scales.affine(1.0 / (2.0f64.powi(bit_idx)), 0.0)?
-                              .broadcast_as(residual.shape())?; // [FIX] 모양 맞춤
+        let cur_scale = scales.affine(1.0 / (2.0f64.powi(bit_idx)), 0.0)?;
         let mask = residual.ge(0.0)?;
-        let delta = mask.where_cond(&cur_scale, &cur_scale.neg()?)?;
+        
+        // [FIX] 양쪽 인자 모두 명시적으로 변수에 담아 브로드캐스팅 보장
+        let on_true = cur_scale.broadcast_as(mask.shape())?;
+        let on_false = cur_scale.neg()?.broadcast_as(mask.shape())?;
+        let delta = mask.where_cond(&on_true, &on_false)?;
+        
         residual = residual.sub(&delta)?;
         plane_bits.push(mask.to_dtype(DType::U8)?);
     }

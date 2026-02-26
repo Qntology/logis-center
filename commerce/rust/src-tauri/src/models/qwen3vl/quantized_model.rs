@@ -1017,15 +1017,14 @@ impl QuantizedQwen3VLTextAttention {
         // 3. 반복적 잔차 복구 (GPU Tensor Ops)
         let mut decoded = Tensor::zeros(original_shape, DType::F32, device)?;
         for (b, mask_plane) in planes.into_iter().enumerate() {
-            // [FIX] bit_scale을 명시적으로 [1, 8, 256, 128] 모양으로 확장
-            let bit_scale = scales_gpu.affine(1.0 / (2.0f64.powi(b as i32)), 0.0)?
-                                      .broadcast_as(original_shape)?; 
-            
+            let bit_scale = scales_gpu.affine(1.0 / (2.0f64.powi(b as i32)), 0.0)?;
             let mask = mask_plane.reshape(original_shape)?;
             
-            // val += is_set ? scale : -scale
-            // 여기서 mask와 bit_scale의 모양이 완전히 일치해야 합니다.
-            let delta = mask.where_cond(&bit_scale, &bit_scale.neg()?)?;
+            // [FIX] 양쪽 인자 모두 명시적으로 브로드캐스팅하여 모양 일치 보장
+            let on_true = bit_scale.broadcast_as(original_shape)?;
+            let on_false = bit_scale.neg()?.broadcast_as(original_shape)?;
+            let delta = mask.where_cond(&on_true, &on_false)?;
+            
             decoded = decoded.add(&delta)?;
         }
 
