@@ -604,12 +604,12 @@ impl QuantizedQwen3VLTextAttention {
             };
             if b_off >= total_len { continue; }
 
-            if loc == KVLocation::VRAM {
+            // [FIX] Streaming 상태의 블록도 VRAM에 상주하는 것이므로 동일하게 처리
+            if loc == KVLocation::VRAM || loc == KVLocation::Streaming {
                 vram_count += 1;
                 let inner = block.inner.read().unwrap();
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                     if vram_start_off.is_none() { vram_start_off = Some(b_off); }
-                    // [FIX] BF16 vs F32 충돌 방지: VRAM 블록도 명시적으로 target_dtype으로 맞춤
                     vram_ks.push(k.to_device(dev)?.to_dtype(target_dtype)?);
                     vram_vs.push(v.to_device(dev)?.to_dtype(target_dtype)?);
                     vram_total_len += b_len;
@@ -676,13 +676,17 @@ impl QuantizedQwen3VLTextAttention {
                 let s_i = p_i.sum_keepdim(D::Minus1)?;
                 let o_i = p_i.matmul(&v)?;
                 match (running_m.take(), running_s.take(), running_o.take()) {
-                    (None, None, None) => { running_m = Some(m_i); running_s = Some(s_i); running_o = Some(o_i); }
+                    (None, None, None) => { 
+                        running_m = Some(m_i); 
+                        running_s = Some(s_i.to_dtype(target_dtype)?); 
+                        running_o = Some(o_i.to_dtype(target_dtype)?); 
+                    }
                     (Some(m_prev), Some(s_prev), Some(o_prev)) => {
                         let m_new = m_prev.maximum(&m_i)?;
-                        let alpha_prev = m_prev.broadcast_sub(&m_new)?.exp()?;
-                        let alpha_i = m_i.broadcast_sub(&m_new)?.exp()?;
-                        running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&s_i.broadcast_mul(&alpha_i)?)?);
-                        running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&o_i.broadcast_mul(&alpha_i)?)?);
+                        let alpha_prev = m_prev.broadcast_sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
+                        let alpha_i = m_i.broadcast_sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
+                        running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&s_i.to_dtype(target_dtype)?.broadcast_mul(&alpha_i)?)?);
+                        running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&o_i.to_dtype(target_dtype)?.broadcast_mul(&alpha_i)?)?);
                         running_m = Some(m_new);
                     }
                     _ => unreachable!(),
@@ -712,20 +716,24 @@ impl QuantizedQwen3VLTextAttention {
             let s_i = p_i.sum_keepdim(D::Minus1)?;
             let o_i = p_i.matmul(&v)?;
             match (running_m.take(), running_s.take(), running_o.take()) {
-                (None, None, None) => { running_m = Some(m_i); running_s = Some(s_i); running_o = Some(o_i); }
+                (None, None, None) => { 
+                    running_m = Some(m_i); 
+                    running_s = Some(s_i.to_dtype(target_dtype)?); 
+                    running_o = Some(o_i.to_dtype(target_dtype)?); 
+                }
                 (Some(m_prev), Some(s_prev), Some(o_prev)) => {
                     let m_new = m_prev.maximum(&m_i)?;
-                    let alpha_prev = m_prev.broadcast_sub(&m_new)?.exp()?;
-                    let alpha_i = m_i.broadcast_sub(&m_new)?.exp()?;
-                    running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&s_i.broadcast_mul(&alpha_i)?)?);
-                    running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&o_i.broadcast_mul(&alpha_i)?)?);
+                    let alpha_prev = m_prev.broadcast_sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
+                    let alpha_i = m_i.broadcast_sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
+                    running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&s_i.to_dtype(target_dtype)?.broadcast_mul(&alpha_i)?)?);
+                    running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&o_i.to_dtype(target_dtype)?.broadcast_mul(&alpha_i)?)?);
                     running_m = Some(m_new);
                 }
                 _ => unreachable!(),
             }
         }
 
-        let attn_output = running_o.ok_or_else(|| anyhow!("No attention output"))?.broadcast_div(&running_s.unwrap())?;
+        let attn_output = running_o.ok_or_else(|| anyhow!("No attention output"))?.broadcast_div(&running_s.unwrap().to_dtype(target_dtype)?)?;
         let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
         let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
         
@@ -895,15 +903,18 @@ impl QuantizedQwen3VLTextAttention {
         let target_indices: Vec<usize> = self.kv_blocks.iter().enumerate().filter_map(|(i, b)| {
             let inner = b.inner.read().unwrap();
             let is_full = inner.len == 256;
-            let is_not_on_ssd = inner.location != KVLocation::SSD;
-            if (is_full || is_last_chunk) && is_not_on_ssd { Some(i) } else { None }
+            // [FIX] 이미 저장을 보냈거나(Streaming) 완료된(SSD) 블록은 제외하고, 순수 VRAM 블록만 대상으로 함
+            if (is_full || is_last_chunk) && inner.location == KVLocation::VRAM { Some(i) } else { None }
         }).collect();
 
         for idx in target_indices {
             let block = self.kv_blocks[idx].clone();
             let (k_opt, v_opt, off, b_idx, b_len) = {
-                let inner = block.inner.read().unwrap();
-                (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len)
+                let mut inner = block.inner.write().unwrap();
+                let snapshot = (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len);
+                // [FIX] 보내자마자 Streaming으로 변경하여 중복 전송 방지
+                inner.location = KVLocation::Streaming;
+                snapshot
             };
 
             if let (Some(k), Some(v)) = (k_opt, v_opt) {
@@ -919,16 +930,17 @@ impl QuantizedQwen3VLTextAttention {
                     v_packed: vp.to_device(&Device::Cpu)?,
                     v_scales: vs.to_device(&Device::Cpu)?,
                     k_shape: Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?,
+                    raw_k: None,
+                    raw_v: None,
                 };
 
-                let kv_name_base = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
-                // [FIX] inference/inference 중복 방지 및 타입 명시 (소유권 확보)
-                let kv_type = if kv_name_base == "inference" || kv_name_base == "reference" { "text".to_string() } else { kv_name_base };
+                // [FIX] 경로 클리닝: inference/inference 같은 중복 방지
+                let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
+                let kv_type = kv_name_raw.split('/').last().unwrap_or("text").to_string();
                 
                 let session_id_owned = session_id.to_string();
                 let registry_clone = self.registry.clone();
 
-                // [FIRE-AND-FORGET] SSD 저장을 백그라운드 태스크로 분리하여 연산 흐름을 방해하지 않음
                 tauri::async_runtime::spawn(async move {
                     if let Some(tx) = BAKE_TX.get() {
                         let sub_path = if baking_only {
@@ -953,12 +965,6 @@ impl QuantizedQwen3VLTextAttention {
                         })).await;
                     }
                 });
-                
-                // VRAM Pinning 유지
-                {
-                    let mut inner = block.inner.write().unwrap();
-                    inner.location = KVLocation::VRAM;
-                }
             }
         }
         Ok(())
@@ -1865,10 +1871,13 @@ impl QuantizedQwen3VLTextModel {
             let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)?;
             results.push(out);
 
-            // [FIX] 비동기로 변경된 베이킹 호출 (await 제거)
+            // [STRATEGY] Prefill(대량 입력)이거나 Baking 모드일 때는 레이어별/오프셋별 즉시 개별 저장 수행
             if let Some(sid) = &sid_opt {
+                let is_prefill = take > 1;
                 let is_last = chunk_idx == chunk_offsets.len() - 1;
-                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last, self.baking_only);
+                if is_prefill || self.baking_only {
+                    let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last, self.baking_only);
+                }
             }
 
             // [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로만 이동 (저장은 위에서 실시간 처리)
@@ -2133,51 +2142,34 @@ impl QuantizedQwen3VLTextModel {
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> {
         use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
         
-        // 1. VRAM 데이터를 RAM 캐시로 모두 내림
-        self.evacuate_vram_to_cache()?;
-
-        // [STRATEGY] 오프셋(블록)별로 레이어 데이터를 그룹화합니다.
+        // 1. VRAM 데이터를 CPU로 복제만 수행 (압축은 워커가 함)
         let mut block_groups: std::collections::HashMap<usize, Vec<LayerKVDump>> = std::collections::HashMap::new();
         
-        let n_kv_h = self.layers[0].self_attn.num_key_value_heads;
-        let h_d = self.layers[0].self_attn.head_dim;
-
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
             for block in &mut layer.self_attn.kv_blocks {
                 let mut inner = block.inner.write().unwrap();
                 
-                if inner.k_cache.is_some() && inner.len == 256 {
+                // 아직 SSD에 없고 VRAM/RAM에 데이터가 있는 완성된 블록(256) 대상
+                if inner.location != KVLocation::SSD && inner.len == 256 {
                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                         // GPU 양자화 데이터 생성
-                         let (ka, kp, ks) = crate::utils::tensor_utils::pack_bitkv_gpu(k)?;
-                         let (va, vp, vs) = crate::utils::tensor_utils::pack_bitkv_gpu(v)?;
+                         let k_shape_u32: Vec<u32> = k.shape().dims().iter().map(|&x| x as u32).collect();
                          
-                         // RAM 캐시에 보관 (읽기용)
-                         let meta_os = vec![1, n_kv_h, inner.len, h_d];
-                         {
-                             let reg = self.registry.entries.read().unwrap();
-                             let mut cache = reg[inner.index].bitkv_cache.write().unwrap();
-                             cache[l_idx] = Some(BitKVMetadata {
-                                 k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(),
-                                 v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(),
-                                 original_shape: meta_os,
-                             });
-                         }
-
-                         // 그룹화 (저장용) - [FIX] 압축된 개별 구성요소들을 전송
-                         let k_shape_u32 = vec![1u32, n_kv_h as u32, inner.len as u32, h_d as u32];
                          block_groups.entry(inner.offset).or_default().push(LayerKVDump {
                              layer_idx: l_idx,
-                             k_anchors: ka.to_device(&Device::Cpu)?, 
-                             k_packed: kp.to_device(&Device::Cpu)?,
-                             k_scales: ks.to_device(&Device::Cpu)?,
-                             v_anchors: va.to_device(&Device::Cpu)?,
-                             v_packed: vp.to_device(&Device::Cpu)?,
-                             v_scales: vs.to_device(&Device::Cpu)?,
-                             k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu)?,
+                             // 빈 텐서들로 초기화 (워커가 압축 후 채울 것임)
+                             k_anchors: Tensor::zeros((1,1), DType::F32, &Device::Cpu)?,
+                             k_packed: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
+                             k_scales: Tensor::zeros((1,), DType::F32, &Device::Cpu)?,
+                             v_anchors: Tensor::zeros((1,1), DType::F32, &Device::Cpu)?,
+                             v_packed: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
+                             v_scales: Tensor::zeros((1,), DType::F32, &Device::Cpu)?,
+                             k_shape: Tensor::from_vec(k_shape_u32, (k.shape().dims().len(),), &Device::Cpu)?,
+                             // [FIX] 원본 데이터를 CPU로 복제하여 전달 (연산 흐름 방해 최소화)
+                             raw_k: Some(k.to_device(&Device::Cpu)?),
+                             raw_v: Some(v.to_device(&Device::Cpu)?),
                          });
                          
-                         // 메모리 관리
+                         // 상태 변경 및 메모리 해제
                          inner.k_cache = None; inner.v_cache = None;
                          inner.location = KVLocation::SSD;
                     }
@@ -2191,24 +2183,19 @@ impl QuantizedQwen3VLTextModel {
         if let Some(tx) = BAKE_TX.get() {
             let kv_dir = crate::utils::paths::get_kv_dir(None);
             let mode = self.baking_only;
-            let kv_name_base = kv_name.unwrap_or("general");
+            let kv_name_raw = kv_name.unwrap_or("text");
+            let kv_type = kv_name_raw.split('/').last().unwrap_or("text");
             
             let sub_path = if mode {
-                format!("{}/reference/{}", session_id, kv_name_base)
+                format!("{}/reference/{}", session_id, kv_type)
             } else {
-                format!("{}/inference/{}", session_id, kv_name_base)
+                format!("{}/inference/{}", session_id, kv_type)
             };
 
             for (off, layers) in block_groups {
                 let sid = SLOT_MANAGER.acquire_write_slot(256).await;
                 let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
                 if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
-
-                {
-                    let mut reg_w = self.registry.entries.write().unwrap();
-                    let b_idx = off / 256;
-                    if b_idx < reg_w.len() { reg_w[b_idx].ssd_path = Some(block_dir.clone()); }
-                }
 
                 let _ = tx.send(SlotTask::Bake(BakeTask {
                     slot_id: sid,
@@ -2328,6 +2315,8 @@ impl QuantizedQwen3VLTextModel {
                                 v_packed: vp.to_device(&Device::Cpu)?,
                                 v_scales: vs.to_device(&Device::Cpu)?,
                                 k_shape: Tensor::from_vec(k_shape_vec, (k.shape().dims().len(),), &Device::Cpu)?,
+                                raw_k: None,
+                                raw_v: None,
                             },
                             inner.offset,
                             inner.len

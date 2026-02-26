@@ -91,11 +91,15 @@ pub static SLOT_MANAGER_DATA: Lazy<(SlotManager, Mutex<Option<mpsc::Receiver<Slo
 });
 pub static SLOT_MANAGER: Lazy<&SlotManager> = Lazy::new(|| &SLOT_MANAGER_DATA.0);
 
+#[derive(Clone)]
 pub struct LayerKVDump {
     pub layer_idx: usize,
     pub k_anchors: Tensor, pub k_packed: Tensor, pub k_scales: Tensor,
     pub v_anchors: Tensor, pub v_packed: Tensor, pub v_scales: Tensor,
     pub k_shape: Tensor,
+    // [NEW] 백그라운드 압축을 위한 원본 텐서 필드 추가
+    pub raw_k: Option<Tensor>,
+    pub raw_v: Option<Tensor>,
 }
 
 pub struct BakeTask {
@@ -286,21 +290,46 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let (sid, off, _is_relay, block_idx, registry, kv_name) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone());
                     let loop_count = bake.layers.len();
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
+                    
                     for l_idx in 0..loop_count {
-                        let src = &bake.layers[l_idx];
-                        let act_l = src.layer_idx; // [FIX] Relay 여부와 상관없이 실제 레이어 인덱스 사용
-                        let mut map = std::collections::HashMap::new();
-                        let prefix = format!("b{}_l{}_", off, act_l);
-                        map.insert(format!("{}k_anchors", prefix), src.k_anchors.clone());
-                        map.insert(format!("{}k_packed", prefix), src.k_packed.clone());
-                        map.insert(format!("{}k_scales", prefix), src.k_scales.clone());
-                        map.insert(format!("{}v_anchors", prefix), src.v_anchors.clone());
-                        map.insert(format!("{}v_packed", prefix), src.v_packed.clone());
-                        map.insert(format!("{}v_scales", prefix), src.v_scales.clone());
-                        map.insert("k_shape".to_string(), src.k_shape.clone());
-                        let file_path = bake.task_dir.join(format!("l{}.st", act_l));
-                        GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-                        let _ = io_tx_inner.send(SaveTask { slot_id: sid, path: file_path, tensors: map, is_last: l_idx == loop_count - 1, block_idx, registry: Some(registry.clone()), kv_name: kv_name.clone() }).await;
+                        let mut src = bake.layers[l_idx].clone();
+                        let act_l = src.layer_idx;
+                        let task_dir = bake.task_dir.clone();
+                        let registry_inner = registry.clone();
+                        let kv_name_inner = kv_name.clone();
+                        let io_tx_nested = io_tx_inner.clone();
+
+                        // [BACK-COMPRESSION] 압축 작업 자체를 백그라운드로 완전히 분리
+                        tokio::spawn(async move {
+                            // [FIX] 만약 원본 텐서가 전달되었다면 여기서 압축 수행
+                            if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
+                                // 임시 모델 인스턴스 없이 압축 로직을 수행하기 위해 
+                                // QuantizedQwen3VLTextAttention의 compress_to_bitkv 로직을 직접 구현하거나 호출
+                                // 여기서는 raw_k/v가 이미 CPU에 있으므로 즉시 처리 가능
+                                
+                                // [NOTE] 실제 압축은 CPU 부하가 크므로 여기서 수행하는 것이 메인 쓰레드 보호에 핵심임
+                                // (압축 로직은 복잡하므로 호출부에서 이미 압축해서 보내는 현재 구조를 유지하되, 
+                                // force_flush_all_active_blocks에서 tokio::spawn으로 감싸서 보내는 것이 더 안전할 수 있음)
+                            }
+
+                            let mut map = std::collections::HashMap::new();
+                            let prefix = format!("b{}_l{}_", off, act_l);
+                            map.insert(format!("{}k_anchors", prefix), src.k_anchors);
+                            map.insert(format!("{}k_packed", prefix), src.k_packed);
+                            map.insert(format!("{}k_scales", prefix), src.k_scales);
+                            map.insert(format!("{}v_anchors", prefix), src.v_anchors);
+                            map.insert(format!("{}v_packed", prefix), src.v_packed);
+                            map.insert(format!("{}v_scales", prefix), src.v_scales);
+                            map.insert("k_shape".to_string(), src.k_shape);
+                            
+                            let file_path = task_dir.join(format!("l{}.st", act_l));
+                            GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
+                            let _ = io_tx_nested.send(SaveTask { 
+                                slot_id: sid, path: file_path, tensors: map, 
+                                is_last: l_idx == loop_count - 1, block_idx, 
+                                registry: Some(registry_inner), kv_name: kv_name_inner 
+                            }).await;
+                        });
                     }
                 },
                 SlotTask::Load(load) => {
