@@ -80,6 +80,9 @@ impl SlotManager {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     }
+    pub fn get_counts(&self) -> (usize, usize, usize, usize) {
+        (self.count_reads.load(Ordering::Relaxed), self.count_writes.load(Ordering::Relaxed), self.count_cached.load(Ordering::Relaxed), self.count_free.load(Ordering::Relaxed))
+    }
 }
 
 pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -243,7 +246,15 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                 v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (1, 1, 256, 1), &Device::Cpu).unwrap(),
                                                 original_shape: vec![1, 1, 256, 64],
                                             };
-                                            if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let mut cache = r[b_idx].bitkv_cache.write().unwrap(); cache[l_idx] = Some(meta); r[b_idx].location[l_idx] = KVLocation::RAM; } }
+                                            if let Ok(mut r) = reg.entries.write() {
+                                                if b_idx < r.len() {
+                                                    {
+                                                        let mut cache = r[b_idx].bitkv_cache.write().unwrap();
+                                                        cache[l_idx] = Some(meta);
+                                                    }
+                                                    r[b_idx].location[l_idx] = KVLocation::RAM;
+                                                }
+                                            }
                                         }
                                     }
                                 }
