@@ -921,13 +921,12 @@ impl QuantizedQwen3VLTextAttention {
                     k_shape: Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?,
                 };
 
-                let kv_name_base = self.active_kv_name.as_deref().unwrap_or("text");
-                // [FIX] inference/inference 중복 방지 및 타입 명시
-                let kv_type = if kv_name_base == "inference" || kv_name_base == "reference" { "text" } else { kv_name_base };
+                let kv_name_base = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
+                // [FIX] inference/inference 중복 방지 및 타입 명시 (소유권 확보)
+                let kv_type = if kv_name_base == "inference" || kv_name_base == "reference" { "text".to_string() } else { kv_name_base };
                 
                 let session_id_owned = session_id.to_string();
                 let registry_clone = self.registry.clone();
-                let layer_idx = self.layer_idx;
 
                 // [FIRE-AND-FORGET] SSD 저장을 백그라운드 태스크로 분리하여 연산 흐름을 방해하지 않음
                 tauri::async_runtime::spawn(async move {
