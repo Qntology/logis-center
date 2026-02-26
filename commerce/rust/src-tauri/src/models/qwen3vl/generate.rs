@@ -106,9 +106,65 @@ pub struct BakeTask {
 pub struct SaveTask {
     pub slot_id: usize, pub path: PathBuf, pub tensors: std::collections::HashMap<String, Tensor>,
     pub is_last: bool, pub block_idx: Option<usize>, pub registry: Option<KVRegistry>,
+    pub kv_name: Option<String>,
 }
 
-pub enum SlotTask { Bake(BakeTask), Load(LoadTask) }
+pub enum SlotTask { 
+    Bake(BakeTask), 
+    Load(LoadTask),
+    IndexUpdate {
+        kv_name: String,
+        layer_idx: usize,
+        offset: usize,
+        len: usize,
+        file_name: String,
+    },
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct LayerIndex {
+    pub layer_idx: usize,
+    pub total_tokens: usize,
+    pub blocks: Vec<LayerBlockInfo>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct LayerBlockInfo {
+    pub offset: usize,
+    pub len: usize,
+    pub file: String,
+}
+
+// [GLOBAL] 인덱스 업데이트 채널
+pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
+    let (tx, mut rx) = mpsc::channel(2048);
+    tokio::spawn(async move {
+        let kv_dir = crate::utils::paths::get_kv_dir(None);
+        while let Some(task) = rx.recv().await {
+            if let SlotTask::IndexUpdate { kv_name, layer_idx, offset, len, file_name } = task {
+                let index_path = kv_dir.join(&kv_name).join(format!("layer{}.json", layer_idx));
+                let mut index = if index_path.exists() {
+                    fs::read_to_string(&index_path).ok().and_then(|s| serde_json::from_str::<LayerIndex>(&s).ok())
+                        .unwrap_or(LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] })
+                } else {
+                    let _ = fs::create_dir_all(index_path.parent().unwrap());
+                    LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] }
+                };
+
+                if !index.blocks.iter().any(|b| b.offset == offset) {
+                    index.blocks.push(LayerBlockInfo { offset, len, file: file_name });
+                    index.blocks.sort_by_key(|b| b.offset);
+                    index.total_tokens = index.blocks.iter().map(|b| b.len).sum();
+                    if let Ok(json) = serde_json::to_string_pretty(&index) {
+                        let _ = fs::write(&index_path, json);
+                    }
+                }
+            }
+        }
+    });
+    tx
+});
+
 pub struct LoadTask { pub slot_id: usize, pub path: PathBuf, pub layer_idx: usize, pub kv_name: Option<String>, pub shared_block: KVBlock, pub registry: KVRegistry }
 
 pub static BAKE_TX: OnceCell<mpsc::Sender<SlotTask>> = OnceCell::const_new();
@@ -130,7 +186,7 @@ pub fn init_bake_worker() {
 async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {
         match req {
-            SlotRequest::Acquire { total_tokens, tx } => {
+            SlotRequest::Acquire { total_tokens: _total_tokens, tx } => {
                 let max_writes = 64; let mut found = None;
                 while found.is_none() {
                     if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
@@ -170,7 +226,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(2000)); 
         while let Some(task) = io_rx.recv().await {
             let sem = semaphore.clone();
-            let (tp, ts, reg, b_idx, sid, is_last) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last);
+            let (tp, ts, reg, b_idx, sid, is_last, kv_n) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone());
             tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
                 struct IoGuard; impl Drop for IoGuard { fn drop(&mut self) { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } }
@@ -178,6 +234,27 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 if let Ok(data) = safetensors::serialize(&ts, &None) {
                     drop(ts); let _ = save_kv_block(&tp, &data);
+                    
+                    // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
+                    if let Some(kv_name) = kv_n {
+                        if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
+                            if let Ok(l_idx) = l_str.parse::<usize>() {
+                                // 오프셋 추출 (파일명 b{offset}_l{idx}_k_anchors 에서 추출하거나 SaveTask에 추가 가능)
+                                // 현재는 tp.parent() 폴더명이 b{offset} 이므로 이를 활용
+                                let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
+                                let offset = offset_str.parse::<usize>().unwrap_or(0);
+                                
+                                let _ = INDEX_TX.send(SlotTask::IndexUpdate {
+                                    kv_name,
+                                    layer_idx: l_idx,
+                                    offset,
+                                    len: 256,
+                                    file_name: format!("b{}/l{}.st", offset, l_idx),
+                                }).await;
+                            }
+                        }
+                    }
+
                     if let (Some(r), Some(idx)) = (reg, b_idx) {
                         if let Ok(mut entries) = r.entries.write() {
                             if idx < entries.len() {
@@ -187,16 +264,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         if l_idx < 28 { 
                                             e.location[l_idx] = KVLocation::SSD; 
                                             e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                                            
-                                            // [DECENTRALIZED-META] 레이어별 독립 JSON 기록 (락 경합 완전 제거)
-                                            let meta_file = tp.parent().unwrap().join(format!("layer{}_meta.json", l_idx));
-                                            let info = serde_json::json!({
-                                                "token_start": e.token_start,
-                                                "token_len": e.token_len,
-                                                "layer_idx": l_idx,
-                                                "path": tp.to_string_lossy()
-                                            });
-                                            let _ = fs::write(meta_file, info.to_string());
                                         } 
                                     }
                                 }
@@ -215,7 +282,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             match task {
                 SlotTask::Bake(bake) => {
                     let io_tx_inner = io_tx.clone();
-                    let (sid, off, is_relay, block_idx, registry) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone());
+                    let (sid, off, is_relay, block_idx, registry, kv_name) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone());
                     let loop_count = bake.layers.len();
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
                     for l_idx in 0..loop_count {
@@ -231,7 +298,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         map.insert(format!("{}v_scales", prefix), src.v_scales.clone());
                         let file_path = bake.task_dir.join(format!("l{}.st", act_l));
                         GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-                        let _ = io_tx_inner.send(SaveTask { slot_id: sid, path: file_path, tensors: map, is_last: l_idx == loop_count - 1, block_idx, registry: Some(registry.clone()) }).await;
+                        let _ = io_tx_inner.send(SaveTask { slot_id: sid, path: file_path, tensors: map, is_last: l_idx == loop_count - 1, block_idx, registry: Some(registry.clone()), kv_name: kv_name.clone() }).await;
                     }
                 },
                 SlotTask::Load(load) => {
@@ -276,6 +343,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             }
                         }
                     });
+                },
+                SlotTask::IndexUpdate { .. } => {
+                    // IndexUpdate tasks are handled by their own INDEX_TX worker.
+                    // This match arm ensures the main worker doesn't panic if it receives one.
                 }
             }
         }

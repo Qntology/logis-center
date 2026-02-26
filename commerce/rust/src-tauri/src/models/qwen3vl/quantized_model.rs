@@ -1141,8 +1141,117 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_blocks.clear();
     }
 
+    pub async fn trigger_realtime_layer_bake(&mut self, inner: &mut KVBlockInner, session_id: &str) -> Result<()> {
+        use crate::models::qwen3vl::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
+        
+        if let (Some(k), Some(v)) = (inner.k_cache.take(), inner.v_cache.take()) {
+            // 1bit/bitkv 압축 수행 (4개 요소 반환: ka, kp, ks, original_shape)
+            let (ka, kp, ks, _) = self.compress_to_bitkv(&k)?;
+            let (va, vp, vs, _) = self.compress_to_bitkv(&v)?;
+            
+            let dump = LayerKVDump {
+                layer_idx: self.layer_idx,
+                k_anchors: ka.to_device(&Device::Cpu)?,
+                k_packed: kp.to_device(&Device::Cpu)?,
+                k_scales: ks.to_device(&Device::Cpu)?,
+                v_anchors: va.to_device(&Device::Cpu)?,
+                v_packed: vp.to_device(&Device::Cpu)?,
+                v_scales: vs.to_device(&Device::Cpu)?,
+            };
+
+            if let Some(tx) = BAKE_TX.get() {
+                let kv_name = self.active_kv_name.clone().unwrap_or_else(|| "general".to_string());
+                let sub_folder = format!("reference/{}", kv_name);
+                let path = crate::utils::paths::get_kv_dir(None).join(session_id).join(&sub_folder);
+                let block_dir = path.join(format!("b{}", inner.offset));
+                
+                let sid = SLOT_MANAGER.acquire_write_slot(256).await;
+                let _ = tx.send(SlotTask::Bake(BakeTask {
+                    slot_id: sid,
+                    task_dir: block_dir,
+                    kv_name: Some(sub_folder),
+                    offset: inner.offset,
+                    layers: vec![dump],
+                    is_relay_baking: true,
+                    block_idx: Some(inner.index),
+                    registry: self.registry.clone(),
+                })).await;
+                
+                inner.location = KVLocation::SSD;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn trigger_realtime_layer_bake_all_full(&mut self, session_id: &str) -> Result<()> {
+        // [FIX] 가변 차용 중복 방지를 위해 인덱스를 먼저 수집
+        let full_block_indices: Vec<usize> = self.kv_blocks.iter().enumerate().filter_map(|(i, b)| {
+            let inner = b.inner.read().unwrap();
+            if inner.len == 256 && inner.location != KVLocation::SSD { Some(i) } else { None }
+        }).collect();
+
+        for idx in full_block_indices {
+            let mut inner = self.kv_blocks[idx].inner.write().unwrap();
+            self.trigger_realtime_layer_bake(&mut inner, session_id).await?;
+        }
+        Ok(())
+    }
+
     pub fn get_kv_len(&self) -> usize {
         self.kv_blocks.iter().map(|b| b.inner.read().unwrap().len).sum()
+    }
+
+    pub fn batch_load_layer_kv(&mut self, kv_name: &str) -> Result<()> {
+        use crate::models::qwen3vl::generate::LayerIndex;
+        let kv_dir = crate::utils::paths::get_kv_dir(None);
+        let index_path = kv_dir.join(kv_name).join(format!("layer{}.json", self.layer_idx));
+        
+        if !index_path.exists() { return Ok(()); }
+        
+        let index_json = fs::read_to_string(&index_path)?;
+        let index: LayerIndex = serde_json::from_str(&index_json)?;
+        
+        for block_info in index.blocks {
+            let file_path = kv_dir.join(kv_name).join(&block_info.file);
+            if !file_path.exists() { continue; }
+            
+            let b_idx = block_info.offset / 256;
+            
+            if let Ok(content) = crate::utils::direct_loader::load_kv_block(&file_path) {
+                if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                    let prefix = if block_info.file.contains("l0.st") { format!("b{}_l0_", block_info.offset) } else { format!("b{}_l{}_", block_info.offset, self.layer_idx) };
+                    let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                    
+                    if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
+                        let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
+                        let meta = BitKVMetadata {
+                            k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), (1, self.num_key_value_heads, ka.shape()[2], self.head_dim), &Device::Cpu)?,
+                            k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?,
+                            k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (1, self.num_key_value_heads, 256, 1), &Device::Cpu)?,
+                            v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), (1, self.num_key_value_heads, ka.shape()[2], self.head_dim), &Device::Cpu)?,
+                            v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?,
+                            v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (1, self.num_key_value_heads, 256, 1), &Device::Cpu)?,
+                            original_shape: vec![1, self.num_key_value_heads, 256, self.head_dim],
+                        };
+                        
+                        let mut reg = self.registry.entries.write().unwrap();
+                        if b_idx < reg.len() {
+                            {
+                                let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
+                                cache[self.layer_idx] = Some(meta);
+                            }
+                            reg[b_idx].location[self.layer_idx] = KVLocation::RAM;
+                            reg[b_idx].ssd_path = Some(file_path.parent().unwrap().to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+        
+        if self.layer_idx == 0 {
+            println!("[BATCH-LOAD] Layer {} fully cached to RAM from index.", self.layer_idx);
+        }
+        Ok(())
     }
 
     pub fn drop_kv_storage(&mut self) -> Result<()> {
@@ -1562,6 +1671,10 @@ impl QuantizedQwen3VLTextDecoderLayer {
         self.self_attn.save_kv_cache(path, true, block_size, None)
     }
 
+    pub fn batch_load_kv(&mut self, kv_name: &str) -> Result<()> {
+        self.self_attn.batch_load_layer_kv(kv_name)
+    }
+
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>, fragments: &[(usize, std::path::PathBuf)], current_kv_len: usize) -> Result<()> {
         self.self_attn.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, fragments, current_kv_len)
     }
@@ -1787,6 +1900,31 @@ impl QuantizedQwen3VLTextModel {
         Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_else(|| if config.head_dim == 128 { vec![16, 24, 24] } else { vec![] }), mmap: None, registry, baking_only, is_forced_cpu, active_session_id: None, active_kv_name: None, pinned_layer_count, current_kv_len: 0 })
     }
 
+    pub fn load_kv_cache_chunked(&mut self, kv_name: &str) -> Result<()> {
+        let mut sys = sysinfo::System::new_all();
+        sys.refresh_memory();
+        let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+        
+        // 가용 RAM에 따른 청크 크기 결정 (28개 레이어 기준)
+        let chunk_size = if free_ram_gb > 8.0 { 28 } else if free_ram_gb > 4.0 { 14 } else { 7 };
+        
+        println!("[PREFILL-RAM] Available RAM: {:.2} GB. Loading in chunks of {}.", free_ram_gb, chunk_size);
+        
+        for chunk_start in (0..self.layers.len()).step_by(chunk_size) {
+            let chunk_end = (chunk_start + chunk_size).min(self.layers.len());
+            for l_idx in chunk_start..chunk_end {
+                self.layers[l_idx].batch_load_kv(kv_name)?;
+            }
+            // 청크 간 약간의 휴식 (OS I/O 안정화)
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        
+        // 전체 길이 업데이트 (인덱스에서 읽어온 정보 바탕으로 registry가 채워졌으므로)
+        let reg = self.registry.entries.read().unwrap();
+        self.current_kv_len = reg.iter().map(|e| e.token_len).sum();
+        Ok(())
+    }
+
     /// [CHUNK-ASYNC-PROCESSOR]
     /// 청크 단위로 연산 -> CPU 대피 -> VRAM 소각을 실시간으로 반복합니다.
     async fn process_chunks_iterative(
@@ -1861,6 +1999,13 @@ impl QuantizedQwen3VLTextModel {
 
             let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)?;
             results.push(out);
+
+            // [NEW] 실시간 베이킹 트리거: 꽉 찬 블록은 계산 즉시 SSD 덤프 큐로 전송
+            if self.baking_only {
+                if let Some(sid) = &sid_opt {
+                    let _ = self.layers[layer_idx].self_attn.trigger_realtime_layer_bake_all_full(sid).await;
+                }
+            }
 
             // [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로만 이동 (저장은 루프 밖에서 통합 처리)
             let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
@@ -2585,6 +2730,15 @@ impl QuantizedQwen3VLTextModel {
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
         if !path.exists() { return Ok(()); }
 
+        // [CENTRALIZED-INDEX-REDIRECT] 통합 인덱스가 있으면 청크 로더 사용
+        if let Some(name) = kv_name {
+            let kv_dir = crate::utils::paths::get_kv_dir(None);
+            if kv_dir.join(name).join("layer0.json").exists() {
+                println!("[PREFILL] Centralized index found for {}. Using RAM-aware chunked load.", name);
+                return self.language_model.load_kv_cache_chunked(name);
+            }
+        }
+
         let mut fragments = Vec::new();
         let mut max_offset = 0;
         let mut last_chunk_len = 0;
@@ -3108,7 +3262,7 @@ impl QuantizedQwen3TextModel {
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
-    pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, total_len) }
+    pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, _total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, _total_len) }
 }
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
