@@ -667,6 +667,9 @@ impl QuantizedQwen3VLTextAttention {
             match loc {
                 KVLocation::VRAM => {
                     vram_count += 1;
+                    if self.layer_idx == 0 {
+                        println!("[JIT-LOAD] SUCCESS: Layer {} Block {} (VRAM Offset: {})", self.layer_idx, b_off, b_off);
+                    }
                     vram_ks.push(k.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
                     vram_vs.push(v.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
                     vram_total_len += b_len;
@@ -684,6 +687,9 @@ impl QuantizedQwen3VLTextAttention {
                         if let (Some(kc), Some(vc)) = (&inner.k_cache, &inner.v_cache) {
                             k_active = Some(kc.to_device(dev)?.to_dtype(target_dtype)?);
                             v_active = Some(vc.to_device(dev)?.to_dtype(target_dtype)?);
+                            if self.layer_idx == 0 {
+                                println!("[JIT-LOAD] SUCCESS: Layer {} Block {} (Cache Offset: {})", self.layer_idx, b_off, b_off);
+                            }
                         }
                     }
 
