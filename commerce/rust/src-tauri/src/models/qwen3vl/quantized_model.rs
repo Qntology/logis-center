@@ -2095,29 +2095,26 @@ impl QuantizedQwen3VLTextModel {
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> {
         use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
         
-        // [VRAM-SYNC] VRAM에 남아있는 최신 조각들을 모두 RAM 캐시로 내려보냅니다.
+        // 1. VRAM 데이터를 RAM 캐시로 모두 내림
         self.evacuate_vram_to_cache()?;
 
-        let mut tasks = Vec::new();
-
-        // 루프 진입 전 필요한 설정값 미리 복사 (Borrow Checker 해결)
+        // [STRATEGY] 오프셋(블록)별로 레이어 데이터를 그룹화합니다.
+        let mut block_groups: std::collections::HashMap<usize, Vec<LayerKVDump>> = std::collections::HashMap::new();
+        
         let n_kv_h = self.layers[0].self_attn.num_key_value_heads;
         let h_d = self.layers[0].self_attn.head_dim;
 
-        // 1. 모든 레이어의 활성 블록 수집
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
             for block in &mut layer.self_attn.kv_blocks {
                 let mut inner = block.inner.write().unwrap();
                 
-                // [OPTIMIZATION] RAM에 데이터가 있고, 꽉 찬 블록(256)인 경우에만 저장 대상으로 수집합니다.
-                // 1토큰 단위의 짜투리 데이터 저장을 막아 병목을 해결합니다.
                 if inner.k_cache.is_some() && inner.len == 256 {
                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                         // 1. GPU에서 압축 데이터(BitKV) 생성
+                         // GPU 양자화 데이터 생성
                          let (ka, kp, ks) = crate::utils::tensor_utils::pack_bitkv_gpu(k)?;
                          let (va, vp, vs) = crate::utils::tensor_utils::pack_bitkv_gpu(v)?;
                          
-                         // 2. [STICKY-RAM] RAM 캐시에 보관 (다음 토큰 생성 시 사용)
+                         // RAM 캐시에 보관 (읽기용)
                          let meta_os = vec![1, n_kv_h, inner.len, h_d];
                          {
                              let reg = self.registry.entries.read().unwrap();
@@ -2129,70 +2126,65 @@ impl QuantizedQwen3VLTextModel {
                              });
                          }
 
-                         // 3. SSD 저장 큐로 전달 (압축된 데이터 사용)
-                         tasks.push((
-                             l_idx,
-                             inner.offset,
-                             inner.len,
-                             LayerKVDump { layer_idx: l_idx, k_tensor: k.to_device(&Device::Cpu)?, v_tensor: v.to_device(&Device::Cpu)? }
-                         ));
+                         // 그룹화 (저장용) - [FIX] 압축된 개별 구성요소들을 전송
+                         block_groups.entry(inner.offset).or_default().push(LayerKVDump {
+                             layer_idx: l_idx,
+                             k_anchors: ka.to_device(&Device::Cpu)?, 
+                             k_packed: kp.to_device(&Device::Cpu)?,
+                             k_scales: ks.to_device(&Device::Cpu)?,
+                             v_anchors: va.to_device(&Device::Cpu)?,
+                             v_packed: vp.to_device(&Device::Cpu)?,
+                             v_scales: vs.to_device(&Device::Cpu)?,
+                         });
                          
-                         // 메모리 해제 및 위치 업데이트
-                         inner.k_cache = None;
-                         inner.v_cache = None;
+                         // 메모리 관리
+                         inner.k_cache = None; inner.v_cache = None;
                          inner.location = KVLocation::SSD;
                     }
                 }
             }
         }
 
-        if tasks.is_empty() { return Ok(()); }
+        if block_groups.is_empty() { return Ok(()); }
 
-        // 2. 수집된 태스크를 베이킹 큐로 전송
+        // 2. 블록별 통합 태스크 전송
         if let Some(tx) = BAKE_TX.get() {
             let path = crate::utils::paths::get_kv_dir(None).join(session_id);
             if !path.exists() { let _ = fs::create_dir_all(&path); }
-            let rr = Some(self.registry.clone());
+            
             let mode = self.baking_only;
-            let task_count = tasks.len();
+            let block_groups_count = block_groups.len();
+            let sub_folder = if mode {
+                format!("reference/{}", kv_name.unwrap_or("general"))
+            } else {
+                kv_name.unwrap_or("inference").to_string()
+            };
 
-            for (l_idx, off, len, dump) in tasks {
-                // [SLOT-ACQUIRE] 쓰기 슬롯 확보
-                let sid = SLOT_MANAGER.acquire_write_slot(len).await;
-                
-                // [FIX] 'reference' 하위 폴더 구조 지원
-                let sub_folder = if mode {
-                    let name = kv_name.unwrap_or("general");
-                    format!("reference/{}", name)
-                } else {
-                    kv_name.unwrap_or("inference").to_string()
-                };
-                
+            for (off, layers) in block_groups {
+                let sid = SLOT_MANAGER.acquire_write_slot(256).await;
                 let block_dir = path.join(&sub_folder).join(format!("b{}", off));
                 if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
 
-                // [REGISTRY-UPDATE]
+                // 레지스트리 업데이트 (대표 경로 기록)
                 {
                     let mut reg_w = self.registry.entries.write().unwrap();
                     let b_idx = off / 256;
-                    if b_idx < reg_w.len() {
-                        reg_w[b_idx].ssd_path = Some(block_dir.clone());
-                        reg_w[b_idx].location[l_idx] = KVLocation::SSD;
-                    }
+                    if b_idx < reg_w.len() { reg_w[b_idx].ssd_path = Some(block_dir.clone()); }
                 }
 
+                // 28개 레이어가 포함된 단일 태스크 전송
                 let _ = tx.send(SlotTask::Bake(BakeTask {
                     slot_id: sid,
                     task_dir: block_dir,
-                    kv_name: Some(sub_folder),
+                    kv_name: Some(sub_folder.clone()),
                     offset: off,
-                    layers: vec![dump],
+                    layers,
                     is_relay_baking: mode,
                     block_idx: Some(off / 256),
-                    registry: rr.clone().expect("registry"),
+                    registry: self.registry.clone(),
                 })).await;
             }
-            println!("[FLUSH-FORCE] Submitted {} layers to Bake queue.", task_count);
+            println!("[FLUSH-FORCE] Submitted {} blocks to background merging worker.", block_groups_count);
         }
         Ok(())
     }
@@ -2285,8 +2277,20 @@ impl QuantizedQwen3VLTextModel {
                         inner.v_cache = None;
                         inner.location = KVLocation::SSD;
                     } else if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                        // GPU 양자화 수행
+                        let (ka, kp, ks) = crate::utils::tensor_utils::pack_bitkv_gpu(k)?;
+                        let (va, vp, vs) = crate::utils::tensor_utils::pack_bitkv_gpu(v)?;
+
                         dumps_to_send.push((
-                            LayerKVDump { layer_idx, k_tensor: k.clone(), v_tensor: v.clone() },
+                            LayerKVDump { 
+                                layer_idx, 
+                                k_anchors: ka.to_device(&Device::Cpu)?, 
+                                k_packed: kp.to_device(&Device::Cpu)?,
+                                k_scales: ks.to_device(&Device::Cpu)?,
+                                v_anchors: va.to_device(&Device::Cpu)?,
+                                v_packed: vp.to_device(&Device::Cpu)?,
+                                v_scales: vs.to_device(&Device::Cpu)?,
+                            },
                             inner.offset,
                             inner.len
                         ));

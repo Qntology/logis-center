@@ -127,8 +127,8 @@ pub static SLOT_MANAGER: Lazy<&SlotManager> = Lazy::new(|| &SLOT_MANAGER_DATA.0)
 
 pub struct LayerKVDump {
     pub layer_idx: usize,
-    pub k_tensor: Tensor,
-    pub v_tensor: Tensor,
+    pub k_anchors: Tensor, pub k_packed: Tensor, pub k_scales: Tensor,
+    pub v_anchors: Tensor, pub v_packed: Tensor, pub v_scales: Tensor,
 }
 
 pub struct BakeTask {
@@ -250,14 +250,21 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             let (tp, ts, reg, b_idx, sid, is_last) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last);
             
             tokio::spawn(async move {
+                // [RAII-GUARD] 어떤 상황에서도 카운터를 줄이도록 보장
+                struct IoGuard(usize);
+                impl Drop for IoGuard {
+                    fn drop(&mut self) {
+                        GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                let _guard = IoGuard(sid);
+
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 
                 // [OPTIMIZED-SAVE] Serialize to memory
-                let serialize_res = safetensors::serialize(&ts, &None);
-                drop(ts); // 원본 텐서 즉시 해제하여 RAM 확보
-
-                match serialize_res {
+                match safetensors::serialize(&ts, &None) {
                     Ok(data) => {
+                        drop(ts); // 원본 텐서 즉시 해제
                         let _ = save_kv_block(&tp, &data);
                         
                         // 장부 업데이트 (SSD 위치 기록)
@@ -272,11 +279,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             }
                         }
                     },
-                    Err(e) => eprintln!("[BAKE-SAVE-ERROR] Serialization failed: {}", e),
+                    Err(e) => {
+                        drop(ts);
+                        eprintln!("[BAKE-SAVE-ERROR] Serialization failed: {}", e);
+                    }
                 }
                 
-                // 후속 처리 (카운터 및 슬롯 상태)
-                GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
+                // 슬롯 상태 관리
                 let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
                 if rem == 1 || is_last { 
                     SLOT_MANAGER.mark_ready(sid).await; 
@@ -292,52 +301,38 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             match task {
                 SlotTask::Bake(bake) => {
                     let io_tx_inner = io_tx.clone();
-                    let (sid, off, is_relay) = (bake.slot_id, bake.offset, bake.is_relay_baking);
-                    let loop_count = bake.layers.len();
+                    let (sid, off, is_relay, block_idx, registry) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone());
                     
-                    // [OPTIMIZATION] 256 토큰 미만의 작은 청크는 생성 중인 '짜투리'이므로 SSD 저장을 생략합니다.
-                    // (단, 릴레이 모드나 명시적 저장이 필요한 경우는 제외할 수 있으나 여기서는 속도 우선)
-                    let first_layer_len = bake.layers.first().map(|l| l.k_tensor.dim(2).unwrap_or(0)).unwrap_or(0);
-                    if first_layer_len < 256 && !is_relay {
-                        SLOT_MANAGER.mark_ready(sid).await;
-                        continue;
-                    }
-
-                    SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
-                    for l_idx in 0..loop_count {
-                        let src = &bake.layers[l_idx];
-                        let act_l = if is_relay && loop_count == 1 { 0 } else { src.layer_idx };
-                        let mut map = std::collections::HashMap::new();
+                    // [BACK-MERGE] CPU 백그라운드 태스크로 레이어 병합
+                    tokio::spawn(async move {
+                        let mut unified_map = std::collections::HashMap::new();
                         
-                        // [FIX] 로더와 일치하도록 Prefix 규칙 수정
-                        // 로더는 l0.st 파일의 경우 무조건 b{off}_l0_ 프리픽스를 기대합니다.
-                        let prefix = if is_relay { format!("b{}_l0_", off) } else { format!("b{}_l{}_", off, act_l) };
-                        
-                        if let Ok(dims) = src.k_tensor.dims4() {
-                            let (b, h, s, d) = (dims.0, dims.1, dims.2, dims.3);
-                            // [GPU-QUANT] Execute 4-bit packing on GPU
-                            if let Ok((ka, kp, ks)) = crate::utils::tensor_utils::pack_bitkv_gpu(&src.k_tensor) {
-                                map.insert(format!("{}k_anchors", prefix), ka);
-                                map.insert(format!("{}k_packed", prefix), kp);
-                                map.insert(format!("{}k_scales", prefix), ks);
-                            }
-                            if let Ok((va, vp, vs)) = crate::utils::tensor_utils::pack_bitkv_gpu(&src.v_tensor) {
-                                map.insert(format!("{}v_anchors", prefix), va);
-                                map.insert(format!("{}v_packed", prefix), vp);
-                                map.insert(format!("{}v_scales", prefix), vs);
-                            }
+                        for src in bake.layers {
+                            let act_l = if is_relay { 0 } else { src.layer_idx };
+                            let prefix = if is_relay { format!("b{}_l0_", off) } else { format!("b{}_l{}_", off, act_l) };
                             
-                            if let Ok(sh) = Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu) {
-                                map.insert(format!("{}k_shape", prefix), sh);
-                            }
-                            if let Ok(mo) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
-                                map.insert(format!("{}mode", prefix), mo);
+                            // 텐서 조립 (개별 요소들을 통합 맵에 삽입)
+                            unified_map.insert(format!("{}k_anchors", prefix), src.k_anchors);
+                            unified_map.insert(format!("{}k_packed", prefix), src.k_packed);
+                            unified_map.insert(format!("{}k_scales", prefix), src.k_scales);
+                            unified_map.insert(format!("{}v_anchors", prefix), src.v_anchors);
+                            unified_map.insert(format!("{}v_packed", prefix), src.v_packed);
+                            unified_map.insert(format!("{}v_scales", prefix), src.v_scales);
+                            
+                            // 모양 정보 (256 토큰 블록 기준)
+                            if let Ok(sh) = Tensor::from_vec(vec![1u32, 1, 256, 64], (4,), &Device::Cpu) {
+                                unified_map.insert(format!("{}k_shape", prefix), sh);
                             }
                         }
+
+                        let file_path = bake.task_dir.join("full_block.st");
                         
                         GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-                        let _ = io_tx_inner.send(SaveTask { slot_id: sid, path: bake.task_dir.join(format!("l{}.st", act_l)), tensors: map, is_last: l_idx == loop_count - 1, block_idx: bake.block_idx, registry: Some(bake.registry.clone()) }).await;
-                    }
+                        let _ = io_tx_inner.send(SaveTask { 
+                            slot_id: sid, path: file_path, tensors: unified_map, 
+                            is_last: true, block_idx, registry: Some(registry) 
+                        }).await;
+                    });
                 },
                 SlotTask::Load(load) => {
                     let sid = load.slot_id; let reg = load.registry.clone(); let l_idx = load.layer_idx; let shared_block = load.shared_block.clone();
@@ -349,20 +344,37 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         while root.to_string_lossy().contains("inference") || root.to_string_lossy().contains("reference") || root.to_string_lossy().contains("b") {
                             if let Some(parent) = root.parent() { root = parent.to_path_buf(); if root.to_string_lossy().ends_with("kv") { break; } } else { break; }
                         }
-                        let filename = format!("l{}.st", l_idx);
+                        let filename = "full_block.st";
                         let b_str = format!("b{}", b_idx_off);
-                        let act_p = if let Some(path) = recorded_path { if path.is_file() { path } else { path.join(&filename) } } else { root.join("inference").join(&b_str).join(&filename) };
-                        let ref_p = root.join("reference").join(&b_str).join("l0.st");
+                        let act_p = if let Some(path) = recorded_path { 
+                            if path.to_string_lossy().ends_with(".st") { path } else { path.join(filename) } 
+                        } else { root.join("inference").join(&b_str).join(filename) };
+                        
+                        let ref_p = root.join("reference").join(&b_str).join(filename);
                         let final_path = if act_p.is_file() { Some(act_p) } else if ref_p.is_file() { Some(ref_p) } else { None };
                         if let Some(p) = final_path {
-                            if let Ok(st) = candle_core::safetensors::load(&p, &Device::Cpu) {
-                                let is_relay = p.to_string_lossy().contains("l0.st");
-                                let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
-                                if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (st.get(&format!("{}k_shape", prefix)), st.get(&format!("{}k_anchors", prefix)), st.get(&format!("{}k_packed", prefix)), st.get(&format!("{}k_scales", prefix)), st.get(&format!("{}v_anchors", prefix)), st.get(&format!("{}v_packed", prefix)), st.get(&format!("{}v_scales", prefix)) ) {
-                                    let v_u32 = kh.to_vec1::<u32>().unwrap_or_default();
-                                    let os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
-                                    let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(), v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(), original_shape: os };
-                                    if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
+                            if let Ok(content) = crate::utils::direct_loader::load_kv_block(&p) {
+                                if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                                    let is_relay = p.to_string_lossy().contains("reference");
+                                    let prefix = if is_relay { format!("b{}_l0_", b_idx_off) } else { format!("b{}_l{}_", b_idx_off, l_idx) };
+                                    
+                                    let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).ok();
+                                    if let (Some(kh), Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_shape"), get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
+                                        let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
+                                        let v_u32 = kh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<u32>>();
+                                        let os = vec![v_u32[0] as usize, v_u32[1] as usize, v_u32[2] as usize, v_u32[3] as usize];
+                                        
+                                        let m = crate::models::qwen3vl::quantized_model::BitKVMetadata { 
+                                            k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), (1, os[1], ka.shape()[2], os[3]), &Device::Cpu).unwrap(),
+                                            k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(),
+                                            k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (1, os[1], os[2], 1), &Device::Cpu).unwrap(),
+                                            v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), (1, os[1], ka.shape()[2], os[3]), &Device::Cpu).unwrap(),
+                                            v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(),
+                                            v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (1, os[1], os[2], 1), &Device::Cpu).unwrap(),
+                                            original_shape: os 
+                                        };
+                                        if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let e = &mut r[b_idx]; let mut cache = e.bitkv_cache.write().unwrap(); cache[l_idx] = Some(m); e.location[l_idx] = crate::models::qwen3vl::quantized_model::KVLocation::RAM; } }
+                                    }
                                 }
                             }
                         }
