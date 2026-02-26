@@ -233,18 +233,26 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
 }
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
-    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(1000); 
+    // [BACK-PRESSURE] 채널 크기를 줄여 RAM 폭증 방지 (저장이 너무 밀리면 연산을 잠시 멈춤)
+    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(64); 
     tokio::spawn(async move {
         while let Some(task) = io_rx.recv().await {
             let (tp, ts, reg, b_idx, sid, is_last) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last);
             if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
             
-            // [OPTIMIZED-SAVE] Serialize to memory and use high-performance I/O for saving
-            match safetensors::serialize(&ts, &None) {
+            // [OPTIMIZED-SAVE] Serialize to memory
+            let serialize_res = safetensors::serialize(&ts, &None);
+            
+            // [MEMORY-RELEASE] 원본 텐서 맵(ts)을 여기서 명시적으로 드롭하여 RAM 확보
+            drop(ts); 
+
+            match serialize_res {
                 Ok(data) => {
                     match save_kv_block(&tp, &data) {
-                        Ok(_) => println!("[BAKE-SAVE] Saved KV (Optimized): {:?}", tp.file_name().unwrap_or_default()),
-                        Err(e) => eprintln!("[BAKE-SAVE-ERROR] Failed to save via direct_loader: {}", e),
+                        Ok(_) => {
+                            // 성공 로그 생략 (너무 많음)
+                        },
+                        Err(e) => eprintln!("[BAKE-SAVE-ERROR] Failed to save {:?}: {}", tp, e),
                     }
                 },
                 Err(e) => eprintln!("[BAKE-SAVE-ERROR] Serialization failed: {}", e),

@@ -978,60 +978,37 @@ impl QuantizedQwen3VLTextAttention {
     pub fn decompress_from_bitkv(&self, anchors: &Tensor, packed: &Tensor, scales: &Tensor, original_shape: &[usize], device: &Device) -> Result<Tensor> {
         let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
         
-        let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
-        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let anchors_vec = anchors.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        
-        let last_dim = original_shape[original_shape.len() - 1];
-        let seq_len = original_shape[original_shape.len() - 2];
-        let total_elements: usize = original_shape.iter().product();
-        let mut decoded = vec![0.0f32; total_elements];
-        
-        let head_tokens = seq_len * last_dim;
-        let anchor_count_expected = (0..seq_len).filter(|&i| i < 4 || i % 8 == 0).count();
+        // 1. GPU로 압축 데이터 전송
+        let packed_gpu = packed.to_device(device)?;
+        let scales_gpu = scales.to_device(device)?.to_dtype(DType::F32)?;
+        let anchors_gpu = anchors.to_device(device)?.to_dtype(DType::F32)?;
 
-        use rayon::prelude::*;
-        decoded.par_chunks_mut(head_tokens).enumerate().for_each(|(bh_idx, head_out)| {
-            let bh_offset = bh_idx * head_tokens;
-            let anchor_offset = bh_idx * anchor_count_expected * last_dim;
-            let num_bits = if packed_vec.len() > (total_elements + 7) / 8 * 2 { 4 } else { 1 };
+        // 2. GPU에서 비트 언패킹 수행 (Zero CPU Loop)
+        let planes = crate::utils::tensor_utils::unpack_bitkv_gpu(&packed_gpu, original_shape)?;
+        
+        // 3. 반복적 잔차 복구 (GPU Tensor Ops)
+        let mut decoded = Tensor::zeros(original_shape, DType::F32, device)?;
+        for (b, mask_plane) in planes.into_iter().enumerate() {
+            let bit_scale = scales_gpu.affine(1.0 / (2.0f64.powi(b as i32)), 0.0)?;
+            let mask = mask_plane.reshape(original_shape)?;
             
-            for s_idx in 0..seq_len {
-                let scale_idx = bh_idx * seq_len + s_idx;
-                let base_scale = if scale_idx < scales_vec.len() { scales_vec[scale_idx] } else { 0.0 };
-                let token_out = &mut head_out[s_idx * last_dim .. (s_idx + 1) * last_dim];
-                
-                // 1. Multi-bit Residual Restoration
-                for d_idx in 0..last_dim {
-                    let mut val = 0.0f32;
-                    let elem_idx = bh_offset + s_idx * last_dim + d_idx;
-                    
-                    for b in 0..num_bits {
-                        let bit_idx = elem_idx + b * total_elements;
-                        let byte_idx = bit_idx / 8;
-                        if byte_idx < packed_vec.len() {
-                            let is_set = (packed_vec[byte_idx] & (1 << (bit_idx % 8))) != 0;
-                            let bit_scale = base_scale / (2.0f32.powi(b as i32));
-                            val += if is_set { bit_scale } else { -bit_scale };
-                        }
-                    }
-                    token_out[d_idx] = val;
-                }
-                
-                // 2. Anchor Refinement (Safety Check Added)
-                if s_idx < 4 || s_idx % 8 == 0 {
-                    let a_pos = if s_idx < 4 { s_idx } else { 4 + (s_idx - 4) / 8 };
-                    let src_start = anchor_offset + a_pos * last_dim;
-                    let src_end = src_start + last_dim;
-                    if src_end <= anchors_vec.len() {
-                        token_out.copy_from_slice(&anchors_vec[src_start..src_end]);
-                    }
-                }
-            }
-        });
+            // val += is_set ? scale : -scale
+            let delta = mask.where_cond(&bit_scale, &bit_scale.neg()?)?;
+            decoded = decoded.add(&delta)?;
+        }
 
-        let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
-        Ok(t.to_device(device)?.to_dtype(target_dtype)?)
+        // 4. Anchor 복구 (Sparse vectors)
+        let seq_len = original_shape[2];
+        let ac_indices: Vec<u32> = (0..seq_len as u32).filter(|&i| i < 4 || i % 8 == 0).collect();
+        
+        // slice_assign을 사용하여 앵커 위치만 원본 값으로 덮어씀
+        let mut final_out = decoded;
+        for (idx, target_s) in ac_indices.into_iter().enumerate() {
+            let anchor_vec = anchors_gpu.narrow(2, idx, 1)?;
+            final_out = final_out.slice_assign(&[(0..1), (0..self.num_key_value_heads), (target_s as usize..target_s as usize + 1), (0..self.head_dim)], &anchor_vec)?;
+        }
+
+        Ok(final_out.to_dtype(target_dtype)?)
     }
 
     pub fn decompress_from_1bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {

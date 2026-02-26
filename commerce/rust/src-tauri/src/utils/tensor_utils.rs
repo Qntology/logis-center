@@ -8,11 +8,6 @@ pub fn prepare_causal_attention_mask(
     seqlen_offset: usize,
     device: &Device,
 ) -> Result<Tensor> {
-    // Sliding window mask?
-    // let mask: Vec<_> = (0..tgt_len)
-    //     .flat_map(|i| (0..tgt_len).map(move |j| if i < j { f32::NEG_INFINITY } else { 0. }))
-    //     .collect();
-    // let mask = Tensor::from_vec(mask, (tgt_len, tgt_len), device)?;
     let arange = Tensor::arange(0u32, tgt_len as u32, device)?;
     let arange = arange.unsqueeze(1)?.broadcast_as((tgt_len, tgt_len))?;
     let upper_triangle = arange.t()?.gt(&arange)?;
@@ -37,9 +32,6 @@ pub fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
         Ok(xs)
     } else {
         let (b_sz, n_kv_head, seq_len, head_dim) = xs.dims4()?;
-        // Using cat is faster than a broadcast as it avoids going through a potentially
-        // strided copy.
-        // https://github.com/huggingface/candle/pull/2043
         let kv = Tensor::cat(&vec![&xs; n_rep], 2)?.reshape((
             b_sz,
             n_kv_head * n_rep,
@@ -51,9 +43,6 @@ pub fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
 }
 
 pub fn split_tensor<D: Dim>(t: &Tensor, splits: &[usize], dim: D) -> Result<Vec<Tensor>> {
-    // 按给定长度切分tensor
-    // 例： t:(25), splits: [5, 10, 5, 5] dim: 0,
-    // 返回vec len=4, 其中tensor维度分别是:(5), (10), (5), (5)
     let dim = dim.to_index(t.shape(), "split")?;
     let mut split_res = Vec::new();
     let mut index = 0;
@@ -69,9 +58,6 @@ pub fn split_tensor_with_size<D: Dim>(
     splits_size: usize,
     dim: D,
 ) -> Result<Vec<Tensor>> {
-    // 按给定size切分tensor
-    // 例： t:(25), splits: 5 dim: 0,
-    // 返回vec len=5, 其中tensor维度分别是:(5), (5), (5), (5), (5)
     let dim = dim.to_index(t.shape(), "split")?;
     let mut split_res = Vec::new();
     let dim_size = t.dim(dim)?;
@@ -87,8 +73,6 @@ pub fn split_tensor_with_size<D: Dim>(
 }
 
 pub fn safe_arg_sort_last_dim(t: &Tensor, ascending: bool) -> Result<Tensor> {
-    // tensor在GPU上时，维度超过1024， arg_sort_last_dim方法会报错
-    // 所以维度大于1024时，放到CPU上处理
     let last_dim = t.dims()[t.rank() - 1];
     if last_dim <= 1024 {
         let t = t.arg_sort_last_dim(ascending)?;
@@ -102,8 +86,6 @@ pub fn safe_arg_sort_last_dim(t: &Tensor, ascending: bool) -> Result<Tensor> {
 }
 
 pub fn nonzero_index_vec(mask: &Tensor) -> Result<Vec<u32>> {
-    // 根据mask矩阵选出其中不为0的元素所在索引, 返回vec
-    // 只能处理1维数据
     let mut mask = mask.clone();
     if mask.dtype() != DType::U32 {
         mask = mask.to_dtype(DType::U32)?;
@@ -130,7 +112,6 @@ pub fn nonzero_index_vec(mask: &Tensor) -> Result<Vec<u32>> {
 }
 
 pub fn nonzero_index(mask: &Tensor) -> Result<Tensor> {
-    // 根据mask矩阵选出其中不为1的元素所在索引, 返回Tensor
     let indices_tensor = match mask.rank() {
         0 => {
             return Err(anyhow!(format!(
@@ -153,8 +134,6 @@ pub fn nonzero_index(mask: &Tensor) -> Result<Tensor> {
 }
 
 pub fn zero_index_vec(mask: &Tensor) -> Result<Vec<u32>> {
-    // 根据mask矩阵选出其中为0的元素所在索引, 返回vec
-    // 只能处理1维数据
     let mut mask = mask.clone();
     if mask.dtype() != DType::U32 {
         mask = mask.to_dtype(DType::U32)?;
@@ -187,11 +166,6 @@ pub fn zero_index(mask: &Tensor) -> Result<Tensor> {
 }
 
 pub fn nonzero_slice(mask: &Tensor) -> Result<Vec<(usize, usize)>> {
-    // 根据mask矩阵选出其中非0的元素所在索引
-    // 根据索引获取连续索引间隔
-    // 如不为零索引元素为[0, 3, 4, 5, 8, 9]
-    // 间隔为: [(0, 1), (3, 6), (8, 10)]
-    // 索引前闭后开
     let mut index_vec = nonzero_index_vec(mask)?;
     match index_vec.len() {
         0 => Ok(vec![]),
@@ -218,12 +192,6 @@ pub fn nonzero_slice(mask: &Tensor) -> Result<Vec<(usize, usize)>> {
 }
 
 pub fn masked_scatter_dim0(original: &Tensor, replace: &Tensor, mask: &Tensor) -> Result<Tensor> {
-    // 根据mask中非0元素所在索引,使用replace中的数据替换掉original中的数据
-    // original: rank = 3: (bs, seq_len, hidden_dim)
-    // replace: rank = 2: (seq_len, hidden_dim)
-    // mask: rank = 2: (bs, seq_len)
-    // 推理时bs=1,为了方便替换,将bs squeeze,替换后再unsqueeze
-    // 按行替换
     if original.dim(0)? != 1 || mask.dim(0)? != 1 {
         return Err(anyhow!(format!(
             "masked_scatter_dim0 original bs: {} or mask bs :{} not equal to 1 ",
@@ -264,14 +232,12 @@ pub fn get_equal_mask(input_ids: &Tensor, token_ids: u32) -> Result<Tensor> {
 }
 
 pub fn get_eq_indices(input_ids: &Tensor, token_id: u32) -> Result<Tensor> {
-    // input_ids -> shape: (seq_len)
     let mask = get_equal_mask(input_ids, token_id)?;
     let indices = nonzero_index(&mask)?;
     Ok(indices)
 }
 
 pub fn get_vision_next_indices(input_ids: &Tensor, token_id: u32) -> Result<Tensor> {
-    // input_ids -> shape: (seq_len)
     let indices = get_eq_indices(input_ids, token_id)?;
     let indices = indices.broadcast_add(&Tensor::new(vec![1u32], input_ids.device())?)?;
     Ok(indices)
@@ -411,7 +377,6 @@ pub fn compute_1d_coords(
             Ok((0..output_size)
                 .map(|i| {
                     (i as f32 + 0.5) * (input_size as f32 / output_size as f32) - 0.5
-                    // coord.max(0.0).min((input_size - 1) as f32)
                 })
                 .collect())
         }
@@ -419,7 +384,6 @@ pub fn compute_1d_coords(
         Ok((0..output_size)
             .map(|i| {
                 (i as f32 + 0.5) * (input_size as f32 / output_size as f32) - 0.5
-                // coord.max(0.0).min((input_size - 1) as f32)
             })
             .collect())
     }
@@ -430,7 +394,6 @@ pub fn interpolate_linear_1d(
     target_size: usize,
     align_corner: Option<bool>,
 ) -> Result<Tensor> {
-    // t: [b, channels, features]
     if t.rank() != 3 {
         return Err(anyhow::anyhow!(
             "Input rank must have equal to 3 dimensions"
@@ -449,7 +412,6 @@ pub fn interpolate_linear_1d(
         for c in 0..channels {
             let input_slice = t.i((b, c))?;
             let mut out_i = Vec::new();
-            // for x_out in 0..target_size {
             for &coord in coords.iter().take(target_size) {
                 let coord = if coord < 0.0 { 0.0 } else { coord };
                 let x0 = coord.floor() as usize;
@@ -474,7 +436,6 @@ pub fn interpolate_bilinear(
     target_size: (usize, usize),
     align_corner: Option<bool>,
 ) -> Result<Tensor> {
-    // input: [b, channels, height, width]
     if input.rank() != 4 {
         return Err(anyhow::anyhow!(
             "Input rank must have equal to 4 dimensions [b, c, h, w]"
@@ -484,14 +445,12 @@ pub fn interpolate_bilinear(
     let (bs, channels, input_height, input_width) = input.dims4()?;
     let (target_height, target_width) = target_size;
 
-    // If size is the same, return clone
     if input_height == target_height && input_width == target_width {
         return Ok(input.clone());
     }
 
     let align_corners = align_corner.unwrap_or(false);
 
-    // Compute scaling factors
     let height_scale = if align_corners && target_height > 1 {
         (input_height - 1) as f64 / (target_height - 1) as f64
     } else {
@@ -579,7 +538,6 @@ pub fn interpolate_bicubic_antialias(
     width_scale: f64,
     align_corners: bool,
 ) -> Result<Tensor> {
-    // tensor没有to_vec4, 所以把bs和channels先合在一起
     let dim0 = batch_size * channels;
     let input_3dim = input.reshape((dim0, input_height, input_width))?;
     let input_data = input_3dim.to_dtype(DType::F32)?.to_vec3::<f32>()?;
@@ -637,24 +595,19 @@ pub fn interpolate_bicubic_antialias(
 
 fn get_cubic_coefficients(t: f64) -> [f64; 4] {
     let a = -0.75;
-
     let x1 = t;
     let coeff0 = cubic_convolution2(x1 + 1.0, a);
     let coeff1 = cubic_convolution1(x1, a);
-
     let x2 = 1.0 - t;
     let coeff2 = cubic_convolution1(x2, a);
     let coeff3 = cubic_convolution2(x2 + 1.0, a);
-
     [coeff0, coeff1, coeff2, coeff3]
 }
 
-// 三次卷积函数1
 fn cubic_convolution1(x: f64, a: f64) -> f64 {
     ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0
 }
 
-// 三次卷积函数2
 fn cubic_convolution2(x: f64, a: f64) -> f64 {
     ((a * x - 5.0 * a) * x + 8.0 * a) * x - 4.0 * a
 }
@@ -676,7 +629,6 @@ pub fn interpolate_bicubic_standard(
     width_scale: f64,
     align_corners: bool,
 ) -> Result<Tensor> {
-    // tensor没有to_vec4, 所以把bs和channels先合在一起
     let dim0 = batch_size * channels;
     let input_3dim = input.reshape((dim0, input_height, input_width))?;
     let input_data = input_3dim.to_dtype(DType::F32)?.to_vec3::<f32>()?;
@@ -699,7 +651,6 @@ pub fn interpolate_bicubic_standard(
                 let in_x = center_x.floor() as isize;
                 let t_x = center_x - in_x as f64;
                 let mut coefficients = [0.0; 4];
-                // for k in 0..4 {
                 for (k, coefficients_k) in coefficients.iter_mut().enumerate() {
                     let row = (in_y - 1 + k as isize)
                         .max(0)
@@ -712,8 +663,6 @@ pub fn interpolate_bicubic_standard(
                         [(in_x + 1).max(0).min(input_width as isize - 1) as usize];
                     let x_plus_2 = input_data[c][row]
                         [(in_x + 2).max(0).min(input_width as isize - 1) as usize];
-
-                    // coefficients[k] = cubic_interp1d(x_minus_1, x_plus_0, x_plus_1, x_plus_2, t_x);
                     *coefficients_k = cubic_interp1d(x_minus_1, x_plus_0, x_plus_1, x_plus_2, t_x);
                 }
                 output_data[c][out_y][out_x] = cubic_interp1d(
@@ -743,9 +692,6 @@ pub fn interpolate_bicubic(
             "Input rank must have at least 3 dimensions"
         ));
     }
-    // if input.dim(0)? != 1 {
-    //     return Err(anyhow::anyhow!("Input batch_size must be 1"));
-    // }
     let (batch_size, channels, input_height, input_width) = input.dims4()?;
     let (output_height, output_width) = target_size;
     if output_height == input_height && output_width == input_width {
@@ -758,7 +704,6 @@ pub fn interpolate_bicubic(
     };
     let height_scale = compute_scale(input_height, output_height, align_corners);
     let width_scale = compute_scale(input_width, output_width, align_corners);
-    // let input_squeeze = input.squeeze(0)?;
     let output = if let Some(antialias_) = antialias {
         if antialias_ && (input_height > output_height || input_width > output_width) {
             interpolate_bicubic_antialias(
@@ -864,7 +809,6 @@ pub fn nonzero(input: &Tensor) -> Result<(Vec<u32>, Vec<u32>)> {
     Ok((topk_ids, token_ids_all))
 }
 
-// [ULTRA-SWAP] Tensor Disk I/O Utilities
 pub fn save_tensor<P: AsRef<std::path::Path>>(path: P, name: &str, tensor: &Tensor) -> Result<()> {
     let mut map = std::collections::HashMap::new();
     let cpu_tensor = tensor.to_device(&Device::Cpu)?;
@@ -880,52 +824,72 @@ pub fn load_tensor<P: AsRef<std::path::Path>>(path: P, name: &str, device: &Devi
     Ok(tensor.clone())
 }
 
-/// [GPU-QUANT] 4-bit Iterative Residual Quantization on GPU
+/// [GPU-PACK] Bit-level Packing on GPU (Zero CPU Loop)
 pub fn pack_bitkv_gpu(t: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
     let dev = t.device();
-    let dims = t.dims4()?; // (B, H, S, D)
+    let dims = t.dims4()?; 
     let (b, h, s, d) = (dims.0, dims.1, dims.2, dims.3);
-    
-    // 1. Anchors (Selected sparse vectors)
+    let total_els = b * h * s * d;
+
     let ac_indices: Vec<u32> = (0..s as u32).filter(|&i| i < 4 || i % 8 == 0).collect();
-    let ac_count = ac_indices.len();
-    let ac_tensor = Tensor::from_vec(ac_indices, vec![ac_count], dev)?;
+    let ac_tensor = Tensor::from_vec(ac_indices.clone(), vec![ac_indices.len()], dev)?;
     let anchors = t.index_select(&ac_tensor, 2)?;
 
-    // 2. Iterative Quantization
     let mut residual = t.to_dtype(DType::F32)?;
-    let scales = t.abs()?.max_keepdim(3)?.to_dtype(DType::F32)?; // (B, H, S, 1)
+    let scales = t.abs()?.max_keepdim(3)?.to_dtype(DType::F32)?;
     
-    let mut packed_planes = Vec::new();
+    let mut plane_bits = Vec::new();
     for bit_idx in 0..4 {
         let cur_scale = scales.affine(1.0 / (2.0f64.powi(bit_idx)), 0.0)?;
-        let mask = residual.ge(0.0)?; // (B, H, S, D) - Bool mask
-        
-        // Update residual: res = res - (mask ? cur_scale : -cur_scale)
+        let mask = residual.ge(0.0)?;
         let delta = mask.where_cond(&cur_scale, &cur_scale.neg()?)?;
         residual = residual.sub(&delta)?;
+        plane_bits.push(mask.to_dtype(DType::U8)?);
+    }
+
+    let mut final_packed_u8 = Vec::new();
+    for plane in plane_bits {
+        let flat = plane.flatten_all()?;
+        let num_u8 = (total_els + 7) / 8;
+        let padded_size = num_u8 * 8;
+        let padded = if padded_size > total_els {
+            Tensor::cat(&[&flat, &Tensor::zeros(padded_size - total_els, DType::U8, dev)?], 0)?
+        } else { flat };
         
-        packed_planes.push(mask.to_dtype(DType::U8)?);
+        let chunked = padded.reshape((num_u8, 8))?;
+        let bit_weights = Tensor::from_vec(vec![1u8, 2, 4, 8, 16, 32, 64, 128], (8,), dev)?;
+        let packed_u8 = chunked.broadcast_mul(&bit_weights)?.sum(1)?;
+        final_packed_u8.push(packed_u8);
     }
-
-    // 3. Bit Packing (Convert 4 boolean planes to U8 bits)
-    // Layout: Flatten(B, H, S, D) then 4 planes
-    let total_els = b * h * s * d;
     
-    // This part is tricky without a custom CUDA kernel for bit-packing.
-    // For now, we move the 4 bit planes (U8) to CPU and pack bits there.
-    // Still saves RAM because we only move 1-byte-per-element masks instead of 4-byte F32.
-    let mut final_packed = vec![0u8; (total_els * 4 + 7) / 8];
-    for (p_idx, plane) in packed_planes.iter().enumerate() {
-        let p_data = plane.flatten_all()?.to_device(&Device::Cpu)?.to_vec1::<u8>()?;
-        for (i, &val) in p_data.iter().enumerate() {
-            if val > 0 {
-                let bit_pos = i + p_idx * total_els;
-                final_packed[bit_pos / 8] |= 1 << (bit_pos % 8);
-            }
-        }
-    }
-    let packed_tensor = Tensor::from_vec(final_packed, vec![(total_els * 4 + 7) / 8], &Device::Cpu)?;
+    let packed_tensor = Tensor::cat(&final_packed_u8, 0)?;
+    Ok((anchors.to_device(&Device::Cpu)?, packed_tensor.to_device(&Device::Cpu)?, scales.to_device(&Device::Cpu)?))
+}
 
-    Ok((anchors.to_device(&Device::Cpu)?, packed_tensor, scales.to_device(&Device::Cpu)?))
+/// [GPU-UNPACK] Bit-level Unpacking on GPU (Zero CPU Loop)
+pub fn unpack_bitkv_gpu(packed: &Tensor, original_shape: &[usize]) -> Result<Vec<Tensor>> {
+    let dev = packed.device();
+    let total_els: usize = original_shape.iter().product();
+    let num_u8 = (total_els + 7) / 8;
+    
+    let mut planes = Vec::new();
+    for bit_idx in 0..4 {
+        let start = bit_idx * num_u8;
+        let chunk = packed.narrow(0, start, num_u8)?;
+        
+        let mut bits = Vec::new();
+        for i in 0..8 {
+            let divisor = 1u8 << i;
+            let div_t = Tensor::new(divisor, dev)?;
+            let bit = chunk.div(&div_t.broadcast_as(chunk.shape())?)?;
+            let bit_mod = bit.broadcast_sub(&bit.div(&Tensor::new(2u8, dev)?)?.broadcast_mul(&Tensor::new(2u8, dev)?)?)?
+                             .gt(&Tensor::new(0u8, dev)?)?;
+            
+            bits.push(bit_mod.to_dtype(DType::F32)?);
+        }
+        
+        let plane = Tensor::stack(&bits, 1)?.flatten_all()?.narrow(0, 0, total_els)?;
+        planes.push(plane);
+    }
+    Ok(planes)
 }
