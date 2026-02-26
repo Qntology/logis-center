@@ -282,14 +282,14 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             match task {
                 SlotTask::Bake(bake) => {
                     let io_tx_inner = io_tx.clone();
-                    let (sid, off, is_relay, block_idx, registry, kv_name) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone());
+                    let (sid, off, _is_relay, block_idx, registry, kv_name) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone());
                     let loop_count = bake.layers.len();
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
                     for l_idx in 0..loop_count {
                         let src = &bake.layers[l_idx];
-                        let act_l = if is_relay { 0 } else { src.layer_idx };
+                        let act_l = src.layer_idx; // [FIX] Relay 여부와 상관없이 실제 레이어 인덱스 사용
                         let mut map = std::collections::HashMap::new();
-                        let prefix = if is_relay { format!("b{}_l0_", off) } else { format!("b{}_l{}_", off, act_l) };
+                        let prefix = format!("b{}_l{}_", off, act_l);
                         map.insert(format!("{}k_anchors", prefix), src.k_anchors.clone());
                         map.insert(format!("{}k_packed", prefix), src.k_packed.clone());
                         map.insert(format!("{}k_scales", prefix), src.k_scales.clone());

@@ -700,9 +700,6 @@ impl QuantizedQwen3VLTextAttention {
             match loc {
                 KVLocation::VRAM => {
                     vram_count += 1;
-                    if self.layer_idx == 0 {
-                        println!("[JIT-LOAD] SUCCESS: Layer {} Block {} (VRAM Offset: {})", self.layer_idx, b_off, b_off);
-                    }
                     vram_ks.push(k.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
                     vram_vs.push(v.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
                     vram_total_len += b_len;
@@ -720,9 +717,6 @@ impl QuantizedQwen3VLTextAttention {
                         if let (Some(kc), Some(vc)) = (&inner.k_cache, &inner.v_cache) {
                             k_active = Some(kc.to_device(dev)?.to_dtype(target_dtype)?);
                             v_active = Some(vc.to_device(dev)?.to_dtype(target_dtype)?);
-                            if self.layer_idx == 0 {
-                                println!("[JIT-LOAD] SUCCESS: Layer {} Block {} (Cache Offset: {})", self.layer_idx, b_off, b_off);
-                            }
                         }
                     }
 
@@ -1278,7 +1272,7 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_blocks.clear();
     }
 
-    pub async fn trigger_realtime_incremental_bake(&mut self, session_id: &str, is_last_chunk: bool) -> Result<()> {
+    pub async fn trigger_realtime_incremental_bake(&mut self, session_id: &str, is_last_chunk: bool, baking_only: bool) -> Result<()> {
         use crate::models::qwen3vl::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
 
         let target_indices: Vec<usize> = self.kv_blocks.iter().enumerate().filter_map(|(i, b)| {
@@ -1310,19 +1304,29 @@ impl QuantizedQwen3VLTextAttention {
                 };
 
                 if let Some(tx) = BAKE_TX.get() {
-                    let kv_name = self.active_kv_name.clone().unwrap_or_else(|| "general".to_string());
-                    let sub_folder = format!("reference/{}", kv_name);
-                    let path = crate::utils::paths::get_kv_dir(None).join(session_id).join(&sub_folder);
-                    let block_dir = path.join(format!("b{}", off));
+                    let kv_name_base = self.active_kv_name.clone().unwrap_or_else(|| "general".to_string());
+                    
+                    // [PATH-STRATEGY]
+                    // Baking(Reference): Root reference folder (shared across sessions)
+                    // Inference: Session-specific folder
+                    let (target_path, index_kv_name): (std::path::PathBuf, String) = if baking_only {
+                        let sub = format!("reference/{}", kv_name_base);
+                        (crate::utils::paths::get_kv_dir(None).join(&sub), sub)
+                    } else {
+                        let sub = format!("inference/{}", kv_name_base);
+                        (crate::utils::paths::get_kv_dir(None).join(session_id).join(&sub), format!("{}/{}", session_id, sub))
+                    };
+
+                    let block_dir = target_path.join(format!("b{}", off));
                     
                     let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
                     let _ = tx.send(SlotTask::Bake(BakeTask {
                         slot_id: sid,
                         task_dir: block_dir,
-                        kv_name: Some(sub_folder),
+                        kv_name: Some(index_kv_name),
                         offset: off,
                         layers: vec![dump],
-                        is_relay_baking: true,
+                        is_relay_baking: baking_only,
                         block_idx: Some(b_idx),
                         registry: self.registry.clone(),
                     })).await;
@@ -2144,7 +2148,7 @@ impl QuantizedQwen3VLTextModel {
             if self.baking_only {
                 if let Some(sid) = &sid_opt {
                     let is_last = chunk_idx == chunk_offsets.len() - 1;
-                    let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last).await;
+                    let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last, true).await;
                 }
             }
 
@@ -2154,11 +2158,6 @@ impl QuantizedQwen3VLTextModel {
             if target_device.is_cuda() { let _ = target_device.synchronize(); }
         }
         
-        // [BLOCK-LEVEL-SYNC] 모든 레이어의 청크 연산이 끝난 후, 완성된 블록들을 한꺼번에 SSD로 저장
-        if let Some(sid) = &sid_opt {
-            let _ = self.sync_all_layers_to_ssd(sid).await;
-        }
-
         Ok(results)
     }
 
