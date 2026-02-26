@@ -934,9 +934,14 @@ impl QuantizedQwen3VLTextAttention {
                     raw_v: None,
                 };
 
-                // [FIX] 경로 클리닝: inference/inference 같은 중복 방지
+                // [FIX] 경로 정규화: inference/inference 중복 방지 및 text/image 명시
                 let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
-                let kv_type = kv_name_raw.split('/').last().unwrap_or("text").to_string();
+                let last_part = kv_name_raw.split('/').last().unwrap_or("text");
+                let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { 
+                    "text".to_string() 
+                } else { 
+                    last_part.to_string() 
+                };
                 
                 let session_id_owned = session_id.to_string();
                 let registry_clone = self.registry.clone();
@@ -2184,7 +2189,12 @@ impl QuantizedQwen3VLTextModel {
             let kv_dir = crate::utils::paths::get_kv_dir(None);
             let mode = self.baking_only;
             let kv_name_raw = kv_name.unwrap_or("text");
-            let kv_type = kv_name_raw.split('/').last().unwrap_or("text");
+            let last_part = kv_name_raw.split('/').last().unwrap_or("text");
+            let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { 
+                "text".to_string() 
+            } else { 
+                last_part.to_string() 
+            };
             
             let sub_path = if mode {
                 format!("{}/reference/{}", session_id, kv_type)
@@ -2335,12 +2345,18 @@ impl QuantizedQwen3VLTextModel {
             if let Some(tx) = BAKE_TX.get() {
                 let kv_dir = crate::utils::paths::get_kv_dir(None);
                 let mode = self.baking_only;
-                let kv_name_base = self.active_kv_name.as_deref().unwrap_or("general");
+                let kv_name_raw = self.active_kv_name.as_deref().unwrap_or("text");
+                let last_part = kv_name_raw.split('/').last().unwrap_or("text");
+                let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { 
+                    "text" 
+                } else { 
+                    last_part 
+                };
                 
                 let sub_path = if mode {
-                    format!("{}/reference/{}", session_id, kv_name_base)
+                    format!("{}/reference/{}", session_id, kv_type)
                 } else {
-                    format!("{}/inference/{}", session_id, kv_name_base)
+                    format!("{}/inference/{}", session_id, kv_type)
                 };
 
                 for (dump, off, b_len) in dumps_to_send {
