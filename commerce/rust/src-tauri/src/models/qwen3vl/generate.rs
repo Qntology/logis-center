@@ -183,21 +183,44 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {
         match req {
             SlotRequest::Acquire { total_tokens, tx } => {
-                // [EXPAND-LIMITS] I/O 동시성을 높이기 위해 동시 쓰기 슬롯 상한을 대폭 확장
-                let max_writes = if total_tokens < 4096 { 64 } else if total_tokens < 8192 { 32 } else { 16 };
+                // [OPTIMIZED-LIMITS] NVMe SSD의 성능을 고려하여 동시 쓰기 허용량을 64개로 설정
+                let max_writes = 64; 
                 let mut found = None;
+                let mut attempts = 0;
+                
                 while found.is_none() {
                     if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
+                        // 1순위: 완전히 비어있는 슬롯(0) 탐색
                         for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
-                            if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { SLOT_MANAGER.update_counters(0, 1); SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); found = Some(i); break; }
+                            if slot.state.load(Ordering::SeqCst) == 0 {
+                                if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { 
+                                    SLOT_MANAGER.update_counters(0, 1); 
+                                    SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); 
+                                    found = Some(i); break; 
+                                }
+                            }
                         }
+                        // 2순위: 이미 캐시된 슬롯(2) 재사용
                         if found.is_none() {
                             for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
-                                if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { SLOT_MANAGER.update_counters(2, 1); SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); found = Some(i); break; }
+                                if slot.state.load(Ordering::SeqCst) == 2 {
+                                    if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { 
+                                        SLOT_MANAGER.update_counters(2, 1); 
+                                        SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); 
+                                        found = Some(i); break; 
+                                    }
+                                }
                             }
                         }
                     }
-                    if found.is_none() { tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
+                    
+                    if found.is_none() { 
+                        attempts += 1;
+                        if attempts % 200 == 0 { 
+                            println!("[SLOT-STALL] Waiting for free write slots... (Active Writes: {})", SLOT_MANAGER.active_write_count.load(Ordering::SeqCst));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await; 
+                    }
                 }
                 let _ = tx.send(found.unwrap());
             },
@@ -219,12 +242,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     // [BACK-PRESSURE] 병렬 처리를 위해 채널 확장 (I/O 병목 해소)
     let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(2048); 
     
-    // 1. 디스크 I/O 병렬 처리 워커 (제한 없는 병렬성으로 SSD 최대 대역폭 활용)
+    // 1. 디스크 I/O 병렬 처리 워커 (Semaphore를 통한 안정적 병렬성 확보)
     tokio::spawn(async move {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(64)); 
         while let Some(task) = io_rx.recv().await {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
             let (tp, ts, reg, b_idx, sid, is_last) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last);
             
-            // 각 쓰기 요청을 별도 태스크로 분리하여 즉시 병렬 실행
             tokio::spawn(async move {
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 
@@ -257,6 +281,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 if rem == 1 || is_last { 
                     SLOT_MANAGER.mark_ready(sid).await; 
                 }
+                drop(permit);
             });
         }
     });
