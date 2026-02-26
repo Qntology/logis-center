@@ -256,6 +256,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     });
 
     tokio::spawn(async move {
+        use rayon::prelude::*;
         while let Some(task) = rx.recv().await {
             match task {
                 SlotTask::Bake(bake) => {
@@ -263,15 +264,19 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let (sid, off, is_relay) = (bake.slot_id, bake.offset, bake.is_relay_baking);
                     let loop_count = bake.layers.len();
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
-                    for l_idx in 0..loop_count {
-                        let src = &bake.layers[l_idx];
+
+                    // [STRATEGY-A] 레이어별 압축 가공을 CPU 모든 코어로 병렬화합니다.
+                    let processed_layers: Vec<_> = bake.layers.into_par_iter().map(|src| {
                         let act_l = if is_relay && loop_count == 1 { 0 } else { src.layer_idx };
                         let mut map = std::collections::HashMap::new();
                         let prefix = if is_relay { format!("b{}_l0_", off) } else { format!("b{}_l{}_", off, act_l) };
+                        
                         if let Ok(ks_dims) = src.k_tensor.dims4() {
                             let (b, h, s, d) = (ks_dims.0, ks_dims.1, ks_dims.2, ks_dims.3);
                             let total_elements = b * h * s * d;
                             let ac = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
+                            
+                            // K Tensor 가공
                             if let Ok(t_f32) = src.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()) {
                                 if let Ok(t_data) = t_f32.to_vec1::<f32>() {
                                     let mut ka = vec![0.0f32; b * h * ac * d];
@@ -300,6 +305,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     if let Ok(t) = Tensor::from_vec(ksc, vec![b, h, s, 1], &Device::Cpu) { map.insert(format!("{}k_scales", prefix), t); }
                                 }
                             }
+                            
+                            // V Tensor 가공
                             if let Ok(t_f32) = src.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()) {
                                 if let Ok(t_data) = t_f32.to_vec1::<f32>() {
                                     let mut va = vec![0.0f32; b * h * ac * d];
@@ -331,9 +338,29 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             if let Ok(t) = Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu) { map.insert(format!("{}k_shape", prefix), t); }
                             if let Ok(t) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) { map.insert(format!("{}mode", prefix), t); }
                         }
-                        GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-                        let _ = io_tx_inner.send(SaveTask { slot_id: sid, path: bake.task_dir.join(format!("l{}.st", act_l)), tensors: map, is_last: l_idx == loop_count - 1, block_idx: bake.block_idx, registry: Some(bake.registry.clone()) }).await;
+                        (act_l, map)
+                    }).collect();
+
+                    // 가공이 완료된 결과들을 하나의 맵으로 병합 (Strategy B)
+                    let reg_ref = bake.registry.clone();
+                    let task_dir = bake.task_dir.clone();
+                    let block_idx = bake.block_idx;
+                    
+                    let mut combined_map = std::collections::HashMap::new();
+                    for (_act_l, map) in processed_layers {
+                        combined_map.extend(map);
                     }
+
+                    // 단 한 번의 I/O 작업으로 28개 레이어 전부 저장
+                    GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
+                    let _ = io_tx_inner.send(SaveTask { 
+                        slot_id: sid, 
+                        path: task_dir.join("all_layers.st"), 
+                        tensors: combined_map, 
+                        is_last: true, 
+                        block_idx, 
+                        registry: Some(reg_ref) 
+                    }).await;
                 },
                 SlotTask::Load(load) => {
                     let sid = load.slot_id; let reg = load.registry.clone(); let l_idx = load.layer_idx; let shared_block = load.shared_block.clone();
