@@ -1110,6 +1110,8 @@ impl QuantizedQwen3VLTextAttention {
         let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
         let mut scales = vec![0.0f32; b * h * s];
 
+        // 1. Parallel pass for Bit Packing (Read-only on t_data)
+        // Since packed_residuals is indexed by global token index, we can safely parallelize by Head
         let head_token_size = s * d;
         packed_residuals.par_chunks_mut(head_token_size / 8).enumerate().for_each(|(bh_idx, head_packed)| {
             let bh_offset = bh_idx * head_token_size;
@@ -1120,26 +1122,30 @@ impl QuantizedQwen3VLTextAttention {
             }
         });
         
+        // 2. Parallel pass for Anchors and Scales
+        // Group anchors and scales by head to avoid mutable borrow conflicts
         let anchor_head_size = anchor_count * d;
         let mut anchors_heads: Vec<&mut [f32]> = anchors.chunks_mut(anchor_head_size).collect();
         let mut scales_heads: Vec<&mut [f32]> = scales.chunks_mut(s).collect();
 
+        // Use zip to process both together in parallel
         anchors_heads.par_iter_mut().zip(scales_heads.par_iter_mut()).enumerate().for_each(|(bh_idx, (anchor_head, head_scales))| {
             let bh_offset = bh_idx * head_token_size;
             for token_idx in 0..s {
                 let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
                 
+                // Copy Anchor if index matches
                 if token_idx < 4 || token_idx % 8 == 0 {
                     let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
                     anchor_head[anchor_pos * d .. (anchor_pos + 1) * d].copy_from_slice(token_data);
                 }
                 
-                let mut max_abs = 0.0f32;
+                // [FIX] Stable Mean Absolute Scaling (from previous source)
+                let mut abs_sum = 0.0f32;
                 for &v in token_data {
-                    let a = v.abs();
-                    if a > max_abs { max_abs = a; }
+                    abs_sum += v.abs();
                 }
-                head_scales[token_idx] = max_abs;
+                head_scales[token_idx] = abs_sum / (d as f32);
             }
         });
 
@@ -1153,44 +1159,49 @@ impl QuantizedQwen3VLTextAttention {
     pub fn decompress_from_bitkv(&self, anchors: &Tensor, packed: &Tensor, scales: &Tensor, original_shape: &[usize], device: &Device) -> Result<Tensor> {
         let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
         
-        let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
-        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let anchors_vec = anchors.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        
-        let last_dim = original_shape[original_shape.len() - 1];
-        let seq_len = original_shape[original_shape.len() - 2];
-        
-        let total_elements: usize = original_shape.iter().product();
-        let mut decoded = vec![0.0f32; total_elements];
-        
-        let head_tokens = seq_len * last_dim;
-        let anchor_count = (0..seq_len).filter(|&i| i < 4 || i % 8 == 0).count();
+        // 1. GPU로 압축 데이터 전송
+        let packed_gpu = packed.to_device(device)?;
+        let scales_gpu = scales.to_device(device)?.to_dtype(DType::F32)?;
+        let anchors_gpu = anchors.to_device(device)?.to_dtype(DType::F32)?;
 
-        use rayon::prelude::*;
-        decoded.par_chunks_mut(head_tokens).enumerate().for_each(|(bh_idx, head_out)| {
-            let bh_offset = bh_idx * head_tokens;
-            let anchor_offset = bh_idx * anchor_count * last_dim;
+        // 2. GPU에서 비트 언패킹 수행 (Zero CPU Loop)
+        let planes = crate::utils::tensor_utils::unpack_bitkv_gpu(&packed_gpu, original_shape)?;
+        
+        // 3. 반복적 잔차 복구 (GPU Tensor Ops)
+        let mut decoded = Tensor::zeros(original_shape, DType::F32, device)?;
+        for (b, mask_plane) in planes.into_iter().enumerate() {
+            let bit_scale = scales_gpu.affine(1.0 / (2.0f64.powi(b as i32)), 0.0)?;
+            let mask = mask_plane.reshape(original_shape)?;
             
-            for s_idx in 0..seq_len {
-                let scale = scales_vec[bh_idx * seq_len + s_idx];
-                let token_out = &mut head_out[s_idx * last_dim .. (s_idx + 1) * last_dim];
-                
-                for d_idx in 0..last_dim {
-                    let global_bit_idx = bh_offset + s_idx * last_dim + d_idx;
-                    let is_set = (packed_vec[global_bit_idx / 8] & (1 << (global_bit_idx % 8))) != 0;
-                    token_out[d_idx] = if is_set { scale } else { -scale };
-                }
-                
-                if s_idx < 4 || s_idx % 8 == 0 {
-                    let a_pos = if s_idx < 4 { s_idx } else { 4 + (s_idx - 4) / 8 };
-                    let anchor_data = &anchors_vec[anchor_offset + a_pos * last_dim .. anchor_offset + (a_pos + 1) * last_dim];
-                    token_out.copy_from_slice(anchor_data);
-                }
-            }
-        });
+            // [FIX] 양쪽 인자 모두 명시적으로 브로드캐스팅하여 모양 일치 보장
+            let on_true = bit_scale.broadcast_as(original_shape)?;
+            let on_false = bit_scale.neg()?.broadcast_as(original_shape)?;
+            let delta = mask.where_cond(&on_true, &on_false)?;
+            
+            decoded = decoded.add(&delta)?;
+        }
 
-        let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
-        Ok(t.to_device(device)?.to_dtype(target_dtype)?)
+        // 4. Anchor 복구 (Sparse vectors) - [OPTIMIZED] 단일 연산으로 처리
+        let seq_len = original_shape[2];
+        let ac_indices: Vec<u32> = (0..seq_len as u32).filter(|&i| i < 4 || i % 8 == 0).collect();
+        let ac_count = ac_indices.len();
+        
+        // 앵커 위치를 나타내는 불리언 마스크 생성
+        let mut mask_vec = vec![0u8; seq_len];
+        for &idx in &ac_indices { mask_vec[idx as usize] = 1; }
+        let anchor_mask = Tensor::from_vec(mask_vec, vec![1, 1, seq_len, 1], device)?.to_dtype(DType::U8)?.broadcast_as(original_shape)?;
+
+        // 앵커 데이터를 원래 위치로 확산 (Scatter)
+        // 1. 전체 크기의 제로 텐서 생성
+        let zeros = Tensor::zeros(original_shape, DType::F32, device)?;
+        // 2. index_add를 사용하여 앵커들만 제자리에 배치 (이 연산은 앵커 텐서가 (1, H, AC, D) 구조임을 활용)
+        let ac_idx_tensor = Tensor::from_vec(ac_indices, vec![ac_count], device)?;
+        let anchor_scattered = zeros.index_add(&ac_idx_tensor, &anchors_gpu, 2)?;
+
+        // 3. 마스크를 사용하여 최종 합성: (mask ? anchor : decoded)
+        let final_out = anchor_mask.where_cond(&anchor_scattered, &decoded)?;
+
+        Ok(final_out.to_dtype(target_dtype)?)
     }
 
     pub fn decompress_from_1bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
@@ -1270,7 +1281,7 @@ impl QuantizedQwen3VLTextAttention {
             };
 
             if let (Some(k), Some(v)) = (k_opt, v_opt) {
-                let (ka, kp, ks, k_shape) = self.compress_to_bitkv(&k)?;
+                let (ka, kp, ks, _) = self.compress_to_bitkv(&k)?;
                 let (va, vp, vs, _) = self.compress_to_bitkv(&v)?;
                 
                 let dump = LayerKVDump {
@@ -1281,21 +1292,20 @@ impl QuantizedQwen3VLTextAttention {
                     v_anchors: va.to_device(&Device::Cpu)?,
                     v_packed: vp.to_device(&Device::Cpu)?,
                     v_scales: vs.to_device(&Device::Cpu)?,
-                    k_shape: Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?,
                 };
 
                 if let Some(tx) = BAKE_TX.get() {
                     let kv_name_base = self.active_kv_name.clone().unwrap_or_else(|| "general".to_string());
-                    let mode = baking_only;
                     
-                    // [PATH-STRATEGY-FIX]
-                    // 모든 데이터(Reference/Inference)를 session_id 폴더 하위에 격리하여 저장합니다.
-                    let (target_path, index_kv_name): (std::path::PathBuf, String) = if mode {
-                        let sub = format!("{}/reference/{}", session_id, kv_name_base);
+                    // [PATH-STRATEGY]
+                    // Baking(Reference): Root reference folder (shared across sessions)
+                    // Inference: Session-specific folder
+                    let (target_path, index_kv_name): (std::path::PathBuf, String) = if baking_only {
+                        let sub = format!("reference/{}", kv_name_base);
                         (crate::utils::paths::get_kv_dir(None).join(&sub), sub)
                     } else {
-                        let sub = format!("{}/inference/{}", session_id, kv_name_base);
-                        (crate::utils::paths::get_kv_dir(None).join(&sub), sub)
+                        let sub = format!("inference/{}", kv_name_base);
+                        (crate::utils::paths::get_kv_dir(None).join(session_id).join(&sub), format!("{}/{}", session_id, sub))
                     };
 
                     let block_dir = target_path.join(format!("b{}", off));
@@ -1365,58 +1375,67 @@ impl QuantizedQwen3VLTextAttention {
                     if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
                         let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
                         
-                        // 1. 파일에서 실제 형상 정보(k_shape) 가져오기
-                        let file_shape = if let Some(sh) = get_t("k_shape") {
-                            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                            sh_u32.iter().map(|&x| x as usize).collect()
-                        } else {
-                            vec![1, ka.shape()[1], block_info.len, ka.shape()[3]]
-                        };
-
-                        let dev = &Device::Cpu;
-                        let ka_t = Tensor::from_vec(bytes_to_f32(ka.data()), (file_shape[0], file_shape[1], (file_shape[2] + 7) / 8 + 4, file_shape[3]), dev)?;
-                        let kp_t = Tensor::from_slice(kp.data(), kp.shape(), dev)?;
-                        let ks_t = Tensor::from_vec(bytes_to_f32(ks.data()), (file_shape[0], file_shape[1], file_shape[2], 1), dev)?;
-                        let va_t = Tensor::from_vec(bytes_to_f32(va.data()), (file_shape[0], file_shape[1], (file_shape[2] + 7) / 8 + 4, file_shape[3]), dev)?;
-                        let vp_t = Tensor::from_slice(vp.data(), vp.shape(), dev)?;
-                        let vs_t = Tensor::from_vec(bytes_to_f32(vs.data()), (file_shape[0], file_shape[1], file_shape[2], 1), dev)?;
-
-                        // 2. 즉시 해제 (Decode-First)
-                        let mut k_raw = self.decompress_from_bitkv(&ka_t, &kp_t, &ks_t, &file_shape, dev)?;
-                        let mut v_raw = self.decompress_from_bitkv(&va_t, &vp_t, &vs_t, &file_shape, dev)?;
-
-                        // 3. 차원 정렬 (KV-BRIDGE)
+                        // [KV-BRIDGE] 0.6B 베이킹 데이터와 현재 모델 규격 사이의 차원 정렬
+                        let (ka_data, kp_data, ks_data) = (bytes_to_f32(ka.data()), kp.data().to_vec(), bytes_to_f32(ks.data()));
+                        let (va_data, vp_data, vs_data) = (bytes_to_f32(va.data()), vp.data().to_vec(), bytes_to_f32(vs.data()));
+                        
+                        let file_heads = ka.shape()[1];
+                        let file_dim = ka.shape()[3];
                         let target_heads = self.num_key_value_heads;
                         let target_dim = self.head_dim;
-                        let (_b, h, _s, d) = k_raw.dims4()?;
 
-                        if d < target_dim {
-                            k_raw = Tensor::cat(&[&k_raw, &k_raw], D::Minus1)?;
-                            v_raw = Tensor::cat(&[&v_raw, &v_raw], D::Minus1)?;
-                        }
-                        if h != target_heads {
-                            let mut k_list = Vec::with_capacity(target_heads);
-                            let mut v_list = Vec::with_capacity(target_heads);
-                            for i in 0..target_heads {
-                                let src_idx = i % h;
-                                k_list.push(k_raw.narrow(1, src_idx, 1)?);
-                                v_list.push(v_raw.narrow(1, src_idx, 1)?);
+                        let mut final_ka = Tensor::from_vec(ka_data, (1, file_heads, ka.shape()[2], file_dim), &Device::Cpu)?;
+                        let mut final_kp = Tensor::from_slice(&kp_data, kp.shape(), &Device::Cpu)?;
+                        let mut final_ks = Tensor::from_vec(ks_data, (1, file_heads, 256, 1), &Device::Cpu)?;
+                        let mut final_va = Tensor::from_vec(va_data, (1, file_heads, ka.shape()[2], file_dim), &Device::Cpu)?;
+                        let mut final_vp = Tensor::from_slice(&vp_data, vp.shape(), &Device::Cpu)?;
+                        let mut final_vs = Tensor::from_vec(vs_data, (1, file_heads, 256, 1), &Device::Cpu)?;
+
+                        if file_heads != target_heads || file_dim != target_dim {
+                            if self.layer_idx == 0 { println!("[KV-BRIDGE] Aligning 0.6B context (H:{}, D:{}) to Target (H:{}, D:{})", file_heads, file_dim, target_heads, target_dim); }
+                            
+                            if file_dim < target_dim {
+                                final_ka = Tensor::cat(&[&final_ka, &final_ka], D::Minus1)?;
+                                final_va = Tensor::cat(&[&final_va, &final_va], D::Minus1)?;
                             }
-                            k_raw = Tensor::cat(&k_list, 1)?;
-                            v_raw = Tensor::cat(&v_list, 1)?;
+                            
+                            if file_heads != target_heads {
+                                let mut k_list = Vec::with_capacity(target_heads);
+                                let mut v_list = Vec::with_capacity(target_heads);
+                                let mut ks_list = Vec::with_capacity(target_heads);
+                                let mut vs_list = Vec::with_capacity(target_heads);
+                                for i in 0..target_heads {
+                                    let src_idx = i % file_heads;
+                                    k_list.push(final_ka.narrow(1, src_idx, 1)?);
+                                    v_list.push(final_va.narrow(1, src_idx, 1)?);
+                                    ks_list.push(final_ks.narrow(1, src_idx, 1)?);
+                                    vs_list.push(final_vs.narrow(1, src_idx, 1)?);
+                                }
+                                final_ka = Tensor::cat(&k_list, 1)?;
+                                final_va = Tensor::cat(&v_list, 1)?;
+                                final_ks = Tensor::cat(&ks_list, 1)?;
+                                final_vs = Tensor::cat(&vs_list, 1)?;
+                            }
                         }
 
-                        // 4. 결과 주입
+                        let meta = BitKVMetadata {
+                            k_anchors: final_ka,
+                            k_packed: final_kp,
+                            k_scales: final_ks,
+                            v_anchors: final_va,
+                            v_packed: final_vp,
+                            v_scales: final_vs,
+                            original_shape: vec![1, target_heads, 256, target_dim],
+                        };
+                        
                         let mut reg = self.registry.entries.write().unwrap();
                         if b_idx < reg.len() {
-                            if let Some(block) = self.kv_blocks.get(b_idx) {
-                                let mut inner = block.inner.write().unwrap();
-                                inner.k_cache = Some(k_raw);
-                                inner.v_cache = Some(v_raw);
-                                inner.location = KVLocation::RAM;
-                                reg[b_idx].location[self.layer_idx] = KVLocation::RAM;
-                                reg[b_idx].ssd_path = Some(file_path.parent().unwrap().to_path_buf());
+                            {
+                                let mut cache = reg[b_idx].bitkv_cache.write().unwrap();
+                                cache[self.layer_idx] = Some(meta);
                             }
+                            reg[b_idx].location[self.layer_idx] = KVLocation::RAM;
+                            reg[b_idx].ssd_path = Some(file_path.parent().unwrap().to_path_buf());
                         }
                     }
                 }
@@ -2530,7 +2549,6 @@ impl QuantizedQwen3VLTextModel {
                          }
 
                          // 그룹화 (저장용) - [FIX] 압축된 개별 구성요소들을 전송
-                         let k_shape_u32 = vec![1u32, n_kv_h as u32, inner.len as u32, h_d as u32];
                          block_groups.entry(inner.offset).or_default().push(LayerKVDump {
                              layer_idx: l_idx,
                              k_anchors: ka.to_device(&Device::Cpu)?, 
@@ -2539,7 +2557,6 @@ impl QuantizedQwen3VLTextModel {
                              v_anchors: va.to_device(&Device::Cpu)?,
                              v_packed: vp.to_device(&Device::Cpu)?,
                              v_scales: vs.to_device(&Device::Cpu)?,
-                             k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu)?,
                          });
                          
                          // 메모리 관리
@@ -2685,7 +2702,6 @@ impl QuantizedQwen3VLTextModel {
                         // GPU 양자화 수행
                         let (ka, kp, ks) = crate::utils::tensor_utils::pack_bitkv_gpu(k)?;
                         let (va, vp, vs) = crate::utils::tensor_utils::pack_bitkv_gpu(v)?;
-                        let k_shape_vec: Vec<u32> = k.shape().dims().iter().map(|&x| x as u32).collect();
 
                         dumps_to_send.push((
                             LayerKVDump { 
@@ -2696,7 +2712,6 @@ impl QuantizedQwen3VLTextModel {
                                 v_anchors: va.to_device(&Device::Cpu)?,
                                 v_packed: vp.to_device(&Device::Cpu)?,
                                 v_scales: vs.to_device(&Device::Cpu)?,
-                                k_shape: Tensor::from_vec(k_shape_vec, (k.shape().dims().len(),), &Device::Cpu)?,
                             },
                             inner.offset,
                             inner.len
@@ -2709,7 +2724,6 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
         }
-
 
         // 3. SSD 저장 위임 (Safe await)
         if !dumps_to_send.is_empty() {
