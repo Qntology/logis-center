@@ -840,7 +840,8 @@ pub fn pack_bitkv_gpu(t: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
     
     let mut plane_bits = Vec::new();
     for bit_idx in 0..4 {
-        let cur_scale = scales.affine(1.0 / (2.0f64.powi(bit_idx)), 0.0)?;
+        let cur_scale = scales.affine(1.0 / (2.0f64.powi(bit_idx)), 0.0)?
+                              .broadcast_as(residual.shape())?; // [FIX] 모양 맞춤
         let mask = residual.ge(0.0)?;
         let delta = mask.where_cond(&cur_scale, &cur_scale.neg()?)?;
         residual = residual.sub(&delta)?;
