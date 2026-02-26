@@ -262,29 +262,46 @@ impl KVRegistry {
 
     pub fn save_to_file(&self, path: &std::path::Path) -> Result<()> {
         let entries = self.entries.read().unwrap();
-        let json = serde_json::to_string_pretty(&*entries)?;
-        std::fs::write(path.join("metadata.json"), json)?;
+        
+        // [DECENTRALIZED-SAVE] 레이어별로 장부를 쪼개서 저장
+        for l_idx in 0..28 {
+            let mut layer_data = Vec::new();
+            for entry in entries.iter() {
+                if entry.location[l_idx] == KVLocation::SSD {
+                    layer_data.push(serde_json::json!({
+                        "token_start": entry.token_start,
+                        "token_len": entry.token_len,
+                        "ssd_path": entry.ssd_path
+                    }));
+                }
+            }
+            let json = serde_json::to_string_pretty(&layer_data)?;
+            let _ = std::fs::write(path.join(format!("layer{}_meta.json", l_idx)), json);
+        }
         Ok(())
     }
 
     pub fn load_from_file(&self, path: &std::path::Path) -> Result<()> {
-        let meta_path = path.join("metadata.json");
-        if !meta_path.exists() { return Ok(()); }
-        let json = std::fs::read_to_string(meta_path)?;
-        let mut loaded: Vec<RegistryEntry> = serde_json::from_str(&json)?;
-        
-        for entry in loaded.iter_mut() {
-            if entry.ssd_path.is_some() {
-                for loc in entry.location.iter_mut() {
-                    *loc = KVLocation::SSD;
-                }
-            }
-        }
-
         let mut entries = self.entries.write().unwrap();
-        for (i, entry) in loaded.into_iter().enumerate() {
-            if i < entries.len() {
-                entries[i] = entry;
+        
+        // [DECENTRALIZED-LOAD] 28개 레이어 장부를 각각 읽어서 통합 장부 복원
+        for l_idx in 0..28 {
+            let meta_path = path.join(format!("layer{}_meta.json", l_idx));
+            if meta_path.exists() {
+                if let Ok(json) = std::fs::read_to_string(meta_path) {
+                    if let Ok(loaded) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
+                        for item in loaded {
+                            let start = item["token_start"].as_u64().unwrap_or(0) as usize;
+                            let idx = start / 256;
+                            if idx < entries.len() {
+                                entries[idx].location[l_idx] = KVLocation::SSD;
+                                if let Some(p) = item["ssd_path"].as_str() {
+                                    entries[idx].ssd_path = Some(std::path::PathBuf::from(p));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())

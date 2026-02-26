@@ -165,13 +165,14 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
 }
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
-    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(2048); 
+    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(10000); 
     tokio::spawn(async move {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(64)); 
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(2000)); 
         while let Some(task) = io_rx.recv().await {
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let sem = semaphore.clone();
             let (tp, ts, reg, b_idx, sid, is_last) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last);
             tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await.unwrap();
                 struct IoGuard; impl Drop for IoGuard { fn drop(&mut self) { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } }
                 let _guard = IoGuard;
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
@@ -180,9 +181,24 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     if let (Some(r), Some(idx)) = (reg, b_idx) {
                         if let Ok(mut entries) = r.entries.write() {
                             if idx < entries.len() {
-                                let e = &mut entries[idx]; e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                                let e = &mut entries[idx]; 
                                 if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
-                                    if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = KVLocation::SSD; } }
+                                    if let Ok(l_idx) = l_str.parse::<usize>() { 
+                                        if l_idx < 28 { 
+                                            e.location[l_idx] = KVLocation::SSD; 
+                                            e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                                            
+                                            // [DECENTRALIZED-META] 레이어별 독립 JSON 기록 (락 경합 완전 제거)
+                                            let meta_file = tp.parent().unwrap().join(format!("layer{}_meta.json", l_idx));
+                                            let info = serde_json::json!({
+                                                "token_start": e.token_start,
+                                                "token_len": e.token_len,
+                                                "layer_idx": l_idx,
+                                                "path": tp.to_string_lossy()
+                                            });
+                                            let _ = fs::write(meta_file, info.to_string());
+                                        } 
+                                    }
                                 }
                             }
                         }
@@ -190,7 +206,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 }
                 let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
                 if rem == 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; }
-                drop(permit);
             });
         }
     });
