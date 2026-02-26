@@ -1904,6 +1904,7 @@ impl QuantizedQwen3VLTextModel {
         let (vram_limit, ram_limit) = self.get_dynamic_limits();
         let mut vram_evicted = false;
 
+        let mut transfers = Vec::new();
         {
             let mut reg = self.registry.entries.write().unwrap();
             let kv_blocks = &mut self.layers[layer_idx].self_attn.kv_blocks;
@@ -1918,25 +1919,53 @@ impl QuantizedQwen3VLTextModel {
                 let num_to_evict = if self.baking_only { vram_indices.len() } else { vram_indices.len().saturating_sub(vram_limit) };
                 for i in 0..num_to_evict {
                     let (idx, _) = vram_indices[i];
-                    let (k_to_move, v_to_move) = {
-                        let inner = kv_blocks[idx].inner.read().unwrap();
+                    
+                    // [STRATEGY-D] 비동기 전송을 위해 데이터를 미리 추출
+                    let (k_vram, v_vram, b_idx) = {
+                        let mut inner = kv_blocks[idx].inner.write().unwrap();
                         if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                            (Some(k.clone()), Some(v.clone()))
-                        } else { (None, None) }
+                            let k_clone = k.clone();
+                            let v_clone = v.clone();
+                            let b_idx = inner.index;
+                            
+                            // VRAM 캐시는 즉시 비워서 다음 레이어가 쓸 공간 확보
+                            inner.k_cache = None;
+                            inner.v_cache = None;
+                            inner.location = KVLocation::Loading; // "이동 중" 상태로 표시
+                            
+                            (k_clone, v_clone, b_idx)
+                        } else { continue; }
                     };
 
-                    if let (Some(k), Some(v)) = (k_to_move, v_to_move) {
-                        let mut inner = kv_blocks[idx].inner.write().unwrap();
-                        inner.k_cache = Some(k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?);
-                        inner.v_cache = Some(v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?);
-                        inner.location = KVLocation::RAM;
-                        if inner.index < reg.len() { reg[inner.index].location[layer_idx] = KVLocation::RAM; }
-                        vram_evicted = true;
-                    }
+                    // 장부 업데이트: 이동 중임을 표시
+                    if b_idx < reg.len() { reg[b_idx].location[layer_idx] = KVLocation::Loading; }
+
+                    let block_clone = kv_blocks[idx].clone();
+                    let registry_clone = self.registry.clone();
+                    
+                    // [ASYNC-TRANSFER] 백그라운드에서 CPU 복사 수행
+                    let handle = tokio::task::spawn_blocking(move || {
+                        let k_cpu = k_vram.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32));
+                        let v_cpu = v_vram.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32));
+                        
+                        if let (Ok(k), Ok(v)) = (k_cpu, v_cpu) {
+                            let mut inner = block_clone.inner.write().unwrap();
+                            inner.k_cache = Some(k);
+                            inner.v_cache = Some(v);
+                            inner.location = KVLocation::RAM;
+                            
+                            let mut reg_w = registry_clone.entries.write().unwrap();
+                            if b_idx < reg_w.len() {
+                                reg_w[b_idx].location[layer_idx] = KVLocation::RAM;
+                            }
+                        }
+                    });
+                    transfers.push(handle);
+                    vram_evicted = true;
                 }
             }
 
-            // RAM 캐시 정리 로직
+            // RAM 캐시 정리 로직 (이미 SSD에 저장된 것들 중 용량 넘치는 것만)
             let mut ram_cached_indices = Vec::new();
             for (idx, block) in kv_blocks.iter().enumerate() {
                 let inner = block.inner.read().unwrap();
@@ -1954,6 +1983,7 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
         }
+        
         if vram_evicted {
             self.layers[layer_idx].self_attn.vram_merged_k = None;
             self.layers[layer_idx].self_attn.vram_merged_v = None;
@@ -2428,6 +2458,24 @@ impl QuantizedQwen3VLTextModel {
             }
             let deepstack_embed = deepstack_visual_embeds.as_ref().and_then(|v| v.get(layer_idx));
             xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks).await?;
+        }
+
+        // [STRATEGY-D-WAIT] 비동기 전송(VRAM -> RAM)이 모두 완료될 때까지 잠시 대기합니다.
+        // 모든 레이어의 모든 블록 중 'Loading' 상태가 없을 때까지 루프를 돕니다.
+        let start_wait = std::time::Instant::now();
+        loop {
+            let mut any_loading = false;
+            {
+                let reg = self.registry.entries.read().unwrap();
+                for entry in reg.iter() {
+                    if entry.location.iter().any(|&loc| loc == KVLocation::Loading) {
+                        any_loading = true;
+                        break;
+                    }
+                }
+            }
+            if !any_loading || start_wait.elapsed().as_secs() > 5 { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
         if target_device.is_cuda() { let _ = target_device.synchronize(); }

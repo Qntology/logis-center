@@ -236,14 +236,51 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         while let Some(task) = io_rx.recv().await {
             let (tp, ts, reg, b_idx, sid, is_last) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last);
             if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
-            if let Ok(_) = candle_core::safetensors::save(&ts, &tp) {
-                println!("[BAKE-SAVE] Saved KV: {:?}", tp.file_name().unwrap_or_default());
+            
+            // [STRATEGY-C] Zero-Copy Mmap 쓰기 적용
+            let save_res = (|| -> Result<()> {
+                use std::fs::OpenOptions;
+                use memmap2::MmapMut;
+                
+                // 1. 데이터 크기 계산
+                let tensors_vec: Vec<_> = ts.iter().collect();
+                let bytes = safetensors::serialize(&ts, &None)?;
+                let total_size = bytes.len();
+
+                // 2. 파일 생성 및 크기 할당
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&tp)?;
+                file.set_len(total_size as u64)?;
+
+                // 3. Memory Map 생성 및 데이터 복사 (OS가 직접 I/O 관리)
+                let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+                mmap.copy_from_slice(&bytes);
+                mmap.flush()?; // 디스크 동기화 유도
+                
+                Ok(())
+            })();
+
+            if save_res.is_ok() {
+                println!("[BAKE-SAVE-ZERO] Saved KV (Mmap): {:?}", tp.file_name().unwrap_or_default());
+            } else {
+                // Mmap 실패 시 폴백 (기존 방식)
+                let _ = candle_core::safetensors::save(&ts, &tp);
+                println!("[BAKE-SAVE-FALLBACK] Saved KV: {:?}", tp.file_name().unwrap_or_default());
             }
+
             if let (Some(r), Some(idx)) = (reg, b_idx) {
                 if let Ok(mut entries) = r.entries.write() {
                     if idx < entries.len() {
                         let e = &mut entries[idx]; e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                        if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
+                        
+                        // [FIX] Strategy B 대응: all_layers.st일 경우 28개 레이어 모두 SSD로 표시
+                        if tp.file_name().map(|n| n == "all_layers.st").unwrap_or(false) {
+                            for loc in e.location.iter_mut() { *loc = KVLocation::SSD; }
+                        } else if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
                             if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = KVLocation::SSD; } }
                         }
                     }
