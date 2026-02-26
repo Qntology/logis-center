@@ -390,9 +390,9 @@ async fn process_task(
     let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
     // [FIX] 작업 유형에 따라 파일명을 자동으로 결정합니다.
     let kv_name = if task.r#type == "image_extraction" {
-        Some("img".to_string())
+        Some("image".to_string())
     } else {
-        Some("pug".to_string())
+        Some("text".to_string())
     };
     
     // [FIX] Robust device preference parsing (supports both "cpu" string and true/false boolean)
