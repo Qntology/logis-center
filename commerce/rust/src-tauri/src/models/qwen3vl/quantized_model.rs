@@ -722,7 +722,7 @@ impl QuantizedQwen3VLTextAttention {
                                    };
                         
                         if let Some(p) = act_path {
-                            if let Ok(content) = std::fs::read(&p) {
+                            if let Ok(content) = crate::utils::direct_loader::load_kv_block(&p) {
                                 if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
                                     let is_relay = p.to_string_lossy().contains("l0.st");
                                     // [STRICT-PREFIX] 기본적으로 현재 블록 오프셋에 맞는 프리픽스를 생성합니다.
@@ -1829,20 +1829,16 @@ impl QuantizedQwen3VLTextModel {
         Ok(results)
     }
 
-    /// [CHUNK-LEVEL-STRICT] 계층형 메모리 관리 (VRAM -> RAM -> SSD)
-    async fn evacuate_chunk_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, _chunk_off: usize, _len: usize) -> Result<()> {
-        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
-        
+    /// [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로 이동
+    async fn evacuate_vram_to_ram_only(&mut self, layer_idx: usize) -> Result<()> {
         // [DYNAMIC-LIMITS] 시스템 자원 상황에 따라 임계값 유동적 조절 (OOM 방지)
-        let (vram_limit, ram_limit) = {
+        let vram_limit = {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
             
             // VRAM 여유분 체크 (간단히 4.0GB 이상 여유 있으면 최대치 사용)
-            let v_limit = if free_ram_gb > 4.0 { 64 } else if free_ram_gb > 2.0 { 32 } else { 8 };
-            let r_limit = if free_ram_gb > 8.0 { 128 } else if free_ram_gb > 4.0 { 64 } else { 16 };
-            (v_limit, r_limit)
+            if free_ram_gb > 4.0 { 64 } else if free_ram_gb > 2.0 { 32 } else { 8 }
         };
 
         let mut vram_evicted = false;
@@ -1892,103 +1888,15 @@ impl QuantizedQwen3VLTextModel {
             self.layers[layer_idx].self_attn.merged_vram_block_count = 0;
         }
 
-        // 2. RAM -> SSD 계층 관리
-        let mut dumps_to_send = Vec::new();
-        {
-            let mut reg = self.registry.entries.write().unwrap();
-            let kv_blocks = &mut self.layers[layer_idx].self_attn.kv_blocks;
-            
-            // [BACKGROUND-SYNC] RAM에 있지만 아직 SSD에 저장되지 않은 모든 블록을 찾아 저장 큐에 넣습니다.
-            for (idx, block) in kv_blocks.iter().enumerate() {
-                let mut inner = block.inner.write().unwrap();
-                if inner.location == KVLocation::RAM && inner.k_cache.is_some() {
-                    let is_already_on_ssd = inner.index < reg.len() && reg[inner.index].location[layer_idx] == KVLocation::SSD;
-                    
-                    if !is_already_on_ssd {
-                        if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                            dumps_to_send.push((
-                                LayerKVDump { layer_idx, k_tensor: k.clone(), v_tensor: v.clone() },
-                                inner.offset,
-                                inner.len
-                            ));
-                            if inner.index < reg.len() {
-                                reg[inner.index].location[layer_idx] = KVLocation::SSD;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // [MEMORY-EVICTION] 만약 RAM 사용량이 임계치를 넘었거나, 베이킹 모드라면 SSD로 백업된 캐시를 비웁니다.
-            let mut ram_cached_indices = Vec::new();
-            for (idx, block) in kv_blocks.iter().enumerate() {
-                let inner = block.inner.read().unwrap();
-                if inner.k_cache.is_some() && inner.index < reg.len() && reg[inner.index].location[layer_idx] == KVLocation::SSD {
-                    ram_cached_indices.push((idx, inner.offset));
-                }
-            }
-
-            if ram_cached_indices.len() > ram_limit || (self.baking_only && !ram_cached_indices.is_empty()) {
-                ram_cached_indices.sort_by_key(|k| k.1); 
-                let num_to_clear = if self.baking_only { ram_cached_indices.len() } else { ram_cached_indices.len().saturating_sub(ram_limit) };
-                for i in 0..num_to_clear {
-                    let (idx, _) = ram_cached_indices[i];
-                    let mut inner = kv_blocks[idx].inner.write().unwrap();
-                    inner.k_cache = None;
-                    inner.v_cache = None;
-                }
-            }
-        } // Registry lock dropped here
-
-        // 3. SSD 저장 실행 (Await points are safe now)
-        if !dumps_to_send.is_empty() {
-            if let Some(tx) = BAKE_TX.get() {
-                let path = crate::utils::paths::get_kv_dir(None).join(session_id);
-                
-                // [FIX] 'reference' 하위 폴더 구조 지원 (예: reference/pug, reference/img)
-                let sub_folder = if self.baking_only {
-                    let name = self.active_kv_name.as_deref().unwrap_or("general");
-                    format!("reference/{}", name)
-                } else {
-                    self.active_kv_name.clone().unwrap_or_else(|| "inference".to_string())
-                };
-                
-                let target_path = path.join(&sub_folder);
-                if !target_path.exists() { let _ = fs::create_dir_all(&target_path); }
-                if !target_path.exists() { let _ = fs::create_dir_all(&target_path); }
-                
-                let rr = Some(self.registry.clone());
-                let mode = self.baking_only;
-
-                for (dump, off, b_len) in dumps_to_send {
-                    let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
-                    let block_dir = target_path.join(format!("b{}", off));
-                    if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
-                    
-                    let b_idx = off / 256;
-                    // Registry update needs a brief lock
-                    {
-                        let mut reg_w = self.registry.entries.write().unwrap();
-                        if b_idx < reg_w.len() {
-                            reg_w[b_idx].ssd_path = Some(block_dir.clone());
-                        }
-                    }
-
-                    let _ = tx.send(SlotTask::Bake(BakeTask {
-                        slot_id: sid,
-                        task_dir: block_dir,
-                        kv_name: Some(sub_folder.clone()),
-                        offset: off,
-                        layers: vec![dump],
-                        is_relay_baking: mode,
-                        block_idx: Some(b_idx),
-                        registry: rr.clone().expect("registry"),
-                    })).await;
-                }
-            }
-        }
         Ok(())
     }
+
+    /// [BLOCK-LEVEL-SYNC] 모든 레이어의 청크 연산이 끝난 후, 완성된 블록들을 한꺼번에 SSD로 저장
+    async fn sync_all_layers_to_ssd(&mut self, session_id: &str) -> Result<()> {
+        let kv_name = self.active_kv_name.clone();
+        self.force_flush_all_active_blocks(session_id, kv_name.as_deref()).await
+    }
+
 
     pub fn get_current_kv(&self) -> (Vec<Tensor>, Vec<Tensor>) {
         let mut ks = vec![];
@@ -2082,7 +1990,7 @@ impl QuantizedQwen3VLTextModel {
                 };
 
                 if let Some(act_p) = actual_path {
-                    if let Ok(content) = std::fs::read(&act_p) {
+                    if let Ok(content) = crate::utils::direct_loader::load_kv_block(&act_p) {
                         if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
                             let is_relay_file = act_p.file_name().map(|n| n == "l0.st").unwrap_or(false);
                             let prefix = if is_relay_file { format!("b{}_l0_", block_offset) } else { format!("b{}_l{}_", block_offset, l_idx) };
@@ -2639,7 +2547,7 @@ impl QuantizedQwen3VLTextModel {
 
         // 마지막 프래그먼트에서 실제 길이를 읽어와 전체 길이를 확정합니다.
         let (_, last_st_path) = fragments.last().unwrap();
-        if let Ok(content) = std::fs::read(last_st_path) {
+        if let Ok(content) = crate::utils::direct_loader::load_kv_block(last_st_path) {
             if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
                 if let Ok(view) = st.tensor("k_shape") {
                     let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };

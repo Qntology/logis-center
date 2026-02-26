@@ -4,6 +4,7 @@ pub mod hash;
 pub mod paths;
 pub mod compression;
 pub mod resources;
+pub mod direct_loader;
 
 use candle_core::{Device, DType};
 use anyhow::Result;

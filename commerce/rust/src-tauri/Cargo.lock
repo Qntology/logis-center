@@ -2671,6 +2671,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "direct-storage"
+version = "0.7.1"
+dependencies = [
+ "libloading 0.8.9",
+ "windows 0.61.3",
+ "windows-core 0.61.2",
+ "windows-link 0.1.3",
+]
+
+[[package]]
 name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4936,6 +4946,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "io-uring"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "595a0399f411a508feb2ec1e970a4a30c249351e30208960d58298de8660b0e5"
+dependencies = [
+ "bitflags 1.3.2",
+ "libc",
 ]
 
 [[package]]
@@ -8500,6 +8520,7 @@ dependencies = [
  "candle-transformers",
  "chromiumoxide",
  "chrono",
+ "direct-storage",
  "dirs",
  "ego-tree",
  "encoding_rs",
@@ -8509,9 +8530,11 @@ dependencies = [
  "flate2",
  "futures",
  "image",
+ "io-uring",
  "lancedb",
  "libc",
  "memmap2",
+ "metal 0.29.0",
  "minijinja",
  "num",
  "nvml-wrapper",
@@ -8535,6 +8558,7 @@ dependencies = [
  "url",
  "uuid 1.19.0",
  "which 6.0.3",
+ "windows 0.61.3",
  "windows-sys 0.52.0",
 ]
 

@@ -19,6 +19,7 @@ use crate::{
         get_device,
         get_dtype,
         get_logit_processor,
+        direct_loader::save_kv_block,
     },
     openai_types::ChatCompletionParameters,
 };
@@ -28,6 +29,7 @@ use std::path::Path;
 
 use std::path::PathBuf;
 use tokio::sync::mpsc;
+use safetensors;
 
 // [GLOBAL] 슬롯 관리자
 pub struct SlotManager {
@@ -236,8 +238,12 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         while let Some(task) = io_rx.recv().await {
             let (tp, ts, reg, b_idx, sid, is_last) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last);
             if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
-            if let Ok(_) = candle_core::safetensors::save(&ts, &tp) {
-                println!("[BAKE-SAVE] Saved KV: {:?}", tp.file_name().unwrap_or_default());
+            
+            // [OPTIMIZED-SAVE] Serialize to memory and use high-performance I/O for saving
+            if let Ok(data) = safetensors::serialize(&ts, &None) {
+                if let Ok(_) = save_kv_block(&tp, &data) {
+                    println!("[BAKE-SAVE] Saved KV (Optimized): {:?}", tp.file_name().unwrap_or_default());
+                }
             }
             if let (Some(r), Some(idx)) = (reg, b_idx) {
                 if let Ok(mut entries) = r.entries.write() {
