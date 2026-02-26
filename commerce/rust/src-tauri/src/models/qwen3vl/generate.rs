@@ -294,6 +294,15 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let io_tx_inner = io_tx.clone();
                     let (sid, off, is_relay) = (bake.slot_id, bake.offset, bake.is_relay_baking);
                     let loop_count = bake.layers.len();
+                    
+                    // [OPTIMIZATION] 256 토큰 미만의 작은 청크는 생성 중인 '짜투리'이므로 SSD 저장을 생략합니다.
+                    // (단, 릴레이 모드나 명시적 저장이 필요한 경우는 제외할 수 있으나 여기서는 속도 우선)
+                    let first_layer_len = bake.layers.first().map(|l| l.k_tensor.dim(2).unwrap_or(0)).unwrap_or(0);
+                    if first_layer_len < 256 && !is_relay {
+                        SLOT_MANAGER.mark_ready(sid).await;
+                        continue;
+                    }
+
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
                     for l_idx in 0..loop_count {
                         let src = &bake.layers[l_idx];

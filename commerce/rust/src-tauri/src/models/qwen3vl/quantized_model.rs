@@ -721,45 +721,73 @@ impl QuantizedQwen3VLTextAttention {
                                        else { None }
                                    };
                         
-                                                if let Some(p) = act_path {
-                                                    if let Ok(content) = crate::utils::direct_loader::load_kv_block(&p) {
-                                                        let recovery_data = if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                                            let is_relay = p.to_string_lossy().contains("l0.st");
-                                                            let exact_prefix = if is_relay { format!("b{}_l0_", b_off) } else { format!("b{}_l{}_", b_off, self.layer_idx) };
-                                                            
-                                                            let mut act_prefix = exact_prefix.clone();
-                                                            let mut found_data = st.tensor(&format!("{}k_anchors", act_prefix)).is_ok();
-                        
-                                                            if !found_data {
-                                                                if let Some((k, _)) = st.tensors().iter().find(|(name, _)| name.contains("k_anchors")) {
-                                                                    act_prefix = k.strip_suffix("k_anchors").unwrap_or("").to_string();
-                                                                    found_data = true;
-                                                                }
-                                                            }
-                        
-                                                            let get_t = |s: &str| st.tensor(&format!("{}{}", act_prefix, s)).ok();
-                                                                                                                                    if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
-                                                                                                                                        let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
-                                                                                                                                        Some((
-                                                                                                                                            Tensor::from_vec(bytes_to_f32(ka.data()), (1, self.num_key_value_heads, ka.shape()[2], self.head_dim), &Device::Cpu).map_err(|e| anyhow!(e))?,
-                                                                                                                                            Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).map_err(|e| anyhow!(e))?,
-                                                                                                                                            Tensor::from_vec(bytes_to_f32(ks.data()), (1, self.num_key_value_heads, b_len, 1), &Device::Cpu).map_err(|e| anyhow!(e))?,
-                                                                                                                                            Tensor::from_vec(bytes_to_f32(va.data()), (1, self.num_key_value_heads, ka.shape()[2], self.head_dim), &Device::Cpu).map_err(|e| anyhow!(e))?,
-                                                                                                                                            Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).map_err(|e| anyhow!(e))?,
-                                                                                                                                            Tensor::from_vec(bytes_to_f32(vs.data()), (1, self.num_key_value_heads, b_len, 1), &Device::Cpu).map_err(|e| anyhow!(e))?,
-                                                                                                                                        ))
-                                                                                                                                    } else { None }
-                                                                                                                                                        } else { None };
-                        
-                                                        // content and st are dropped here
-                                                        if let Some((ka, kp, ks, va, vp, vs)) = recovery_data {
-                                                            let meta_os = vec![1, self.num_key_value_heads, b_len, self.head_dim];
-                                                            k_active = Some(self.decompress_from_bitkv(&ka, &kp, &ks, &meta_os, dev)?);
-                                                            v_active = Some(self.decompress_from_bitkv(&va, &vp, &vs, &meta_os, dev)?);
-                                                            if self.layer_idx == 0 { println!("[JIT-LOAD] SUCCESS: Layer {} Block {}", self.layer_idx, b_off); }
-                                                        }
-                                                    }
-                                                }
+                                                                        // [OPTIMIZATION] RAM 캐시(bitkv_cache) 먼저 확인
+                                                                        let cached_data = {
+                                                                            let reg = self.registry.entries.read().unwrap();
+                                                                            if index < reg.len() {
+                                                                                let cache = reg[index].bitkv_cache.read().unwrap();
+                                                                                cache[self.layer_idx].as_ref().map(|m| (m.k_anchors.clone(), m.k_packed.clone(), m.k_scales.clone(), m.v_anchors.clone(), m.v_packed.clone(), m.v_scales.clone()))
+                                                                            } else { None }
+                                                                        };
+                                                
+                                                                        if let Some((ka, kp, ks, va, vp, vs)) = cached_data {
+                                                                            // [HIT] RAM 캐시에 데이터가 있음 - SSD I/O 생략
+                                                                            let meta_os = vec![1, self.num_key_value_heads, b_len, self.head_dim];
+                                                                            k_active = Some(self.decompress_from_bitkv(&ka, &kp, &ks, &meta_os, dev)?);
+                                                                            v_active = Some(self.decompress_from_bitkv(&va, &vp, &vs, &meta_os, dev)?);
+                                                                        } else if let Some(p) = act_path {
+                                                                            // [MISS] SSD에서 읽어오기
+                                                                            if let Ok(content) = crate::utils::direct_loader::load_kv_block(&p) {
+                                                                                let recovery_data = if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                                                                                    let is_relay = p.to_string_lossy().contains("l0.st");
+                                                                                    let exact_prefix = if is_relay { format!("b{}_l0_", b_off) } else { format!("b{}_l{}_", b_off, self.layer_idx) };
+                                                                                    
+                                                                                    let mut act_prefix = exact_prefix.clone();
+                                                                                    let mut found_data = st.tensor(&format!("{}k_anchors", act_prefix)).is_ok();
+                                                
+                                                                                    if !found_data {
+                                                                                        if let Some((k, _)) = st.tensors().iter().find(|(name, _)| name.contains("k_anchors")) {
+                                                                                            act_prefix = k.strip_suffix("k_anchors").unwrap_or("").to_string();
+                                                                                            found_data = true;
+                                                                                        }
+                                                                                    }
+                                                
+                                                                                    let get_t = |s: &str| st.tensor(&format!("{}{}", act_prefix, s)).ok();
+                                                                                    if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
+                                                                                        let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
+                                                                                        Some((
+                                                                                            Tensor::from_vec(bytes_to_f32(ka.data()), (1, self.num_key_value_heads, ka.shape()[2], self.head_dim), &Device::Cpu).map_err(|e| anyhow!(e))?,
+                                                                                            Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).map_err(|e| anyhow!(e))?,
+                                                                                            Tensor::from_vec(bytes_to_f32(ks.data()), (1, self.num_key_value_heads, b_len, 1), &Device::Cpu).map_err(|e| anyhow!(e))?,
+                                                                                            Tensor::from_vec(bytes_to_f32(va.data()), (1, self.num_key_value_heads, ka.shape()[2], self.head_dim), &Device::Cpu).map_err(|e| anyhow!(e))?,
+                                                                                            Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).map_err(|e| anyhow!(e))?,
+                                                                                            Tensor::from_vec(bytes_to_f32(vs.data()), (1, self.num_key_value_heads, b_len, 1), &Device::Cpu).map_err(|e| anyhow!(e))?,
+                                                                                        ))
+                                                                                    } else { None }
+                                                                                } else { None };
+                                                
+                                                                                if let Some((ka, kp, ks, va, vp, vs)) = recovery_data {
+                                                                                    // [STICKY-SAVE] 읽어온 데이터를 RAM 캐시에 영구 보관 (다음 토큰부터 SSD 안 씀)
+                                                                                    let meta_os = vec![1, self.num_key_value_heads, b_len, self.head_dim];
+                                                                                    {
+                                                                                        let reg = self.registry.entries.read().unwrap();
+                                                                                        if index < reg.len() {
+                                                                                            let mut cache = reg[index].bitkv_cache.write().unwrap();
+                                                                                            cache[self.layer_idx] = Some(BitKVMetadata {
+                                                                                                k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(),
+                                                                                                v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(),
+                                                                                                original_shape: meta_os.clone(),
+                                                                                            });
+                                                                                        }
+                                                                                    }
+                                                
+                                                                                    k_active = Some(self.decompress_from_bitkv(&ka, &kp, &ks, &meta_os, dev)?);
+                                                                                    v_active = Some(self.decompress_from_bitkv(&va, &vp, &vs, &meta_os, dev)?);
+                                                                                    if self.layer_idx == 0 { println!("[JIT-LOAD] SSD -> RAM CACHED: Block {}", b_off); }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                
                          else if self.layer_idx == 0 {
                             println!("[JIT-LOAD] NOT-FOUND: Layer {} Block {} at {:?}", self.layer_idx, b_off, path);
                         }
@@ -989,10 +1017,14 @@ impl QuantizedQwen3VLTextAttention {
         // 3. 반복적 잔차 복구 (GPU Tensor Ops)
         let mut decoded = Tensor::zeros(original_shape, DType::F32, device)?;
         for (b, mask_plane) in planes.into_iter().enumerate() {
-            let bit_scale = scales_gpu.affine(1.0 / (2.0f64.powi(b as i32)), 0.0)?;
+            // [FIX] bit_scale을 명시적으로 [1, 8, 256, 128] 모양으로 확장
+            let bit_scale = scales_gpu.affine(1.0 / (2.0f64.powi(b as i32)), 0.0)?
+                                      .broadcast_as(original_shape)?; 
+            
             let mask = mask_plane.reshape(original_shape)?;
             
             // val += is_set ? scale : -scale
+            // 여기서 mask와 bit_scale의 모양이 완전히 일치해야 합니다.
             let delta = mask.where_cond(&bit_scale, &bit_scale.neg()?)?;
             decoded = decoded.add(&delta)?;
         }
@@ -2069,29 +2101,47 @@ impl QuantizedQwen3VLTextModel {
 
         let mut tasks = Vec::new();
 
+        // 루프 진입 전 필요한 설정값 미리 복사 (Borrow Checker 해결)
+        let n_kv_h = self.layers[0].self_attn.num_key_value_heads;
+        let h_d = self.layers[0].self_attn.head_dim;
+
         // 1. 모든 레이어의 활성 블록 수집
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
             for block in &mut layer.self_attn.kv_blocks {
                 let mut inner = block.inner.write().unwrap();
                 
-                // RAM에 데이터가 있다면 저장 대상 (이미 위에서 VRAM -> RAM으로 다 내렸음)
-                if inner.k_cache.is_some() {
+                // [OPTIMIZATION] RAM에 데이터가 있고, 꽉 찬 블록(256)인 경우에만 저장 대상으로 수집합니다.
+                // 1토큰 단위의 짜투리 데이터 저장을 막아 병목을 해결합니다.
+                if inner.k_cache.is_some() && inner.len == 256 {
                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                         // CPU로 이동 (이미 RAM이면 비용 없음)
-                         let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                         let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                         // 1. GPU에서 압축 데이터(BitKV) 생성
+                         let (ka, kp, ks) = crate::utils::tensor_utils::pack_bitkv_gpu(k)?;
+                         let (va, vp, vs) = crate::utils::tensor_utils::pack_bitkv_gpu(v)?;
                          
+                         // 2. [STICKY-RAM] RAM 캐시에 보관 (다음 토큰 생성 시 사용)
+                         let meta_os = vec![1, n_kv_h, inner.len, h_d];
+                         {
+                             let reg = self.registry.entries.read().unwrap();
+                             let mut cache = reg[inner.index].bitkv_cache.write().unwrap();
+                             cache[l_idx] = Some(BitKVMetadata {
+                                 k_anchors: ka.clone(), k_packed: kp.clone(), k_scales: ks.clone(),
+                                 v_anchors: va.clone(), v_packed: vp.clone(), v_scales: vs.clone(),
+                                 original_shape: meta_os,
+                             });
+                         }
+
+                         // 3. SSD 저장 큐로 전달 (압축된 데이터 사용)
                          tasks.push((
                              l_idx,
                              inner.offset,
                              inner.len,
-                             LayerKVDump { layer_idx: l_idx, k_tensor: k_cpu, v_tensor: v_cpu }
+                             LayerKVDump { layer_idx: l_idx, k_tensor: k.to_device(&Device::Cpu)?, v_tensor: v.to_device(&Device::Cpu)? }
                          ));
                          
-                         // 메모리 해제
+                         // 메모리 해제 및 위치 업데이트
                          inner.k_cache = None;
                          inner.v_cache = None;
-                         inner.location = KVLocation::SSD; // 곧 저장될 것임
+                         inner.location = KVLocation::SSD;
                     }
                 }
             }
