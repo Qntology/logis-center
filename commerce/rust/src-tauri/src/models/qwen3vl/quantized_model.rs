@@ -997,16 +997,25 @@ impl QuantizedQwen3VLTextAttention {
             decoded = decoded.add(&delta)?;
         }
 
-        // 4. Anchor 복구 (Sparse vectors)
+        // 4. Anchor 복구 (Sparse vectors) - [OPTIMIZED] 단일 연산으로 처리
         let seq_len = original_shape[2];
         let ac_indices: Vec<u32> = (0..seq_len as u32).filter(|&i| i < 4 || i % 8 == 0).collect();
+        let ac_count = ac_indices.len();
         
-        // slice_assign을 사용하여 앵커 위치만 원본 값으로 덮어씀
-        let mut final_out = decoded;
-        for (idx, target_s) in ac_indices.into_iter().enumerate() {
-            let anchor_vec = anchors_gpu.narrow(2, idx, 1)?;
-            final_out = final_out.slice_assign(&[(0..1), (0..self.num_key_value_heads), (target_s as usize..target_s as usize + 1), (0..self.head_dim)], &anchor_vec)?;
-        }
+        // 앵커 위치를 나타내는 불리언 마스크 생성
+        let mut mask_vec = vec![0u8; seq_len];
+        for &idx in &ac_indices { mask_vec[idx as usize] = 1; }
+        let anchor_mask = Tensor::from_vec(mask_vec, vec![1, 1, seq_len, 1], device)?.to_dtype(DType::U8)?.broadcast_as(original_shape)?;
+
+        // 앵커 데이터를 원래 위치로 확산 (Scatter)
+        // 1. 전체 크기의 제로 텐서 생성
+        let zeros = Tensor::zeros(original_shape, DType::F32, device)?;
+        // 2. index_add를 사용하여 앵커들만 제자리에 배치 (이 연산은 앵커 텐서가 (1, H, AC, D) 구조임을 활용)
+        let ac_idx_tensor = Tensor::from_vec(ac_indices, vec![ac_count], device)?;
+        let anchor_scattered = zeros.index_add(&ac_idx_tensor, &anchors_gpu, 2)?;
+
+        // 3. 마스크를 사용하여 최종 합성: (mask ? anchor : decoded)
+        let final_out = anchor_mask.where_cond(&anchor_scattered, &decoded)?;
 
         Ok(final_out.to_dtype(target_dtype)?)
     }
