@@ -193,40 +193,28 @@ pub fn init_bake_worker() {
 async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {
         match req {
-            SlotRequest::Acquire { total_tokens: _, tx } => {
-                let max_writes = 8;
+            SlotRequest::Acquire { total_tokens, tx } => {
+                let max_writes = if total_tokens < 4096 { 12 } else if total_tokens < 8192 { 8 } else { 4 };
                 let mut found = None;
                 while found.is_none() {
                     if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
                         for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
-                            if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { 
-                                SLOT_MANAGER.update_counters(0, 1); 
-                                SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); 
-                                found = Some(i); 
-                                break; 
-                            }
+                            if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { SLOT_MANAGER.update_counters(0, 1); SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); found = Some(i); break; }
                         }
                         if found.is_none() {
                             for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
-                                if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { 
-                                    SLOT_MANAGER.update_counters(2, 1); 
-                                    SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); 
-                                    found = Some(i); 
-                                    break; 
-                                }
+                                if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { SLOT_MANAGER.update_counters(2, 1); SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); found = Some(i); break; }
                             }
                         }
                     }
-                    if found.is_none() { 
-                        // [OPTIMIZATION] 1ms 폴링 대신 Notify 이벤트를 기다려 반응성 극대화
-                        SLOT_MANAGER.handoff_notifier.notified().await;
-                    }
+                    if found.is_none() { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
                 }
                 let _ = tx.send(found.unwrap());
             },
             SlotRequest::Release { idx, .. } => {
                 let slot = &SLOT_MANAGER.slots[idx];
                 if slot.remaining_layers.load(Ordering::SeqCst) > 0 {
+                    println!("[SLOT-WARN] Release denied for Slot {}. IO still in progress.", idx);
                     continue; 
                 }
                 let prev = slot.state.swap(0, Ordering::SeqCst);
@@ -236,7 +224,6 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                     for lk in &slot.k_layers { if let Ok(mut g) = lk.try_lock() { *g = None; } }
                     for lv in &slot.v_layers { if let Ok(mut g) = lv.try_lock() { *g = None; } }
                 }
-                // 대기 중인 Acquire 태스크들에게 알림
                 SLOT_MANAGER.handoff_notifier.notify_waiters();
             }
         }
@@ -249,86 +236,42 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         while let Some(task) = io_rx.recv().await {
             let (tp, ts, reg, b_idx, sid, is_last) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last);
             if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
-            
-            // [STRATEGY-C] Zero-Copy Mmap 쓰기 적용
-            let save_res = (|| -> Result<()> {
-                use std::fs::OpenOptions;
-                use memmap2::MmapMut;
-                let bytes = safetensors::serialize(&ts, &None)?;
-                let total_size = bytes.len();
-
-                let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tp)?;
-                file.set_len(total_size as u64)?;
-
-                let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-                mmap.copy_from_slice(&bytes);
-                mmap.flush()?;
-                Ok(())
-            })();
-
-            if save_res.is_ok() {
-                println!("[BAKE-SAVE-ZERO] Saved KV (Mmap): {:?} | Slot: {}", tp.file_name().unwrap_or_default(), sid);
-                if let (Some(r), Some(idx)) = (reg, b_idx) {
-                    if let Ok(mut entries) = r.entries.write() {
-                        if idx < entries.len() {
-                            let e = &mut entries[idx];
-                            e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                            if tp.file_name().map(|n| n == "all_layers.st").unwrap_or(false) {
-                                for loc in e.location.iter_mut() { *loc = KVLocation::SSD; }
-                            }
-                        }
-                    }
-                }
-            } else {
-                let _ = candle_core::safetensors::save(&ts, &tp);
-                println!("[BAKE-SAVE-FALLBACK] Saved KV: {:?}", tp.file_name().unwrap_or_default());
-                if let (Some(r), Some(idx)) = (reg, b_idx) {
-                    if let Ok(mut entries) = r.entries.write() {
-                        if idx < entries.len() {
-                            let e = &mut entries[idx];
-                            e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                            if tp.file_name().map(|n| n == "all_layers.st").unwrap_or(false) {
-                                for loc in e.location.iter_mut() { *loc = KVLocation::SSD; }
-                            }
+            if let Ok(_) = candle_core::safetensors::save(&ts, &tp) {
+                println!("[BAKE-SAVE] Saved KV: {:?}", tp.file_name().unwrap_or_default());
+            }
+            if let (Some(r), Some(idx)) = (reg, b_idx) {
+                if let Ok(mut entries) = r.entries.write() {
+                    if idx < entries.len() {
+                        let e = &mut entries[idx]; e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                        if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
+                            if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = KVLocation::SSD; } }
                         }
                     }
                 }
             }
-
             GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
             let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
-            if rem == 1 || is_last { 
-                SLOT_MANAGER.slots[sid].remaining_layers.store(0, Ordering::SeqCst);
-                SLOT_MANAGER.release_slot(sid).await;
-                println!("[SLOT-SYNC] Slot {} released. Active Writes: {}", sid, SLOT_MANAGER.active_write_count.load(Ordering::SeqCst)); 
-            }
+            if rem == 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; println!("[SLOT-SYNC] Slot {} is now fully baked and ready.", sid); }
         }
     });
 
     tokio::spawn(async move {
-        use rayon::prelude::*;
         while let Some(task) = rx.recv().await {
             match task {
                 SlotTask::Bake(bake) => {
                     let io_tx_inner = io_tx.clone();
                     let (sid, off, is_relay) = (bake.slot_id, bake.offset, bake.is_relay_baking);
                     let loop_count = bake.layers.len();
-                    
-                    // [FIX] Strategy B: 28개 파일을 하나로 합쳐서 한 번만 쓰므로, 대기 카운트를 1로 설정합니다.
-                    SLOT_MANAGER.slots[sid].remaining_layers.store(1, Ordering::SeqCst);
-
-                    // [STRATEGY-A] 레이어별 압축 가공을 CPU 모든 코어로 병렬화합니다.
-                    let processed_layers: Vec<_> = bake.layers.into_par_iter().map(|src| {
+                    SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
+                    for l_idx in 0..loop_count {
+                        let src = &bake.layers[l_idx];
                         let act_l = if is_relay && loop_count == 1 { 0 } else { src.layer_idx };
                         let mut map = std::collections::HashMap::new();
                         let prefix = if is_relay { format!("b{}_l0_", off) } else { format!("b{}_l{}_", off, act_l) };
-                        
                         if let Ok(ks_dims) = src.k_tensor.dims4() {
                             let (b, h, s, d) = (ks_dims.0, ks_dims.1, ks_dims.2, ks_dims.3);
                             let total_elements = b * h * s * d;
                             let ac = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
-                            
-                            // K Tensor 가공
                             if let Ok(t_f32) = src.k_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()) {
                                 if let Ok(t_data) = t_f32.to_vec1::<f32>() {
                                     let mut ka = vec![0.0f32; b * h * ac * d];
@@ -357,8 +300,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     if let Ok(t) = Tensor::from_vec(ksc, vec![b, h, s, 1], &Device::Cpu) { map.insert(format!("{}k_scales", prefix), t); }
                                 }
                             }
-                            
-                            // V Tensor 가공
                             if let Ok(t_f32) = src.v_tensor.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)).and_then(|t| t.flatten_all()) {
                                 if let Ok(t_data) = t_f32.to_vec1::<f32>() {
                                     let mut va = vec![0.0f32; b * h * ac * d];
@@ -390,29 +331,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             if let Ok(t) = Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu) { map.insert(format!("{}k_shape", prefix), t); }
                             if let Ok(t) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) { map.insert(format!("{}mode", prefix), t); }
                         }
-                        (act_l, map)
-                    }).collect();
-
-                    // 가공이 완료된 결과들을 하나의 맵으로 병합 (Strategy B)
-                    let reg_ref = bake.registry.clone();
-                    let task_dir = bake.task_dir.clone();
-                    let block_idx = bake.block_idx;
-                    
-                    let mut combined_map = std::collections::HashMap::new();
-                    for (_act_l, map) in processed_layers {
-                        combined_map.extend(map);
+                        GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
+                        let _ = io_tx_inner.send(SaveTask { slot_id: sid, path: bake.task_dir.join(format!("l{}.st", act_l)), tensors: map, is_last: l_idx == loop_count - 1, block_idx: bake.block_idx, registry: Some(bake.registry.clone()) }).await;
                     }
-
-                    // 단 한 번의 I/O 작업으로 28개 레이어 전부 저장
-                    GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-                    let _ = io_tx_inner.send(SaveTask { 
-                        slot_id: sid, 
-                        path: task_dir.join("all_layers.st"), 
-                        tensors: combined_map, 
-                        is_last: true, 
-                        block_idx, 
-                        registry: Some(reg_ref) 
-                    }).await;
                 },
                 SlotTask::Load(load) => {
                     let sid = load.slot_id; let reg = load.registry.clone(); let l_idx = load.layer_idx; let shared_block = load.shared_block.clone();
