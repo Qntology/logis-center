@@ -609,8 +609,9 @@ impl QuantizedQwen3VLTextAttention {
                 let inner = block.inner.read().unwrap();
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                     if vram_start_off.is_none() { vram_start_off = Some(b_off); }
-                    vram_ks.push(k.clone());
-                    vram_vs.push(v.clone());
+                    // [FIX] BF16 vs F32 충돌 방지: VRAM 블록도 명시적으로 target_dtype으로 맞춤
+                    vram_ks.push(k.to_device(dev)?.to_dtype(target_dtype)?);
+                    vram_vs.push(v.to_device(dev)?.to_dtype(target_dtype)?);
                     vram_total_len += b_len;
                 }
                 continue;
@@ -888,7 +889,7 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_blocks.clear();
     }
 
-    pub async fn trigger_realtime_incremental_bake(&mut self, session_id: &str, is_last_chunk: bool, baking_only: bool) -> Result<()> {
+    pub fn trigger_realtime_incremental_bake(&self, session_id: &str, is_last_chunk: bool, baking_only: bool) -> Result<()> {
         use crate::models::qwen3vl::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
 
         let target_indices: Vec<usize> = self.kv_blocks.iter().enumerate().filter_map(|(i, b)| {
@@ -902,7 +903,6 @@ impl QuantizedQwen3VLTextAttention {
             let block = self.kv_blocks[idx].clone();
             let (k_opt, v_opt, off, b_idx, b_len) = {
                 let inner = block.inner.read().unwrap();
-                // [VRAM-PINNING] .take() 대신 .clone()을 사용하여 VRAM에 원본을 남깁니다.
                 (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len)
             };
 
@@ -921,36 +921,44 @@ impl QuantizedQwen3VLTextAttention {
                     k_shape: Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?,
                 };
 
-                if let Some(tx) = BAKE_TX.get() {
-                    let kv_name_base = self.active_kv_name.clone().unwrap_or_else(|| "general".to_string());
-                    let mode = baking_only;
-                    
-                    let (target_path, index_kv_name): (std::path::PathBuf, String) = if mode {
-                        let sub = format!("{}/reference/{}", session_id, kv_name_base);
-                        (crate::utils::paths::get_kv_dir(None).join(&sub), sub)
-                    } else {
-                        let sub = format!("{}/inference/{}", session_id, kv_name_base);
-                        (crate::utils::paths::get_kv_dir(None).join(&sub), sub)
-                    };
+                let kv_name_base = self.active_kv_name.as_deref().unwrap_or("text");
+                // [FIX] inference/inference 중복 방지 및 타입 명시
+                let kv_type = if kv_name_base == "inference" || kv_name_base == "reference" { "text" } else { kv_name_base };
+                
+                let session_id_owned = session_id.to_string();
+                let registry_clone = self.registry.clone();
+                let layer_idx = self.layer_idx;
 
-                    let block_dir = target_path.join(format!("b{}", off));
-                    let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
-                    let _ = tx.send(SlotTask::Bake(BakeTask {
-                        slot_id: sid,
-                        task_dir: block_dir,
-                        kv_name: Some(index_kv_name),
-                        offset: off,
-                        layers: vec![dump],
-                        is_relay_baking: baking_only,
-                        block_idx: Some(b_idx),
-                        registry: self.registry.clone(),
-                    })).await;
-                    
-                    // [VRAM-PINNING] 위치를 SSD로 바꾸지 않고 VRAM으로 유지하여 초고속 연산 지속
-                    {
-                        let mut inner = block.inner.write().unwrap();
-                        inner.location = KVLocation::VRAM;
+                // [FIRE-AND-FORGET] SSD 저장을 백그라운드 태스크로 분리하여 연산 흐름을 방해하지 않음
+                tauri::async_runtime::spawn(async move {
+                    if let Some(tx) = BAKE_TX.get() {
+                        let sub_path = if baking_only {
+                            format!("{}/reference/{}", session_id_owned, kv_type)
+                        } else {
+                            format!("{}/inference/{}", session_id_owned, kv_type)
+                        };
+
+                        let block_dir = crate::utils::paths::get_kv_dir(None).join(&sub_path).join(format!("b{}", off));
+                        if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
+
+                        let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
+                        let _ = tx.send(SlotTask::Bake(BakeTask {
+                            slot_id: sid,
+                            task_dir: block_dir,
+                            kv_name: Some(sub_path),
+                            offset: off,
+                            layers: vec![dump],
+                            is_relay_baking: baking_only,
+                            block_idx: Some(b_idx),
+                            registry: registry_clone,
+                        })).await;
                     }
+                });
+                
+                // VRAM Pinning 유지
+                {
+                    let mut inner = block.inner.write().unwrap();
+                    inner.location = KVLocation::VRAM;
                 }
             }
         }
@@ -1858,10 +1866,10 @@ impl QuantizedQwen3VLTextModel {
             let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)?;
             results.push(out);
 
-            // [FIX] session_id가 있으면 베이킹 여부와 상관없이 SSD 저장 트리거 (Inference 폴더 저장 보장)
+            // [FIX] 비동기로 변경된 베이킹 호출 (await 제거)
             if let Some(sid) = &sid_opt {
                 let is_last = chunk_idx == chunk_offsets.len() - 1;
-                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last, self.baking_only).await;
+                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last, self.baking_only);
             }
 
             // [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로만 이동 (저장은 위에서 실시간 처리)
@@ -1902,10 +1910,10 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
 
-            // [BAKING-PRIORITY] 베이킹 모드라면 VRAM에 있는 것을 즉시 RAM으로 밀어냅니다 (SSD 저장을 위해)
-            if vram_indices.len() > vram_limit || (self.baking_only && !vram_indices.is_empty()) {
+            // [FIX] 베이킹 모드에서의 강제 대피를 제거하여 VRAM Pinning을 유지합니다.
+            if vram_indices.len() > vram_limit {
                 vram_indices.sort_by_key(|k| k.1); // 오래된 순 정렬
-                let num_to_evict = if self.baking_only { vram_indices.len() } else { vram_indices.len().saturating_sub(vram_limit) };
+                let num_to_evict = vram_indices.len().saturating_sub(vram_limit);
                 for i in 0..num_to_evict {
                     let (idx, _) = vram_indices[i];
                     let mut inner = kv_blocks[idx].inner.write().unwrap();
@@ -2083,7 +2091,10 @@ impl QuantizedQwen3VLTextModel {
         // 1. KV 캐시 즉시 대피 및 VRAM 삭제
         let sid_opt = self.active_session_id.clone();
         if let Some(sid) = sid_opt {
-            let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count).await;
+            // [FIX] 베이킹 모드에서는 청크별로 이미 저장했으므로, 레이어 끝에서의 중복/차단 대피를 건너뜁니다.
+            if !self.baking_only {
+                let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count).await;
+            }
         }
 
         // 2. [VRAM-PERSISTENCE] 디코딩 시에는 무게추를 GPU에 유지, 프리필 시에만 CPU로 반납
