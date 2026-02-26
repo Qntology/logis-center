@@ -95,6 +95,7 @@ pub struct LayerKVDump {
     pub layer_idx: usize,
     pub k_anchors: Tensor, pub k_packed: Tensor, pub k_scales: Tensor,
     pub v_anchors: Tensor, pub v_packed: Tensor, pub v_scales: Tensor,
+    pub k_shape: Tensor,
 }
 
 pub struct BakeTask {
@@ -296,6 +297,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         map.insert(format!("{}v_anchors", prefix), src.v_anchors.clone());
                         map.insert(format!("{}v_packed", prefix), src.v_packed.clone());
                         map.insert(format!("{}v_scales", prefix), src.v_scales.clone());
+                        map.insert("k_shape".to_string(), src.k_shape.clone());
                         let file_path = bake.task_dir.join(format!("l{}.st", act_l));
                         GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
                         let _ = io_tx_inner.send(SaveTask { slot_id: sid, path: file_path, tensors: map, is_last: l_idx == loop_count - 1, block_idx, registry: Some(registry.clone()), kv_name: kv_name.clone() }).await;
@@ -319,14 +321,22 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).ok();
                                         if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
                                             let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
+                                            
+                                            let file_shape = if let Some(sh) = st.tensor("k_shape").ok() {
+                                                let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                                sh_u32.iter().map(|&x| x as usize).collect()
+                                            } else {
+                                                vec![1, 1, 256, 64]
+                                            };
+
                                             let meta = BitKVMetadata {
-                                                k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), (1, 1, ka.shape()[2], 64), &Device::Cpu).unwrap(),
+                                                k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), (file_shape[0], file_shape[1], ka.shape()[2], file_shape[3]), &Device::Cpu).unwrap(),
                                                 k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(),
-                                                k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (1, 1, 256, 1), &Device::Cpu).unwrap(),
-                                                v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), (1, 1, ka.shape()[2], 64), &Device::Cpu).unwrap(),
+                                                k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (file_shape[0], file_shape[1], file_shape[2], 1), &Device::Cpu).unwrap(),
+                                                v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), (file_shape[0], file_shape[1], va.shape()[2], file_shape[3]), &Device::Cpu).unwrap(),
                                                 v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(),
-                                                v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (1, 1, 256, 1), &Device::Cpu).unwrap(),
-                                                original_shape: vec![1, 1, 256, 64],
+                                                v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (file_shape[0], file_shape[1], file_shape[2], 1), &Device::Cpu).unwrap(),
+                                                original_shape: file_shape,
                                             };
                                             if let Ok(mut r) = reg.entries.write() {
                                                 if b_idx < r.len() {
