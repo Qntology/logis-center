@@ -1331,11 +1331,15 @@ impl QuantizedQwen3VLTextAttention {
         let kv_dir = crate::utils::paths::get_kv_dir(None);
         let mut index_path = kv_dir.join(kv_name).join(format!("layer{}.json", self.layer_idx));
         
+        // [RELAY-FALLBACK] 만약 해당 레이어 인덱스 파일이 없으면 layer0.json을 공용 컨텍스트로 사용
         if !index_path.exists() {
             let fallback = kv_dir.join(kv_name).join("layer0.json");
             if fallback.exists() {
+                if self.layer_idx == 0 { println!("[BATCH-LOAD] Specific index for L{} not found. Falling back to Layer 0 for Relay.", self.layer_idx); }
                 index_path = fallback;
-            } else { return Ok(()); }
+            } else {
+                return Ok(());
+            }
         }
         
         let index_json = fs::read_to_string(&index_path)?;
@@ -1343,6 +1347,7 @@ impl QuantizedQwen3VLTextAttention {
         
         for block_info in index.blocks {
             let block_parent = kv_dir.join(kv_name).join(format!("b{}", block_info.offset));
+            // 해당 레이어 전용 파일이 있으면 우선 사용, 없으면 l0.st 사용
             let l_file = block_parent.join(format!("l{}.st", self.layer_idx));
             let file_path = if l_file.exists() { l_file } else { block_parent.join("l0.st") };
             
@@ -1352,14 +1357,15 @@ impl QuantizedQwen3VLTextAttention {
             
             if let Ok(content) = crate::utils::direct_loader::load_kv_block(&file_path) {
                 if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                    // [RESTORATION] 프리픽스 매칭 로직 복구
+                    // 프리픽스도 파일명에 맞춰 유연하게 매칭
                     let is_l0 = file_path.to_string_lossy().contains("l0.st");
                     let prefix = if is_l0 { format!("b{}_l0_", block_info.offset) } else { format!("b{}_l{}_", block_info.offset, self.layer_idx) };
                     let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
-
+                    
                     if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
                         let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
                         
+                        // 1. 파일에서 실제 형상 정보(k_shape) 가져오기
                         let file_shape = if let Some(sh) = get_t("k_shape") {
                             let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                             sh_u32.iter().map(|&x| x as usize).collect()
@@ -1375,10 +1381,11 @@ impl QuantizedQwen3VLTextAttention {
                         let vp_t = Tensor::from_slice(vp.data(), vp.shape(), dev)?;
                         let vs_t = Tensor::from_vec(bytes_to_f32(vs.data()), (file_shape[0], file_shape[1], file_shape[2], 1), dev)?;
 
+                        // 2. 즉시 해제 (Decode-First)
                         let mut k_raw = self.decompress_from_bitkv(&ka_t, &kp_t, &ks_t, &file_shape, dev)?;
                         let mut v_raw = self.decompress_from_bitkv(&va_t, &vp_t, &vs_t, &file_shape, dev)?;
 
-                        // [KV-BRIDGE] 0.6B -> 0.6B 상황에서도 규격이 다르면 정렬 (커밋 261fe0ef 매커니즘)
+                        // 3. 차원 정렬 (KV-BRIDGE)
                         let target_heads = self.num_key_value_heads;
                         let target_dim = self.head_dim;
                         let (_b, h, _s, d) = k_raw.dims4()?;
@@ -1399,12 +1406,13 @@ impl QuantizedQwen3VLTextAttention {
                             v_raw = Tensor::cat(&v_list, 1)?;
                         }
 
+                        // 4. 결과 주입
                         let mut reg = self.registry.entries.write().unwrap();
                         if b_idx < reg.len() {
                             if let Some(block) = self.kv_blocks.get(b_idx) {
                                 let mut inner = block.inner.write().unwrap();
-                                inner.k_cache = Some(k_raw.to_device(self.q_proj.device())?);
-                                inner.v_cache = Some(v_raw.to_device(self.q_proj.device())?);
+                                inner.k_cache = Some(k_raw);
+                                inner.v_cache = Some(v_raw);
                                 inner.location = KVLocation::RAM;
                                 reg[b_idx].location[self.layer_idx] = KVLocation::RAM;
                                 reg[b_idx].ssd_path = Some(file_path.parent().unwrap().to_path_buf());
@@ -2701,6 +2709,7 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
         }
+
 
         // 3. SSD 저장 위임 (Safe await)
         if !dumps_to_send.is_empty() {
