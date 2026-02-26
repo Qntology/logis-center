@@ -45,12 +45,12 @@ pub struct SlotManager {
 
 pub enum SlotRequest {
     Acquire { total_tokens: usize, tx: tokio::sync::oneshot::Sender<usize> },
-    Release { idx: usize, task_id: Option<String>, block_index: Option<usize>, is_bake: bool },
+    Release { idx: usize, is_bake: bool },
 }
 
 impl SlotManager {
     pub fn new(count: usize) -> (Self, mpsc::Receiver<SlotRequest>) {
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(1024);
         let mut slots = Vec::new();
         let num_layers = 28;
         for i in 0..count {
@@ -92,6 +92,9 @@ impl SlotManager {
         rx.await.unwrap_or(0)
     }
 
+    pub async fn release_slot(&self, idx: usize) { let _ = self.request_tx.send(SlotRequest::Release { idx, is_bake: false }).await; }
+    pub async fn mark_ready(&self, idx: usize) { let _ = self.request_tx.send(SlotRequest::Release { idx, is_bake: true }).await; }
+
     pub async fn acquire_read_slot(&self) -> usize {
         loop {
             for (i, slot) in self.slots.iter().enumerate() {
@@ -103,24 +106,8 @@ impl SlotManager {
                     }
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-    }
-
-    pub async fn release_slot(&self, id: usize) {
-        let _ = self.request_tx.send(SlotRequest::Release { idx: id, task_id: None, block_index: None, is_bake: true }).await;
-    }
-
-    pub async fn mark_ready(&self, id: usize) {
-        if id < self.slots.len() {
-            let slot = &self.slots[id];
-            let current = slot.state.load(Ordering::SeqCst);
-            if (current == 1 || current == 3) && slot.state.compare_exchange(current, 2, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                self.update_counters(current, 2);
-                if current == 1 { self.active_write_count.fetch_sub(1, Ordering::SeqCst); }
-            }
-        }
-        self.handoff_notifier.notify_waiters();
     }
 
     pub fn get_counts(&self) -> (usize, usize, usize, usize) {
@@ -184,8 +171,8 @@ pub async fn get_load_worker() -> Result<mpsc::Sender<SlotTask>> { LOAD_TX.get()
 pub async fn wait_for_global_io() { while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { tokio::time::sleep(std::time::Duration::from_millis(10)).await; } }
 
 pub fn init_bake_worker() {
-    let (btx, brx) = mpsc::channel(1000);
-    let (ltx, lrx) = mpsc::channel(1000);
+    let (btx, brx) = mpsc::channel(2048);
+    let (ltx, lrx) = mpsc::channel(2048);
     let _ = BAKE_TX.set(btx); let _ = LOAD_TX.set(ltx);
     if let Some(rx) = SLOT_MANAGER_DATA.1.lock().unwrap().take() { tauri::async_runtime::spawn(async move { spawn_slot_dispatcher(rx).await; }); }
     tauri::async_runtime::spawn(async move { spawn_slot_worker(brx); }); 
@@ -196,7 +183,8 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {
         match req {
             SlotRequest::Acquire { total_tokens, tx } => {
-                let max_writes = if total_tokens < 4096 { 12 } else if total_tokens < 8192 { 8 } else { 4 };
+                // [EXPAND-LIMITS] I/O 동시성을 높이기 위해 동시 쓰기 슬롯 상한을 대폭 확장
+                let max_writes = if total_tokens < 4096 { 64 } else if total_tokens < 8192 { 32 } else { 16 };
                 let mut found = None;
                 while found.is_none() {
                     if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
@@ -209,70 +197,71 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                             }
                         }
                     }
-                    if found.is_none() { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+                    if found.is_none() { tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
                 }
                 let _ = tx.send(found.unwrap());
             },
-            SlotRequest::Release { idx, .. } => {
-                let slot = &SLOT_MANAGER.slots[idx];
-                if slot.remaining_layers.load(Ordering::SeqCst) > 0 {
-                    println!("[SLOT-WARN] Release denied for Slot {}. IO still in progress.", idx);
-                    continue; 
+            SlotRequest::Release { idx, is_bake } => {
+                let s = &SLOT_MANAGER.slots[idx];
+                let old = s.state.load(Ordering::SeqCst);
+                let new = if is_bake { 2 } else { 0 };
+                if s.state.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    SLOT_MANAGER.update_counters(old, new);
+                    if old == 1 { SLOT_MANAGER.active_write_count.fetch_sub(1, Ordering::SeqCst); }
+                    SLOT_MANAGER.handoff_notifier.notify_waiters();
                 }
-                let prev = slot.state.swap(0, Ordering::SeqCst);
-                if prev != 0 {
-                    SLOT_MANAGER.update_counters(prev, 0);
-                    if prev == 1 { SLOT_MANAGER.active_write_count.fetch_sub(1, Ordering::SeqCst); }
-                    for lk in &slot.k_layers { if let Ok(mut g) = lk.try_lock() { *g = None; } }
-                    for lv in &slot.v_layers { if let Ok(mut g) = lv.try_lock() { *g = None; } }
-                }
-                SLOT_MANAGER.handoff_notifier.notify_waiters();
             }
         }
     }
 }
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
-    // [BACK-PRESSURE] 채널 크기를 줄여 RAM 폭증 방지 (저장이 너무 밀리면 연산을 잠시 멈춤)
-    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(64); 
+    // [BACK-PRESSURE] 병렬 처리를 위해 채널 확장 (I/O 병목 해소)
+    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(2048); 
+    
+    // 1. 디스크 I/O 병렬 처리 워커 (제한 없는 병렬성으로 SSD 최대 대역폭 활용)
     tokio::spawn(async move {
         while let Some(task) = io_rx.recv().await {
             let (tp, ts, reg, b_idx, sid, is_last) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last);
-            if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
             
-            // [OPTIMIZED-SAVE] Serialize to memory
-            let serialize_res = safetensors::serialize(&ts, &None);
-            
-            // [MEMORY-RELEASE] 원본 텐서 맵(ts)을 여기서 명시적으로 드롭하여 RAM 확보
-            drop(ts); 
+            // 각 쓰기 요청을 별도 태스크로 분리하여 즉시 병렬 실행
+            tokio::spawn(async move {
+                if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
+                
+                // [OPTIMIZED-SAVE] Serialize to memory
+                let serialize_res = safetensors::serialize(&ts, &None);
+                drop(ts); // 원본 텐서 즉시 해제하여 RAM 확보
 
-            match serialize_res {
-                Ok(data) => {
-                    match save_kv_block(&tp, &data) {
-                        Ok(_) => {
-                            // 성공 로그 생략 (너무 많음)
-                        },
-                        Err(e) => eprintln!("[BAKE-SAVE-ERROR] Failed to save {:?}: {}", tp, e),
-                    }
-                },
-                Err(e) => eprintln!("[BAKE-SAVE-ERROR] Serialization failed: {}", e),
-            }
-            if let (Some(r), Some(idx)) = (reg, b_idx) {
-                if let Ok(mut entries) = r.entries.write() {
-                    if idx < entries.len() {
-                        let e = &mut entries[idx]; e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                        if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
-                            if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = KVLocation::SSD; } }
+                match serialize_res {
+                    Ok(data) => {
+                        let _ = save_kv_block(&tp, &data);
+                        
+                        // 장부 업데이트 (SSD 위치 기록)
+                        if let (Some(r), Some(idx)) = (reg, b_idx) {
+                            if let Ok(mut entries) = r.entries.write() {
+                                if idx < entries.len() {
+                                    let e = &mut entries[idx]; e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                                    if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
+                                        if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = KVLocation::SSD; } }
+                                    }
+                                }
+                            }
                         }
-                    }
+                    },
+                    Err(e) => eprintln!("[BAKE-SAVE-ERROR] Serialization failed: {}", e),
                 }
-            }
-            GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
-            let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
-            if rem == 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; println!("[SLOT-SYNC] Slot {} is now fully baked and ready.", sid); }
+                
+                // 후속 처리 (카운터 및 슬롯 상태)
+                GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
+                let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
+                if rem == 1 || is_last { 
+                    SLOT_MANAGER.mark_ready(sid).await; 
+                }
+            });
         }
     });
 
+    // 2. GPU 연산 태스크 처리 루프
     tokio::spawn(async move {
         while let Some(task) = rx.recv().await {
             match task {

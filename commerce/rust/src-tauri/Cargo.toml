@@ -63,7 +63,7 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 direct-storage = { path = "./direct-storage" }
-windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Graphics_Direct3D12"] }
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Graphics_Direct3D12", "Win32_Security", "Win32_System_IO"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.6"
