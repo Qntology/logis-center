@@ -812,14 +812,13 @@ impl QuantizedQwen3VLTextAttention {
                                                                                         }
                                                                                     }
                                                 
-                                                                                    k_active = Some(self.decompress_from_bitkv(&ka, &kp, &ks, &meta_os, dev)?);
-                                                                                    v_active = Some(self.decompress_from_bitkv(&va, &vp, &vs, &meta_os, dev)?);
-                                                                                    if self.layer_idx == 0 { println!("[JIT-LOAD] SSD -> RAM CACHED: Block {}", b_off); }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                
-                         else if self.layer_idx == 0 {
+                                                                                                                                        k_active = Some(self.decompress_from_bitkv(&ka, &kp, &ks, &meta_os, dev)?);
+                                                                                                                                        v_active = Some(self.decompress_from_bitkv(&va, &vp, &vs, &meta_os, dev)?);
+                                                                                                                                        // [LOG-REDUCTION] 불필요한 성공 로그 제거 (SSD 로딩 시에만 출력)
+                                                                                                                                    }
+                                                                                                                                }
+                                                                                                                            }
+                                                                                                             else if self.layer_idx == 0 {
                             println!("[JIT-LOAD] NOT-FOUND: Layer {} Block {} at {:?}", self.layer_idx, b_off, path);
                         }
                     }
@@ -1279,66 +1278,59 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_blocks.clear();
     }
 
-    pub async fn trigger_realtime_layer_bake(&mut self, k: Tensor, v: Tensor, offset: usize, block_index: usize, session_id: &str) -> Result<()> {
+    pub async fn trigger_realtime_incremental_bake(&mut self, session_id: &str, is_last_chunk: bool) -> Result<()> {
         use crate::models::qwen3vl::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
-        
-        // 1bit/bitkv 압축 수행 (4개 요소 반환: ka, kp, ks, original_shape)
-        let (ka, kp, ks, _) = self.compress_to_bitkv(&k)?;
-        let (va, vp, vs, _) = self.compress_to_bitkv(&v)?;
-        
-        let dump = LayerKVDump {
-            layer_idx: self.layer_idx,
-            k_anchors: ka.to_device(&Device::Cpu)?,
-            k_packed: kp.to_device(&Device::Cpu)?,
-            k_scales: ks.to_device(&Device::Cpu)?,
-            v_anchors: va.to_device(&Device::Cpu)?,
-            v_packed: vp.to_device(&Device::Cpu)?,
-            v_scales: vs.to_device(&Device::Cpu)?,
-        };
 
-        if let Some(tx) = BAKE_TX.get() {
-            let kv_name = self.active_kv_name.clone().unwrap_or_else(|| "general".to_string());
-            let sub_folder = format!("reference/{}", kv_name);
-            let path = crate::utils::paths::get_kv_dir(None).join(session_id).join(&sub_folder);
-            let block_dir = path.join(format!("b{}", offset));
-            
-            let sid = SLOT_MANAGER.acquire_write_slot(256).await;
-            let _ = tx.send(SlotTask::Bake(BakeTask {
-                slot_id: sid,
-                task_dir: block_dir,
-                kv_name: Some(sub_folder),
-                offset,
-                layers: vec![dump],
-                is_relay_baking: true,
-                block_idx: Some(block_index),
-                registry: self.registry.clone(),
-            })).await;
-        }
-        Ok(())
-    }
-
-    pub async fn trigger_realtime_layer_bake_all_full(&mut self, session_id: &str) -> Result<()> {
-        let full_block_indices: Vec<usize> = self.kv_blocks.iter().enumerate().filter_map(|(i, b)| {
+        let target_indices: Vec<usize> = self.kv_blocks.iter().enumerate().filter_map(|(i, b)| {
             let inner = b.inner.read().unwrap();
-            if inner.len == 256 && inner.location != KVLocation::SSD { Some(i) } else { None }
+            let is_full = inner.len == 256;
+            let is_not_on_ssd = inner.location != KVLocation::SSD;
+            if (is_full || is_last_chunk) && is_not_on_ssd { Some(i) } else { None }
         }).collect();
 
-        for idx in full_block_indices {
+        for idx in target_indices {
             let block = self.kv_blocks[idx].clone();
-            // 1. 잠그고 데이터 추출 후 즉시 잠금 해제 (non-Send Guard 문제 해결)
-            let (k_opt, v_opt, off, b_idx) = {
+            let (k_opt, v_opt, off, b_idx, b_len) = {
                 let mut inner = block.inner.write().unwrap();
-                (inner.k_cache.take(), inner.v_cache.take(), inner.offset, inner.index)
+                (inner.k_cache.take(), inner.v_cache.take(), inner.offset, inner.index, inner.len)
             };
 
             if let (Some(k), Some(v)) = (k_opt, v_opt) {
-                // 2. 잠금 없는 상태에서 Await 수행
-                self.trigger_realtime_layer_bake(k, v, off, b_idx, session_id).await?;
+                let (ka, kp, ks, _) = self.compress_to_bitkv(&k)?;
+                let (va, vp, vs, _) = self.compress_to_bitkv(&v)?;
                 
-                // 3. 다시 잠그고 상태 업데이트
-                {
-                    let mut inner = block.inner.write().unwrap();
-                    inner.location = KVLocation::SSD;
+                let dump = LayerKVDump {
+                    layer_idx: self.layer_idx,
+                    k_anchors: ka.to_device(&Device::Cpu)?,
+                    k_packed: kp.to_device(&Device::Cpu)?,
+                    k_scales: ks.to_device(&Device::Cpu)?,
+                    v_anchors: va.to_device(&Device::Cpu)?,
+                    v_packed: vp.to_device(&Device::Cpu)?,
+                    v_scales: vs.to_device(&Device::Cpu)?,
+                };
+
+                if let Some(tx) = BAKE_TX.get() {
+                    let kv_name = self.active_kv_name.clone().unwrap_or_else(|| "general".to_string());
+                    let sub_folder = format!("reference/{}", kv_name);
+                    let path = crate::utils::paths::get_kv_dir(None).join(session_id).join(&sub_folder);
+                    let block_dir = path.join(format!("b{}", off));
+                    
+                    let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
+                    let _ = tx.send(SlotTask::Bake(BakeTask {
+                        slot_id: sid,
+                        task_dir: block_dir,
+                        kv_name: Some(sub_folder),
+                        offset: off,
+                        layers: vec![dump],
+                        is_relay_baking: true,
+                        block_idx: Some(b_idx),
+                        registry: self.registry.clone(),
+                    })).await;
+                    
+                    {
+                        let mut inner = block.inner.write().unwrap();
+                        inner.location = KVLocation::SSD;
+                    }
                 }
             }
         }
@@ -2148,14 +2140,15 @@ impl QuantizedQwen3VLTextModel {
             let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)?;
             results.push(out);
 
-            // [NEW] 실시간 베이킹 트리거: 꽉 찬 블록은 계산 즉시 SSD 덤프 큐로 전송
+            // [NEW] 실시간 베이킹 트리거: 꽉 찬 블록 및 마지막 청크 데이터 즉시 SSD 전송
             if self.baking_only {
                 if let Some(sid) = &sid_opt {
-                    let _ = self.layers[layer_idx].self_attn.trigger_realtime_layer_bake_all_full(sid).await;
+                    let is_last = chunk_idx == chunk_offsets.len() - 1;
+                    let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last).await;
                 }
             }
 
-            // [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로만 이동 (저장은 루프 밖에서 통합 처리)
+            // [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로만 이동 (저장은 위에서 실시간 처리)
             let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
             
             if target_device.is_cuda() { let _ = target_device.synchronize(); }
@@ -2717,14 +2710,8 @@ impl QuantizedQwen3VLTextModel {
 
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
 
-        // [FLUSH-COMMIT] 베이킹 모드일 경우에만 즉시 SSD 저장을 실행합니다.
-        // Step A 추론 시에는 모든 데이터가 VRAM/RAM에 유지되므로 강제 저장이 불필요하며 속도를 위해 생략합니다.
-        if let Some(sid) = session_id {
-            if self.baking_only {
-                self.force_flush_all_active_blocks(&sid, None).await?;
-                if target_device.is_cuda() { let _ = target_device.synchronize(); }
-            }
-        }
+        // [FLUSH-COMMIT] 베이킹 모드일 경우 이미 레이어별 루프에서 즉시 SSD 저장이 실행되었습니다.
+        // 따라서 여기서 중복으로 전체 flush를 수행할 필요가 없으므로 제거하여 병목을 방지합니다.
 
         self.current_kv_len = seqlen_offset + seq_len;
         let norm_dev = self.norm.weight().device();
