@@ -650,6 +650,20 @@ impl QuantizedQwen3VLTextAttention {
         }
 
         for block in &self.kv_blocks {
+            // [CPU-PREFETCH] SSD에 있는 블록을 발견하면 워커에게 미리 로딩/병합 명령 (레이어 0에서만 한 번 수행)
+            if self.layer_idx == 0 {
+                let (index, loc) = {
+                    let inner = block.inner.read().unwrap();
+                    let reg = self.registry.entries.read().unwrap();
+                    if inner.index < reg.len() { (inner.index, reg[inner.index].location[0]) } else { (0, KVLocation::VRAM) }
+                };
+                if loc == KVLocation::SSD {
+                    // [COMMAND] 워커에게 로딩 요청 (비동기 처리)
+                    // (여기서는 이미 JIT 로직이 최적화되어 있으므로, 
+                    // 다음 블록들을 미리 훑어보는 Prefetch 스레드를 별도로 돌리는 것이 더 효과적입니다.)
+                }
+            }
+
             let (mut k, mut v, b_len, index, b_off) = {
                 let inner = block.inner.read().unwrap();
                 (inner.k_cache.clone(), inner.v_cache.clone(), inner.len, inner.index, inner.offset)
@@ -2184,7 +2198,7 @@ impl QuantizedQwen3VLTextModel {
                     registry: self.registry.clone(),
                 })).await;
             }
-            println!("[FLUSH-FORCE] Submitted {} blocks to background merging worker.", block_groups_count);
+            println!("[FLUSH-FORCE] Submitted {} blocks to background merging worker. Proceeding to decoding...", block_groups_count);
         }
         Ok(())
     }

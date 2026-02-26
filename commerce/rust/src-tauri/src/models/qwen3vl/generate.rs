@@ -302,37 +302,34 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 SlotTask::Bake(bake) => {
                     let io_tx_inner = io_tx.clone();
                     let (sid, off, is_relay, block_idx, registry) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone());
+                    let loop_count = bake.layers.len();
                     
-                    // [BACK-MERGE] CPU 백그라운드 태스크로 레이어 병합
-                    tokio::spawn(async move {
-                        let mut unified_map = std::collections::HashMap::new();
-                        
-                        for src in bake.layers {
-                            let act_l = if is_relay { 0 } else { src.layer_idx };
-                            let prefix = if is_relay { format!("b{}_l0_", off) } else { format!("b{}_l{}_", off, act_l) };
-                            
-                            // 텐서 조립 (개별 요소들을 통합 맵에 삽입)
-                            unified_map.insert(format!("{}k_anchors", prefix), src.k_anchors);
-                            unified_map.insert(format!("{}k_packed", prefix), src.k_packed);
-                            unified_map.insert(format!("{}k_scales", prefix), src.k_scales);
-                            unified_map.insert(format!("{}v_anchors", prefix), src.v_anchors);
-                            unified_map.insert(format!("{}v_packed", prefix), src.v_packed);
-                            unified_map.insert(format!("{}v_scales", prefix), src.v_scales);
-                            
-                            // 모양 정보 (256 토큰 블록 기준)
-                            if let Ok(sh) = Tensor::from_vec(vec![1u32, 1, 256, 64], (4,), &Device::Cpu) {
-                                unified_map.insert(format!("{}k_shape", prefix), sh);
-                            }
-                        }
+                    SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
 
-                        let file_path = bake.task_dir.join("full_block.st");
+                    // [INSTANT-DUMP] 합치지 않고 개별 레이어를 즉시 저장 큐로 보냄
+                    for l_idx in 0..loop_count {
+                        let src = &bake.layers[l_idx];
+                        let act_l = if is_relay { 0 } else { src.layer_idx };
+                        let mut map = std::collections::HashMap::new();
+                        
+                        let prefix = if is_relay { format!("b{}_l0_", off) } else { format!("b{}_l{}_", off, act_l) };
+                        
+                        map.insert(format!("{}k_anchors", prefix), src.k_anchors.clone());
+                        map.insert(format!("{}k_packed", prefix), src.k_packed.clone());
+                        map.insert(format!("{}k_scales", prefix), src.k_scales.clone());
+                        map.insert(format!("{}v_anchors", prefix), src.v_anchors.clone());
+                        map.insert(format!("{}v_packed", prefix), src.v_packed.clone());
+                        map.insert(format!("{}v_scales", prefix), src.v_scales.clone());
+
+                        let file_path = bake.task_dir.join(format!("l{}.st", act_l));
                         
                         GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
                         let _ = io_tx_inner.send(SaveTask { 
-                            slot_id: sid, path: file_path, tensors: unified_map, 
-                            is_last: true, block_idx, registry: Some(registry) 
+                            slot_id: sid, path: file_path, tensors: map, 
+                            is_last: l_idx == loop_count - 1, 
+                            block_idx, registry: Some(registry.clone()) 
                         }).await;
-                    });
+                    }
                 },
                 SlotTask::Load(load) => {
                     let sid = load.slot_id; let reg = load.registry.clone(); let l_idx = load.layer_idx; let shared_block = load.shared_block.clone();
