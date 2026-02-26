@@ -239,10 +239,9 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
 }
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
-    // [BACK-PRESSURE] 병렬 처리를 위해 채널 확장 (I/O 병목 해소)
     let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(2048); 
     
-    // 1. 디스크 I/O 병렬 처리 워커 (Semaphore를 통한 안정적 병렬성 확보)
+    // 1. 병렬 디스크 I/O 워커 (실제 SSD 저장을 담당)
     tokio::spawn(async move {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(64)); 
         while let Some(task) = io_rx.recv().await {
@@ -250,54 +249,98 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             let (tp, ts, reg, b_idx, sid, is_last) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last);
             
             tokio::spawn(async move {
-                // [RAII-GUARD] 어떤 상황에서도 카운터를 줄이도록 보장
-                struct IoGuard(usize);
-                impl Drop for IoGuard {
-                    fn drop(&mut self) {
-                        GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
-                    }
-                }
-                let _guard = IoGuard(sid);
+                struct IoGuard;
+                impl Drop for IoGuard { fn drop(&mut self) { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } }
+                let _guard = IoGuard;
 
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
-                
-                // [OPTIMIZED-SAVE] Serialize to memory
-                match safetensors::serialize(&ts, &None) {
-                    Ok(data) => {
-                        drop(ts); // 원본 텐서 즉시 해제
-                        let _ = save_kv_block(&tp, &data);
-                        
-                        // 장부 업데이트 (SSD 위치 기록)
-                        if let (Some(r), Some(idx)) = (reg, b_idx) {
-                            if let Ok(mut entries) = r.entries.write() {
-                                if idx < entries.len() {
-                                    let e = &mut entries[idx]; e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                                    if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
-                                        if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = KVLocation::SSD; } }
-                                    }
+                if let Ok(data) = safetensors::serialize(&ts, &None) {
+                    drop(ts);
+                    let _ = save_kv_block(&tp, &data);
+                    if let (Some(r), Some(idx)) = (reg, b_idx) {
+                        if let Ok(mut entries) = r.entries.write() {
+                            if idx < entries.len() {
+                                let e = &mut entries[idx]; e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                                if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
+                                    if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = KVLocation::SSD; } }
                                 }
                             }
                         }
-                    },
-                    Err(e) => {
-                        drop(ts);
-                        eprintln!("[BAKE-SAVE-ERROR] Serialization failed: {}", e);
                     }
                 }
-                
-                // 슬롯 상태 관리
                 let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
-                if rem == 1 || is_last { 
-                    SLOT_MANAGER.mark_ready(sid).await; 
-                }
+                if rem == 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; }
                 drop(permit);
             });
         }
     });
 
-    // 2. GPU 연산 태스크 처리 루프
+    // 2. 태스크 분류 및 백그라운드 전처리 루프
     tokio::spawn(async move {
         while let Some(task) = rx.recv().await {
+            match task {
+                SlotTask::Bake(bake) => {
+                    let io_tx_inner = io_tx.clone();
+                    let (sid, off, is_relay, block_idx, registry) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone());
+                    let loop_count = bake.layers.len();
+                    SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
+
+                    for l_idx in 0..loop_count {
+                        let src = &bake.layers[l_idx];
+                        let act_l = if is_relay { 0 } else { src.layer_idx };
+                        let mut map = std::collections::HashMap::new();
+                        let prefix = if is_relay { format!("b{}_l0_", off) } else { format!("b{}_l{}_", off, act_l) };
+                        map.insert(format!("{}k_anchors", prefix), src.k_anchors.clone());
+                        map.insert(format!("{}k_packed", prefix), src.k_packed.clone());
+                        map.insert(format!("{}k_scales", prefix), src.k_scales.clone());
+                        map.insert(format!("{}v_anchors", prefix), src.v_anchors.clone());
+                        map.insert(format!("{}v_packed", prefix), src.v_packed.clone());
+                        map.insert(format!("{}v_scales", prefix), src.v_scales.clone());
+                        let file_path = bake.task_dir.join(format!("l{}.st", act_l));
+                        GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
+                        let _ = io_tx_inner.send(SaveTask { slot_id: sid, path: file_path, tensors: map, is_last: l_idx == loop_count - 1, block_idx, registry: Some(registry.clone()) }).await;
+                    }
+                },
+                SlotTask::Load(load) => {
+                    let sid = load.slot_id; let reg = load.registry.clone(); let shared_block = load.shared_block.clone();
+                    let provided_path = load.path.clone(); 
+                    let kv_name = load.kv_name.clone();
+                    tokio::spawn(async move {
+                        let _guard = ReadSlotGuard { sid, active: true };
+                        let (b_idx_off, b_idx) = { match shared_block.inner.read() { Ok(inner) => (inner.offset, inner.index), _ => (0, 999) } };
+                        let mut root = provided_path.clone();
+                        while !root.to_string_lossy().ends_with("kv") && root.parent().is_some() { root = root.parent().unwrap().to_path_buf(); }
+                        let block_root = root.join(kv_name.as_deref().unwrap_or("inference")).join(format!("b{}", b_idx_off));
+                        for l_idx in 0..28 {
+                            let file_path = block_root.join(format!("l{}.st", l_idx));
+                            if file_path.is_file() {
+                                if let Ok(content) = load_kv_block(&file_path) {
+                                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                                        let prefix = format!("b{}_l{}_", b_idx_off, l_idx);
+                                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).ok();
+                                        if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
+                                            let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
+                                            let meta = BitKVMetadata {
+                                                k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), (1, 1, ka.shape()[2], 64), &Device::Cpu).unwrap(),
+                                                k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(),
+                                                k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (1, 1, 256, 1), &Device::Cpu).unwrap(),
+                                                v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), (1, 1, ka.shape()[2], 64), &Device::Cpu).unwrap(),
+                                                v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(),
+                                                v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (1, 1, 256, 1), &Device::Cpu).unwrap(),
+                                                original_shape: vec![1, 1, 256, 64],
+                                            };
+                                            if let Ok(mut r) = reg.entries.write() { if b_idx < r.len() { let mut cache = r[b_idx].bitkv_cache.write().unwrap(); cache[l_idx] = Some(meta); r[b_idx].location[l_idx] = KVLocation::RAM; } }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+}
             match task {
                 SlotTask::Bake(bake) => {
                     let io_tx_inner = io_tx.clone();

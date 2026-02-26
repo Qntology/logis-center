@@ -2198,7 +2198,7 @@ impl QuantizedQwen3VLTextModel {
                     registry: self.registry.clone(),
                 })).await;
             }
-            println!("[FLUSH-FORCE] Submitted {} blocks to background merging worker. Proceeding to decoding...", block_groups_count);
+            println!("[FLUSH-FORCE] Triggered background dump for {} blocks. Proceeding to decoding immediately...", block_groups_count);
         }
         Ok(())
     }
