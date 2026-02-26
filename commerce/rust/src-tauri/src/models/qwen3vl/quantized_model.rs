@@ -7,6 +7,7 @@ use std::path::Path;
 use std::fs;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use memmap2::Mmap;
 
 use crate::{
@@ -1849,7 +1850,9 @@ impl QuantizedQwen3VLTextModel {
                 if inner.location == KVLocation::RAM && inner.k_cache.is_some() {
                     let entries = self.registry.entries.read().unwrap();
                     let is_already_on_ssd = inner.index < entries.len() && entries[inner.index].location[l_idx] == KVLocation::SSD;
-                    if !is_already_on_ssd {
+                    let is_loading = inner.index < entries.len() && entries[inner.index].location[l_idx] == KVLocation::Loading;
+                    
+                    if !is_already_on_ssd && !is_loading {
                         blocks_to_sync.entry(inner.offset).or_insert_with(Vec::new).push((l_idx, inner.index, inner.len, inner.k_cache.clone().unwrap(), inner.v_cache.clone().unwrap()));
                     }
                 }
@@ -1871,37 +1874,32 @@ impl QuantizedQwen3VLTextModel {
             let sid_task = sid_root.clone();
             let reg_task = registry_clone.clone();
 
-            // 텐서 데이터 준비
             let mut dumps = Vec::new();
             for (l_idx, _, _, k, v) in layer_data {
                 dumps.push(LayerKVDump { layer_idx: l_idx, k_tensor: k, v_tensor: v });
             }
 
-            // [FIRE-AND-FORGET] 슬롯 획득과 전송 과정을 연산 루프와 완전히 분리
+            // [FIRE-AND-FORGET]
             tokio::spawn(async move {
                 if let Some(tx) = BAKE_TX.get() {
-                    // 슬롯 획득 (여기서 대기가 발생하더라도 메인 루프는 이미 다음 토큰 연산 중)
+                    // [STEP 1] 상태를 'Loading'으로 먼저 마크하여 중복 요청 방지
+                    {
+                        let mut reg_w = reg_task.entries.write().unwrap();
+                        for dump in &dumps {
+                            if b_idx < reg_w.len() { reg_w[b_idx].location[dump.layer_idx] = KVLocation::Loading; }
+                        }
+                    }
+
+                    // [STEP 2] 슬롯 획득 및 경로 준비
                     let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
-                    
                     let path = crate::utils::paths::get_kv_dir(None).join(&sid_task);
                     let sub_root = if baking_only { "reference" } else { "inference" };
                     let name = kv_name_task.as_deref().unwrap_or("general");
                     let sub_folder = format!("{}/{}", sub_root, name);
-                    
                     let block_dir = path.join(&sub_folder).join(format!("b{}", off));
                     if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
 
-                    // 장부 업데이트
-                    {
-                        let mut reg_w = reg_task.entries.write().unwrap();
-                        for dump in &dumps {
-                            if b_idx < reg_w.len() {
-                                reg_w[b_idx].location[dump.layer_idx] = KVLocation::SSD;
-                                reg_w[b_idx].ssd_path = Some(block_dir.clone());
-                            }
-                        }
-                    }
-
+                    // [STEP 3] 베이킹 워커로 전송 (워커가 파일 쓰기를 완료한 후에 'SSD' 상태로 최종 변경함)
                     let _ = tx.send(SlotTask::Bake(BakeTask {
                         slot_id: sid,
                         task_dir: block_dir,
@@ -1918,36 +1916,6 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    fn evacuate_vram_to_ram_only(&mut self, layer_idx: usize) -> Result<()> {
-        let (vram_limit, ram_limit) = self.get_dynamic_limits();
-        let mut vram_evicted = false;
-
-        {
-            let mut reg = self.registry.entries.write().unwrap();
-            let kv_blocks = &mut self.layers[layer_idx].self_attn.kv_blocks;
-            let mut vram_indices = Vec::new();
-            for (idx, block) in kv_blocks.iter().enumerate() {
-                let inner = block.inner.read().unwrap();
-                if inner.location == KVLocation::VRAM { vram_indices.push((idx, inner.offset)); }
-            }
-
-            if vram_indices.len() > vram_limit || (self.baking_only && !vram_indices.is_empty()) {
-                vram_indices.sort_by_key(|k| k.1);
-                let num_to_evict = if self.baking_only { vram_indices.len() } else { vram_indices.len().saturating_sub(vram_limit) };
-                for i in 0..num_to_evict {
-                    let (idx, _) = vram_indices[i];
-                    
-                    // [STRATEGY-D] 비동기 전송을 위해 데이터를 미리 추출
-                    let (k_vram, v_vram, b_idx) = {
-                        let mut inner = kv_blocks[idx].inner.write().unwrap();
-                        if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                            let k_clone = k.clone();
-                            let v_clone = v.clone();
-                            let b_idx = inner.index;
-                            
-                            // VRAM 캐시는 즉시 비워서 다음 레이어가 쓸 공간 확보
-                            inner.k_cache = None;
-                            inner.v_cache = None;
     fn evacuate_vram_to_ram_only(&mut self, layer_idx: usize) -> Result<()> {
         let (vram_limit, ram_limit) = self.get_dynamic_limits();
         let mut vram_evicted = false;

@@ -280,26 +280,36 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 
             if save_res.is_ok() {
                 println!("[BAKE-SAVE-ZERO] Saved KV (Mmap): {:?}", tp.file_name().unwrap_or_default());
+                // [CRITICAL-SYNC] 파일 쓰기가 완전히 성공한 직후에만 장부 상태를 SSD로 변경합니다.
+                if let (Some(r), Some(idx)) = (reg, b_idx) {
+                    if let Ok(mut entries) = r.entries.write() {
+                        if idx < entries.len() {
+                            let e = &mut entries[idx];
+                            e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                            if tp.file_name().map(|n| n == "all_layers.st").unwrap_or(false) {
+                                for loc in e.location.iter_mut() { *loc = KVLocation::SSD; }
+                            }
+                        }
+                    }
+                }
             } else {
                 // Mmap 실패 시 폴백 (기존 방식)
                 let _ = candle_core::safetensors::save(&ts, &tp);
                 println!("[BAKE-SAVE-FALLBACK] Saved KV: {:?}", tp.file_name().unwrap_or_default());
-            }
-
-            if let (Some(r), Some(idx)) = (reg, b_idx) {
-                if let Ok(mut entries) = r.entries.write() {
-                    if idx < entries.len() {
-                        let e = &mut entries[idx]; e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                        
-                        // [FIX] Strategy B 대응: all_layers.st일 경우 28개 레이어 모두 SSD로 표시
-                        if tp.file_name().map(|n| n == "all_layers.st").unwrap_or(false) {
-                            for loc in e.location.iter_mut() { *loc = KVLocation::SSD; }
-                        } else if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
-                            if let Ok(l_idx) = l_str.parse::<usize>() { if l_idx < 28 { e.location[l_idx] = KVLocation::SSD; } }
+                // 폴백 저장 후에도 상태 업데이트 시도
+                if let (Some(r), Some(idx)) = (reg, b_idx) {
+                    if let Ok(mut entries) = r.entries.write() {
+                        if idx < entries.len() {
+                            let e = &mut entries[idx];
+                            e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                            if tp.file_name().map(|n| n == "all_layers.st").unwrap_or(false) {
+                                for loc in e.location.iter_mut() { *loc = KVLocation::SSD; }
+                            }
                         }
                     }
                 }
             }
+
             GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
             let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
             if rem == 1 || is_last { 
