@@ -1374,14 +1374,58 @@ impl QuantizedQwen3VLTextAttention {
                     
                     if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
                         let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
+                        
+                        // [KV-BRIDGE] 0.6B 베이킹 데이터와 현재 모델 규격 사이의 차원 정렬
+                        let (ka_data, kp_data, ks_data) = (bytes_to_f32(ka.data()), kp.data().to_vec(), bytes_to_f32(ks.data()));
+                        let (va_data, vp_data, vs_data) = (bytes_to_f32(va.data()), vp.data().to_vec(), bytes_to_f32(vs.data()));
+                        
+                        let file_heads = ka.shape()[1];
+                        let file_dim = ka.shape()[3];
+                        let target_heads = self.num_key_value_heads;
+                        let target_dim = self.head_dim;
+
+                        let mut final_ka = Tensor::from_vec(ka_data, (1, file_heads, ka.shape()[2], file_dim), &Device::Cpu)?;
+                        let mut final_kp = Tensor::from_slice(&kp_data, kp.shape(), &Device::Cpu)?;
+                        let mut final_ks = Tensor::from_vec(ks_data, (1, file_heads, 256, 1), &Device::Cpu)?;
+                        let mut final_va = Tensor::from_vec(va_data, (1, file_heads, ka.shape()[2], file_dim), &Device::Cpu)?;
+                        let mut final_vp = Tensor::from_slice(&vp_data, vp.shape(), &Device::Cpu)?;
+                        let mut final_vs = Tensor::from_vec(vs_data, (1, file_heads, 256, 1), &Device::Cpu)?;
+
+                        if file_heads != target_heads || file_dim != target_dim {
+                            if self.layer_idx == 0 { println!("[KV-BRIDGE] Aligning 0.6B context (H:{}, D:{}) to Target (H:{}, D:{})", file_heads, file_dim, target_heads, target_dim); }
+                            
+                            if file_dim < target_dim {
+                                final_ka = Tensor::cat(&[&final_ka, &final_ka], D::Minus1)?;
+                                final_va = Tensor::cat(&[&final_va, &final_va], D::Minus1)?;
+                            }
+                            
+                            if file_heads != target_heads {
+                                let mut k_list = Vec::with_capacity(target_heads);
+                                let mut v_list = Vec::with_capacity(target_heads);
+                                let mut ks_list = Vec::with_capacity(target_heads);
+                                let mut vs_list = Vec::with_capacity(target_heads);
+                                for i in 0..target_heads {
+                                    let src_idx = i % file_heads;
+                                    k_list.push(final_ka.narrow(1, src_idx, 1)?);
+                                    v_list.push(final_va.narrow(1, src_idx, 1)?);
+                                    ks_list.push(final_ks.narrow(1, src_idx, 1)?);
+                                    vs_list.push(final_vs.narrow(1, src_idx, 1)?);
+                                }
+                                final_ka = Tensor::cat(&k_list, 1)?;
+                                final_va = Tensor::cat(&v_list, 1)?;
+                                final_ks = Tensor::cat(&ks_list, 1)?;
+                                final_vs = Tensor::cat(&vs_list, 1)?;
+                            }
+                        }
+
                         let meta = BitKVMetadata {
-                            k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), (1, self.num_key_value_heads, ka.shape()[2], self.head_dim), &Device::Cpu)?,
-                            k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?,
-                            k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (1, self.num_key_value_heads, 256, 1), &Device::Cpu)?,
-                            v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), (1, self.num_key_value_heads, ka.shape()[2], self.head_dim), &Device::Cpu)?,
-                            v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?,
-                            v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (1, self.num_key_value_heads, 256, 1), &Device::Cpu)?,
-                            original_shape: vec![1, self.num_key_value_heads, 256, self.head_dim],
+                            k_anchors: final_ka,
+                            k_packed: final_kp,
+                            k_scales: final_ks,
+                            v_anchors: final_va,
+                            v_packed: final_vp,
+                            v_scales: final_vs,
+                            original_shape: vec![1, target_heads, 256, target_dim],
                         };
                         
                         let mut reg = self.registry.entries.write().unwrap();
