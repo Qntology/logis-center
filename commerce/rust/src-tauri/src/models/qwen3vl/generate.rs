@@ -463,13 +463,19 @@ impl Qwen3VLGenerateModel {
         let total_toks = f_ids.len();
         
         let kv_len = self.get_kv_len();
-        let use_zero_prefill = kv_len >= total_toks && total_toks > 0;
+        // [STRICT-ZERO-PREFILL] 0.6B 모델이 28개 레이어 모드일 때는 캐시 복사로 인한 오염을 막기 위해 
+        // Zero Prefill을 사용하지 않고 항상 전체 연산(Full Prefill)을 수행합니다.
+        // Zero Prefill은 오직 2B 모델의 릴레이 단계에서만 활성화됩니다.
+        let is_0_6b_full = self.model_name.contains("0.6B") && self.get_kv_len() > 0;
+        let use_zero_prefill = !is_0_6b_full && kv_len >= total_toks && total_toks > 0;
+        
         let mut gen_text = String::new();
         let (input_ids, offset) = if use_zero_prefill {
             println!("[ZERO-PREFILL] Active cache found (Len: {}). Skipping full prompt prefill.", kv_len);
             (Tensor::from_vec(vec![f_ids[total_toks - 1]], (1, 1), &self.text_device)?, total_toks - 1)
         } else {
-            println!("[FULL-PREFILL] No valid cache. Computing entire context (Len: {}).", total_toks);
+            // [CLEAN-START] 0.6B 모델은 추론 품질을 위해 항상 전체 문맥을 새로 연산합니다.
+            println!("[FULL-PREFILL] Computing entire context for 28-layer inference (Len: {}).", total_toks);
             (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
         };
 
