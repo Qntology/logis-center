@@ -193,21 +193,35 @@ pub fn init_bake_worker() {
 async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {
         match req {
-            SlotRequest::Acquire { total_tokens, tx } => {
-                let max_writes = if total_tokens < 4096 { 12 } else if total_tokens < 8192 { 8 } else { 4 };
+            SlotRequest::Acquire { total_tokens: _, tx } => {
+                // [FIX] 쓰기 슬롯 한도를 대폭 늘려 (4 -> 32) 모델 연산이 멈추는 병목을 제거합니다.
+                let max_writes = 32;
                 let mut found = None;
                 while found.is_none() {
                     if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
                         for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
-                            if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { SLOT_MANAGER.update_counters(0, 1); SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); found = Some(i); break; }
+                            if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { 
+                                SLOT_MANAGER.update_counters(0, 1); 
+                                SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); 
+                                found = Some(i); 
+                                break; 
+                            }
                         }
                         if found.is_none() {
                             for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
-                                if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { SLOT_MANAGER.update_counters(2, 1); SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); found = Some(i); break; }
+                                if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { 
+                                    SLOT_MANAGER.update_counters(2, 1); 
+                                    SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); 
+                                    found = Some(i); 
+                                    break; 
+                                }
                             }
                         }
                     }
-                    if found.is_none() { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+                    if found.is_none() { 
+                        // [FIX] 대기 시간을 10ms -> 1ms로 줄여 반응성 극대화
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await; 
+                    }
                 }
                 let _ = tx.send(found.unwrap());
             },
@@ -288,7 +302,12 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             }
             GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
             let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
-            if rem == 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; println!("[SLOT-SYNC] Slot {} is now fully baked and ready.", sid); }
+            if rem == 1 || is_last { 
+                // [CRITICAL-FIX] 슬롯을 완전히 해제하여 active_write_count를 복구합니다.
+                SLOT_MANAGER.slots[sid].remaining_layers.store(0, Ordering::SeqCst);
+                SLOT_MANAGER.release_slot(sid).await;
+                println!("[SLOT-SYNC] Slot {} is now fully baked and released.", sid); 
+            }
         }
     });
 
@@ -300,7 +319,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let io_tx_inner = io_tx.clone();
                     let (sid, off, is_relay) = (bake.slot_id, bake.offset, bake.is_relay_baking);
                     let loop_count = bake.layers.len();
-                    SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
+                    
+                    // [FIX] Strategy B: 28개 파일을 하나로 합쳐서 한 번만 쓰므로, 대기 카운트를 1로 설정합니다.
+                    SLOT_MANAGER.slots[sid].remaining_layers.store(1, Ordering::SeqCst);
 
                     // [STRATEGY-A] 레이어별 압축 가공을 CPU 모든 코어로 병렬화합니다.
                     let processed_layers: Vec<_> = bake.layers.into_par_iter().map(|src| {
