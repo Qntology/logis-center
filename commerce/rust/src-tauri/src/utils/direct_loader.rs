@@ -11,6 +11,7 @@ mod windows_impl {
     use std::mem::ManuallyDrop;
 
     pub fn load_block(path: &Path) -> Result<Vec<u8>> {
+        println!("[IO-WIN] Loading via DirectStorage: {:?}", path.file_name());
         unsafe {
             let factory: IDStorageFactory = DStorageGetFactory()?;
             let metadata = fs::metadata(path)?;
@@ -78,6 +79,7 @@ mod linux_impl {
     use std::os::unix::io::AsRawFd;
 
     pub fn load_block(path: &Path) -> Result<Vec<u8>> {
+        println!("[IO-LINUX] Loading via io_uring: {:?}", path.file_name());
         let file = File::open(path)?;
         let size = file.metadata()?.len() as usize;
         let mut buffer = vec![0u8; size];
@@ -100,6 +102,7 @@ mod linux_impl {
     }
 
     pub fn save_block(path: &Path, data: &[u8]) -> Result<()> {
+        println!("[IO-LINUX] Saving via io_uring: {:?}", path.file_name());
         let file = File::create(path)?;
         let mut ring = IoUring::new(8)?;
         let write_e = opcode::Write::new(types::Fd(file.as_raw_fd()), data.as_ptr(), data.len() as u32)
@@ -126,6 +129,7 @@ mod macos_impl {
     use metal::*;
 
     pub fn load_block(path: &Path) -> Result<Vec<u8>> {
+        println!("[IO-MAC] Loading via Metal IO: {:?}", path.file_name());
         let device = Device::system_default().ok_or_else(|| anyhow!("No Metal device found"))?;
         let queue_desc = IOCommandQueueDescriptor::new();
         let io_queue = device.new_io_command_queue(&queue_desc).map_err(|e| anyhow!("Failed to create Metal IO Queue: {}", e))?;

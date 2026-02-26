@@ -879,3 +879,53 @@ pub fn load_tensor<P: AsRef<std::path::Path>>(path: P, name: &str, device: &Devi
     let tensor = st.get(name).ok_or_else(|| anyhow!("Tensor {} not found", name))?;
     Ok(tensor.clone())
 }
+
+/// [GPU-QUANT] 4-bit Iterative Residual Quantization on GPU
+pub fn pack_bitkv_gpu(t: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+    let dev = t.device();
+    let dims = t.dims4()?; // (B, H, S, D)
+    let (b, h, s, d) = (dims.0, dims.1, dims.2, dims.3);
+    
+    // 1. Anchors (Selected sparse vectors)
+    let ac_indices: Vec<u32> = (0..s as u32).filter(|&i| i < 4 || i % 8 == 0).collect();
+    let ac_count = ac_indices.len();
+    let ac_tensor = Tensor::from_vec(ac_indices, vec![ac_count], dev)?;
+    let anchors = t.index_select(&ac_tensor, 2)?;
+
+    // 2. Iterative Quantization
+    let mut residual = t.to_dtype(DType::F32)?;
+    let scales = t.abs()?.max_keepdim(3)?.to_dtype(DType::F32)?; // (B, H, S, 1)
+    
+    let mut packed_planes = Vec::new();
+    for bit_idx in 0..4 {
+        let cur_scale = scales.affine(1.0 / (2.0f64.powi(bit_idx)), 0.0)?;
+        let mask = residual.ge(0.0)?; // (B, H, S, D) - Bool mask
+        
+        // Update residual: res = res - (mask ? cur_scale : -cur_scale)
+        let delta = mask.where_cond(&cur_scale, &cur_scale.neg()?)?;
+        residual = residual.sub(&delta)?;
+        
+        packed_planes.push(mask.to_dtype(DType::U8)?);
+    }
+
+    // 3. Bit Packing (Convert 4 boolean planes to U8 bits)
+    // Layout: Flatten(B, H, S, D) then 4 planes
+    let total_els = b * h * s * d;
+    
+    // This part is tricky without a custom CUDA kernel for bit-packing.
+    // For now, we move the 4 bit planes (U8) to CPU and pack bits there.
+    // Still saves RAM because we only move 1-byte-per-element masks instead of 4-byte F32.
+    let mut final_packed = vec![0u8; (total_els * 4 + 7) / 8];
+    for (p_idx, plane) in packed_planes.iter().enumerate() {
+        let p_data = plane.flatten_all()?.to_device(&Device::Cpu)?.to_vec1::<u8>()?;
+        for (i, &val) in p_data.iter().enumerate() {
+            if val > 0 {
+                let bit_pos = i + p_idx * total_els;
+                final_packed[bit_pos / 8] |= 1 << (bit_pos % 8);
+            }
+        }
+    }
+    let packed_tensor = Tensor::from_vec(final_packed, vec![(total_els * 4 + 7) / 8], &Device::Cpu)?;
+
+    Ok((anchors.to_device(&Device::Cpu)?, packed_tensor, scales.to_device(&Device::Cpu)?))
+}
