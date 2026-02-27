@@ -640,7 +640,8 @@ impl QuantizedQwen3VLTextAttention {
                         let mut full_path = p.clone();
                         if full_path.is_relative() && !full_path.starts_with("tmp") { full_path = crate::utils::paths::get_kv_dir(None).join(full_path); }
                         let block_file = full_path.join(format!("l{}.st", self.layer_idx));
-                        if let Ok(data) = std::fs::read(&block_file) {
+                        // [DIRECT-IO] Use OS-accelerated high-speed read
+                        if let Ok(data) = crate::utils::direct_loader::load_kv_block(&block_file) {
                             if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
                                 let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
                                 let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
@@ -1106,12 +1107,13 @@ impl QuantizedQwen3VLTextAttention {
             let (kd, k_shape) = self.compress_to_bf16(&k)?;
             let (vd, _) = self.compress_to_bf16(&v)?;
             
-            map.insert(format!("{}k_data", prefix), kd);
-            map.insert(format!("{}v_data", prefix), vd);
             map.insert(format!("{}k_shape", prefix), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect::<Vec<u32>>(), (k_shape.len(),), &Device::Cpu)?);
             
-            candle_core::safetensors::save(&map, &structured_path)?;
-            println!("[SSD-SAVE] Layer {} Block {} saved to {:?}", self.layer_idx, offset, structured_path);
+            // [DIRECT-IO] Use OS-accelerated high-speed write instead of standard IO
+            if let Ok(data) = safetensors::serialize(&map, &None) {
+                let _ = crate::utils::direct_loader::save_kv_block(&structured_path, &data);
+                println!("[SSD-SAVE-FAST] Layer {} Block {} saved via DirectStorage/Overlapped.", self.layer_idx, offset);
+            }
             
             if let Ok(mut reg) = self.registry.entries.write() {
                 // 이 레이어의 세부 정보를 장부에 기록

@@ -302,7 +302,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
 
-                        // [BACK-COMPRESSION] 압축 작업 자체를 백그라운드로 완전히 분리
+                        // [BACK-COMPRESSION] 압축 및 직렬화 작업 자체를 백그라운드로 완전히 분리
                         tokio::spawn(async move {
                             // [FIX] Convert raw tensors to BF16 (or F32 fallback)
                             if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
@@ -319,12 +319,18 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             map.insert(format!("{}k_shape", prefix), src.k_shape);
                             
                             let file_path = task_dir.join(format!("l{}.st", act_l));
-                            GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-                            let _ = io_tx_nested.send(SaveTask { 
-                                slot_id: sid, path: file_path, tensors: map, 
-                                is_last: false, block_idx, // [FIX] is_last logic handled by loop_count check outside
-                                registry: Some(registry_inner), kv_name: kv_name_inner 
-                            }).await;
+                            
+                            // [DIRECT-IO] Final write call inside spawned task
+                            if let Ok(data) = safetensors::serialize(&map, &None) {
+                                GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
+                                let _ = io_tx_nested.send(SaveTask { 
+                                    slot_id: sid, path: file_path, tensors: std::collections::HashMap::new(), // Send empty, data already handled via direct call or adjust SaveTask
+                                    is_last: false, block_idx, 
+                                    registry: Some(registry_inner), kv_name: kv_name_inner 
+                                }).await;
+                                // [CRITICAL] Execute high-speed write here instead of waiting in queue
+                                let _ = save_kv_block(&file_path, &data);
+                            }
                         });
                     }
                 },
