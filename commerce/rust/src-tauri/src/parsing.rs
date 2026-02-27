@@ -328,25 +328,26 @@ pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> 
 }
 
 pub fn page_type_prompt() -> String { r###"[TASK]
-Based on the PREVIOUSLY RECORDED Pug template content, identify the primary category of this webpage.
-
-[INSTRUCTION]
-You have already received the page data in chunks. Analyze the entire history and determine the page type. 
+Based on the provided Pug template, identify the primary category of this webpage.
 
 [SCHEMA DEFINITIONS]
-- type: The main category of the page content. Must be one of:
+- type: The main category. Must be one of:
   - 'order': Order history, order details, checkout success.
   - 'goods': Product list, product detail, shopping cart.
   - 'tracking': Shipment tracking status, delivery history.
   - 'review': Product reviews, feedback list.
   - 'coupon': Coupon list, discount events.
   - 'event': Promotion pages, event announcements.
-  - '': If none of the above match or the page is irrelevant
+  - '': If none of the above match.
+
+[EXTRACTION RULES]
+- Return ONLY valid JSON.
+- NO EXPLANATION. 
+- NO THINKING.
 
 [OUTPUT FORMAT]
-Return valid JSON only. No explanation.
 {
-    "type": "..."
+    "type": type
 }"###.to_string() }
 
 pub fn page_selectors_prompt(page_type: &str) -> String {
@@ -1059,18 +1060,32 @@ pub fn json_to_natural_language(value: &serde_json::Value) -> String {
 }
 
 pub fn parse_json_from_llm(text: &str) -> serde_json::Value {
-    if let Ok(v) = serde_json::from_str(text) { return v; }
-    if let Some(start) = text.find("{") {
-        if let Some(end) = text.rfind("}") {
+    // [CLEANUP] Remove <think>...</think> tags if they exist
+    let mut clean_text = text.to_string();
+    if let Some(start_think) = clean_text.find("<think>") {
+        if let Some(end_think) = clean_text.find("</think>") {
+            if start_think < end_think {
+                clean_text.replace_range(start_think..end_think + 8, "");
+            }
+        } else {
+            // Unclosed think tag - just remove from start
+            clean_text.replace_range(start_think.., "");
+        }
+    }
+    let clean_text = clean_text.trim();
+
+    if let Ok(v) = serde_json::from_str(clean_text) { return v; }
+    if let Some(start) = clean_text.find("{") {
+        if let Some(end) = clean_text.rfind("}") {
             if start < end {
-                if let Ok(v) = serde_json::from_str(&text[start..=end]) { return v; }
+                if let Ok(v) = serde_json::from_str(&clean_text[start..=end]) { return v; }
             }
         }
     }
-    if let Some(start) = text.find("[") {
-        if let Some(end) = text.rfind("]") {
+    if let Some(start) = clean_text.find("[") {
+        if let Some(end) = clean_text.rfind("]") {
             if start < end {
-                if let Ok(v) = serde_json::from_str(&text[start..=end]) { return v; }
+                if let Ok(v) = serde_json::from_str(&clean_text[start..=end]) { return v; }
             }
         }
     }

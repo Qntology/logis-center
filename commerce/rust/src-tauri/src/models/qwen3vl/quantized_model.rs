@@ -840,6 +840,15 @@ impl QuantizedQwen3VLTextAttention {
             };
 
             if let (Some(k), Some(v)) = (k_opt, v_opt) {
+                // [RAM-GUARD] Check if the bake worker is overloaded before cloning to CPU
+                if let Some(tx) = BAKE_TX.get() {
+                    if tx.capacity() == 0 {
+                        // Skip offloading this block if the queue is full to prevent RAM spike.
+                        // The next prefill chunk or decoding step will try again if it's still dirty.
+                        continue; 
+                    }
+                }
+
                 let k_cpu = k.to_device(&Device::Cpu)?;
                 let v_cpu = v.to_device(&Device::Cpu)?;
                 

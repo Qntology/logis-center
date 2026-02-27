@@ -180,7 +180,7 @@ pub async fn get_load_worker() -> Result<mpsc::Sender<SlotTask>> { LOAD_TX.get()
 pub async fn wait_for_global_io() { while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { tokio::time::sleep(std::time::Duration::from_millis(10)).await; } }
 
 pub fn init_bake_worker() {
-    let (btx, brx) = mpsc::channel(2048); let (ltx, lrx) = mpsc::channel(2048);
+    let (btx, brx) = mpsc::channel(128); let (ltx, lrx) = mpsc::channel(128);
     let _ = BAKE_TX.set(btx); let _ = LOAD_TX.set(ltx);
     if let Some(rx) = SLOT_MANAGER_DATA.1.lock().unwrap().take() { tauri::async_runtime::spawn(async move { spawn_slot_dispatcher(rx).await; }); }
     tauri::async_runtime::spawn(async move { spawn_slot_worker(brx); }); 
@@ -492,7 +492,7 @@ impl Qwen3VLGenerateModel {
     
             let temperature = mes.temperature.unwrap_or(0.7) as f32;
             let seed = mes.seed.unwrap_or(34562) as u64;
-            let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(0.9) as f32), Some(9), seed);
+            let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(0.9) as f32), Some(50), seed);
             let mes_render = self.chat_template.apply_chat_template(&mes)?;
             let input = self.pre_processor.process_info(&mes, &mes_render)?;
             let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
@@ -518,7 +518,14 @@ impl Qwen3VLGenerateModel {
         let mut gen_ids = vec![];
         for i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
-            let next_id = lp.sample(&logits.flatten_all()?.to_dtype(DType::F32)?)?;
+            
+            // [REPETITION-PENALTY] Apply penalty to logits to prevent looping
+            let mut logits_tensor = logits.flatten_all()?.to_dtype(DType::F32)?;
+            if !gen_ids.is_empty() {
+                logits_tensor = apply_repetition_penalty(&logits_tensor, 1.2, &gen_ids)?;
+            }
+            
+            let next_id = lp.sample(&logits_tensor)?;
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             gen_ids.push(next_id);
             gen_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
@@ -555,4 +562,22 @@ impl Qwen3VLGenerateModel {
         self.qwen3_vl.forward(&chunk_ids, None, None, None, None, None, current_pos, current_pos + chunk_size, None, None).await?;
         Ok(chunk_size)
     }
+}
+
+fn apply_repetition_penalty(logits: &Tensor, penalty: f32, previous_tokens: &[u32]) -> Result<Tensor> {
+    let mut logits_vec = logits.to_vec1::<f32>()?;
+    let mut set = std::collections::HashSet::new();
+    for &t in previous_tokens {
+        if !set.contains(&t) {
+            let logit = logits_vec[t as usize];
+            if logit < 0.0 {
+                logits_vec[t as usize] = logit * penalty;
+            } else {
+                logits_vec[t as usize] = logit / penalty;
+            }
+            set.insert(t);
+        }
+    }
+    let dev = logits.device();
+    Ok(Tensor::from_vec(logits_vec, logits.shape(), dev)?)
 }

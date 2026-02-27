@@ -605,7 +605,9 @@ async fn process_task(
 
         let type_prompt = parsing::page_type_prompt();
         let pug_content = light_pug.clone();
-        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, type_prompt);
+        
+        // [REFINED-PROMPT] Place specific instructions at the end for better compliance.
+        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] Identify the page type.\n\n[INSTRUCTION]\n{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING.", pug_content, type_prompt);
         let snapshot_id = format!("{}_step_a", task.id);
         
         // [CHECKPOINT] Check if Step A snapshot already exists (Resume from OOM)
@@ -649,7 +651,9 @@ async fn process_task(
                     content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                     name: None,
                 })],
-                model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
+                model: "qwen3vl".to_string(), 
+                max_tokens: Some(32), // Increased from 128 to 512
+                temperature: Some(0.1),
                 ..Default::default()
             };
 
@@ -738,7 +742,7 @@ async fn process_task(
                     content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                     name: None,
                 })],
-                model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
+                model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
                 ..Default::default()
             };
 
@@ -887,7 +891,7 @@ async fn process_task(
                         content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                         name: None,
                     })],
-                    model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(0.1),
+                    model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
                     ..Default::default()
                 };
 
