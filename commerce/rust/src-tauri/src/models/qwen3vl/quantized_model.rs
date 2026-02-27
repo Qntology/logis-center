@@ -655,39 +655,28 @@ impl QuantizedQwen3VLTextAttention {
                                     let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                                     let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
 
-                                    let dev = &Device::Cpu;
-                                    let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, dev)?;
-                                    let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, dev)?;
+                                    // [VRAM-DIRECT] Move BF16 bytes directly to GPU and decompress (cast) there
+                                    let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+                                    let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
 
-                                    k_cpu = Some(self.decompress_from_bf16(&kd_t, &meta_os, &Device::Cpu)?);
-                                    v_cpu = Some(self.decompress_from_bf16(&vd_t, &meta_os, &Device::Cpu)?);
+                                    bulk_ks.push(self.decompress_from_bf16(&kd_t, &meta_os, dev)?);
+                                    bulk_vs.push(self.decompress_from_bf16(&vd_t, &meta_os, dev)?);
                                     ssd_count += 1;
                                 }
                             }
                         }
                     }
                 }
-                if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
-                    ram_queue_ks.push(k.to_dtype(DType::F32)?); ram_queue_vs.push(v.to_dtype(DType::F32)?);
-                    if ram_queue_ks.len() >= 3 {
-                        let k_cat = Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?;
-                        let v_cat = Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?;
-                        bulk_ks.push(k_cat); bulk_vs.push(v_cat);
-                        ram_queue_ks.clear(); ram_queue_vs.clear();
-                    }
+                if let Some(k) = k_cpu {
+                    bulk_ks.push(k.to_device(dev)?.to_dtype(DType::F32)?);
+                    bulk_vs.push(v_cpu.unwrap().to_device(dev)?.to_dtype(DType::F32)?);
                 }
             }
-        }
-        // Final leftovers ordered flush
-        if !ram_queue_ks.is_empty() {
-            let k_cat = Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?;
-            let v_cat = Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?;
-            bulk_ks.push(k_cat); bulk_vs.push(v_cat);
         }
 
         if bulk_ks.is_empty() { return Err(anyhow!("No KV data found")); }
 
-        // 4. [BULK-ATTENTION] F32 Total Precision Pass
+        // 4. [BULK-ATTENTION] GPU Parallel Concatenation
         let k = Tensor::cat(&bulk_ks, 2)?;
         let v = Tensor::cat(&bulk_vs, 2)?;
         let final_kv_len = k.dim(2)?;
@@ -1809,13 +1798,12 @@ impl QuantizedQwen3VLTextModel {
             let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i, session_id.clone(), kv_name.clone(), baking_only)?;
             results.push(out);
 
-            // [STRATEGY] Real-time backup during Prefill or Baking
+            // [STRATEGY] Real-time backup during Prefill, Baking or Decoding
             if let Some(sid) = &session_id {
                 let is_prefill = take > 1;
                 let is_last = chunk_idx == chunk_offsets.len() - 1;
-                if is_prefill || self.baking_only {
-                    let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last, self.baking_only, !is_prefill);
-                }
+                // [FIX] Always trigger baking to ensure SSD mirror is up-to-date even during decoding
+                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last, baking_only, !is_prefill);
             }
 
             // [VRAM-EVACUATION] Manage VRAM pressure after chunk processing
