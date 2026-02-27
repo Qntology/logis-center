@@ -694,16 +694,6 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // 5. [UNIFIED-VRAM-PASS] VRAM 병합 연산
-        if !vram_ks.is_empty() {
-            let mut k = Tensor::cat(&vram_ks, 2)?;
-            let mut v = Tensor::cat(&vram_vs, 2)?;
-            if self.num_kv_groups > 1 {
-                let (b, h, s, d) = k.dims4()?;
-                k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-            }
-            let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
         // 5. [BATCH-VRAM-PASS] VRAM 병합 연산 (누산기 활용 최적화)
         if vram_total_len > 0 {
             let total_vram_blocks: usize = vram_count;
@@ -950,11 +940,15 @@ impl QuantizedQwen3VLTextAttention {
     pub fn trigger_realtime_incremental_bake(&self, session_id: &str, is_last_chunk: bool, baking_only: bool) -> Result<()> {
         use crate::models::qwen3vl::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
 
+        let total_blocks = self.kv_blocks.len();
+        // [VRAM-GUARD] 최신 3개 블록만 VRAM 유지, 나머지는 정리 대상
+        let vram_limit_idx = total_blocks.saturating_sub(3);
+
         let target_indices: Vec<usize> = self.kv_blocks.iter().enumerate().filter_map(|(i, b)| {
             let inner = b.inner.read().unwrap();
             let is_full = inner.len == 256;
-            // [FIX] 이미 저장을 보냈거나(Streaming) 완료된(SSD) 블록은 제외하고, 순수 VRAM 블록만 대상으로 함
-            if (is_full || is_last_chunk) && inner.location == KVLocation::VRAM { Some(i) } else { None }
+            // VRAM에 데이터가 있거나 아직 SSD로 가지 않은 블록 수집
+            if (is_full || is_last_chunk) && inner.k_cache.is_some() { Some(i) } else { None }
         }).collect();
 
         for idx in target_indices {
@@ -962,34 +956,33 @@ impl QuantizedQwen3VLTextAttention {
             let (k_opt, v_opt, off, b_idx, b_len) = {
                 let mut inner = block.inner.write().unwrap();
                 let snapshot = (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len);
-                // [FIX] 보내자마자 Streaming으로 변경하여 중복 전송 방지
-                inner.location = KVLocation::Streaming;
+                
+                // [FIX] 최신 3개 블록이 아니면 연산 직후 VRAM 원본 즉시 삭제 (대기열 관리)
+                if idx < vram_limit_idx {
+                    inner.k_cache = None;
+                    inner.v_cache = None;
+                    inner.location = KVLocation::Streaming;
+                }
                 snapshot
             };
 
             if let (Some(k), Some(v)) = (k_opt, v_opt) {
-                let (ka, kp, ks, k_shape) = self.compress_to_bitkv(&k)?;
-                let (va, vp, vs, _) = self.compress_to_bitkv(&v)?;
+                let k_cpu = k.to_device(&Device::Cpu)?;
+                let v_cpu = v.to_device(&Device::Cpu)?;
                 
-                let dump = LayerKVDump {
-                    layer_idx: self.layer_idx,
-                    k_anchors: ka.to_device(&Device::Cpu)?,
-                    k_packed: kp.to_device(&Device::Cpu)?,
-                    k_scales: ks.to_device(&Device::Cpu)?,
-                    v_anchors: va.to_device(&Device::Cpu)?,
-                    v_packed: vp.to_device(&Device::Cpu)?,
-                    v_scales: vs.to_device(&Device::Cpu)?,
-                    k_shape: Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?,
-                    raw_k: None,
-                    raw_v: None,
-                };
-
-                // [FIX] 경로 클리닝: inference/inference 같은 중복 방지
                 let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
-                let kv_type = kv_name_raw.split('/').last().unwrap_or("text").to_string();
+                let last_part = kv_name_raw.split('/').last().unwrap_or("text");
+                let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { 
+                    "text".to_string() 
+                } else { 
+                    last_part.to_string() 
+                };
                 
                 let session_id_owned = session_id.to_string();
                 let registry_clone = self.registry.clone();
+                let layer_idx = self.layer_idx;
+                let num_kv_h = self.num_key_value_heads;
+                let h_d = self.head_dim;
 
                 tauri::async_runtime::spawn(async move {
                     if let Some(tx) = BAKE_TX.get() {
@@ -1001,6 +994,20 @@ impl QuantizedQwen3VLTextAttention {
 
                         let block_dir = crate::utils::paths::get_kv_dir(None).join(&sub_path).join(format!("b{}", off));
                         if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
+
+                        let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
+                        let dump = LayerKVDump {
+                            layer_idx,
+                            k_anchors: Tensor::zeros((1,1), DType::F32, &Device::Cpu).unwrap(),
+                            k_packed: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
+                            k_scales: Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap(),
+                            v_anchors: Tensor::zeros((1,1), DType::F32, &Device::Cpu).unwrap(),
+                            v_packed: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
+                            v_scales: Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap(),
+                            k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
+                            raw_k: Some(k_cpu),
+                            raw_v: Some(v_cpu),
+                        };
 
                         let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
                         let _ = tx.send(SlotTask::Bake(BakeTask {
@@ -2233,8 +2240,15 @@ impl QuantizedQwen3VLTextModel {
         if let Some(tx) = BAKE_TX.get() {
             let kv_dir = crate::utils::paths::get_kv_dir(None);
             let mode = self.baking_only;
+            
+            // [FIX] 2d4cf92 커밋의 경로 정규화 및 세션 격리
             let kv_name_raw = kv_name.unwrap_or("text");
-            let kv_type = kv_name_raw.split('/').last().unwrap_or("text");
+            let last_part = kv_name_raw.split('/').last().unwrap_or("text");
+            let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { 
+                "text".to_string() 
+            } else { 
+                last_part.to_string() 
+            };
             
             let sub_path = if mode {
                 format!("{}/reference/{}", session_id, kv_type)
