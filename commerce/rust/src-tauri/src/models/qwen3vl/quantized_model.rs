@@ -704,36 +704,86 @@ impl QuantizedQwen3VLTextAttention {
                 v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
             }
             let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
-            if let Some(mask) = &attention_mask {
-                let m_len = mask.dim(D::Minus1)?;
-                let b_off = vram_start_off.unwrap_or(0);
-                if b_off + vram_total_len <= m_len {
-                    attn_weights = attn_weights.broadcast_add(&mask.narrow(D::Minus1, b_off, vram_total_len)?.to_dtype(target_dtype)?)?;
+        // 5. [BATCH-VRAM-PASS] VRAM 병합 연산 (누산기 활용 최적화)
+        if vram_total_len > 0 {
+            let total_vram_blocks: usize = vram_count;
+            let has_active = self.kv_blocks.last().map(|b| b.inner.read().unwrap().len < 256).unwrap_or(false);
+            let full_count = if has_active { total_vram_blocks.saturating_sub(1) } else { total_vram_blocks };
+
+            // 1. [ACCUMULATE] 새로 완성된 블록들을 캐시에 반영
+            if full_count > 0 && self.merged_vram_block_count < full_count {
+                let mut to_merge_k = Vec::new();
+                let mut to_merge_v = Vec::new();
+                let merge_take = full_count - self.merged_vram_block_count;
+                for i in 0..merge_take.min(vram_ks.len()) {
+                    to_merge_k.push(vram_ks[i].clone());
+                    to_merge_v.push(vram_vs[i].clone());
+                }
+                if !to_merge_k.is_empty() {
+                    if let Some(mk) = self.vram_merged_k.take() {
+                        let mut list = vec![mk]; list.extend(to_merge_k);
+                        self.vram_merged_k = Some(Tensor::cat(&list, 2)?);
+                    } else { self.vram_merged_k = Some(Tensor::cat(&to_merge_k, 2)?); }
+                    if let Some(mv) = self.vram_merged_v.take() {
+                        let mut list = vec![mv]; list.extend(to_merge_v);
+                        self.vram_merged_v = Some(Tensor::cat(&list, 2)?);
+                    } else { self.vram_merged_v = Some(Tensor::cat(&to_merge_v, 2)?); }
+                    self.merged_vram_block_count = full_count;
                 }
             }
-            let m_i = attn_weights.max_keepdim(D::Minus1)?;
-            let p_i = attn_weights.broadcast_sub(&m_i)?.exp()?;
+
+            // 2. [FINAL-COMBINE] 캐시 + 현재 연산 중인 나머지 조각들 합체
+            let mut final_list_k = Vec::new();
+            let mut final_list_v = Vec::new();
+            if let (Some(mk), Some(mv)) = (&self.vram_merged_k, &self.vram_merged_v) {
+                final_list_k.push(mk.clone());
+                final_list_v.push(mv.clone());
+            }
+            let r_start = full_count.saturating_sub(self.merged_vram_block_count);
+            for i in r_start..vram_ks.len() {
+                final_list_k.push(vram_ks[i].clone());
+                final_list_v.push(vram_vs[i].clone());
+            }
+
+            let mut k = Tensor::cat(&final_list_k, 2)?;
+            let mut v = Tensor::cat(&final_list_v, 2)?;
+
+            if self.num_kv_groups > 1 {
+                let (b, h, s, d) = k.dims4()?;
+                k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+            }
+            
+            // [FIX] VRAM 패스에서는 마스크 적용 제외 (Shape Mismatch 해결 및 속도 향상)
+            let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
+            
+            let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
+            let m_i = attn_weights_f32.max_keepdim(D::Minus1)?;
+            let p_i = attn_weights_f32.broadcast_sub(&m_i)?.exp()?;
             let s_i = p_i.sum_keepdim(D::Minus1)?;
-            let o_i = p_i.matmul(&v)?;
+            let o_i = p_i.to_dtype(target_dtype)?.matmul(&v)?;
+
             match (running_m.take(), running_s.take(), running_o.take()) {
                 (None, None, None) => { 
                     running_m = Some(m_i); 
-                    running_s = Some(s_i.to_dtype(target_dtype)?); 
-                    running_o = Some(o_i.to_dtype(target_dtype)?); 
+                    running_s = Some(s_i); 
+                    running_o = Some(o_i.to_dtype(DType::F32)?); 
                 }
                 (Some(m_prev), Some(s_prev), Some(o_prev)) => {
                     let m_new = m_prev.maximum(&m_i)?;
-                    let alpha_prev = m_prev.broadcast_sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
-                    let alpha_i = m_i.broadcast_sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
-                    running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&s_i.to_dtype(target_dtype)?.broadcast_mul(&alpha_i)?)?);
-                    running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&o_i.to_dtype(target_dtype)?.broadcast_mul(&alpha_i)?)?);
+                    let alpha_prev = m_prev.broadcast_sub(&m_new)?.exp()?;
+                    let alpha_i = m_i.broadcast_sub(&m_new)?.exp()?;
+                    running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&s_i.broadcast_mul(&alpha_i)?)?);
+                    running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&o_i.to_dtype(DType::F32)?.broadcast_mul(&alpha_i)?)?);
                     running_m = Some(m_new);
                 }
                 _ => unreachable!(),
             }
         }
 
-        let attn_output = running_o.ok_or_else(|| anyhow!("No attention output"))?.broadcast_div(&running_s.unwrap().to_dtype(target_dtype)?)?;
+        let attn_output = running_o.ok_or_else(|| anyhow!("No attention output"))?
+            .broadcast_div(&running_s.unwrap())?
+            .to_dtype(target_dtype)?;
         let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
         let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
         
