@@ -473,7 +473,8 @@ impl Qwen3VLGenerateModel {
             if !path.exists() { fs::create_dir_all(&path)?; }
             fs::write(path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
-            println!("[PREFILL-SAVE] All active KV blocks flushed to disk.");
+            wait_for_global_io().await; // [SYNC] Ensure SSD write is complete
+            println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk.");
         }
         Ok(total_toks)
     }
@@ -497,6 +498,8 @@ impl Qwen3VLGenerateModel {
             println!("[FULL-PREFILL] Computing entire context for 28-layer inference (Len: {}).", total_toks);
             (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
         };
+        
+        wait_for_global_io().await; // [SYNC] Ensure disk is ready before inference
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_toks, session_id.clone(), _kv_name.clone()).await?;
         let mut gen_ids = vec![];
         for i in 0..mes.max_tokens.unwrap_or(2048) {
@@ -506,6 +509,8 @@ impl Qwen3VLGenerateModel {
             gen_ids.push(next_id);
             gen_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
             let current_pos = total_toks + i as usize;
+            
+            wait_for_global_io().await; // [SYNC] Wait for any incremental baking
             logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;
         }
         if let Some(s_id) = &session_id {

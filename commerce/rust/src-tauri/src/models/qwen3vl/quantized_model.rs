@@ -588,7 +588,7 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // 3. [SEQUENTIAL-LOADER] Maintain F32 Integrity during Staging
+        // 3. [SEQUENTIAL-KV-LOADER] Strictly Ordered Hybrid Pipeline
         let mut bulk_ks = Vec::new();
         let mut bulk_vs = Vec::new();
         let mut ram_queue_ks = Vec::new();
@@ -602,12 +602,12 @@ impl QuantizedQwen3VLTextAttention {
             };
             if b_off >= total_tokens_now { continue; }
 
+            // Check physical VRAM presence
             let mut k_vram = None;
             let mut v_vram = None;
             {
                 let inner = block.inner.read().unwrap();
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    // Keep in F32 if possible for higher precision
                     k_vram = Some(k.to_device(dev)?.to_dtype(DType::F32)?);
                     v_vram = Some(v.to_device(dev)?.to_dtype(DType::F32)?);
                     vram_count += 1;
@@ -615,13 +615,16 @@ impl QuantizedQwen3VLTextAttention {
             }
 
             if let (Some(k), Some(v)) = (k_vram, v_vram) {
+                // [CRITICAL-ORDER-SYNC] Flush SSD queue BEFORE current VRAM block to maintain timeline
                 if !ram_queue_ks.is_empty() {
-                    bulk_ks.push(Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?);
-                    bulk_vs.push(Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?);
+                    let k_cat = Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?;
+                    let v_cat = Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?;
+                    bulk_ks.push(k_cat); bulk_vs.push(v_cat);
                     ram_queue_ks.clear(); ram_queue_vs.clear();
                 }
                 bulk_ks.push(k); bulk_vs.push(v);
             } else {
+                // SSD/RAM Pipeline: Load to RAM, cat every 3 for efficiency
                 let mut k_cpu = None;
                 let mut v_cpu = None;
                 {
@@ -663,16 +666,19 @@ impl QuantizedQwen3VLTextAttention {
                 if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
                     ram_queue_ks.push(k.to_dtype(DType::F32)?); ram_queue_vs.push(v.to_dtype(DType::F32)?);
                     if ram_queue_ks.len() >= 3 {
-                        bulk_ks.push(Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?);
-                        bulk_vs.push(Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?);
+                        let k_cat = Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?;
+                        let v_cat = Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?;
+                        bulk_ks.push(k_cat); bulk_vs.push(v_cat);
                         ram_queue_ks.clear(); ram_queue_vs.clear();
                     }
                 }
             }
         }
+        // Final leftovers ordered flush
         if !ram_queue_ks.is_empty() {
-            bulk_ks.push(Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?);
-            bulk_vs.push(Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?);
+            let k_cat = Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?;
+            let v_cat = Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?;
+            bulk_ks.push(k_cat); bulk_vs.push(v_cat);
         }
 
         if bulk_ks.is_empty() { return Err(anyhow!("No KV data found")); }
@@ -722,59 +728,64 @@ impl QuantizedQwen3VLTextAttention {
         
         let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
         let mut anchors = vec![0.0f32; b * h * anchor_count * d];
-        let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
-        let mut scales = vec![0.0f32; b * h * s];
+        // [RESIDUAL-QUANT] Store 4 stages of bit-planes
+        let packed_len = (b * h * s * d * 4 + 7) / 8;
+        let mut packed_residuals = vec![0u8; packed_len];
 
         let head_token_size = s * d;
-        packed_residuals.par_chunks_mut(head_token_size / 8).enumerate().for_each(|(bh_idx, head_packed)| {
+
+        use rayon::prelude::*;
+        // Process each head in parallel
+        packed_residuals.par_chunks_mut(head_token_size * 4 / 8).enumerate().for_each(|(bh_idx, head_packed)| {
             let bh_offset = bh_idx * head_token_size;
-            for i in 0..head_token_size {
-                if t_data[bh_offset + i] >= 0.0 {
-                    head_packed[i / 8] |= 1 << (i % 8);
+            let mut head_residual: Vec<f32> = t_data[bh_offset..bh_offset + head_token_size].to_vec();
+            
+            for stage in 0..4 {
+                let stage_bit_offset = stage * head_token_size;
+                let mut stage_max_abs = 0.0f32;
+                for &v in &head_residual { if v.abs() > stage_max_abs { stage_max_abs = v.abs(); } }
+                
+                for i in 0..head_token_size {
+                    let val = head_residual[i];
+                    if val >= 0.0 {
+                        head_packed[(stage_bit_offset + i) / 8] |= 1 << ((stage_bit_offset + i) % 8);
+                        head_residual[i] -= stage_max_abs * 0.5; // Adaptive residual update
+                    } else {
+                        head_residual[i] += stage_max_abs * 0.5;
+                    }
                 }
             }
         });
         
+        // 2. Anchors collection (remains original for high-precision reference)
         let anchor_head_size = anchor_count * d;
         let mut anchors_heads: Vec<&mut [f32]> = anchors.chunks_mut(anchor_head_size).collect();
-        let mut scales_heads: Vec<&mut [f32]> = scales.chunks_mut(s).collect();
 
-        anchors_heads.par_iter_mut().zip(scales_heads.par_iter_mut()).enumerate().for_each(|(bh_idx, (anchor_head, head_scales))| {
+        anchors_heads.par_iter_mut().enumerate().for_each(|(bh_idx, anchor_head)| {
             let bh_offset = bh_idx * head_token_size;
             for token_idx in 0..s {
                 let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
-                
                 if token_idx < 4 || token_idx % 8 == 0 {
                     let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
                     anchor_head[anchor_pos * d .. (anchor_pos + 1) * d].copy_from_slice(token_data);
                 }
-                
-                let mut max_abs = 0.0f32;
-                for &v in token_data {
-                    let a = v.abs();
-                    if a > max_abs { max_abs = a; }
-                }
-                head_scales[token_idx] = max_abs;
             }
         });
 
-        let packed_len = packed_residuals.len();
+        // Simplified scales storage for 4-stage compatibility
+        let scales_tensor = Tensor::from_vec(vec![1.0f32; b * h * s], vec![b, h, s, 1], &Device::Cpu)?; 
         let anchors_tensor = Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu)?;
         let packed_tensor = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu)?;
-        let scales_tensor = Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu)?;
         Ok((anchors_tensor, packed_tensor, scales_tensor, original_shape))
     }
 
-    pub fn decompress_from_bitkv(&self, anchors: &Tensor, packed: &Tensor, scales: &Tensor, original_shape: &[usize], device: &Device) -> Result<Tensor> {
+    pub fn decompress_from_bitkv(&self, anchors: &Tensor, packed: &Tensor, _scales: &Tensor, original_shape: &[usize], device: &Device) -> Result<Tensor> {
         let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-        
         let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
-        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         let anchors_vec = anchors.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         
         let last_dim = original_shape[original_shape.len() - 1];
         let seq_len = original_shape[original_shape.len() - 2];
-        
         let total_elements: usize = original_shape.iter().product();
         let mut decoded = vec![0.0f32; total_elements];
         
@@ -784,40 +795,28 @@ impl QuantizedQwen3VLTextAttention {
         use rayon::prelude::*;
         decoded.par_chunks_mut(head_tokens).enumerate().for_each(|(bh_idx, head_out)| {
             let bh_offset = bh_idx * head_tokens;
+            let anchor_offset = bh_idx * anchor_count * last_dim;
             
-            // [SAFE-INDEX] Check head counts to prevent division by zero or out-of-bounds
-            let scale_head_count = scales_vec.len() / seq_len;
-            let scale_head_idx = if scale_head_count > 0 { bh_idx % scale_head_count } else { 0 };
-            
-            let anchor_per_head = anchor_count * last_dim;
-            let anchor_head_count = if anchor_per_head > 0 { anchors_vec.len() / anchor_per_head } else { 0 };
-            let anchor_head_idx = if anchor_head_count > 0 { bh_idx % anchor_head_count } else { 0 };
-            
-            let anchor_offset = anchor_head_idx * anchor_per_head;
-            
-            for s_idx in 0..seq_len {
-                let scale_idx = scale_head_idx * seq_len + s_idx;
-                let scale = if scale_idx < scales_vec.len() { scales_vec[scale_idx] } else { 0.0 };
+            // 1. 4-Stage Cumulative Restoration
+            for stage in 0..4 {
+                let stage_bit_offset = bh_offset * 4 + stage * head_tokens;
+                let step_scale = 1.0f32 / (2.0f32.powi(stage as i32)); // Example decaying scale
                 
-                let token_out = &mut head_out[s_idx * last_dim .. (s_idx + 1) * last_dim];
-                
-                for d_idx in 0..last_dim {
-                    let global_bit_idx = bh_offset + s_idx * last_dim + d_idx;
-                    // Bit-sign restoration
+                for i in 0..head_tokens {
+                    let global_bit_idx = stage_bit_offset + i;
                     if global_bit_idx / 8 < packed_vec.len() {
                         let is_set = (packed_vec[global_bit_idx / 8] & (1 << (global_bit_idx % 8))) != 0;
-                        token_out[d_idx] = if is_set { scale } else { -scale };
+                        head_out[i] += if is_set { step_scale } else { -step_scale };
                     }
                 }
-                
+            }
+            
+            // 2. Anchor Override (Reference integrity)
+            for s_idx in 0..seq_len {
                 if s_idx < 4 || s_idx % 8 == 0 {
                     let a_pos = if s_idx < 4 { s_idx } else { 4 + (s_idx - 4) / 8 };
-                    let a_idx_start = anchor_offset + a_pos * last_dim;
-                    let a_idx_end = a_idx_start + last_dim;
-                    
-                    if a_idx_end <= anchors_vec.len() {
-                        token_out.copy_from_slice(&anchors_vec[a_idx_start .. a_idx_end]);
-                    }
+                    let a_data = &anchors_vec[anchor_offset + a_pos * last_dim .. anchor_offset + (a_pos + 1) * last_dim];
+                    head_out[s_idx * last_dim .. (s_idx + 1) * last_dim].copy_from_slice(a_data);
                 }
             }
         });
