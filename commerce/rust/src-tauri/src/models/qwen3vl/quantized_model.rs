@@ -540,64 +540,7 @@ impl QuantizedQwen3VLTextAttention {
         let sin = if sin.dtype() != target_dtype { sin.to_dtype(target_dtype)? } else { sin.clone() };
         let (query_states, key_states) = apply_rotary_pos_emb(&query_states, &key_states, &cos, &sin, false)?;
         
-        // 3. [BLOCK-ALLOCATION] Append or Create New
-        let current_chunk_len = key_states.dim(2)?;
-        let mut tokens_to_process = current_chunk_len;
-        let mut chunk_offset = 0;
-        
-        while tokens_to_process > 0 {
-            let mut appended = false;
-            if let Some(last_block) = self.kv_blocks.last_mut() {
-                let mut inner = last_block.inner.write().unwrap();
-                let free_space = 256usize.saturating_sub(inner.len);
-                if inner.location == KVLocation::VRAM && free_space > 0 {
-                    let take = tokens_to_process.min(free_space);
-                    let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
-                    let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
-                    if let (Some(prev_k), Some(prev_v)) = (inner.k_cache.take(), inner.v_cache.take()) {
-                        let pk = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k };
-                        let pv = if !prev_v.device().same_device(dev) { prev_v.to_device(dev)? } else { prev_v };
-                        
-                        inner.k_cache = Some(Tensor::cat(&[pk.to_dtype(target_dtype)?, k_piece.to_dtype(target_dtype)?], 2)?.contiguous()?);
-                        inner.v_cache = Some(Tensor::cat(&[pv.to_dtype(target_dtype)?, v_piece.to_dtype(target_dtype)?], 2)?.contiguous()?);
-                        inner.len += take; tokens_to_process -= take; chunk_offset += take;
-                        appended = true;
-                        
-                        // [DIRY-MARK] Mark as dirty for SSD backup
-                        let b_idx = inner.index;
-                        if self.layer_idx == 0 {
-                            let mut reg = self.registry.entries.write().unwrap();
-                            if b_idx < reg.len() { reg[b_idx].is_dirty = true; }
-                        }
-                    }
-                }
-            }
-            if !appended {
-                let take = tokens_to_process.min(256);
-                let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
-                let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
-                let index = self.kv_blocks.len();
-                let current_total = seqlen_offset + chunk_offset;
-                let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
-                {
-                    let mut inner = new_block.inner.write().unwrap();
-                    inner.k_cache = Some(k_piece); inner.v_cache = Some(v_piece);
-                }
-                if self.layer_idx == 0 {
-                    let mut reg = self.registry.entries.write().unwrap();
-                    if index < reg.len() {
-                        let entry = &mut reg[index];
-                        entry.token_start = current_total; entry.token_len = take; entry.is_dirty = true;
-                        for loc in entry.location.iter_mut() { *loc = KVLocation::VRAM; }
-                        entry.last_accessed = std::time::Instant::now();
-                    }
-                }
-                self.kv_blocks.push(new_block);
-                tokens_to_process -= take; chunk_offset += take;
-            }
-        }
-
-        // 3. [BLOCK-STAGING-ALLOCATION] Append or Create New (Mark Dirty for Real-time SSD Write)
+        // 3. [BLOCK-PIPELINE-ALLOCATION] Append or Create New (Mark Dirty for Real-time SSD Write)
         let current_chunk_len = key_states.dim(2)?;
         let mut tokens_to_process = current_chunk_len;
         let mut chunk_offset = 0;
@@ -654,8 +597,8 @@ impl QuantizedQwen3VLTextAttention {
         }
 
         // 4. [PIPELINE-STAGING-LOADER] 3-Block RAM Staging -> 3-Block VRAM Slide 1
-        let mut final_ks = Vec::new();
-        let mut final_vs = Vec::new();
+        let mut bulk_ks = Vec::new();
+        let mut bulk_vs = Vec::new();
 
         let mut ram_queue_ks = Vec::new();
         let mut ram_queue_vs = Vec::new();
@@ -667,7 +610,7 @@ impl QuantizedQwen3VLTextAttention {
                 let inner = block.inner.read().unwrap();
                 (inner.index, inner.offset, inner.len)
             };
-            if b_off >= total_len { continue; }
+            if b_off >= (seqlen_offset + q_len) { continue; }
 
             let (loc, ssd_path) = {
                 let reg = self.registry.entries.read().unwrap();
@@ -735,13 +678,13 @@ impl QuantizedQwen3VLTextAttention {
             }
 
             if let (Some(k), Some(v)) = (k_to_stage, v_to_stage) {
-                // VRAM Slide 1
+                // VRAM Slide 1 (Maintain 3 blocks max in staging queue)
                 if vram_queue_ks.len() >= 3 { vram_queue_ks.pop_front(); vram_queue_vs.pop_front(); }
                 vram_queue_ks.push_back(k); vram_queue_vs.push_back(v);
                 
                 // [INTELLIGENCE-RECOVERY] Collect all past blocks for single stable attention pass
-                final_ks.push(vram_queue_ks.back().unwrap().clone());
-                final_vs.push(vram_queue_vs.back().unwrap().clone());
+                bulk_ks.push(vram_queue_ks.back().unwrap().clone());
+                bulk_vs.push(vram_queue_vs.back().unwrap().clone());
             }
         }
 
@@ -749,14 +692,14 @@ impl QuantizedQwen3VLTextAttention {
         if !ram_queue_ks.is_empty() {
             let k = Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
             let v = Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
-            final_ks.push(k); final_vs.push(v);
+            bulk_ks.push(k); bulk_vs.push(v);
         }
 
-        if final_ks.is_empty() { return Err(anyhow!("No KV data found for attention")); }
+        if bulk_ks.is_empty() { return Err(anyhow!("No KV data found for attention")); }
 
         // 5. [UNIFIED-BULK-ATTENTION] Single pass for maximum accuracy
-        let k = Tensor::cat(&final_ks, 2)?;
-        let v = Tensor::cat(&final_vs, 2)?;
+        let k = Tensor::cat(&bulk_ks, 2)?;
+        let v = Tensor::cat(&bulk_vs, 2)?;
         let final_kv_len = k.dim(2)?;
 
         let (mut k, mut v) = (k, v);
@@ -776,6 +719,12 @@ impl QuantizedQwen3VLTextAttention {
             let m = k_indices.broadcast_gt(&(q_indices.broadcast_add(&Tensor::new(seqlen_offset as u32, dev)?)?))?;
             let mask = m.to_dtype(target_dtype)?.affine(-1e9, 0.0)?.unsqueeze(0)?.unsqueeze(0)?;
             attn_weights = attn_weights.broadcast_add(&mask)?;
+        } else if let Some(m) = attention_mask_in {
+            // Apply provided mask for single tokens if aligned
+            let m_len = m.dim(D::Minus1)?;
+            if final_kv_len <= m_len {
+                attn_weights = attn_weights.broadcast_add(&m.narrow(D::Minus1, 0, final_kv_len)?.to_device(dev)?.to_dtype(target_dtype)?)?;
+            }
         }
 
         let attn_weights = candle_nn::ops::softmax(&attn_weights.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(target_dtype)?;
