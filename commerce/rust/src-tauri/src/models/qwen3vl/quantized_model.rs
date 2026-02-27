@@ -555,19 +555,20 @@ impl QuantizedQwen3VLTextAttention {
                     let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
                     let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
                     if let (Some(prev_k), Some(prev_v)) = (inner.k_cache.take(), inner.v_cache.take()) {
-                        // [FIX] 장치 및 타입 통일 보장
                         let pk = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k };
                         let pv = if !prev_v.device().same_device(dev) { prev_v.to_device(dev)? } else { prev_v };
-                        let pk = pk.to_dtype(target_dtype)?;
-                        let pv = pv.to_dtype(target_dtype)?;
                         
-                        let kp = k_piece.to_dtype(target_dtype)?;
-                        let vp = v_piece.to_dtype(target_dtype)?;
-                        
-                        inner.k_cache = Some(Tensor::cat(&[pk, kp], 2)?.contiguous()?);
-                        inner.v_cache = Some(Tensor::cat(&[pv, vp], 2)?.contiguous()?);
+                        inner.k_cache = Some(Tensor::cat(&[pk.to_dtype(target_dtype)?, k_piece.to_dtype(target_dtype)?], 2)?.contiguous()?);
+                        inner.v_cache = Some(Tensor::cat(&[pv.to_dtype(target_dtype)?, v_piece.to_dtype(target_dtype)?], 2)?.contiguous()?);
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
+                        
+                        // [DIRY-MARK] Mark as dirty for SSD backup
+                        let b_idx = inner.index;
+                        if self.layer_idx == 0 {
+                            let mut reg = self.registry.entries.write().unwrap();
+                            if b_idx < reg.len() { reg[b_idx].is_dirty = true; }
+                        }
                     }
                 }
             }
@@ -596,10 +597,72 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // 4. [UNIFIED-ATTENTION-PASS] Collect ALL KV sources (VRAM + SSD/RAM via Registry)
-        let mut all_ks = Vec::new();
-        let mut all_vs = Vec::new();
-        let mut total_kv_len = 0;
+        // 3. [BLOCK-STAGING-ALLOCATION] Append or Create New (Mark Dirty for Real-time SSD Write)
+        let current_chunk_len = key_states.dim(2)?;
+        let mut tokens_to_process = current_chunk_len;
+        let mut chunk_offset = 0;
+        
+        while tokens_to_process > 0 {
+            let mut appended = false;
+            if let Some(last_block) = self.kv_blocks.last_mut() {
+                let mut inner = last_block.inner.write().unwrap();
+                let free_space = 256usize.saturating_sub(inner.len);
+                // Only append to VRAM-resident active blocks
+                if inner.location == KVLocation::VRAM && free_space > 0 {
+                    let take = tokens_to_process.min(free_space);
+                    let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
+                    let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
+                    if let (Some(prev_k), Some(prev_v)) = (inner.k_cache.take(), inner.v_cache.take()) {
+                        let pk = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k };
+                        let pv = if !prev_v.device().same_device(dev) { prev_v.to_device(dev)? } else { prev_v };
+                        
+                        inner.k_cache = Some(Tensor::cat(&[pk.to_dtype(target_dtype)?, k_piece.to_dtype(target_dtype)?], 2)?.contiguous()?);
+                        inner.v_cache = Some(Tensor::cat(&[pv.to_dtype(target_dtype)?, v_piece.to_dtype(target_dtype)?], 2)?.contiguous()?);
+                        inner.len += take; tokens_to_process -= take; chunk_offset += take;
+                        appended = true;
+                        
+                        // [DIRTY-MARK] Trigger immediate SSD backup for this layer
+                        if self.layer_idx == 0 {
+                            let mut reg = self.registry.entries.write().unwrap();
+                            if inner.index < reg.len() { reg[inner.index].is_dirty = true; }
+                        }
+                    }
+                }
+            }
+            if !appended {
+                let take = tokens_to_process.min(256);
+                let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
+                let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
+                let index = self.kv_blocks.len();
+                let current_total = seqlen_offset + chunk_offset;
+                let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
+                {
+                    let mut inner = new_block.inner.write().unwrap();
+                    inner.k_cache = Some(k_piece); inner.v_cache = Some(v_piece);
+                }
+                if self.layer_idx == 0 {
+                    let mut reg = self.registry.entries.write().unwrap();
+                    if index < reg.len() {
+                        let entry = &mut reg[index];
+                        entry.token_start = current_total; entry.token_len = take; entry.is_dirty = true;
+                        for loc in entry.location.iter_mut() { *loc = KVLocation::VRAM; }
+                        entry.last_accessed = std::time::Instant::now();
+                    }
+                }
+                self.kv_blocks.push(new_block);
+                tokens_to_process -= take; chunk_offset += take;
+            }
+        }
+
+        // 4. [PIPELINE-SLIDING-WINDOW] 3-Block RAM Staging -> 3-Block VRAM Slide 1
+        let mut running_m: Option<Tensor> = None;
+        let mut running_s: Option<Tensor> = None;
+        let mut running_o: Option<Tensor> = None;
+
+        let mut ram_staging_ks = Vec::new();
+        let mut ram_staging_vs = Vec::new();
+        let mut vram_queue_ks = std::collections::VecDeque::with_capacity(3);
+        let mut vram_queue_vs = std::collections::VecDeque::with_capacity(3);
 
         for block in &self.kv_blocks {
             let (index, b_off, b_len) = {
@@ -608,122 +671,150 @@ impl QuantizedQwen3VLTextAttention {
             };
             if b_off >= total_len { continue; }
 
-            // [REGISTRY-SYNC] Get the absolute truth about block location and SSD path
+            // [REGISTRY-SYNC]
             let (loc, ssd_path) = {
                 let reg = self.registry.entries.read().unwrap();
-                if index < reg.len() {
-                    // registry.location is Vec<KVLocation>, one per layer
-                    (reg[index].location[self.layer_idx], reg[index].ssd_path.clone())
-                } else {
-                    (KVLocation::VRAM, None) // Fallback for safety
-                }
+                if index < reg.len() { (reg[index].location[self.layer_idx], reg[index].ssd_path.clone()) }
+                else { (KVLocation::VRAM, None) }
             };
 
-            let mut k_active = None;
-            let mut v_active = None;
+            let mut k_final = None;
+            let mut v_final = None;
 
             if loc == KVLocation::VRAM || loc == KVLocation::Streaming {
                 vram_count += 1;
                 let inner = block.inner.read().unwrap();
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    k_active = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
-                    v_active = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
+                    k_final = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
+                    v_final = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
                 }
-            }
-            
-            // If VRAM load failed or location is SSD/RAM, try to load from storage
-            if k_active.is_none() {
-                if let Some(p) = ssd_path {
-                    let fetch_start = std::time::Instant::now();
-                    
-                    // [PATH-FIX] Ensure the path is correct and absolute
-                    let mut full_path = p.clone();
-                    if full_path.is_relative() && !full_path.starts_with("tmp") {
-                        full_path = crate::utils::paths::get_kv_dir(None).join(full_path);
+            } else {
+                // Pipeline: SSD -> RAM staging
+                let mut k_cpu = None;
+                let mut v_cpu = None;
+
+                // Check RAM Cache
+                {
+                    let reg = self.registry.entries.read().unwrap();
+                    let cache = reg[index].bitkv_cache.read().unwrap();
+                    if let Some(m) = &cache[self.layer_idx] {
+                        k_cpu = Some(self.decompress_from_bitkv(&m.k_anchors, &m.k_packed, &m.k_scales, &m.original_shape, &Device::Cpu)?);
+                        v_cpu = Some(self.decompress_from_bitkv(&m.v_anchors, &m.v_packed, &m.v_scales, &m.original_shape, &Device::Cpu)?);
+                        ram_count += 1;
                     }
-                    
-                    // [SSD-LOAD] Try DirectStorage first, fallback to standard fs::read
-                    let block_file: std::path::PathBuf = full_path.join(format!("l{}.st", self.layer_idx));
-                    
-                    let content_res = crate::utils::direct_loader::load_kv_block(&block_file);
-                    let content = match content_res {
-                        Ok(c) => Some(c),
-                        Err(_) => {
-                            // [FALLBACK] DirectStorage failed, try standard filesystem read
-                            std::fs::read(&block_file).ok()
-                        }
-                    };
+                }
 
-                    if let Some(data) = content {
-                        if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
-                            let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
-                            let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
-                            if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
-                                let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
-                                let meta_os = if let Ok(view) = st.tensor("k_shape") {
-                                    let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };
-                                    shape_u32.iter().map(|&x| x as usize).collect()
-                                } else { vec![1, self.num_key_value_heads, b_len, self.head_dim] };
-
-                                // [SAFE-SHAPE] Get actual dimensions from loaded tensors
-                                let ka_shape = ka.shape();
-                                let ka_t = Tensor::from_vec(bytes_to_f32(ka.data()), ka_shape, &Device::Cpu)?;
-                                let kp_t = Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?;
-                                let ks_t = Tensor::from_vec(bytes_to_f32(ks.data()), ks.shape(), &Device::Cpu)?;
-                                
-                                let va_shape = va.shape();
-                                let va_t = Tensor::from_vec(bytes_to_f32(va.data()), va_shape, &Device::Cpu)?;
-                                let vp_t = Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?;
-                                let vs_t = Tensor::from_vec(bytes_to_f32(vs.data()), vs.shape(), &Device::Cpu)?;
-
-                                k_active = Some(self.decompress_from_bitkv(&ka_t, &kp_t, &ks_t, &meta_os, dev)?);
-                                v_active = Some(self.decompress_from_bitkv(&va_t, &vp_t, &vs_t, &meta_os, dev)?);
-                                ssd_count += 1;
+                if k_cpu.is_none() {
+                    if let Some(p) = ssd_path {
+                        let mut full_path = p.clone();
+                        if full_path.is_relative() && !full_path.starts_with("tmp") { full_path = crate::utils::paths::get_kv_dir(None).join(full_path); }
+                        let block_file = full_path.join(format!("l{}.st", self.layer_idx));
+                        if let Ok(data) = std::fs::read(&block_file) {
+                            if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
+                                let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
+                                let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                                if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
+                                    let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
+                                    let meta_os = vec![1, self.num_key_value_heads, b_len, self.head_dim];
+                                    let ka_t = Tensor::from_vec(bytes_to_f32(ka.data()), ka.shape(), &Device::Cpu)?;
+                                    let kp_t = Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?;
+                                    let ks_t = Tensor::from_vec(bytes_to_f32(ks.data()), ks.shape(), &Device::Cpu)?;
+                                    let va_t = Tensor::from_vec(bytes_to_f32(va.data()), va.shape(), &Device::Cpu)?;
+                                    let vp_t = Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?;
+                                    let vs_t = Tensor::from_vec(bytes_to_f32(vs.data()), vs.shape(), &Device::Cpu)?;
+                                    k_cpu = Some(self.decompress_from_bitkv(&ka_t, &kp_t, &ks_t, &meta_os, &Device::Cpu)?);
+                                    v_cpu = Some(self.decompress_from_bitkv(&va_t, &vp_t, &vs_t, &meta_os, &Device::Cpu)?);
+                                    ssd_count += 1;
+                                }
                             }
                         }
-                    } else if self.layer_idx == 0 {
-                        println!("[ERROR] SSD Load failed for block {} at {:?}", index, block_file);
                     }
-                    time_kv_fetch += fetch_start.elapsed();
+                }
+
+                if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
+                    ram_staging_ks.push(k);
+                    ram_staging_vs.push(v);
+                    // When 3 blocks collected in RAM, merge and move to VRAM queue
+                    if ram_staging_ks.len() >= 3 {
+                        k_final = Some(Tensor::cat(&ram_staging_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?);
+                        v_final = Some(Tensor::cat(&ram_staging_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?);
+                        ram_staging_ks.clear(); ram_staging_vs.clear();
+                    }
                 }
             }
 
-            if let (Some(k), Some(v)) = (k_active, v_active) {
-                all_ks.push(k);
-                all_vs.push(v);
-                total_kv_len += b_len;
-            } else {
-                println!("[WARNING] Block {} (off {}) failed to load at Layer {}", index, b_off, self.layer_idx);
+            // [VRAM-SLIDING-COMPUTE] Maintain 3 slots, Slide by 1
+            if let (Some(k), Some(v)) = (k_final, v_final) {
+                if vram_queue_ks.len() >= 3 { vram_queue_ks.pop_front(); vram_queue_vs.pop_front(); }
+                vram_queue_ks.push_back(k); vram_queue_vs.push_back(v);
+
+                // Compute attention using the newest entry in the sliding window
+                let mut k_op = vram_queue_ks.back().unwrap().clone();
+                let mut v_op = vram_queue_vs.back().unwrap().clone();
+
+                if self.num_kv_groups > 1 {
+                    let (b, h, s, d) = k_op.dims4()?;
+                    k_op = k_op.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                    v_op = v_op.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                }
+
+                let attn_weights = query_states.matmul(&k_op.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
+                
+                // Stable Softmax in F32
+                let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
+                let m_i = attn_weights_f32.max_keepdim(D::Minus1)?;
+                let p_i = attn_weights_f32.broadcast_sub(&m_i)?.exp()?;
+                let s_i = p_i.sum_keepdim(D::Minus1)?;
+                let o_i = p_i.to_dtype(target_dtype)?.matmul(&v_op)?;
+
+                match (running_m.take(), running_s.take(), running_o.take()) {
+                    (None, None, None) => { running_m = Some(m_i); running_s = Some(s_i); running_o = Some(o_i.to_dtype(DType::F32)?); }
+                    (Some(m_prev), Some(s_prev), Some(o_prev)) => {
+                        let m_new = m_prev.maximum(&m_i)?;
+                        let alpha_prev = m_prev.broadcast_sub(&m_new)?.exp()?;
+                        let alpha_i = m_i.broadcast_sub(&m_new)?.exp()?;
+                        running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&s_i.broadcast_mul(&alpha_i)?)?);
+                        running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&o_i.to_dtype(DType::F32)?.broadcast_mul(&alpha_i)?)?);
+                        running_m = Some(m_new);
+                    }
+                    _ => unreachable!(),
+                }
             }
         }
 
-        if all_ks.is_empty() { return Err(anyhow!("No KV data found for attention")); }
-
-        // 5. [EXECUTE-BULK-ATTENTION]
-        let mut k = Tensor::cat(&all_ks, 2)?;
-        let mut v = Tensor::cat(&all_vs, 2)?;
-
-        if self.num_kv_groups > 1 {
-            let (b, h, s, d) = k.dims4()?;
-            k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-            v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-        }
-
-        let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?
-            .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
-
-        if let Some(mask) = &attention_mask {
-            let m_len = mask.dim(D::Minus1)?;
-            if total_kv_len <= m_len {
-                let sub_mask = mask.narrow(D::Minus1, 0, total_kv_len)?.to_dtype(target_dtype)?;
-                attn_weights = attn_weights.broadcast_add(&sub_mask)?;
+        // Process remaining RAM chunks
+        if !ram_staging_ks.is_empty() {
+            let k = Tensor::cat(&ram_staging_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
+            let v = Tensor::cat(&ram_staging_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
+            let mut k_op = k; let mut v_op = v;
+            if self.num_kv_groups > 1 {
+                let (b, h, s, d) = k_op.dims4()?;
+                k_op = k_op.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                v_op = v_op.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+            }
+            let attn_weights = query_states.matmul(&k_op.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
+            let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
+            let m_i = attn_weights_f32.max_keepdim(D::Minus1)?;
+            let p_i = attn_weights_f32.broadcast_sub(&m_i)?.exp()?;
+            let s_i = p_i.sum_keepdim(D::Minus1)?;
+            let o_i = p_i.to_dtype(target_dtype)?.matmul(&v_op)?;
+            match (running_m.take(), running_s.take(), running_o.take()) {
+                (None, None, None) => { running_m = Some(m_i); running_s = Some(s_i); running_o = Some(o_i.to_dtype(DType::F32)?); }
+                (Some(m_prev), Some(s_prev), Some(o_prev)) => {
+                    let m_new = m_prev.maximum(&m_i)?;
+                    let alpha_prev = m_prev.broadcast_sub(&m_new)?.exp()?;
+                    let alpha_i = m_i.broadcast_sub(&m_new)?.exp()?;
+                    running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&s_i.broadcast_mul(&alpha_i)?)?);
+                    running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&o_i.to_dtype(DType::F32)?.broadcast_mul(&alpha_i)?)?);
+                    running_m = Some(m_new);
+                }
+                _ => unreachable!(),
             }
         }
 
-        // [PRECISION-FIX] Softmax in F32 to avoid instability in small models
-        let attn_weights = candle_nn::ops::softmax(&attn_weights.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(target_dtype)?;
-        let attn_output = attn_weights.matmul(&v)?;
-
+        let attn_output = running_o.ok_or_else(|| anyhow!("No attention output"))?
+            .broadcast_div(&running_s.unwrap())?
+            .to_dtype(target_dtype)?;
         let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
         let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
         
@@ -909,24 +1000,39 @@ impl QuantizedQwen3VLTextAttention {
         use crate::models::qwen3vl::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
 
         let total_blocks = self.kv_blocks.len();
-        // [VRAM-GUARD] 디코딩 시에는 최신 3개만 유지, 프리필 시에는 일단 모두 유지 (연산 완료 후 한꺼번에 비움)
+        // [VRAM-GUARD] 디코딩 시에는 최신 3개만 VRAM에 유지 (SSD에는 모두 백업)
         let vram_limit_idx = if is_decoding { total_blocks.saturating_sub(3) } else { 0 };
 
         let target_indices: Vec<usize> = self.kv_blocks.iter().enumerate().filter_map(|(i, b)| {
             let inner = b.inner.read().unwrap();
             let is_full = inner.len == 256;
-            // VRAM에 데이터가 있거나 아직 SSD로 가지 않은 블록 수집
-            if (is_full || is_last_chunk) && inner.k_cache.is_some() { Some(i) } else { None }
+            
+            // [DIRTY-CHECK] Only bake if the block is dirty (new tokens since last save)
+            let is_dirty = {
+                let reg = self.registry.entries.read().unwrap();
+                if i < reg.len() { reg[i].is_dirty } else { true }
+            };
+
+            // [BACKUP-STRATEGY] 
+            // 1. 완성된 블록(256개)은 즉시 SSD로 백업 대상
+            // 2. 마지막 조각(is_last_chunk)도 백업 대상
+            // 3. VRAM에 데이터가 있고, 아직 저장이 안 된(dirty) 경우만 수집
+            if (is_full || is_last_chunk) && inner.k_cache.is_some() && is_dirty { Some(i) } else { None }
         }).collect();
 
         for idx in target_indices {
+            // [DIRTY-RESET] Clear dirty flag before sending to avoid redundant tasks
+            if self.layer_idx == 0 {
+                let mut reg = self.registry.entries.write().unwrap();
+                if idx < reg.len() { reg[idx].is_dirty = false; }
+            }
+
             let block = self.kv_blocks[idx].clone();
             let (k_opt, v_opt, off, b_idx, b_len) = {
                 let mut inner = block.inner.write().unwrap();
                 let snapshot = (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len);
                 
-                // [FIX] 최신 3개 블록이 아니면 VRAM 캐시 즉시 삭제 (사용한 건 정리)
-                // 통합 어텐션 패스에서 SSD 로드를 수행하므로 상주할 필요 없음
+                // [OFFLOAD] VRAM 상주 한계를 넘은 블록만 실제 데이터를 비움 (SSD 백업은 별개)
                 if is_decoding && idx < vram_limit_idx {
                     inner.k_cache = None;
                     inner.v_cache = None;
