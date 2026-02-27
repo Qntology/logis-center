@@ -555,11 +555,17 @@ impl QuantizedQwen3VLTextAttention {
                     let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
                     let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
                     if let (Some(prev_k), Some(prev_v)) = (inner.k_cache.take(), inner.v_cache.take()) {
-                        // [FIX] 블록 추가 시 타입 통일 (BF16 vs F32 방지)
-                        let pk = prev_k.to_dtype(target_dtype)?;
-                        let pv = prev_v.to_dtype(target_dtype)?;
-                        inner.k_cache = Some(Tensor::cat(&[pk, k_piece.to_dtype(target_dtype)?], 2)?.contiguous()?);
-                        inner.v_cache = Some(Tensor::cat(&[pv, v_piece.to_dtype(target_dtype)?], 2)?.contiguous()?);
+                        // [FIX] 장치 및 타입 통일 보장
+                        let pk = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k };
+                        let pv = if !prev_v.device().same_device(dev) { prev_v.to_device(dev)? } else { prev_v };
+                        let pk = pk.to_dtype(target_dtype)?;
+                        let pv = pv.to_dtype(target_dtype)?;
+                        
+                        let kp = k_piece.to_dtype(target_dtype)?;
+                        let vp = v_piece.to_dtype(target_dtype)?;
+                        
+                        inner.k_cache = Some(Tensor::cat(&[pk, kp], 2)?.contiguous()?);
+                        inner.v_cache = Some(Tensor::cat(&[pv, vp], 2)?.contiguous()?);
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
                     }
@@ -766,8 +772,18 @@ impl QuantizedQwen3VLTextAttention {
                 v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
             }
             
-            // [FIX] VRAM 패스에서는 마스크 적용 제외 (Shape Mismatch 해결 및 속도 향상)
+            // [FIX] VRAM 패스에서도 마스크 적용 (Prefill 시 인과성 보장)
             let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
+            
+            if let Some(mask) = &attention_mask {
+                let m_len = mask.dim(D::Minus1)?;
+                let b_off = vram_start_off.unwrap_or(0);
+                // 실제 합쳐진 너비(actual_vram_width)만큼 마스크를 잘라서 적용
+                if b_off + actual_vram_width <= m_len {
+                    let sub_mask = mask.narrow(D::Minus1, b_off, actual_vram_width)?.to_dtype(target_dtype)?;
+                    attn_weights = attn_weights.broadcast_add(&sub_mask)?;
+                }
+            }
             
             let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
             let m_i = attn_weights_f32.max_keepdim(D::Minus1)?;
@@ -1665,17 +1681,9 @@ impl QuantizedQwen3VLTextModel {
         let mut pinned_layer_count = 0;
         
         for _ in 0..config.num_hidden_layers {
-            if current_device.is_cuda() && is_vram_checked {
-                 let buffer_factor = 1.2; 
-                 if simulated_free_vram > ( (cost_per_layer as f64 * buffer_factor) as u64 + safety_floor ) {
-                     simulated_free_vram = simulated_free_vram.saturating_sub(cost_per_layer);
-                     layer_devices.push(current_device.clone());
-                     pinned_layer_count += 1;
-                 } else {
-                     layer_devices.push(Device::Cpu);
-                 }
-            } else {
-                layer_devices.push(current_device.clone());
+            layer_devices.push(current_device.clone());
+            if current_device.is_cuda() {
+                pinned_layer_count += 1;
             }
         }
 

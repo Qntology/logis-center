@@ -14,27 +14,27 @@ use nvml_wrapper::Nvml;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
-static GLOBAL_CUDA_DEVICE: Lazy<Mutex<Option<Device>>> = Lazy::new(|| Mutex::new(None));
+// [FIX] 장치 번호별로 장치 객체를 캐싱하여 중복 생성 방지 (DeviceId 폭주 해결)
+static DEVICE_CACHE: Lazy<Mutex<Vec<Option<Device>>>> = Lazy::new(|| Mutex::new(vec![None; 8]));
 
 pub fn get_cuda_device(id: usize) -> Device {
-    let mut cache = GLOBAL_CUDA_DEVICE.lock().unwrap();
-    if let Some(dev) = cache.as_ref() {
-        return dev.clone();
+    let mut cache = DEVICE_CACHE.lock().unwrap();
+    if id < cache.len() {
+        if let Some(dev) = &cache[id] {
+            return dev.clone();
+        }
+        println!("[CUDA] 🚀 Initializing Primary Context on GPU {}...", id);
+        let dev = Device::new_cuda(id).unwrap_or(Device::Cpu);
+        cache[id] = Some(dev.clone());
+        dev
+    } else {
+        Device::new_cuda(id).unwrap_or(Device::Cpu)
     }
-    println!("[CUDA] 🚀 Initializing Primary Context on GPU {}...", id);
-    let dev = Device::new_cuda(id).unwrap_or(Device::Cpu);
-    *cache = Some(dev.clone());
-    dev
 }
 
 pub fn get_best_device() -> Device {
     #[cfg(feature = "cuda")]
     {
-        // 이미 초기화된 장치가 있다면 즉시 반환
-        if let Some(dev) = GLOBAL_CUDA_DEVICE.lock().unwrap().as_ref() {
-            return dev.clone();
-        }
-
         if let Ok(nvml) = Nvml::init() {
             if let Ok(count) = nvml.device_count() {
                 let mut best_id = 0;

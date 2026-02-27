@@ -586,22 +586,7 @@ impl LogisModel {
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
         let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
         
-        let mut target_device = self.device_config.device.clone();
-        
-        // [OOM-SAFETY] Small (0.6B) can stay on CPU if VRAM is tight to keep Large (2B) on GPU.
-        if size == ModelSize::Small && target_device.is_cuda() {
-            if let Ok(nvml_inst) = nvml_wrapper::Nvml::init() {
-                if let Ok(dev) = nvml_inst.device_by_index(self.device_config.gpu_id as u32) {
-                    if let Ok(mem) = dev.memory_info() {
-                        if mem.free < 3_000_000_000 {
-                            println!("[MODEL-CONFIG] Tight VRAM. Loading Small (0.6B) on CPU.");
-                            target_device = Device::Cpu;
-                        }
-                    }
-                }
-            }
-        }
-
+        let target_device = self.device_config.device.clone();
         let is_disk_swap = self.is_disk_swap;
         let dev_id = self.device_config.gpu_id;
         let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
