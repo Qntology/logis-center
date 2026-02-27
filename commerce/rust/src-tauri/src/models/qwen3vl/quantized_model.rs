@@ -735,8 +735,12 @@ impl QuantizedQwen3VLTextAttention {
                 final_list_v.push(vram_vs[i].clone());
             }
 
-            let mut k = Tensor::cat(&final_list_k, 2)?;
-            let mut v = Tensor::cat(&final_list_v, 2)?;
+            // [FIX] 모든 텐서를 target_dtype으로 통일하여 cat 시의 타입 충돌 방지 (anyhow 에러 변환 포함)
+            let final_list_k: Result<Vec<Tensor>> = final_list_k.into_iter().map(|t| t.to_dtype(target_dtype).map_err(|e| anyhow!(e))).collect();
+            let final_list_v: Result<Vec<Tensor>> = final_list_v.into_iter().map(|t| t.to_dtype(target_dtype).map_err(|e| anyhow!(e))).collect();
+
+            let mut k = Tensor::cat(&final_list_k?, 2)?;
+            let mut v = Tensor::cat(&final_list_v?, 2)?;
 
             if self.num_kv_groups > 1 {
                 let (b, h, s, d) = k.dims4()?;
