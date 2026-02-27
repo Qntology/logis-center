@@ -237,7 +237,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 let _guard = IoGuard;
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 if let Ok(data) = safetensors::serialize(&ts, &None) {
-                    drop(ts); let _ = save_kv_block(&tp, &data);
+                    drop(ts); 
+                    // [DIRECT-IO] Use OS-accelerated high-speed write
+                    let _ = save_kv_block(&tp, &data);
                     
                     // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
                     if let Some(kv_name) = kv_n {
@@ -340,6 +342,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         for l_idx in 0..28 {
                             let file_path = block_root.join(format!("l{}.st", l_idx));
                             if file_path.is_file() {
+                                // [DIRECT-IO] High-speed OS-level read
                                 if let Ok(content) = load_kv_block(&file_path) {
                                     if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
                                         let prefix = format!("b{}_l{}_", b_idx_off, l_idx);
