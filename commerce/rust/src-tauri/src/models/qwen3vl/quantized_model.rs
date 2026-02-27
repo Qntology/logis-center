@@ -681,9 +681,14 @@ impl QuantizedQwen3VLTextAttention {
             v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
         }
 
+        // [FINAL-DTYPE-GUARD] Ensure all components are matched before matmul
+        let query_states = query_states.to_dtype(target_dtype)?;
+        let k = k.to_dtype(target_dtype)?;
+        let v = v.to_dtype(target_dtype)?;
+
         // Scores in unified precision (target_dtype)
-        let mut attn_weights = query_states.to_dtype(target_dtype)?.matmul(&k.transpose(2, 3)?)?
-            .to_dtype(DType::F32)? // Softmax usually better in F32
+        let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?
+            .to_dtype(DType::F32)? // Softmax and Masking better in F32
             .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?;
 
         // Apply Internally Generated Causal Mask
