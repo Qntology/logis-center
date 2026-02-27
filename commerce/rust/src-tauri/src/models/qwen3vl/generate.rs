@@ -361,10 +361,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                             let meta = BitKVMetadata {
                                                 k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), (file_shape[0], file_shape[1], ka.shape()[2], file_shape[3]), &Device::Cpu).unwrap(),
                                                 k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(),
-                                                k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (file_shape[0], file_shape[1], file_shape[2], 1), &Device::Cpu).unwrap(),
+                                                k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (file_shape[0], file_shape[1], file_shape[2], 4), &Device::Cpu).unwrap(),
                                                 v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), (file_shape[0], file_shape[1], va.shape()[2], file_shape[3]), &Device::Cpu).unwrap(),
                                                 v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(),
-                                                v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (file_shape[0], file_shape[1], file_shape[2], 1), &Device::Cpu).unwrap(),
+                                                v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (file_shape[0], file_shape[1], file_shape[2], 4), &Device::Cpu).unwrap(),
                                                 original_shape: file_shape,
                                             };
                                             if let Ok(mut r) = reg.entries.write() {

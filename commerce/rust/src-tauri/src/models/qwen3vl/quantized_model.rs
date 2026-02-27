@@ -728,60 +728,75 @@ impl QuantizedQwen3VLTextAttention {
         
         let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
         let mut anchors = vec![0.0f32; b * h * anchor_count * d];
-        // [RESIDUAL-QUANT] Store 4 stages of bit-planes
+        // [RESIDUAL-QUANT] Store 4 stages of bit-planes and 4 scales per token
         let packed_len = (b * h * s * d * 4 + 7) / 8;
         let mut packed_residuals = vec![0u8; packed_len];
+        let mut scales = vec![0.0f32; b * h * s * 4];
 
         let head_token_size = s * d;
 
         use rayon::prelude::*;
-        // Process each head in parallel
-        packed_residuals.par_chunks_mut(head_token_size * 4 / 8).enumerate().for_each(|(bh_idx, head_packed)| {
+        // Parallel process by Head
+        let mut head_packed_chunks: Vec<&mut [u8]> = packed_residuals.chunks_mut(head_token_size * 4 / 8).collect();
+        let mut head_scales_chunks: Vec<&mut [f32]> = scales.chunks_mut(s * 4).collect();
+
+        head_packed_chunks.par_iter_mut().zip(head_scales_chunks.par_iter_mut()).enumerate().for_each(|(bh_idx, (head_packed, head_scales))| {
             let bh_offset = bh_idx * head_token_size;
-            let mut head_residual: Vec<f32> = t_data[bh_offset..bh_offset + head_token_size].to_vec();
+            let mut current_residual: Vec<f32> = t_data[bh_offset..bh_offset + head_token_size].to_vec();
             
             for stage in 0..4 {
                 let stage_bit_offset = stage * head_token_size;
-                let mut stage_max_abs = 0.0f32;
-                for &v in &head_residual { if v.abs() > stage_max_abs { stage_max_abs = v.abs(); } }
                 
-                for i in 0..head_token_size {
-                    let val = head_residual[i];
-                    if val >= 0.0 {
-                        head_packed[(stage_bit_offset + i) / 8] |= 1 << ((stage_bit_offset + i) % 8);
-                        head_residual[i] -= stage_max_abs * 0.5; // Adaptive residual update
-                    } else {
-                        head_residual[i] += stage_max_abs * 0.5;
+                for token_idx in 0..s {
+                    let mut token_max_abs = 0.0f32;
+                    let token_start = token_idx * d;
+                    for d_idx in 0..d {
+                        let v = current_residual[token_start + d_idx].abs();
+                        if v > token_max_abs { token_max_abs = v; }
+                    }
+                    
+                    // Save unique scale for this token at this stage
+                    head_scales[token_idx * 4 + stage] = token_max_abs;
+                    let s_val = token_max_abs;
+                    
+                    for d_idx in 0..d {
+                        let idx = token_start + d_idx;
+                        let val = current_residual[idx];
+                        if val >= 0.0 {
+                            head_packed[(stage_bit_offset + idx) / 8] |= 1 << ((stage_bit_offset + idx) % 8);
+                            current_residual[idx] -= s_val;
+                        } else {
+                            current_residual[idx] += s_val;
+                        }
                     }
                 }
             }
         });
         
-        // 2. Anchors collection (remains original for high-precision reference)
+        // 2. Anchors (Remains original for reference points)
         let anchor_head_size = anchor_count * d;
         let mut anchors_heads: Vec<&mut [f32]> = anchors.chunks_mut(anchor_head_size).collect();
-
         anchors_heads.par_iter_mut().enumerate().for_each(|(bh_idx, anchor_head)| {
             let bh_offset = bh_idx * head_token_size;
             for token_idx in 0..s {
-                let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
                 if token_idx < 4 || token_idx % 8 == 0 {
                     let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
+                    let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
                     anchor_head[anchor_pos * d .. (anchor_pos + 1) * d].copy_from_slice(token_data);
                 }
             }
         });
 
-        // Simplified scales storage for 4-stage compatibility
-        let scales_tensor = Tensor::from_vec(vec![1.0f32; b * h * s], vec![b, h, s, 1], &Device::Cpu)?; 
         let anchors_tensor = Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu)?;
         let packed_tensor = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu)?;
+        let scales_tensor = Tensor::from_vec(scales, vec![b, h, s, 4], &Device::Cpu)?;
         Ok((anchors_tensor, packed_tensor, scales_tensor, original_shape))
     }
 
-    pub fn decompress_from_bitkv(&self, anchors: &Tensor, packed: &Tensor, _scales: &Tensor, original_shape: &[usize], device: &Device) -> Result<Tensor> {
+    pub fn decompress_from_bitkv(&self, anchors: &Tensor, packed: &Tensor, scales: &Tensor, original_shape: &[usize], device: &Device) -> Result<Tensor> {
         let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
         let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
+        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         let anchors_vec = anchors.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         
         let last_dim = original_shape[original_shape.len() - 1];
@@ -795,18 +810,21 @@ impl QuantizedQwen3VLTextAttention {
         use rayon::prelude::*;
         decoded.par_chunks_mut(head_tokens).enumerate().for_each(|(bh_idx, head_out)| {
             let bh_offset = bh_idx * head_tokens;
+            let scale_offset = bh_idx * seq_len * 4;
             let anchor_offset = bh_idx * anchor_count * last_dim;
             
-            // 1. 4-Stage Cumulative Restoration
+            // 1. 4-Stage Cumulative Restoration using stage-specific scales
             for stage in 0..4 {
                 let stage_bit_offset = bh_offset * 4 + stage * head_tokens;
-                let step_scale = 1.0f32 / (2.0f32.powi(stage as i32)); // Example decaying scale
-                
-                for i in 0..head_tokens {
-                    let global_bit_idx = stage_bit_offset + i;
-                    if global_bit_idx / 8 < packed_vec.len() {
-                        let is_set = (packed_vec[global_bit_idx / 8] & (1 << (global_bit_idx % 8))) != 0;
-                        head_out[i] += if is_set { step_scale } else { -step_scale };
+                for token_idx in 0..seq_len {
+                    let s_val = scales_vec[scale_offset + token_idx * 4 + stage];
+                    for d_idx in 0..last_dim {
+                        let inner_idx = token_idx * last_dim + d_idx;
+                        let global_bit_idx = stage_bit_offset + inner_idx;
+                        if global_bit_idx / 8 < packed_vec.len() {
+                            let is_set = (packed_vec[global_bit_idx / 8] & (1 << (global_bit_idx % 8))) != 0;
+                            head_out[inner_idx] += if is_set { s_val } else { -s_val };
+                        }
                     }
                 }
             }
