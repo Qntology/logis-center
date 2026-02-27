@@ -589,16 +589,16 @@ async fn process_task(
     // ==================================================================================
     // [ULTRA-OPTIMIZED PIPELINE]
     // Step 1: 0.6B Bakes [PUG + Classification Task] -> Save SNAPSHOT_A
-    // Step 2: 2B Loads SNAPSHOT_A -> Instant Generation
+    // Step 2: 0.6B Loads SNAPSHOT_A -> Instant Generation
     // Step 3: 0.6B Bakes [PUG + Selector Task] -> Save SNAPSHOT_B
-    // Step 4: 2B Loads SNAPSHOT_B -> Instant Generation
+    // Step 4: 0.6B Loads SNAPSHOT_B -> Instant Generation
     // ...
     // ==================================================================================
 
     // --- STEP A: CLASSIFICATION (Disk Bridge Relay) ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] Starting DISK BRIDGE RELAY (0.6B -> Disk -> 2B)");
+        println!("[Scheduler] Starting DISK BRIDGE RELAY (0.6B -> Disk -> 0.6B)");
         
         // [NEW] Log step A start for UI recovery
         log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
@@ -640,9 +640,9 @@ async fn process_task(
             println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
         }
 
-        // 2. [2B] Load Snapshot & Generate
+        // 2. [0.6B] Load Snapshot & Generate
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -654,7 +654,7 @@ async fn process_task(
             };
 
             if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 2B Step A: Asking classification question...");
+                println!("[Scheduler] 0.6B Step A: Asking classification question...");
                 let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
                 println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
                 
