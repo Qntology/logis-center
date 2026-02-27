@@ -605,21 +605,22 @@ async fn process_task(
 
         let type_prompt = parsing::page_type_prompt();
         let pug_content = light_pug.clone();
-        let shared_snapshot_id = format!("{}_context", task.id);
+        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, type_prompt);
+        let snapshot_id = format!("{}_step_a", task.id);
         
-        // [CHECKPOINT] Check if Shared Context already exists
-        let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&shared_snapshot_id);
+        // [CHECKPOINT] Check if Step A snapshot already exists (Resume from OOM)
+        let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
         let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
 
         if !has_snapshot {
-            // 1. [0.6B] Bake Pure Data Context (Shared for all steps)
-            println!("[Scheduler] Phase 1: Baking Shared Context with 0.6B...");
+            // 1. [0.6B] Bake FULL Templated Prompt
+            println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
             model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
             
             let model_clone = model.clone();
-            let data_to_bake = format!("[DATA]\n{}", pug_content);
+            let question_clone = task_question.clone();
             let token_clone = cancellation_token.clone();
-            let session_clone = Some(shared_snapshot_id.clone());
+            let session_clone = Some(snapshot_id.clone());
 
             {
                 let mut gen_guard = model_clone.generator.lock().await;
@@ -627,37 +628,34 @@ async fn process_task(
                     worker.clear_kv_cache();
                     let params = crate::openai_types::ChatCompletionParameters {
                         messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(data_to_bake),
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
                             name: None,
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None, Some("reference".to_string())).await?;
+                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name.clone()).await?;
                 }
             }
         } else {
-            println!("[Scheduler] Found existing shared context. Skipping 0.6B baking.");
+            println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
         }
 
-        // 2. [Small] Load Shared Context & Ask Classification
+        // 2. [2B] Load Snapshot & Generate
         {
-            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&shared_snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
-            let classify_prompt = format!("Analyze the data provided. [TASK] {}. Return only JSON Format.", type_prompt);
             let params = ChatCompletionParameters {
-                messages: vec![
-                    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                        content: ChatCompletionRequestUserMessageContent::Text(classify_prompt),
-                        name: None,
-                    })
-                ],
-                model: "qwen3vl".to_string(), max_tokens: Some(64), temperature: Some(0.0),
+                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                    content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                    name: None,
+                })],
+                model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
                 ..Default::default()
             };
 
             if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] Small Step A: Asking classification question...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), Some(shared_snapshot_id.clone()), Some("inference".to_string())).await?;
+                println!("[Scheduler] 2B Step A: Asking classification question...");
+                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
                 println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
                 
                 let _ = data_manager.offload(&res, "step_a_res");
@@ -843,39 +841,67 @@ async fn process_task(
 
         if !content_pug.trim().is_empty() {
             let extraction_instruction = parsing::item2json(&page_type, &url, language);
-            let shared_snapshot_id = format!("{}_context", task.id);
+            let pug_content = content_pug.clone();
+            let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, extraction_instruction);
+            let snapshot_id = format!("{}_detail", task.id);
 
-            // [PROMPT-RESTRUCTURE] Use shared context + task-specific instructions
-            let system_prompt = format!("You are a professional web data extractor. [TASK] {}. Respond with valid JSON only.", extraction_instruction);
-            let _final_action = "\n\n[FINAL ACTION] Extract data as JSON. START RESPONSE WITH '{'.";
+            // [CHECKPOINT] Check if Detail snapshot already exists
+            let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
+            let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
 
-            // 2. [Small] Load Shared Context (Bake step skipped as it's already done in Step A)
+            if !has_snapshot {
+                // 1. [0.6B] Bake Detail Context
+                println!("[Scheduler] Phase 1: Baking Detail Context with 0.6B...");
+                log_task_progress(app_handle, &task.id, &json!({ "category": "Context Baking", "summary": "Baking content with 0.6B model..." }));
+                
+                model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
+                let model_clone = model.clone();
+                let question_clone = task_question.clone();
+                let token_clone = cancellation_token.clone();
+                let session_clone = Some(snapshot_id.clone());
+
+                {
+                    let mut gen_guard = model_clone.generator.lock().await;
+                    if let Some(worker) = gen_guard.as_mut() {
+                        worker.clear_kv_cache();
+                        let params = crate::openai_types::ChatCompletionParameters {
+                            messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                                content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
+                                name: None,
+                            })],
+                            ..Default::default()
+                        };
+                        worker.prefill_only(params, Some(token_clone), session_clone, None, Some("reference".to_string())).await?;
+                    }
+                }
+            } else {
+                println!("[Scheduler] Found existing snapshot for Detail Extraction. Skipping 0.6B baking.");
+            }
+
+            // 2. [Small] Load & Generate
             {
-                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&shared_snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
-                let inference_prompt = format!("Based on the content above, perform the following extraction. [TASK] {}. Return only JSON Format.", extraction_instruction);
                 let params = ChatCompletionParameters {
-                    messages: vec![
-                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                            content: ChatCompletionRequestUserMessageContent::Text(inference_prompt),
-                            name: None,
-                        })
-                    ],
-                    model: "qwen3vl".to_string(), 
-                    max_tokens: Some(2048), 
-                    temperature: Some(0.0),
+                    messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                        content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                        name: None,
+                    })],
+                    model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(0.1),
                     ..Default::default()
                 };
 
                 // 3. Small Instant Inference
                 if let Some(gen) = model.generator.lock().await.as_mut() {
-                    println!("[Scheduler] Small Step C: Asking extraction question (using shared context)...");
-                    log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Fast Inference..." }));
+                    println!("[Scheduler] Small Step C: Asking extraction question...");
+                    log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Small Inference..." }));
                     
-                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(shared_snapshot_id.clone()), Some("inference".to_string())).await?;
+                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), Some("inference".to_string())).await?;
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
 
+                    // [DEBUG] AI 응답 저장
                     let _ = data_manager.offload(&res, "step_c_res");
+
                     extracted_data = parsing::parse_json_from_llm(&res);
                 }
             }
