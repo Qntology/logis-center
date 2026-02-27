@@ -2040,21 +2040,16 @@ impl QuantizedQwen3VLTextModel {
         }
         
         if !is_decoding {
-            println!("[ENGINE-TRACE] << End Layer {} | VRAM Evicted. | Time: {:.2}s", layer_idx, start_layer_time.elapsed().as_secs_f32());
+            // [STABILITY-FIX] Force immediate offload to CPU (before version parity)
+            let _ = self.layers[layer_idx].to_device(&Device::Cpu);
+            println!("[ENGINE-TRACE] << End Layer {} | VRAM Evicted (Serial). | Time: {:.2}s", layer_idx, start_layer_time.elapsed().as_secs_f32());
         }
         Ok(next_xs)
     }
 
     /// [DEC-SPEED-UP] 디코딩 속도를 위해 모든 레이어를 GPU에 상주 시킴
     pub async fn pin_all_layers_to_gpu(&mut self) -> Result<()> {
-        let target_device = crate::utils::get_cuda_device(self.device_id);
-        println!("[DEC-SPEED-UP] Pinning all layers to GPU for vertical inference...");
-        for (_i, layer) in self.layers.iter_mut().enumerate() {
-            if !layer.device().same_device(&target_device) {
-                layer.to_device(&target_device)?;
-            }
-        }
-        if target_device.is_cuda() { let _ = target_device.synchronize(); }
+        println!("[DEC-SPEED-UP] Pinning disabled for long-context stability. Using On-Demand serial loading.");
         Ok(())
     }
 
@@ -2530,7 +2525,7 @@ impl QuantizedQwen3VLTextModel {
         let danger_zone = 500_000_000; // 500MB 이하: 위험 (내리기 시작)
         let safe_zone = 1_000_000_000; // 1GB 이상: 여유 (올리기 시작)
 
-        // 2. 무게추(Weights) 리밸런싱
+        // 2. 무게추(Weights) 리밸런싱 - OOM 방지를 위해 공격적인 업로드를 차단합니다.
         if free_vram > 0 && free_vram < danger_zone {
             // [OFFLOAD] GPU -> CPU (뒤쪽 레이어부터)
             for layer in self.layers.iter_mut().rev() {
@@ -2541,21 +2536,8 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
         } else if free_vram > safe_zone {
-            // [UPLOAD] CPU -> GPU (한 번에 4개씩 안전하게 업로드)
-            let mut upload_count = 0;
-            let target_dev = crate::utils::get_cuda_device(device_id);
-            
-            for layer in self.layers.iter_mut() {
-                if layer.device().is_cpu() {
-                    layer.to_device(&target_dev)?;
-                    upload_count += 1;
-                    if upload_count >= 4 { break; } 
-                }
-            }
-            if upload_count > 0 {
-                println!("[REBALANCE] (Offset: {}/{}) Free VRAM ({:.2} GB). Uploaded {} layers to GPU.", offset, total_len, free_vram as f64 / 1e9, upload_count);
-                let _ = target_dev.synchronize(); 
-            }
+            // [STABILITY-FIX] Do NOT auto-upload layers in long context mode to avoid sudden OOM.
+            // Layers will be handled individually in process_single_layer.
         }
         Ok(())
     }
