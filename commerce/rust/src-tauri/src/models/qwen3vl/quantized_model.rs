@@ -526,16 +526,18 @@ impl QuantizedQwen3VLTextAttention {
         };
 
         let mut query_states = self.q_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
-        query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?.contiguous()?;
+        query_states = self.q_norm.forward(&query_states)?.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
         
         let mut key_states = self.k_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
-        key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?.contiguous()?;
+        key_states = self.k_norm.forward(&key_states)?.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
         
-        let value_states = self.v_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let value_states = self.v_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?.to_dtype(target_dtype)?;
 
         let cos = if cos.dtype() != target_dtype { cos.to_dtype(target_dtype)? } else { cos.clone() };
         let sin = if sin.dtype() != target_dtype { sin.to_dtype(target_dtype)? } else { sin.clone() };
         let (query_states, key_states) = apply_rotary_pos_emb(&query_states, &key_states, &cos, &sin, false)?;
+        let query_states = query_states.to_dtype(target_dtype)?;
+        let key_states = key_states.to_dtype(target_dtype)?;
         
         // 2. [BLOCK-PIPELINE-ALLOCATION] Append or Create New (Mark Dirty for Real-time SSD Write)
         let mut tokens_to_process = q_len;
@@ -611,8 +613,8 @@ impl QuantizedQwen3VLTextAttention {
             {
                 let inner = block.inner.read().unwrap();
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    k_vram = Some(k.to_device(dev)?.to_dtype(DType::F32)?);
-                    v_vram = Some(v.to_device(dev)?.to_dtype(DType::F32)?);
+                    k_vram = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
+                    v_vram = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
                     vram_count += 1;
                 }
             }
@@ -659,8 +661,8 @@ impl QuantizedQwen3VLTextAttention {
                     }
                 }
                 if let Some(k) = k_cpu {
-                    bulk_ks.push(k.to_device(dev)?.to_dtype(DType::F32)?);
-                    bulk_vs.push(v_cpu.unwrap().to_device(dev)?.to_dtype(DType::F32)?);
+                    bulk_ks.push(k.to_device(dev)?.to_dtype(target_dtype)?);
+                    bulk_vs.push(v_cpu.unwrap().to_device(dev)?.to_dtype(target_dtype)?);
                 }
             }
         }
@@ -679,8 +681,9 @@ impl QuantizedQwen3VLTextAttention {
             v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
         }
 
-        // Scores in F32
-        let mut attn_weights = query_states.to_dtype(DType::F32)?.matmul(&k.transpose(2, 3)?)?
+        // Scores in unified precision (target_dtype)
+        let mut attn_weights = query_states.to_dtype(target_dtype)?.matmul(&k.transpose(2, 3)?)?
+            .to_dtype(DType::F32)? // Softmax usually better in F32
             .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?;
 
         // Apply Internally Generated Causal Mask
