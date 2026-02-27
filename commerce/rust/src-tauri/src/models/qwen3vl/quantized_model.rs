@@ -501,38 +501,24 @@ impl QuantizedQwen3VLTextAttention {
         attention_mask_in: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        let start_total = std::time::Instant::now();
         let dev = self.q_proj.device();
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
 
         let mut vram_count = 0;
         let mut ram_count = 0;
         let mut ssd_count = 0;
-        let mut time_kv_fetch = std::time::Duration::ZERO;
         let start_attn = std::time::Instant::now();
 
-        // 1. [HARDENING] Inbound Input Alignment
+        // 1. [ALIGNMENT] Input & Rotary
         let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
         let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
         let (b_sz, q_len, _) = xs.dims3()?;
 
-        // [FIX] Dynamic Causal Mask Generation
-        let total_len = seqlen_offset + q_len;
-        let attention_mask = if q_len > 1 && attention_mask_in.is_none() {
-            let q_indices = Tensor::arange(0u32, q_len as u32, dev)?.unsqueeze(1)?;
-            let k_indices = Tensor::arange(0u32, total_len as u32, dev)?.unsqueeze(0)?;
-            let mask = k_indices.broadcast_gt(&(q_indices.broadcast_add(&Tensor::new(seqlen_offset as u32, dev)?)?))?;
-            let mask = mask.to_dtype(target_dtype)?.affine(-1e9, 0.0)?;
-            Some(mask.unsqueeze(0)?.unsqueeze(0)?)
-        } else {
-            attention_mask_in.map(|m| m.clone())
-        };
+        let mut query_states = self.q_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
+        query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?.contiguous()?;
         
-        let query_states = self.q_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
-        let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?.contiguous()?;
-        
-        let key_states = self.k_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
-        let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?.contiguous()?;
+        let mut key_states = self.k_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
+        key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?.contiguous()?;
         
         let value_states = self.v_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
 
@@ -540,7 +526,7 @@ impl QuantizedQwen3VLTextAttention {
         let sin = if sin.dtype() != target_dtype { sin.to_dtype(target_dtype)? } else { sin.clone() };
         let (query_states, key_states) = apply_rotary_pos_emb(&query_states, &key_states, &cos, &sin, false)?;
         
-        // 2. [BLOCK-PIPELINE-ALLOCATION] Append or Create New (Mark Dirty for Real-time SSD Write)
+        // 2. [BLOCK-ALLOCATION] Append or Create New (Mark Dirty for Real-time SSD Write)
         let mut tokens_to_process = q_len;
         let mut chunk_offset = 0;
         while tokens_to_process > 0 {
@@ -590,13 +576,11 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // 3. [SEQUENTIAL-KV-LOADER] Hybrid VRAM-First Ordered Pipeline
+        // 3. [SEQUENTIAL-LOADER] Strictly Chronological 3-Block Staging
         let mut bulk_ks = Vec::new();
         let mut bulk_vs = Vec::new();
         let mut ram_queue_ks = Vec::new();
         let mut ram_queue_vs = Vec::new();
-        let mut vram_rolling_ks = std::collections::VecDeque::with_capacity(3);
-        let mut vram_rolling_vs = std::collections::VecDeque::with_capacity(3);
 
         let total_tokens_now = seqlen_offset + q_len;
         for block in &self.kv_blocks {
@@ -606,7 +590,7 @@ impl QuantizedQwen3VLTextAttention {
             };
             if b_off >= total_tokens_now { continue; }
 
-            // Check physical VRAM presence for strict chronological integrity
+            // VRAM-First physical presence check
             let mut k_vram = None;
             let mut v_vram = None;
             {
@@ -619,22 +603,15 @@ impl QuantizedQwen3VLTextAttention {
             }
 
             if let (Some(k), Some(v)) = (k_vram, v_vram) {
-                // [ORDER-SYNC] Flush RAM queue before VRAM block to maintain timeline
+                // [ORDER-FLUSH] Force pending SSD blocks to main queue before current VRAM block
                 if !ram_queue_ks.is_empty() {
-                    let k_cat = Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
-                    let v_cat = Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
-                    if vram_rolling_ks.len() >= 3 { vram_rolling_ks.pop_front(); vram_rolling_vs.pop_front(); }
-                    vram_rolling_ks.push_back(k_cat); vram_rolling_vs.push_back(v_cat);
-                    bulk_ks.push(vram_rolling_ks.back().unwrap().clone());
-                    bulk_vs.push(vram_rolling_vs.back().unwrap().clone());
+                    bulk_ks.push(Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?);
+                    bulk_vs.push(Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?);
                     ram_queue_ks.clear(); ram_queue_vs.clear();
                 }
-                if vram_rolling_ks.len() >= 3 { vram_rolling_ks.pop_front(); vram_rolling_vs.pop_front(); }
-                vram_rolling_ks.push_back(k); vram_rolling_vs.push_back(v);
-                bulk_ks.push(vram_rolling_ks.back().unwrap().clone());
-                bulk_vs.push(vram_rolling_vs.back().unwrap().clone());
+                bulk_ks.push(k); bulk_vs.push(v);
             } else {
-                // SSD -> RAM Staging
+                // SSD/RAM Pipeline: Load to RAM, cat every 3
                 let mut k_cpu = None;
                 let mut v_cpu = None;
                 {
@@ -676,22 +653,17 @@ impl QuantizedQwen3VLTextAttention {
                 if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
                     ram_queue_ks.push(k); ram_queue_vs.push(v);
                     if ram_queue_ks.len() >= 3 {
-                        let k_cat = Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
-                        let v_cat = Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
-                        if vram_rolling_ks.len() >= 3 { vram_rolling_ks.pop_front(); vram_rolling_vs.pop_front(); }
-                        vram_rolling_ks.push_back(k_cat); vram_rolling_vs.push_back(v_cat);
-                        bulk_ks.push(vram_rolling_ks.back().unwrap().clone());
-                        bulk_vs.push(vram_rolling_vs.back().unwrap().clone());
+                        bulk_ks.push(Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?);
+                        bulk_vs.push(Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?);
                         ram_queue_ks.clear(); ram_queue_vs.clear();
                     }
                 }
             }
         }
-        // Final leftovers ordered flush
+        // Final leftovers flush (Strict sequential order)
         if !ram_queue_ks.is_empty() {
-            let k_cat = Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
-            let v_cat = Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
-            bulk_ks.push(k_cat); bulk_vs.push(v_cat);
+            bulk_ks.push(Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?);
+            bulk_vs.push(Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?);
         }
 
         if bulk_ks.is_empty() { return Err(anyhow!("No KV data found")); }
@@ -708,7 +680,7 @@ impl QuantizedQwen3VLTextAttention {
             v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
         }
 
-        // Restore Intelligence: Compute scores in F32 to prevent drift in long context (10k+)
+        // Restore Intelligence: Score calculation in F32 to prevent 발산(divergence)
         let mut attn_weights = query_states.to_dtype(DType::F32)?.matmul(&k.to_dtype(DType::F32)?.transpose(2, 3)?)?
             .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?;
 
@@ -725,8 +697,9 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?.to_dtype(target_dtype)?;
-        let attn_output = attn_weights.matmul(&v)?;
+        let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
+        // Sum values in F32 for maximum precision
+        let attn_output = attn_weights.matmul(&v.to_dtype(DType::F32)?)?.to_dtype(target_dtype)?;
 
         let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
         let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
