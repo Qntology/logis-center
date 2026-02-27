@@ -1581,6 +1581,7 @@ pub struct QuantizedQwen3VLTextModel {
     pub norm: RmsNorm,
     pub rotary_emb: Qwen3VLTextRotaryEmbedding,
     pub mrope_section: Vec<usize>,
+    pub device_id: usize, // [NEW] 실제 할당된 GPU ID 저장
     pub mmap: Option<Arc<Mmap>>, 
     pub registry: KVRegistry, // [NEW] 모델 전체 공유 목차
     pub baking_only: bool,
@@ -1701,7 +1702,22 @@ impl QuantizedQwen3VLTextModel {
         let norm_dtype = if last_device.is_cpu() { DType::F32 } else { dtype };
         let norm = get_rms_norm(ct, &mut reader, norm_prefix, config.rms_norm_eps, last_device, norm_dtype)?;
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_else(|| if config.head_dim == 128 { vec![16, 24, 24] } else { vec![] }), mmap: mmap_handle, registry, baking_only, is_forced_cpu, active_session_id: None, active_kv_name: None, pinned_layer_count, current_kv_len: 0 })
+        Ok(Self { 
+            embed_tokens, 
+            layers, 
+            norm, 
+            rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), 
+            mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_else(|| if config.head_dim == 128 { vec![16, 24, 24] } else { vec![] }), 
+            device_id, // [NEW]
+            mmap: mmap_handle, 
+            registry, 
+            baking_only, 
+            is_forced_cpu, 
+            active_session_id: None, 
+            active_kv_name: None, 
+            pinned_layer_count, 
+            current_kv_len: 0 
+        })
     }
 
     pub fn new<R: std::io::Seek + std::io::Read>(
@@ -1770,18 +1786,13 @@ impl QuantizedQwen3VLTextModel {
 
         let mut layers = vec![];
         let mut pinned_layer_count = 0;
-        // [FIX] 베이킹 모드에서도 전체 레이어의 KV 캐시가 필요하므로 28개 레이어를 모두 로드합니다.
         let num_layers_to_load = config.num_hidden_layers;
 
         for layer_idx in 0..num_layers_to_load {
-            let mut layer_device = current_device.clone();
-            if current_device.is_cuda() && is_vram_checked {
-                 let buffer_factor = 1.1; 
-                 if simulated_free_vram > ( (cost_per_layer as f64 * buffer_factor) as u64 + safety_floor ) {
-                     simulated_free_vram = simulated_free_vram.saturating_sub(cost_per_layer);
-                     pinned_layer_count += 1;
-                 } else { layer_device = Device::Cpu; }
-            }
+            // [FIX] 사용자 요청에 따라 모든 레이어를 GPU(Cuda)에 강제 할당
+            let layer_device = current_device.clone();
+            if current_device.is_cuda() { pinned_layer_count += 1; }
+            
             let gguf_blk = format!("blk.{layer_idx}");
             let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{base_name}.layers.{layer_idx}") };
             layers.push(QuantizedQwen3VLTextDecoderLayer::new(config, ct, reader, &prefix, &layer_device, if layer_device.is_cpu() { DType::F32 } else { dtype }, layer_idx, baking_only, registry.clone())?);
@@ -1791,7 +1802,22 @@ impl QuantizedQwen3VLTextModel {
         let norm_device = layers.last().map(|l| l.device()).unwrap_or(&current_device);
         let norm = get_rms_norm(ct, reader, norm_prefix, config.rms_norm_eps, norm_device, if norm_device.is_cpu() { DType::F32 } else { dtype })?;
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_else(|| if config.head_dim == 128 { vec![16, 24, 24] } else { vec![] }), mmap: None, registry, baking_only, is_forced_cpu, active_session_id: None, active_kv_name: None, pinned_layer_count, current_kv_len: 0 })
+        Ok(Self { 
+            embed_tokens, 
+            layers, 
+            norm, 
+            rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), 
+            mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_else(|| if config.head_dim == 128 { vec![16, 24, 24] } else { vec![] }), 
+            device_id, // [NEW]
+            mmap: None, 
+            registry, 
+            baking_only, 
+            is_forced_cpu, 
+            active_session_id: None, 
+            active_kv_name: None, 
+            pinned_layer_count, 
+            current_kv_len: 0 
+        })
     }
 
     pub fn load_kv_cache_chunked(&mut self, kv_name: &str) -> Result<()> {
@@ -2077,7 +2103,7 @@ impl QuantizedQwen3VLTextModel {
         let is_decoding = input_token_count <= 1;
 
         // [STEP 1] Load Weights to GPU (이미 있으면 건너뜀)
-        let target_device = crate::utils::get_cuda_device(0); 
+        let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
         let current_device = self.layers[layer_idx].device();
         
         if !current_device.same_device(&target_device) {
@@ -2197,7 +2223,7 @@ impl QuantizedQwen3VLTextModel {
 
     /// [DEC-SPEED-UP] 디코딩 속도를 위해 모든 레이어를 GPU에 상주 시킴
     pub async fn pin_all_layers_to_gpu(&mut self) -> Result<()> {
-        let target_device = crate::utils::get_cuda_device(0);
+        let target_device = crate::utils::get_cuda_device(self.device_id);
         println!("[DEC-SPEED-UP] Pinning all layers to GPU for vertical inference...");
         for (i, layer) in self.layers.iter_mut().enumerate() {
             if !layer.device().same_device(&target_device) {
@@ -2989,8 +3015,10 @@ impl QuantizedQwen3VLModel {
     }
 
     pub async fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
-        // [OPTION A] 실시간 VRAM 재배치 활성화 (현재 위치 정보 포함)
-        let _ = self.rebalance_layers(0, seqlen_offset, total_len);
+        // [OPTIMIZATION] 매 토큰이 아닌 16토큰마다 리밸런싱을 수행하여 NVML 오버헤드 제거
+        if seqlen_offset % 16 == 0 || seqlen_offset == 0 {
+            let _ = self.rebalance_layers(self.language_model.device_id, seqlen_offset, total_len);
+        }
 
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
         let (b_sz, seq_len) = input_ids.dims2()?;
@@ -3126,8 +3154,10 @@ impl QuantizedQwen3TextModel {
     }
 
     pub async fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
-        // [OPTION A] 실시간 VRAM 재배치 활성화 (현재 위치 정보 포함)
-        let _ = self.rebalance_layers(0, seqlen_offset, total_len);
+        // [OPTIMIZATION] 16토큰 주기로 리밸런싱 수행
+        if seqlen_offset % 16 == 0 || seqlen_offset == 0 {
+            let _ = self.rebalance_layers(self.language_model.device_id, seqlen_offset, total_len);
+        }
 
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
         
