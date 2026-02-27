@@ -217,7 +217,7 @@ pub struct RegistryEntry {
     pub ssd_path: Option<std::path::PathBuf>,
     pub hidden_states_path: Vec<Option<std::path::PathBuf>>, // [Layer Index] -> SSD Path for Output
     #[serde(skip)]
-    pub is_dirty: bool, // SSD 저장이 필요한지 여부
+    pub is_dirty: Vec<bool>, // [NEW] Per-layer dirty flag to prevent redundant SSD backup tasks
     #[serde(skip, default = "std::time::Instant::now")]
     pub last_accessed: std::time::Instant, // LRU 순위 결정을 위한 접근 시각
     #[serde(skip, default = "default_bitkv_cache")]
@@ -233,7 +233,7 @@ impl RegistryEntry {
             slot_ids: vec![None; num_layers],
             ssd_path: None,
             hidden_states_path: vec![None; num_layers],
-            is_dirty: false,
+            is_dirty: vec![true; num_layers],
             last_accessed: std::time::Instant::now(),
             bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; num_layers])),
         }
@@ -557,14 +557,12 @@ impl QuantizedQwen3VLTextAttention {
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
                         
-                        // [SSD-TRIGGER] Mark as dirty in registry to force backup
-                        if self.layer_idx == 0 {
-                            let mut reg = self.registry.entries.write().unwrap();
-                            if inner.index < reg.len() {
-                                let entry = &mut reg[inner.index];
-                                entry.token_len = inner.len;
-                                entry.is_dirty = true;
-                            }
+                        // [SSD-TRIGGER] Mark as dirty in registry to force backup for THIS layer
+                        let mut reg = self.registry.entries.write().unwrap();
+                        if inner.index < reg.len() {
+                            let entry = &mut reg[inner.index];
+                            entry.token_len = inner.len;
+                            if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = true; }
                         }
                     }
                 }
@@ -582,15 +580,13 @@ impl QuantizedQwen3VLTextAttention {
                 }
                 
                 // [SSD-TRIGGER] Initialize and mark dirty for new blocks
-                if self.layer_idx == 0 {
-                    let mut reg = self.registry.entries.write().unwrap();
-                    if index < reg.len() {
-                        let entry = &mut reg[index];
-                        entry.token_start = current_total;
-                        entry.token_len = take;
-                        entry.is_dirty = true;
-                        for loc in entry.location.iter_mut() { *loc = KVLocation::VRAM; }
-                    }
+                let mut reg = self.registry.entries.write().unwrap();
+                if index < reg.len() {
+                    let entry = &mut reg[index];
+                    entry.token_start = current_total;
+                    entry.token_len = take;
+                    if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = true; }
+                    if self.layer_idx < entry.location.len() { entry.location[self.layer_idx] = KVLocation::VRAM; }
                 }
                 self.kv_blocks.push(new_block);
                 tokens_to_process -= take; chunk_offset += take;
@@ -721,12 +717,6 @@ impl QuantizedQwen3VLTextAttention {
         let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
         let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
         
-        // [SSD-RELAY] Trigger incremental baking with Full-Mirror guarantee
-        if let Some(s_id) = &session_id {
-            let is_decoding = q_len == 1; 
-            let _ = self.trigger_realtime_incremental_bake(s_id, true, baking_only, is_decoding);
-        }
-
         if self.layer_idx == 0 {
             println!("[SPEED] Token {} | R:{} S:{} V:{} | Attn: {:?}", total_tokens_now, ram_count, ssd_count, vram_count, start_attn.elapsed());
         }
@@ -819,10 +809,12 @@ impl QuantizedQwen3VLTextAttention {
             let inner = b.inner.read().unwrap();
             let is_full = inner.len == 256;
             
-            // [DIRTY-CHECK] Only bake if the block is dirty (new tokens since last save)
+            // [DIRTY-CHECK] Only bake if THIS layer is dirty for this block
             let is_dirty = {
                 let reg = self.registry.entries.read().unwrap();
-                if i < reg.len() { reg[i].is_dirty } else { true }
+                if i < reg.len() { 
+                    if self.layer_idx < reg[i].is_dirty.len() { reg[i].is_dirty[self.layer_idx] } else { true }
+                } else { true }
             };
 
             // [BACKUP-STRATEGY] 
@@ -833,10 +825,12 @@ impl QuantizedQwen3VLTextAttention {
         }).collect();
 
         for idx in target_indices {
-            // [DIRTY-RESET] Clear dirty flag only after the LAST layer (27) has processed the block
-            if self.layer_idx == 27 {
+            // [DIRTY-RESET] Clear dirty flag immediately for THIS layer
+            {
                 let mut reg = self.registry.entries.write().unwrap();
-                if idx < reg.len() { reg[idx].is_dirty = false; }
+                if idx < reg.len() {
+                    if self.layer_idx < reg[idx].is_dirty.len() { reg[idx].is_dirty[self.layer_idx] = false; }
+                }
             }
 
             let block = self.kv_blocks[idx].clone();
@@ -1135,11 +1129,13 @@ impl QuantizedQwen3VLTextAttention {
                     let entry = &mut reg[entry_idx];
                     entry.ssd_path = Some(path.to_path_buf());
                     entry.location[self.layer_idx] = KVLocation::SSD;
+                    if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = false; }
                 } else {
                     // 장부가 비어있거나 부족하면 확장
                     let mut entry = crate::models::qwen3vl::quantized_model::RegistryEntry::new(offset, k.dim(2)?, 28);
                     entry.ssd_path = Some(path.to_path_buf());
                     entry.location[self.layer_idx] = KVLocation::SSD;
+                    if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = false; }
                     reg.push(entry);
                 }
             }
@@ -1216,7 +1212,7 @@ impl QuantizedQwen3VLTextAttention {
                     token_len: b_len,
                     ssd_path: Some(path.clone()),
                     hidden_states_path: vec![None; 28],
-                    is_dirty: false, 
+                    is_dirty: vec![false; 28], 
                     last_accessed: std::time::Instant::now(),
                     bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; 28])),
                 });
@@ -2107,11 +2103,13 @@ impl QuantizedQwen3VLTextModel {
             for block in &mut layer.self_attn.kv_blocks {
                 let mut inner = block.inner.write().unwrap();
                 
-                // [STRICT-RELAY] Include partial blocks and check is_dirty
-                let is_dirty = if l_idx == 0 {
+                // [STRICT-RELAY] Include partial blocks and check per-layer dirty flag
+                let is_dirty = {
                     let reg = self.registry.entries.read().unwrap();
-                    if inner.index < reg.len() { reg[inner.index].is_dirty } else { true }
-                } else { true };
+                    if inner.index < reg.len() { 
+                        if l_idx < reg[inner.index].is_dirty.len() { reg[inner.index].is_dirty[l_idx] } else { true }
+                    } else { true }
+                };
 
                 if inner.k_cache.is_some() && is_dirty {
                     let k = inner.k_cache.as_ref().unwrap();
@@ -2126,10 +2124,12 @@ impl QuantizedQwen3VLTextModel {
                         raw_v: Some(inner.v_cache.as_ref().unwrap().to_device(&Device::Cpu)?),
                     });
                     
-                    // Reset dirty flag
-                    if l_idx == 0 {
+                    // Reset per-layer dirty flag
+                    {
                         let mut reg = self.registry.entries.write().unwrap();
-                        if inner.index < reg.len() { reg[inner.index].is_dirty = false; }
+                        if inner.index < reg.len() {
+                            if l_idx < reg[inner.index].is_dirty.len() { reg[inner.index].is_dirty[l_idx] = false; }
+                        }
                     }
                 }
             }
