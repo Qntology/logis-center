@@ -268,6 +268,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         if l_idx < 28 { 
                                             e.location[l_idx] = KVLocation::SSD; 
                                             e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                                            // [MEMORY-RELEASE] SSD 저장 완료 즉시 RAM 메모리 해제
+                                            if let Ok(mut cache) = e.bitkv_cache.write() {
+                                                if l_idx < cache.len() { cache[l_idx] = None; }
+                                            }
                                         } 
                                     }
                                 }
