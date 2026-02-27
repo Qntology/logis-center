@@ -514,6 +514,18 @@ impl QuantizedQwen3VLTextAttention {
         let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
         let (b_sz, q_len, _) = xs.dims3()?;
 
+        // [CRITICAL] Internal Causal Mask Generation for Prefill Integrity
+        let total_len = seqlen_offset + q_len;
+        let attention_mask = if q_len > 1 && attention_mask_in.is_none() {
+            let q_indices = Tensor::arange(0u32, q_len as u32, dev)?.unsqueeze(1)?;
+            let k_indices = Tensor::arange(0u32, total_len as u32, dev)?.unsqueeze(0)?;
+            let mask = k_indices.broadcast_gt(&(q_indices.broadcast_add(&Tensor::new(seqlen_offset as u32, dev)?)?))?;
+            let mask = mask.to_dtype(DType::F32)?.affine(-1e9, 0.0)?;
+            Some(mask.unsqueeze(0)?.unsqueeze(0)?)
+        } else {
+            attention_mask_in.map(|m| m.clone())
+        };
+
         let mut query_states = self.q_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
         query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?.contiguous()?;
         
@@ -576,7 +588,7 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // 3. [SEQUENTIAL-KV-LOADER] Hybrid VRAM-First Ordered Pipeline
+        // 3. [SEQUENTIAL-LOADER] Maintain F32 Integrity during Staging
         let mut bulk_ks = Vec::new();
         let mut bulk_vs = Vec::new();
         let mut ram_queue_ks = Vec::new();
@@ -590,29 +602,26 @@ impl QuantizedQwen3VLTextAttention {
             };
             if b_off >= total_tokens_now { continue; }
 
-            // Check physical VRAM presence for strict chronological integrity
             let mut k_vram = None;
             let mut v_vram = None;
             {
                 let inner = block.inner.read().unwrap();
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    k_vram = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
-                    v_vram = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
+                    // Keep in F32 if possible for higher precision
+                    k_vram = Some(k.to_device(dev)?.to_dtype(DType::F32)?);
+                    v_vram = Some(v.to_device(dev)?.to_dtype(DType::F32)?);
                     vram_count += 1;
                 }
             }
 
             if let (Some(k), Some(v)) = (k_vram, v_vram) {
-                // [ORDER-SYNC] Flush RAM queue before VRAM block to maintain timeline
                 if !ram_queue_ks.is_empty() {
-                    let k_cat = Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
-                    let v_cat = Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
-                    bulk_ks.push(k_cat); bulk_vs.push(v_cat);
+                    bulk_ks.push(Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?);
+                    bulk_vs.push(Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?);
                     ram_queue_ks.clear(); ram_queue_vs.clear();
                 }
                 bulk_ks.push(k); bulk_vs.push(v);
             } else {
-                // SSD -> RAM Staging (3-block cat mechanism)
                 let mut k_cpu = None;
                 let mut v_cpu = None;
                 {
@@ -652,26 +661,23 @@ impl QuantizedQwen3VLTextAttention {
                     }
                 }
                 if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
-                    ram_queue_ks.push(k); ram_queue_vs.push(v);
+                    ram_queue_ks.push(k.to_dtype(DType::F32)?); ram_queue_vs.push(v.to_dtype(DType::F32)?);
                     if ram_queue_ks.len() >= 3 {
-                        let k_cat = Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
-                        let v_cat = Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
-                        bulk_ks.push(k_cat); bulk_vs.push(v_cat);
+                        bulk_ks.push(Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?);
+                        bulk_vs.push(Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?);
                         ram_queue_ks.clear(); ram_queue_vs.clear();
                     }
                 }
             }
         }
-        // Final leftovers ordered flush
         if !ram_queue_ks.is_empty() {
-            let k_cat = Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
-            let v_cat = Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
-            bulk_ks.push(k_cat); bulk_vs.push(v_cat);
+            bulk_ks.push(Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?);
+            bulk_vs.push(Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?);
         }
 
         if bulk_ks.is_empty() { return Err(anyhow!("No KV data found")); }
 
-        // 4. [BULK-ATTENTION] F32 High-Precision Stability Pass
+        // 4. [BULK-ATTENTION] F32 Total Precision Pass
         let k = Tensor::cat(&bulk_ks, 2)?;
         let v = Tensor::cat(&bulk_vs, 2)?;
         let final_kv_len = k.dim(2)?;
@@ -683,25 +689,20 @@ impl QuantizedQwen3VLTextAttention {
             v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
         }
 
-        // Restore Intelligence: Score, Softmax, and Value Accumulation all in F32
-        let mut attn_weights = query_states.to_dtype(DType::F32)?.matmul(&k.to_dtype(DType::F32)?.transpose(2, 3)?)?
+        // Scores in F32
+        let mut attn_weights = query_states.to_dtype(DType::F32)?.matmul(&k.transpose(2, 3)?)?
             .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?;
 
-        if q_len > 1 {
-            let q_indices = Tensor::arange(0u32, q_len as u32, dev)?.unsqueeze(1)?;
-            let k_indices = Tensor::arange(0u32, final_kv_len as u32, dev)?.unsqueeze(0)?;
-            let m = k_indices.broadcast_gt(&(q_indices.broadcast_add(&Tensor::new(seqlen_offset as u32, dev)?)?))?;
-            let mask = m.to_dtype(DType::F32)?.affine(-1e9, 0.0)?.unsqueeze(0)?.unsqueeze(0)?;
-            attn_weights = attn_weights.broadcast_add(&mask)?;
-        } else if let Some(m) = attention_mask_in {
-            let m_len = m.dim(D::Minus1)?;
+        // Apply Internally Generated Causal Mask
+        if let Some(mask) = &attention_mask {
+            let m_len = mask.dim(D::Minus1)?;
             if final_kv_len <= m_len {
-                attn_weights = attn_weights.broadcast_add(&m.narrow(D::Minus1, 0, final_kv_len)?.to_device(dev)?.to_dtype(DType::F32)?)?;
+                attn_weights = attn_weights.broadcast_add(&mask.narrow(D::Minus1, 0, final_kv_len)?)?;
             }
         }
 
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-        let attn_output = attn_weights.matmul(&v.to_dtype(DType::F32)?)?.to_dtype(target_dtype)?;
+        let attn_output = attn_weights.matmul(&v)?.to_dtype(target_dtype)?;
 
         let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
         let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
