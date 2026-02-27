@@ -594,10 +594,8 @@ impl QuantizedQwen3VLTextAttention {
         }
 
         // 3. [SEQUENTIAL-KV-LOADER] Strictly Ordered Hybrid Pipeline
-        let mut bulk_ks = Vec::new();
-        let mut bulk_vs = Vec::new();
-        let mut ram_queue_ks = Vec::new();
-        let mut ram_queue_vs = Vec::new();
+        let mut bulk_ks: Vec<Tensor> = Vec::new();
+        let mut bulk_vs: Vec<Tensor> = Vec::new();
 
         let total_tokens_now = seqlen_offset + q_len;
         for block in &self.kv_blocks {
@@ -620,16 +618,9 @@ impl QuantizedQwen3VLTextAttention {
             }
 
             if let (Some(k), Some(v)) = (k_vram, v_vram) {
-                // [CRITICAL-ORDER-SYNC] Flush SSD queue BEFORE current VRAM block to maintain timeline
-                if !ram_queue_ks.is_empty() {
-                    let k_cat = Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?;
-                    let v_cat = Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?;
-                    bulk_ks.push(k_cat); bulk_vs.push(v_cat);
-                    ram_queue_ks.clear(); ram_queue_vs.clear();
-                }
                 bulk_ks.push(k); bulk_vs.push(v);
             } else {
-                // SSD/RAM Pipeline: Load to RAM, cat every 3 for efficiency
+                // SSD/RAM Pipeline: Direct load to VRAM for high-speed inference
                 let mut k_cpu = None;
                 let mut v_cpu = None;
                 {
