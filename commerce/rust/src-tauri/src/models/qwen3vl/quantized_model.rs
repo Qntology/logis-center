@@ -709,16 +709,24 @@ impl QuantizedQwen3VLTextAttention {
                 let mut to_merge_v = Vec::new();
                 let merge_take = full_count - self.merged_vram_block_count;
                 for i in 0..merge_take.min(vram_ks.len()) {
-                    to_merge_k.push(vram_ks[i].clone());
-                    to_merge_v.push(vram_vs[i].clone());
+                    // [FIX] 캐시 병합 전 장치 및 타입 고정
+                    let tk = &vram_ks[i];
+                    let tv = &vram_vs[i];
+                    let tk_dev = if !tk.device().same_device(dev) { tk.to_device(dev)? } else { tk.clone() };
+                    let tv_dev = if !tv.device().same_device(dev) { tv.to_device(dev)? } else { tv.clone() };
+                    to_merge_k.push(tk_dev.to_dtype(target_dtype)?);
+                    to_merge_v.push(tv_dev.to_dtype(target_dtype)?);
                 }
                 if !to_merge_k.is_empty() {
                     if let Some(mk) = self.vram_merged_k.take() {
-                        let mut list = vec![mk]; list.extend(to_merge_k);
+                        // 기존 캐시도 현재 장치로 정렬
+                        let mk_dev = if !mk.device().same_device(dev) { mk.to_device(dev)? } else { mk };
+                        let mut list = vec![mk_dev.to_dtype(target_dtype)?]; list.extend(to_merge_k);
                         self.vram_merged_k = Some(Tensor::cat(&list, 2)?);
                     } else { self.vram_merged_k = Some(Tensor::cat(&to_merge_k, 2)?); }
                     if let Some(mv) = self.vram_merged_v.take() {
-                        let mut list = vec![mv]; list.extend(to_merge_v);
+                        let mv_dev = if !mv.device().same_device(dev) { mv.to_device(dev)? } else { mv };
+                        let mut list = vec![mv_dev.to_dtype(target_dtype)?]; list.extend(to_merge_v);
                         self.vram_merged_v = Some(Tensor::cat(&list, 2)?);
                     } else { self.vram_merged_v = Some(Tensor::cat(&to_merge_v, 2)?); }
                     self.merged_vram_block_count = full_count;
@@ -738,9 +746,16 @@ impl QuantizedQwen3VLTextAttention {
                 final_list_v.push(vram_vs[i].clone());
             }
 
-            // [FIX] 모든 텐서를 target_dtype으로 통일하여 cat 시의 타입 충돌 방지 (anyhow 에러 변환 보강)
-            let final_list_k: anyhow::Result<Vec<Tensor>> = final_list_k.into_iter().map(|t| t.to_dtype(target_dtype).map_err(anyhow::Error::msg)).collect();
-            let final_list_v: anyhow::Result<Vec<Tensor>> = final_list_v.into_iter().map(|t| t.to_dtype(target_dtype).map_err(anyhow::Error::msg)).collect();
+            // [FIX] 모든 텐서를 현재 연산 장치(dev) 및 타입(target_dtype)으로 통일 (anyhow 에러 변환 포함)
+            let final_list_k: anyhow::Result<Vec<Tensor>> = final_list_k.into_iter().map(|t| {
+                let t = if !t.device().same_device(dev) { t.to_device(dev).map_err(|e| anyhow!(e))? } else { t };
+                t.to_dtype(target_dtype).map_err(anyhow::Error::msg)
+            }).collect();
+            
+            let final_list_v: anyhow::Result<Vec<Tensor>> = final_list_v.into_iter().map(|t| {
+                let t = if !t.device().same_device(dev) { t.to_device(dev).map_err(|e| anyhow!(e))? } else { t };
+                t.to_dtype(target_dtype).map_err(anyhow::Error::msg)
+            }).collect();
 
             let mut k = Tensor::cat(&final_list_k?, 2)?;
             let mut v = Tensor::cat(&final_list_v?, 2)?;
