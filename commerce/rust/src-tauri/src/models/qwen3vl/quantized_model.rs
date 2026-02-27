@@ -596,17 +596,28 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // 4. [UNIFIED-ATTENTION-PASS] Collect all KV sources and perform a single Bulk Attention pass
+        // 4. [UNIFIED-ATTENTION-PASS] Collect ALL KV sources (VRAM + SSD/RAM via Registry)
         let mut all_ks = Vec::new();
         let mut all_vs = Vec::new();
         let mut total_kv_len = 0;
 
         for block in &self.kv_blocks {
-            let (loc, ssd_path, index, b_off, b_len) = {
+            let (index, b_off, b_len) = {
                 let inner = block.inner.read().unwrap();
-                (inner.location, inner.ssd_path.clone(), inner.index, inner.offset, inner.len)
+                (inner.index, inner.offset, inner.len)
             };
             if b_off >= total_len { continue; }
+
+            // [REGISTRY-SYNC] Get the absolute truth about block location and SSD path
+            let (loc, ssd_path) = {
+                let reg = self.registry.entries.read().unwrap();
+                if index < reg.len() {
+                    // registry.location is Vec<KVLocation>, one per layer
+                    (reg[index].location[self.layer_idx], reg[index].ssd_path.clone())
+                } else {
+                    (KVLocation::VRAM, None) // Fallback for safety
+                }
+            };
 
             let mut k_active = None;
             let mut v_active = None;
@@ -618,11 +629,15 @@ impl QuantizedQwen3VLTextAttention {
                     k_active = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
                     v_active = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
                 }
-            } else {
-                // Load from SSD/RAM temporarily
-                let fetch_start = std::time::Instant::now();
+            }
+            
+            // If VRAM load failed or location is SSD/RAM, try to load from storage
+            if k_active.is_none() {
                 if let Some(p) = ssd_path {
-                    if let Ok(content) = crate::utils::direct_loader::load_kv_block(&p.join(format!("l{}.st", self.layer_idx))) {
+                    let fetch_start = std::time::Instant::now();
+                    // [SSD-LOAD] Search for the block on disk
+                    let block_file: std::path::PathBuf = p.join(format!("l{}.st", self.layer_idx));
+                    if let Ok(content) = crate::utils::direct_loader::load_kv_block(&block_file) {
                         if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
                             let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
                             let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
@@ -646,14 +661,16 @@ impl QuantizedQwen3VLTextAttention {
                             }
                         }
                     }
+                    time_kv_fetch += fetch_start.elapsed();
                 }
-                time_kv_fetch += fetch_start.elapsed();
             }
 
             if let (Some(k), Some(v)) = (k_active, v_active) {
                 all_ks.push(k);
                 all_vs.push(v);
                 total_kv_len += b_len;
+            } else {
+                println!("[WARNING] Block {} (off {}) failed to load at Layer {}", index, b_off, self.layer_idx);
             }
         }
 
@@ -674,14 +691,14 @@ impl QuantizedQwen3VLTextAttention {
 
         if let Some(mask) = &attention_mask {
             let m_len = mask.dim(D::Minus1)?;
-            // Apply full mask corresponding to the gathered KV length
             if total_kv_len <= m_len {
                 let sub_mask = mask.narrow(D::Minus1, 0, total_kv_len)?.to_dtype(target_dtype)?;
                 attn_weights = attn_weights.broadcast_add(&sub_mask)?;
             }
         }
 
-        let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
+        // [PRECISION-FIX] Softmax in F32 to avoid instability in small models
+        let attn_weights = candle_nn::ops::softmax(&attn_weights.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(target_dtype)?;
         let attn_output = attn_weights.matmul(&v)?;
 
         let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
