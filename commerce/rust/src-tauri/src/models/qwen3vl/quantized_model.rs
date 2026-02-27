@@ -596,15 +596,10 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // 4. [UNIFIED-ATTENTION-PASS] 모든 소스(VRAM/RAM/SSD)에서 데이터 통합 및 단일 연산
-        let mut running_m: Option<Tensor> = None;
-        let mut running_s: Option<Tensor> = None;
-        let mut running_o: Option<Tensor> = None;
-
-        let mut vram_ks = Vec::new();
-        let mut vram_vs = Vec::new();
-        let mut vram_total_len = 0;
-        let mut vram_start_off = None;
+        // 4. [UNIFIED-ATTENTION-PASS] Collect all KV sources and perform a single Bulk Attention pass
+        let mut all_ks = Vec::new();
+        let mut all_vs = Vec::new();
+        let mut total_kv_len = 0;
 
         for block in &self.kv_blocks {
             let (loc, ssd_path, index, b_off, b_len) = {
@@ -613,214 +608,82 @@ impl QuantizedQwen3VLTextAttention {
             };
             if b_off >= total_len { continue; }
 
-            // [FIX] Streaming 상태의 블록도 VRAM에 상주하는 것이므로 동일하게 처리
+            let mut k_active = None;
+            let mut v_active = None;
+
             if loc == KVLocation::VRAM || loc == KVLocation::Streaming {
                 vram_count += 1;
                 let inner = block.inner.read().unwrap();
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    if vram_start_off.is_none() { vram_start_off = Some(b_off); }
-                    vram_ks.push(k.to_device(dev)?.to_dtype(target_dtype)?);
-                    vram_vs.push(v.to_device(dev)?.to_dtype(target_dtype)?);
-                    vram_total_len += b_len;
+                    k_active = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
+                    v_active = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
                 }
-                continue;
-            }
+            } else {
+                // Load from SSD/RAM temporarily
+                let fetch_start = std::time::Instant::now();
+                if let Some(p) = ssd_path {
+                    if let Ok(content) = crate::utils::direct_loader::load_kv_block(&p.join(format!("l{}.st", self.layer_idx))) {
+                        if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                            let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
+                            let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                            if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
+                                let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
+                                let meta_os = if let Ok(view) = st.tensor("k_shape") {
+                                    let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };
+                                    shape_u32.iter().map(|&x| x as usize).collect()
+                                } else { vec![1, self.num_key_value_heads, b_len, self.head_dim] };
 
-            // [RAM/SSD/Loading] 처리
-            let mut k_active = None;
-            let mut v_active = None;
-            let fetch_start = std::time::Instant::now();
-            
-            // [FIX] 스티키 캐싱(RAM 캐시) 제거: 무조건 SSD에서 직접 읽기
-            if let Some(p) = ssd_path {
-                if let Ok(content) = crate::utils::direct_loader::load_kv_block(&p.join(format!("l{}.st", self.layer_idx))) {
-                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                        let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
-                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
-                        if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
-                            let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
-                            
-                            // 파일의 형상 정보 사용
-                            let meta_os = if let Ok(view) = st.tensor("k_shape") {
-                                let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };
-                                shape_u32.iter().map(|&x| x as usize).collect()
-                            } else {
-                                vec![1, self.num_key_value_heads, b_len, self.head_dim]
-                            };
+                                let ka_t = Tensor::from_vec(bytes_to_f32(ka.data()), (1, ka.shape()[1], ka.shape()[2], ka.shape()[3]), &Device::Cpu)?;
+                                let kp_t = Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?;
+                                let ks_t = Tensor::from_vec(bytes_to_f32(ks.data()), (1, ks.shape()[1], b_len, 1), &Device::Cpu)?;
+                                let va_t = Tensor::from_vec(bytes_to_f32(va.data()), (1, va.shape()[1], va.shape()[2], va.shape()[3]), &Device::Cpu)?;
+                                let vp_t = Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?;
+                                let vs_t = Tensor::from_vec(bytes_to_f32(vs.data()), (1, vs.shape()[1], b_len, 1), &Device::Cpu)?;
 
-                            let ka_t = Tensor::from_vec(bytes_to_f32(ka.data()), (1, ka.shape()[1], ka.shape()[2], ka.shape()[3]), &Device::Cpu)?;
-                            let kp_t = Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?;
-                            let ks_t = Tensor::from_vec(bytes_to_f32(ks.data()), (1, ks.shape()[1], b_len, 1), &Device::Cpu)?;
-                            let va_t = Tensor::from_vec(bytes_to_f32(va.data()), (1, va.shape()[1], va.shape()[2], va.shape()[3]), &Device::Cpu)?;
-                            let vp_t = Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?;
-                            let vs_t = Tensor::from_vec(bytes_to_f32(vs.data()), (1, vs.shape()[1], b_len, 1), &Device::Cpu)?;
-
-                            // [STICKY-CACHE] 읽어온 데이터를 RAM 캐시에 저장 (3-블록 대기열에 의해 관리됨)
-                            {
-                                let reg = self.registry.entries.read().unwrap();
-                                if index < reg.len() {
-                                    let mut cache_w = reg[index].bitkv_cache.write().unwrap();
-                                    cache_w[self.layer_idx] = Some(BitKVMetadata {
-                                        k_anchors: ka_t.clone(), k_packed: kp_t.clone(), k_scales: ks_t.clone(),
-                                        v_anchors: va_t.clone(), v_packed: vp_t.clone(), v_scales: vs_t.clone(),
-                                        original_shape: meta_os.clone(),
-                                    });
-                                }
+                                k_active = Some(self.decompress_from_bitkv(&ka_t, &kp_t, &ks_t, &meta_os, dev)?);
+                                v_active = Some(self.decompress_from_bitkv(&va_t, &vp_t, &vs_t, &meta_os, dev)?);
+                                ssd_count += 1;
                             }
-
-                            k_active = Some(self.decompress_from_bitkv(&ka_t, &kp_t, &ks_t, &meta_os, dev)?);
-                            v_active = Some(self.decompress_from_bitkv(&va_t, &vp_t, &vs_t, &meta_os, dev)?);
-                            ssd_count += 1;
                         }
                     }
                 }
+                time_kv_fetch += fetch_start.elapsed();
             }
-            time_kv_fetch += fetch_start.elapsed();
 
-            if let (Some(mut k), Some(mut v)) = (k_active, v_active) {
-                if self.num_kv_groups > 1 {
-                    let (b, h, s, d) = k.dims4()?;
-                    k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                    v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                }
-                let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
-                if let Some(mask) = &attention_mask {
-                    let m_len = mask.dim(D::Minus1)?;
-                    if b_off + b_len <= m_len {
-                        attn_weights = attn_weights.broadcast_add(&mask.narrow(D::Minus1, b_off, b_len)?.to_dtype(target_dtype)?)?;
-                    }
-                }
-                let m_i = attn_weights.max_keepdim(D::Minus1)?;
-                let p_i = attn_weights.broadcast_sub(&m_i)?.exp()?;
-                let s_i = p_i.sum_keepdim(D::Minus1)?;
-                let o_i = p_i.matmul(&v)?;
-                match (running_m.take(), running_s.take(), running_o.take()) {
-                    (None, None, None) => { 
-                        running_m = Some(m_i); 
-                        running_s = Some(s_i.to_dtype(target_dtype)?); 
-                        running_o = Some(o_i.to_dtype(target_dtype)?); 
-                    }
-                    (Some(m_prev), Some(s_prev), Some(o_prev)) => {
-                        let m_new = m_prev.maximum(&m_i)?;
-                        let alpha_prev = m_prev.broadcast_sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
-                        let alpha_i = m_i.broadcast_sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
-                        running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&s_i.to_dtype(target_dtype)?.broadcast_mul(&alpha_i)?)?);
-                        running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&o_i.to_dtype(target_dtype)?.broadcast_mul(&alpha_i)?)?);
-                        running_m = Some(m_new);
-                    }
-                    _ => unreachable!(),
-                }
+            if let (Some(k), Some(v)) = (k_active, v_active) {
+                all_ks.push(k);
+                all_vs.push(v);
+                total_kv_len += b_len;
             }
         }
 
-        // 5. [BATCH-VRAM-PASS] VRAM 병합 연산 (누산기 활용 최적화)
-        if vram_total_len > 0 {
-            let total_vram_blocks: usize = vram_count;
-            let has_active = self.kv_blocks.last().map(|b| b.inner.read().unwrap().len < 256).unwrap_or(false);
-            let full_count = if has_active { total_vram_blocks.saturating_sub(1) } else { total_vram_blocks };
+        if all_ks.is_empty() { return Err(anyhow!("No KV data found for attention")); }
 
-            // 1. [ACCUMULATE] 새로 완성된 블록들을 캐시에 반영
-            if full_count > 0 && self.merged_vram_block_count < full_count {
-                let mut to_merge_k = Vec::new();
-                let mut to_merge_v = Vec::new();
-                let merge_take = full_count - self.merged_vram_block_count;
-                for i in 0..merge_take.min(vram_ks.len()) {
-                    // [FIX] 캐시 병합 전 장치 및 타입 고정
-                    let tk = &vram_ks[i];
-                    let tv = &vram_vs[i];
-                    let tk_dev = if !tk.device().same_device(dev) { tk.to_device(dev)? } else { tk.clone() };
-                    let tv_dev = if !tv.device().same_device(dev) { tv.to_device(dev)? } else { tv.clone() };
-                    to_merge_k.push(tk_dev.to_dtype(target_dtype)?);
-                    to_merge_v.push(tv_dev.to_dtype(target_dtype)?);
-                }
-                if !to_merge_k.is_empty() {
-                    if let Some(mk) = self.vram_merged_k.take() {
-                        let mk_dev = if !mk.device().same_device(dev) { mk.to_device(dev)? } else { mk };
-                        let mut list = vec![mk_dev.to_dtype(target_dtype)?]; list.extend(to_merge_k);
-                        self.vram_merged_k = Some(Tensor::cat(&list, 2)?);
-                    } else { self.vram_merged_k = Some(Tensor::cat(&to_merge_k, 2)?); }
-                    if let Some(mv) = self.vram_merged_v.take() {
-                        let mv_dev = if !mv.device().same_device(dev) { mv.to_device(dev)? } else { mv };
-                        let mut list = vec![mv_dev.to_dtype(target_dtype)?]; list.extend(to_merge_v);
-                        self.vram_merged_v = Some(Tensor::cat(&list, 2)?);
-                    } else { self.vram_merged_v = Some(Tensor::cat(&to_merge_v, 2)?); }
-                    self.merged_vram_block_count = full_count;
-                }
-            }
+        // 5. [EXECUTE-BULK-ATTENTION]
+        let mut k = Tensor::cat(&all_ks, 2)?;
+        let mut v = Tensor::cat(&all_vs, 2)?;
 
-            // 2. [FINAL-COMBINE] 캐시 + 현재 연산 중인 나머지 조각들 합체
-            let mut final_list_k = Vec::new();
-            let mut final_list_v = Vec::new();
-            if let (Some(mk), Some(mv)) = (&self.vram_merged_k, &self.vram_merged_v) {
-                final_list_k.push(mk.clone());
-                final_list_v.push(mv.clone());
-            }
-            let r_start = full_count.saturating_sub(self.merged_vram_block_count);
-            for i in r_start..vram_ks.len() {
-                final_list_k.push(vram_ks[i].clone());
-                final_list_v.push(vram_vs[i].clone());
-            }
+        if self.num_kv_groups > 1 {
+            let (b, h, s, d) = k.dims4()?;
+            k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+            v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+        }
 
-            // [FIX] 모든 텐서를 현재 연산 장치(dev) 및 타입(target_dtype)으로 통일 (anyhow 에러 변환 포함)
-            let final_list_k: anyhow::Result<Vec<Tensor>> = final_list_k.into_iter().map(|t| {
-                let t = if !t.device().same_device(dev) { t.to_device(dev).map_err(|e| anyhow!(e))? } else { t };
-                t.to_dtype(target_dtype).map_err(anyhow::Error::msg)
-            }).collect();
-            
-            let final_list_v: anyhow::Result<Vec<Tensor>> = final_list_v.into_iter().map(|t| {
-                let t = if !t.device().same_device(dev) { t.to_device(dev).map_err(|e| anyhow!(e))? } else { t };
-                t.to_dtype(target_dtype).map_err(anyhow::Error::msg)
-            }).collect();
+        let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?
+            .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
 
-            let mut k = Tensor::cat(&final_list_k?, 2)?;
-            let mut v = Tensor::cat(&final_list_v?, 2)?;
-            let actual_vram_width = k.dim(2)?;
-
-            if self.num_kv_groups > 1 {
-                let (b, h, s, d) = k.dims4()?;
-                k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-            }
-            
-            // [FIX] VRAM 패스에서도 마스크 적용 (Prefill 시 인과성 보장)
-            let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
-            
-            if let Some(mask) = &attention_mask {
-                let m_len = mask.dim(D::Minus1)?;
-                let b_off = vram_start_off.unwrap_or(0);
-                if b_off + actual_vram_width <= m_len {
-                    let sub_mask = mask.narrow(D::Minus1, b_off, actual_vram_width)?.to_dtype(target_dtype)?;
-                    attn_weights = attn_weights.broadcast_add(&sub_mask)?;
-                }
-            }
-            
-            let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
-            let m_i = attn_weights_f32.max_keepdim(D::Minus1)?;
-            let p_i = attn_weights_f32.broadcast_sub(&m_i)?.exp()?;
-            let s_i = p_i.sum_keepdim(D::Minus1)?;
-            let o_i = p_i.to_dtype(target_dtype)?.matmul(&v)?;
-
-            match (running_m.take(), running_s.take(), running_o.take()) {
-                (None, None, None) => { 
-                    running_m = Some(m_i); 
-                    running_s = Some(s_i); 
-                    running_o = Some(o_i.to_dtype(DType::F32)?); 
-                }
-                (Some(m_prev), Some(s_prev), Some(o_prev)) => {
-                    let m_new = m_prev.maximum(&m_i)?;
-                    let alpha_prev = m_prev.broadcast_sub(&m_new)?.exp()?;
-                    let alpha_i = m_i.broadcast_sub(&m_new)?.exp()?;
-                    running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&s_i.broadcast_mul(&alpha_i)?)?);
-                    running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&o_i.to_dtype(DType::F32)?.broadcast_mul(&alpha_i)?)?);
-                    running_m = Some(m_new);
-                }
-                _ => unreachable!(),
+        if let Some(mask) = &attention_mask {
+            let m_len = mask.dim(D::Minus1)?;
+            // Apply full mask corresponding to the gathered KV length
+            if total_kv_len <= m_len {
+                let sub_mask = mask.narrow(D::Minus1, 0, total_kv_len)?.to_dtype(target_dtype)?;
+                attn_weights = attn_weights.broadcast_add(&sub_mask)?;
             }
         }
 
-        let attn_output = running_o.ok_or_else(|| anyhow!("No attention output"))?
-            .broadcast_div(&running_s.unwrap())?
-            .to_dtype(target_dtype)?;
+        let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
+        let attn_output = attn_weights.matmul(&v)?;
+
         let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
         let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
         
@@ -1004,18 +867,12 @@ impl QuantizedQwen3VLTextAttention {
                 let mut inner = block.inner.write().unwrap();
                 let snapshot = (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len);
                 
-                // [FIX] 최신 3개 블록이 아니면 VRAM 및 RAM 캐시 즉시 삭제 (사용한 건 정리)
+                // [FIX] 최신 3개 블록이 아니면 VRAM 캐시 즉시 삭제 (사용한 건 정리)
+                // 통합 어텐션 패스에서 SSD 로드를 수행하므로 상주할 필요 없음
                 if is_decoding && idx < vram_limit_idx {
                     inner.k_cache = None;
                     inner.v_cache = None;
                     inner.location = KVLocation::SSD;
-                    
-                    // [RAM-WIPE] 전역 장부의 RAM 캐시도 함께 비움
-                    let reg_r = self.registry.entries.read().unwrap();
-                    if idx < reg_r.len() {
-                        let mut cache_w = reg_r[idx].bitkv_cache.write().unwrap();
-                        cache_w[self.layer_idx] = None;
-                    }
                 }
                 snapshot
             };
