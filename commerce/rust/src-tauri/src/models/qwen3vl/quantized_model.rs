@@ -500,6 +500,8 @@ impl QuantizedQwen3VLTextAttention {
         sin: &Tensor,
         attention_mask_in: Option<&Tensor>,
         seqlen_offset: usize,
+        session_id: Option<String>,
+        kv_name: Option<String>,
     ) -> Result<Tensor> {
         let dev = self.q_proj.device();
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
@@ -557,9 +559,15 @@ impl QuantizedQwen3VLTextAttention {
                         inner.v_cache = Some(Tensor::cat(&[pv.to_dtype(target_dtype)?, v_piece.to_dtype(target_dtype)?], 2)?.contiguous()?);
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
+                        
+                        // [SSD-TRIGGER] Mark as dirty in registry to force backup
                         if self.layer_idx == 0 {
                             let mut reg = self.registry.entries.write().unwrap();
-                            if inner.index < reg.len() { reg[inner.index].is_dirty = true; }
+                            if inner.index < reg.len() {
+                                let entry = &mut reg[inner.index];
+                                entry.token_len = inner.len;
+                                entry.is_dirty = true;
+                            }
                         }
                     }
                 }
@@ -575,11 +583,15 @@ impl QuantizedQwen3VLTextAttention {
                     let mut inner = new_block.inner.write().unwrap();
                     inner.k_cache = Some(k_piece); inner.v_cache = Some(v_piece);
                 }
+                
+                // [SSD-TRIGGER] Initialize and mark dirty for new blocks
                 if self.layer_idx == 0 {
                     let mut reg = self.registry.entries.write().unwrap();
                     if index < reg.len() {
                         let entry = &mut reg[index];
-                        entry.token_start = current_total; entry.token_len = take; entry.is_dirty = true;
+                        entry.token_start = current_total;
+                        entry.token_len = take;
+                        entry.is_dirty = true;
                         for loc in entry.location.iter_mut() { *loc = KVLocation::VRAM; }
                     }
                 }
@@ -713,6 +725,12 @@ impl QuantizedQwen3VLTextAttention {
         let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
         let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
         
+        // [SSD-RELAY] Trigger incremental baking with Full-Mirror guarantee
+        if let Some(s_id) = &session_id {
+            let is_decoding = q_len == 1; 
+            let _ = self.trigger_realtime_incremental_bake(s_id, true, false, is_decoding);
+        }
+
         if self.layer_idx == 0 {
             println!("[SPEED] Token {} | R:{} S:{} V:{} | Attn: {:?}", total_tokens_now, ram_count, ssd_count, vram_count, start_attn.elapsed());
         }
@@ -728,15 +746,15 @@ impl QuantizedQwen3VLTextAttention {
         
         let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
         let mut anchors = vec![0.0f32; b * h * anchor_count * d];
-        // [RESIDUAL-QUANT] Store 4 stages of bit-planes and 4 scales per token
-        let packed_len = (b * h * s * d * 4 + 7) / 8;
-        let mut packed_residuals = vec![0u8; packed_len];
-        let mut scales = vec![0.0f32; b * h * s * 4];
-
+        
+        // [FIX] Correct total allocation: include batch * head
+        let num_heads = b * h;
         let head_token_size = s * d;
+        let total_packed_len = (num_heads * head_token_size * 4 + 7) / 8;
+        let mut packed_residuals = vec![0u8; total_packed_len];
+        let mut scales = vec![0.0f32; num_heads * s * 4];
 
         use rayon::prelude::*;
-        // Parallel process by Head
         let mut head_packed_chunks: Vec<&mut [u8]> = packed_residuals.chunks_mut(head_token_size * 4 / 8).collect();
         let mut head_scales_chunks: Vec<&mut [f32]> = scales.chunks_mut(s * 4).collect();
 
@@ -746,7 +764,6 @@ impl QuantizedQwen3VLTextAttention {
             
             for stage in 0..4 {
                 let stage_bit_offset = stage * head_token_size;
-                
                 for token_idx in 0..s {
                     let mut token_max_abs = 0.0f32;
                     let token_start = token_idx * d;
@@ -755,14 +772,11 @@ impl QuantizedQwen3VLTextAttention {
                         if v > token_max_abs { token_max_abs = v; }
                     }
                     
-                    // Save unique scale for this token at this stage
                     head_scales[token_idx * 4 + stage] = token_max_abs;
                     let s_val = token_max_abs;
-                    
                     for d_idx in 0..d {
                         let idx = token_start + d_idx;
-                        let val = current_residual[idx];
-                        if val >= 0.0 {
+                        if current_residual[idx] >= 0.0 {
                             head_packed[(stage_bit_offset + idx) / 8] |= 1 << ((stage_bit_offset + idx) % 8);
                             current_residual[idx] -= s_val;
                         } else {
@@ -773,7 +787,6 @@ impl QuantizedQwen3VLTextAttention {
             }
         });
         
-        // 2. Anchors (Remains original for reference points)
         let anchor_head_size = anchor_count * d;
         let mut anchors_heads: Vec<&mut [f32]> = anchors.chunks_mut(anchor_head_size).collect();
         anchors_heads.par_iter_mut().enumerate().for_each(|(bh_idx, anchor_head)| {
@@ -788,7 +801,7 @@ impl QuantizedQwen3VLTextAttention {
         });
 
         let anchors_tensor = Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu)?;
-        let packed_tensor = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu)?;
+        let packed_tensor = Tensor::from_vec(packed_residuals, vec![total_packed_len], &Device::Cpu)?;
         let scales_tensor = Tensor::from_vec(scales, vec![b, h, s, 4], &Device::Cpu)?;
         Ok((anchors_tensor, packed_tensor, scales_tensor, original_shape))
     }
@@ -813,11 +826,13 @@ impl QuantizedQwen3VLTextAttention {
             let scale_offset = bh_idx * seq_len * 4;
             let anchor_offset = bh_idx * anchor_count * last_dim;
             
-            // 1. 4-Stage Cumulative Restoration using stage-specific scales
             for stage in 0..4 {
                 let stage_bit_offset = bh_offset * 4 + stage * head_tokens;
                 for token_idx in 0..seq_len {
-                    let s_val = scales_vec[scale_offset + token_idx * 4 + stage];
+                    // [SAFE-INDEX] Guard against mismatched scale tensor sizes
+                    let s_idx = scale_offset + token_idx * 4 + stage;
+                    let s_val = if s_idx < scales_vec.len() { scales_vec[s_idx] } else { 0.0 };
+                    
                     for d_idx in 0..last_dim {
                         let inner_idx = token_idx * last_dim + d_idx;
                         let global_bit_idx = stage_bit_offset + inner_idx;
@@ -829,12 +844,13 @@ impl QuantizedQwen3VLTextAttention {
                 }
             }
             
-            // 2. Anchor Override (Reference integrity)
             for s_idx in 0..seq_len {
                 if s_idx < 4 || s_idx % 8 == 0 {
                     let a_pos = if s_idx < 4 { s_idx } else { 4 + (s_idx - 4) / 8 };
-                    let a_data = &anchors_vec[anchor_offset + a_pos * last_dim .. anchor_offset + (a_pos + 1) * last_dim];
-                    head_out[s_idx * last_dim .. (s_idx + 1) * last_dim].copy_from_slice(a_data);
+                    let a_data_idx = anchor_offset + a_pos * last_dim;
+                    if a_data_idx + last_dim <= anchors_vec.len() {
+                        head_out[s_idx * last_dim .. (s_idx + 1) * last_dim].copy_from_slice(&anchors_vec[a_data_idx .. a_data_idx + last_dim]);
+                    }
                 }
             }
         });
@@ -1436,18 +1452,14 @@ impl QuantizedQwen3VLTextDecoderLayer {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
-        seqlen_offset: usize, // [NEW]
+        seqlen_offset: usize,
+        session_id: Option<String>,
+        kv_name: Option<String>,
     ) -> Result<Tensor> {
         let dev = self.input_layernorm.weight().device();
         let target_dtype = self.input_layernorm.weight().dtype();
 
-        // if self.self_attn.layer_idx % 5 == 0 || dev.is_cpu() {
-        //     println!("[TRACE-LAYER-{}] Device: {:?}, DType: {:?}, In: {:?}", 
-        //         self.self_attn.layer_idx, dev, target_dtype, xs.dtype());
-        // }
-        
         // 2. Ensure inputs are on this device and dtype
-        //    (Clone via Cow logic or explicit clone if needed, here we use explicit clones/conversions for safety)
         let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
         let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
 
@@ -1458,7 +1470,6 @@ impl QuantizedQwen3VLTextDecoderLayer {
         if sin.dtype() != target_dtype { sin = sin.to_dtype(target_dtype)?; }
 
         let attention_mask = if let Some(mask) = attention_mask {
-             // Mask is usually F32 or specific, but we ensure device match
              Some(if !mask.device().same_device(dev) { mask.to_device(dev)? } else { mask.clone() })
         } else {
              None
@@ -1466,7 +1477,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
         let residual = xs.clone();
         let xs = self.input_layernorm.forward(&xs)?;
-        let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref(), seqlen_offset)?;
+        let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref(), seqlen_offset, session_id, kv_name)?;
         
         // [HARDENING] Residual Addition DType Guard
         let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
@@ -1862,19 +1873,19 @@ impl QuantizedQwen3VLTextModel {
         cos: &Tensor,
         sin: &Tensor,
         seqlen_offset: usize,
+        session_id: Option<String>,
+        kv_name: Option<String>,
     ) -> Result<Vec<Tensor>> {
         let mut results = Vec::with_capacity(chunk_offsets.len());
         let chunk_size = 256;
         let current_seq_len = xs.dim(1)?;
         // [STABILITY] 텐서 장치가 아닌, 레이어에 고정된 싱글톤 장치 참조 사용
         let target_device = self.layers[layer_idx].device().clone();
-        let sid_opt = self.active_session_id.clone();
 
         for (chunk_idx, &i) in chunk_offsets.iter().enumerate() {
             let take = (current_seq_len - i).min(chunk_size);
             
             // [SLIDING-WINDOW-PREFETCH] 현재 청크 연산 중에 다음 레이어들의 대응하는 청크를 미리 로드
-            // 레이어 시작 시(chunk_idx == 0)에는 초기 윈도우(4개)를 한꺼번에 예독하고, 그 후에는 하나씩 전진하며 예독합니다.
             let prefetch_window = 4;
             let look_ahead_layers = 2;
             let target_chunks = if chunk_idx == 0 { (0..=prefetch_window).collect::<Vec<_>>() } else { vec![chunk_idx + prefetch_window] };
@@ -1901,11 +1912,12 @@ impl QuantizedQwen3VLTextModel {
                                     }
                                     let shared_block = block.clone();
                                     let reg_clone = self.registry.clone();
+                                    let kv_name_for_load = kv_name.clone();
                                     tauri::async_runtime::spawn(async move {
                                         use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
                                         let sid = SLOT_MANAGER.acquire_read_slot().await;
                                         if let Ok(tx) = get_load_worker().await {
-                                            let _ = tx.send(SlotTask::Load(LoadTask { slot_id: sid, path, layer_idx: target_layer, kv_name: None, shared_block, registry: reg_clone })).await;
+                                            let _ = tx.send(SlotTask::Load(LoadTask { slot_id: sid, path, layer_idx: target_layer, kv_name: kv_name_for_load, shared_block, registry: reg_clone })).await;
                                         } else {
                                             SLOT_MANAGER.release_slot(sid).await;
                                         }
@@ -1924,18 +1936,22 @@ impl QuantizedQwen3VLTextModel {
             let cos_chunk = cos.narrow(cos.rank().saturating_sub(2), i, take)?;
             let sin_chunk = sin.narrow(sin.rank().saturating_sub(2), i, take)?;
 
-            let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i)?;
+            let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i, session_id.clone(), kv_name.clone())?;
             results.push(out);
 
-            // [STRATEGY] Prefill(대량 입력)이거나 Baking 모드일 때는 레이어별/오프셋별 즉시 개별 저장 수행
-            if let Some(sid) = &sid_opt {
+            // [STRATEGY] Real-time backup during Prefill or Baking
+            if let Some(sid) = &session_id {
                 let is_prefill = take > 1;
                 let is_last = chunk_idx == chunk_offsets.len() - 1;
                 if is_prefill || self.baking_only {
-                    // [FIX] is_decoding 플래그를 전달하여 Prefill 중에는 비우지 않도록 보호
                     let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last, self.baking_only, !is_prefill);
                 }
             }
+
+            // [VRAM-EVACUATION] Manage VRAM pressure
+            let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
+            if target_device.is_cuda() { let _ = target_device.synchronize(); }
+        }
 
             // [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로만 이동 (저장은 위에서 실시간 처리)
             let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
@@ -2063,10 +2079,14 @@ impl QuantizedQwen3VLTextModel {
         seqlen_offset: usize,
         deepstack_embed: Option<&Tensor>,
         visual_mask: Option<&Tensor>,
+        session_id: Option<String>,
+        kv_name: Option<String>,
     ) -> Result<Tensor> {
         let start_layer_time = std::time::Instant::now();
         let input_token_count = xs.dim(1).unwrap_or(0);
         let is_decoding = input_token_count <= 1;
+
+        // ... [Steps 1 & 2 omitted for brevity] ...
 
         // [STEP 1] Load Weights to GPU (이미 있으면 건너뜀)
         let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
@@ -2157,7 +2177,7 @@ impl QuantizedQwen3VLTextModel {
         // [STEP 3] GPU 연산 실행
         let current_seq_len = xs.dim(1)?;
         let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(256).collect();
-        let next_xs_all = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset).await?;
+        let next_xs_all = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset, session_id, kv_name).await?;
         let mut next_xs = Tensor::cat(&next_xs_all, 1)?;
 
         if let (Some(embed), Some(mask)) = (deepstack_embed, visual_mask) {
@@ -2500,7 +2520,7 @@ impl QuantizedQwen3VLTextModel {
                 println!("[ENGINE] Running Layer {}/{}", layer_idx + 1, total_layers);
             }
             let deepstack_embed = deepstack_visual_embeds.as_ref().and_then(|v| v.get(layer_idx));
-            xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks).await?;
+            xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks, session_id.clone(), kv_name.clone()).await?;
         }
 
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
