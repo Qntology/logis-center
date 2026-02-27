@@ -607,7 +607,6 @@ impl QuantizedQwen3VLTextAttention {
             if let Some(last_block) = self.kv_blocks.last_mut() {
                 let mut inner = last_block.inner.write().unwrap();
                 let free_space = 256usize.saturating_sub(inner.len);
-                // Only append to VRAM-resident active blocks
                 if inner.location == KVLocation::VRAM && free_space > 0 {
                     let take = tokens_to_process.min(free_space);
                     let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
@@ -654,13 +653,12 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // 4. [PIPELINE-SLIDING-WINDOW] 3-Block RAM Staging -> 3-Block VRAM Slide 1
-        let mut running_m: Option<Tensor> = None;
-        let mut running_s: Option<Tensor> = None;
-        let mut running_o: Option<Tensor> = None;
+        // 4. [PIPELINE-STAGING-LOADER] 3-Block RAM Staging -> 3-Block VRAM Slide 1
+        let mut final_ks = Vec::new();
+        let mut final_vs = Vec::new();
 
-        let mut ram_staging_ks = Vec::new();
-        let mut ram_staging_vs = Vec::new();
+        let mut ram_queue_ks = Vec::new();
+        let mut ram_queue_vs = Vec::new();
         let mut vram_queue_ks = std::collections::VecDeque::with_capacity(3);
         let mut vram_queue_vs = std::collections::VecDeque::with_capacity(3);
 
@@ -671,29 +669,26 @@ impl QuantizedQwen3VLTextAttention {
             };
             if b_off >= total_len { continue; }
 
-            // [REGISTRY-SYNC]
             let (loc, ssd_path) = {
                 let reg = self.registry.entries.read().unwrap();
                 if index < reg.len() { (reg[index].location[self.layer_idx], reg[index].ssd_path.clone()) }
                 else { (KVLocation::VRAM, None) }
             };
 
-            let mut k_final = None;
-            let mut v_final = None;
+            let mut k_to_stage = None;
+            let mut v_to_stage = None;
 
             if loc == KVLocation::VRAM || loc == KVLocation::Streaming {
                 vram_count += 1;
                 let inner = block.inner.read().unwrap();
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    k_final = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
-                    v_final = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
+                    k_to_stage = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
+                    v_to_stage = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
                 }
             } else {
-                // Pipeline: SSD -> RAM staging
+                // SSD/RAM Pipeline: Load to RAM, cat every 3
                 let mut k_cpu = None;
                 let mut v_cpu = None;
-
-                // Check RAM Cache
                 {
                     let reg = self.registry.entries.read().unwrap();
                     let cache = reg[index].bitkv_cache.read().unwrap();
@@ -703,7 +698,6 @@ impl QuantizedQwen3VLTextAttention {
                         ram_count += 1;
                     }
                 }
-
                 if k_cpu.is_none() {
                     if let Some(p) = ssd_path {
                         let mut full_path = p.clone();
@@ -730,91 +724,63 @@ impl QuantizedQwen3VLTextAttention {
                         }
                     }
                 }
-
                 if let (Some(k), Some(v)) = (k_cpu, v_cpu) {
-                    ram_staging_ks.push(k);
-                    ram_staging_vs.push(v);
-                    // When 3 blocks collected in RAM, merge and move to VRAM queue
-                    if ram_staging_ks.len() >= 3 {
-                        k_final = Some(Tensor::cat(&ram_staging_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?);
-                        v_final = Some(Tensor::cat(&ram_staging_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?);
-                        ram_staging_ks.clear(); ram_staging_vs.clear();
+                    ram_queue_ks.push(k); ram_queue_vs.push(v);
+                    if ram_queue_ks.len() >= 3 {
+                        k_to_stage = Some(Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?);
+                        v_to_stage = Some(Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?);
+                        ram_queue_ks.clear(); ram_queue_vs.clear();
                     }
                 }
             }
 
-            // [VRAM-SLIDING-COMPUTE] Maintain 3 slots, Slide by 1
-            if let (Some(k), Some(v)) = (k_final, v_final) {
+            if let (Some(k), Some(v)) = (k_to_stage, v_to_stage) {
+                // VRAM Slide 1
                 if vram_queue_ks.len() >= 3 { vram_queue_ks.pop_front(); vram_queue_vs.pop_front(); }
                 vram_queue_ks.push_back(k); vram_queue_vs.push_back(v);
-
-                // Compute attention using the newest entry in the sliding window
-                let mut k_op = vram_queue_ks.back().unwrap().clone();
-                let mut v_op = vram_queue_vs.back().unwrap().clone();
-
-                if self.num_kv_groups > 1 {
-                    let (b, h, s, d) = k_op.dims4()?;
-                    k_op = k_op.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                    v_op = v_op.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                }
-
-                let attn_weights = query_states.matmul(&k_op.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
                 
-                // Stable Softmax in F32
-                let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
-                let m_i = attn_weights_f32.max_keepdim(D::Minus1)?;
-                let p_i = attn_weights_f32.broadcast_sub(&m_i)?.exp()?;
-                let s_i = p_i.sum_keepdim(D::Minus1)?;
-                let o_i = p_i.to_dtype(target_dtype)?.matmul(&v_op)?;
-
-                match (running_m.take(), running_s.take(), running_o.take()) {
-                    (None, None, None) => { running_m = Some(m_i); running_s = Some(s_i); running_o = Some(o_i.to_dtype(DType::F32)?); }
-                    (Some(m_prev), Some(s_prev), Some(o_prev)) => {
-                        let m_new = m_prev.maximum(&m_i)?;
-                        let alpha_prev = m_prev.broadcast_sub(&m_new)?.exp()?;
-                        let alpha_i = m_i.broadcast_sub(&m_new)?.exp()?;
-                        running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&s_i.broadcast_mul(&alpha_i)?)?);
-                        running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&o_i.to_dtype(DType::F32)?.broadcast_mul(&alpha_i)?)?);
-                        running_m = Some(m_new);
-                    }
-                    _ => unreachable!(),
-                }
+                // [INTELLIGENCE-RECOVERY] Collect all past blocks for single stable attention pass
+                final_ks.push(vram_queue_ks.back().unwrap().clone());
+                final_vs.push(vram_queue_vs.back().unwrap().clone());
             }
         }
 
-        // Process remaining RAM chunks
-        if !ram_staging_ks.is_empty() {
-            let k = Tensor::cat(&ram_staging_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
-            let v = Tensor::cat(&ram_staging_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
-            let mut k_op = k; let mut v_op = v;
-            if self.num_kv_groups > 1 {
-                let (b, h, s, d) = k_op.dims4()?;
-                k_op = k_op.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                v_op = v_op.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-            }
-            let attn_weights = query_states.matmul(&k_op.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
-            let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
-            let m_i = attn_weights_f32.max_keepdim(D::Minus1)?;
-            let p_i = attn_weights_f32.broadcast_sub(&m_i)?.exp()?;
-            let s_i = p_i.sum_keepdim(D::Minus1)?;
-            let o_i = p_i.to_dtype(target_dtype)?.matmul(&v_op)?;
-            match (running_m.take(), running_s.take(), running_o.take()) {
-                (None, None, None) => { running_m = Some(m_i); running_s = Some(s_i); running_o = Some(o_i.to_dtype(DType::F32)?); }
-                (Some(m_prev), Some(s_prev), Some(o_prev)) => {
-                    let m_new = m_prev.maximum(&m_i)?;
-                    let alpha_prev = m_prev.broadcast_sub(&m_new)?.exp()?;
-                    let alpha_i = m_i.broadcast_sub(&m_new)?.exp()?;
-                    running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&s_i.broadcast_mul(&alpha_i)?)?);
-                    running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&o_i.to_dtype(DType::F32)?.broadcast_mul(&alpha_i)?)?);
-                    running_m = Some(m_new);
-                }
-                _ => unreachable!(),
-            }
+        // Handle leftovers in RAM queue
+        if !ram_queue_ks.is_empty() {
+            let k = Tensor::cat(&ram_queue_ks, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
+            let v = Tensor::cat(&ram_queue_vs, 2)?.to_device(dev)?.to_dtype(target_dtype)?;
+            final_ks.push(k); final_vs.push(v);
         }
 
-        let attn_output = running_o.ok_or_else(|| anyhow!("No attention output"))?
-            .broadcast_div(&running_s.unwrap())?
-            .to_dtype(target_dtype)?;
+        if final_ks.is_empty() { return Err(anyhow!("No KV data found for attention")); }
+
+        // 5. [UNIFIED-BULK-ATTENTION] Single pass for maximum accuracy
+        let k = Tensor::cat(&final_ks, 2)?;
+        let v = Tensor::cat(&final_vs, 2)?;
+        let final_kv_len = k.dim(2)?;
+
+        let (mut k, mut v) = (k, v);
+        if self.num_kv_groups > 1 {
+            let (b, h, s, d) = k.dims4()?;
+            k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+            v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+        }
+
+        let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?
+            .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
+
+        // [LOCAL-CAUSAL-MASK] Fix shape mismatch and ensure intelligence
+        if q_len > 1 {
+            let q_indices = Tensor::arange(0u32, q_len as u32, dev)?.unsqueeze(1)?;
+            let k_indices = Tensor::arange(0u32, final_kv_len as u32, dev)?.unsqueeze(0)?;
+            let m = k_indices.broadcast_gt(&(q_indices.broadcast_add(&Tensor::new(seqlen_offset as u32, dev)?)?))?;
+            let mask = m.to_dtype(target_dtype)?.affine(-1e9, 0.0)?.unsqueeze(0)?.unsqueeze(0)?;
+            attn_weights = attn_weights.broadcast_add(&mask)?;
+        }
+
+        let attn_weights = candle_nn::ops::softmax(&attn_weights.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(target_dtype)?;
+        let attn_output = attn_weights.matmul(&v)?;
+
         let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
         let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
         
@@ -2314,29 +2280,33 @@ impl QuantizedQwen3VLTextModel {
             for block in &mut layer.self_attn.kv_blocks {
                 let mut inner = block.inner.write().unwrap();
                 
-                // 아직 SSD에 없고 VRAM/RAM에 데이터가 있는 완성된 블록(256) 대상
-                if inner.location != KVLocation::SSD && inner.len == 256 {
-                    if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                         let k_shape_u32: Vec<u32> = k.shape().dims().iter().map(|&x| x as u32).collect();
-                         
-                         block_groups.entry(inner.offset).or_default().push(LayerKVDump {
-                             layer_idx: l_idx,
-                             // 빈 텐서들로 초기화 (워커가 압축 후 채울 것임)
-                             k_anchors: Tensor::zeros((1,1), DType::F32, &Device::Cpu)?,
-                             k_packed: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
-                             k_scales: Tensor::zeros((1,), DType::F32, &Device::Cpu)?,
-                             v_anchors: Tensor::zeros((1,1), DType::F32, &Device::Cpu)?,
-                             v_packed: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
-                             v_scales: Tensor::zeros((1,), DType::F32, &Device::Cpu)?,
-                             k_shape: Tensor::from_vec(k_shape_u32, (k.shape().dims().len(),), &Device::Cpu)?,
-                             // [FIX] 원본 데이터를 CPU로 복제하여 전달 (연산 흐름 방해 최소화)
-                             raw_k: Some(k.to_device(&Device::Cpu)?),
-                             raw_v: Some(v.to_device(&Device::Cpu)?),
-                         });
-                         
-                         // 상태 변경 및 메모리 해제
-                         inner.k_cache = None; inner.v_cache = None;
-                         inner.location = KVLocation::SSD;
+                // [STRICT-RELAY] Include partial blocks and check is_dirty
+                let is_dirty = if l_idx == 0 {
+                    let reg = self.registry.entries.read().unwrap();
+                    if inner.index < reg.len() { reg[inner.index].is_dirty } else { true }
+                } else { true };
+
+                if inner.k_cache.is_some() && is_dirty {
+                    let k = inner.k_cache.as_ref().unwrap();
+                    let k_shape_u32: Vec<u32> = k.shape().dims().iter().map(|&x| x as u32).collect();
+                    
+                    block_groups.entry(inner.offset).or_default().push(LayerKVDump {
+                        layer_idx: l_idx,
+                        k_anchors: Tensor::zeros((1,1), DType::F32, &Device::Cpu)?,
+                        k_packed: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
+                        k_scales: Tensor::zeros((1,), DType::F32, &Device::Cpu)?,
+                        v_anchors: Tensor::zeros((1,1), DType::F32, &Device::Cpu)?,
+                        v_packed: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
+                        v_scales: Tensor::zeros((1,), DType::F32, &Device::Cpu)?,
+                        k_shape: Tensor::from_vec(k_shape_u32, (k.shape().dims().len(),), &Device::Cpu)?,
+                        raw_k: Some(k.to_device(&Device::Cpu)?),
+                        raw_v: Some(inner.v_cache.as_ref().unwrap().to_device(&Device::Cpu)?),
+                    });
+                    
+                    // Reset dirty flag
+                    if l_idx == 0 {
+                        let mut reg = self.registry.entries.write().unwrap();
+                        if inner.index < reg.len() { reg[inner.index].is_dirty = false; }
                     }
                 }
             }
