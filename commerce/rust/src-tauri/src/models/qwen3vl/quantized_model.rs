@@ -338,12 +338,8 @@ impl KVBlock {
 
 #[derive(Clone)]
 pub struct BitKVMetadata {
-    pub k_anchors: Tensor,
-    pub k_packed: Tensor,
-    pub k_scales: Tensor,
-    pub v_anchors: Tensor,
-    pub v_packed: Tensor,
-    pub v_scales: Tensor,
+    pub k_data: Tensor,
+    pub v_data: Tensor,
     pub original_shape: Vec<usize>,
 }
 
@@ -644,8 +640,8 @@ impl QuantizedQwen3VLTextAttention {
                     let reg = self.registry.entries.read().unwrap();
                     let cache = reg[index].bitkv_cache.read().unwrap();
                     if let Some(m) = &cache[self.layer_idx] {
-                        k_cpu = Some(self.decompress_from_bitkv(&m.k_anchors, &m.k_packed, &m.k_scales, &m.original_shape, &Device::Cpu)?);
-                        v_cpu = Some(self.decompress_from_bitkv(&m.v_anchors, &m.v_packed, &m.v_scales, &m.original_shape, &Device::Cpu)?);
+                        k_cpu = Some(self.decompress_from_bf16(&m.k_data, &m.original_shape, &Device::Cpu)?);
+                        v_cpu = Some(self.decompress_from_bf16(&m.v_data, &m.original_shape, &Device::Cpu)?);
                         ram_count += 1;
                     }
                 }
@@ -659,17 +655,16 @@ impl QuantizedQwen3VLTextAttention {
                             if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
                                 let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
                                 let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
-                                if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
-                                    let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
-                                    let meta_os = vec![1, self.num_key_value_heads, b_len, self.head_dim];
-                                    let ka_t = Tensor::from_vec(bytes_to_f32(ka.data()), ka.shape(), &Device::Cpu)?;
-                                    let kp_t = Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?;
-                                    let ks_t = Tensor::from_vec(bytes_to_f32(ks.data()), ks.shape(), &Device::Cpu)?;
-                                    let va_t = Tensor::from_vec(bytes_to_f32(va.data()), va.shape(), &Device::Cpu)?;
-                                    let vp_t = Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?;
-                                    let vs_t = Tensor::from_vec(bytes_to_f32(vs.data()), vs.shape(), &Device::Cpu)?;
-                                    k_cpu = Some(self.decompress_from_bitkv(&ka_t, &kp_t, &ks_t, &meta_os, &Device::Cpu)?);
-                                    v_cpu = Some(self.decompress_from_bitkv(&va_t, &vp_t, &vs_t, &meta_os, &Device::Cpu)?);
+                                if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                    let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                    let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+
+                                    let dev = &Device::Cpu;
+                                    let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, dev)?;
+                                    let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, dev)?;
+
+                                    k_cpu = Some(self.decompress_from_bf16(&kd_t, &meta_os, &Device::Cpu)?);
+                                    v_cpu = Some(self.decompress_from_bf16(&vd_t, &meta_os, &Device::Cpu)?);
                                     ssd_count += 1;
                                 }
                             }
@@ -739,125 +734,19 @@ impl QuantizedQwen3VLTextAttention {
     }
 
 
-    pub fn compress_to_bitkv(&self, t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
+    // [REPLACED] Direct BF16 Storage (16-bit precision, no compression)
+    pub fn compress_to_bf16(&self, t: &Tensor) -> Result<(Tensor, Vec<usize>)> {
         let original_shape = t.shape().dims().to_vec();
-        let (b, h, s, d) = t.dims4()?;
-        let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
-        
-        let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
-        let mut anchors = vec![0.0f32; b * h * anchor_count * d];
-        
-        // [FIX] Correct total allocation: include batch * head
-        let num_heads = b * h;
-        let head_token_size = s * d;
-        let total_packed_len = (num_heads * head_token_size * 4 + 7) / 8;
-        let mut packed_residuals = vec![0u8; total_packed_len];
-        let mut scales = vec![0.0f32; num_heads * s * 4];
-
-        use rayon::prelude::*;
-        let mut head_packed_chunks: Vec<&mut [u8]> = packed_residuals.chunks_mut(head_token_size * 4 / 8).collect();
-        let mut head_scales_chunks: Vec<&mut [f32]> = scales.chunks_mut(s * 4).collect();
-
-        head_packed_chunks.par_iter_mut().zip(head_scales_chunks.par_iter_mut()).enumerate().for_each(|(bh_idx, (head_packed, head_scales))| {
-            let bh_offset = bh_idx * head_token_size;
-            let mut current_residual: Vec<f32> = t_data[bh_offset..bh_offset + head_token_size].to_vec();
-            
-            for stage in 0..4 {
-                let stage_bit_offset = stage * head_token_size;
-                for token_idx in 0..s {
-                    let mut token_max_abs = 0.0f32;
-                    let token_start = token_idx * d;
-                    for d_idx in 0..d {
-                        let v = current_residual[token_start + d_idx].abs();
-                        if v > token_max_abs { token_max_abs = v; }
-                    }
-                    
-                    head_scales[token_idx * 4 + stage] = token_max_abs;
-                    let s_val = token_max_abs;
-                    for d_idx in 0..d {
-                        let idx = token_start + d_idx;
-                        if current_residual[idx] >= 0.0 {
-                            head_packed[(stage_bit_offset + idx) / 8] |= 1 << ((stage_bit_offset + idx) % 8);
-                            current_residual[idx] -= s_val;
-                        } else {
-                            current_residual[idx] += s_val;
-                        }
-                    }
-                }
-            }
-        });
-        
-        let anchor_head_size = anchor_count * d;
-        let mut anchors_heads: Vec<&mut [f32]> = anchors.chunks_mut(anchor_head_size).collect();
-        anchors_heads.par_iter_mut().enumerate().for_each(|(bh_idx, anchor_head)| {
-            let bh_offset = bh_idx * head_token_size;
-            for token_idx in 0..s {
-                if token_idx < 4 || token_idx % 8 == 0 {
-                    let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
-                    let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
-                    anchor_head[anchor_pos * d .. (anchor_pos + 1) * d].copy_from_slice(token_data);
-                }
-            }
-        });
-
-        let anchors_tensor = Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu)?;
-        let packed_tensor = Tensor::from_vec(packed_residuals, vec![total_packed_len], &Device::Cpu)?;
-        let scales_tensor = Tensor::from_vec(scales, vec![b, h, s, 4], &Device::Cpu)?;
-        Ok((anchors_tensor, packed_tensor, scales_tensor, original_shape))
+        // Convert to BF16 on CPU
+        let t_bf16 = t.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
+        Ok((t_bf16, original_shape))
     }
 
-    pub fn decompress_from_bitkv(&self, anchors: &Tensor, packed: &Tensor, scales: &Tensor, original_shape: &[usize], device: &Device) -> Result<Tensor> {
+    pub fn decompress_from_bf16(&self, data: &Tensor, _original_shape: &[usize], device: &Device) -> Result<Tensor> {
         let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-        let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
-        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let anchors_vec = anchors.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        
-        let last_dim = original_shape[original_shape.len() - 1];
-        let seq_len = original_shape[original_shape.len() - 2];
-        let total_elements: usize = original_shape.iter().product();
-        let mut decoded = vec![0.0f32; total_elements];
-        
-        let head_tokens = seq_len * last_dim;
-        let anchor_count = (0..seq_len).filter(|&i| i < 4 || i % 8 == 0).count();
-
-        use rayon::prelude::*;
-        decoded.par_chunks_mut(head_tokens).enumerate().for_each(|(bh_idx, head_out)| {
-            let bh_offset = bh_idx * head_tokens;
-            let scale_offset = bh_idx * seq_len * 4;
-            let anchor_offset = bh_idx * anchor_count * last_dim;
-            
-            for stage in 0..4 {
-                let stage_bit_offset = bh_offset * 4 + stage * head_tokens;
-                for token_idx in 0..seq_len {
-                    // [SAFE-INDEX] Guard against mismatched scale tensor sizes
-                    let s_idx = scale_offset + token_idx * 4 + stage;
-                    let s_val = if s_idx < scales_vec.len() { scales_vec[s_idx] } else { 0.0 };
-                    
-                    for d_idx in 0..last_dim {
-                        let inner_idx = token_idx * last_dim + d_idx;
-                        let global_bit_idx = stage_bit_offset + inner_idx;
-                        if global_bit_idx / 8 < packed_vec.len() {
-                            let is_set = (packed_vec[global_bit_idx / 8] & (1 << (global_bit_idx % 8))) != 0;
-                            head_out[inner_idx] += if is_set { s_val } else { -s_val };
-                        }
-                    }
-                }
-            }
-            
-            for s_idx in 0..seq_len {
-                if s_idx < 4 || s_idx % 8 == 0 {
-                    let a_pos = if s_idx < 4 { s_idx } else { 4 + (s_idx - 4) / 8 };
-                    let a_data_idx = anchor_offset + a_pos * last_dim;
-                    if a_data_idx + last_dim <= anchors_vec.len() {
-                        head_out[s_idx * last_dim .. (s_idx + 1) * last_dim].copy_from_slice(&anchors_vec[a_data_idx .. a_data_idx + last_dim]);
-                    }
-                }
-            }
-        });
-
-        let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
-        Ok(t.to_device(device)?.to_dtype(target_dtype)?)
+        // Data is already BF16 tensor (loaded from safetensors), just move to device and cast
+        let t = data.to_device(device)?;
+        Ok(t.to_dtype(target_dtype)?)
     }
 
     pub fn decompress_from_1bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
@@ -996,12 +885,8 @@ impl QuantizedQwen3VLTextAttention {
                         let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
                         let dump = LayerKVDump {
                             layer_idx,
-                            k_anchors: Tensor::zeros((1,1), DType::F32, &Device::Cpu).unwrap(),
-                            k_packed: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
-                            k_scales: Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap(),
-                            v_anchors: Tensor::zeros((1,1), DType::F32, &Device::Cpu).unwrap(),
-                            v_packed: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
-                            v_scales: Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap(),
+                            k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
+                            v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
                             k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
                             raw_k: Some(k_cpu),
                             raw_v: Some(v_cpu),
@@ -1060,26 +945,16 @@ impl QuantizedQwen3VLTextAttention {
                     let prefix = if is_l0 { format!("b{}_l0_", block_info.offset) } else { format!("b{}_l{}_", block_info.offset, self.layer_idx) };
                     let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
 
-                    if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
-                        let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
+                    if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                        let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                        let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
                         
-                        let file_shape = if let Some(sh) = get_t("k_shape") {
-                            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                            sh_u32.iter().map(|&x| x as usize).collect()
-                        } else {
-                            vec![1, ka.shape()[1], block_info.len, ka.shape()[3]]
-                        };
-
                         let dev = &Device::Cpu;
-                        let ka_t = Tensor::from_vec(bytes_to_f32(ka.data()), (file_shape[0], file_shape[1], (file_shape[2] + 7) / 8 + 4, file_shape[3]), dev)?;
-                        let kp_t = Tensor::from_slice(kp.data(), kp.shape(), dev)?;
-                        let ks_t = Tensor::from_vec(bytes_to_f32(ks.data()), (file_shape[0], file_shape[1], file_shape[2], 1), dev)?;
-                        let va_t = Tensor::from_vec(bytes_to_f32(va.data()), (file_shape[0], file_shape[1], (file_shape[2] + 7) / 8 + 4, file_shape[3]), dev)?;
-                        let vp_t = Tensor::from_slice(vp.data(), vp.shape(), dev)?;
-                        let vs_t = Tensor::from_vec(bytes_to_f32(vs.data()), (file_shape[0], file_shape[1], file_shape[2], 1), dev)?;
+                        let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, dev)?;
+                        let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, dev)?;
 
-                        let mut k_raw = self.decompress_from_bitkv(&ka_t, &kp_t, &ks_t, &file_shape, dev)?;
-                        let mut v_raw = self.decompress_from_bitkv(&va_t, &vp_t, &vs_t, &file_shape, dev)?;
+                        let mut k_raw = self.decompress_from_bf16(&kd_t, &meta_os, dev)?;
+                        let mut v_raw = self.decompress_from_bf16(&vd_t, &meta_os, dev)?;
 
                         // [KV-BRIDGE] 0.6B -> 0.6B 상황에서도 규격이 다르면 정렬 (커밋 261fe0ef 매커니즘)
                         let target_heads = self.num_key_value_heads;
@@ -1243,16 +1118,12 @@ impl QuantizedQwen3VLTextAttention {
             let k = Tensor::cat(&ks, 2)?;
             let v = Tensor::cat(&vs, 2)?;
             
-            let (k_anchors, k_packed, k_scales, k_shape) = self.compress_to_bitkv(&k)?;
-            let (v_anchors, v_packed, v_scales, _) = self.compress_to_bitkv(&v)?;
+            let (kd, k_shape) = self.compress_to_bf16(&k)?;
+            let (vd, _) = self.compress_to_bf16(&v)?;
             
-            map.insert(format!("{}k_anchors", prefix), k_anchors);
-            map.insert(format!("{}k_packed", prefix), k_packed);
-            map.insert(format!("{}k_scales", prefix), k_scales);
-            map.insert(format!("{}v_anchors", prefix), v_anchors);
-            map.insert(format!("{}v_packed", prefix), v_packed);
-            map.insert(format!("{}v_scales", prefix), v_scales);
-            map.insert(format!("{}k_shape", prefix), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?);
+            map.insert(format!("{}k_data", prefix), kd);
+            map.insert(format!("{}v_data", prefix), vd);
+            map.insert(format!("{}k_shape", prefix), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect::<Vec<u32>>(), (k_shape.len(),), &Device::Cpu)?);
             
             candle_core::safetensors::save(&map, &structured_path)?;
             println!("[SSD-SAVE] Layer {} Block {} saved to {:?}", self.layer_idx, offset, structured_path);
@@ -2145,20 +2016,18 @@ impl QuantizedQwen3VLTextModel {
                             let prefix = if is_relay_file { format!("b{}_l0_", block_offset) } else { format!("b{}_l{}_", block_offset, l_idx) };
                             let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
                             
-                            if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
-                                let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
-                                let expected_h = self.layers[layer_idx].self_attn.num_key_value_heads;
-                                let expected_d = self.layers[layer_idx].self_attn.head_dim;
-                                let anchor_count = ka.shape()[2];
+                            // [MODIFIED] BF16 Load
+                            if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
                                 
+                                let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+                                let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+
                                 let metadata = BitKVMetadata {
-                                    k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), (1, expected_h, anchor_count, expected_d), &Device::Cpu)?,
-                                    k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?,
-                                    k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (1, expected_h, 256, 1), &Device::Cpu)?,
-                                    v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), (1, expected_h, anchor_count, expected_d), &Device::Cpu)?,
-                                    v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?,
-                                    v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (1, expected_h, 256, 1), &Device::Cpu)?,
-                                    original_shape: vec![1, expected_h, 256, expected_d],
+                                    k_data: kd_t,
+                                    v_data: vd_t,
+                                    original_shape: meta_os,
                                 };
                                 let mut inner = block.inner.write().unwrap();
                                 inner.bitkv_metadata = Some(metadata);
@@ -2250,12 +2119,8 @@ impl QuantizedQwen3VLTextModel {
                     
                     block_groups.entry(inner.offset).or_default().push(LayerKVDump {
                         layer_idx: l_idx,
-                        k_anchors: Tensor::zeros((1,1), DType::F32, &Device::Cpu)?,
-                        k_packed: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
-                        k_scales: Tensor::zeros((1,), DType::F32, &Device::Cpu)?,
-                        v_anchors: Tensor::zeros((1,1), DType::F32, &Device::Cpu)?,
-                        v_packed: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
-                        v_scales: Tensor::zeros((1,), DType::F32, &Device::Cpu)?,
+                        k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
+                        v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
                         k_shape: Tensor::from_vec(k_shape_u32, (k.shape().dims().len(),), &Device::Cpu)?,
                         raw_k: Some(k.to_device(&Device::Cpu)?),
                         raw_v: Some(inner.v_cache.as_ref().unwrap().to_device(&Device::Cpu)?),
@@ -2400,20 +2265,14 @@ impl QuantizedQwen3VLTextModel {
                         inner.v_cache = None;
                         inner.location = KVLocation::SSD;
                     } else if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                        // GPU 양자화 수행
-                        let (ka, kp, ks) = crate::utils::tensor_utils::pack_bitkv_gpu(k)?;
-                        let (va, vp, vs) = crate::utils::tensor_utils::pack_bitkv_gpu(v)?;
+                        // [MODIFIED] BF16 Transfer (No bitpacking)
                         let k_shape_vec: Vec<u32> = k.shape().dims().iter().map(|&x| x as u32).collect();
 
                         dumps_to_send.push((
                             LayerKVDump { 
                                 layer_idx, 
-                                k_anchors: ka.to_device(&Device::Cpu)?, 
-                                k_packed: kp.to_device(&Device::Cpu)?,
-                                k_scales: ks.to_device(&Device::Cpu)?,
-                                v_anchors: va.to_device(&Device::Cpu)?,
-                                v_packed: vp.to_device(&Device::Cpu)?,
-                                v_scales: vs.to_device(&Device::Cpu)?,
+                                k_data: k.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?,
+                                v_data: v.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?,
                                 k_shape: Tensor::from_vec(k_shape_vec, (k.shape().dims().len(),), &Device::Cpu)?,
                                 raw_k: None,
                                 raw_v: None,
@@ -2549,9 +2408,9 @@ impl QuantizedQwen3VLTextModel {
         self.current_kv_len
     }
 
-    pub fn compress_to_bitkv(&self, t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
+    pub fn compress_to_bf16(&self, t: &Tensor) -> Result<(Tensor, Vec<usize>)> {
         // Just use the first layer's logic as it's purely mathematical
-        self.layers[0].self_attn.compress_to_bitkv(t)
+        self.layers[0].self_attn.compress_to_bf16(t)
     }
 
     pub fn drop_kv_storage(&mut self) -> Result<()> {
@@ -2575,15 +2434,15 @@ impl QuantizedQwen3VLTextModel {
         self.inject_live_kv(k_list, v_list, k_scales[0], v_scales[0])
     }
 
-    pub fn inject_live_kv_bitkv(&mut self, k_anchors: &[Tensor], k_packed: &[Tensor], k_scales: &[Tensor], v_anchors: &[Tensor], v_packed: &[Tensor], v_scales: &[Tensor], original_shape: &[usize]) -> Result<()> {
+    pub fn inject_live_kv_bitkv(&mut self, k_data: &[Tensor], v_data: &[Tensor], original_shape: &[usize]) -> Result<()> {
         let target_device = self.layers[0].device().clone();
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            if i < k_anchors.len() {
+            if i < k_data.len() {
                 // Decompress directly into 0.6B shape
-                let k_final = layer.self_attn.decompress_from_bitkv(&k_anchors[i].to_device(&target_device)?, &k_packed[i].to_device(&target_device)?, &k_scales[i].to_device(&target_device)?, original_shape, &target_device)?;
-                let v_final = layer.self_attn.decompress_from_bitkv(&v_anchors[i].to_device(&target_device)?, &v_packed[i].to_device(&target_device)?, &v_scales[i].to_device(&target_device)?, original_shape, &target_device)?;
+                let k_final = layer.self_attn.decompress_from_bf16(&k_data[i].to_device(&target_device)?, original_shape, &target_device)?;
+                let v_final = layer.self_attn.decompress_from_bf16(&v_data[i].to_device(&target_device)?, original_shape, &target_device)?;
                 
                 layer.self_attn.inject_live_kv_direct(&k_final.to_dtype(target_dtype)?, &v_final.to_dtype(target_dtype)?)?;
             }

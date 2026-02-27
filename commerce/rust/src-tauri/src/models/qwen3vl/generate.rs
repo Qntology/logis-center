@@ -94,10 +94,9 @@ pub static SLOT_MANAGER: Lazy<&SlotManager> = Lazy::new(|| &SLOT_MANAGER_DATA.0)
 #[derive(Clone)]
 pub struct LayerKVDump {
     pub layer_idx: usize,
-    pub k_anchors: Tensor, pub k_packed: Tensor, pub k_scales: Tensor,
-    pub v_anchors: Tensor, pub v_packed: Tensor, pub v_scales: Tensor,
+    pub k_data: Tensor,
+    pub v_data: Tensor,
     pub k_shape: Tensor,
-    // [NEW] 백그라운드 압축을 위한 원본 텐서 필드 추가
     pub raw_k: Option<Tensor>,
     pub raw_v: Option<Tensor>,
 }
@@ -301,32 +300,25 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 
                         // [BACK-COMPRESSION] 압축 작업 자체를 백그라운드로 완전히 분리
                         tokio::spawn(async move {
-                            // [FIX] 만약 원본 텐서가 전달되었다면 여기서 압축 수행
+                            // [FIX] Convert raw tensors to BF16 (or F32 fallback)
                             if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
-                                // 임시 모델 인스턴스 없이 압축 로직을 수행하기 위해 
-                                // QuantizedQwen3VLTextAttention의 compress_to_bitkv 로직을 직접 구현하거나 호출
-                                // 여기서는 raw_k/v가 이미 CPU에 있으므로 즉시 처리 가능
-                                
-                                // [NOTE] 실제 압축은 CPU 부하가 크므로 여기서 수행하는 것이 메인 쓰레드 보호에 핵심임
-                                // (압축 로직은 복잡하므로 호출부에서 이미 압축해서 보내는 현재 구조를 유지하되, 
-                                // force_flush_all_active_blocks에서 tokio::spawn으로 감싸서 보내는 것이 더 안전할 수 있음)
+                                let k_bf16 = rk.to_dtype(DType::BF16).unwrap_or(rk);
+                                let v_bf16 = rv.to_dtype(DType::BF16).unwrap_or(rv);
+                                src.k_data = k_bf16;
+                                src.v_data = v_bf16;
                             }
 
                             let mut map = std::collections::HashMap::new();
                             let prefix = format!("b{}_l{}_", off, act_l);
-                            map.insert(format!("{}k_anchors", prefix), src.k_anchors);
-                            map.insert(format!("{}k_packed", prefix), src.k_packed);
-                            map.insert(format!("{}k_scales", prefix), src.k_scales);
-                            map.insert(format!("{}v_anchors", prefix), src.v_anchors);
-                            map.insert(format!("{}v_packed", prefix), src.v_packed);
-                            map.insert(format!("{}v_scales", prefix), src.v_scales);
-                            map.insert("k_shape".to_string(), src.k_shape);
+                            map.insert(format!("{}k_data", prefix), src.k_data);
+                            map.insert(format!("{}v_data", prefix), src.v_data);
+                            map.insert(format!("{}k_shape", prefix), src.k_shape);
                             
                             let file_path = task_dir.join(format!("l{}.st", act_l));
                             GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
                             let _ = io_tx_nested.send(SaveTask { 
                                 slot_id: sid, path: file_path, tensors: map, 
-                                is_last: l_idx == loop_count - 1, block_idx, 
+                                is_last: false, block_idx, // [FIX] is_last logic handled by loop_count check outside
                                 registry: Some(registry_inner), kv_name: kv_name_inner 
                             }).await;
                         });
@@ -348,23 +340,19 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
                                         let prefix = format!("b{}_l{}_", b_idx_off, l_idx);
                                         let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).ok();
-                                        if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
-                                            let bytes_to_f32 = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() };
-                                            
-                                            let file_shape = if let Some(sh) = st.tensor("k_shape").ok() {
-                                                let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                                                sh_u32.iter().map(|&x| x as usize).collect()
-                                            } else {
-                                                vec![1, 1, 256, 64]
-                                            };
+                                        
+                                        // [MODIFIED] BF16 Direct Load
+                                        if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                            let file_shape: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+
+                                            let dev = &Device::Cpu;
+                                            let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &file_shape, dev).unwrap();
+                                            let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &file_shape, dev).unwrap();
 
                                             let meta = BitKVMetadata {
-                                                k_anchors: Tensor::from_vec(bytes_to_f32(ka.data()), (file_shape[0], file_shape[1], ka.shape()[2], file_shape[3]), &Device::Cpu).unwrap(),
-                                                k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(),
-                                                k_scales: Tensor::from_vec(bytes_to_f32(ks.data()), (file_shape[0], file_shape[1], file_shape[2], 4), &Device::Cpu).unwrap(),
-                                                v_anchors: Tensor::from_vec(bytes_to_f32(va.data()), (file_shape[0], file_shape[1], va.shape()[2], file_shape[3]), &Device::Cpu).unwrap(),
-                                                v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(),
-                                                v_scales: Tensor::from_vec(bytes_to_f32(vs.data()), (file_shape[0], file_shape[1], file_shape[2], 4), &Device::Cpu).unwrap(),
+                                                k_data: kd_t,
+                                                v_data: vd_t,
                                                 original_shape: file_shape,
                                             };
                                             if let Ok(mut r) = reg.entries.write() {
@@ -408,7 +396,7 @@ impl ModelVariant {
     }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.rebalance_layers(device_id, offset, total_len), Self::QuantizedText(m) => m.rebalance_layers(device_id, offset, total_len) } }
     pub fn get_current_kv(&self) -> (Vec<Tensor>, Vec<Tensor>) { match self { Self::QuantizedVL(m) => m.language_model.get_current_kv(), Self::QuantizedText(m) => m.language_model.get_current_kv(), _ => (vec![], vec![]) } }
-    pub fn inject_kv_bitkv(&mut self, ka: &[Tensor], kp: &[Tensor], ks: &[Tensor], va: &[Tensor], vp: &[Tensor], vs: &[Tensor], os: &[usize]) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.inject_live_kv_bitkv(ka, kp, ks, va, vp, vs, os), Self::QuantizedText(m) => m.language_model.inject_live_kv_bitkv(ka, kp, ks, va, vp, vs, os), _ => Ok(()) } }
+    pub fn inject_kv_bitkv(&mut self, kd: &[Tensor], vd: &[Tensor], os: &[usize]) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.inject_live_kv_bitkv(kd, vd, os), Self::QuantizedText(m) => m.language_model.inject_live_kv_bitkv(kd, vd, os), _ => Ok(()) } }
     pub async fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage(), _ => Ok(()) } }
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, Self::QuantizedText(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, _ => Ok(()) } }
 }
