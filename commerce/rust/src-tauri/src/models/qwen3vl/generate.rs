@@ -320,19 +320,19 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             
                             let file_path = task_dir.join(format!("l{}.st", act_l));
                             
-                            // [DIRECT-IO] Final high-speed write call inside spawned task
-                            if let Ok(data) = safetensors::serialize(&map, &None) {
+                            // [FIX] Centralize write logic: Send tensors to IO worker instead of writing twice
+                            if let Ok(_data) = safetensors::serialize(&map, &None) {
+                                // We send the actual map for serialization in the IO worker
                                 GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
                                 let _ = io_tx_nested.send(SaveTask { 
                                     slot_id: sid, 
                                     path: file_path.clone(), 
-                                    tensors: std::collections::HashMap::new(), 
+                                    tensors: map, // Send the actual map!
                                     is_last: false, 
                                     block_idx, 
                                     registry: Some(registry_inner), 
                                     kv_name: kv_name_inner 
                                 }).await;
-                                let _ = save_kv_block(&file_path, &data);
                             }
                         });
                     }

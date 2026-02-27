@@ -843,9 +843,6 @@ impl QuantizedQwen3VLTextAttention {
                 let k_cpu = k.to_device(&Device::Cpu)?;
                 let v_cpu = v.to_device(&Device::Cpu)?;
                 
-                // [FIX] Capture actual shape from the cloned tensor to avoid metadata mismatch
-                let actual_shape: Vec<u32> = k_cpu.shape().dims().iter().map(|&x| x as u32).collect();
-                
                 let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
                 let last_part = kv_name_raw.split('/').last().unwrap_or("text");
                 let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { 
@@ -871,11 +868,12 @@ impl QuantizedQwen3VLTextAttention {
                         let block_dir = crate::utils::paths::get_kv_dir(None).join(&sub_path).join(format!("b{}", off));
                         if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
 
+                        let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
                         let dump = LayerKVDump {
                             layer_idx,
                             k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
                             v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
-                            k_shape: Tensor::from_vec(actual_shape.clone(), (actual_shape.len(),), &Device::Cpu).unwrap(),
+                            k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
                             raw_k: Some(k_cpu),
                             raw_v: Some(v_cpu),
                         };
@@ -1109,6 +1107,8 @@ impl QuantizedQwen3VLTextAttention {
             let (kd, k_shape) = self.compress_to_bf16(&k)?;
             let (vd, _) = self.compress_to_bf16(&v)?;
             
+            map.insert(format!("{}k_data", prefix), kd);
+            map.insert(format!("{}v_data", prefix), vd);
             map.insert(format!("{}k_shape", prefix), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect::<Vec<u32>>(), (k_shape.len(),), &Device::Cpu)?);
             
             // [DIRECT-IO] Use OS-accelerated high-speed write instead of standard IO
