@@ -1948,18 +1948,12 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
 
-            // [VRAM-EVACUATION] Manage VRAM pressure
+            // [VRAM-EVACUATION] Manage VRAM pressure after chunk processing
             let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
             if target_device.is_cuda() { let _ = target_device.synchronize(); }
         }
 
-            // [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로만 이동 (저장은 위에서 실시간 처리)
-            let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
-            
-            if target_device.is_cuda() { let _ = target_device.synchronize(); }
-        }
-
-        // [VRAM-CLEANUP-POST-PREFILL] 프리필 연산이 완전히 끝난 후 해당 레이어의 VRAM을 싹 비움
+        // [VRAM-CLEANUP-POST-PREFILL] After prefill is fully done, clear this layer's VRAM
         if current_seq_len > 1 {
             for block in &self.layers[layer_idx].self_attn.kv_blocks {
                 let mut inner = block.inner.write().unwrap();
