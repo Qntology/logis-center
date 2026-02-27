@@ -2449,34 +2449,22 @@ impl QuantizedQwen3VLTextModel {
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
         if !path.exists() { return Ok(()); }
 
-        // [CENTRALIZED-INDEX-REDIRECT] 통합 인덱스가 있으면 청크 로더 사용
-        if let Some(name) = kv_name {
-            let kv_dir = crate::utils::paths::get_kv_dir(None);
-            if kv_dir.join(name).join("layer0.json").exists() {
-                println!("[PREFILL] Centralized index found for {}. Using RAM-aware chunked load.", name);
-                return self.load_kv_cache_chunked(name);
-            }
-        }
-
         let mut fragments = Vec::new();
         let mut max_offset = 0;
-        let mut last_chunk_len = 0;
 
-        // [FIX] 중첩 폴더 구조 지원 스캔 (reference/pug/b0/l0.st 등)
+        // [FIX] Scan for b{offset} folders to build fragments list
         let scan_path = if let Some(name) = kv_name { path.join(name) } else { path.to_path_buf() };
         if !scan_path.exists() { return Ok(()); }
 
         if let Ok(entries) = std::fs::read_dir(&scan_path) {
             for entry in entries.flatten() {
-                let dname = entry.file_name().to_string_lossy().to_string();
-                if dname.starts_with('b') {
-                    if let Ok(offset) = dname[1..].parse::<usize>() {
-                        // Ensure this block has at least one layer file
-                        let block_dir = entry.path();
-                        if let Ok(mut sub) = std::fs::read_dir(&block_dir) {
-                            if sub.any(|e| e.is_ok() && e.unwrap().file_name().to_string_lossy().ends_with(".st")) {
-                                fragments.push((offset, block_dir));
-                            }
+                let path_buf = entry.path();
+                if path_buf.is_dir() {
+                    let dname = path_buf.file_name().unwrap_or_default().to_string_lossy();
+                    if dname.starts_with('b') {
+                        if let Ok(offset) = dname[1..].parse::<usize>() {
+                            if offset > max_offset { max_offset = offset; }
+                            fragments.push((offset, path_buf));
                         }
                     }
                 }
@@ -2486,15 +2474,15 @@ impl QuantizedQwen3VLTextModel {
         if fragments.is_empty() { return Ok(()); }
         fragments.sort_by_key(|f| f.0);
 
-        // [ROBUST-LENGTH-DETECTION] Find any tensor ending with 'k_shape' to get block length
-        let mut last_chunk_len = 256; // Default fallback
-        let (max_offset, last_st_path) = fragments.last().unwrap();
-        if let Ok(content) = crate::utils::direct_loader::load_kv_block(last_st_path) {
+        // [ROBUST-LENGTH-DETECTION] Get actual length of the last block
+        let mut last_chunk_len = 256;
+        let (_, last_st_path) = fragments.last().unwrap();
+        if let Ok(content) = crate::utils::direct_loader::load_kv_block(&last_st_path.join("l0.st")) {
             if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
                 if let Some(name) = st.names().iter().find(|n| n.contains("k_shape")) {
                     if let Ok(view) = st.tensor(name) {
                         let data = view.data();
-                        if data.len() >= 12 { // [1, H, LEN, D] -> Index 2 is length (u32 LE)
+                        if data.len() >= 12 {
                             last_chunk_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
                         }
                     }
@@ -2502,12 +2490,12 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         
-        let total_kv_len = *max_offset + last_chunk_len;
+        let total_kv_len = max_offset + last_chunk_len;
         self.current_kv_len = total_kv_len;
-        println!("[SSD-MEMORY-RESTORE] Successfully restored total context map. Length: {} tokens.", total_kv_len);
+        println!("[SSD-GLOBAL] Restored total context length: {} tokens.", total_kv_len);
 
         self.layers.iter_mut().try_for_each(|layer| {
-            layer.load_kv_cache(&scan_path, device, expected_len, upscale_refill_len, kv_name, &fragments, total_kv_len)
+            layer.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, &fragments, total_kv_len)
         })
     }
 

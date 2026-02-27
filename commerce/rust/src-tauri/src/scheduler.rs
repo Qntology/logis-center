@@ -643,8 +643,7 @@ async fn process_task(
         {
             model.secure_vram_relay(crate::model::ModelSize::Small, Some(&shared_snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
-            // [PROMPT-FINAL-INSTRUCTION] Place task at the end for maximum focus
-            let classify_prompt = format!("Analyze the data provided above. \n[TASK] {} \n[ACTION] Return ONLY JSON like {{\"type\": \"goods\"}}.", type_prompt);
+            let classify_prompt = format!("Analyze the data provided. [TASK] {}. Return only JSON Format.", type_prompt);
             let params = ChatCompletionParameters {
                 messages: vec![
                     ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -653,7 +652,6 @@ async fn process_task(
                     })
                 ],
                 model: "qwen3vl".to_string(), max_tokens: Some(64), temperature: Some(0.0),
-                stop: Some(vec!["}".to_string()]),
                 ..Default::default()
             };
 
@@ -662,13 +660,8 @@ async fn process_task(
                 let res = gen.generate(params, Some(cancellation_token.clone()), Some(shared_snapshot_id.clone()), Some("inference".to_string())).await?;
                 println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
                 
-                // [RECOVERY]
-                let mut final_res = res.trim().to_string();
-                if !final_res.starts_with('{') && final_res.contains('{') { final_res = final_res[final_res.find('{').unwrap()..].to_string(); }
-                if final_res.starts_with('{') && !final_res.ends_with('}') { final_res.push('}'); }
-
-                let _ = data_manager.offload(&final_res, "step_a_res");
-                let type_info = parsing::parse_json_from_llm(&final_res); 
+                let _ = data_manager.offload(&res, "step_a_res");
+                let type_info = parsing::parse_json_from_llm(&res); 
                 page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
                 if page_type.is_empty() {
                     println!("[Scheduler] Warning: LLM returned empty type. Using task type fallback.");
@@ -860,8 +853,7 @@ async fn process_task(
             {
                 model.secure_vram_relay(crate::model::ModelSize::Small, Some(&shared_snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
-                // [PROMPT-FINAL-INSTRUCTION] Instructions follow the context
-                let inference_prompt = format!("Based on the content above, perform the following extraction. \n[TASK] {} \n[ACTION] Return ONLY JSON.", extraction_instruction);
+                let inference_prompt = format!("Based on the content above, perform the following extraction. [TASK] {}. Return only JSON Format.", extraction_instruction);
                 let params = ChatCompletionParameters {
                     messages: vec![
                         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -872,7 +864,6 @@ async fn process_task(
                     model: "qwen3vl".to_string(), 
                     max_tokens: Some(2048), 
                     temperature: Some(0.0),
-                    stop: Some(vec!["}".to_string()]),
                     ..Default::default()
                 };
 
@@ -884,13 +875,8 @@ async fn process_task(
                     let res = gen.generate(params, Some(cancellation_token.clone()), Some(shared_snapshot_id.clone()), Some("inference".to_string())).await?;
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
 
-                    // [RECOVERY]
-                    let mut final_res = res.trim().to_string();
-                    if !final_res.starts_with('{') && final_res.contains('{') { final_res = final_res[final_res.find('{').unwrap()..].to_string(); }
-                    if final_res.starts_with('{') && !final_res.ends_with('}') { final_res.push('}'); }
-
-                    let _ = data_manager.offload(&final_res, "step_c_res");
-                    extracted_data = parsing::parse_json_from_llm(&final_res);
+                    let _ = data_manager.offload(&res, "step_c_res");
+                    extracted_data = parsing::parse_json_from_llm(&res);
                 }
             }
         }
