@@ -840,17 +840,11 @@ impl QuantizedQwen3VLTextAttention {
             };
 
             if let (Some(k), Some(v)) = (k_opt, v_opt) {
-                // [RAM-GUARD] Check if the bake worker is overloaded before cloning to CPU
-                if let Some(tx) = BAKE_TX.get() {
-                    if tx.capacity() == 0 {
-                        // Skip offloading this block if the queue is full to prevent RAM spike.
-                        // The next prefill chunk or decoding step will try again if it's still dirty.
-                        continue; 
-                    }
-                }
-
                 let k_cpu = k.to_device(&Device::Cpu)?;
                 let v_cpu = v.to_device(&Device::Cpu)?;
+                
+                // [FIX] Capture actual shape from the cloned tensor to avoid metadata mismatch
+                let actual_shape: Vec<u32> = k_cpu.shape().dims().iter().map(|&x| x as u32).collect();
                 
                 let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
                 let last_part = kv_name_raw.split('/').last().unwrap_or("text");
@@ -877,12 +871,11 @@ impl QuantizedQwen3VLTextAttention {
                         let block_dir = crate::utils::paths::get_kv_dir(None).join(&sub_path).join(format!("b{}", off));
                         if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
 
-                        let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
                         let dump = LayerKVDump {
                             layer_idx,
                             k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
                             v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
-                            k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
+                            k_shape: Tensor::from_vec(actual_shape.clone(), (actual_shape.len(),), &Device::Cpu).unwrap(),
                             raw_k: Some(k_cpu),
                             raw_v: Some(v_cpu),
                         };
@@ -1739,17 +1732,16 @@ impl QuantizedQwen3VLTextModel {
         session_id: Option<String>,
         kv_name: Option<String>,
         baking_only: bool,
-    ) -> Result<Vec<Tensor>> {
-        let mut results = Vec::with_capacity(chunk_offsets.len());
+    ) -> Result<Tensor> {
+        let mut final_output: Option<Tensor> = None;
         let chunk_size = 256;
         let current_seq_len = xs.dim(1)?;
-        // [STABILITY] 텐서 장치가 아닌, 레이어에 고정된 싱글톤 장치 참조 사용
         let target_device = self.layers[layer_idx].device().clone();
 
         for (chunk_idx, &i) in chunk_offsets.iter().enumerate() {
             let take = (current_seq_len - i).min(chunk_size);
             
-            // [SLIDING-WINDOW-PREFETCH] 현재 청크 연산 중에 다음 레이어들의 대응하는 청크를 미리 로드
+            // [SLIDING-WINDOW-PREFETCH] ... (Prefetch logic remains same)
             let prefetch_window = 4;
             let look_ahead_layers = 2;
             let target_chunks = if chunk_idx == 0 { (0..=prefetch_window).collect::<Vec<_>>() } else { vec![chunk_idx + prefetch_window] };
@@ -1793,30 +1785,28 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
 
-            println!("[DIAG-CHUNK] L{} | Chunk {}/{} (Tokens {}..{}) | Device: {:?}", 
-                layer_idx, chunk_idx + 1, chunk_offsets.len(), i, i + take, target_device);
-
             let xs_chunk = xs.narrow(1, i, take)?;
             let cos_chunk = cos.narrow(cos.rank().saturating_sub(2), i, take)?;
             let sin_chunk = sin.narrow(sin.rank().saturating_sub(2), i, take)?;
 
             let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i, session_id.clone(), kv_name.clone(), baking_only)?;
-            results.push(out);
+            
+            // [VRAM-ONLY-MERGE] 즉시 병합하여 RAM에 파편이 남지 않게 함
+            final_output = match final_output {
+                None => Some(out),
+                Some(prev) => Some(Tensor::cat(&[prev, out], 1)?),
+            };
 
-            // [STRATEGY] Real-time backup during Prefill, Baking or Decoding
             if let Some(sid) = &session_id {
                 let is_prefill = take > 1;
                 let is_last = chunk_idx == chunk_offsets.len() - 1;
-                // [FIX] Always trigger baking to ensure SSD mirror is up-to-date even during decoding
                 let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last, baking_only, !is_prefill);
             }
 
-            // [VRAM-EVACUATION] Manage VRAM pressure after chunk processing
             let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
             if target_device.is_cuda() { let _ = target_device.synchronize(); }
         }
 
-        // [VRAM-CLEANUP-POST-PREFILL] After prefill is fully done, clear this layer's VRAM
         if current_seq_len > 1 {
             for block in &self.layers[layer_idx].self_attn.kv_blocks {
                 let mut inner = block.inner.write().unwrap();
@@ -1824,13 +1814,12 @@ impl QuantizedQwen3VLTextModel {
                 inner.v_cache = None;
                 if inner.location == KVLocation::VRAM { inner.location = KVLocation::Streaming; }
             }
-            // 누산기도 초기화
             self.layers[layer_idx].self_attn.vram_merged_k = None;
             self.layers[layer_idx].self_attn.vram_merged_v = None;
             self.layers[layer_idx].self_attn.merged_vram_block_count = 0;
         }
         
-        Ok(results)
+        final_output.ok_or_else(|| anyhow::anyhow!("No output generated from chunks"))
     }
 
     /// [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로 이동
@@ -2026,8 +2015,7 @@ impl QuantizedQwen3VLTextModel {
         // [STEP 3] GPU 연산 실행
         let current_seq_len = xs.dim(1)?;
         let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(256).collect();
-        let next_xs_all = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset, session_id, kv_name, baking_only).await?;
-        let mut next_xs = Tensor::cat(&next_xs_all, 1)?;
+        let mut next_xs = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset, session_id, kv_name, baking_only).await?;
 
         if let (Some(embed), Some(mask)) = (deepstack_embed, visual_mask) {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
@@ -2498,11 +2486,15 @@ impl QuantizedQwen3VLTextModel {
         
         let total_kv_len = max_offset + last_chunk_len;
         self.current_kv_len = total_kv_len;
-        println!("[SSD-GLOBAL] Restored total context length: {} tokens.", total_kv_len);
+        println!("[SSD-GLOBAL] Snapshot loaded. Total context length: {} tokens.", total_kv_len);
 
         self.layers.iter_mut().try_for_each(|layer| {
             layer.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, &fragments, total_kv_len)
-        })
+        })?;
+        
+        // [STABILITY-FIX] Double check if all layers have the same current_kv_len
+        self.current_kv_len = total_kv_len;
+        Ok(())
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {

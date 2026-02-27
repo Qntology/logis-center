@@ -607,7 +607,7 @@ async fn process_task(
         let pug_content = light_pug.clone();
         
         // [REFINED-PROMPT] Place specific instructions at the end for better compliance.
-        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] Identify the page type.\n\n[INSTRUCTION]\n{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING.", pug_content, type_prompt);
+        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] Identify the page type.\n\n[INSTRUCTION]\n{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, type_prompt);
         let snapshot_id = format!("{}_step_a", task.id);
         
         // [CHECKPOINT] Check if Step A snapshot already exists (Resume from OOM)

@@ -500,30 +500,56 @@ impl Qwen3VLGenerateModel {
             let total_toks = f_ids.len();
             let kv_len = self.get_kv_len();
             
-            // [FIX] Correctly determine if we should append to existing context
-            let use_zero_prefill = kv_len > 0;
+            // [REFINED-RELAY-LOGIC] Trust restored kv_len and skip prefill if it matches or covers the prompt.
             let mut gen_text = String::new();
-            let (input_ids, offset) = if use_zero_prefill {
-                println!("[ZERO-PREFILL] Context restored. Appending new prompt at offset {}.", kv_len);
-                (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, kv_len)
+            let (input_ids, offset) = if kv_len > 0 {
+                if kv_len >= total_toks {
+                    println!("[SKIP-PREFILL] Snapshot covers entire prompt ({} >= {}). Ready to decode.", kv_len, total_toks);
+                    let last_id = *f_ids.last().unwrap_or(&0);
+                    (Tensor::from_vec(vec![last_id], (1, 1), &self.text_device)?, total_toks - 1)
+                } else {
+                    let missing_ids = f_ids[kv_len..].to_vec();
+                    let missing_len = missing_ids.len();
+                    println!("[PARTIAL-PREFILL] Context partially restored ({}). Prefilling remaining {} tokens.", kv_len, missing_len);
+                    (Tensor::from_vec(missing_ids, (1, missing_len), &self.text_device)?, kv_len)
+                }
             } else {
                 println!("[FULL-PREFILL] No context found. Computing entire prompt (Len: {}).", total_toks);
                 (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
             };
             
-            let total_tokens_after_prefill = offset + total_toks;
+            let total_tokens_after_prefill = offset + input_ids.dim(1)?;
         
         wait_for_global_io().await; // [SYNC] Ensure disk is ready before inference
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         let mut gen_ids = vec![];
+
+        // [DENSE-MODE] Find token IDs for '<', 'think', and '{' to apply biases
+        let think_token_id = self.tokenizer.text_encode_vec("<think>".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let lt_id = self.tokenizer.text_encode_vec("<".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+
         for i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
             
-            // [REPETITION-PENALTY] Apply penalty to logits to prevent looping
             let mut logits_tensor = logits.flatten_all()?.to_dtype(DType::F32)?;
+            
+            // [REPETITION-PENALTY]
             if !gen_ids.is_empty() {
                 logits_tensor = apply_repetition_penalty(&logits_tensor, 1.2, &gen_ids)?;
             }
+
+            // [DENSE-BIAS] Penalize <think> and < to prevent reasoning mode
+            let mut logits_vec = logits_tensor.to_vec1::<f32>()?;
+            let len = logits_vec.len();
+            if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 100.0; }
+            if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 10.0; } // Bias away from starting any tags
+            
+            // If it's the very first token, strongly favor '{'
+            if i == 0 && (open_bracket_id as usize) < len {
+                logits_vec[open_bracket_id as usize] += 5.0; 
+            }
+            logits_tensor = Tensor::from_vec(logits_vec, logits_tensor.shape(), logits_tensor.device())?;
             
             let next_id = lp.sample(&logits_tensor)?;
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
