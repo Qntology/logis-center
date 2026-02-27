@@ -865,7 +865,6 @@ async fn process_task(
                 let question_clone = task_question.clone();
                 let token_clone = cancellation_token.clone();
                 let session_clone = Some(snapshot_id.clone());
-                let kv_name_clone = kv_name.clone();
 
                 {
                     let mut gen_guard = model_clone.generator.lock().await;

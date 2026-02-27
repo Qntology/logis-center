@@ -518,12 +518,14 @@ pub fn decoding_attention_parallel(
         let k_chunk = key_states.narrow(2, start, end - start)?;
         let v_chunk = value_states.narrow(2, start, end - start)?;
 
-        let attn_weights = (query_states.matmul(&k_chunk.transpose(2, 3)?)? * scaling)?;
+        // [DTYPE-GUARD] Ensure query_states matches the chunk dtype (likely BF16 from SSD)
+        let q_aligned = query_states.to_dtype(k_chunk.dtype())?;
+        let attn_weights = (q_aligned.matmul(&k_chunk.transpose(2, 3)?)? * scaling)?;
         let max_logits = attn_weights.max_keepdim(D::Minus1)?;
         let exp_weights = attn_weights.broadcast_sub(&max_logits)?.exp()?;
         let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
         
-        let out_chunk = exp_weights.matmul(&v_chunk)?;
+        let out_chunk = exp_weights.to_dtype(v_chunk.dtype())?.matmul(&v_chunk)?;
         let lse = (sum_exp.log()? + max_logits)?;
 
         chunk_outputs.push(out_chunk);
@@ -592,7 +594,8 @@ pub fn eager_attention_forward(
     }
 
     if kv_seq_len <= block_size {
-        let attn_weights = query_states.matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?;
+        let q_aligned = query_states.to_dtype(key_states.dtype())?;
+        let attn_weights = q_aligned.matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?;
         let attn_weights = (attn_weights * scaling)?;
         let attn_weights = match attention_mask {
             None => attn_weights,
@@ -603,7 +606,7 @@ pub fn eager_attention_forward(
             }
         };
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&value_states)?;
+        let attn_output = attn_weights.to_dtype(value_states.dtype())?.matmul(&value_states)?;
         return Ok(attn_output.transpose(1, 2)?.contiguous()?);
     }
 
@@ -618,8 +621,9 @@ pub fn eager_attention_forward(
         let k_block = key_states.narrow(2, start, end - start)?;
         let v_block = value_states.narrow(2, start, end - start)?;
 
-        // 로컬 어텐션 스코어 계산
-        let attn_weights = (query_states.matmul(&k_block.transpose(2, 3)?)? * scaling)?;
+        // [DTYPE-GUARD] Ensure query_states matches the block dtype
+        let q_aligned = query_states.to_dtype(k_block.dtype())?;
+        let attn_weights = (q_aligned.matmul(&k_block.transpose(2, 3)?)? * scaling)?;
         
         // 마스크 처리
         let attn_weights = if let Some(mask) = attention_mask {
@@ -642,7 +646,7 @@ pub fn eager_attention_forward(
         let exp_weights = attn_weights.broadcast_sub(&max_logits)?.exp()?;
         let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
         
-        let out_block = exp_weights.matmul(&v_block)?;
+        let out_block = exp_weights.to_dtype(v_block.dtype())?.matmul(&v_block)?;
         let lse = (sum_exp.log()? + max_logits)?;
 
         block_outputs.push(out_block);

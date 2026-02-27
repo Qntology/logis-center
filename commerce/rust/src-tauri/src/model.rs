@@ -152,7 +152,7 @@ pub struct LogisModel {
     embedding_path: std::path::PathBuf,
     device_config: utils::DeviceConfig,
     max_tokens_limit: u32,
-    dtype: Option<DType>, 
+    _dtype: Option<DType>, 
     current_size: Arc<TokioMutex<Option<ModelSize>>>,
 }
 
@@ -727,7 +727,7 @@ impl LogisModel {
             embedding_path,
             device_config: config.clone(),
             max_tokens_limit: max_tokens_limit as u32,
-            dtype: None, 
+            _dtype: None, 
             current_size: Arc::new(TokioMutex::new(None)),
         })
     }

@@ -496,9 +496,9 @@ impl QuantizedQwen3VLTextAttention {
         sin: &Tensor,
         attention_mask_in: Option<&Tensor>,
         seqlen_offset: usize,
-        session_id: Option<String>,
-        kv_name: Option<String>,
-        baking_only: bool,
+        _session_id: Option<String>,
+        _kv_name: Option<String>,
+        _baking_only: bool,
     ) -> Result<Tensor> {
         let dev = self.q_proj.device();
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
@@ -533,9 +533,9 @@ impl QuantizedQwen3VLTextAttention {
         
         let value_states = self.v_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?.to_dtype(target_dtype)?;
 
-        let cos = if cos.dtype() != target_dtype { cos.to_dtype(target_dtype)? } else { cos.clone() };
-        let sin = if sin.dtype() != target_dtype { sin.to_dtype(target_dtype)? } else { sin.clone() };
-        let (query_states, key_states) = apply_rotary_pos_emb(&query_states, &key_states, &cos, &sin, false)?;
+        let cos = cos.to_dtype(target_dtype)?;
+        let sin = sin.to_dtype(target_dtype)?;
+        let (query_states, key_states) = apply_rotary_pos_emb(&query_states.to_dtype(target_dtype)?, &key_states.to_dtype(target_dtype)?, &cos, &sin, false)?;
         let query_states = query_states.to_dtype(target_dtype)?;
         let key_states = key_states.to_dtype(target_dtype)?;
         
@@ -601,7 +601,7 @@ impl QuantizedQwen3VLTextAttention {
 
         let total_tokens_now = seqlen_offset + q_len;
         for block in &self.kv_blocks {
-            let (index, b_off, b_len) = {
+            let (index, b_off, _b_len) = {
                 let inner = block.inner.read().unwrap();
                 (inner.index, inner.offset, inner.len)
             };
@@ -681,14 +681,13 @@ impl QuantizedQwen3VLTextAttention {
             v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
         }
 
-        // [FINAL-DTYPE-GUARD] Ensure all components are matched before matmul
-        let query_states = query_states.to_dtype(target_dtype)?;
-        let k = k.to_dtype(target_dtype)?;
-        let v = v.to_dtype(target_dtype)?;
+        // [FORCE-TYPE-STRICT] Ensure matmul operands are perfectly matched
+        let lhs = query_states.to_dtype(target_dtype)?;
+        let rhs = k.transpose(2, 3)?.to_dtype(target_dtype)?;
 
-        // Scores in unified precision (target_dtype)
-        let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?
-            .to_dtype(DType::F32)? // Softmax and Masking better in F32
+        // Scores in F32 precision for stability
+        let mut attn_weights = lhs.matmul(&rhs)?
+            .to_dtype(DType::F32)?
             .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?;
 
         // Apply Internally Generated Causal Mask
@@ -700,7 +699,11 @@ impl QuantizedQwen3VLTextAttention {
         }
 
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-        let attn_output = attn_weights.matmul(&v)?.to_dtype(target_dtype)?;
+        
+        // [FINAL-DTYPE-STRICT] Force match for second matmul
+        let weights_final = attn_weights.to_dtype(target_dtype)?;
+        let v_final = v.to_dtype(target_dtype)?;
+        let attn_output = weights_final.matmul(&v_final)?;
 
         let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
         let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
@@ -1469,20 +1472,20 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         
-        let cost_per_layer = if baking_only { layer_weight_size / 3 } else { layer_weight_size };
-        let estimated_activation_buffer = 200_000_000;
-        let mut simulated_free_vram: u64 = 0;
-        let mut is_vram_checked = false;
-        let mut safety_floor: u64 = 0;
+        let _cost_per_layer = if baking_only { layer_weight_size / 3 } else { layer_weight_size };
+        let _estimated_activation_buffer = 200_000_000;
+        let mut _simulated_free_vram: u64 = 0;
+        let mut _is_vram_checked = false;
+        let mut _safety_floor: u64 = 0;
 
         if current_device.is_cuda() {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
                      if let Ok(mem) = dev.memory_info() {
-                         simulated_free_vram = mem.free;
-                         is_vram_checked = true;
+                         _simulated_free_vram = mem.free;
+                         _is_vram_checked = true;
                          let os_reserve = 100_000_000; 
-                         safety_floor = os_reserve + kv_reserve + estimated_activation_buffer;
+                         _safety_floor = os_reserve + kv_reserve + _estimated_activation_buffer;
                      }
                  }
              }
@@ -1586,18 +1589,18 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         
-        let cost_per_layer = if baking_only { layer_weight_size / 3 } else { layer_weight_size };
-        let mut simulated_free_vram: u64 = 0;
-        let mut is_vram_checked = false;
-        let mut safety_floor: u64 = 0;
+        let _cost_per_layer = if baking_only { layer_weight_size / 3 } else { layer_weight_size };
+        let mut _simulated_free_vram: u64 = 0;
+        let mut _is_vram_checked = false;
+        let mut _safety_floor: u64 = 0;
 
         if current_device.is_cuda() {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
                      if let Ok(mem) = dev.memory_info() {
-                         simulated_free_vram = mem.free;
-                         is_vram_checked = true;
-                         safety_floor = 50_000_000 + kv_reserve + 50_000_000;
+                         _simulated_free_vram = mem.free;
+                         _is_vram_checked = true;
+                         _safety_floor = 50_000_000 + kv_reserve + 50_000_000;
                      }
                  }
              }
@@ -1889,13 +1892,6 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    /// [BLOCK-LEVEL-SYNC] 모든 레이어의 청크 연산이 끝난 후, 완성된 블록들을 한꺼번에 SSD로 저장
-    async fn sync_all_layers_to_ssd(&mut self, session_id: &str) -> Result<()> {
-        let kv_name = self.active_kv_name.clone();
-        self.force_flush_all_active_blocks(session_id, kv_name.as_deref()).await
-    }
-
-
     pub fn get_current_kv(&self) -> (Vec<Tensor>, Vec<Tensor>) {
         let mut ks = vec![];
         let mut vs = vec![];
@@ -2061,7 +2057,7 @@ impl QuantizedQwen3VLTextModel {
     pub async fn pin_all_layers_to_gpu(&mut self) -> Result<()> {
         let target_device = crate::utils::get_cuda_device(self.device_id);
         println!("[DEC-SPEED-UP] Pinning all layers to GPU for vertical inference...");
-        for (i, layer) in self.layers.iter_mut().enumerate() {
+        for (_i, layer) in self.layers.iter_mut().enumerate() {
             if !layer.device().same_device(&target_device) {
                 layer.to_device(&target_device)?;
             }
@@ -2088,7 +2084,7 @@ impl QuantizedQwen3VLTextModel {
         
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
             for block in &mut layer.self_attn.kv_blocks {
-                let mut inner = block.inner.write().unwrap();
+                let inner = block.inner.write().unwrap();
                 
                 // [STRICT-RELAY] Include partial blocks and check per-layer dirty flag
                 let is_dirty = {
@@ -2435,69 +2431,6 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         Ok(())
-    }
-
-    fn compress_to_1bit(&self, t: &Tensor) -> Result<(Tensor, Tensor, Vec<usize>)> {
-        let original_shape = t.shape().dims().to_vec();
-        let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
-        
-        let last_dim = original_shape[original_shape.len() - 1];
-        let total_elements = t_data.len();
-        let num_vectors = total_elements / last_dim;
-        
-        let packed_size = (total_elements + 7) / 8;
-        let mut packed = vec![0u8; packed_size];
-        let mut scales = vec![0.0f32; num_vectors];
-        
-        for v_idx in 0..num_vectors {
-            let t_start = v_idx * last_dim;
-            let t_vector = &t_data[t_start..t_start + last_dim];
-            
-            let mut abs_sum = 0.0f32;
-            for &val in t_vector { abs_sum += val.abs(); }
-            let s = abs_sum / (last_dim as f32);
-            scales[v_idx] = s;
-            
-            for (i, &val) in t_vector.iter().enumerate() {
-                if val >= 0.0 {
-                    let bit_pos = (t_start + i) % 8;
-                    let byte_pos = (t_start + i) / 8;
-                    packed[byte_pos] |= 1 << bit_pos;
-                }
-            }
-        }
-            
-        let packed_tensor = Tensor::from_vec(packed, vec![packed_size], &Device::Cpu)?;
-        let scales_tensor = Tensor::from_vec(scales, vec![original_shape[0], original_shape[1], original_shape[2], 1], &Device::Cpu)?;
-        
-        Ok((packed_tensor, scales_tensor, original_shape))
-    }
-
-    fn decompress_from_1bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
-        let device = packed.device();
-        let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
-        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        
-        let last_dim = original_shape[original_shape.len() - 1];
-        let total_elements: usize = original_shape.iter().product();
-        let mut decoded = vec![0.0f32; total_elements];
-        
-        for v_idx in 0..(total_elements / last_dim) {
-            let s = scales_vec[v_idx];
-            let t_start = v_idx * last_dim;
-            
-            for i in 0..last_dim {
-                let global_idx = t_start + i;
-                let byte_pos = global_idx / 8;
-                let bit_pos = global_idx % 8;
-                let is_set = (packed_vec[byte_pos] & (1 << bit_pos)) != 0;
-                decoded[global_idx] = if is_set { s } else { -s };
-            }
-        }
-        
-        let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
-        Ok(t.to_device(device)?)
     }
 
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> {
@@ -3067,35 +3000,6 @@ fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader
     let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
     let weight = QMatMul::from_qtensor(weight)?;
     let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { Some(t.dequantize(device)?.to_dtype(dtype)?) } else { None };
-    Ok(QLinear::new(weight, bias, device.clone()))
-}
-
-fn get_sliced_qlinear<R: std::io::Seek + std::io::Read>(
-    ct: &gguf_file::Content, 
-    reader: &mut R, 
-    name: &str, 
-    device: &Device, 
-    dtype: DType,
-    dim: usize,
-    start: usize,
-    len: usize
-) -> Result<QLinear> {
-    let qtensor = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight for slicing: {e}"))?;
-    // We must dequantize to slice accurately along specific dimensions
-    let tensor = qtensor.dequantize(device)?;
-    let sliced = tensor.narrow(dim, start, len)?.to_dtype(dtype)?.contiguous()?;
-    let weight = QMatMul::Tensor(sliced);
-    
-    let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { 
-        let b = t.dequantize(device)?;
-        // If dim was 0 (output features), we must slice the bias as well
-        if dim == 0 {
-            Some(b.narrow(0, start, len)?.to_dtype(dtype)?)
-        } else {
-            Some(b.to_dtype(dtype)?)
-        }
-    } else { None };
-    
     Ok(QLinear::new(weight, bias, device.clone()))
 }
 
