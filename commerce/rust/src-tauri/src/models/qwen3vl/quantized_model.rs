@@ -725,7 +725,6 @@ impl QuantizedQwen3VLTextAttention {
                 }
                 if !to_merge_k.is_empty() {
                     if let Some(mk) = self.vram_merged_k.take() {
-                        // 기존 캐시도 현재 장치로 정렬
                         let mk_dev = if !mk.device().same_device(dev) { mk.to_device(dev)? } else { mk };
                         let mut list = vec![mk_dev.to_dtype(target_dtype)?]; list.extend(to_merge_k);
                         self.vram_merged_k = Some(Tensor::cat(&list, 2)?);
@@ -765,6 +764,7 @@ impl QuantizedQwen3VLTextAttention {
 
             let mut k = Tensor::cat(&final_list_k?, 2)?;
             let mut v = Tensor::cat(&final_list_v?, 2)?;
+            let actual_vram_width = k.dim(2)?;
 
             if self.num_kv_groups > 1 {
                 let (b, h, s, d) = k.dims4()?;
@@ -778,7 +778,6 @@ impl QuantizedQwen3VLTextAttention {
             if let Some(mask) = &attention_mask {
                 let m_len = mask.dim(D::Minus1)?;
                 let b_off = vram_start_off.unwrap_or(0);
-                // 실제 합쳐진 너비(actual_vram_width)만큼 마스크를 잘라서 적용
                 if b_off + actual_vram_width <= m_len {
                     let sub_mask = mask.narrow(D::Minus1, b_off, actual_vram_width)?.to_dtype(target_dtype)?;
                     attn_weights = attn_weights.broadcast_add(&sub_mask)?;
@@ -786,6 +785,28 @@ impl QuantizedQwen3VLTextAttention {
             }
             
             let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
+            let m_i = attn_weights_f32.max_keepdim(D::Minus1)?;
+            let p_i = attn_weights_f32.broadcast_sub(&m_i)?.exp()?;
+            let s_i = p_i.sum_keepdim(D::Minus1)?;
+            let o_i = p_i.to_dtype(target_dtype)?.matmul(&v)?;
+
+            match (running_m.take(), running_s.take(), running_o.take()) {
+                (None, None, None) => { 
+                    running_m = Some(m_i); 
+                    running_s = Some(s_i); 
+                    running_o = Some(o_i.to_dtype(DType::F32)?); 
+                }
+                (Some(m_prev), Some(s_prev), Some(o_prev)) => {
+                    let m_new = m_prev.maximum(&m_i)?;
+                    let alpha_prev = m_prev.broadcast_sub(&m_new)?.exp()?;
+                    let alpha_i = m_i.broadcast_sub(&m_new)?.exp()?;
+                    running_s = Some(s_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&s_i.broadcast_mul(&alpha_i)?)?);
+                    running_o = Some(o_prev.broadcast_mul(&alpha_prev)?.broadcast_add(&o_i.to_dtype(DType::F32)?.broadcast_mul(&alpha_i)?)?);
+                    running_m = Some(m_new);
+                }
+                _ => unreachable!(),
+            }
+        }
             let m_i = attn_weights_f32.max_keepdim(D::Minus1)?;
             let p_i = attn_weights_f32.broadcast_sub(&m_i)?.exp()?;
             let s_i = p_i.sum_keepdim(D::Minus1)?;
