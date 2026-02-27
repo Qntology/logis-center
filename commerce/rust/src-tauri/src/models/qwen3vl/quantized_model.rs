@@ -2468,15 +2468,14 @@ impl QuantizedQwen3VLTextModel {
 
         if let Ok(entries) = std::fs::read_dir(&scan_path) {
             for entry in entries.flatten() {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    let dname = entry.file_name().to_string_lossy().to_string();
-                    if dname.starts_with('b') {
-                        let offset = dname[1..].parse::<usize>().unwrap_or(0);
-                        // 해당 폴더 안에서 아무 .st 파일이나 하나 찾아서 대표 경로로 지정
-                        if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
-                            if let Some(st_file) = sub_entries.flatten().find(|e| e.file_name().to_string_lossy().ends_with(".st")) {
-                                if offset >= max_offset { max_offset = offset; }
-                                fragments.push((offset, st_file.path()));
+                let dname = entry.file_name().to_string_lossy().to_string();
+                if dname.starts_with('b') {
+                    if let Ok(offset) = dname[1..].parse::<usize>() {
+                        // Ensure this block has at least one layer file
+                        let block_dir = entry.path();
+                        if let Ok(mut sub) = std::fs::read_dir(&block_dir) {
+                            if sub.any(|e| e.is_ok() && e.unwrap().file_name().to_string_lossy().ends_with(".st")) {
+                                fragments.push((offset, block_dir));
                             }
                         }
                     }
@@ -2505,7 +2504,7 @@ impl QuantizedQwen3VLTextModel {
         
         let total_kv_len = *max_offset + last_chunk_len;
         self.current_kv_len = total_kv_len;
-        if self.layers.len() > 0 { println!("[SSD-GLOBAL] Restored total context length: {}", total_kv_len); }
+        println!("[SSD-MEMORY-RESTORE] Successfully restored total context map. Length: {} tokens.", total_kv_len);
 
         self.layers.iter_mut().try_for_each(|layer| {
             layer.load_kv_cache(&scan_path, device, expected_len, upscale_refill_len, kv_name, &fragments, total_kv_len)
