@@ -502,6 +502,7 @@ impl QuantizedQwen3VLTextAttention {
         seqlen_offset: usize,
         session_id: Option<String>,
         kv_name: Option<String>,
+        baking_only: bool,
     ) -> Result<Tensor> {
         let dev = self.q_proj.device();
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
@@ -728,7 +729,7 @@ impl QuantizedQwen3VLTextAttention {
         // [SSD-RELAY] Trigger incremental baking with Full-Mirror guarantee
         if let Some(s_id) = &session_id {
             let is_decoding = q_len == 1; 
-            let _ = self.trigger_realtime_incremental_bake(s_id, true, self.baking_only, is_decoding);
+            let _ = self.trigger_realtime_incremental_bake(s_id, true, baking_only, is_decoding);
         }
 
         if self.layer_idx == 0 {
@@ -1455,6 +1456,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
         seqlen_offset: usize,
         session_id: Option<String>,
         kv_name: Option<String>,
+        baking_only: bool,
     ) -> Result<Tensor> {
         let dev = self.input_layernorm.weight().device();
         let target_dtype = self.input_layernorm.weight().dtype();
@@ -1477,7 +1479,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
         let residual = xs.clone();
         let xs = self.input_layernorm.forward(&xs)?;
-        let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref(), seqlen_offset, session_id, kv_name)?;
+        let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref(), seqlen_offset, session_id, kv_name, baking_only)?;
         
         // [HARDENING] Residual Addition DType Guard
         let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
@@ -1875,6 +1877,7 @@ impl QuantizedQwen3VLTextModel {
         seqlen_offset: usize,
         session_id: Option<String>,
         kv_name: Option<String>,
+        baking_only: bool,
     ) -> Result<Vec<Tensor>> {
         let mut results = Vec::with_capacity(chunk_offsets.len());
         let chunk_size = 256;
@@ -1936,7 +1939,7 @@ impl QuantizedQwen3VLTextModel {
             let cos_chunk = cos.narrow(cos.rank().saturating_sub(2), i, take)?;
             let sin_chunk = sin.narrow(sin.rank().saturating_sub(2), i, take)?;
 
-            let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i, session_id.clone(), kv_name.clone())?;
+            let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i, session_id.clone(), kv_name.clone(), baking_only)?;
             results.push(out);
 
             // [STRATEGY] Real-time backup during Prefill or Baking
@@ -2075,6 +2078,7 @@ impl QuantizedQwen3VLTextModel {
         visual_mask: Option<&Tensor>,
         session_id: Option<String>,
         kv_name: Option<String>,
+        baking_only: bool,
     ) -> Result<Tensor> {
         let start_layer_time = std::time::Instant::now();
         let input_token_count = xs.dim(1).unwrap_or(0);
@@ -2171,7 +2175,7 @@ impl QuantizedQwen3VLTextModel {
         // [STEP 3] GPU 연산 실행
         let current_seq_len = xs.dim(1)?;
         let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(256).collect();
-        let next_xs_all = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset, session_id, kv_name).await?;
+        let next_xs_all = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset, session_id, kv_name, baking_only).await?;
         let mut next_xs = Tensor::cat(&next_xs_all, 1)?;
 
         if let (Some(embed), Some(mask)) = (deepstack_embed, visual_mask) {
@@ -2514,7 +2518,7 @@ impl QuantizedQwen3VLTextModel {
                 println!("[ENGINE] Running Layer {}/{}", layer_idx + 1, total_layers);
             }
             let deepstack_embed = deepstack_visual_embeds.as_ref().and_then(|v| v.get(layer_idx));
-            xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks, session_id.clone(), kv_name.clone()).await?;
+            xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks, session_id.clone(), kv_name.clone(), self.baking_only).await?;
         }
 
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
