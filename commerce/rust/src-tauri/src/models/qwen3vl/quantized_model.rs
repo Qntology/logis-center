@@ -555,8 +555,11 @@ impl QuantizedQwen3VLTextAttention {
                     let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
                     let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
                     if let (Some(prev_k), Some(prev_v)) = (inner.k_cache.take(), inner.v_cache.take()) {
-                        inner.k_cache = Some(Tensor::cat(&[prev_k, k_piece], 2)?.contiguous()?);
-                        inner.v_cache = Some(Tensor::cat(&[prev_v, v_piece], 2)?.contiguous()?);
+                        // [FIX] 블록 추가 시 타입 통일 (BF16 vs F32 방지)
+                        let pk = prev_k.to_dtype(target_dtype)?;
+                        let pv = prev_v.to_dtype(target_dtype)?;
+                        inner.k_cache = Some(Tensor::cat(&[pk, k_piece.to_dtype(target_dtype)?], 2)?.contiguous()?);
+                        inner.v_cache = Some(Tensor::cat(&[pv, v_piece.to_dtype(target_dtype)?], 2)?.contiguous()?);
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
                     }
