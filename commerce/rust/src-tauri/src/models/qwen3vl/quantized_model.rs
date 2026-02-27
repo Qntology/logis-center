@@ -635,10 +635,27 @@ impl QuantizedQwen3VLTextAttention {
             if k_active.is_none() {
                 if let Some(p) = ssd_path {
                     let fetch_start = std::time::Instant::now();
-                    // [SSD-LOAD] Search for the block on disk
-                    let block_file: std::path::PathBuf = p.join(format!("l{}.st", self.layer_idx));
-                    if let Ok(content) = crate::utils::direct_loader::load_kv_block(&block_file) {
-                        if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                    
+                    // [PATH-FIX] Ensure the path is correct and absolute
+                    let mut full_path = p.clone();
+                    if full_path.is_relative() && !full_path.starts_with("tmp") {
+                        full_path = crate::utils::paths::get_kv_dir(None).join(full_path);
+                    }
+                    
+                    // [SSD-LOAD] Try DirectStorage first, fallback to standard fs::read
+                    let block_file: std::path::PathBuf = full_path.join(format!("l{}.st", self.layer_idx));
+                    
+                    let content_res = crate::utils::direct_loader::load_kv_block(&block_file);
+                    let content = match content_res {
+                        Ok(c) => Some(c),
+                        Err(_) => {
+                            // [FALLBACK] DirectStorage failed, try standard filesystem read
+                            std::fs::read(&block_file).ok()
+                        }
+                    };
+
+                    if let Some(data) = content {
+                        if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
                             let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
                             let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
                             if let (Some(ka), Some(kp), Some(ks), Some(va), Some(vp), Some(vs)) = (get_t("k_anchors"), get_t("k_packed"), get_t("k_scales"), get_t("v_anchors"), get_t("v_packed"), get_t("v_scales")) {
@@ -648,18 +665,24 @@ impl QuantizedQwen3VLTextAttention {
                                     shape_u32.iter().map(|&x| x as usize).collect()
                                 } else { vec![1, self.num_key_value_heads, b_len, self.head_dim] };
 
-                                let ka_t = Tensor::from_vec(bytes_to_f32(ka.data()), (1, ka.shape()[1], ka.shape()[2], ka.shape()[3]), &Device::Cpu)?;
+                                // [SAFE-SHAPE] Get actual dimensions from loaded tensors
+                                let ka_shape = ka.shape();
+                                let ka_t = Tensor::from_vec(bytes_to_f32(ka.data()), ka_shape, &Device::Cpu)?;
                                 let kp_t = Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu)?;
-                                let ks_t = Tensor::from_vec(bytes_to_f32(ks.data()), (1, ks.shape()[1], b_len, 1), &Device::Cpu)?;
-                                let va_t = Tensor::from_vec(bytes_to_f32(va.data()), (1, va.shape()[1], va.shape()[2], va.shape()[3]), &Device::Cpu)?;
+                                let ks_t = Tensor::from_vec(bytes_to_f32(ks.data()), ks.shape(), &Device::Cpu)?;
+                                
+                                let va_shape = va.shape();
+                                let va_t = Tensor::from_vec(bytes_to_f32(va.data()), va_shape, &Device::Cpu)?;
                                 let vp_t = Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?;
-                                let vs_t = Tensor::from_vec(bytes_to_f32(vs.data()), (1, vs.shape()[1], b_len, 1), &Device::Cpu)?;
+                                let vs_t = Tensor::from_vec(bytes_to_f32(vs.data()), vs.shape(), &Device::Cpu)?;
 
                                 k_active = Some(self.decompress_from_bitkv(&ka_t, &kp_t, &ks_t, &meta_os, dev)?);
                                 v_active = Some(self.decompress_from_bitkv(&va_t, &vp_t, &vs_t, &meta_os, dev)?);
                                 ssd_count += 1;
                             }
                         }
+                    } else if self.layer_idx == 0 {
+                        println!("[ERROR] SSD Load failed for block {} at {:?}", index, block_file);
                     }
                     time_kv_fetch += fetch_start.elapsed();
                 }
@@ -781,22 +804,40 @@ impl QuantizedQwen3VLTextAttention {
         use rayon::prelude::*;
         decoded.par_chunks_mut(head_tokens).enumerate().for_each(|(bh_idx, head_out)| {
             let bh_offset = bh_idx * head_tokens;
-            let anchor_offset = bh_idx * anchor_count * last_dim;
+            
+            // [SAFE-INDEX] Check head counts to prevent division by zero or out-of-bounds
+            let scale_head_count = scales_vec.len() / seq_len;
+            let scale_head_idx = if scale_head_count > 0 { bh_idx % scale_head_count } else { 0 };
+            
+            let anchor_per_head = anchor_count * last_dim;
+            let anchor_head_count = if anchor_per_head > 0 { anchors_vec.len() / anchor_per_head } else { 0 };
+            let anchor_head_idx = if anchor_head_count > 0 { bh_idx % anchor_head_count } else { 0 };
+            
+            let anchor_offset = anchor_head_idx * anchor_per_head;
             
             for s_idx in 0..seq_len {
-                let scale = scales_vec[bh_idx * seq_len + s_idx];
+                let scale_idx = scale_head_idx * seq_len + s_idx;
+                let scale = if scale_idx < scales_vec.len() { scales_vec[scale_idx] } else { 0.0 };
+                
                 let token_out = &mut head_out[s_idx * last_dim .. (s_idx + 1) * last_dim];
                 
                 for d_idx in 0..last_dim {
                     let global_bit_idx = bh_offset + s_idx * last_dim + d_idx;
-                    let is_set = (packed_vec[global_bit_idx / 8] & (1 << (global_bit_idx % 8))) != 0;
-                    token_out[d_idx] = if is_set { scale } else { -scale };
+                    // Bit-sign restoration
+                    if global_bit_idx / 8 < packed_vec.len() {
+                        let is_set = (packed_vec[global_bit_idx / 8] & (1 << (global_bit_idx % 8))) != 0;
+                        token_out[d_idx] = if is_set { scale } else { -scale };
+                    }
                 }
                 
                 if s_idx < 4 || s_idx % 8 == 0 {
                     let a_pos = if s_idx < 4 { s_idx } else { 4 + (s_idx - 4) / 8 };
-                    let anchor_data = &anchors_vec[anchor_offset + a_pos * last_dim .. anchor_offset + (a_pos + 1) * last_dim];
-                    token_out.copy_from_slice(anchor_data);
+                    let a_idx_start = anchor_offset + a_pos * last_dim;
+                    let a_idx_end = a_idx_start + last_dim;
+                    
+                    if a_idx_end <= anchors_vec.len() {
+                        token_out.copy_from_slice(&anchors_vec[a_idx_start .. a_idx_end]);
+                    }
                 }
             }
         });
