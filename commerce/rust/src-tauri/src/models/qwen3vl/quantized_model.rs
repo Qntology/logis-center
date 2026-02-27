@@ -655,7 +655,18 @@ impl QuantizedQwen3VLTextAttention {
                             let vp_t = Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu)?;
                             let vs_t = Tensor::from_vec(bytes_to_f32(vs.data()), (1, vs.shape()[1], b_len, 1), &Device::Cpu)?;
 
-                            // [NOTE] 여기에 있던 bitkv_cache 저장 로직 삭제됨 (Pure SSD 모드)
+                            // [STICKY-CACHE] 읽어온 데이터를 RAM 캐시에 저장 (3-블록 대기열에 의해 관리됨)
+                            {
+                                let reg = self.registry.entries.read().unwrap();
+                                if index < reg.len() {
+                                    let mut cache_w = reg[index].bitkv_cache.write().unwrap();
+                                    cache_w[self.layer_idx] = Some(BitKVMetadata {
+                                        k_anchors: ka_t.clone(), k_packed: kp_t.clone(), k_scales: ks_t.clone(),
+                                        v_anchors: va_t.clone(), v_packed: vp_t.clone(), v_scales: vs_t.clone(),
+                                        original_shape: meta_os.clone(),
+                                    });
+                                }
+                            }
 
                             k_active = Some(self.decompress_from_bitkv(&ka_t, &kp_t, &ks_t, &meta_os, dev)?);
                             v_active = Some(self.decompress_from_bitkv(&va_t, &vp_t, &vs_t, &meta_os, dev)?);
@@ -783,7 +794,7 @@ impl QuantizedQwen3VLTextAttention {
                 }
             }
             
-            
+            let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
             let m_i = attn_weights_f32.max_keepdim(D::Minus1)?;
             let p_i = attn_weights_f32.broadcast_sub(&m_i)?.exp()?;
             let s_i = p_i.sum_keepdim(D::Minus1)?;
@@ -993,11 +1004,18 @@ impl QuantizedQwen3VLTextAttention {
                 let mut inner = block.inner.write().unwrap();
                 let snapshot = (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len);
                 
-                // [FIX] 디코딩 중이면서 최신 3개 블록이 아니면 VRAM 원본 즉시 삭제 (대기열 관리)
+                // [FIX] 최신 3개 블록이 아니면 VRAM 및 RAM 캐시 즉시 삭제 (사용한 건 정리)
                 if is_decoding && idx < vram_limit_idx {
                     inner.k_cache = None;
                     inner.v_cache = None;
-                    inner.location = KVLocation::Streaming;
+                    inner.location = KVLocation::SSD;
+                    
+                    // [RAM-WIPE] 전역 장부의 RAM 캐시도 함께 비움
+                    let reg_r = self.registry.entries.read().unwrap();
+                    if idx < reg_r.len() {
+                        let mut cache_w = reg_r[idx].bitkv_cache.write().unwrap();
+                        cache_w[self.layer_idx] = None;
+                    }
                 }
                 snapshot
             };
