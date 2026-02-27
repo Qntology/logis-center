@@ -471,28 +471,41 @@ impl Qwen3VLGenerateModel {
         Ok(total_toks)
     }
 
-    pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
-        let temperature = mes.temperature.unwrap_or(0.7) as f32;
-        let seed = mes.seed.unwrap_or(34562) as u64;
-        let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(0.9) as f32), Some(40), seed);
-        let mes_render = self.chat_template.apply_chat_template(&mes)?;
-        let input = self.pre_processor.process_info(&mes, &mes_render)?;
-        let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
-        let total_toks = f_ids.len();
-        let kv_len = self.get_kv_len();
-        let is_0_6b_full = self.model_name.contains("0.6B") && self.get_kv_len() > 0;
-        let use_zero_prefill = !is_0_6b_full && kv_len >= total_toks && total_toks > 0;
-        let mut gen_text = String::new();
-        let (input_ids, offset) = if use_zero_prefill {
-            println!("[ZERO-PREFILL] Active cache found (Len: {}). Skipping full prompt prefill.", kv_len);
-            (Tensor::from_vec(vec![f_ids[total_toks - 1]], (1, 1), &self.text_device)?, total_toks - 1)
-        } else {
-            println!("[FULL-PREFILL] Computing entire context for 28-layer inference (Len: {}).", total_toks);
-            (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
-        };
+        pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
+            // [CONTEXT-RESTORATION] If a session_id is provided, load the previous KV context from SSD
+            if let Some(s_id) = &session_id {
+                let snapshot_path = crate::utils::paths::get_kv_dir(None).join(s_id);
+                if snapshot_path.exists() {
+                    println!("[GEN-LOAD] Loading existing snapshot from {:?}...", snapshot_path);
+                    let _ = self.load_kv_from_disk(&snapshot_path, _kv_name.as_deref());
+                }
+            }
+    
+            let temperature = mes.temperature.unwrap_or(0.7) as f32;
+            let seed = mes.seed.unwrap_or(34562) as u64;
+            let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(0.9) as f32), Some(40), seed);
+            let mes_render = self.chat_template.apply_chat_template(&mes)?;
+            let input = self.pre_processor.process_info(&mes, &mes_render)?;
+            let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
+            
+            let total_toks = f_ids.len();
+            let kv_len = self.get_kv_len();
+            
+            // [FIX] Correctly determine if we should append to existing context
+            let use_zero_prefill = kv_len > 0;
+            let mut gen_text = String::new();
+            let (input_ids, offset) = if use_zero_prefill {
+                println!("[ZERO-PREFILL] Context restored. Appending new prompt at offset {}.", kv_len);
+                (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, kv_len)
+            } else {
+                println!("[FULL-PREFILL] No context found. Computing entire prompt (Len: {}).", total_toks);
+                (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
+            };
+            
+            let total_tokens_after_prefill = offset + total_toks;
         
         wait_for_global_io().await; // [SYNC] Ensure disk is ready before inference
-        let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_toks, session_id.clone(), _kv_name.clone()).await?;
+        let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         let mut gen_ids = vec![];
         for i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
@@ -500,7 +513,7 @@ impl Qwen3VLGenerateModel {
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             gen_ids.push(next_id);
             gen_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
-            let current_pos = total_toks + i as usize;
+            let current_pos = total_tokens_after_prefill + i as usize;
             
             wait_for_global_io().await; // [SYNC] Wait for any incremental baking
             logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;

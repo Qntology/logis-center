@@ -643,7 +643,8 @@ async fn process_task(
         {
             model.secure_vram_relay(crate::model::ModelSize::Small, Some(&shared_snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
-            let classify_prompt = format!("Based on the provided data, identify the page type. \n[TASK] {}. \n[ACTION] Return JSON only like {{\"type\": \"goods\"}}.", type_prompt);
+            // [PROMPT-FINAL-INSTRUCTION] Place task at the end for maximum focus
+            let classify_prompt = format!("Analyze the data provided above. \n[TASK] {} \n[ACTION] Return ONLY JSON like {{\"type\": \"goods\"}}.", type_prompt);
             let params = ChatCompletionParameters {
                 messages: vec![
                     ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -853,13 +854,14 @@ async fn process_task(
 
             // [PROMPT-RESTRUCTURE] Use shared context + task-specific instructions
             let system_prompt = format!("You are a professional web data extractor. [TASK] {}. Respond with valid JSON only.", extraction_instruction);
-            let final_action = "\n\n[FINAL ACTION] Extract data as JSON. START RESPONSE WITH '{'.";
+            let _final_action = "\n\n[FINAL ACTION] Extract data as JSON. START RESPONSE WITH '{'.";
 
             // 2. [Small] Load Shared Context (Bake step skipped as it's already done in Step A)
             {
                 model.secure_vram_relay(crate::model::ModelSize::Small, Some(&shared_snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
-                let inference_prompt = format!("Extract information from the provided data. [TASK] {}. \n[ACTION] Return JSON only like {{\"id\": \"...\", \"name\": \"...\"}}.", system_prompt);
+                // [PROMPT-FINAL-INSTRUCTION] Instructions follow the context
+                let inference_prompt = format!("Based on the content above, perform the following extraction. \n[TASK] {} \n[ACTION] Return ONLY JSON.", extraction_instruction);
                 let params = ChatCompletionParameters {
                     messages: vec![
                         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 

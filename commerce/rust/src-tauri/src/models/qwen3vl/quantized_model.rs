@@ -1176,21 +1176,22 @@ impl QuantizedQwen3VLTextAttention {
     pub fn load_kv_cache(&mut self, _path: &Path, _device: &Device, _expected_len: usize, _upscale_refill_len: usize, _kv_name: Option<&str>, fragments: &[(usize, std::path::PathBuf)], current_kv_len: usize) -> Result<()> {
         if fragments.is_empty() { return Ok(()); }
         
+        // [CONTEXT-RESET] Clear current session's live blocks before loading snapshot
         self.kv_blocks.clear();
-        
-        for (i, (offset, path)) in fragments.iter().enumerate() {
-            // [FIX] Calculate actual block length based on current total context
+        let mut total_restored_len = 0;
+
+        for (i, (offset, frag_path)) in fragments.iter().enumerate() {
+            // [FIX] Calculate block length based on current total context
             let b_len = if *offset < current_kv_len {
                 (current_kv_len - *offset).min(256)
             } else { 256 };
+            total_restored_len += b_len;
             
             let new_block = KVBlock::new(KVLocation::SSD, i, b_len, *offset);
             {
-                if let Ok(mut inner) = new_block.inner.write() {
-                    inner.ssd_path = Some(path.clone());
-                } else {
-                    println!("[ERROR] Block {} inner lock poisoned during load_kv_cache.", i);
-                }
+                let mut inner = new_block.inner.write().unwrap();
+                inner.len = b_len;
+                inner.location = KVLocation::SSD;
             }
             self.kv_blocks.push(new_block);
 
@@ -1201,7 +1202,7 @@ impl QuantizedQwen3VLTextAttention {
                     slot_ids: vec![None; 28],
                     token_start: *offset,
                     token_len: b_len,
-                    ssd_path: Some(path.clone()),
+                    ssd_path: Some(frag_path.parent().unwrap().to_path_buf()),
                     hidden_states_path: vec![None; 28],
                     is_dirty: vec![false; 28], 
                     last_accessed: std::time::Instant::now(),
@@ -1209,23 +1210,14 @@ impl QuantizedQwen3VLTextAttention {
                 });
             }
             
-            // [FIX] 이미 RAM에 있거나 로딩 중이면 SSD로 덮어쓰지 않음
-            let current_loc = reg[i].location[self.layer_idx];
-            if current_loc != KVLocation::RAM && current_loc != crate::models::qwen3vl::quantized_model::KVLocation::Loading {
-                let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let is_relay_source = fname == "l0.st";
-                if is_relay_source || fname.contains(&format!("l{}.st", self.layer_idx)) {
-                    reg[i].location[self.layer_idx] = KVLocation::SSD;
-                    reg[i].ssd_path = Some(path.clone());
-                }
-            }
-            if reg[i].ssd_path.is_none() {
-                reg[i].ssd_path = Some(path.clone());
+            if i < reg.len() {
+                reg[i].location[self.layer_idx] = KVLocation::SSD;
+                reg[i].ssd_path = Some(frag_path.parent().unwrap().to_path_buf());
             }
         }
 
         if self.layer_idx == 0 {
-            println!("[SSD-LOAD] Layer 0 registered {} blocks.", fragments.len());
+            println!("[SSD-RESTORE] Restored {} tokens across {} blocks.", total_restored_len, fragments.len());
         }
         Ok(())
     }
@@ -2495,19 +2487,25 @@ impl QuantizedQwen3VLTextModel {
         if fragments.is_empty() { return Ok(()); }
         fragments.sort_by_key(|f| f.0);
 
-        // 마지막 프래그먼트에서 실제 길이를 읽어와 전체 길이를 확정합니다.
-        let (_, last_st_path) = fragments.last().unwrap();
+        // [ROBUST-LENGTH-DETECTION] Find any tensor ending with 'k_shape' to get block length
+        let mut last_chunk_len = 256; // Default fallback
+        let (max_offset, last_st_path) = fragments.last().unwrap();
         if let Ok(content) = crate::utils::direct_loader::load_kv_block(last_st_path) {
             if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                if let Ok(view) = st.tensor("k_shape") {
-                    let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };
-                    last_chunk_len = shape_u32[2] as usize;
+                if let Some(name) = st.names().iter().find(|n| n.contains("k_shape")) {
+                    if let Ok(view) = st.tensor(name) {
+                        let data = view.data();
+                        if data.len() >= 12 { // [1, H, LEN, D] -> Index 2 is length (u32 LE)
+                            last_chunk_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+                        }
+                    }
                 }
             }
         }
         
-        let total_kv_len = max_offset + last_chunk_len;
+        let total_kv_len = *max_offset + last_chunk_len;
         self.current_kv_len = total_kv_len;
+        if self.layers.len() > 0 { println!("[SSD-GLOBAL] Restored total context length: {}", total_kv_len); }
 
         self.layers.iter_mut().try_for_each(|layer| {
             layer.load_kv_cache(&scan_path, device, expected_len, upscale_refill_len, kv_name, &fragments, total_kv_len)
