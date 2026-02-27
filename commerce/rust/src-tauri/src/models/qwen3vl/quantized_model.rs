@@ -728,7 +728,7 @@ impl QuantizedQwen3VLTextAttention {
         // [SSD-RELAY] Trigger incremental baking with Full-Mirror guarantee
         if let Some(s_id) = &session_id {
             let is_decoding = q_len == 1; 
-            let _ = self.trigger_realtime_incremental_bake(s_id, true, false, is_decoding);
+            let _ = self.trigger_realtime_incremental_bake(s_id, true, self.baking_only, is_decoding);
         }
 
         if self.layer_idx == 0 {
@@ -943,8 +943,8 @@ impl QuantizedQwen3VLTextAttention {
         }).collect();
 
         for idx in target_indices {
-            // [DIRTY-RESET] Clear dirty flag before sending to avoid redundant tasks
-            if self.layer_idx == 0 {
+            // [DIRTY-RESET] Clear dirty flag only after the LAST layer (27) has processed the block
+            if self.layer_idx == 27 {
                 let mut reg = self.registry.entries.write().unwrap();
                 if idx < reg.len() { reg[idx].is_dirty = false; }
             }
