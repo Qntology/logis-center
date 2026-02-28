@@ -205,13 +205,13 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
 
             // ID 속성 처리
             if let Some(id) = element.id() {
-                other_attributes.push(format!("id=\"{}\"", id));
+                other_attributes.push(format!("id=“{}”", id));
             }
 
-            // Class 속성 처리 [class="class1 class2"]
+            // Class 속성 처리 [class=“class1 class2”]
             if let Some(classes) = element.attr("class") {
                 if !classes.is_empty() {
-                    other_attributes.push(format!("class=\"{}\"", classes));
+                    other_attributes.push(format!("class=“{}”", classes));
                 }
             }
 
@@ -230,7 +230,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                         other_attributes.push(name.to_string());
                     } else if !value.is_empty() {
                         let safe_value = value.replace("\"", "'");
-                        other_attributes.push(format!("{}=\"{}\"", name, safe_value));
+                        other_attributes.push(format!("{}=“{}”", name, safe_value));
                     }
                 }
             }
@@ -264,8 +264,15 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 break;
             }
 
+            // 태그 이름 결정 (div이고 속성이 있으면 태그명 생략)
+            let display_tag = if tag_name == "div" && !attributes_string.is_empty() {
+                ""
+            } else {
+                &tag_name
+            };
+
             // 태그 이름과 변환된 속성 문자열을 함께 추가 (원래 노드 기준)
-            output.push_str(&format!("{}{}{}\n", indent, tag_name, attributes_string));
+            output.push_str(&format!("{}{}{}\n", indent, display_tag, attributes_string));
 
             // textarea의 값 처리
             if tag_name == "textarea" {
@@ -350,11 +357,11 @@ The page has been classified as '{TYPE}'.
 Based on the provided Pug template, identify the structural CSS selectors required for data extraction.
 
 [INSTRUCTION]
-Analyze the page structure you have already learned and find the repeating CSS Selector patterns.
+Analyze the page structure you have already learned and find the repeating patterns.
 
 [SCHEMA DEFINITIONS]
-- item: '{TYPE}' based CSS selector for sibling items(e.g., `div[class="className"]`, `tr[class="className"]`, `li[class="className"]`). Match recurring patterns and exclude header, footer, ads, and pagination.
-- node: '{TYPE}' based CSS selector for the main container wrapping all list items(e.g., `div[id="idName"]`, `ul[id="idName"]`, `ol[id="idName"]`, `div[class="className"]`, `ul[class="className"]`, `ol[class="className"]`). Focus on the direct parent of recurring rows/items, excluding header, footer, ads, and pagination.
+- item: Common CSS selector for sibling items (e.g., `[class=“{TYPE} class”]`). Match recurring patterns and exclude header, footer, ads, and pagination.
+- node: Common CSS selector for the item container wrapping all list items (e.g., `[id=“{TYPE} id”]`). Focus on the direct parent of recurring rows/items, excluding header, footer, ads, and pagination.
 - detail: is a detail page or a detail form. Exclude header, footer, ads, pagination.
 
 [OUTPUT FORMAT]
