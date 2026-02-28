@@ -180,7 +180,7 @@ pub async fn get_load_worker() -> Result<mpsc::Sender<SlotTask>> { LOAD_TX.get()
 pub async fn wait_for_global_io() { while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { tokio::time::sleep(std::time::Duration::from_millis(10)).await; } }
 
 pub fn init_bake_worker() {
-    let (btx, brx) = mpsc::channel(128); let (ltx, lrx) = mpsc::channel(128);
+    let (btx, brx) = mpsc::channel(1024); let (ltx, lrx) = mpsc::channel(1024);
     let _ = BAKE_TX.set(btx); let _ = LOAD_TX.set(ltx);
     if let Some(rx) = SLOT_MANAGER_DATA.1.lock().unwrap().take() { tauri::async_runtime::spawn(async move { spawn_slot_dispatcher(rx).await; }); }
     tauri::async_runtime::spawn(async move { spawn_slot_worker(brx); }); 
@@ -464,6 +464,11 @@ impl Qwen3VLGenerateModel {
     }
 
     pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut Qwen3VLGenerateModel>, _kv_name: Option<String>) -> Result<usize> {
+        // [FIX] Always start prefill from zero to avoid double offset on restart
+        self.clear_kv_cache();
+        if let ModelVariant::QuantizedVL(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
+        if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
+
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
@@ -504,7 +509,8 @@ impl Qwen3VLGenerateModel {
             let mut gen_text = String::new();
             let (input_ids, offset) = if kv_len > 0 {
                 if kv_len >= total_toks {
-                    println!("[SKIP-PREFILL] Snapshot covers entire prompt ({} >= {}). Ready to decode.", kv_len, total_toks);
+                    println!("[SKIP-PREFILL] Snapshot covers entire prompt (Detected: {}, Needed: {}). Capping offset.", kv_len, total_toks);
+                    // [FIX] Strictly cap offset at total_toks - 1 to prevent double offset
                     let last_id = *f_ids.last().unwrap_or(&0);
                     (Tensor::from_vec(vec![last_id], (1, 1), &self.text_device)?, total_toks - 1)
                 } else {
