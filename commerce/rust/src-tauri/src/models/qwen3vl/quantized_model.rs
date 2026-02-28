@@ -1089,10 +1089,11 @@ impl QuantizedQwen3VLTextAttention {
                         if b_idx < reg.len() {
                             if let Some(block) = self.kv_blocks.get(b_idx) {
                                 let mut inner = block.inner.write().unwrap();
-                                inner.k_cache = Some(k_raw);
-                                inner.v_cache = Some(v_raw);
-                                inner.location = KVLocation::RAM;
-                                reg[b_idx].location[self.layer_idx] = KVLocation::RAM;
+                                // [VRAM-PROMOTION] SSD 데이터를 VRAM으로 즉시 승격하여 엔진이 인지하게 함
+                                inner.k_cache = Some(k_raw.to_device(self.q_proj.device())?);
+                                inner.v_cache = Some(v_raw.to_device(self.q_proj.device())?);
+                                inner.location = KVLocation::VRAM;
+                                reg[b_idx].location[self.layer_idx] = KVLocation::VRAM;
                                 reg[b_idx].ssd_path = Some(file_path.parent().unwrap().to_path_buf());
                             }
                         }
@@ -1102,7 +1103,7 @@ impl QuantizedQwen3VLTextAttention {
         }
         
         if self.layer_idx == 0 {
-            println!("[BATCH-LOAD] Layer {} fully cached to RAM from index.", self.layer_idx);
+            println!("[BATCH-LOAD] Layer {} foundation promoted to VRAM from SSD.", self.layer_idx);
         }
         Ok(())
     }
@@ -1772,41 +1773,39 @@ impl QuantizedQwen3VLTextModel {
         if !index_path.exists() { return Ok(()); }
         
         // [FIX-REGISTRY-SIZE] 로딩 전 인덱스를 확인하여 레지스트리 공간 선제 확보
-        // [DIRECT-IO] Use OS-accelerated read for index
         let index_json = if let Ok(data) = crate::utils::direct_loader::load_kv_block(&index_path) {
             String::from_utf8(data).unwrap_or_default()
         } else { return Ok(()); };
         
         let index: LayerIndex = serde_json::from_str(&index_json)?;
         let total_tokens = index.total_tokens;
-        
-        // [FIX] 로딩 전 전체 길이에 맞춰 VRAM 블록 구조를 먼저 동기화 (순서 및 개수 보장)
-        let _ = self.truncate_kv_cache(total_tokens);
-        
-        println!("[SSD-LOAD-CHUNK] Foundation restoration started: {} tokens.", total_tokens);
+        let needed_blocks = (total_tokens + 255) / 256;
 
-        for i in 0..self.layers.len() {
-            let _ = self.layers[i].self_attn.batch_load_layer_kv(kv_name);
-        }
-        
-        // [FIX-BLOCK-LENGTHS] 인덱스에서 읽어온 정보를 바탕으로 각 블록의 실제 길이를 확정
-        {
-            let mut reg = self.registry.entries.write().unwrap();
-            for (idx, entry) in reg.iter_mut().enumerate() {
+        println!("[SSD-LOAD-CHUNK] Foundation restoration started: {} tokens ({} blocks).", total_tokens, needed_blocks);
+
+        // [FIX] 모든 레이어의 블록 구조를 SSD 인덱스에 맞게 강제 확장 (V:1 현상 해결)
+        for layer in self.layers.iter_mut() {
+            let mut blocks = &mut layer.self_attn.kv_blocks;
+            blocks.clear(); // 기존 잔재 제거
+            for idx in 0..needed_blocks {
                 let off = idx * 256;
                 let b_len = if off + 256 <= total_tokens { 256 } else { total_tokens.saturating_sub(off) };
-                entry.token_len = b_len;
-                
-                // 개별 레이어의 KVBlockInner 길이도 동기화
-                for layer in self.layers.iter_mut() {
-                    if let Some(block) = layer.self_attn.kv_blocks.get(idx) {
-                        let mut inner = block.inner.write().unwrap();
-                        inner.len = b_len;
-                        if entry.location[layer.self_attn.layer_idx] == KVLocation::RAM {
-                            inner.location = KVLocation::RAM;
-                        }
-                    }
-                }
+                blocks.push(KVBlock::new(KVLocation::SSD, idx, b_len, off));
+            }
+            // 레이어별 로딩 수행 (내부에서 VRAM으로 올림)
+            let _ = layer.self_attn.batch_load_layer_kv(kv_name);
+        }
+        
+        // [FIX] 레지스트리 정보도 VRAM 상태로 동기화
+        {
+            let mut reg = self.registry.entries.write().unwrap();
+            reg.clear();
+            for idx in 0..needed_blocks {
+                let off = idx * 256;
+                let b_len = if off + 256 <= total_tokens { 256 } else { total_tokens.saturating_sub(off) };
+                let mut entry = RegistryEntry::new(off, b_len, 28);
+                entry.location.fill(KVLocation::VRAM); // 로더가 VRAM으로 올렸으므로
+                reg.push(entry);
             }
         }
 
