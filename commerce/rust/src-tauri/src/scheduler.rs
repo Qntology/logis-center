@@ -54,11 +54,11 @@ impl TaskDataManager {
 
 impl Drop for TaskDataManager {
     fn drop(&mut self) {
-        println!("[Cleanup] TaskDataManager dropping. Keeping files for debugging: {}", self.task_id);
+        // [DEBUG] 디버깅 및 Resume을 위해 생성된 파일을 보존합니다.
+        println!("[Cleanup] TaskDataManager dropping. Keeping {} files for debugging: {}", self.created_files.len(), self.task_id);
         for path in &self.created_files {
-            println!("[DEBUG] Persisted file: {:?}", path);
             if path.exists() {
-                let _ = fs::remove_file(path);
+                println!("[DEBUG] File available: {:?}", path);
             }
         }
         // KV 캐시는 재사용을 위해 디스크에 유지합니다.
