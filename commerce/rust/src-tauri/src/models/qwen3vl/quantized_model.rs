@@ -1808,15 +1808,23 @@ impl QuantizedQwen3VLTextModel {
         }
 
         if current_seq_len > 1 {
-            for block in &self.layers[layer_idx].self_attn.kv_blocks {
-                let mut inner = block.inner.write().unwrap();
-                inner.k_cache = None;
-                inner.v_cache = None;
-                if inner.location == KVLocation::VRAM { inner.location = KVLocation::Streaming; }
+            // [OPTIMIZATION] 0.6B (Small) 모델은 프리필 후에도 VRAM 캐시를 유지하여 즉시 디코딩 진입 보장
+            let is_small_model = self.layers.len() <= 36;
+            
+            if !is_small_model {
+                for block in &self.layers[layer_idx].self_attn.kv_blocks {
+                    let mut inner = block.inner.write().unwrap();
+                    inner.k_cache = None;
+                    inner.v_cache = None;
+                    if inner.location == KVLocation::VRAM { inner.location = KVLocation::Streaming; }
+                }
+                self.layers[layer_idx].self_attn.vram_merged_k = None;
+                self.layers[layer_idx].self_attn.vram_merged_v = None;
+                self.layers[layer_idx].self_attn.merged_vram_block_count = 0;
+                println!("[ENGINE-TRACE] Layer {} Prefill Cache Evicted (Large Model).", layer_idx);
+            } else {
+                println!("[ENGINE-TRACE] Layer {} Prefill Cache Kept (Small Model).", layer_idx);
             }
-            self.layers[layer_idx].self_attn.vram_merged_k = None;
-            self.layers[layer_idx].self_attn.vram_merged_v = None;
-            self.layers[layer_idx].self_attn.merged_vram_block_count = 0;
         }
         
         final_output.ok_or_else(|| anyhow::anyhow!("No output generated from chunks"))
@@ -2034,14 +2042,21 @@ impl QuantizedQwen3VLTextModel {
         }
 
         // 2. [VRAM-PERSISTENCE] 디코딩 시에는 무게추를 GPU에 유지, 프리필 시에만 CPU로 반납
-        if !is_decoding && target_device.is_cuda() {
+        // [OPTIMIZATION] 0.6B (Small) 모델은 VRAM에 상주시켜 속도 저하 방지 (Layer Count <= 36)
+        let is_small_model = self.layers.len() <= 36;
+
+        if !is_decoding && target_device.is_cuda() && !is_small_model {
             self.layers[layer_idx].to_device(&Device::Cpu)?;
         }
         
         if !is_decoding {
-            // [STABILITY-FIX] Force immediate offload to CPU (before version parity)
-            let _ = self.layers[layer_idx].to_device(&Device::Cpu);
-            println!("[ENGINE-TRACE] << End Layer {} | VRAM Evicted (Serial). | Time: {:.2}s", layer_idx, start_layer_time.elapsed().as_secs_f32());
+            if !is_small_model {
+                // [STABILITY-FIX] Force immediate offload to CPU (before version parity)
+                let _ = self.layers[layer_idx].to_device(&Device::Cpu);
+                println!("[ENGINE-TRACE] << End Layer {} | VRAM Evicted (Serial). | Time: {:.2}s", layer_idx, start_layer_time.elapsed().as_secs_f32());
+            } else {
+                 println!("[ENGINE-TRACE] << End Layer {} | VRAM Kept (Small Model). | Time: {:.2}s", layer_idx, start_layer_time.elapsed().as_secs_f32());
+            }
         }
         Ok(next_xs)
     }

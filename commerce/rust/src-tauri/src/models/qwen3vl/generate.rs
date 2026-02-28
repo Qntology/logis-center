@@ -510,7 +510,28 @@ impl Qwen3VLGenerateModel {
                         let _ = self.load_kv_from_disk(&snapshot_path, None); // [FIX] Already pointed to full path
                         
                         if is_reference_snapshot {
-                            println!("[GEN-LOAD] Reference snapshot detected. Clearing volatile blocks to force full prefill while keeping Registry.");
+                            println!("[GEN-LOAD] Reference snapshot detected. Resetting Registry Entry states for Full 28-Layer Prefill...");
+                            
+                            // [FIX] Registry 상태를 RAM/Empty로 초기화하여 엔진이 SSD(Ref)를 무시하고 0번 블록부터 새로 계산하게 함
+                            let reset_reg = |reg: &KVRegistry| {
+                                let mut entries = reg.entries.write().unwrap();
+                                for entry in entries.iter_mut() {
+                                    for loc in entry.location.iter_mut() { *loc = KVLocation::RAM; }
+                                    for slot in entry.slot_ids.iter_mut() { *slot = None; }
+                                    entry.token_len = 0;
+                                    entry.is_dirty.fill(true);
+                                    let mut cache = entry.bitkv_cache.write().unwrap();
+                                    cache.fill(None);
+                                }
+                            };
+
+                            if let ModelVariant::QuantizedVL(m) = &mut self.qwen3_vl {
+                                reset_reg(&m.language_model.registry);
+                                let _ = m.language_model.truncate_kv_cache(0);
+                            } else if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl {
+                                reset_reg(&m.language_model.registry);
+                                let _ = m.language_model.truncate_kv_cache(0);
+                            }
                             self.clear_kv_cache();
                         }
                         break;
@@ -555,6 +576,10 @@ impl Qwen3VLGenerateModel {
         
         wait_for_global_io().await; // [SYNC] Ensure disk is ready before inference
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
+        
+        // [DEBUG-SAMPLING] 첫 번째 토큰 샘플링 전 로그
+        println!("[DEBUG-GEN] Prefill Complete. EOS IDs: {}, {}. Sampling first token...", self.eos_token_id1, self.eos_token_id2);
+
         let mut gen_ids = vec![];
 
         // [DENSE-MODE] Find token IDs for '<', 'think', and '{' to apply biases
@@ -580,14 +605,24 @@ impl Qwen3VLGenerateModel {
             
             // If it's the very first token, strongly favor '{'
             if i == 0 && (open_bracket_id as usize) < len {
-                logits_vec[open_bracket_id as usize] += 5.0; 
+                logits_vec[open_bracket_id as usize] += 10.0; // [BOOST]
             }
             logits_tensor = Tensor::from_vec(logits_vec, logits_tensor.shape(), logits_tensor.device())?;
             
             let next_id = lp.sample(&logits_tensor)?;
-            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
+            
+            if i == 0 {
+                println!("[DEBUG-GEN] First Token Sampled: {} ('{}')", next_id, self.tokenizer.token_decode(vec![next_id]).unwrap_or_else(|_| "???".to_string()));
+            }
+
+            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
+                if i == 0 { println!("[DEBUG-GEN] Warning: Model emitted EOS on first token."); }
+                break; 
+            }
             gen_ids.push(next_id);
-            gen_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
+            let piece = self.tokenizer.token_decode(vec![next_id])?;
+            gen_text.push_str(&piece);
+            
             let current_pos = total_tokens_after_prefill + i as usize;
             
             wait_for_global_io().await; // [SYNC] Wait for any incremental baking
