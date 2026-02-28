@@ -831,19 +831,21 @@ pub fn pack_bitkv_gpu(t: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
     let (b, h, s, d) = (dims.0, dims.1, dims.2, dims.3);
     let total_els = b * h * s * d;
 
+    // 1. Anchors (Keep on GPU)
     let ac_indices: Vec<u32> = (0..s as u32).filter(|&i| i < 4 || i % 8 == 0).collect();
     let ac_tensor = Tensor::from_vec(ac_indices.clone(), vec![ac_indices.len()], dev)?;
     let anchors = t.index_select(&ac_tensor, 2)?;
 
+    // 2. Residual Packing on GPU
     let mut residual = t.to_dtype(DType::F32)?;
     let scales = t.abs()?.max_keepdim(3)?.to_dtype(DType::F32)?;
     
     let mut plane_bits = Vec::new();
     for bit_idx in 0..4 {
-        let cur_scale = scales.affine(1.0 / (2.0f64.powi(bit_idx)), 0.0)?;
+        let step_scale_factor = 1.0 / (2.0f64.powi(bit_idx as i32));
+        let cur_scale = scales.affine(step_scale_factor, 0.0)?;
         let mask = residual.ge(0.0)?;
         
-        // [FIX] 양쪽 인자 모두 명시적으로 변수에 담아 브로드캐스팅 보장
         let on_true = cur_scale.broadcast_as(mask.shape())?;
         let on_false = cur_scale.neg()?.broadcast_as(mask.shape())?;
         let delta = mask.where_cond(&on_true, &on_false)?;
@@ -852,17 +854,19 @@ pub fn pack_bitkv_gpu(t: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         plane_bits.push(mask.to_dtype(DType::U8)?);
     }
 
+    // 3. Final Pack to U8 on GPU
     let mut final_packed_u8 = Vec::new();
+    let bit_weights = Tensor::from_vec(vec![1u8, 2, 4, 8, 16, 32, 64, 128], (8,), dev)?;
+    let num_u8 = (total_els + 7) / 8;
+    let padded_size = num_u8 * 8;
+
     for plane in plane_bits {
         let flat = plane.flatten_all()?;
-        let num_u8 = (total_els + 7) / 8;
-        let padded_size = num_u8 * 8;
         let padded = if padded_size > total_els {
             Tensor::cat(&[&flat, &Tensor::zeros(padded_size - total_els, DType::U8, dev)?], 0)?
         } else { flat };
         
         let chunked = padded.reshape((num_u8, 8))?;
-        let bit_weights = Tensor::from_vec(vec![1u8, 2, 4, 8, 16, 32, 64, 128], (8,), dev)?;
         let packed_u8 = chunked.broadcast_mul(&bit_weights)?.sum(1)?;
         final_packed_u8.push(packed_u8);
     }

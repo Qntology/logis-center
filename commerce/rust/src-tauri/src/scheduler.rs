@@ -261,8 +261,8 @@ pub async fn start_background_worker(
                                 if let Some(db) = store_guard.as_ref() {
                                     let _ = db.update_task_status(&task.id, crate::logic::parse_status("complete")).await;
                                 }
-                                // [NEW] 성공 시에만 리소스 정리 및 모드 리셋
-                                cleanup_task_resources(&task.id, Some(&app_handle));
+                                // [NEW] 성공 시에도 디버깅을 위해 리소스를 보존합니다.
+                                // cleanup_task_resources(&task.id, Some(&app_handle));
                                 current_device_pref = None; 
                             },
                             Err(e) => {
@@ -569,9 +569,11 @@ async fn process_task(
             let log_path = pug_logs_dir.join(format!("light_{}_{}.pug", task.id, ts_nano));
             let _ = std::fs::write(&log_path, &p);
             
-            let _ = data_manager.offload(&p, "light_pug")?;
+            let final_pug_path = data_manager.offload(&p, "light_pug")?;
+            println!("[PROCESS] PUG file created at: {:?}", final_pug_path);
             p // Return String
         };
+        println!("[PROCESS] HTML processing complete. Files stored in task_data.");
         pug
     };
 
