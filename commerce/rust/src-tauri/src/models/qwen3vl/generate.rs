@@ -45,7 +45,7 @@ pub enum SlotRequest {
 
 impl SlotManager {
     pub fn new(count: usize) -> (Self, mpsc::Receiver<SlotRequest>) {
-        let (tx, rx) = mpsc::channel(1024);
+        let (tx, rx) = mpsc::channel(128);
         let mut slots = Vec::new();
         let num_layers = 28;
         for i in 0..count { slots.push(MemorySlot::new(i, num_layers)); }
@@ -141,7 +141,7 @@ pub struct LayerBlockInfo {
 
 // [GLOBAL] 인덱스 업데이트 채널
 pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
-    let (tx, mut rx) = mpsc::channel(2048);
+    let (tx, mut rx) = mpsc::channel(128);
     tokio::spawn(async move {
         let kv_dir = crate::utils::paths::get_kv_dir(None);
         while let Some(task) = rx.recv().await {
@@ -180,7 +180,7 @@ pub async fn get_load_worker() -> Result<mpsc::Sender<SlotTask>> { LOAD_TX.get()
 pub async fn wait_for_global_io() { while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { tokio::time::sleep(std::time::Duration::from_millis(10)).await; } }
 
 pub fn init_bake_worker() {
-    let (btx, brx) = mpsc::channel(1024); let (ltx, lrx) = mpsc::channel(1024);
+    let (btx, brx) = mpsc::channel(128); let (ltx, lrx) = mpsc::channel(128);
     let _ = BAKE_TX.set(btx); let _ = LOAD_TX.set(ltx);
     if let Some(rx) = SLOT_MANAGER_DATA.1.lock().unwrap().take() { tauri::async_runtime::spawn(async move { spawn_slot_dispatcher(rx).await; }); }
     tauri::async_runtime::spawn(async move { spawn_slot_worker(brx); }); 
