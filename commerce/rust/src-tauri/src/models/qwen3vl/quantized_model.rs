@@ -275,8 +275,10 @@ impl KVRegistry {
                     }));
                 }
             }
-            let json = serde_json::to_string_pretty(&layer_data)?;
-            let _ = std::fs::write(path.join(format!("layer{}_meta.json", l_idx)), json);
+            if let Ok(json) = serde_json::to_string_pretty(&layer_data) {
+                // [DIRECT-IO] Use OS-accelerated write for metadata
+                let _ = crate::utils::direct_loader::save_kv_block(&path.join(format!("layer{}_meta.json", l_idx)), json.as_bytes());
+            }
         }
         Ok(())
     }
@@ -288,15 +290,18 @@ impl KVRegistry {
         for l_idx in 0..28 {
             let meta_path = path.join(format!("layer{}_meta.json", l_idx));
             if meta_path.exists() {
-                if let Ok(json) = std::fs::read_to_string(meta_path) {
-                    if let Ok(loaded) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
-                        for item in loaded {
-                            let start = item["token_start"].as_u64().unwrap_or(0) as usize;
-                            let idx = start / 256;
-                            if idx < entries.len() {
-                                entries[idx].location[l_idx] = KVLocation::SSD;
-                                if let Some(p) = item["ssd_path"].as_str() {
-                                    entries[idx].ssd_path = Some(std::path::PathBuf::from(p));
+                // [DIRECT-IO] Use OS-accelerated read for metadata
+                if let Ok(data) = crate::utils::direct_loader::load_kv_block(&meta_path) {
+                    if let Ok(json_str) = String::from_utf8(data) {
+                        if let Ok(loaded) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
+                            for item in loaded {
+                                let start = item["token_start"].as_u64().unwrap_or(0) as usize;
+                                let idx = start / 256;
+                                if idx < entries.len() {
+                                    entries[idx].location[l_idx] = KVLocation::SSD;
+                                    if let Some(p) = item["ssd_path"].as_str() {
+                                        entries[idx].ssd_path = Some(std::path::PathBuf::from(p));
+                                    }
                                 }
                             }
                         }
@@ -1646,7 +1651,11 @@ impl QuantizedQwen3VLTextModel {
         if !index_path.exists() { return Ok(()); }
         
         // [FIX-REGISTRY-SIZE] 로딩 전 인덱스를 확인하여 레지스트리 공간 선제 확보
-        let index_json = fs::read_to_string(&index_path)?;
+        // [DIRECT-IO] Use OS-accelerated read for index
+        let index_json = if let Ok(data) = crate::utils::direct_loader::load_kv_block(&index_path) {
+            String::from_utf8(data).unwrap_or_default()
+        } else { return Ok(()); };
+        
         let index: LayerIndex = serde_json::from_str(&index_json)?;
         let total_tokens = index.total_tokens;
         
@@ -1833,16 +1842,19 @@ impl QuantizedQwen3VLTextModel {
 
     /// [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로 이동
     async fn evacuate_vram_to_ram_only(&mut self, layer_idx: usize) -> Result<()> {
+        // [OPTIMIZATION] 0.6B (Small) 모델은 모든 문맥을 VRAM에 박제하여 PCIe 병목 제거
+        let is_small_model = self.layers.len() <= 36;
+        if is_small_model { return Ok(()); }
+
         // [DYNAMIC-LIMITS] 시스템 자원 상황에 따라 임계값 유동적 조절 (OOM 방지)
         let vram_limit = {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-            
-            // VRAM 여유분 체크 (간단히 4.0GB 이상 여유 있으면 최대치 사용)
-            if free_ram_gb > 4.0 { 64 } else if free_ram_gb > 2.0 { 32 } else { 8 }
-        };
 
+            // [FIX] VRAM 한도를 대폭 상향하여 불필요한 RAM 대피 방지 (기존 64 -> 1024)
+            if free_ram_gb > 4.0 { 1024 } else if free_ram_gb > 2.0 { 512 } else { 128 }
+        };
         let mut vram_evicted = false;
 
         // 1. VRAM -> RAM 계층 관리

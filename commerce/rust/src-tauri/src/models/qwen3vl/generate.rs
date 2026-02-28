@@ -147,9 +147,16 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
         while let Some(task) = rx.recv().await {
             if let SlotTask::IndexUpdate { kv_name, layer_idx, offset, len, file_name } = task {
                 let index_path = kv_dir.join(&kv_name).join(format!("layer{}.json", layer_idx));
+                
+                // [DIRECT-IO] Use OS-accelerated read for index metadata
                 let mut index = if index_path.exists() {
-                    fs::read_to_string(&index_path).ok().and_then(|s| serde_json::from_str::<LayerIndex>(&s).ok())
-                        .unwrap_or(LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] })
+                    if let Ok(data) = load_kv_block(&index_path) {
+                        String::from_utf8(data).ok()
+                            .and_then(|s| serde_json::from_str::<LayerIndex>(&s).ok())
+                            .unwrap_or(LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] })
+                    } else {
+                        LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] }
+                    }
                 } else {
                     let _ = fs::create_dir_all(index_path.parent().unwrap());
                     LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] }
@@ -160,7 +167,8 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
                     index.blocks.sort_by_key(|b| b.offset);
                     index.total_tokens = index.blocks.iter().map(|b| b.len).sum();
                     if let Ok(json) = serde_json::to_string_pretty(&index) {
-                        let _ = fs::write(&index_path, json);
+                        // [DIRECT-IO] Use OS-accelerated write for index metadata
+                        let _ = save_kv_block(&index_path, json.as_bytes());
                     }
                 }
             }
@@ -512,12 +520,13 @@ impl Qwen3VLGenerateModel {
                         if is_reference_snapshot {
                             println!("[GEN-LOAD] Reference snapshot detected. Resetting Registry Entry states for Full 28-Layer Prefill...");
                             
-                            // [FIX] Registry 상태를 RAM/Empty로 초기화하여 엔진이 SSD(Ref)를 무시하고 0번 블록부터 새로 계산하게 함
+                            // [FIX] Registry 상태를 RAM/Empty로 초기화하고 token_start를 0번부터 다시 설정
                             let reset_reg = |reg: &KVRegistry| {
                                 let mut entries = reg.entries.write().unwrap();
-                                for entry in entries.iter_mut() {
+                                for (i, entry) in entries.iter_mut().enumerate() {
                                     for loc in entry.location.iter_mut() { *loc = KVLocation::RAM; }
                                     for slot in entry.slot_ids.iter_mut() { *slot = None; }
+                                    entry.token_start = i * 256; // [FIX] Re-initialize start position
                                     entry.token_len = 0;
                                     entry.is_dirty.fill(true);
                                     let mut cache = entry.bitkv_cache.write().unwrap();
@@ -547,6 +556,8 @@ impl Qwen3VLGenerateModel {
             let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
             
             let total_toks = f_ids.len();
+            println!("[DIAG-GEN] Encoded Prompt Length: {} tokens.", total_toks); // [DEBUG] 24k 원인 파악용
+            
             let kv_len = self.get_kv_len();
             
             // [REFINED-RELAY-LOGIC] Trust restored kv_len and skip prefill if it matches or covers the prompt.
