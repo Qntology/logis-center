@@ -1797,14 +1797,15 @@ impl QuantizedQwen3VLTextModel {
                 Some(prev) => Some(Tensor::cat(&[prev, out], 1)?),
             };
 
-            if let Some(sid) = &session_id {
-                let is_prefill = take > 1;
-                let is_last = chunk_idx == chunk_offsets.len() - 1;
-                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last, baking_only, !is_prefill);
-            }
-
             let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
             if target_device.is_cuda() { let _ = target_device.synchronize(); }
+        }
+
+        // [OPTIMIZATION] 프리필(청크 연산)이 모두 끝난 후 레이어 단위로 단 한 번 SSD 백업 트리거
+        if let Some(sid) = &session_id {
+            let is_prefill = current_seq_len > 1;
+            // 프리필 중에는 루프 밖에서 일괄 처리, 디코딩(seq_len=1)일 때는 루프와 동일하게 작동
+            let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, !is_prefill);
         }
 
         if current_seq_len > 1 {
