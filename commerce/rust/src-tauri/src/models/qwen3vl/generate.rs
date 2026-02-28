@@ -632,6 +632,21 @@ impl Qwen3VLGenerateModel {
             gen_ids.push(next_id);
             let piece = self.tokenizer.token_decode(vec![next_id])?;
             gen_text.push_str(&piece);
+
+            // [EARLY-STOP] JSON 중첩 깊이(Nesting Depth)를 추적하여 완벽히 닫혔을 때만 종료
+            if gen_text.contains('{') {
+                let mut depth = 0;
+                let mut has_started = false;
+                for c in gen_text.chars() {
+                    if c == '{' { depth += 1; has_started = true; }
+                    else if c == '}' { depth -= 1; }
+                }
+                // 모든 괄호의 쌍이 맞고(depth 0), 마지막 토큰이 '}' 계열일 때 종료
+                if has_started && depth == 0 && gen_text.trim_end().ends_with('}') {
+                    println!("[DEBUG-GEN] Balanced JSON detected (Depth 0). Stopping at token {}.", i + 1);
+                    break;
+                }
+            }
             
             let current_pos = total_tokens_after_prefill + i as usize;
             
