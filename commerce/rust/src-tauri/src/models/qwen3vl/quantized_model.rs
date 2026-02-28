@@ -1785,7 +1785,7 @@ impl QuantizedQwen3VLTextModel {
 
         // [FIX] 모든 레이어의 블록 구조를 SSD 인덱스에 맞게 강제 확장 (V:1 현상 해결)
         for layer in self.layers.iter_mut() {
-            let mut blocks = &mut layer.self_attn.kv_blocks;
+            let blocks = &mut layer.self_attn.kv_blocks;
             blocks.clear(); // 기존 잔재 제거
             for idx in 0..needed_blocks {
                 let off = idx * 256;
@@ -2573,7 +2573,7 @@ impl QuantizedQwen3VLTextModel {
         self.save_kv_cache(path, true, block_size, None)
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
+    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, _expected_len: usize, _upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
         if !path.exists() { return Ok(()); }
 
         let mut fragments = Vec::new();
@@ -2618,14 +2618,54 @@ impl QuantizedQwen3VLTextModel {
         }
         
         let total_kv_len = max_offset + last_chunk_len;
-        self.current_kv_len = total_kv_len;
         println!("[SSD-GLOBAL] Snapshot loaded. Total context length: {} tokens.", total_kv_len);
 
         self.layers.iter_mut().try_for_each(|layer| {
-            layer.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, &fragments, total_kv_len)
+            // [CONTEXT-RESET] Clear current session's live blocks before loading snapshot
+            layer.self_attn.kv_blocks.clear();
+            
+            // [REGISTRY-RESET] Clear registry to avoid stale data conflicts
+            {
+                let mut reg = layer.self_attn.registry.entries.write().unwrap();
+                reg.clear();
+            }
+
+            for (i, (offset, frag_path)) in fragments.iter().enumerate() {
+                let b_len = if *offset + 256 <= total_kv_len { 256 } else { total_kv_len.saturating_sub(*offset) };
+                
+                let new_block = KVBlock::new(KVLocation::SSD, i, b_len, *offset);
+                {
+                    let mut inner = new_block.inner.write().unwrap();
+                    inner.len = b_len;
+                    inner.location = KVLocation::SSD;
+                    inner.ssd_path = Some(frag_path.parent().unwrap().to_path_buf());
+                }
+                layer.self_attn.kv_blocks.push(new_block);
+
+                let mut reg = layer.self_attn.registry.entries.write().unwrap();
+                if i >= reg.len() {
+                    reg.push(crate::models::qwen3vl::quantized_model::RegistryEntry {
+                        location: vec![KVLocation::SSD; 28],
+                        slot_ids: vec![None; 28],
+                        token_start: *offset,
+                        token_len: b_len,
+                        ssd_path: Some(frag_path.parent().unwrap().to_path_buf()),
+                        hidden_states_path: vec![None; 28],
+                        is_dirty: vec![false; 28], 
+                        last_accessed: std::time::Instant::now(),
+                        bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; 28])),
+                    });
+                }
+                
+                if i < reg.len() {
+                    reg[i].location[layer.self_attn.layer_idx] = KVLocation::SSD;
+                    reg[i].ssd_path = Some(frag_path.parent().unwrap().to_path_buf());
+                    reg[i].token_len = b_len;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
         })?;
         
-        // [STABILITY-FIX] Double check if all layers have the same current_kv_len
         self.current_kv_len = total_kv_len;
         Ok(())
     }
