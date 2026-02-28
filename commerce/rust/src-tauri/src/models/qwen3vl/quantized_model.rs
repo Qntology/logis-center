@@ -1504,7 +1504,7 @@ impl QuantizedQwen3VLTextModel {
 
         let pool = rayon::ThreadPoolBuilder::new().num_threads(crate::utils::resources::get_optimal_thread_config(current_device.is_cpu()).thread_count).build()?;
         let final_config = config; 
-        let num_layers_to_load = if baking_only { 1 } else { final_config.num_hidden_layers };
+        let num_layers_to_load = final_config.num_hidden_layers;
         let registry = KVRegistry::new();
 
         let layers: Result<Vec<_>> = pool.install(|| {
@@ -2614,12 +2614,6 @@ impl QuantizedQwen3VLModel {
 
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
-        // [OPTIMIZATION] If baking only, limit to 1 layer to save massive VRAM/RAM
-        if baking_only {
-            println!("[MODEL] Vision Baker Mode: Reducing LLM to 1 layer.");
-            t_config.num_hidden_layers = 1;
-        }
-
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
             &t_config, ct_main, main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
         )?;

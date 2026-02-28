@@ -462,7 +462,7 @@ impl Qwen3VLGenerateModel {
                 ModelVariant::QuantizedVL(QuantizedQwen3VLModel::new_with_mmap(&cfg, &gguf_file::Content::read(&mut std::io::Cursor::new(&m_mmap[..]))?, Some(Arc::new(m_mmap)), &gguf_file::Content::read(&mut std::io::Cursor::new(&mm_mmap[..]))?, Some(Arc::new(mm_mmap)), &t_dev, text_device_id, &v_dev, vision_device_id, dtype, kv_res, baking_only)?)
             } else {
                 let m_mmap = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(m_p.as_ref().unwrap())?)? };
-                ModelVariant::QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &gguf_file::Content::read(&mut std::io::Cursor::new(&m_mmap[..]))?, Some(Arc::new(m_mmap)), &t_dev, text_device_id, dtype, kv_res, baking_only, baking_only)?)
+                ModelVariant::QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &gguf_file::Content::read(&mut std::io::Cursor::new(&m_mmap[..]))?, Some(Arc::new(m_mmap)), &t_dev, text_device_id, dtype, kv_res, baking_only, false)?)
             }
         } else { ModelVariant::Standard(Qwen3VLModel::new(cfg, unsafe { VarBuilder::from_mmaped_safetensors(&find_type_files(path, "safetensors")?, dtype, &t_dev)? })?) };
         let g_p = std::path::Path::new(cfg_path).join("generation_config.json"); let g_cfg = if g_p.exists() { serde_json::from_slice(&std::fs::read(g_p)?)? } else { Qwen3VLGenerationConfig::default() };
@@ -488,7 +488,7 @@ impl Qwen3VLGenerateModel {
             fs::write(path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
             wait_for_global_io().await; // [SYNC] Ensure SSD write is complete
-            println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk.");
+            println!("[PREFILL-SAVE] All active KV blocks (All 28 Layers) safely persisted to disk.");
         }
         Ok(total_toks)
     }
@@ -510,7 +510,7 @@ impl Qwen3VLGenerateModel {
                     if snapshot_path.exists() && fs::read_dir(&snapshot_path).map(|mut d| d.next().is_some()).unwrap_or(false) {
                         println!("[GEN-LOAD] Loading existing snapshot from {:?}...", snapshot_path);
                         
-                        // [FIX] If loading from 'reference', we must force prefill for the other 27 layers.
+                        // [FIX] If loading from 'reference', check if we can skip prefill
                         if snapshot_path.to_string_lossy().contains("reference") {
                             is_reference_snapshot = true;
                         }
@@ -518,30 +518,7 @@ impl Qwen3VLGenerateModel {
                         let _ = self.load_kv_from_disk(&snapshot_path, None); // [FIX] Already pointed to full path
                         
                         if is_reference_snapshot {
-                            println!("[GEN-LOAD] Reference snapshot detected. Resetting Registry Entry states for Full 28-Layer Prefill...");
-                            
-                            // [FIX] Registry 상태를 RAM/Empty로 초기화하고 token_start를 0번부터 다시 설정
-                            let reset_reg = |reg: &KVRegistry| {
-                                let mut entries = reg.entries.write().unwrap();
-                                for (i, entry) in entries.iter_mut().enumerate() {
-                                    for loc in entry.location.iter_mut() { *loc = KVLocation::RAM; }
-                                    for slot in entry.slot_ids.iter_mut() { *slot = None; }
-                                    entry.token_start = i * 256; // [FIX] Re-initialize start position
-                                    entry.token_len = 0;
-                                    entry.is_dirty.fill(true);
-                                    let mut cache = entry.bitkv_cache.write().unwrap();
-                                    cache.fill(None);
-                                }
-                            };
-
-                            if let ModelVariant::QuantizedVL(m) = &mut self.qwen3_vl {
-                                reset_reg(&m.language_model.registry);
-                                let _ = m.language_model.truncate_kv_cache(0);
-                            } else if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl {
-                                reset_reg(&m.language_model.registry);
-                                let _ = m.language_model.truncate_kv_cache(0);
-                            }
-                            self.clear_kv_cache();
+                            println!("[GEN-LOAD] Reference snapshot detected. Checking if Zero Prefill is possible...");
                         }
                         break;
                     }
@@ -562,9 +539,16 @@ impl Qwen3VLGenerateModel {
             
             // [REFINED-RELAY-LOGIC] Trust restored kv_len and skip prefill if it matches or covers the prompt.
             let mut gen_text = String::new();
-            let (input_ids, offset) = if kv_len > 0 && !is_reference_snapshot {
+            let (input_ids, offset) = if kv_len > 0 {
                 if kv_len >= total_toks {
-                    println!("[SKIP-PREFILL] Snapshot covers entire prompt (Detected: {}, Needed: {}). Capping offset.", kv_len, total_toks);
+                    println!("[SKIP-PREFILL] Zero Prefill Activated! Snapshot covers entire prompt (Detected: {}, Needed: {}).", kv_len, total_toks);
+                    
+                    // [FIX] Strictly truncate to total_toks to remove block-alignment garbage (e.g. 24064 -> 24007)
+                    if kv_len > total_toks {
+                        println!("[SKIP-PREFILL] Truncating restored cache from {} to {} to align with prompt.", kv_len, total_toks);
+                        let _ = self.truncate_kv_cache(total_toks);
+                    }
+
                     // [FIX] Strictly cap offset at total_toks - 1 to prevent double offset
                     let last_id = *f_ids.last().unwrap_or(&0);
                     (Tensor::from_vec(vec![last_id], (1, 1), &self.text_device)?, total_toks - 1)
@@ -575,11 +559,7 @@ impl Qwen3VLGenerateModel {
                     (Tensor::from_vec(missing_ids, (1, missing_len), &self.text_device)?, kv_len)
                 }
             } else {
-                if is_reference_snapshot {
-                    println!("[FULL-PREFILL] Reference context found. Computing entire prompt to fill all 28 layers (Len: {}).", total_toks);
-                } else {
-                    println!("[FULL-PREFILL] No context found. Computing entire prompt (Len: {}).", total_toks);
-                }
+                println!("[FULL-PREFILL] No context found. Computing entire prompt (Len: {}).", total_toks);
                 (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
             };
             
