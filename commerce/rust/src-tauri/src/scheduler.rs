@@ -445,6 +445,8 @@ async fn process_task(
             let snapshot_id = format!("{}_img", task.id);
             let prompt = crate::model::get_image_extraction_prompt("kr", "korean", "tracking", "");
 
+            // [ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think
+
             // 1. [Vision Baker] Load 1-layer 2B model and bake image
             log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer 2B)...", "spinner": "⠋" }));
             
@@ -698,7 +700,7 @@ async fn process_task(
 
         let selector_prompt = parsing::page_selectors_prompt(&page_type); 
         let pug_content = light_pug.clone();
-        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, selector_prompt);
+        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, selector_prompt);
         let snapshot_id = format!("{}_step_b", task.id);
 
         // [CHECKPOINT] Check if Step B snapshot already exists
@@ -846,7 +848,7 @@ async fn process_task(
         if !content_pug.trim().is_empty() {
             let extraction_instruction = parsing::item2json(&page_type, &url, language);
             let pug_content = content_pug.clone();
-            let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, extraction_instruction);
+            let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, extraction_instruction);
             let snapshot_id = format!("{}_detail", task.id);
 
             // [CHECKPOINT] Check if Detail snapshot already exists
