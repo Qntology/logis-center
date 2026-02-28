@@ -488,10 +488,21 @@ impl Qwen3VLGenerateModel {
         pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
             // [CONTEXT-RESTORATION] If a session_id is provided, load the previous KV context from SSD
             if let Some(s_id) = &session_id {
-                let snapshot_path = crate::utils::paths::get_kv_dir(None).join(s_id);
-                if snapshot_path.exists() {
-                    println!("[GEN-LOAD] Loading existing snapshot from {:?}...", snapshot_path);
-                    let _ = self.load_kv_from_disk(&snapshot_path, _kv_name.as_deref());
+                let snapshot_root = crate::utils::paths::get_kv_dir(None).join(s_id);
+                
+                // [FIX] Try both 'inference/text' and 'reference/text' paths
+                let paths_to_try = vec![
+                    snapshot_root.join("inference").join("text"),
+                    snapshot_root.join("reference").join("text"),
+                    snapshot_root.clone(),
+                ];
+
+                for snapshot_path in paths_to_try {
+                    if snapshot_path.exists() && fs::read_dir(&snapshot_path).map(|mut d| d.next().is_some()).unwrap_or(false) {
+                        println!("[GEN-LOAD] Loading existing snapshot from {:?}...", snapshot_path);
+                        let _ = self.load_kv_from_disk(&snapshot_path, None); // [FIX] Already pointed to full path
+                        break;
+                    }
                 }
             }
     

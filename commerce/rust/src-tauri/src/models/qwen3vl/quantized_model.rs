@@ -2364,6 +2364,7 @@ impl QuantizedQwen3VLTextModel {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
+        self.current_kv_len = 0;
     }
 
     pub fn evacuate_vram_to_cache(&mut self) -> Result<()> {
@@ -2433,7 +2434,9 @@ impl QuantizedQwen3VLTextModel {
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
         self.layers.iter_mut().try_for_each(|layer| {
             layer.truncate_kv_cache(len)
-        })
+        })?;
+        self.current_kv_len = len;
+        Ok(())
     }
 
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
