@@ -594,6 +594,17 @@ impl Qwen3VLGenerateModel {
         wait_for_global_io().await; // [SYNC] Ensure disk is ready before inference
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         
+        // [RELOAD-FOUNDATION] 프리필(10k) 완료 후, 레이어별로 삭제되었던 캐시를 VRAM으로 다시 로드 (사용자 요청: 디코딩은 VRAM 상주)
+        if total_toks > 1 {
+            wait_for_global_io().await; // SSD 쓰기 완료 대기
+            let kv_n = if let Some(n) = &_kv_name { n.clone() } else if let Some(sid) = &session_id { 
+                format!("{}/inference/text", sid) 
+            } else { "inference/text".to_string() };
+            
+            let _ = self.qwen3_vl.load_kv_cache_chunked(&kv_n);
+            println!("[GEN-RELOAD] 10k Context re-loaded from {} to VRAM for decoding.", kv_n);
+        }
+
         // [DEBUG-SAMPLING] 첫 번째 토큰 샘플링 전 로그
         println!("[DEBUG-GEN] Prefill Complete. EOS IDs: {}, {}. Sampling first token...", self.eos_token_id1, self.eos_token_id2);
 

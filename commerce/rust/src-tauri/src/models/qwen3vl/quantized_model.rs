@@ -1789,23 +1789,12 @@ impl QuantizedQwen3VLTextModel {
             let _ = self.layers[i].self_attn.batch_load_layer_kv(kv_name);
         }
         
-        self.current_kv_len = total_tokens;
-        Ok(())
-    }
-            let chunk_end = (chunk_start + chunk_size).min(self.layers.len());
-            for l_idx in chunk_start..chunk_end {
-                self.layers[l_idx].batch_load_kv(kv_name)?;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        
         // [FIX-BLOCK-LENGTHS] 인덱스에서 읽어온 정보를 바탕으로 각 블록의 실제 길이를 확정
         {
             let mut reg = self.registry.entries.write().unwrap();
-            let total_t = self.current_kv_len;
             for (idx, entry) in reg.iter_mut().enumerate() {
                 let off = idx * 256;
-                let b_len = if off + 256 <= total_t { 256 } else { total_t.saturating_sub(off) };
+                let b_len = if off + 256 <= total_tokens { 256 } else { total_tokens.saturating_sub(off) };
                 entry.token_len = b_len;
                 
                 // 개별 레이어의 KVBlockInner 길이도 동기화
@@ -1820,6 +1809,8 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
         }
+
+        self.current_kv_len = total_tokens;
         Ok(())
     }
 
