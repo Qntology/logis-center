@@ -605,14 +605,24 @@ impl Qwen3VLGenerateModel {
             
             // If it's the very first token, strongly favor '{'
             if i == 0 && (open_bracket_id as usize) < len {
-                logits_vec[open_bracket_id as usize] += 10.0; // [BOOST]
+                logits_vec[open_bracket_id as usize] += 20.0; // [BOOST-HEAVY] Increase boost
+                // [EOS-BAN] Forcibly ban EOS tokens on the first step
+                if (self.eos_token_id1 as usize) < len { logits_vec[self.eos_token_id1 as usize] = -1000.0; }
+                if (self.eos_token_id2 as usize) < len { logits_vec[self.eos_token_id2 as usize] = -1000.0; }
             }
             logits_tensor = Tensor::from_vec(logits_vec, logits_tensor.shape(), logits_tensor.device())?;
             
-            let next_id = lp.sample(&logits_tensor)?;
+            let mut next_id = lp.sample(&logits_tensor)?;
+            
+            // [FORCE-START] If model still tries to output EOS at step 0, override it with '{'
+            if i == 0 && (next_id == self.eos_token_id1 || next_id == self.eos_token_id2) {
+                println!("[DEBUG-GEN] EOS detected on first token. Overriding with '{{' to force JSON.");
+                next_id = 123; // ASCII for '{' is usually safe, or use open_bracket_id
+                if open_bracket_id != 999999 { next_id = open_bracket_id; }
+            }
             
             if i == 0 {
-                println!("[DEBUG-GEN] First Token Sampled: {} ('{}')", next_id, self.tokenizer.token_decode(vec![next_id]).unwrap_or_else(|_| "???".to_string()));
+                println!("[DEBUG-GEN] First Token Final: {} ('{}')", next_id, self.tokenizer.token_decode(vec![next_id]).unwrap_or_else(|_| "???".to_string()));
             }
 
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
