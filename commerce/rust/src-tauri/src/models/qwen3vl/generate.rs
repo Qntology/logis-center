@@ -45,7 +45,7 @@ pub enum SlotRequest {
 
 impl SlotManager {
     pub fn new(count: usize) -> (Self, mpsc::Receiver<SlotRequest>) {
-        let (tx, rx) = mpsc::channel(128);
+        let (tx, rx) = mpsc::channel(64);
         let mut slots = Vec::new();
         let num_layers = 28;
         for i in 0..count { slots.push(MemorySlot::new(i, num_layers)); }
@@ -141,7 +141,7 @@ pub struct LayerBlockInfo {
 
 // [GLOBAL] 인덱스 업데이트 채널
 pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
-    let (tx, mut rx) = mpsc::channel(128);
+    let (tx, mut rx) = mpsc::channel(64);
     tokio::spawn(async move {
         let kv_dir = crate::utils::paths::get_kv_dir(None);
         while let Some(task) = rx.recv().await {
@@ -188,7 +188,7 @@ pub async fn get_load_worker() -> Result<mpsc::Sender<SlotTask>> { LOAD_TX.get()
 pub async fn wait_for_global_io() { while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { tokio::time::sleep(std::time::Duration::from_millis(10)).await; } }
 
 pub fn init_bake_worker() {
-    let (btx, brx) = mpsc::channel(128); let (ltx, lrx) = mpsc::channel(128);
+    let (btx, brx) = mpsc::channel(64); let (ltx, lrx) = mpsc::channel(64);
     let _ = BAKE_TX.set(btx); let _ = LOAD_TX.set(ltx);
     if let Some(rx) = SLOT_MANAGER_DATA.1.lock().unwrap().take() { tauri::async_runtime::spawn(async move { spawn_slot_dispatcher(rx).await; }); }
     tauri::async_runtime::spawn(async move { spawn_slot_worker(brx); }); 
@@ -233,9 +233,9 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
 }
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
-    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(10000); 
+    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(100); 
     tokio::spawn(async move {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(2000)); 
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(48)); 
         while let Some(task) = io_rx.recv().await {
             let sem = semaphore.clone();
             let (tp, ts, reg, b_idx, sid, is_last, kv_n) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone());
@@ -548,9 +548,9 @@ impl Qwen3VLGenerateModel {
                 }
             }
     
-            let temperature = mes.temperature.unwrap_or(0.7) as f32;
+            let temperature = mes.temperature.unwrap_or(1.0) as f32;
             let seed = mes.seed.unwrap_or(34562) as u64;
-            let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(0.9) as f32), Some(50), seed);
+            let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(1.0) as f32), Some(9), seed);
             let mes_render = self.chat_template.apply_chat_template(&mes)?;
             let input = self.pre_processor.process_info(&mes, &mes_render)?;
             let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;

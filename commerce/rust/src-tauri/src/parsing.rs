@@ -203,16 +203,15 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             let mut attributes_string = String::new();
             let mut other_attributes = Vec::new();
 
-            // ID 속성 처리 (#my-id)
+            // ID 속성 처리
             if let Some(id) = element.id() {
-                attributes_string.push_str(&format!("#{}", id));
+                other_attributes.push(format!("id=\"{}\"", id));
             }
 
-            // Class 속성 처리 (.class1.class2)
+            // Class 속성 처리 [class="class1 class2"]
             if let Some(classes) = element.attr("class") {
-                let class_list: Vec<_> = classes.split_whitespace().collect();
-                if !class_list.is_empty() {
-                    attributes_string.push_str(&format!(".{}", class_list.join(".")));
+                if !classes.is_empty() {
+                    other_attributes.push(format!("class=\"{}\"", classes));
                 }
             }
 
@@ -236,9 +235,9 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 }
             }
 
-            // 괄호로 묶는 속성들 추가
+            // 브래킷으로 묶는 속성들 추가
             if !other_attributes.is_empty() {
-                attributes_string.push_str(&format!("({})", other_attributes.join(" ")));
+                attributes_string.push_str(&format!("[{}]", other_attributes.join(" ")));
             }
 
             // div 축약 로직 (JS Parity)
@@ -332,18 +331,13 @@ Based on the provided Pug template, identify the primary category of this webpag
 
 [SCHEMA DEFINITIONS]
 - type: The main category. Must be one of:
-  - 'order': Order history, order details, checkout success.
-  - 'goods': Product list, product detail, shopping cart.
-  - 'tracking': Shipment tracking status, delivery history.
-  - 'review': Product reviews, feedback list.
-  - 'coupon': Coupon list, discount events.
-  - 'event': Promotion pages, event announcements.
-  - '': If none of the above match.
-
-[EXTRACTION RULES]
-- Return ONLY valid JSON.
-- NO EXPLANATION. 
-- NO THINKING.
+  - "order": Order history, order details, checkout success.
+  - "goods": Product list, product detail, shopping cart.
+  - "tracking": Shipment tracking status, delivery history.
+  - "review": Product reviews, feedback list.
+  - "coupon": Coupon list, discount events.
+  - "event": Promotion pages, event announcements.
+  - "": If none of the above match.
 
 [OUTPUT FORMAT]
 {
@@ -353,18 +347,17 @@ Based on the provided Pug template, identify the primary category of this webpag
 pub fn page_selectors_prompt(page_type: &str) -> String {
     let template = r###"[TASK]
 The page has been classified as '{TYPE}'.
-Based on the PREVIOUSLY RECORDED history, identify the structural CSS1 selectors required for data extraction.
+Based on the provided Pug template, identify the structural CSS selectors required for data extraction.
 
 [INSTRUCTION]
-Analyze the page structure you have already learned and find the repeating patterns.
+Analyze the page structure you have already learned and find the repeating CSS Selector patterns.
 
 [SCHEMA DEFINITIONS]
-- item: Common CSS1 selector for sibling items (e.g., `tr`, `li`). Match recurring patterns and exclude header, footer, ads, and pagination.
-- node: Common CSS1 selector for the main container wrapping all list items (e.g., tbody, ul). Focus on the direct parent of recurring rows/items, excluding header, footer, ads, and pagination.
+- item: '{TYPE}' based CSS selector for sibling items(e.g., `div[class="className"]`, `tr[class="className"]`, `li[class="className"]`). Match recurring patterns and exclude header, footer, ads, and pagination.
+- node: '{TYPE}' based CSS selector for the main container wrapping all list items(e.g., `div[id="idName"]`, `ul[id="idName"]`, `ol[id="idName"]`, `div[class="className"]`, `ul[class="className"]`, `ol[class="className"]`). Focus on the direct parent of recurring rows/items, excluding header, footer, ads, and pagination.
 - detail: is a detail page or a detail form. Exclude header, footer, ads, pagination.
 
 [OUTPUT FORMAT]
-Return valid JSON only. No explanation.
 {
     "item": "...",
     "node": "...",
@@ -422,7 +415,7 @@ pub fn graph2contexts(current: &str) -> String {
 
 pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
-        "tracking" => r###"node:tracking form container CSS1 selector,
+        "tracking" => r###"node:tracking form container CSS selector,
 status:{
     value:'draft' or 'progress' or 'return' or 'complete' or 'error',
     selector:selector
@@ -503,7 +496,7 @@ registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
 },"###.to_string(),
-        "goods" => r###"node:goods form container CSS1 selector,
+        "goods" => r###"node:goods form container CSS selector,
 code:{
     value:product constant code | string,
     selector:selector
@@ -697,7 +690,7 @@ registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
 },"###.replace("{HREF}", href),
-        "order" => r###"node:order form container CSS1 selector,
+        "order" => r###"node:order form container CSS selector,
 link : '{HREF}',
 id:{
     value:Refer to the ID value from the link or an attribute or input value | string,
@@ -777,7 +770,7 @@ registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
 },"###.replace("{HREF}", href),
-        "coupon" | "event" => r###"node:{TYPE} container CSS1 selector,
+        "coupon" | "event" => r###"node:{TYPE} container CSS selector,
 link : '{HREF}',
 id:{
     value:Refer to the ID value from the link or an attribute or input value | string,
@@ -843,7 +836,7 @@ registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
 },"###.replace("{TYPE}", page_type).replace("{HREF}", href),
-        "review" => r###"node:review container CSS1 selector,
+        "review" => r###"node:review container CSS selector,
 link : '{HREF}',
 id:Refer to the ID value from the link or an attribute or input value | string,,
 status:{

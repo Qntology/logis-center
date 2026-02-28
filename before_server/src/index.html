@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	
+	<meta property="og:title" content="oauth.network">
+	<meta property="og:url" content="https://www.oauth.network/">
+	<meta property="og:image" content="https://www.oauth.network/static/img/common/favicon.ico">
+	<meta property="og:description" content="인증 폼에서 상담 폼까지">
+
+	<meta name="popup-link-verification" content="6757d390597f497229ca4087048d3c32f58b67c85432e270d0d340e911e38263" />
+	<meta name="privacy" content="/privacy/" />
+	<meta name="terms" content="/terms/" />
+
+	<link rel="stylesheet" href="/static/fonts/fontawesome/css/all.min.css">
+	<link rel="stylesheet" href="/static/fonts/xeicon/xeicon.min.css">
+
+	<link rel="stylesheet" href="/static/css/style.css">
+	<link rel="stylesheet" href="/static/css/main.css">
+	<link rel="stylesheet" href="/static/css/host.css">
+
+	<style>
+		body[mobile] #footer{display: none; background-color: #f6f6f6;}
+
+		body{overflow-y: scroll !important;}
+		.article.full{}
+		.title_style01 a{display: inline; margin-left: 5px; text-decoration: underline;}
+
+		body[mobile] .title_style01 .title span,
+		body[mobile] .title_style01 .desc span{color:#000;}
+
+		body[mobile][open] .title_style01 .title span,
+		body[mobile][open] .title_style01 .desc span{color:#fff;}
+		body[mobile][open] .title_style01 .title span,
+		body[mobile][open] .title_style01 .desc span{text-shadow: 0 0 5px black;}
+
+		.article{opacity: 0.2; transition-duration: 0.5s;}		
+		.article.on{opacity: 1;}
+		.article.pricing .tc{text-align: center;}
+		.article.pricing .table{display: inline-block;}
+		.article.pricing .table th,
+		.article.pricing .table tc{padding: 1em;}
+
+		.form_nav{text-align: center;}
+		.form_nav a{display: inline-block; height: 5em; line-height: 5em; vertical-align: top;}
+		.form_nav a+a{margin-left: 1em;}
+		.form_nav a img{vertical-align: middle;}
+		body[mobile] .wrap>*{position: relative; z-index: 110;}
+
+		body[section] popup.link a{pointer-events: none !important;}
+
+		body[mobile] popup.link tip{display: none;}
+
+		
+		body[mobile] popup.link a{opacity: 0;}
+		body[mobile][end] popup.link a{opacity: 1;}
+		body[mobile][end] popup.link layer iframe{opacity: 1;}
+	
+		body[mobile] #header .area,
+		body[mobile] #headline{opacity: 1; transition-duration: 0.5s;}
+
+		body[mobile][open] #header .area,
+		body[mobile][open] #headline{opacity: 0;}
+
+		body[mobile][open] #header{border-color: transparent;}
+
+
+		.title_style01{display: block; padding: 8em 0; text-align: center;}
+		.title_style01 .title{margin-bottom:15px;}
+		.title_style01 .title span{font-size:34px; font-weight:900; word-break: keep-all; line-height: 1.5; letter-spacing: 1px;}
+		.title_style01 .desc span{display: block; font-size:20px; font-weight:900; word-break: keep-all; line-height: 1.5;}
+		.title_style01 a{display: none;}
+
+		#headline{position: relative; margin: 4em 0 7em;text-align: center; z-index: 0;}
+		#headline h2{margin-top: 0.1em; font-size: 3.3em; font-weight: 200; line-height: 1.2; word-break: keep-all;}
+		body[mobile] #headline h2{font-size: 2.75em}
+
+		#headline strong{display: inline-block; position: relative; font-size: 1em; font-weight: 900;}
+		#headline span{margin-top: 25px; font-size: 20px; line-height: 1.3; word-break: keep-all;}
+
+		#headline a{font-size: 1em; font-weight: 700; color:#235bf5;}
+		#headline a.verify{display: inline-block; margin-top: 40px; padding: 18px 50px 21px; border-radius: 7px; text-decoration: inherit; font-size:18px; font-weight: 400; background-color: #235bf5; color: #fff;}
+
+		.notification{position: absolute; left: 1em; top: 1em; right: 1em; padding: 2.8em 1em 1em; border-radius: 1em; z-index: 1; background: rgb(255 255 255 / 95%); overflow: hidden;}
+		
+		.notification .title{margin-bottom: 4px;}
+		.notification .title span{font-size: 13px; font-weight: bold;}
+		.notification .desc span{font-size: 10px; font-weight: bold;}
+
+
+		.notification .title:before{content: "\f0f3"; font-family: "Font Awesome 6 Free"; font-weight: 600; position: absolute; left: 1em; top: 1em;}
+		.notification .title span:before{content: "popup.link"; position: absolute; left: 3.5em; top: 1.5em; font-size: 10px; font-weight: bold;}
+		.notification .title span:after{content: "now"; position: absolute; right: 1.5em; top: 1em; font-size: 10px; font-weight: bold;}
+
+		@media (max-width: 999px) {
+			.mobile[style]{display: none;}
+		}
+	</style>
+
+	<title>Logis.center</title>
+
+	<style>
+		body { font-family: sans-serif; text-align: center; margin: 0; padding: 1rem; background-color: #f4f4f9; }
+		.container { max-width: 640px; margin: 0 auto; background: #fff; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+		h1 { color: #333; }
+		video, img { max-width: 100%; border: 1px solid #ddd; margin-bottom: 1rem; border-radius: 4px; }
+		canvas { display: none; }
+		.buttons button { font-size: 1rem; padding: 0.7rem 1.5rem; margin: 0.5rem; cursor: pointer; border: none; border-radius: 4px; color: #fff; transition: background-color 0.2s; }
+		#snap { background-color: #007bff; }
+		#snap:hover { background-color: #0056b3; }
+		#send { background-color: #28a745; }
+		#send:hover { background-color: #218838; }
+		#send:disabled { background-color: #aaa; cursor: not-allowed; }
+		#status { margin-top: 1rem; font-weight: bold; min-height: 1.5em; }
+
+		.wrap{display:none;}
+	</style>
+
+	<div class="container">
+		<div class="camera">
+			<video id="video" width="640" height="480" autoplay playsinline></video>
+			<canvas id="canvas"></canvas>
+			
+			<h2>미리보기</h2>
+			<img id="photo" alt="찍은 사진이 여기에 표시됩니다." style="display: none;">
+
+			<div class="buttons">
+				<button id="snap">사진 찍기</button>
+				<button id="send" disabled>서버로 전송</button>
+			</div>
+			
+			<div id="status">카메라를 시작합니다...</div>
+		</div>
+	</div>
+</head>
+<body>
+	<div class="wrap">
+		<div id="header">
+			<div class="area">
+				<h1>
+					<a href="/" alt="oauth.network">
+						<svg xmlns="http://www.w3.org/2000/svg" version="1.2" viewBox="0.9547386169433594 0.954742431640625 78.09051513671875 78.09051513671875" width="500" height="500"> <title>L8bUVjtCrGCGZKRx0Ez58BngbIDzG2xxuXvQpTfpssWHCJAID5Uxe_7t4f-v6PaI-HgadSBjbBLMSzXP_Tyd2w</title> <style> .s0 { fill: #000000 } .s1 { fill: #ffffff } </style> <path fill-rule="evenodd" class="s0" d="m2.3 29.9c5.6-20.8 27-33.2 47.8-27.6 20.8 5.6 33.2 27 27.6 47.8-5.6 20.8-27 33.2-47.8 27.6-20.8-5.6-33.2-27-27.6-47.8z"></path> <path class="s1" d="m76.7 49.8c2.6-9.7 1.2-20.1-3.8-28.8-5-8.7-13.3-15.1-23.1-17.7-9.7-2.6-20.1-1.2-28.8 3.8-8.7 5-15.1 13.3-17.7 23.1-1.3 4.8-0.6 10 1.9 14.4 2.5 4.3 6.7 7.5 11.5 8.8 4.9 1.3 10.1 0.7 14.4-1.9 4.4-2.5 7.6-6.6 8.9-11.5 1.3-4.9 4.5-9 8.9-11.5 4.3-2.6 9.5-3.2 14.4-1.9 4.8 1.3 9 4.5 11.5 8.8 2.5 4.4 3.2 9.6 1.9 14.4z"></path> </svg>
+					</a>
+				</h1>
+
+				<label for="nav"></label>
+				<input id="nav" type="checkbox">
+				<nav></nav>
+			</div>
+
+			<div id="headline">
+				<div class="area">
+					<h2>AI <strong>Lift</strong> Work and Makes it <strong>Lite</strong></h2>
+					<span><a>#커머스 #리테일 #어시스턴트</a></span>
+					<a class="verify">Add To Chrome</a>
+				</div>
+			</div>
+		</div>
+
+
+		<div class="main">
+			<div class="section">
+				<div class="article">
+					<div class="title_style01">
+						<div class="title">
+							<span>셀러에게 딱 맞는<br>5분이면 충분합니다</span>
+						</div>
+						<div class="desc">
+							<span>실시간 작업 테스크 파악<br>데이터 기반 인사이트를 제공합니다</span>
+						</div>
+					</div>
+				</div>
+
+				<div class="article">
+					<div class="title_style01">
+						<div class="title">
+							<span>새로운 업무 절차가 아닌<br>업무 지원의 편리함을 경험해보세요</span>
+						</div>
+						<div class="desc">
+							<span>일을 위한 일에서 벗어나는<br>해결을 위한 솔루션</span>
+						</div>
+					</div>
+				</div>
+
+				<div class="article">
+					<div class="title_style01">
+						<div class="title">
+							<span>간단한 메세지 전송<br>시작하는 푸시 알림</span>
+						</div>
+						<div class="desc">
+							<span>고객의 재방문을 유도하여<br>고객의 리텐션을 높이세요</span>
+						</div>
+					</div>
+				</div>
+
+				<div class="article">
+					<div class="title_style01">
+						<div class="title">
+							<span>오픈 인증 프로토콜</span>
+						</div>
+						<div class="desc">
+							<span>이메일, 휴대폰 인증을 무료로 제공합니다</span>
+						</div>
+					</div>
+				</div>
+			</div>
+		</div>
+
+		<a class="aside verify">
+			<span class="tb">
+				<span class="tc">
+					<span class="text">
+						<span>지금 무료로 사용해보세요</span>
+						<em>시작하기</em>
+					</span>
+				</span>
+			</span>
+		</a>
+
+		<div id="footer"></div>
+	</div>
+
+	<script>
+		var cookies = ${JSON.stringify(cookies)}
+		var rows = ${JSON.stringify(rows)}
+	</script>
+	<script src="/static/js/min.js"></script>
+	<script src="/static/js/${ cookies.address ? 'script.js' : 'auth.js' }"></script>
+</body>
+</html>

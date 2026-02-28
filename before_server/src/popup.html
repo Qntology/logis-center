@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang>
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width,initial-scale=1,minimum-scale=1,maximum-scale=1,user-scalable=no">
+
+    <meta property="og:title" content="${og_title}">
+    <meta property="og:description" content="${og_description}">
+
+    <meta property="og:url" content="${og_url}">
+    <meta property="og:image" content="${og_image}">
+
+    <link rel="icon" href="${og_icon}" />
+	
+	<link rel="stylesheet" href="static/css/style.css">
+
+	<title>Logis.center</title>
+
+
+	<link rel="stylesheet" href="/static/fonts/fontawesome/css/all.min.css">
+	<link rel="stylesheet" href="/static/fonts/xeicon/xeicon.min.css">
+	<link rel="stylesheet" href="/static/css/style.css">
+
+	<style>
+		oauth{overflow: hidden; display: block; margin-bottom: 100px;}
+
+		oauth .lds-ring{position: fixed;}
+		qr{display: block;}
+		.qr-code{margin-bottom: 30px; padding: 0; max-width: 320px;}
+		#header{display: none;}
+		#footer{background-color: inherit;}
+	</style>
+</head>
+<body>
+	<!-- 
+		최대 크기: 가로 800픽셀, 세로 600픽셀
+
+		최소 크기: 가로 25픽셀, 세로 25픽셀
+	 -->
+	<div class="wrap" oauth>
+		<div class="main">
+			<oauth>
+				<div class="tb">
+					<div class="tc">
+						<div class="area">
+							<div class="title">
+								<a href="/"><img src="/static/img/common/logo0.png" alt=""></a>
+							</div>
+							
+							<forms class="loading">
+								<div class="title">
+									<p>After scanning the QR and sending an email</p>
+									<span>Please click the confirmation button</span>
+								</div>
+
+								<qr></qr>
+
+								<div class="lds-ring">
+									<div></div>
+									<div></div>
+									<div></div>
+									<div></div>
+									<p class="verify"></p>
+									<a href="/login/">Choose a different verification</a>
+								</div>
+
+								<div class="items">
+									<ul>
+										<li>
+											<a href="javascript:Email('phone')">Verification confirmation</a>
+										</li>
+									</ul>
+
+									<div class="msg">
+										<div class="tb">
+											<div class="tc">
+												<div class="icon"></div>
+												<div class="text">
+													<span>After a while, you will be moved to the main page.</span>
+												</div>
+											</div>
+										</div>
+									</div>
+								</div>
+
+								<div class="tip">
+									<em>It may take about 1 minute after sending the email.</em>
+									<p>
+										* To protect your privacy, please use it only on your personal device.<br><br>
+										* Email services that do not support SSL cannot be authenticated.
+									</p>
+								</div>
+
+								<div class="items" style="height: 200px;">
+									<div class="guide">
+										<a class="skip">Skip</a>
+										<div class="steps">
+											<ul>
+												<li>
+													<div class="tb step step01">
+														<div class="tc context">
+															<div class="tit">
+																<strong>Send verify email</strong>
+															</div>
+															<div class="desc">
+																<span></span>
+															</div>
+														</div>
+													</div>
+												</li>
+												<li>
+													<div class="tb step step02">
+														<div class="tc context">
+															<div class="tit">
+																<strong>Back to Login</strong>
+															</div>
+															<div class="desc">
+																<span></span>
+															</div>
+														</div>
+													</div>
+												</li>
+												<li>
+													<div class="tb step step03">
+														<div class="tc context">
+															<div class="tit">
+																<strong>Wait for verify</strong>
+															</div>
+															<div class="desc">
+																<span></span>
+															</div>
+														</div>
+													</div>
+												</li>
+											</ul>
+										</div>
+									</div>
+								</div>
+							</forms>
+						</div>
+					</div>
+				</div>
+			</oauth>
+		</div>
+		<div id="footer"></div>
+	</div>
+	
+	<script src="/static/js/blockies.min.js?ver1"></script>
+	<script src="/static/js/url-polyfill.min.js"></script>
+	<script src="/static/js/jquery.min.js"></script>
+	<script src="/static/js/jquery.touchSlider.js"></script>
+	<script src="/static/js/typed.min.js"></script>
+	<script src="/static/js/script.js"></script>
+	
+	<script src="/static/js/qrcode.min.js?ver1"></script>
+	<script src="/static/js/browser-image-compression.js"></script>
+	<script src="/static/js/oauth3.js"></script>
+	
+	<script>
+		(function() {
+			if(window.localStorage.verify){
+				$('.guide').remove()
+			}else{
+				var $skip = $('.guide .skip')
+
+				var current = 0
+
+				var $steps = $('.guide .steps')
+					$skip.on({
+						click : function(e){
+							$("oauth").addClass("on")
+							$("oauth forms").removeClass("loading")
+						}
+					})
+
+					$steps.touchSlider({
+						roll:false,
+						resize:true,
+						transition:false,
+						initComplete: function(e) {
+							
+						},
+						counter: function(e) {
+							console.log(e)
+
+							var $next = $(this).find(".ts-next")
+
+							// $('.guide .steps')
+
+							if(e.total == e.current){
+								$next.text("confirm")
+
+								if(current == e.current){
+									$("oauth").addClass("on")
+									$("oauth forms").removeClass("loading")
+								}
+							}else{
+								$next.text("next")
+							}
+
+							current = e.current
+						}
+					})
+			}
+				
+
+
+
+			OAuth3.on("ready", function(){
+				OAuth3.Origin = ""
+
+				var cc_url = window.location.origin
+
+				if(OAuth3.localhost){
+					cc_url = "http://"+OAuth3.localhost
+				}
+
+				// 메뉴 & 멤버 조회
+				var request = {
+					method : "GET",
+					query : {
+						cc : cc_url
+					}
+				}
+				
+				// 값 받기
+				var response = function(res){
+					console.log(res)
+
+					var cookies = JSON.parse(res.body.cookies)
+
+					if(!OAuth3.hash && cookies.hash){
+						OAuth3.hash = cookies.hash
+					}
+					
+					if(cookies.email){
+						window.location.href = "/"
+					}
+					
+					var rows = res.body.rows
+
+					var target = document.querySelector("sitemap")
+
+					var len = rows.length
+
+					var limit = rows.limit
+
+					var teams = {}
+
+					for(var f = 0; f < len; f++){
+						var row = rows[f]
+
+						teams[row.From] = row
+					}
+
+					var $loading = document.querySelector(".loading")
+						$loading.className = ""
+					
+					OAuth3.teams = teams
+
+					var host = window.location.host
+
+					if(OAuth3.localhost){
+						host = OAuth3.localhost
+					}
+
+					if(OAuth3.isMobile){
+						var $a = document.querySelector('a[href="javascript:Email(\'phone\')"]')
+							$a.textContent = "verify"
+						
+						document.querySelector('.main oauth forms .title span').innerHTML = 'After sending the email, please press the <br>verify authentication button.'
+					}else{
+						var to = encodeURIComponent(cookies.hash+"."+host+"@oauth.email")
+
+						var mailto = "mailto:"+to
+
+						document.querySelector("qr").innerHTML = '<a target="_blank" href="'+mailto+'" class="qr-code"></a>'
+
+						var $qrcode = document.querySelector(".qr-code")
+
+						new QRCode($qrcode, {
+							text: mailto,
+							width: 300,
+							height: 300,
+							colorDark : "#000000",
+							colorLight : "#ffffff",
+							correctLevel : QRCode.CorrectLevel.H
+						})
+					}
+				}
+
+				OAuth3.fetch(request, response)
+			})
+		})()
+		
+		function Email(compose){
+			var mailto = ""
+
+			var host = window.location.host
+
+			if(OAuth3.localhost){
+				host = OAuth3.localhost
+			}
+
+			var to = encodeURIComponent(host+"/#"+OAuth3.hash+"@oauth.email")
+
+			if(compose == "phone"){
+				mailto = "mailto:"+to
+
+				if(OAuth3.isMobile){
+					
+				}else{
+					mailto = ""
+				}
+			}else if(compose == "naver"){
+				mailto = "https://mail.naver.com/write/?cmd=compose&to="+to
+			}else if(compose == "daum"){
+				mailto = "https://mail.daum.net/hanmail/mail/MailComposeFrame.daum?TO="+to+"#?composer"
+			}else if(compose == "nate"){
+				mailto = "https://mail3.nate.com/#write/?act=new&to="+to
+			}else if(compose == "google"){
+				mailto = "https://mail.google.com/mail/?view=cm&fs=1&to="+to+"&su=&body="
+			}else if(compose == "apple"){
+				mailto = "https://www.icloud.com/message/current/ko-kr/index.html#compose?to="+to
+			}else{
+				mailto = "mailto:"+to
+			}
+
+			var _fetch
+
+			var request = {
+				method : "GET",
+				count : 100,
+				url : OAuth3.host,
+				delay : 3000
+			}
+
+			if(mailto){
+				request.mailto = mailto
+
+				if(compose){
+					request.compose = compose
+				}
+			}
+
+			if(compose == "phone"){
+				request.query = {}
+			}
+
+			var $loading = document.querySelector("forms")
+				$loading.className = "loading mailto"
+		
+			var deviceCompose = "mail app"
+
+			var $verify = document.querySelector("forms .verify")
+				$verify.innerHTML = 'Authentication in progress'
+
+			// 값 받기
+			var response = function(res){
+				var rows = res.body.rows
+
+				var date = new Date()
+				var len = rows.length
+
+				var limit = rows.limit
+				var To = ""
+				var table = {}
+
+				var cookies = JSON.parse(res.body.cookies)
+
+				if(OAuth3.hash != cookies.hash){
+					window.location.reload()
+				}
+
+				if(cookies.email){
+					_fetch.abort()
+
+					OAuth3.opener ? OAuth3.opener.close() : ""
+
+					$loading.className = "complete"
+
+					var $title = document.querySelector("forms .title")
+						$title.innerHTML = '<p>Verification completed</p>'
+
+					var uri = new URL(document.URL)
+
+					var href = document.referrer ? document.referrer : "/"
+
+					window.localStorage.verify = "true"
+
+					window.location.href = href
+				}
+			}
+
+			_fetch = OAuth3.fetch(request, response)
+		}
+	</script>
+</body>
+</html>
