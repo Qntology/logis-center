@@ -442,6 +442,7 @@ pub struct Qwen3VLGenerateModel {
     pub model_name: String,
     pub hard_token_limit: Option<usize>,
     pub kv_root: std::path::PathBuf,
+    pub baking_only: bool,
 }
 
 impl Qwen3VLGenerateModel {
@@ -475,26 +476,36 @@ impl Qwen3VLGenerateModel {
         let g_p = std::path::Path::new(cfg_path).join("generation_config.json"); let g_cfg = if g_p.exists() { serde_json::from_slice(&std::fs::read(g_p)?)? } else { Qwen3VLGenerationConfig::default() };
         let (e1, e2) = match &g_cfg.eos_token_id { serde_json::Value::Number(n) => { let id = n.as_u64().unwrap_or(151645) as u32; (id, id) }, serde_json::Value::Array(arr) => { (arr.get(0).and_then(|v| v.as_u64()).unwrap_or(151643) as u32, arr.get(1).and_then(|v| v.as_u64()).unwrap_or(151643) as u32) }, _ => (151643, 151643) };
         let loaded_model_name = if m_p.as_ref().map(|p| p.contains("0.6B")).unwrap_or(false) { "0.6B".to_string() } else { "2B".to_string() };
-        Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &v_dev, dtype)?, qwen3_vl, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: loaded_model_name, hard_token_limit, kv_root })
+        Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &v_dev, dtype)?, qwen3_vl, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: loaded_model_name, hard_token_limit, kv_root, baking_only })
     }
 
     pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut Qwen3VLGenerateModel>, _kv_name: Option<String>) -> Result<usize> {
-        // [FIX] Always start prefill from zero to avoid double offset on restart
+        // [FORCE-ZERO-RESET] 프리필 시작 전 모든 상태를 0으로 고정하여 오프셋 중복 합산 방지
         self.clear_kv_cache();
-        if let ModelVariant::QuantizedVL(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
-        if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
+        if let ModelVariant::QuantizedVL(m) = &mut self.qwen3_vl { 
+            m.language_model.registry.entries.write().unwrap().clear();
+            let _ = m.language_model.truncate_kv_cache(0); 
+        }
+        if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl { 
+            m.language_model.registry.entries.write().unwrap().clear();
+            let _ = m.language_model.truncate_kv_cache(0); 
+        }
 
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
+        
         let full_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_toks = full_ids.len();
+        
+        println!("[DIAG-PREFILL] Total Tokens: {}", total_toks);
+
+        // [STRICT-OFFSET-ZERO] Offset을 무조건 0으로 강제하여 24k 현상 차단
         self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
         
-        // [SSD-PERSISTENCE] 프리필(베이킹) 종료 후 즉시 SSD에 일괄 저장
         if let Some(s_id) = &session_id {
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
-            wait_for_global_io().await; // [SYNC] Ensure SSD write is complete
-            println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk.");
+            wait_for_global_io().await;
+            println!("[PREFILL-SAVE] Safely persisted {} tokens.", total_toks);
         }
         Ok(total_toks)
     }
@@ -594,15 +605,20 @@ impl Qwen3VLGenerateModel {
         wait_for_global_io().await; // [SYNC] Ensure disk is ready before inference
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         
-        // [RELOAD-FOUNDATION] 프리필(10k) 완료 후, 레이어별로 삭제되었던 캐시를 VRAM으로 다시 로드 (사용자 요청: 디코딩은 VRAM 상주)
+        // [RELOAD-FOUNDATION] 프리필(10k) 완료 후, 레이어별로 삭제되었던 캐시를 VRAM으로 다시 로드
         if total_toks > 1 {
             wait_for_global_io().await; // SSD 쓰기 완료 대기
-            let kv_n = if let Some(n) = &_kv_name { n.clone() } else if let Some(sid) = &session_id { 
-                format!("{}/inference/text", sid) 
-            } else { "inference/text".to_string() };
+            
+            // [FIX] 세션 ID와 추론 경로를 결합하여 정확한 위치 지정
+            let kv_n = if let Some(sid) = &session_id {
+                let last_part = _kv_name.as_deref().unwrap_or("text");
+                format!("{}/inference/{}", sid, last_part)
+            } else {
+                "inference/text".to_string()
+            };
             
             let _ = self.qwen3_vl.load_kv_cache_chunked(&kv_n);
-            println!("[GEN-RELOAD] 10k Context re-loaded from {} to VRAM for decoding.", kv_n);
+            println!("[GEN-RELOAD] 10k Context re-loaded from {} to VRAM.", kv_n);
         }
 
         // [DEBUG-SAMPLING] 첫 번째 토큰 샘플링 전 로그

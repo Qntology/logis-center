@@ -1915,7 +1915,7 @@ impl QuantizedQwen3VLTextModel {
                 println!("[ENGINE-TRACE] Layer {} Prefill Complete. Saved to SSD and VRAM Cleared.", layer_idx);
             }
         } else {
-            // [DECODING-SPEED] 디코딩(1토큰) 시에는 실시간 저장 수행 및 VRAM 캐시 보존 (28개 레이어 상주)
+            // [DECODING-SPEED] 디코딩(1토큰) 시에는 실시간 저장 수행 및 VRAM 캐시 보존
             if let Some(sid) = &session_id {
                 let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, true);
             }
@@ -2281,7 +2281,7 @@ impl QuantizedQwen3VLTextModel {
         let block_start = (start_off / 256) * 256;
 
         // [DYNAMIC-LIMITS] 0.6B 모델은 가벼우므로 10k 문맥 전체를 VRAM에 상주시켜 PCIe 병목을 제거합니다.
-        let (vram_limit, ram_limit) = {
+        let (vram_limit, _ram_limit) = {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;

@@ -208,85 +208,77 @@ impl LogisModel {
     }
 
     /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced with Diagnostics)
-    pub async fn deep_purge_resources(&self) {
-        println!("[DIAG-PURGE] Step 0: Waiting for background IO to finish...");
-        crate::models::qwen3vl::generate::wait_for_global_io().await;
+    pub async fn deep_purge_resources(&self, aggressive: bool) {
+        if aggressive {
+            println!("[DIAG-PURGE] Step 0: Waiting for background IO to finish...");
+            crate::models::qwen3vl::generate::wait_for_global_io().await;
+        }
 
         println!("[DIAG-PURGE] Step 1: Clearing ALL Generation Slots...");
         
         {
             let mut gen = self.generator.lock().await;
             if let Some(mut g) = gen.take() {
-                println!("[DIAG-PURGE] Dropping Active Generator (0.6B/2B)...");
                 let _ = g.clear_kv_cache();
                 let _ = g.qwen3_vl.drop_kv_storage(); 
                 drop(g); 
             }
         }
-        {
-            let mut s_hib = self.small_hibernation.lock().await;
-            if let Some(mut g) = s_hib.take() { 
-                println!("[DIAG-PURGE] Dropping Small Hibernation...");
-                let _ = g.clear_kv_cache();
-                let _ = g.qwen3_vl.drop_kv_storage();
-                drop(g); 
-            }
-        }
-        {
-            let mut l_hib = self.large_hibernation.lock().await;
-            if let Some(mut g) = l_hib.take() { 
-                println!("[DIAG-PURGE] Dropping Large Hibernation...");
-                let _ = g.clear_kv_cache();
-                let _ = g.qwen3_vl.drop_kv_storage();
-                drop(g); 
-            }
-        }
         
-        println!("[DIAG-PURGE] Step 2: Clearing Embedding Model...");
-        {
-            let mut emb = self.embedding_model.lock().await;
-            if let Some(e) = emb.take() { 
-                drop(e); 
+        if aggressive {
+            {
+                let mut s_hib = self.small_hibernation.lock().await;
+                if let Some(mut g) = s_hib.take() { 
+                    let _ = g.clear_kv_cache();
+                    let _ = g.qwen3_vl.drop_kv_storage();
+                    drop(g); 
+                }
             }
-        }
-        
-        println!("[DIAG-PURGE] Step 3: Synchronizing CUDA Context...");
-        if !self.is_cpu_mode {
-            let dev = self.device_config.device.clone();
-            let sync_res = tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(move || {
-                if dev.is_cuda() { 
-                    println!("[DIAG-PURGE] Executing dev.synchronize()...");
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        dev.synchronize()
-                    }))
-                } else { Ok(Ok(())) }
-            })).await;
+            {
+                let mut l_hib = self.large_hibernation.lock().await;
+                if let Some(mut g) = l_hib.take() { 
+                    let _ = g.clear_kv_cache();
+                    let _ = g.qwen3_vl.drop_kv_storage();
+                    drop(g); 
+                }
+            }
             
-            match sync_res {
-                Ok(Ok(Ok(Ok(_)))) => println!("[DIAG-PURGE] CUDA Synchronization Successful."),
-                Ok(Ok(Ok(Err(e)))) => println!("[DIAG-PURGE] CUDA Sync Error: {:?}", e),
-                Ok(Err(_)) => println!("[DIAG-PURGE] CUDA Sync Task Join Error."),
-                Err(_) => println!("[DIAG-PURGE] CUDA Sync Timeout! Continuing purge."),
-                _ => println!("[DIAG-PURGE] CUDA Sync Panicked or Failed."),
+            println!("[DIAG-PURGE] Step 2: Clearing Embedding Model...");
+            {
+                let mut emb = self.embedding_model.lock().await;
+                if let Some(e) = emb.take() { drop(e); }
+            }
+            
+            println!("[DIAG-PURGE] Step 3: Synchronizing CUDA Context...");
+            if !self.is_cpu_mode {
+                let dev = self.device_config.device.clone();
+                let _ = tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(move || {
+                    if dev.is_cuda() { let _ = dev.synchronize(); }
+                })).await;
+            }
+
+            println!("[DIAG-PURGE] Step 4: Flushing OS Memory...");
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows_sys::Win32::System::Threading::*;
+                use windows_sys::Win32::System::Memory::*;
+                let current_process = GetCurrentProcess();
+                let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
             }
         }
 
-        println!("[DIAG-PURGE] Step 4: Flushing OS Memory...");
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows_sys::Win32::System::Threading::*;
-            use windows_sys::Win32::System::Memory::*;
-            let current_process = GetCurrentProcess();
-            let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-        }
-
-        println!("[DIAG-PURGE] Aggressive Purge Complete.");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        println!("[DIAG-PURGE] Purge Complete.");
     }
 
     // --- [NEW] VRAM Settlement Monitor (Smart Polling) ---
     async fn wait_for_vram_settle(&self, target_free_mb: u64, timeout_sec: u64, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         if self.is_cpu_mode { return Ok(()); } 
+        
+        // [OPTIMIZATION] If current is Small, VRAM pressure is low. Skip wait.
+        {
+            let size_guard = self.current_size.lock().await;
+            if *size_guard == Some(ModelSize::Small) { return Ok(()); }
+        }
 
         println!("[VRAM-WATCH] Monitoring VRAM (Target > {} MB)...", target_free_mb);
         let start = Instant::now();
@@ -429,14 +421,26 @@ impl LogisModel {
     pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool, kv_name: Option<String>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
-        // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
-        println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
-        self.deep_purge_resources().await;
+        // 1. [FIX] 모델 사이즈뿐만 아니라 베이킹 모드(1층 vs 28층) 일치 여부도 확인
+        let current_is_baking = {
+            let gen = self.generator.lock().await;
+            gen.as_ref().map(|g| g.baking_only).unwrap_or(false)
+        };
         
-        if !self.is_cpu_mode {
-            // VRAM이 실제로 비워질 때까지 대기
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            self.wait_for_vram_settle(2000, 5, cancel_token.clone()).await?;
+        let size_match = { *self.current_size.lock().await == Some(target_size) };
+        let mode_match = current_is_baking == is_baking;
+        let needs_purge = !size_match || !mode_match; // 모드가 다르면 무조건 퍼지 후 새로 로드
+
+        if needs_purge {
+            println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
+            self.deep_purge_resources(true).await;
+            
+            if !self.is_cpu_mode {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                self.wait_for_vram_settle(2000, 5, cancel_token.clone()).await?;
+            }
+        } else {
+            println!("[RELAY] Fast Transition: Size {:?} and Mode (Baking: {}) match. Skipping purge.", target_size, is_baking);
         }
 
         // 2. [LOAD] 새 모델 로드 (이제 VRAM이 최대치로 확보된 상태)
