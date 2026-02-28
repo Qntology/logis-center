@@ -487,6 +487,7 @@ impl Qwen3VLGenerateModel {
 
         pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
             // [CONTEXT-RESTORATION] If a session_id is provided, load the previous KV context from SSD
+            let mut is_reference_snapshot = false;
             if let Some(s_id) = &session_id {
                 let snapshot_root = crate::utils::paths::get_kv_dir(None).join(s_id);
                 
@@ -500,7 +501,18 @@ impl Qwen3VLGenerateModel {
                 for snapshot_path in paths_to_try {
                     if snapshot_path.exists() && fs::read_dir(&snapshot_path).map(|mut d| d.next().is_some()).unwrap_or(false) {
                         println!("[GEN-LOAD] Loading existing snapshot from {:?}...", snapshot_path);
+                        
+                        // [FIX] If loading from 'reference', we must force prefill for the other 27 layers.
+                        if snapshot_path.to_string_lossy().contains("reference") {
+                            is_reference_snapshot = true;
+                        }
+
                         let _ = self.load_kv_from_disk(&snapshot_path, None); // [FIX] Already pointed to full path
+                        
+                        if is_reference_snapshot {
+                            println!("[GEN-LOAD] Reference snapshot detected. Clearing volatile blocks to force full prefill while keeping Registry.");
+                            self.clear_kv_cache();
+                        }
                         break;
                     }
                 }
@@ -518,7 +530,7 @@ impl Qwen3VLGenerateModel {
             
             // [REFINED-RELAY-LOGIC] Trust restored kv_len and skip prefill if it matches or covers the prompt.
             let mut gen_text = String::new();
-            let (input_ids, offset) = if kv_len > 0 {
+            let (input_ids, offset) = if kv_len > 0 && !is_reference_snapshot {
                 if kv_len >= total_toks {
                     println!("[SKIP-PREFILL] Snapshot covers entire prompt (Detected: {}, Needed: {}). Capping offset.", kv_len, total_toks);
                     // [FIX] Strictly cap offset at total_toks - 1 to prevent double offset
@@ -531,7 +543,11 @@ impl Qwen3VLGenerateModel {
                     (Tensor::from_vec(missing_ids, (1, missing_len), &self.text_device)?, kv_len)
                 }
             } else {
-                println!("[FULL-PREFILL] No context found. Computing entire prompt (Len: {}).", total_toks);
+                if is_reference_snapshot {
+                    println!("[FULL-PREFILL] Reference context found. Computing entire prompt to fill all 28 layers (Len: {}).", total_toks);
+                } else {
+                    println!("[FULL-PREFILL] No context found. Computing entire prompt (Len: {}).", total_toks);
+                }
                 (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
             };
             
