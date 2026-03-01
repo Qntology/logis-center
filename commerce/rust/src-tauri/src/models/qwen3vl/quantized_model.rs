@@ -287,11 +287,17 @@ impl KVRegistry {
     }
 
     /// [PARALLEL-STITCHING] 여러 세션의 KV 파편들을 하나로 이어붙여 가상 문맥을 생성합니다.
-    /// sessions: Vec<(세션ID, SSD_오프셋_시작, 토큰_길이)>
     pub fn stitch_sessions(&self, sessions: Vec<(String, usize, usize)>) -> Result<()> {
         let mut entries = self.entries.write().unwrap();
-        let mut current_block_idx = 0;
+        
+        // [FIX] 기존 장부 초기화 (이전 태스크 파편 제거)
+        for entry in entries.iter_mut() {
+            entry.ssd_path = None;
+            entry.token_len = 0;
+            for loc in &mut entry.location { *loc = KVLocation::SSD; }
+        }
 
+        let mut current_block_idx = 0;
         for (session_id, _ssd_offset, length_tokens) in sessions {
             let num_blocks = (length_tokens + 255) / 256;
             let kv_dir = crate::utils::paths::get_kv_dir(None).join(&session_id);
@@ -301,15 +307,17 @@ impl KVRegistry {
                 
                 let entry = &mut entries[current_block_idx];
                 entry.ssd_path = Some(kv_dir.clone());
-                entry.token_len = if b_idx == num_blocks - 1 { length_tokens % 256 } else { 256 };
-                if entry.token_len == 0 { entry.token_len = 256; }
+                entry.ssd_block_offset = b_idx * 256; // [FIX] 물리적 SSD 오프셋 (b0, b256...)
+                entry.token_len = if b_idx == num_blocks - 1 { 
+                    let rem = length_tokens % 256;
+                    if rem == 0 { 256 } else { rem }
+                } else { 256 };
                 
-                // 모든 레이어가 SSD에 있는 것으로 표시
                 for loc in &mut entry.location { *loc = KVLocation::SSD; }
                 current_block_idx += 1;
             }
         }
-        println!("[KV-STITCH] Merged sessions into virtual context (Total Blocks: {}).", current_block_idx);
+        println!("[KV-STITCH] Virtual Context cleared and stitched. Total Blocks: {}", current_block_idx);
         Ok(())
     }
 
@@ -2942,15 +2950,15 @@ impl QuantizedQwen3VLModel {
         let head_dev = self.lm_head.device();
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
 
-        // [FIX] Prefill/Baking 시에는 전체 시퀀스 결과를 유지하되, 
-        // [VRAM-GUARD] 무거운 Logits 연산은 디코딩(seq_len=1) 시에만 수행하여 OOM 방지
-        if seq_len > 1 {
-            // 베이킹 중에는 로짓이 필요 없으므로 더미 반환 (VRAM 3.2GB 절약)
-            return Ok(Tensor::zeros((b_sz, 1, 1), head_dtype, head_dev)?);
-        }
+        // [FIX] VRAM-GUARD: 프리필(seq_len > 1) 시에는 마지막 토큰의 로짓만 계산하여 OOM 방지
+        // 전체 시퀀스를 계산하면 3.2GB가 들지만, 마지막 토큰만 계산하면 0.3MB면 충분합니다.
+        let last_token_hidden = if seq_len > 1 {
+            outputs.narrow(1, seq_len - 1, 1)? // 마지막 토큰만 추출 [Batch, 1, Hidden]
+        } else {
+            outputs.clone()
+        };
 
-        let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
-        let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };
+        let hidden_state = if !last_token_hidden.device().same_device(head_dev) { last_token_hidden.to_device(head_dev)? } else { last_token_hidden };
         let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state };
         
         let logits = self.lm_head.forward(&hidden_state)?;

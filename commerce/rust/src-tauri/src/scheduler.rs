@@ -604,60 +604,54 @@ async fn process_task(
     // Skeleton 방식이므로 baking_only=false로 설정해도 RAM 사용량은 동일하게 낮습니다.
     model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, None).await?;
 
-    // 1.1 Line-aware Tokenization and Splitting
-    let (chunk_data, total_actual_tokens) = {
+    // 1.1 Chat-structured Tokenization and Splitting
+    let (chunk_data, _total_actual_tokens) = {
         let gen_guard = model.generator.lock().await;
         let gen = gen_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Generator failed to load"))?;
         
-        let lines: Vec<&str> = light_pug.lines().collect();
+        // [CHAT-FORMAT] PUG를 시스템/사용자 메시지 형식으로 감싸서 구조화
+        let structured_pug = format!("<|im_start|>system\nYou are a document analyzer. Use the following PUG context for future tasks.<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n", light_pug);
+        
+        let lines: Vec<&str> = structured_pug.lines().collect();
         let mut all_chunks = Vec::new();
         let mut current_chunk_tokens = Vec::new();
-        let mut total_count = 0;
 
         for line in lines {
             let line_with_nl = format!("{}\n", line);
             let line_ids = gen.tokenizer.text_encode_vec(line_with_nl, false)?;
             
             if current_chunk_tokens.len() + line_ids.len() > 256 && !current_chunk_tokens.is_empty() {
-                // 현재 조각이 꽉 차면 저장 (256을 넘지 않게 조절)
                 all_chunks.push(current_chunk_tokens.clone());
-                total_count += current_chunk_tokens.len();
                 current_chunk_tokens.clear();
             }
             
             if line_ids.len() > 256 {
-                // 한 줄 자체가 256보다 길면 어쩔 수 없이 토큰 단위로 쪼갬
                 for sub_chunk in line_ids.chunks(256) {
                     all_chunks.push(sub_chunk.to_vec());
-                    total_count += sub_chunk.len();
                 }
             } else {
                 current_chunk_tokens.extend(line_ids);
             }
         }
-        
         if !current_chunk_tokens.is_empty() {
             all_chunks.push(current_chunk_tokens.clone());
-            total_count += current_chunk_tokens.len();
         }
-        
-        (all_chunks, total_count)
+        (all_chunks, 0)
     };
 
     let mut stitch_targets = Vec::new();
 
-    // 1.2 Batched Parallel Bake (Ultra-Fast)
+    // 1.2 Batched Sequential-RoPE Bake (Ultra-Fast)
     {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": format!("Batch Processing {} Line-safe Chunks...", chunk_data.len()), "spinner": "🚀" }));
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": format!("Baking {} structured history fragments...", chunk_data.len()), "spinner": "🚀" }));
             
             gen.clear_kv_cache();
             
             let chunk_len = 256;
             let b_sz = chunk_data.len();
             
-            // [FIX] 조각별로 실제 길이를 복사하고 나머지는 패딩(0)
             let mut batched_ids = vec![0u32; b_sz * chunk_len];
             for (i, ids) in chunk_data.iter().enumerate() {
                 let len = ids.len().min(chunk_len);
@@ -665,16 +659,22 @@ async fn process_task(
             }
             
             let ids_t = Tensor::from_vec(batched_ids, (b_sz, chunk_len), &gen.text_device)?;
-            let pos_ids = Tensor::arange(0u32, chunk_len as u32, &gen.text_device)?
-                .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, chunk_len))?;
+            
+            // [ROPE-SEQUENTIAL-FIX] 각 배치 행에 대해 고유한 절대 위치 부여
+            let mut pos_ids_rows = Vec::new();
+            for b in 0..b_sz {
+                let start = (b * chunk_len) as u32;
+                let row = Tensor::arange(start, start + chunk_len as u32, &gen.text_device)?
+                    .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, chunk_len))?;
+                pos_ids_rows.push(row);
+            }
+            let pos_ids = Tensor::cat(&pos_ids_rows, 1)?;
 
             gen.qwen3_vl.forward(&ids_t, None, None, None, None, Some(&pos_ids), 0, chunk_len, Some(task.id.clone()), Some("reference".to_string())).await?;
             
-            // [SCATTER] 병렬 저장 트리거
             gen.force_flush_all_active_blocks(&task.id, Some("reference")).await?;
-            gen.clear_kv_cache();
+            gen.clear_kv_cache(); 
 
-            // [STITCH-METADATA] 각 조각의 실제 유효 길이를 장부용 데이터로 기록
             for (c_idx, ids) in chunk_data.iter().enumerate() {
                 stitch_targets.push((format!("{}_c{}", task.id, c_idx), ids.len()));
             }
