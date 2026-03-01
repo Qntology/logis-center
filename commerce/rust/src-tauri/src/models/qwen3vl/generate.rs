@@ -592,21 +592,16 @@ impl Qwen3VLGenerateModel {
             
             let kv_len = self.get_kv_len();
             
-            // [REFINED-RELAY-LOGIC] Trust restored kv_len and skip prefill if it matches or covers the prompt.
+            // [FIX] 스티칭된 문맥(kv_len)이 있는 경우, 오프셋을 깎지 않고 그 뒤에 질문을 붙입니다.
             let mut gen_text = String::new();
             let (input_ids, offset) = if kv_len > 0 && !is_reference_snapshot {
-                if kv_len >= total_toks {
-                    println!("[SKIP-PREFILL] Snapshot covers entire prompt (Detected: {}, Needed: {}). Capping offset.", kv_len, total_toks);
-                    // [FIX] Strictly cap offset at total_toks - 1 to prevent double offset
-                    let last_id = *f_ids.last().unwrap_or(&0);
-                    (Tensor::from_vec(vec![last_id], (1, 1), &self.text_device)?, total_toks - 1)
-                } else {
-                    let missing_ids = f_ids[kv_len..].to_vec();
-                    let missing_len = missing_ids.len();
-                    println!("[PARTIAL-PREFILL] Context partially restored ({}). Prefilling remaining {} tokens.", kv_len, missing_len);
-                    (Tensor::from_vec(missing_ids, (1, missing_len), &self.text_device)?, kv_len)
-                }
+                // 이미 본문(PUG)이 SSD에 로드된 상태 (예: 10,752 토큰)
+                println!("[STITCHED-INFERENCE] Found baked context ({} tokens). Appending prompt ({} tokens).", kv_len, total_toks);
+                
+                // 질문 프롬프트 전체를 GPU에서 연산하여 본문 뒤에 붙임
+                (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, kv_len)
             } else {
+                // 기존 방식 (새로운 세션)
                 if is_reference_snapshot {
                     println!("[FULL-PREFILL] Reference context found. Computing entire prompt to fill all 28 layers (Len: {}).", total_toks);
                 } else {

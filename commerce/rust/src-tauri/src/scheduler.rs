@@ -604,49 +604,79 @@ async fn process_task(
     // Skeleton 방식이므로 baking_only=false로 설정해도 RAM 사용량은 동일하게 낮습니다.
     model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, None).await?;
 
-    // 1.1 Tokenize and Split
-    let full_ids = {
+    // 1.1 Line-aware Tokenization and Splitting
+    let (chunk_data, total_actual_tokens) = {
         let gen_guard = model.generator.lock().await;
         let gen = gen_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Generator failed to load"))?;
-        gen.tokenizer.text_encode_vec(light_pug.clone(), false)?
+        
+        let lines: Vec<&str> = light_pug.lines().collect();
+        let mut all_chunks = Vec::new();
+        let mut current_chunk_tokens = Vec::new();
+        let mut total_count = 0;
+
+        for line in lines {
+            let line_with_nl = format!("{}\n", line);
+            let line_ids = gen.tokenizer.text_encode_vec(line_with_nl, false)?;
+            
+            if current_chunk_tokens.len() + line_ids.len() > 256 && !current_chunk_tokens.is_empty() {
+                // 현재 조각이 꽉 차면 저장 (256을 넘지 않게 조절)
+                all_chunks.push(current_chunk_tokens.clone());
+                total_count += current_chunk_tokens.len();
+                current_chunk_tokens.clear();
+            }
+            
+            if line_ids.len() > 256 {
+                // 한 줄 자체가 256보다 길면 어쩔 수 없이 토큰 단위로 쪼갬
+                for sub_chunk in line_ids.chunks(256) {
+                    all_chunks.push(sub_chunk.to_vec());
+                    total_count += sub_chunk.len();
+                }
+            } else {
+                current_chunk_tokens.extend(line_ids);
+            }
+        }
+        
+        if !current_chunk_tokens.is_empty() {
+            all_chunks.push(current_chunk_tokens.clone());
+            total_count += current_chunk_tokens.len();
+        }
+        
+        (all_chunks, total_count)
     };
-    let chunk_size = 256;
-    let chunks: Vec<_> = full_ids.chunks(chunk_size).enumerate().collect();
+
     let mut stitch_targets = Vec::new();
 
     // 1.2 Batched Parallel Bake (Ultra-Fast)
     {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": format!("High-speed Parallel Prefill ({} chunks)...", chunks.len()), "spinner": "🚀" }));
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": format!("Batch Processing {} Line-safe Chunks...", chunk_data.len()), "spinner": "🚀" }));
             
             gen.clear_kv_cache();
             
             let chunk_len = 256;
-            let b_sz = chunks.len();
+            let b_sz = chunk_data.len();
             
-            // [FIX] Create a correctly padded buffer for the batch
+            // [FIX] 조각별로 실제 길이를 복사하고 나머지는 패딩(0)
             let mut batched_ids = vec![0u32; b_sz * chunk_len];
-            for (i, (_, ids)) in chunks.iter().enumerate() {
+            for (i, ids) in chunk_data.iter().enumerate() {
                 let len = ids.len().min(chunk_len);
                 batched_ids[i * chunk_len .. i * chunk_len + len].copy_from_slice(&ids[..len]);
             }
             
             let ids_t = Tensor::from_vec(batched_ids, (b_sz, chunk_len), &gen.text_device)?;
-            
-            // [ROPE-BATCH-FIX] Qwen3-VL mRoPE expects [3, Batch, Seq]
             let pos_ids = Tensor::arange(0u32, chunk_len as u32, &gen.text_device)?
                 .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, chunk_len))?;
 
-            // [CRITICAL] 배치 전체를 한 번의 forward로 실행! (이게 SeqLen: 256이 되는 포인트)
             gen.qwen3_vl.forward(&ids_t, None, None, None, None, Some(&pos_ids), 0, chunk_len, Some(task.id.clone()), Some("reference".to_string())).await?;
             
-            // [SCATTER] 96개 워커로 병렬 저장 트리거
+            // [SCATTER] 병렬 저장 트리거
             gen.force_flush_all_active_blocks(&task.id, Some("reference")).await?;
-            gen.clear_kv_cache(); // 배치 연산 후 메모리 소각
+            gen.clear_kv_cache();
 
-            for (c_idx, _) in chunks {
-                stitch_targets.push((format!("{}_c{}", task.id, c_idx), chunk_len));
+            // [STITCH-METADATA] 각 조각의 실제 유효 길이를 장부용 데이터로 기록
+            for (c_idx, ids) in chunk_data.iter().enumerate() {
+                stitch_targets.push((format!("{}_c{}", task.id, c_idx), ids.len()));
             }
         }
     }

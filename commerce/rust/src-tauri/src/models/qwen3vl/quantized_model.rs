@@ -2470,9 +2470,10 @@ impl QuantizedQwen3VLTextModel {
                 }
         
                 for layer_idx in 0..total_layers {
-            if layer_idx % 7 == 0 || layer_idx == total_layers - 1 {
+            if seq_len > 1 && (layer_idx % 7 == 0 || layer_idx == total_layers - 1) {
                 println!("[ENGINE] Running Layer {}/{}", layer_idx + 1, total_layers);
             }
+
             let deepstack_embed = deepstack_visual_embeds.as_ref().and_then(|v| v.get(layer_idx));
             xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks, session_id.clone(), kv_name.clone(), self.baking_only).await?;
         }
