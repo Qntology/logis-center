@@ -889,8 +889,10 @@ impl QuantizedQwen3VLTextAttention {
             };
 
             if let (Some(k), Some(v)) = (k_opt, v_opt) {
-                let k_cpu = k.to_device(&Device::Cpu)?;
-                let v_cpu = v.to_device(&Device::Cpu)?;
+                // [VRAM-DIRECT-QUEUE] RAM 이동을 메인 스레드에서 하지 않고 VRAM 텐서를 그대로 워커에게 토스
+                // 이를 통해 메인 스레드는 지체 없이 다음 레이어 연산으로 넘어갑니다.
+                let k_vram = k.clone();
+                let v_vram = v.clone();
                 
                 let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
                 let last_part = kv_name_raw.split('/').last().unwrap_or("text");
@@ -923,8 +925,9 @@ impl QuantizedQwen3VLTextAttention {
                             k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
                             v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
                             k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
-                            raw_k: Some(k_cpu),
-                            raw_v: Some(v_cpu),
+                            // [NEW] 워커가 직접 VRAM에서 가져가도록 텐서 전달
+                            raw_k: Some(k_vram),
+                            raw_v: Some(v_vram),
                         };
 
                         let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
@@ -2057,27 +2060,23 @@ impl QuantizedQwen3VLTextModel {
             if !already_loaded { self.reload_all_layers()?; }
         }
 
-        // [MEMORY-OPT] Prefill 시 현재 레이어 로드 (이전 단계에서 prefetch 안 된 경우 대비)
+        // [MEMORY-OPT] Prefill 시 현재 레이어 로드
         if !is_decoding {
             self.reload_layer(layer_idx)?;
         }
 
         // [STEP 1] 현재 레이어를 GPU로 이동
         let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
-        let current_device = self.layers[layer_idx].device();
         
-        if !current_device.same_device(&target_device) {
+        if !self.layers[layer_idx].device().same_device(&target_device) {
             self.layers[layer_idx].to_device(&target_device)?;
-            // GPU로 가중치가 이동하는 즉시 RAM은 자동으로 해제됨 (QTensor -> Tensor 변환)
+            // GPU 이동 후 RAM 가중치는 자동으로 drop됨
             if !is_decoding { let _ = target_device.synchronize(); }
         }
 
-        // [MEMORY-OPT] [PREFETCH] 다음 레이어를 RAM으로 미리 로드 시작
-        // 현재 레이어가 GPU에서 연산하는 동안 CPU는 미리 다음 데이터를 읽어옵니다.
+        // [MEMORY-OPT] [PREFETCH] 다음 레이어를 RAM으로 미리 로드
         if !is_decoding && layer_idx + 1 < self.layers.len() {
-            let next_layer_idx = layer_idx + 1;
-            // 비동기로 하거나 단순히 forward 전 호출 (mmap 읽기는 빠르므로)
-            let _ = self.reload_layer(next_layer_idx);
+            let _ = self.reload_layer(layer_idx + 1);
         }
 
         // [STEP 3] GPU 연산 실행
@@ -2089,10 +2088,17 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [STEP 4] 자원 반납
-        if target_device.is_cuda() { let _ = target_device.synchronize(); }
-        
-        // KV 캐시 대피
+        // [MEMORY-OPT] [IMMEDIATE-PURGE] 연산 직후 가중치 즉시 소각
+        // KV 대피(IO)는 시간이 걸릴 수 있으므로, 그 전에 가중치를 먼저 지워서 VRAM 공간 확보
+        if !is_decoding {
+            self.layers[layer_idx].clear();
+            if target_device.is_cuda() { 
+                let _ = target_device.synchronize(); // GPU 메모리 해제 확정
+            }
+            println!("[MEMORY-OPT] Layer {} Weights Purged. (RAM/VRAM cleared)", layer_idx);
+        }
+
+        // [STEP 4] 자원 반납 및 KV 대피
         let sid_opt = self.active_session_id.clone();
         if let Some(sid) = sid_opt {
             if !self.baking_only {
@@ -2100,11 +2106,7 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
-        // [MEMORY-OPT] 연산 종료 후 VRAM 가중치 즉시 파기
-        if !is_decoding {
-            self.layers[layer_idx].clear();
-            println!("[MEMORY-OPT] Layer {} Complete -> Cleared. Time: {:.2}s", layer_idx, start_layer_time.elapsed().as_secs_f32());
-        } else {
+        if is_decoding {
             let is_small_model = self.layers.len() <= 36;
             if !is_small_model { self.layers[layer_idx].clear(); }
         }

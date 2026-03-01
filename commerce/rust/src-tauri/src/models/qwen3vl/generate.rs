@@ -313,35 +313,37 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         // [BACK-COMPRESSION] 압축 및 직렬화 작업 자체를 백그라운드로 완전히 분리
                         tokio::spawn(async move {
                             // [FIX] Convert raw tensors to BF16 (or F32 fallback)
+                            // [CRITICAL] 텐서가 GPU에 있는 경우, to_device는 해당 스레드의 컨텍스트를 필요로 함
                             if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
-                                let k_bf16 = rk.to_dtype(DType::BF16).unwrap_or(rk);
-                                let v_bf16 = rv.to_dtype(DType::BF16).unwrap_or(rv);
-                                src.k_data = k_bf16;
-                                src.v_data = v_bf16;
+                                // 워커 스레드에서 안전하게 CPU로 이동
+                                // [STABILITY] to_device 호출 시 장치 컨텍스트가 자동으로 보장되지 않을 수 있으므로
+                                // candle-core의 Device 스코프 내에서 실행되도록 유도 (필요시)
+                                let k_cpu = rk.to_device(&Device::Cpu).unwrap_or(rk);
+                                let v_cpu = rv.to_device(&Device::Cpu).unwrap_or(rv);
+                                
+                                src.k_data = k_cpu.to_dtype(DType::BF16).unwrap_or(k_cpu);
+                                src.v_data = v_cpu.to_dtype(DType::BF16).unwrap_or(v_cpu);
                             }
 
                             let mut map = std::collections::HashMap::new();
                             let prefix = format!("b{}_l{}_", off, act_l);
-                            map.insert(format!("{}k_data", prefix), src.k_data);
-                            map.insert(format!("{}v_data", prefix), src.v_data);
-                            map.insert(format!("{}k_shape", prefix), src.k_shape);
+                            map.insert(format!("{}k_data", prefix), src.k_data.clone());
+                            map.insert(format!("{}v_data", prefix), src.v_data.clone());
+                            map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
                             
                             let file_path = task_dir.join(format!("l{}.st", act_l));
                             
-                            // [FIX] Centralize write logic: Send tensors to IO worker instead of writing twice
-                            if let Ok(_data) = safetensors::serialize(&map, &None) {
-                                // We send the actual map for serialization in the IO worker
-                                GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-                                let _ = io_tx_nested.send(SaveTask { 
-                                    slot_id: sid, 
-                                    path: file_path.clone(), 
-                                    tensors: map, // Send the actual map!
-                                    is_last: false, 
-                                    block_idx, 
-                                    registry: Some(registry_inner), 
-                                    kv_name: kv_name_inner 
-                                }).await;
-                            }
+                            // [FIX] Send to IO worker after confirming all tensors are on CPU
+                            GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
+                            let _ = io_tx_nested.send(SaveTask { 
+                                slot_id: sid, 
+                                path: file_path.clone(), 
+                                tensors: map, 
+                                is_last: false, 
+                                block_idx, 
+                                registry: Some(registry_inner), 
+                                kv_name: kv_name_inner 
+                            }).await;
                         });
                     }
                 },
