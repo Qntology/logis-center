@@ -10,15 +10,15 @@ pub enum PugMode {
 
 pub fn sanitize_llm_input(text: &str) -> String {
     // 1. Filter out non-printable and non-ASCII/Korean characters if they are broken
+    // But we want to keep Korean. Let's filter out known problematic control codes.
     let cleaned: String = text.chars()
         .filter(|c| {
             let u = *c as u32;
-            // Keep: standard ASCII, Korean, Special Quotes (“ ”), Common Punctuation
+            // Keep: standard ASCII, Korean Hangul Jamo/Syllables, Common Punctuation
             (u >= 32 && u <= 126) || // Basic ASCII
             (u >= 0xAC00 && u <= 0xD7A3) || // Hangul Syllables
             (u >= 0x1100 && u <= 0x11FF) || // Hangul Jamo
             (u >= 0x3130 && u <= 0x318F) || // Hangul Compatibility Jamo
-            u == 0x201C || u == 0x201D ||   // Left and Right Double Quotes (“ ”)
             u == 10 || u == 13 || u == 9     // \n, \r, \t
         })
         .collect();
@@ -205,13 +205,13 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
 
             // ID 속성 처리
             if let Some(id) = element.id() {
-                other_attributes.push(format!("id=“{}”", id));
+                other_attributes.push(format!("id=\"{}\"", id));
             }
 
-            // Class 속성 처리 [class=“class1 class2”]
+            // Class 속성 처리 [class="class1 class2"]
             if let Some(classes) = element.attr("class") {
                 if !classes.is_empty() {
-                    other_attributes.push(format!("class=“{}”", classes));
+                    other_attributes.push(format!("class=\"{}\"", classes));
                 }
             }
 
@@ -230,7 +230,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                         other_attributes.push(name.to_string());
                     } else if !value.is_empty() {
                         let safe_value = value.replace("\"", "'");
-                        other_attributes.push(format!("{}=“{}”", name, safe_value));
+                        other_attributes.push(format!("{}=\"{}\"", name, safe_value));
                     }
                 }
             }
@@ -264,15 +264,8 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 break;
             }
 
-            // 태그 이름 결정 (div이고 속성이 있으면 태그명 생략)
-            let display_tag = if tag_name == "div" && !attributes_string.is_empty() {
-                ""
-            } else {
-                &tag_name
-            };
-
             // 태그 이름과 변환된 속성 문자열을 함께 추가 (원래 노드 기준)
-            output.push_str(&format!("{}{}{}\n", indent, display_tag, attributes_string));
+            output.push_str(&format!("{}{}{}\n", indent, tag_name, attributes_string));
 
             // textarea의 값 처리
             if tag_name == "textarea" {
@@ -337,7 +330,7 @@ pub fn page_type_prompt() -> String { r###"[TASK]
 Based on the provided Pug template, identify the primary category of this webpage.
 
 [SCHEMA DEFINITIONS]
-- "type": The main category. Must be one of:
+- type: The main category. Must be one of:
   - "order": Order history, order details, checkout success.
   - "goods": Product list, product detail, shopping cart.
   - "tracking": Shipment tracking status, delivery history.
@@ -348,7 +341,7 @@ Based on the provided Pug template, identify the primary category of this webpag
 
 [OUTPUT FORMAT]
 {
-    "type": "..."
+    "type": type
 }"###.to_string() }
 
 pub fn page_selectors_prompt(page_type: &str) -> String {
@@ -357,12 +350,12 @@ The page has been classified as '{TYPE}'.
 Based on the provided Pug template, identify the structural CSS selectors required for data extraction.
 
 [INSTRUCTION]
-Analyze the page structure you have already learned and find the repeating patterns.
+Analyze the page structure you have already learned and find the repeating CSS Selector patterns.
 
 [SCHEMA DEFINITIONS]
-- "item": Common CSS selector for sibling `{TYPE}` items (e.g., `[class=“{TYPE} class”]`). Match recurring patterns and exclude header, footer, ads, and pagination.
-- "node": Common CSS selector for `{TYPE}` items container wrapping (e.g., `[id=“{TYPE} id”]`). Focus on the direct parent of recurring rows/items, excluding header, footer, ads, and pagination.
-- "detail": is a detail page or a detail form. Exclude header, footer, ads, pagination.
+- item: '{TYPE}' based CSS selector for sibling items(e.g., `div[class="className"]`, `tr[class="className"]`, `li[class="className"]`). Match recurring patterns and exclude header, footer, ads, and pagination.
+- node: '{TYPE}' based CSS selector for the main container wrapping all list items(e.g., `div[id="idName"]`, `ul[id="idName"]`, `ol[id="idName"]`, `div[class="className"]`, `ul[class="className"]`, `ol[class="className"]`). Focus on the direct parent of recurring rows/items, excluding header, footer, ads, and pagination.
+- detail: is a detail page or a detail form. Exclude header, footer, ads, pagination.
 
 [OUTPUT FORMAT]
 {
