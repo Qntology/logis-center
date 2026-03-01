@@ -367,7 +367,35 @@ impl LogisModel {
         Ok(())
     }
 
-    // --- [NEW] SSD Bridge Operations ---
+    // --- [NEW] Parallel KV Stitching Operation ---
+    pub async fn stitch_kv_fragments(&self, fragments: Vec<(String, usize)>) -> anyhow::Result<usize> {
+        let generator_arc = self.generator.clone();
+        
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let mut gen_guard = generator_arc.blocking_lock();
+            if let Some(gen) = gen_guard.as_mut() {
+                let mut total_tokens = 0;
+                let mut session_data = Vec::new();
+                
+                for (session_id, length) in fragments {
+                    session_data.push((session_id, 0, length));
+                    total_tokens += length;
+                }
+                
+                // 가상 장부 통합 실행
+                if let Some(registry) = gen.qwen3_vl.get_registry() {
+                    registry.stitch_sessions(session_data)?;
+                    gen.qwen3_vl.set_kv_len(total_tokens);
+                    println!("[STITCH] Successfully merged fragments. New Virtual Context: {} tokens.", total_tokens);
+                    Ok(total_tokens)
+                } else {
+                    Err(anyhow::anyhow!("Stitching not supported for this model variant"))
+                }
+            } else {
+                Err(anyhow::anyhow!("No active generator to stitch fragments into"))
+            }
+        }).await?
+    }
     pub async fn save_kv_snapshot(&self, task_id: &str, kv_name: Option<String>, offset: usize) -> anyhow::Result<String> {
         let generator_arc = self.generator.clone();
         let task_id_str = task_id.to_string();

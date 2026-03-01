@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use candle_core::Tensor;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use crate::store::{VectorStore, Task};
@@ -587,179 +588,109 @@ async fn process_task(
 
     let mut page_type = String::new();
     let mut selector_info: serde_json::Value = json!({});
+    let mut extracted_data: serde_json::Value = json!({});
 
     // ==================================================================================
-    // [ULTRA-OPTIMIZED PIPELINE]
-    // Step 1: 0.6B Bakes [PUG + Classification Task] -> Save SNAPSHOT_A
-    // Step 2: 0.6B Loads SNAPSHOT_A -> Instant Generation
-    // Step 3: 0.6B Bakes [PUG + Selector Task] -> Save SNAPSHOT_B
-    // Step 4: 0.6B Loads SNAPSHOT_B -> Instant Generation
-    // ...
+    // [REFINED JIT-INSTRUCTION PIPELINE]
+    // 1. Bake massive PUG content in parallel (256-token chunks) to SSD.
+    // 2. Load PUG KV and prefill instructions on-the-fly for each step.
     // ==================================================================================
 
-    // --- STEP A: CLASSIFICATION (Disk Bridge Relay) ---
+    // --- STEP 1: Parallel Knowledge Baking (PUG) ---
+    let base_session = format!("{}_base", task.id);
+    log_task_progress(app_handle, &task.id, &json!({ "category": "Base Context", "summary": "Baking PUG in Parallel (256-unit)...", "spinner": "🔥" }));
+
+    // 1.1 Tokenize and Split
+    let full_ids = {
+        let gen_guard = model.generator.lock().await;
+        gen_guard.as_ref().unwrap().tokenizer.text_encode_vec(light_pug.clone(), false)?
+    };
+    let chunk_size = 256;
+    let chunks: Vec<_> = full_ids.chunks(chunk_size).enumerate().collect();
+    let mut stitch_targets = Vec::new();
+
+    // 1.2 Batched Parallel Bake (Ultra-Fast)
     {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] Starting DISK BRIDGE RELAY (0.6B -> Disk -> 0.6B)");
-        
-        // [NEW] Log step A start for UI recovery
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
-
-        let type_prompt = parsing::page_type_prompt();
-        let pug_content = light_pug.clone();
-        
-        // [REFINED-PROMPT] Place specific instructions at the end for better compliance.
-        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] Identify the page type.\n\n[INSTRUCTION]\n{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, type_prompt);
-        let snapshot_id = format!("{}_step_a", task.id);
-        
-        // [CHECKPOINT] Check if Step A snapshot already exists (Resume from OOM)
-        let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
-        let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
-
-        if !has_snapshot {
-            // 1. [0.6B] Bake FULL Templated Prompt
-            println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
+        let mut gen_m = model.generator.lock().await;
+        if let Some(gen) = gen_m.as_mut() {
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": format!("Batch Processing {} Chunks on GPU...", chunks.len()), "spinner": "🚀" }));
             
-            let model_clone = model.clone();
-            let question_clone = task_question.clone();
-            let token_clone = cancellation_token.clone();
-            let session_clone = Some(snapshot_id.clone());
+            gen.truncate_kv_cache(0)?;
+            
+            // 모든 조각을 하나의 배치로 결합 [N, 256]
+            let mut batched_ids = Vec::new();
+            for (_, ids) in &chunks { batched_ids.extend_from_slice(ids); }
+            let b_sz = chunks.len();
+            let chunk_len = 256;
+            
+            let ids_t = Tensor::from_vec(batched_ids, (b_sz, chunk_len), &gen.text_device)?;
+            
+            // [ROPE-BATCH-FIX] 각 배치 행에 대해 독립적인 0~255 오프셋 부여
+            // 이렇게 하면 각 조각이 서로를 보지 않고(Independent) 병렬로 구워집니다.
+            let pos_ids = Tensor::arange(0u32, chunk_len as u32, &gen.text_device)?
+                .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, chunk_len))?;
 
-            {
-                let mut gen_guard = model_clone.generator.lock().await;
-                if let Some(worker) = gen_guard.as_mut() {
-                    worker.clear_kv_cache();
-                    let params = crate::openai_types::ChatCompletionParameters {
-                        messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
-                            name: None,
-                        })],
-                        ..Default::default()
-                    };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name.clone()).await?;
-                }
+            // 단 한 번의 연산으로 N개의 오프셋 동시 생성!
+            gen.qwen3_vl.forward(&ids_t, None, None, None, None, Some(&pos_ids), 0, chunk_len, Some(task.id.clone()), Some("reference".to_string())).await?;
+            
+            // 연산 결과(배치)를 워커들에게 동시에 뿌리기
+            gen.force_flush_all_active_blocks(&task.id, Some("reference")).await?;
+            
+            for (c_idx, _) in chunks {
+                stitch_targets.push((format!("{}_c{}", task.id, c_idx), chunk_len));
             }
-        } else {
-            println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
-        }
-
-        // 2. [0.6B] Load Snapshot & Generate
-        {
-            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
-
-            let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
-                    name: None,
-                })],
-                model: "qwen3vl".to_string(), 
-                max_tokens: Some(32), // Increased from 128 to 512
-                temperature: Some(0.1),
-                ..Default::default()
-            };
-
-            if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 0.6B Step A: Asking classification question...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
-                println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
-                
-                let _ = data_manager.offload(&res, "step_a_res");
-                let type_info = parsing::parse_json_from_llm(&res); 
-                page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
-                if page_type.is_empty() {
-                    println!("[Scheduler] Warning: LLM returned empty type. Using task type fallback.");
-                    page_type = match task.r#type.as_str() {
-                        "image_extraction" => "tracking".to_string(),
-                        _ => "unknown".to_string(),
-                    };
-                }
-                println!("[Scheduler] Classified as: {}", page_type);
-            }
-        }
-        
-        if page_type.is_empty() || page_type == "unknown" { 
-            model.deep_purge_resources().await;
-            return Ok(()); 
         }
     }
-                        
-    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+    // [WAIT] 모든 워커가 SSD 저장을 마칠 때까지 대기
+    crate::models::qwen3vl::generate::wait_for_global_io().await;
 
-    // [CRITICAL-CLEANUP] Clear the cache from Step A before Step B (git e8260c5 parity)
-    model.deep_purge_resources().await;
-    wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
+    // --- STEP 2: Instant Inference with On-the-fly Instructions ---
+    
+    // [LOAD-BASE] 
+    model.stitch_kv_fragments(stitch_targets).await?;
+    let base_len = model.generator.lock().await.as_ref().map(|g| g.qwen3_vl.get_kv_len()).unwrap_or(0);
 
-    // --- STEP B: SELECTORS (Disk Bridge Relay) ---
-    {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] Starting DISK BRIDGE RELAY for Selectors");
-        
-        // [NEW] Log step B start
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Identifying data elements...", "spinner": "⠋" }));
+    // 2.1 Classification (JIT Prefill)
+    log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Identifying type...", "spinner": "🔍" }));
+    let res_class = model.chat(
+        &parsing::page_type_prompt(), 
+        "Return JSON only.", 
+        Some(cancellation_token.clone()), 
+        None, // Use already stitched context
+        None
+    ).await?;
+    let type_info = parsing::parse_json_from_llm(&res_class);
+    page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
 
-        let selector_prompt = parsing::page_selectors_prompt(&page_type); 
-        let pug_content = light_pug.clone();
-        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, selector_prompt);
-        let snapshot_id = format!("{}_step_b", task.id);
+    // [RESET-CONTEXT] 분류 프롬프트 제거하고 다시 PUG 끝으로 이동
+    if let Some(gen) = model.generator.lock().await.as_mut() { gen.truncate_kv_cache(base_len)?; }
 
-        // [CHECKPOINT] Check if Step B snapshot already exists
-        let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
-        let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
+    // 2.2 Selectors (JIT Prefill)
+    log_task_progress(app_handle, &task.id, &json!({ "category": "Selectors", "summary": "Locating anchors...", "spinner": "🎯" }));
+    let res_select = model.chat(
+        &parsing::page_selectors_prompt(&page_type), 
+        "Return JSON only.", 
+        Some(cancellation_token.clone()), 
+        None, 
+        None
+    ).await?;
+    selector_info = parsing::parse_json_from_llm(&res_select);
 
-        if !has_snapshot {
-            // 1. [0.6B] Bake Full Context
-            println!("[Scheduler] Phase 1: Baking Selector Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
-            let model_clone = model.clone();
-            let question_clone = task_question.clone();
-            let token_clone = cancellation_token.clone();
-            let session_clone = Some(snapshot_id.clone());
-            let kv_name_clone = kv_name.clone();
+    // [RESET-CONTEXT] 셀렉터 프롬프트 제거
+    if let Some(gen) = model.generator.lock().await.as_mut() { gen.truncate_kv_cache(base_len)?; }
 
-            {
-                let mut gen_guard = model_clone.generator.lock().await;
-                if let Some(worker) = gen_guard.as_mut() {
-                    worker.clear_kv_cache();
-                    let params = crate::openai_types::ChatCompletionParameters {
-                        messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
-                            name: None,
-                        })],
-                        ..Default::default()
-                    };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
-                }
-            }
-        } else {
-            println!("[Scheduler] Found existing snapshot for Step B. Skipping 0.6B baking.");
-        }
-
-        // 2. [Small] Load & Generate
-        {
-            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
-
-            let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
-                    name: None,
-                })],
-                model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
-                ..Default::default()
-            };
-
-            if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] Small Step B: Asking selector question...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
-                println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
-
-                // [DEBUG] AI 응답 저장
-                let _ = data_manager.offload(&res, "step_b_res");
-
-                selector_info = parsing::parse_json_from_llm(&res);
-                println!("[Scheduler] Selectors Identified.");
-            }
-        }
+    // --- STEP 3: Detail Extraction (JIT Prefill) ---
+    if selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false) {
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Extracting details...", "spinner": "⠋" }));
+        let extraction_instruction = parsing::item2json(&page_type, &url, language);
+        let res_detail = model.chat(
+            &extraction_instruction, 
+            "Return valid JSON.", 
+            Some(cancellation_token.clone()), 
+            None, 
+            None
+        ).await?;
+        extracted_data = parsing::parse_json_from_llm(&res_detail);
     }
 
     // [INTERMEDIATE PARITY LOGIC] Save Page Info
@@ -804,8 +735,6 @@ async fn process_task(
         format!("{} {}", node_selector, item_selector) // Simplified for brevity
     } else if !item_selector.is_empty() { item_selector.to_string() } else { node_selector.to_string() };
     
-    let mut extracted_data = json!({});
-
     // --- PHASE 2 Continue: Detail Extraction (If needed) ---
     if !is_detail {
         // [LIST MODE] Direct DOM Extraction
@@ -848,68 +777,79 @@ async fn process_task(
         if !content_pug.trim().is_empty() {
             let extraction_instruction = parsing::item2json(&page_type, &url, language);
             let pug_content = content_pug.clone();
-            let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, extraction_instruction);
-            let snapshot_id = format!("{}_detail", task.id);
+            
+            // ==================================================================================
+            // [SPLIT-PARALLEL BAKING FOR DETAILS]
+            // ==================================================================================
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": "Splitting & Baking Content in Parallel...", "spinner": "⚡" }));
 
-            // [CHECKPOINT] Check if Detail snapshot already exists
-            let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
-            let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
+            // 1. 토큰화 및 256 단위 분할
+            let full_ids = {
+                let gen_guard = model.generator.lock().await;
+                gen_guard.as_ref().unwrap().tokenizer.text_encode_vec(pug_content, false)?
+            };
+            let chunk_size = 256;
+            let chunks: Vec<_> = full_ids.chunks(chunk_size).enumerate().collect();
+            let mut chunk_results = Vec::new();
 
-            if !has_snapshot {
-                // 1. [0.6B] Bake Detail Context
-                println!("[Scheduler] Phase 1: Baking Detail Context with 0.6B...");
-                log_task_progress(app_handle, &task.id, &json!({ "category": "Context Baking", "summary": "Baking content with 0.6B model..." }));
+            // 2. 병렬 베이킹 실행 (GPU 파이프라인 활용)
+            let mut bake_tasks = Vec::new();
+            for (c_idx, ids) in chunks {
+                let model_c = model.clone();
+                let chunk_session = format!("{}_c{}", task.id, c_idx);
+                let ids_vec = ids.to_vec();
                 
-                model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
-                let model_clone = model.clone();
-                let question_clone = task_question.clone();
-                let token_clone = cancellation_token.clone();
-                let session_clone = Some(snapshot_id.clone());
-
-                {
-                    let mut gen_guard = model_clone.generator.lock().await;
-                    if let Some(worker) = gen_guard.as_mut() {
-                        worker.clear_kv_cache();
-                        let params = crate::openai_types::ChatCompletionParameters {
-                            messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
-                                content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
-                                name: None,
-                            })],
-                            ..Default::default()
-                        };
-                        worker.prefill_only(params, Some(token_clone), session_clone, None, Some("reference".to_string())).await?;
+                bake_tasks.push(async move {
+                    let mut gen_m = model_c.generator.lock().await;
+                    let mut actual_len = 0;
+                    if let Some(gen) = gen_m.as_mut() {
+                        // 각 청크는 독립된 0번 오프셋에서 시작하도록 truncate
+                        gen.truncate_kv_cache(0)?; 
+                        let ids_tensor = Tensor::from_vec(ids_vec.clone(), (1, ids_vec.len()), &gen.text_device)?;
+                        gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, None, 0, ids_vec.len(), Some(chunk_session.clone()), Some("reference".to_string())).await?;
+                        gen.force_flush_all_active_blocks(&chunk_session, Some("reference")).await?;
+                        actual_len = ids_vec.len();
                     }
-                }
-            } else {
-                println!("[Scheduler] Found existing snapshot for Detail Extraction. Skipping 0.6B baking.");
+                    Ok::<(String, usize), anyhow::Error>((chunk_session, actual_len))
+                });
             }
 
-            // 2. [Small] Load & Generate
-            {
-                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+            // 모든 청크를 병렬로 굽기 (워커 세마포어가 처리량 조절)
+            let results = futures::future::join_all(bake_tasks).await;
+            for res in results { chunk_results.push(res?); }
+            chunk_results.sort_by_key(|(name, _)| {
+                name.split("_c").last().unwrap_or("0").parse::<usize>().unwrap_or(0)
+            });
 
-                let params = ChatCompletionParameters {
-                    messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                        content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
-                        name: None,
-                    })],
-                    model: "qwen3vl".to_string(), max_tokens: Some(256), temperature: Some(0.1),
-                    ..Default::default()
-                };
+            // 3. 추출 질문(Instruction) 전용 청크 굽기
+            let snapshot_inst = format!("{}_inst", task.id);
+            let inst_len = {
+                let mut gen_m = model.generator.lock().await;
+                if let Some(gen) = gen_m.as_mut() {
+                    gen.truncate_kv_cache(0)?;
+                    let inst_params = ChatCompletionParameters {
+                        messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                            content: ChatCompletionRequestUserMessageContent::Text(format!("\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY.", extraction_instruction)),
+                            name: None,
+                        })], ..Default::default()
+                    };
+                    gen.prefill_only(inst_params, Some(cancellation_token.clone()), Some(snapshot_inst.clone()), None, Some("reference".to_string())).await?
+                } else { 0 }
+            };
 
-                // 3. Small Instant Inference
-                if let Some(gen) = model.generator.lock().await.as_mut() {
-                    println!("[Scheduler] Small Step C: Asking extraction question...");
-                    log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Small Inference..." }));
-                    
-                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), Some("inference".to_string())).await?;
-                    println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
+            // 4. [STITCH-ALL] 모든 조각 이어붙이기
+            // [Base] + [Chunk0] + [Chunk1] + ... + [Instruction]
+            let mut stitch_targets = vec![(base_session.clone(), base_len)];
+            for (c_name, c_len) in chunk_results { stitch_targets.push((c_name, c_len)); }
+            stitch_targets.push((snapshot_inst, inst_len));
 
-                    // [DEBUG] AI 응답 저장
-                    let _ = data_manager.offload(&res, "step_c_res");
+            model.stitch_kv_fragments(stitch_targets).await?;
 
-                    extracted_data = parsing::parse_json_from_llm(&res);
-                }
+            // 5. 즉시 결과 생성
+            if let Some(gen) = model.generator.lock().await.as_mut() {
+                println!("[Scheduler] Virtual context assembled. Starting instant extraction...");
+                let res = gen.generate(ChatCompletionParameters::default(), Some(cancellation_token.clone()), None, None).await?;
+                extracted_data = parsing::parse_json_from_llm(&res);
             }
         }
     }

@@ -87,7 +87,7 @@ impl SlotManager {
 
 pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub static SLOT_MANAGER_DATA: Lazy<(SlotManager, Mutex<Option<mpsc::Receiver<SlotRequest>>>)> = Lazy::new(|| {
-    let (sm, rx) = SlotManager::new(128); (sm, Mutex::new(Some(rx)))
+    let (sm, rx) = SlotManager::new(512); (sm, Mutex::new(Some(rx)))
 });
 pub static SLOT_MANAGER: Lazy<&SlotManager> = Lazy::new(|| &SLOT_MANAGER_DATA.0);
 
@@ -188,7 +188,7 @@ pub async fn get_load_worker() -> Result<mpsc::Sender<SlotTask>> { LOAD_TX.get()
 pub async fn wait_for_global_io() { while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { tokio::time::sleep(std::time::Duration::from_millis(10)).await; } }
 
 pub fn init_bake_worker() {
-    let (btx, brx) = mpsc::channel(64); let (ltx, lrx) = mpsc::channel(64);
+    let (btx, brx) = mpsc::channel(256); let (ltx, lrx) = mpsc::channel(256);
     let _ = BAKE_TX.set(btx); let _ = LOAD_TX.set(ltx);
     if let Some(rx) = SLOT_MANAGER_DATA.1.lock().unwrap().take() { tauri::async_runtime::spawn(async move { spawn_slot_dispatcher(rx).await; }); }
     tauri::async_runtime::spawn(async move { spawn_slot_worker(brx); }); 
@@ -199,7 +199,7 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {
         match req {
             SlotRequest::Acquire { total_tokens: _total_tokens, tx } => {
-                let max_writes = 64; let mut found = None;
+                let max_writes = 128; let mut found = None;
                 while found.is_none() {
                     if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
                         for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
@@ -233,9 +233,9 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
 }
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
-    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(100); 
+    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(256); 
     tokio::spawn(async move {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(48)); 
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(96)); 
         while let Some(task) = io_rx.recv().await {
             let sem = semaphore.clone();
             let (tp, ts, reg, b_idx, sid, is_last, kv_n) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone());
@@ -326,6 +326,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             }
 
                             let mut map = std::collections::HashMap::new();
+                            // [FIX] 물리적 SSD 오프셋을 접두어로 사용 (b0, b256 등 실제 폴더명과 일치시킴)
                             let prefix = format!("b{}_l{}_", off, act_l);
                             map.insert(format!("{}k_data", prefix), src.k_data.clone());
                             map.insert(format!("{}v_data", prefix), src.v_data.clone());
@@ -410,6 +411,30 @@ impl Drop for ReadSlotGuard { fn drop(&mut self) { if self.active { let sid = se
 pub enum ModelVariant { Standard(Qwen3VLModel), QuantizedVL(QuantizedQwen3VLModel), QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel) }
 
 impl ModelVariant {
+    pub fn get_kv_len(&self) -> usize {
+        match self {
+            Self::QuantizedVL(m) => m.language_model.current_kv_len,
+            Self::QuantizedText(m) => m.language_model.current_kv_len,
+            _ => 0,
+        }
+    }
+
+    pub fn set_kv_len(&mut self, len: usize) {
+        match self {
+            Self::QuantizedVL(m) => m.language_model.current_kv_len = len,
+            Self::QuantizedText(m) => m.language_model.current_kv_len = len,
+            _ => {}
+        }
+    }
+
+    pub fn get_registry(&self) -> Option<KVRegistry> {
+        match self {
+            Self::QuantizedVL(m) => Some(m.language_model.registry.clone()),
+            Self::QuantizedText(m) => Some(m.language_model.registry.clone()),
+            _ => None,
+        }
+    }
+
     pub async fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
         match self {
             Self::Standard(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),

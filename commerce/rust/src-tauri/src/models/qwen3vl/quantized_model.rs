@@ -233,7 +233,6 @@ fn default_bitkv_cache() -> Arc<std::sync::RwLock<Vec<Option<BitKVMetadata>>>> {
     Arc::new(std::sync::RwLock::new(vec![None; 28]))
 }
 
-// [NEW] 중앙 집중식 KV 목차의 각 항목 (별도 고정 슬롯 관리용)
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RegistryEntry {
     pub location: Vec<KVLocation>, // [Layer Index] -> Location
@@ -241,11 +240,12 @@ pub struct RegistryEntry {
     pub token_start: usize,
     pub token_len: usize,
     pub ssd_path: Option<std::path::PathBuf>,
+    pub ssd_block_offset: usize, // [NEW] 실제 물리적 SSD 폴더명 오프셋
     pub hidden_states_path: Vec<Option<std::path::PathBuf>>, // [Layer Index] -> SSD Path for Output
     #[serde(skip)]
-    pub is_dirty: Vec<bool>, // [NEW] Per-layer dirty flag to prevent redundant SSD backup tasks
+    pub is_dirty: Vec<bool>, 
     #[serde(skip, default = "std::time::Instant::now")]
-    pub last_accessed: std::time::Instant, // LRU 순위 결정을 위한 접근 시각
+    pub last_accessed: std::time::Instant, 
     #[serde(skip, default = "default_bitkv_cache")]
     pub bitkv_cache: Arc<std::sync::RwLock<Vec<Option<BitKVMetadata>>>>,
 }
@@ -258,6 +258,7 @@ impl RegistryEntry {
             location: vec![KVLocation::SSD; num_layers],
             slot_ids: vec![None; num_layers],
             ssd_path: None,
+            ssd_block_offset: token_start,
             hidden_states_path: vec![None; num_layers],
             is_dirty: vec![true; num_layers],
             last_accessed: std::time::Instant::now(),
@@ -274,16 +275,42 @@ pub struct KVRegistry {
 
 impl KVRegistry {
     pub fn new() -> Self {
-        // [FIX] 장부를 128개 미리 할당하되, 실제 데이터 길이는 0으로 초기화합니다.
-        // 이를 통해 RoPE 오프셋이 32512로 점프하는 대참사를 막습니다.
-        let mut entries = Vec::with_capacity(128);
-        for i in 0..128 {
+        // [FIX] 장부를 512개 미리 할당 (약 13만 토큰 대응)
+        let mut entries = Vec::with_capacity(512);
+        for i in 0..512 {
             let entry = RegistryEntry::new(i * 256, 0, 28);
             entries.push(entry);
         }
         Self {
             entries: Arc::new(std::sync::RwLock::new(entries)),
         }
+    }
+
+    /// [PARALLEL-STITCHING] 여러 세션의 KV 파편들을 하나로 이어붙여 가상 문맥을 생성합니다.
+    /// sessions: Vec<(세션ID, SSD_오프셋_시작, 토큰_길이)>
+    pub fn stitch_sessions(&self, sessions: Vec<(String, usize, usize)>) -> Result<()> {
+        let mut entries = self.entries.write().unwrap();
+        let mut current_block_idx = 0;
+
+        for (session_id, _ssd_offset, length_tokens) in sessions {
+            let num_blocks = (length_tokens + 255) / 256;
+            let kv_dir = crate::utils::paths::get_kv_dir(None).join(&session_id);
+
+            for b_idx in 0..num_blocks {
+                if current_block_idx >= entries.len() { break; }
+                
+                let entry = &mut entries[current_block_idx];
+                entry.ssd_path = Some(kv_dir.clone());
+                entry.token_len = if b_idx == num_blocks - 1 { length_tokens % 256 } else { 256 };
+                if entry.token_len == 0 { entry.token_len = 256; }
+                
+                // 모든 레이어가 SSD에 있는 것으로 표시
+                for loc in &mut entry.location { *loc = KVLocation::SSD; }
+                current_block_idx += 1;
+            }
+        }
+        println!("[KV-STITCH] Merged sessions into virtual context (Total Blocks: {}).", current_block_idx);
+        Ok(())
     }
 
     pub fn save_to_file(&self, path: &std::path::Path) -> Result<()> {
@@ -875,7 +902,7 @@ impl QuantizedQwen3VLTextAttention {
             }
 
             let block = self.kv_blocks[idx].clone();
-            let (k_opt, v_opt, off, b_idx, b_len) = {
+            let (k_opt, v_opt, off, _b_idx, b_len) = {
                 let mut inner = block.inner.write().unwrap();
                 let snapshot = (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len);
                 
@@ -889,60 +916,71 @@ impl QuantizedQwen3VLTextAttention {
             };
 
             if let (Some(k), Some(v)) = (k_opt, v_opt) {
-                // [VRAM-DIRECT-QUEUE] RAM 이동을 메인 스레드에서 하지 않고 VRAM 텐서를 그대로 워커에게 토스
-                // 이를 통해 메인 스레드는 지체 없이 다음 레이어 연산으로 넘어갑니다.
-                let k_vram = k.clone();
-                let v_vram = v.clone();
+                let b_sz = k.dim(0)?;
                 
-                let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
-                let last_part = kv_name_raw.split('/').last().unwrap_or("text");
-                let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { 
-                    "text".to_string() 
-                } else { 
-                    last_part.to_string() 
-                };
-                
-                let session_id_owned = session_id.to_string();
-                let registry_clone = self.registry.clone();
-                let layer_idx = self.layer_idx;
-                let num_kv_h = self.num_key_value_heads;
-                let h_d = self.head_dim;
+                for b in 0..b_sz {
+                    // [BATCH-SCATTER] 배치를 개별 오프셋 조각으로 분리
+                    let k_vram = if b_sz > 1 { k.i(b)?.unsqueeze(0)? } else { k.clone() };
+                    let v_vram = if b_sz > 1 { v.i(b)?.unsqueeze(0)? } else { v.clone() };
+                    
+                    // [BATCH-ALIGN] 배치 모드일 경우 각 세션의 시작(b0)에 저장하여 스티칭을 용이하게 함
+                    let actual_off = if b_sz > 1 { 0 } else { off };
+                    
+                    let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
+                    let last_part = kv_name_raw.split('/').last().unwrap_or("text");
+                    let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { 
+                        "text".to_string() 
+                    } else { 
+                        last_part.to_string() 
+                    };
+                    
+                    let session_id_owned = if b_sz > 1 { 
+                        // 배치 모드일 경우 각 배치 아이템에 맞는 세션 ID 부여 (예: task_id_c0, task_id_c1)
+                        format!("{}_c{}", session_id, b) 
+                    } else { 
+                        session_id.to_string() 
+                    };
 
-                tauri::async_runtime::spawn(async move {
-                    if let Some(tx) = BAKE_TX.get() {
-                        let sub_path = if baking_only {
-                            format!("{}/reference/{}", session_id_owned, kv_type)
-                        } else {
-                            format!("{}/inference/{}", session_id_owned, kv_type)
-                        };
+                    let registry_clone = self.registry.clone();
+                    let layer_idx = self.layer_idx;
+                    let num_kv_h = self.num_key_value_heads;
+                    let h_d = self.head_dim;
 
-                        let block_dir = crate::utils::paths::get_kv_dir(None).join(&sub_path).join(format!("b{}", off));
-                        if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(tx) = BAKE_TX.get() {
+                            let sub_path = if baking_only {
+                                format!("{}/reference/{}", session_id_owned, kv_type)
+                            } else {
+                                format!("{}/inference/{}", session_id_owned, kv_type)
+                            };
 
-                        let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
-                        let dump = LayerKVDump {
-                            layer_idx,
-                            k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
-                            v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
-                            k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
-                            // [NEW] 워커가 직접 VRAM에서 가져가도록 텐서 전달
-                            raw_k: Some(k_vram),
-                            raw_v: Some(v_vram),
-                        };
+                            let block_dir = crate::utils::paths::get_kv_dir(None).join(&sub_path).join(format!("b{}", actual_off));
+                            if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
 
-                        let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
-                        let _ = tx.send(SlotTask::Bake(BakeTask {
-                            slot_id: sid,
-                            task_dir: block_dir,
-                            kv_name: Some(sub_path),
-                            offset: off,
-                            layers: vec![dump],
-                            is_relay_baking: baking_only,
-                            block_idx: Some(b_idx),
-                            registry: registry_clone,
-                        })).await;
-                    }
-                });
+                            let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
+                            let dump = LayerKVDump {
+                                layer_idx,
+                                k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
+                                v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
+                                k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
+                                raw_k: Some(k_vram),
+                                raw_v: Some(v_vram),
+                            };
+
+                            let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
+                            let _ = tx.send(SlotTask::Bake(BakeTask {
+                                slot_id: sid,
+                                task_dir: block_dir,
+                                kv_name: Some(sub_path),
+                                offset: actual_off,
+                                layers: vec![dump],
+                                is_relay_baking: baking_only,
+                                block_idx: Some(actual_off / 256),
+                                registry: registry_clone,
+                            })).await;
+                        }
+                    });
+                }
             }
         }
         Ok(())
@@ -1259,6 +1297,7 @@ impl QuantizedQwen3VLTextAttention {
                     token_start: *offset,
                     token_len: b_len,
                     ssd_path: Some(frag_path.parent().unwrap().to_path_buf()),
+                    ssd_block_offset: *offset, // [NEW]
                     hidden_states_path: vec![None; 28],
                     is_dirty: vec![false; 28], 
                     last_accessed: std::time::Instant::now(),
@@ -2050,7 +2089,7 @@ impl QuantizedQwen3VLTextModel {
         kv_name: Option<String>,
         baking_only: bool,
     ) -> Result<Tensor> {
-        let start_layer_time = std::time::Instant::now();
+        let _start_layer_time = std::time::Instant::now();
         let input_token_count = xs.dim(1).unwrap_or(0);
         let is_decoding = input_token_count <= 1;
 
