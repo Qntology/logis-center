@@ -600,10 +600,15 @@ async fn process_task(
     let base_session = format!("{}_base", task.id);
     log_task_progress(app_handle, &task.id, &json!({ "category": "Base Context", "summary": "Baking PUG in Parallel (256-unit)...", "spinner": "🔥" }));
 
+    // [FIX] 텍스트 베이킹 시에는 28개 레이어 전체 연산이 필요합니다. 
+    // Skeleton 방식이므로 baking_only=false로 설정해도 RAM 사용량은 동일하게 낮습니다.
+    model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, None).await?;
+
     // 1.1 Tokenize and Split
     let full_ids = {
         let gen_guard = model.generator.lock().await;
-        gen_guard.as_ref().unwrap().tokenizer.text_encode_vec(light_pug.clone(), false)?
+        let gen = gen_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Generator failed to load"))?;
+        gen.tokenizer.text_encode_vec(light_pug.clone(), false)?
     };
     let chunk_size = 256;
     let chunks: Vec<_> = full_ids.chunks(chunk_size).enumerate().collect();
@@ -613,29 +618,33 @@ async fn process_task(
     {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": format!("Batch Processing {} Chunks on GPU...", chunks.len()), "spinner": "🚀" }));
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": format!("High-speed Parallel Prefill ({} chunks)...", chunks.len()), "spinner": "🚀" }));
             
-            gen.truncate_kv_cache(0)?;
+            gen.clear_kv_cache();
             
-            // 모든 조각을 하나의 배치로 결합 [N, 256]
-            let mut batched_ids = Vec::new();
-            for (_, ids) in &chunks { batched_ids.extend_from_slice(ids); }
-            let b_sz = chunks.len();
             let chunk_len = 256;
+            let b_sz = chunks.len();
+            
+            // [FIX] Create a correctly padded buffer for the batch
+            let mut batched_ids = vec![0u32; b_sz * chunk_len];
+            for (i, (_, ids)) in chunks.iter().enumerate() {
+                let len = ids.len().min(chunk_len);
+                batched_ids[i * chunk_len .. i * chunk_len + len].copy_from_slice(&ids[..len]);
+            }
             
             let ids_t = Tensor::from_vec(batched_ids, (b_sz, chunk_len), &gen.text_device)?;
             
-            // [ROPE-BATCH-FIX] 각 배치 행에 대해 독립적인 0~255 오프셋 부여
-            // 이렇게 하면 각 조각이 서로를 보지 않고(Independent) 병렬로 구워집니다.
+            // [ROPE-BATCH-FIX] Qwen3-VL mRoPE expects [3, Batch, Seq]
             let pos_ids = Tensor::arange(0u32, chunk_len as u32, &gen.text_device)?
                 .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, chunk_len))?;
 
-            // 단 한 번의 연산으로 N개의 오프셋 동시 생성!
+            // [CRITICAL] 배치 전체를 한 번의 forward로 실행! (이게 SeqLen: 256이 되는 포인트)
             gen.qwen3_vl.forward(&ids_t, None, None, None, None, Some(&pos_ids), 0, chunk_len, Some(task.id.clone()), Some("reference".to_string())).await?;
             
-            // 연산 결과(배치)를 워커들에게 동시에 뿌리기
+            // [SCATTER] 96개 워커로 병렬 저장 트리거
             gen.force_flush_all_active_blocks(&task.id, Some("reference")).await?;
-            
+            gen.clear_kv_cache(); // 배치 연산 후 메모리 소각
+
             for (c_idx, _) in chunks {
                 stitch_targets.push((format!("{}_c{}", task.id, c_idx), chunk_len));
             }
@@ -652,44 +661,81 @@ async fn process_task(
 
     // 2.1 Classification (JIT Prefill)
     log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Identifying type...", "spinner": "🔍" }));
-    let res_class = model.chat(
-        &parsing::page_type_prompt(), 
-        "Return JSON only.", 
-        Some(cancellation_token.clone()), 
-        None, // Use already stitched context
-        None
-    ).await?;
+    
+    let res_class = {
+        let mut gen_m = model.generator.lock().await;
+        if let Some(gen) = gen_m.as_mut() {
+            let prompt = parsing::page_type_prompt();
+            gen.prefill_chunk(prompt.clone(), Some(cancellation_token.clone()), None).await?;
+            
+            let params = ChatCompletionParameters {
+                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Text(prompt),
+                    name: None,
+                })],
+                max_tokens: Some(32),
+                temperature: Some(0.1),
+                ..Default::default()
+            };
+            gen.generate(params, Some(cancellation_token.clone()), None, None).await?
+        } else { String::new() }
+    };
+    
     let type_info = parsing::parse_json_from_llm(&res_class);
     page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
 
-    // [RESET-CONTEXT] 분류 프롬프트 제거하고 다시 PUG 끝으로 이동
+    // [RESET-CONTEXT] 
     if let Some(gen) = model.generator.lock().await.as_mut() { gen.truncate_kv_cache(base_len)?; }
 
     // 2.2 Selectors (JIT Prefill)
     log_task_progress(app_handle, &task.id, &json!({ "category": "Selectors", "summary": "Locating anchors...", "spinner": "🎯" }));
-    let res_select = model.chat(
-        &parsing::page_selectors_prompt(&page_type), 
-        "Return JSON only.", 
-        Some(cancellation_token.clone()), 
-        None, 
-        None
-    ).await?;
+    
+    let res_select = {
+        let mut gen_m = model.generator.lock().await;
+        if let Some(gen) = gen_m.as_mut() {
+            let prompt = parsing::page_selectors_prompt(&page_type);
+            gen.prefill_chunk(prompt.clone(), Some(cancellation_token.clone()), None).await?;
+            
+            let params = ChatCompletionParameters {
+                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Text(prompt),
+                    name: None,
+                })],
+                max_tokens: Some(256),
+                temperature: Some(0.1),
+                ..Default::default()
+            };
+            gen.generate(params, Some(cancellation_token.clone()), None, None).await?
+        } else { String::new() }
+    };
+    
     selector_info = parsing::parse_json_from_llm(&res_select);
 
-    // [RESET-CONTEXT] 셀렉터 프롬프트 제거
+    // [RESET-CONTEXT] 
     if let Some(gen) = model.generator.lock().await.as_mut() { gen.truncate_kv_cache(base_len)?; }
 
     // --- STEP 3: Detail Extraction (JIT Prefill) ---
     if selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false) {
         log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Extracting details...", "spinner": "⠋" }));
-        let extraction_instruction = parsing::item2json(&page_type, &url, language);
-        let res_detail = model.chat(
-            &extraction_instruction, 
-            "Return valid JSON.", 
-            Some(cancellation_token.clone()), 
-            None, 
-            None
-        ).await?;
+        
+        let res_detail = {
+            let mut gen_m = model.generator.lock().await;
+            if let Some(gen) = gen_m.as_mut() {
+                let prompt = parsing::item2json(&page_type, &url, language);
+                gen.prefill_chunk(prompt.clone(), Some(cancellation_token.clone()), None).await?;
+                
+                let params = ChatCompletionParameters {
+                    messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Text(prompt),
+                        name: None,
+                    })],
+                    max_tokens: Some(2048),
+                    temperature: Some(0.1),
+                    ..Default::default()
+                };
+                gen.generate(params, Some(cancellation_token.clone()), None, None).await?
+            } else { String::new() }
+        };
         extracted_data = parsing::parse_json_from_llm(&res_detail);
     }
 
