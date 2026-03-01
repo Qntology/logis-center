@@ -10,15 +10,15 @@ pub enum PugMode {
 
 pub fn sanitize_llm_input(text: &str) -> String {
     // 1. Filter out non-printable and non-ASCII/Korean characters if they are broken
-    // But we want to keep Korean. Let's filter out known problematic control codes.
     let cleaned: String = text.chars()
         .filter(|c| {
             let u = *c as u32;
-            // Keep: standard ASCII, Korean Hangul Jamo/Syllables, Common Punctuation
+            // Keep: standard ASCII, Korean, Special Quotes (“ ”), Common Punctuation
             (u >= 32 && u <= 126) || // Basic ASCII
             (u >= 0xAC00 && u <= 0xD7A3) || // Hangul Syllables
             (u >= 0x1100 && u <= 0x11FF) || // Hangul Jamo
             (u >= 0x3130 && u <= 0x318F) || // Hangul Compatibility Jamo
+            u == 0x201C || u == 0x201D ||   // Left and Right Double Quotes (“ ”)
             u == 10 || u == 13 || u == 9     // \n, \r, \t
         })
         .collect();
@@ -337,7 +337,7 @@ pub fn page_type_prompt() -> String { r###"[TASK]
 Based on the provided Pug template, identify the primary category of this webpage.
 
 [SCHEMA DEFINITIONS]
-- type: The main category. Must be one of:
+- "type": The main category. Must be one of:
   - "order": Order history, order details, checkout success.
   - "goods": Product list, product detail, shopping cart.
   - "tracking": Shipment tracking status, delivery history.
@@ -348,7 +348,7 @@ Based on the provided Pug template, identify the primary category of this webpag
 
 [OUTPUT FORMAT]
 {
-    "type": type
+    "type": "..."
 }"###.to_string() }
 
 pub fn page_selectors_prompt(page_type: &str) -> String {
@@ -360,9 +360,9 @@ Based on the provided Pug template, identify the structural CSS selectors requir
 Analyze the page structure you have already learned and find the repeating patterns.
 
 [SCHEMA DEFINITIONS]
-- item: Common CSS selector for sibling items (e.g., `[class=“{TYPE} class”]`). Match recurring patterns and exclude header, footer, ads, and pagination.
-- node: Common CSS selector for the item container wrapping all list items (e.g., `[id=“{TYPE} id”]`). Focus on the direct parent of recurring rows/items, excluding header, footer, ads, and pagination.
-- detail: is a detail page or a detail form. Exclude header, footer, ads, pagination.
+- "item": Common CSS selector for sibling `{TYPE}` items (e.g., `[class=“{TYPE} class”]`). Match recurring patterns and exclude header, footer, ads, and pagination.
+- "node": Common CSS selector for `{TYPE}` items container wrapping (e.g., `[id=“{TYPE} id”]`). Focus on the direct parent of recurring rows/items, excluding header, footer, ads, and pagination.
+- "detail": is a detail page or a detail form. Exclude header, footer, ads, pagination.
 
 [OUTPUT FORMAT]
 {
