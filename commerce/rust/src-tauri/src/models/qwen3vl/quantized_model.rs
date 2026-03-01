@@ -300,7 +300,8 @@ impl KVRegistry {
         let mut current_block_idx = 0;
         for (session_id, _ssd_offset, length_tokens) in sessions {
             let num_blocks = (length_tokens + 255) / 256;
-            let kv_dir = crate::utils::paths::get_kv_dir(None).join(&session_id);
+            // [FIX] 데이터가 저장된 실제 하위 경로(inference/text)까지 포함
+            let kv_dir = crate::utils::paths::get_kv_dir(None).join(&session_id).join("inference/text");
 
             for b_idx in 0..num_blocks {
                 if current_block_idx >= entries.len() { break; }
@@ -1604,6 +1605,7 @@ pub struct QuantizedQwen3VLTextModel {
     pub ct: Option<Arc<gguf_file::Content>>,
     pub base_name: String,
     pub dtype: DType,
+    pub is_high_speed: bool, // [NEW] 모든 레이어가 로드된 상태인지 추적
 }
 
 impl QuantizedQwen3VLTextModel {
@@ -1721,16 +1723,18 @@ impl QuantizedQwen3VLTextModel {
             ct: Some(ct),
             base_name: base_name.to_string(),
             dtype,
+            is_high_speed: false,
         })
     }
 
     /// [MEMORY-OPT] 모든 레이어를 한꺼번에 로드합니다. (디코딩 시작 시 호출)
     pub fn reload_all_layers(&mut self) -> Result<()> {
         let count = self.layers.len();
-        println!("[MEMORY-OPT] Prefill complete. Reloading all {} layers for high-speed decoding...", count);
+        println!("[MEMORY-OPT] Switching to High-Speed Mode. Loading all {} layers for instant response...", count);
         for i in 0..count {
             self.reload_layer(i)?;
         }
+        self.is_high_speed = true; // [IMPORTANT] 고속 모드 활성화
         Ok(())
     }
 
@@ -1801,6 +1805,7 @@ impl QuantizedQwen3VLTextModel {
             ct: Some(ct),
             base_name: base_name.to_string(),
             dtype,
+            is_high_speed: false,
         })
     }
 
@@ -1981,10 +1986,8 @@ impl QuantizedQwen3VLTextModel {
         if current_seq_len > 1 {
             // [OPTIMIZATION] 0.6B (Small) 모델은 디코딩(seq_len=1) 중에만 VRAM 캐시를 유지합니다.
             // 프리필(Prefill)이나 베이킹 중에는 배치 크기가 커서 OOM이 발생하므로 무조건 VRAM에서 비워야 합니다.
-            let is_small_model = self.layers.len() <= 36;
-            
-            // seq_len > 1 인 모든 상황(프리필/베이킹)에서 VRAM 캐시 해제 강제
-            let force_evict = true; 
+            // [FIX] 단, 고속 모드(이미 지식이 SSD에 있고 질문만 읽는 상황)에서는 비우지 않고 VRAM에 유지하여 속도를 극대화합니다.
+            let force_evict = !self.is_high_speed; 
             
             if force_evict {
                 for block in &self.layers[layer_idx].self_attn.kv_blocks {
@@ -2112,13 +2115,13 @@ impl QuantizedQwen3VLTextModel {
         let is_decoding = input_token_count <= 1;
 
         // [MEMORY-OPT] 디코딩 단계 진입 시 모든 레이어를 미리 로드
-        if is_decoding && layer_idx == 0 {
+        if is_decoding && layer_idx == 0 && !self.is_high_speed {
             let already_loaded = !self.layers[0].self_attn.q_proj.is_cleared();
             if !already_loaded { self.reload_all_layers()?; }
         }
 
-        // [MEMORY-OPT] Prefill 시 현재 레이어 로드
-        if !is_decoding {
+        // [MEMORY-OPT] Prefill 시 현재 레이어 로드 (고속 모드가 아닐 때만)
+        if !is_decoding && !self.is_high_speed {
             self.reload_layer(layer_idx)?;
         }
 
@@ -2128,11 +2131,11 @@ impl QuantizedQwen3VLTextModel {
         if !self.layers[layer_idx].device().same_device(&target_device) {
             self.layers[layer_idx].to_device(&target_device)?;
             // GPU 이동 후 RAM 가중치는 자동으로 drop됨
-            if !is_decoding { let _ = target_device.synchronize(); }
+            if !is_decoding && !self.is_high_speed { let _ = target_device.synchronize(); }
         }
 
-        // [MEMORY-OPT] [PREFETCH] 다음 레이어를 RAM으로 미리 로드
-        if !is_decoding && layer_idx + 1 < self.layers.len() {
+        // [MEMORY-OPT] [PREFETCH] 다음 레이어를 RAM으로 미리 로드 (고속 모드가 아닐 때만)
+        if !is_decoding && !self.is_high_speed && layer_idx + 1 < self.layers.len() {
             let _ = self.reload_layer(layer_idx + 1);
         }
 
@@ -2145,9 +2148,8 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [MEMORY-OPT] [IMMEDIATE-PURGE] 연산 직후 가중치 즉시 소각
-        // KV 대피(IO)는 시간이 걸릴 수 있으므로, 그 전에 가중치를 먼저 지워서 VRAM 공간 확보
-        if !is_decoding {
+        // [MEMORY-OPT] [IMMEDIATE-PURGE] 연산 직후 가중치 즉시 소각 (고속 모드가 아닐 때만)
+        if !is_decoding && !self.is_high_speed {
             self.layers[layer_idx].clear();
             if target_device.is_cuda() { 
                 let _ = target_device.synchronize(); // GPU 메모리 해제 확정
@@ -2478,8 +2480,11 @@ impl QuantizedQwen3VLTextModel {
                 }
         
                 for layer_idx in 0..total_layers {
-            if seq_len > 1 && (layer_idx % 7 == 0 || layer_idx == total_layers - 1) {
+            // [LOG-OPT] 고속 모드일 때는 레이어 반복 로그를 숨겨서 오해 방지
+            if seq_len > 1 && !self.is_high_speed && (layer_idx % 7 == 0 || layer_idx == total_layers - 1) {
                 println!("[ENGINE] Running Layer {}/{}", layer_idx + 1, total_layers);
+            } else if seq_len > 1 && self.is_high_speed && layer_idx == 0 {
+                println!("[INST-PREFILL] Processing instruction ({} tokens) on top of baked knowledge...", seq_len);
             }
 
             let deepstack_embed = deepstack_visual_embeds.as_ref().and_then(|v| v.get(layer_idx));
@@ -2950,38 +2955,17 @@ impl QuantizedQwen3VLModel {
         let head_dev = self.lm_head.device();
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
 
-        // [FIX] VRAM-GUARD: 프리필(seq_len > 1) 시에는 마지막 토큰의 로짓만 계산하여 OOM 방지
-        // 전체 시퀀스를 계산하면 3.2GB가 들지만, 마지막 토큰만 계산하면 0.3MB면 충분합니다.
+        // [FIX] VRAM-GUARD & SAMPLER-COMPATIBILITY: 프리필 시 마지막 토큰의 로짓만 계산하여 반환
         let last_token_hidden = if seq_len > 1 {
-            outputs.narrow(1, seq_len - 1, 1)? // 마지막 토큰만 추출 [Batch, 1, Hidden]
+            outputs.narrow(1, seq_len - 1, 1)? // [Batch, 1, Hidden]
         } else {
             outputs.clone()
         };
 
-        let hidden_state = if !last_token_hidden.device().same_device(head_dev) { last_token_hidden.to_device(head_dev)? } else { last_token_hidden };
+        let hidden_state = if !last_token_hidden.device().same_device(&head_dev) { last_token_hidden.to_device(&head_dev)? } else { last_token_hidden };
         let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state };
         
         let logits = self.lm_head.forward(&hidden_state)?;
-        
-        // [DIAG-LOGITS] 결과값 폭주 여부 확인 및 파일 저장
-        if seqlen_offset % 5 == 0 {
-            let l_max = logits.flatten_all()?.abs()?.max(0)?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-            let p_min = position_ids.flatten_all()?.min(0)?.to_scalar::<u32>()?;
-            let p_max = position_ids.flatten_all()?.max(0)?.to_scalar::<u32>()?;
-            
-            let log_msg = format!("[DIAG-VL] Off: {} | Pos: {}..{} | MaxLogit: {:.4}\n", seqlen_offset, p_min, p_max, l_max);
-            let log_path = std::path::Path::new("tmp/logs/engine_diag.log");
-            if let Some(parent) = log_path.parent() { let _ = std::fs::create_dir_all(parent); }
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
-                use std::io::Write;
-                let _ = writeln!(file, "{}", log_msg.trim());
-            }
-            
-            if l_max > 100.0 || l_max.is_nan() {
-                println!("[DIAG-WARN] Potential Tensor Explosion! Max Logit: {}", l_max);
-            }
-        }
-        
         Ok(logits)
     }
 
@@ -3097,40 +3081,25 @@ impl QuantizedQwen3TextModel {
 
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, session_id, kv_name).await?;
         
-        let head_dev = self.text_device.clone(); // Text model uses its own device
+        let head_dev = self.text_device.clone(); 
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
 
-        // [FIX] Prefill/Baking 시에는 전체 시퀀스 결과를 유지, 디코딩(seq_len=1) 시에만 마지막 토큰 추출
-        if seq_len > 1 {
-            return Ok(outputs.clone()); // Text-only model returns hidden states directly if no head
-        }
+        // [FIX] VRAM-GUARD & SAMPLER-COMPATIBILITY: 프리필 시 마지막 토큰의 로짓만 계산하여 반환
+        let last_token_hidden = if seq_len > 1 {
+            outputs.narrow(1, seq_len - 1, 1)? // [Batch, 1, Hidden]
+        } else {
+            outputs.clone()
+        };
 
-        let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
+        let hidden_state = if !last_token_hidden.device().same_device(&head_dev) { last_token_hidden.to_device(&head_dev)? } else { last_token_hidden };
+        let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state };
         
         let logits = if let Some(head) = &self.lm_head {
-            let hidden_state = if !hidden_state.device().same_device(head.device()) { hidden_state.to_device(head.device())? } else { hidden_state };
-            head.forward(&hidden_state)?
+            let head_dev_inner = head.device();
+            let hidden_ready = if !hidden_state.device().same_device(head_dev_inner) { hidden_state.to_device(head_dev_inner)? } else { hidden_state };
+            head.forward(&hidden_ready)?
         } else { hidden_state };
 
-        // [DIAG-LOGITS-TEXT] 결과값 폭주 여부 확인 및 파일 저장
-        if seqlen_offset % 5 == 0 {
-            let l_max = logits.flatten_all()?.abs()?.max(0)?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-            let p_min = position_ids.flatten_all()?.min(0)?.to_scalar::<u32>()?;
-            let p_max = position_ids.flatten_all()?.max(0)?.to_scalar::<u32>()?;
-
-            let log_msg = format!("[DIAG-TEXT] Off: {} | Pos: {}..{} | MaxLogit: {:.4}\n", seqlen_offset, p_min, p_max, l_max);
-            let log_path = std::path::Path::new("tmp/logs/engine_diag.log");
-            if let Some(parent) = log_path.parent() { let _ = std::fs::create_dir_all(parent); }
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
-                use std::io::Write;
-                let _ = writeln!(file, "{}", log_msg.trim());
-            }
-
-            if l_max > 100.0 || l_max.is_nan() {
-                println!("[DIAG-WARN-TEXT] Potential Tensor Explosion! Max Logit: {}", l_max);
-            }
-        }
-        
         Ok(logits)
     }
 
