@@ -447,6 +447,15 @@ impl ModelVariant {
     pub fn inject_kv_bitkv(&mut self, kd: &[Tensor], vd: &[Tensor], os: &[usize]) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.inject_live_kv_bitkv(kd, vd, os), Self::QuantizedText(m) => m.language_model.inject_live_kv_bitkv(kd, vd, os), _ => Ok(()) } }
     pub async fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage(), _ => Ok(()) } }
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, Self::QuantizedText(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, _ => Ok(()) } }
+    
+    /// [NEW] 모든 레이어 가중치를 한꺼번에 로드하여 디코딩 속도 확보
+    pub fn reload_all_layers(&mut self) -> Result<()> {
+        match self {
+            Self::QuantizedVL(m) => m.language_model.reload_all_layers(),
+            Self::QuantizedText(m) => m.language_model.reload_all_layers(),
+            _ => Ok(()),
+        }
+    }
 }
 
 pub struct Qwen3VLGenerateModel {
@@ -711,6 +720,12 @@ impl Qwen3VLGenerateModel {
             _ => Ok(()) 
         } 
     }
+
+    /// [NEW] 모든 레이어 가중치를 메모리에 상주시켜 디코딩 속도 확보
+    pub fn reload_all_layers(&mut self) -> Result<()> {
+        self.qwen3_vl.reload_all_layers()
+    }
+
     pub async fn prefill_chunk(&mut self, text: String, _cancel_flag: Option<Arc<AtomicBool>>, _relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
         let chunk_ids_vec = self.tokenizer.text_encode_vec(text, false)?;
         let chunk_size = chunk_ids_vec.len();

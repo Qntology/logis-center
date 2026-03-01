@@ -683,11 +683,19 @@ async fn process_task(
     // [WAIT] 모든 워커가 SSD 저장을 마칠 때까지 대기
     crate::models::qwen3vl::generate::wait_for_global_io().await;
 
-    // --- STEP 2: Instant Inference with On-the-fly Instructions ---
-    
+    // --- STEP 2: Transition to High-Speed Decoding Mode ---
+    // [UNIFIED-MODE-SWITCH] 베이킹이 끝났으므로 이제 28개 레이어를 모두 메모리에 상주시켜 속도를 확보합니다.
+    {
+        let mut gen_m = model.generator.lock().await;
+        if let Some(gen) = gen_m.as_mut() {
+            gen.reload_all_layers()?;
+        }
+    }
+
     // [LOAD-BASE] 
     model.stitch_kv_fragments(stitch_targets).await?;
     let base_len = model.generator.lock().await.as_ref().map(|g| g.qwen3_vl.get_kv_len()).unwrap_or(0);
+
 
     // 2.1 Classification (JIT Prefill)
     log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Identifying type...", "spinner": "🔍" }));
