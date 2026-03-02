@@ -687,7 +687,8 @@ impl Qwen3VLGenerateModel {
                     let max_logit = logits_tensor.max(0)?.to_scalar::<f32>()?;
                     let threshold = max_logit + (mp as f32).ln();
                     let mask = logits_tensor.ge(threshold as f64)?;
-                    logits_tensor = mask.where_cond(&logits_tensor, &Tensor::new(-1000.0f32, &device)?)?;
+                    let threshold_t = Tensor::new(-1000.0f32, &candle_core::Device::Cpu)?.to_device(&device)?;
+                    logits_tensor = mask.where_cond(&logits_tensor, &threshold_t)?;
                 }
             }
 
@@ -705,8 +706,8 @@ impl Qwen3VLGenerateModel {
             }
             
             if !bias_indices.is_empty() {
-                let idx_t = Tensor::new(bias_indices.as_slice(), &device)?;
-                let val_t = Tensor::from_vec(bias_values, (bias_indices.len(),), &device)?;
+                let idx_t = Tensor::new(bias_indices.as_slice(), &candle_core::Device::Cpu)?.to_device(&device)?;
+                let val_t = Tensor::from_vec(bias_values, (bias_indices.len(),), &candle_core::Device::Cpu)?.to_device(&device)?;
                 logits_tensor = logits_tensor.scatter_add(&idx_t, &val_t, 0)?;
             }
             
@@ -817,7 +818,7 @@ fn apply_penalties(logits: &Tensor, repetition_penalty: f32, presence_penalty: f
     let unique_tokens: Vec<u32> = unique_tokens.into_iter().filter(|&t| (t as usize) < vocab_size).collect();
     if unique_tokens.is_empty() { return Ok(logits.clone()); }
 
-    let indices = Tensor::new(unique_tokens.as_slice(), device)?;
+    let indices = Tensor::new(unique_tokens.as_slice(), &candle_core::Device::Cpu)?.to_device(device)?;
     
     // 1. Get logits for previous tokens
     let mut prev_logits = logits.index_select(&indices, 0)?;

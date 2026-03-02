@@ -1874,11 +1874,16 @@ impl QuantizedQwen3VLTextModel {
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
         
         // 입력 데이터를 GPU로 이동
-        let ids_gpu = if !input_ids.device().same_device(&dev) { input_ids.to_device(&dev)? } else { input_ids.clone() };
-        
+        let mut ids_gpu = if !input_ids.device().same_device(&dev) { input_ids.to_device(&dev)? } else { input_ids.clone() };
+
+        // [FIX] Double-check and ensure ids_gpu is on the exact same device as the embedding weights
+        let embed_dev = self.embed_tokens.embeddings().device();
+        if !ids_gpu.device().same_device(embed_dev) {
+            ids_gpu = ids_gpu.to_device(embed_dev)?;
+        }
+
         // VRAM에서 연산 수행
-        let inputs_embeds = self.embed_tokens.forward(&ids_gpu)?;
-        Ok(inputs_embeds.to_dtype(target_dtype)?)
+        let inputs_embeds = self.embed_tokens.forward(&ids_gpu)?;        Ok(inputs_embeds.to_dtype(target_dtype)?)
     }
 
     /// [LAYER-BY-LAYER] 특정 레이어 하나만 실행하고 결과를 반환합니다.
@@ -3280,6 +3285,15 @@ impl QuantizedQwen3VLModel {
 
         // 1. Embedding & Vision Integration
         let flat_input = input_ids.flatten_all()?;
+        
+        // [FIX] Ensure flat_input is on the same device as the embedding weights
+        let embed_dev = self.language_model.embed_tokens.embeddings().device();
+        let flat_input = if !flat_input.device().same_device(embed_dev) {
+            flat_input.to_device(embed_dev)?
+        } else {
+            flat_input
+        };
+        
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
         
@@ -3437,6 +3451,15 @@ impl QuantizedQwen3TextModel {
         let cache_position = if let Some(cp) = cache_position_in { if !cp.device().same_device(&self.text_device) { Some(cp.to_device(&self.text_device)?) } else { Some(cp.clone()) } } else { None };
         let (b_sz, seq_len) = input_ids.dims2()?;
         let flat_input = input_ids.flatten_all()?;
+        
+        // [FIX] Ensure flat_input is on the same device as the embedding weights
+        let embed_dev = self.language_model.embed_tokens.embeddings().device();
+        let flat_input = if !flat_input.device().same_device(embed_dev) {
+            flat_input.to_device(embed_dev)?
+        } else {
+            flat_input
+        };
+        
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
         
