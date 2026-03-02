@@ -97,6 +97,7 @@ pub struct Qwen3VLConfig {
     pub auto_map: Option<std::collections::HashMap<String, String>>,
     pub hidden_size: Option<usize>,
     pub image_token_id: Option<usize>,
+    #[serde(default = "default_model_type")]
     pub model_type: String, 
     pub text_config: Option<Qwen3VLTextConfig>,
     pub tie_word_embeddings: bool,
@@ -106,6 +107,8 @@ pub struct Qwen3VLConfig {
     pub vision_start_token_id: Option<usize>,
     pub vision_end_token_id: Option<usize>,
 }
+
+fn default_model_type() -> String { "qwen3_5".to_string() }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Size {

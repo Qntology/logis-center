@@ -603,7 +603,7 @@ async fn process_task(
     // ==================================================================================
 
     // --- STEP 1: Parallel Knowledge Baking (PUG) ---
-    let base_session = format!("{}_base", task.id);
+    let _base_session = format!("{}_base", task.id);
     log_task_progress(app_handle, &task.id, &json!({ "category": "Base Context", "summary": "Baking PUG in Parallel (256-unit)...", "spinner": "🔥" }));
 
     // [TEXT-ONLY-OPTIMIZATION] 이미지가 필요한 태스크가 아니라면 비전 모델을 로드하지 않음
@@ -1231,7 +1231,7 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
             stable_ticks = 0;
         }
 
-        // [FAST-EXIT] If stable for 1.5 seconds OR we have at least 600MB free (enough for Embedding/0.6B)
+        // [FAST-EXIT] If stable for 1.5 seconds OR we have at least 600MB free (enough for Embedding/0.8B)
         // This prevents being stuck at 0.7GB when target is 1.1GB.
         if (stable_ticks >= 3 && current_vram > 600_000_000) || current_vram > target_vram_bytes {
             println!("[RESOURCE-WATCH] Memory sufficient or stabilized. Proceeding with {:.2} GB free VRAM.", current_vram as f64 / 1e9);

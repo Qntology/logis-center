@@ -130,7 +130,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelSize {
-    Small, // 0.6B for Ingestion
+    Small, // 0.8B for Ingestion
     Large, // 2B-VL for Inference
 }
 
@@ -138,7 +138,7 @@ pub enum ModelSize {
 pub struct LogisModel {
     pub app_handle: tauri::AppHandle,
     pub generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // Primary Active Slot (GPU)
-    pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.6B RAM Slot
+    pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.8B RAM Slot
     pub large_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 2B RAM Slot
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     
@@ -216,7 +216,7 @@ impl LogisModel {
         {
             let mut gen = self.generator.lock().await;
             if let Some(mut g) = gen.take() {
-                println!("[DIAG-PURGE] Dropping Active Generator (0.6B/2B)...");
+                println!("[DIAG-PURGE] Dropping Active Generator (0.8B/2B-VL)...");
                 let _ = g.clear_kv_cache();
                 let _ = g.qwen3_vl.drop_kv_storage(); 
                 drop(g); 
@@ -608,8 +608,7 @@ impl LogisModel {
         // 2. [LOAD] Load from disk if not found in any slot
         println!("[LOAD] Fresh loading {:?} from disk...", size);
         let path = &self.model_path;
-        let shared_path: Option<&str> = None; // [UNIFIED] All models are in the same folder now
-        
+        let _shared_path: Option<&str> = None; // [UNIFIED] All models are in the same folder now        
         let target_device = self.device_config.device.clone();
         let is_disk_swap = self.is_disk_swap;
         let dev_id = self.device_config.gpu_id;
@@ -659,7 +658,7 @@ impl LogisModel {
             },
             Some(ModelSize::Small) => {
                 // Small and Embedding can coexist. 
-                println!("[MODEL] Small model active. Embedding and 0.6B will coexist.");
+                println!("[MODEL] Small model active. Embedding and 0.8B will coexist.");
             },
             None => {
                 // No generator active, safe to clean up any leftovers
@@ -781,7 +780,7 @@ impl LogisModel {
                 Some(dynamic_image), 
                 app_handle, 
                 "extraction-progress", 
-                json!({ "category": "Vision Analysis", "summary": "Analyzing image with 2B model..." }), 
+                json!({ "category": "Vision Analysis", "summary": "Analyzing image with 2B-VL model..." }), 
                 1024, 
                 cancel_token.clone(), 
                 Some(task_id.clone()),
@@ -851,7 +850,7 @@ impl LogisModel {
     }
 
     pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        // [FIX] Default to Small (0.6B) for all chat tasks to align with 0.6B-focused architecture.
+        // [FIX] Default to Small (0.8B) for all chat tasks to align with 0.8B-focused architecture.
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
@@ -889,7 +888,7 @@ impl LogisModel {
 
             let params = ChatCompletionParameters {
                 messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
-                model: "qwen3vl".to_string(),
+                model: "qwen3_5".to_string(),
                 max_tokens: Some(max_tok),
                 temperature: Some(0.1),
                 top_p: Some(0.9),
@@ -932,7 +931,7 @@ impl LogisModel {
 
         let params = ChatCompletionParameters {
             messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
-            model: "qwen3vl".to_string(),
+            model: "qwen3_5".to_string(),
             max_tokens: Some(max_tokens as u32),
             temperature: Some(0.1),
             top_p: Some(0.9),
@@ -952,7 +951,7 @@ impl LogisModel {
         session_id: Option<String>,
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
-        // [FIX] Ensure we stay on Small (0.6B).
+        // [FIX] Ensure we stay on Small (0.8B).
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
@@ -1042,7 +1041,7 @@ impl LogisModel {
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.6B (Small)
+        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.8B (Small)
         let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
         self.ensure_generator(target_size).await?;
         
@@ -1075,7 +1074,7 @@ impl LogisModel {
 
         let params = ChatCompletionParameters {
             messages: vec![ChatCompletionRequestMessage::User(message)],
-            model: "qwen3vl".to_string(),
+            model: "qwen3_5".to_string(),
             max_tokens: Some(self.max_tokens_limit),
             temperature: Some(0.1),
             top_p: Some(0.9),
@@ -1096,7 +1095,7 @@ impl LogisModel {
         session_id: Option<String>,
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
-        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.6B (Small)
+        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.8B (Small)
         let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
         self.ensure_generator(target_size).await?;
 
@@ -1144,7 +1143,7 @@ impl LogisModel {
 
         let params = ChatCompletionParameters {
             messages: vec![ChatCompletionRequestMessage::User(message)],
-            model: "qwen3vl".to_string(),
+            model: "qwen3_5".to_string(),
             max_tokens: Some(max_tok),
             temperature: Some(0.1),
             top_p: Some(0.9),

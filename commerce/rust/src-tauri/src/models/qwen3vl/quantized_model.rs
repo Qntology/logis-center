@@ -422,6 +422,15 @@ pub struct QuantizedQwen3VLTextAttention {
     pub o_proj: QLinear,
     pub q_norm: RmsNorm,
     pub k_norm: RmsNorm,
+
+    // [QWEN3.5-HYBRID] Mamba-2 / Linear Attention Support
+    pub is_linear_attention: bool,
+    pub ssm_conv1d: Option<Tensor>,
+    pub ssm_a: Option<Tensor>,
+    pub ssm_dt_bias: Option<Tensor>,
+    pub ssm_norm: Option<RmsNorm>,
+    pub ssm_gate: Option<QLinear>, // attn_gate in GGUF
+
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub head_dim: usize,
@@ -449,7 +458,14 @@ impl QuantizedQwen3VLTextAttention {
         self.o_proj.to_device(device)?;
         self.q_norm.to_device(device)?;
         self.k_norm.to_device(device)?;
-        
+
+        // [HYBRID-DEVICE-SYNC]
+        if let Some(t) = &mut self.ssm_conv1d { *t = t.to_device(device)?; }
+        if let Some(t) = &mut self.ssm_a { *t = t.to_device(device)?; }
+        if let Some(t) = &mut self.ssm_dt_bias { *t = t.to_device(device)?; }
+        if let Some(n) = &mut self.ssm_norm { n.to_device(device)?; }
+        if let Some(g) = &mut self.ssm_gate { g.to_device(device)?; }
+
         // [ACCUMULATOR-RESET] 장치 이동 시 병합 캐시 초기화 (필요시 새로 생성)
         self.vram_merged_k = None;
         self.vram_merged_v = None;
@@ -485,7 +501,14 @@ impl QuantizedQwen3VLTextAttention {
         self.o_proj.clear();
         self.q_norm.clear();
         self.k_norm.clear();
-        
+
+        // [HYBRID-CLEAR]
+        self.ssm_conv1d = None;
+        self.ssm_a = None;
+        self.ssm_dt_bias = None;
+        self.ssm_norm = None;
+        if let Some(g) = &mut self.ssm_gate { g.clear(); }
+
         // VRAM 병합 캐시도 삭제
         self.vram_merged_k = None;
         self.vram_merged_v = None;
@@ -507,9 +530,16 @@ impl QuantizedQwen3VLTextAttention {
         let head_dim = config.head_dim;
         let scaling = 1f64 / f64::sqrt(head_dim as f64);
 
+        // [HYBRID-DETECTION] Determine if this is a Linear Attention (Mamba) layer
+        let is_linear = if let Some(lt) = config.layer_types.get(layer_idx) {
+            lt == "linear_attention"
+        } else {
+            ct.tensor_infos.contains_key(&format!("{base_name}.ssm_out.weight"))
+        };
+
         let (q, k, v, o, q_n, k_n) = if is_gguf_naming {
             let mut q = "attn_q";
-            for opt in &["attn_q", "attn_q_proj", "q_proj", "attn.linear_qkv", "attn.linear_q", "attn.query", "attn.linear_qkv"] {
+            for opt in &["attn_q", "attn_q_proj", "q_proj", "attn.linear_qkv", "attn.linear_q", "attn.query"] {
                 if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { q = opt; break; }
             }
             let mut k = "attn_k";
@@ -521,11 +551,11 @@ impl QuantizedQwen3VLTextAttention {
                 if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { v = opt; break; }
             }
             let mut o = "attn_output";
-            for opt in &["attn_output", "attn_o_proj", "o_proj", "attn.out_proj", "attn.linear_o", "attn.output", "attn.proj"] {
+            for opt in &["attn_output", "attn_o_proj", "o_proj", "attn.out_proj", "attn.linear_o", "attn.output", "attn.proj", "ssm_out"] {
                 if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { o = opt; break; }
             }
             let mut q_n = "attn_q_norm";
-            for opt in &["attn_q_norm", "q_norm", "attn.q_norm", "attn.linear_q_norm", "attn_norm", "input_layernorm"] {
+            for opt in &["attn_q_norm", "q_norm", "attn.q_norm", "attn.linear_q_norm", "attn_norm", "input_layernorm", "ssm_norm"] {
                 if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { q_n = opt; break; }
             }
             let mut k_n = "attn_k_norm";
@@ -538,20 +568,13 @@ impl QuantizedQwen3VLTextAttention {
         };
 
         let q_weight_name = format!("{base_name}.{q}.weight");
-        let k_weight_name = format!("{base_name}.{k}.weight");
+        let qkv_merged_name = format!("{base_name}.attn_qkv.weight");
 
-        let num_attention_heads = if let Some(info) = ct.tensor_infos.get(&q_weight_name) {
+        let (num_attention_heads, num_key_value_heads) = if let Some(info) = ct.tensor_infos.get(&q_weight_name) {
             let out_features = info.shape.dims()[0];
-            out_features / head_dim
+            (out_features / head_dim, config.num_key_value_heads)
         } else {
-            config.num_attention_heads
-        };
-
-        let num_key_value_heads = if let Some(info) = ct.tensor_infos.get(&k_weight_name) {
-            let out_features = info.shape.dims()[0];
-            out_features / head_dim
-        } else {
-            config.num_key_value_heads
+            (config.num_attention_heads, config.num_key_value_heads)
         };
 
         let num_kv_groups = if num_key_value_heads > 0 {
@@ -560,27 +583,20 @@ impl QuantizedQwen3VLTextAttention {
             1
         };
 
-        if num_attention_heads != config.num_attention_heads || num_key_value_heads != config.num_key_value_heads {
-            if layer_idx == 0 {
-                println!("[MODEL-FIX] Architecture Mismatch Detected. GGUF: {} heads / {} KV heads. Config: {} heads / {} KV heads. Overriding config.",
-                    num_attention_heads, num_key_value_heads, config.num_attention_heads, config.num_key_value_heads);
-            }
-        }
-
-        let (q_proj, k_proj, v_proj) = if ct.tensor_infos.contains_key(&format!("{base_name}.attn_qkv.weight")) {
-            // [FIX] Qwen 3.5 Merged QKV Support
-            let qkv_name = format!("{base_name}.attn_qkv");
-            let qkv_weight = ct.tensor(reader, &format!("{}.weight", qkv_name), device)?;
+        let (q_proj, k_proj, v_proj) = if ct.tensor_infos.contains_key(&qkv_merged_name) {
+            // [MAMBA-2 SPLIT] Qwen 3.5 Gated Delta Net Split Logic
+            // Based on transformers: split(mixed_qkv, [key_dim, key_dim, value_dim])
+            let qkv_weight = ct.tensor(reader, &qkv_merged_name, device)?;
             let qkv_tensor = qkv_weight.dequantize(device)?.to_dtype(dtype)?;
             
-            // QKV 분할 (Head Dim과 Head 수를 기반으로 슬라이싱)
-            let total_heads = num_attention_heads + 2 * num_key_value_heads;
-            let hidden_size = num_attention_heads * head_dim;
-            let kv_size = num_key_value_heads * head_dim;
+            let key_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+            let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
             
-            let q_t = qkv_tensor.narrow(0, 0, hidden_size)?;
-            let k_t = qkv_tensor.narrow(0, hidden_size, kv_size)?;
-            let v_t = qkv_tensor.narrow(0, hidden_size + kv_size, kv_size)?;
+            // Safety check for narrow
+            let total_out = qkv_tensor.dim(0)?;
+            let q_t = qkv_tensor.narrow(0, 0, key_dim.min(total_out))?;
+            let k_t = qkv_tensor.narrow(0, key_dim.min(total_out), key_dim.min(total_out.saturating_sub(key_dim)))?;
+            let v_t = qkv_tensor.narrow(0, (2 * key_dim).min(total_out), value_dim.min(total_out.saturating_sub(2 * key_dim)))?;
             
             (
                 QLinear::new(QMatMul::Tensor(q_t), None, device.clone()),
@@ -588,7 +604,7 @@ impl QuantizedQwen3VLTextAttention {
                 QLinear::new(QMatMul::Tensor(v_t), None, device.clone()),
             )
         } else {
-            // 기존 개별 로딩 방식
+            // Individual loading (Attention case)
             let q_p = get_qlinear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
             let k_p = get_qlinear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?;
             let v_p = get_qlinear(ct, reader, &format!("{base_name}.{v}"), device, dtype)?;
@@ -596,8 +612,43 @@ impl QuantizedQwen3VLTextAttention {
         };
 
         let o_proj = get_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
-        let q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype)?;
-        let k_norm = get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype)?;
+        
+        let q_norm = if ct.tensor_infos.contains_key(&format!("{base_name}.{q_n}.weight")) {
+            get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype)?
+        } else {
+            let zero_t = Tensor::zeros((head_dim * num_attention_heads,), dtype, device)?;
+            RmsNorm::new(zero_t, config.rms_norm_eps)
+        };
+
+        let k_norm = if ct.tensor_infos.contains_key(&format!("{base_name}.{k_n}.weight")) {
+            get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype)?
+        } else {
+            let zero_t = Tensor::zeros((head_dim * num_key_value_heads,), dtype, device)?;
+            RmsNorm::new(zero_t, config.rms_norm_eps)
+        };
+
+        // [MAMBA-2 EXTRA TENSORS]
+        let mut ssm_conv1d = None;
+        let mut ssm_a = None;
+        let mut ssm_dt_bias = None;
+        let ssm_norm = None;
+        let mut ssm_gate = None;
+
+        if is_linear {
+            if let Ok(t) = ct.tensor(reader, &format!("{base_name}.ssm_conv1d.weight"), device) {
+                ssm_conv1d = Some(t.dequantize(device)?.to_dtype(dtype)?);
+            }
+            if let Ok(t) = ct.tensor(reader, &format!("{base_name}.ssm_a"), device) {
+                ssm_a = Some(t.dequantize(device)?.to_dtype(dtype)?);
+            }
+            if let Ok(t) = ct.tensor(reader, &format!("{base_name}.ssm_dt.bias"), device) {
+                ssm_dt_bias = Some(t.dequantize(device)?.to_dtype(dtype)?);
+            }
+            if let Ok(g) = get_qlinear(ct, reader, &format!("{base_name}.attn_gate"), device, dtype) {
+                ssm_gate = Some(g);
+            }
+            // ssm_norm already handled by q_n mapping above (ssm_norm -> q_norm)
+        }
 
         Ok(Self {
             q_proj,
@@ -606,6 +657,12 @@ impl QuantizedQwen3VLTextAttention {
             o_proj,
             q_norm,
             k_norm,
+            is_linear_attention: is_linear,
+            ssm_conv1d,
+            ssm_a,
+            ssm_dt_bias,
+            ssm_norm,
+            ssm_gate,
             num_attention_heads,
             num_key_value_heads,
             num_kv_groups,
@@ -1094,7 +1151,7 @@ impl QuantizedQwen3VLTextAttention {
                         let mut k_raw = self.decompress_from_bf16(&kd_t, &meta_os, dev)?;
                         let mut v_raw = self.decompress_from_bf16(&vd_t, &meta_os, dev)?;
 
-                        // [KV-BRIDGE] 0.6B -> 0.6B 상황에서도 규격이 다르면 정렬 (커밋 261fe0ef 매커니즘)
+                        // [KV-BRIDGE] 0.8B -> 0.8B 상황에서도 규격이 다르면 정렬 (커밋 261fe0ef 매커니즘)
                         let target_heads = self.num_key_value_heads;
                         let target_dim = self.head_dim;
                         let (_b, h, _s, d) = k_raw.dims4()?;
@@ -1432,6 +1489,12 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
         let mut self_attn = QuantizedQwen3VLTextAttention {
             q_proj, k_proj, v_proj, o_proj, q_norm, k_norm,
+            is_linear_attention: false,
+            ssm_conv1d: None,
+            ssm_a: None,
+            ssm_dt_bias: None,
+            ssm_norm: None,
+            ssm_gate: None,
             num_attention_heads: config.num_attention_heads,
             num_key_value_heads: config.num_key_value_heads,
             num_kv_groups: config.num_attention_heads / config.num_key_value_heads.max(1),
@@ -1495,7 +1558,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
         // Detect GGUF naming convention
         let is_gguf_naming = base_name.starts_with("blk.");
         
-        let (attn_base, gate, up, down, in_ln, post_ln) = if is_gguf_naming {
+        let (attn_base, _gate, _up, _down, in_ln, post_ln) = if is_gguf_naming {
             let mut in_ln = "attn_norm";
             for opt in &["attn_norm", "attn.norm", "input_layernorm"] {
                 if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { in_ln = opt; break; }
@@ -2069,7 +2132,7 @@ impl QuantizedQwen3VLTextModel {
         }
 
         if current_seq_len > 1 {
-            // [OPTIMIZATION] 0.6B (Small) 모델은 디코딩(seq_len=1) 중에만 VRAM 캐시를 유지합니다.
+            // [OPTIMIZATION] 0.8B (Small) 모델은 디코딩(seq_len=1) 중에만 VRAM 캐시를 유지합니다.
             // 프리필(Prefill)이나 베이킹 중에는 배치 크기가 커서 OOM이 발생하므로 무조건 VRAM에서 비워야 합니다.
             // [FIX] 단, 고속 모드(이미 지식이 SSD에 있고 질문만 읽는 상황)에서는 비우지 않고 VRAM에 유지하여 속도를 극대화합니다.
             let force_evict = !self.is_high_speed; 
@@ -2093,7 +2156,7 @@ impl QuantizedQwen3VLTextModel {
 
     /// [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로 이동
     async fn evacuate_vram_to_ram_only(&mut self, layer_idx: usize) -> Result<()> {
-        // [OPTIMIZATION] 0.6B (Small) 모델은 디코딩 시에만 VRAM에 상주 시킵니다.
+        // [OPTIMIZATION] 0.8B (Small) 모델은 디코딩 시에만 VRAM에 상주 시킵니다.
         // 베이킹(Baking) 중에는 배치 크기가 커서 OOM이 발생하므로 강제 대피가 필요합니다.
         let is_small_model = self.layers.len() <= 36;
         if is_small_model && !self.baking_only { return Ok(()); }
@@ -2375,7 +2438,7 @@ impl QuantizedQwen3VLTextModel {
         
         let block_start = (start_off / 256) * 256;
 
-        // [DYNAMIC-LIMITS] 0.6B 모델은 가벼우므로 10k 문맥 전체를 VRAM에 상주시켜 PCIe 병목을 제거합니다.
+        // [DYNAMIC-LIMITS] 0.8B 모델은 가벼우므로 10k 문맥 전체를 VRAM에 상주시켜 PCIe 병목을 제거합니다.
         let (vram_limit, ram_limit) = {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
@@ -2555,7 +2618,7 @@ impl QuantizedQwen3VLTextModel {
 
         let (cos, sin) = self.rotary_emb.forward(&position_ids, inputs_embeds.dtype(), self.mrope_section.clone())?;
         
-        // [FAST-PATH] 0.6B 모델은 수직적(전체) 추론을 사용하여 속도를 극대화합니다.
+        // [FAST-PATH] 0.8B 모델은 수직적(전체) 추론을 사용하여 속도를 극대화합니다.
         // 각 레이어의 무게추는 이미 메모리에 있으며, KV 캐시만 필요시 SSD에서 읽어옵니다.
                 let total_layers = self.layers.len();
                 
@@ -2637,7 +2700,7 @@ impl QuantizedQwen3VLTextModel {
         
         for (i, layer) in self.layers.iter_mut().enumerate() {
             if i < k_data.len() {
-                // Decompress directly into 0.6B shape
+                // Decompress directly into 0.8B shape
                 let k_final = layer.self_attn.decompress_from_bf16(&k_data[i].to_device(&target_device)?, original_shape, &target_device)?;
                 let v_final = layer.self_attn.decompress_from_bf16(&v_data[i].to_device(&target_device)?, original_shape, &target_device)?;
                 
