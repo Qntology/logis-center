@@ -1779,11 +1779,15 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
         let residual = xs.clone();
         let xs = self.input_layernorm.forward(&xs)?;
-        let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref(), seqlen_offset, session_id, kv_name, baking_only)?;
+        let mut xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref(), seqlen_offset, session_id, kv_name, baking_only)?;
         
-        // [HARDENING] Residual Addition DType Guard
-        let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
-        let xs = residual.add(&xs)?;
+        // [HARDENING] Residual Addition DType & Device Guard
+        let xs = {
+            if !xs.device().same_device(residual.device()) { xs = xs.to_device(residual.device())?; }
+            let xs_final = xs.to_dtype(target_dtype)?;
+            let residual_final = residual.to_dtype(target_dtype)?;
+            residual_final.add(&xs_final)?
+        };
         
         // [OPTIMIZATION] Skip MLP block if not available (MLP 0% Mode)
         if let (Some(gate_proj), Some(up_proj), Some(down_proj), Some(post_norm)) = (&self.mlp_gate, &self.mlp_up, &self.mlp_down, &self.post_attention_layernorm) {
@@ -1807,8 +1811,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
             // [HARDENING] Second Residual Addition DType & Device Guard
             let mut xs = xs;
             if !xs.device().same_device(residual.device()) { xs = xs.to_device(residual.device())?; }
-            let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
-            Ok(residual.add(&xs)?)
+            let xs_final = xs.to_dtype(target_dtype)?;
+            let residual_final = residual.to_dtype(target_dtype)?;
+            Ok(residual_final.add(&xs_final)?)
         } else {
             // MLP was skipped (Attention-Only), just return result after attention
             Ok(xs)
@@ -2009,13 +2014,10 @@ impl QuantizedQwen3VLTextModel {
         
         if layer_idx == 0 { println!("[MEMORY-OPT] Reloading Layer {} using prefix: {}", layer_idx, prefix); }
 
-        // [FIX] Determine target device from model's device_id instead of skeleton layer
-        let target_device = if self.device_id < 100 { 
-            Device::new_cuda(self.device_id)? 
-        } else { 
-            Device::Cpu 
-        };
-
+        // [FIX] Use the "source of truth" device from the embedding layer 
+        // instead of recreating it from device_id, which avoids DeviceId(1) vs DeviceId(2) mismatch.
+        let target_device = self.embed_tokens.embeddings().device().clone();
+        
         let mut new_layer = QuantizedQwen3VLTextDecoderLayer::new(
             &self.config,
             ct,
