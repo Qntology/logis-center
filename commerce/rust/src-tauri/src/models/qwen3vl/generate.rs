@@ -579,7 +579,13 @@ impl Qwen3VLGenerateModel {
     
             let temperature = mes.temperature.unwrap_or(1.0) as f32;
             let seed = mes.seed.unwrap_or(34562) as u64;
-            let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(1.0) as f32), Some(9), seed);
+            let top_p = mes.top_p.unwrap_or(1.0) as f32;
+            let top_k = mes.top_k;
+            let min_p = mes.min_p;
+            let rep_penalty = mes.repetition_penalty.unwrap_or(1.0);
+            let pres_penalty = mes.presence_penalty.unwrap_or(0.0);
+
+            let mut lp = get_logit_processor(Some(temperature), Some(top_p), top_k, min_p, seed);
             let mes_render = self.chat_template.apply_chat_template(&mes)?;
             let input = self.pre_processor.process_info(&mes, &mes_render)?;
             let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
@@ -626,15 +632,27 @@ impl Qwen3VLGenerateModel {
             }
             
             let mut logits_tensor = logits.flatten_all()?.to_dtype(DType::F32)?;
-            
-            // [REPETITION-PENALTY]
+
+            // [PENALTIES] Apply combined repetition and presence penalties
             if !gen_ids.is_empty() {
-                logits_tensor = apply_repetition_penalty(&logits_tensor, 1.2, &gen_ids)?;
+                logits_tensor = apply_penalties(&logits_tensor, rep_penalty, pres_penalty, &gen_ids)?;
+            }
+
+            // [MIN-P-FILTERING] Manual implementation of Min-P sampling
+            if let Some(mp) = min_p {
+                if mp > 0.0 {
+                    let mut logits_vec = logits_tensor.to_vec1::<f32>()?;
+                    let max_logit = logits_vec.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let threshold = max_logit + mp.ln(); // log domain threshold
+                    for val in logits_vec.iter_mut() {
+                        if *val < threshold { *val = -1000.0; }
+                    }
+                    logits_tensor = Tensor::from_vec(logits_vec, logits_tensor.shape(), logits_tensor.device())?;
+                }
             }
 
             // [DENSE-BIAS] Penalize <think> and < to prevent reasoning mode
-            let mut logits_vec = logits_tensor.to_vec1::<f32>()?;
-            let len = logits_vec.len();
+            let mut logits_vec = logits_tensor.to_vec1::<f32>()?;            let len = logits_vec.len();
             if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 100.0; }
             if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 10.0; } // Bias away from starting any tags
             
@@ -731,18 +749,29 @@ impl Qwen3VLGenerateModel {
     }
 }
 
-fn apply_repetition_penalty(logits: &Tensor, penalty: f32, previous_tokens: &[u32]) -> Result<Tensor> {
+fn apply_penalties(logits: &Tensor, repetition_penalty: f32, presence_penalty: f32, previous_tokens: &[u32]) -> Result<Tensor> {
+    if repetition_penalty == 1.0 && presence_penalty == 0.0 { return Ok(logits.clone()); }
+    
     let mut logits_vec = logits.to_vec1::<f32>()?;
-    let mut set = std::collections::HashSet::new();
+    let mut counts = std::collections::HashMap::new();
     for &t in previous_tokens {
-        if !set.contains(&t) {
-            let logit = logits_vec[t as usize];
-            if logit < 0.0 {
-                logits_vec[t as usize] = logit * penalty;
-            } else {
-                logits_vec[t as usize] = logit / penalty;
+        *counts.entry(t).or_insert(0) += 1;
+    }
+
+    for (t, count) in counts {
+        let t_idx = t as usize;
+        if t_idx < logits_vec.len() {
+            // Presence Penalty: Apply once regardless of count
+            logits_vec[t_idx] -= presence_penalty;
+            
+            // Repetition Penalty: Multiplicative scaling
+            if repetition_penalty != 1.0 {
+                if logits_vec[t_idx] < 0.0 {
+                    logits_vec[t_idx] *= repetition_penalty;
+                } else {
+                    logits_vec[t_idx] /= repetition_penalty;
+                }
             }
-            set.insert(t);
         }
     }
     let dev = logits.device();

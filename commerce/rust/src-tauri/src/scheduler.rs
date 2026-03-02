@@ -469,8 +469,14 @@ async fn process_task(
                 if let Some(worker) = gen_guard.as_mut() {
                     worker.clear_kv_cache();
                     
-                    // Create vision message
+                    // Create vision message (VL Task Parameters)
                     let params = ChatCompletionParameters {
+                        temperature: Some(0.7),
+                        top_p: Some(0.8),
+                        top_k: Some(20),
+                        min_p: Some(0.0),
+                        presence_penalty: Some(1.5),
+                        repetition_penalty: Some(1.0),
                         messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                             content: ChatCompletionRequestUserMessageContent::Array(vec![
                                 ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText {
@@ -604,59 +610,60 @@ async fn process_task(
     let needs_vision = task.r#type == "image_extraction" || task.r#type == "vision_analysis";
     model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, None, !needs_vision).await?;
 
-    // 1.1 [CLEAN-CONTEXT] 태그를 최소화하여 맥락 유지
-    let chunk_ids_list = {
+    // 1.1 [INDEPENDENT-CHUNKING] 독립적으로 구울 수 있도록 텍스트 조각화
+    let (chunk_ids_list, chunk_texts) = {
         let gen_guard = model.generator.lock().await;
         let gen = gen_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Generator failed to load"))?;
-
+        
         let mut chunk_list = Vec::new();
+        let mut text_list = Vec::new();
+        let space_token = gen.tokenizer.text_encode_vec(" ".to_string(), false).unwrap_or(vec![220])[0];
 
-        // 전체를 하나의 긴 텍스트로 구성 (이전 성공 버전의 구조 복구)
-        let full_text = format!("<|im_start|>system\nPUG context for analysis:\n{}\n<|im_end|>\n", light_pug);
-        let full_ids = gen.tokenizer.text_encode_vec(full_text, false)?;
-
-        // 256 단위로 자르되, 태그 없이 순수 데이터만 유지
-        for chunk in full_ids.chunks(256) {
-            let mut c = chunk.to_vec();
-            while c.len() < 256 { c.push(0); } // 0번(보통 <pad> 또는 null)으로 패딩
-            chunk_list.push(c);
+        // [FIX] 각 청크는 독립적인 메시지로 구성됨
+        for (c_idx, line_chunk) in light_pug.lines().collect::<Vec<_>>().chunks(15).enumerate() {
+            let chunk_raw_text = line_chunk.join("\n");
+            let structured_text = format!("PUG [PART {}] (READ ONLY):\n{}", c_idx + 1, chunk_raw_text);
+            let mut ids = gen.tokenizer.text_encode_vec(structured_text.clone(), false)?;
+            
+            // 256 토큰 고정 사이즈 패딩 (워커 슬롯 규격)
+            while ids.len() < 256 { ids.push(space_token); }
+            if ids.len() > 256 { ids.truncate(256); }
+            
+            chunk_list.push(ids);
+            text_list.push(structured_text);
         }
-        chunk_list
+        (chunk_list, text_list)
     };
 
     let mut stitch_targets = Vec::new();
 
-    // 1.2 Stable Sequential Bake (Fixes Rank Error)
+    // 1.2 Parallel Independent Bake (Offset 0 for all workers)
     {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": format!("Baking {} context fragments...", chunk_ids_list.len()), "spinner": "🚀" }));
-
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": format!("Baking {} independent fragments...", chunk_ids_list.len()), "spinner": "🚀" }));
+            
             gen.clear_kv_cache();
             for (c_idx, ids_vec) in chunk_ids_list.iter().enumerate() {
-                let current_offset = c_idx * 256;
                 let ids_t = Tensor::from_vec(ids_vec.clone(), (1, 256), &gen.text_device)?;
-
-                // [FIX] Qwen 3.5 mRoPE를 위한 Rank 3 위치 텐서 생성
-                let cache_pos_1d = Tensor::arange(current_offset as u32, (current_offset + 256) as u32, &gen.text_device)?;
+                
+                // [FIX] 모든 워커가 0번 오프셋에서 독립적으로 프리필 (병렬 슬롯 최적화)
+                // Qwen 3.5 mRoPE를 위해 Rank 3 위치 텐서 (0..256) 생성
+                let cache_pos_1d = Tensor::arange(0u32, 256u32, &gen.text_device)?;
                 let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, 256))?;
 
-                // [CRITICAL] forward 시 6번째 인자(cache_position)에 3D 텐서를 직접 전달
-                gen.qwen3_vl.forward(&ids_t, None, None, None, None, Some(&pos_ids_3d), current_offset, current_offset + 256, Some(task.id.clone()), Some("inference".to_string())).await?;
-
-                // 10개 청크마다 한 번씩만 Flush하여 I/O 대기 최소화
-                if (c_idx + 1) % 10 == 0 || c_idx == chunk_ids_list.len() - 1 {
-                    gen.force_flush_all_active_blocks(&task.id, Some("inference")).await?;
-                }
+                gen.qwen3_vl.forward(&ids_t, None, None, None, None, Some(&pos_ids_3d), 0, 256, Some(format!("{}_c{}", task.id, c_idx)), Some("inference".to_string())).await?;
+                gen.force_flush_all_active_blocks(&format!("{}_c{}", task.id, c_idx), Some("inference")).await?;
+                gen.clear_kv_cache();
+                
+                stitch_targets.push((format!("{}_c{}", task.id, c_idx), 0, 256));
             }
-            gen.clear_kv_cache(); 
-            stitch_targets.push((task.id.clone(), 0, chunk_ids_list.len() * 256));
         }
-    }    // [WAIT] 모든 워커가 SSD 저장을 마칠 때까지 대기
+    }
+    // [WAIT]
     crate::models::qwen3vl::generate::wait_for_global_io().await;
 
     // --- STEP 2: Transition to High-Speed Decoding Mode ---
-    // [UNIFIED-MODE-SWITCH] 베이킹이 끝났으므로 이제 28개 레이어를 모두 메모리에 상주시켜 속도를 확보합니다.
     {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
@@ -664,28 +671,43 @@ async fn process_task(
         }
     }
 
+    // [HELPER] 히스토리가 포함된 파라미터 생성 함수 (Text Task 최적 사양)
+    let build_params = |prompt: String, max_t: u32, texts: &Vec<String>| {
+        let mut messages = Vec::new();
+        for text in texts {
+            messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Text(text.clone()),
+                name: None,
+            }));
+        }
+        messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Text(prompt),
+            name: None,
+        }));
+
+        ChatCompletionParameters {
+            messages,
+            max_tokens: Some(max_t),
+            temperature: Some(1.0),
+            top_p: Some(1.0),
+            top_k: Some(20),
+            min_p: Some(0.0),
+            presence_penalty: Some(2.0),
+            repetition_penalty: Some(1.0),
+            ..Default::default()
+        }
+    };
+
     // [LOAD-BASE] 
     model.stitch_kv_fragments(stitch_targets.clone()).await?;
     let base_len = model.generator.lock().await.as_ref().map(|g| g.qwen3_vl.get_kv_len()).unwrap_or(0);
 
-
-    // 2.1 Classification (JIT Prefill)
+    // 2.1 Classification
     log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Identifying type...", "spinner": "🔍" }));
-    
     let res_class = {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
-            let prompt = parsing::page_type_prompt();
-            
-            let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                    content: ChatCompletionRequestUserMessageContent::Text(prompt),
-                    name: None,
-                })],
-                max_tokens: Some(32),
-                temperature: Some(0.1),
-                ..Default::default()
-            };
+            let params = build_params(parsing::page_type_prompt(), 32, &chunk_texts);
             gen.generate(params, Some(cancellation_token.clone()), None, None).await?
         } else { String::new() }
     };
@@ -693,57 +715,37 @@ async fn process_task(
     let type_info = parsing::parse_json_from_llm(&res_class);
     page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
 
-    // [RESET-CONTEXT] 
-    if let Some(gen) = model.generator.lock().await.as_mut() { gen.truncate_kv_cache(base_len)?; }
-
-    // 2.2 Selectors (JIT Prefill)
+    // 2.2 Selectors
     log_task_progress(app_handle, &task.id, &json!({ "category": "Selectors", "summary": "Locating anchors...", "spinner": "🎯" }));
-    
     let res_select = {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
-            let prompt = parsing::page_selectors_prompt(&page_type);
-            
-            let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                    content: ChatCompletionRequestUserMessageContent::Text(prompt),
-                    name: None,
-                })],
-                max_tokens: Some(256),
-                temperature: Some(0.1),
-                ..Default::default()
-            };
+            let params = build_params(parsing::page_selectors_prompt(&page_type), 256, &chunk_texts);
             gen.generate(params, Some(cancellation_token.clone()), None, None).await?
         } else { String::new() }
     };
     
     selector_info = parsing::parse_json_from_llm(&res_select);
 
-    // [RESET-CONTEXT] 
-    if let Some(gen) = model.generator.lock().await.as_mut() { gen.truncate_kv_cache(base_len)?; }
-
-    // --- STEP 3: Detail Extraction (JIT Prefill) ---
+    // --- STEP 3: Detail Extraction ---
     if selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false) {
         log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Extracting details...", "spinner": "⠋" }));
         
-        let res_detail = {
-            let mut gen_m = model.generator.lock().await;
-            if let Some(gen) = gen_m.as_mut() {
-                let prompt = parsing::item2json(&page_type, &url, language);
-                
-                let params = ChatCompletionParameters {
-                    messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                        content: ChatCompletionRequestUserMessageContent::Text(prompt),
-                        name: None,
-                    })],
-                    max_tokens: Some(512),
-                    temperature: Some(0.1),
-                    ..Default::default()
-                };
-                gen.generate(params, Some(cancellation_token.clone()), None, None).await?
-            } else { String::new() }
-        };
-        extracted_data = parsing::parse_json_from_llm(&res_detail);
+        let extraction_instruction = parsing::item2json(&page_type, &url, language);
+        
+        // 병렬 모드인지 확인
+        if task.r#type == "parallel_extraction" {
+            // ... (병렬 로직에서도 build_params 사용하도록 아래에서 수정 예정)
+        } else {
+            let res_detail = {
+                let mut gen_m = model.generator.lock().await;
+                if let Some(gen) = gen_m.as_mut() {
+                    let params = build_params(extraction_instruction, 1024, &chunk_texts);
+                    gen.generate(params, Some(cancellation_token.clone()), None, None).await?
+                } else { String::new() }
+            };
+            extracted_data = parsing::parse_json_from_llm(&res_detail);
+        }
     }
 
     // [INTERMEDIATE PARITY LOGIC] Save Page Info

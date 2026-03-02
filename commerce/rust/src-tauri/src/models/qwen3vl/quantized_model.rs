@@ -509,7 +509,7 @@ impl QuantizedQwen3VLTextAttention {
 
         let (q, k, v, o, q_n, k_n) = if is_gguf_naming {
             let mut q = "attn_q";
-            for opt in &["attn_q", "attn_q_proj", "q_proj", "attn.qkv", "attn.q_proj", "attn.linear_q", "attn.query"] {
+            for opt in &["attn_q", "attn_q_proj", "q_proj", "attn.linear_qkv", "attn.linear_q", "attn.query", "attn.linear_qkv"] {
                 if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { q = opt; break; }
             }
             let mut k = "attn_k";
@@ -521,11 +521,11 @@ impl QuantizedQwen3VLTextAttention {
                 if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { v = opt; break; }
             }
             let mut o = "attn_output";
-            for opt in &["attn_output", "attn_o_proj", "o_proj", "attn.out_proj", "attn.linear_o", "attn.output"] {
+            for opt in &["attn_output", "attn_o_proj", "o_proj", "attn.out_proj", "attn.linear_o", "attn.output", "attn.proj"] {
                 if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { o = opt; break; }
             }
             let mut q_n = "attn_q_norm";
-            for opt in &["attn_q_norm", "q_norm", "attn.q_norm", "attn.linear_q_norm"] {
+            for opt in &["attn_q_norm", "q_norm", "attn.q_norm", "attn.linear_q_norm", "attn_norm", "input_layernorm"] {
                 if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { q_n = opt; break; }
             }
             let mut k_n = "attn_k_norm";
@@ -567,16 +567,35 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        let q_proj = get_qlinear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
-        
-        if layer_idx == 0 {
-            println!("[DIAG-MODEL] Layer 0 Q-Proj Weight Shape: {:?}", q_proj.shape());
-        }
+        let (q_proj, k_proj, v_proj) = if ct.tensor_infos.contains_key(&format!("{base_name}.attn_qkv.weight")) {
+            // [FIX] Qwen 3.5 Merged QKV Support
+            let qkv_name = format!("{base_name}.attn_qkv");
+            let qkv_weight = ct.tensor(reader, &format!("{}.weight", qkv_name), device)?;
+            let qkv_tensor = qkv_weight.dequantize(device)?.to_dtype(dtype)?;
+            
+            // QKV 분할 (Head Dim과 Head 수를 기반으로 슬라이싱)
+            let total_heads = num_attention_heads + 2 * num_key_value_heads;
+            let hidden_size = num_attention_heads * head_dim;
+            let kv_size = num_key_value_heads * head_dim;
+            
+            let q_t = qkv_tensor.narrow(0, 0, hidden_size)?;
+            let k_t = qkv_tensor.narrow(0, hidden_size, kv_size)?;
+            let v_t = qkv_tensor.narrow(0, hidden_size + kv_size, kv_size)?;
+            
+            (
+                QLinear::new(QMatMul::Tensor(q_t), None, device.clone()),
+                QLinear::new(QMatMul::Tensor(k_t), None, device.clone()),
+                QLinear::new(QMatMul::Tensor(v_t), None, device.clone()),
+            )
+        } else {
+            // 기존 개별 로딩 방식
+            let q_p = get_qlinear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
+            let k_p = get_qlinear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?;
+            let v_p = get_qlinear(ct, reader, &format!("{base_name}.{v}"), device, dtype)?;
+            (q_p, k_p, v_p)
+        };
 
-        let k_proj = get_qlinear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?;
-        let v_proj = get_qlinear(ct, reader, &format!("{base_name}.{v}"), device, dtype)?;
         let o_proj = get_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
-
         let q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype)?;
         let k_norm = get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype)?;
 
@@ -3205,8 +3224,18 @@ impl QuantizedQwen3TextModel {
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
     let weight_name = format!("{name}.weight");
-    let weight = ct.tensor(reader, &weight_name, device)
-        .map_err(|e| anyhow!("Failed to load weight tensor '{}' (Error: {})", weight_name, e))?;
+    let weight = match ct.tensor(reader, &weight_name, device) {
+        Ok(w) => w,
+        Err(e) => {
+            println!("[DIAG-GGUF] Failed to find: {}. Searching for similar keys...", weight_name);
+            let mut similar = Vec::new();
+            for k in ct.tensor_infos.keys() {
+                if k.contains("attn") || k.contains("blk.0") { similar.push(k.clone()); }
+            }
+            println!("[DIAG-GGUF] Available keys nearby: {:?}", similar);
+            return Err(anyhow!("Failed to load weight tensor '{}' (Error: {})", weight_name, e));
+        }
+    };
     let weight = QMatMul::from_qtensor(weight)?;
     let bias_name = format!("{name}.bias");
     let bias = if let Ok(t) = ct.tensor(reader, &bias_name, device) { 
