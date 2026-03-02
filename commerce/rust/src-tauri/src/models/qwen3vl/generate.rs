@@ -448,6 +448,14 @@ impl ModelVariant {
     pub async fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage(), _ => Ok(()) } }
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, Self::QuantizedText(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, _ => Ok(()) } }
     
+    pub fn sync_blocks_from_registry(&mut self) -> Result<()> {
+        match self {
+            Self::QuantizedVL(m) => m.sync_blocks_from_registry(),
+            Self::QuantizedText(m) => m.sync_blocks_from_registry(),
+            _ => Ok(()),
+        }
+    }
+
     /// [NEW] 모든 레이어 가중치를 한꺼번에 로드하여 디코딩 속도 확보
     pub fn reload_all_layers(&mut self) -> Result<()> {
         match self {
@@ -483,11 +491,25 @@ impl Qwen3VLGenerateModel {
         let raw_config: serde_json::Value = serde_json::from_slice(&std::fs::read(&std::path::Path::new(cfg_path).join("config.json"))?)?;
         let cfg: Qwen3VLConfig = if raw_config.get("text_config").is_some() { serde_json::from_value(raw_config)? } else {
             let text_config: crate::models::qwen3vl::config::Qwen3VLTextConfig = serde_json::from_value(raw_config.clone())?;
-            Qwen3VLConfig { architectures: raw_config.get("architectures").and_then(|v| serde_json::from_value(v.clone()).ok()), auto_map: raw_config.get("auto_map").and_then(|v| serde_json::from_value(v.clone()).ok()), hidden_size: raw_config.get("hidden_size").and_then(|v| v.as_u64()).map(|v| v as usize), image_token_id: raw_config.get("image_token_id").and_then(|v| v.as_u64()).map(|v| v as usize), model_type: raw_config.get("model_type").and_then(|v| v.as_str()).unwrap_or("qwen2").to_string(), text_config: Some(text_config), tie_word_embeddings: raw_config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(true), torch_dtype: raw_config.get("torch_dtype").and_then(|v| v.as_str()).map(|s| s.to_string()), transformers_version: raw_config.get("transformers_version").and_then(|v| v.as_str()).unwrap_or("").to_string(), video_token_id: raw_config.get("video_token_id").and_then(|v| v.as_u64()).map(|v| v as usize), vision_config: None, vision_start_token_id: None, vision_end_token_id: None }
+            Qwen3VLConfig { 
+                architectures: raw_config.get("architectures").and_then(|v| serde_json::from_value(v.clone()).ok()), 
+                auto_map: raw_config.get("auto_map").and_then(|v| serde_json::from_value(v.clone()).ok()), 
+                hidden_size: raw_config.get("hidden_size").and_then(|v| v.as_u64()).map(|v| v as usize), 
+                image_token_id: raw_config.get("image_token_id").and_then(|v| v.as_u64()).map(|v| v as usize), 
+                model_type: raw_config.get("model_type").and_then(|v| v.as_str()).unwrap_or("qwen2").to_string(), 
+                text_config: Some(text_config), 
+                tie_word_embeddings: raw_config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(true), 
+                transformers_version: raw_config.get("transformers_version").and_then(|v| v.as_str()).unwrap_or("").to_string(), 
+                video_token_id: raw_config.get("video_token_id").and_then(|v| v.as_u64()).map(|v| v as usize), 
+                vision_config: None, 
+                vision_start_token_id: None, 
+                vision_end_token_id: None 
+            }
         };
         let t_dev = get_device(text_device); let v_dev = get_device(vision_device); let dtype = get_dtype(dtype, cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16"));
         let gguf_f = find_type_files(path, "gguf")?; let mmproj_p = gguf_f.iter().find(|f| f.contains("mmproj")).cloned();
-        let mut m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned();
+        let mut m_p = gguf_f.iter().find(|f| f.contains("Qwen3.5-0.8B.gguf")).cloned();
+        if m_p.is_none() { m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned(); }
         if m_p.is_none() { m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.6B-Q4_K_M.gguf")).cloned(); }
         if m_p.is_none() { m_p = gguf_f.iter().find(|f| !f.contains("mmproj")).cloned(); }
         let qwen3_vl = if !gguf_f.is_empty() {
@@ -508,7 +530,7 @@ impl Qwen3VLGenerateModel {
         } else { ModelVariant::Standard(Qwen3VLModel::new(cfg, unsafe { VarBuilder::from_mmaped_safetensors(&find_type_files(path, "safetensors")?, dtype, &t_dev)? })?) };
         let g_p = std::path::Path::new(cfg_path).join("generation_config.json"); let g_cfg = if g_p.exists() { serde_json::from_slice(&std::fs::read(g_p)?)? } else { Qwen3VLGenerationConfig::default() };
         let (e1, e2) = match &g_cfg.eos_token_id { serde_json::Value::Number(n) => { let id = n.as_u64().unwrap_or(151645) as u32; (id, id) }, serde_json::Value::Array(arr) => { (arr.get(0).and_then(|v| v.as_u64()).unwrap_or(151643) as u32, arr.get(1).and_then(|v| v.as_u64()).unwrap_or(151643) as u32) }, _ => (151643, 151643) };
-        let loaded_model_name = if m_p.as_ref().map(|p| p.contains("0.6B")).unwrap_or(false) { "0.6B".to_string() } else { "2B".to_string() };
+        let loaded_model_name = if m_p.as_ref().map(|p| p.contains("Qwen3.5-0.8B")).unwrap_or(false) { "0.8B".to_string() } else if m_p.as_ref().map(|p| p.contains("0.6B")).unwrap_or(false) { "0.6B".to_string() } else { "2B".to_string() };
         Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &v_dev, dtype)?, qwen3_vl, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: loaded_model_name, hard_token_limit, kv_root })
     }
 
@@ -550,6 +572,9 @@ impl Qwen3VLGenerateModel {
                     println!("[GEN-LOAD] Loading context from session root {:?}...", snapshot_root);
                     let _ = self.load_kv_from_disk(&snapshot_root, None);
                 }
+                
+                // [FIX] 로드 또는 스티칭 후 반드시 레이어별 블록 리스트를 새로고침해야 함
+                self.qwen3_vl.sync_blocks_from_registry()?;
             }
     
             let temperature = mes.temperature.unwrap_or(1.0) as f32;

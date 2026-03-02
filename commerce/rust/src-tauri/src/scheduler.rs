@@ -604,39 +604,56 @@ async fn process_task(
     // Skeleton 방식이므로 baking_only=false로 설정해도 RAM 사용량은 동일하게 낮습니다.
     model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, None).await?;
 
-    // 1.1 Chat-structured Tokenization and Splitting
-    let (chunk_data, _total_actual_tokens) = {
+    // 1.1 Chat-structured Tokenization and Aligned Splitting
+    let chunk_data = {
         let gen_guard = model.generator.lock().await;
         let gen = gen_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Generator failed to load"))?;
         
-        // [CHAT-FORMAT] PUG를 시스템/사용자 메시지 형식으로 감싸서 구조화
-        let structured_pug = format!("<|im_start|>PUG context. READ ONLY. NO THINKING. /no_think<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n", light_pug);
-        
-        let lines: Vec<&str> = structured_pug.lines().collect();
-        let mut all_chunks = Vec::new();
-        let mut current_chunk_tokens = Vec::new();
+        let mut chunk_ids_list = Vec::new();
+        let space_token = gen.tokenizer.text_encode_vec(" ".to_string(), false).unwrap_or(vec![220])[0];
+        let mut current_lines = Vec::new();
+        let mut chunk_idx = 1;
 
-        for line in lines {
-            let line_with_nl = format!("{}\n", line);
-            let line_ids = gen.tokenizer.text_encode_vec(line_with_nl, false)?;
-            
-            if current_chunk_tokens.len() + line_ids.len() > 256 && !current_chunk_tokens.is_empty() {
-                all_chunks.push(current_chunk_tokens.clone());
-                current_chunk_tokens.clear();
-            }
-            
-            if line_ids.len() > 256 {
-                for sub_chunk in line_ids.chunks(256) {
-                    all_chunks.push(sub_chunk.to_vec());
+        let mut lines_iter = light_pug.lines().peekable();
+        while lines_iter.peek().is_some() {
+            let test_pug = current_lines.join("\n");
+            let structured_test = format!(
+                "<|im_start|>system\nPUG context [PART {}]. READ ONLY. NO THINKING. /no_think<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n",
+                chunk_idx,
+                parsing::sanitize_llm_input(&test_pug)
+            );
+            let current_total_ids = gen.tokenizer.text_encode_vec(structured_test.clone(), false).unwrap_or_default();
+
+            if let Some(&next_line) = lines_iter.peek() {
+                let mut next_lines = current_lines.clone();
+                next_lines.push(next_line.to_string());
+                let next_pug = next_lines.join("\n");
+                let structured_next = format!(
+                    "<|im_start|>system\nPUG context [PART {}]. READ ONLY. NO THINKING. /no_think<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n",
+                    chunk_idx,
+                    parsing::sanitize_llm_input(&next_pug)
+                );
+                let next_total_ids = gen.tokenizer.text_encode_vec(structured_next, false).unwrap_or_default();
+
+                if next_total_ids.len() > 256 || current_lines.len() >= 40 {
+                    let mut final_ids = current_total_ids;
+                    while final_ids.len() < 256 { final_ids.push(space_token); }
+                    if final_ids.len() > 256 { final_ids.truncate(256); }
+                    chunk_ids_list.push(final_ids);
+                    current_lines.clear();
+                    chunk_idx += 1;
+                } else {
+                    current_lines.push(lines_iter.next().unwrap().to_string());
                 }
             } else {
-                current_chunk_tokens.extend(line_ids);
+                let mut final_ids = current_total_ids;
+                while final_ids.len() < 256 { final_ids.push(space_token); }
+                if final_ids.len() > 256 { final_ids.truncate(256); }
+                chunk_ids_list.push(final_ids);
+                break;
             }
         }
-        if !current_chunk_tokens.is_empty() {
-            all_chunks.push(current_chunk_tokens.clone());
-        }
-        (all_chunks, 0)
+        chunk_ids_list
     };
 
     let mut stitch_targets = Vec::new();
@@ -648,19 +665,16 @@ async fn process_task(
             log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": format!("Baking {} structured history fragments...", chunk_data.len()), "spinner": "🚀" }));
             
             gen.clear_kv_cache();
-            
-            let chunk_len = 256;
             let b_sz = chunk_data.len();
+            let chunk_len = 256;
             
             let mut batched_ids = vec![0u32; b_sz * chunk_len];
             for (i, ids) in chunk_data.iter().enumerate() {
-                let len = ids.len().min(chunk_len);
-                batched_ids[i * chunk_len .. i * chunk_len + len].copy_from_slice(&ids[..len]);
+                batched_ids[i * chunk_len .. (i + 1) * chunk_len].copy_from_slice(ids);
             }
             
             let ids_t = Tensor::from_vec(batched_ids, (b_sz, chunk_len), &gen.text_device)?;
             
-            // [ROPE-SEQUENTIAL-FIX] 각 배치 행에 대해 고유한 절대 위치 부여
             let mut pos_ids_rows = Vec::new();
             for b in 0..b_sz {
                 let start = (b * chunk_len) as u32;
@@ -671,13 +685,11 @@ async fn process_task(
             let pos_ids = Tensor::cat(&pos_ids_rows, 1)?;
 
             gen.qwen3_vl.forward(&ids_t, None, None, None, None, Some(&pos_ids), 0, chunk_len, Some(task.id.clone()), Some("inference".to_string())).await?;
-            
             gen.force_flush_all_active_blocks(&task.id, Some("inference")).await?;
             gen.clear_kv_cache(); 
 
-            for (c_idx, ids) in chunk_data.iter().enumerate() {
-                stitch_targets.push((format!("{}_c{}", task.id, c_idx), ids.len()));
-            }
+            // [FIX] 초기 베이킹은 단일 세션(task.id)에 모든 블록(b0, b256...)이 0번 오프셋부터 들어있음
+            stitch_targets.push((task.id.clone(), 0, b_sz * 256));
         }
     }
     // [WAIT] 모든 워커가 SSD 저장을 마칠 때까지 대기
@@ -693,7 +705,7 @@ async fn process_task(
     }
 
     // [LOAD-BASE] 
-    model.stitch_kv_fragments(stitch_targets).await?;
+    model.stitch_kv_fragments(stitch_targets.clone()).await?;
     let base_len = model.generator.lock().await.as_ref().map(|g| g.qwen3_vl.get_kv_len()).unwrap_or(0);
 
 
@@ -928,21 +940,25 @@ async fn process_task(
                 let model_c = model.clone();
                 let chunk_session = format!("{}_c{}", task.id, c_idx);
                 
+                // [FIX] base_len을 더하지 않고, 순수하게 청크 인덱스에 따른 256 배수 오프셋 사용
+                // base_session은 항상 0번 위치에 오고, 그 뒤에 청크들이 256 단위로 붙음
+                let current_offset = base_len + (c_idx * 256); 
+                
                 bake_tasks.push(async move {
                     let mut gen_m = model_c.generator.lock().await;
-                    let mut actual_len = 0;
                     if let Some(gen) = gen_m.as_mut() {
                         gen.truncate_kv_cache(0)?; 
                         let ids_tensor = Tensor::from_vec(ids_vec.clone(), (1, 256), &gen.text_device)?;
-                        gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, None, 0, 256, Some(chunk_session.clone()), Some("inference".to_string())).await?;
+                        
+                        // [CRITICAL] 256 배수 정렬을 보장하여 RoPE와 Registry 매핑을 일치시킴
+                        gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, None, current_offset, current_offset + 256, Some(chunk_session.clone()), Some("inference".to_string())).await?;
                         gen.force_flush_all_active_blocks(&chunk_session, Some("inference")).await?;
-                        actual_len = 256;
                     }
-                    Ok::<(String, usize), anyhow::Error>((chunk_session, actual_len))
+                    Ok::<(String, usize), anyhow::Error>((chunk_session, 256))
                 });
             }
 
-            // 모든 청크를 병렬로 굽기 (워커 세마포어가 처리량 조절)
+            // 모든 청크를 병렬로 굽기
             let results = futures::future::join_all(bake_tasks).await;
             for res in results { chunk_results.push(res?); }
             chunk_results.sort_by_key(|(name, _)| {
@@ -952,31 +968,47 @@ async fn process_task(
             // 3. 추출 질문(Instruction) 전용 청크 굽기
             let snapshot_inst = format!("{}_inst", task.id);
             let total_parts = chunk_results.len();
+            
+            // [FIX] 지시 사항도 반드시 256 배수 지점에서 시작하도록 정렬
+            let inst_offset = base_len + (total_parts * 256);
+            
             let inst_len = {
                 let mut gen_m = model.generator.lock().await;
                 if let Some(gen) = gen_m.as_mut() {
                     gen.truncate_kv_cache(0)?;
-                    let inst_params = ChatCompletionParameters {
-                        messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                            content: ChatCompletionRequestUserMessageContent::Text(format!(
-                                "\n\n[TASK] Analyze all {} parts of the PUG context provided above and perform the following extraction: {}\n\n[ACTION] RETURN JSON ONLY.", 
-                                total_parts,
-                                extraction_instruction
-                            )),
-                            name: None,
-                        })], ..Default::default()
-                    };
-                    gen.prefill_only(inst_params, Some(cancellation_token.clone()), Some(snapshot_inst.clone()), None, Some("inference".to_string())).await?
+                    let extraction_prompt = format!(
+                        "\n\n[TASK] Analyze all {} parts of the PUG context provided above and perform the following extraction: {}\n\n[ACTION] RETURN JSON ONLY.", 
+                        total_parts,
+                        extraction_instruction
+                    );
+                    let mut inst_ids = gen.tokenizer.text_encode_vec(extraction_prompt, false)?;
+                    
+                    // [ALIGN] 지시 사항 청크도 256 배수로 맞춤 (패딩)
+                    let space_token = gen.tokenizer.text_encode_vec(" ".to_string(), false).unwrap_or(vec![220])[0];
+                    let original_inst_len = inst_ids.len();
+                    let aligned_inst_len = ((original_inst_len + 255) / 256) * 256;
+                    while inst_ids.len() < aligned_inst_len { inst_ids.push(space_token); }
+
+                    let ids_tensor = Tensor::from_vec(inst_ids.clone(), (1, aligned_inst_len), &gen.text_device)?;
+                    
+                    gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, None, inst_offset, inst_offset + aligned_inst_len, Some(snapshot_inst.clone()), Some("inference".to_string())).await?;
+                    gen.force_flush_all_active_blocks(&snapshot_inst, Some("inference")).await?;
+                    
+                    aligned_inst_len
                 } else { 0 }
             };
 
             // 4. [STITCH-ALL] 모든 조각 이어붙이기
             // [Base] + [Chunk0] + [Chunk1] + ... + [Instruction]
-            let mut stitch_targets = vec![(base_session.clone(), base_len)];
-            for (c_name, c_len) in chunk_results { stitch_targets.push((c_name, c_len)); }
-            stitch_targets.push((snapshot_inst, inst_len));
+            let mut final_stitch_targets = vec![(task.id.clone(), 0, base_len)];
+            for (c_name, _) in chunk_results { 
+                let c_idx = c_name.split("_c").last().unwrap_or("0").parse::<usize>().unwrap_or(0);
+                let c_offset = base_len + (c_idx * 256);
+                final_stitch_targets.push((c_name, c_offset, 256)); 
+            }
+            final_stitch_targets.push((snapshot_inst, inst_offset, inst_len));
 
-            model.stitch_kv_fragments(stitch_targets).await?;
+            model.stitch_kv_fragments(final_stitch_targets).await?;
 
             // 5. 즉시 결과 생성
             if let Some(gen) = model.generator.lock().await.as_mut() {

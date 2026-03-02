@@ -32,8 +32,8 @@ impl Qwen3VLVisionPatchEmbed {
         let patch_size = cfg.patch_size;
         let temporal_patch_size = cfg.temporal_patch_size;
         let in_channels = cfg.in_channels;
-        // Use embed_dim if present, otherwise fallback to hidden_size
-        let embed_dim = cfg.embed_dim.unwrap_or(cfg.hidden_size);
+        // Use hidden_size directly as embed_dim is no longer used in Qwen 3.5 config
+        let embed_dim = cfg.hidden_size;
         
         // conv3d weight key: visual.patch_embed.proj.weight, value: Tensor[dims 1024, 3, 2, 16, 16; bf16, cuda:0]
         // (1024, 3, 2, 16, 16) -> (1024, 1536) -> (1536, 1024)
@@ -782,10 +782,9 @@ impl Qwen3VLTextModel {
         }
         let norm = rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
         let head_dim = config.head_dim;
-        let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
-        // [FIX] rope_scaling is now optional. Assuming it exists if we are here, or panic/default.
-        // Given Qwen3 config flow, if it was missing it should have failed earlier or defaults populated.
-        let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
+        let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_parameters.rope_theta);
+        // [FIX] Use rope_parameters directly for mrope_section in Qwen 3.5
+        let mrope_section = config.rope_parameters.mrope_section.clone();
         Ok(Self {
             embed_tokens,
             layers,

@@ -298,27 +298,29 @@ impl KVRegistry {
         }
 
         let mut current_block_idx = 0;
-        for (session_id, _ssd_offset, length_tokens) in sessions {
+        for (session_id, ssd_start_offset, length_tokens) in sessions {
             let num_blocks = (length_tokens + 255) / 256;
             // [FIX] 데이터가 저장된 실제 하위 경로(inference/text)까지 포함
             let kv_dir = crate::utils::paths::get_kv_dir(None).join(&session_id).join("inference/text");
 
             for b_idx in 0..num_blocks {
                 if current_block_idx >= entries.len() { break; }
-                
+
                 let entry = &mut entries[current_block_idx];
                 entry.ssd_path = Some(kv_dir.clone());
-                entry.ssd_block_offset = b_idx * 256; // [FIX] 물리적 SSD 오프셋 (b0, b256...)
-                entry.token_len = if b_idx == num_blocks - 1 { 
+
+                // [FIX] 해당 세션이 시작된 물리적 오프셋(ssd_start_offset)을 더해줌
+                entry.ssd_block_offset = ssd_start_offset + (b_idx * 256); 
+
+                entry.token_len = if b_idx == num_blocks - 1 {
                     let rem = length_tokens % 256;
                     if rem == 0 { 256 } else { rem }
                 } else { 256 };
-                
+
                 for loc in &mut entry.location { *loc = KVLocation::SSD; }
                 current_block_idx += 1;
             }
-        }
-        println!("[KV-STITCH] Virtual Context cleared and stitched. Total Blocks: {}", current_block_idx);
+        }        println!("[KV-STITCH] Virtual Context cleared and stitched. Total Blocks: {}", current_block_idx);
         Ok(())
     }
 
@@ -1579,6 +1581,21 @@ impl QuantizedQwen3VLTextDecoderLayer {
         self.self_attn.batch_load_layer_kv(kv_name)
     }
 
+    /// [NEW] 스티칭된 가상 장부를 실제 모델 레이어의 KV 블록 리스트로 동기화합니다.
+    pub fn sync_blocks_from_registry(&mut self) -> Result<()> {
+        self.self_attn.kv_blocks.clear();
+        let reg_entries = self.self_attn.registry.entries.read().unwrap();
+        
+        for (idx, entry) in reg_entries.iter().enumerate() {
+            if entry.ssd_path.is_some() && entry.token_len > 0 {
+                // 스티칭된 경로가 있는 경우 해당 블록을 모델의 실행 리스트에 추가
+                let new_block = KVBlock::new(KVLocation::SSD, idx, entry.token_len, entry.token_start);
+                self.self_attn.kv_blocks.push(new_block);
+            }
+        }
+        Ok(())
+    }
+
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>, fragments: &[(usize, std::path::PathBuf)], current_kv_len: usize) -> Result<()> {
         self.self_attn.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, fragments, current_kv_len)
     }
@@ -1708,8 +1725,8 @@ impl QuantizedQwen3VLTextModel {
             embed_tokens, 
             layers, 
             norm, 
-            rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), 
-            mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_else(|| if config.head_dim == 128 { vec![16, 24, 24] } else { vec![] }), 
+            rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_parameters.rope_theta), 
+            mrope_section: config.rope_parameters.mrope_section.clone(), 
             device_id,
             mmap: mmap_handle, 
             registry, 
@@ -1790,8 +1807,8 @@ impl QuantizedQwen3VLTextModel {
             embed_tokens, 
             layers, 
             norm, 
-            rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), 
-            mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_else(|| if config.head_dim == 128 { vec![16, 24, 24] } else { vec![] }), 
+            rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_parameters.rope_theta), 
+            mrope_section: config.rope_parameters.mrope_section.clone(), 
             device_id,
             mmap: None, 
             registry, 
@@ -2585,6 +2602,13 @@ impl QuantizedQwen3VLTextModel {
         self.save_kv_cache(path, true, block_size, None)
     }
 
+    pub fn sync_blocks_from_registry(&mut self) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.sync_blocks_from_registry()?;
+        }
+        Ok(())
+    }
+
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
         if !path.exists() { return Ok(()); }
 
@@ -2976,6 +3000,13 @@ impl QuantizedQwen3VLModel {
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { self.language_model.force_flush_all_active_blocks(session_id, kv_name).await }
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
+    pub fn sync_blocks_from_registry(&mut self) -> Result<()> {
+        for layer in &mut self.language_model.layers {
+            layer.sync_blocks_from_registry()?;
+        }
+        Ok(())
+    }
+
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; self.text_device = device.clone(); self.vision_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, total_len) }
@@ -3111,6 +3142,13 @@ impl QuantizedQwen3TextModel {
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { self.language_model.force_flush_all_active_blocks(session_id, kv_name).await }
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
+    pub fn sync_blocks_from_registry(&mut self) -> Result<()> {
+        for layer in &mut self.language_model.layers {
+            layer.sync_blocks_from_registry()?;
+        }
+        Ok(())
+    }
+
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, _total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, _total_len) }

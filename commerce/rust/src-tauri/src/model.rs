@@ -147,8 +147,7 @@ pub struct LogisModel {
     pub dual_mode_enabled: bool,
     
     // Config for Lazy Reloading
-    small_model_path: String,
-    large_model_path: String,
+    model_path: String,
     embedding_path: std::path::PathBuf,
     device_config: utils::DeviceConfig,
     max_tokens_limit: u32,
@@ -368,20 +367,20 @@ impl LogisModel {
     }
 
     // --- [NEW] Parallel KV Stitching Operation ---
-    pub async fn stitch_kv_fragments(&self, fragments: Vec<(String, usize)>) -> anyhow::Result<usize> {
+    pub async fn stitch_kv_fragments(&self, fragments: Vec<(String, usize, usize)>) -> anyhow::Result<usize> {
         let generator_arc = self.generator.clone();
-        
+
         tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
                 let mut total_tokens = 0;
                 let mut session_data = Vec::new();
-                
-                for (session_id, length) in fragments {
-                    session_data.push((session_id, 0, length));
+
+                for (session_id, offset, length) in fragments {
+                    session_data.push((session_id, offset, length));
                     total_tokens += length;
                 }
-                
+
                 // 가상 장부 통합 실행
                 if let Some(registry) = gen.qwen3_vl.get_registry() {
                     registry.stitch_sessions(session_data)?;
@@ -395,8 +394,7 @@ impl LogisModel {
                 Err(anyhow::anyhow!("No active generator to stitch fragments into"))
             }
         }).await?
-    }
-    pub async fn save_kv_snapshot(&self, task_id: &str, kv_name: Option<String>, offset: usize) -> anyhow::Result<String> {
+    }    pub async fn save_kv_snapshot(&self, task_id: &str, kv_name: Option<String>, offset: usize) -> anyhow::Result<String> {
         let generator_arc = self.generator.clone();
         let task_id_str = task_id.to_string();
         
@@ -611,8 +609,8 @@ impl LogisModel {
 
         // 2. [LOAD] Load from disk if not found in any slot
         println!("[LOAD] Fresh loading {:?} from disk...", size);
-        let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
-        let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
+        let path = &self.model_path;
+        let shared_path: Option<&str> = None; // [UNIFIED] All models are in the same folder now
         
         let target_device = self.device_config.device.clone();
         let is_disk_swap = self.is_disk_swap;
@@ -620,15 +618,14 @@ impl LogisModel {
         let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;
         let path_clone = path.to_string();
-        let shared_path_clone = shared_path.map(|s| s.to_string());
         let handle_clone = self.app_handle.clone();
 
         let gen = tokio::task::spawn_blocking(move || {
             let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
-                shared_path_clone.as_deref(), 
-                shared_path_clone.as_deref(), 
+                None, // Tokenizer path (None = use path)
+                None, // Config path (None = use path)
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
                 force_text_only,
                 baking_only,
@@ -735,8 +732,7 @@ impl LogisModel {
             }
         };
 
-        let small_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf"));
-        let large_model_path = normalize_path(base_path.join("Qwen3-VL-2B-Instruct-gguf"));
+        let model_path = normalize_path(base_path.join("Qwen3.5-0.8B-gguf"));
         let embedding_path = base_path.join("embeddinggemma-300m");
 
         let max_tokens_limit = 65536; 
@@ -750,8 +746,7 @@ impl LogisModel {
             is_cpu_mode: config.is_cpu,
             is_disk_swap,
             dual_mode_enabled: true, 
-            small_model_path,
-            large_model_path,
+            model_path,
             embedding_path,
             device_config: config.clone(),
             max_tokens_limit: max_tokens_limit as u32,
