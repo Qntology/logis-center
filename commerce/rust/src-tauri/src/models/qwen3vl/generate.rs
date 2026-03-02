@@ -213,13 +213,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     drop(ts); let _ = save_kv_block(&tp, &data);
                     
                     // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
-                    if let Some(kv_name) = kv_n {
+                    if let Some(_kv_name) = kv_n {
                         if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
-                            if let Ok(l_idx) = l_str.parse::<usize>() {
+                            if let Ok(_l_idx) = l_str.parse::<usize>() {
                                 // 오프셋 추출 (파일명 b{offset}_l{idx}_k_anchors 에서 추출하거나 SaveTask에 추가 가능)
                                 // 현재는 tp.parent() 폴더명이 b{offset} 이므로 이를 활용
                                 let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
-                                let offset = offset_str.parse::<usize>().unwrap_or(0);
+                                let _offset = offset_str.parse::<usize>().unwrap_or(0);
                                 
                                 // [FIX] Real-time index update via INDEX_TX removed to prevent file corruption.
                                 // Registry is now dumped once at the end of baking.
@@ -706,6 +706,15 @@ impl Qwen3VLGenerateModel {
     /// [NEW] 모든 레이어 가중치를 메모리에 상주시켜 디코딩 속도 확보
     pub fn reload_all_layers(&mut self) -> Result<()> {
         self.qwen3_vl.reload_all_layers()
+    }
+
+    /// [NEW] 구워진 KV 데이터를 VRAM으로 일괄 로드
+    pub fn load_kv_cache_chunked(&mut self, kv_name: &str) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.language_model.load_kv_cache_chunked(kv_name),
+            ModelVariant::QuantizedText(m) => m.language_model.load_kv_cache_chunked(kv_name),
+            _ => Ok(()),
+        }
     }
 
     pub async fn prefill_chunk(&mut self, text: String, _cancel_flag: Option<Arc<AtomicBool>>, _relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {

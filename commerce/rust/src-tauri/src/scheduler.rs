@@ -610,7 +610,7 @@ async fn process_task(
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
             gen.clear_kv_cache();
-            let full_ids = gen.tokenizer.text_encode_vec(structured_pug, false)?;
+            let full_ids = gen.tokenizer.text_encode_vec(structured_pug.clone(), false)?;
             let total_pug_len = full_ids.len();
             
             println!("[LINEAR-BAKE] Processing entire sequence ({} tokens) layer-by-layer...", total_pug_len);
@@ -636,8 +636,12 @@ async fn process_task(
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
             gen.reload_all_layers()?;
-            // 베이킹한 문맥 길이를 현재 모델에 설정
-            let baked_len = gen.tokenizer.text_encode_vec(format!("<|im_start|>system\nYou are a document analyzer. Use the following PUG context for future tasks.<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n", light_pug), false)?.len();
+            
+            // [FIX] 구워진 지식(PUG)을 SSD에서 VRAM으로 다시 불러와 모델에게 "기억"을 되돌려줍니다.
+            // 이제 모델은 SSD를 읽지 않고 100% VRAM에서 답변을 생성합니다.
+            gen.load_kv_cache_chunked(&base_session)?;
+            
+            let baked_len = gen.tokenizer.text_encode_vec(structured_pug, false)?.len();
             gen.qwen3_vl.set_kv_len(baked_len);
         }
     }

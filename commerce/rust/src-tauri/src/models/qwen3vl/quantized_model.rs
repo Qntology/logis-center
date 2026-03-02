@@ -1078,10 +1078,10 @@ impl QuantizedQwen3VLTextAttention {
                         let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, dev)?;
                         let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, dev)?;
 
-                        let mut k_raw = self.decompress_from_bf16(&kd_t, &meta_os, dev)?;
-                        let mut v_raw = self.decompress_from_bf16(&vd_t, &meta_os, dev)?;
+                        let mut k_raw = self.decompress_from_bf16(&kd_t, &meta_os, &self.q_proj.device())?;
+                        let mut v_raw = self.decompress_from_bf16(&vd_t, &meta_os, &self.q_proj.device())?;
 
-                        // [KV-BRIDGE] 0.6B -> 0.6B 상황에서도 규격이 다르면 정렬 (커밋 261fe0ef 매커니즘)
+                        // [KV-BRIDGE] 0.6B -> 0.6B 상황에서도 규격이 다르면 정렬
                         let target_heads = self.num_key_value_heads;
                         let target_dim = self.head_dim;
                         let (_b, h, _s, d) = k_raw.dims4()?;
@@ -1106,10 +1106,11 @@ impl QuantizedQwen3VLTextAttention {
                         if b_idx < reg.len() {
                             if let Some(block) = self.kv_blocks.get(b_idx) {
                                 let mut inner = block.inner.write().unwrap();
-                                inner.k_cache = Some(k_raw.to_device(self.q_proj.device())?);
-                                inner.v_cache = Some(v_raw.to_device(self.q_proj.device())?);
-                                inner.location = KVLocation::RAM;
-                                reg[b_idx].location[self.layer_idx] = KVLocation::RAM;
+                                // [IMPORTANT] VRAM으로 직접 로드
+                                inner.k_cache = Some(k_raw.contiguous()?);
+                                inner.v_cache = Some(v_raw.contiguous()?);
+                                inner.location = KVLocation::VRAM;
+                                reg[b_idx].location[self.layer_idx] = KVLocation::VRAM;
                                 reg[b_idx].ssd_path = Some(file_path.parent().unwrap().to_path_buf());
                             }
                         }
@@ -2177,8 +2178,10 @@ impl QuantizedQwen3VLTextModel {
         // [SSD-OFFLOAD] 레이어 단위 연산 종료 후 즉시 SSD 저장 트리거
         if let Some(sid) = &session_id {
             // 프리필(베이킹) 중에는 해당 레이어의 모든 블록을 SSD 워커로 보냄
-            if current_seq_len > 1 {
-                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, false);
+            if current_seq_len > 1 && !self.is_high_speed {
+                let kv_n = kv_name.clone().unwrap_or_else(|| "text".to_string());
+                println!("[SSD-BACKUP] Triggering bake for Layer {} (Session: {}, KV: {})", layer_idx, sid, kv_n);
+                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, self.baking_only, false);
             }
         }
 
@@ -2543,6 +2546,33 @@ impl QuantizedQwen3VLTextModel {
     }
 
     /// [MEMORY-OPT] VRAM에 있는 텐서들만 즉시 소각하고 문맥 상태(Registry, Len)는 유지합니다.
+    /// [NEW] 중앙 장부(Registry)의 정보를 각 레이어의 kv_blocks로 동기화합니다.
+    /// 베이킹 완료 후 또는 스티칭 후에 호출하여 모델이 SSD 지식을 인식하게 합니다.
+    pub fn sync_kv_blocks_with_registry(&mut self) -> Result<()> {
+        let reg_len = {
+            let reg = self.registry.entries.read().unwrap();
+            reg.iter().filter(|e| e.token_len > 0).count()
+        };
+        
+        println!("[REGISTRY-SYNC] Syncing {} blocks from Registry to all {} layers...", reg_len, self.layers.len());
+        
+        for layer in self.layers.iter_mut() {
+            layer.self_attn.kv_blocks.clear();
+            let reg = self.registry.entries.read().unwrap();
+            for (i, entry) in reg.iter().enumerate() {
+                if entry.token_len > 0 {
+                    let block = KVBlock::new(KVLocation::SSD, i, entry.token_len, entry.token_start);
+                    {
+                        let mut inner = block.inner.write().unwrap();
+                        inner.ssd_path = entry.ssd_path.clone();
+                    }
+                    layer.self_attn.kv_blocks.push(block);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn clear_vram_only(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.self_attn.kv_blocks.clear();
