@@ -596,116 +596,63 @@ async fn process_task(
     // 2. Load PUG KV and prefill instructions on-the-fly for each step.
     // ==================================================================================
 
-    // --- STEP 1: Parallel Knowledge Baking (PUG) ---
+    // --- STEP 1: Linear Knowledge Baking (PUG) ---
     let base_session = format!("{}_base", task.id);
-    log_task_progress(app_handle, &task.id, &json!({ "category": "Base Context", "summary": "Baking PUG in Parallel (256-unit)...", "spinner": "🔥" }));
+    log_task_progress(app_handle, &task.id, &json!({ "category": "Base Context", "summary": "Baking entire PUG layer-by-layer (Sequential Prefill)...", "spinner": "🔥" }));
 
-    // [FIX] 텍스트 베이킹 시에는 28개 레이어 전체 연산이 필요합니다. 
-    // Skeleton 방식이므로 baking_only=false로 설정해도 RAM 사용량은 동일하게 낮습니다.
     model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, None).await?;
 
-    // 1.1 Chat-structured Tokenization and Splitting
-    let (chunk_data, _total_actual_tokens) = {
-        let gen_guard = model.generator.lock().await;
-        let gen = gen_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Generator failed to load"))?;
-        
-        // [CHAT-FORMAT] PUG를 시스템/사용자 메시지 형식으로 감싸서 구조화
-        let structured_pug = format!("<|im_start|>system\nYou are a document analyzer. Use the following PUG context for future tasks.<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n", light_pug);
-        
-        let lines: Vec<&str> = structured_pug.lines().collect();
-        let mut all_chunks = Vec::new();
-        let mut current_chunk_tokens = Vec::new();
-
-        for line in lines {
-            let line_with_nl = format!("{}\n", line);
-            let line_ids = gen.tokenizer.text_encode_vec(line_with_nl, false)?;
-            
-            if current_chunk_tokens.len() + line_ids.len() > 256 && !current_chunk_tokens.is_empty() {
-                all_chunks.push(current_chunk_tokens.clone());
-                current_chunk_tokens.clear();
-            }
-            
-            if line_ids.len() > 256 {
-                for sub_chunk in line_ids.chunks(256) {
-                    all_chunks.push(sub_chunk.to_vec());
-                }
-            } else {
-                current_chunk_tokens.extend(line_ids);
-            }
-        }
-        if !current_chunk_tokens.is_empty() {
-            all_chunks.push(current_chunk_tokens.clone());
-        }
-        (all_chunks, 0)
-    };
-
-    let mut stitch_targets = Vec::new();
-
-    // 1.2 Batched Sequential-RoPE Bake (Ultra-Fast)
+    // 1.1 Chat-structured Tokenization
+    let structured_pug = format!("<|im_start|>system\nYou are a document analyzer. Use the following PUG context for future tasks.<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n", light_pug);
+    
+    // 1.2 Full-Sequence Bake (One-shot call, internal layer-wise processing)
     {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": format!("Baking {} structured history fragments...", chunk_data.len()), "spinner": "🚀" }));
-            
             gen.clear_kv_cache();
+            let full_ids = gen.tokenizer.text_encode_vec(structured_pug, false)?;
+            let total_pug_len = full_ids.len();
             
-            let chunk_len = 256;
-            let b_sz = chunk_data.len();
+            println!("[LINEAR-BAKE] Processing entire sequence ({} tokens) layer-by-layer...", total_pug_len);
             
-            let mut batched_ids = vec![0u32; b_sz * chunk_len];
-            for (i, ids) in chunk_data.iter().enumerate() {
-                let len = ids.len().min(chunk_len);
-                batched_ids[i * chunk_len .. i * chunk_len + len].copy_from_slice(&ids[..len]);
-            }
+            let ids_t = Tensor::from_vec(full_ids, (1, total_pug_len), &gen.text_device)?;
             
-            let ids_t = Tensor::from_vec(batched_ids, (b_sz, chunk_len), &gen.text_device)?;
+            // [CRITICAL] 10,000 토큰 전체를 한 번에 보냄. 
+            // 내부 process_single_layer가 레이어 하나당 전체 토큰을 처리하고 SSD에 저장함.
+            gen.qwen3_vl.forward(&ids_t, None, None, None, None, None, 0, total_pug_len, Some(base_session.clone()), Some("text".to_string())).await?;
             
-            // [ROPE-SEQUENTIAL-FIX] 각 배치 행에 대해 고유한 절대 위치 부여
-            let mut pos_ids_rows = Vec::new();
-            for b in 0..b_sz {
-                let start = (b * chunk_len) as u32;
-                let row = Tensor::arange(start, start + chunk_len as u32, &gen.text_device)?
-                    .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, chunk_len))?;
-                pos_ids_rows.push(row);
-            }
-            let pos_ids = Tensor::cat(&pos_ids_rows, 1)?;
-
-            gen.qwen3_vl.forward(&ids_t, None, None, None, None, Some(&pos_ids), 0, chunk_len, Some(task.id.clone()), Some("reference".to_string())).await?;
-            
-            gen.force_flush_all_active_blocks(&task.id, Some("reference")).await?;
-            gen.clear_kv_cache(); 
-
-            for (c_idx, ids) in chunk_data.iter().enumerate() {
-                stitch_targets.push((format!("{}_c{}", task.id, c_idx), ids.len()));
-            }
+            // [FIX] 모든 레이어 연산이 끝난 후 인덱스 파일 1회 생성
+            gen.dump_registry(&base_session)?;
+            println!("[BAKE-COMPLETE] Baked {} tokens into session '{}'.", total_pug_len, base_session);
         }
     }
+
     // [WAIT] 모든 워커가 SSD 저장을 마칠 때까지 대기
     crate::models::qwen3vl::generate::wait_for_global_io().await;
 
     // --- STEP 2: Transition to High-Speed Decoding Mode ---
-    // [UNIFIED-MODE-SWITCH] 베이킹이 끝났으므로 이제 28개 레이어를 모두 메모리에 상주시켜 속도를 확보합니다.
+    // [UNIFIED-MODE-SWITCH] 베이킹 완료! 이제 모든 가중치를 메모리에 올리고 고속 모드로 전환합니다.
     {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
             gen.reload_all_layers()?;
+            // 베이킹한 문맥 길이를 현재 모델에 설정
+            let baked_len = gen.tokenizer.text_encode_vec(format!("<|im_start|>system\nYou are a document analyzer. Use the following PUG context for future tasks.<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n", light_pug), false)?.len();
+            gen.qwen3_vl.set_kv_len(baked_len);
         }
     }
 
-    // [LOAD-BASE] 
-    model.stitch_kv_fragments(stitch_targets).await?;
+    // 장부(Stitch) 작업 없이, 이미 메모리에 완성된 Registry를 그대로 사용합니다.
     let base_len = model.generator.lock().await.as_ref().map(|g| g.qwen3_vl.get_kv_len()).unwrap_or(0);
 
 
-    // 2.1 Classification (JIT Prefill)
+    // 2.1 Classification (JIT Inference)
     log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Identifying type...", "spinner": "🔍" }));
     
     let res_class = {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
             let prompt = parsing::page_type_prompt();
-            gen.prefill_chunk(prompt.clone(), Some(cancellation_token.clone()), None).await?;
-            
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                     content: ChatCompletionRequestUserMessageContent::Text(prompt),
@@ -715,7 +662,9 @@ async fn process_task(
                 temperature: Some(0.1),
                 ..Default::default()
             };
-            gen.generate(params, Some(cancellation_token.clone()), None, None).await?
+            let res = gen.generate(params, Some(cancellation_token.clone()), None, None).await?;
+            println!("\n[RESULT-CLASS] {}", res);
+            res
         } else { String::new() }
     };
     
@@ -725,15 +674,13 @@ async fn process_task(
     // [RESET-CONTEXT] 
     if let Some(gen) = model.generator.lock().await.as_mut() { gen.truncate_kv_cache(base_len)?; }
 
-    // 2.2 Selectors (JIT Prefill)
+    // 2.2 Selectors (JIT Inference)
     log_task_progress(app_handle, &task.id, &json!({ "category": "Selectors", "summary": "Locating anchors...", "spinner": "🎯" }));
     
     let res_select = {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
             let prompt = parsing::page_selectors_prompt(&page_type);
-            gen.prefill_chunk(prompt.clone(), Some(cancellation_token.clone()), None).await?;
-            
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                     content: ChatCompletionRequestUserMessageContent::Text(prompt),
@@ -743,7 +690,9 @@ async fn process_task(
                 temperature: Some(0.1),
                 ..Default::default()
             };
-            gen.generate(params, Some(cancellation_token.clone()), None, None).await?
+            let res = gen.generate(params, Some(cancellation_token.clone()), None, None).await?;
+            println!("\n[RESULT-SELECT] {}", res);
+            res
         } else { String::new() }
     };
     
@@ -752,7 +701,7 @@ async fn process_task(
     // [RESET-CONTEXT] 
     if let Some(gen) = model.generator.lock().await.as_mut() { gen.truncate_kv_cache(base_len)?; }
 
-    // --- STEP 3: Detail Extraction (JIT Prefill) ---
+    // --- STEP 3: Detail Extraction (JIT Inference) ---
     if selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false) {
         log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Extracting details...", "spinner": "⠋" }));
         
@@ -760,8 +709,6 @@ async fn process_task(
             let mut gen_m = model.generator.lock().await;
             if let Some(gen) = gen_m.as_mut() {
                 let prompt = parsing::item2json(&page_type, &url, language);
-                gen.prefill_chunk(prompt.clone(), Some(cancellation_token.clone()), None).await?;
-                
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                         content: ChatCompletionRequestUserMessageContent::Text(prompt),
@@ -771,7 +718,9 @@ async fn process_task(
                     temperature: Some(0.1),
                     ..Default::default()
                 };
-                gen.generate(params, Some(cancellation_token.clone()), None, None).await?
+                let res = gen.generate(params, Some(cancellation_token.clone()), None, None).await?;
+                println!("\n[RESULT-DETAIL] {}", res);
+                res
             } else { String::new() }
         };
         extracted_data = parsing::parse_json_from_llm(&res_detail);

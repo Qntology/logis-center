@@ -139,43 +139,8 @@ pub struct LayerBlockInfo {
     pub file: String,
 }
 
-// [GLOBAL] 인덱스 업데이트 채널
-pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
-    let (tx, mut rx) = mpsc::channel(64);
-    tokio::spawn(async move {
-        let kv_dir = crate::utils::paths::get_kv_dir(None);
-        while let Some(task) = rx.recv().await {
-            if let SlotTask::IndexUpdate { kv_name, layer_idx, offset, len, file_name } = task {
-                let index_path = kv_dir.join(&kv_name).join(format!("layer{}.json", layer_idx));
-                
-                // [DIRECT-IO] Use OS-accelerated read for index metadata
-                let mut index = if index_path.exists() {
-                    if let Ok(data) = load_kv_block(&index_path) {
-                        String::from_utf8(data).ok()
-                            .and_then(|s| serde_json::from_str::<LayerIndex>(&s).ok())
-                            .unwrap_or(LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] })
-                    } else {
-                        LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] }
-                    }
-                } else {
-                    let _ = fs::create_dir_all(index_path.parent().unwrap());
-                    LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] }
-                };
-
-                if !index.blocks.iter().any(|b| b.offset == offset) {
-                    index.blocks.push(LayerBlockInfo { offset, len, file: file_name });
-                    index.blocks.sort_by_key(|b| b.offset);
-                    index.total_tokens = index.blocks.iter().map(|b| b.len).sum();
-                    if let Ok(json) = serde_json::to_string_pretty(&index) {
-                        // [DIRECT-IO] Use OS-accelerated write for index metadata
-                        let _ = save_kv_block(&index_path, json.as_bytes());
-                    }
-                }
-            }
-        }
-    });
-    tx
-});
+// [GLOBAL] 인덱스 업데이트 채널 제거 (불안정하고 덮어씌우기 문제 발생)
+// 대신 베이킹 완료 후 장부를 일괄 저장하는 방식을 사용합니다.
 
 pub struct LoadTask { pub slot_id: usize, pub path: PathBuf, pub layer_idx: usize, pub kv_name: Option<String>, pub shared_block: KVBlock, pub registry: KVRegistry }
 
@@ -256,13 +221,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
                                 let offset = offset_str.parse::<usize>().unwrap_or(0);
                                 
-                                let _ = INDEX_TX.send(SlotTask::IndexUpdate {
-                                    kv_name,
-                                    layer_idx: l_idx,
-                                    offset,
-                                    len: 256,
-                                    file_name: format!("b{}/l{}.st", offset, l_idx),
-                                }).await;
+                                // [FIX] Real-time index update via INDEX_TX removed to prevent file corruption.
+                                // Registry is now dumped once at the end of baking.
                             }
                         }
                     }
@@ -448,6 +408,17 @@ impl ModelVariant {
     pub async fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage(), _ => Ok(()) } }
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, Self::QuantizedText(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, _ => Ok(()) } }
     
+    /// [NEW] 메모리 장부를 SSD 파일로 일괄 저장
+    pub fn dump_registry(&self, kv_name: &str) -> Result<()> {
+        // [FIX] 데이터가 들어있는 실제 하위 경로(inference/text)에 인덱스 파일도 함께 저장
+        let kv_dir = crate::utils::paths::get_kv_dir(None).join(kv_name).join("inference/text");
+        match self {
+            Self::QuantizedVL(m) => m.language_model.registry.dump_registry_to_disk(&kv_dir),
+            Self::QuantizedText(m) => m.language_model.registry.dump_registry_to_disk(&kv_dir),
+            _ => Ok(()),
+        }
+    }
+
     /// [NEW] 모든 레이어 가중치를 한꺼번에 로드하여 디코딩 속도 확보
     pub fn reload_all_layers(&mut self) -> Result<()> {
         match self {
@@ -678,6 +649,12 @@ impl Qwen3VLGenerateModel {
             }
             gen_ids.push(next_id);
             let piece = self.tokenizer.token_decode(vec![next_id])?;
+            
+            // [LOG-OUTPUT] 실시간 토큰 출력
+            print!("{}", piece);
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+
             gen_text.push_str(&piece);
 
             // [EARLY-STOP] JSON 중첩 깊이(Nesting Depth)를 추적하여 완벽히 닫혔을 때만 종료
@@ -719,6 +696,11 @@ impl Qwen3VLGenerateModel {
             ModelVariant::QuantizedText(m) => m.language_model.load_kv_cache(path, &self.text_device, 0, 128, kv_name), 
             _ => Ok(()) 
         } 
+    }
+
+    /// [NEW] 메모리 장부를 SSD 파일로 일괄 저장
+    pub fn dump_registry(&self, kv_name: &str) -> Result<()> {
+        self.qwen3_vl.dump_registry(kv_name)
     }
 
     /// [NEW] 모든 레이어 가중치를 메모리에 상주시켜 디코딩 속도 확보
