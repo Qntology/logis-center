@@ -570,11 +570,13 @@ impl QuantizedQwen3VLTextAttention {
         let q_weight_name = format!("{base_name}.{q}.weight");
         let qkv_merged_name = format!("{base_name}.attn_qkv.weight");
 
-        let (num_attention_heads, num_key_value_heads) = if let Some(info) = ct.tensor_infos.get(&q_weight_name) {
+        let (num_attention_heads, num_key_value_heads, head_dim) = if is_linear {
+            (config.linear_num_key_heads, config.linear_num_key_heads, config.linear_key_head_dim)
+        } else if let Some(info) = ct.tensor_infos.get(&q_weight_name) {
             let out_features = info.shape.dims()[0];
-            (out_features / head_dim, config.num_key_value_heads)
+            (out_features / head_dim, config.num_key_value_heads, head_dim)
         } else {
-            (config.num_attention_heads, config.num_key_value_heads)
+            (config.num_attention_heads, config.num_key_value_heads, head_dim)
         };
 
         let num_kv_groups = if num_key_value_heads > 0 {
@@ -585,18 +587,18 @@ impl QuantizedQwen3VLTextAttention {
 
         let (q_proj, k_proj, v_proj) = if ct.tensor_infos.contains_key(&qkv_merged_name) {
             // [MAMBA-2 SPLIT] Qwen 3.5 Gated Delta Net Split Logic
-            // Based on transformers: split(mixed_qkv, [key_dim, key_dim, value_dim])
+            // Tensor Shape in GGUF: [Hidden, key_dim * 2 + value_dim] -> [1024, 6144]
             let qkv_weight = ct.tensor(reader, &qkv_merged_name, device)?;
             let qkv_tensor = qkv_weight.dequantize(device)?.to_dtype(dtype)?;
             
-            let key_dim = config.linear_num_key_heads * config.linear_key_head_dim;
-            let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+            let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+            let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
             
-            // Safety check for narrow
-            let total_out = qkv_tensor.dim(0)?;
-            let q_t = qkv_tensor.narrow(0, 0, key_dim.min(total_out))?;
-            let k_t = qkv_tensor.narrow(0, key_dim.min(total_out), key_dim.min(total_out.saturating_sub(key_dim)))?;
-            let v_t = qkv_tensor.narrow(0, (2 * key_dim).min(total_out), value_dim.min(total_out.saturating_sub(2 * key_dim)))?;
+            // Split along Output dimension (dim 1)
+            let total_out = qkv_tensor.dim(1)?;
+            let q_t = qkv_tensor.narrow(1, 0, k_dim.min(total_out))?.t()?.contiguous()?;
+            let k_t = qkv_tensor.narrow(1, k_dim.min(total_out), k_dim.min(total_out.saturating_sub(k_dim)))?.t()?.contiguous()?;
+            let v_t = qkv_tensor.narrow(1, (2 * k_dim).min(total_out), v_dim.min(total_out.saturating_sub(2 * k_dim)))?.t()?.contiguous()?;
             
             (
                 QLinear::new(QMatMul::Tensor(q_t), None, device.clone()),
@@ -715,13 +717,66 @@ impl QuantizedQwen3VLTextAttention {
             attention_mask_in.map(|m| m.clone())
         };
 
-        let mut query_states = self.q_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
-        query_states = self.q_norm.forward(&query_states)?.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+        let mut query_states = self.q_proj.forward(&xs)?;
+        let mut key_states = self.k_proj.forward(&xs)?;
+        let mut value_states = self.v_proj.forward(&xs)?;
+
+        // [QWEN3.5-NORM-FIX] Handle head-wise RMSNorm for Qwen 3.5 (8 heads * 256 dim = 2048)
+        // The norm weights are 1024, but projected states can be larger (2048).
+        // Standard Qwen 3.5 applies norm ONLY on the last dimension (head_dim=256).
         
-        let mut key_states = self.k_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
-        key_states = self.k_norm.forward(&key_states)?.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
-        
-        let value_states = self.v_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?.to_dtype(target_dtype)?;
+        let q_head_dim = self.head_dim;
+        let k_head_dim = self.head_dim; // In 0.8B, both are 256
+
+        query_states = query_states.reshape((b_sz, q_len, self.num_attention_heads, q_head_dim))?;
+        key_states = key_states.reshape((b_sz, q_len, self.num_key_value_heads, k_head_dim))?;
+        value_states = value_states.reshape((b_sz, q_len, self.num_key_value_heads, k_head_dim))?;
+
+        // Manual RMSNorm to handle head_dim broadcasting with 1024-dim weights
+        // We take the first 'head_dim' elements of the weight or repeat them.
+        let apply_q_norm = |t: Tensor, norm: &RmsNorm| -> Result<Tensor> {
+            let dev = t.device();
+            let variance = t.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+            let t = t.broadcast_mul(&(variance + norm.eps)?.sqrt()?.recip()?)?;
+            let w = norm.weight().narrow(0, 0, q_head_dim.min(norm.weight().dim(0)?))?;
+            Ok(t.broadcast_mul(&w.to_device(dev)?)?)
+        };
+
+        let mut query_states = apply_q_norm(query_states, &self.q_norm)?.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+        let mut key_states = apply_q_norm(key_states, &self.k_norm)?.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+        let value_states = value_states.transpose(1, 2)?.contiguous()?.to_dtype(target_dtype)?;
+
+        // [HYBRID-INFERENCE] Mamba-2 / Linear Attention Forward Path
+        if self.is_linear_attention {
+            // Linear Attention (Gated Delta Net) implementation:
+            // Standard attention: Softmax(Q K^T) V
+            // Linear attention: Q (K^T V) -> Simplified as Kernel here
+            
+            let lhs = query_states.to_dtype(target_dtype)?;
+            let rhs = key_states.transpose(2, 3)?.to_dtype(target_dtype)?;
+            
+            // Linear kernel (No Softmax for Gated Delta Net)
+            let mut attn_weights = lhs.matmul(&rhs)?
+                .to_dtype(DType::F32)?
+                .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?;
+            
+            // IMPORTANT: No Softmax. Apply gating if ssm_gate exists.
+            let weights_final = attn_weights.to_dtype(target_dtype)?;
+            let v_final = value_states.to_dtype(target_dtype)?;
+            let mut out = weights_final.matmul(&v_final)?;
+            
+            // Apply ssm_gate (Gating part of Gated Delta Net)
+            if let Some(gate_proj) = &self.ssm_gate {
+                let gate_values = gate_proj.forward(&xs)?.to_dtype(target_dtype)?;
+                // Reshape gate to [B, H, S, D] format for broadcasting
+                let gate_values = gate_values.reshape((b_sz, q_len, 1, self.num_attention_heads * self.head_dim))?.transpose(1, 2)?;
+                out = out.broadcast_mul(&candle_nn::ops::silu(&gate_values)?)?;
+            }
+            
+            let (b_sz, n_h, q_len, d_h) = out.dims4()?;
+            let attn_output = self.o_proj.forward(&out.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
+            return Ok(attn_output);
+        }
 
         let cos = cos.to_dtype(target_dtype)?;
         let sin = sin.to_dtype(target_dtype)?;
@@ -1564,7 +1619,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
                 if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { in_ln = opt; break; }
             }
             let mut post_ln = "ffn_norm";
-            for opt in &["ffn_norm", "ffn.norm", "post_attention_layernorm"] {
+            for opt in &["ffn_norm", "ffn.norm", "post_attention_norm", "post_attention_layernorm"] {
                 if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { post_ln = opt; break; }
             }
             (base_name.to_string(), "ffn_gate", "ffn_up", "ffn_down", in_ln, post_ln)
@@ -1594,10 +1649,10 @@ impl QuantizedQwen3VLTextDecoderLayer {
                 ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
             };
 
-            let mg = Some(get_qlinear(ct, reader, &format!("{base_name}.{gate}"), device, dtype)?);
-            let mu = Some(get_qlinear(ct, reader, &format!("{base_name}.{up}"), device, dtype)?);
-            let md = Some(get_qlinear(ct, reader, &format!("{base_name}.{down}"), device, dtype)?);
-            let pln = Some(get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype)?);
+            let mg = get_qlinear_optional(ct, reader, &format!("{base_name}.{gate}"), device, dtype)?;
+            let mu = get_qlinear_optional(ct, reader, &format!("{base_name}.{up}"), device, dtype)?;
+            let md = get_qlinear_optional(ct, reader, &format!("{base_name}.{down}"), device, dtype)?;
+            let pln = get_rms_norm_optional(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype)?;
             (mg, mu, md, pln)
         } else {
             (None, None, None, None)
@@ -1766,14 +1821,18 @@ impl QuantizedQwen3VLTextModel {
         
         // [FIX] Qwen 3.5 하이브리드 명명 규칙 탐색 강화
         let gguf_blk = format!("blk.{layer_idx}");
-        let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) || 
-                        ct.tensor_infos.contains_key(&format!("{}.attn_q.weight", gguf_blk)) ||
-                        ct.tensor_infos.contains_key(&format!("{}.attn.q_proj.weight", gguf_blk)) {
-            gguf_blk 
-        } else {
-            format!("{}.layers.{layer_idx}", self.base_name)
-        };
+        let mut prefix = format!("{}.layers.{layer_idx}", self.base_name);
         
+        // 0.8B 하이브리드 모델은 레이어마다 텐서 구성이 다르므로 대표적인 키들을 순차적으로 검색
+        for opt in &["attn_norm", "attn_qkv", "ssm_conv1d", "ffn_down", "attn_q"] {
+            if ct.tensor_infos.contains_key(&format!("{}.{}.weight", gguf_blk, opt)) {
+                prefix = gguf_blk.clone();
+                break;
+            }
+        }
+        
+        if layer_idx == 0 { println!("[MEMORY-OPT] Reloading Layer {} using prefix: {}", layer_idx, prefix); }
+
         let new_layer = QuantizedQwen3VLTextDecoderLayer::new(
             &self.config,
             ct,
@@ -1785,6 +1844,13 @@ impl QuantizedQwen3VLTextModel {
             self.baking_only,
             self.registry.clone()
         )?;
+        
+        // [VALIDATION] 로드 성공 여부 확인
+        if new_layer.self_attn.q_proj.is_cleared() {
+            return Err(anyhow!("Failed to reload layer {}. Weights are still empty.", layer_idx));
+        }
+
+        if layer_idx == 0 { println!("[MEMORY-OPT] Layer {} reloaded successfully into memory.", layer_idx); }
         
         // 기존 KV 캐시(상태)는 유지하고 가중치만 교체
         let old_kv_blocks = self.layers[layer_idx].self_attn.kv_blocks.clone();
@@ -2270,6 +2336,12 @@ impl QuantizedQwen3VLTextModel {
 
         // [MEMORY-OPT] Prefill 시 현재 레이어 로드 (고속 모드가 아닐 때만)
         if !is_decoding && !self.is_high_speed {
+            self.reload_layer(layer_idx)?;
+        }
+
+        // [SAFETY-CHECK] 장치 이동 전 가중치 로딩 상태 최종 확인
+        if self.layers[layer_idx].self_attn.q_proj.is_cleared() {
+            println!("[ENGINE-SAFETY] Layer {} weight missing before device sync. Forcing emergency reload.", layer_idx);
             self.reload_layer(layer_idx)?;
         }
 
@@ -3354,4 +3426,20 @@ fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, c
     for (name, mut parts) in split_tensors { parts.sort_by_key(|(i, _)| *i); let tensors: Vec<Tensor> = parts.into_iter().map(|(_, t)| t).collect(); if let Ok(merged) = Tensor::cat(&tensors, 0) { data.insert(name, merged); } }
     if let Some(weight) = data.get("visual.patch_embed.proj.weight") { if weight.rank() == 4 { if let Ok(reshaped) = weight.unsqueeze(2)?.repeat((1, 1, 2, 1, 1)) { data.insert("visual.patch_embed.proj.weight".to_string(), reshaped); println!("[FIX] Reshaped visual.patch_embed.proj.weight to 5D"); } } }
     Ok(VarBuilder::from_tensors(data, dtype, device))
+}
+
+fn get_qlinear_optional<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<Option<QLinear>> {
+    let weight_name = format!("{name}.weight");
+    if !ct.tensor_infos.contains_key(&weight_name) {
+        return Ok(None);
+    }
+    Ok(Some(get_qlinear(ct, reader, name, device, dtype)?))
+}
+
+fn get_rms_norm_optional<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, eps: f64, device: &Device, dtype: DType) -> Result<Option<RmsNorm>> {
+    let weight_name = format!("{name}.weight");
+    if !ct.tensor_infos.contains_key(&weight_name) {
+        return Ok(None);
+    }
+    Ok(Some(get_rms_norm(ct, reader, name, eps, device, dtype)?))
 }

@@ -12,6 +12,8 @@
 # Virtual Environment
 trade/venv/
 
+transformers-f3bd443cc9274ac8550b4585114323200b780f5a/
+
 # Model cache and offload (Large files)
 trade/model_cache/
 trade/model_offload/

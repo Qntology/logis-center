@@ -368,10 +368,10 @@ async fn process_task(
         println!("[PROCESS] Found existing KV cache for task {}. Ready to reuse.", task.id);
     }
 
-    // [SSD-BRIDGE] Start warming up 2B weights in background RAM immediately
-    let large_model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3-VL-2B-Instruct-gguf")
-        .or_else(|_| std::fs::canonicalize("models/Qwen3-VL-2B-Instruct-gguf")).ok();
-    if let Some(p) = large_model_path_hint {
+    // [SSD-BRIDGE] Start warming up active model weights in background RAM immediately
+    let model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3.5-0.8B-gguf")
+        .or_else(|_| std::fs::canonicalize("models/Qwen3.5-0.8B-gguf")).ok();
+    if let Some(p) = model_path_hint {
         let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
     }
 
@@ -441,15 +441,15 @@ async fn process_task(
     if task.r#type == "image_extraction" {
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
         if !image_path.is_empty() {
-            println!("[Scheduler] Starting VISION BAKER (1-Layer 2B) for {}", task.id);
+            println!("[Scheduler] Starting VISION BAKER (1-Layer 0.8B-VL) for {}", task.id);
             
             let snapshot_id = format!("{}_img", task.id);
             let prompt = crate::model::get_image_extraction_prompt("kr", "korean", "tracking", "");
 
             // [ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think
 
-            // 1. [Vision Baker] Load 1-layer 2B model and bake image
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer 2B)...", "spinner": "⠋" }));
+            // 1. [Vision Baker] Load 1-layer 0.8B-VL model and bake image
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer 0.8B-VL)...", "spinner": "⠋" }));
             
             // Activate 2B in Baking mode (1 layer, no MLP)
             model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true, None, false).await?;
@@ -499,8 +499,8 @@ async fn process_task(
 
             model.save_kv_snapshot(&snapshot_id, kv_name.clone(), 0).await?;
 
-            // 2. [Full Vision] Reload full 2B model and inject baked cache
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 2B-VL...", "spinner": "⠋" }));
+            // 2. [Full Vision] Reload full 0.8B-VL model and inject baked cache
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 0.8B-VL...", "spinner": "⠋" }));
             
             // Transition to full Large model with the baked snapshot
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone(), false).await?;

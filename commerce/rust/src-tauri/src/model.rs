@@ -130,16 +130,16 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelSize {
-    Small, // 0.8B for Ingestion
-    Large, // 2B-VL for Inference
+    Small, // 0.8B Text-Only (For Txt Preprocessing)
+    Large, // 0.8B Vision + Text (For Img Preprocessing)
 }
 
 #[derive(Clone)]
 pub struct LogisModel {
     pub app_handle: tauri::AppHandle,
     pub generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // Primary Active Slot (GPU)
-    pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.8B RAM Slot
-    pub large_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 2B RAM Slot
+    pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.8B Text RAM Slot
+    pub large_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.8B VL RAM Slot
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     
     pub is_cpu_mode: bool, 
@@ -525,30 +525,27 @@ impl LogisModel {
         self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false, None, true).await
     }
 
-    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
-        println!("[MODEL] Loading Generator from {} (Text-Only: {})...", path, force_text_only);
+    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool, baking_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
         let dev = self.device_config.device.clone();
         let dev_id = self.device_config.gpu_id;
-
         let dtype = if self.device_config.is_cpu { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;
         let path_clone = path.to_string();
         let shared_path = shared_config_path.map(|s| s.to_string());
-
         let handle_clone = self.app_handle.clone();
-
         let is_disk_swap = self.is_disk_swap;
+
+        println!("[LOAD] Fresh loading 0.8B (Text-Only: {}, Baking: {})...", force_text_only, baking_only);
 
         let generator = tokio::task::spawn_blocking(move || {
             let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
-            // [CRITICAL] Use init_with_config to force shared settings (Config + Tokenizer)
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
                 shared_path.as_deref(), // Tokenizer path
                 shared_path.as_deref(), // Config path
                 Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize),
                 force_text_only,
-                false, // [NEW] baking_only
+                baking_only, 
                 is_disk_swap, 
                 kv_root
             )
@@ -606,43 +603,25 @@ impl LogisModel {
         }
 
         // 2. [LOAD] Load from disk if not found in any slot
-        println!("[LOAD] Fresh loading {:?} from disk...", size);
-        let path = &self.model_path;
-        let _shared_path: Option<&str> = None; // [UNIFIED] All models are in the same folder now        
-        let target_device = self.device_config.device.clone();
-        let is_disk_swap = self.is_disk_swap;
-        let dev_id = self.device_config.gpu_id;
-        let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
-        let limit = self.max_tokens_limit;
-        let path_clone = path.to_string();
-        let handle_clone = self.app_handle.clone();
+        if !found_in_slot {
+            let path = self.model_path.clone();
+            let _shared_path: Option<&str> = None; 
+            
+            let gen = self.load_generator_internal(&path, _shared_path, force_text_only, baking_only).await?;
 
-        let gen = tokio::task::spawn_blocking(move || {
-            let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
-            Qwen3VLGenerateModel::init_with_config(
-                &path_clone, 
-                None, // Tokenizer path (None = use path)
-                None, // Config path (None = use path)
-                Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
-                force_text_only,
-                baking_only,
-                is_disk_swap,
-                kv_root
-            )
-        }).await??;
-
-        // Move current main to slot
-        if let Some(old_m) = gen_guard.take() {
-            if let Some(old_size) = *current_size_guard {
-                match old_size {
-                    ModelSize::Small => *small_slot = Some(old_m),
-                    ModelSize::Large => *large_slot = Some(old_m),
+            // Move current main to slot
+            if let Some(old_m) = gen_guard.take() {
+                if let Some(old_size) = *current_size_guard {
+                    match old_size {
+                        ModelSize::Small => *small_slot = Some(old_m),
+                        ModelSize::Large => *large_slot = Some(old_m),
+                    }
                 }
             }
-        }
 
-        *gen_guard = Some(gen);
-        *current_size_guard = Some(size);
+            *gen_guard = Some(gen);
+            *current_size_guard = Some(size);
+        }
         
         Ok(())
     }
