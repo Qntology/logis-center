@@ -1232,7 +1232,12 @@ impl QuantizedQwen3VLTextAttention {
             } else { return Ok(()); }
         }
         
-        let index_json = fs::read_to_string(&index_path)?;
+        // [DIRECT-IO] Use OS-accelerated read for index metadata
+        let index_json = if let Ok(data) = crate::utils::direct_loader::load_kv_block(&index_path) {
+            String::from_utf8(data).map_err(|e| anyhow!("Invalid UTF-8 in index: {}", e))?
+        } else {
+            return Err(anyhow!("Failed to load index via direct_loader: {:?}", index_path));
+        };
         let index: LayerIndex = serde_json::from_str(&index_json)?;
         
         for block_info in index.blocks {
