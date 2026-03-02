@@ -1028,17 +1028,16 @@ impl QuantizedQwen3VLTextAttention {
     }
 
 
-    // [REPLACED] Direct BF16 Storage (16-bit precision, no compression)
     pub fn compress_to_bf16(&self, t: &Tensor) -> Result<(Tensor, Vec<usize>)> {
         let original_shape = t.shape().dims().to_vec();
-        // Convert to BF16 on CPU
-        let t_bf16 = t.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
+        // [ZERO-CPU] Perform DType conversion on GPU before moving to CPU to minimize CPU load
+        let t_bf16 = t.to_dtype(DType::BF16)?.to_device(&Device::Cpu)?;
         Ok((t_bf16, original_shape))
     }
 
     pub fn decompress_from_bf16(&self, data: &Tensor, _original_shape: &[usize], device: &Device) -> Result<Tensor> {
         let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-        // Data is already BF16 tensor (loaded from safetensors), just move to device and cast
+        // [ZERO-CPU] Move to device first, then convert if needed
         let t = data.to_device(device)?;
         Ok(t.to_dtype(target_dtype)?)
     }
@@ -1935,7 +1934,7 @@ impl QuantizedQwen3VLTextModel {
     /// [SSD-HS-PIPE] 레이어 간 Hidden States를 SSD에 저장 (VRAM -> SSD)
     pub fn save_hidden_states(&self, path: &Path, tensor: &Tensor) -> Result<()> {
         let mut map = HashMap::new();
-        // GPU 데이터를 즉시 CPU로 이동 (최소한의 전송)
+        // [ZERO-CPU] Ensure any final dtype adjustments happen on GPU if needed, then move to CPU for serialization
         map.insert("hidden_states".to_string(), tensor.to_device(&Device::Cpu)?);
         let data = safetensors::serialize(&map, &None)?;
         crate::utils::direct_loader::save_kv_block(path, &data)?;
@@ -2015,7 +2014,7 @@ impl QuantizedQwen3VLTextModel {
         device: &Device,
         device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
@@ -2104,7 +2103,7 @@ impl QuantizedQwen3VLTextModel {
         device: &Device,
         device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
@@ -2405,8 +2404,9 @@ impl QuantizedQwen3VLTextModel {
                     let (idx, _) = vram_indices[i];
                     let mut inner = kv_blocks[idx].inner.write().unwrap();
                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                        // [ZERO-CPU] Perform DType conversion on GPU before moving to CPU
+                        let k_cpu = k.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+                        let v_cpu = v.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
                         inner.k_cache = Some(k_cpu);
                         inner.v_cache = Some(v_cpu);
                         inner.location = KVLocation::RAM;
@@ -2690,8 +2690,9 @@ impl QuantizedQwen3VLTextModel {
                     let (idx, _) = vram_indices[i];
                     let mut inner = kv_blocks[idx].inner.write().unwrap();
                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                        // [ZERO-CPU] Perform DType conversion on GPU before moving to CPU
+                        let k_cpu = k.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+                        let v_cpu = v.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
                         inner.k_cache = Some(k_cpu);
                         inner.v_cache = Some(v_cpu);
                         inner.location = KVLocation::RAM;
@@ -2742,8 +2743,9 @@ impl QuantizedQwen3VLTextModel {
                         dumps_to_send.push((
                             LayerKVDump { 
                                 layer_idx, 
-                                k_data: k.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?,
-                                v_data: v.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?,
+                                // [ZERO-CPU] Convert to BF16 on GPU before moving to CPU
+                                k_data: k.to_dtype(DType::BF16)?.to_device(&Device::Cpu)?,
+                                v_data: v.to_dtype(DType::BF16)?.to_device(&Device::Cpu)?,
                                 k_shape: Tensor::from_vec(k_shape_vec, (k.shape().dims().len(),), &Device::Cpu)?,
                                 raw_k: None,
                                 raw_v: None,

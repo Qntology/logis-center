@@ -38,13 +38,16 @@ impl TaskDataManager {
         // [FIX] Use fixed filenames for intermediate steps to support resumption
         let filename = format!("{}.txt", suffix);
         let path = dir.join(filename);
-        fs::write(&path, content)?;
+        // [ZERO-CPU] Use Direct I/O for task data offloading
+        utils::direct_loader::save_kv_block(&path, content.as_bytes())?;
         self.created_files.push(path.clone());
         Ok(path)
     }
 
     fn load(&self, path: &std::path::Path) -> Result<String> {
-        Ok(fs::read_to_string(path)?)
+        // [ZERO-CPU] Use Direct I/O for loading task data
+        let data = utils::direct_loader::load_kv_block(path)?;
+        Ok(String::from_utf8(data).map_err(|e| anyhow::anyhow!("Invalid UTF-8: {}", e))?)
     }
 
     fn get_path(&self, suffix: &str) -> PathBuf {
@@ -635,8 +638,6 @@ async fn process_task(
         (chunk_list, text_list)
     };
 
-    let mut stitch_targets: Vec<(String, usize, usize)> = Vec::new();
-
     // --- STEP 1: Layer-by-Layer Parallel Baking (Offset-Centric SSD-Direct) ---
     log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": "Initializing Layer-by-Layer Parallel Pipeline...", "spinner": "🔥" }));
 
@@ -1214,21 +1215,15 @@ fn cleanup_task_resources(task_id: &str, app_handle: Option<&tauri::AppHandle>) 
 
 // [3번 가속: PRE-FETCH] OS 페이지 캐시에 무게추 파일을 미리 로드함
 fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
-    use std::io::Read;
-    println!("[PRE-FETCH] Warming up OS Page Cache for weights in: {:?}", path);
+    println!("[PRE-FETCH] Warming up OS Page Cache for weights (DirectStorage/io_uring) in: {:?}", path);
     if path.is_dir() {
         if let Ok(entries) = std::fs::read_dir(path) {
             for entry in entries {
                 if let Ok(entry) = entry {
                     let p = entry.path();
                     if p.extension().map_or(false, |ext| ext == "gguf" || ext == "safetensors") {
-                        if let Ok(mut file) = std::fs::File::open(p) {
-                            let mut buffer = [0u8; 1024 * 1024]; // 1MB buffer
-                            // 파일 전체를 읽어서 OS가 램에 캐싱하도록 유도함
-                            while let Ok(n) = file.read(&mut buffer) {
-                                if n == 0 { break; }
-                            }
-                        }
+                        // [ZERO-CPU] Use accelerated direct_loader for pre-fetching weights into RAM
+                        let _ = utils::direct_loader::load_kv_block(&p);
                     }
                 }
             }

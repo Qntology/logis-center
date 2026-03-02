@@ -313,16 +313,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         // [BACK-COMPRESSION] 압축 및 직렬화 작업 자체를 백그라운드로 완전히 분리
                         tokio::spawn(async move {
                             // [FIX] Convert raw tensors to BF16 (or F32 fallback)
-                            // [CRITICAL] 텐서가 GPU에 있는 경우, to_device는 해당 스레드의 컨텍스트를 필요로 함
                             if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
-                                // 워커 스레드에서 안전하게 CPU로 이동
-                                // [STABILITY] to_device 호출 시 장치 컨텍스트가 자동으로 보장되지 않을 수 있으므로
-                                // candle-core의 Device 스코프 내에서 실행되도록 유도 (필요시)
-                                let k_cpu = rk.to_device(&Device::Cpu).unwrap_or(rk);
-                                let v_cpu = rv.to_device(&Device::Cpu).unwrap_or(rv);
+                                // [ZERO-CPU] Perform DType conversion on GPU before moving to CPU
+                                let k_bf16 = rk.to_dtype(DType::BF16).unwrap_or(rk);
+                                let v_bf16 = rv.to_dtype(DType::BF16).unwrap_or(rv);
                                 
-                                src.k_data = k_cpu.to_dtype(DType::BF16).unwrap_or(k_cpu);
-                                src.v_data = v_cpu.to_dtype(DType::BF16).unwrap_or(v_cpu);
+                                src.k_data = k_bf16.to_device(&Device::Cpu).unwrap_or(k_bf16);
+                                src.v_data = v_bf16.to_device(&Device::Cpu).unwrap_or(v_bf16);
                             }
 
                             let mut map = std::collections::HashMap::new();
@@ -523,7 +520,9 @@ impl Qwen3VLGenerateModel {
         let cfg_path = config_path.unwrap_or(path).strip_prefix(r"\\?\").unwrap_or(config_path.unwrap_or(path));
         let chat_template = ChatTemplate::init(tok_path)?;
         let tokenizer = TokenizerModel::init(tok_path)?;
-        let raw_config: serde_json::Value = serde_json::from_slice(&std::fs::read(&std::path::Path::new(cfg_path).join("config.json"))?)?;
+        // [ZERO-CPU] Use accelerated direct_loader for config loading
+        let config_data = load_kv_block(&std::path::Path::new(cfg_path).join("config.json"))?;
+        let raw_config: serde_json::Value = serde_json::from_slice(&config_data)?;
         let cfg: Qwen3VLConfig = if raw_config.get("text_config").is_some() { serde_json::from_value(raw_config)? } else {
             let text_config: crate::models::qwen3vl::config::Qwen3VLTextConfig = serde_json::from_value(raw_config.clone())?;
             Qwen3VLConfig { 
@@ -562,7 +561,12 @@ impl Qwen3VLGenerateModel {
                 ModelVariant::QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, ct_main, Some(Arc::new(m_mmap)), &t_dev, text_device_id, dtype, kv_res, baking_only, baking_only)?)
             }
         } else { ModelVariant::Standard(Qwen3VLModel::new(cfg, unsafe { VarBuilder::from_mmaped_safetensors(&find_type_files(path, "safetensors")?, dtype, &t_dev)? })?) };
-        let g_p = std::path::Path::new(cfg_path).join("generation_config.json"); let g_cfg = if g_p.exists() { serde_json::from_slice(&std::fs::read(g_p)?)? } else { Qwen3VLGenerationConfig::default() };
+        let g_p = std::path::Path::new(cfg_path).join("generation_config.json"); 
+        // [ZERO-CPU] Use accelerated direct_loader for generation config
+        let g_cfg = if g_p.exists() { 
+            let g_data = load_kv_block(&g_p)?;
+            serde_json::from_slice(&g_data)? 
+        } else { Qwen3VLGenerationConfig::default() };
         let (e1, e2) = match &g_cfg.eos_token_id { serde_json::Value::Number(n) => { let id = n.as_u64().unwrap_or(151645) as u32; (id, id) }, serde_json::Value::Array(arr) => { (arr.get(0).and_then(|v| v.as_u64()).unwrap_or(151643) as u32, arr.get(1).and_then(|v| v.as_u64()).unwrap_or(151643) as u32) }, _ => (151643, 151643) };
         let loaded_model_name = if m_p.as_ref().map(|p| p.contains("0.8B")).unwrap_or(false) { "Qwen3.5-0.8B".to_string() } else { "Qwen3-VL-2B".to_string() };
         Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &v_dev, dtype)?, qwen3_vl, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: loaded_model_name, hard_token_limit, kv_root })
@@ -582,7 +586,9 @@ impl Qwen3VLGenerateModel {
         if let Some(s_id) = &session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(s_id);
             if !path.exists() { fs::create_dir_all(&path)?; }
-            fs::write(path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
+            // [ZERO-CPU] Use accelerated direct_loader for token saving
+            let token_data = serde_json::to_vec(&full_ids)?;
+            let _ = save_kv_block(&path.join("tokens.json"), &token_data);
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
             wait_for_global_io().await; // [SYNC] Ensure SSD write is complete
             println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk.");
@@ -666,38 +672,43 @@ impl Qwen3VLGenerateModel {
             }
             
             let mut logits_tensor = logits.flatten_all()?.to_dtype(DType::F32)?;
+            let vocab_size = logits_tensor.dim(0)?;
+            // [FIX] Clone the device to avoid borrowing conflict during logits_tensor re-assignment
+            let device = logits_tensor.device().clone();
 
-            // [PENALTIES] Apply combined repetition and presence penalties
+            // [PENALTIES] Apply combined repetition and presence penalties (GPU)
             if !gen_ids.is_empty() {
                 logits_tensor = apply_penalties(&logits_tensor, rep_penalty, pres_penalty, &gen_ids)?;
             }
 
-            // [MIN-P-FILTERING] Manual implementation of Min-P sampling
+            // [MIN-P-FILTERING] GPU Implementation of Min-P sampling
             if let Some(mp) = min_p {
                 if mp > 0.0 {
-                    let mut logits_vec = logits_tensor.to_vec1::<f32>()?;
-                    let max_logit = logits_vec.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                    let threshold = max_logit + mp.ln(); // log domain threshold
-                    for val in logits_vec.iter_mut() {
-                        if *val < threshold { *val = -1000.0; }
-                    }
-                    logits_tensor = Tensor::from_vec(logits_vec, logits_tensor.shape(), logits_tensor.device())?;
+                    let max_logit = logits_tensor.max(0)?.to_scalar::<f32>()?;
+                    let threshold = max_logit + (mp as f32).ln();
+                    let mask = logits_tensor.ge(threshold as f64)?;
+                    logits_tensor = mask.where_cond(&logits_tensor, &Tensor::new(-1000.0f32, &device)?)?;
                 }
             }
 
-            // [DENSE-BIAS] Penalize <think> and < to prevent reasoning mode
-            let mut logits_vec = logits_tensor.to_vec1::<f32>()?;            let len = logits_vec.len();
-            if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 100.0; }
-            if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 10.0; } // Bias away from starting any tags
+            // [DENSE-BIAS] GPU Implementation to prevent reasoning mode and force JSON
+            let mut bias_indices = vec![];
+            let mut bias_values = vec![];
+            if (think_token_id as usize) < vocab_size { bias_indices.push(think_token_id); bias_values.push(-100.0f32); }
+            if (lt_id as usize) < vocab_size { bias_indices.push(lt_id); bias_values.push(-10.0f32); }
             
             // If it's the very first token, strongly favor '{'
-            if i == 0 && (open_bracket_id as usize) < len {
-                logits_vec[open_bracket_id as usize] += 20.0; // [BOOST-HEAVY] Increase boost
-                // [EOS-BAN] Forcibly ban EOS tokens on the first step
-                if (self.eos_token_id1 as usize) < len { logits_vec[self.eos_token_id1 as usize] = -1000.0; }
-                if (self.eos_token_id2 as usize) < len { logits_vec[self.eos_token_id2 as usize] = -1000.0; }
+            if i == 0 {
+                if (open_bracket_id as usize) < vocab_size { bias_indices.push(open_bracket_id); bias_values.push(20.0f32); }
+                if (self.eos_token_id1 as usize) < vocab_size { bias_indices.push(self.eos_token_id1); bias_values.push(-1000.0f32); }
+                if (self.eos_token_id2 as usize) < vocab_size { bias_indices.push(self.eos_token_id2); bias_values.push(-1000.0f32); }
             }
-            logits_tensor = Tensor::from_vec(logits_vec, logits_tensor.shape(), logits_tensor.device())?;
+            
+            if !bias_indices.is_empty() {
+                let idx_t = Tensor::new(bias_indices.as_slice(), &device)?;
+                let val_t = Tensor::from_vec(bias_values, (bias_indices.len(),), &device)?;
+                logits_tensor = logits_tensor.scatter_add(&idx_t, &val_t, 0)?;
+            }
             
             let mut next_id = lp.sample(&logits_tensor)?;
             
@@ -792,29 +803,43 @@ impl Qwen3VLGenerateModel {
 
 fn apply_penalties(logits: &Tensor, repetition_penalty: f32, presence_penalty: f32, previous_tokens: &[u32]) -> Result<Tensor> {
     if repetition_penalty == 1.0 && presence_penalty == 0.0 { return Ok(logits.clone()); }
+    if previous_tokens.is_empty() { return Ok(logits.clone()); }
+
+    let device = logits.device();
+    let vocab_size = logits.dim(0)?;
+
+    // [ZERO-CPU] Keep logits on GPU. Only manipulate the indices of previous tokens.
+    let mut unique_tokens: Vec<u32> = previous_tokens.iter().cloned().collect();
+    unique_tokens.sort();
+    unique_tokens.dedup();
     
-    let mut logits_vec = logits.to_vec1::<f32>()?;
-    let mut counts = std::collections::HashMap::new();
-    for &t in previous_tokens {
-        *counts.entry(t).or_insert(0) += 1;
+    // Filter out of bounds tokens
+    let unique_tokens: Vec<u32> = unique_tokens.into_iter().filter(|&t| (t as usize) < vocab_size).collect();
+    if unique_tokens.is_empty() { return Ok(logits.clone()); }
+
+    let indices = Tensor::new(unique_tokens.as_slice(), device)?;
+    
+    // 1. Get logits for previous tokens
+    let mut prev_logits = logits.index_select(&indices, 0)?;
+
+    // 2. Apply presence penalty
+    if presence_penalty != 0.0 {
+        prev_logits = (prev_logits - presence_penalty as f64)?;
     }
 
-    for (t, _count) in counts {
-        let t_idx = t as usize;
-        if t_idx < logits_vec.len() {
-            // Presence Penalty: Apply once regardless of count
-            logits_vec[t_idx] -= presence_penalty;
-            
-            // Repetition Penalty: Multiplicative scaling
-            if repetition_penalty != 1.0 {
-                if logits_vec[t_idx] < 0.0 {
-                    logits_vec[t_idx] *= repetition_penalty;
-                } else {
-                    logits_vec[t_idx] /= repetition_penalty;
-                }
-            }
-        }
+    // 3. Apply repetition penalty (Multiplicative scaling on GPU)
+    if repetition_penalty != 1.0 {
+        let penalty = repetition_penalty as f64;
+        // if logit < 0 { logit * penalty } else { logit / penalty }
+        let cond = prev_logits.gt(0.0)?;
+        let div_v = (prev_logits.clone() / penalty)?;
+        let mul_v = (prev_logits.clone() * penalty)?;
+        prev_logits = cond.where_cond(&div_v, &mul_v)?;
     }
-    let dev = logits.device();
-    Ok(Tensor::from_vec(logits_vec, logits.shape(), dev)?)
+
+    // 4. Calculate delta and scatter back to original logits
+    let original_prev_logits = logits.index_select(&indices, 0)?;
+    let delta = (prev_logits - original_prev_logits)?;
+    
+    Ok(logits.scatter_add(&indices, &delta, 0)?)
 }
