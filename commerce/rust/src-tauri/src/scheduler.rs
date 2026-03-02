@@ -767,7 +767,7 @@ async fn process_task(
                         content: ChatCompletionRequestUserMessageContent::Text(prompt),
                         name: None,
                     })],
-                    max_tokens: Some(2048),
+                    max_tokens: Some(512),
                     temperature: Some(0.1),
                     ..Default::default()
                 };
