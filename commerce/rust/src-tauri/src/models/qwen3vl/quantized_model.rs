@@ -229,8 +229,8 @@ pub struct KVBlock {
     pub inner: Arc<std::sync::RwLock<KVBlockInner>>,
 }
 
-fn default_bitkv_cache() -> Arc<std::sync::RwLock<Vec<Option<BitKVMetadata>>>> {
-    Arc::new(std::sync::RwLock::new(vec![None; 28]))
+fn default_bitkv_cache(num_layers: usize) -> Arc<std::sync::RwLock<Vec<Option<BitKVMetadata>>>> {
+    Arc::new(std::sync::RwLock::new(vec![None; num_layers]))
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -246,7 +246,7 @@ pub struct RegistryEntry {
     pub is_dirty: Vec<bool>, 
     #[serde(skip, default = "std::time::Instant::now")]
     pub last_accessed: std::time::Instant, 
-    #[serde(skip, default = "default_bitkv_cache")]
+    #[serde(skip)]
     pub bitkv_cache: Arc<std::sync::RwLock<Vec<Option<BitKVMetadata>>>>,
 }
 
@@ -271,18 +271,20 @@ impl RegistryEntry {
 #[derive(Clone)]
 pub struct KVRegistry {
     pub entries: Arc<std::sync::RwLock<Vec<RegistryEntry>>>,
+    pub num_layers: usize,
 }
 
 impl KVRegistry {
-    pub fn new() -> Self {
+    pub fn new(num_layers: usize) -> Self {
         // [FIX] 장부를 512개 미리 할당 (약 13만 토큰 대응)
         let mut entries = Vec::with_capacity(512);
         for i in 0..512 {
-            let entry = RegistryEntry::new(i * 256, 0, 28);
+            let entry = RegistryEntry::new(i * 256, 0, num_layers);
             entries.push(entry);
         }
         Self {
             entries: Arc::new(std::sync::RwLock::new(entries)),
+            num_layers,
         }
     }
 
@@ -328,7 +330,7 @@ impl KVRegistry {
         let entries = self.entries.read().unwrap();
         
         // [DECENTRALIZED-SAVE] 레이어별로 장부를 쪼개서 저장
-        for l_idx in 0..28 {
+        for l_idx in 0..self.num_layers {
             let mut layer_data = Vec::new();
             for entry in entries.iter() {
                 if entry.location[l_idx] == KVLocation::SSD {
@@ -350,8 +352,8 @@ impl KVRegistry {
     pub fn load_from_file(&self, path: &std::path::Path) -> Result<()> {
         let mut entries = self.entries.write().unwrap();
         
-        // [DECENTRALIZED-LOAD] 28개 레이어 장부를 각각 읽어서 통합 장부 복원
-        for l_idx in 0..28 {
+        // [DECENTRALIZED-LOAD] 레이어 장부를 각각 읽어서 통합 장부 복원
+        for l_idx in 0..self.num_layers {
             let meta_path = path.join(format!("layer{}_meta.json", l_idx));
             if meta_path.exists() {
                 // [DIRECT-IO] Use OS-accelerated read for metadata
@@ -427,6 +429,7 @@ pub struct QuantizedQwen3VLTextAttention {
     pub scaling: f64,
     pub kv_blocks: Vec<KVBlock>,
     pub registry: KVRegistry, // [NEW] 중앙 목차 참조
+    pub num_layers: usize, // [NEW]
     pub layer_idx: usize,
     pub active_kv_name: Option<String>, // [NEW] JIT-LOAD 경로 동기화용
     // [ACCUMULATOR] VRAM 내 병합 캐시: 매번 수십개의 블록을 cat하는 오버헤드 제거
@@ -504,23 +507,32 @@ impl QuantizedQwen3VLTextAttention {
         let head_dim = config.head_dim;
         let scaling = 1f64 / f64::sqrt(head_dim as f64);
 
-        // [FIX] Qwen 3.5 / GGUF Flexible Naming
-        let find_key = |options: &[&str]| -> &str {
-            for &opt in options {
-                if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { return opt; }
-            }
-            options[0] // Fallback to first if none found
-        };
-
         let (q, k, v, o, q_n, k_n) = if is_gguf_naming {
-            (
-                find_key(&["attn_q", "attn_q_proj", "q_proj"]),
-                find_key(&["attn_k", "attn_k_proj", "k_proj"]),
-                find_key(&["attn_v", "attn_v_proj", "v_proj"]),
-                find_key(&["attn_output", "attn_o_proj", "o_proj"]),
-                find_key(&["attn_q_norm", "q_norm"]),
-                find_key(&["attn_k_norm", "k_norm"])
-            )
+            let mut q = "attn_q";
+            for opt in &["attn_q", "attn_q_proj", "q_proj", "attn.qkv", "attn.q_proj", "attn.linear_q", "attn.query"] {
+                if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { q = opt; break; }
+            }
+            let mut k = "attn_k";
+            for opt in &["attn_k", "attn_k_proj", "k_proj", "attn.k_proj", "attn.linear_k", "attn.key"] {
+                if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { k = opt; break; }
+            }
+            let mut v = "attn_v";
+            for opt in &["attn_v", "attn_v_proj", "v_proj", "attn.v_proj", "attn.linear_v", "attn.value"] {
+                if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { v = opt; break; }
+            }
+            let mut o = "attn_output";
+            for opt in &["attn_output", "attn_o_proj", "o_proj", "attn.out_proj", "attn.linear_o", "attn.output"] {
+                if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { o = opt; break; }
+            }
+            let mut q_n = "attn_q_norm";
+            for opt in &["attn_q_norm", "q_norm", "attn.q_norm", "attn.linear_q_norm"] {
+                if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { q_n = opt; break; }
+            }
+            let mut k_n = "attn_k_norm";
+            for opt in &["attn_k_norm", "k_norm", "attn.k_norm", "attn.linear_k_norm"] {
+                if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { k_n = opt; break; }
+            }
+            (q, k, v, o, q_n, k_n)
         } else {
             ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
         };
@@ -582,6 +594,7 @@ impl QuantizedQwen3VLTextAttention {
             scaling,
             kv_blocks: Vec::new(),
             registry,
+            num_layers: config.num_hidden_layers,
             layer_idx,
             active_kv_name: None,
             vram_merged_k: None,
@@ -1247,7 +1260,7 @@ impl QuantizedQwen3VLTextAttention {
                     if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = false; }
                 } else {
                     // 장부가 비어있거나 부족하면 확장
-                    let mut entry = crate::models::qwen3vl::quantized_model::RegistryEntry::new(offset, k.dim(2)?, 28);
+                    let mut entry = crate::models::qwen3vl::quantized_model::RegistryEntry::new(offset, k.dim(2)?, self.num_layers);
                     entry.ssd_path = Some(path.to_path_buf());
                     entry.location[self.layer_idx] = KVLocation::SSD;
                     if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = false; }
@@ -1321,18 +1334,10 @@ impl QuantizedQwen3VLTextAttention {
 
             let mut reg = self.registry.entries.write().unwrap();
             if i >= reg.len() {
-                reg.push(crate::models::qwen3vl::quantized_model::RegistryEntry {
-                    location: vec![KVLocation::SSD; 28],
-                    slot_ids: vec![None; 28],
-                    token_start: *offset,
-                    token_len: b_len,
-                    ssd_path: Some(frag_path.parent().unwrap().to_path_buf()),
-                    ssd_block_offset: *offset, // [NEW]
-                    hidden_states_path: vec![None; 28],
-                    is_dirty: vec![false; 28], 
-                    last_accessed: std::time::Instant::now(),
-                    bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; 28])),
-                });
+                let mut entry = crate::models::qwen3vl::quantized_model::RegistryEntry::new(*offset, b_len, self.num_layers);
+                entry.ssd_path = Some(frag_path.parent().unwrap().to_path_buf());
+                entry.is_dirty.fill(false);
+                reg.push(entry);
             }
             
             if i < reg.len() {
@@ -1415,6 +1420,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
             scaling: 1.0 / (config.head_dim as f64).sqrt(),
             kv_blocks: Vec::new(),
             registry,
+            num_layers: config.num_hidden_layers,
             layer_idx,
             active_kv_name: None,
             vram_merged_k: None,
@@ -1480,6 +1486,24 @@ impl QuantizedQwen3VLTextDecoderLayer {
         
         // [OPTIMIZATION] Skip MLP loading if we only need to bake KV cache (MLP 0% Mode)
         let (mlp_gate, mlp_up, mlp_down, post_attention_layernorm) = if !baking_only {
+            let (gate, up, down) = if is_gguf_naming {
+                let mut g = "ffn_gate";
+                for opt in &["ffn_gate", "mlp.gate_proj", "ffn.gate"] {
+                    if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { g = opt; break; }
+                }
+                let mut u = "ffn_up";
+                for opt in &["ffn_up", "mlp.up_proj", "mlp.linear_fc1", "ffn.up"] {
+                    if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { u = opt; break; }
+                }
+                let mut d = "ffn_down";
+                for opt in &["ffn_down", "mlp.down_proj", "mlp.linear_fc2", "ffn.down"] {
+                    if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { d = opt; break; }
+                }
+                (g, u, d)
+            } else {
+                ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+            };
+
             let mg = Some(get_qlinear(ct, reader, &format!("{base_name}.{gate}"), device, dtype)?);
             let mu = Some(get_qlinear(ct, reader, &format!("{base_name}.{up}"), device, dtype)?);
             let md = Some(get_qlinear(ct, reader, &format!("{base_name}.{down}"), device, dtype)?);
@@ -1714,8 +1738,8 @@ impl QuantizedQwen3VLTextModel {
         let config = &patched_config;
 
         let current_device = device.clone(); 
-        let registry = KVRegistry::new();
-        // [FIX] baking_only 모드에서도 전체 레이어(28개) 구조를 생성합니다.
+        let registry = KVRegistry::new(config.num_hidden_layers);
+        // [FIX] baking_only 모드에서도 전체 레이어 구조를 생성합니다.
         // 어차피 Skeleton 방식이라 RAM을 차지하지 않으며, 전체 레이어를 돌아야 정상적인 KV가 생성됩니다.
         let num_layers_to_load = config.num_hidden_layers;
 
@@ -1799,7 +1823,7 @@ impl QuantizedQwen3VLTextModel {
         let mut patched_config = config.clone();
         patched_config.hidden_size = actual_hidden_size;
         let config = &patched_config;
-        let registry = KVRegistry::new();
+        let registry = KVRegistry::new(config.num_hidden_layers);
         
         let mut pinned_layer_count = 0;
         let num_layers_to_load = config.num_hidden_layers;
@@ -1863,7 +1887,7 @@ impl QuantizedQwen3VLTextModel {
             while reg.len() < needed_blocks {
                 let off = reg.len() * 256;
                 // RegistryEntry::new 생성자를 사용하여 모든 필드를 정확하게 초기화
-                reg.push(RegistryEntry::new(off, 0, 28));
+                reg.push(RegistryEntry::new(off, 0, self.config.num_hidden_layers));
             }
             // 전체 길이 업데이트
             self.current_kv_len = total_tokens;
@@ -1956,7 +1980,7 @@ impl QuantizedQwen3VLTextModel {
                 if t_idx < chunk_offsets.len() {
                     for l_off in 1..=look_ahead_layers {
                         let target_layer = layer_idx + l_off;
-                        if target_layer < 28 {
+                        if target_layer < self.layers.len() {
                             if let Some(block) = self.layers[layer_idx].self_attn.kv_blocks.get(t_idx) {
                                 let (index, path_opt) = {
                                     let reg = self.registry.entries.read().unwrap();
