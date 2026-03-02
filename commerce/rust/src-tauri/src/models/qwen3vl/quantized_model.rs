@@ -322,40 +322,6 @@ impl KVRegistry {
         Ok(())
     }
 
-    /// [NEW] 메모리 장부를 SSD 인덱스 파일(layerN.json)로 일괄 저장합니다.
-    pub fn dump_registry_to_disk(&self, kv_dir: &std::path::Path) -> Result<()> {
-        let entries = self.entries.read().unwrap();
-        if !kv_dir.exists() { std::fs::create_dir_all(&kv_dir)?; }
-
-        for layer_idx in 0..28 {
-            let mut blocks = Vec::new();
-            for entry in entries.iter() {
-                if entry.token_len > 0 {
-                    let offset = entry.ssd_block_offset;
-                    blocks.push(crate::models::qwen3vl::generate::LayerBlockInfo {
-                        offset,
-                        len: entry.token_len,
-                        file: format!("b{}/l{}.st", offset, layer_idx),
-                    });
-                }
-            }
-            
-            if blocks.is_empty() { continue; }
-
-            let index = crate::models::qwen3vl::generate::LayerIndex {
-                layer_idx,
-                total_tokens: blocks.iter().map(|b| b.len).sum(),
-                blocks,
-            };
-
-            let index_path = kv_dir.join(format!("layer{}.json", layer_idx));
-            let json = serde_json::to_string_pretty(&index)?;
-            std::fs::write(index_path, json)?;
-        }
-        println!("[REGISTRY-DUMP] Successfully saved 28 layer indices to disk at {:?}", kv_dir);
-        Ok(())
-    }
-
     pub fn save_to_file(&self, path: &std::path::Path) -> Result<()> {
         let entries = self.entries.read().unwrap();
         
@@ -692,8 +658,8 @@ impl QuantizedQwen3VLTextAttention {
                 let take = tokens_to_process.min(256);
                 let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
                 let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
+                let index = self.kv_blocks.len();
                 let current_total = seqlen_offset + chunk_offset;
-                let index = current_total / 256; // [FIX] 절대 인덱스 사용 (clear해도 유지됨)
                 let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
                 {
                     let mut inner = new_block.inner.write().unwrap();
@@ -706,7 +672,6 @@ impl QuantizedQwen3VLTextAttention {
                     let entry = &mut reg[index];
                     entry.token_start = current_total;
                     entry.token_len = take;
-                    entry.ssd_block_offset = current_total; // [FIX] 오프셋 명시적 저장
                     if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = true; }
                     if self.layer_idx < entry.location.len() { entry.location[self.layer_idx] = KVLocation::VRAM; }
                 }
@@ -1078,10 +1043,10 @@ impl QuantizedQwen3VLTextAttention {
                         let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, dev)?;
                         let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, dev)?;
 
-                        let mut k_raw = self.decompress_from_bf16(&kd_t, &meta_os, &self.q_proj.device())?;
-                        let mut v_raw = self.decompress_from_bf16(&vd_t, &meta_os, &self.q_proj.device())?;
+                        let mut k_raw = self.decompress_from_bf16(&kd_t, &meta_os, dev)?;
+                        let mut v_raw = self.decompress_from_bf16(&vd_t, &meta_os, dev)?;
 
-                        // [KV-BRIDGE] 0.6B -> 0.6B 상황에서도 규격이 다르면 정렬
+                        // [KV-BRIDGE] 0.6B -> 0.6B 상황에서도 규격이 다르면 정렬 (커밋 261fe0ef 매커니즘)
                         let target_heads = self.num_key_value_heads;
                         let target_dim = self.head_dim;
                         let (_b, h, _s, d) = k_raw.dims4()?;
@@ -1106,11 +1071,10 @@ impl QuantizedQwen3VLTextAttention {
                         if b_idx < reg.len() {
                             if let Some(block) = self.kv_blocks.get(b_idx) {
                                 let mut inner = block.inner.write().unwrap();
-                                // [IMPORTANT] VRAM으로 직접 로드
-                                inner.k_cache = Some(k_raw.contiguous()?);
-                                inner.v_cache = Some(v_raw.contiguous()?);
-                                inner.location = KVLocation::VRAM;
-                                reg[b_idx].location[self.layer_idx] = KVLocation::VRAM;
+                                inner.k_cache = Some(k_raw.to_device(self.q_proj.device())?);
+                                inner.v_cache = Some(v_raw.to_device(self.q_proj.device())?);
+                                inner.location = KVLocation::RAM;
+                                reg[b_idx].location[self.layer_idx] = KVLocation::RAM;
                                 reg[b_idx].ssd_path = Some(file_path.parent().unwrap().to_path_buf());
                             }
                         }
@@ -2008,26 +1972,35 @@ impl QuantizedQwen3VLTextModel {
                 Some(prev) => Some(Tensor::cat(&[prev, out], 1)?),
             };
 
-            // [FIX] [REALTIME-OFFLOAD] 256 토큰 연산 직후 즉시 SSD 저장 및 VRAM 소각
-            if !self.is_high_speed && current_seq_len > 1 {
-                if let Some(sid) = &session_id {
-                    // 현재 레이어의 방금 생성된 블록을 SSD 워커로 전송
-                    let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, false);
-                    
-                    // 전송 후 VRAM 캐시 즉시 리셋 (VRAM 누적 방지)
-                    self.layers[layer_idx].self_attn.kv_blocks.clear();
-                    self.layers[layer_idx].self_attn.vram_merged_k = None;
-                    self.layers[layer_idx].self_attn.vram_merged_v = None;
-                    self.layers[layer_idx].self_attn.merged_vram_block_count = 0;
-                }
-            }
-
+            let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
             if target_device.is_cuda() { let _ = target_device.synchronize(); }
         }
 
-        // [LOG] 레이어 단위 연산 종료 로그
-        if current_seq_len > 1 && !self.is_high_speed {
-            println!("[ENGINE-TRACE] Layer {} Sequential Bake Complete & Offloaded.", layer_idx);
+        // [OPTIMIZATION] 프리필(청크 연산)이 모두 끝난 후 레이어 단위로 단 한 번 SSD 백업 트리거
+        if let Some(sid) = &session_id {
+            let is_prefill = current_seq_len > 1;
+            // 프리필 중에는 루프 밖에서 일괄 처리, 디코딩(seq_len=1)일 때는 루프와 동일하게 작동
+            let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, !is_prefill);
+        }
+
+        if current_seq_len > 1 {
+            // [OPTIMIZATION] 0.6B (Small) 모델은 디코딩(seq_len=1) 중에만 VRAM 캐시를 유지합니다.
+            // 프리필(Prefill)이나 베이킹 중에는 배치 크기가 커서 OOM이 발생하므로 무조건 VRAM에서 비워야 합니다.
+            // [FIX] 단, 고속 모드(이미 지식이 SSD에 있고 질문만 읽는 상황)에서는 비우지 않고 VRAM에 유지하여 속도를 극대화합니다.
+            let force_evict = !self.is_high_speed; 
+            
+            if force_evict {
+                for block in &self.layers[layer_idx].self_attn.kv_blocks {
+                    let mut inner = block.inner.write().unwrap();
+                    inner.k_cache = None;
+                    inner.v_cache = None;
+                    if inner.location == KVLocation::VRAM { inner.location = KVLocation::SSD; }
+                }
+                self.layers[layer_idx].self_attn.vram_merged_k = None;
+                self.layers[layer_idx].self_attn.vram_merged_v = None;
+                self.layers[layer_idx].self_attn.merged_vram_block_count = 0;
+                println!("[ENGINE-TRACE] Layer {} Prefill Cache Evicted (Memory-Safe Mode).", layer_idx);
+            }
         }
         
         final_output.ok_or_else(|| anyhow::anyhow!("No output generated from chunks"))
@@ -2141,7 +2114,7 @@ impl QuantizedQwen3VLTextModel {
         let input_token_count = xs.dim(1).unwrap_or(0);
         let is_decoding = input_token_count <= 1;
 
-        // [MEMORY-OPT] 디코딩 단계 진입 시 모든 레이어를 미리 로드
+        // [MEMORY-OPT] 디코딩 단계 진입 시 모든 레이어를 미리 로드 
         if is_decoding && layer_idx == 0 && !self.is_high_speed {
             let already_loaded = !self.layers[0].self_attn.q_proj.is_cleared();
             if !already_loaded { self.reload_all_layers()?; }
@@ -2175,29 +2148,13 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [SSD-OFFLOAD] 레이어 단위 연산 종료 후 즉시 SSD 저장 트리거
-        if let Some(sid) = &session_id {
-            // 프리필(베이킹) 중에는 해당 레이어의 모든 블록을 SSD 워커로 보냄
-            if current_seq_len > 1 && !self.is_high_speed {
-                let kv_n = kv_name.clone().unwrap_or_else(|| "text".to_string());
-                println!("[SSD-BACKUP] Triggering bake for Layer {} (Session: {}, KV: {})", layer_idx, sid, kv_n);
-                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, self.baking_only, false);
-            }
-        }
-
-        // [MEMORY-OPT] [IMMEDIATE-PURGE] 연산 직후 가중치 및 KV 캐시 즉시 소각 (고속 모드가 아닐 때만)
+        // [MEMORY-OPT] [IMMEDIATE-PURGE] 연산 직후 가중치 즉시 소각 (고속 모드가 아닐 때만)
         if !is_decoding && !self.is_high_speed {
-            // KV 캐시 VRAM 소각 (SSD로 보냈으므로 안전)
-            self.layers[layer_idx].self_attn.kv_blocks.clear();
-            self.layers[layer_idx].self_attn.vram_merged_k = None;
-            self.layers[layer_idx].self_attn.vram_merged_v = None;
-            
-            // 가중치 소각
             self.layers[layer_idx].clear();
             if target_device.is_cuda() { 
                 let _ = target_device.synchronize(); // GPU 메모리 해제 확정
             }
-            println!("[MEMORY-OPT] Layer {} Weights & VRAM Cache Purged.", layer_idx);
+            println!("[MEMORY-OPT] Layer {} Weights Purged. (RAM/VRAM cleared)", layer_idx);
         }
 
         // [STEP 4] 자원 반납 및 KV 대피
@@ -2545,50 +2502,11 @@ impl QuantizedQwen3VLTextModel {
         Ok(xs.apply(&self.norm)?)
     }
 
-    /// [MEMORY-OPT] VRAM에 있는 텐서들만 즉시 소각하고 문맥 상태(Registry, Len)는 유지합니다.
-    /// [NEW] 중앙 장부(Registry)의 정보를 각 레이어의 kv_blocks로 동기화합니다.
-    /// 베이킹 완료 후 또는 스티칭 후에 호출하여 모델이 SSD 지식을 인식하게 합니다.
-    pub fn sync_kv_blocks_with_registry(&mut self) -> Result<()> {
-        let reg_len = {
-            let reg = self.registry.entries.read().unwrap();
-            reg.iter().filter(|e| e.token_len > 0).count()
-        };
-        
-        println!("[REGISTRY-SYNC] Syncing {} blocks from Registry to all {} layers...", reg_len, self.layers.len());
-        
-        for layer in self.layers.iter_mut() {
-            layer.self_attn.kv_blocks.clear();
-            let reg = self.registry.entries.read().unwrap();
-            for (i, entry) in reg.iter().enumerate() {
-                if entry.token_len > 0 {
-                    let block = KVBlock::new(KVLocation::SSD, i, entry.token_len, entry.token_start);
-                    {
-                        let mut inner = block.inner.write().unwrap();
-                        inner.ssd_path = entry.ssd_path.clone();
-                    }
-                    layer.self_attn.kv_blocks.push(block);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn clear_vram_only(&mut self) {
-        for layer in self.layers.iter_mut() {
-            layer.self_attn.kv_blocks.clear();
-            layer.self_attn.vram_merged_k = None;
-            layer.self_attn.vram_merged_v = None;
-            layer.self_attn.merged_vram_block_count = 0;
-        }
-        // [IMPORTANT] self.current_kv_len은 유지하여 다음 오프셋이 이어지게 함
-    }
-
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
         self.current_kv_len = 0;
-        self.is_high_speed = false; // 리셋 시 고속 모드도 해제
     }
 
     pub fn evacuate_vram_to_cache(&mut self) -> Result<()> {
