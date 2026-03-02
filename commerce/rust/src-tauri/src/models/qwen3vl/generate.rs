@@ -496,7 +496,7 @@ impl Qwen3VLGenerateModel {
                 auto_map: raw_config.get("auto_map").and_then(|v| serde_json::from_value(v.clone()).ok()), 
                 hidden_size: raw_config.get("hidden_size").and_then(|v| v.as_u64()).map(|v| v as usize), 
                 image_token_id: raw_config.get("image_token_id").and_then(|v| v.as_u64()).map(|v| v as usize), 
-                model_type: raw_config.get("model_type").and_then(|v| v.as_str()).unwrap_or("qwen2").to_string(), 
+                model_type: raw_config.get("model_type").and_then(|v| v.as_str()).unwrap_or("qwen3_5").to_string(), 
                 text_config: Some(text_config), 
                 tie_word_embeddings: raw_config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(true), 
                 transformers_version: raw_config.get("transformers_version").and_then(|v| v.as_str()).unwrap_or("").to_string(), 
