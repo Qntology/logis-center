@@ -1477,7 +1477,15 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let is_gguf_naming = base_name.starts_with("blk.");
         
         let (attn_base, gate, up, down, in_ln, post_ln) = if is_gguf_naming {
-            (base_name.to_string(), "ffn_gate", "ffn_up", "ffn_down", "attn_norm", "ffn_norm")
+            let mut in_ln = "attn_norm";
+            for opt in &["attn_norm", "attn.norm", "input_layernorm"] {
+                if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { in_ln = opt; break; }
+            }
+            let mut post_ln = "ffn_norm";
+            for opt in &["ffn_norm", "ffn.norm", "post_attention_layernorm"] {
+                if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { post_ln = opt; break; }
+            }
+            (base_name.to_string(), "ffn_gate", "ffn_up", "ffn_down", in_ln, post_ln)
         } else {
             (format!("{}.self_attn", base_name), "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "input_layernorm", "post_attention_layernorm")
         };
@@ -1674,8 +1682,11 @@ impl QuantizedQwen3VLTextModel {
         let ct = self.ct.as_ref().ok_or(anyhow!("GGUF Content missing for reload"))?;
         let mut reader = std::io::Cursor::new(&mmap[..]);
         
+        // [FIX] Qwen 3.5 하이브리드 명명 규칙 탐색 강화
         let gguf_blk = format!("blk.{layer_idx}");
-        let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) {
+        let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) || 
+                        ct.tensor_infos.contains_key(&format!("{}.attn_q.weight", gguf_blk)) ||
+                        ct.tensor_infos.contains_key(&format!("{}.attn.q_proj.weight", gguf_blk)) {
             gguf_blk 
         } else {
             format!("{}.layers.{layer_idx}", self.base_name)
@@ -3193,9 +3204,14 @@ impl QuantizedQwen3TextModel {
 }
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
-    let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
+    let weight_name = format!("{name}.weight");
+    let weight = ct.tensor(reader, &weight_name, device)
+        .map_err(|e| anyhow!("Failed to load weight tensor '{}' (Error: {})", weight_name, e))?;
     let weight = QMatMul::from_qtensor(weight)?;
-    let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { Some(t.dequantize(device)?.to_dtype(dtype)?) } else { None };
+    let bias_name = format!("{name}.bias");
+    let bias = if let Ok(t) = ct.tensor(reader, &bias_name, device) { 
+        Some(t.dequantize(device)?.to_dtype(dtype)?) 
+    } else { None };
     Ok(QLinear::new(weight, bias, device.clone()))
 }
 
