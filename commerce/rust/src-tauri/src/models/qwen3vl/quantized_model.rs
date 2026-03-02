@@ -63,11 +63,19 @@ impl Module for RmsNorm {
             return Err(candle_core::Error::Msg("RMSNorm weight is cleared. Reload required.".to_string()));
         }
         let target_dtype = self.weight.dtype();
+        let dev = x.device();
         let x = x.to_dtype(DType::F32)?;
         let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
         let hidden_states = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let hidden_states = hidden_states.to_dtype(target_dtype)?;
-        hidden_states.broadcast_mul(&self.weight)
+        
+        let weight = if !self.weight.device().same_device(dev) {
+            println!("[DIAG-DEVICE-ERROR] RmsNorm Mismatch! x: {:?}, weight: {:?}", dev, self.weight.device());
+            self.weight.to_device(dev)?
+        } else {
+            self.weight.clone()
+        };
+        hidden_states.broadcast_mul(&weight)
     }
 }
 
@@ -762,7 +770,10 @@ impl QuantizedQwen3VLTextAttention {
             if let Some(n) = norm {
                 let dev = t.device();
                 let variance = t.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-                let t = t.broadcast_mul(&(variance + n.eps)?.sqrt()?.recip()?)?;
+                let eps_t = Tensor::from_vec(vec![n.eps as f32], (1,), dev)?;
+                let norm_factor = variance.broadcast_add(&eps_t)?.sqrt()?.recip()?;
+                let t = t.broadcast_mul(&norm_factor)?;
+                
                 // IMPORTANT: Use d_h (actual current head_dim) for narrowing
                 let w = n.weight().narrow(0, 0, d_h.min(n.weight().dim(0)?))?;
                 Ok(t.broadcast_mul(&w.to_device(dev)?)?)
@@ -790,7 +801,7 @@ impl QuantizedQwen3VLTextAttention {
             // 2. Compute Output: Q * State -> [B, H, S, D]
             let mut out = q.matmul(&state)?
                 .to_dtype(DType::F32)?
-                .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?
+                .broadcast_mul(&Tensor::from_vec(vec![self.scaling as f32], (1,), dev)?)?
                 .to_dtype(target_dtype)?;
             
             // Apply ssm_gate (Gating part of Gated Delta Net)
@@ -999,9 +1010,16 @@ impl QuantizedQwen3VLTextAttention {
         let rhs = k.transpose(2, 3)?.to_dtype(target_dtype)?;
 
         // Scores in F32 precision for stability
+        let scaling_t = Tensor::from_vec(vec![self.scaling as f32], (1,), dev)?;
         let mut attn_weights = lhs.matmul(&rhs)?
-            .to_dtype(DType::F32)?
-            .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?;
+            .to_dtype(DType::F32)?;
+            
+        // [DIAGNOSTIC]
+        if !attn_weights.device().same_device(scaling_t.device()) {
+            println!("[DIAG-DEVICE-ERROR] Attention Scaling Mismatch! weights: {:?}, scaling: {:?}", attn_weights.device(), scaling_t.device());
+        }
+        
+        attn_weights = attn_weights.broadcast_mul(&scaling_t)?;
 
         // Apply Internally Generated Causal Mask
         if let Some(mask) = &attention_mask {
@@ -1773,12 +1791,22 @@ impl QuantizedQwen3VLTextDecoderLayer {
             let xs = post_norm.forward(&xs)?;
             let xs = {
                 let gate = gate_proj.forward(&xs)?;
-                let up = up_proj.forward(&xs)?;
+                let mut up = up_proj.forward(&xs)?;
+                
+                // [DIAGNOSTIC] Check devices before SwiGLU multiplication
+                if !up.device().same_device(gate.device()) {
+                    println!("[DIAG-DEVICE-ERROR] MLP Mismatch! gate: {:?}, up: {:?}", gate.device(), up.device());
+                    up = up.to_device(gate.device())?;
+                }
+                
                 let gate = candle_nn::ops::silu(&gate)?;
                 let hidden = gate.mul(&up)?;
                 down_proj.forward(&hidden)?
             };
-            // [HARDENING] Second Residual Addition DType Guard
+            
+            // [HARDENING] Second Residual Addition DType & Device Guard
+            let mut xs = xs;
+            if !xs.device().same_device(residual.device()) { xs = xs.to_device(residual.device())?; }
             let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
             Ok(residual.add(&xs)?)
         } else {
@@ -1981,24 +2009,34 @@ impl QuantizedQwen3VLTextModel {
         
         if layer_idx == 0 { println!("[MEMORY-OPT] Reloading Layer {} using prefix: {}", layer_idx, prefix); }
 
-        let new_layer = QuantizedQwen3VLTextDecoderLayer::new(
+        // [FIX] Determine target device from model's device_id instead of skeleton layer
+        let target_device = if self.device_id < 100 { 
+            Device::new_cuda(self.device_id)? 
+        } else { 
+            Device::Cpu 
+        };
+
+        let mut new_layer = QuantizedQwen3VLTextDecoderLayer::new(
             &self.config,
             ct,
             &mut reader,
             &prefix,
-            &Device::Cpu, // 항상 CPU로 먼저 로드
+            &Device::Cpu, // Always load to CPU first to minimize peak VRAM
             self.dtype,
             layer_idx,
             self.baking_only,
             self.registry.clone()
         )?;
         
+        // [FIX] Move the newly loaded layer to the target device (GPU)
+        new_layer.to_device(&target_device)?;
+        
         // [VALIDATION] 로드 성공 여부 확인
         if new_layer.self_attn.q_proj.is_cleared() {
             return Err(anyhow!("Failed to reload layer {}. Weights are still empty.", layer_idx));
         }
 
-        if layer_idx == 0 { println!("[MEMORY-OPT] Layer {} reloaded successfully into memory.", layer_idx); }
+        if layer_idx == 0 { println!("[MEMORY-OPT] Layer {} reloaded successfully into memory and moved to {:?}.", layer_idx, target_device); }
         
         // 기존 KV 캐시(상태)는 유지하고 가중치만 교체
         let old_kv_blocks = self.layers[layer_idx].self_attn.kv_blocks.clone();

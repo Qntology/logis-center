@@ -28,6 +28,10 @@ pub fn apply_multimodel_rotary_pos_emb(
     sin: &Tensor,
     mrope_section: Vec<usize>,
 ) -> Result<(Tensor, Tensor)> {
+    let dev = q.device();
+    let cos = if !cos.device().same_device(dev) { cos.to_device(dev)? } else { cos.clone() };
+    let sin = if !sin.device().same_device(dev) { sin.to_device(dev)? } else { sin.clone() };
+    
     let mrope_section = mrope_section.repeat(2);
     let cos_select: Vec<Tensor> = cos
         .split(&mrope_section, D::Minus1)?
@@ -62,6 +66,10 @@ pub fn apply_rotary_pos_emb_vision(
     cos: &Tensor,
     sin: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
+    let dev = q.device();
+    let cos = if !cos.device().same_device(dev) { cos.to_device(dev)? } else { cos.clone() };
+    let sin = if !sin.device().same_device(dev) { sin.to_device(dev)? } else { sin.clone() };
+
     let cos = cos.unsqueeze(D::Minus2)?;
     let sin = sin.unsqueeze(D::Minus2)?;
     let cos = cos.to_dtype(q.dtype())?;
@@ -82,8 +90,10 @@ pub fn apply_rotary_pos_emb(
     sin: &Tensor,
     tof32: bool,
 ) -> Result<(Tensor, Tensor)> {
-    let mut cos = cos.clone();
-    let mut sin = sin.clone();
+    let dev = q.device();
+    let mut cos = if !cos.device().same_device(dev) { cos.to_device(dev)? } else { cos.clone() };
+    let mut sin = if !sin.device().same_device(dev) { sin.to_device(dev)? } else { sin.clone() };
+
     if cos.rank() == 2 {
         cos = cos.unsqueeze(0)?.unsqueeze(0)?;
         sin = sin.unsqueeze(0)?.unsqueeze(0)?;
@@ -244,12 +254,13 @@ impl Qwen3VLTextRotaryEmbedding {
 
         // Split by sections and select based on dimension index
         let mrope_section_doubled = mrope_section.iter().map(|&s| s * 2).collect::<Vec<_>>();
+        let dev = position_ids.device();
         
         let cos_select: Vec<Tensor> = cos_all
             .split(&mrope_section_doubled, D::Minus1)?
             .iter()
             .enumerate()
-            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
+            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap().to_device(dev).unwrap())
             .collect();
         let cos = Tensor::cat(&cos_select, D::Minus1)?
             .unsqueeze(1)?
@@ -259,7 +270,7 @@ impl Qwen3VLTextRotaryEmbedding {
             .split(&mrope_section_doubled, D::Minus1)?
             .iter()
             .enumerate()
-            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
+            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap().to_device(dev).unwrap())
             .collect();
         let sin = Tensor::cat(&sin_select, D::Minus1)?
             .unsqueeze(1)?

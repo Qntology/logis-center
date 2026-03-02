@@ -38,15 +38,17 @@ impl TaskDataManager {
         // [FIX] Use fixed filenames for intermediate steps to support resumption
         let filename = format!("{}.txt", suffix);
         let path = dir.join(filename);
-        // [ZERO-CPU] Use Direct I/O for task data offloading
-        utils::direct_loader::save_kv_block(&path, content.as_bytes())?;
+        // [FIX] Use standard fs::write as DirectStorage (direct_loader) does not support Write (0x80004001)
+        if let Some(p) = path.parent() { if !p.exists() { std::fs::create_dir_all(p)?; } }
+        std::fs::write(&path, content.as_bytes())?;
+        
         self.created_files.push(path.clone());
         Ok(path)
     }
 
     fn load(&self, path: &std::path::Path) -> Result<String> {
-        // [ZERO-CPU] Use Direct I/O for loading task data
-        let data = utils::direct_loader::load_kv_block(path)?;
+        // [FIX] Use standard fs::read as DirectStorage (direct_loader) is meant for GPU-bound Read only
+        let data = std::fs::read(path)?;
         Ok(String::from_utf8(data).map_err(|e| anyhow::anyhow!("Invalid UTF-8: {}", e))?)
     }
 

@@ -21,13 +21,19 @@ mod windows_impl {
         status_array: IDStorageStatusArray,
     }
 
-
     unsafe impl Send for WinContext {}
     unsafe impl Sync for WinContext {}
 
-    static CONTEXT: Lazy<Result<Arc<WinContext>>> = Lazy::new(|| {
+    // [STABILITY] DirectStorage 팩토리 초기화 성공 여부를 별도로 추적
+    static CONTEXT: Lazy<Option<Arc<WinContext>>> = Lazy::new(|| {
         unsafe {
-            let factory: IDStorageFactory = DStorageGetFactory()?;
+            let factory: IDStorageFactory = match DStorageGetFactory() {
+                Ok(f) => f,
+                Err(e) => {
+                    println!("[I/O-INFO] DirectStorage not supported or failed to init: {}. Fallback will be used.", e);
+                    return None;
+                }
+            };
             let queue_desc = DSTORAGE_QUEUE_DESC {
                 SourceType: DSTORAGE_REQUEST_SOURCE_FILE,
                 Capacity: DSTORAGE_MAX_QUEUE_CAPACITY as u16,
@@ -35,19 +41,35 @@ mod windows_impl {
                 Name: windows::core::PCSTR::null(),
                 Device: ManuallyDrop::new(None), 
             };
-            let queue = factory.CreateQueue(&queue_desc)?;
-            let status_array = factory.CreateStatusArray(1, None)?;
-            Ok(Arc::new(WinContext { factory, queue, status_array }))
+            let queue = match factory.CreateQueue(&queue_desc) {
+                Ok(q) => q,
+                Err(_) => return None,
+            };
+            let status_array = match factory.CreateStatusArray(1, None) {
+                Ok(s) => s,
+                Err(_) => return None,
+            };
+            Some(Arc::new(WinContext { factory, queue, status_array }))
         }
     });
 
     pub fn load_block(path: &Path) -> Result<Vec<u8>> {
-        let ctx = CONTEXT.as_ref().map_err(|e| anyhow!("DirectStorage init error: {}", e))?;
+        // [FALLBACK-LOGIC] CONTEXT가 None이면 즉시 일반 fs::read로 전환
+        let ctx = match CONTEXT.as_ref() {
+            Some(c) => c,
+            None => return Ok(fs::read(path)?),
+        };
+
         unsafe {
             let metadata = fs::metadata(path)?;
             let size = metadata.len() as usize;
             let path_str = path.to_string_lossy().to_string();
-            let file: IDStorageFile = ctx.factory.OpenFile(&HSTRING::from(path_str))?;
+            
+            let file: IDStorageFile = match ctx.factory.OpenFile(&HSTRING::from(path_str)) {
+                Ok(f) => f,
+                Err(_) => return Ok(fs::read(path)?), // 개별 파일 오픈 실패 시에도 Fallback
+            };
+
             let mut buffer = vec![0u8; size];
             let mut request = DSTORAGE_REQUEST::default();
             request.Options.set_SourceType(DSTORAGE_REQUEST_SOURCE_FILE);
@@ -64,16 +86,20 @@ mod windows_impl {
             ctx.queue.EnqueueRequest(&request);
             ctx.queue.EnqueueStatus(&ctx.status_array, 0);
             ctx.queue.Submit();
+            
             while !ctx.status_array.IsComplete(0) { std::thread::yield_now(); }
-            ctx.status_array.GetHResult(0).map_err(|e| anyhow!(e))?;
-            Ok(buffer)
+            
+            match ctx.status_array.GetHResult(0) {
+                Ok(_) => Ok(buffer),
+                Err(_) => Ok(fs::read(path)?), // 실행 중 에러 발생 시에도 Fallback
+            }
         }
     }
 
     pub fn save_block(path: &Path, data: &[u8]) -> Result<()> {
         unsafe {
             let path_wide = HSTRING::from(path.to_string_lossy().as_ref());
-            let handle: HANDLE = CreateFileW(
+            let handle: HANDLE = match CreateFileW(
                 &path_wide,
                 GENERIC_WRITE.0,
                 FILE_SHARE_WRITE,
@@ -81,14 +107,24 @@ mod windows_impl {
                 CREATE_ALWAYS,
                 FILE_FLAG_OVERLAPPED | FILE_ATTRIBUTE_NORMAL,
                 Some(HANDLE::default()),
-            ).map_err(|e| anyhow!("Failed to create file: {}", e))?;
+            ) {
+                Ok(h) => h,
+                Err(_) => {
+                    fs::write(path, data)?;
+                    return Ok(());
+                }
+            };
 
             let mut overlapped = OVERLAPPED::default();
             let mut bytes_written = 0u32;
             let _ = WriteFile(handle, Some(data), Some(&mut bytes_written), Some(&mut overlapped));
 
             let mut transferred = 0u32;
-            GetOverlappedResult(handle, &overlapped, &mut transferred, true).map_err(|e| anyhow!(e))?;
+            if GetOverlappedResult(handle, &overlapped, &mut transferred, true).is_err() {
+                let _ = CloseHandle(handle);
+                fs::write(path, data)?;
+                return Ok(());
+            }
             let _ = CloseHandle(handle);
             Ok(())
         }
@@ -108,30 +144,39 @@ mod linux_impl {
     unsafe impl Send for LinuxContext {}
     unsafe impl Sync for LinuxContext {}
 
-    static CONTEXT: Lazy<Result<Arc<LinuxContext>>> = Lazy::new(|| {
-        let ring = IoUring::new(128).map_err(|e| anyhow!(e))?;
-        Ok(Arc::new(LinuxContext { ring: Mutex::new(ring) }))
+    static CONTEXT: Lazy<Option<Arc<LinuxContext>>> = Lazy::new(|| {
+        let ring = match IoUring::new(128) {
+            Ok(r) => r,
+            Err(_) => return None,
+        };
+        Some(Arc::new(LinuxContext { ring: Mutex::new(ring) }))
     });
 
     pub fn load_block(path: &Path) -> Result<Vec<u8>> {
-        let ctx = CONTEXT.as_ref().map_err(|e| anyhow!(e))?;
+        let ctx = match CONTEXT.as_ref() {
+            Some(c) => c,
+            None => return Ok(fs::read(path)?),
+        };
         let file = File::open(path)?;
         let size = file.metadata()?.len() as usize;
         let mut buffer = vec![0u8; size];
         let read_e = opcode::Read::new(types::Fd(file.as_raw_fd()), buffer.as_mut_ptr(), size as u32).build();
         let mut ring = ctx.ring.lock().unwrap();
-        unsafe { ring.submission().push(&read_e).map_err(|e| anyhow!(e))?; }
-        ring.submit_and_wait(1)?;
+        unsafe { if ring.submission().push(&read_e).is_err() { return Ok(fs::read(path)?); } }
+        if ring.submit_and_wait(1).is_err() { return Ok(fs::read(path)?); }
         Ok(buffer)
     }
 
     pub fn save_block(path: &Path, data: &[u8]) -> Result<()> {
-        let ctx = CONTEXT.as_ref().map_err(|e| anyhow!(e))?;
+        let ctx = match CONTEXT.as_ref() {
+            Some(c) => c,
+            None => { fs::write(path, data)?; return Ok(()); },
+        };
         let file = File::create(path)?;
         let write_e = opcode::Write::new(types::Fd(file.as_raw_fd()), data.as_ptr(), data.len() as u32).build();
         let mut ring = ctx.ring.lock().unwrap();
-        unsafe { ring.submission().push(&write_e).map_err(|e| anyhow!(e))?; }
-        ring.submit_and_wait(1)?;
+        unsafe { if ring.submission().push(&write_e).is_err() { fs::write(path, data)?; return Ok(()); } }
+        if ring.submit_and_wait(1).is_err() { fs::write(path, data)?; return Ok(()); }
         Ok(())
     }
 }
@@ -144,14 +189,20 @@ mod macos_impl {
     struct MacContext { queue: IOCommandQueue }
     unsafe impl Send for MacContext {}
     unsafe impl Sync for MacContext {}
-    static CONTEXT: Lazy<Result<Arc<MacContext>>> = Lazy::new(|| {
-        let device = Device::system_default().ok_or_else(|| anyhow!("No Metal device found"))?;
-        let queue = device.new_io_command_queue(&IOCommandQueueDescriptor::new()).map_err(|e| anyhow!(e))?;
-        Ok(Arc::new(MacContext { queue }))
+    static CONTEXT: Lazy<Option<Arc<MacContext>>> = Lazy::new(|| {
+        let device = Device::system_default()?;
+        let queue = device.new_io_command_queue(&IOCommandQueueDescriptor::new()).ok()?;
+        Some(Arc::new(MacContext { queue }))
     });
     pub fn load_block(path: &Path) -> Result<Vec<u8>> {
-        let ctx = CONTEXT.as_ref().map_err(|e| anyhow!(e))?;
-        let io_handle = ctx.queue.new_io_handle(&path.to_string_lossy()).map_err(|e| anyhow!(e))?;
+        let ctx = match CONTEXT.as_ref() {
+            Some(c) => c,
+            None => return Ok(fs::read(path)?),
+        };
+        let io_handle = match ctx.queue.new_io_handle(&path.to_string_lossy()) {
+            Ok(h) => h,
+            Err(_) => return Ok(fs::read(path)?),
+        };
         let size = fs::metadata(path)?.len() as usize;
         let mut buffer = vec![0u8; size];
         let command_buffer = ctx.queue.new_io_command_buffer();
