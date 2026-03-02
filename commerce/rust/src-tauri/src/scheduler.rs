@@ -645,18 +645,18 @@ async fn process_task(
             
             gen.clear_kv_cache();
             for (c_idx, ids_vec) in chunk_ids_list.iter().enumerate() {
-                let ids_t = Tensor::from_vec(ids_vec.clone(), (1, 256), &gen.text_device)?;
+                let ids_t = Tensor::from_vec(ids_vec.clone(), (1, ids_vec.len()), &gen.text_device)?;
                 
                 // [FIX] 모든 워커가 0번 오프셋에서 독립적으로 프리필 (병렬 슬롯 최적화)
-                // Qwen 3.5 mRoPE를 위해 Rank 3 위치 텐서 (0..256) 생성
-                let cache_pos_1d = Tensor::arange(0u32, 256u32, &gen.text_device)?;
-                let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, 256))?;
+                // Qwen 3.5 mRoPE를 위해 Rank 3 위치 텐서 생성
+                let cache_pos_1d = Tensor::arange(0u32, ids_vec.len() as u32, &gen.text_device)?;
+                let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, ids_vec.len()))?;
 
-                gen.qwen3_vl.forward(&ids_t, None, None, None, None, Some(&pos_ids_3d), 0, 256, Some(format!("{}_c{}", task.id, c_idx)), Some("inference".to_string())).await?;
+                gen.qwen3_vl.forward(&ids_t, None, None, None, None, Some(&pos_ids_3d), 0, ids_vec.len(), Some(format!("{}_c{}", task.id, c_idx)), Some("inference".to_string())).await?;
                 gen.force_flush_all_active_blocks(&format!("{}_c{}", task.id, c_idx), Some("inference")).await?;
                 gen.clear_kv_cache();
                 
-                stitch_targets.push((format!("{}_c{}", task.id, c_idx), 0, 256));
+                stitch_targets.push((format!("{}_c{}", task.id, c_idx), 0, ids_vec.len()));
             }
         }
     }
@@ -910,17 +910,17 @@ async fn process_task(
                     let mut gen_m = model_c.generator.lock().await;
                     if let Some(gen) = gen_m.as_mut() {
                         gen.truncate_kv_cache(0)?; 
-                        let ids_tensor = Tensor::from_vec(ids_vec.clone(), (1, 256), &gen.text_device)?;
+                        let ids_tensor = Tensor::from_vec(ids_vec.clone(), (1, ids_vec.len()), &gen.text_device)?;
                         
                         // [FIX] Qwen 3.5 mRoPE를 위한 Rank 3 위치 텐서 생성 (병렬 청크용)
-                        let cache_pos_1d = Tensor::arange(current_offset as u32, (current_offset + 256) as u32, &gen.text_device)?;
-                        let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, 256))?;
+                        let cache_pos_1d = Tensor::arange(current_offset as u32, (current_offset + ids_vec.len()) as u32, &gen.text_device)?;
+                        let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, ids_vec.len()))?;
 
                         // [CRITICAL] forward 시 6번째 인자에 3D 텐서 직접 전달
-                        gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, Some(&pos_ids_3d), current_offset, current_offset + 256, Some(chunk_session.clone()), Some("inference".to_string())).await?;
+                        gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, Some(&pos_ids_3d), current_offset, current_offset + ids_vec.len(), Some(chunk_session.clone()), Some("inference".to_string())).await?;
                         gen.force_flush_all_active_blocks(&chunk_session, Some("inference")).await?;
                     }
-                    Ok::<(String, usize), anyhow::Error>((chunk_session, 256))
+                    Ok::<(String, usize), anyhow::Error>((chunk_session, ids_vec.len()))
                 });
             }
 

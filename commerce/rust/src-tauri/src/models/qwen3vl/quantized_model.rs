@@ -420,8 +420,8 @@ pub struct QuantizedQwen3VLTextAttention {
     pub k_proj: QLinear,
     pub v_proj: QLinear,
     pub o_proj: QLinear,
-    pub q_norm: RmsNorm,
-    pub k_norm: RmsNorm,
+    pub q_norm: Option<RmsNorm>,
+    pub k_norm: Option<RmsNorm>,
 
     // [QWEN3.5-HYBRID] Mamba-2 / Linear Attention Support
     pub is_linear_attention: bool,
@@ -457,8 +457,9 @@ impl QuantizedQwen3VLTextAttention {
         self.k_proj.to_device(device)?;
         self.v_proj.to_device(device)?;
         self.o_proj.to_device(device)?;
-        self.q_norm.to_device(device)?;
-        self.k_norm.to_device(device)?;
+        
+        if let Some(n) = &mut self.q_norm { n.to_device(device)?; }
+        if let Some(n) = &mut self.k_norm { n.to_device(device)?; }
 
         // [HYBRID-DEVICE-SYNC]
         if let Some(t) = &mut self.ssm_conv1d { *t = t.to_device(device)?; }
@@ -502,8 +503,9 @@ impl QuantizedQwen3VLTextAttention {
         self.k_proj.clear();
         self.v_proj.clear();
         self.o_proj.clear();
-        self.q_norm.clear();
-        self.k_norm.clear();
+        
+        if let Some(n) = &mut self.q_norm { n.clear(); }
+        if let Some(n) = &mut self.k_norm { n.clear(); }
 
         // [HYBRID-CLEAR]
         self.ssm_conv1d = None;
@@ -533,10 +535,11 @@ impl QuantizedQwen3VLTextAttention {
         let global_head_dim = config.head_dim;
         let scaling = 1f64 / f64::sqrt(global_head_dim as f64);
 
-        // [HYBRID-DETECTION] Determine if this is a Linear Attention (Mamba) layer
+        // [HYBRID-DETECTION-FIX] Strictly use layer_types from config.json
         let is_linear = if let Some(lt) = config.layer_types.get(layer_idx) {
             lt == "linear_attention"
         } else {
+            // Fallback only if config is missing (unlikely)
             ct.tensor_infos.contains_key(&format!("{base_name}.ssm_out.weight"))
         };
 
@@ -570,17 +573,17 @@ impl QuantizedQwen3VLTextAttention {
             ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
         };
 
-        let q_weight_name = format!("{base_name}.{q}.weight");
         let qkv_merged_name = format!("{base_name}.attn_qkv.weight");
 
+        // [QWEN3.5-DIM-STRICT] Trust Config but handle GGUF Padding/MTP Heads
         let (num_attention_heads, num_key_value_heads, actual_head_dim) = if is_linear {
             (config.linear_num_key_heads, config.linear_num_key_heads, config.linear_key_head_dim)
-        } else if let Some(info) = ct.tensor_infos.get(&q_weight_name) {
-            let out_features = info.shape.dims()[0];
-            (out_features / global_head_dim, config.num_key_value_heads, global_head_dim)
         } else {
             (config.num_attention_heads, config.num_key_value_heads, global_head_dim)
         };
+
+        let target_q_out = num_attention_heads * actual_head_dim;
+        let target_kv_out = num_key_value_heads * actual_head_dim;
 
         let num_kv_groups = if num_key_value_heads > 0 {
             num_attention_heads / num_key_value_heads
@@ -597,11 +600,6 @@ impl QuantizedQwen3VLTextAttention {
             let v_dim_val = config.linear_num_value_heads * config.linear_value_head_dim;
             let target_out_size = 2 * k_dim_val + v_dim_val;
 
-            if layer_idx == 0 {
-                println!("[DEBUG-MAMBA] Layer 0 attn_qkv shape: {:?}. Target Out: {}", qkv_tensor.shape(), target_out_size);
-            }
-
-            // GGUF layout can be [In, Out]. Target split dimension should match target_out_size.
             let split_dim = if qkv_tensor.dim(1).unwrap_or(0) == target_out_size { 1 } else { 0 };
             let total_out = qkv_tensor.dim(split_dim)?;
             
@@ -609,7 +607,6 @@ impl QuantizedQwen3VLTextAttention {
             let k_t = qkv_tensor.narrow(split_dim, k_dim_val.min(total_out), k_dim_val.min(total_out.saturating_sub(k_dim_val)))?;
             let v_t = qkv_tensor.narrow(split_dim, (2 * k_dim_val).min(total_out), v_dim_val.min(total_out.saturating_sub(2 * k_dim_val)))?;
             
-            // QMatMul expects [Out, In]. If we split along dim 1, we must transpose to get Out=MergedDim.
             let (q_final, k_final, v_final) = if split_dim == 1 {
                 (q_t.t()?.contiguous()?, k_t.t()?.contiguous()?, v_t.t()?.contiguous()?)
             } else {
@@ -622,28 +619,42 @@ impl QuantizedQwen3VLTextAttention {
                 QLinear::new(QMatMul::Tensor(v_final), None, device.clone()),
             )
         } else {
-            // Individual loading (Attention case)
-            let q_p = get_qlinear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
-            let k_p = get_qlinear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?;
-            let v_p = get_qlinear(ct, reader, &format!("{base_name}.{v}"), device, dtype)?;
+            // [SMART-SLICE] Load and trim if tensor is larger than config (Padding/MTP support)
+            let mut load_and_trim = |name: &str, target_size: usize| -> Result<QLinear> {
+                let ql = get_qlinear(ct, reader, name, device, dtype)?;
+                if ql.shape().dims()[0] > target_size {
+                    // GGUF Linear weights are [Out, In] in our QLinear wrapper after to_device
+                    // But during 'new' (CPU load), they might be [In, Out]. 
+                    // Let's perform a safe dequantize and narrow.
+                    let w = ct.tensor(reader, &format!("{name}.weight"), device)?;
+                    let t = w.dequantize(device)?.to_dtype(dtype)?;
+                    let dim = if t.dim(0)? > t.dim(1)? { 0 } else { 1 };
+                    let sliced = t.narrow(dim, 0, target_size)?;
+                    let final_t = if dim == 1 { sliced.t()?.contiguous()? } else { sliced.contiguous()? };
+                    Ok(QLinear::new(QMatMul::Tensor(final_t), None, device.clone()))
+                } else {
+                    Ok(ql)
+                }
+            };
+
+            let q_p = load_and_trim(&format!("{base_name}.{q}"), target_q_out)?;
+            let k_p = load_and_trim(&format!("{base_name}.{k}"), target_kv_out)?;
+            let v_p = load_and_trim(&format!("{base_name}.{v}"), target_kv_out)?;
             (q_p, k_p, v_p)
         };
 
         let o_proj = get_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
         
         let q_norm = if ct.tensor_infos.contains_key(&format!("{base_name}.{q_n}.weight")) {
-            get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype)?
+            Some(get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype)?)
         } else {
-            // [IDENTITY-FIX] Use ONES instead of ZEROS to preserve signal
-            let one_t = Tensor::ones((actual_head_dim * num_attention_heads,), dtype, device)?;
-            RmsNorm::new(one_t, config.rms_norm_eps)
+            None
         };
 
         let k_norm = if ct.tensor_infos.contains_key(&format!("{base_name}.{k_n}.weight")) {
-            get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype)?
+            Some(get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype)?)
         } else {
-            let one_t = Tensor::ones((actual_head_dim * num_key_value_heads,), dtype, device)?;
-            RmsNorm::new(one_t, config.rms_norm_eps)
+            None
         };
 
         // [MAMBA-2 EXTRA TENSORS]
@@ -733,27 +744,27 @@ impl QuantizedQwen3VLTextAttention {
             attention_mask_in.map(|m| m.clone())
         };
 
-        let mut query_states = self.q_proj.forward(&xs)?;
-        let mut key_states = self.k_proj.forward(&xs)?;
-        let mut value_states = self.v_proj.forward(&xs)?;
+        // [QWEN3.5-DIM-STRICT] Use the dynamically detected head count from new()
+        let n_h = self.num_attention_heads;
+        let n_kv_h = self.num_key_value_heads;
+        let d_h = self.head_dim;
 
-        // [QWEN3.5-NORM-FIX] Use the actual head dimensions of the current layer
-        // Mamba layers (16 heads * 128 dim) vs Attention layers (8 heads * 256 dim)
-        let q_head_dim = self.head_dim;
-        let k_head_dim = self.head_dim;
+        let query_states = self.q_proj.forward(&xs)?.reshape((b_sz, q_len, n_h, d_h))?;
+        let key_states = self.k_proj.forward(&xs)?.reshape((b_sz, q_len, n_kv_h, d_h))?;
+        let value_states = self.v_proj.forward(&xs)?.reshape((b_sz, q_len, n_kv_h, d_h))?;
 
-        query_states = query_states.reshape((b_sz, q_len, self.num_attention_heads, q_head_dim))?;
-        key_states = key_states.reshape((b_sz, q_len, self.num_key_value_heads, k_head_dim))?;
-        value_states = value_states.reshape((b_sz, q_len, self.num_key_value_heads, k_head_dim))?;
-
-        // Manual RMSNorm to handle head_dim broadcasting with 1024-dim weights
-        let apply_q_norm = |t: Tensor, norm: &RmsNorm| -> Result<Tensor> {
-            let dev = t.device();
-            let variance = t.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-            let t = t.broadcast_mul(&(variance + norm.eps)?.sqrt()?.recip()?)?;
-            // Take weights matching the actual head_dim of THIS layer
-            let w = norm.weight().narrow(0, 0, q_head_dim.min(norm.weight().dim(0)?))?;
-            Ok(t.broadcast_mul(&w.to_device(dev)?)?)
+        // Manual RMSNorm to handle head_dim broadcasting
+        let apply_q_norm = |t: Tensor, norm: &Option<RmsNorm>| -> Result<Tensor> {
+            if let Some(n) = norm {
+                let dev = t.device();
+                let variance = t.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+                let t = t.broadcast_mul(&(variance + n.eps)?.sqrt()?.recip()?)?;
+                // IMPORTANT: Use d_h (actual current head_dim) for narrowing
+                let w = n.weight().narrow(0, 0, d_h.min(n.weight().dim(0)?))?;
+                Ok(t.broadcast_mul(&w.to_device(dev)?)?)
+            } else {
+                Ok(t)
+            }
         };
 
         let query_states_norm = apply_q_norm(query_states.clone(), &self.q_norm)?.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
@@ -763,30 +774,20 @@ impl QuantizedQwen3VLTextAttention {
         // [HYBRID-INFERENCE] Mamba-2 / Linear Attention Forward Path
         if self.is_linear_attention {
             // Linear Attention (Gated Delta Net) implementation:
-            // Standard attention: Softmax(Q K^T) V
-            // Linear attention: Q (K^T V)
+            // Optimized Path: query * (key.T * value)
+            let q = query_states_norm.to_dtype(target_dtype)?.contiguous()?; // [B, H, S, D]
+            let k = key_states_norm.to_dtype(target_dtype)?.contiguous()?;   // [B, H, S, D]
+            let v = value_states.to_dtype(target_dtype)?.contiguous()?;      // [B, H, S, D]
             
-            let lhs = query_states.to_dtype(target_dtype)?.contiguous()?;
-            let rhs = key_states.transpose(2, 3)?.to_dtype(target_dtype)?.contiguous()?;
+            // 1. Compute State: K^T * V -> [B, H, D, D]
+            let k_t = k.transpose(2, 3)?.contiguous()?; // [B, H, D, S]
+            let state = k_t.matmul(&v)?; // [B, H, D, D]
             
-            // Linear kernel (No Softmax for Gated Delta Net)
-            let attn_weights = lhs.matmul(&rhs)?
+            // 2. Compute Output: Q * State -> [B, H, S, D]
+            let mut out = q.matmul(&state)?
                 .to_dtype(DType::F32)?
-                .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?;
-            
-            // Apply causal mask if available (Linear Attention also follows causality)
-            let mut attn_weights = attn_weights;
-            if let Some(mask) = attention_mask_in {
-                let m_len = mask.dim(candle_core::D::Minus1)?;
-                let kv_len = key_states.dim(2)?;
-                if kv_len <= m_len {
-                    attn_weights = attn_weights.broadcast_add(&mask.narrow(candle_core::D::Minus1, 0, kv_len)?.to_device(dev)?)?;
-                }
-            }
-
-            let weights_final = attn_weights.to_dtype(target_dtype)?.contiguous()?;
-            let v_final = value_states.to_dtype(target_dtype)?.contiguous()?;
-            let mut out = weights_final.matmul(&v_final)?;
+                .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?
+                .to_dtype(target_dtype)?;
             
             // Apply ssm_gate (Gating part of Gated Delta Net)
             if let Some(gate_proj) = &self.ssm_gate {
@@ -800,13 +801,7 @@ impl QuantizedQwen3VLTextAttention {
             let out_combined = out.transpose(1, 2)?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
             
             // Double check rank for stability in diverse environments
-            let out_ready = if out_combined.rank() == 2 {
-                println!("[ENGINE-WARN] Mamba-2 output was rank 2, unsqueezing to rank 3.");
-                out_combined.unsqueeze(0)?
-            } else {
-                out_combined
-            };
-
+            let out_ready = if out_combined.rank() == 2 { out_combined.unsqueeze(0)? } else { out_combined };
             let attn_output = self.o_proj.forward(&out_ready)?;
             return Ok(attn_output);
         }
@@ -1599,17 +1594,17 @@ impl QuantizedQwen3VLTextDecoderLayer {
             (format!("{}.self_attn", base_name), "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "input_layernorm", "post_attention_layernorm")
         };
 
-        // 빈 텐서들로 초기화
+        // 빈 텐서들로 초기화 (elem_count <= 1 이면 is_cleared() 가 true 반환)
         let zero_t = Tensor::zeros((1,), dtype, device)?;
         let q_proj = QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone());
         let k_proj = QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone());
         let v_proj = QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone());
         let o_proj = QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone());
-        let q_norm = RmsNorm::new(zero_t.clone(), config.rms_norm_eps);
-        let k_norm = RmsNorm::new(zero_t.clone(), config.rms_norm_eps);
 
         let mut self_attn = QuantizedQwen3VLTextAttention {
-            q_proj, k_proj, v_proj, o_proj, q_norm, k_norm,
+            q_proj, k_proj, v_proj, o_proj,
+            q_norm: None,
+            k_norm: None,
             is_linear_attention: false,
             ssm_conv1d: None,
             ssm_a: None,
