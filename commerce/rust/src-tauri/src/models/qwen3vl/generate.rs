@@ -685,8 +685,12 @@ impl Qwen3VLGenerateModel {
             
             let current_pos = total_tokens_after_prefill + i as usize;
             
+            // [FIX] Qwen 3.5 mRoPE를 위한 Rank 3 위치 텐서 생성 (디코딩용 단일 토큰)
+            let cache_pos_1d = Tensor::from_vec(vec![current_pos as u32], (1, 1), &self.text_device)?;
+            let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.broadcast_as((3, 1, 1))?;
+
             wait_for_global_io().await; // [SYNC] Wait for any incremental baking
-            logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;
+            logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, Some(&pos_ids_3d), current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;
         }
         
         println!("[GEN-RESULT] Generated {} tokens. Result: {}", gen_ids.len(), gen_text.replace("\n", " "));

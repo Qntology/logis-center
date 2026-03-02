@@ -452,7 +452,7 @@ async fn process_task(
             log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer 2B)...", "spinner": "⠋" }));
             
             // Activate 2B in Baking mode (1 layer, no MLP)
-            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true, None).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true, None, false).await?;
             
             // Perform prefill with image to create visual KV cache
             let model_clone = model.clone();
@@ -497,7 +497,7 @@ async fn process_task(
             log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 2B-VL...", "spinner": "⠋" }));
             
             // Transition to full Large model with the baked snapshot
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone(), false).await?;
 
             model.extract_from_image(
                 task.id.clone(),
@@ -600,99 +600,59 @@ async fn process_task(
     let base_session = format!("{}_base", task.id);
     log_task_progress(app_handle, &task.id, &json!({ "category": "Base Context", "summary": "Baking PUG in Parallel (256-unit)...", "spinner": "🔥" }));
 
-    // [FIX] 텍스트 베이킹 시에는 28개 레이어 전체 연산이 필요합니다. 
-    // Skeleton 방식이므로 baking_only=false로 설정해도 RAM 사용량은 동일하게 낮습니다.
-    model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, None).await?;
+    // [TEXT-ONLY-OPTIMIZATION] 이미지가 필요한 태스크가 아니라면 비전 모델을 로드하지 않음
+    let needs_vision = task.r#type == "image_extraction" || task.r#type == "vision_analysis";
+    model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, None, !needs_vision).await?;
 
-    // 1.1 Chat-structured Tokenization and Aligned Splitting
-    let chunk_data = {
+    // 1.1 [CLEAN-CONTEXT] 태그를 최소화하여 맥락 유지
+    let chunk_ids_list = {
         let gen_guard = model.generator.lock().await;
         let gen = gen_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Generator failed to load"))?;
-        
-        let mut chunk_ids_list = Vec::new();
-        let space_token = gen.tokenizer.text_encode_vec(" ".to_string(), false).unwrap_or(vec![220])[0];
-        let mut current_lines = Vec::new();
-        let mut chunk_idx = 1;
 
-        let mut lines_iter = light_pug.lines().peekable();
-        while lines_iter.peek().is_some() {
-            let test_pug = current_lines.join("\n");
-            let structured_test = format!(
-                "<|im_start|>system\nPUG context [PART {}]. READ ONLY. NO THINKING. /no_think<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n",
-                chunk_idx,
-                parsing::sanitize_llm_input(&test_pug)
-            );
-            let current_total_ids = gen.tokenizer.text_encode_vec(structured_test.clone(), false).unwrap_or_default();
+        let mut chunk_list = Vec::new();
 
-            if let Some(&next_line) = lines_iter.peek() {
-                let mut next_lines = current_lines.clone();
-                next_lines.push(next_line.to_string());
-                let next_pug = next_lines.join("\n");
-                let structured_next = format!(
-                    "<|im_start|>system\nPUG context [PART {}]. READ ONLY. NO THINKING. /no_think<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n",
-                    chunk_idx,
-                    parsing::sanitize_llm_input(&next_pug)
-                );
-                let next_total_ids = gen.tokenizer.text_encode_vec(structured_next, false).unwrap_or_default();
+        // 전체를 하나의 긴 텍스트로 구성 (이전 성공 버전의 구조 복구)
+        let full_text = format!("<|im_start|>system\nPUG context for analysis:\n{}\n<|im_end|>\n", light_pug);
+        let full_ids = gen.tokenizer.text_encode_vec(full_text, false)?;
 
-                if next_total_ids.len() > 256 || current_lines.len() >= 40 {
-                    let mut final_ids = current_total_ids;
-                    while final_ids.len() < 256 { final_ids.push(space_token); }
-                    if final_ids.len() > 256 { final_ids.truncate(256); }
-                    chunk_ids_list.push(final_ids);
-                    current_lines.clear();
-                    chunk_idx += 1;
-                } else {
-                    current_lines.push(lines_iter.next().unwrap().to_string());
-                }
-            } else {
-                let mut final_ids = current_total_ids;
-                while final_ids.len() < 256 { final_ids.push(space_token); }
-                if final_ids.len() > 256 { final_ids.truncate(256); }
-                chunk_ids_list.push(final_ids);
-                break;
-            }
+        // 256 단위로 자르되, 태그 없이 순수 데이터만 유지
+        for chunk in full_ids.chunks(256) {
+            let mut c = chunk.to_vec();
+            while c.len() < 256 { c.push(0); } // 0번(보통 <pad> 또는 null)으로 패딩
+            chunk_list.push(c);
         }
-        chunk_ids_list
+        chunk_list
     };
 
     let mut stitch_targets = Vec::new();
 
-    // 1.2 Batched Sequential-RoPE Bake (Ultra-Fast)
+    // 1.2 Stable Sequential Bake (Fixes Rank Error)
     {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": format!("Baking {} structured history fragments...", chunk_data.len()), "spinner": "🚀" }));
-            
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": format!("Baking {} context fragments...", chunk_ids_list.len()), "spinner": "🚀" }));
+
             gen.clear_kv_cache();
-            let b_sz = chunk_data.len();
-            let chunk_len = 256;
-            
-            let mut batched_ids = vec![0u32; b_sz * chunk_len];
-            for (i, ids) in chunk_data.iter().enumerate() {
-                batched_ids[i * chunk_len .. (i + 1) * chunk_len].copy_from_slice(ids);
-            }
-            
-            let ids_t = Tensor::from_vec(batched_ids, (b_sz, chunk_len), &gen.text_device)?;
-            
-            let mut pos_ids_rows = Vec::new();
-            for b in 0..b_sz {
-                let start = (b * chunk_len) as u32;
-                let row = Tensor::arange(start, start + chunk_len as u32, &gen.text_device)?
-                    .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, chunk_len))?;
-                pos_ids_rows.push(row);
-            }
-            let pos_ids = Tensor::cat(&pos_ids_rows, 1)?;
+            for (c_idx, ids_vec) in chunk_ids_list.iter().enumerate() {
+                let current_offset = c_idx * 256;
+                let ids_t = Tensor::from_vec(ids_vec.clone(), (1, 256), &gen.text_device)?;
 
-            gen.qwen3_vl.forward(&ids_t, None, None, None, None, Some(&pos_ids), 0, chunk_len, Some(task.id.clone()), Some("inference".to_string())).await?;
-            gen.force_flush_all_active_blocks(&task.id, Some("inference")).await?;
+                // [FIX] Qwen 3.5 mRoPE를 위한 Rank 3 위치 텐서 생성
+                let cache_pos_1d = Tensor::arange(current_offset as u32, (current_offset + 256) as u32, &gen.text_device)?;
+                let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, 256))?;
+
+                // [CRITICAL] forward 시 6번째 인자(cache_position)에 3D 텐서를 직접 전달
+                gen.qwen3_vl.forward(&ids_t, None, None, None, None, Some(&pos_ids_3d), current_offset, current_offset + 256, Some(task.id.clone()), Some("inference".to_string())).await?;
+
+                // 10개 청크마다 한 번씩만 Flush하여 I/O 대기 최소화
+                if (c_idx + 1) % 10 == 0 || c_idx == chunk_ids_list.len() - 1 {
+                    gen.force_flush_all_active_blocks(&task.id, Some("inference")).await?;
+                }
+            }
             gen.clear_kv_cache(); 
-
-            // [FIX] 초기 베이킹은 단일 세션(task.id)에 모든 블록(b0, b256...)이 0번 오프셋부터 들어있음
-            stitch_targets.push((task.id.clone(), 0, b_sz * 256));
+            stitch_targets.push((task.id.clone(), 0, chunk_ids_list.len() * 256));
         }
-    }
-    // [WAIT] 모든 워커가 SSD 저장을 마칠 때까지 대기
+    }    // [WAIT] 모든 워커가 SSD 저장을 마칠 때까지 대기
     crate::models::qwen3vl::generate::wait_for_global_io().await;
 
     // --- STEP 2: Transition to High-Speed Decoding Mode ---
@@ -950,8 +910,12 @@ async fn process_task(
                         gen.truncate_kv_cache(0)?; 
                         let ids_tensor = Tensor::from_vec(ids_vec.clone(), (1, 256), &gen.text_device)?;
                         
-                        // [CRITICAL] 256 배수 정렬을 보장하여 RoPE와 Registry 매핑을 일치시킴
-                        gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, None, current_offset, current_offset + 256, Some(chunk_session.clone()), Some("inference".to_string())).await?;
+                        // [FIX] Qwen 3.5 mRoPE를 위한 Rank 3 위치 텐서 생성 (병렬 청크용)
+                        let cache_pos_1d = Tensor::arange(current_offset as u32, (current_offset + 256) as u32, &gen.text_device)?;
+                        let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, 256))?;
+
+                        // [CRITICAL] forward 시 6번째 인자에 3D 텐서 직접 전달
+                        gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, Some(&pos_ids_3d), current_offset, current_offset + 256, Some(chunk_session.clone()), Some("inference".to_string())).await?;
                         gen.force_flush_all_active_blocks(&chunk_session, Some("inference")).await?;
                     }
                     Ok::<(String, usize), anyhow::Error>((chunk_session, 256))
@@ -991,7 +955,12 @@ async fn process_task(
 
                     let ids_tensor = Tensor::from_vec(inst_ids.clone(), (1, aligned_inst_len), &gen.text_device)?;
                     
-                    gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, None, inst_offset, inst_offset + aligned_inst_len, Some(snapshot_inst.clone()), Some("inference".to_string())).await?;
+                    // [FIX] Qwen 3.5 mRoPE를 위한 Rank 3 위치 텐서 생성 (지시 사항용)
+                    let cache_pos_1d = Tensor::arange(inst_offset as u32, (inst_offset + aligned_inst_len) as u32, &gen.text_device)?;
+                    let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, aligned_inst_len))?;
+
+                    // [CRITICAL] forward 시 6번째 인자에 3D 텐서 직접 전달
+                    gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, Some(&pos_ids_3d), inst_offset, inst_offset + aligned_inst_len, Some(snapshot_inst.clone()), Some("inference".to_string())).await?;
                     gen.force_flush_all_active_blocks(&snapshot_inst, Some("inference")).await?;
                     
                     aligned_inst_len

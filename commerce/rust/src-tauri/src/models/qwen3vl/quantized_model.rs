@@ -504,13 +504,27 @@ impl QuantizedQwen3VLTextAttention {
         let head_dim = config.head_dim;
         let scaling = 1f64 / f64::sqrt(head_dim as f64);
 
+        // [FIX] Qwen 3.5 / GGUF Flexible Naming
+        let find_key = |options: &[&str]| -> &str {
+            for &opt in options {
+                if ct.tensor_infos.contains_key(&format!("{base_name}.{opt}.weight")) { return opt; }
+            }
+            options[0] // Fallback to first if none found
+        };
+
         let (q, k, v, o, q_n, k_n) = if is_gguf_naming {
-            ("attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm")
+            (
+                find_key(&["attn_q", "attn_q_proj", "q_proj"]),
+                find_key(&["attn_k", "attn_k_proj", "k_proj"]),
+                find_key(&["attn_v", "attn_v_proj", "v_proj"]),
+                find_key(&["attn_output", "attn_o_proj", "o_proj"]),
+                find_key(&["attn_q_norm", "q_norm"]),
+                find_key(&["attn_k_norm", "k_norm"])
+            )
         } else {
             ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
         };
 
-        // [FIX] Dynamic Head Detection: Trust GGUF tensor shapes over config to prevent reshape mismatches.
         let q_weight_name = format!("{base_name}.{q}.weight");
         let k_weight_name = format!("{base_name}.{k}.weight");
 

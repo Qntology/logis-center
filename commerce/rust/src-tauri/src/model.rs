@@ -452,11 +452,11 @@ impl LogisModel {
     }
 
     /// [NEW] Secure VRAM/RAM Transition Logic (Isolation Protocol)
-    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool, kv_name: Option<String>) -> anyhow::Result<()> {
+    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool, kv_name: Option<String>, force_text_only: bool) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
         // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
-        println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
+        println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {}, Text-Only: {})...", target_size, is_baking, force_text_only);
         self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {
@@ -466,9 +466,7 @@ impl LogisModel {
         }
 
         // 2. [LOAD] 새 모델 로드 (이제 VRAM이 최대치로 확보된 상태)
-        // [OPTIMIZATION] If transitioning to Large for a Relay (task_id present), skip Vision module
-        let text_only = target_size == ModelSize::Large && task_id.is_some() && !is_baking;
-        self.ensure_generator_ext(target_size, text_only, is_baking).await?;
+        self.ensure_generator_ext(target_size, force_text_only, is_baking).await?;
 
         // 4. [RESTORE] 디스크 스냅샷 로드
         if let Some(tid) = task_id {
@@ -484,7 +482,7 @@ impl LogisModel {
         let base_session = format!("{}_base", task_id);
         
         // 1. Load Small Model Isolated
-        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true, None).await?;
+        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true, None, true).await?;
 
         // 2. Ingest PUG content
         {
@@ -524,7 +522,7 @@ impl LogisModel {
             }
         }
 
-        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false, None).await
+        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false, None, true).await
     }
 
     async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
