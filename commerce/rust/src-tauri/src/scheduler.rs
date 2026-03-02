@@ -635,43 +635,106 @@ async fn process_task(
         (chunk_list, text_list)
     };
 
-    let mut stitch_targets = Vec::new();
+    let mut stitch_targets: Vec<(String, usize, usize)> = Vec::new();
 
-    // 1.2 Parallel Independent Bake (Offset 0 for all workers)
+    // --- STEP 1: Layer-by-Layer Parallel Baking (Offset-Centric SSD-Direct) ---
+    log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": "Initializing Layer-by-Layer Parallel Pipeline...", "spinner": "🔥" }));
+
+    let task_kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id);
+    if !task_kv_dir.exists() { fs::create_dir_all(&task_kv_dir)?; }
+
+    // 1.1 [COMMON-EMBEDDING] Generate and save initial hidden states for all chunks
     {
-        let mut gen_m = model.generator.lock().await;
-        if let Some(gen) = gen_m.as_mut() {
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": format!("Baking {} independent fragments...", chunk_ids_list.len()), "spinner": "🚀" }));
-            
-            gen.clear_kv_cache();
+        let gen_m = model.generator.lock().await;
+        if let Some(gen) = gen_m.as_ref() {
             for (c_idx, ids_vec) in chunk_ids_list.iter().enumerate() {
+                let offset = c_idx * 256;
+                let offset_dir = task_kv_dir.join(format!("l{}", offset));
+                if !offset_dir.exists() { fs::create_dir_all(&offset_dir)?; }
+                
                 let ids_t = Tensor::from_vec(ids_vec.clone(), (1, ids_vec.len()), &gen.text_device)?;
+                let embeds = gen.qwen3_vl.get_initial_embeddings(&ids_t)?;
                 
-                // [FIX] 모든 워커가 0번 오프셋에서 독립적으로 프리필 (병렬 슬롯 최적화)
-                // Qwen 3.5 mRoPE를 위해 Rank 3 위치 텐서 생성
-                let cache_pos_1d = Tensor::arange(0u32, ids_vec.len() as u32, &gen.text_device)?;
-                let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, ids_vec.len()))?;
-
-                gen.qwen3_vl.forward(&ids_t, None, None, None, None, Some(&pos_ids_3d), 0, ids_vec.len(), Some(format!("{}_c{}", task.id, c_idx)), Some("inference".to_string())).await?;
-                gen.force_flush_all_active_blocks(&format!("{}_c{}", task.id, c_idx), Some("inference")).await?;
-                gen.clear_kv_cache();
-                
-                stitch_targets.push((format!("{}_c{}", task.id, c_idx), 0, ids_vec.len()));
+                // Save as Layer 0's input (input.st)
+                let input_path = offset_dir.join("input.st");
+                gen.qwen3_vl.save_hidden_states(&input_path, &embeds)?;
             }
         }
     }
-    // [WAIT]
-    crate::models::qwen3vl::generate::wait_for_global_io().await;
 
-    // --- STEP 2: Transition to High-Speed Decoding Mode ---
-    {
-        let mut gen_m = model.generator.lock().await;
-        if let Some(gen) = gen_m.as_mut() {
-            gen.reload_all_layers()?;
+    // 1.2 [OUTER-LOOP] Sequential Layer Processing (Layer 0 to 23)
+    let num_total_layers = 24;
+    for l_idx in 0..num_total_layers {
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": format!("Processing Layer {}/{} for all chunks...", l_idx + 1, num_total_layers), "spinner": "⚡" }));
+        
+        // GPU에 현재 레이어 가중치만 상주 (VRAM 효율 극대화)
+        {
+            let mut gen_m = model.generator.lock().await;
+            if let Some(gen) = gen_m.as_mut() {
+                gen.reload_layer(l_idx)?; 
+            }
         }
+
+        // [INNER-PARALLEL] 모든 청크 오프셋을 병렬로 연산 (SSD-to-SSD Relay)
+        let mut layer_tasks = Vec::new();
+        for c_idx in 0..chunk_ids_list.len() {
+            let model_c = model.clone();
+            let task_id_c = task.id.clone();
+            let offset = c_idx * 256;
+            let current_l = l_idx;
+            let kv_name_c = kv_name.clone();
+
+            layer_tasks.push(async move {
+                let mut gen_m = model_c.generator.lock().await;
+                if let Some(gen) = gen_m.as_mut() {
+                    let offset_dir = utils::paths::get_kv_dir(None).join(&task_id_c).join(format!("l{}", offset));
+                    
+                    // 1. Load Input from SSD (Either initial input.st or previous layer's output h{N-1}.st)
+                    let input_path = if current_l == 0 { offset_dir.join("input.st") } else { offset_dir.join(format!("h{}.st", current_l - 1)) };
+                    let device = gen.text_device.clone();
+                    let dtype = if device.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+                    let xs = gen.qwen3_vl.load_hidden_states(&input_path, &device, dtype)?;
+
+                    // 2. Prepare Position/RoPE (For parallel chunks, offset is 0 as they are independent histories)
+                    let cache_pos_1d = Tensor::arange(0u32, 256u32, &device)?;
+                    let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, 256))?;
+                    
+                    // Qwen 3.5 RoPE cos/sin generation (Internal helper needed or use forward_single_layer)
+                    // For simplicity, we assume forward_single_layer handles internal RoPE if not provided
+                    // But here we need to be precise. 
+                    // [STABILITY] Get cos/sin from model's internal rotary embedding
+                    let (cos, sin) = match &gen.qwen3_vl {
+                        crate::models::qwen3vl::generate::ModelVariant::QuantizedVL(m) => m.language_model.rotary_emb.forward(&pos_ids_3d, dtype, m.language_model.mrope_section.clone())?,
+                        crate::models::qwen3vl::generate::ModelVariant::QuantizedText(m) => m.language_model.rotary_emb.forward(&pos_ids_3d, dtype, m.language_model.mrope_section.clone())?,
+                        _ => return Err(anyhow::anyhow!("Rotary error")),
+                    };
+
+                    // 3. Forward Single Layer (Generates KV + Next Hidden States)
+                    // KV is automatically saved to task_id/l{offset}/b{layer}.st via generate.rs IO worker
+                    let session_id = Some(task_id_c.clone());
+                    let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, 0, session_id, kv_name_c, true)?;
+
+                    // 4. Save Next Hidden States to SSD
+                    let output_path = offset_dir.join(format!("h{}.st", current_l));
+                    gen.qwen3_vl.save_hidden_states(&output_path, &next_xs)?;
+                    
+                    // 5. Cleanup previous layer's hidden states to save space
+                    if current_l > 0 { let _ = fs::remove_file(input_path); }
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+        }
+        
+        // Execute all chunks for current layer in parallel
+        let results = futures::future::join_all(layer_tasks).await;
+        for res in results { res?; }
+        
+        // [SYNC] 모든 병렬 IO(KV 저장 및 Hidden States 저장)가 끝날 때까지 대기
+        crate::models::qwen3vl::generate::wait_for_global_io().await;
     }
 
-    // [HELPER] 히스토리가 포함된 파라미터 생성 함수 (Text Task 최적 사양)
+    // --- STEP 2: Transition to Decoding Mode ---
+    // [HELPER] 히스토리 데이터가 포함된 파라미터 생성 함수
     let build_params = |prompt: String, max_t: u32, texts: &Vec<String>| {
         let mut messages = Vec::new();
         for text in texts {
@@ -698,7 +761,28 @@ async fn process_task(
         }
     };
 
-    // [LOAD-BASE] 
+    // [CLEANUP] Remove all temporary hidden state files (h23.st etc.)
+    for c_idx in 0..chunk_ids_list.len() {
+        let offset = c_idx * 256;
+        let last_h = task_kv_dir.join(format!("l{}", offset)).join(format!("h{}.st", num_total_layers - 1));
+        if last_h.exists() { let _ = fs::remove_file(last_h); }
+        let input_f = task_kv_dir.join(format!("l{}", offset)).join("input.st");
+        if input_f.exists() { let _ = fs::remove_file(input_f); }
+    }
+
+    {
+        let mut gen_m = model.generator.lock().await;
+        if let Some(gen) = gen_m.as_mut() {
+            gen.reload_all_layers()?;
+        }
+    }
+
+    // 2.1 [STITCH-ALL-LAYERS] Assemble virtual context from offset-centric blocks
+    let mut stitch_targets: Vec<(String, usize, usize)> = Vec::new();
+    for c_idx in 0..chunk_ids_list.len() {
+        let offset = c_idx * 256;
+        stitch_targets.push((task.id.clone(), offset, 256));
+    }
     model.stitch_kv_fragments(stitch_targets.clone()).await?;
     let base_len = model.generator.lock().await.as_ref().map(|g| g.qwen3_vl.get_kv_len()).unwrap_or(0);
 

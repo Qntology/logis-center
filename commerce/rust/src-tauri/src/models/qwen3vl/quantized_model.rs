@@ -239,9 +239,10 @@ pub struct RegistryEntry {
     pub slot_ids: Vec<Option<usize>>, // [Layer Index] -> Slot ID
     pub token_start: usize,
     pub token_len: usize,
-    pub ssd_path: Option<std::path::PathBuf>,
-    pub ssd_block_offset: usize, // [NEW] 실제 물리적 SSD 폴더명 오프셋
-    pub hidden_states_path: Vec<Option<std::path::PathBuf>>, // [Layer Index] -> SSD Path for Output
+    pub ssd_path: Option<std::path::PathBuf>, // [RESTORED]
+    pub ssd_block_offset: usize, // [RESTORED]
+    pub task_root: Option<std::path::PathBuf>,
+    pub hidden_states_path: Option<std::path::PathBuf>,
     #[serde(skip)]
     pub is_dirty: Vec<bool>, 
     #[serde(skip, default = "std::time::Instant::now")]
@@ -259,11 +260,19 @@ impl RegistryEntry {
             slot_ids: vec![None; num_layers],
             ssd_path: None,
             ssd_block_offset: token_start,
-            hidden_states_path: vec![None; num_layers],
+            task_root: None,
+            hidden_states_path: None,
             is_dirty: vec![true; num_layers],
             last_accessed: std::time::Instant::now(),
             bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; num_layers])),
         }
+    }
+
+    pub fn get_block_path(&self, layer_idx: usize) -> Option<std::path::PathBuf> {
+        if let Some(root) = &self.task_root {
+            return Some(root.join(format!("l{}", self.token_start)).join(format!("b{}.st", layer_idx)));
+        }
+        self.ssd_path.as_ref().map(|p| p.join(format!("l{}.st", layer_idx)))
     }
 }
 
@@ -276,9 +285,8 @@ pub struct KVRegistry {
 
 impl KVRegistry {
     pub fn new(num_layers: usize) -> Self {
-        // [FIX] 장부를 512개 미리 할당 (약 13만 토큰 대응)
-        let mut entries = Vec::with_capacity(512);
-        for i in 0..512 {
+        let mut entries = Vec::with_capacity(1024); // Support up to ~260k tokens
+        for i in 0..1024 {
             let entry = RegistryEntry::new(i * 256, 0, num_layers);
             entries.push(entry);
         }
@@ -288,32 +296,27 @@ impl KVRegistry {
         }
     }
 
-    /// [PARALLEL-STITCHING] 여러 세션의 KV 파편들을 하나로 이어붙여 가상 문맥을 생성합니다.
+    /// [OFFSET-CENTRIC-STITCHING] 사용자 제안 구조(l{offset}/b{layer})에 맞춘 병합 로직
     pub fn stitch_sessions(&self, sessions: Vec<(String, usize, usize)>) -> Result<()> {
         let mut entries = self.entries.write().unwrap();
-        
-        // [FIX] 기존 장부 초기화 (이전 태스크 파편 제거)
+
+        // 초기화
         for entry in entries.iter_mut() {
-            entry.ssd_path = None;
+            entry.task_root = None;
             entry.token_len = 0;
             for loc in &mut entry.location { *loc = KVLocation::SSD; }
         }
 
         let mut current_block_idx = 0;
-        for (session_id, ssd_start_offset, length_tokens) in sessions {
+        for (session_id, _unused_off, length_tokens) in sessions {
             let num_blocks = (length_tokens + 255) / 256;
-            // [FIX] 데이터가 저장된 실제 하위 경로(inference/text)까지 포함
-            let kv_dir = crate::utils::paths::get_kv_dir(None).join(&session_id).join("inference/text");
+            let task_dir = crate::utils::paths::get_kv_dir(None).join(&session_id);
 
             for b_idx in 0..num_blocks {
                 if current_block_idx >= entries.len() { break; }
 
                 let entry = &mut entries[current_block_idx];
-                entry.ssd_path = Some(kv_dir.clone());
-
-                // [FIX] 해당 세션이 시작된 물리적 오프셋(ssd_start_offset)을 더해줌
-                entry.ssd_block_offset = ssd_start_offset + (b_idx * 256); 
-
+                entry.task_root = Some(task_dir.clone());
                 entry.token_len = if b_idx == num_blocks - 1 {
                     let rem = length_tokens % 256;
                     if rem == 0 { 256 } else { rem }
@@ -322,7 +325,8 @@ impl KVRegistry {
                 for loc in &mut entry.location { *loc = KVLocation::SSD; }
                 current_block_idx += 1;
             }
-        }        println!("[KV-STITCH] Virtual Context cleared and stitched. Total Blocks: {}", current_block_idx);
+        }
+        println!("[KV-STITCH] Virtual Context assembled using Offset-Centric structure. Total Blocks: {}", current_block_idx);
         Ok(())
     }
 
@@ -1395,16 +1399,15 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, _kv_name: Option<&str>) -> Result<()> {
-        // [SSD-ALIGNMENT] 실제 오프셋을 폴더명으로 사용
-        let b_str = format!("b{}", offset);
-        let block_dir = path.join(&b_str);
+        // [OFFSET-CENTRIC-FIX] 오프셋을 폴더명(l), 레이어를 파일명(b)으로 사용
+        let l_str = format!("l{}", offset);
+        let block_dir = path.join(&l_str);
         if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
         
-        let structured_path = block_dir.join(format!("l{}.st", self.layer_idx));
+        let structured_path = block_dir.join(format!("b{}.st", self.layer_idx));
         
         let mut map = HashMap::new();
-        // [PREFIX-FIX] 저장 시에도 실제 오프셋 이름을 접두어로 사용
-        let prefix = format!("{}l{}_", b_str, self.layer_idx);
+        let prefix = format!("{}_b{}_", l_str, self.layer_idx);
 
         let mut ks = Vec::new();
         let mut vs = Vec::new();
@@ -1427,27 +1430,18 @@ impl QuantizedQwen3VLTextAttention {
             map.insert(format!("{}v_data", prefix), vd);
             map.insert(format!("{}k_shape", prefix), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect::<Vec<u32>>(), (k_shape.len(),), &Device::Cpu)?);
             
-            // [DIRECT-IO] Use OS-accelerated high-speed write instead of standard IO
             if let Ok(data) = safetensors::serialize(&map, &None) {
                 let _ = crate::utils::direct_loader::save_kv_block(&structured_path, &data);
-                println!("[SSD-SAVE-FAST] Layer {} Block {} saved via DirectStorage/Overlapped.", self.layer_idx, offset);
+                println!("[SSD-SAVE-OFFSET] Saved Offset {} Layer {} to {:?}", offset, self.layer_idx, structured_path);
             }
             
             if let Ok(mut reg) = self.registry.entries.write() {
-                // 이 레이어의 세부 정보를 장부에 기록
                 let entry_idx = offset / 256;
                 if entry_idx < reg.len() {
                     let entry = &mut reg[entry_idx];
-                    entry.ssd_path = Some(path.to_path_buf());
+                    entry.task_root = Some(path.to_path_buf());
                     entry.location[self.layer_idx] = KVLocation::SSD;
                     if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = false; }
-                } else {
-                    // 장부가 비어있거나 부족하면 확장
-                    let mut entry = crate::models::qwen3vl::quantized_model::RegistryEntry::new(offset, k.dim(2)?, self.num_layers);
-                    entry.ssd_path = Some(path.to_path_buf());
-                    entry.location[self.layer_idx] = KVLocation::SSD;
-                    if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = false; }
-                    reg.push(entry);
                 }
             }
         }
@@ -1870,6 +1864,90 @@ pub struct QuantizedQwen3VLTextModel {
 }
 
 impl QuantizedQwen3VLTextModel {
+    /// [LAYER-BY-LAYER] 공통 기초 임베딩 연산 (VRAM 전용)
+    pub fn get_initial_embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let dev = self.layers[0].device().clone();
+        let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
+        
+        // 입력 데이터를 GPU로 이동
+        let ids_gpu = if !input_ids.device().same_device(&dev) { input_ids.to_device(&dev)? } else { input_ids.clone() };
+        
+        // VRAM에서 연산 수행
+        let inputs_embeds = self.embed_tokens.forward(&ids_gpu)?;
+        Ok(inputs_embeds.to_dtype(target_dtype)?)
+    }
+
+    /// [LAYER-BY-LAYER] 특정 레이어 하나만 실행하고 결과를 반환합니다.
+    pub fn forward_single_layer(
+        &mut self,
+        layer_idx: usize,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_mask: Option<&Tensor>,
+        seqlen_offset: usize,
+        session_id: Option<String>,
+        kv_name: Option<String>,
+        baking_only: bool,
+    ) -> Result<Tensor> {
+        let layer = &mut self.layers[layer_idx];
+        
+        // [SAFETY] 연산 전 가중치 로드 상태 확인
+        if layer.self_attn.q_proj.is_cleared() {
+            return Err(anyhow!("Layer {} weight is cleared. Call reload_layer first.", layer_idx));
+        }
+
+        let residual = xs.clone();
+        let xs_norm = layer.input_layernorm.forward(xs)?;
+        
+        let attn_output = layer.self_attn.forward(
+            &xs_norm,
+            cos,
+            sin,
+            attention_mask,
+            seqlen_offset,
+            session_id,
+            kv_name,
+            baking_only
+        )?;
+
+        let mut xs = (attn_output + residual)?;
+        
+        if let (Some(gate), Some(up), Some(down), Some(post_norm)) = 
+           (&layer.mlp_gate, &layer.mlp_up, &layer.mlp_down, &layer.post_attention_layernorm) {
+            let residual = xs.clone();
+            let xs_norm = post_norm.forward(&xs)?;
+            let gate_out = gate.forward(&xs_norm)?;
+            let up_out = up.forward(&xs_norm)?;
+            let activated = (candle_nn::ops::silu(&gate_out)? * up_out)?;
+            let mlp_out = down.forward(&activated)?;
+            xs = (mlp_out + residual)?;
+        }
+
+        Ok(xs)
+    }
+
+    /// [SSD-HS-PIPE] 레이어 간 Hidden States를 SSD에 저장 (VRAM -> SSD)
+    pub fn save_hidden_states(&self, path: &Path, tensor: &Tensor) -> Result<()> {
+        let mut map = HashMap::new();
+        // GPU 데이터를 즉시 CPU로 이동 (최소한의 전송)
+        map.insert("hidden_states".to_string(), tensor.to_device(&Device::Cpu)?);
+        let data = safetensors::serialize(&map, &None)?;
+        crate::utils::direct_loader::save_kv_block(path, &data)?;
+        Ok(())
+    }
+
+    /// [SSD-HS-PIPE] 레이어 간 Hidden States를 SSD에서 로드 (SSD -> VRAM)
+    pub fn load_hidden_states(&self, path: &Path, device: &Device, dtype: DType) -> Result<Tensor> {
+        let data = crate::utils::direct_loader::load_kv_block(path)?;
+        let st = safetensors::SafeTensors::deserialize(&data)?;
+        let t = st.tensor("hidden_states")?;
+        
+        // CPU 텐서 래퍼 생성을 건너뛰고 즉시 VRAM으로 데이터 주입
+        let tensor = Tensor::from_raw_buffer(t.data(), dtype, t.shape(), &Device::Cpu)?;
+        Ok(tensor.to_device(device)?)
+    }
+
     /// [MEMORY-OPT] 특정 레이어의 가중치를 mmap에서 다시 로드합니다.
     pub fn reload_layer(&mut self, layer_idx: usize) -> Result<()> {
         if !self.layers[layer_idx].self_attn.q_proj.is_cleared() {

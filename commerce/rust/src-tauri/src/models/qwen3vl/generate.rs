@@ -326,13 +326,15 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             }
 
                             let mut map = std::collections::HashMap::new();
-                            // [FIX] 물리적 SSD 오프셋을 접두어로 사용 (b0, b256 등 실제 폴더명과 일치시킴)
-                            let prefix = format!("b{}_l{}_", off, act_l);
+                            // [OFFSET-CENTRIC-FIX] Use layer index as file name, and offset as folder name
+                            let prefix = format!("l{}_b{}_", off, act_l);
                             map.insert(format!("{}k_data", prefix), src.k_data.clone());
                             map.insert(format!("{}v_data", prefix), src.v_data.clone());
                             map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
                             
-                            let file_path = task_dir.join(format!("l{}.st", act_l));
+                            // [STRUCTURE] task_root/l{offset}/b{layer}.st
+                            let offset_dir = task_dir.join(format!("l{}", off));
+                            let file_path = offset_dir.join(format!("b{}.st", act_l));
                             
                             // [FIX] Send to IO worker after confirming all tensors are on CPU
                             GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -448,6 +450,39 @@ impl ModelVariant {
     pub async fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage(), _ => Ok(()) } }
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, Self::QuantizedText(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, _ => Ok(()) } }
     
+    // [NEW] 레이어별 전수 처리를 위한 단일 레이어 제어 인터페이스
+    pub fn get_initial_embeddings(&self, ids: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::QuantizedVL(m) => m.language_model.get_initial_embeddings(ids),
+            Self::QuantizedText(m) => m.language_model.get_initial_embeddings(ids),
+            _ => Err(anyhow!("Unsupported model variant for initial embeddings")),
+        }
+    }
+
+    pub fn forward_single_layer(&mut self, layer_idx: usize, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, offset: usize, session_id: Option<String>, kv_name: Option<String>, baking: bool) -> Result<Tensor> {
+        match self {
+            Self::QuantizedVL(m) => m.language_model.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking),
+            Self::QuantizedText(m) => m.language_model.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking),
+            _ => Err(anyhow!("Unsupported model variant for single layer forward")),
+        }
+    }
+
+    pub fn save_hidden_states(&self, path: &Path, t: &Tensor) -> Result<()> {
+        match self {
+            Self::QuantizedVL(m) => m.language_model.save_hidden_states(path, t),
+            Self::QuantizedText(m) => m.language_model.save_hidden_states(path, t),
+            _ => Err(anyhow!("Unsupported model variant for save_hidden_states")),
+        }
+    }
+
+    pub fn load_hidden_states(&self, path: &Path, device: &Device, dtype: DType) -> Result<Tensor> {
+        match self {
+            Self::QuantizedVL(m) => m.language_model.load_hidden_states(path, device, dtype),
+            Self::QuantizedText(m) => m.language_model.load_hidden_states(path, device, dtype),
+            _ => Err(anyhow!("Unsupported model variant for load_hidden_states")),
+        }
+    }
+
     pub fn sync_blocks_from_registry(&mut self) -> Result<()> {
         match self {
             Self::QuantizedVL(m) => m.sync_blocks_from_registry(),
@@ -735,6 +770,14 @@ impl Qwen3VLGenerateModel {
     /// [NEW] 모든 레이어 가중치를 메모리에 상주시켜 디코딩 속도 확보
     pub fn reload_all_layers(&mut self) -> Result<()> {
         self.qwen3_vl.reload_all_layers()
+    }
+
+    pub fn reload_layer(&mut self, l_idx: usize) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.language_model.reload_layer(l_idx),
+            ModelVariant::QuantizedText(m) => m.language_model.reload_layer(l_idx),
+            _ => Ok(()),
+        }
     }
 
     pub async fn prefill_chunk(&mut self, text: String, _cancel_flag: Option<Arc<AtomicBool>>, _relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
