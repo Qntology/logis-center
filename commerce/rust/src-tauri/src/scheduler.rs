@@ -704,7 +704,6 @@ async fn process_task(
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
             let prompt = parsing::page_type_prompt();
-            gen.prefill_chunk(prompt.clone(), Some(cancellation_token.clone()), None).await?;
             
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -732,7 +731,6 @@ async fn process_task(
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
             let prompt = parsing::page_selectors_prompt(&page_type);
-            gen.prefill_chunk(prompt.clone(), Some(cancellation_token.clone()), None).await?;
             
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -760,7 +758,6 @@ async fn process_task(
             let mut gen_m = model.generator.lock().await;
             if let Some(gen) = gen_m.as_mut() {
                 let prompt = parsing::item2json(&page_type, &url, language);
-                gen.prefill_chunk(prompt.clone(), Some(cancellation_token.clone()), None).await?;
                 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -867,32 +864,79 @@ async fn process_task(
             // ==================================================================================
             log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": "Splitting & Baking Content in Parallel...", "spinner": "⚡" }));
 
-            // 1. 토큰화 및 256 단위 분할
-            let full_ids = {
+            // 1. [TOTAL-AWARE CHUNKING] 태그와 컨텍스트를 포함하여 정확히 256 토큰 맞춤
+            let mut chunk_ids_list = Vec::new();
+            {
                 let gen_guard = model.generator.lock().await;
-                gen_guard.as_ref().unwrap().tokenizer.text_encode_vec(pug_content, false)?
-            };
-            let chunk_size = 256;
-            let chunks: Vec<_> = full_ids.chunks(chunk_size).enumerate().collect();
-            let mut chunk_results = Vec::new();
+                if let Some(gen) = gen_guard.as_ref() {
+                    let space_token = gen.tokenizer.text_encode_vec(" ".to_string(), false).unwrap_or(vec![220])[0];
+                    let mut current_lines = Vec::new();
+                    let mut chunk_idx = 1;
 
+                    let mut lines_iter = pug_content.lines().peekable();
+                    while lines_iter.peek().is_some() {
+                        // 현재 구성으로 토큰 수 계산
+                        let test_pug = current_lines.join("\n");
+                        let structured_test = format!(
+                            "<|im_start|>system\nPUG context [PART {}]. READ ONLY. NO THINKING. /no_think<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n",
+                            chunk_idx,
+                            parsing::sanitize_llm_input(&test_pug)
+                        );
+                        let current_total_ids = gen.tokenizer.text_encode_vec(structured_test.clone(), false).unwrap_or_default();
+
+                        // 다음 줄을 추가했을 때 256을 넘는지 확인
+                        if let Some(&next_line) = lines_iter.peek() {
+                            let mut next_lines = current_lines.clone();
+                            next_lines.push(next_line.to_string());
+                            let next_pug = next_lines.join("\n");
+                            let structured_next = format!(
+                                "<|im_start|>system\nPUG context [PART {}]. READ ONLY. NO THINKING. /no_think<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n",
+                                chunk_idx,
+                                parsing::sanitize_llm_input(&next_pug)
+                            );
+                            let next_total_ids = gen.tokenizer.text_encode_vec(structured_next, false).unwrap_or_default();
+
+                            if next_total_ids.len() > 256 || current_lines.len() >= 40 {
+                                // 현재까지의 내용으로 확정 및 256 패딩
+                                let mut final_ids = current_total_ids;
+                                while final_ids.len() < 256 { final_ids.push(space_token); }
+                                if final_ids.len() > 256 { final_ids.truncate(256); }
+                                
+                                chunk_ids_list.push(final_ids);
+                                current_lines.clear();
+                                chunk_idx += 1;
+                            } else {
+                                // 다음 줄 추가 가능
+                                current_lines.push(lines_iter.next().unwrap().to_string());
+                            }
+                        } else {
+                            // 더 이상 줄이 없음. 마지막 청크 처리
+                            let mut final_ids = current_total_ids;
+                            while final_ids.len() < 256 { final_ids.push(space_token); }
+                            if final_ids.len() > 256 { final_ids.truncate(256); }
+                            chunk_ids_list.push(final_ids);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let mut chunk_results = Vec::new();
             // 2. 병렬 베이킹 실행 (GPU 파이프라인 활용)
             let mut bake_tasks = Vec::new();
-            for (c_idx, ids) in chunks {
+            for (c_idx, ids_vec) in chunk_ids_list.into_iter().enumerate() {
                 let model_c = model.clone();
                 let chunk_session = format!("{}_c{}", task.id, c_idx);
-                let ids_vec = ids.to_vec();
                 
                 bake_tasks.push(async move {
                     let mut gen_m = model_c.generator.lock().await;
                     let mut actual_len = 0;
                     if let Some(gen) = gen_m.as_mut() {
-                        // 각 청크는 독립된 0번 오프셋에서 시작하도록 truncate
                         gen.truncate_kv_cache(0)?; 
-                        let ids_tensor = Tensor::from_vec(ids_vec.clone(), (1, ids_vec.len()), &gen.text_device)?;
-                        gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, None, 0, ids_vec.len(), Some(chunk_session.clone()), Some("inference".to_string())).await?;
+                        let ids_tensor = Tensor::from_vec(ids_vec.clone(), (1, 256), &gen.text_device)?;
+                        gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, None, 0, 256, Some(chunk_session.clone()), Some("inference".to_string())).await?;
                         gen.force_flush_all_active_blocks(&chunk_session, Some("inference")).await?;
-                        actual_len = ids_vec.len();
+                        actual_len = 256;
                     }
                     Ok::<(String, usize), anyhow::Error>((chunk_session, actual_len))
                 });
@@ -907,13 +951,18 @@ async fn process_task(
 
             // 3. 추출 질문(Instruction) 전용 청크 굽기
             let snapshot_inst = format!("{}_inst", task.id);
+            let total_parts = chunk_results.len();
             let inst_len = {
                 let mut gen_m = model.generator.lock().await;
                 if let Some(gen) = gen_m.as_mut() {
                     gen.truncate_kv_cache(0)?;
                     let inst_params = ChatCompletionParameters {
                         messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                            content: ChatCompletionRequestUserMessageContent::Text(format!("\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY.", extraction_instruction)),
+                            content: ChatCompletionRequestUserMessageContent::Text(format!(
+                                "\n\n[TASK] Analyze all {} parts of the PUG context provided above and perform the following extraction: {}\n\n[ACTION] RETURN JSON ONLY.", 
+                                total_parts,
+                                extraction_instruction
+                            )),
                             name: None,
                         })], ..Default::default()
                     };
@@ -932,7 +981,12 @@ async fn process_task(
             // 5. 즉시 결과 생성
             if let Some(gen) = model.generator.lock().await.as_mut() {
                 println!("[Scheduler] Virtual context assembled. Starting instant extraction...");
-                let res = gen.generate(ChatCompletionParameters::default(), Some(cancellation_token.clone()), None, None).await?;
+                let params = ChatCompletionParameters {
+                    max_tokens: Some(1024),
+                    temperature: Some(0.1),
+                    ..Default::default()
+                };
+                let res = gen.generate(params, Some(cancellation_token.clone()), None, None).await?;
                 extracted_data = parsing::parse_json_from_llm(&res);
             }
         }

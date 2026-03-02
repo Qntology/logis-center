@@ -535,57 +535,20 @@ impl Qwen3VLGenerateModel {
     }
 
         pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
-            // [CONTEXT-RESTORATION] If a session_id is provided, load the previous KV context from SSD
-            let mut is_reference_snapshot = false;
+            // [CONTEXT-RESTORATION] Load existing KV context from SSD (Inference path only)
             if let Some(s_id) = &session_id {
                 let snapshot_root = crate::utils::paths::get_kv_dir(None).join(s_id);
+                let kv_sub = _kv_name.as_deref().unwrap_or("inference");
                 
-                // [FIX] Try both 'inference/text' and 'reference/text' paths
-                let paths_to_try = vec![
-                    snapshot_root.join("inference").join("text"),
-                    snapshot_root.join("reference").join("text"),
-                    snapshot_root.clone(),
-                ];
-
-                for snapshot_path in paths_to_try {
-                    if snapshot_path.exists() && fs::read_dir(&snapshot_path).map(|mut d| d.next().is_some()).unwrap_or(false) {
-                        println!("[GEN-LOAD] Loading existing snapshot from {:?}...", snapshot_path);
-                        
-                        // [FIX] If loading from 'reference', we must force prefill for the other 27 layers.
-                        if snapshot_path.to_string_lossy().contains("reference") {
-                            is_reference_snapshot = true;
-                        }
-
-                        let _ = self.load_kv_from_disk(&snapshot_path, None); // [FIX] Already pointed to full path
-                        
-                        if is_reference_snapshot {
-                            println!("[GEN-LOAD] Reference snapshot detected. Resetting Registry Entry states for Full 28-Layer Prefill...");
-                            
-                            // [FIX] Registry 상태를 RAM/Empty로 초기화하고 token_start를 0번부터 다시 설정
-                            let reset_reg = |reg: &KVRegistry| {
-                                let mut entries = reg.entries.write().unwrap();
-                                for (i, entry) in entries.iter_mut().enumerate() {
-                                    for loc in entry.location.iter_mut() { *loc = KVLocation::RAM; }
-                                    for slot in entry.slot_ids.iter_mut() { *slot = None; }
-                                    entry.token_start = i * 256; // [FIX] Re-initialize start position
-                                    entry.token_len = 0;
-                                    entry.is_dirty.fill(true);
-                                    let mut cache = entry.bitkv_cache.write().unwrap();
-                                    cache.fill(None);
-                                }
-                            };
-
-                            if let ModelVariant::QuantizedVL(m) = &mut self.qwen3_vl {
-                                reset_reg(&m.language_model.registry);
-                                let _ = m.language_model.truncate_kv_cache(0);
-                            } else if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl {
-                                reset_reg(&m.language_model.registry);
-                                let _ = m.language_model.truncate_kv_cache(0);
-                            }
-                            self.clear_kv_cache();
-                        }
-                        break;
-                    }
+                // [UNIFIED-PATH] Look for context in the specified sub-path (default: inference/text)
+                let snapshot_path = snapshot_root.join(kv_sub).join("text");
+                if snapshot_path.exists() && fs::read_dir(&snapshot_path).map(|mut d| d.next().is_some()).unwrap_or(false) {
+                    println!("[GEN-LOAD] Loading unified context from {:?}...", snapshot_path);
+                    let _ = self.load_kv_from_disk(&snapshot_path, None);
+                } else if snapshot_root.exists() {
+                    // Fallback to root if sub-path doesn't exist but root has files
+                    println!("[GEN-LOAD] Loading context from session root {:?}...", snapshot_root);
+                    let _ = self.load_kv_from_disk(&snapshot_root, None);
                 }
             }
     
@@ -597,25 +560,17 @@ impl Qwen3VLGenerateModel {
             let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
             
             let total_toks = f_ids.len();
-            println!("[DIAG-GEN] Encoded Prompt Length: {} tokens.", total_toks); // [DEBUG] 24k 원인 파악용
+            println!("[DIAG-GEN] Encoded Prompt Length: {} tokens.", total_toks);
             
             let kv_len = self.get_kv_len();
             
-            // [FIX] 스티칭된 문맥(kv_len)이 있는 경우, 오프셋을 깎지 않고 그 뒤에 질문을 붙입니다.
+            // [FIX] Always use stitched context (kv_len) if available
             let mut gen_text = String::new();
-            let (input_ids, offset) = if kv_len > 0 && !is_reference_snapshot {
-                // 이미 본문(PUG)이 SSD에 로드된 상태 (예: 10,752 토큰)
-                println!("[STITCHED-INFERENCE] Found baked context ({} tokens). Appending prompt ({} tokens).", kv_len, total_toks);
-                
-                // 질문 프롬프트 전체를 GPU에서 연산하여 본문 뒤에 붙임
+            let (input_ids, offset) = if kv_len > 0 {
+                println!("[STITCHED-INFERENCE] Using baked context ({} tokens). Appending prompt ({} tokens).", kv_len, total_toks);
                 (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, kv_len)
             } else {
-                // 기존 방식 (새로운 세션)
-                if is_reference_snapshot {
-                    println!("[FULL-PREFILL] Reference context found. Computing entire prompt to fill all 28 layers (Len: {}).", total_toks);
-                } else {
-                    println!("[FULL-PREFILL] No context found. Computing entire prompt (Len: {}).", total_toks);
-                }
+                println!("[FULL-PREFILL] No baked context. Computing entire prompt (Len: {}).", total_toks);
                 (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
             };
             
@@ -634,8 +589,16 @@ impl Qwen3VLGenerateModel {
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
         let lt_id = self.tokenizer.text_encode_vec("<".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
 
-        for i in 0..mes.max_tokens.unwrap_or(2048) {
-            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
+        let max_new_tokens = mes.max_tokens.unwrap_or(2048);
+        println!("[GEN-START] Target: {} tokens | Temp: {} | Seed: {}", max_new_tokens, temperature, seed);
+
+        for i in 0..max_new_tokens {
+            if let Some(flag) = &cancel_flag { 
+                if flag.load(Ordering::Relaxed) { 
+                    println!("[GEN-STOP] Cancelled by user at token {}.", i);
+                    break; 
+                } 
+            }
             
             let mut logits_tensor = logits.flatten_all()?.to_dtype(DType::F32)?;
             
@@ -668,12 +631,8 @@ impl Qwen3VLGenerateModel {
                 if open_bracket_id != 999999 { next_id = open_bracket_id; }
             }
             
-            if i == 0 {
-                println!("[DEBUG-GEN] First Token Final: {} ('{}')", next_id, self.tokenizer.token_decode(vec![next_id]).unwrap_or_else(|_| "???".to_string()));
-            }
-
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
-                if i == 0 { println!("[DEBUG-GEN] Warning: Model emitted EOS on first token."); }
+                println!("[GEN-STOP] EOS detected at token {}.", i + 1);
                 break; 
             }
             gen_ids.push(next_id);
@@ -690,9 +649,13 @@ impl Qwen3VLGenerateModel {
                 }
                 // 모든 괄호의 쌍이 맞고(depth 0), 마지막 토큰이 '}' 계열일 때 종료
                 if has_started && depth == 0 && gen_text.trim_end().ends_with('}') {
-                    println!("[DEBUG-GEN] Balanced JSON detected (Depth 0). Stopping at token {}.", i + 1);
+                    println!("[GEN-STOP] Balanced JSON detected (Depth 0) at token {}.", i + 1);
                     break;
                 }
+            }
+            
+            if i == max_new_tokens - 1 {
+                println!("[GEN-STOP] Reached max_tokens limit ({}).", max_new_tokens);
             }
             
             let current_pos = total_tokens_after_prefill + i as usize;
@@ -700,6 +663,9 @@ impl Qwen3VLGenerateModel {
             wait_for_global_io().await; // [SYNC] Wait for any incremental baking
             logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;
         }
+        
+        println!("[GEN-RESULT] Generated {} tokens. Result: {}", gen_ids.len(), gen_text.replace("\n", " "));
+        
         if let Some(s_id) = &session_id {
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
             println!("[GEN-SAVE] All active KV blocks flushed to disk.");
