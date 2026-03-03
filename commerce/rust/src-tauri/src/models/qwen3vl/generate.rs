@@ -249,15 +249,17 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         drop(ts); 
                         if let Err(e) = save_kv_block(&tp, &data) {
                             eprintln!("[IO-ERROR] save_kv_block failed for {:?}: {}", tp, e);
+                        } else if tp.to_string_lossy().contains("b0.st") {
+                            println!("[IO-SUCCESS] Saved block to {:?}", tp);
                         }
                         
                         // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
                         if let Some(kv_name) = kv_n {
-                            if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
+                            // tp.file_name() is b{layer}.st
+                            if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).and_then(|s| s.strip_suffix(".st")) {
                                 if let Ok(l_idx) = l_str.parse::<usize>() {
-                                    // 오프셋 추출 (파일명 b{offset}_l{idx}_k_anchors 에서 추출하거나 SaveTask에 추가 가능)
-                                    // 현재는 tp.parent() 폴더명이 b{offset} 이므로 이를 활용
-                                    let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
+                                    // tp.parent() folder name is l{offset}
+                                    let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).unwrap_or("0");
                                     let offset = offset_str.parse::<usize>().unwrap_or(0);
                                     
                                     let _ = INDEX_TX.send(SlotTask::IndexUpdate {
@@ -265,7 +267,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         layer_idx: l_idx,
                                         offset,
                                         len: 256,
-                                        file_name: format!("b{}/l{}.st", offset, l_idx),
+                                        file_name: format!("l{}/b{}.st", offset, l_idx),
                                     }).await;
                                 }
                             }
@@ -275,7 +277,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             if let Ok(mut entries) = r.entries.write() {
                                 if idx < entries.len() {
                                     let e = &mut entries[idx]; 
-                                    if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
+                                    if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).and_then(|s| s.strip_suffix(".st")) {
                                         if let Ok(l_idx) = l_str.parse::<usize>() { 
                                             if l_idx < 28 { 
                                                 e.location[l_idx] = KVLocation::SSD; 
@@ -313,7 +315,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     for l_idx in 0..loop_count {
                         let mut src = bake.layers[l_idx].clone();
                         let act_l = src.layer_idx;
-                        let task_dir = bake.task_dir.clone();
+                        let task_dir = bake.task_dir.clone(); // task_dir is session_id/kv_type/l{offset}
                         let registry_inner = registry.clone();
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
@@ -337,15 +339,15 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             };
 
                             let mut map = std::collections::HashMap::new();
-                            // [OFFSET-CENTRIC-FIX] Use layer index as file name, and offset as folder name
+                            // [OFFSET-CENTRIC-FIX] Use layer index as file name (b{layer}), and offset as folder name (l{offset})
                             let prefix = format!("l{}_b{}_", off, act_l);
                             map.insert(format!("{}k_data", prefix), k_data);
                             map.insert(format!("{}v_data", prefix), v_data);
                             map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
                             
                             // [STRUCTURE] task_root/l{offset}/b{layer}.st
-                            let offset_dir = task_dir.join(format!("l{}", off));
-                            let file_path = offset_dir.join(format!("b{}.st", act_l));
+                            // task_dir already contains the l{offset} part from trigger_realtime_incremental_bake
+                            let file_path = task_dir.join(format!("b{}.st", act_l));
                             
                             // [FIX] Send to IO worker after confirming all tensors are on CPU
                             GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -376,13 +378,19 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let (b_idx_off, b_idx) = { match shared_block.inner.read() { Ok(inner) => (inner.offset, inner.index), _ => (0, 999) } };
                         let mut root = provided_path.clone();
                         while !root.to_string_lossy().ends_with("kv") && root.parent().is_some() { root = root.parent().unwrap().to_path_buf(); }
-                        let block_root = root.join(kv_name.as_deref().unwrap_or("inference")).join(format!("b{}", b_idx_off));
+                        // [LOAD-FIX] Match new structure: session_id/kv_type/l{offset}/b{layer}.st
+                        let block_root = root.join(kv_name.as_deref().unwrap_or("inference")).join(format!("l{}", b_idx_off));
+                        
+                        if sid == 0 {
+                            println!("[LOAD-START] Loading from {:?}", block_root);
+                        }
+
                         for l_idx in 0..28 {
-                            let file_path = block_root.join(format!("l{}.st", l_idx));
+                            let file_path = block_root.join(format!("b{}.st", l_idx));
                             if file_path.is_file() {
                                 if let Ok(content) = load_kv_block(&file_path) {
                                     if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                        let prefix = format!("b{}_l{}_", b_idx_off, l_idx);
+                                        let prefix = format!("l{}_b{}_", b_idx_off, l_idx);
                                         let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).ok();
                                         
                                         // [MODIFIED] BF16 Direct Load
@@ -595,6 +603,7 @@ impl Qwen3VLGenerateModel {
 
     pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut Qwen3VLGenerateModel>, _kv_name: Option<String>) -> Result<usize> {
         // [FIX] Always start prefill from zero to avoid double offset on restart
+        println!("[PREFILL-START] Initializing prefill for session: {:?}, kv_name: {:?}", session_id, _kv_name);
         self.clear_kv_cache();
         if let ModelVariant::QuantizedVL(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
         if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
@@ -603,69 +612,76 @@ impl Qwen3VLGenerateModel {
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_toks = full_ids.len();
+        println!("[PREFILL-EXEC] Forwarding {} tokens...", total_toks);
+
         self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
+
         if let Some(s_id) = &session_id {
-            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
-            if !path.exists() { fs::create_dir_all(&path)?; }
+            let kv_type = _kv_name.as_deref().unwrap_or("text");
+            let path = crate::utils::paths::get_kv_dir(None).join(s_id).join(kv_type);
+            if !path.exists() { 
+                println!("[PREFILL-SAVE] Creating directory: {:?}", path);
+                fs::create_dir_all(&path)?; 
+            }
+
             // [ZERO-CPU] Use accelerated direct_loader for token saving
             let token_data = serde_json::to_vec(&full_ids)?;
-            let _ = save_kv_block(&path.join("tokens.json"), &token_data);
-            let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
+            let token_path = path.join("tokens.json");
+            println!("[PREFILL-SAVE] Saving tokens.json to {:?}", token_path);
+            let _ = save_kv_block(&token_path, &token_data);
+
+            println!("[PREFILL-SAVE] Flushing active blocks for session: {}, type: {}", s_id, kv_type);
+            let _ = self.force_flush_all_active_blocks(s_id, Some(kv_type)).await;
             wait_for_global_io().await; // [SYNC] Ensure SSD write is complete
-            println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk.");
+            println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk in structured format.");
         }
         Ok(total_toks)
     }
 
-        pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
-            // [CONTEXT-RESTORATION] Load existing KV context from SSD (Inference path only)
-            if let Some(s_id) = &session_id {
-                let snapshot_root = crate::utils::paths::get_kv_dir(None).join(s_id);
-                let kv_sub = _kv_name.as_deref().unwrap_or("inference");
-                
-                // [UNIFIED-PATH] Look for context in the specified sub-path (default: inference/text)
-                let snapshot_path = snapshot_root.join(kv_sub).join("text");
-                if snapshot_path.exists() && fs::read_dir(&snapshot_path).map(|mut d| d.next().is_some()).unwrap_or(false) {
-                    println!("[GEN-LOAD] Loading unified context from {:?}...", snapshot_path);
-                    let _ = self.load_kv_from_disk(&snapshot_path, None);
-                } else if snapshot_root.exists() {
-                    // Fallback to root if sub-path doesn't exist but root has files
-                    println!("[GEN-LOAD] Loading context from session root {:?}...", snapshot_root);
-                    let _ = self.load_kv_from_disk(&snapshot_root, None);
-                }
-                
-                // [FIX] 로드 또는 스티칭 후 반드시 레이어별 블록 리스트를 새로고침해야 함 
-                self.qwen3_vl.sync_blocks_from_registry()?;
-            }
-    
-            let temperature = mes.temperature.unwrap_or(1.0) as f32;
-            let seed = mes.seed.unwrap_or(34562) as u64;
-            let top_p = mes.top_p.unwrap_or(1.0) as f32;
-            let top_k = mes.top_k;
-            let min_p = mes.min_p;
-            let rep_penalty = mes.repetition_penalty.unwrap_or(1.0);
-            let pres_penalty = mes.presence_penalty.unwrap_or(0.0);
+    pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
+        // [CONTEXT-RESTORATION] Load existing KV context from SSD (Inference path only)
+        if let Some(s_id) = &session_id {
+            let kv_type = _kv_name.as_deref().unwrap_or("text");
+            let snapshot_root = crate::utils::paths::get_kv_dir(None).join(s_id).join(kv_type);
 
-            let mut lp = get_logit_processor(Some(temperature), Some(top_p), top_k, min_p, seed);
-            let mes_render = self.chat_template.apply_chat_template(&mes)?;
-            let input = self.pre_processor.process_info(&mes, &mes_render)?;
-            let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
-            
-            let total_toks = f_ids.len();
-            println!("[DIAG-GEN] Encoded Prompt Length: {} tokens.", total_toks);
-            
-            let kv_len = self.get_kv_len();
-            
-            // [FIX] Always use stitched context (kv_len) if available
-            let mut gen_text = String::new();
-            let (input_ids, offset) = if kv_len > 0 {
-                println!("[STITCHED-INFERENCE] Using baked context ({} tokens). Appending prompt ({} tokens).", kv_len, total_toks);
-                (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, kv_len)
+            println!("[GEN-LOAD] Checking for existing context in {:?}", snapshot_root);
+            if snapshot_root.exists() && fs::read_dir(&snapshot_root).map(|mut d| d.next().is_some()).unwrap_or(false) {
+                println!("[GEN-LOAD] Loading structured context from {:?}...", snapshot_root);
+                let _ = self.load_kv_from_disk(&snapshot_root, None);
             } else {
-                println!("[FULL-PREFILL] No baked context. Computing entire prompt (Len: {}).", total_toks);
-                (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
-            };
-            
+                println!("[GEN-LOAD] No existing context found for session {}, type {}. Proceeding with fresh prefill if needed.", s_id, kv_type);
+            }
+
+            // [FIX] 로드 또는 스티칭 후 반드시 레이어별 블록 리스트를 새로고침해야 함 
+            self.qwen3_vl.sync_blocks_from_registry()?;
+        }
+
+        let temperature = mes.temperature.unwrap_or(1.0) as f32;
+        let seed = mes.seed.unwrap_or(34562) as u64;
+        let top_p = mes.top_p.unwrap_or(1.0) as f32;
+        let top_k = mes.top_k;
+        let min_p = mes.min_p;
+        let rep_penalty = mes.repetition_penalty.unwrap_or(1.0);
+        let pres_penalty = mes.presence_penalty.unwrap_or(0.0);
+
+        let mut lp = get_logit_processor(Some(temperature), Some(top_p), top_k, min_p, seed);
+        let mes_render = self.chat_template.apply_chat_template(&mes)?;
+        let input = self.pre_processor.process_info(&mes, &mes_render)?;
+        let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
+
+        let total_toks = f_ids.len();
+        let kv_len = self.get_kv_len();
+        println!("[DIAG-GEN] Current KV Cache Len: {} tokens. Prompt: {} tokens.", kv_len, total_toks);
+
+        // [FIX] Always use stitched context (kv_len) if available
+        let mut gen_text = String::new();
+        let (input_ids, offset) = if kv_len > 0 {
+            println!("[STITCHED-INFERENCE] Using existing context ({} tokens). Appending prompt ({} tokens).", kv_len, total_toks);
+            (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, kv_len)
+        } else {
+            println!("[FULL-PREFILL] No existing context. Computing entire prompt (Len: {}).", total_toks);
+            (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
+        };            
             let total_tokens_after_prefill = offset + input_ids.dim(1)?;
         
         wait_for_global_io().await; // [SYNC] Ensure disk is ready before inference

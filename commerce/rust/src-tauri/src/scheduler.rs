@@ -773,13 +773,6 @@ async fn process_task(
         if input_f.exists() { let _ = fs::remove_file(input_f); }
     }
 
-    {
-        let mut gen_m = model.generator.lock().await;
-        if let Some(gen) = gen_m.as_mut() {
-            gen.reload_all_layers()?;
-        }
-    }
-
     // 2.1 [STITCH-ALL-LAYERS] Assemble virtual context from offset-centric blocks
     let mut stitch_targets: Vec<(String, usize, usize)> = Vec::new();
     for c_idx in 0..chunk_ids_list.len() {
