@@ -706,8 +706,9 @@ async fn process_task(
                 let dtype = if device.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
                 let xs = gen.qwen3_vl.load_hidden_states(&input_path, &device, dtype)?;
 
-                // 2. Prepare Position/RoPE (모든 청크가 0~256 범위를 독립적으로 사용)
-                let cache_pos_1d = Tensor::arange(0u32, 256u32, &device)?;
+                // 2. Prepare Position/RoPE (각 청크의 절대 오프셋 사용)
+                let current_offset = chunk_index * 256;
+                let cache_pos_1d = Tensor::arange(current_offset as u32, (current_offset + 256) as u32, &device)?;
                 let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, 256))?;
                 
                 let (cos, sin) = match &gen.qwen3_vl {
@@ -716,9 +717,9 @@ async fn process_task(
                     _ => return Err(anyhow::anyhow!("Rotary error")),
                 };
 
-                // 3. Forward Single Layer (0-오프셋 독립 계산)
+                // 3. Forward Single Layer (절대 오프셋 전달)
                 let session_id = Some(task_id_c.clone());
-                let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, chunk_index, session_id, kv_name_c, true, chunk_index).await?;
+                let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, current_offset, session_id, kv_name_c, true, chunk_index).await?;
 
                 // 4. Save Next Hidden States to SSD
                 let output_path = chunk_dir.join(format!("h{}.st", current_l));
@@ -771,10 +772,10 @@ async fn process_task(
 
     // [CLEANUP] Remove all temporary hidden state files (h23.st etc.)
     for c_idx in 0..chunk_ids_list.len() {
-        let offset = c_idx * 256;
-        let last_h = task_kv_dir.join(format!("l{}", offset)).join(format!("h{}.st", num_total_layers - 1));
+        let chunk_dir = task_kv_dir.join(format!("l{}", c_idx));
+        let last_h = chunk_dir.join(format!("h{}.st", num_total_layers - 1));
         if last_h.exists() { let _ = fs::remove_file(last_h); }
-        let input_f = task_kv_dir.join(format!("l{}", offset)).join("input.st");
+        let input_f = chunk_dir.join("input.st");
         if input_f.exists() { let _ = fs::remove_file(input_f); }
     }
 
