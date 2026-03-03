@@ -38,18 +38,13 @@ impl TaskDataManager {
         // [FIX] Use fixed filenames for intermediate steps to support resumption
         let filename = format!("{}.txt", suffix);
         let path = dir.join(filename);
-        // [FIX] Use standard fs::write as DirectStorage (direct_loader) does not support Write (0x80004001)
-        if let Some(p) = path.parent() { if !p.exists() { std::fs::create_dir_all(p)?; } }
-        std::fs::write(&path, content.as_bytes())?;
-        
+        fs::write(&path, content)?;
         self.created_files.push(path.clone());
         Ok(path)
     }
 
     fn load(&self, path: &std::path::Path) -> Result<String> {
-        // [FIX] Use standard fs::read as DirectStorage (direct_loader) is meant for GPU-bound Read only
-        let data = std::fs::read(path)?;
-        Ok(String::from_utf8(data).map_err(|e| anyhow::anyhow!("Invalid UTF-8: {}", e))?)
+        Ok(fs::read_to_string(path)?)
     }
 
     fn get_path(&self, suffix: &str) -> PathBuf {
@@ -455,6 +450,13 @@ async fn process_task(
 
             // 1. [Vision Baker] Load 1-layer 0.8B-VL model and bake image
             log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer 0.8B-VL)...", "spinner": "⠋" }));
+
+            // [NEW-STRUCTURE] Separate directory for image baking
+            let image_kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id).join("image");
+            if !image_kv_dir.exists() { fs::create_dir_all(&image_kv_dir)?; }
+
+            // Save tokens.json (Visual context)
+            fs::write(image_kv_dir.join("tokens.json"), "[]")?;
             
             // Activate 2B in Baking mode (1 layer, no MLP)
             model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true, None, false).await?;
@@ -640,11 +642,18 @@ async fn process_task(
         (chunk_list, text_list)
     };
 
+    let mut stitch_targets: Vec<(String, usize, usize)> = Vec::new();
+
     // --- STEP 1: Layer-by-Layer Parallel Baking (Offset-Centric SSD-Direct) ---
     log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": "Initializing Layer-by-Layer Parallel Pipeline...", "spinner": "🔥" }));
 
-    let task_kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id);
+    // [NEW-STRUCTURE] Separate directory for text baking
+    let task_kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id).join("text");
     if !task_kv_dir.exists() { fs::create_dir_all(&task_kv_dir)?; }
+
+    // Save tokens.json for text context recovery
+    let tokens_json_path = task_kv_dir.join("tokens.json");
+    fs::write(&tokens_json_path, serde_json::to_string(&chunk_ids_list)?)?;
 
     // 1.1 [COMMON-EMBEDDING] Generate and save initial hidden states for all chunks
     {
@@ -690,7 +699,8 @@ async fn process_task(
             layer_tasks.push(async move {
                 let mut gen_m = model_c.generator.lock().await;
                 if let Some(gen) = gen_m.as_mut() {
-                    let offset_dir = utils::paths::get_kv_dir(None).join(&task_id_c).join(format!("l{}", offset));
+                    let task_kv_dir = utils::paths::get_kv_dir(None).join(&task_id_c).join("text");
+                    let offset_dir = task_kv_dir.join(format!("l{}", offset));
                     
                     // 1. Load Input from SSD (Either initial input.st or previous layer's output h{N-1}.st)
                     let input_path = if current_l == 0 { offset_dir.join("input.st") } else { offset_dir.join(format!("h{}.st", current_l - 1)) };
@@ -698,22 +708,17 @@ async fn process_task(
                     let dtype = if device.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
                     let xs = gen.qwen3_vl.load_hidden_states(&input_path, &device, dtype)?;
 
-                    // 2. Prepare Position/RoPE (For parallel chunks, offset is 0 as they are independent histories)
+                    // 2. Prepare Position/RoPE
                     let cache_pos_1d = Tensor::arange(0u32, 256u32, &device)?;
                     let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, 256))?;
                     
-                    // Qwen 3.5 RoPE cos/sin generation (Internal helper needed or use forward_single_layer)
-                    // For simplicity, we assume forward_single_layer handles internal RoPE if not provided
-                    // But here we need to be precise. 
-                    // [STABILITY] Get cos/sin from model's internal rotary embedding
                     let (cos, sin) = match &gen.qwen3_vl {
                         crate::models::qwen3vl::generate::ModelVariant::QuantizedVL(m) => m.language_model.rotary_emb.forward(&pos_ids_3d, dtype, m.language_model.mrope_section.clone())?,
                         crate::models::qwen3vl::generate::ModelVariant::QuantizedText(m) => m.language_model.rotary_emb.forward(&pos_ids_3d, dtype, m.language_model.mrope_section.clone())?,
                         _ => return Err(anyhow::anyhow!("Rotary error")),
                     };
 
-                    // 3. Forward Single Layer (Generates KV + Next Hidden States)
-                    // KV is automatically saved to task_id/l{offset}/b{layer}.st via generate.rs IO worker
+                    // 3. Forward Single Layer
                     let session_id = Some(task_id_c.clone());
                     let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, 0, session_id, kv_name_c, true)?;
 
@@ -721,14 +726,12 @@ async fn process_task(
                     let output_path = offset_dir.join(format!("h{}.st", current_l));
                     gen.qwen3_vl.save_hidden_states(&output_path, &next_xs)?;
                     
-                    // 5. Cleanup previous layer's hidden states to save space
                     if current_l > 0 { let _ = fs::remove_file(input_path); }
                 }
                 Ok::<(), anyhow::Error>(())
             });
         }
         
-        // Execute all chunks for current layer in parallel
         let results = futures::future::join_all(layer_tasks).await;
         for res in results { res?; }
         
@@ -1217,15 +1220,21 @@ fn cleanup_task_resources(task_id: &str, app_handle: Option<&tauri::AppHandle>) 
 
 // [3번 가속: PRE-FETCH] OS 페이지 캐시에 무게추 파일을 미리 로드함
 fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
-    println!("[PRE-FETCH] Warming up OS Page Cache for weights (DirectStorage/io_uring) in: {:?}", path);
+    use std::io::Read;
+    println!("[PRE-FETCH] Warming up OS Page Cache for weights in: {:?}", path);
     if path.is_dir() {
         if let Ok(entries) = std::fs::read_dir(path) {
             for entry in entries {
                 if let Ok(entry) = entry {
                     let p = entry.path();
                     if p.extension().map_or(false, |ext| ext == "gguf" || ext == "safetensors") {
-                        // [ZERO-CPU] Use accelerated direct_loader for pre-fetching weights into RAM
-                        let _ = utils::direct_loader::load_kv_block(&p);
+                        if let Ok(mut file) = std::fs::File::open(p) {
+                            let mut buffer = [0u8; 1024 * 1024]; // 1MB buffer
+                            // 파일 전체를 읽어서 OS가 램에 캐싱하도록 유도함
+                            while let Ok(n) = file.read(&mut buffer) {
+                                if n == 0 { break; }
+                            }
+                        }
                     }
                 }
             }

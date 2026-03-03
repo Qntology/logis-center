@@ -754,10 +754,17 @@ pub fn index_select_2d(t: &Tensor, index: &Tensor) -> Result<Tensor> {
     if t.rank() != 2 && index.rank() != 2 {
         return Err(anyhow::anyhow!("t and index rank must be equal to 2"));
     }
+    let dev = t.device();
     let mut res_vec = Vec::new();
     let index_dim0 = index.dim(0)?;
     for i in 0..index_dim0 {
         let index_i = index.i(i)?;
+        // [FIX] Ensure index is on the same device as the target tensor
+        let index_i = if !index_i.device().same_device(dev) {
+            index_i.to_device(dev)?
+        } else {
+            index_i
+        };
         let rel_i = t.index_select(&index_i, 0)?;
         res_vec.push(rel_i);
     }
