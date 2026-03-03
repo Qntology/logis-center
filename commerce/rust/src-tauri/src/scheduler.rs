@@ -692,7 +692,6 @@ async fn process_task(
         for (c_idx, _ids) in chunk_ids_list.iter().enumerate() {
             let task_id_c = task.id.clone();
             let chunk_index = c_idx; 
-            let chunk_offset = c_idx * 256; // [FIX] Use absolute offset for RoPE consistency
             let current_l = l_idx;
             let kv_name_c = kv_name.clone();
 
@@ -707,12 +706,19 @@ async fn process_task(
                 let dtype = if device.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
                 let xs = gen.qwen3_vl.load_hidden_states(&input_path, &device, dtype)?;
 
-                // 2. Position logic is handled internally by forward_single_layer using 'offset'
-                let cos_sin_dummy = Tensor::zeros((1,), dtype, &device)?; // Not used in single layer when None passed
+                // 2. Prepare Position/RoPE (모든 청크가 0~256 범위를 독립적으로 사용)
+                let cache_pos_1d = Tensor::arange(0u32, 256u32, &device)?;
+                let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, 256))?;
+                
+                let (cos, sin) = match &gen.qwen3_vl {
+                    crate::models::qwen3vl::generate::ModelVariant::QuantizedVL(m) => m.language_model.rotary_emb.forward(&pos_ids_3d, dtype, m.language_model.mrope_section.clone())?,
+                    crate::models::qwen3vl::generate::ModelVariant::QuantizedText(m) => m.language_model.rotary_emb.forward(&pos_ids_3d, dtype, m.language_model.mrope_section.clone())?,
+                    _ => return Err(anyhow::anyhow!("Rotary error")),
+                };
 
-                // 3. Forward Single Layer (Use None for cos/sin to trigger internal generation)
+                // 3. Forward Single Layer (0-오프셋 독립 계산)
                 let session_id = Some(task_id_c.clone());
-                let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos_sin_dummy, &cos_sin_dummy, None, chunk_offset, session_id, kv_name_c, true, chunk_index).await?;
+                let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, chunk_index, session_id, kv_name_c, true, chunk_index).await?;
 
                 // 4. Save Next Hidden States to SSD
                 let output_path = chunk_dir.join(format!("h{}.st", current_l));
@@ -991,9 +997,12 @@ async fn process_task(
                         gen.truncate_kv_cache(0)?; 
                         let ids_tensor = Tensor::from_vec(ids_vec.clone(), (1, ids_vec.len()), &gen.text_device)?;
                         
-                        // [ROPE-FIX] Position logic is handled internally by forward using 'current_offset'
-                        // Pass None for cache_position to trigger internal generation
-                        gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, None, current_offset, current_offset + ids_vec.len(), Some(chunk_session.clone()), Some("inference".to_string())).await?;
+                        // [FIX] Qwen 3.5 mRoPE를 위한 Rank 3 위치 텐서 생성 (병렬 청크용)
+                        let cache_pos_1d = Tensor::arange(current_offset as u32, (current_offset + ids_vec.len()) as u32, &gen.text_device)?;
+                        let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, ids_vec.len()))?;
+
+                        // [CRITICAL] forward 시 6번째 인자에 3D 텐서 직접 전달
+                        gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, Some(&pos_ids_3d), current_offset, current_offset + ids_vec.len(), Some(chunk_session.clone()), Some("inference".to_string())).await?;
                         gen.force_flush_all_active_blocks(&chunk_session, Some("inference")).await?;
                     }
                     Ok::<(String, usize), anyhow::Error>((chunk_session, ids_vec.len()))

@@ -63,8 +63,7 @@ impl Module for RmsNorm {
             return Err(candle_core::Error::Msg("RMSNorm weight is cleared. Reload required.".to_string()));
         }
         let dev = x.device();
-        let original_dtype = x.dtype();
-
+        
         // [DEVICE-SAFETY] Sync weight to input device first
         let weight = if !self.weight.device().same_device(dev) {
             self.weight.to_device(dev)?
@@ -72,20 +71,13 @@ impl Module for RmsNorm {
             self.weight.clone()
         };
 
-        // [STABILITY-SANDWICH-TOTAL] 
-        // 1. Upcast to F32 for math precision
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let variance = x_f32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-        let eps_t = Tensor::new(self.eps as f32, dev)?.to_dtype(DType::F32)?;
-        let norm_factor = variance.broadcast_add(&eps_t)?.sqrt()?.recip()?;
-        let x_normed = x_f32.broadcast_mul(&norm_factor)?;
-
-        // 2. Perform final scale in F32 to avoid strict kernel errors, then downcast back
-        let w_f32 = weight.to_dtype(DType::F32)?;
-        let result_f32 = x_normed.broadcast_mul(&w_f32)?;
-
-        // 3. Return to original context dtype (BF16 or F32)
-        result_f32.to_dtype(original_dtype)
+        let target_dtype = weight.dtype();
+        let x = x.to_dtype(DType::F32)?;
+        let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        let hidden_states = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        let hidden_states = hidden_states.to_dtype(target_dtype)?;
+        
+        hidden_states.broadcast_mul(&weight)
     }
 }
 
@@ -761,7 +753,7 @@ impl QuantizedQwen3VLTextAttention {
         seqlen_offset: usize,
         _session_id: Option<String>,
         _kv_name: Option<String>,
-        baking_only: bool,
+        _baking_only: bool,
     ) -> Result<Tensor> {
         let dev = self.q_proj.device();
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
@@ -775,10 +767,6 @@ impl QuantizedQwen3VLTextAttention {
         let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
         let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
         let (b_sz, q_len, _) = xs.dims3()?;
-        
-        // [DTYPE-STRICT] Ensure RoPE matches target_dtype
-        let cos = cos.to_dtype(target_dtype)?;
-        let sin = sin.to_dtype(target_dtype)?;
 
         // [CRITICAL] Internal Causal Mask Generation for Prefill Integrity
         let total_len = seqlen_offset + q_len;
@@ -786,11 +774,11 @@ impl QuantizedQwen3VLTextAttention {
             let q_indices = Tensor::arange(0u32, q_len as u32, dev)?.unsqueeze(1)?;
             let k_indices = Tensor::arange(0u32, total_len as u32, dev)?.unsqueeze(0)?;
             let mask = k_indices.broadcast_gt(&(q_indices.broadcast_add(&Tensor::new(seqlen_offset as u32, dev)?)?))?;
-            // [FIX] Force mask to target_dtype immediately
+            // [FIX] Generate mask in target_dtype to avoid future mismatches
             let mask = mask.to_dtype(target_dtype)?.affine(-1e9, 0.0)?;
             Some(mask.unsqueeze(0)?.unsqueeze(0)?)
         } else {
-            attention_mask_in.map(|m| m.to_dtype(target_dtype).unwrap_or_else(|_| m.clone()))
+            attention_mask_in.map(|m| m.clone())
         };
 
         // [QWEN3.5-DIM-STRICT] Use the dynamically detected head count from new()
@@ -806,21 +794,16 @@ impl QuantizedQwen3VLTextAttention {
         let apply_q_norm = |t: Tensor, norm: &Option<RmsNorm>| -> Result<Tensor> {
             if let Some(n) = norm {
                 let dev = t.device();
-                let dtype = t.dtype();
-                // [STABILITY-SANDWICH] Perform Norm in F32 to avoid strict kernel dtype checks
-                let t_f32 = t.to_dtype(DType::F32)?;
-                let variance = t_f32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-                let eps_t = Tensor::from_vec(vec![n.eps as f32], (1,), dev)?;
+                let variance = t.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+                // [FIX] Match eps_t dtype with variance (likely target_dtype)
+                let eps_t = Tensor::from_vec(vec![n.eps as f32], (1,), dev)?.to_dtype(variance.dtype())?;
                 let norm_factor = variance.broadcast_add(&eps_t)?.sqrt()?.recip()?;
-                let t_norm = t_f32.broadcast_mul(&norm_factor)?;
+                let t = t.broadcast_mul(&norm_factor)?;
                 
-                let w = n.weight().to_dtype(DType::F32)?;
-                let w_head = w.narrow(0, 0, d_h.min(w.dim(0)?))?;
-                let w_dev = if !w_head.device().same_device(dev) { w_head.to_device(dev)? } else { w_head };
-                
-                let res = t_norm.broadcast_mul(&w_dev)?;
-                // Cast back to original dtype (BF16) for subsequent matmuls
-                Ok(res.to_dtype(dtype)?)
+                // IMPORTANT: Use d_h (actual current head_dim) for narrowing
+                let w = n.weight().narrow(0, 0, d_h.min(n.weight().dim(0)?))?;
+                let w_dev = if !w.device().same_device(dev) { w.to_device(dev)? } else { w };
+                Ok(t.broadcast_mul(&w_dev.to_dtype(t.dtype())?)?)
             } else {
                 Ok(t)
             }
@@ -838,68 +821,87 @@ impl QuantizedQwen3VLTextAttention {
             let k = key_states_norm.to_dtype(target_dtype)?.contiguous()?;   // [B, H, S, D]
             let v = value_states.to_dtype(target_dtype)?.contiguous()?;      // [B, H, S, D]
             
-            // 1. Compute State for CURRENT chunk: K^T * V -> [B, H, D, D]
+            // 1. Compute State: K^T * V -> [B, H, D, D]
             let k_t = k.transpose(2, 3)?.contiguous()?; // [B, H, D, S]
-            let chunk_state = k_t.matmul(&v)?; // [B, H, D, D]
+            let mut current_state = k_t.matmul(&v)?; // [B, H, D, D]
             
-            // [HYBRID-STATE-AGGURATION] Correctly sum states across ALL fragments for stitched inference
-            let mut current_state = chunk_state;
-            
-            if !self.kv_blocks.is_empty() {
-                // [STITCHED-RECONSTRUCTION] If we have multiple blocks, it means we are in stitched mode.
-                // We need to sum the states from ALL blocks up to current seqlen_offset.
-                for block in self.kv_blocks.iter() {
-                    let (index, b_off, _b_len) = {
-                        let inner = block.inner.read().unwrap();
-                        (inner.index, inner.offset, inner.len)
-                    };
-                    
-                    // Only sum states that come BEFORE our current query
-                    if b_off >= seqlen_offset { continue; }
-
-                    // Load state for this block
-                    let mut pk = None;
-                    {
-                        let inner = block.inner.read().unwrap();
-                        if let Some(k) = &inner.k_cache {
-                            pk = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
-                        }
-                    }
-
-                    if pk.is_none() {
-                        // SSD/RAM fallback
-                        let reg_data = {
-                            let reg = self.registry.entries.read().unwrap();
-                            if index < reg.len() {
-                                let entry = &reg[index];
-                                let cache = entry.bitkv_cache.read().unwrap();
-                                if let Some(m) = &cache[self.layer_idx] {
-                                    Some(self.decompress_from_bf16(&m.k_data, &m.original_shape, dev)?)
-                                } else {
-                                    if let Some(file_path) = entry.get_block_path(self.layer_idx) {
-                                        if let Ok(data) = crate::utils::direct_loader::load_kv_block(&file_path) {
-                                            if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
-                                                let prefix = format!("l{}_b{}_", entry.token_start, self.layer_idx);
-                                                if let Ok(kd) = st.tensor(&format!("{}k_data", prefix)).or_else(|_| st.tensor("k_data")) {
-                                                    if let Ok(sh) = st.tensor(&format!("{}k_shape", prefix)).or_else(|_| st.tensor("k_shape")) {
-                                                        let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                                                        let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
-                                                        let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
-                                                        Some(self.decompress_from_bf16(&kd_t, &meta_os, dev)?)
-                                                    } else { None }
+            // [HYBRID-STATE-ACCUMULATION] Load previous state if available
+            if let Some(block) = self.kv_blocks.first() {
+                let mut inner = block.inner.write().unwrap();
+                let mut pk = inner.k_cache.take();
+                
+                if pk.is_none() {
+                    // Try to load from Registry/RAM cache or SSD
+                    let (idx, b_off) = (inner.index, inner.offset);
+                    let reg_data = {
+                        let reg = self.registry.entries.read().unwrap();
+                        if idx < reg.len() {
+                            let entry = &reg[idx];
+                            let cache = entry.bitkv_cache.read().unwrap();
+                            if let Some(m) = &cache[self.layer_idx] {
+                                Some(self.decompress_from_bf16(&m.k_data, &m.original_shape, dev)?)
+                            } else {
+                                // Try SSD load
+                                if let Some(file_path) = entry.get_block_path(self.layer_idx) {
+                                    if let Ok(data) = crate::utils::direct_loader::load_kv_block(&file_path) {
+                                        if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
+                                            let prefix = format!("l{}_b{}_", b_off, self.layer_idx);
+                                            if let Ok(kd) = st.tensor(&format!("{}k_data", prefix)).or_else(|_| st.tensor("k_data")) {
+                                                if let Ok(sh) = st.tensor(&format!("{}k_shape", prefix)).or_else(|_| st.tensor("k_shape")) {
+                                                    let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                                    let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                                                    let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+                                                    Some(self.decompress_from_bf16(&kd_t, &meta_os, dev)?)
                                                 } else { None }
                                             } else { None }
                                         } else { None }
                                     } else { None }
-                                }
-                            } else { None }
-                        };
-                        pk = reg_data;
-                    }
+                                } else { None }
+                            }
+                        } else { None }
+                    };
+                    pk = reg_data;
+                }
 
-                    if let Some(prev_state) = pk {
-                        current_state = (current_state + prev_state.to_device(dev)?.to_dtype(target_dtype)?)?;
-                    }
+                if let Some(prev_state) = pk {
+                    let prev_state = if !prev_state.device().same_device(dev) { prev_state.to_device(dev)? } else { prev_state };
+                    current_state = (prev_state + current_state)?;
+                }
+                inner.k_cache = Some(current_state.clone());
+                // Dummy V_cache to satisfy offload logic
+                if inner.v_cache.is_none() {
+                    inner.v_cache = Some(Tensor::zeros_like(&current_state)?);
+                }
+                inner.len += q_len;
+                
+                // [SSD-TRIGGER] Mark dirty
+                let mut reg = self.registry.entries.write().unwrap();
+                if inner.index < reg.len() {
+                    let entry = &mut reg[inner.index];
+                    entry.token_len = inner.len;
+                    if entry.is_dirty.len() < self.num_layers { entry.is_dirty.resize(self.num_layers, true); }
+                    entry.is_dirty[self.layer_idx] = true;
+                }
+            } else {
+                // First chunk for this linear layer
+                let new_block = KVBlock::new(KVLocation::VRAM, 0, q_len, seqlen_offset);
+                {
+                    let mut inner = new_block.inner.write().unwrap();
+                    inner.k_cache = Some(current_state.clone());
+                    // Dummy V_cache to satisfy Bake logic which expects both
+                    inner.v_cache = Some(Tensor::zeros_like(&current_state)?); 
+                }
+                self.kv_blocks.push(new_block);
+                
+                // [SSD-TRIGGER]
+                let mut reg = self.registry.entries.write().unwrap();
+                if let Some(entry) = reg.get_mut(0) {
+                    entry.token_start = seqlen_offset;
+                    entry.token_len = q_len;
+                    if entry.is_dirty.len() < self.num_layers { entry.is_dirty.resize(self.num_layers, true); }
+                    entry.is_dirty[self.layer_idx] = true;
+                    if entry.location.len() < self.num_layers { entry.location.resize(self.num_layers, KVLocation::VRAM); }
+                    entry.location[self.layer_idx] = KVLocation::VRAM;
                 }
             }
 
@@ -908,11 +910,7 @@ impl QuantizedQwen3VLTextAttention {
                 .to_dtype(DType::F32)?
                 .broadcast_mul(&Tensor::from_vec(vec![self.scaling as f32], (1,), dev)?)?
                 .to_dtype(target_dtype)?;
-
-            if self.layer_idx == 0 && seqlen_offset % 1000 == 0 {
-                println!("[DIAG-LINEAR] Layer 0 | Offset {} | State Norm: {:?}", seqlen_offset, current_state.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt());
-            }
-
+            
             // Apply ssm_gate (Gating part of Gated Delta Net)
             if let Some(gate_proj) = &self.ssm_gate {
                 let gate_values = gate_proj.forward(&xs)?.to_dtype(target_dtype)?;
@@ -929,11 +927,6 @@ impl QuantizedQwen3VLTextAttention {
             let attn_output = self.o_proj.forward(&out_ready)?;
             return Ok(attn_output);
         }
-
-        // --- Standard Attention Path ---
-        let mut vram_count = 0;
-        let mut ram_count = 0;
-        let mut ssd_count = 0;
 
         let cos = cos.to_dtype(target_dtype)?;
         let sin = sin.to_dtype(target_dtype)?;
@@ -1821,15 +1814,11 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let v_proj = QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone());
         let o_proj = QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone());
 
-        let is_linear = if layer_idx < config.layer_types.len() {
-            config.layer_types[layer_idx] == "linear_attention"
-        } else { false };
-
         let mut self_attn = QuantizedQwen3VLTextAttention {
             q_proj, k_proj, v_proj, o_proj,
             q_norm: None,
             k_norm: None,
-            is_linear_attention: is_linear,
+            is_linear_attention: false,
             ssm_conv1d: None,
             ssm_a: None,
             ssm_dt_bias: None,
@@ -2152,39 +2141,24 @@ impl QuantizedQwen3VLTextModel {
         chunk_index: usize, // [NEW] Added for isolation
     ) -> Result<Tensor> {
         let layer = &mut self.layers[layer_idx];
-        let dev = self.embed_tokens.embeddings().device();
-        let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
-        
-        // [DTYPE-DYNAMIC-ALIGNMENT] Detect the layer's actual weight dtype
-        // This is the only way to perfectly avoid 'unexpected dtype' errors.
-        let layer_dtype = layer.input_layernorm.weight().dtype();
         
         // [SAFETY] 연산 전 가중치 로드 상태 확인
         if layer.self_attn.q_proj.is_cleared() {
             return Err(anyhow!("Layer {} weight is cleared. Call reload_layer first.", layer_idx));
         }
 
-        // [ROPE-GEN-SINGLE] Generate RoPE in layer's own dtype
-        let (cos_final, sin_final) = if cos.elem_count() <= 1 {
-            let seq_len = xs.dim(1)?;
-            let b_sz = xs.dim(0)?;
-            let start = seqlen_offset as u32;
-            let p_ids = Tensor::arange(start, start + seq_len as u32, xs.device())?;
-            let position_ids = p_ids.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
-            self.rotary_emb.forward(&position_ids, layer_dtype, self.mrope_section.clone())?
-        } else {
-            (cos.to_dtype(layer_dtype)?, sin.to_dtype(layer_dtype)?)
-        };
+        // [ISOLATION] 이전 청크의 잔재가 남아있지 않도록 비움 (단, 상태 보존이 필요한 선형 레이어는 제외)
+        if !layer.self_attn.is_linear_attention {
+            layer.self_attn.kv_blocks.clear();
+        }
 
-        // [DTYPE-STRICT] Hidden states and residuals must match layer's weight dtype
-        let residual = xs.to_dtype(layer_dtype)?;
-        let xs_input = xs.to_dtype(layer_dtype)?;
-        let xs_norm = layer.input_layernorm.forward(&xs_input)?;
+        let residual = xs.clone();
+        let xs_norm = layer.input_layernorm.forward(xs)?;
         
         let attn_output = layer.self_attn.forward(
             &xs_norm,
-            &cos_final,
-            &sin_final,
+            cos,
+            sin,
             attention_mask,
             seqlen_offset,
             session_id.clone(),
@@ -2192,33 +2166,30 @@ impl QuantizedQwen3VLTextModel {
             baking_only
         )?;
 
-        let mut xs = (attn_output.to_dtype(layer_dtype)? + residual)?;
+        let mut xs = (attn_output + residual)?;
         
-        // [BAKE-TRIGGER-SINGLE]
+        // [BAKE-TRIGGER-SINGLE] 레이어 연산 직후 KV를 SSD로 내보냄 (Scheduler 전용)
         if let Some(sid) = &session_id {
+            // [FIX] Pass chunk_index for correct folder naming
             let _ = layer.force_offload_layer_kv(sid, baking_only, chunk_index).await;
         }
 
+        // [CLEANUP] 연산 결과가 저장되었으므로 다시 비움 (단, 상태 보존이 필요한 선형 레이어는 제외)
         if !layer.self_attn.is_linear_attention {
             layer.self_attn.kv_blocks.clear();
         }
 
         if let (Some(gate), Some(up), Some(down), Some(post_norm)) = 
            (&layer.mlp_gate, &layer.mlp_up, &layer.mlp_down, &layer.post_attention_layernorm) {
-            let residual_mlp = xs.clone();
-            // Ensure inputs to MLP components match the weight dtype of those components
-            let mlp_dtype = post_norm.weight().dtype();
-            let xs_norm = post_norm.forward(&xs.to_dtype(mlp_dtype)?)?;
-            
+            let residual = xs.clone();
+            let xs_norm = post_norm.forward(&xs)?;
             let gate_out = gate.forward(&xs_norm)?;
             let up_out = up.forward(&xs_norm)?;
             let activated = (candle_nn::ops::silu(&gate_out)? * up_out)?;
             let mlp_out = down.forward(&activated)?;
-            
-            xs = (mlp_out.to_dtype(layer_dtype)? + residual_mlp)?;
+            xs = (mlp_out + residual)?;
         }
 
-        // Return result in layer's dtype
         Ok(xs)
     }
 
@@ -3776,12 +3747,13 @@ impl QuantizedQwen3TextModel {
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
         
-        let position_ids = {
-            // [ROPE-FIX] Use absolute global offset for text tokens
+        let position_ids = if let Some(cp) = cache_position { 
+            let start = cp.flatten_all()?.i(0)?.to_scalar::<u32>()?; 
+            Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))? 
+        } else {
+            // [ROPE-CORRECTION] Use the updated seqlen_offset for position IDs
             let start = seqlen_offset as u32;
-            let p_ids = Tensor::arange(start, start + seq_len as u32, input_ids.device())?;
-            // Broadcast to (3, Batch, Seq) to satisfy shared mRoPE logic
-            p_ids.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?
+            Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?
         };
         
         self.language_model.active_session_id = session_id.clone();
