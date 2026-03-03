@@ -1068,7 +1068,10 @@ async fn process_task(
 
             // 5. 즉시 결과 생성
             if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] Virtual context assembled. Starting instant extraction...");
+                // [FIX] 보정: Stitch 이후 실제 로드된 KV 길이를 엔진에 강제 동기화
+                let actual_kv_len = gen.get_kv_len();
+                println!("[Scheduler] Virtual context assembled ({} tokens). Starting instant extraction...", actual_kv_len);
+                
                 let params = ChatCompletionParameters {
                     max_tokens: Some(1024),
                     temperature: Some(0.1),
