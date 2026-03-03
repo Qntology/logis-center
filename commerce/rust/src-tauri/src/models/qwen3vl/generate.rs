@@ -171,6 +171,8 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
                         let _ = save_kv_block(&index_path, json.as_bytes());
                     }
                 }
+                // [SYNC-WAIT-FIX] 인덱스 업데이트 완료 후 카운터 감소
+                GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
             }
         }
     });
@@ -235,42 +237,45 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(256); 
     tokio::spawn(async move {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(96)); 
+        // [PARALLEL-IO] SSD 쓰기를 병렬로 처리하되, 시스템 부하를 고려해 동시 실행 수를 제한합니다.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(12)); // 최대 12개 파일 동시 쓰기
+        
         while let Some(task) = io_rx.recv().await {
             let sem = semaphore.clone();
             let (tp, ts, reg, b_idx, sid, is_last, kv_n) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone());
+            
             tokio::spawn(async move {
-                let _permit = sem.acquire_owned().await.unwrap();
+                // 세마포어 허가 대기 (병렬 수 제한)
+                let _permit = sem.acquire().await.unwrap();
+                
                 struct IoGuard; impl Drop for IoGuard { fn drop(&mut self) { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } }
                 let _guard = IoGuard;
+                
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 match safetensors::serialize(&ts, &None) {
                     Ok(data) => {
                         drop(ts); 
                         if let Err(e) = save_kv_block(&tp, &data) {
                             eprintln!("[IO-ERROR] save_kv_block failed for {:?}: {}", tp, e);
-                        } else if tp.to_string_lossy().contains("b0.st") {
-                            println!("[IO-SUCCESS] Saved block to {:?}", tp);
+                        } else if tp.to_string_lossy().contains("b0.st") || tp.to_string_lossy().contains("b23.st") {
+                            // 시작과 끝 레이어 저장 시 로그 출력
+                            println!("[IO-SUCCESS] Parallel Save Complete: {:?}", tp);
                         }
                         
                         // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
                         if let Some(kv_name) = kv_n {
-                            // tp.file_name() is b{layer}.st
                             if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).and_then(|s| s.strip_suffix(".st")) {
                                 if let Ok(l_idx) = l_str.parse::<usize>() {
-                                    // tp.parent() folder name is l{offset}
                                     let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).unwrap_or("0");
                                     let offset = offset_str.parse::<usize>().unwrap_or(0);
-                                    
+
+                                    // [SYNC-WAIT-FIX] 인덱스 업데이트 시작 전 카운터 증가
+                                    GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
                                     let _ = INDEX_TX.send(SlotTask::IndexUpdate {
-                                        kv_name,
-                                        layer_idx: l_idx,
-                                        offset,
-                                        len: 256,
+                                        kv_name, layer_idx: l_idx, offset, len: 256,
                                         file_name: format!("l{}/b{}.st", offset, l_idx),
                                     }).await;
-                                }
-                            }
+                                    }                            }
                         }
 
                         if let (Some(r), Some(idx)) = (reg, b_idx) {
@@ -282,7 +287,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                             if l_idx < 28 { 
                                                 e.location[l_idx] = KVLocation::SSD; 
                                                 e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                                                // [MEMORY-RELEASE] SSD 저장 완료 즉시 RAM 메모리 해제
                                                 if let Ok(mut cache) = e.bitkv_cache.write() {
                                                     if l_idx < cache.len() { cache[l_idx] = None; }
                                                 }
@@ -350,7 +354,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             let file_path = task_dir.join(format!("b{}.st", act_l));
                             
                             // [FIX] Send to IO worker after confirming all tensors are on CPU
-                            GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
                             if let Err(e) = io_tx_nested.send(SaveTask { 
                                 slot_id: sid, 
                                 path: file_path.clone(), 

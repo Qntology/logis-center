@@ -899,7 +899,11 @@ impl QuantizedQwen3VLTextAttention {
                         if inner.index < reg.len() {
                             let entry = &mut reg[inner.index];
                             entry.token_len = inner.len;
-                            if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = true; }
+                            // [FIX] Ensure the dirty array is large enough and set the flag for this layer
+                            if entry.is_dirty.len() < self.num_layers {
+                                entry.is_dirty.resize(self.num_layers, true);
+                            }
+                            entry.is_dirty[self.layer_idx] = true;
                         }
                     }
                 }
@@ -922,8 +926,16 @@ impl QuantizedQwen3VLTextAttention {
                     let entry = &mut reg[index];
                     entry.token_start = current_total;
                     entry.token_len = take;
-                    if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = true; }
-                    if self.layer_idx < entry.location.len() { entry.location[self.layer_idx] = KVLocation::VRAM; }
+                    
+                    if entry.is_dirty.len() < self.num_layers {
+                        entry.is_dirty.resize(self.num_layers, true);
+                    }
+                    entry.is_dirty[self.layer_idx] = true;
+                    
+                    if entry.location.len() < self.num_layers {
+                        entry.location.resize(self.num_layers, KVLocation::VRAM);
+                    }
+                    entry.location[self.layer_idx] = KVLocation::VRAM;
                 }
                 self.kv_blocks.push(new_block);
                 tokens_to_process -= take; chunk_offset += take;
@@ -1193,13 +1205,11 @@ impl QuantizedQwen3VLTextAttention {
             };
 
             // [BACKUP-STRATEGY] 
-            // 1. 완성된 블록(256개)은 즉시 SSD로 백업 대상
-            // 2. 마지막 조각(is_last_chunk)도 백업 대상
-            // 3. VRAM에 데이터가 있고, 아직 저장이 안 된(dirty) 경우만 수집
+            // 데이터가 있고, 아직 저장이 안 된(dirty) 상태라면 무조건 저장 대상
             // [FIX] Prefill 시에는 현재 연산 중인 블록만 타겟팅 (오프셋 기반)
             let is_current_chunk = inner.offset == (chunk_offset / 256) * 256;
 
-            if (is_full || is_last_chunk) && inner.k_cache.is_some() && is_dirty && (is_decoding || is_current_chunk) { 
+            if inner.k_cache.is_some() && is_dirty && (is_decoding || is_current_chunk) { 
                 Some(i) 
             } else { None }
         }).collect();
@@ -1511,13 +1521,18 @@ impl QuantizedQwen3VLTextAttention {
                         
                         let k_shape_u32: Vec<u32> = k_vram.shape().dims().iter().map(|&x| x as u32).collect();
                         
+                        // [IMMEDIATE-COPY] 워커 스레드에 맡기지 않고 여기서 즉시 CPU로 복사하여 데이터 생존 보장
+                        let kd_cpu = k_vram.to_dtype(DType::BF16)?.to_device(&Device::Cpu)?;
+                        let vd_cpu = v_vram.to_dtype(DType::BF16)?.to_device(&Device::Cpu)?;
+
                         blocks_to_bake.push((
                             LayerKVDump {
                                 layer_idx: self.layer_idx,
-                                k_data: k_vram.to_dtype(DType::BF16)?.to_device(&Device::Cpu)?,
-                                v_data: v_vram.to_dtype(DType::BF16)?.to_device(&Device::Cpu)?,
-                                k_shape: Tensor::from_vec(k_shape_u32, (k_vram.shape().dims().len(),), &Device::Cpu)?,
-                                raw_k: None, raw_v: None,
+                                k_data: kd_cpu,
+                                v_data: vd_cpu,
+                                k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu)?,
+                                raw_k: None, 
+                                raw_v: None,
                             },
                             actual_off,
                             b_len
@@ -1545,6 +1560,9 @@ impl QuantizedQwen3VLTextAttention {
                     let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
                     let block_dir = kv_root.join(&sub_path).join(format!("l{}", off));
                     if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
+
+                    // [SYNC-WAIT-FIX] 워커로 보내기 전에 카운터를 올려서 wait_for_global_io가 정확히 대기하게 함
+                    crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                     let _ = tx.send(SlotTask::Bake(BakeTask {
                         slot_id: sid,

@@ -728,8 +728,8 @@ async fn process_task(
                     let output_path = offset_dir.join(format!("h{}.st", current_l));
                     gen.qwen3_vl.save_hidden_states(&output_path, &next_xs)?;
                     
-                    // 5. Cleanup previous layer's hidden states to save space
-                    if current_l > 0 { let _ = fs::remove_file(input_path); }
+                    // [DEBUG] 잠시 삭제 로직 중단하여 파일 생존 확인
+                    // if current_l > 0 { let _ = fs::remove_file(input_path); }
                 }
                 Ok::<(), anyhow::Error>(())
             });
