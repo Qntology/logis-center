@@ -1292,18 +1292,18 @@ impl QuantizedQwen3VLTextAttention {
                 } else { true }
             };
 
-            // [BACKUP-STRATEGY] 
+            // [BACKUP-STRATEGY]
             // 데이터가 있고, 아직 저장이 안 된(dirty) 상태라면 무조건 저장 대상
-            // [FIX] Prefill 시에는 현재 연산 중인 블록만 타겟팅 (오프셋 기반)
+            // [FIX] 디코딩 시에는 1토큰마다 즉시 저장하여 영속성 보장 (Dirty 체크 무시)
             let is_current_chunk = inner.offset == (chunk_offset / 256) * 256;
 
-            if inner.k_cache.is_some() && is_dirty && (is_decoding || is_current_chunk) { 
-                Some(i) 
+            if inner.k_cache.is_some() && (is_decoding || (is_dirty && is_current_chunk)) {
+                Some(i)
             } else { None }
-        }).collect();
+            }).collect();
 
-        for idx in target_indices {
-            // [DIRTY-RESET] Clear dirty flag immediately for THIS layer
+            for idx in target_indices {
+            // [DIRTY-RESET]
             {
                 let mut reg = self.registry.entries.write().unwrap();
                 if idx < reg.len() {
@@ -1315,8 +1315,9 @@ impl QuantizedQwen3VLTextAttention {
             let (k_opt, v_opt, off, _b_idx, b_len) = {
                 let mut inner = block.inner.write().unwrap();
                 let snapshot = (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len);
-                
-                // [OFFLOAD] VRAM 상주 한계를 넘은 블록만 실제 데이터를 비움 (SSD 백업은 별개)
+
+                // [OFFLOAD] VRAM 상주 한계를 넘은 블록만 실제 데이터를 비움
+                // [FIX] 디코딩 중이고 방금 저장한 블록이 VRAM 한계 밖이라면 비움
                 if is_decoding && idx < vram_limit_idx {
                     inner.k_cache = None;
                     inner.v_cache = None;
@@ -1324,7 +1325,6 @@ impl QuantizedQwen3VLTextAttention {
                 }
                 snapshot
             };
-
             if let (Some(k), Some(v)) = (k_opt, v_opt) {
                 let b_sz = k.dim(0)?;
                 

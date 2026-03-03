@@ -649,6 +649,12 @@ impl Qwen3VLGenerateModel {
         let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
 
         let total_toks = f_ids.len();
+        println!("[DEBUG-PROMPT] Rendered Prompt Len: {} chars, {} tokens.", input.replace_text.len(), total_toks);
+        if total_toks > 1000 {
+            println!("[DEBUG-PROMPT] Head: {:?}", &input.replace_text[..200.min(input.replace_text.len())]);
+            println!("[DEBUG-PROMPT] Tail: {:?}", &input.replace_text[input.replace_text.len().saturating_sub(200)..]);
+        }
+
         let kv_len = self.get_kv_len();
         println!("[DIAG-GEN] Current KV Cache Len: {} tokens. Prompt: {} tokens.", kv_len, total_toks);
 
@@ -763,7 +769,8 @@ impl Qwen3VLGenerateModel {
                 println!("[GEN-STOP] Reached max_tokens limit ({}).", max_new_tokens);
             }
             
-            let current_pos = total_tokens_after_prefill + i as usize;
+            // [FIX] 고정된 pre-calculated 오프셋 대신 엔진의 실제 현재 길이를 실시간으로 참조
+            let current_pos = self.get_kv_len();
             
             // [FIX] Qwen 3.5 mRoPE를 위한 Rank 3 위치 텐서 생성 (디코딩용 단일 토큰)
             let cache_pos_1d = Tensor::from_vec(vec![current_pos as u32], (1, 1), &self.text_device)?;

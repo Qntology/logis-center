@@ -1016,67 +1016,31 @@ async fn process_task(
                 name.split("_c").last().unwrap_or("0").parse::<usize>().unwrap_or(0)
             });
 
-            // 3. 추출 질문(Instruction) 전용 청크 굽기
-            let snapshot_inst = format!("{}_inst", task.id);
-            let total_parts = chunk_results.len();
+            // 3. [ZERO-PREFILL OPTIMIZATION] 지시 사항(Instruction)만 프롬프트로 전달
+            // 이미 PUG 데이터는 SSD에 구워졌으므로(Step 1), 다시 프롬프트에 넣을 필요가 없습니다.
+            let extraction_prompt = parsing::item2json(&page_type, &url, language);
             
-            // [FIX] 지시 사항도 반드시 256 배수 지점에서 시작하도록 정렬
-            let inst_offset = base_len + (total_parts * 256);
-            
-            let inst_len = {
-                let mut gen_m = model.generator.lock().await;
-                if let Some(gen) = gen_m.as_mut() {
-                    gen.truncate_kv_cache(0)?;
-                    let extraction_prompt = format!(
-                        "\n\n[TASK] Analyze all {} parts of the PUG context provided above and perform the following extraction: {}\n\n[ACTION] RETURN JSON ONLY.", 
-                        total_parts,
-                        extraction_instruction
-                    );
-                    let mut inst_ids = gen.tokenizer.text_encode_vec(extraction_prompt, false)?;
-                    
-                    // [ALIGN] 지시 사항 청크도 256 배수로 맞춤 (패딩)
-                    let space_token = gen.tokenizer.text_encode_vec(" ".to_string(), false).unwrap_or(vec![220])[0];
-                    let original_inst_len = inst_ids.len();
-                    let aligned_inst_len = ((original_inst_len + 255) / 256) * 256;
-                    while inst_ids.len() < aligned_inst_len { inst_ids.push(space_token); }
-
-                    let ids_tensor = Tensor::from_vec(inst_ids.clone(), (1, aligned_inst_len), &gen.text_device)?;
-                    
-                    // [FIX] Qwen 3.5 mRoPE를 위한 Rank 3 위치 텐서 생성 (지시 사항용)
-                    let cache_pos_1d = Tensor::arange(inst_offset as u32, (inst_offset + aligned_inst_len) as u32, &gen.text_device)?;
-                    let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, aligned_inst_len))?;
-
-                    // [CRITICAL] forward 시 6번째 인자에 3D 텐서 직접 전달
-                    gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, Some(&pos_ids_3d), inst_offset, inst_offset + aligned_inst_len, Some(snapshot_inst.clone()), Some("inference".to_string())).await?;
-                    gen.force_flush_all_active_blocks(&snapshot_inst, Some("inference")).await?;
-                    
-                    aligned_inst_len
-                } else { 0 }
-            };
-
-            // 4. [STITCH-ALL] 모든 조각 이어붙이기
-            // [Base] + [Chunk0] + [Chunk1] + ... + [Instruction]
+            // 4. [STITCH-ONLY] PUG 조각들만 이어붙이기
+            // [Base] + [Chunk0] + [Chunk1] + ...
             let mut final_stitch_targets = vec![(task.id.clone(), 0, base_len)];
-            for (c_name, _) in chunk_results { 
-                let c_idx = c_name.split("_c").last().unwrap_or("0").parse::<usize>().unwrap_or(0);
+            for (c_idx, _) in chunk_results.iter().enumerate() { 
+                let c_name = format!("{}_c{}", task.id, c_idx);
                 let c_offset = base_len + (c_idx * 256);
                 final_stitch_targets.push((c_name, c_offset, 256)); 
             }
-            final_stitch_targets.push((snapshot_inst, inst_offset, inst_len));
 
             model.stitch_kv_fragments(final_stitch_targets).await?;
 
             // 5. 즉시 결과 생성
             if let Some(gen) = model.generator.lock().await.as_mut() {
-                // [FIX] 보정: Stitch 이후 실제 로드된 KV 길이를 엔진에 강제 동기화
+                // 보정: Stitch 이후 실제 로드된 KV 길이를 확인
                 let actual_kv_len = gen.get_kv_len();
                 println!("[Scheduler] Virtual context assembled ({} tokens). Starting instant extraction...", actual_kv_len);
                 
-                let params = ChatCompletionParameters {
-                    max_tokens: Some(1024),
-                    temperature: Some(0.1),
-                    ..Default::default()
-                };
+                // [FIX] 이미 구워진 텍스트(&chunk_texts)를 제외하고 지시문만 포함하여 호출
+                // 이렇게 하면 엔진이 중복 연산 없이 SSD 컨텍스트 위에서 즉시 시작합니다.
+                let params = build_params(extraction_prompt, 1024, &vec![]); 
+                
                 let res = gen.generate(params, Some(cancellation_token.clone()), None, None).await?;
                 extracted_data = parsing::parse_json_from_llm(&res);
             }
