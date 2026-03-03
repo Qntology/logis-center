@@ -485,11 +485,19 @@ impl ModelVariant {
         }
     }
 
-    pub fn forward_single_layer(&mut self, layer_idx: usize, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, offset: usize, session_id: Option<String>, kv_name: Option<String>, baking: bool) -> Result<Tensor> {
+    pub async fn forward_single_layer(&mut self, layer_idx: usize, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, offset: usize, session_id: Option<String>, kv_name: Option<String>, baking: bool) -> Result<Tensor> {
         match self {
-            Self::QuantizedVL(m) => m.language_model.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking),
-            Self::QuantizedText(m) => m.language_model.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking),
+            Self::QuantizedVL(m) => m.language_model.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking).await,
+            Self::QuantizedText(m) => m.language_model.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking).await,
             _ => Err(anyhow!("Unsupported model variant for single layer forward")),
+        }
+    }
+
+    pub fn clear_layer(&mut self, layer_idx: usize) {
+        match self {
+            Self::QuantizedVL(m) => m.language_model.layers[layer_idx].clear(),
+            Self::QuantizedText(m) => m.language_model.layers[layer_idx].clear(),
+            _ => {}
         }
     }
 

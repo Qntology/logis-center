@@ -2025,7 +2025,7 @@ impl QuantizedQwen3VLTextModel {
     }
 
     /// [LAYER-BY-LAYER] 특정 레이어 하나만 실행하고 결과를 반환합니다.
-    pub fn forward_single_layer(
+    pub async fn forward_single_layer(
         &mut self,
         layer_idx: usize,
         xs: &Tensor,
@@ -2053,13 +2053,18 @@ impl QuantizedQwen3VLTextModel {
             sin,
             attention_mask,
             seqlen_offset,
-            session_id,
-            kv_name,
+            session_id.clone(),
+            kv_name.clone(),
             baking_only
         )?;
 
         let mut xs = (attn_output + residual)?;
         
+        // [BAKE-TRIGGER-SINGLE] 레이어 연산 직후 KV를 SSD로 내보냄 (Scheduler 전용)
+        if let Some(sid) = &session_id {
+            let _ = layer.force_offload_layer_kv(sid, baking_only).await;
+        }
+
         if let (Some(gate), Some(up), Some(down), Some(post_norm)) = 
            (&layer.mlp_gate, &layer.mlp_up, &layer.mlp_down, &layer.post_attention_layernorm) {
             let residual = xs.clone();
@@ -3485,6 +3490,14 @@ impl QuantizedQwen3VLModel {
         Ok(())
     }
 
+    pub async fn forward_single_layer(&mut self, layer_idx: usize, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, offset: usize, session_id: Option<String>, kv_name: Option<String>, baking: bool) -> Result<Tensor> {
+        self.language_model.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking).await
+    }
+
+    pub fn clear_layer(&mut self, layer_idx: usize) {
+        self.language_model.layers[layer_idx].clear();
+    }
+
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; self.text_device = device.clone(); self.vision_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, total_len) }
@@ -3650,6 +3663,14 @@ impl QuantizedQwen3TextModel {
             layer.sync_blocks_from_registry()?;
         }
         Ok(())
+    }
+
+    pub async fn forward_single_layer(&mut self, layer_idx: usize, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, offset: usize, session_id: Option<String>, kv_name: Option<String>, baking: bool) -> Result<Tensor> {
+        self.language_model.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking).await
+    }
+
+    pub fn clear_layer(&mut self, layer_idx: usize) {
+        self.language_model.layers[layer_idx].clear();
     }
 
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }

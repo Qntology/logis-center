@@ -643,8 +643,15 @@ async fn process_task(
     // --- STEP 1: Layer-by-Layer Parallel Baking (Offset-Centric SSD-Direct) ---
     log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": "Initializing Layer-by-Layer Parallel Pipeline...", "spinner": "🔥" }));
 
-    let task_kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id);
+    let task_kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id).join("text");
     if !task_kv_dir.exists() { fs::create_dir_all(&task_kv_dir)?; }
+
+    // Save tokens.json for future recovery
+    let all_tokens: Vec<u32> = chunk_ids_list.iter().flatten().cloned().collect();
+    let tokens_path = task_kv_dir.join("tokens.json");
+    if let Ok(json_data) = serde_json::to_vec(&all_tokens) {
+        let _ = crate::utils::direct_loader::save_kv_block(&tokens_path, &json_data);
+    }
 
     // 1.1 [COMMON-EMBEDDING] Generate and save initial hidden states for all chunks
     {
@@ -690,7 +697,7 @@ async fn process_task(
             layer_tasks.push(async move {
                 let mut gen_m = model_c.generator.lock().await;
                 if let Some(gen) = gen_m.as_mut() {
-                    let offset_dir = utils::paths::get_kv_dir(None).join(&task_id_c).join(format!("l{}", offset));
+                    let offset_dir = utils::paths::get_kv_dir(None).join(&task_id_c).join("text").join(format!("l{}", offset));
                     
                     // 1. Load Input from SSD (Either initial input.st or previous layer's output h{N-1}.st)
                     let input_path = if current_l == 0 { offset_dir.join("input.st") } else { offset_dir.join(format!("h{}.st", current_l - 1)) };
@@ -713,9 +720,9 @@ async fn process_task(
                     };
 
                     // 3. Forward Single Layer (Generates KV + Next Hidden States)
-                    // KV is automatically saved to task_id/l{offset}/b{layer}.st via generate.rs IO worker
+                    // [FIX] Pass correct 'offset' so it saves to task_id/text/l{offset}/b{layer}.st
                     let session_id = Some(task_id_c.clone());
-                    let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, 0, session_id, kv_name_c, true)?;
+                    let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, offset, session_id, kv_name_c, true).await?;
 
                     // 4. Save Next Hidden States to SSD
                     let output_path = offset_dir.join(format!("h{}.st", current_l));
@@ -734,6 +741,17 @@ async fn process_task(
         
         // [SYNC] 모든 병렬 IO(KV 저장 및 Hidden States 저장)가 끝날 때까지 대기
         crate::models::qwen3vl::generate::wait_for_global_io().await;
+
+        // [MEMORY-OPT] 연산이 끝난 레이어는 즉시 소각하여 VRAM 확보
+        {
+            let mut gen_m = model.generator.lock().await;
+            if let Some(gen) = gen_m.as_mut() {
+                gen.qwen3_vl.clear_layer(l_idx);
+                let dev = gen.text_device.clone();
+                if dev.is_cuda() { let _ = dev.synchronize(); }
+                println!("[BAKE-PURGE] Layer {} weights cleared from VRAM.", l_idx);
+            }
+        }
     }
 
     // --- STEP 2: Transition to Decoding Mode ---
