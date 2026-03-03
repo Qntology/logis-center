@@ -30,7 +30,7 @@ mod windows_impl {
             let factory: IDStorageFactory = match DStorageGetFactory() {
                 Ok(f) => f,
                 Err(e) => {
-                    println!("[I/O-INFO] DirectStorage not supported or failed to init: {}. Fallback will be used.", e);
+                    println!("[I/O-INFO] DirectStorage Factory creation failed: {}. (Error Code: 0x{:X}). Fallback will be used.", e, e.code().0);
                     return None;
                 }
             };
@@ -47,7 +47,7 @@ mod windows_impl {
             let queue = match factory.CreateQueue(&queue_desc) {
                 Ok(q) => q,
                 Err(e) => {
-                    println!("[I/O-INFO] DirectStorage Queue creation failed: {}. Falling back.", e);
+                    println!("[I/O-INFO] DirectStorage Queue creation failed: {}. (Likely driver/HW compatibility issue). Falling back.", e);
                     return None;
                 }
             };
@@ -60,6 +60,7 @@ mod windows_impl {
                 }
             };
             
+            println!("[I/O-SUCCESS] DirectStorage context initialized successfully on Windows.");
             Some(Arc::new(WinContext { factory, queue, status_array }))
         }
     });
