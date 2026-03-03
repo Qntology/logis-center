@@ -236,74 +236,65 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(256); 
+
     tokio::spawn(async move {
-        // [PARALLEL-IO] SSD 쓰기를 병렬로 처리하되, 시스템 부하를 고려해 동시 실행 수를 제한합니다.
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(12)); // 최대 12개 파일 동시 쓰기
-        
+        // [SEQUENTIAL-IO] 파일 손상을 방지하기 위해 이 워커 스레드 내에서 순차적으로 저장합니다.
         while let Some(task) = io_rx.recv().await {
-            let sem = semaphore.clone();
             let (tp, ts, reg, b_idx, sid, is_last, kv_n) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone());
-            
-            tokio::spawn(async move {
-                // 세마포어 허가 대기 (병렬 수 제한)
-                let _permit = sem.acquire().await.unwrap();
-                
-                struct IoGuard; impl Drop for IoGuard { fn drop(&mut self) { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } }
-                let _guard = IoGuard;
-                
-                if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
-                match safetensors::serialize(&ts, &None) {
-                    Ok(data) => {
-                        drop(ts); 
-                        if let Err(e) = save_kv_block(&tp, &data) {
-                            eprintln!("[IO-ERROR] save_kv_block failed for {:?}: {}", tp, e);
-                        } else if tp.to_string_lossy().contains("b0.st") || tp.to_string_lossy().contains("b23.st") {
-                            // 시작과 끝 레이어 저장 시 로그 출력
-                            println!("[IO-SUCCESS] Parallel Save Complete: {:?}", tp);
-                        }
-                        
-                        // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
-                        if let Some(kv_name) = kv_n {
-                            if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).and_then(|s| s.strip_suffix(".st")) {
-                                if let Ok(l_idx) = l_str.parse::<usize>() {
-                                    let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).unwrap_or("0");
-                                    let offset = offset_str.parse::<usize>().unwrap_or(0);
 
-                                    // [SYNC-WAIT-FIX] 인덱스 업데이트 시작 전 카운터 증가
-                                    GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-                                    let _ = INDEX_TX.send(SlotTask::IndexUpdate {
-                                        kv_name, layer_idx: l_idx, offset, len: 256,
-                                        file_name: format!("l{}/b{}.st", offset, l_idx),
-                                    }).await;
-                                    }                            }
-                        }
+            // [SYNC-WAIT] 별도의 spawn 없이 여기서 직접 연달아 처리
+            if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
+            match safetensors::serialize(&ts, &None) {
+                Ok(data) => {
+                    drop(ts); 
+                    if let Err(e) = save_kv_block(&tp, &data) {
+                        eprintln!("[IO-ERROR] save_kv_block failed: {} -> {:?}", e, tp);
+                    } else if tp.to_string_lossy().contains("b0.st") || tp.to_string_lossy().contains("b23.st") {
+                        println!("[IO-SUCCESS] Saved: {:?}", tp);
+                    }
 
-                        if let (Some(r), Some(idx)) = (reg, b_idx) {
-                            if let Ok(mut entries) = r.entries.write() {
-                                if idx < entries.len() {
-                                    let e = &mut entries[idx]; 
-                                    if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).and_then(|s| s.strip_suffix(".st")) {
-                                        if let Ok(l_idx) = l_str.parse::<usize>() { 
-                                            if l_idx < 28 { 
-                                                e.location[l_idx] = KVLocation::SSD; 
-                                                e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                                                if let Ok(mut cache) = e.bitkv_cache.write() {
-                                                    if l_idx < cache.len() { cache[l_idx] = None; }
-                                                }
-                                            } 
-                                        }
+                    // 인덱스 업데이트
+                    if let Some(kv_name) = kv_n {
+                        if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).and_then(|s| s.strip_suffix(".st")) {
+                            if let Ok(l_idx) = l_str.parse::<usize>() {
+                                let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).unwrap_or("0");
+                                let offset = offset_str.parse::<usize>().unwrap_or(0);
+
+                                GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
+                                let _ = INDEX_TX.send(SlotTask::IndexUpdate {
+                                    kv_name, layer_idx: l_idx, offset, len: 256,
+                                    file_name: format!("l{}/b{}.st", offset, l_idx),
+                                }).await;
+                            }
+                        }
+                    }
+
+                    // 레지스트리 상태 업데이트
+                    if let (Some(r), Some(idx)) = (reg, b_idx) {
+                        if let Ok(mut entries) = r.entries.write() {
+                            if idx < entries.len() {
+                                let e = &mut entries[idx]; 
+                                if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).and_then(|s| s.strip_suffix(".st")) {
+                                    if let Ok(l_idx) = l_str.parse::<usize>() { 
+                                        if l_idx < 28 { 
+                                            e.location[l_idx] = KVLocation::SSD; 
+                                            e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                                            if let Ok(mut cache) = e.bitkv_cache.write() {
+                                                if l_idx < cache.len() { cache[l_idx] = None; }
+                                            }
+                                        } 
                                     }
                                 }
                             }
                         }
-                    },
-                    Err(e) => {
-                        eprintln!("[IO-ERROR] safetensors::serialize failed for {:?}: {}", tp, e);
                     }
-                }
-                let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
-                if rem == 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; }
-            });
+                },
+                Err(e) => eprintln!("[IO-ERROR] serialize failed: {}", e),
+            }
+            // 작업 완료 후 카운터 감소 및 슬롯 해제
+            GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
+            let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
+            if rem == 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; }
         }
     });
 
@@ -315,61 +306,31 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let (sid, off, _is_relay, block_idx, registry, kv_name) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone());
                     let loop_count = bake.layers.len();
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
-                    
+
                     for l_idx in 0..loop_count {
                         let mut src = bake.layers[l_idx].clone();
                         let act_l = src.layer_idx;
-                        let task_dir = bake.task_dir.clone(); // task_dir is session_id/kv_type/l{offset}
+                        let task_dir = bake.task_dir.clone();
                         let registry_inner = registry.clone();
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
 
-                        // [BACK-COMPRESSION] 압축 및 직렬화 작업 자체를 백그라운드로 완전히 분리
                         tokio::spawn(async move {
-                            // [FIX] Convert raw tensors to BF16 (or F32 fallback)
-                            // Handle potential missing raw data gracefully to avoid hangs
-                            let (k_data, v_data) = if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
-                                // [ZERO-CPU] Perform DType conversion on GPU before moving to CPU
-                                let k_bf16 = rk.to_dtype(DType::BF16).unwrap_or(rk);
-                                let v_bf16 = rv.to_dtype(DType::BF16).unwrap_or(rv);
-                                
-                                let k_cpu = k_bf16.to_device(&Device::Cpu).unwrap_or(k_bf16);
-                                let v_cpu = v_bf16.to_device(&Device::Cpu).unwrap_or(v_bf16);
-                                (k_cpu, v_cpu)
-                            } else {
-                                // If raw is missing, fallback to existing data or empty tensors
-                                // This ensures we don't skip the IO task creation entirely
-                                (src.k_data.clone(), src.v_data.clone())
-                            };
-
+                            // [SYNC-COPY] 이미 CPU에 복사된 데이터를 사용함
                             let mut map = std::collections::HashMap::new();
-                            // [OFFSET-CENTRIC-FIX] Use layer index as file name (b{layer}), and offset as folder name (l{offset})
                             let prefix = format!("l{}_b{}_", off, act_l);
-                            map.insert(format!("{}k_data", prefix), k_data);
-                            map.insert(format!("{}v_data", prefix), v_data);
-                            map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
-                            
-                            // [STRUCTURE] task_root/l{offset}/b{layer}.st
-                            // task_dir already contains the l{offset} part from trigger_realtime_incremental_bake
+                            map.insert(format!("{}k_data", prefix), src.k_data);
+                            map.insert(format!("{}v_data", prefix), src.v_data);
+                            map.insert(format!("{}k_shape", prefix), src.k_shape);
+
                             let file_path = task_dir.join(format!("b{}.st", act_l));
-                            
-                            // [FIX] Send to IO worker after confirming all tensors are on CPU
-                            if let Err(e) = io_tx_nested.send(SaveTask { 
-                                slot_id: sid, 
-                                path: file_path.clone(), 
-                                tensors: map, 
-                                is_last: false, 
-                                block_idx, 
-                                registry: Some(registry_inner), 
-                                kv_name: kv_name_inner 
-                            }).await {
-                                eprintln!("[BAKE-ERROR] Failed to send SaveTask to IO worker: {}. Slot {} might hang.", e, sid);
-                                // If we fail to send, we must manually decrement the global counter (since IoGuard won't run)
-                                // and the remaining_layers counter to prevent slot hang.
-                                GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
-                                let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
-                                if rem == 1 { SLOT_MANAGER.mark_ready(sid).await; }
-                            }
+
+                            // 큐에 넣기 전에 카운터 증가 (메인 스레드 대기용)
+                            GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
+                            let _ = io_tx_nested.send(SaveTask { 
+                                slot_id: sid, path: file_path, tensors: map, is_last: false, 
+                                block_idx, registry: Some(registry_inner), kv_name: kv_name_inner 
+                            }).await;
                         });
                     }
                 },
