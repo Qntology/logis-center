@@ -793,10 +793,10 @@ impl Qwen3VLGenerateModel {
         self.qwen3_vl.reload_all_layers()
     }
 
-    pub fn reload_layer(&mut self, l_idx: usize) -> Result<()> {
+    pub fn reload_layer(&mut self, l_idx: usize, target_device: &Device) -> Result<()> {
         match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.language_model.reload_layer(l_idx, &self.text_device),
-            ModelVariant::QuantizedText(m) => m.language_model.reload_layer(l_idx, &self.text_device),
+            ModelVariant::QuantizedVL(m) => m.language_model.reload_layer(l_idx, target_device),
+            ModelVariant::QuantizedText(m) => m.language_model.reload_layer(l_idx, target_device),
             _ => Ok(()),
         }
     }

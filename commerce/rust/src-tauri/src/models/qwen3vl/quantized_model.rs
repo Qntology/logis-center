@@ -280,13 +280,13 @@ impl RegistryEntry {
 
     pub fn get_block_path(&self, layer_idx: usize) -> Option<std::path::PathBuf> {
         if let Some(root) = &self.task_root {
-            // [STRUCTURE-CHECK] session_id/kv_type/l{offset}/b{layer}.st
-            // root already points to session_id/kv_type
-            let path = root.join(format!("l{}", self.token_start)).join(format!("b{}.st", layer_idx));
+            // [STRUCTURE-FIX] root is session_id/text. Directory is l{chunk_index}
+            let chunk_index = self.token_start / 256;
+            let path = root.join(format!("l{}", chunk_index)).join(format!("b{}.st", layer_idx));
             if path.exists() { return Some(path); }
             
-            // Fallback to task_id/l{offset}/b{layer}.st (without kv_type)
-            let alt_path = root.parent().unwrap_or(root).join(format!("l{}", self.token_start)).join(format!("b{}.st", layer_idx));
+            // Fallback: try l{offset} for backward compatibility
+            let alt_path = root.join(format!("l{}", self.token_start)).join(format!("b{}.st", layer_idx));
             if alt_path.exists() { return Some(alt_path); }
         }
         self.ssd_path.as_ref().map(|p| p.join(format!("l{}.st", layer_idx)))
@@ -332,13 +332,20 @@ impl KVRegistry {
             for b_idx in 0..num_blocks {
                 if current_block_idx >= entries.len() { break; }
                 
-                let token_start = current_block_idx * 256;
-                // [STRICT-CHECK] 실제로 파일이 존재하는지 확인
-                let block_file = task_dir.join(format!("l{}", token_start)).join("b0.st");
+                // [STRUCTURE-FIX] Check for l{chunk_index} first
+                let block_file = task_dir.join(format!("l{}", b_idx)).join("b0.st");
+                let mut found_path = if block_file.exists() { Some(task_dir.clone()) } else { None };
+
+                // Fallback: check for l{offset}
+                if found_path.is_none() {
+                    let token_start = current_block_idx * 256;
+                    let alt_block = task_dir.join(format!("l{}", token_start)).join("b0.st");
+                    if alt_block.exists() { found_path = Some(task_dir.clone()); }
+                }
                 
-                if block_file.exists() {
+                if let Some(final_task_dir) = found_path {
                     let entry = &mut entries[current_block_idx];
-                    entry.task_root = Some(task_dir.clone());
+                    entry.task_root = Some(final_task_dir);
                     entry.token_len = if b_idx == num_blocks - 1 {
                         let rem = length_tokens % 256;
                         if rem == 0 { 256 } else { rem }
