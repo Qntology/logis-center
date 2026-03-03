@@ -1347,10 +1347,11 @@ impl QuantizedQwen3VLTextAttention {
 
                     tauri::async_runtime::spawn(async move {
                         if let Some(tx) = BAKE_TX.get() {
-                            // [STRUCTURE-FIX] session_id / kv_type / l{offset} / b{layer}.st
+                            // [STRUCTURE-FIX] Unify to l{chunk_index} format: session_id / kv_type / l{idx} / b{layer}.st
+                            let chunk_idx = actual_off / 256;
                             let sub_path = format!("{}/{}", session_id_owned, kv_type);
                             let kv_root = crate::utils::paths::get_kv_dir(None);
-                            let block_dir = kv_root.join(&sub_path).join(format!("l{}", actual_off));
+                            let block_dir = kv_root.join(&sub_path).join(format!("l{}", chunk_idx));
                             
                             if !block_dir.exists() { 
                                 let _ = std::fs::create_dir_all(&block_dir); 
@@ -2779,8 +2780,8 @@ impl QuantizedQwen3VLTextModel {
         let is_decoding = input_token_count <= 1;
         
         // [MEMORY-SAFE-PREFILL] 프리필(대량 토큰) 작업 시에는 고속 모드(VRAM 상주)를 일시 비활성화
-        // [VRAM-GUARD] 컨텍스트가 너무 길면(8k 이상) 디코딩 시에도 고속 모드를 금지하여 OOM 방지
-        let is_context_too_long = self.current_kv_len > 8192;
+        // [VRAM-GUARD] 이제 비전 가중치가 빠졌으므로 40k 토큰까지는 고속 모드 허용 (4GB GPU 기준)
+        let is_context_too_long = self.current_kv_len > 40000;
         let effective_high_speed = if !is_decoding || is_context_too_long { false } else { self.is_high_speed };
         
         let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
@@ -2825,13 +2826,16 @@ impl QuantizedQwen3VLTextModel {
 
         // [SSD-BACKUP] 레이어 연산 직후, 데이터가 살아있을 때 최종 SSD 백업 트리거
         if let Some(sid) = &session_id {
-            // [STRICT-OFFLOAD] 프리필 중에는 즉시 SSD로 내보내어 VRAM 확보
-            if !effective_high_speed {
+            if is_decoding {
+                // 디코딩 중에는 고속 모드 여부와 상관없이 항상 효율적인 증분 백업 사용
+                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, true, seqlen_offset);
+            } else if !effective_high_speed {
+                // 프리필 중에는 즉시 SSD로 내보내어 VRAM 확보
                 let chunk_idx = seqlen_offset / 256;
                 let _ = self.force_offload_layer_kv(layer_idx, sid, chunk_idx).await;
             } else {
-                // 디코딩 중에는 기존 실시간 백업 사용
-                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, is_decoding, seqlen_offset);
+                // 고속 프리필 시에는 일괄 저장을 위해 지연 처리
+                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, false, seqlen_offset);
             }
         }
 
