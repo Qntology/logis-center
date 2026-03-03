@@ -792,7 +792,7 @@ async fn process_task(
     let res_class = {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
-            let params = build_params(parsing::page_type_prompt(), 32, &chunk_texts);
+            let params = build_params(parsing::page_type_prompt(), 32, &vec![]);
             gen.generate(params, Some(cancellation_token.clone()), None, None).await?
         } else { String::new() }
     };
@@ -805,7 +805,7 @@ async fn process_task(
     let res_select = {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
-            let params = build_params(parsing::page_selectors_prompt(&page_type), 256, &chunk_texts);
+            let params = build_params(parsing::page_selectors_prompt(&page_type), 256, &vec![]);
             gen.generate(params, Some(cancellation_token.clone()), None, None).await?
         } else { String::new() }
     };
@@ -825,7 +825,7 @@ async fn process_task(
             let res_detail = {
                 let mut gen_m = model.generator.lock().await;
                 if let Some(gen) = gen_m.as_mut() {
-                    let params = build_params(extraction_instruction, 1024, &chunk_texts);
+                    let params = build_params(extraction_instruction, 1024, &vec![]);
                     gen.generate(params, Some(cancellation_token.clone()), None, None).await?
                 } else { String::new() }
             };
