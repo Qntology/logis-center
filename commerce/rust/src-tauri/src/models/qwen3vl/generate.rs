@@ -171,8 +171,6 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
                         let _ = save_kv_block(&index_path, json.as_bytes());
                     }
                 }
-                // [SYNC-WAIT-FIX] 인덱스 업데이트 완료 후 카운터 감소
-                GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
             }
         }
     });
@@ -260,7 +258,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).unwrap_or("0");
                                 let offset = offset_str.parse::<usize>().unwrap_or(0);
 
-                                GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
+                                // GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst); // [REMOVE] Redundant
                                 let _ = INDEX_TX.send(SlotTask::IndexUpdate {
                                     kv_name, layer_idx: l_idx, offset, len: 256,
                                     file_name: format!("l{}/b{}.st", offset, l_idx),
@@ -333,6 +331,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             }).await;
                         });
                     }
+                    // [FIX] Bake 태스크 분배가 완료되었으므로 메인 스레드에서 올린 카운터 원상복귀
+                    GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); 
                 },
                 SlotTask::Load(load) => {
                     let sid = load.slot_id; let reg = load.registry.clone(); let shared_block = load.shared_block.clone();
