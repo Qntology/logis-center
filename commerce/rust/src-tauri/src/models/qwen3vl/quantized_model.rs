@@ -767,6 +767,10 @@ impl QuantizedQwen3VLTextAttention {
         let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
         let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
         let (b_sz, q_len, _) = xs.dims3()?;
+        
+        // [DTYPE-STRICT] Ensure RoPE matches target_dtype
+        let cos = cos.to_dtype(target_dtype)?;
+        let sin = sin.to_dtype(target_dtype)?;
 
         // [CRITICAL] Internal Causal Mask Generation for Prefill Integrity
         let total_len = seqlen_offset + q_len;
@@ -774,11 +778,11 @@ impl QuantizedQwen3VLTextAttention {
             let q_indices = Tensor::arange(0u32, q_len as u32, dev)?.unsqueeze(1)?;
             let k_indices = Tensor::arange(0u32, total_len as u32, dev)?.unsqueeze(0)?;
             let mask = k_indices.broadcast_gt(&(q_indices.broadcast_add(&Tensor::new(seqlen_offset as u32, dev)?)?))?;
-            // [FIX] Generate mask in target_dtype to avoid future mismatches
+            // [FIX] Force mask to target_dtype immediately
             let mask = mask.to_dtype(target_dtype)?.affine(-1e9, 0.0)?;
             Some(mask.unsqueeze(0)?.unsqueeze(0)?)
         } else {
-            attention_mask_in.map(|m| m.clone())
+            attention_mask_in.map(|m| m.to_dtype(target_dtype).unwrap_or_else(|_| m.clone()))
         };
 
         // [QWEN3.5-DIM-STRICT] Use the dynamically detected head count from new()
@@ -2143,22 +2147,22 @@ impl QuantizedQwen3VLTextModel {
             return Err(anyhow!("Layer {} weight is cleared. Call reload_layer first.", layer_idx));
         }
 
-        // [ROPE-GEN-SINGLE] If dummy cos/sin are passed, generate them from offset
+        // [ROPE-GEN-SINGLE] Generate RoPE in target_dtype
         let (cos_final, sin_final) = if cos.elem_count() <= 1 {
             let seq_len = xs.dim(1)?;
             let b_sz = xs.dim(0)?;
             let start = seqlen_offset as u32;
             let p_ids = Tensor::arange(start, start + seq_len as u32, xs.device())?;
             let position_ids = p_ids.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
-            let (c, s) = self.rotary_emb.forward(&position_ids, xs.dtype(), self.mrope_section.clone())?;
-            // [DTYPE-STRICT] Force match with target_dtype
-            (c.to_dtype(target_dtype)?, s.to_dtype(target_dtype)?)
+            let (c, s) = self.rotary_emb.forward(&position_ids, target_dtype, self.mrope_section.clone())?;
+            (c, s)
         } else {
             (cos.to_dtype(target_dtype)?, sin.to_dtype(target_dtype)?)
         };
 
-        let residual = xs.to_device(dev)?.to_dtype(target_dtype)?;
-        let xs_input = xs.to_device(dev)?.to_dtype(target_dtype)?;
+        // [DTYPE-STRICT] All hidden states and residuals must match target_dtype
+        let residual = xs.to_dtype(target_dtype)?;
+        let xs_input = xs.to_dtype(target_dtype)?;
         let xs_norm = layer.input_layernorm.forward(&xs_input)?;
         
         let attn_output = layer.self_attn.forward(
@@ -2172,15 +2176,13 @@ impl QuantizedQwen3VLTextModel {
             baking_only
         )?;
 
-        let mut xs = (attn_output.to_dtype(target_dtype)? + residual)?;
+        let mut xs = (attn_output + residual)?;
         
-        // [BAKE-TRIGGER-SINGLE] 레이어 연산 직후 KV를 SSD로 내보냄 (Scheduler 전용)
+        // [BAKE-TRIGGER-SINGLE]
         if let Some(sid) = &session_id {
-            // [FIX] Pass chunk_index for correct folder naming
             let _ = layer.force_offload_layer_kv(sid, baking_only, chunk_index).await;
         }
 
-        // [CLEANUP] 연산 결과가 저장되었으므로 다시 비움 (단, 상태 보존이 필요한 선형 레이어는 제외)
         if !layer.self_attn.is_linear_attention {
             layer.self_attn.kv_blocks.clear();
         }
@@ -2188,14 +2190,18 @@ impl QuantizedQwen3VLTextModel {
         if let (Some(gate), Some(up), Some(down), Some(post_norm)) = 
            (&layer.mlp_gate, &layer.mlp_up, &layer.mlp_down, &layer.post_attention_layernorm) {
             let residual_mlp = xs.clone();
-            let xs_norm = post_norm.forward(&xs)?;
-            let gate_out = gate.forward(&xs_norm.to_dtype(target_dtype)?)?;
-            let up_out = up.forward(&xs_norm.to_dtype(target_dtype)?)?;
-            let activated = (candle_nn::ops::silu(&gate_out.to_dtype(target_dtype)?)? * up_out.to_dtype(target_dtype)?)?;
+            // Ensure inputs to MLP components are strictly target_dtype
+            let xs_norm = post_norm.forward(&xs.to_dtype(target_dtype)?)?;
+            
+            let gate_out = gate.forward(&xs_norm)?;
+            let up_out = up.forward(&xs_norm)?;
+            let activated = (candle_nn::ops::silu(&gate_out)? * up_out)?;
             let mlp_out = down.forward(&activated)?;
-            xs = (mlp_out.to_dtype(target_dtype)? + residual_mlp)?;
+            
+            xs = (mlp_out + residual_mlp)?;
         }
 
+        // Final output
         Ok(xs)
     }
 
