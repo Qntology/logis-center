@@ -3326,8 +3326,17 @@ impl QuantizedQwen3VLModel {
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
         let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { dtype };
         let mut reader_vision = std::io::Cursor::new(mmproj_mmap);
-        let vb_visual = from_gguf_content(config, &ct_vision, &mut reader_vision, vision_device, vision_dtype)?;
-        let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
+        
+        // [VRAM-OPT] Skip loading vision encoder if we are in pure text/baking mode
+        let visual = if baking_only {
+            let vb_visual = from_gguf_content(config, &ct_vision, &mut reader_vision, vision_device, vision_dtype)?;
+            Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?
+        } else {
+            // [TEXT-ONLY-SKIPPED] Vision model initialized with empty/CPU dummy if not needed
+            println!("[MODEL] Text-Only Mode: Skipping Vision Encoder loading to save VRAM.");
+            let vb_dummy = VarBuilder::from_tensors(HashMap::new(), vision_dtype, &Device::Cpu);
+            Qwen3VLVisionModel::new(v_config.clone(), vb_dummy.pp("visual"))?
+        };
 
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
@@ -3371,8 +3380,15 @@ impl QuantizedQwen3VLModel {
     ) -> Result<Self> {
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
         let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { dtype };
-        let vb_visual = from_gguf_content(config, &ct_vision, reader_vision, vision_device, vision_dtype)?;
-        let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
+        
+        let visual = if baking_only {
+            let vb_visual = from_gguf_content(config, &ct_vision, reader_vision, vision_device, vision_dtype)?;
+            Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?
+        } else {
+            println!("[MODEL] Text-Only Mode (Reader): Skipping Vision Encoder loading to save VRAM.");
+            let vb_dummy = VarBuilder::from_tensors(HashMap::new(), vision_dtype, &Device::Cpu);
+            Qwen3VLVisionModel::new(v_config.clone(), vb_dummy.pp("visual"))?
+        };
         
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
