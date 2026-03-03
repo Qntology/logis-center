@@ -1784,10 +1784,14 @@ impl QuantizedQwen3VLTextDecoderLayer {
         // [HARDENING] Residual Addition DType & Device Guard
         let xs = {
             if !xs.device().same_device(residual.device()) { xs = xs.to_device(residual.device())?; }
-            let xs_final = xs.to_dtype(target_dtype)?;
-            let residual_final = residual.to_dtype(target_dtype)?;
-            residual_final.add(&xs_final)?
+            if xs.dtype() != residual.dtype() {
+                if self.self_attn.layer_idx == 0 { println!("[DIAG-DTYPE] Attn Add Mismatch! residual: {:?}, xs: {:?}", residual.dtype(), xs.dtype()); }
+                xs.to_dtype(residual.dtype())?
+            } else {
+                xs
+            }
         };
+        let xs = residual.add(&xs)?;
         
         // [OPTIMIZATION] Skip MLP block if not available (MLP 0% Mode)
         if let (Some(gate_proj), Some(up_proj), Some(down_proj), Some(post_norm)) = (&self.mlp_gate, &self.mlp_up, &self.mlp_down, &self.post_attention_layernorm) {
@@ -1811,9 +1815,11 @@ impl QuantizedQwen3VLTextDecoderLayer {
             // [HARDENING] Second Residual Addition DType & Device Guard
             let mut xs = xs;
             if !xs.device().same_device(residual.device()) { xs = xs.to_device(residual.device())?; }
-            let xs_final = xs.to_dtype(target_dtype)?;
-            let residual_final = residual.to_dtype(target_dtype)?;
-            Ok(residual_final.add(&xs_final)?)
+            if xs.dtype() != residual.dtype() {
+                if self.self_attn.layer_idx == 0 { println!("[DIAG-DTYPE] MLP Add Mismatch! residual: {:?}, xs: {:?}", residual.dtype(), xs.dtype()); }
+                xs = xs.to_dtype(residual.dtype())?;
+            }
+            Ok(residual.add(&xs)?)
         } else {
             // MLP was skipped (Attention-Only), just return result after attention
             Ok(xs)
