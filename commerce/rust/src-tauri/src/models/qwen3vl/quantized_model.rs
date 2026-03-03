@@ -507,8 +507,6 @@ impl QuantizedQwen3VLTextAttention {
         if let Some(t) = &mut self.ssm_dt_bias { *t = t.to_device(device)?; }
         if let Some(n) = &mut self.ssm_norm { n.to_device(device)?; }
         if let Some(g) = &mut self.ssm_gate { g.to_device(device)?; }
-        
-        // ... (rest of the method)
 
         // [ACCUMULATOR-RESET] 장치 이동 시 병합 캐시 초기화 (필요시 새로 생성)
         self.vram_merged_k = None;
@@ -517,13 +515,11 @@ impl QuantizedQwen3VLTextAttention {
 
         let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
         for block in &mut self.kv_blocks {
-            let (index, mut inner) = {
-                let inner = block.inner.write().unwrap();
-                (inner.index, inner)
-            };
+            let mut inner = block.inner.write().unwrap();
+            let idx = inner.index;
             let loc = {
                 let reg = self.registry.entries.read().unwrap();
-                if index < reg.len() { reg[index].location[self.layer_idx] } else { KVLocation::VRAM }
+                if idx < reg.len() { reg[idx].location[self.layer_idx] } else { KVLocation::VRAM }
             };
             if loc == KVLocation::VRAM {
                 if let Some(k) = &inner.k_cache {
@@ -2384,7 +2380,7 @@ impl QuantizedQwen3VLTextModel {
         let target_device = if self.device_id == 999 { 
             Device::Cpu 
         } else { 
-            Device::new_cuda(self.device_id).unwrap_or(Device::Cpu)
+            crate::utils::get_cuda_device(self.device_id)
         };
 
         println!("[MEMORY-OPT] High-Speed Mode: Loading all {} layers into VRAM...", count);
