@@ -2135,6 +2135,8 @@ impl QuantizedQwen3VLTextModel {
         chunk_index: usize, // [NEW] Added for isolation
     ) -> Result<Tensor> {
         let layer = &mut self.layers[layer_idx];
+        let dev = self.embed_tokens.embeddings().device();
+        let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
         
         // [SAFETY] 연산 전 가중치 로드 상태 확인
         if layer.self_attn.q_proj.is_cleared() {
@@ -2148,13 +2150,16 @@ impl QuantizedQwen3VLTextModel {
             let start = seqlen_offset as u32;
             let p_ids = Tensor::arange(start, start + seq_len as u32, xs.device())?;
             let position_ids = p_ids.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
-            self.rotary_emb.forward(&position_ids, xs.dtype(), self.mrope_section.clone())?
+            let (c, s) = self.rotary_emb.forward(&position_ids, xs.dtype(), self.mrope_section.clone())?;
+            // [DTYPE-STRICT] Force match with target_dtype
+            (c.to_dtype(target_dtype)?, s.to_dtype(target_dtype)?)
         } else {
-            (cos.clone(), sin.clone())
+            (cos.to_dtype(target_dtype)?, sin.to_dtype(target_dtype)?)
         };
 
-        let residual = xs.clone();
-        let xs_norm = layer.input_layernorm.forward(xs)?;
+        let residual = xs.to_device(dev)?.to_dtype(target_dtype)?;
+        let xs_input = xs.to_device(dev)?.to_dtype(target_dtype)?;
+        let xs_norm = layer.input_layernorm.forward(&xs_input)?;
         
         let attn_output = layer.self_attn.forward(
             &xs_norm,
@@ -2167,7 +2172,7 @@ impl QuantizedQwen3VLTextModel {
             baking_only
         )?;
 
-        let mut xs = (attn_output + residual)?;
+        let mut xs = (attn_output.to_dtype(target_dtype)? + residual)?;
         
         // [BAKE-TRIGGER-SINGLE] 레이어 연산 직후 KV를 SSD로 내보냄 (Scheduler 전용)
         if let Some(sid) = &session_id {
@@ -2182,13 +2187,13 @@ impl QuantizedQwen3VLTextModel {
 
         if let (Some(gate), Some(up), Some(down), Some(post_norm)) = 
            (&layer.mlp_gate, &layer.mlp_up, &layer.mlp_down, &layer.post_attention_layernorm) {
-            let residual = xs.clone();
+            let residual_mlp = xs.clone();
             let xs_norm = post_norm.forward(&xs)?;
-            let gate_out = gate.forward(&xs_norm)?;
-            let up_out = up.forward(&xs_norm)?;
-            let activated = (candle_nn::ops::silu(&gate_out)? * up_out)?;
+            let gate_out = gate.forward(&xs_norm.to_dtype(target_dtype)?)?;
+            let up_out = up.forward(&xs_norm.to_dtype(target_dtype)?)?;
+            let activated = (candle_nn::ops::silu(&gate_out.to_dtype(target_dtype)?)? * up_out.to_dtype(target_dtype)?)?;
             let mlp_out = down.forward(&activated)?;
-            xs = (mlp_out + residual)?;
+            xs = (mlp_out.to_dtype(target_dtype)? + residual_mlp)?;
         }
 
         Ok(xs)
