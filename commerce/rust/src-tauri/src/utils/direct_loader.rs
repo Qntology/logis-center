@@ -81,7 +81,10 @@ mod windows_impl {
             
             let file: IDStorageFile = match ctx.factory.OpenFile(&HSTRING::from(path_str)) {
                 Ok(f) => f,
-                Err(_) => return fs::read(path).map_err(|e| anyhow!(e)), // 개별 파일 오픈 실패 시에도 Fallback
+                Err(e) => {
+                    println!("[DIRECT-LOAD-FAIL] OpenFile failed: {}. Path: {:?}. Fallback to fs::read.", e, path);
+                    return fs::read(path).map_err(|e| anyhow!(e)); // 개별 파일 오픈 실패 시에도 Fallback
+                }
             };
 
             let mut buffer = vec![0u8; size];
@@ -108,7 +111,10 @@ mod windows_impl {
             
             match ctx.status_array.GetHResult(0) {
                 Ok(_) => Ok(buffer),
-                Err(_) => fs::read(path).map_err(|e| anyhow!(e)), // 실행 중 에러 발생 시에도 Fallback
+                Err(e) => {
+                    println!("[DIRECT-LOAD-FAIL] Request failed: {}. Path: {:?}. Fallback to fs::read.", e, path);
+                    fs::read(path).map_err(|e| anyhow!(e)) // 실행 중 에러 발생 시에도 Fallback
+                }
             }
         }
     }
@@ -131,7 +137,8 @@ mod windows_impl {
                 Some(HANDLE::default()),
             ) {
                 Ok(h) => h,
-                Err(_) => {
+                Err(e) => {
+                    println!("[DIRECT-SAVE-FAIL] CreateFileW failed: {}. Path: {:?}. Fallback to fs::write.", e, path);
                     return fs::write(path, data).map_err(|e| anyhow!(e));
                 }
             };
@@ -146,13 +153,15 @@ mod windows_impl {
                 // Check if it's just pending
                 let err = windows::core::Error::from_win32();
                 if err.code().0 as u32 != 997 { // ERROR_IO_PENDING
+                    println!("[DIRECT-SAVE-FAIL] WriteFile failed (not pending): {}. Path: {:?}. Fallback to fs::write.", err, path);
                     let _ = CloseHandle(handle);
                     return fs::write(path, data).map_err(|e| anyhow!(e));
                 }
             }
 
             let mut transferred = 0u32;
-            if GetOverlappedResult(handle, &overlapped, &mut transferred, true).is_err() {
+            if let Err(e) = GetOverlappedResult(handle, &overlapped, &mut transferred, true) {
+                println!("[DIRECT-SAVE-FAIL] GetOverlappedResult failed: {}. Path: {:?}. Fallback to fs::write.", e, path);
                 let _ = CloseHandle(handle);
                 return fs::write(path, data).map_err(|e| anyhow!(e));
             }
