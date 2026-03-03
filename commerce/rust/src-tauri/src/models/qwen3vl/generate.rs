@@ -449,18 +449,18 @@ impl ModelVariant {
         }
     }
 
-    pub async fn forward_single_layer(&mut self, layer_idx: usize, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, offset: usize, session_id: Option<String>, kv_name: Option<String>, baking: bool) -> Result<Tensor> {
+    pub async fn forward_single_layer(&mut self, layer_idx: usize, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, offset: usize, session_id: Option<String>, kv_name: Option<String>, baking: bool, chunk_index: usize) -> Result<Tensor> {
         match self {
-            Self::QuantizedVL(m) => m.language_model.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking).await,
-            Self::QuantizedText(m) => m.language_model.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking).await,
+            Self::QuantizedVL(m) => m.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking, chunk_index).await,
+            Self::QuantizedText(m) => m.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking, chunk_index).await,
             _ => Err(anyhow!("Unsupported model variant for single layer forward")),
         }
     }
 
     pub fn clear_layer(&mut self, layer_idx: usize) {
         match self {
-            Self::QuantizedVL(m) => m.language_model.layers[layer_idx].clear(),
-            Self::QuantizedText(m) => m.language_model.layers[layer_idx].clear(),
+            Self::QuantizedVL(m) => m.clear_layer(layer_idx),
+            Self::QuantizedText(m) => m.clear_layer(layer_idx),
             _ => {}
         }
     }
@@ -489,11 +489,18 @@ impl ModelVariant {
         }
     }
 
-    /// [NEW] 모든 레이어 가중치를 한꺼번에 로드하여 디코딩 속도 확보
     pub fn reload_all_layers(&mut self) -> Result<()> {
         match self {
             Self::QuantizedVL(m) => m.language_model.reload_all_layers(),
             Self::QuantizedText(m) => m.language_model.reload_all_layers(),
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn force_offload_layer_kv(&mut self, layer_idx: usize, session_id: &str, chunk_index: usize) -> Result<()> {
+        match self {
+            Self::QuantizedVL(m) => m.force_offload_layer_kv(layer_idx, session_id, chunk_index).await,
+            Self::QuantizedText(m) => m.force_offload_layer_kv(layer_idx, session_id, chunk_index).await,
             _ => Ok(()),
         }
     }
@@ -777,7 +784,16 @@ impl Qwen3VLGenerateModel {
 
     pub fn get_kv_len(&self) -> usize { match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.get_kv_len(), ModelVariant::QuantizedText(m) => m.language_model.get_kv_len(), _ => 0 } }
     pub async fn drop_kv_storage(&mut self) -> Result<()> { self.qwen3_vl.drop_kv_storage().await }
-    pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { self.qwen3_vl.force_flush_all_active_blocks(session_id, kv_name).await }
+    pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { 
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await,
+            ModelVariant::QuantizedText(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await,
+            _ => Ok(())
+        }
+    }
+    pub async fn force_offload_layer_kv(&mut self, layer_idx: usize, session_id: &str, chunk_index: usize) -> Result<()> {
+        self.qwen3_vl.force_offload_layer_kv(layer_idx, session_id, chunk_index).await
+    }
     pub fn clear_kv_cache(&mut self) { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.clear_kv_cache(), ModelVariant::QuantizedText(m) => m.language_model.clear_kv_cache(), _ => {} } }
     pub fn save_kv_to_disk(&mut self, path: &Path, kv_name: Option<&str>, offset: usize) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.save_kv_cache(path, false, offset, kv_name), ModelVariant::QuantizedText(m) => m.language_model.save_kv_cache(path, false, offset, kv_name), _ => Ok(()) } }
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.truncate_kv_cache(len), ModelVariant::QuantizedText(m) => m.language_model.truncate_kv_cache(len), _ => Ok(()) } }

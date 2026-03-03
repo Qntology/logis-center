@@ -719,9 +719,9 @@ async fn process_task(
                     };
 
                     // 3. Forward Single Layer (0-오프셋 독립 계산)
-                    // [FIX] Pass chunk_index as 'offset' for directory mapping, but logical compute is 0-based
+                    // [FIX] Pass chunk_index as BOTH 'offset' (for mapping) and 'chunk_index' (for isolation)
                     let session_id = Some(task_id_c.clone());
-                    let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, chunk_index, session_id, kv_name_c, true).await?;
+                    let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, chunk_index, session_id, kv_name_c, true, chunk_index).await?;
 
                     // 4. Save Next Hidden States to SSD
                     let output_path = chunk_dir.join(format!("h{}.st", current_l));

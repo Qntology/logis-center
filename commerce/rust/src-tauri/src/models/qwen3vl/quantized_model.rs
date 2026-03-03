@@ -1497,7 +1497,7 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     /// [PURGE-STRICT] 고속 모드가 아닐 때 (Prefill), 현재 레이어의 KV를 강제로 SSD로 보내고 VRAM을 비웁니다.
-    pub async fn force_offload_layer_kv(&mut self, session_id: &str, baking_only: bool) -> Result<()> {
+    pub async fn force_offload_layer_kv(&mut self, session_id: &str, baking_only: bool, chunk_index: usize) -> Result<()> {
         use crate::models::qwen3vl::generate::{SLOT_MANAGER, LayerKVDump, BAKE_TX, SlotTask, BakeTask};
         
         // 1. 모든 더티 블록 수집 및 즉시 해제
@@ -1508,23 +1508,19 @@ impl QuantizedQwen3VLTextAttention {
                 let mut inner = block.inner.write().unwrap();
                 let idx = inner.index;
                 
-                let is_dirty = if idx < reg.len() { 
-                    if self.layer_idx < reg[idx].is_dirty.len() { reg[idx].is_dirty[self.layer_idx] } else { true }
-                } else { true };
+                // [FORCE-SAVE] Prefill 모드에서는 Dirty 체크 없이 무조건 저장 (어차피 1회용 연산)
+                // let is_dirty = ... (Removed)
 
-                // Only offload if it's in VRAM and dirty
-                if is_dirty && inner.k_cache.is_some() {
+                if inner.k_cache.is_some() {
                     let k = inner.k_cache.take().unwrap();
                     let v = inner.v_cache.take().unwrap();
                     let b_sz = k.dim(0)?;
                     let b_len = inner.len;
-                    let off = inner.offset;
 
                     // [BATCH-RESTORE] 배치를 개별 오프셋 조각으로 분리
                     for b in 0..b_sz {
                         let k_vram = if b_sz > 1 { k.i(b)?.unsqueeze(0)? } else { k.clone() };
                         let v_vram = if b_sz > 1 { v.i(b)?.unsqueeze(0)? } else { v.clone() };
-                        let actual_off = if b_sz > 1 { b * 256 } else { off };
                         
                         let k_shape_u32: Vec<u32> = k_vram.shape().dims().iter().map(|&x| x as u32).collect();
                         
@@ -1541,7 +1537,6 @@ impl QuantizedQwen3VLTextAttention {
                                 raw_k: None, 
                                 raw_v: None,
                             },
-                            actual_off,
                             b_len
                         ));
                     }
@@ -1550,6 +1545,11 @@ impl QuantizedQwen3VLTextAttention {
                     if idx < reg.len() { 
                         reg[idx].location[self.layer_idx] = KVLocation::SSD; 
                         reg[idx].is_dirty[self.layer_idx] = false; 
+                    }
+                } else {
+                    // [DEBUG] 데이터가 없어서 건너뛴 경우 로그 출력
+                    if self.layer_idx == 0 {
+                        println!("[SKIP-BAKE] Block {} has no KV cache.", idx);
                     }
                 }
             }
@@ -1563,9 +1563,10 @@ impl QuantizedQwen3VLTextAttention {
                 let sub_path = format!("{}/{}", session_id, kv_type);
                 let kv_root = crate::utils::paths::get_kv_dir(None);
 
-                for (dump, off, b_len) in blocks_to_bake {
+                for (dump, b_len) in blocks_to_bake {
                     let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
-                    let block_dir = kv_root.join(&sub_path).join(format!("l{}", off));
+                    // [STRUCTURE-FIX] chunk_index를 사용하여 l0, l1... 폴더명 생성
+                    let block_dir = kv_root.join(&sub_path).join(format!("l{}", chunk_index));
                     if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
 
                     // [SYNC-WAIT-FIX] 워커로 보내기 전에 카운터를 올려서 wait_for_global_io가 정확히 대기하게 함
@@ -1575,10 +1576,10 @@ impl QuantizedQwen3VLTextAttention {
                         slot_id: sid,
                         task_dir: block_dir,
                         kv_name: Some(sub_path.clone()),
-                        offset: off,
+                        offset: chunk_index * 256, // 통계 기록용
                         layers: vec![dump],
                         is_relay_baking: baking_only,
-                        block_idx: Some(off / 256),
+                        block_idx: Some(chunk_index),
                         registry: self.registry.clone(),
                     })).await;
                 }
@@ -2001,8 +2002,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
         self.self_attn.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, fragments, current_kv_len)
     }
 
-    pub async fn force_offload_layer_kv(&mut self, session_id: &str, baking_only: bool) -> Result<()> {
-        self.self_attn.force_offload_layer_kv(session_id, baking_only).await
+    pub async fn force_offload_layer_kv(&mut self, session_id: &str, baking_only: bool, chunk_index: usize) -> Result<()> {
+        self.self_attn.force_offload_layer_kv(session_id, baking_only, chunk_index).await
     }
 }
 
@@ -2061,6 +2062,7 @@ impl QuantizedQwen3VLTextModel {
         session_id: Option<String>,
         kv_name: Option<String>,
         baking_only: bool,
+        chunk_index: usize, // [NEW] Added for isolation
     ) -> Result<Tensor> {
         let layer = &mut self.layers[layer_idx];
         
@@ -2068,6 +2070,9 @@ impl QuantizedQwen3VLTextModel {
         if layer.self_attn.q_proj.is_cleared() {
             return Err(anyhow!("Layer {} weight is cleared. Call reload_layer first.", layer_idx));
         }
+
+        // [ISOLATION] 이전 청크의 잔재가 남아있지 않도록 비움
+        layer.self_attn.kv_blocks.clear();
 
         let residual = xs.clone();
         let xs_norm = layer.input_layernorm.forward(xs)?;
@@ -2087,8 +2092,12 @@ impl QuantizedQwen3VLTextModel {
         
         // [BAKE-TRIGGER-SINGLE] 레이어 연산 직후 KV를 SSD로 내보냄 (Scheduler 전용)
         if let Some(sid) = &session_id {
-            let _ = layer.force_offload_layer_kv(sid, baking_only).await;
+            // [FIX] Pass chunk_index for correct folder naming
+            let _ = layer.force_offload_layer_kv(sid, baking_only, chunk_index).await;
         }
+
+        // [CLEANUP] 연산 결과가 저장되었으므로 다시 비워서 메모리 확보 및 간섭 방지
+        layer.self_attn.kv_blocks.clear();
 
         if let (Some(gate), Some(up), Some(down), Some(post_norm)) = 
            (&layer.mlp_gate, &layer.mlp_up, &layer.mlp_down, &layer.post_attention_layernorm) {
@@ -2573,8 +2582,8 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    pub async fn force_offload_layer_kv(&mut self, layer_idx: usize, session_id: &str) -> Result<()> {
-        self.layers[layer_idx].force_offload_layer_kv(session_id, self.baking_only).await
+    pub async fn force_offload_layer_kv(&mut self, layer_idx: usize, session_id: &str, chunk_index: usize) -> Result<()> {
+        self.layers[layer_idx].force_offload_layer_kv(session_id, self.baking_only, chunk_index).await
     }
 
     /// [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로 이동
@@ -2732,7 +2741,8 @@ impl QuantizedQwen3VLTextModel {
         if let Some(sid) = &session_id {
             // [STRICT-OFFLOAD] 프리필 중에는 즉시 SSD로 내보내어 VRAM 확보
             if !effective_high_speed {
-                let _ = self.force_offload_layer_kv(layer_idx, sid).await;
+                let chunk_idx = seqlen_offset / 256;
+                let _ = self.force_offload_layer_kv(layer_idx, sid, chunk_idx).await;
             } else {
                 // 디코딩 중에는 기존 실시간 백업 사용
                 let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, is_decoding, seqlen_offset);
@@ -3515,12 +3525,16 @@ impl QuantizedQwen3VLModel {
         Ok(())
     }
 
-    pub async fn forward_single_layer(&mut self, layer_idx: usize, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, offset: usize, session_id: Option<String>, kv_name: Option<String>, baking: bool) -> Result<Tensor> {
-        self.language_model.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking).await
+    pub async fn forward_single_layer(&mut self, layer_idx: usize, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, offset: usize, session_id: Option<String>, kv_name: Option<String>, baking: bool, chunk_index: usize) -> Result<Tensor> {
+        self.language_model.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking, chunk_index).await
     }
 
     pub fn clear_layer(&mut self, layer_idx: usize) {
         self.language_model.layers[layer_idx].clear();
+    }
+
+    pub async fn force_offload_layer_kv(&mut self, layer_idx: usize, session_id: &str, chunk_index: usize) -> Result<()> {
+        self.language_model.force_offload_layer_kv(layer_idx, session_id, chunk_index).await
     }
 
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
@@ -3690,12 +3704,16 @@ impl QuantizedQwen3TextModel {
         Ok(())
     }
 
-    pub async fn forward_single_layer(&mut self, layer_idx: usize, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, offset: usize, session_id: Option<String>, kv_name: Option<String>, baking: bool) -> Result<Tensor> {
-        self.language_model.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking).await
+    pub async fn forward_single_layer(&mut self, layer_idx: usize, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, offset: usize, session_id: Option<String>, kv_name: Option<String>, baking: bool, chunk_index: usize) -> Result<Tensor> {
+        self.language_model.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking, chunk_index).await
     }
 
     pub fn clear_layer(&mut self, layer_idx: usize) {
         self.language_model.layers[layer_idx].clear();
+    }
+
+    pub async fn force_offload_layer_kv(&mut self, layer_idx: usize, session_id: &str, chunk_index: usize) -> Result<()> {
+        self.language_model.force_offload_layer_kv(layer_idx, session_id, chunk_index).await
     }
 
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
