@@ -63,7 +63,8 @@ impl Module for RmsNorm {
             return Err(candle_core::Error::Msg("RMSNorm weight is cleared. Reload required.".to_string()));
         }
         let dev = x.device();
-        
+        let original_dtype = x.dtype();
+
         // [DEVICE-SAFETY] Sync weight to input device first
         let weight = if !self.weight.device().same_device(dev) {
             self.weight.to_device(dev)?
@@ -71,13 +72,20 @@ impl Module for RmsNorm {
             self.weight.clone()
         };
 
-        let target_dtype = weight.dtype();
-        let x = x.to_dtype(DType::F32)?;
-        let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-        let hidden_states = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let hidden_states = hidden_states.to_dtype(target_dtype)?;
-        
-        hidden_states.broadcast_mul(&weight)
+        // [STABILITY-SANDWICH-TOTAL] 
+        // 1. Upcast to F32 for math precision
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let variance = x_f32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        let eps_t = Tensor::new(self.eps as f32, dev)?.to_dtype(DType::F32)?;
+        let norm_factor = variance.broadcast_add(&eps_t)?.sqrt()?.recip()?;
+        let x_normed = x_f32.broadcast_mul(&norm_factor)?;
+
+        // 2. Perform final scale in F32 to avoid strict kernel errors, then downcast back
+        let w_f32 = weight.to_dtype(DType::F32)?;
+        let result_f32 = x_normed.broadcast_mul(&w_f32)?;
+
+        // 3. Return to original context dtype (BF16 or F32)
+        result_f32.to_dtype(original_dtype)
     }
 }
 
@@ -798,16 +806,21 @@ impl QuantizedQwen3VLTextAttention {
         let apply_q_norm = |t: Tensor, norm: &Option<RmsNorm>| -> Result<Tensor> {
             if let Some(n) = norm {
                 let dev = t.device();
-                let variance = t.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-                // [FIX] Match eps_t dtype with variance (likely target_dtype)
-                let eps_t = Tensor::from_vec(vec![n.eps as f32], (1,), dev)?.to_dtype(variance.dtype())?;
+                let dtype = t.dtype();
+                // [STABILITY-SANDWICH] Perform Norm in F32 to avoid strict kernel dtype checks
+                let t_f32 = t.to_dtype(DType::F32)?;
+                let variance = t_f32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+                let eps_t = Tensor::from_vec(vec![n.eps as f32], (1,), dev)?;
                 let norm_factor = variance.broadcast_add(&eps_t)?.sqrt()?.recip()?;
-                let t = t.broadcast_mul(&norm_factor)?;
+                let t_norm = t_f32.broadcast_mul(&norm_factor)?;
                 
-                // IMPORTANT: Use d_h (actual current head_dim) for narrowing
-                let w = n.weight().narrow(0, 0, d_h.min(n.weight().dim(0)?))?;
-                let w_dev = if !w.device().same_device(dev) { w.to_device(dev)? } else { w };
-                Ok(t.broadcast_mul(&w_dev.to_dtype(t.dtype())?)?)
+                let w = n.weight().to_dtype(DType::F32)?;
+                let w_head = w.narrow(0, 0, d_h.min(w.dim(0)?))?;
+                let w_dev = if !w_head.device().same_device(dev) { w_head.to_device(dev)? } else { w_head };
+                
+                let res = t_norm.broadcast_mul(&w_dev)?;
+                // Cast back to original dtype (BF16) for subsequent matmuls
+                Ok(res.to_dtype(dtype)?)
             } else {
                 Ok(t)
             }
@@ -2142,27 +2155,30 @@ impl QuantizedQwen3VLTextModel {
         let dev = self.embed_tokens.embeddings().device();
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
         
+        // [DTYPE-DYNAMIC-ALIGNMENT] Detect the layer's actual weight dtype
+        // This is the only way to perfectly avoid 'unexpected dtype' errors.
+        let layer_dtype = layer.input_layernorm.weight().dtype();
+        
         // [SAFETY] 연산 전 가중치 로드 상태 확인
         if layer.self_attn.q_proj.is_cleared() {
             return Err(anyhow!("Layer {} weight is cleared. Call reload_layer first.", layer_idx));
         }
 
-        // [ROPE-GEN-SINGLE] Generate RoPE in target_dtype
+        // [ROPE-GEN-SINGLE] Generate RoPE in layer's own dtype
         let (cos_final, sin_final) = if cos.elem_count() <= 1 {
             let seq_len = xs.dim(1)?;
             let b_sz = xs.dim(0)?;
             let start = seqlen_offset as u32;
             let p_ids = Tensor::arange(start, start + seq_len as u32, xs.device())?;
             let position_ids = p_ids.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
-            let (c, s) = self.rotary_emb.forward(&position_ids, target_dtype, self.mrope_section.clone())?;
-            (c, s)
+            self.rotary_emb.forward(&position_ids, layer_dtype, self.mrope_section.clone())?
         } else {
-            (cos.to_dtype(target_dtype)?, sin.to_dtype(target_dtype)?)
+            (cos.to_dtype(layer_dtype)?, sin.to_dtype(layer_dtype)?)
         };
 
-        // [DTYPE-STRICT] All hidden states and residuals must match target_dtype
-        let residual = xs.to_dtype(target_dtype)?;
-        let xs_input = xs.to_dtype(target_dtype)?;
+        // [DTYPE-STRICT] Hidden states and residuals must match layer's weight dtype
+        let residual = xs.to_dtype(layer_dtype)?;
+        let xs_input = xs.to_dtype(layer_dtype)?;
         let xs_norm = layer.input_layernorm.forward(&xs_input)?;
         
         let attn_output = layer.self_attn.forward(
@@ -2176,7 +2192,7 @@ impl QuantizedQwen3VLTextModel {
             baking_only
         )?;
 
-        let mut xs = (attn_output + residual)?;
+        let mut xs = (attn_output.to_dtype(layer_dtype)? + residual)?;
         
         // [BAKE-TRIGGER-SINGLE]
         if let Some(sid) = &session_id {
@@ -2190,18 +2206,19 @@ impl QuantizedQwen3VLTextModel {
         if let (Some(gate), Some(up), Some(down), Some(post_norm)) = 
            (&layer.mlp_gate, &layer.mlp_up, &layer.mlp_down, &layer.post_attention_layernorm) {
             let residual_mlp = xs.clone();
-            // Ensure inputs to MLP components are strictly target_dtype
-            let xs_norm = post_norm.forward(&xs.to_dtype(target_dtype)?)?;
+            // Ensure inputs to MLP components match the weight dtype of those components
+            let mlp_dtype = post_norm.weight().dtype();
+            let xs_norm = post_norm.forward(&xs.to_dtype(mlp_dtype)?)?;
             
             let gate_out = gate.forward(&xs_norm)?;
             let up_out = up.forward(&xs_norm)?;
             let activated = (candle_nn::ops::silu(&gate_out)? * up_out)?;
             let mlp_out = down.forward(&activated)?;
             
-            xs = (mlp_out + residual_mlp)?;
+            xs = (mlp_out.to_dtype(layer_dtype)? + residual_mlp)?;
         }
 
-        // Final output
+        // Return result in layer's dtype
         Ok(xs)
     }
 
