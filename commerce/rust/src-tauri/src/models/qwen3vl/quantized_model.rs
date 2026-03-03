@@ -750,7 +750,8 @@ impl QuantizedQwen3VLTextAttention {
             let q_indices = Tensor::arange(0u32, q_len as u32, dev)?.unsqueeze(1)?;
             let k_indices = Tensor::arange(0u32, total_len as u32, dev)?.unsqueeze(0)?;
             let mask = k_indices.broadcast_gt(&(q_indices.broadcast_add(&Tensor::new(seqlen_offset as u32, dev)?)?))?;
-            let mask = mask.to_dtype(DType::F32)?.affine(-1e9, 0.0)?;
+            // [FIX] Generate mask in target_dtype to avoid future mismatches
+            let mask = mask.to_dtype(target_dtype)?.affine(-1e9, 0.0)?;
             Some(mask.unsqueeze(0)?.unsqueeze(0)?)
         } else {
             attention_mask_in.map(|m| m.clone())
@@ -770,13 +771,15 @@ impl QuantizedQwen3VLTextAttention {
             if let Some(n) = norm {
                 let dev = t.device();
                 let variance = t.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-                let eps_t = Tensor::from_vec(vec![n.eps as f32], (1,), dev)?;
+                // [FIX] Match eps_t dtype with variance (likely target_dtype)
+                let eps_t = Tensor::from_vec(vec![n.eps as f32], (1,), dev)?.to_dtype(variance.dtype())?;
                 let norm_factor = variance.broadcast_add(&eps_t)?.sqrt()?.recip()?;
                 let t = t.broadcast_mul(&norm_factor)?;
                 
                 // IMPORTANT: Use d_h (actual current head_dim) for narrowing
                 let w = n.weight().narrow(0, 0, d_h.min(n.weight().dim(0)?))?;
-                Ok(t.broadcast_mul(&w.to_device(dev)?)?)
+                let w_dev = if !w.device().same_device(dev) { w.to_device(dev)? } else { w };
+                Ok(t.broadcast_mul(&w_dev.to_dtype(t.dtype())?)?)
             } else {
                 Ok(t)
             }
@@ -1025,7 +1028,8 @@ impl QuantizedQwen3VLTextAttention {
         if let Some(mask) = &attention_mask {
             let m_len = mask.dim(D::Minus1)?;
             if final_kv_len <= m_len {
-                attn_weights = attn_weights.broadcast_add(&mask.narrow(D::Minus1, 0, final_kv_len)?)?;
+                let mask_piece = mask.narrow(D::Minus1, 0, final_kv_len)?.to_dtype(attn_weights.dtype())?;
+                attn_weights = attn_weights.broadcast_add(&mask_piece)?;
             }
         }
 
