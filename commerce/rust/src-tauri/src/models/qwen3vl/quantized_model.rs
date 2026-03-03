@@ -327,24 +327,34 @@ impl KVRegistry {
         let mut current_block_idx = 0;
         for (session_id, _unused_off, length_tokens) in sessions {
             let num_blocks = (length_tokens + 255) / 256;
-            // [STRUCTURE-FIX] Always assume 'text' subfolder for stitched sessions unless specified
             let task_dir = crate::utils::paths::get_kv_dir(None).join(&session_id).join("text");
 
             for b_idx in 0..num_blocks {
                 if current_block_idx >= entries.len() { break; }
+                
+                let token_start = current_block_idx * 256;
+                // [STRICT-CHECK] 실제로 파일이 존재하는지 확인
+                let block_file = task_dir.join(format!("l{}", token_start)).join("b0.st");
+                
+                if block_file.exists() {
+                    let entry = &mut entries[current_block_idx];
+                    entry.task_root = Some(task_dir.clone());
+                    entry.token_len = if b_idx == num_blocks - 1 {
+                        let rem = length_tokens % 256;
+                        if rem == 0 { 256 } else { rem }
+                    } else { 256 };
 
-                let entry = &mut entries[current_block_idx];
-                entry.task_root = Some(task_dir.clone());
-                entry.token_len = if b_idx == num_blocks - 1 {
-                    let rem = length_tokens % 256;
-                    if rem == 0 { 256 } else { rem }
-                } else { 256 };
-
-                for loc in &mut entry.location { *loc = KVLocation::SSD; }
-                current_block_idx += 1;
+                    for loc in &mut entry.location { *loc = KVLocation::SSD; }
+                    current_block_idx += 1;
+                } else {
+                    if b_idx == 0 {
+                        println!("[KV-STITCH-SKIP] Session {} blocks not found on disk. Skipping stitch.", session_id);
+                    }
+                    break; // 해당 세션의 이후 블록들도 없을 것이므로 중단
+                }
             }
         }
-        println!("[KV-STITCH] Virtual Context assembled using Offset-Centric structure. Total Blocks: {}", current_block_idx);
+        println!("[KV-STITCH] Virtual Context assembled. Actual Blocks found: {}", current_block_idx);
         Ok(())
     }
 
@@ -1163,7 +1173,7 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_blocks.clear();
     }
 
-    pub fn trigger_realtime_incremental_bake(&self, session_id: &str, is_last_chunk: bool, baking_only: bool, is_decoding: bool) -> Result<()> {
+    pub fn trigger_realtime_incremental_bake(&self, session_id: &str, is_last_chunk: bool, baking_only: bool, is_decoding: bool, chunk_offset: usize) -> Result<()> {
         use crate::models::qwen3vl::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
 
         let total_blocks = self.kv_blocks.len();
@@ -1186,7 +1196,12 @@ impl QuantizedQwen3VLTextAttention {
             // 1. 완성된 블록(256개)은 즉시 SSD로 백업 대상
             // 2. 마지막 조각(is_last_chunk)도 백업 대상
             // 3. VRAM에 데이터가 있고, 아직 저장이 안 된(dirty) 경우만 수집
-            if (is_full || is_last_chunk) && inner.k_cache.is_some() && is_dirty { Some(i) } else { None }
+            // [FIX] Prefill 시에는 현재 연산 중인 블록만 타겟팅 (오프셋 기반)
+            let is_current_chunk = inner.offset == (chunk_offset / 256) * 256;
+
+            if (is_full || is_last_chunk) && inner.k_cache.is_some() && is_dirty && (is_decoding || is_current_chunk) { 
+                Some(i) 
+            } else { None }
         }).collect();
 
         for idx in target_indices {
@@ -1243,9 +1258,7 @@ impl QuantizedQwen3VLTextAttention {
                                 let _ = std::fs::create_dir_all(&block_dir); 
                             }
 
-                            if layer_idx == 0 {
-                                println!("[BAKE-TRIGGER] Session: {}, Type: {}, Offset: {}, Path: {:?}", session_id_owned, kv_type, actual_off, block_dir);
-                            }
+                            println!("[BAKE-START] Layer {} -> Offset {}, Path: {:?}", layer_idx, actual_off, block_dir);
 
                             let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
                             let dump = LayerKVDump {
@@ -1549,55 +1562,8 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, _kv_name: Option<&str>) -> Result<()> {
-        // [OFFSET-CENTRIC-FIX] 오프셋을 폴더명(l), 레이어를 파일명(b)으로 사용
-        let l_str = format!("l{}", offset);
-        let block_dir = path.join(&l_str);
-        if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
-        
-        let structured_path = block_dir.join(format!("b{}.st", self.layer_idx));
-        
-        let mut map = HashMap::new();
-        let prefix = format!("{}_b{}_", l_str, self.layer_idx);
-
-        let mut ks = Vec::new();
-        let mut vs = Vec::new();
-        for block in &self.kv_blocks {
-            let inner = block.inner.read().unwrap();
-            if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                ks.push(k.clone());
-                vs.push(v.clone());
-            }
-        }
-
-        if !ks.is_empty() {
-            let k = Tensor::cat(&ks, 2)?;
-            let v = Tensor::cat(&vs, 2)?;
-            
-            let (kd, k_shape) = self.compress_to_bf16(&k)?;
-            let (vd, _) = self.compress_to_bf16(&v)?;
-            
-            map.insert(format!("{}k_data", prefix), kd);
-            map.insert(format!("{}v_data", prefix), vd);
-            map.insert(format!("{}k_shape", prefix), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect::<Vec<u32>>(), (k_shape.len(),), &Device::Cpu)?);
-            
-            if let Ok(data) = safetensors::serialize(&map, &None) {
-                let _ = crate::utils::direct_loader::save_kv_block(&structured_path, &data);
-                println!("[SSD-SAVE-OFFSET] Saved Offset {} Layer {} to {:?}", offset, self.layer_idx, structured_path);
-            }
-            
-            if let Ok(mut reg) = self.registry.entries.write() {
-                let entry_idx = offset / 256;
-                if entry_idx < reg.len() {
-                    let entry = &mut reg[entry_idx];
-                    entry.task_root = Some(path.to_path_buf());
-                    entry.location[self.layer_idx] = KVLocation::SSD;
-                    if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = false; }
-                }
-            }
-        }
-
-        if clear { self.kv_blocks.clear(); }
+    pub fn save_kv_cache(&mut self, _path: &Path, _clear: bool, _offset: usize, _kv_name: Option<&str>) -> Result<()> {
+        // [DEPRECATED] Old whole-layer saving logic is now replaced by real-time chunk backing.
         Ok(())
     }
 
@@ -2130,7 +2096,7 @@ impl QuantizedQwen3VLTextModel {
     }
 
     /// [MEMORY-OPT] 특정 레이어의 가중치를 mmap에서 다시 로드합니다.
-    pub fn reload_layer(&mut self, layer_idx: usize) -> Result<()> {
+    pub fn reload_layer(&mut self, layer_idx: usize, target_device: &Device) -> Result<()> {
         if !self.layers[layer_idx].self_attn.q_proj.is_cleared() {
             return Ok(());
         }
@@ -2151,14 +2117,6 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         
-        // [FIX] 하드웨어 가속 장치 결정 로직 강화
-        // embed_tokens가 Lazy 상태일 수 있으므로, 모델 초기화 시 전달된 장치 정보를 우선함
-        let target_device = if self.device_id == 999 { 
-            Device::Cpu 
-        } else { 
-            Device::new_cuda(self.device_id).unwrap_or(Device::Cpu)
-        };
-
         let mem_info = self.get_resource_status();
         println!("[MEMORY-OPT] Reloading Layer {} Weights (Prefix: {}) to {:?} | {}", layer_idx, prefix, target_device, mem_info);
 
@@ -2175,7 +2133,7 @@ impl QuantizedQwen3VLTextModel {
         )?;
         
         // [FIX] Move the newly loaded layer to the target device (GPU)
-        new_layer.to_device(&target_device)?;
+        new_layer.to_device(target_device)?;
         
         // [VALIDATION] 로드 성공 여부 확인
         if new_layer.self_attn.q_proj.is_cleared() {
@@ -2300,9 +2258,15 @@ impl QuantizedQwen3VLTextModel {
     /// [MEMORY-OPT] 모든 레이어를 한꺼번에 로드합니다. (디코딩 시작 시 호출)
     pub fn reload_all_layers(&mut self) -> Result<()> {
         let count = self.layers.len();
+        let target_device = if self.device_id == 999 { 
+            Device::Cpu 
+        } else { 
+            Device::new_cuda(self.device_id).unwrap_or(Device::Cpu)
+        };
+
         println!("[MEMORY-OPT] High-Speed Mode: Loading all {} layers into VRAM...", count);
         for i in 0..count {
-            self.reload_layer(i)?;
+            self.reload_layer(i, &target_device)?;
             if i > 0 && i % 4 == 3 {
                 println!("[MEMORY-OPT] Progress: {}/{} layers loaded to VRAM.", i + 1, count);
                 // [VRAM-BURST-PROTECTION] Give OS/CUDA a moment to stabilize memory between batches
@@ -2541,18 +2505,8 @@ impl QuantizedQwen3VLTextModel {
             let cos_chunk = cos.narrow(cos.rank().saturating_sub(2), i, take)?;
             let sin_chunk = sin.narrow(sin.rank().saturating_sub(2), i, take)?;
 
-            // [LAYER-BY-LAYER-ENFORCEMENT] 고속 모드가 아니면 연산 직전에 로드
-            if !self.is_high_speed && self.layers[layer_idx].self_attn.q_proj.is_cleared() {
-                self.reload_layer(layer_idx)?;
-            }
-
             let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i, session_id.clone(), kv_name.clone(), baking_only)?;
             
-            // [LAYER-BY-LAYER-ENFORCEMENT] 고속 모드가 아니면 연산 직후 즉시 해제하여 VRAM 확보
-            if !self.is_high_speed {
-                self.layers[layer_idx].clear();
-            }
-
             // [VRAM-ONLY-MERGE] 즉시 병합하여 RAM에 파편이 남지 않게 함
             final_output = match final_output {
                 None => Some(out),
@@ -2562,7 +2516,14 @@ impl QuantizedQwen3VLTextModel {
             // [BAKE-TRIGGER] 연산 직후, 데이터가 아직 VRAM/RAM에 있을 때 백업 트리거
             if let Some(sid) = &session_id {
                 let is_prefill = current_seq_len > 1;
-                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last_chunk, baking_only, !is_prefill);
+                // [FIX] 루프의 i 값이 현재 청크의 시작 오프셋입니다.
+                let chunk_offset = seqlen_offset + i;
+                
+                if self.layers[layer_idx].self_attn.layer_idx == 0 {
+                    println!("[BAKE-DEBUG] Triggering bake for Chunk at Offset {}", chunk_offset);
+                }
+
+                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last_chunk, baking_only, !is_prefill, chunk_offset);
             }
 
             let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
@@ -2576,7 +2537,8 @@ impl QuantizedQwen3VLTextModel {
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> {
         println!("[FLUSH] Manually flushing all active KV blocks to SSD for session: {}", session_id);
         for layer_idx in 0..self.layers.len() {
-            let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(session_id, true, self.baking_only, false);
+            // [FIX] Flush ALL chunks for this layer
+            let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(session_id, true, self.baking_only, false, 0);
         }
         Ok(())
     }
@@ -2705,18 +2667,16 @@ impl QuantizedQwen3VLTextModel {
 
         // [MEMORY-OPT] Prefill 시 현재 레이어 로드
         if !effective_high_speed {
-            self.reload_layer(layer_idx)?;
+            self.reload_layer(layer_idx, &target_device)?;
         }
 
         // [SAFETY-CHECK] 장치 이동 전 가중치 로딩 상태 최종 확인
         if self.layers[layer_idx].self_attn.q_proj.is_cleared() {
             println!("[ENGINE-SAFETY] Layer {} weight missing before device sync. Forcing emergency reload.", layer_idx);
-            self.reload_layer(layer_idx)?;
+            self.reload_layer(layer_idx, &target_device)?;
         }
 
         // [STEP 1] 현재 레이어를 GPU로 이동
-        let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
-        
         if !self.layers[layer_idx].device().same_device(&target_device) {
             self.layers[layer_idx].to_device(&target_device)?;
             // GPU 이동 후 RAM 가중치는 자동으로 drop됨
@@ -2725,7 +2685,7 @@ impl QuantizedQwen3VLTextModel {
 
         // [MEMORY-OPT] [PREFETCH] 다음 레이어를 RAM으로 미리 로드 (고속 모드가 아닐 때만)
         if !effective_high_speed && layer_idx + 1 < self.layers.len() {
-            let _ = self.reload_layer(layer_idx + 1);
+            let _ = self.reload_layer(layer_idx + 1, &target_device);
         }
 
         // [STEP 3] GPU 연산 실행
@@ -2744,7 +2704,7 @@ impl QuantizedQwen3VLTextModel {
                 let _ = self.force_offload_layer_kv(layer_idx, sid).await;
             } else {
                 // 디코딩 중에는 기존 실시간 백업 사용
-                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, is_decoding);
+                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, is_decoding, seqlen_offset);
             }
         }
 

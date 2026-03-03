@@ -21,8 +21,10 @@ pub fn get_template(path: String) -> Result<String> {
         .ok_or(anyhow!(format!("chat_template to str error")))?;
     
     let fixed_template = chat_template
+        .replace(".startswith(", " is startingwith(")
+        .replace(".endswith(", " is endingwith(")
         .replace(
-            "message.content.startswith('<tool_response>')",
+            "message.content is startingwith('<tool_response>')",
             "message.content is startingwith('<tool_response>')", 
         )
         .replace(
@@ -92,6 +94,14 @@ impl ChatTemplate {
         env.add_filter("rstrip", |s: String, chars: Option<String>| match chars {
             Some(chars_str) => s.trim_end_matches(chars_str.as_str()).to_string(),
             None => s.trim_end().to_string(),
+        });
+
+        // [FIX] Register startingwith and endingwith tests for Jinja compatibility
+        env.add_test("startingwith", |s: String, prefix: String| {
+            s.starts_with(&prefix)
+        });
+        env.add_test("endingwith", |s: String, suffix: String| {
+            s.ends_with(&suffix)
         });
         
         let _ = env.add_template("chat", template);
