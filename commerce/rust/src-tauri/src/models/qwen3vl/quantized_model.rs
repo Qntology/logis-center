@@ -332,15 +332,16 @@ impl KVRegistry {
             for b_idx in 0..num_blocks {
                 if current_block_idx >= entries.len() { break; }
                 
-                // [STRUCTURE-FIX] Check for l{chunk_index} first
-                let block_file = task_dir.join(format!("l{}", b_idx)).join("b0.st");
-                let mut found_path = if block_file.exists() { Some(task_dir.clone()) } else { None };
+                // [STRUCTURE-FIX] Check for chunk directory existence instead of b0.st
+                // Hybrid models like Qwen 3.5 might have some layers (like layer 0) without KV cache.
+                let chunk_dir = task_dir.join(format!("l{}", b_idx));
+                let mut found_path = if chunk_dir.is_dir() { Some(task_dir.clone()) } else { None };
 
-                // Fallback: check for l{offset}
+                // Fallback: check for l{offset} directory
                 if found_path.is_none() {
                     let token_start = current_block_idx * 256;
-                    let alt_block = task_dir.join(format!("l{}", token_start)).join("b0.st");
-                    if alt_block.exists() { found_path = Some(task_dir.clone()); }
+                    let alt_chunk_dir = task_dir.join(format!("l{}", token_start));
+                    if alt_chunk_dir.is_dir() { found_path = Some(task_dir.clone()); }
                 }
                 
                 if let Some(final_task_dir) = found_path {
@@ -826,10 +827,90 @@ impl QuantizedQwen3VLTextAttention {
             
             // 1. Compute State: K^T * V -> [B, H, D, D]
             let k_t = k.transpose(2, 3)?.contiguous()?; // [B, H, D, S]
-            let state = k_t.matmul(&v)?; // [B, H, D, D]
+            let mut current_state = k_t.matmul(&v)?; // [B, H, D, D]
             
+            // [HYBRID-STATE-ACCUMULATION] Load previous state if available
+            if let Some(block) = self.kv_blocks.first() {
+                let mut inner = block.inner.write().unwrap();
+                let mut pk = inner.k_cache.take();
+                
+                if pk.is_none() {
+                    // Try to load from Registry/RAM cache or SSD
+                    let (idx, b_off) = (inner.index, inner.offset);
+                    let reg_data = {
+                        let reg = self.registry.entries.read().unwrap();
+                        if idx < reg.len() {
+                            let entry = &reg[idx];
+                            let cache = entry.bitkv_cache.read().unwrap();
+                            if let Some(m) = &cache[self.layer_idx] {
+                                Some(self.decompress_from_bf16(&m.k_data, &m.original_shape, dev)?)
+                            } else {
+                                // Try SSD load
+                                if let Some(file_path) = entry.get_block_path(self.layer_idx) {
+                                    if let Ok(data) = crate::utils::direct_loader::load_kv_block(&file_path) {
+                                        if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
+                                            let prefix = format!("l{}_b{}_", b_off, self.layer_idx);
+                                            if let Ok(kd) = st.tensor(&format!("{}k_data", prefix)).or_else(|_| st.tensor("k_data")) {
+                                                if let Ok(sh) = st.tensor(&format!("{}k_shape", prefix)).or_else(|_| st.tensor("k_shape")) {
+                                                    let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                                    let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                                                    let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+                                                    Some(self.decompress_from_bf16(&kd_t, &meta_os, dev)?)
+                                                } else { None }
+                                            } else { None }
+                                        } else { None }
+                                    } else { None }
+                                } else { None }
+                            }
+                        } else { None }
+                    };
+                    pk = reg_data;
+                }
+
+                if let Some(prev_state) = pk {
+                    let prev_state = if !prev_state.device().same_device(dev) { prev_state.to_device(dev)? } else { prev_state };
+                    current_state = (prev_state + current_state)?;
+                }
+                inner.k_cache = Some(current_state.clone());
+                // Dummy V_cache to satisfy offload logic
+                if inner.v_cache.is_none() {
+                    inner.v_cache = Some(Tensor::zeros_like(&current_state)?);
+                }
+                inner.len += q_len;
+                
+                // [SSD-TRIGGER] Mark dirty
+                let mut reg = self.registry.entries.write().unwrap();
+                if inner.index < reg.len() {
+                    let entry = &mut reg[inner.index];
+                    entry.token_len = inner.len;
+                    if entry.is_dirty.len() < self.num_layers { entry.is_dirty.resize(self.num_layers, true); }
+                    entry.is_dirty[self.layer_idx] = true;
+                }
+            } else {
+                // First chunk for this linear layer
+                let new_block = KVBlock::new(KVLocation::VRAM, 0, q_len, seqlen_offset);
+                {
+                    let mut inner = new_block.inner.write().unwrap();
+                    inner.k_cache = Some(current_state.clone());
+                    // Dummy V_cache to satisfy Bake logic which expects both
+                    inner.v_cache = Some(Tensor::zeros_like(&current_state)?); 
+                }
+                self.kv_blocks.push(new_block);
+                
+                // [SSD-TRIGGER]
+                let mut reg = self.registry.entries.write().unwrap();
+                if let Some(entry) = reg.get_mut(0) {
+                    entry.token_start = seqlen_offset;
+                    entry.token_len = q_len;
+                    if entry.is_dirty.len() < self.num_layers { entry.is_dirty.resize(self.num_layers, true); }
+                    entry.is_dirty[self.layer_idx] = true;
+                    if entry.location.len() < self.num_layers { entry.location.resize(self.num_layers, KVLocation::VRAM); }
+                    entry.location[self.layer_idx] = KVLocation::VRAM;
+                }
+            }
+
             // 2. Compute Output: Q * State -> [B, H, S, D]
-            let mut out = q.matmul(&state)?
+            let mut out = q.matmul(&current_state)?
                 .to_dtype(DType::F32)?
                 .broadcast_mul(&Tensor::from_vec(vec![self.scaling as f32], (1,), dev)?)?
                 .to_dtype(target_dtype)?;
@@ -1511,9 +1592,7 @@ impl QuantizedQwen3VLTextAttention {
                 // [FORCE-SAVE] Prefill 모드에서는 Dirty 체크 없이 무조건 저장 (어차피 1회용 연산)
                 // let is_dirty = ... (Removed)
 
-                if inner.k_cache.is_some() {
-                    let k = inner.k_cache.take().unwrap();
-                    let v = inner.v_cache.take().unwrap();
+                if let (Some(k), Some(v)) = (inner.k_cache.take(), inner.v_cache.take()) {
                     let b_sz = k.dim(0)?;
                     let b_len = inner.len;
 
@@ -2071,8 +2150,10 @@ impl QuantizedQwen3VLTextModel {
             return Err(anyhow!("Layer {} weight is cleared. Call reload_layer first.", layer_idx));
         }
 
-        // [ISOLATION] 이전 청크의 잔재가 남아있지 않도록 비움
-        layer.self_attn.kv_blocks.clear();
+        // [ISOLATION] 이전 청크의 잔재가 남아있지 않도록 비움 (단, 상태 보존이 필요한 선형 레이어는 제외)
+        if !layer.self_attn.is_linear_attention {
+            layer.self_attn.kv_blocks.clear();
+        }
 
         let residual = xs.clone();
         let xs_norm = layer.input_layernorm.forward(xs)?;
@@ -2096,8 +2177,10 @@ impl QuantizedQwen3VLTextModel {
             let _ = layer.force_offload_layer_kv(sid, baking_only, chunk_index).await;
         }
 
-        // [CLEANUP] 연산 결과가 저장되었으므로 다시 비워서 메모리 확보 및 간섭 방지
-        layer.self_attn.kv_blocks.clear();
+        // [CLEANUP] 연산 결과가 저장되었으므로 다시 비움 (단, 상태 보존이 필요한 선형 레이어는 제외)
+        if !layer.self_attn.is_linear_attention {
+            layer.self_attn.kv_blocks.clear();
+        }
 
         if let (Some(gate), Some(up), Some(down), Some(post_norm)) = 
            (&layer.mlp_gate, &layer.mlp_up, &layer.mlp_down, &layer.post_attention_layernorm) {

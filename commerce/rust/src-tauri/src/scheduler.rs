@@ -687,55 +687,46 @@ async fn process_task(
             }
         }
 
-        // [INNER-PARALLEL] 모든 청크를 독립적으로 병렬 연산 (0-오프셋 방식)
-        let mut layer_tasks = Vec::new();
+        // [SEQUENTIAL-CHUNKS] Avoid lock contention by processing chunks one by one
+        // Background IO (Bake) will still happen in parallel via BAKE_TX.
         for (c_idx, _ids) in chunk_ids_list.iter().enumerate() {
-            let model_c = model.clone();
             let task_id_c = task.id.clone();
             let chunk_index = c_idx; 
             let current_l = l_idx;
             let kv_name_c = kv_name.clone();
 
-            layer_tasks.push(async move {
-                let mut gen_m = model_c.generator.lock().await;
-                if let Some(gen) = gen_m.as_mut() {
-                    // [STRUCTURE-FIX] chunk_index 기반 폴더 (l0, l1, l2...)
-                    let chunk_dir = utils::paths::get_kv_dir(None).join(&task_id_c).join("text").join(format!("l{}", chunk_index));
-                    
-                    // 1. Load Input (이전 레이어의 출력값 h{N-1}.st)
-                    let input_path = if current_l == 0 { chunk_dir.join("input.st") } else { chunk_dir.join(format!("h{}.st", current_l - 1)) };
-                    let device = gen.text_device.clone();
-                    let dtype = if device.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
-                    let xs = gen.qwen3_vl.load_hidden_states(&input_path, &device, dtype)?;
+            let mut gen_m = model.generator.lock().await;
+            if let Some(gen) = gen_m.as_mut() {
+                // [STRUCTURE-FIX] chunk_index 기반 폴더 (l0, l1, l2...)
+                let chunk_dir = utils::paths::get_kv_dir(None).join(&task_id_c).join("text").join(format!("l{}", chunk_index));
+                
+                // 1. Load Input (이전 레이어의 출력값 h{N-1}.st)
+                let input_path = if current_l == 0 { chunk_dir.join("input.st") } else { chunk_dir.join(format!("h{}.st", current_l - 1)) };
+                let device = gen.text_device.clone();
+                let dtype = if device.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+                let xs = gen.qwen3_vl.load_hidden_states(&input_path, &device, dtype)?;
 
-                    // 2. Prepare Position/RoPE (모든 청크가 0~256 범위를 독립적으로 사용)
-                    let cache_pos_1d = Tensor::arange(0u32, 256u32, &device)?;
-                    let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, 256))?;
-                    
-                    let (cos, sin) = match &gen.qwen3_vl {
-                        crate::models::qwen3vl::generate::ModelVariant::QuantizedVL(m) => m.language_model.rotary_emb.forward(&pos_ids_3d, dtype, m.language_model.mrope_section.clone())?,
-                        crate::models::qwen3vl::generate::ModelVariant::QuantizedText(m) => m.language_model.rotary_emb.forward(&pos_ids_3d, dtype, m.language_model.mrope_section.clone())?,
-                        _ => return Err(anyhow::anyhow!("Rotary error")),
-                    };
+                // 2. Prepare Position/RoPE (모든 청크가 0~256 범위를 독립적으로 사용)
+                let cache_pos_1d = Tensor::arange(0u32, 256u32, &device)?;
+                let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, 256))?;
+                
+                let (cos, sin) = match &gen.qwen3_vl {
+                    crate::models::qwen3vl::generate::ModelVariant::QuantizedVL(m) => m.language_model.rotary_emb.forward(&pos_ids_3d, dtype, m.language_model.mrope_section.clone())?,
+                    crate::models::qwen3vl::generate::ModelVariant::QuantizedText(m) => m.language_model.rotary_emb.forward(&pos_ids_3d, dtype, m.language_model.mrope_section.clone())?,
+                    _ => return Err(anyhow::anyhow!("Rotary error")),
+                };
 
-                    // 3. Forward Single Layer (0-오프셋 독립 계산)
-                    // [FIX] Pass chunk_index as BOTH 'offset' (for mapping) and 'chunk_index' (for isolation)
-                    let session_id = Some(task_id_c.clone());
-                    let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, chunk_index, session_id, kv_name_c, true, chunk_index).await?;
+                // 3. Forward Single Layer (0-오프셋 독립 계산)
+                let session_id = Some(task_id_c.clone());
+                let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, chunk_index, session_id, kv_name_c, true, chunk_index).await?;
 
-                    // 4. Save Next Hidden States to SSD
-                    let output_path = chunk_dir.join(format!("h{}.st", current_l));
-                    gen.qwen3_vl.save_hidden_states(&output_path, &next_xs)?;
-                }
-                Ok::<(), anyhow::Error>(())
-            });
+                // 4. Save Next Hidden States to SSD
+                let output_path = chunk_dir.join(format!("h{}.st", current_l));
+                gen.qwen3_vl.save_hidden_states(&output_path, &next_xs)?;
+            }
         }
         
-        // Execute all chunks for current layer in parallel
-        let results = futures::future::join_all(layer_tasks).await;
-        for res in results { res?; }
-        
-        // [SYNC] 모든 병렬 IO(KV 저장 및 Hidden States 저장)가 끝날 때까지 대기
+        // [SYNC] 모든 병렬 IO(KV 저장)가 끝날 때까지 대기
         crate::models::qwen3vl::generate::wait_for_global_io().await;
 
         // [MEMORY-OPT] 연산이 끝난 레이어는 즉시 소각하여 VRAM 확보
