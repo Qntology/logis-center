@@ -2779,11 +2779,14 @@ impl QuantizedQwen3VLTextModel {
         let is_decoding = input_token_count <= 1;
         
         // [MEMORY-SAFE-PREFILL] 프리필(대량 토큰) 작업 시에는 고속 모드(VRAM 상주)를 일시 비활성화
-        let effective_high_speed = if !is_decoding { false } else { self.is_high_speed };
+        // [VRAM-GUARD] 컨텍스트가 너무 길면(8k 이상) 디코딩 시에도 고속 모드를 금지하여 OOM 방지
+        let is_context_too_long = self.current_kv_len > 8192;
+        let effective_high_speed = if !is_decoding || is_context_too_long { false } else { self.is_high_speed };
+        
         let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
 
         // [MEMORY-OPT] 디코딩 단계 진입 시 모든 레이어를 미리 로드 
-        if is_decoding && layer_idx == 0 && !effective_high_speed {
+        if is_decoding && layer_idx == 0 && !effective_high_speed && !is_context_too_long {
             let already_loaded = !self.layers[0].self_attn.q_proj.is_cleared();
             if !already_loaded { self.reload_all_layers()?; }
         }
