@@ -721,10 +721,12 @@ async fn process_task(
                 let chunk_dir = text_ref_path.join("text").join(format!("l{}", chunk_index));
                 if !chunk_dir.exists() { fs::create_dir_all(&chunk_dir)?; }
                 
-                // 1. Load Input (이전 레이어의 출력값 b{N-1}.st)
+                // 1. Prepare Input (이전 레이어의 출력값 b{N-1}.st)
                 let input_path = if current_l == 0 { chunk_dir.join("input.st") } else { chunk_dir.join(format!("b{}.st", current_l - 1)) };
                 let device = gen.text_device.clone();
                 let dtype = if device.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+                
+                // [FIX] TensorNotFound 에러 해결: 엔진의 규격에 맞는 load_hidden_states 호출
                 let xs = gen.qwen3_vl.load_hidden_states(&input_path, &device, dtype)?;
 
                 // 2. Prepare Position/RoPE
@@ -741,8 +743,6 @@ async fn process_task(
                 // [FIX] Restore session_id to let the engine manage the single optimized save to reference folder.
                 let ref_session_id = Some(format!("{}/text/reference", task.id));
                 let _next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, chunk_index, ref_session_id, kv_name_c, true, chunk_index).await?;
-
-                // [REMOVED] Legacy redundant manual save_hidden_states was here.
             }
         }
         
