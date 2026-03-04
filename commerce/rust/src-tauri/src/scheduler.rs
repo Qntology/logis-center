@@ -361,16 +361,27 @@ async fn process_task(
     app_handle: &tauri::AppHandle,
     device_preference: Option<String>,
 ) -> Result<()> {
+    // [STRUCTURE-UPDATE] Define hierarchical KV storage paths (Reference vs Inference)
+    let base_kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id);
+    let text_ref_path = base_kv_path.join("text").join("reference");
+    let text_inf_path = base_kv_path.join("text").join("inference");
+    let img_ref_path = base_kv_path.join("image").join("reference");
+    let img_inf_path = base_kv_path.join("image").join("inference");
+
+    // Ensure directory structure exists immediately
+    for p in &[&text_ref_path, &text_inf_path, &img_ref_path, &img_inf_path] {
+        if !p.exists() { fs::create_dir_all(p)?; }
+    }
+
     // [NEW] Ensure log directory exists at runtime using dynamic path
     let pug_logs_dir = utils::paths::get_pug_logs_dir(Some(app_handle), &task.id);
     println!("[DEBUG] Pug logs directory: {:?}", pug_logs_dir);
 
     println!("[PROCESS] Task {} started processing.", task.id);
 
-    // [KV-CHECK] Check if task specific KV exists
-    let kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id);
-    if kv_path.exists() {
-        println!("[PROCESS] Found existing KV cache for task {}. Ready to reuse.", task.id);
+    // [KV-CHECK] Check if task specific KV exists in reference
+    if text_ref_path.exists() && fs::read_dir(&text_ref_path)?.next().is_some() {
+        println!("[PROCESS] Found existing Reference KV for task {}. Ready to reuse.", task.id);
     }
 
     // [SSD-BRIDGE] Start warming up active model weights in background RAM immediately
@@ -643,14 +654,17 @@ async fn process_task(
     // --- STEP 1: Layer-by-Layer Parallel Baking (Offset-Centric SSD-Direct) ---
     log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": "Initializing Layer-by-Layer Parallel Pipeline...", "spinner": "🔥" }));
 
-    let task_kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id).join("text");
-    if !task_kv_dir.exists() { fs::create_dir_all(&task_kv_dir)?; }
-
-    // Save tokens.json for future recovery
+    // [REFERENCE-SETUP] Save tokens.json and metadata for PUG
     let all_tokens: Vec<u32> = chunk_ids_list.iter().flatten().cloned().collect();
-    let tokens_path = task_kv_dir.join("tokens.json");
     if let Ok(json_data) = serde_json::to_vec(&all_tokens) {
-        let _ = crate::utils::direct_loader::save_kv_block(&tokens_path, &json_data);
+        let _ = crate::utils::direct_loader::save_kv_block(&text_ref_path.join("tokens.json"), &json_data);
+    }
+    
+    // Initialize layerN.json metadata in both reference and inference
+    for l_idx in 0..24 {
+        let meta = json!({ "status": "pending", "tokens": all_tokens.len() }).to_string();
+        let _ = fs::write(text_ref_path.join(format!("layer{}.json", l_idx)), &meta);
+        let _ = fs::write(text_inf_path.join(format!("layer{}.json", l_idx)), json!({ "status": "pending" }).to_string());
     }
 
     // 1.1 [COMMON-EMBEDDING] Generate and save initial hidden states for all chunks
@@ -658,8 +672,8 @@ async fn process_task(
         let gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_ref() {
             for (c_idx, ids_vec) in chunk_ids_list.iter().enumerate() {
-                // [STRUCTURE-FIX] Use chunk index (l0, l1, l2...) consistently
-                let offset_dir = task_kv_dir.join(format!("l{}", c_idx));
+                // [STRUCTURE-FIX] Use chunk index (l0, l1, l2...) under reference
+                let offset_dir = text_ref_path.join(format!("l{}", c_idx));
                 if !offset_dir.exists() { fs::create_dir_all(&offset_dir)?; }
                 
                 let ids_t = Tensor::from_vec(ids_vec.clone(), (1, ids_vec.len()), &gen.text_device)?;
@@ -688,20 +702,18 @@ async fn process_task(
         }
 
         // [SEQUENTIAL-CHUNKS] Avoid lock contention by processing chunks one by one
-        // Background IO (Bake) will still happen in parallel via BAKE_TX.
         for (c_idx, _ids) in chunk_ids_list.iter().enumerate() {
-            let task_id_c = task.id.clone();
             let chunk_index = c_idx; 
             let current_l = l_idx;
             let kv_name_c = kv_name.clone();
 
             let mut gen_m = model.generator.lock().await;
             if let Some(gen) = gen_m.as_mut() {
-                // [STRUCTURE-FIX] chunk_index 기반 폴더 (l0, l1, l2...)
-                let chunk_dir = utils::paths::get_kv_dir(None).join(&task_id_c).join("text").join(format!("l{}", chunk_index));
+                // [STRUCTURE-FIX] chunk_index 기반 폴더 (l0, l1, l2...) under reference
+                let chunk_dir = text_ref_path.join(format!("l{}", chunk_index));
                 
-                // 1. Load Input (이전 레이어의 출력값 h{N-1}.st)
-                let input_path = if current_l == 0 { chunk_dir.join("input.st") } else { chunk_dir.join(format!("h{}.st", current_l - 1)) };
+                // 1. Load Input (이전 레이어의 출력값 b{N-1}.st)
+                let input_path = if current_l == 0 { chunk_dir.join("input.st") } else { chunk_dir.join(format!("b{}.st", current_l - 1)) };
                 let device = gen.text_device.clone();
                 let dtype = if device.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
                 let xs = gen.qwen3_vl.load_hidden_states(&input_path, &device, dtype)?;
@@ -717,12 +729,15 @@ async fn process_task(
                 };
 
                 // 3. Forward Single Layer (0-오프셋 독립 계산)
-                let session_id = Some(task_id_c.clone());
+                let session_id = Some(task.id.clone());
                 let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, chunk_index, session_id, kv_name_c, true, chunk_index).await?;
 
-                // 4. Save Next Hidden States to SSD
-                let output_path = chunk_dir.join(format!("h{}.st", current_l));
+                // 4. Save Next Hidden States (b{N}.st) to SSD under reference
+                let output_path = chunk_dir.join(format!("b{}.st", current_l));
                 gen.qwen3_vl.save_hidden_states(&output_path, &next_xs)?;
+                
+                // Update layer metadata status in reference
+                let _ = fs::write(text_ref_path.join(format!("layer{}.json", current_l)), json!({ "status": "completed", "tokens": all_tokens.len() }).to_string());
             }
         }
         
@@ -769,20 +784,20 @@ async fn process_task(
         }
     };
 
-    // [CLEANUP] Remove all temporary hidden state files (h23.st etc.)
+    // [CLEANUP] Remove all temporary hidden state files (b23.st etc.)
     for c_idx in 0..chunk_ids_list.len() {
-        let offset = c_idx * 256;
-        let last_h = task_kv_dir.join(format!("l{}", offset)).join(format!("h{}.st", num_total_layers - 1));
-        if last_h.exists() { let _ = fs::remove_file(last_h); }
-        let input_f = task_kv_dir.join(format!("l{}", offset)).join("input.st");
+        let last_b = text_ref_path.join(format!("l{}", c_idx)).join(format!("b{}.st", num_total_layers - 1));
+        if last_b.exists() { let _ = fs::remove_file(last_b); }
+        let input_f = text_ref_path.join(format!("l{}", c_idx)).join("input.st");
         if input_f.exists() { let _ = fs::remove_file(input_f); }
     }
 
     // 2.1 [STITCH-ALL-LAYERS] Assemble virtual context from offset-centric blocks
+    // [FIX] Use "reference" subfolder for the stitched context
     let mut stitch_targets: Vec<(String, usize, usize)> = Vec::new();
     for c_idx in 0..chunk_ids_list.len() {
         let offset = c_idx * 256;
-        stitch_targets.push((task.id.clone(), offset, 256));
+        stitch_targets.push((format!("{}/text/reference", task.id), offset, 256));
     }
     model.stitch_kv_fragments(stitch_targets.clone()).await?;
     let base_len = model.generator.lock().await.as_ref().map(|g| g.qwen3_vl.get_kv_len()).unwrap_or(0);
@@ -1022,9 +1037,9 @@ async fn process_task(
             
             // 4. [STITCH-ONLY] PUG 조각들만 이어붙이기
             // [Base] + [Chunk0] + [Chunk1] + ...
-            let mut final_stitch_targets = vec![(task.id.clone(), 0, base_len)];
+            let mut final_stitch_targets = vec![(format!("{}/text/reference", task.id), 0, base_len)];
             for (c_idx, _) in chunk_results.iter().enumerate() { 
-                let c_name = format!("{}_c{}", task.id, c_idx);
+                let c_name = format!("{}/text/inference/{}_c{}", task.id, task.id, c_idx);
                 let c_offset = base_len + (c_idx * 256);
                 final_stitch_targets.push((c_name, c_offset, 256)); 
             }
