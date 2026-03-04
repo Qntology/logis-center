@@ -769,11 +769,11 @@ async fn process_task(
     let kv_name_str = "text".to_string();
 
     // [STITCH-PREP] Prepare stitch targets and measure base length for all subsequent steps
-    // [FIX] 엔진이 baking 시 kv_name("text") 폴더를 자동으로 추가하므로 경로에 이를 반영함
+    // [FIX] 엔진 내부에서 자동으로 "text"를 붙이므로 여기서는 reference까지만 지정 (중복 방지)
     let mut stitch_targets: Vec<(String, usize, usize)> = Vec::new();
     for c_idx in 0..chunk_ids_list.len() {
         let offset = c_idx * 256;
-        stitch_targets.push((format!("{}/text/reference/text", task.id), offset, 256));
+        stitch_targets.push((format!("{}/text/reference", task.id), offset, 256));
     }
     model.stitch_kv_fragments(stitch_targets.clone()).await?;
     let base_len = model.generator.lock().await.as_ref().map(|g| g.qwen3_vl.get_kv_len()).unwrap_or(0);
