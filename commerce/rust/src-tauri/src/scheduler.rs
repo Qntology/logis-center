@@ -805,11 +805,11 @@ async fn process_task(
         }
     };
 
-    // [CLEANUP] Remove all temporary hidden state files (b23.st etc.)
-    // [FIX] 엔진 경로(text subfolder) 반영
+    // [CLEANUP] Remove all temporary hidden state files (h23.st etc.)
+    // [FIX] b{N}.st 대신 실제 생성된 h{N}.st(Hidden States)를 삭제하여 SSD 용량 확보
     for c_idx in 0..chunk_ids_list.len() {
-        let last_b = text_ref_path.join("text").join(format!("l{}", c_idx)).join(format!("b{}.st", num_total_layers - 1));
-        if last_b.exists() { let _ = fs::remove_file(last_b); }
+        let last_h = text_ref_path.join("text").join(format!("l{}", c_idx)).join(format!("h{}.st", num_total_layers - 1));
+        if last_h.exists() { let _ = fs::remove_file(last_h); }
         let input_f = text_ref_path.join("text").join(format!("l{}", c_idx)).join("input.st");
         if input_f.exists() { let _ = fs::remove_file(input_f); }
     }
