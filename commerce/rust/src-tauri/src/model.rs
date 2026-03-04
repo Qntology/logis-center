@@ -130,8 +130,8 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelSize {
-    Small, // 0.6B for Ingestion
-    Large, // 2B-VL for Inference
+    Small, // 0.8B Text-Only (Baking)
+    Large, // 0.8B Full Vision (Inference)
 }
 
 #[derive(Clone)]
@@ -157,6 +157,31 @@ pub struct LogisModel {
 }
 
 impl LogisModel {
+    pub async fn new(app_handle: tauri::AppHandle, device_preference: Option<&str>) -> anyhow::Result<Self> {
+        let device_config = utils::get_device_config(device_preference);
+        let model_dir = "models"; // Default or resolve from app_handle
+        let unified_model_path = format!("{}/Qwen3.5-0.8B-GGUF/model.gguf", model_dir);
+        let embedding_path = std::path::PathBuf::from(model_dir).join("embeddinggemma-300m");
+
+        Ok(Self {
+            app_handle,
+            generator: Arc::new(TokioMutex::new(None)),
+            small_hibernation: Arc::new(TokioMutex::new(None)),
+            large_hibernation: Arc::new(TokioMutex::new(None)),
+            embedding_model: Arc::new(TokioMutex::new(None)),
+            is_cpu_mode: device_config.device.is_cpu(),
+            is_disk_swap: true,
+            dual_mode_enabled: true,
+            small_model_path: unified_model_path.clone(),
+            large_model_path: unified_model_path,
+            embedding_path,
+            device_config,
+            max_tokens_limit: 32768,
+            _dtype: None,
+            current_size: Arc::new(TokioMutex::new(None)),
+        })
+    }
+
     pub async fn unload_generator(&self) {
         // Clear everything
         let mut gen = self.generator.lock().await;
@@ -665,71 +690,6 @@ impl LogisModel {
             *emb_guard = Some(emb);
         }
         Ok(())
-    }
-
-    pub async fn new(app_handle: tauri::AppHandle, device_preference: Option<&str>) -> anyhow::Result<Self> {
-        // Default to true for SSD-Swap unless user explicitly wants pure CPU
-        let is_disk_swap = match device_preference {
-            Some("cpu") => false,
-            _ => true,
-        };
-        
-        println!("[MODEL-00] Initializing LogisModel (Preference: {:?}, DiskSwap: {})", device_preference, is_disk_swap);
-
-        let mut config = utils::get_optimal_device_config();
-        
-        if device_preference == Some("cpu") {
-            println!("⚠️ [MODEL] EXPLICIT CPU MODE FORCED by user/system preference.");
-            config = utils::DeviceConfig {
-                device: Device::Cpu,
-                is_cpu: true,
-                classify_chunk_size: 12000,
-                extract_chunk_size: 12000,
-                name: "CPU-Forced".to_string(),
-                gpu_id: 0,
-            };
-        } else {
-            // [STABILITY] Use persistent global CUDA device (Synchronous Singleton)
-            let persistent_dev = utils::get_cuda_device(config.gpu_id);
-            config.device = persistent_dev;
-            println!("🚀 [MODEL] Running in default mode ({})", config.name);
-        }
-
-        let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models"))?;
-        
-        // [FIX] Normalize UNC paths for Windows to prevent "builder error" in model loaders
-        let normalize_path = |path: std::path::PathBuf| -> String {
-            let s = path.to_string_lossy().to_string();
-            if s.starts_with(r"\\?\") {
-                s[4..].to_string()
-            } else {
-                s
-            }
-        };
-
-        let small_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf"));
-        let large_model_path = normalize_path(base_path.join("Qwen3-VL-2B-Instruct-gguf"));
-        let embedding_path = base_path.join("embeddinggemma-300m");
-
-        let max_tokens_limit = 65536; 
-
-        Ok(Self {
-            app_handle,
-            generator: Arc::new(TokioMutex::new(None)),
-            small_hibernation: Arc::new(TokioMutex::new(None)),
-            large_hibernation: Arc::new(TokioMutex::new(None)),
-            embedding_model: Arc::new(TokioMutex::new(None)),
-            is_cpu_mode: config.is_cpu,
-            is_disk_swap,
-            dual_mode_enabled: true, 
-            small_model_path,
-            large_model_path,
-            embedding_path,
-            device_config: config.clone(),
-            max_tokens_limit: max_tokens_limit as u32,
-            _dtype: None, 
-            current_size: Arc::new(TokioMutex::new(None)),
-        })
     }
 
     pub async fn extract_from_image(

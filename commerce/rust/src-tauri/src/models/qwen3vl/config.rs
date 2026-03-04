@@ -65,6 +65,7 @@ pub struct Qwen3VLTextConfig {
     pub hidden_size: usize,
     pub initializer_range: f32,
     pub intermediate_size: usize,
+    pub layer_types: Option<Vec<String>>, 
     pub max_position_embeddings: usize,
     pub max_window_layers: Option<usize>,
     pub model_type: String, 
