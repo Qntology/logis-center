@@ -385,6 +385,7 @@ pub struct QuantizedQwen3VLTextAttention {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub head_dim: usize,
+    pub v_head_dim: usize,
     pub num_kv_groups: usize,
     pub scaling: f64,
     pub kv_blocks: Vec<KVBlock>,
@@ -505,6 +506,16 @@ impl QuantizedQwen3VLTextAttention {
             }
         };
 
+        // Determine V-head dimension based on output projection input size
+        let v_h_dim = {
+            let o_in = match &o_proj.inner {
+                QMatMul::Tensor(t) => t.dim(1).unwrap_or(0),
+                QMatMul::QTensor(t) => t.shape().dims()[1],
+                QMatMul::TensorF16(t) => t.dim(1).unwrap_or(0),
+            };
+            o_in / n_attn_heads
+        };
+
         let num_kv_groups = n_attn_heads / (n_kv_heads as usize).max(1);
         let scaling = 1.0 / (h_dim as f64).sqrt();
 
@@ -514,8 +525,8 @@ impl QuantizedQwen3VLTextAttention {
                 QMatMul::QTensor(t) => t.shape().dims()[1],
                 QMatMul::TensorF16(t) => t.dim(1).unwrap_or(0),
             };
-            println!("[MODEL-ARCH] Layer {}: {} heads ({} KV), dim {}. Proj: {} -> {}", 
-                layer_idx, n_attn_heads, n_kv_heads, h_dim, q_in, q_out);
+            println!("[MODEL-ARCH] Layer {}: {} heads ({} KV), dim {} (V-dim {}). Proj: {} -> {}", 
+                layer_idx, n_attn_heads, n_kv_heads, h_dim, v_h_dim, q_in, q_out);
         }
 
         Ok(Self {
@@ -524,6 +535,7 @@ impl QuantizedQwen3VLTextAttention {
             num_key_value_heads: n_kv_heads,
             num_kv_groups,
             head_dim: h_dim,
+            v_head_dim: v_h_dim,
             scaling,
             kv_blocks: Vec::new(),
             registry,
@@ -589,7 +601,7 @@ impl QuantizedQwen3VLTextAttention {
         let mut key_states = key_states.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
         key_states = self.k_norm.forward(&key_states)?.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
 
-        let value_states = value_states.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?.to_dtype(target_dtype)?;
+        let value_states = value_states.reshape((b_sz, q_len, self.num_key_value_heads, self.v_head_dim))?.transpose(1, 2)?.contiguous()?.to_dtype(target_dtype)?;
         let cos = cos.to_dtype(target_dtype)?;
         let sin = sin.to_dtype(target_dtype)?;
         let (query_states, key_states) = apply_rotary_pos_emb(&query_states.to_dtype(target_dtype)?, &key_states.to_dtype(target_dtype)?, &cos, &sin, false)?;
@@ -763,8 +775,7 @@ impl QuantizedQwen3VLTextAttention {
         let v_final = v.to_dtype(target_dtype)?.contiguous()?;
         let attn_output = weights_final.matmul(&v_final)?;
 
-        let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
-        let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
+        let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, self.num_attention_heads * self.v_head_dim))?)?;
         
         if self.layer_idx == 0 {
             println!("[SPEED] Token {} | R:{} S:{} V:{} | Attn: {:?}", total_tokens_now, ram_count, ssd_count, vram_count, start_attn.elapsed());
