@@ -761,6 +761,11 @@ impl QuantizedQwen3VLTextAttention {
         _kv_name: Option<String>,
         _baking_only: bool,
     ) -> Result<Tensor> {
+        // [FIX] Strict Weight Validity Check to prevent inference on cleared/empty weights
+        if self.q_proj.is_cleared() {
+            return Err(anyhow!("[ENGINE-CRITICAL] Layer {} weights are cleared! Reload required before forward.", self.layer_idx));
+        }
+
         let dev = self.q_proj.device();
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
 
@@ -934,8 +939,9 @@ impl QuantizedQwen3VLTextAttention {
             return Ok(attn_output);
         }
 
-        let cos = cos.to_dtype(target_dtype)?;
-        let sin = sin.to_dtype(target_dtype)?;
+        // [FIX] Use F32 for RoPE to prevent precision loss in long contexts (>19k tokens)
+        let cos = cos.to_dtype(DType::F32)?;
+        let sin = sin.to_dtype(DType::F32)?;
 
         // [QWEN3.5-PARTIAL-ROPE] Apply RoPE only to the first X dimensions (rotary_dim = 64)
         let rotary_dim = cos.dim(candle_core::D::Minus1)?;
@@ -948,16 +954,17 @@ impl QuantizedQwen3VLTextAttention {
             let k_rot = key_states_norm.narrow(candle_core::D::Minus1, 0, rotary_dim)?.contiguous()?;
             let k_pass = key_states_norm.narrow(candle_core::D::Minus1, rotary_dim, current_head_dim - rotary_dim)?;
             
-            // Apply RoPE only to the rotary part
-            let (q_rotated, k_rotated) = apply_rotary_pos_emb(&q_rot, &k_rot, &cos, &sin, false)?;
+            // [FIX] Pass tof32: true to apply_rotary_pos_emb
+            let (q_rotated, k_rotated) = apply_rotary_pos_emb(&q_rot, &k_rot, &cos, &sin, true)?;
             
             // Cat back rotated and passive parts
-            let q_final = Tensor::cat(&[q_rotated, q_pass.to_dtype(target_dtype)?], candle_core::D::Minus1)?.contiguous()?;
-            let k_final = Tensor::cat(&[k_rotated, k_pass.to_dtype(target_dtype)?], candle_core::D::Minus1)?.contiguous()?;
+            let q_final = Tensor::cat(&[q_rotated.to_dtype(target_dtype)?, q_pass.to_dtype(target_dtype)?], candle_core::D::Minus1)?.contiguous()?;
+            let k_final = Tensor::cat(&[k_rotated.to_dtype(target_dtype)?, k_pass.to_dtype(target_dtype)?], candle_core::D::Minus1)?.contiguous()?;
             (q_final, k_final)
         } else {
-            // Full rotation (standard RoPE)
-            apply_rotary_pos_emb(&query_states_norm, &key_states_norm, &cos, &sin, false)?
+            // Full rotation (standard RoPE) - [FIX] Pass tof32: true
+            let (q_rotated, k_rotated) = apply_rotary_pos_emb(&query_states_norm, &key_states_norm, &cos, &sin, true)?;
+            (q_rotated.to_dtype(target_dtype)?, k_rotated.to_dtype(target_dtype)?)
         };
 
         // Final safety cast to target_dtype and ensure memory continuity for matmul
@@ -1037,7 +1044,12 @@ impl QuantizedQwen3VLTextAttention {
         let mut bulk_vs: Vec<Tensor> = Vec::new();
 
         let total_tokens_now = seqlen_offset + q_len;
-        for block in &self.kv_blocks {
+        
+        // [FIX] Explicitly Sort KV Blocks by Offset for Prefill Integrity
+        let mut sorted_blocks = self.kv_blocks.clone();
+        sorted_blocks.sort_by_key(|b| b.inner.read().unwrap().offset);
+
+        for block in &sorted_blocks {
             let (index, b_off, _b_len) = {
                 let inner = block.inner.read().unwrap();
                 (inner.index, inner.offset, inner.len)
