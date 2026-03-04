@@ -486,6 +486,7 @@ pub struct QuantizedQwen3VLTextAttention {
     pub vram_merged_k: Option<Tensor>,
     pub vram_merged_v: Option<Tensor>,
     pub merged_vram_block_count: usize,
+    pub session_start_offset: usize, // [NEW] 세션 시작 지점 추적
 }
 
 impl QuantizedQwen3VLTextAttention {
@@ -1341,14 +1342,18 @@ impl QuantizedQwen3VLTextAttention {
                     let layer_idx = self.layer_idx;
                     let num_kv_h = self.num_key_value_heads;
                     let h_d = self.head_dim;
+                    let session_start_off = self.session_start_offset; // 세션 시작 오프셋 사용
 
                     tauri::async_runtime::spawn(async move {
                         if let Some(tx) = BAKE_TX.get() {
-                            // [STRUCTURE-FIX] Unify to l{chunk_index} format: session_id / kv_type / l{idx} / b{layer}.st
-                            let chunk_idx = actual_off / 256;
-                            let sub_path = format!("{}/{}", session_id_owned, kv_type);
+                            // [STRUCTURE-RESTORE] text / NAME / text / l{relative} 구조를 정확히 재현
+                            let local_chunk_idx = (actual_off.saturating_sub(session_start_off)) / 256;
+                            
+                            // [NAME-CLEANUP] session_id가 이미 'task/text/inference' 구조라면 'text'를 중복하지 않음
+                            // 하지만 사용자 tree에 따르면 세션ID 이후에 text/inference/text 순서임
                             let kv_root = crate::utils::paths::get_kv_dir(None);
-                            let block_dir = kv_root.join(&sub_path).join(format!("l{}", chunk_idx));
+                            let sub_path = format!("{}/text", session_id_owned); // [TASK]/text/inference/text 구조 재현
+                            let block_dir = kv_root.join(&sub_path).join(format!("l{}", local_chunk_idx));
                             
                             if !block_dir.exists() { 
                                 let _ = std::fs::create_dir_all(&block_dir); 
@@ -1362,6 +1367,7 @@ impl QuantizedQwen3VLTextAttention {
                             let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
                             let dump = LayerKVDump {
                                 layer_idx,
+                                offset: actual_off, // 오프셋 주입
                                 k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
                                 v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
                                 k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
@@ -1611,6 +1617,7 @@ impl QuantizedQwen3VLTextAttention {
                         blocks_to_bake.push((
                             LayerKVDump {
                                 layer_idx: self.layer_idx,
+                                offset: inner.offset, // [FIX] 오프셋 추가
                                 k_data: kd_cpu,
                                 v_data: vd_cpu,
                                 k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu)?,
@@ -1638,18 +1645,27 @@ impl QuantizedQwen3VLTextAttention {
         // 2. 백업 태스크 전송
         if !blocks_to_bake.is_empty() {
             if let Some(tx) = BAKE_TX.get() {
-                let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
-                let kv_type = if kv_name_raw.contains("image") { "image" } else { "text" };
-                let sub_path = format!("{}/{}", session_id, kv_type);
+                // [STRUCTURE-CLEANUP] session_id 자체가 이미 'text/reference' 형태이므로 kv_type 중복 생략
+                let sub_path = session_id.to_string(); 
                 let kv_root = crate::utils::paths::get_kv_dir(None);
 
                 for (dump, b_len) in blocks_to_bake {
                     let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
                     
-                    // [LOCAL-INDEX-RESTORE] 물리 폴더명은 다시 세션 내 상대 번호(l0, l1...)로 생성하여 일관성 유지
-                    let local_chunk_idx = (dump.offset - (chunk_index * 256)) / 256;
+                    // [CONTINUITY-SAFE] 현재 세션의 시작 지점보다 이전 블록은 저장하지 않음
+                    let session_start_off = chunk_index * 256;
+                    if dump.offset < session_start_off {
+                        SLOT_MANAGER.release_slot(sid).await;
+                        continue;
+                    }
+
+                    // [LOCAL-INDEX-RESTORE] 물리 폴더명은 현재 세션 내 상대 번호(l0, l1...)로 생성
+                    // saturating_sub로 한 번 더 안전 장치 마련
+                    let local_chunk_idx = (dump.offset.saturating_sub(session_start_off)) / 256;
                     
-                    let block_dir = kv_root.join(&sub_path).join(format!("l{}", local_chunk_idx));
+                    // [STRUCTURE-RESTORE] text / NAME / text / l{relative} 구조 재현
+                    let sub_path_nested = format!("{}/text", sub_path);
+                    let block_dir = kv_root.join(&sub_path_nested).join(format!("l{}", local_chunk_idx));
                     if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
 
                     // [SYNC-WAIT-FIX] 워커로 보내기 전에 카운터를 올려서 wait_for_global_io가 정확히 대기하게 함
@@ -1658,11 +1674,11 @@ impl QuantizedQwen3VLTextAttention {
                     let _ = tx.send(SlotTask::Bake(BakeTask {
                         slot_id: sid,
                         task_dir: block_dir,
-                        kv_name: Some(sub_path.clone()),
+                        kv_name: Some(sub_path_nested),
                         offset: dump.offset, 
                         layers: vec![dump],
                         is_relay_baking: baking_only,
-                        block_idx: Some(local_chunk_idx), // 레지스트리 업데이트용 인덱스도 로컬로 유지
+                        block_idx: Some(local_chunk_idx),
                         registry: self.registry.clone(),
                     })).await;
                 }
@@ -2106,6 +2122,7 @@ pub struct QuantizedQwen3VLTextModel {
     pub active_kv_name: Option<String>,
     pub pinned_layer_count: usize,
     pub current_kv_len: usize,
+    pub session_start_offset: usize, // [NEW] 세션 시작 지점 추적
     // [NEW] 재로딩을 위한 메타데이터
     pub config: Qwen3VLTextConfig,
     pub ct: Option<Arc<gguf_file::Content>>,
@@ -2132,6 +2149,8 @@ impl QuantizedQwen3VLTextModel {
         // VRAM에서 연산 수행
         let inputs_embeds = self.embed_tokens.forward(&ids_gpu)?;        Ok(inputs_embeds.to_dtype(target_dtype)?)
     }
+
+    // ... (get_block_path logic inside RegistryEntry) ...
 
     /// [LAYER-BY-LAYER] 특정 레이어 하나만 실행하고 결과를 반환합니다.
     pub async fn forward_single_layer(
@@ -2978,6 +2997,7 @@ impl QuantizedQwen3VLTextModel {
                         dumps_to_send.push((
                             LayerKVDump { 
                                 layer_idx, 
+                                offset: inner.offset, // [FIX] 오프셋 추가
                                 // [ZERO-CPU] Convert to BF16 on GPU before moving to CPU
                                 k_data: k.to_dtype(DType::BF16)?.to_device(&Device::Cpu)?,
                                 v_data: v.to_dtype(DType::BF16)?.to_device(&Device::Cpu)?,

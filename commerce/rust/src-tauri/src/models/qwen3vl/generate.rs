@@ -94,6 +94,7 @@ pub static SLOT_MANAGER: Lazy<&SlotManager> = Lazy::new(|| &SLOT_MANAGER_DATA.0)
 #[derive(Clone)]
 pub struct LayerKVDump {
     pub layer_idx: usize,
+    pub offset: usize,
     pub k_data: Tensor,
     pub v_data: Tensor,
     pub k_shape: Tensor,
@@ -599,24 +600,26 @@ impl Qwen3VLGenerateModel {
         self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
 
         if let Some(s_id) = &session_id {
-            let kv_type = _kv_name.as_deref().unwrap_or("text");
-            // [STRUCTURE-RESTORE] 원래의 중합 구조(task/text/reference)를 유지
-            let path = crate::utils::paths::get_kv_dir(None).join(s_id).join(kv_type);
+            let kv_name_raw = _kv_name.as_deref().unwrap_or("inference");
+            // [STRUCTURE-UNIFY] TASK_ID / text / NAME 구조로 일원화
+            let path = crate::utils::paths::get_kv_dir(None).join(s_id).join("text").join(kv_name_raw);
             if !path.exists() { 
                 println!("[PREFILL-SAVE] Creating directory: {:?}", path);
                 fs::create_dir_all(&path)?; 
             }
 
-            // [ZERO-CPU] Use accelerated direct_loader for token saving
+            // [ZERO-CPU] tokens.json 저장
             let token_data = serde_json::to_vec(&full_ids)?;
             let token_path = path.join("tokens.json");
             println!("[PREFILL-SAVE] Saving tokens.json to {:?}", token_path);
             let _ = save_kv_block(&token_path, &token_data);
 
-            println!("[PREFILL-SAVE] Flushing active blocks for session: {}, type: {}", s_id, kv_type);
-            let _ = self.force_flush_all_active_blocks(s_id, Some(kv_type)).await;
-            wait_for_global_io().await; // [SYNC] Ensure SSD write is complete
-            println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk in structured format.");
+            // [STRUCTURE-UNIFY] quantized_model에 'text/NAME' 형태의 경로를 전달하여 내부에서 중첩 구조를 완성하게 함
+            let sub_path = format!("text/{}", kv_name_raw);
+            println!("[PREFILL-SAVE] Flushing active blocks for session: {}, sub_path: {}", s_id, sub_path);
+            let _ = self.force_flush_all_active_blocks(s_id, Some(&sub_path)).await;
+            wait_for_global_io().await; 
+            println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk.");
         }
         Ok(total_toks)
     }
