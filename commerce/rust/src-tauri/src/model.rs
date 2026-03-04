@@ -158,10 +158,17 @@ pub struct LogisModel {
 
 impl LogisModel {
     pub async fn new(app_handle: tauri::AppHandle, device_preference: Option<&str>) -> anyhow::Result<Self> {
-        let device_config = utils::get_device_config(device_preference);
-        let model_dir = "models"; // Default or resolve from app_handle
-        let unified_model_path = format!("{}/Qwen3.5-0.8B-GGUF/model.gguf", model_dir);
-        let embedding_path = std::path::PathBuf::from(model_dir).join("embeddinggemma-300m");
+        let device_config = utils::get_optimal_device_config();
+        
+        // [FIX] Use directory path instead of file path to satisfy find_type_files()
+        let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models"))?;
+        let normalize_path = |path: std::path::PathBuf| -> String {
+            let s = path.to_string_lossy().to_string();
+            if s.starts_with(r"\\?\") { s[4..].to_string() } else { s }
+        };
+
+        let unified_model_dir = normalize_path(base_path.join("Qwen3.5-0.8B-GGUF"));
+        let embedding_path = base_path.join("embeddinggemma-300m");
 
         Ok(Self {
             app_handle,
@@ -172,8 +179,8 @@ impl LogisModel {
             is_cpu_mode: device_config.device.is_cpu(),
             is_disk_swap: true,
             dual_mode_enabled: true,
-            small_model_path: unified_model_path.clone(),
-            large_model_path: unified_model_path,
+            small_model_path: unified_model_dir.clone(),
+            large_model_path: unified_model_dir,
             embedding_path,
             device_config,
             max_tokens_limit: 32768,

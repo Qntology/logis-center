@@ -782,7 +782,8 @@ impl Qwen3VLTextModel {
         }
         let norm = rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
         let head_dim = config.head_dim;
-        let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
+        let rope_theta = config.rope_scaling.as_ref().and_then(|r| r.rope_theta).or(config.rope_theta).unwrap_or(1000000.0);
+        let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, rope_theta);
         // [FIX] rope_scaling is now optional. Assuming it exists if we are here, or panic/default.
         // Given Qwen3 config flow, if it was missing it should have failed earlier or defaults populated.
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
