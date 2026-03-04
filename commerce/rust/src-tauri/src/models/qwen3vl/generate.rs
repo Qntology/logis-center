@@ -736,6 +736,16 @@ impl Qwen3VLGenerateModel {
             
             let mut next_id = lp.sample(&logits_tensor)?;
             
+            let piece = self.tokenizer.token_decode(vec![next_id])?;
+            // [LOG-PROGRESS] 각 토큰 생성 시마다 진행 상황 출력
+            print!("{}", piece); 
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            
+            if i % 10 == 0 {
+                println!("\n[GEN-STEP] Token {}/{}", i + 1, max_new_tokens);
+            }
+            
             // [FORCE-START] If model still tries to output EOS at step 0, override it with '{'
             if i == 0 && (next_id == self.eos_token_id1 || next_id == self.eos_token_id2) {
                 println!("[DEBUG-GEN] EOS detected on first token. Overriding with '{{' to force JSON.");
