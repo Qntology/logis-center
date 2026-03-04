@@ -456,77 +456,74 @@ impl QuantizedQwen3VLTextAttention {
         ct: &gguf_file::Content,
         reader: &mut R,
         base_name: &str,
-        is_gguf_naming: bool,
+        _is_gguf_naming: bool,
         device: &Device,
         dtype: DType,
         layer_idx: usize,
-        registry: KVRegistry, // [NEW]
+        registry: KVRegistry,
     ) -> Result<Self> {
-        let _hidden_size = config.hidden_size;
-        let head_dim = config.head_dim;
-        let scaling = 1f64 / f64::sqrt(head_dim as f64);
+        let q_name = format!("{base_name}.attn_q");
+        let k_name = format!("{base_name}.attn_k");
+        let v_name = format!("{base_name}.attn_v");
+        let qkv_name = format!("{base_name}.attn_qkv");
+        let o_name = format!("{base_name}.attn_output");
+        let q_norm_name = format!("{base_name}.attn_q_norm");
+        let k_norm_name = format!("{base_name}.attn_k_norm");
 
-        let (q, k, v, o, q_n, k_n) = if is_gguf_naming {
-            ("attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm")
+        // 1. Dynamic QKV Loading (Handling Hybrid Architecture)
+        let (q_proj, k_proj, v_proj) = if ct.tensor_infos.contains_key(&format!("{}.weight", q_name)) {
+            // Case A: Individual Tensors (Found in Full Attention layers)
+            let q = get_qlinear(ct, reader, &q_name, device, dtype)?;
+            let k = get_qlinear(ct, reader, &k_name, device, dtype)?;
+            let v = get_qlinear(ct, reader, &v_name, device, dtype)?;
+            (q, k, v)
         } else {
-            ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
+            // Case B: Unified QKV Tensor (Found in Linear Attention layers)
+            let qkv = get_qlinear(ct, reader, &qkv_name, device, dtype)?;
+            (qkv.clone(), qkv.clone(), qkv)
         };
 
-        // [FIX] Dynamic Head Detection: Trust GGUF tensor shapes over config to prevent reshape mismatches.
-        let q_weight_name = format!("{base_name}.{q}.weight");
-        let k_weight_name = format!("{base_name}.{k}.weight");
+        let o_proj = get_qlinear(ct, reader, &o_name, device, dtype)?;
+        let q_norm = get_rms_norm(ct, reader, &q_norm_name, config.rms_norm_eps, device, dtype)?;
+        let k_norm = get_rms_norm(ct, reader, &k_norm_name, config.rms_norm_eps, device, dtype)?;
 
-        let num_attention_heads = if let Some(info) = ct.tensor_infos.get(&q_weight_name) {
-            let out_features = info.shape.dims()[0];
-            out_features / head_dim
-        } else {
-            config.num_attention_heads
-        };
-
-        let num_key_value_heads = if let Some(info) = ct.tensor_infos.get(&k_weight_name) {
-            let out_features = info.shape.dims()[0];
-            out_features / head_dim
-        } else {
-            config.num_key_value_heads
-        };
-
-        let num_kv_groups = if num_key_value_heads > 0 {
-            num_attention_heads / num_key_value_heads
-        } else {
-            1
-        };
-
-        if num_attention_heads != config.num_attention_heads || num_key_value_heads != config.num_key_value_heads {
-            if layer_idx == 0 {
-                println!("[MODEL-FIX] Architecture Mismatch Detected. GGUF: {} heads / {} KV heads. Config: {} heads / {} KV heads. Overriding config.",
-                    num_attention_heads, num_key_value_heads, config.num_attention_heads, config.num_key_value_heads);
+        // 2. Dynamic Architecture Detection (Trust Weights over Config)
+        let (n_attn_heads, n_kv_heads, h_dim, q_out) = {
+            let q_out = match &q_proj.inner {
+                QMatMul::Tensor(t) => t.dim(0).unwrap_or(0),
+                QMatMul::QTensor(t) => t.shape().dims()[0],
+                QMatMul::TensorF16(t) => t.dim(0).unwrap_or(0),
+            };
+            if q_out == 6144 { // Unified QKV (3 * 2048)
+                (16, 16, 128, q_out)
+            } else if q_out == 4096 { // Layer 3 style (16 heads * 256 dim)
+                (16, 2, 256, q_out) 
+            } else {
+                let heads = q_out / config.head_dim;
+                if heads > 0 { (heads, config.num_key_value_heads, config.head_dim, q_out) }
+                else { (config.num_attention_heads, config.num_key_value_heads, config.head_dim, q_out) }
             }
+        };
+
+        let num_kv_groups = n_attn_heads / (n_kv_heads as usize).max(1);
+        let scaling = 1.0 / (h_dim as f64).sqrt();
+
+        if layer_idx == 0 || layer_idx == 3 {
+            let q_in = match &q_proj.inner {
+                QMatMul::Tensor(t) => t.dim(1).unwrap_or(0),
+                QMatMul::QTensor(t) => t.shape().dims()[1],
+                QMatMul::TensorF16(t) => t.dim(1).unwrap_or(0),
+            };
+            println!("[MODEL-ARCH] Layer {}: {} heads ({} KV), dim {}. Proj: {} -> {}", 
+                layer_idx, n_attn_heads, n_kv_heads, h_dim, q_in, q_out);
         }
-
-        let q_proj = get_qlinear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
-        
-        if layer_idx == 0 {
-            println!("[DIAG-MODEL] Layer 0 Q-Proj Weight Shape: {:?}", q_proj.shape());
-        }
-
-        let k_proj = get_qlinear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?;
-        let v_proj = get_qlinear(ct, reader, &format!("{base_name}.{v}"), device, dtype)?;
-        let o_proj = get_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
-
-        let q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype)?;
-        let k_norm = get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype)?;
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            q_norm,
-            k_norm,
-            num_attention_heads,
-            num_key_value_heads,
+            q_proj, k_proj, v_proj, o_proj, q_norm, k_norm,
+            num_attention_heads: n_attn_heads,
+            num_key_value_heads: n_kv_heads,
             num_kv_groups,
-            head_dim,
+            head_dim: h_dim,
             scaling,
             kv_blocks: Vec::new(),
             registry,
@@ -574,14 +571,25 @@ impl QuantizedQwen3VLTextAttention {
             attention_mask_in.map(|m| m.clone())
         };
 
-        let mut query_states = self.q_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
-        query_states = self.q_norm.forward(&query_states)?.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
-        
-        let mut key_states = self.k_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
-        key_states = self.k_norm.forward(&key_states)?.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
-        
-        let value_states = self.v_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?.to_dtype(target_dtype)?;
+        let mut query_states = self.q_proj.forward(&xs)?;
+        let mut key_states = self.k_proj.forward(&xs)?;
+        let mut value_states = self.v_proj.forward(&xs)?;
 
+        // [DYNAMIC-SPLIT] Handle unified QKV (Linear) vs individual Q/K/V (Full)
+        if query_states.dim(D::Minus1)? == 6144 {
+            let chunks = query_states.chunk(3, D::Minus1)?;
+            query_states = chunks[0].clone();
+            key_states = chunks[1].clone();
+            value_states = chunks[2].clone();
+        }
+
+        let mut query_states = query_states.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
+        query_states = self.q_norm.forward(&query_states)?.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+
+        let mut key_states = key_states.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
+        key_states = self.k_norm.forward(&key_states)?.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+
+        let value_states = value_states.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?.to_dtype(target_dtype)?;
         let cos = cos.to_dtype(target_dtype)?;
         let sin = sin.to_dtype(target_dtype)?;
         let (query_states, key_states) = apply_rotary_pos_emb(&query_states.to_dtype(target_dtype)?, &key_states.to_dtype(target_dtype)?, &cos, &sin, false)?;
@@ -1353,14 +1361,16 @@ impl QuantizedQwen3_5GatedDeltaNet {
         let q = q.to_dtype(target_dtype)?;
         let k = k.to_dtype(target_dtype)?;
         let v = v.to_dtype(target_dtype)?;
-
+        let gate = gate.to_dtype(target_dtype)?;
+        
         let att = q.broadcast_mul(&k)?;
         let mut out = att.broadcast_mul(&v)?;
         out = out.broadcast_mul(&gate)?;
-
+        
         // 4. Scaling
         let scaling = 1.0 / (self.head_dim as f64).sqrt();
-        out = out.broadcast_mul(&Tensor::new(&[scaling as f32], dev)?)?;
+        let scaling_tensor = Tensor::new(&[scaling as f32], dev)?.to_dtype(target_dtype)?;
+        out = out.broadcast_mul(&scaling_tensor)?;
 
         // 5. Final Assembly: [B, H, L, D] -> [B, L, H*D] -> [B, L, 2048]
         let out = out.transpose(1, 2)?.reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
