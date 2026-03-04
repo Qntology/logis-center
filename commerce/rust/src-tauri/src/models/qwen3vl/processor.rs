@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    models::qwen3vl::config::{PreprocessorConfig, VideoPreprocessorConfig},
+    models::qwen3vl::config::PreprocessorConfig,
     openai_types::{
         ChatCompletionParameters, ChatCompletionRequestMessage,
         ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart,
@@ -33,7 +33,6 @@ pub struct GeneralInput {
 #[allow(unused)]
 pub struct Qwen3VLProcessor {
     img_process_cfg: PreprocessorConfig,
-    vid_process_cfg: VideoPreprocessorConfig,
     device: Device,
     dtype: DType,
     image_token: String,
@@ -51,20 +50,12 @@ impl Qwen3VLProcessor {
             PreprocessorConfig::default()
         };
 
-        let vid_process_cfg_file = std::path::Path::new(path).join("video_preprocessor_config.json");
-        let vid_process_cfg: VideoPreprocessorConfig = if vid_process_cfg_file.exists() {
-            serde_json::from_slice(&std::fs::read(vid_process_cfg_file)?)?
-        } else {
-            VideoPreprocessorConfig::default()
-        };
-
         let image_token = "<|image_pad|>".to_string();
         let video_token = "<|video_pad|>".to_string();
         let vision_start_token = "<|vision_start|>".to_string();
         let vision_end_token = "<|vision_end|>".to_string();
         Ok(Self {
             img_process_cfg,
-            vid_process_cfg,
             device: device.clone(),
             dtype,
             image_token,

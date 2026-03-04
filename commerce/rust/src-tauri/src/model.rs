@@ -130,16 +130,16 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelSize {
-    Small, // 0.8B Text-Only (For Txt Preprocessing)
-    Large, // 0.8B Vision + Text (For Img Preprocessing)
+    Small, // 0.6B for Ingestion
+    Large, // 2B-VL for Inference
 }
 
 #[derive(Clone)]
 pub struct LogisModel {
     pub app_handle: tauri::AppHandle,
     pub generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // Primary Active Slot (GPU)
-    pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.8B Text RAM Slot
-    pub large_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.8B VL RAM Slot
+    pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.6B RAM Slot
+    pub large_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 2B RAM Slot
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     
     pub is_cpu_mode: bool, 
@@ -147,7 +147,8 @@ pub struct LogisModel {
     pub dual_mode_enabled: bool,
     
     // Config for Lazy Reloading
-    model_path: String,
+    small_model_path: String,
+    large_model_path: String,
     embedding_path: std::path::PathBuf,
     device_config: utils::DeviceConfig,
     max_tokens_limit: u32,
@@ -216,7 +217,7 @@ impl LogisModel {
         {
             let mut gen = self.generator.lock().await;
             if let Some(mut g) = gen.take() {
-                println!("[DIAG-PURGE] Dropping Active Generator (0.8B/2B-VL)...");
+                println!("[DIAG-PURGE] Dropping Active Generator (0.6B/2B)...");
                 let _ = g.clear_kv_cache();
                 let _ = g.qwen3_vl.drop_kv_storage(); 
                 drop(g); 
@@ -366,35 +367,8 @@ impl LogisModel {
         Ok(())
     }
 
-    // --- [NEW] Parallel KV Stitching Operation ---
-    pub async fn stitch_kv_fragments(&self, fragments: Vec<(String, usize, usize)>) -> anyhow::Result<usize> {
-        let generator_arc = self.generator.clone();
-
-        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
-            let mut gen_guard = generator_arc.blocking_lock();
-            if let Some(gen) = gen_guard.as_mut() {
-                let mut total_tokens = 0;
-                let mut session_data = Vec::new();
-
-                for (session_id, offset, length) in fragments {
-                    session_data.push((session_id, offset, length));
-                    total_tokens += length;
-                }
-
-                // 가상 장부 통합 실행
-                if let Some(registry) = gen.qwen3_vl.get_registry() {
-                    registry.stitch_sessions(session_data)?;
-                    gen.qwen3_vl.set_kv_len(total_tokens);
-                    println!("[STITCH] Successfully merged fragments. New Virtual Context: {} tokens.", total_tokens);
-                    Ok(total_tokens)
-                } else {
-                    Err(anyhow::anyhow!("Stitching not supported for this model variant"))
-                }
-            } else {
-                Err(anyhow::anyhow!("No active generator to stitch fragments into"))
-            }
-        }).await?
-    }    pub async fn save_kv_snapshot(&self, task_id: &str, kv_name: Option<String>, offset: usize) -> anyhow::Result<String> {
+    // --- [NEW] SSD Bridge Operations ---
+    pub async fn save_kv_snapshot(&self, task_id: &str, kv_name: Option<String>, offset: usize) -> anyhow::Result<String> {
         let generator_arc = self.generator.clone();
         let task_id_str = task_id.to_string();
         
@@ -452,11 +426,11 @@ impl LogisModel {
     }
 
     /// [NEW] Secure VRAM/RAM Transition Logic (Isolation Protocol)
-    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool, kv_name: Option<String>, force_text_only: bool) -> anyhow::Result<()> {
+    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool, kv_name: Option<String>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
         // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
-        println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {}, Text-Only: {})...", target_size, is_baking, force_text_only);
+        println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
         self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {
@@ -466,7 +440,9 @@ impl LogisModel {
         }
 
         // 2. [LOAD] 새 모델 로드 (이제 VRAM이 최대치로 확보된 상태)
-        self.ensure_generator_ext(target_size, force_text_only, is_baking).await?;
+        // [OPTIMIZATION] If transitioning to Large for a Relay (task_id present), skip Vision module
+        let text_only = target_size == ModelSize::Large && task_id.is_some() && !is_baking;
+        self.ensure_generator_ext(target_size, text_only, is_baking).await?;
 
         // 4. [RESTORE] 디스크 스냅샷 로드
         if let Some(tid) = task_id {
@@ -482,7 +458,7 @@ impl LogisModel {
         let base_session = format!("{}_base", task_id);
         
         // 1. Load Small Model Isolated
-        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true, None, true).await?;
+        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true, None).await?;
 
         // 2. Ingest PUG content
         {
@@ -522,30 +498,33 @@ impl LogisModel {
             }
         }
 
-        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false, None, true).await
+        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false, None).await
     }
 
-    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool, baking_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
+    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
+        println!("[MODEL] Loading Generator from {} (Text-Only: {})...", path, force_text_only);
         let dev = self.device_config.device.clone();
         let dev_id = self.device_config.gpu_id;
+
         let dtype = if self.device_config.is_cpu { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;
         let path_clone = path.to_string();
         let shared_path = shared_config_path.map(|s| s.to_string());
-        let handle_clone = self.app_handle.clone();
-        let is_disk_swap = self.is_disk_swap;
 
-        println!("[LOAD] Fresh loading 0.8B (Text-Only: {}, Baking: {})...", force_text_only, baking_only);
+        let handle_clone = self.app_handle.clone();
+
+        let is_disk_swap = self.is_disk_swap;
 
         let generator = tokio::task::spawn_blocking(move || {
             let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
+            // [CRITICAL] Use init_with_config to force shared settings (Config + Tokenizer)
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
                 shared_path.as_deref(), // Tokenizer path
                 shared_path.as_deref(), // Config path
                 Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize),
                 force_text_only,
-                baking_only, 
+                false, // [NEW] baking_only
                 is_disk_swap, 
                 kv_root
             )
@@ -603,25 +582,45 @@ impl LogisModel {
         }
 
         // 2. [LOAD] Load from disk if not found in any slot
-        if !found_in_slot {
-            let path = self.model_path.clone();
-            let _shared_path: Option<&str> = None; 
-            
-            let gen = self.load_generator_internal(&path, _shared_path, force_text_only, baking_only).await?;
+        println!("[LOAD] Fresh loading {:?} from disk...", size);
+        let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
+        let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
+        
+        let target_device = self.device_config.device.clone();
+        let is_disk_swap = self.is_disk_swap;
+        let dev_id = self.device_config.gpu_id;
+        let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
+        let limit = self.max_tokens_limit;
+        let path_clone = path.to_string();
+        let shared_path_clone = shared_path.map(|s| s.to_string());
+        let handle_clone = self.app_handle.clone();
 
-            // Move current main to slot
-            if let Some(old_m) = gen_guard.take() {
-                if let Some(old_size) = *current_size_guard {
-                    match old_size {
-                        ModelSize::Small => *small_slot = Some(old_m),
-                        ModelSize::Large => *large_slot = Some(old_m),
-                    }
+        let gen = tokio::task::spawn_blocking(move || {
+            let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
+            Qwen3VLGenerateModel::init_with_config(
+                &path_clone, 
+                shared_path_clone.as_deref(), 
+                shared_path_clone.as_deref(), 
+                Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
+                force_text_only,
+                baking_only,
+                is_disk_swap,
+                kv_root
+            )
+        }).await??;
+
+        // Move current main to slot
+        if let Some(old_m) = gen_guard.take() {
+            if let Some(old_size) = *current_size_guard {
+                match old_size {
+                    ModelSize::Small => *small_slot = Some(old_m),
+                    ModelSize::Large => *large_slot = Some(old_m),
                 }
             }
-
-            *gen_guard = Some(gen);
-            *current_size_guard = Some(size);
         }
+
+        *gen_guard = Some(gen);
+        *current_size_guard = Some(size);
         
         Ok(())
     }
@@ -637,7 +636,7 @@ impl LogisModel {
             },
             Some(ModelSize::Small) => {
                 // Small and Embedding can coexist. 
-                println!("[MODEL] Small model active. Embedding and 0.8B will coexist.");
+                println!("[MODEL] Small model active. Embedding and 0.6B will coexist.");
             },
             None => {
                 // No generator active, safe to clean up any leftovers
@@ -708,7 +707,8 @@ impl LogisModel {
             }
         };
 
-        let model_path = normalize_path(base_path.join("Qwen3.5-0.8B-gguf"));
+        let small_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf"));
+        let large_model_path = normalize_path(base_path.join("Qwen3-VL-2B-Instruct-gguf"));
         let embedding_path = base_path.join("embeddinggemma-300m");
 
         let max_tokens_limit = 65536; 
@@ -722,7 +722,8 @@ impl LogisModel {
             is_cpu_mode: config.is_cpu,
             is_disk_swap,
             dual_mode_enabled: true, 
-            model_path,
+            small_model_path,
+            large_model_path,
             embedding_path,
             device_config: config.clone(),
             max_tokens_limit: max_tokens_limit as u32,
@@ -759,7 +760,7 @@ impl LogisModel {
                 Some(dynamic_image), 
                 app_handle, 
                 "extraction-progress", 
-                json!({ "category": "Vision Analysis", "summary": "Analyzing image with 2B-VL model..." }), 
+                json!({ "category": "Vision Analysis", "summary": "Analyzing image with 2B model..." }), 
                 1024, 
                 cancel_token.clone(), 
                 Some(task_id.clone()),
@@ -829,7 +830,7 @@ impl LogisModel {
     }
 
     pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        // [FIX] Default to Small (0.8B) for all chat tasks to align with 0.8B-focused architecture.
+        // [FIX] Default to Small (0.6B) for all chat tasks to align with 0.6B-focused architecture.
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
@@ -867,7 +868,7 @@ impl LogisModel {
 
             let params = ChatCompletionParameters {
                 messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
-                model: "qwen3_5".to_string(),
+                model: "qwen3vl".to_string(),
                 max_tokens: Some(max_tok),
                 temperature: Some(0.1),
                 top_p: Some(0.9),
@@ -910,7 +911,7 @@ impl LogisModel {
 
         let params = ChatCompletionParameters {
             messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
-            model: "qwen3_5".to_string(),
+            model: "qwen3vl".to_string(),
             max_tokens: Some(max_tokens as u32),
             temperature: Some(0.1),
             top_p: Some(0.9),
@@ -930,7 +931,7 @@ impl LogisModel {
         session_id: Option<String>,
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
-        // [FIX] Ensure we stay on Small (0.8B).
+        // [FIX] Ensure we stay on Small (0.6B).
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
@@ -1020,7 +1021,7 @@ impl LogisModel {
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.8B (Small)
+        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.6B (Small)
         let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
         self.ensure_generator(target_size).await?;
         
@@ -1053,7 +1054,7 @@ impl LogisModel {
 
         let params = ChatCompletionParameters {
             messages: vec![ChatCompletionRequestMessage::User(message)],
-            model: "qwen3_5".to_string(),
+            model: "qwen3vl".to_string(),
             max_tokens: Some(self.max_tokens_limit),
             temperature: Some(0.1),
             top_p: Some(0.9),
@@ -1074,7 +1075,7 @@ impl LogisModel {
         session_id: Option<String>,
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
-        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.8B (Small)
+        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.6B (Small)
         let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
         self.ensure_generator(target_size).await?;
 
@@ -1122,7 +1123,7 @@ impl LogisModel {
 
         let params = ChatCompletionParameters {
             messages: vec![ChatCompletionRequestMessage::User(message)],
-            model: "qwen3_5".to_string(),
+            model: "qwen3vl".to_string(),
             max_tokens: Some(max_tok),
             temperature: Some(0.1),
             top_p: Some(0.9),

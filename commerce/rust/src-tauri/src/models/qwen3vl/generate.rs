@@ -87,14 +87,13 @@ impl SlotManager {
 
 pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub static SLOT_MANAGER_DATA: Lazy<(SlotManager, Mutex<Option<mpsc::Receiver<SlotRequest>>>)> = Lazy::new(|| {
-    let (sm, rx) = SlotManager::new(512); (sm, Mutex::new(Some(rx)))
+    let (sm, rx) = SlotManager::new(128); (sm, Mutex::new(Some(rx)))
 });
 pub static SLOT_MANAGER: Lazy<&SlotManager> = Lazy::new(|| &SLOT_MANAGER_DATA.0);
 
 #[derive(Clone)]
 pub struct LayerKVDump {
     pub layer_idx: usize,
-    pub offset: usize,
     pub k_data: Tensor,
     pub v_data: Tensor,
     pub k_shape: Tensor,
@@ -106,14 +105,12 @@ pub struct BakeTask {
     pub slot_id: usize, pub task_dir: PathBuf, pub kv_name: Option<String>,
     pub offset: usize, pub layers: Vec<LayerKVDump>, pub is_relay_baking: bool,
     pub block_idx: Option<usize>, pub registry: KVRegistry,
-    pub tokens: Option<Vec<u32>>, // [NEW] 입력 토큰 정보 추가
 }
 
 pub struct SaveTask {
     pub slot_id: usize, pub path: PathBuf, pub tensors: std::collections::HashMap<String, Tensor>,
     pub is_last: bool, pub block_idx: Option<usize>, pub registry: Option<KVRegistry>,
     pub kv_name: Option<String>,
-    pub tokens: Option<Vec<u32>>, // [NEW] 입력 토큰 추가
 }
 
 pub enum SlotTask { 
@@ -191,7 +188,7 @@ pub async fn get_load_worker() -> Result<mpsc::Sender<SlotTask>> { LOAD_TX.get()
 pub async fn wait_for_global_io() { while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { tokio::time::sleep(std::time::Duration::from_millis(10)).await; } }
 
 pub fn init_bake_worker() {
-    let (btx, brx) = mpsc::channel(256); let (ltx, lrx) = mpsc::channel(256);
+    let (btx, brx) = mpsc::channel(64); let (ltx, lrx) = mpsc::channel(64);
     let _ = BAKE_TX.set(btx); let _ = LOAD_TX.set(ltx);
     if let Some(rx) = SLOT_MANAGER_DATA.1.lock().unwrap().take() { tauri::async_runtime::spawn(async move { spawn_slot_dispatcher(rx).await; }); }
     tauri::async_runtime::spawn(async move { spawn_slot_worker(brx); }); 
@@ -202,7 +199,7 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {
         match req {
             SlotRequest::Acquire { total_tokens: _total_tokens, tx } => {
-                let max_writes = 128; let mut found = None;
+                let max_writes = 64; let mut found = None;
                 while found.is_none() {
                     if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
                         for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
@@ -236,62 +233,50 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
 }
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
-    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(256); 
-
+    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(100); 
     tokio::spawn(async move {
-        // [SEQUENTIAL-IO] 파일 손상을 방지하기 위해 이 워커 스레드 내에서 순차적으로 저장합니다.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(48)); 
         while let Some(task) = io_rx.recv().await {
+            let sem = semaphore.clone();
             let (tp, ts, reg, b_idx, sid, is_last, kv_n) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone());
-
-            // [SYNC-WAIT] 별도의 spawn 없이 여기서 직접 연달아 처리
-            if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
-            match safetensors::serialize(&ts, &None) {
-                Ok(data) => {
-                    drop(ts); 
-                    if let Err(e) = save_kv_block(&tp, &data) {
-                        eprintln!("[IO-ERROR] save_kv_block failed: {} -> {:?}", e, tp);
-                    } else {
-                        // [NEW] input.json 저장 (청크의 입력 정보 기록)
-                        if let (Some(parent), Some(tokens)) = (tp.parent(), task.tokens.as_ref()) {
-                            let input_path = parent.join("input.json");
-                            if !input_path.exists() {
-                                let input_data = serde_json::json!({
-                                    "tokens": tokens,
-                                    "timestamp": chrono::Utc::now().to_rfc3339()
-                                });
-                                if let Ok(json_str) = serde_json::to_string_pretty(&input_data) {
-                                    let _ = save_kv_block(&input_path, json_str.as_bytes());
-                                }
-                            }
-                        }
-                    }
-
-                    // 인덱스 업데이트
+            tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await.unwrap();
+                struct IoGuard; impl Drop for IoGuard { fn drop(&mut self) { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } }
+                let _guard = IoGuard;
+                if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
+                if let Ok(data) = safetensors::serialize(&ts, &None) {
+                    drop(ts); let _ = save_kv_block(&tp, &data);
+                    
+                    // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
                     if let Some(kv_name) = kv_n {
-                        if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).and_then(|s| s.strip_suffix(".st")) {
+                        if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
                             if let Ok(l_idx) = l_str.parse::<usize>() {
-                                let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).unwrap_or("0");
+                                // 오프셋 추출 (파일명 b{offset}_l{idx}_k_anchors 에서 추출하거나 SaveTask에 추가 가능)
+                                // 현재는 tp.parent() 폴더명이 b{offset} 이므로 이를 활용
+                                let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
                                 let offset = offset_str.parse::<usize>().unwrap_or(0);
-
-                                // GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst); // [REMOVE] Redundant
+                                
                                 let _ = INDEX_TX.send(SlotTask::IndexUpdate {
-                                    kv_name, layer_idx: l_idx, offset, len: 256,
-                                    file_name: format!("l{}/b{}.st", offset, l_idx),
+                                    kv_name,
+                                    layer_idx: l_idx,
+                                    offset,
+                                    len: 256,
+                                    file_name: format!("b{}/l{}.st", offset, l_idx),
                                 }).await;
                             }
                         }
                     }
 
-                    // 레지스트리 상태 업데이트
                     if let (Some(r), Some(idx)) = (reg, b_idx) {
                         if let Ok(mut entries) = r.entries.write() {
                             if idx < entries.len() {
                                 let e = &mut entries[idx]; 
-                                if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).and_then(|s| s.strip_suffix(".st")) {
+                                if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
                                     if let Ok(l_idx) = l_str.parse::<usize>() { 
                                         if l_idx < 28 { 
                                             e.location[l_idx] = KVLocation::SSD; 
                                             e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                                            // [MEMORY-RELEASE] SSD 저장 완료 즉시 RAM 메모리 해제
                                             if let Ok(mut cache) = e.bitkv_cache.write() {
                                                 if l_idx < cache.len() { cache[l_idx] = None; }
                                             }
@@ -301,13 +286,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             }
                         }
                     }
-                },
-                Err(e) => eprintln!("[IO-ERROR] serialize failed: {}", e),
-            }
-            // 작업 완료 후 카운터 감소 및 슬롯 해제
-            GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
-            let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
-            if rem == 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; }
+                }
+                let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
+                if rem == 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; }
+            });
         }
     });
 
@@ -316,40 +298,54 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             match task {
                 SlotTask::Bake(bake) => {
                     let io_tx_inner = io_tx.clone();
-                    let (sid, off, _is_relay, block_idx, registry, kv_name, tokens) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone(), bake.tokens.clone());
+                    let (sid, off, _is_relay, block_idx, registry, kv_name) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone());
                     let loop_count = bake.layers.len();
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
-
+                    
                     for l_idx in 0..loop_count {
-                        let src = bake.layers[l_idx].clone();
+                        let mut src = bake.layers[l_idx].clone();
                         let act_l = src.layer_idx;
                         let task_dir = bake.task_dir.clone();
                         let registry_inner = registry.clone();
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
-                        let tokens_inner = tokens.clone();
 
+                        // [BACK-COMPRESSION] 압축 및 직렬화 작업 자체를 백그라운드로 완전히 분리
                         tokio::spawn(async move {
-                            // [SYNC-COPY] 이미 CPU에 복사된 데이터를 사용함
+                            // [FIX] Convert raw tensors to BF16 (or F32 fallback)
+                            // [CRITICAL] 텐서가 GPU에 있는 경우, to_device는 해당 스레드의 컨텍스트를 필요로 함
+                            if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
+                                // 워커 스레드에서 안전하게 CPU로 이동
+                                // [STABILITY] to_device 호출 시 장치 컨텍스트가 자동으로 보장되지 않을 수 있으므로
+                                // candle-core의 Device 스코프 내에서 실행되도록 유도 (필요시)
+                                let k_cpu = rk.to_device(&Device::Cpu).unwrap_or(rk);
+                                let v_cpu = rv.to_device(&Device::Cpu).unwrap_or(rv);
+                                
+                                src.k_data = k_cpu.to_dtype(DType::BF16).unwrap_or(k_cpu);
+                                src.v_data = v_cpu.to_dtype(DType::BF16).unwrap_or(v_cpu);
+                            }
+
                             let mut map = std::collections::HashMap::new();
-                            let prefix = format!("l{}_b{}_", off, act_l);
-                            map.insert(format!("{}k_data", prefix), src.k_data);
-                            map.insert(format!("{}v_data", prefix), src.v_data);
-                            map.insert(format!("{}k_shape", prefix), src.k_shape);
-
-                            let file_path = task_dir.join(format!("b{}.st", act_l));
-
-                            // 큐에 넣기 전에 카운터 증가 (메인 스레드 대기용)
+                            let prefix = format!("b{}_l{}_", off, act_l);
+                            map.insert(format!("{}k_data", prefix), src.k_data.clone());
+                            map.insert(format!("{}v_data", prefix), src.v_data.clone());
+                            map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
+                            
+                            let file_path = task_dir.join(format!("l{}.st", act_l));
+                            
+                            // [FIX] Send to IO worker after confirming all tensors are on CPU
                             GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
                             let _ = io_tx_nested.send(SaveTask { 
-                                slot_id: sid, path: file_path, tensors: map, is_last: false, 
-                                block_idx, registry: Some(registry_inner), kv_name: kv_name_inner,
-                                tokens: tokens_inner
+                                slot_id: sid, 
+                                path: file_path.clone(), 
+                                tensors: map, 
+                                is_last: false, 
+                                block_idx, 
+                                registry: Some(registry_inner), 
+                                kv_name: kv_name_inner 
                             }).await;
                         });
                     }
-                    // [FIX] Bake 태스크 분배가 완료되었으므로 메인 스레드에서 올린 카운터 원상복귀
-                    GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); 
                 },
                 SlotTask::Load(load) => {
                     let sid = load.slot_id; let reg = load.registry.clone(); let shared_block = load.shared_block.clone();
@@ -359,21 +355,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let (b_idx_off, b_idx) = { match shared_block.inner.read() { Ok(inner) => (inner.offset, inner.index), _ => (0, 999) } };
                         let mut root = provided_path.clone();
                         while !root.to_string_lossy().ends_with("kv") && root.parent().is_some() { root = root.parent().unwrap().to_path_buf(); }
-                        // [LOAD-FIX] Match new structure: session_id/kv_type/l{offset}/b{layer}.st
-                        let block_root = root.join(kv_name.as_deref().unwrap_or("inference")).join(format!("l{}", b_idx_off));
-                        
-                        /* 
-                        if sid == 0 {
-                            println!("[LOAD-START] Loading from {:?}", block_root);
-                        }
-                        */
-
+                        let block_root = root.join(kv_name.as_deref().unwrap_or("inference")).join(format!("b{}", b_idx_off));
                         for l_idx in 0..28 {
-                            let file_path = block_root.join(format!("b{}.st", l_idx));
+                            let file_path = block_root.join(format!("l{}.st", l_idx));
                             if file_path.is_file() {
                                 if let Ok(content) = load_kv_block(&file_path) {
                                     if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                        let prefix = format!("l{}_b{}_", b_idx_off, l_idx);
+                                        let prefix = format!("b{}_l{}_", b_idx_off, l_idx);
                                         let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).ok();
                                         
                                         // [MODIFIED] BF16 Direct Load
@@ -422,37 +410,11 @@ impl Drop for ReadSlotGuard { fn drop(&mut self) { if self.active { let sid = se
 pub enum ModelVariant { Standard(Qwen3VLModel), QuantizedVL(QuantizedQwen3VLModel), QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel) }
 
 impl ModelVariant {
-    pub fn get_kv_len(&self) -> usize {
-        match self {
-            Self::QuantizedVL(m) => m.language_model.current_kv_len,
-            Self::QuantizedText(m) => m.language_model.current_kv_len,
-            _ => 0,
-        }
-    }
-
-    pub fn set_kv_len(&mut self, len: usize) {
-        match self {
-            Self::QuantizedVL(m) => m.language_model.current_kv_len = len,
-            Self::QuantizedText(m) => m.language_model.current_kv_len = len,
-            _ => {}
-        }
-    }
-
-    pub fn get_registry(&self) -> Option<KVRegistry> {
-        match self {
-            Self::QuantizedVL(m) => Some(m.language_model.registry.clone()),
-            Self::QuantizedText(m) => Some(m.language_model.registry.clone()),
-            _ => None,
-        }
-    }
-
     pub async fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
-        let tokens = input_ids.flatten_all()?.to_vec1::<u32>().ok(); // [NEW] 토큰 추출
-        
         match self {
             Self::Standard(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),
             Self::QuantizedVL(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset, total_len, session_id, kv_name).await,
-            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset, total_len, session_id, kv_name, tokens).await,
+            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset, total_len, session_id, kv_name).await,
         }
     }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.rebalance_layers(device_id, offset, total_len), Self::QuantizedText(m) => m.rebalance_layers(device_id, offset, total_len) } }
@@ -460,71 +422,6 @@ impl ModelVariant {
     pub fn inject_kv_bitkv(&mut self, kd: &[Tensor], vd: &[Tensor], os: &[usize]) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.inject_live_kv_bitkv(kd, vd, os), Self::QuantizedText(m) => m.language_model.inject_live_kv_bitkv(kd, vd, os), _ => Ok(()) } }
     pub async fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage(), _ => Ok(()) } }
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, Self::QuantizedText(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, _ => Ok(()) } }
-    
-    // [NEW] 레이어별 전수 처리를 위한 단일 레이어 제어 인터페이스
-    pub fn get_initial_embeddings(&self, ids: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::QuantizedVL(m) => m.language_model.get_initial_embeddings(ids),
-            Self::QuantizedText(m) => m.language_model.get_initial_embeddings(ids),
-            _ => Err(anyhow!("Unsupported model variant for initial embeddings")),
-        }
-    }
-
-    pub async fn forward_single_layer(&mut self, layer_idx: usize, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, offset: usize, session_id: Option<String>, kv_name: Option<String>, baking: bool, chunk_index: usize) -> Result<Tensor> {
-        match self {
-            Self::QuantizedVL(m) => m.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking, chunk_index).await,
-            Self::QuantizedText(m) => m.forward_single_layer(layer_idx, xs, cos, sin, mask, offset, session_id, kv_name, baking, chunk_index).await,
-            _ => Err(anyhow!("Unsupported model variant for single layer forward")),
-        }
-    }
-
-    pub fn clear_layer(&mut self, layer_idx: usize) {
-        match self {
-            Self::QuantizedVL(m) => m.clear_layer(layer_idx),
-            Self::QuantizedText(m) => m.clear_layer(layer_idx),
-            _ => {}
-        }
-    }
-
-    pub fn save_hidden_states(&self, path: &Path, t: &Tensor) -> Result<()> {
-        match self {
-            Self::QuantizedVL(m) => m.language_model.save_hidden_states(path, t),
-            Self::QuantizedText(m) => m.language_model.save_hidden_states(path, t),
-            _ => Err(anyhow!("Unsupported model variant for save_hidden_states")),
-        }
-    }
-
-    pub fn load_hidden_states(&self, path: &Path, device: &Device, dtype: DType) -> Result<Tensor> {
-        match self {
-            Self::QuantizedVL(m) => m.language_model.load_hidden_states(path, device, dtype),
-            Self::QuantizedText(m) => m.language_model.load_hidden_states(path, device, dtype),
-            _ => Err(anyhow!("Unsupported model variant for load_hidden_states")),
-        }
-    }
-
-    pub fn sync_blocks_from_registry(&mut self) -> Result<()> {
-        match self {
-            Self::QuantizedVL(m) => m.sync_blocks_from_registry(),
-            Self::QuantizedText(m) => m.sync_blocks_from_registry(),
-            _ => Ok(()),
-        }
-    }
-
-    pub fn reload_all_layers(&mut self) -> Result<()> {
-        match self {
-            Self::QuantizedVL(m) => m.language_model.reload_all_layers(),
-            Self::QuantizedText(m) => m.language_model.reload_all_layers(),
-            _ => Ok(()),
-        }
-    }
-
-    pub async fn force_offload_layer_kv(&mut self, layer_idx: usize, session_id: &str, chunk_index: usize) -> Result<()> {
-        match self {
-            Self::QuantizedVL(m) => m.force_offload_layer_kv(layer_idx, session_id, chunk_index).await,
-            Self::QuantizedText(m) => m.force_offload_layer_kv(layer_idx, session_id, chunk_index).await,
-            _ => Ok(()),
-        }
-    }
 }
 
 pub struct Qwen3VLGenerateModel {
@@ -549,30 +446,15 @@ impl Qwen3VLGenerateModel {
         let cfg_path = config_path.unwrap_or(path).strip_prefix(r"\\?\").unwrap_or(config_path.unwrap_or(path));
         let chat_template = ChatTemplate::init(tok_path)?;
         let tokenizer = TokenizerModel::init(tok_path)?;
-        // [ZERO-CPU] Use accelerated direct_loader for config loading
-        let config_data = load_kv_block(&std::path::Path::new(cfg_path).join("config.json"))?;
-        let raw_config: serde_json::Value = serde_json::from_slice(&config_data)?;
+        let raw_config: serde_json::Value = serde_json::from_slice(&std::fs::read(&std::path::Path::new(cfg_path).join("config.json"))?)?;
         let cfg: Qwen3VLConfig = if raw_config.get("text_config").is_some() { serde_json::from_value(raw_config)? } else {
             let text_config: crate::models::qwen3vl::config::Qwen3VLTextConfig = serde_json::from_value(raw_config.clone())?;
-            Qwen3VLConfig { 
-                architectures: raw_config.get("architectures").and_then(|v| serde_json::from_value(v.clone()).ok()), 
-                auto_map: raw_config.get("auto_map").and_then(|v| serde_json::from_value(v.clone()).ok()), 
-                hidden_size: raw_config.get("hidden_size").and_then(|v| v.as_u64()).map(|v| v as usize), 
-                image_token_id: raw_config.get("image_token_id").and_then(|v| v.as_u64()).map(|v| v as usize), 
-                model_type: raw_config.get("model_type").and_then(|v| v.as_str()).unwrap_or("qwen3_5").to_string(), 
-                text_config: Some(text_config), 
-                tie_word_embeddings: raw_config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(true), 
-                transformers_version: raw_config.get("transformers_version").and_then(|v| v.as_str()).unwrap_or("").to_string(), 
-                video_token_id: raw_config.get("video_token_id").and_then(|v| v.as_u64()).map(|v| v as usize), 
-                vision_config: None, 
-                vision_start_token_id: None, 
-                vision_end_token_id: None 
-            }
+            Qwen3VLConfig { architectures: raw_config.get("architectures").and_then(|v| serde_json::from_value(v.clone()).ok()), auto_map: raw_config.get("auto_map").and_then(|v| serde_json::from_value(v.clone()).ok()), hidden_size: raw_config.get("hidden_size").and_then(|v| v.as_u64()).map(|v| v as usize), image_token_id: raw_config.get("image_token_id").and_then(|v| v.as_u64()).map(|v| v as usize), model_type: raw_config.get("model_type").and_then(|v| v.as_str()).unwrap_or("qwen2").to_string(), text_config: Some(text_config), tie_word_embeddings: raw_config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(true), torch_dtype: raw_config.get("torch_dtype").and_then(|v| v.as_str()).map(|s| s.to_string()), transformers_version: raw_config.get("transformers_version").and_then(|v| v.as_str()).unwrap_or("").to_string(), video_token_id: raw_config.get("video_token_id").and_then(|v| v.as_u64()).map(|v| v as usize), vision_config: None, vision_start_token_id: None, vision_end_token_id: None }
         };
         let t_dev = get_device(text_device); let v_dev = get_device(vision_device); let dtype = get_dtype(dtype, cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16"));
         let gguf_f = find_type_files(path, "gguf")?; let mmproj_p = gguf_f.iter().find(|f| f.contains("mmproj")).cloned();
-        let mut m_p = gguf_f.iter().find(|f| f.contains("Qwen3.5-0.8B.gguf")).cloned();
-        if m_p.is_none() { m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.8B-Q4_K_M.gguf")).cloned(); }
+        let mut m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned();
+        if m_p.is_none() { m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.6B-Q4_K_M.gguf")).cloned(); }
         if m_p.is_none() { m_p = gguf_f.iter().find(|f| !f.contains("mmproj")).cloned(); }
         let qwen3_vl = if !gguf_f.is_empty() {
             let kv_res = hard_token_limit.unwrap_or(4096) as u64 * 40000;
@@ -590,20 +472,14 @@ impl Qwen3VLGenerateModel {
                 ModelVariant::QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, ct_main, Some(Arc::new(m_mmap)), &t_dev, text_device_id, dtype, kv_res, baking_only, baking_only)?)
             }
         } else { ModelVariant::Standard(Qwen3VLModel::new(cfg, unsafe { VarBuilder::from_mmaped_safetensors(&find_type_files(path, "safetensors")?, dtype, &t_dev)? })?) };
-        let g_p = std::path::Path::new(cfg_path).join("generation_config.json"); 
-        // [ZERO-CPU] Use accelerated direct_loader for generation config
-        let g_cfg = if g_p.exists() { 
-            let g_data = load_kv_block(&g_p)?;
-            serde_json::from_slice(&g_data)? 
-        } else { Qwen3VLGenerationConfig::default() };
+        let g_p = std::path::Path::new(cfg_path).join("generation_config.json"); let g_cfg = if g_p.exists() { serde_json::from_slice(&std::fs::read(g_p)?)? } else { Qwen3VLGenerationConfig::default() };
         let (e1, e2) = match &g_cfg.eos_token_id { serde_json::Value::Number(n) => { let id = n.as_u64().unwrap_or(151645) as u32; (id, id) }, serde_json::Value::Array(arr) => { (arr.get(0).and_then(|v| v.as_u64()).unwrap_or(151643) as u32, arr.get(1).and_then(|v| v.as_u64()).unwrap_or(151643) as u32) }, _ => (151643, 151643) };
-        let loaded_model_name = if m_p.as_ref().map(|p| p.contains("0.8B")).unwrap_or(false) { "Qwen3.5-0.8B".to_string() } else { "Qwen3-VL-2B".to_string() };
+        let loaded_model_name = if m_p.as_ref().map(|p| p.contains("0.6B")).unwrap_or(false) { "0.6B".to_string() } else { "2B".to_string() };
         Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &v_dev, dtype)?, qwen3_vl, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: loaded_model_name, hard_token_limit, kv_root })
     }
 
     pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut Qwen3VLGenerateModel>, _kv_name: Option<String>) -> Result<usize> {
         // [FIX] Always start prefill from zero to avoid double offset on restart
-        println!("[PREFILL-START] Initializing prefill for session: {:?}, kv_name: {:?}", session_id, _kv_name);
         self.clear_kv_cache();
         if let ModelVariant::QuantizedVL(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
         if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
@@ -612,106 +488,115 @@ impl Qwen3VLGenerateModel {
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_toks = full_ids.len();
-        println!("[PREFILL-EXEC] Forwarding {} tokens...", total_toks);
-
         self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
-
         if let Some(s_id) = &session_id {
-            let kv_name_raw = _kv_name.as_deref().unwrap_or("inference");
-            // [STRUCTURE-UNIFY] TASK_ID / text / NAME 구조로 일원화
-            let path = crate::utils::paths::get_kv_dir(None).join(s_id).join("text").join(kv_name_raw);
-            if !path.exists() { 
-                println!("[PREFILL-SAVE] Creating directory: {:?}", path);
-                fs::create_dir_all(&path)?; 
-            }
-
-            // [ZERO-CPU] tokens.json 저장
-            let token_data = serde_json::to_vec(&full_ids)?;
-            let token_path = path.join("tokens.json");
-            println!("[PREFILL-SAVE] Saving tokens.json to {:?}", token_path);
-            let _ = save_kv_block(&token_path, &token_data);
-
-            // [STRUCTURE-UNIFY] quantized_model에 'text/NAME' 형태의 경로를 전달하여 내부에서 중첩 구조를 완성하게 함
-            let sub_path = format!("text/{}", kv_name_raw);
-            println!("[PREFILL-SAVE] Flushing active blocks for session: {}, sub_path: {}", s_id, sub_path);
-            let _ = self.force_flush_all_active_blocks(s_id, Some(&sub_path)).await;
-            wait_for_global_io().await; 
+            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+            if !path.exists() { fs::create_dir_all(&path)?; }
+            fs::write(path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
+            let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
+            wait_for_global_io().await; // [SYNC] Ensure SSD write is complete
             println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk.");
         }
         Ok(total_toks)
     }
 
-    pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
-        // [CONTEXT-RESTORATION] Load existing KV context from SSD (Inference path only)
-        if let Some(s_id) = &session_id {
-            let kv_type = _kv_name.as_deref().unwrap_or("text");
-            let snapshot_root = crate::utils::paths::get_kv_dir(None).join(s_id).join(kv_type);
+        pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
+            // [CONTEXT-RESTORATION] If a session_id is provided, load the previous KV context from SSD
+            let mut is_reference_snapshot = false;
+            if let Some(s_id) = &session_id {
+                let snapshot_root = crate::utils::paths::get_kv_dir(None).join(s_id);
+                
+                // [FIX] Try both 'inference/text' and 'reference/text' paths
+                let paths_to_try = vec![
+                    snapshot_root.join("inference").join("text"),
+                    snapshot_root.join("reference").join("text"),
+                    snapshot_root.clone(),
+                ];
 
-            println!("[GEN-LOAD] Checking for existing context in {:?}", snapshot_root);
-            if snapshot_root.exists() && fs::read_dir(&snapshot_root).map(|mut d| d.next().is_some()).unwrap_or(false) {
-                println!("[GEN-LOAD] Loading structured context from {:?}...", snapshot_root);
-                let _ = self.load_kv_from_disk(&snapshot_root, None);
-            } else {
-                println!("[GEN-LOAD] No existing context found for session {}, type {}. Proceeding with fresh prefill if needed.", s_id, kv_type);
+                for snapshot_path in paths_to_try {
+                    if snapshot_path.exists() && fs::read_dir(&snapshot_path).map(|mut d| d.next().is_some()).unwrap_or(false) {
+                        println!("[GEN-LOAD] Loading existing snapshot from {:?}...", snapshot_path);
+                        
+                        // [FIX] If loading from 'reference', we must force prefill for the other 27 layers.
+                        if snapshot_path.to_string_lossy().contains("reference") {
+                            is_reference_snapshot = true;
+                        }
+
+                        let _ = self.load_kv_from_disk(&snapshot_path, None); // [FIX] Already pointed to full path
+                        
+                        if is_reference_snapshot {
+                            println!("[GEN-LOAD] Reference snapshot detected. Resetting Registry Entry states for Full 28-Layer Prefill...");
+                            
+                            // [FIX] Registry 상태를 RAM/Empty로 초기화하고 token_start를 0번부터 다시 설정
+                            let reset_reg = |reg: &KVRegistry| {
+                                let mut entries = reg.entries.write().unwrap();
+                                for (i, entry) in entries.iter_mut().enumerate() {
+                                    for loc in entry.location.iter_mut() { *loc = KVLocation::RAM; }
+                                    for slot in entry.slot_ids.iter_mut() { *slot = None; }
+                                    entry.token_start = i * 256; // [FIX] Re-initialize start position
+                                    entry.token_len = 0;
+                                    entry.is_dirty.fill(true);
+                                    let mut cache = entry.bitkv_cache.write().unwrap();
+                                    cache.fill(None);
+                                }
+                            };
+
+                            if let ModelVariant::QuantizedVL(m) = &mut self.qwen3_vl {
+                                reset_reg(&m.language_model.registry);
+                                let _ = m.language_model.truncate_kv_cache(0);
+                            } else if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl {
+                                reset_reg(&m.language_model.registry);
+                                let _ = m.language_model.truncate_kv_cache(0);
+                            }
+                            self.clear_kv_cache();
+                        }
+                        break;
+                    }
+                }
             }
-
-            // [FIX] 로드 또는 스티칭 후 반드시 레이어별 블록 리스트를 새로고침해야 함 
-            self.qwen3_vl.sync_blocks_from_registry()?;
-        }
-
-        let temperature = mes.temperature.unwrap_or(1.0) as f32;
-        let seed = mes.seed.unwrap_or(34562) as u64;
-        let top_p = mes.top_p.unwrap_or(1.0) as f32;
-        let top_k = mes.top_k;
-        let min_p = mes.min_p;
-        let rep_penalty = mes.repetition_penalty.unwrap_or(1.0);
-        let pres_penalty = mes.presence_penalty.unwrap_or(0.0);
-
-        let mut lp = get_logit_processor(Some(temperature), Some(top_p), top_k, min_p, seed);
-        let mes_render = self.chat_template.apply_chat_template(&mes)?;
-        let input = self.pre_processor.process_info(&mes, &mes_render)?;
-        let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
-
-        let total_toks = f_ids.len();
-        println!("[DEBUG-PROMPT] Rendered Prompt Len: {} chars, {} tokens.", input.replace_text.len(), total_toks);
-        if total_toks > 1000 {
-            println!("[DEBUG-PROMPT] Head: {:?}", &input.replace_text[..200.min(input.replace_text.len())]);
-            println!("[DEBUG-PROMPT] Tail: {:?}", &input.replace_text[input.replace_text.len().saturating_sub(200)..]);
-        }
-
-        let kv_len = self.get_kv_len();
-        println!("[DIAG-GEN] Current KV Cache Len: {} tokens. Prompt: {} tokens.", kv_len, total_toks);
-
-        // [STRICT-STITCHING] 이미 프리필된 캐시(reference)가 있다면 그 "다음"부터 inference 폴더를 생성함
-        let mut gen_text = String::new();
-        let mut logits = if kv_len < total_toks {
-            let offset = kv_len; // 이 offset이 18944라면, 폴더도 l18944(l74)부터 생성됨
-            let missing_ids = &f_ids[offset..];
-            println!("[GEN-PREFILL] Appending {} tokens to existing context (Global Offset: {})...", missing_ids.len(), offset);
-
-            let input_ids = Tensor::from_vec(missing_ids.to_vec(), (1, missing_ids.len()), &self.text_device)?;
-            wait_for_global_io().await;
-
-            // forward 시에 offset을 전달하면 quantized_model이 자동으로 l{offset} 폴더를 생성함
-            self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_toks, session_id.clone(), _kv_name.clone()).await?
-        } else {
-            // [ROPE-FIX] 이미 모든 프롬프트가 KV에 있다면, 그 "끝"에서부터 첫 토큰을 생성해야 함
-            // 만약 kv_len이 18944이고 프롬프트가 158이라면, 실제 생성 시작 지점은 18944 + 158 - 1 이 아님.
-            // 보통 kv_len에 이미 프롬프트가 포함되어 있다고 가정하면 kv_len - 1 을 사용.
-            // 하지만 로그상 kv_len(18944)와 Prompt(158)가 별개라면 kv_len + total_toks - 1 이 맞음.
-            // 현재 구조상 kv_len은 reference(기존 지식)이고 total_toks는 현재 질문임.
-            let global_offset = kv_len + total_toks - 1;
-            println!("[GEN-TRANSITION] Already fully prefilled. Starting decode at Global Offset: {}.", global_offset);
-
-            let last_id = Tensor::from_vec(vec![f_ids[total_toks - 1]], (1, 1), &self.text_device)?;
-            self.qwen3_vl.forward(&last_id, None, None, None, None, None, global_offset, total_toks, session_id.clone(), _kv_name.clone()).await?
-        };        
-        // [PERF-FIX] 2차 프리필이 끝난 "이 시점"에서 즉시 모든 레이어를 메모리에 고정
-        println!("[MEMORY-OPT] Prefill complete. Transitioning to 24-layer High-Speed Decoding...");
-        self.reload_all_layers()?;
-
+    
+            let temperature = mes.temperature.unwrap_or(1.0) as f32;
+            let seed = mes.seed.unwrap_or(34562) as u64;
+            let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(1.0) as f32), Some(9), seed);
+            let mes_render = self.chat_template.apply_chat_template(&mes)?;
+            let input = self.pre_processor.process_info(&mes, &mes_render)?;
+            let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
+            
+            let total_toks = f_ids.len();
+            println!("[DIAG-GEN] Encoded Prompt Length: {} tokens.", total_toks); // [DEBUG] 24k 원인 파악용
+            
+            let kv_len = self.get_kv_len();
+            
+            // [REFINED-RELAY-LOGIC] Trust restored kv_len and skip prefill if it matches or covers the prompt.
+            let mut gen_text = String::new();
+            let (input_ids, offset) = if kv_len > 0 && !is_reference_snapshot {
+                if kv_len >= total_toks {
+                    println!("[SKIP-PREFILL] Snapshot covers entire prompt (Detected: {}, Needed: {}). Capping offset.", kv_len, total_toks);
+                    // [FIX] Strictly cap offset at total_toks - 1 to prevent double offset
+                    let last_id = *f_ids.last().unwrap_or(&0);
+                    (Tensor::from_vec(vec![last_id], (1, 1), &self.text_device)?, total_toks - 1)
+                } else {
+                    let missing_ids = f_ids[kv_len..].to_vec();
+                    let missing_len = missing_ids.len();
+                    println!("[PARTIAL-PREFILL] Context partially restored ({}). Prefilling remaining {} tokens.", kv_len, missing_len);
+                    (Tensor::from_vec(missing_ids, (1, missing_len), &self.text_device)?, kv_len)
+                }
+            } else {
+                if is_reference_snapshot {
+                    println!("[FULL-PREFILL] Reference context found. Computing entire prompt to fill all 28 layers (Len: {}).", total_toks);
+                } else {
+                    println!("[FULL-PREFILL] No context found. Computing entire prompt (Len: {}).", total_toks);
+                }
+                (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
+            };
+            
+            let total_tokens_after_prefill = offset + input_ids.dim(1)?;
+        
+        wait_for_global_io().await; // [SYNC] Ensure disk is ready before inference
+        let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
+        
         // [DEBUG-SAMPLING] 첫 번째 토큰 샘플링 전 로그
-        println!("[DEBUG-GEN] Ready to sample first token. EOS IDs: {}, {}", self.eos_token_id1, self.eos_token_id2);
+        println!("[DEBUG-GEN] Prefill Complete. EOS IDs: {}, {}. Sampling first token...", self.eos_token_id1, self.eos_token_id2);
 
         let mut gen_ids = vec![];
 
@@ -720,68 +605,32 @@ impl Qwen3VLGenerateModel {
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
         let lt_id = self.tokenizer.text_encode_vec("<".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
 
-        let max_new_tokens = mes.max_tokens.unwrap_or(2048);
-        println!("[GEN-START] Target: {} tokens | Temp: {} | Seed: {}", max_new_tokens, temperature, seed);
-
-        for i in 0..max_new_tokens {
-            if let Some(flag) = &cancel_flag { 
-                if flag.load(Ordering::Relaxed) { 
-                    println!("[GEN-STOP] Cancelled by user at token {}.", i);
-                    break; 
-                } 
-            }
+        for i in 0..mes.max_tokens.unwrap_or(2048) {
+            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
             
             let mut logits_tensor = logits.flatten_all()?.to_dtype(DType::F32)?;
-            let vocab_size = logits_tensor.dim(0)?;
-            // [FIX] Clone the device to avoid borrowing conflict during logits_tensor re-assignment
-            let device = logits_tensor.device().clone();
-
-            // [PENALTIES] Apply combined repetition and presence penalties (GPU)
+            
+            // [REPETITION-PENALTY]
             if !gen_ids.is_empty() {
-                logits_tensor = apply_penalties(&logits_tensor, rep_penalty, pres_penalty, &gen_ids)?;
+                logits_tensor = apply_repetition_penalty(&logits_tensor, 1.2, &gen_ids)?;
             }
 
-            // [MIN-P-FILTERING] GPU Implementation of Min-P sampling
-            if let Some(mp) = min_p {
-                if mp > 0.0 {
-                    let max_logit = logits_tensor.max(0)?.to_scalar::<f32>()?;
-                    let threshold = max_logit + (mp as f32).ln();
-                    let mask = logits_tensor.ge(threshold as f64)?;
-                    let threshold_t = Tensor::new(-1000.0f32, &candle_core::Device::Cpu)?.to_device(&device)?;
-                    logits_tensor = mask.where_cond(&logits_tensor, &threshold_t)?;
-                }
-            }
-
-            // [DENSE-BIAS] GPU Implementation to prevent reasoning mode and force JSON
-            let mut bias_indices = vec![];
-            let mut bias_values = vec![];
-            if (think_token_id as usize) < vocab_size { bias_indices.push(think_token_id); bias_values.push(-100.0f32); }
-            if (lt_id as usize) < vocab_size { bias_indices.push(lt_id); bias_values.push(-10.0f32); }
+            // [DENSE-BIAS] Penalize <think> and < to prevent reasoning mode
+            let mut logits_vec = logits_tensor.to_vec1::<f32>()?;
+            let len = logits_vec.len();
+            if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 100.0; }
+            if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 10.0; } // Bias away from starting any tags
             
             // If it's the very first token, strongly favor '{'
-            if i == 0 {
-                if (open_bracket_id as usize) < vocab_size { bias_indices.push(open_bracket_id); bias_values.push(20.0f32); }
-                if (self.eos_token_id1 as usize) < vocab_size { bias_indices.push(self.eos_token_id1); bias_values.push(-1000.0f32); }
-                if (self.eos_token_id2 as usize) < vocab_size { bias_indices.push(self.eos_token_id2); bias_values.push(-1000.0f32); }
+            if i == 0 && (open_bracket_id as usize) < len {
+                logits_vec[open_bracket_id as usize] += 20.0; // [BOOST-HEAVY] Increase boost
+                // [EOS-BAN] Forcibly ban EOS tokens on the first step
+                if (self.eos_token_id1 as usize) < len { logits_vec[self.eos_token_id1 as usize] = -1000.0; }
+                if (self.eos_token_id2 as usize) < len { logits_vec[self.eos_token_id2 as usize] = -1000.0; }
             }
-            
-            if !bias_indices.is_empty() {
-                let idx_t = Tensor::new(bias_indices.as_slice(), &candle_core::Device::Cpu)?.to_device(&device)?;
-                let val_t = Tensor::from_vec(bias_values, (bias_indices.len(),), &candle_core::Device::Cpu)?.to_device(&device)?;
-                logits_tensor = logits_tensor.scatter_add(&idx_t, &val_t, 0)?;
-            }
+            logits_tensor = Tensor::from_vec(logits_vec, logits_tensor.shape(), logits_tensor.device())?;
             
             let mut next_id = lp.sample(&logits_tensor)?;
-            
-            let piece = self.tokenizer.token_decode(vec![next_id])?;
-            // [LOG-PROGRESS] 각 토큰 생성 시마다 진행 상황 출력
-            print!("{}", piece); 
-            use std::io::Write;
-            std::io::stdout().flush().ok();
-            
-            if i % 10 == 0 {
-                println!("\n[GEN-STEP] Token {}/{}", i + 1, max_new_tokens);
-            }
             
             // [FORCE-START] If model still tries to output EOS at step 0, override it with '{'
             if i == 0 && (next_id == self.eos_token_id1 || next_id == self.eos_token_id2) {
@@ -790,8 +639,12 @@ impl Qwen3VLGenerateModel {
                 if open_bracket_id != 999999 { next_id = open_bracket_id; }
             }
             
+            if i == 0 {
+                println!("[DEBUG-GEN] First Token Final: {} ('{}')", next_id, self.tokenizer.token_decode(vec![next_id]).unwrap_or_else(|_| "???".to_string()));
+            }
+
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
-                println!("[GEN-STOP] EOS detected at token {}.", i + 1);
+                if i == 0 { println!("[DEBUG-GEN] Warning: Model emitted EOS on first token."); }
                 break; 
             }
             gen_ids.push(next_id);
@@ -808,38 +661,16 @@ impl Qwen3VLGenerateModel {
                 }
                 // 모든 괄호의 쌍이 맞고(depth 0), 마지막 토큰이 '}' 계열일 때 종료
                 if has_started && depth == 0 && gen_text.trim_end().ends_with('}') {
-                    println!("[GEN-STOP] Balanced JSON detected (Depth 0) at token {}.", i + 1);
+                    println!("[DEBUG-GEN] Balanced JSON detected (Depth 0). Stopping at token {}.", i + 1);
                     break;
                 }
             }
             
-            if i == max_new_tokens - 1 {
-                println!("[GEN-STOP] Reached max_tokens limit ({}).", max_new_tokens);
-            }
+            let current_pos = total_tokens_after_prefill + i as usize;
             
-            // [FIX] Qwen 3.5 mRoPE를 위한 Rank 3 위치 텐서 생성 (디코딩용 단일 토큰)
-            // 텍스트의 경우 [pos, pos, pos]가 연속적으로 이어져야 모델이 문맥을 인식함
-            let current_pos = self.get_kv_len();
-            
-            let pos_vec = vec![current_pos as u32];
-            let cache_pos_1d = Tensor::from_vec(pos_vec, (1, 1), &self.text_device)?;
-            // Qwen2-VL/3.5 규격: (3, 1, 1) 형태로 확장
-            let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.broadcast_as((3, 1, 1))?;
-
-            // [STRICT-OFFSET] 이전 토큰까지의 길이가 정확히 반영되어야 함
-            logits = self.qwen3_vl.forward(
-                &Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, 
-                None, None, None, None, 
-                Some(&pos_ids_3d), 
-                current_pos, 
-                current_pos + 1, 
-                session_id.clone(), 
-                _kv_name.clone()
-            ).await?;
+            wait_for_global_io().await; // [SYNC] Wait for any incremental baking
+            logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;
         }
-        
-        println!("[GEN-RESULT] Generated {} tokens. Result: {}", gen_ids.len(), gen_text.replace("\n", " "));
-        
         if let Some(s_id) = &session_id {
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
             println!("[GEN-SAVE] All active KV blocks flushed to disk.");
@@ -849,39 +680,17 @@ impl Qwen3VLGenerateModel {
 
     pub fn get_kv_len(&self) -> usize { match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.get_kv_len(), ModelVariant::QuantizedText(m) => m.language_model.get_kv_len(), _ => 0 } }
     pub async fn drop_kv_storage(&mut self) -> Result<()> { self.qwen3_vl.drop_kv_storage().await }
-    pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { 
-        match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await,
-            ModelVariant::QuantizedText(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await,
-            _ => Ok(())
-        }
-    }
-    pub async fn force_offload_layer_kv(&mut self, layer_idx: usize, session_id: &str, chunk_index: usize) -> Result<()> {
-        self.qwen3_vl.force_offload_layer_kv(layer_idx, session_id, chunk_index).await
-    }
+    pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { self.qwen3_vl.force_flush_all_active_blocks(session_id, kv_name).await }
     pub fn clear_kv_cache(&mut self) { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.clear_kv_cache(), ModelVariant::QuantizedText(m) => m.language_model.clear_kv_cache(), _ => {} } }
     pub fn save_kv_to_disk(&mut self, path: &Path, kv_name: Option<&str>, offset: usize) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.save_kv_cache(path, false, offset, kv_name), ModelVariant::QuantizedText(m) => m.language_model.save_kv_cache(path, false, offset, kv_name), _ => Ok(()) } }
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.truncate_kv_cache(len), ModelVariant::QuantizedText(m) => m.language_model.truncate_kv_cache(len), _ => Ok(()) } }
     pub fn load_kv_from_disk(&mut self, path: &Path, kv_name: Option<&str>) -> Result<()> { 
         match &mut self.qwen3_vl { 
-            ModelVariant::QuantizedVL(m) => m.language_model.load_kv_cache(path, &self.text_device, 0, 0, kv_name),
-            ModelVariant::QuantizedText(m) => m.language_model.load_kv_cache(path, &self.text_device, 0, 0, kv_name),            _ => Ok(()) 
+            ModelVariant::QuantizedVL(m) => m.language_model.load_kv_cache(path, &self.text_device, 0, 128, kv_name), 
+            ModelVariant::QuantizedText(m) => m.language_model.load_kv_cache(path, &self.text_device, 0, 128, kv_name), 
+            _ => Ok(()) 
         } 
     }
-
-    /// [NEW] 모든 레이어 가중치를 메모리에 상주시켜 디코딩 속도 확보
-    pub fn reload_all_layers(&mut self) -> Result<()> {
-        self.qwen3_vl.reload_all_layers()
-    }
-
-    pub fn reload_layer(&mut self, l_idx: usize, target_device: &Device) -> Result<()> {
-        match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.language_model.reload_layer(l_idx, target_device),
-            ModelVariant::QuantizedText(m) => m.language_model.reload_layer(l_idx, target_device),
-            _ => Ok(()),
-        }
-    }
-
     pub async fn prefill_chunk(&mut self, text: String, _cancel_flag: Option<Arc<AtomicBool>>, _relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
         let chunk_ids_vec = self.tokenizer.text_encode_vec(text, false)?;
         let chunk_size = chunk_ids_vec.len();
@@ -892,45 +701,20 @@ impl Qwen3VLGenerateModel {
     }
 }
 
-fn apply_penalties(logits: &Tensor, repetition_penalty: f32, presence_penalty: f32, previous_tokens: &[u32]) -> Result<Tensor> {
-    if repetition_penalty == 1.0 && presence_penalty == 0.0 { return Ok(logits.clone()); }
-    if previous_tokens.is_empty() { return Ok(logits.clone()); }
-
-    let device = logits.device();
-    let vocab_size = logits.dim(0)?;
-
-    // [ZERO-CPU] Keep logits on GPU. Only manipulate the indices of previous tokens.
-    let mut unique_tokens: Vec<u32> = previous_tokens.iter().cloned().collect();
-    unique_tokens.sort();
-    unique_tokens.dedup();
-    
-    // Filter out of bounds tokens
-    let unique_tokens: Vec<u32> = unique_tokens.into_iter().filter(|&t| (t as usize) < vocab_size).collect();
-    if unique_tokens.is_empty() { return Ok(logits.clone()); }
-
-    let indices = Tensor::new(unique_tokens.as_slice(), &candle_core::Device::Cpu)?.to_device(device)?;
-    
-    // 1. Get logits for previous tokens
-    let mut prev_logits = logits.index_select(&indices, 0)?;
-
-    // 2. Apply presence penalty
-    if presence_penalty != 0.0 {
-        prev_logits = (prev_logits - presence_penalty as f64)?;
+fn apply_repetition_penalty(logits: &Tensor, penalty: f32, previous_tokens: &[u32]) -> Result<Tensor> {
+    let mut logits_vec = logits.to_vec1::<f32>()?;
+    let mut set = std::collections::HashSet::new();
+    for &t in previous_tokens {
+        if !set.contains(&t) {
+            let logit = logits_vec[t as usize];
+            if logit < 0.0 {
+                logits_vec[t as usize] = logit * penalty;
+            } else {
+                logits_vec[t as usize] = logit / penalty;
+            }
+            set.insert(t);
+        }
     }
-
-    // 3. Apply repetition penalty (Multiplicative scaling on GPU)
-    if repetition_penalty != 1.0 {
-        let penalty = repetition_penalty as f64;
-        // if logit < 0 { logit * penalty } else { logit / penalty }
-        let cond = prev_logits.gt(0.0)?;
-        let div_v = (prev_logits.clone() / penalty)?;
-        let mul_v = (prev_logits.clone() * penalty)?;
-        prev_logits = cond.where_cond(&div_v, &mul_v)?;
-    }
-
-    // 4. Calculate delta and scatter back to original logits
-    let original_prev_logits = logits.index_select(&indices, 0)?;
-    let delta = (prev_logits - original_prev_logits)?;
-    
-    Ok(logits.scatter_add(&indices, &delta, 0)?)
+    let dev = logits.device();
+    Ok(Tensor::from_vec(logits_vec, logits.shape(), dev)?)
 }

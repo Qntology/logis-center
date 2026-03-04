@@ -221,7 +221,6 @@ pub fn get_logit_processor(
     temperature: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<usize>,
-    _min_p: Option<f32>, // Reserved for future native support or manual filtering
     seed: u64,
 ) -> LogitsProcessor {
     let temperature = temperature.and_then(|v| if v < 1e-7 { None } else { Some(v) });
