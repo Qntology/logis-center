@@ -353,6 +353,22 @@ pub async fn start_background_worker(
     });
 }
 
+// Helper to clear a directory's contents without deleting the directory itself
+fn clear_dir(path: &std::path::Path) -> Result<()> {
+    if path.exists() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                fs::remove_dir_all(&path)?;
+            } else {
+                fs::remove_file(&path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn process_task(
     task: Task,
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
@@ -757,6 +773,18 @@ async fn process_task(
     }
 
     // --- STEP 2: Transition to Decoding Mode ---
+    let inference_session_id = format!("{}/text/inference", task.id);
+    let kv_name_str = "text".to_string();
+
+    // [STITCH-PREP] Prepare stitch targets and measure base length for all subsequent steps
+    let mut stitch_targets: Vec<(String, usize, usize)> = Vec::new();
+    for c_idx in 0..chunk_ids_list.len() {
+        let offset = c_idx * 256;
+        stitch_targets.push((format!("{}/text/reference", task.id), offset, 256));
+    }
+    model.stitch_kv_fragments(stitch_targets.clone()).await?;
+    let base_len = model.generator.lock().await.as_ref().map(|g| g.qwen3_vl.get_kv_len()).unwrap_or(0);
+
     // [HELPER] 히스토리 데이터가 포함된 파라미터 생성 함수
     let build_params = |prompt: String, max_t: u32, texts: &Vec<String>| {
         let mut messages = Vec::new();
@@ -792,23 +820,18 @@ async fn process_task(
         if input_f.exists() { let _ = fs::remove_file(input_f); }
     }
 
-    // 2.1 [STITCH-ALL-LAYERS] Assemble virtual context from offset-centric blocks
-    // [FIX] Use "reference" subfolder for the stitched context
-    let mut stitch_targets: Vec<(String, usize, usize)> = Vec::new();
-    for c_idx in 0..chunk_ids_list.len() {
-        let offset = c_idx * 256;
-        stitch_targets.push((format!("{}/text/reference", task.id), offset, 256));
-    }
-    model.stitch_kv_fragments(stitch_targets.clone()).await?;
-    let base_len = model.generator.lock().await.as_ref().map(|g| g.qwen3_vl.get_kv_len()).unwrap_or(0);
-
     // 2.1 Classification
     log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Identifying type...", "spinner": "🔍" }));
+    
+    // [SANDBOX-INIT] Clear inference and reset context to reference PUG
+    clear_dir(&text_inf_path)?;
+    model.stitch_kv_fragments(stitch_targets.clone()).await?;
+
     let res_class = {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
             let params = build_params(parsing::page_type_prompt(), 32, &vec![]);
-            gen.generate(params, Some(cancellation_token.clone()), None, None).await?
+            gen.generate(params, Some(cancellation_token.clone()), Some(inference_session_id.clone()), Some(kv_name_str.clone())).await?
         } else { String::new() }
     };
     
@@ -817,11 +840,16 @@ async fn process_task(
 
     // 2.2 Selectors
     log_task_progress(app_handle, &task.id, &json!({ "category": "Selectors", "summary": "Locating anchors...", "spinner": "🎯" }));
+    
+    // [SANDBOX-RESET] Clear previous step and reset to reference PUG
+    clear_dir(&text_inf_path)?;
+    model.stitch_kv_fragments(stitch_targets.clone()).await?;
+
     let res_select = {
         let mut gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_mut() {
             let params = build_params(parsing::page_selectors_prompt(&page_type), 256, &vec![]);
-            gen.generate(params, Some(cancellation_token.clone()), None, None).await?
+            gen.generate(params, Some(cancellation_token.clone()), Some(inference_session_id.clone()), Some(kv_name_str.clone())).await?
         } else { String::new() }
     };
     
@@ -837,11 +865,15 @@ async fn process_task(
         if task.r#type == "parallel_extraction" {
             // ... (병렬 로직에서도 build_params 사용하도록 아래에서 수정 예정)
         } else {
+            // [SANDBOX-RESET] Clear previous step and reset to reference PUG
+            clear_dir(&text_inf_path)?;
+            model.stitch_kv_fragments(stitch_targets.clone()).await?;
+
             let res_detail = {
                 let mut gen_m = model.generator.lock().await;
                 if let Some(gen) = gen_m.as_mut() {
                     let params = build_params(extraction_instruction, 1024, &vec![]);
-                    gen.generate(params, Some(cancellation_token.clone()), None, None).await?
+                    gen.generate(params, Some(cancellation_token.clone()), Some(inference_session_id.clone()), Some(kv_name_str.clone())).await?
                 } else { String::new() }
             };
             extracted_data = parsing::parse_json_from_llm(&res_detail);
@@ -933,6 +965,9 @@ async fn process_task(
             let extraction_instruction = parsing::item2json(&page_type, &url, language);
             let pug_content = content_pug.clone();
             
+            // [SANDBOX-RESET] Clear inference before baking specific detail chunks
+            clear_dir(&text_inf_path)?;
+
             // ==================================================================================
             // [SPLIT-PARALLEL BAKING FOR DETAILS]
             // ==================================================================================
@@ -1000,10 +1035,8 @@ async fn process_task(
             let mut bake_tasks = Vec::new();
             for (c_idx, ids_vec) in chunk_ids_list.into_iter().enumerate() {
                 let model_c = model.clone();
-                let chunk_session = format!("{}_c{}", task.id, c_idx);
-                
-                // [FIX] base_len을 더하지 않고, 순수하게 청크 인덱스에 따른 256 배수 오프셋 사용
-                // base_session은 항상 0번 위치에 오고, 그 뒤에 청크들이 256 단위로 붙음
+                // [STRUCTURE-UPDATE] Detail chunks go under inference subfolder
+                let chunk_session = format!("{}/text/inference/c{}", task.id, c_idx);
                 let current_offset = base_len + (c_idx * 256); 
                 
                 bake_tasks.push(async move {
@@ -1011,14 +1044,11 @@ async fn process_task(
                     if let Some(gen) = gen_m.as_mut() {
                         gen.truncate_kv_cache(0)?; 
                         let ids_tensor = Tensor::from_vec(ids_vec.clone(), (1, ids_vec.len()), &gen.text_device)?;
-                        
-                        // [FIX] Qwen 3.5 mRoPE를 위한 Rank 3 위치 텐서 생성 (병렬 청크용)
                         let cache_pos_1d = Tensor::arange(current_offset as u32, (current_offset + ids_vec.len()) as u32, &gen.text_device)?;
                         let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, ids_vec.len()))?;
 
-                        // [CRITICAL] forward 시 6번째 인자에 3D 텐서 직접 전달
-                        gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, Some(&pos_ids_3d), current_offset, current_offset + ids_vec.len(), Some(chunk_session.clone()), Some("inference".to_string())).await?;
-                        gen.force_flush_all_active_blocks(&chunk_session, Some("inference")).await?;
+                        gen.qwen3_vl.forward(&ids_tensor, None, None, None, None, Some(&pos_ids_3d), current_offset, current_offset + ids_vec.len(), Some(chunk_session.clone()), Some("text".to_string())).await?;
+                        gen.force_flush_all_active_blocks(&chunk_session, Some("text")).await?;
                     }
                     Ok::<(String, usize), anyhow::Error>((chunk_session, ids_vec.len()))
                 });
@@ -1027,19 +1057,11 @@ async fn process_task(
             // 모든 청크를 병렬로 굽기
             let results = futures::future::join_all(bake_tasks).await;
             for res in results { chunk_results.push(res?); }
-            chunk_results.sort_by_key(|(name, _)| {
-                name.split("_c").last().unwrap_or("0").parse::<usize>().unwrap_or(0)
-            });
 
-            // 3. [ZERO-PREFILL OPTIMIZATION] 지시 사항(Instruction)만 프롬프트로 전달
-            // 이미 PUG 데이터는 SSD에 구워졌으므로(Step 1), 다시 프롬프트에 넣을 필요가 없습니다.
-            let extraction_prompt = parsing::item2json(&page_type, &url, language);
-            
-            // 4. [STITCH-ONLY] PUG 조각들만 이어붙이기
-            // [Base] + [Chunk0] + [Chunk1] + ...
+            // 4. [STITCH-ONLY] PUG 조각들만 이어붙이기: Base(Reference) + Details(Inference)
             let mut final_stitch_targets = vec![(format!("{}/text/reference", task.id), 0, base_len)];
             for (c_idx, _) in chunk_results.iter().enumerate() { 
-                let c_name = format!("{}/text/inference/{}_c{}", task.id, task.id, c_idx);
+                let c_name = format!("{}/text/inference/c{}", task.id, c_idx);
                 let c_offset = base_len + (c_idx * 256);
                 final_stitch_targets.push((c_name, c_offset, 256)); 
             }
@@ -1048,17 +1070,16 @@ async fn process_task(
 
             // 5. 즉시 결과 생성
             if let Some(gen) = model.generator.lock().await.as_mut() {
-                // 보정: Stitch 이후 실제 로드된 KV 길이를 확인
                 let actual_kv_len = gen.get_kv_len();
                 println!("[Scheduler] Virtual context assembled ({} tokens). Starting instant extraction...", actual_kv_len);
                 
-                // [FIX] 이미 구워진 텍스트(&chunk_texts)를 제외하고 지시문만 포함하여 호출
-                // 이렇게 하면 엔진이 중복 연산 없이 SSD 컨텍스트 위에서 즉시 시작합니다.
-                let params = build_params(extraction_prompt, 1024, &vec![]); 
-                
-                let res = gen.generate(params, Some(cancellation_token.clone()), None, None).await?;
+                let params = build_params(extraction_instruction, 1024, &vec![]); 
+                let res = gen.generate(params, Some(cancellation_token.clone()), Some(inference_session_id.clone()), Some(kv_name_str.clone())).await?;
                 extracted_data = parsing::parse_json_from_llm(&res);
             }
+            
+            // [SANDBOX-CLEANUP] Final cleanup of inference folder after successful extraction
+            clear_dir(&text_inf_path)?;
         }
     }
 
