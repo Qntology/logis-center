@@ -346,9 +346,11 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         // [LOAD-FIX] Match new structure: session_id/kv_type/l{offset}/b{layer}.st
                         let block_root = root.join(kv_name.as_deref().unwrap_or("inference")).join(format!("l{}", b_idx_off));
                         
+                        /* 
                         if sid == 0 {
                             println!("[LOAD-START] Loading from {:?}", block_root);
                         }
+                        */
 
                         for l_idx in 0..28 {
                             let file_path = block_root.join(format!("b{}.st", l_idx));
@@ -673,6 +675,10 @@ impl Qwen3VLGenerateModel {
         wait_for_global_io().await; // [SYNC] Ensure disk is ready before inference
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         
+        // [PERF-FIX] 프리필(Layer-by-layer) 완료 후, 디코딩을 위해 모든 레이어를 메모리에 고정
+        println!("[MEMORY-OPT] Prefill complete. Locking all 24 layers into memory for fast decoding...");
+        self.reload_all_layers()?;
+
         // [DEBUG-SAMPLING] 첫 번째 토큰 샘플링 전 로그
         println!("[DEBUG-GEN] Prefill Complete. EOS IDs: {}, {}. Sampling first token...", self.eos_token_id1, self.eos_token_id2);
 

@@ -1356,7 +1356,7 @@ impl QuantizedQwen3VLTextAttention {
                             // [SYNC-WAIT-FIX] 워커로 보내기 전에 카운터를 올려서 wait_for_global_io가 정확히 대기하게 함
                             crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-                            println!("[BAKE-START] Layer {} -> Offset {}, Path: {:?}", layer_idx, actual_off, block_dir);
+                            // println!("[BAKE-START] Layer {} -> Offset {}, Path: {:?}", layer_idx, actual_off, block_dir);
 
                             let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
                             let dump = LayerKVDump {
