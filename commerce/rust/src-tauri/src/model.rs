@@ -138,8 +138,8 @@ pub enum ModelSize {
 pub struct LogisModel {
     pub app_handle: tauri::AppHandle,
     pub generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // Primary Active Slot (GPU)
-    pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.6B RAM Slot
-    pub large_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 2B RAM Slot
+    pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.8B Text-Only RAM Slot
+    pub large_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.8B Full-Vision RAM Slot
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     
     pub is_cpu_mode: bool, 
@@ -249,7 +249,7 @@ impl LogisModel {
         {
             let mut gen = self.generator.lock().await;
             if let Some(mut g) = gen.take() {
-                println!("[DIAG-PURGE] Dropping Active Generator (0.6B/2B)...");
+                println!("[DIAG-PURGE] Dropping Active Generator (0.8B)...");
                 let _ = g.clear_kv_cache();
                 let _ = g.qwen3_vl.drop_kv_storage(); 
                 drop(g); 
@@ -668,7 +668,7 @@ impl LogisModel {
             },
             Some(ModelSize::Small) => {
                 // Small and Embedding can coexist. 
-                println!("[MODEL] Small model active. Embedding and 0.6B will coexist.");
+                println!("[MODEL] Small model active. Embedding and 0.8B will coexist.");
             },
             None => {
                 // No generator active, safe to clean up any leftovers
@@ -797,7 +797,7 @@ impl LogisModel {
     }
 
     pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        // [FIX] Default to Small (0.6B) for all chat tasks to align with 0.6B-focused architecture.
+        // [FIX] Default to Small (0.8B) for all chat tasks to align with unified architecture.
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
@@ -898,7 +898,7 @@ impl LogisModel {
         session_id: Option<String>,
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
-        // [FIX] Ensure we stay on Small (0.6B).
+        // [FIX] Ensure we stay on Small (0.8B).
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
@@ -988,7 +988,7 @@ impl LogisModel {
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.6B (Small)
+        // [VISION-DYNAMIC] 이미지가 있으면 0.8B (Large), 없으면 0.8B (Small)
         let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
         self.ensure_generator(target_size).await?;
         

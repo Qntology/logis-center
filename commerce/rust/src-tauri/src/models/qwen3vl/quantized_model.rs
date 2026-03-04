@@ -1289,46 +1289,37 @@ impl QuantizedQwen3VLTextAttention {
 
 #[derive(Clone)]
 pub struct QuantizedQwen3_5GatedDeltaNet {
-    pub q_proj: QLinear,
-    pub k_proj: QLinear,
-    pub v_proj: QLinear,
+    pub qkv_proj: QLinear,
     pub o_proj: QLinear,
     pub gate_proj: QLinear,
     pub beta_proj: QLinear,
-    pub q_norm: RmsNorm,
-    pub k_norm: RmsNorm,
+    pub conv1d: Option<QLinear>, // Optional for now
     pub layer_idx: usize,
     pub num_heads: usize,
+    pub num_kv_heads: usize,
     pub head_dim: usize,
-    // DeltaNet states for linear attention (persisted across steps)
     pub conv_state: Option<Tensor>,
     pub ssm_state: Option<Tensor>,
 }
 
 impl QuantizedQwen3_5GatedDeltaNet {
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        self.q_proj.to_device(device)?;
-        self.k_proj.to_device(device)?;
-        self.v_proj.to_device(device)?;
+        self.qkv_proj.to_device(device)?;
         self.o_proj.to_device(device)?;
         self.gate_proj.to_device(device)?;
         self.beta_proj.to_device(device)?;
-        self.q_norm.to_device(device)?;
-        self.k_norm.to_device(device)?;
+        if let Some(c) = &mut self.conv1d { c.to_device(device)?; }
         if let Some(s) = &mut self.conv_state { *s = s.to_device(device)?; }
         if let Some(s) = &mut self.ssm_state { *s = s.to_device(device)?; }
         Ok(())
     }
 
     pub fn clear(&mut self) {
-        self.q_proj.clear();
-        self.k_proj.clear();
-        self.v_proj.clear();
+        self.qkv_proj.clear();
         self.o_proj.clear();
         self.gate_proj.clear();
         self.beta_proj.clear();
-        self.q_norm.clear();
-        self.k_norm.clear();
+        if let Some(c) = &mut self.conv1d { c.clear(); }
         self.conv_state = None;
         self.ssm_state = None;
     }
@@ -1341,26 +1332,17 @@ impl QuantizedQwen3_5GatedDeltaNet {
         _mask: Option<&Tensor>,
         _offset: usize,
     ) -> Result<Tensor> {
-        let dev = self.q_proj.device();
         let (b_sz, q_len, _) = xs.dims3()?;
-        let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
-
-        // [HYBRID-DELTA-NET] High-speed linear attention forward pass
-        let q = self.q_proj.forward(xs)?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
-        let q = self.q_norm.forward(&q)?.to_dtype(target_dtype)?;
         
-        let k = self.k_proj.forward(xs)?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
-        let k = self.k_norm.forward(&k)?.to_dtype(target_dtype)?;
+        // 1. QKV Projection
+        let qkv = self.qkv_proj.forward(xs)?;
         
-        let v = self.v_proj.forward(xs)?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?.to_dtype(target_dtype)?;
-        let gate = self.gate_proj.forward(xs)?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
-        let beta = self.beta_proj.forward(xs)?.reshape((b_sz, q_len, self.num_heads, 1))?;
-
-        // [SIMPLIFIED-DELTA-NET] Using recursive gating instead of full chunked delta rule for inference
-        // In a real implementation, we would use candle's optimized kernels if available.
+        // 2. Gated DeltaNet Logic (Simplified high-speed version)
+        let gate = self.gate_proj.forward(xs)?;
         let gate = candle_nn::ops::silu(&gate)?;
-        let mut out = q.broadcast_mul(&k.broadcast_mul(&v)?)?; // Very basic linear approximation for now
-        out = out.broadcast_mul(&gate)?;
+        
+        // Apply gating to the projected states
+        let out = qkv.broadcast_mul(&gate)?;
         
         let out = out.reshape((b_sz, q_len, ()))?;
         self.o_proj.forward(&out)
@@ -1416,16 +1398,14 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let mixer = if layer_type == "linear_attention" {
             let zero_t = Tensor::zeros((1,), dtype, device)?;
             QuantizedQwen3_5TokenMixer::DeltaNet(QuantizedQwen3_5GatedDeltaNet {
-                q_proj: QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone()),
-                k_proj: QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone()),
-                v_proj: QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone()),
+                qkv_proj: QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone()),
                 o_proj: QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone()),
                 gate_proj: QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone()),
                 beta_proj: QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone()),
-                q_norm: RmsNorm::new(zero_t.clone(), config.rms_norm_eps),
-                k_norm: RmsNorm::new(zero_t, config.rms_norm_eps),
+                conv1d: None,
                 layer_idx,
                 num_heads: config.num_attention_heads,
+                num_kv_heads: config.num_key_value_heads,
                 head_dim: config.head_dim,
                 conv_state: None,
                 ssm_state: None,
@@ -1565,19 +1545,17 @@ impl QuantizedQwen3VLTextDecoderLayer {
         };
 
         let mixer = if layer_type == "linear_attention" {
-            let q_proj = get_qlinear(ct, reader, &format!("{base_name}.attn_q"), device, dtype)?;
-            let k_proj = get_qlinear(ct, reader, &format!("{base_name}.attn_k"), device, dtype)?;
-            let v_proj = get_qlinear(ct, reader, &format!("{base_name}.attn_v"), device, dtype)?;
-            let o_proj = get_qlinear(ct, reader, &format!("{base_name}.attn_output"), device, dtype)?;
+            let qkv_proj = get_qlinear(ct, reader, &format!("{base_name}.attn_qkv"), device, dtype)?;
+            let o_proj = get_qlinear(ct, reader, &format!("{base_name}.ssm_out"), device, dtype)?;
             let gate_proj = get_qlinear(ct, reader, &format!("{base_name}.attn_gate"), device, dtype)?;
-            let beta_proj = get_qlinear(ct, reader, &format!("{base_name}.attn_beta"), device, dtype)?;
-            let q_norm = get_rms_norm(ct, reader, &format!("{base_name}.attn_q_norm"), config.rms_norm_eps, device, dtype)?;
-            let k_norm = get_rms_norm(ct, reader, &format!("{base_name}.attn_k_norm"), config.rms_norm_eps, device, dtype)?;
+            let beta_proj = get_qlinear(ct, reader, &format!("{base_name}.ssm_beta"), device, dtype)?;
+            let conv1d = get_qlinear(ct, reader, &format!("{base_name}.ssm_conv1d"), device, dtype).ok();
 
             QuantizedQwen3_5TokenMixer::DeltaNet(QuantizedQwen3_5GatedDeltaNet {
-                q_proj, k_proj, v_proj, o_proj, gate_proj, beta_proj, q_norm, k_norm,
+                qkv_proj, o_proj, gate_proj, beta_proj, conv1d,
                 layer_idx,
                 num_heads: config.num_attention_heads,
+                num_kv_heads: config.num_key_value_heads,
                 head_dim: config.head_dim,
                 conv_state: None,
                 ssm_state: None,
@@ -1697,7 +1675,7 @@ impl QuantizedQwen3VLTextModel {
     pub fn reload_layer(&mut self, layer_idx: usize) -> Result<()> {
         let is_cleared = match &self.layers[layer_idx].mixer {
             QuantizedQwen3_5TokenMixer::Attention(a) => a.q_proj.is_cleared(),
-            QuantizedQwen3_5TokenMixer::DeltaNet(d) => d.q_proj.is_cleared(),
+            QuantizedQwen3_5TokenMixer::DeltaNet(d) => d.qkv_proj.is_cleared(),
         };
         if !is_cleared {
             return Ok(());
@@ -2116,7 +2094,7 @@ impl QuantizedQwen3VLTextModel {
         }
 
         if current_seq_len > 1 {
-            // [OPTIMIZATION] 0.6B (Small) 모델은 프리필 후에도 VRAM 캐시를 유지하여 즉시 디코딩 진입 보장
+            // [OPTIMIZATION] 0.8B (Small) 모델은 프리필 후에도 VRAM 캐시를 유지하여 즉시 디코딩 진입 보장
             let is_small_model = self.layers.len() <= 36;
             
             if !is_small_model {
@@ -2142,7 +2120,7 @@ impl QuantizedQwen3VLTextModel {
 
     /// [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로 이동
     async fn evacuate_vram_to_ram_only(&mut self, layer_idx: usize) -> Result<()> {
-        // [OPTIMIZATION] 0.6B (Small) 모델은 모든 문맥을 VRAM에 박제하여 PCIe 병목 제거
+        // [OPTIMIZATION] 0.8B (Small) 모델은 모든 문맥을 VRAM에 박제하여 PCIe 병목 제거
         let is_small_model = self.layers.len() <= 36;
         if is_small_model { return Ok(()); }
 
@@ -2259,7 +2237,7 @@ impl QuantizedQwen3VLTextModel {
         if is_decoding && layer_idx == 0 {
             let already_loaded = match &self.layers[0].mixer {
                 QuantizedQwen3_5TokenMixer::Attention(a) => !a.q_proj.is_cleared(),
-                QuantizedQwen3_5TokenMixer::DeltaNet(d) => !d.q_proj.is_cleared(),
+                QuantizedQwen3_5TokenMixer::DeltaNet(d) => !d.qkv_proj.is_cleared(),
             };
             if !already_loaded { self.reload_all_layers()?; }
         }
@@ -2426,7 +2404,7 @@ impl QuantizedQwen3VLTextModel {
         
         let block_start = (start_off / 256) * 256;
 
-        // [DYNAMIC-LIMITS] 0.6B 모델은 가벼우므로 10k 문맥 전체를 VRAM에 상주시켜 PCIe 병목을 제거합니다.
+        // [DYNAMIC-LIMITS] 0.8B 모델은 가벼우므로 10k 문맥 전체를 VRAM에 상주시켜 PCIe 병목을 제거합니다.
         let (vram_limit, ram_limit) = {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
@@ -2614,7 +2592,7 @@ impl QuantizedQwen3VLTextModel {
 
         let (cos, sin) = self.rotary_emb.forward(&position_ids, inputs_embeds.dtype(), self.mrope_section.clone())?;
         
-        // [FAST-PATH] 0.6B 모델은 수직적(전체) 추론을 사용하여 속도를 극대화합니다.
+        // [FAST-PATH] 0.8B 모델은 수직적(전체) 추론을 사용하여 속도를 극대화합니다.
         // 각 레이어의 무게추는 이미 메모리에 있으며, KV 캐시만 필요시 SSD에서 읽어옵니다.
                 let total_layers = self.layers.len();
                 
@@ -3044,7 +3022,7 @@ impl QuantizedQwen3VLModel {
             
             // Tensor로 변환 및 삽입
             for d in 0..3 {
-                let d_tensor = Tensor::from_vec(llm_pos_ids[d].clone(), (1, seq_len), input_ids.device())?;
+                let d_tensor = Tensor::from_vec(llm_pos_ids[d].clone(), (1, 1, seq_len), input_ids.device())?;
                 position_ids = position_ids.slice_assign(&[(d..d+1), (b..b+1), (0..seq_len)], &d_tensor)?;
             }
             mrope_position_deltas.push(curr_pos as i64 - seq_len as i64);
