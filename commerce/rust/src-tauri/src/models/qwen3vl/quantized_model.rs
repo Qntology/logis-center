@@ -1272,7 +1272,7 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_blocks.clear();
     }
 
-    pub fn trigger_realtime_incremental_bake(&self, session_id: &str, is_last_chunk: bool, baking_only: bool, is_decoding: bool, chunk_offset: usize) -> Result<()> {
+    pub fn trigger_realtime_incremental_bake(&self, session_id: &str, _is_last_chunk: bool, baking_only: bool, is_decoding: bool, chunk_offset: usize) -> Result<()> {
         use crate::models::qwen3vl::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
 
         let total_blocks = self.kv_blocks.len();
@@ -1333,9 +1333,6 @@ impl QuantizedQwen3VLTextAttention {
                     
                     // [BATCH-RESTORE] 기존 매커니즘과 호환되도록 단일 세션 폴더 내에 순차 오프셋으로 저장
                     let actual_off = if b_sz > 1 { b * 256 } else { off };
-                    
-                    let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
-                    let kv_type = if kv_name_raw.contains("image") { "image" } else { "text" };
                     
                     let session_id_owned = session_id.to_string();
                     let registry_clone = self.registry.clone();
@@ -1764,8 +1761,9 @@ impl QuantizedQwen3VLTextAttention {
         }
 
         if self.layer_idx == 0 {
-            println!("[SSD-RESTORE] Restored {} tokens across {} blocks.", total_restored_len, fragments.len());
+            println!("[SSD-RESTORE] Restored {} tokens across {} blocks. Updating Session Offset: {}.", total_restored_len, fragments.len(), current_kv_len);
         }
+        self.session_start_offset = current_kv_len; // [FIX] SSD 로드 후 생성되는 토큰들의 오프셋 기준점 설정
         Ok(())
     }
 

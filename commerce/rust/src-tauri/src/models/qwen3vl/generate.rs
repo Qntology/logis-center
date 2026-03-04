@@ -308,7 +308,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
 
                     for l_idx in 0..loop_count {
-                        let mut src = bake.layers[l_idx].clone();
+                        let src = bake.layers[l_idx].clone();
                         let act_l = src.layer_idx;
                         let task_dir = bake.task_dir.clone();
                         let registry_inner = registry.clone();
@@ -671,18 +671,24 @@ impl Qwen3VLGenerateModel {
             let offset = kv_len; // 이 offset이 18944라면, 폴더도 l18944(l74)부터 생성됨
             let missing_ids = &f_ids[offset..];
             println!("[GEN-PREFILL] Appending {} tokens to existing context (Global Offset: {})...", missing_ids.len(), offset);
-            
+
             let input_ids = Tensor::from_vec(missing_ids.to_vec(), (1, missing_ids.len()), &self.text_device)?;
             wait_for_global_io().await;
-            
+
             // forward 시에 offset을 전달하면 quantized_model이 자동으로 l{offset} 폴더를 생성함
             self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_toks, session_id.clone(), _kv_name.clone()).await?
         } else {
-            println!("[GEN-TRANSITION] Already fully prefilled at offset {}. Ready to decode.", kv_len);
+            // [ROPE-FIX] 이미 모든 프롬프트가 KV에 있다면, 그 "끝"에서부터 첫 토큰을 생성해야 함
+            // 만약 kv_len이 18944이고 프롬프트가 158이라면, 실제 생성 시작 지점은 18944 + 158 - 1 이 아님.
+            // 보통 kv_len에 이미 프롬프트가 포함되어 있다고 가정하면 kv_len - 1 을 사용.
+            // 하지만 로그상 kv_len(18944)와 Prompt(158)가 별개라면 kv_len + total_toks - 1 이 맞음.
+            // 현재 구조상 kv_len은 reference(기존 지식)이고 total_toks는 현재 질문임.
+            let global_offset = kv_len + total_toks - 1;
+            println!("[GEN-TRANSITION] Already fully prefilled. Starting decode at Global Offset: {}.", global_offset);
+
             let last_id = Tensor::from_vec(vec![f_ids[total_toks - 1]], (1, 1), &self.text_device)?;
-            self.qwen3_vl.forward(&last_id, None, None, None, None, None, total_toks - 1, total_toks, session_id.clone(), _kv_name.clone()).await?
-        };
-        
+            self.qwen3_vl.forward(&last_id, None, None, None, None, None, global_offset, total_toks, session_id.clone(), _kv_name.clone()).await?
+        };        
         // [PERF-FIX] 2차 프리필이 끝난 "이 시점"에서 즉시 모든 레이어를 메모리에 고정
         println!("[MEMORY-OPT] Prefill complete. Transitioning to 24-layer High-Speed Decoding...");
         self.reload_all_layers()?;
