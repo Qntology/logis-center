@@ -1348,35 +1348,41 @@ impl QuantizedQwen3_5GatedDeltaNet {
         let qkv = self.qkv_proj.forward(xs)?;
         let chunks = qkv.chunk(3, 2)?; 
 
-        // Reshape to head-wise structure: [B, L, 16, 128]
-        let q = chunks[0].reshape((b_sz, q_len, self.num_heads, self.head_dim))?.transpose(1, 2)?;
-        let k = chunks[1].reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
-        let v = chunks[2].reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
+        // Reshape to head-wise structure: [B, H, L, D]
+        let q = chunks[0].reshape((b_sz, q_len, self.num_heads, self.head_dim))?.transpose(1, 2)?.to_dtype(target_dtype)?;
+        let k = chunks[1].reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?.to_dtype(target_dtype)?;
+        let v = chunks[2].reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?.to_dtype(target_dtype)?;
 
-        // 2. Gate Projection: [B, L, 1024] -> [B, L, 2048]
-        let gate = self.gate_proj.forward(xs)?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?.transpose(1, 2)?;
+        // 2. Compute Current State Fragment: K^T * V -> [B, H, D, D]
+        let k_t = k.transpose(2, 3)?.contiguous()?;
+        let v_cont = v.contiguous()?;
+        let mut current_state = k_t.matmul(&v_cont)?; 
+
+        // [HYBRID-STATE-MANAGEMENT] Accumulate state across steps if available
+        if let Some(block) = self.conv_state.as_ref().or(self.ssm_state.as_ref()) {
+             current_state = (current_state + block.to_device(dev)?.to_dtype(target_dtype)?.contiguous()?)?;
+        }
+        self.ssm_state = Some(current_state.clone());
+
+        // 3. Gate Projection: [B, L, 1024] -> [B, L, 2048]
+        let gate = self.gate_proj.forward(xs)?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?.transpose(1, 2)?.to_dtype(target_dtype)?.contiguous()?;
         let gate = candle_nn::ops::silu(&gate)?;
 
-        // 3. Head-wise Linear Attention Approximation: (q * k) * v * gate
-        let q = q.to_dtype(target_dtype)?;
-        let k = k.to_dtype(target_dtype)?;
-        let v = v.to_dtype(target_dtype)?;
-        let gate = gate.to_dtype(target_dtype)?;
-        
-        let att = q.broadcast_mul(&k)?;
-        let mut out = att.broadcast_mul(&v)?;
-        out = out.broadcast_mul(&gate)?;
-        
-        // 4. Scaling
+        // 4. Final Head-wise Linear Attention: (Q * State) * Gate
+        let q_cont = q.contiguous()?;
+        let mut out = q_cont.matmul(&current_state.contiguous()?)?;
+        // Scaling
         let scaling = 1.0 / (self.head_dim as f64).sqrt();
         let scaling_tensor = Tensor::new(&[scaling as f32], dev)?.to_dtype(target_dtype)?;
         out = out.broadcast_mul(&scaling_tensor)?;
 
-        // 5. Final Assembly: [B, H, L, D] -> [B, L, H*D] -> [B, L, 2048]
+        // Apply Gating
+        out = out.broadcast_mul(&gate)?;
+
+        // 5. Final Assembly: [B, H, L, D] -> [B, L, H*D] -> [B, L, 1024]
         let out = out.transpose(1, 2)?.reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out)
     }
-
         }
 
 
