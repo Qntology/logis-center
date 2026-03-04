@@ -453,8 +453,8 @@ impl Qwen3VLGenerateModel {
         };
         let t_dev = get_device(text_device); let v_dev = get_device(vision_device); let dtype = get_dtype(dtype, cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16"));
         let gguf_f = find_type_files(path, "gguf")?; let mmproj_p = gguf_f.iter().find(|f| f.contains("mmproj")).cloned();
-        let mut m_p = gguf_f.iter().find(|f| f.contains("Qwen3.5-0.8B")).cloned();
-        if m_p.is_none() { m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.6B")).cloned(); }
+        let mut m_p = gguf_f.iter().find(|f| f.contains("Qwen3.5-0.8B") && !f.contains("mmproj")).cloned();
+        if m_p.is_none() { m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.6B") && !f.contains("mmproj")).cloned(); }
         if m_p.is_none() { m_p = gguf_f.iter().find(|f| !f.contains("mmproj")).cloned(); }
         let qwen3_vl = if !gguf_f.is_empty() {
             let kv_res = hard_token_limit.unwrap_or(4096) as u64 * 40000;

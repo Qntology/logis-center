@@ -1765,6 +1765,7 @@ impl QuantizedQwen3VLTextModel {
         let is_forced_cpu = device.is_cpu();
         let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader = std::io::Cursor::new(mmap);
+        
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
         let alt_token_emb2 = "embed_tokens.weight";
