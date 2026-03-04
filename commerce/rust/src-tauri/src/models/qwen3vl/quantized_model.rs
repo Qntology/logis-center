@@ -506,14 +506,17 @@ impl QuantizedQwen3VLTextAttention {
             }
         };
 
-        // Determine V-head dimension based on output projection input size
+        // Determine V-head dimension based on actual V-projection output size
         let v_h_dim = {
-            let o_in = match &o_proj.inner {
-                QMatMul::Tensor(t) => t.dim(1).unwrap_or(0),
-                QMatMul::QTensor(t) => t.shape().dims()[1],
-                QMatMul::TensorF16(t) => t.dim(1).unwrap_or(0),
+            let v_out = match &v_proj.inner {
+                QMatMul::Tensor(t) => t.dim(0).unwrap_or(0),
+                QMatMul::QTensor(t) => t.shape().dims()[0],
+                QMatMul::TensorF16(t) => t.dim(0).unwrap_or(0),
             };
-            o_in / n_attn_heads
+            // If unified QKV, v_out is 6144, we want 2048 / heads. 
+            // If individual, v_out is 512, we want 512 / heads.
+            let v_actual_out = if v_out == 6144 { 2048 } else { v_out };
+            v_actual_out / n_kv_heads.max(1)
         };
 
         let num_kv_groups = n_attn_heads / (n_kv_heads as usize).max(1);
@@ -1478,6 +1481,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
                 num_key_value_heads: config.num_key_value_heads,
                 num_kv_groups: config.num_attention_heads / config.num_key_value_heads.max(1),
                 head_dim: config.head_dim,
+                v_head_dim: config.head_dim, // Default to head_dim for skeleton
                 scaling: 1.0 / (config.head_dim as f64).sqrt(),
                 kv_blocks: Vec::new(),
                 registry,
@@ -1702,6 +1706,23 @@ impl QuantizedQwen3VLTextDecoderLayer {
     pub fn batch_load_kv(&mut self, kv_name: &str) -> Result<()> {
         if let QuantizedQwen3_5TokenMixer::Attention(a) = &mut self.mixer {
             a.batch_load_layer_kv(kv_name)?;
+        }
+        Ok(())
+    }
+
+    /// [NEW] 스티칭된 가상 장부를 실제 모델 레이어의 KV 블록 리스트로 동기화합니다.
+    pub fn sync_blocks_from_registry(&mut self) -> Result<()> {
+        if let QuantizedQwen3_5TokenMixer::Attention(ref mut self_attn) = self.mixer {
+            self_attn.kv_blocks.clear();
+            let reg_entries = self_attn.registry.entries.read().unwrap();
+
+            for (idx, entry) in reg_entries.iter().enumerate() {
+                if entry.ssd_path.is_some() && entry.token_len > 0 {
+                    // 스티칭된 경로가 있는 경우 해당 블록을 모델의 실행 리스트에 추가
+                    let new_block = KVBlock::new(KVLocation::SSD, idx, entry.token_len, entry.token_start);
+                    self_attn.kv_blocks.push(new_block);
+                }
+            }
         }
         Ok(())
     }

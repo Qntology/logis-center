@@ -593,7 +593,14 @@ impl Qwen3VLGenerateModel {
             let total_tokens_after_prefill = offset + input_ids.dim(1)?;
         
         wait_for_global_io().await; // [SYNC] Ensure disk is ready before inference
-        let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
+        
+        let mut logits = match self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await {
+            Ok(l) => l,
+            Err(e) => {
+                println!("[PREFILL-ERROR] Forward pass failed during prefill: {}", e);
+                return Err(e);
+            }
+        };
         
         // [DEBUG-SAMPLING] 첫 번째 토큰 샘플링 전 로그
         println!("[DEBUG-GEN] Prefill Complete. EOS IDs: {}, {}. Sampling first token...", self.eos_token_id1, self.eos_token_id2);
