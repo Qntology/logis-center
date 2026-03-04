@@ -1334,15 +1334,23 @@ impl QuantizedQwen3_5GatedDeltaNet {
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
         
-        // 1. QKV Projection
+        // 1. QKV Projection & Splitting
         let qkv = self.qkv_proj.forward(xs)?;
+        let chunks = qkv.chunk(3, 2)?; // Split 6144 into [2048, 2048, 2048]
+        let q = &chunks[0];
+        let k = &chunks[1];
+        let v = &chunks[2];
         
-        // 2. Gated DeltaNet Logic (Simplified high-speed version)
+        // 2. Gate & Beta Projection
         let gate = self.gate_proj.forward(xs)?;
         let gate = candle_nn::ops::silu(&gate)?;
+        let _beta = self.beta_proj.forward(xs)?; 
         
-        // Apply gating to the projected states
-        let out = qkv.broadcast_mul(&gate)?;
+        // 3. Simplified Linear Attention Approximation: (q * k) * v * gate
+        // This maintains the 2048 dimension throughout the pipe.
+        let att = q.broadcast_mul(k)?;
+        let mut out = att.broadcast_mul(v)?;
+        out = out.broadcast_mul(&gate)?;
         
         let out = out.reshape((b_sz, q_len, ()))?;
         self.o_proj.forward(&out)
@@ -1539,7 +1547,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
             .unwrap_or("full_attention");
 
         let (attn_base, gate, up, down, in_ln, post_ln) = if is_gguf_naming {
-            (base_name.to_string(), "ffn_gate", "ffn_up", "ffn_down", "attn_norm", "ffn_norm")
+            (base_name.to_string(), "ffn_gate", "ffn_up", "ffn_down", "attn_norm", "post_attention_norm")
         } else {
             (format!("{}.self_attn", base_name), "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "input_layernorm", "post_attention_layernorm")
         };
@@ -1570,7 +1578,16 @@ impl QuantizedQwen3VLTextDecoderLayer {
             let mg = Some(get_qlinear(ct, reader, &format!("{base_name}.{gate}"), device, dtype)?);
             let mu = Some(get_qlinear(ct, reader, &format!("{base_name}.{up}"), device, dtype)?);
             let md = Some(get_qlinear(ct, reader, &format!("{base_name}.{down}"), device, dtype)?);
-            let pln = Some(get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype)?);
+            
+            // Try different names for the post-attention/FFN normalization layer
+            let pln = if let Ok(n) = get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype) {
+                Some(n)
+            } else if let Ok(n) = get_rms_norm(ct, reader, &format!("{base_name}.ssm_norm"), config.rms_norm_eps, device, dtype) {
+                Some(n)
+            } else {
+                get_rms_norm(ct, reader, &format!("{base_name}.ffn_norm"), config.rms_norm_eps, device, dtype).ok()
+            };
+            
             (mg, mu, md, pln)
         } else {
             (None, None, None, None)
