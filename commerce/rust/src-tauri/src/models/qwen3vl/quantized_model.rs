@@ -743,6 +743,7 @@ impl QuantizedQwen3VLTextAttention {
             vram_merged_k: None,
             vram_merged_v: None,
             merged_vram_block_count: 0,
+            session_start_offset: 0,
         })
     }
 
@@ -1280,7 +1281,6 @@ impl QuantizedQwen3VLTextAttention {
 
         let target_indices: Vec<usize> = self.kv_blocks.iter().enumerate().filter_map(|(i, b)| {
             let inner = b.inner.read().unwrap();
-            let is_full = inner.len == 256;
             
             // [DIRTY-CHECK] Only bake if THIS layer is dirty for this block
             let is_dirty = {
@@ -1349,10 +1349,9 @@ impl QuantizedQwen3VLTextAttention {
                             // [STRUCTURE-RESTORE] text / NAME / text / l{relative} 구조를 정확히 재현
                             let local_chunk_idx = (actual_off.saturating_sub(session_start_off)) / 256;
                             
-                            // [NAME-CLEANUP] session_id가 이미 'task/text/inference' 구조라면 'text'를 중복하지 않음
-                            // 하지만 사용자 tree에 따르면 세션ID 이후에 text/inference/text 순서임
+                            // [NAME-CLEANUP] session_id 자체가 이미 'text/reference' 형태이므로 kv_type 중복 생략
                             let kv_root = crate::utils::paths::get_kv_dir(None);
-                            let sub_path = format!("{}/text", session_id_owned); // [TASK]/text/inference/text 구조 재현
+                            let sub_path = session_id_owned; // [FIX] session_id를 그대로 사용하여 경로 중복 방지
                             let block_dir = kv_root.join(&sub_path).join(format!("l{}", local_chunk_idx));
                             
                             if !block_dir.exists() { 
@@ -1663,9 +1662,8 @@ impl QuantizedQwen3VLTextAttention {
                     // saturating_sub로 한 번 더 안전 장치 마련
                     let local_chunk_idx = (dump.offset.saturating_sub(session_start_off)) / 256;
                     
-                    // [STRUCTURE-RESTORE] text / NAME / text / l{relative} 구조 재현
-                    let sub_path_nested = format!("{}/text", sub_path);
-                    let block_dir = kv_root.join(&sub_path_nested).join(format!("l{}", local_chunk_idx));
+                    // [STRUCTURE-RESTORE] session_id가 이미 'task/text/reference' 형태이므로 그대로 사용
+                    let block_dir = kv_root.join(&sub_path).join(format!("l{}", local_chunk_idx));
                     if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
 
                     // [SYNC-WAIT-FIX] 워커로 보내기 전에 카운터를 올려서 wait_for_global_io가 정확히 대기하게 함
@@ -1674,7 +1672,7 @@ impl QuantizedQwen3VLTextAttention {
                     let _ = tx.send(SlotTask::Bake(BakeTask {
                         slot_id: sid,
                         task_dir: block_dir,
-                        kv_name: Some(sub_path_nested),
+                        kv_name: Some(sub_path.clone()),
                         offset: dump.offset, 
                         layers: vec![dump],
                         is_relay_baking: baking_only,
@@ -1860,6 +1858,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
             vram_merged_k: None,
             vram_merged_v: None,
             merged_vram_block_count: 0,
+            session_start_offset: 0,
         };
         self_attn.clear(); // 내부적으로 1-element 상태로 확정
 
@@ -2392,6 +2391,7 @@ impl QuantizedQwen3VLTextModel {
             active_kv_name: None, 
             pinned_layer_count: if current_device.is_cuda() { num_layers_to_load } else { 0 }, 
             current_kv_len: 0,
+            session_start_offset: 0,
             config: config.clone(),
             ct: Some(ct),
             base_name: base_name.to_string(),
@@ -2486,6 +2486,7 @@ impl QuantizedQwen3VLTextModel {
             active_kv_name: None, 
             pinned_layer_count, 
             current_kv_len: 0,
+            session_start_offset: 0,
             config: config.clone(),
             ct: Some(ct),
             base_name: base_name.to_string(),
@@ -3025,14 +3026,16 @@ impl QuantizedQwen3VLTextModel {
                 let kv_name_base = self.active_kv_name.as_deref().unwrap_or("general");
                 
                 let sub_path = if mode {
-                    format!("{}/reference/{}", session_id, kv_name_base)
+                    format!("{}/{}/reference", session_id, kv_name_base)
                 } else {
-                    format!("{}/inference/{}", session_id, kv_name_base)
+                    format!("{}/{}/inference", session_id, kv_name_base)
                 };
 
                 for (dump, off, b_len) in dumps_to_send {
                     let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
-                    let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
+                    // [LOCAL-INDEX-RESTORE] 물리 폴더명은 세션 내 상대 번호(l0, l1...)로 생성
+                    let local_chunk_idx = off / 256;
+                    let block_dir = kv_dir.join(&sub_path).join(format!("l{}", local_chunk_idx));
                     if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
                     
                     {
