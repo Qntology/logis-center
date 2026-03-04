@@ -721,12 +721,12 @@ async fn process_task(
                 let chunk_dir = text_ref_path.join("text").join(format!("l{}", chunk_index));
                 if !chunk_dir.exists() { fs::create_dir_all(&chunk_dir)?; }
                 
-                // 1. Prepare Input (이전 레이어의 출력값 b{N-1}.st)
-                let input_path = if current_l == 0 { chunk_dir.join("input.st") } else { chunk_dir.join(format!("b{}.st", current_l - 1)) };
+                // 1. Prepare Input (이전 레이어의 Hidden States h{N-1}.st)
+                // [FIX] b{N}.st 대신 h{N}.st 명칭을 사용하여 벡터를 전달함
+                let input_path = if current_l == 0 { chunk_dir.join("input.st") } else { chunk_dir.join(format!("h{}.st", current_l - 1)) };
                 let device = gen.text_device.clone();
                 let dtype = if device.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
                 
-                // [FIX] TensorNotFound 에러 해결: 엔진의 규격에 맞는 load_hidden_states 호출
                 let xs = gen.qwen3_vl.load_hidden_states(&input_path, &device, dtype)?;
 
                 // 2. Prepare Position/RoPE
@@ -740,17 +740,16 @@ async fn process_task(
                 };
 
                 // 3. Forward Single Layer
-                // [FIX] Restore session_id to let the engine manage the single optimized save to reference folder.
                 let ref_session_id = Some(format!("{}/text/reference", task.id));
                 let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, chunk_index, ref_session_id, kv_name_c, true, chunk_index).await?;
 
-                // 4. [MANDATORY] Save Hidden States for NEXT Layer (b{N}.st)
-                let output_path = chunk_dir.join(format!("b{}.st", current_l));
+                // 4. [MANDATORY] Save Hidden States for NEXT Layer (h{N}.st)
+                let output_path = chunk_dir.join(format!("h{}.st", current_l));
                 gen.qwen3_vl.save_hidden_states(&output_path, &next_xs)?;
             }
         }
         
-        // [SYNC] 모든 병렬 IO(KV 저장)가 끝날 때까지 대기
+        // [SYNC] 모든 병렬 IO(KV 저장 및 Hidden States)가 끝날 때까지 대기
         crate::models::qwen3vl::generate::wait_for_global_io().await;
 
         // [MEMORY-OPT] 연산이 끝난 레이어는 즉시 소각하여 VRAM 확보
