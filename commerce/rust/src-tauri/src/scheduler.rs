@@ -681,8 +681,8 @@ async fn process_task(
         let gen_m = model.generator.lock().await;
         if let Some(gen) = gen_m.as_ref() {
             for (c_idx, ids_vec) in chunk_ids_list.iter().enumerate() {
-                // [STRUCTURE-FIX] Use chunk index (l0, l1, l2...) under reference
-                let offset_dir = text_ref_path.join(format!("l{}", c_idx));
+                // [FIX] 엔진의 자동 경로(kv_name 폴더 포함)와 일치시킴
+                let offset_dir = text_ref_path.join("text").join(format!("l{}", c_idx));
                 if !offset_dir.exists() { fs::create_dir_all(&offset_dir)?; }
                 
                 let ids_t = Tensor::from_vec(ids_vec.clone(), (1, ids_vec.len()), &gen.text_device)?;
@@ -717,7 +717,9 @@ async fn process_task(
 
             let mut gen_m = model.generator.lock().await;
             if let Some(gen) = gen_m.as_mut() {
-                let chunk_dir = text_ref_path.join(format!("l{}", chunk_index));
+                // [FIX] 엔진의 자동 경로(kv_name 폴더 포함)와 일치시킴
+                let chunk_dir = text_ref_path.join("text").join(format!("l{}", chunk_index));
+                if !chunk_dir.exists() { fs::create_dir_all(&chunk_dir)?; }
                 
                 // 1. Load Input (이전 레이어의 출력값 b{N-1}.st)
                 let input_path = if current_l == 0 { chunk_dir.join("input.st") } else { chunk_dir.join(format!("b{}.st", current_l - 1)) };
@@ -736,12 +738,11 @@ async fn process_task(
                 };
 
                 // 3. Forward Single Layer
-                // [REMOVED] session_id 제거하여 엔진 자동 저장 방지 (레거시 제거)
-                let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, chunk_index, None, kv_name_c, true, chunk_index).await?;
+                // [FIX] Restore session_id to let the engine manage the single optimized save to reference folder.
+                let ref_session_id = Some(format!("{}/text/reference", task.id));
+                let _next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, chunk_index, ref_session_id, kv_name_c, true, chunk_index).await?;
 
-                // 4. Save Next Hidden States (b{N}.st)
-                let output_path = chunk_dir.join(format!("b{}.st", current_l));
-                gen.qwen3_vl.save_hidden_states(&output_path, &next_xs)?;
+                // [REMOVED] Legacy redundant manual save_hidden_states was here.
             }
         }
         
@@ -765,10 +766,11 @@ async fn process_task(
     let kv_name_str = "text".to_string();
 
     // [STITCH-PREP] Prepare stitch targets and measure base length for all subsequent steps
+    // [FIX] 엔진이 baking 시 kv_name("text") 폴더를 자동으로 추가하므로 경로에 이를 반영함
     let mut stitch_targets: Vec<(String, usize, usize)> = Vec::new();
     for c_idx in 0..chunk_ids_list.len() {
         let offset = c_idx * 256;
-        stitch_targets.push((format!("{}/text/reference", task.id), offset, 256));
+        stitch_targets.push((format!("{}/text/reference/text", task.id), offset, 256));
     }
     model.stitch_kv_fragments(stitch_targets.clone()).await?;
     let base_len = model.generator.lock().await.as_ref().map(|g| g.qwen3_vl.get_kv_len()).unwrap_or(0);
@@ -801,10 +803,11 @@ async fn process_task(
     };
 
     // [CLEANUP] Remove all temporary hidden state files (b23.st etc.)
+    // [FIX] 엔진 경로(text subfolder) 반영
     for c_idx in 0..chunk_ids_list.len() {
-        let last_b = text_ref_path.join(format!("l{}", c_idx)).join(format!("b{}.st", num_total_layers - 1));
+        let last_b = text_ref_path.join("text").join(format!("l{}", c_idx)).join(format!("b{}.st", num_total_layers - 1));
         if last_b.exists() { let _ = fs::remove_file(last_b); }
-        let input_f = text_ref_path.join(format!("l{}", c_idx)).join("input.st");
+        let input_f = text_ref_path.join("text").join(format!("l{}", c_idx)).join("input.st");
         if input_f.exists() { let _ = fs::remove_file(input_f); }
     }
 
@@ -1047,7 +1050,8 @@ async fn process_task(
             for res in results { chunk_results.push(res?); }
 
             // 4. [STITCH-ONLY] PUG 조각들만 이어붙이기: Base(Reference) + Details(Inference)
-            let mut final_stitch_targets = vec![(format!("{}/text/reference", task.id), 0, base_len)];
+            // [FIX] 엔진 경로(text subfolder) 반영
+            let mut final_stitch_targets = vec![(format!("{}/text/reference/text", task.id), 0, base_len)];
             for (c_idx, _) in chunk_results.iter().enumerate() { 
                 let c_name = format!("{}/text/inference/c{}", task.id, c_idx);
                 let c_offset = base_len + (c_idx * 256);
