@@ -742,7 +742,11 @@ async fn process_task(
                 // 3. Forward Single Layer
                 // [FIX] Restore session_id to let the engine manage the single optimized save to reference folder.
                 let ref_session_id = Some(format!("{}/text/reference", task.id));
-                let _next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, chunk_index, ref_session_id, kv_name_c, true, chunk_index).await?;
+                let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, chunk_index, ref_session_id, kv_name_c, true, chunk_index).await?;
+
+                // 4. [MANDATORY] Save Hidden States for NEXT Layer (b{N}.st)
+                let output_path = chunk_dir.join(format!("b{}.st", current_l));
+                gen.qwen3_vl.save_hidden_states(&output_path, &next_xs)?;
             }
         }
         
