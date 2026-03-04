@@ -321,33 +321,36 @@ impl KVRegistry {
         // 초기화
         for entry in entries.iter_mut() {
             entry.task_root = None;
+            entry.ssd_path = None; // [NEW] Clear explicit SSD path as well
             entry.token_len = 0;
             for loc in &mut entry.location { *loc = KVLocation::SSD; }
         }
 
         let mut current_block_idx = 0;
+        let kv_root = crate::utils::paths::get_kv_dir(None);
+
         for (session_id, _unused_off, length_tokens) in sessions {
             let num_blocks = (length_tokens + 255) / 256;
-            let task_dir = crate::utils::paths::get_kv_dir(None).join(&session_id).join("text");
+            // [STRUCTURE-FIX] session_id가 이미 'task/text/reference' 형태이므로 그대로 사용
+            let task_dir = kv_root.join(&session_id);
 
             for b_idx in 0..num_blocks {
                 if current_block_idx >= entries.len() { break; }
                 
-                // [STRUCTURE-FIX] Check for chunk directory existence instead of b0.st
-                // Hybrid models like Qwen 3.5 might have some layers (like layer 0) without KV cache.
+                // [STRUCTURE-FIX] Check for chunk directory existence (l0, l1...)
                 let chunk_dir = task_dir.join(format!("l{}", b_idx));
-                let mut found_path = if chunk_dir.is_dir() { Some(task_dir.clone()) } else { None };
+                let mut found_path = if chunk_dir.is_dir() { Some(chunk_dir) } else { None };
 
                 // Fallback: check for l{offset} directory
                 if found_path.is_none() {
                     let token_start = current_block_idx * 256;
                     let alt_chunk_dir = task_dir.join(format!("l{}", token_start));
-                    if alt_chunk_dir.is_dir() { found_path = Some(task_dir.clone()); }
+                    if alt_chunk_dir.is_dir() { found_path = Some(alt_chunk_dir); }
                 }
                 
-                if let Some(final_task_dir) = found_path {
+                if let Some(final_chunk_dir) = found_path {
                     let entry = &mut entries[current_block_idx];
-                    entry.task_root = Some(final_task_dir);
+                    entry.ssd_path = Some(final_chunk_dir); // [FIX] 개별 청크의 lN 폴더를 저장
                     entry.token_len = if b_idx == num_blocks - 1 {
                         let rem = length_tokens % 256;
                         if rem == 0 { 256 } else { rem }
@@ -1272,7 +1275,7 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_blocks.clear();
     }
 
-    pub fn trigger_realtime_incremental_bake(&self, session_id: &str, _is_last_chunk: bool, baking_only: bool, is_decoding: bool, chunk_offset: usize) -> Result<()> {
+    pub fn trigger_realtime_incremental_bake(&self, session_id: &str, _is_last_chunk: bool, baking_only: bool, is_decoding: bool, chunk_offset: usize, tokens: Option<Vec<u32>>) -> Result<()> {
         use crate::models::qwen3vl::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
 
         let total_blocks = self.kv_blocks.len();
@@ -1340,6 +1343,7 @@ impl QuantizedQwen3VLTextAttention {
                     let num_kv_h = self.num_key_value_heads;
                     let h_d = self.head_dim;
                     let session_start_off = self.session_start_offset; // 세션 시작 오프셋 사용
+                    let tokens_clone = tokens.clone(); // [NEW]
 
                     tauri::async_runtime::spawn(async move {
                         if let Some(tx) = BAKE_TX.get() {
@@ -1381,6 +1385,7 @@ impl QuantizedQwen3VLTextAttention {
                                 is_relay_baking: baking_only,
                                 block_idx: Some(actual_off / 256),
                                 registry: registry_clone,
+                                tokens: tokens_clone, // [NEW] 토큰 전달
                             })).await {
                                 eprintln!("[BAKE-TRIGGER-ERROR] Failed to send BakeTask: {}. Releasing slot {}.", e, sid);
                                 SLOT_MANAGER.release_slot(sid).await;
@@ -2795,6 +2800,7 @@ impl QuantizedQwen3VLTextModel {
         session_id: Option<String>,
         kv_name: Option<String>,
         baking_only: bool,
+        tokens: Option<Vec<u32>>, // [NEW] 입력 토큰 추가
     ) -> Result<Tensor> {
         let _start_layer_time = std::time::Instant::now();
         let input_token_count = xs.dim(1).unwrap_or(0);
@@ -3021,19 +3027,18 @@ impl QuantizedQwen3VLTextModel {
             if let Some(tx) = BAKE_TX.get() {
                 let kv_dir = crate::utils::paths::get_kv_dir(None);
                 let mode = self.baking_only;
-                let kv_name_base = self.active_kv_name.as_deref().unwrap_or("general");
-                
+                let kv_name_base = self.active_kv_name.as_deref().unwrap_or("text");
                 let sub_path = if mode {
-                    format!("{}/{}/reference", session_id, kv_name_base)
+                    format!("text/{}", kv_name_base) // [STRUCTURE-RESTORE] 'text/reference' 또는 'text/inference'
                 } else {
-                    format!("{}/{}/inference", session_id, kv_name_base)
+                    format!("text/inference")
                 };
 
                 for (dump, off, b_len) in dumps_to_send {
                     let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
                     // [LOCAL-INDEX-RESTORE] 물리 폴더명은 세션 내 상대 번호(l0, l1...)로 생성
                     let local_chunk_idx = off / 256;
-                    let block_dir = kv_dir.join(&sub_path).join(format!("l{}", local_chunk_idx));
+                    let block_dir = kv_dir.join(session_id).join(&sub_path).join(format!("l{}", local_chunk_idx));
                     if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
                     
                     {
@@ -3041,6 +3046,9 @@ impl QuantizedQwen3VLTextModel {
                         let b_idx = off / 256;
                         if b_idx < reg_w.len() { reg_w[b_idx].ssd_path = Some(block_dir.clone()); }
                     }
+
+                    // [SYNC-WAIT-FIX] 워커로 보내기 전에 카운터를 올려서 wait_for_global_io가 정확히 대기하게 함
+                    crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                     let _ = tx.send(SlotTask::Bake(BakeTask {
                         slot_id: sid,
@@ -3067,10 +3075,11 @@ impl QuantizedQwen3VLTextModel {
         visual_pos_masks: Option<&Tensor>,
         deepstack_visual_embeds: Option<Vec<Tensor>>,
         session_id: Option<String>,
-        kv_name: Option<String>, // [RESTORED]
+        kv_name: Option<String>,
+        tokens: Option<Vec<u32>>, // [NEW] 입력 토큰 추가
     ) -> Result<Tensor> {
         self.active_session_id = session_id.clone();
-        self.active_kv_name = kv_name.clone(); // [RESTORED]
+        self.active_kv_name = kv_name.clone();
 
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         let target_device = self.layers[0].device().clone();
@@ -3110,7 +3119,7 @@ impl QuantizedQwen3VLTextModel {
             }
 
             let deepstack_embed = deepstack_visual_embeds.as_ref().and_then(|v| v.get(layer_idx));
-            xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks, session_id.clone(), kv_name.clone(), self.baking_only).await?;
+            xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks, session_id.clone(), kv_name.clone(), self.baking_only, tokens.clone()).await?;
         }
 
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
@@ -3547,6 +3556,8 @@ impl QuantizedQwen3VLModel {
     }
 
     pub async fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
+        let tokens = input_ids_in.flatten_all()?.to_vec1::<u32>().ok(); // [NEW] 토큰 추출
+        
         // [VRAM-LAZY-INIT] Move embedding and norm to GPU on first use
         if self.language_model.embed_tokens.embeddings().device().is_cpu() {
             println!("[VRAM-OPT] Lazy moving Embeddings and Output Norm to VRAM...");
@@ -3621,7 +3632,7 @@ impl QuantizedQwen3VLModel {
             println!("[DIAG-ENGINE] Forward | Offset: {} | SeqLen: {} | PosRange: {}..{}", seqlen_offset, seq_len, p_min, p_max);
         }
 
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, session_id, kv_name).await?;
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, session_id, kv_name, tokens).await?;
         
         let head_dev = self.lm_head.device();
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
@@ -3737,7 +3748,7 @@ impl QuantizedQwen3TextModel {
         Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: None })
     }
 
-    pub async fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
+    pub async fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>, tokens: Option<Vec<u32>>) -> Result<Tensor> {
         // [VRAM-LAZY-INIT] Move embedding and norm to GPU on first use
         if self.language_model.embed_tokens.embeddings().device().is_cpu() {
             println!("[VRAM-OPT] Lazy moving Embeddings and Output Norm to VRAM...");
@@ -3794,7 +3805,7 @@ impl QuantizedQwen3TextModel {
             println!("[DIAG-ENGINE-TEXT] Forward | Offset: {} | SeqLen: {} | PosRange: {}..{}", seqlen_offset, seq_len, p_min, p_max);
         }
 
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, session_id, kv_name).await?;
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, session_id, kv_name, tokens).await?;
         
         let head_dev = self.text_device.clone(); 
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };

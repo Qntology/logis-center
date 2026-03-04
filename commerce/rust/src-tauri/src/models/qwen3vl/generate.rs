@@ -106,12 +106,14 @@ pub struct BakeTask {
     pub slot_id: usize, pub task_dir: PathBuf, pub kv_name: Option<String>,
     pub offset: usize, pub layers: Vec<LayerKVDump>, pub is_relay_baking: bool,
     pub block_idx: Option<usize>, pub registry: KVRegistry,
+    pub tokens: Option<Vec<u32>>, // [NEW] 입력 토큰 정보 추가
 }
 
 pub struct SaveTask {
     pub slot_id: usize, pub path: PathBuf, pub tensors: std::collections::HashMap<String, Tensor>,
     pub is_last: bool, pub block_idx: Option<usize>, pub registry: Option<KVRegistry>,
     pub kv_name: Option<String>,
+    pub tokens: Option<Vec<u32>>, // [NEW] 입력 토큰 추가
 }
 
 pub enum SlotTask { 
@@ -249,8 +251,19 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     if let Err(e) = save_kv_block(&tp, &data) {
                         eprintln!("[IO-ERROR] save_kv_block failed: {} -> {:?}", e, tp);
                     } else {
-                        // [LOG-ALL] 모든 레이어의 저장 성공을 로그로 표시하여 모니터링 강화
-                        // println!("[IO-SUCCESS] Saved: {:?}", tp);
+                        // [NEW] input.json 저장 (청크의 입력 정보 기록)
+                        if let (Some(parent), Some(tokens)) = (tp.parent(), task.tokens.as_ref()) {
+                            let input_path = parent.join("input.json");
+                            if !input_path.exists() {
+                                let input_data = serde_json::json!({
+                                    "tokens": tokens,
+                                    "timestamp": chrono::Utc::now().to_rfc3339()
+                                });
+                                if let Ok(json_str) = serde_json::to_string_pretty(&input_data) {
+                                    let _ = save_kv_block(&input_path, json_str.as_bytes());
+                                }
+                            }
+                        }
                     }
 
                     // 인덱스 업데이트
@@ -303,7 +316,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             match task {
                 SlotTask::Bake(bake) => {
                     let io_tx_inner = io_tx.clone();
-                    let (sid, off, _is_relay, block_idx, registry, kv_name) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone());
+                    let (sid, off, _is_relay, block_idx, registry, kv_name, tokens) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone(), bake.tokens.clone());
                     let loop_count = bake.layers.len();
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
 
@@ -314,6 +327,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let registry_inner = registry.clone();
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
+                        let tokens_inner = tokens.clone();
 
                         tokio::spawn(async move {
                             // [SYNC-COPY] 이미 CPU에 복사된 데이터를 사용함
@@ -329,7 +343,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
                             let _ = io_tx_nested.send(SaveTask { 
                                 slot_id: sid, path: file_path, tensors: map, is_last: false, 
-                                block_idx, registry: Some(registry_inner), kv_name: kv_name_inner 
+                                block_idx, registry: Some(registry_inner), kv_name: kv_name_inner,
+                                tokens: tokens_inner
                             }).await;
                         });
                     }
@@ -432,10 +447,12 @@ impl ModelVariant {
     }
 
     pub async fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
+        let tokens = input_ids.flatten_all()?.to_vec1::<u32>().ok(); // [NEW] 토큰 추출
+        
         match self {
             Self::Standard(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),
             Self::QuantizedVL(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset, total_len, session_id, kv_name).await,
-            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset, total_len, session_id, kv_name).await,
+            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset, total_len, session_id, kv_name, tokens).await,
         }
     }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.rebalance_layers(device_id, offset, total_len), Self::QuantizedText(m) => m.rebalance_layers(device_id, offset, total_len) } }
