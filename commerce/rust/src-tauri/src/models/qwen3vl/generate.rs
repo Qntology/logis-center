@@ -249,7 +249,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         eprintln!("[IO-ERROR] save_kv_block failed: {} -> {:?}", e, tp);
                     } else {
                         // [LOG-ALL] 모든 레이어의 저장 성공을 로그로 표시하여 모니터링 강화
-                        println!("[IO-SUCCESS] Saved: {:?}", tp);
+                        // println!("[IO-SUCCESS] Saved: {:?}", tp);
                     }
 
                     // 인덱스 업데이트
