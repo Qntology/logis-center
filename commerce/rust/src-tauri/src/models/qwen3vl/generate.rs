@@ -600,6 +600,7 @@ impl Qwen3VLGenerateModel {
 
         if let Some(s_id) = &session_id {
             let kv_type = _kv_name.as_deref().unwrap_or("text");
+            // [STRUCTURE-RESTORE] 원래의 중합 구조(task/text/reference)를 유지
             let path = crate::utils::paths::get_kv_dir(None).join(s_id).join(kv_type);
             if !path.exists() { 
                 println!("[PREFILL-SAVE] Creating directory: {:?}", path);
@@ -661,26 +662,30 @@ impl Qwen3VLGenerateModel {
         let kv_len = self.get_kv_len();
         println!("[DIAG-GEN] Current KV Cache Len: {} tokens. Prompt: {} tokens.", kv_len, total_toks);
 
-        // [FIX] Always use stitched context (kv_len) if available
+        // [STRICT-STITCHING] 이미 프리필된 캐시(reference)가 있다면 그 "다음"부터 inference 폴더를 생성함
         let mut gen_text = String::new();
-        let (input_ids, offset) = if kv_len > 0 {
-            println!("[STITCHED-INFERENCE] Using existing context ({} tokens). Appending prompt ({} tokens).", kv_len, total_toks);
-            (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, kv_len)
+        let mut logits = if kv_len < total_toks {
+            let offset = kv_len; // 이 offset이 18944라면, 폴더도 l18944(l74)부터 생성됨
+            let missing_ids = &f_ids[offset..];
+            println!("[GEN-PREFILL] Appending {} tokens to existing context (Global Offset: {})...", missing_ids.len(), offset);
+            
+            let input_ids = Tensor::from_vec(missing_ids.to_vec(), (1, missing_ids.len()), &self.text_device)?;
+            wait_for_global_io().await;
+            
+            // forward 시에 offset을 전달하면 quantized_model이 자동으로 l{offset} 폴더를 생성함
+            self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_toks, session_id.clone(), _kv_name.clone()).await?
         } else {
-            println!("[FULL-PREFILL] No existing context. Computing entire prompt (Len: {}).", total_toks);
-            (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
-        };            
-            let total_tokens_after_prefill = offset + input_ids.dim(1)?;
+            println!("[GEN-TRANSITION] Already fully prefilled at offset {}. Ready to decode.", kv_len);
+            let last_id = Tensor::from_vec(vec![f_ids[total_toks - 1]], (1, 1), &self.text_device)?;
+            self.qwen3_vl.forward(&last_id, None, None, None, None, None, total_toks - 1, total_toks, session_id.clone(), _kv_name.clone()).await?
+        };
         
-        wait_for_global_io().await; // [SYNC] Ensure disk is ready before inference
-        let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
-        
-        // [PERF-FIX] 프리필(Layer-by-layer) 완료 후, 디코딩을 위해 모든 레이어를 메모리에 고정
-        println!("[MEMORY-OPT] Prefill complete. Locking all 24 layers into memory for fast decoding...");
+        // [PERF-FIX] 2차 프리필이 끝난 "이 시점"에서 즉시 모든 레이어를 메모리에 고정
+        println!("[MEMORY-OPT] Prefill complete. Transitioning to 24-layer High-Speed Decoding...");
         self.reload_all_layers()?;
 
         // [DEBUG-SAMPLING] 첫 번째 토큰 샘플링 전 로그
-        println!("[DEBUG-GEN] Prefill Complete. EOS IDs: {}, {}. Sampling first token...", self.eos_token_id1, self.eos_token_id2);
+        println!("[DEBUG-GEN] Ready to sample first token. EOS IDs: {}, {}", self.eos_token_id1, self.eos_token_id2);
 
         let mut gen_ids = vec![];
 
@@ -786,15 +791,25 @@ impl Qwen3VLGenerateModel {
                 println!("[GEN-STOP] Reached max_tokens limit ({}).", max_new_tokens);
             }
             
-            // [FIX] 고정된 pre-calculated 오프셋 대신 엔진의 실제 현재 길이를 실시간으로 참조
+            // [FIX] Qwen 3.5 mRoPE를 위한 Rank 3 위치 텐서 생성 (디코딩용 단일 토큰)
+            // 텍스트의 경우 [pos, pos, pos]가 연속적으로 이어져야 모델이 문맥을 인식함
             let current_pos = self.get_kv_len();
             
-            // [FIX] Qwen 3.5 mRoPE를 위한 Rank 3 위치 텐서 생성 (디코딩용 단일 토큰)
-            let cache_pos_1d = Tensor::from_vec(vec![current_pos as u32], (1, 1), &self.text_device)?;
+            let pos_vec = vec![current_pos as u32];
+            let cache_pos_1d = Tensor::from_vec(pos_vec, (1, 1), &self.text_device)?;
+            // Qwen2-VL/3.5 규격: (3, 1, 1) 형태로 확장
             let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.broadcast_as((3, 1, 1))?;
 
-            wait_for_global_io().await; // [SYNC] Wait for any incremental baking
-            logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, Some(&pos_ids_3d), current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;
+            // [STRICT-OFFSET] 이전 토큰까지의 길이가 정확히 반영되어야 함
+            logits = self.qwen3_vl.forward(
+                &Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, 
+                None, None, None, None, 
+                Some(&pos_ids_3d), 
+                current_pos, 
+                current_pos + 1, 
+                session_id.clone(), 
+                _kv_name.clone()
+            ).await?;
         }
         
         println!("[GEN-RESULT] Generated {} tokens. Result: {}", gen_ids.len(), gen_text.replace("\n", " "));

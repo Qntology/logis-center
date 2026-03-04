@@ -280,18 +280,19 @@ impl RegistryEntry {
 
     pub fn get_block_path(&self, layer_idx: usize) -> Option<std::path::PathBuf> {
         if let Some(root) = &self.task_root {
-            // [STRUCTURE-FIX] root is session_id/text. Directory is l{chunk_index}
-            let chunk_index = self.token_start / 256;
-            let path = root.join(format!("l{}", chunk_index)).join(format!("b{}.st", layer_idx));
+            // [RELATIVE-INDEX-FIX] 전체 오프셋에서 세션 시작 지점을 빼서 로컬 폴더명(l0, l1...)을 계산함
+            // 예: (18944 - 18944) / 256 = 0 -> l0 폴더를 찾음
+            let local_chunk_idx = (self.token_start - self.ssd_block_offset) / 256;
+            let path = root.join(format!("l{}", local_chunk_idx)).join(format!("b{}.st", layer_idx));
             if path.exists() { return Some(path); }
-            
-            // Fallback: try l{offset} for backward compatibility
-            let alt_path = root.join(format!("l{}", self.token_start)).join(format!("b{}.st", layer_idx));
+
+            // Fallback: 글로벌 인덱스로 저장되었을 경우 (하위 호환성)
+            let global_chunk_idx = self.token_start / 256;
+            let alt_path = root.join(format!("l{}", global_chunk_idx)).join(format!("b{}.st", layer_idx));
             if alt_path.exists() { return Some(alt_path); }
         }
         self.ssd_path.as_ref().map(|p| p.join(format!("l{}.st", layer_idx)))
-    }
-}
+    }}
 
 // [NEW] 모델 전체가 공유하는 2차원 KV 목차
 #[derive(Clone)]
@@ -1644,8 +1645,11 @@ impl QuantizedQwen3VLTextAttention {
 
                 for (dump, b_len) in blocks_to_bake {
                     let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
-                    // [STRUCTURE-FIX] chunk_index를 사용하여 l0, l1... 폴더명 생성
-                    let block_dir = kv_root.join(&sub_path).join(format!("l{}", chunk_index));
+                    
+                    // [LOCAL-INDEX-RESTORE] 물리 폴더명은 다시 세션 내 상대 번호(l0, l1...)로 생성하여 일관성 유지
+                    let local_chunk_idx = (dump.offset - (chunk_index * 256)) / 256;
+                    
+                    let block_dir = kv_root.join(&sub_path).join(format!("l{}", local_chunk_idx));
                     if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
 
                     // [SYNC-WAIT-FIX] 워커로 보내기 전에 카운터를 올려서 wait_for_global_io가 정확히 대기하게 함
@@ -1655,10 +1659,10 @@ impl QuantizedQwen3VLTextAttention {
                         slot_id: sid,
                         task_dir: block_dir,
                         kv_name: Some(sub_path.clone()),
-                        offset: chunk_index * 256, // 통계 기록용
+                        offset: dump.offset, 
                         layers: vec![dump],
                         is_relay_baking: baking_only,
-                        block_idx: Some(chunk_index),
+                        block_idx: Some(local_chunk_idx), // 레지스트리 업데이트용 인덱스도 로컬로 유지
                         registry: self.registry.clone(),
                     })).await;
                 }
