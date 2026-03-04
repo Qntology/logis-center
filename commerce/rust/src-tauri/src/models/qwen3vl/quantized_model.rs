@@ -731,9 +731,9 @@ impl QuantizedQwen3VLTextAttention {
             v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
         }
 
-        // [FORCE-TYPE-STRICT] Ensure matmul operands are perfectly matched
-        let lhs = query_states.to_dtype(target_dtype)?;
-        let rhs = k.transpose(2, 3)?.to_dtype(target_dtype)?;
+        // [FORCE-TYPE-STRICT] Ensure matmul operands are perfectly matched and contiguous
+        let lhs = query_states.to_dtype(target_dtype)?.contiguous()?;
+        let rhs = k.transpose(2, 3)?.to_dtype(target_dtype)?.contiguous()?;
 
         // Scores in F32 precision for stability
         let mut attn_weights = lhs.matmul(&rhs)?
@@ -750,9 +750,9 @@ impl QuantizedQwen3VLTextAttention {
 
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
         
-        // [FINAL-DTYPE-STRICT] Force match for second matmul
-        let weights_final = attn_weights.to_dtype(target_dtype)?;
-        let v_final = v.to_dtype(target_dtype)?;
+        // [FINAL-DTYPE-STRICT] Force match for second matmul and ensure contiguity
+        let weights_final = attn_weights.to_dtype(target_dtype)?.contiguous()?;
+        let v_final = v.to_dtype(target_dtype)?.contiguous()?;
         let attn_output = weights_final.matmul(&v_final)?;
 
         let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
@@ -1332,30 +1332,43 @@ impl QuantizedQwen3_5GatedDeltaNet {
         _mask: Option<&Tensor>,
         _offset: usize,
     ) -> Result<Tensor> {
+        let dev = self.qkv_proj.device();
+        let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
         let (b_sz, q_len, _) = xs.dims3()?;
-        
-        // 1. QKV Projection & Splitting
+
+        // 1. QKV Projection: [B, L, 1024] -> [B, L, 6144]
         let qkv = self.qkv_proj.forward(xs)?;
-        let chunks = qkv.chunk(3, 2)?; // Split 6144 into [2048, 2048, 2048]
-        let q = &chunks[0];
-        let k = &chunks[1];
-        let v = &chunks[2];
-        
-        // 2. Gate & Beta Projection
-        let gate = self.gate_proj.forward(xs)?;
+        let chunks = qkv.chunk(3, 2)?; 
+
+        // Reshape to head-wise structure: [B, L, 16, 128]
+        let q = chunks[0].reshape((b_sz, q_len, self.num_heads, self.head_dim))?.transpose(1, 2)?;
+        let k = chunks[1].reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
+        let v = chunks[2].reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
+
+        // 2. Gate Projection: [B, L, 1024] -> [B, L, 2048]
+        let gate = self.gate_proj.forward(xs)?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?.transpose(1, 2)?;
         let gate = candle_nn::ops::silu(&gate)?;
-        let _beta = self.beta_proj.forward(xs)?; 
-        
-        // 3. Simplified Linear Attention Approximation: (q * k) * v * gate
-        // This maintains the 2048 dimension throughout the pipe.
-        let att = q.broadcast_mul(k)?;
-        let mut out = att.broadcast_mul(v)?;
+
+        // 3. Head-wise Linear Attention Approximation: (q * k) * v * gate
+        let q = q.to_dtype(target_dtype)?;
+        let k = k.to_dtype(target_dtype)?;
+        let v = v.to_dtype(target_dtype)?;
+
+        let att = q.broadcast_mul(&k)?;
+        let mut out = att.broadcast_mul(&v)?;
         out = out.broadcast_mul(&gate)?;
-        
-        let out = out.reshape((b_sz, q_len, ()))?;
+
+        // 4. Scaling
+        let scaling = 1.0 / (self.head_dim as f64).sqrt();
+        out = out.broadcast_mul(&Tensor::new(&[scaling as f32], dev)?)?;
+
+        // 5. Final Assembly: [B, H, L, D] -> [B, L, H*D] -> [B, L, 2048]
+        let out = out.transpose(1, 2)?.reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out)
     }
-}
+
+        }
+
 
 #[derive(Clone)]
 pub enum QuantizedQwen3_5TokenMixer {
@@ -1405,6 +1418,11 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
         let mixer = if layer_type == "linear_attention" {
             let zero_t = Tensor::zeros((1,), dtype, device)?;
+            
+            // [QWEN3.5-LINEAR-FIX] Use specific linear dimensions from config
+            let n_heads = config.linear_num_key_heads.unwrap_or(16);
+            let h_dim = config.linear_key_head_dim.unwrap_or(128);
+
             QuantizedQwen3_5TokenMixer::DeltaNet(QuantizedQwen3_5GatedDeltaNet {
                 qkv_proj: QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone()),
                 o_proj: QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone()),
@@ -1412,9 +1430,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
                 beta_proj: QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone()),
                 conv1d: None,
                 layer_idx,
-                num_heads: config.num_attention_heads,
-                num_kv_heads: config.num_key_value_heads,
-                head_dim: config.head_dim,
+                num_heads: n_heads,
+                num_kv_heads: n_heads,
+                head_dim: h_dim,
                 conv_state: None,
                 ssm_state: None,
             })
@@ -1559,12 +1577,16 @@ impl QuantizedQwen3VLTextDecoderLayer {
             let beta_proj = get_qlinear(ct, reader, &format!("{base_name}.ssm_beta"), device, dtype)?;
             let conv1d = get_qlinear(ct, reader, &format!("{base_name}.ssm_conv1d"), device, dtype).ok();
 
+            // [QWEN3.5-LINEAR-FIX] Use specific linear dimensions from config
+            let n_heads = config.linear_num_key_heads.unwrap_or(16);
+            let h_dim = config.linear_key_head_dim.unwrap_or(128);
+
             QuantizedQwen3_5TokenMixer::DeltaNet(QuantizedQwen3_5GatedDeltaNet {
                 qkv_proj, o_proj, gate_proj, beta_proj, conv1d,
                 layer_idx,
-                num_heads: config.num_attention_heads,
-                num_kv_heads: config.num_key_value_heads,
-                head_dim: config.head_dim,
+                num_heads: n_heads,
+                num_kv_heads: n_heads, // DeltaNet uses symmetric heads
+                head_dim: h_dim,
                 conv_state: None,
                 ssm_state: None,
             })
@@ -2881,10 +2903,10 @@ impl QuantizedQwen3VLModel {
 
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
-        // [OPTIMIZATION] If baking only, limit to 1 layer to save massive VRAM/RAM
+        // [MODIFIED] Run all layers even in Baker mode for 0.8B stability. 
+        // 1-layer mode only works for pure Attention models, not hybrid like Qwen 3.5.
         if baking_only {
-            println!("[MODEL] Vision Baker Mode: Reducing LLM to 1 layer.");
-            t_config.num_hidden_layers = 1;
+            println!("[MODEL] Vision Baker Mode: Running full LLM for hybrid architecture stability.");
         }
 
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
@@ -2926,10 +2948,9 @@ impl QuantizedQwen3VLModel {
         
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
-        // [OPTIMIZATION] If baking only, limit to 1 layer
+        // [MODIFIED] Run all layers even in Baker mode for 0.8B stability.
         if baking_only {
-            println!("[MODEL] Vision Baker Mode (Reader): Reducing LLM to 1 layer.");
-            t_config.num_hidden_layers = 1;
+            println!("[MODEL] Vision Baker Mode (Reader): Running full LLM for hybrid architecture stability.");
         }
 
         let language_model = QuantizedQwen3VLTextModel::new(&t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
