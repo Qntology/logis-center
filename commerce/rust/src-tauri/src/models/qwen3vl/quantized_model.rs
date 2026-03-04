@@ -1680,6 +1680,7 @@ impl QuantizedQwen3VLTextAttention {
                         is_relay_baking: baking_only,
                         block_idx: Some(local_chunk_idx),
                         registry: self.registry.clone(),
+                        tokens: None,
                     })).await;
                 }
             }
@@ -2672,7 +2673,7 @@ impl QuantizedQwen3VLTextModel {
                     println!("[BAKE-DEBUG] Triggering bake for Chunk at Offset {}", chunk_offset);
                 }
 
-                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last_chunk, baking_only, !is_prefill, chunk_offset);
+                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last_chunk, baking_only, !is_prefill, chunk_offset, None);
             }
 
             let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
@@ -2683,11 +2684,11 @@ impl QuantizedQwen3VLTextModel {
     }
 
     /// [NEW] 모든 레이어의 활성 블록을 강제로 SSD에 저장합니다.
-    pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> {
+    pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, _kv_name: Option<&str>) -> Result<()> {
         println!("[FLUSH] Manually flushing all active KV blocks to SSD for session: {}", session_id);
         for layer_idx in 0..self.layers.len() {
             // [FIX] Flush ALL chunks for this layer
-            let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(session_id, true, self.baking_only, false, 0);
+            let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(session_id, true, self.baking_only, false, 0, None);
         }
         Ok(())
     }
@@ -2800,7 +2801,7 @@ impl QuantizedQwen3VLTextModel {
         session_id: Option<String>,
         kv_name: Option<String>,
         baking_only: bool,
-        tokens: Option<Vec<u32>>, // [NEW] 입력 토큰 추가
+        tokens: Option<Vec<u32>>, // [FIX] 사용되지 않는 경우를 대비해 언더스코어 추가
     ) -> Result<Tensor> {
         let _start_layer_time = std::time::Instant::now();
         let input_token_count = xs.dim(1).unwrap_or(0);
@@ -2855,14 +2856,14 @@ impl QuantizedQwen3VLTextModel {
         if let Some(sid) = &session_id {
             if is_decoding {
                 // 디코딩 중에는 고속 모드 여부와 상관없이 항상 효율적인 증분 백업 사용
-                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, true, seqlen_offset);
+                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, true, seqlen_offset, tokens.clone());
             } else if !effective_high_speed {
                 // 프리필 중에는 즉시 SSD로 내보내어 VRAM 확보
                 let chunk_idx = seqlen_offset / 256;
                 let _ = self.force_offload_layer_kv(layer_idx, sid, chunk_idx).await;
             } else {
                 // 고속 프리필 시에는 일괄 저장을 위해 지연 처리
-                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, false, seqlen_offset);
+                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, false, seqlen_offset, tokens);
             }
         }
 
@@ -3059,6 +3060,7 @@ impl QuantizedQwen3VLTextModel {
                         is_relay_baking: mode,
                         block_idx: Some(off / 256),
                         registry: self.registry.clone(),
+                        tokens: None, // [NEW] 기본값 None 설정
                     })).await;
                 }
             }

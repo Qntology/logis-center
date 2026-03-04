@@ -651,6 +651,9 @@ async fn process_task(
         let mut text_list = Vec::new();
         let space_token = gen.tokenizer.text_encode_vec(" ".to_string(), false).unwrap_or(vec![220])[0];
 
+        let store_guard = store_mutex.lock().await;
+        let db_opt = store_guard.as_ref();
+
         // [FIX] 각 청크는 독립적인 메시지로 구성됨
         for (c_idx, line_chunk) in light_pug.lines().collect::<Vec<_>>().chunks(15).enumerate() {
             let chunk_raw_text = line_chunk.join("\n");
@@ -662,7 +665,17 @@ async fn process_task(
             if ids.len() > 256 { ids.truncate(256); }
             
             chunk_list.push(ids);
-            text_list.push(structured_text);
+            text_list.push(structured_text.clone());
+
+            // [NEW] messages 테이블에 히스토리 기록
+            if let Some(db) = db_opt {
+                let msg_id = format!("{}_pug_{}", task.id, c_idx);
+                let _ = db.add_message(
+                    &msg_id, "system_task", &structured_text, Some(&task.id), Some(1),
+                    Some(&task.cc), Some(&task.bcc), Some(&task.r#ref),
+                    Some(&task.from), Some(&task.to), Some("pug_chunk"), None
+                ).await;
+            }
         }
         (chunk_list, text_list)
     };
@@ -969,6 +982,8 @@ async fn process_task(
 
             // 1. [TOTAL-AWARE CHUNKING] 태그와 컨텍스트를 포함하여 정확히 256 토큰 맞춤
             let mut chunk_ids_list = Vec::new();
+            let mut chunk_texts: Vec<String> = Vec::new(); // [NEW] 원문 텍스트 보관 명시적 타입 지정
+
             {
                 let gen_guard = model.generator.lock().await;
                 if let Some(gen) = gen_guard.as_ref() {
@@ -1006,6 +1021,7 @@ async fn process_task(
                                 if final_ids.len() > 256 { final_ids.truncate(256); }
                                 
                                 chunk_ids_list.push(final_ids);
+                                chunk_texts.push(structured_test);
                                 current_lines.clear();
                                 chunk_idx += 1;
                             } else {
@@ -1018,8 +1034,24 @@ async fn process_task(
                             while final_ids.len() < 256 { final_ids.push(space_token); }
                             if final_ids.len() > 256 { final_ids.truncate(256); }
                             chunk_ids_list.push(final_ids);
+                            chunk_texts.push(structured_test);
                             break;
                         }
+                    }
+                }
+            }
+
+            // [NEW] messages 테이블에 디테일 청크 히스토리 기록
+            {
+                let store_guard = store_mutex.lock().await;
+                if let Some(db) = store_guard.as_ref() {
+                    for (c_idx, text) in chunk_texts.iter().enumerate() {
+                        let msg_id = format!("{}_pug_detail_{}", task.id, c_idx);
+                        let _ = db.add_message(
+                            &msg_id, "system_task", text, Some(&task.id), Some(1),
+                            Some(&task.cc), Some(&task.bcc), Some(&task.r#ref),
+                            Some(&task.from), Some(&task.to), Some("pug_chunk_detail"), None
+                        ).await;
                     }
                 }
             }
