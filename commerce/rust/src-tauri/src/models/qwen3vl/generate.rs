@@ -422,6 +422,8 @@ impl ModelVariant {
     pub fn inject_kv_bitkv(&mut self, kd: &[Tensor], vd: &[Tensor], os: &[usize]) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.inject_live_kv_bitkv(kd, vd, os), Self::QuantizedText(m) => m.language_model.inject_live_kv_bitkv(kd, vd, os), _ => Ok(()) } }
     pub async fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage(), _ => Ok(()) } }
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, Self::QuantizedText(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, _ => Ok(()) } }
+    pub fn save_hidden_states(&self, path: &std::path::Path, tensor: &Tensor) -> Result<()> { match self { Self::QuantizedVL(m) => m.save_hidden_states(path, tensor), Self::QuantizedText(m) => m.save_hidden_states(path, tensor), _ => Ok(()) } }
+    pub fn load_hidden_states(&self, path: &std::path::Path, device: &Device, dtype: DType) -> Result<Tensor> { match self { Self::QuantizedVL(m) => m.load_hidden_states(path, device, dtype), Self::QuantizedText(m) => m.load_hidden_states(path, device, dtype), _ => Err(anyhow::anyhow!("Unsupported model variant")) } }
 }
 
 pub struct Qwen3VLGenerateModel {
@@ -478,7 +480,7 @@ impl Qwen3VLGenerateModel {
         Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &v_dev, dtype)?, qwen3_vl, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: loaded_model_name, hard_token_limit, kv_root })
     }
 
-    pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut Qwen3VLGenerateModel>, _kv_name: Option<String>) -> Result<usize> {
+    pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut Qwen3VLGenerateModel>, _kv_name: Option<String>) -> Result<(usize, Tensor)> {
         // [FIX] Always start prefill from zero to avoid double offset on restart
         self.clear_kv_cache();
         if let ModelVariant::QuantizedVL(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
@@ -488,16 +490,22 @@ impl Qwen3VLGenerateModel {
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_toks = full_ids.len();
-        self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
+        
+        let logits_or_hidden = self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
+        
         if let Some(s_id) = &session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(s_id);
             if !path.exists() { fs::create_dir_all(&path)?; }
             fs::write(path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
+            
+            // Save the last hidden state for cross-task continuation
+            self.qwen3_vl.save_hidden_states(&path.join("last_hidden.st"), &logits_or_hidden)?;
+            
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
             wait_for_global_io().await; // [SYNC] Ensure SSD write is complete
             println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk.");
         }
-        Ok(total_toks)
+        Ok((total_toks, logits_or_hidden))
     }
 
         pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {

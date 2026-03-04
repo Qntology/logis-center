@@ -96,6 +96,22 @@ impl QLinear {
         }
     }
 
+    pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Result<Self> {
+        let new_inner = match &self.inner {
+            QMatMul::Tensor(t) => QMatMul::Tensor(t.narrow(dim, start, len)?),
+            QMatMul::TensorF16(t) => QMatMul::TensorF16(t.narrow(dim, start, len)?),
+            QMatMul::QTensor(q) => {
+                let t = q.dequantize(&self.device)?;
+                QMatMul::Tensor(t.narrow(dim, start, len)?)
+            }
+        };
+        Ok(Self {
+            inner: new_inner,
+            bias: self.bias.clone(), // Bias might need slicing too if it exists, but for Q/K/V it's usually None or handled separately
+            device: self.device.clone(),
+        })
+    }
+
     /// [MEMORY-OPT] 가중치를 메모리에서 해제합니다.
     pub fn clear(&mut self) {
         // 더미 텐서의 타입은 해제용이므로 F32로 고정
@@ -472,7 +488,7 @@ impl QuantizedQwen3VLTextAttention {
         let k_norm_name = format!("{base_name}.attn_k_norm");
 
         // 1. Dynamic QKV Loading (Handling Hybrid Architecture)
-        let (q_proj, k_proj, v_proj) = if ct.tensor_infos.contains_key(&format!("{}.weight", q_name)) {
+        let (mut q_proj, mut k_proj, mut v_proj) = if ct.tensor_infos.contains_key(&format!("{}.weight", q_name)) {
             // Case A: Individual Tensors (Found in Full Attention layers)
             let q = get_qlinear(ct, reader, &q_name, device, dtype)?;
             let k = get_qlinear(ct, reader, &k_name, device, dtype)?;
@@ -484,54 +500,62 @@ impl QuantizedQwen3VLTextAttention {
             (qkv.clone(), qkv.clone(), qkv)
         };
 
+        // [QWEN3.5-MTP-FIX] Slice MTP heads if present. GGUF often has extra heads for multi-token prediction.
+        let h_dim = config.head_dim;
+        let expected_q_heads = config.num_attention_heads;
+        let expected_kv_heads = config.num_key_value_heads;
+        let expected_q_out = expected_q_heads * h_dim;
+        let expected_kv_out = expected_kv_heads * h_dim;
+
+        // Detection and Slicing logic
+        let actual_q_out = q_proj.shape().dims()[0];
+        
+        if actual_q_out == 6144 {
+            // Unified QKV for Linear Attention (DeltaNet)
+            // No slicing here, forward handles 3 chunks of 2048
+        } else if actual_q_out > expected_q_out {
+            // Full Attention with MTP heads (e.g. 4096 vs 2048)
+            q_proj = q_proj.narrow(0, 0, expected_q_out)?;
+            
+            let actual_k_out = k_proj.shape().dims()[0];
+            if actual_k_out > expected_kv_out {
+                k_proj = k_proj.narrow(0, 0, expected_kv_out)?;
+            }
+            let actual_v_out = v_proj.shape().dims()[0];
+            if actual_v_out > expected_kv_out {
+                v_proj = v_proj.narrow(0, 0, expected_kv_out)?;
+            }
+        }
+
         let o_proj = get_qlinear(ct, reader, &o_name, device, dtype)?;
         let q_norm = get_rms_norm(ct, reader, &q_norm_name, config.rms_norm_eps, device, dtype)?;
         let k_norm = get_rms_norm(ct, reader, &k_norm_name, config.rms_norm_eps, device, dtype)?;
 
-        // 2. Dynamic Architecture Detection (Trust Weights over Config)
-        let (n_attn_heads, n_kv_heads, h_dim, q_out) = {
-            let q_out = match &q_proj.inner {
-                QMatMul::Tensor(t) => t.dim(0).unwrap_or(0),
-                QMatMul::QTensor(t) => t.shape().dims()[0],
-                QMatMul::TensorF16(t) => t.dim(0).unwrap_or(0),
-            };
+        // 2. Dynamic Architecture Detection (Trust Sliced Weights)
+        let (n_attn_heads, n_kv_heads, h_dim_final, q_out_final) = {
+            let q_out = q_proj.shape().dims()[0];
             if q_out == 6144 { // Unified QKV (3 * 2048)
                 (16, 16, 128, q_out)
-            } else if q_out == 4096 { // Layer 3 style (16 heads * 256 dim)
-                (16, 2, 256, q_out) 
             } else {
-                let heads = q_out / config.head_dim;
-                if heads > 0 { (heads, config.num_key_value_heads, config.head_dim, q_out) }
-                else { (config.num_attention_heads, config.num_key_value_heads, config.head_dim, q_out) }
+                (expected_q_heads, expected_kv_heads, h_dim, q_out)
             }
         };
 
         // Determine V-head dimension based on actual V-projection output size
         let v_h_dim = {
-            let v_out = match &v_proj.inner {
-                QMatMul::Tensor(t) => t.dim(0).unwrap_or(0),
-                QMatMul::QTensor(t) => t.shape().dims()[0],
-                QMatMul::TensorF16(t) => t.dim(0).unwrap_or(0),
-            };
-            // If unified QKV, v_out is 6144, we want 2048 / heads. 
-            // If individual, v_out is 512, we want 512 / heads.
+            let v_out = v_proj.shape().dims()[0];
             let v_actual_out = if v_out == 6144 { 2048 } else { v_out };
             v_actual_out / n_kv_heads.max(1)
         };
 
         let num_kv_groups = n_attn_heads / (n_kv_heads as usize).max(1);
-        let scaling = 1.0 / (h_dim as f64).sqrt();
+        let scaling = 1.0 / (h_dim_final as f64).sqrt();
 
         if layer_idx == 0 || layer_idx == 3 {
-            let q_in = match &q_proj.inner {
-                QMatMul::Tensor(t) => t.dim(1).unwrap_or(0),
-                QMatMul::QTensor(t) => t.shape().dims()[1],
-                QMatMul::TensorF16(t) => t.dim(1).unwrap_or(0),
-            };
-            println!("[MODEL-ARCH] Layer {}: {} heads ({} KV), dim {} (V-dim {}). Proj: {} -> {}", 
-                layer_idx, n_attn_heads, n_kv_heads, h_dim, v_h_dim, q_in, q_out);
+            let q_in = q_proj.shape().dims()[1];
+            println!("[MODEL-ARCH] Layer {}: {} heads ({} KV), dim {} (V-dim {}). Proj: {} -> {}",
+                layer_idx, n_attn_heads, n_kv_heads, h_dim_final, v_h_dim, q_in, q_out_final);
         }
-
         Ok(Self {
             q_proj, k_proj, v_proj, o_proj, q_norm, k_norm,
             num_attention_heads: n_attn_heads,
@@ -2780,6 +2804,22 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
+    pub fn save_hidden_states(&self, path: &std::path::Path, tensor: &Tensor) -> Result<()> {
+        let mut map = std::collections::HashMap::new();
+        map.insert("hidden_states".to_string(), tensor.to_device(&Device::Cpu)?);
+        let data = safetensors::serialize(&map, &None)?;
+        crate::utils::direct_loader::save_kv_block(path, &data)?;
+        Ok(())
+    }
+
+    pub fn load_hidden_states(&self, path: &std::path::Path, device: &Device, dtype: DType) -> Result<Tensor> {
+        let data = crate::utils::direct_loader::load_kv_block(path)?;
+        let st = safetensors::SafeTensors::deserialize(&data)?;
+        let t = st.tensor("hidden_states")?;
+        let tensor = Tensor::from_raw_buffer(t.data(), dtype, t.shape(), &Device::Cpu)?;
+        Ok(tensor.to_device(device)?)
+    }
+
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> {
         if !path.exists() {
             fs::create_dir_all(path)?;
@@ -3212,6 +3252,8 @@ impl QuantizedQwen3VLModel {
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
+    pub fn save_hidden_states(&self, path: &std::path::Path, tensor: &Tensor) -> Result<()> { self.language_model.save_hidden_states(path, tensor) }
+    pub fn load_hidden_states(&self, path: &std::path::Path, device: &Device, dtype: DType) -> Result<Tensor> { self.language_model.load_hidden_states(path, device, dtype) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; self.text_device = device.clone(); self.vision_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, total_len) }
 }
@@ -3353,6 +3395,8 @@ impl QuantizedQwen3TextModel {
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
+    pub fn save_hidden_states(&self, path: &std::path::Path, tensor: &Tensor) -> Result<()> { self.language_model.save_hidden_states(path, tensor) }
+    pub fn load_hidden_states(&self, path: &std::path::Path, device: &Device, dtype: DType) -> Result<Tensor> { self.language_model.load_hidden_states(path, device, dtype) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, _total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, _total_len) }
 }

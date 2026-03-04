@@ -486,7 +486,7 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
+                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?.0;
                 }
             }
 
@@ -637,7 +637,7 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name.clone()).await?;
+                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name.clone()).await?.0;
                 }
             }
         } else {
@@ -728,7 +728,7 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
+                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?.0;
                 }
             }
         } else {
@@ -877,7 +877,7 @@ async fn process_task(
                             })],
                             ..Default::default()
                         };
-                        worker.prefill_only(params, Some(token_clone), session_clone, None, Some("reference".to_string())).await?;
+                        worker.prefill_only(params, Some(token_clone), session_clone, None, Some("reference".to_string())).await?.0;
                     }
                 }
             } else {
