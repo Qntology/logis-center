@@ -670,17 +670,10 @@ async fn process_task(
     // --- STEP 1: Layer-by-Layer Parallel Baking (Offset-Centric SSD-Direct) ---
     log_task_progress(app_handle, &task.id, &json!({ "category": "Deep Baking", "summary": "Initializing Layer-by-Layer Parallel Pipeline...", "spinner": "🔥" }));
 
-    // [REFERENCE-SETUP] Save tokens.json and metadata for PUG
+    // [REFERENCE-SETUP] Save tokens.json for PUG
     let all_tokens: Vec<u32> = chunk_ids_list.iter().flatten().cloned().collect();
     if let Ok(json_data) = serde_json::to_vec(&all_tokens) {
         let _ = crate::utils::direct_loader::save_kv_block(&text_ref_path.join("tokens.json"), &json_data);
-    }
-    
-    // Initialize layerN.json metadata in both reference and inference
-    for l_idx in 0..24 {
-        let meta = json!({ "status": "pending", "tokens": all_tokens.len() }).to_string();
-        let _ = fs::write(text_ref_path.join(format!("layer{}.json", l_idx)), &meta);
-        let _ = fs::write(text_inf_path.join(format!("layer{}.json", l_idx)), json!({ "status": "pending" }).to_string());
     }
 
     // 1.1 [COMMON-EMBEDDING] Generate and save initial hidden states for all chunks
@@ -711,7 +704,6 @@ async fn process_task(
         {
             let mut gen_m = model.generator.lock().await;
             if let Some(gen) = gen_m.as_mut() {
-                // [FIX] Correctly pass target device to reload_layer
                 let dev = gen.text_device.clone();
                 gen.reload_layer(l_idx, &dev)?; 
             }
@@ -725,7 +717,6 @@ async fn process_task(
 
             let mut gen_m = model.generator.lock().await;
             if let Some(gen) = gen_m.as_mut() {
-                // [STRUCTURE-FIX] chunk_index 기반 폴더 (l0, l1, l2...) under reference
                 let chunk_dir = text_ref_path.join(format!("l{}", chunk_index));
                 
                 // 1. Load Input (이전 레이어의 출력값 b{N-1}.st)
@@ -734,7 +725,7 @@ async fn process_task(
                 let dtype = if device.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
                 let xs = gen.qwen3_vl.load_hidden_states(&input_path, &device, dtype)?;
 
-                // 2. Prepare Position/RoPE (모든 청크가 0~256 범위를 독립적으로 사용)
+                // 2. Prepare Position/RoPE
                 let cache_pos_1d = Tensor::arange(0u32, 256u32, &device)?;
                 let pos_ids_3d = cache_pos_1d.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, 256))?;
                 
@@ -744,16 +735,13 @@ async fn process_task(
                     _ => return Err(anyhow::anyhow!("Rotary error")),
                 };
 
-                // 3. Forward Single Layer (0-오프셋 독립 계산)
-                let session_id = Some(task.id.clone());
-                let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, chunk_index, session_id, kv_name_c, true, chunk_index).await?;
+                // 3. Forward Single Layer
+                // [REMOVED] session_id 제거하여 엔진 자동 저장 방지 (레거시 제거)
+                let next_xs = gen.qwen3_vl.forward_single_layer(current_l, &xs, &cos, &sin, None, chunk_index, None, kv_name_c, true, chunk_index).await?;
 
-                // 4. Save Next Hidden States (b{N}.st) to SSD under reference
+                // 4. Save Next Hidden States (b{N}.st)
                 let output_path = chunk_dir.join(format!("b{}.st", current_l));
                 gen.qwen3_vl.save_hidden_states(&output_path, &next_xs)?;
-                
-                // Update layer metadata status in reference
-                let _ = fs::write(text_ref_path.join(format!("layer{}.json", current_l)), json!({ "status": "completed", "tokens": all_tokens.len() }).to_string());
             }
         }
         
