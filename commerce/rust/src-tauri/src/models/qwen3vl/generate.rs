@@ -245,15 +245,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 let _guard = IoGuard;
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 if let Ok(data) = safetensors::serialize(&ts, &None) {
-                    drop(ts); 
-                    if let Ok(_) = save_kv_block(&tp, &data) {
-                        if tp.file_name().unwrap_or_default().to_string_lossy().contains('l') {
-                            println!("[IO-WRITE] Layer state saved: {:?}", tp.file_name().unwrap_or_default());
-                        }
-                    }
-
+                    drop(ts); let _ = save_kv_block(&tp, &data);
+                    
                     // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
-
                     if let Some(kv_name) = kv_n {
                         if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
                             if let Ok(l_idx) = l_str.parse::<usize>() {
@@ -318,16 +312,17 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 
                         // [BACK-COMPRESSION] 압축 및 직렬화 작업 자체를 백그라운드로 완전히 분리
                         tokio::spawn(async move {
-                            // [FIX] Convert raw tensors if present. Supports both Attention (K+V) and DeltaNet (SSM only or SSM+Conv)
-                            if src.raw_k.is_some() || src.raw_v.is_some() {
-                                if let Some(rk) = src.raw_k.take() {
-                                    let k_cpu = rk.to_device(&Device::Cpu).unwrap_or(rk);
-                                    src.k_data = k_cpu.to_dtype(DType::BF16).unwrap_or(k_cpu);
-                                }
-                                if let Some(rv) = src.raw_v.take() {
-                                    let v_cpu = rv.to_device(&Device::Cpu).unwrap_or(rv);
-                                    src.v_data = v_cpu.to_dtype(DType::BF16).unwrap_or(v_cpu);
-                                }
+                            // [FIX] Convert raw tensors to BF16 (or F32 fallback)
+                            // [CRITICAL] 텐서가 GPU에 있는 경우, to_device는 해당 스레드의 컨텍스트를 필요로 함
+                            if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
+                                // 워커 스레드에서 안전하게 CPU로 이동
+                                // [STABILITY] to_device 호출 시 장치 컨텍스트가 자동으로 보장되지 않을 수 있으므로
+                                // candle-core의 Device 스코프 내에서 실행되도록 유도 (필요시)
+                                let k_cpu = rk.to_device(&Device::Cpu).unwrap_or(rk);
+                                let v_cpu = rv.to_device(&Device::Cpu).unwrap_or(rv);
+                                
+                                src.k_data = k_cpu.to_dtype(DType::BF16).unwrap_or(k_cpu);
+                                src.v_data = v_cpu.to_dtype(DType::BF16).unwrap_or(v_cpu);
                             }
 
                             let mut map = std::collections::HashMap::new();
@@ -383,14 +378,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                 v_data: vd_t,
                                                 original_shape: file_shape,
                                             };
-
-                                            // [HYBRID-RESTORE] If loading block 0, it might contain recurrent states for DeltaNet layers
-                                            if b_idx_off == 0 {
-                                                // We need access to the actual model instance to inject state. 
-                                                // Since this is an async background loader, we use the registry's indirect link if possible,
-                                                // but the most reliable way is to ensure the next forward pass checks this cache.
-                                            }
-
                                             if let Ok(mut r) = reg.entries.write() {
                                                 if b_idx < r.len() {
                                                     {
@@ -435,8 +422,6 @@ impl ModelVariant {
     pub fn inject_kv_bitkv(&mut self, kd: &[Tensor], vd: &[Tensor], os: &[usize]) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.inject_live_kv_bitkv(kd, vd, os), Self::QuantizedText(m) => m.language_model.inject_live_kv_bitkv(kd, vd, os), _ => Ok(()) } }
     pub async fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage(), _ => Ok(()) } }
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, Self::QuantizedText(m) => m.language_model.force_flush_all_active_blocks(session_id, kv_name).await, _ => Ok(()) } }
-    pub fn save_hidden_states(&self, path: &std::path::Path, tensor: &Tensor) -> Result<()> { match self { Self::QuantizedVL(m) => m.save_hidden_states(path, tensor), Self::QuantizedText(m) => m.save_hidden_states(path, tensor), _ => Ok(()) } }
-    pub fn load_hidden_states(&self, path: &std::path::Path, device: &Device, dtype: DType) -> Result<Tensor> { match self { Self::QuantizedVL(m) => m.load_hidden_states(path, device, dtype), Self::QuantizedText(m) => m.load_hidden_states(path, device, dtype), _ => Err(anyhow::anyhow!("Unsupported model variant")) } }
 }
 
 pub struct Qwen3VLGenerateModel {
@@ -468,8 +453,8 @@ impl Qwen3VLGenerateModel {
         };
         let t_dev = get_device(text_device); let v_dev = get_device(vision_device); let dtype = get_dtype(dtype, cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16"));
         let gguf_f = find_type_files(path, "gguf")?; let mmproj_p = gguf_f.iter().find(|f| f.contains("mmproj")).cloned();
-        let mut m_p = gguf_f.iter().find(|f| f.contains("Qwen3.5-0.8B") && !f.contains("mmproj")).cloned();
-        if m_p.is_none() { m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.6B") && !f.contains("mmproj")).cloned(); }
+        let mut m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned();
+        if m_p.is_none() { m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.6B-Q4_K_M.gguf")).cloned(); }
         if m_p.is_none() { m_p = gguf_f.iter().find(|f| !f.contains("mmproj")).cloned(); }
         let qwen3_vl = if !gguf_f.is_empty() {
             let kv_res = hard_token_limit.unwrap_or(4096) as u64 * 40000;
@@ -489,11 +474,11 @@ impl Qwen3VLGenerateModel {
         } else { ModelVariant::Standard(Qwen3VLModel::new(cfg, unsafe { VarBuilder::from_mmaped_safetensors(&find_type_files(path, "safetensors")?, dtype, &t_dev)? })?) };
         let g_p = std::path::Path::new(cfg_path).join("generation_config.json"); let g_cfg = if g_p.exists() { serde_json::from_slice(&std::fs::read(g_p)?)? } else { Qwen3VLGenerationConfig::default() };
         let (e1, e2) = match &g_cfg.eos_token_id { serde_json::Value::Number(n) => { let id = n.as_u64().unwrap_or(151645) as u32; (id, id) }, serde_json::Value::Array(arr) => { (arr.get(0).and_then(|v| v.as_u64()).unwrap_or(151643) as u32, arr.get(1).and_then(|v| v.as_u64()).unwrap_or(151643) as u32) }, _ => (151643, 151643) };
-        let loaded_model_name = if m_p.as_ref().map(|p| p.contains("0.8B")).unwrap_or(false) { "0.8B".to_string() } else { "Unified 0.8B".to_string() };
+        let loaded_model_name = if m_p.as_ref().map(|p| p.contains("0.6B")).unwrap_or(false) { "0.6B".to_string() } else { "2B".to_string() };
         Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &v_dev, dtype)?, qwen3_vl, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: loaded_model_name, hard_token_limit, kv_root })
     }
 
-    pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut Qwen3VLGenerateModel>, _kv_name: Option<String>) -> Result<(usize, Tensor)> {
+    pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut Qwen3VLGenerateModel>, _kv_name: Option<String>) -> Result<usize> {
         // [FIX] Always start prefill from zero to avoid double offset on restart
         self.clear_kv_cache();
         if let ModelVariant::QuantizedVL(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
@@ -503,43 +488,16 @@ impl Qwen3VLGenerateModel {
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_toks = full_ids.len();
-        
-        let logits_or_hidden = self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
-        
+        self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
         if let Some(s_id) = &session_id {
-            let kv_dir = crate::utils::paths::get_kv_dir(None);
-            
-            // [FIX] Determine exact subpath consistent with force_flush_all_active_blocks
-            let kv_name_raw = _kv_name.as_deref().unwrap_or("text");
-            let last_part = kv_name_raw.split('/').last().unwrap_or("text");
-            let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { 
-                "text".to_string() 
-            } else { 
-                last_part.to_string() 
-            };
-            
-            let mode = if let ModelVariant::QuantizedVL(m) = &self.qwen3_vl { m.language_model.baking_only } 
-                       else if let ModelVariant::QuantizedText(m) = &self.qwen3_vl { m.language_model.baking_only }
-                       else { false };
-
-            let sub_path = if mode {
-                format!("{}/reference/{}", s_id, kv_type)
-            } else {
-                format!("{}/inference/{}", s_id, kv_type)
-            };
-
-            let full_save_path = kv_dir.join(&sub_path);
-            if !full_save_path.exists() { fs::create_dir_all(&full_save_path)?; }
-            
-            // Save metadata inside the specific context folder
-            fs::write(full_save_path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
-            self.qwen3_vl.save_hidden_states(&full_save_path.join("last_hidden.st"), &logits_or_hidden)?;
-            
+            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+            if !path.exists() { fs::create_dir_all(&path)?; }
+            fs::write(path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
             wait_for_global_io().await; // [SYNC] Ensure SSD write is complete
-            println!("[PREFILL-SAVE] All active context (KV + Hidden) safely persisted to: {}", sub_path);
+            println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk.");
         }
-        Ok((total_toks, logits_or_hidden))
+        Ok(total_toks)
     }
 
         pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
@@ -635,14 +593,7 @@ impl Qwen3VLGenerateModel {
             let total_tokens_after_prefill = offset + input_ids.dim(1)?;
         
         wait_for_global_io().await; // [SYNC] Ensure disk is ready before inference
-        
-        let mut logits = match self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await {
-            Ok(l) => l,
-            Err(e) => {
-                println!("[PREFILL-ERROR] Forward pass failed during prefill: {}", e);
-                return Err(e);
-            }
-        };
+        let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         
         // [DEBUG-SAMPLING] 첫 번째 토큰 샘플링 전 로그
         println!("[DEBUG-GEN] Prefill Complete. EOS IDs: {}, {}. Sampling first token...", self.eos_token_id1, self.eos_token_id2);

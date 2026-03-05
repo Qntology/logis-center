@@ -92,24 +92,6 @@ pub fn apply_rotary_pos_emb(
         cos = cos.unsqueeze(1)?;
         sin = sin.unsqueeze(1)?;
     }
-
-    let q_dim = q.dim(D::Minus1)?;
-    let cos_dim = cos.dim(D::Minus1)?;
-
-    // [PARTIAL-ROPE] Handle cases where RoPE only applies to a fraction of the head dimension
-    if q_dim != cos_dim {
-        let q_rope = q.narrow(D::Minus1, 0, cos_dim)?;
-        let q_pass = q.narrow(D::Minus1, cos_dim, q_dim - cos_dim)?;
-        let k_rope = k.narrow(D::Minus1, 0, cos_dim)?;
-        let k_pass = k.narrow(D::Minus1, cos_dim, q_dim - cos_dim)?;
-
-        let (q_rope_emb, k_rope_emb) = apply_rotary_pos_emb(&q_rope, &k_rope, &cos, &sin, tof32)?;
-        
-        let q_final = Tensor::cat(&[&q_rope_emb, &q_pass], D::Minus1)?;
-        let k_final = Tensor::cat(&[&k_rope_emb, &k_pass], D::Minus1)?;
-        return Ok((q_final, k_final));
-    }
-
     let orig_dtype = q.dtype();
     let q = if tof32 { &q.to_dtype(DType::F32)? } else { q };
     let k = if tof32 { &k.to_dtype(DType::F32)? } else { k };

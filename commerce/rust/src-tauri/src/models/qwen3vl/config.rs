@@ -51,8 +51,6 @@ pub struct RopeScaling {
     pub mrope_section: Vec<usize>, 
     pub rope_type: String,
     pub mrope_interleaved: Option<bool>,
-    pub rope_theta: Option<f32>,
-    pub partial_rotary_factor: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -67,12 +65,6 @@ pub struct Qwen3VLTextConfig {
     pub hidden_size: usize,
     pub initializer_range: f32,
     pub intermediate_size: usize,
-    pub layer_types: Option<Vec<String>>, 
-    pub linear_num_key_heads: Option<usize>,
-    pub linear_key_head_dim: Option<usize>,
-    pub linear_num_value_heads: Option<usize>,
-    pub linear_value_head_dim: Option<usize>,
-    pub linear_conv_kernel_dim: Option<usize>,
     pub max_position_embeddings: usize,
     pub max_window_layers: Option<usize>,
     pub model_type: String, 
@@ -80,9 +72,8 @@ pub struct Qwen3VLTextConfig {
     pub num_hidden_layers: usize,
     pub num_key_value_heads: usize,
     pub rms_norm_eps: f64,
-    #[serde(alias = "rope_parameters")]
     pub rope_scaling: Option<RopeScaling>,
-    pub rope_theta: Option<f32>,
+    pub rope_theta: f32,
     pub sliding_window: Option<usize>,
     pub tie_word_embeddings: bool,
     pub use_cache: bool,

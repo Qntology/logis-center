@@ -367,10 +367,10 @@ async fn process_task(
         println!("[PROCESS] Found existing KV cache for task {}. Ready to reuse.", task.id);
     }
 
-    // [SSD-BRIDGE] Start warming up 0.8B weights in background RAM immediately
-    let model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3.5-0.8B-GGUF")
-        .or_else(|_| std::fs::canonicalize("models/Qwen3.5-0.8B-GGUF")).ok();
-    if let Some(p) = model_path_hint {
+    // [SSD-BRIDGE] Start warming up 2B weights in background RAM immediately
+    let large_model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3-VL-2B-Instruct-gguf")
+        .or_else(|_| std::fs::canonicalize("models/Qwen3-VL-2B-Instruct-gguf")).ok();
+    if let Some(p) = large_model_path_hint {
         let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
     }
 
@@ -440,17 +440,17 @@ async fn process_task(
     if task.r#type == "image_extraction" {
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
         if !image_path.is_empty() {
-            println!("[Scheduler] Starting VISION BAKER (1-Layer 0.8B) for {}", task.id);
+            println!("[Scheduler] Starting VISION BAKER (1-Layer 2B) for {}", task.id);
             
             let snapshot_id = format!("{}_img", task.id);
             let prompt = crate::model::get_image_extraction_prompt("kr", "korean", "tracking", "");
 
             // [ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think
 
-            // 1. [Vision Baker] Load 1-layer 0.8B model and bake image
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer 0.8B)...", "spinner": "⠋" }));
+            // 1. [Vision Baker] Load 1-layer 2B model and bake image
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer 2B)...", "spinner": "⠋" }));
             
-            // Activate 0.8B in Baking mode (1 layer, no MLP)
+            // Activate 2B in Baking mode (1 layer, no MLP)
             model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true, None).await?;
             
             // Perform prefill with image to create visual KV cache
@@ -486,14 +486,14 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?.0;
+                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
                 }
             }
 
             model.save_kv_snapshot(&snapshot_id, kv_name.clone(), 0).await?;
 
-            // 2. [Full Vision] Reload full 0.8B model and inject baked cache
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 0.8B-VL...", "spinner": "⠋" }));
+            // 2. [Full Vision] Reload full 2B model and inject baked cache
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 2B-VL...", "spinner": "⠋" }));
             
             // Transition to full Large model with the baked snapshot
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
@@ -590,17 +590,17 @@ async fn process_task(
 
     // ==================================================================================
     // [ULTRA-OPTIMIZED PIPELINE]
-    // Step 1: 0.8B Bakes [PUG + Classification Task] -> Save SNAPSHOT_A
-    // Step 2: 0.8B Loads SNAPSHOT_A -> Instant Generation
-    // Step 3: 0.8B Bakes [PUG + Selector Task] -> Save SNAPSHOT_B
-    // Step 4: 0.8B Loads SNAPSHOT_B -> Instant Generation
+    // Step 1: 0.6B Bakes [PUG + Classification Task] -> Save SNAPSHOT_A
+    // Step 2: 0.6B Loads SNAPSHOT_A -> Instant Generation
+    // Step 3: 0.6B Bakes [PUG + Selector Task] -> Save SNAPSHOT_B
+    // Step 4: 0.6B Loads SNAPSHOT_B -> Instant Generation
     // ...
     // ==================================================================================
 
     // --- STEP A: CLASSIFICATION (Disk Bridge Relay) ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] Starting DISK BRIDGE RELAY (0.8B -> Disk -> 0.8B)");
+        println!("[Scheduler] Starting DISK BRIDGE RELAY (0.6B -> Disk -> 0.6B)");
         
         // [NEW] Log step A start for UI recovery
         log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
@@ -617,8 +617,8 @@ async fn process_task(
         let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
 
         if !has_snapshot {
-            // 1. [0.8B] Bake FULL Templated Prompt
-            println!("[Scheduler] Phase 1: Baking Full Context with 0.8B...");
+            // 1. [0.6B] Bake FULL Templated Prompt
+            println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
             model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
             
             let model_clone = model.clone();
@@ -637,14 +637,14 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name.clone()).await?.0;
+                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name.clone()).await?;
                 }
             }
         } else {
-            println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.8B baking.");
+            println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
         }
 
-        // 2. [0.8B] Load Snapshot & Generate
+        // 2. [0.6B] Load Snapshot & Generate
         {
             model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
@@ -660,7 +660,7 @@ async fn process_task(
             };
 
             if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 0.8B Step A: Asking classification question...");
+                println!("[Scheduler] 0.6B Step A: Asking classification question...");
                 let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
                 println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
                 
@@ -728,7 +728,7 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?.0;
+                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
                 }
             }
         } else {
@@ -806,7 +806,7 @@ async fn process_task(
     
     let mut extracted_data = json!({});
 
-    // --- PHASE 2 Continue: Detail Extraction (If needed) ---
+    // --- PHASE 2 Continue: Detail Extraction (If needed) --- 
     if !is_detail {
         // [LIST MODE] Direct DOM Extraction
         let list_log = json!({ "category": "List Processing", "summary": "Extracting list data...", "spinner": "⠋" });
@@ -877,7 +877,7 @@ async fn process_task(
                             })],
                             ..Default::default()
                         };
-                        worker.prefill_only(params, Some(token_clone), session_clone, None, Some("reference".to_string())).await?.0;
+                        worker.prefill_only(params, Some(token_clone), session_clone, None, Some("reference".to_string())).await?;
                     }
                 }
             } else {

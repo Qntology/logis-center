@@ -4,28 +4,6 @@ use minijinja::{Environment, Value as MiniJinjaValue, context};
 
 use crate::utils::string_to_static_str;
 
-fn patch_template(chat_template: &str) -> String {
-    chat_template
-        .replace(".startswith(", " is startingwith(")
-        .replace(".endswith(", " is endingwith(")
-        .replace(
-            "content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n')",
-            "((content | split('</think>'))[0] | rstrip('\n') | split('<think>'))[-1] | lstrip('\n')", 
-        )
-        .replace(
-            "content.split('</think>')[-1].lstrip('\n')",
-            "(content | split('</think>'))[-1] | lstrip('\n')", 
-        )
-        .replace(
-            "reasoning_content.strip('\n')",
-            "reasoning_content | strip('\n')", 
-        )
-        .replace(
-            "content.lstrip('\n')",
-            "content | lstrip('\n')", 
-        )
-}
-
 pub fn get_template(path: String) -> Result<String> {
     let tokenizer_config_file = std::path::Path::new(&path).join("tokenizer_config.json");
     if !tokenizer_config_file.exists() {
@@ -42,7 +20,32 @@ pub fn get_template(path: String) -> Result<String> {
         .as_str()
         .ok_or(anyhow!(format!("chat_template to str error")))?;
     
-    Ok(patch_template(chat_template))
+    let fixed_template = chat_template
+        .replace(
+            "message.content.startswith('<tool_response>')",
+            "message.content is startingwith('<tool_response>')", 
+        )
+        .replace(
+            "message.content.endswith('</tool_response>')",
+            "message.content is endingwith('</tool_response>')", 
+        )
+        .replace(
+            "content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n')",
+            "((content | split('</think>'))[0] | rstrip('\n') | split('<think>'))[-1] | lstrip('\n')", 
+        )
+        .replace(
+            "content.split('</think>')[-1].lstrip('\n')",
+            "(content | split('</think>'))[-1] | lstrip('\n')", 
+        )
+        .replace(
+            "reasoning_content.strip('\n')",
+            "reasoning_content | strip('\n')", 
+        )
+        .replace(
+            "content.lstrip('\n')",
+            "content | lstrip('\n')", 
+        );
+    Ok(fixed_template)
 }
 
 pub struct ChatTemplate {
@@ -65,18 +68,12 @@ impl ChatTemplate {
                         jinja_path
                     ));
                 }
-                let raw_template = std::fs::read_to_string(&jinja_path)
-                    .map_err(|e| anyhow!("Failed to read chat_template.jinja: {}", e))?;
-                patch_template(&raw_template)
+                std::fs::read_to_string(&jinja_path)
+                    .map_err(|e| anyhow!("Failed to read chat_template.jinja: {}", e))?
             }
         };
         let template = string_to_static_str(template);
         let mut env = Environment::new();
-        
-        // Add Tests for startswith/endswith support
-        env.add_test("startingwith", |s: String, prefix: String| s.starts_with(&prefix));
-        env.add_test("endingwith", |s: String, suffix: String| s.ends_with(&suffix));
-
         env.add_filter("tojson", |v: MiniJinjaValue| {
             serde_json::to_string(&v).unwrap()
         });
