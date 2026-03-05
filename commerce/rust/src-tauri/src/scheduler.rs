@@ -546,7 +546,7 @@ async fn process_task(
     // Step 2: 0.6B Loads SNAPSHOT_A -> Instant Generation
     // Step 3: 0.6B Bakes [PUG + Selector Task] -> Save SNAPSHOT_B
     // Step 4: 0.6B Loads SNAPSHOT_B -> Instant Generation
-    // ...
+    // ... 
     // ==================================================================================
 
     // --- STEP A: CLASSIFICATION (Disk Bridge Relay) ---
