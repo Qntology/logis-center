@@ -457,8 +457,8 @@ impl LogisModel {
     pub async fn ingest_pug_to_ssd(&self, task_id: &str, pug_content: &str, cancel_token: Option<Arc<AtomicBool>>, kv_name: Option<String>) -> anyhow::Result<()> {
         let base_session = format!("{}_base", task_id);
         
-        // 1. Load Small Model Isolated
-        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true, None).await?;
+        // 1. Load Small Model Isolated (Full layers, no baking)
+        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), false, None).await?;
 
         // 2. Ingest PUG content
         {
