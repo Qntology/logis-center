@@ -1446,63 +1446,58 @@ impl QuantizedQwen3_5GatedDeltaNet {
         let dev = self.qkv_proj.device();
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
         let (b_sz, q_len, _) = xs.dims3()?;
+        
+        if self.layer_idx % 5 == 0 { println!("[DELTA-FWD] Layer {} start. SeqLen: {}", self.layer_idx, q_len); }
 
         // 1. QKV Projection: [B, L, 1024] -> [B, L, 6144]
         let mut mixed_qkv = self.qkv_proj.forward(xs)?;
         
-        // 2. Gating and SSM Parameters
-        let z = self.gate_proj.forward(xs)?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?.transpose(1, 2)?.to_dtype(target_dtype)?;
-        let b = self.beta_proj.forward(xs)?;
-        let a = self.alpha_proj.forward(xs)?;
+        // 2. Gating and SSM Parameters (Scalar per head: output dim is 16, not 2048)
+        let z = self.gate_proj.forward(xs)?.to_dtype(target_dtype)?; // [B, L, 16]
+        let b = self.beta_proj.forward(xs)?; // [B, L, 16]
+        let a = self.alpha_proj.forward(xs)?; // [B, L, 16]
         
-        let beta = candle_nn::ops::sigmoid(&b)?.to_dtype(target_dtype)?;
+        let beta = candle_nn::ops::sigmoid(&b)?.to_dtype(target_dtype)?; // [B, L, 16]
         
         // g = -exp(ssm_a) * softplus(a + ssm_dt_bias)
-        let ssm_a_neg_exp = self.ssm_a.to_dtype(DType::F32)?.exp()?.affine(-1.0, 0.0)?;
-        let g = a.to_dtype(DType::F32)?.broadcast_add(&self.ssm_dt_bias.to_dtype(DType::F32)?)?;
+        // All these are size 16 (per head)
+        let ssm_a_neg_exp = self.ssm_a.to_dtype(DType::F32)?.exp()?.affine(-1.0, 0.0)?; // [16]
+        let g_base = a.to_dtype(DType::F32)?.broadcast_add(&self.ssm_dt_bias.to_dtype(DType::F32)?)?; // [B, L, 16]
+        
         // softplus(x) = log(1 + exp(x))
-        let g_softplus = g.exp()?.add(&Tensor::ones_like(&g)?)?.log()?;
-        let g = g_softplus.broadcast_mul(&ssm_a_neg_exp)?;
+        let g_softplus = g_base.exp()?.add(&Tensor::ones_like(&g_base)?)?.log()?;
+        let g = g_softplus.broadcast_mul(&ssm_a_neg_exp.reshape((1, 1, self.num_heads))?)?; // [B, L, 16]
         let g_exp = g.exp()?.to_dtype(target_dtype)?;
 
-        // 3. Causal Convolution (Depthwise)
+        // 3. Causal Convolution (Standard Candle Implementation)
         if let Some(conv) = &self.conv1d {
-             let mut conv_input = mixed_qkv.transpose(1, 2)?; // [B, 6144, L]
+             let weight = conv.weight()?; 
+             let (channels, _, k_size) = weight.dims3()?;
+             let mut conv_input = mixed_qkv.transpose(1, 2)?; // [B, channels, L]
              
              if q_len == 1 {
                  // Recurrent Inference: Use conv_state
-                 let mut state = if let Some(s) = &self.conv_state {
+                 let state = if let Some(s) = &self.conv_state {
                      s.to_device(dev)?.to_dtype(target_dtype)?
                  } else {
-                     Tensor::zeros((b_sz, 6144, 3), target_dtype, dev)?
+                     Tensor::zeros((b_sz, channels, k_size - 1), target_dtype, dev)?
                  };
-                 
-                 // Concatenate [B, 6144, 3] + [B, 6144, 1] -> [B, 6144, 4]
                  let combined = Tensor::cat(&[&state, &conv_input], 2)?;
+                 self.conv_state = Some(combined.narrow(2, 1, k_size - 1)?.contiguous()?);
                  
-                 // Update state for next step (keep last 3)
-                 self.conv_state = Some(combined.narrow(2, 1, 3)?.contiguous()?);
-                 
-                 // Apply conv1d
-                 mixed_qkv = combined.conv1d(&conv.weight()?, 1, 0, 1, 6144)?
+                 // Standard Conv1D: groups=channels makes it depthwise
+                 mixed_qkv = combined.conv1d(&weight, 0, 1, channels, channels)?
                      .transpose(1, 2)?
                      .contiguous()?;
              } else {
-                 // Prefill: Full sequence convolution
-                 // Pad with 3 zeros at start to maintain causality
-                 let padded = conv_input.pad_with_zeros(2, 3, 0)?;
-                 mixed_qkv = padded.conv1d(&conv.weight()?, 1, 0, 1, 6144)?
+                 // Prefill: Full sequence convolution with causal padding
+                 let padded = conv_input.pad_with_zeros(2, k_size - 1, 0)?;
+                 mixed_qkv = padded.conv1d(&weight, 0, 1, channels, channels)?
                      .transpose(1, 2)?
                      .contiguous()?;
                  
-                 // Update state with last 3 tokens
-                 if q_len >= 3 {
-                     self.conv_state = Some(conv_input.narrow(2, q_len - 3, 3)?.contiguous()?);
-                 } else {
-                     // Handle short prefill by combining with existing state if any
-                     // For simplicity, just store the end of what we have
-                     self.conv_state = Some(padded.narrow(2, padded.dim(2)? - 3, 3)?.contiguous()?);
-                 }
+                 // Update state with last tokens for next decoding step
+                 self.conv_state = Some(conv_input.narrow(2, q_len.saturating_sub(k_size - 1), q_len.min(k_size - 1))?.contiguous()?);
              }
              mixed_qkv = candle_nn::ops::silu(&mixed_qkv)?;
         }
@@ -1513,52 +1508,37 @@ impl QuantizedQwen3_5GatedDeltaNet {
         let v = chunks[2].reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?.to_dtype(target_dtype)?;
 
         // 4. Gated Delta Rule (Recurrent Implementation)
-        // state = state * exp(g) + beta * (K^T * V)
         let mut current_state = if let Some(s) = &self.ssm_state {
             s.to_device(dev)?.to_dtype(target_dtype)?
         } else {
             Tensor::zeros((b_sz, self.num_heads, self.head_dim, self.head_dim), target_dtype, dev)?
         };
 
-        let out = if q_len == 1 {
-            // Decoding: Simple one-step update
-            let q_t = q.i((.., .., 0, ..))?;
-            let k_t = k.i((.., .., 0, ..))?;
-            let v_t = v.i((.., .., 0, ..))?;
+        let mut outputs = Vec::with_capacity(q_len);
+        // Optimize: Pre-reshape gates
+        let g_exp = g_exp.reshape((b_sz, q_len, self.num_heads, 1, self.head_dim))?;
+        let beta = beta.reshape((b_sz, q_len, self.num_heads, 1, self.head_dim))?;
+
+        for t in 0..q_len {
+            let q_t = q.i((.., .., t, ..))?; 
+            let k_t = k.i((.., .., t, ..))?; 
+            let v_t = v.i((.., .., t, ..))?; 
             
-            let g_exp_t = g_exp.i((.., 0, ..))?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
-            let beta_t = beta.i((.., 0, ..))?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
+            let g_exp_t = g_exp.i((.., t, ..))?.unsqueeze(D::Minus1)?; 
+            let beta_t = beta.i((.., t, ..))?.unsqueeze(D::Minus1)?;
 
             current_state = current_state.broadcast_mul(&g_exp_t)?;
             let kv_prod = k_t.unsqueeze(D::Minus1)?.matmul(&v_t.unsqueeze(D::Minus2)?)?;
             current_state = (current_state + kv_prod.broadcast_mul(&beta_t)?)?;
             
             let out_t = q_t.unsqueeze(D::Minus2)?.matmul(&current_state)?;
-            out_t.transpose(1, 2)? // [B, 1, H, D] -> [B, H, 1, D]
-        } else {
-            // Prefill: Loop-based update (Optimized to reduce intermediate tensor overhead)
-            // [FIX] For very long prefill, we should ideally use Chunked algorithm.
-            // For now, we keep the loop but use fewer intermediate stacks.
-            let mut outputs = Vec::with_capacity(q_len);
-            for t in 0..q_len {
-                let q_t = q.i((.., .., t, ..))?;
-                let k_t = k.i((.., .., t, ..))?;
-                let v_t = v.i((.., .., t, ..))?;
-                
-                let g_exp_t = g_exp.i((.., t, ..))?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
-                let beta_t = beta.i((.., t, ..))?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
-
-                current_state = current_state.broadcast_mul(&g_exp_t)?;
-                let kv_prod = k_t.unsqueeze(D::Minus1)?.matmul(&v_t.unsqueeze(D::Minus2)?)?;
-                current_state = (current_state + kv_prod.broadcast_mul(&beta_t)?)?;
-                
-                let out_t = q_t.unsqueeze(D::Minus2)?.matmul(&current_state)?;
-                outputs.push(out_t.squeeze(D::Minus2)?);
-            }
-            Tensor::stack(&outputs, 2)? // [B, H, L, D]
-        };
+            outputs.push(out_t.squeeze(D::Minus2)?);
+            
+            if q_len > 1000 && t % 2000 == 0 { println!("[DELTA-SSM] Layer {} Iteration {}/{}", self.layer_idx, t, q_len); }
+        }
         
         self.ssm_state = Some(current_state.clone());
+        let out = Tensor::stack(&outputs, 2)?; // [B, H, L, D]
         // ... (Normalization and Gating)
 
         // 5. Normalization and Gating: [B, H, L, D] -> [B, L, H*D]
@@ -1811,13 +1791,18 @@ impl QuantizedQwen3VLTextDecoderLayer {
             let ssm_norm = get_rms_norm(ct, reader, &format!("{base_name}.ssm_norm"), config.rms_norm_eps, device, dtype)?;
 
             let conv1d_raw = get_raw_tensor(ct, reader, &format!("{base_name}.ssm_conv1d.weight"), device, dtype)?;
-            // Reshape [4, 6144] -> [6144, 1, 4] for depthwise conv1d
-            let conv1d_weight = conv1d_raw.transpose(0, 1)?.unsqueeze(1)?;
+            // Qwen 3.5 Design: Depthwise Conv1D
+            // GGUF weight is [channels, kernel_size]. 
+            // Candle conv1d weight expects [out_channels, in_channels/groups, kernel_size]
+            // For depthwise, groups = channels, so in_channels/groups = 1.
+            // Desired layout: [channels, 1, kernel_size]
+            let (channels, k_size) = conv1d_raw.dims2()?;
+            let conv1d_weight = conv1d_raw.reshape((channels, 1, k_size))?.contiguous()?;
             let conv1d = Some(QLinear::new(QMatMul::Tensor(conv1d_weight), None, device.clone()));
 
-            // [QWEN3.5-LINEAR-FIX] Use specific linear dimensions from config
-            let n_heads = config.linear_num_key_heads.unwrap_or(16);
-            let h_dim = config.linear_key_head_dim.unwrap_or(config.head_dim);
+            // [DYNAMIC-CONFIG] No more hardcoded 16 or 128
+            let n_heads = config.linear_num_key_heads.ok_or(anyhow!("Missing linear_num_key_heads"))?;
+            let h_dim = config.linear_key_head_dim.ok_or(anyhow!("Missing linear_key_head_dim"))?;
 
              QuantizedQwen3_5TokenMixer::DeltaNet(QuantizedQwen3_5GatedDeltaNet {
                 qkv_proj, o_proj, gate_proj, beta_proj, alpha_proj, conv1d,
