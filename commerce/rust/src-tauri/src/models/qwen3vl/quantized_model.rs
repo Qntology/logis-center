@@ -1552,9 +1552,9 @@ impl QuantizedQwen3_5GatedDeltaNet {
                 chunk_outputs.push(out_t.squeeze(D::Minus2)?);
             }
             
-            // Stack chunk results and possibly move to CPU if needed (for now keep on GPU)
+            // Stack chunk results and move to CPU to save VRAM
             let chunk_tensor = Tensor::stack(&chunk_outputs, 2)?; // [B, H, ChunkL, D]
-            all_outputs.push(chunk_tensor);
+            all_outputs.push(chunk_tensor.to_device(&Device::Cpu)?);
             
             if self.layer_idx % 5 == 0 { 
                 println!("[DELTA-SSM] Layer {} Chunk processed: {}..{}", self.layer_idx, chunk_start, chunk_end); 
@@ -1562,7 +1562,13 @@ impl QuantizedQwen3_5GatedDeltaNet {
         }
         
         self.ssm_state = Some(current_state.clone());
-        let out = Tensor::cat(&all_outputs, 2)?; // [B, H, L, D]
+        
+        // Cat on CPU then move back to GPU layer-by-layer or keep on CPU if possible?
+        // To avoid OOM during cat, we keep it on CPU. The caller must handle device mismatch or we move it back if it fits.
+        // For safety in LBL, we move back to dev ONLY if it fits, but here we return CPU tensor to be safe.
+        // Caller (process_chunks_iterative) handles device mismatch.
+        let out = Tensor::cat(&all_outputs, 2)?; // [B, H, L, D] on CPU
+        let out = out.to_device(dev)?; // Move back to GPU for projection (LBL guarantees this fits for one layer)
         // ... (Normalization and Gating)
 
         // 5. Normalization and Gating: [B, H, L, D] -> [B, L, H*D]
