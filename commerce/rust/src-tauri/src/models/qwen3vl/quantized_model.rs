@@ -1469,14 +1469,18 @@ impl QuantizedQwen3_5GatedDeltaNet {
         let g = g_softplus.broadcast_mul(&ssm_a_neg_exp.reshape((1, 1, self.num_heads))?)?; // [B, L, 16]
         let g_exp = g.exp()?.to_dtype(target_dtype)?;
 
-        // 3. Causal Convolution (Standard Candle Implementation)
+        // 3. Causal Convolution (Stable Depthwise via Batch Trick)
         if let Some(conv) = &self.conv1d {
              let weight = conv.weight()?; 
              let (channels, _, k_size) = weight.dims3()?;
              let mut conv_input = mixed_qkv.transpose(1, 2)?; // [B, channels, L]
              
+             // [STABILITY] Use batch-wise convolution to avoid groups=channels panic in Candle
+             // Transform [B, C, L] -> [B*C, 1, L]
+             let flat_input = conv_input.reshape((b_sz * channels, 1, q_len))?; 
+             
              if q_len == 1 {
-                 // Recurrent Inference: Use conv_state
+                 // Recurrent Inference
                  let state = if let Some(s) = &self.conv_state {
                      s.to_device(dev)?.to_dtype(target_dtype)?
                  } else {
@@ -1485,18 +1489,18 @@ impl QuantizedQwen3_5GatedDeltaNet {
                  let combined = Tensor::cat(&[&state, &conv_input], 2)?;
                  self.conv_state = Some(combined.narrow(2, 1, k_size - 1)?.contiguous()?);
                  
-                 // Standard Conv1D: groups=channels makes it depthwise
-                 mixed_qkv = combined.conv1d(&weight, 0, 1, channels, channels)?
-                     .transpose(1, 2)?
-                     .contiguous()?;
+                 // [BATCH-TRICK]
+                 let flat_combined = combined.reshape((b_sz * channels, 1, k_size))?;
+                 let flat_out = flat_combined.conv1d(&weight, 0, 1, 1, 1)?; // groups=1
+                 mixed_qkv = flat_out.reshape((b_sz, channels, 1))?.transpose(1, 2)?.contiguous()?;
              } else {
-                 // Prefill: Full sequence convolution with causal padding
-                 let padded = conv_input.pad_with_zeros(2, k_size - 1, 0)?;
-                 mixed_qkv = padded.conv1d(&weight, 0, 1, channels, channels)?
-                     .transpose(1, 2)?
-                     .contiguous()?;
+                 // Prefill: Full sequence
+                 let padded = flat_input.pad_with_zeros(2, k_size - 1, 0)?;
+                 // [BATCH-TRICK] groups=1 is safe
+                 let flat_out = padded.conv1d(&weight, 0, 1, 1, 1)?; 
+                 mixed_qkv = flat_out.reshape((b_sz, channels, q_len))?.transpose(1, 2)?.contiguous()?;
                  
-                 // Update state with last tokens for next decoding step
+                 // Update state
                  self.conv_state = Some(conv_input.narrow(2, q_len.saturating_sub(k_size - 1), q_len.min(k_size - 1))?.contiguous()?);
              }
              mixed_qkv = candle_nn::ops::silu(&mixed_qkv)?;
@@ -1507,38 +1511,58 @@ impl QuantizedQwen3_5GatedDeltaNet {
         let k = chunks[1].reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?.to_dtype(target_dtype)?;
         let v = chunks[2].reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?.to_dtype(target_dtype)?;
 
-        // 4. Gated Delta Rule (Recurrent Implementation)
+        // 4. Gated Delta Rule (Recurrent Implementation with Chunking for OOM prevention)
         let mut current_state = if let Some(s) = &self.ssm_state {
             s.to_device(dev)?.to_dtype(target_dtype)?
         } else {
             Tensor::zeros((b_sz, self.num_heads, self.head_dim, self.head_dim), target_dtype, dev)?
         };
 
-        let mut outputs = Vec::with_capacity(q_len);
-        // Optimize: Pre-reshape gates
+        // Optimize: Pre-reshape gates outside the loop
         let g_exp = g_exp.reshape((b_sz, q_len, self.num_heads, 1, self.head_dim))?;
         let beta = beta.reshape((b_sz, q_len, self.num_heads, 1, self.head_dim))?;
 
-        for t in 0..q_len {
-            let q_t = q.i((.., .., t, ..))?; 
-            let k_t = k.i((.., .., t, ..))?; 
-            let v_t = v.i((.., .., t, ..))?; 
-            
-            let g_exp_t = g_exp.i((.., t, ..))?.unsqueeze(D::Minus1)?; 
-            let beta_t = beta.i((.., t, ..))?.unsqueeze(D::Minus1)?;
+        // [OOM-FIX] Process in chunks of 512 tokens to keep VRAM usage low
+        let chunk_size = 512; 
+        let mut all_outputs = Vec::new();
 
-            current_state = current_state.broadcast_mul(&g_exp_t)?;
-            let kv_prod = k_t.unsqueeze(D::Minus1)?.matmul(&v_t.unsqueeze(D::Minus2)?)?;
-            current_state = (current_state + kv_prod.broadcast_mul(&beta_t)?)?;
+        for chunk_start in (0..q_len).step_by(chunk_size) {
+            let chunk_end = (chunk_start + chunk_size).min(q_len);
+            let chunk_len = chunk_end - chunk_start;
             
-            let out_t = q_t.unsqueeze(D::Minus2)?.matmul(&current_state)?;
-            outputs.push(out_t.squeeze(D::Minus2)?);
+            let mut chunk_outputs = Vec::with_capacity(chunk_len);
             
-            if q_len > 1000 && t % 2000 == 0 { println!("[DELTA-SSM] Layer {} Iteration {}/{}", self.layer_idx, t, q_len); }
+            for t in 0..chunk_len {
+                let abs_t = chunk_start + t;
+                
+                let q_t = q.i((.., .., abs_t, ..))?; 
+                let k_t = k.i((.., .., abs_t, ..))?; 
+                let v_t = v.i((.., .., abs_t, ..))?; 
+                
+                let g_exp_t = g_exp.i((.., abs_t, ..))?.unsqueeze(D::Minus1)?; 
+                let beta_t = beta.i((.., abs_t, ..))?.unsqueeze(D::Minus1)?;
+
+                // Recurrent update: state = state * g + beta * (k * v)
+                current_state = current_state.broadcast_mul(&g_exp_t)?;
+                let kv_prod = k_t.unsqueeze(D::Minus1)?.matmul(&v_t.unsqueeze(D::Minus2)?)?;
+                current_state = (current_state + kv_prod.broadcast_mul(&beta_t)?)?;
+                
+                // Output: q * state
+                let out_t = q_t.unsqueeze(D::Minus2)?.matmul(&current_state)?;
+                chunk_outputs.push(out_t.squeeze(D::Minus2)?);
+            }
+            
+            // Stack chunk results and possibly move to CPU if needed (for now keep on GPU)
+            let chunk_tensor = Tensor::stack(&chunk_outputs, 2)?; // [B, H, ChunkL, D]
+            all_outputs.push(chunk_tensor);
+            
+            if self.layer_idx % 5 == 0 { 
+                println!("[DELTA-SSM] Layer {} Chunk processed: {}..{}", self.layer_idx, chunk_start, chunk_end); 
+            }
         }
         
         self.ssm_state = Some(current_state.clone());
-        let out = Tensor::stack(&outputs, 2)?; // [B, H, L, D]
+        let out = Tensor::cat(&all_outputs, 2)?; // [B, H, L, D]
         // ... (Normalization and Gating)
 
         // 5. Normalization and Gating: [B, H, L, D] -> [B, L, H*D]
