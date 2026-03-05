@@ -127,6 +127,14 @@ impl QLinear {
         }
     }
 
+    pub fn weight(&self) -> Result<Tensor> {
+        match &self.inner {
+            QMatMul::Tensor(t) => Ok(t.clone()),
+            QMatMul::TensorF16(t) => Ok(t.clone()),
+            QMatMul::QTensor(q) => Ok(q.dequantize(&self.device)?),
+        }
+    }
+
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         if self.is_cleared() {
             return Err(anyhow!("Linear weight is cleared. Reload required."));
@@ -1339,7 +1347,11 @@ pub struct QuantizedQwen3_5GatedDeltaNet {
     pub o_proj: QLinear,
     pub gate_proj: QLinear,
     pub beta_proj: QLinear,
-    pub conv1d: Option<QLinear>, // Optional for now
+    pub alpha_proj: QLinear,
+    pub conv1d: Option<QLinear>, 
+    pub ssm_a: Tensor,
+    pub ssm_dt_bias: Tensor,
+    pub ssm_norm: RmsNorm,
     pub layer_idx: usize,
     pub num_heads: usize,
     pub num_kv_heads: usize,
@@ -1354,7 +1366,11 @@ impl QuantizedQwen3_5GatedDeltaNet {
         self.o_proj.to_device(device)?;
         self.gate_proj.to_device(device)?;
         self.beta_proj.to_device(device)?;
+        self.alpha_proj.to_device(device)?;
         if let Some(c) = &mut self.conv1d { c.to_device(device)?; }
+        self.ssm_a = self.ssm_a.to_device(device)?;
+        self.ssm_dt_bias = self.ssm_dt_bias.to_device(device)?;
+        self.ssm_norm.to_device(device)?;
         if let Some(s) = &mut self.conv_state { *s = s.to_device(device)?; }
         if let Some(s) = &mut self.ssm_state { *s = s.to_device(device)?; }
         Ok(())
@@ -1365,9 +1381,58 @@ impl QuantizedQwen3_5GatedDeltaNet {
         self.o_proj.clear();
         self.gate_proj.clear();
         self.beta_proj.clear();
+        self.alpha_proj.clear();
         if let Some(c) = &mut self.conv1d { c.clear(); }
+        // [FIX] Do NOT clear states here! layer.clear() is used for weight purging.
+        // States should only be cleared when explicitly requested (e.g. session end).
+    }
+
+    pub fn clear_states(&mut self) {
         self.conv_state = None;
         self.ssm_state = None;
+    }
+
+    pub fn trigger_state_bake(&self, session_id: &str, baking_only: bool, kv_name: Option<String>) -> Result<()> {
+        use crate::models::qwen3vl::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
+        if let Some(ssm) = &self.ssm_state {
+            let ssm_vram = ssm.clone();
+            let conv_vram = self.conv_state.clone();
+            let ssm_shape_u32: Vec<u32> = ssm.shape().dims().iter().map(|&x| x as u32).collect();
+            let layer_idx = self.layer_idx;
+            let session_id_owned = session_id.to_string();
+            
+            let kv_name_raw = kv_name.unwrap_or_else(|| "text".to_string());
+            let last_part = kv_name_raw.split('/').last().unwrap_or("text");
+            let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text".to_string() } else { last_part.to_string() };
+
+            tauri::async_runtime::spawn(async move {
+                if let Some(tx) = BAKE_TX.get() {
+                    let sub_path = if baking_only { format!("{}/reference/{}", session_id_owned, kv_type) } 
+                                   else { format!("{}/inference/{}", session_id_owned, kv_type) };
+                    let block_dir = crate::utils::paths::get_kv_dir(None).join(&sub_path).join("b0");
+                    if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
+
+                    let ssm_shape_len = ssm_shape_u32.len();
+                    let dump = LayerKVDump {
+                        layer_idx,
+                        k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
+                        v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
+                        k_shape: Tensor::from_vec(ssm_shape_u32, (ssm_shape_len,), &Device::Cpu).unwrap(),
+                        // [NEW] 워커가 직접 VRAM에서 가져가도록 텐서 전달
+                        raw_k: Some(ssm_vram),
+                        raw_v: conv_vram,
+                    };
+                    let sid = SLOT_MANAGER.acquire_write_slot(256).await;
+                    let _ = tx.send(SlotTask::Bake(BakeTask {
+                        slot_id: sid, task_dir: block_dir, kv_name: Some(sub_path),
+                        offset: 0, layers: vec![dump], is_relay_baking: baking_only,
+                        block_idx: Some(0), registry: KVRegistry::new(), // Local access works
+                    })).await;
+                }
+            });
+            println!("[L-BAKE] Layer {} (DeltaNet) state bake triggered.", layer_idx);
+        }
+        Ok(())
     }
 
     pub fn forward(
@@ -1383,45 +1448,143 @@ impl QuantizedQwen3_5GatedDeltaNet {
         let (b_sz, q_len, _) = xs.dims3()?;
 
         // 1. QKV Projection: [B, L, 1024] -> [B, L, 6144]
-        let qkv = self.qkv_proj.forward(xs)?;
-        let chunks = qkv.chunk(3, 2)?; 
+        let mut mixed_qkv = self.qkv_proj.forward(xs)?;
+        
+        // 2. Gating and SSM Parameters
+        let z = self.gate_proj.forward(xs)?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?.transpose(1, 2)?.to_dtype(target_dtype)?;
+        let b = self.beta_proj.forward(xs)?;
+        let a = self.alpha_proj.forward(xs)?;
+        
+        let beta = candle_nn::ops::sigmoid(&b)?.to_dtype(target_dtype)?;
+        
+        // g = -exp(ssm_a) * softplus(a + ssm_dt_bias)
+        let ssm_a_neg_exp = self.ssm_a.to_dtype(DType::F32)?.exp()?.affine(-1.0, 0.0)?;
+        let g = a.to_dtype(DType::F32)?.broadcast_add(&self.ssm_dt_bias.to_dtype(DType::F32)?)?;
+        // softplus(x) = log(1 + exp(x))
+        let g_softplus = g.exp()?.add(&Tensor::ones_like(&g)?)?.log()?;
+        let g = g_softplus.broadcast_mul(&ssm_a_neg_exp)?;
+        let g_exp = g.exp()?.to_dtype(target_dtype)?;
 
-        // Reshape to head-wise structure: [B, H, L, D]
+        // 3. Causal Convolution (Depthwise)
+        if let Some(conv) = &self.conv1d {
+             let mut conv_input = mixed_qkv.transpose(1, 2)?; // [B, 6144, L]
+             
+             if q_len == 1 {
+                 // Recurrent Inference: Use conv_state
+                 let mut state = if let Some(s) = &self.conv_state {
+                     s.to_device(dev)?.to_dtype(target_dtype)?
+                 } else {
+                     Tensor::zeros((b_sz, 6144, 3), target_dtype, dev)?
+                 };
+                 
+                 // Concatenate [B, 6144, 3] + [B, 6144, 1] -> [B, 6144, 4]
+                 let combined = Tensor::cat(&[&state, &conv_input], 2)?;
+                 
+                 // Update state for next step (keep last 3)
+                 self.conv_state = Some(combined.narrow(2, 1, 3)?.contiguous()?);
+                 
+                 // Apply conv1d
+                 mixed_qkv = combined.conv1d(&conv.weight()?, 1, 0, 1, 6144)?
+                     .transpose(1, 2)?
+                     .contiguous()?;
+             } else {
+                 // Prefill: Full sequence convolution
+                 // Pad with 3 zeros at start to maintain causality
+                 let padded = conv_input.pad_with_zeros(2, 3, 0)?;
+                 mixed_qkv = padded.conv1d(&conv.weight()?, 1, 0, 1, 6144)?
+                     .transpose(1, 2)?
+                     .contiguous()?;
+                 
+                 // Update state with last 3 tokens
+                 if q_len >= 3 {
+                     self.conv_state = Some(conv_input.narrow(2, q_len - 3, 3)?.contiguous()?);
+                 } else {
+                     // Handle short prefill by combining with existing state if any
+                     // For simplicity, just store the end of what we have
+                     self.conv_state = Some(padded.narrow(2, padded.dim(2)? - 3, 3)?.contiguous()?);
+                 }
+             }
+             mixed_qkv = candle_nn::ops::silu(&mixed_qkv)?;
+        }
+
+        let chunks = mixed_qkv.chunk(3, 2)?; 
         let q = chunks[0].reshape((b_sz, q_len, self.num_heads, self.head_dim))?.transpose(1, 2)?.to_dtype(target_dtype)?;
         let k = chunks[1].reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?.to_dtype(target_dtype)?;
         let v = chunks[2].reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?.to_dtype(target_dtype)?;
 
-        // 2. Compute Current State Fragment: K^T * V -> [B, H, D, D]
-        let k_t = k.transpose(2, 3)?.contiguous()?;
-        let v_cont = v.contiguous()?;
-        let mut current_state = k_t.matmul(&v_cont)?; 
+        // 4. Gated Delta Rule (Recurrent Implementation)
+        // state = state * exp(g) + beta * (K^T * V)
+        let mut current_state = if let Some(s) = &self.ssm_state {
+            s.to_device(dev)?.to_dtype(target_dtype)?
+        } else {
+            Tensor::zeros((b_sz, self.num_heads, self.head_dim, self.head_dim), target_dtype, dev)?
+        };
 
-        // [HYBRID-STATE-MANAGEMENT] Accumulate state across steps if available
-        if let Some(block) = self.conv_state.as_ref().or(self.ssm_state.as_ref()) {
-             current_state = (current_state + block.to_device(dev)?.to_dtype(target_dtype)?.contiguous()?)?;
-        }
+        let out = if q_len == 1 {
+            // Decoding: Simple one-step update
+            let q_t = q.i((.., .., 0, ..))?;
+            let k_t = k.i((.., .., 0, ..))?;
+            let v_t = v.i((.., .., 0, ..))?;
+            
+            let g_exp_t = g_exp.i((.., 0, ..))?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
+            let beta_t = beta.i((.., 0, ..))?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
+
+            current_state = current_state.broadcast_mul(&g_exp_t)?;
+            let kv_prod = k_t.unsqueeze(D::Minus1)?.matmul(&v_t.unsqueeze(D::Minus2)?)?;
+            current_state = (current_state + kv_prod.broadcast_mul(&beta_t)?)?;
+            
+            let out_t = q_t.unsqueeze(D::Minus2)?.matmul(&current_state)?;
+            out_t.transpose(1, 2)? // [B, 1, H, D] -> [B, H, 1, D]
+        } else {
+            // Prefill: Loop-based update (Optimized to reduce intermediate tensor overhead)
+            // [FIX] For very long prefill, we should ideally use Chunked algorithm.
+            // For now, we keep the loop but use fewer intermediate stacks.
+            let mut outputs = Vec::with_capacity(q_len);
+            for t in 0..q_len {
+                let q_t = q.i((.., .., t, ..))?;
+                let k_t = k.i((.., .., t, ..))?;
+                let v_t = v.i((.., .., t, ..))?;
+                
+                let g_exp_t = g_exp.i((.., t, ..))?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
+                let beta_t = beta.i((.., t, ..))?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
+
+                current_state = current_state.broadcast_mul(&g_exp_t)?;
+                let kv_prod = k_t.unsqueeze(D::Minus1)?.matmul(&v_t.unsqueeze(D::Minus2)?)?;
+                current_state = (current_state + kv_prod.broadcast_mul(&beta_t)?)?;
+                
+                let out_t = q_t.unsqueeze(D::Minus2)?.matmul(&current_state)?;
+                outputs.push(out_t.squeeze(D::Minus2)?);
+            }
+            Tensor::stack(&outputs, 2)? // [B, H, L, D]
+        };
+        
         self.ssm_state = Some(current_state.clone());
+        // ... (Normalization and Gating)
 
-        // 3. Gate Projection: [B, L, 1024] -> [B, L, 2048]
-        let gate = self.gate_proj.forward(xs)?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?.transpose(1, 2)?.to_dtype(target_dtype)?.contiguous()?;
-        let gate = candle_nn::ops::silu(&gate)?;
-
-        // 4. Final Head-wise Linear Attention: (Q * State) * Gate
-        let q_cont = q.contiguous()?;
-        let mut out = q_cont.matmul(&current_state.contiguous()?)?;
-        // Scaling
-        let scaling = 1.0 / (self.head_dim as f64).sqrt();
-        let scaling_tensor = Tensor::new(&[scaling as f32], dev)?.to_dtype(target_dtype)?;
-        out = out.broadcast_mul(&scaling_tensor)?;
-
-        // Apply Gating
-        out = out.broadcast_mul(&gate)?;
-
-        // 5. Final Assembly: [B, H, L, D] -> [B, L, H*D] -> [B, L, 1024]
+        // 5. Normalization and Gating: [B, H, L, D] -> [B, L, H*D]
         let out = out.transpose(1, 2)?.reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
+        
+        // ssm_norm is applied per-head dimension
+        let out_reshaped = out.reshape(((), self.head_dim))?;
+        let norm_out = self.ssm_norm.forward(&out_reshaped)?;
+        let out = norm_out.reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
+        
+        // Final gate with z
+        let z_flat = z.transpose(1, 2)?.reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
+        let out = out.mul(&candle_nn::ops::silu(&z_flat)?)?;
+
         self.o_proj.forward(&out)
     }
-        }
+
+    pub fn get_state(&self) -> (Option<Tensor>, Option<Tensor>) {
+        (self.ssm_state.clone(), self.conv_state.clone())
+    }
+
+    pub fn set_state(&mut self, ssm: Option<Tensor>, conv: Option<Tensor>) {
+        self.ssm_state = ssm;
+        self.conv_state = conv;
+    }
+}
 
 
 #[derive(Clone)]
@@ -1441,6 +1604,13 @@ pub struct QuantizedQwen3VLTextDecoderLayer {
 }
 
 impl QuantizedQwen3VLTextDecoderLayer {
+    pub fn layer_idx(&self) -> usize {
+        match &self.mixer {
+            QuantizedQwen3_5TokenMixer::Attention(a) => a.layer_idx,
+            QuantizedQwen3_5TokenMixer::DeltaNet(d) => d.layer_idx,
+        }
+    }
+
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         match &mut self.mixer {
             QuantizedQwen3_5TokenMixer::Attention(a) => a.to_device(device)?,
@@ -1482,7 +1652,11 @@ impl QuantizedQwen3VLTextDecoderLayer {
                 o_proj: QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone()),
                 gate_proj: QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone()),
                 beta_proj: QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone()),
+                alpha_proj: QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone()),
                 conv1d: None,
+                ssm_a: zero_t.clone(),
+                ssm_dt_bias: zero_t.clone(),
+                ssm_norm: RmsNorm::new(zero_t, config.rms_norm_eps),
                 layer_idx,
                 num_heads: n_heads,
                 num_kv_heads: n_heads,
@@ -1630,17 +1804,27 @@ impl QuantizedQwen3VLTextDecoderLayer {
             let o_proj = get_qlinear(ct, reader, &format!("{base_name}.ssm_out"), device, dtype)?;
             let gate_proj = get_qlinear(ct, reader, &format!("{base_name}.attn_gate"), device, dtype)?;
             let beta_proj = get_qlinear(ct, reader, &format!("{base_name}.ssm_beta"), device, dtype)?;
-            let conv1d = get_qlinear(ct, reader, &format!("{base_name}.ssm_conv1d"), device, dtype).ok();
+            let alpha_proj = get_qlinear(ct, reader, &format!("{base_name}.ssm_alpha"), device, dtype)?;
+            
+            let ssm_a = get_raw_tensor(ct, reader, &format!("{base_name}.ssm_a"), device, dtype)?;
+            let ssm_dt_bias = get_raw_tensor(ct, reader, &format!("{base_name}.ssm_dt.bias"), device, dtype)?;
+            let ssm_norm = get_rms_norm(ct, reader, &format!("{base_name}.ssm_norm"), config.rms_norm_eps, device, dtype)?;
+
+            let conv1d_raw = get_raw_tensor(ct, reader, &format!("{base_name}.ssm_conv1d.weight"), device, dtype)?;
+            // Reshape [4, 6144] -> [6144, 1, 4] for depthwise conv1d
+            let conv1d_weight = conv1d_raw.transpose(0, 1)?.unsqueeze(1)?;
+            let conv1d = Some(QLinear::new(QMatMul::Tensor(conv1d_weight), None, device.clone()));
 
             // [QWEN3.5-LINEAR-FIX] Use specific linear dimensions from config
             let n_heads = config.linear_num_key_heads.unwrap_or(16);
-            let h_dim = config.linear_key_head_dim.unwrap_or(128);
+            let h_dim = config.linear_key_head_dim.unwrap_or(config.head_dim);
 
-            QuantizedQwen3_5TokenMixer::DeltaNet(QuantizedQwen3_5GatedDeltaNet {
-                qkv_proj, o_proj, gate_proj, beta_proj, conv1d,
+             QuantizedQwen3_5TokenMixer::DeltaNet(QuantizedQwen3_5GatedDeltaNet {
+                qkv_proj, o_proj, gate_proj, beta_proj, alpha_proj, conv1d,
+                ssm_a, ssm_dt_bias, ssm_norm,
                 layer_idx,
                 num_heads: n_heads,
-                num_kv_heads: n_heads, // DeltaNet uses symmetric heads
+                num_kv_heads: n_heads, 
                 head_dim: h_dim,
                 conv_state: None,
                 ssm_state: None,
@@ -1683,8 +1867,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
     }
 
     pub fn clear_kv_cache(&mut self) {
-        if let QuantizedQwen3_5TokenMixer::Attention(a) = &mut self.mixer {
-            a.clear_kv_cache();
+        match &mut self.mixer {
+            QuantizedQwen3_5TokenMixer::Attention(a) => a.clear_kv_cache(),
+            QuantizedQwen3_5TokenMixer::DeltaNet(d) => d.clear_states(),
         }
     }
 
@@ -1752,8 +1937,42 @@ impl QuantizedQwen3VLTextDecoderLayer {
     }
 
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>, fragments: &[(usize, std::path::PathBuf)], current_kv_len: usize) -> Result<()> {
-        if let QuantizedQwen3_5TokenMixer::Attention(a) = &mut self.mixer {
-            a.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, fragments, current_kv_len)?;
+        let l_idx = self.layer_idx();
+        match &mut self.mixer {
+            QuantizedQwen3_5TokenMixer::Attention(a) => {
+                a.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, fragments, current_kv_len)?;
+            },
+            QuantizedQwen3_5TokenMixer::DeltaNet(ref mut delta) => {
+                // [HYBRID-RESTORE] Restore DeltaNet state from SSD (specifically from block 0)
+                if let Some((_, block_path)) = fragments.iter().find(|(off, _)| *off == 0) {
+                    let file_path = block_path.join(format!("l{}.st", l_idx));
+                    if file_path.exists() {
+                        if let Ok(data) = crate::utils::direct_loader::load_kv_block(&file_path) {
+                            if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
+                                let prefix = format!("b0_l{}_", l_idx);
+                                let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                                
+                                if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                    let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                    let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                                    
+                                    let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+                                    let ssm = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?
+                                        .to_device(device)?.to_dtype(target_dtype)?;
+                                    
+                                    let conv = if vd.data().len() > 4 { // At least one float value
+                                        Some(Tensor::from_raw_buffer(vd.data(), DType::BF16, vd.shape(), &Device::Cpu)?
+                                            .to_device(device)?.to_dtype(target_dtype)?)
+                                    } else { None };
+                                    
+                                    delta.set_state(Some(ssm), conv);
+                                    if l_idx == 0 { println!("[SSD-RESTORE] DeltaNet Layer {} state restored.", l_idx); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1886,9 +2105,9 @@ impl QuantizedQwen3VLTextModel {
 
         let current_device = device.clone(); 
         let registry = KVRegistry::new();
-        let num_layers_to_load = if baking_only { 1 } else { config.num_hidden_layers };
+        let num_layers_to_load = config.num_hidden_layers;
 
-        // [ZERO-RAM-STARTUP] 최초 로딩 시 레이어 가중치를 전혀 읽지 않고 껍데기만 생성합니다.
+        // [ZERO-RAM-STARTUP] Skeleton layer generation
         let mut layers = Vec::with_capacity(num_layers_to_load);
         for layer_idx in 0..num_layers_to_load {
             let gguf_blk = format!("blk.{layer_idx}");
@@ -2198,9 +2417,15 @@ impl QuantizedQwen3VLTextModel {
         // [OPTIMIZATION] 프리필(청크 연산)이 모두 끝난 후 레이어 단위로 단 한 번 SSD 백업 트리거
         if let Some(sid) = &session_id {
             let is_prefill = current_seq_len > 1;
-            // 프리필 중에는 루프 밖에서 일괄 처리, 디코딩(seq_len=1)일 때는 루프와 동일하게 작동
-            if let QuantizedQwen3_5TokenMixer::Attention(ref mut self_attn) = self.layers[layer_idx].mixer {
-                let _ = self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, !is_prefill);
+            match &mut self.layers[layer_idx].mixer {
+                QuantizedQwen3_5TokenMixer::Attention(ref mut self_attn) => {
+                    let _ = self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, !is_prefill);
+                    println!("[L-CHUNK-END] Layer {} (Attention) prefill finished and bake triggered.", layer_idx);
+                },
+                QuantizedQwen3_5TokenMixer::DeltaNet(ref mut delta) => {
+                    let _ = delta.trigger_state_bake(sid, baking_only, kv_name.clone());
+                    println!("[L-CHUNK-END] Layer {} (DeltaNet) prefill finished and bake triggered.", layer_idx);
+                }
             }
         }
 
@@ -2355,6 +2580,7 @@ impl QuantizedQwen3VLTextModel {
 
         // [MEMORY-OPT] Prefill 시 현재 레이어 로드
         if !is_decoding {
+            println!("[L-LOAD] Layer {} loading started...", layer_idx);
             self.reload_layer(layer_idx)?;
         }
 
@@ -2363,9 +2589,10 @@ impl QuantizedQwen3VLTextModel {
         
         if !self.layers[layer_idx].device().same_device(&target_device) {
             self.layers[layer_idx].to_device(&target_device)?;
-            // GPU 이동 후 RAM 가중치는 자동으로 drop됨
             if !is_decoding { let _ = target_device.synchronize(); }
         }
+
+        println!("[L-FWD] Layer {}/{} forward started ({} tokens)...", layer_idx + 1, self.layers.len(), input_token_count);
 
         // [MEMORY-OPT] [PREFETCH] 다음 레이어를 RAM으로 미리 로드
         if !is_decoding && layer_idx + 1 < self.layers.len() {
@@ -2430,37 +2657,63 @@ impl QuantizedQwen3VLTextModel {
         let mut block_groups: std::collections::HashMap<usize, Vec<LayerKVDump>> = std::collections::HashMap::new();
         
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
-            if let QuantizedQwen3_5TokenMixer::Attention(ref mut self_attn) = layer.mixer {
-                for block in &mut self_attn.kv_blocks {
-                    let inner = block.inner.write().unwrap();
-                    
-                    // [STRICT-RELAY] Include partial blocks and check per-layer dirty flag
-                    let is_dirty = {
-                        let reg = self.registry.entries.read().unwrap();
-                        if inner.index < reg.len() { 
-                            if l_idx < reg[inner.index].is_dirty.len() { reg[inner.index].is_dirty[l_idx] } else { true }
-                        } else { true }
-                    };
-
-                    if inner.k_cache.is_some() && is_dirty {
-                        let k = inner.k_cache.as_ref().unwrap();
-                        let k_shape_u32: Vec<u32> = k.shape().dims().iter().map(|&x| x as u32).collect();
+            match &mut layer.mixer {
+                QuantizedQwen3_5TokenMixer::Attention(ref mut self_attn) => {
+                    for block in &mut self_attn.kv_blocks {
+                        let inner = block.inner.write().unwrap();
                         
-                        block_groups.entry(inner.offset).or_default().push(LayerKVDump {
-                            layer_idx: l_idx,
-                            k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
-                            v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
-                            k_shape: Tensor::from_vec(k_shape_u32, (k.shape().dims().len(),), &Device::Cpu)?,
-                            raw_k: Some(k.to_device(&Device::Cpu)?),
-                            raw_v: Some(inner.v_cache.as_ref().unwrap().to_device(&Device::Cpu)?),
-                        });
-                        
-                        // Reset per-layer dirty flag
-                        {
-                            let mut reg = self.registry.entries.write().unwrap();
-                            if inner.index < reg.len() {
-                                if l_idx < reg[inner.index].is_dirty.len() { reg[inner.index].is_dirty[l_idx] = false; }
+                        // [STRICT-RELAY] Include partial blocks and check per-layer dirty flag
+                        let is_dirty = {
+                            if self.baking_only { true } // Always save in baking mode
+                            else {
+                                let reg = self.registry.entries.read().unwrap();
+                                if inner.index < reg.len() { 
+                                    if l_idx < reg[inner.index].is_dirty.len() { reg[inner.index].is_dirty[l_idx] } else { true }
+                                } else { true }
                             }
+                        };
+
+                        if inner.k_cache.is_some() && is_dirty {
+                            let k = inner.k_cache.as_ref().unwrap();
+                            let k_shape_u32: Vec<u32> = k.shape().dims().iter().map(|&x| x as u32).collect();
+                            
+                            block_groups.entry(inner.offset).or_default().push(LayerKVDump {
+                                layer_idx: l_idx,
+                                k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
+                                v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
+                                k_shape: Tensor::from_vec(k_shape_u32, (k.shape().dims().len(),), &Device::Cpu)?,
+                                raw_k: Some(k.to_device(&Device::Cpu)?),
+                                raw_v: Some(inner.v_cache.as_ref().unwrap().to_device(&Device::Cpu)?),
+                            });
+                            
+                            // Reset per-layer dirty flag
+                            {
+                                let mut reg = self.registry.entries.write().unwrap();
+                                if inner.index < reg.len() {
+                                    if l_idx < reg[inner.index].is_dirty.len() { reg[inner.index].is_dirty[l_idx] = false; }
+                                }
+                            }
+                        }
+                    }
+                },
+                QuantizedQwen3_5TokenMixer::DeltaNet(ref mut delta) => {
+                    // [HYBRID-FLUSH] Persistent state for DeltaNet (recurrent state)
+                    let should_save = self.baking_only || delta.ssm_state.is_some();
+                    if should_save {
+                        if let Some(ssm) = &delta.ssm_state {
+                            let ssm_shape_u32: Vec<u32> = ssm.shape().dims().iter().map(|&x| x as u32).collect();
+                            block_groups.entry(0).or_default().push(LayerKVDump {
+                                layer_idx: l_idx,
+                                k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
+                                v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
+                                k_shape: Tensor::from_vec(ssm_shape_u32, (ssm.shape().dims().len(),), &Device::Cpu)?,
+                                raw_k: Some(ssm.to_device(&Device::Cpu)?),
+                                raw_v: delta.conv_state.as_ref().map(|s| s.to_device(&Device::Cpu)).transpose()?.or(Some(Tensor::zeros((1,), DType::F32, &Device::Cpu)?)),
+                            });
+                            if l_idx % 5 == 0 { println!("[SSD-FLUSH] Gathering DeltaNet state for Layer {}...", l_idx); }
+                        } else if self.baking_only {
+                            // Even if state is None (start of sequence), baking might want to record zero states
+                            // but usually SSM state is only useful after at least one token.
                         }
                     }
                 }
@@ -3399,6 +3652,11 @@ impl QuantizedQwen3TextModel {
     pub fn load_hidden_states(&self, path: &std::path::Path, device: &Device, dtype: DType) -> Result<Tensor> { self.language_model.load_hidden_states(path, device, dtype) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, _total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, _total_len) }
+}
+
+fn get_raw_tensor<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<Tensor> {
+    let weight = ct.tensor(reader, name, device).map_err(|e| anyhow!("Failed to load {name}: {e}"))?;
+    Ok(weight.dequantize(device)?.to_dtype(dtype)?)
 }
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {

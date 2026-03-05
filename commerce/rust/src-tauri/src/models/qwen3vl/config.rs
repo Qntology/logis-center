@@ -72,6 +72,7 @@ pub struct Qwen3VLTextConfig {
     pub linear_key_head_dim: Option<usize>,
     pub linear_num_value_heads: Option<usize>,
     pub linear_value_head_dim: Option<usize>,
+    pub linear_conv_kernel_dim: Option<usize>,
     pub max_position_embeddings: usize,
     pub max_window_layers: Option<usize>,
     pub model_type: String, 

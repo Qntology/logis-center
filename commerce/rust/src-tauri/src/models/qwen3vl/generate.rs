@@ -245,9 +245,15 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 let _guard = IoGuard;
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 if let Ok(data) = safetensors::serialize(&ts, &None) {
-                    drop(ts); let _ = save_kv_block(&tp, &data);
-                    
+                    drop(ts); 
+                    if let Ok(_) = save_kv_block(&tp, &data) {
+                        if tp.file_name().unwrap_or_default().to_string_lossy().contains('l') {
+                            println!("[IO-WRITE] Layer state saved: {:?}", tp.file_name().unwrap_or_default());
+                        }
+                    }
+
                     // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
+
                     if let Some(kv_name) = kv_n {
                         if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
                             if let Ok(l_idx) = l_str.parse::<usize>() {
@@ -312,17 +318,16 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 
                         // [BACK-COMPRESSION] 압축 및 직렬화 작업 자체를 백그라운드로 완전히 분리
                         tokio::spawn(async move {
-                            // [FIX] Convert raw tensors to BF16 (or F32 fallback)
-                            // [CRITICAL] 텐서가 GPU에 있는 경우, to_device는 해당 스레드의 컨텍스트를 필요로 함
-                            if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
-                                // 워커 스레드에서 안전하게 CPU로 이동
-                                // [STABILITY] to_device 호출 시 장치 컨텍스트가 자동으로 보장되지 않을 수 있으므로
-                                // candle-core의 Device 스코프 내에서 실행되도록 유도 (필요시)
-                                let k_cpu = rk.to_device(&Device::Cpu).unwrap_or(rk);
-                                let v_cpu = rv.to_device(&Device::Cpu).unwrap_or(rv);
-                                
-                                src.k_data = k_cpu.to_dtype(DType::BF16).unwrap_or(k_cpu);
-                                src.v_data = v_cpu.to_dtype(DType::BF16).unwrap_or(v_cpu);
+                            // [FIX] Convert raw tensors if present. Supports both Attention (K+V) and DeltaNet (SSM only or SSM+Conv)
+                            if src.raw_k.is_some() || src.raw_v.is_some() {
+                                if let Some(rk) = src.raw_k.take() {
+                                    let k_cpu = rk.to_device(&Device::Cpu).unwrap_or(rk);
+                                    src.k_data = k_cpu.to_dtype(DType::BF16).unwrap_or(k_cpu);
+                                }
+                                if let Some(rv) = src.raw_v.take() {
+                                    let v_cpu = rv.to_device(&Device::Cpu).unwrap_or(rv);
+                                    src.v_data = v_cpu.to_dtype(DType::BF16).unwrap_or(v_cpu);
+                                }
                             }
 
                             let mut map = std::collections::HashMap::new();
@@ -378,6 +383,14 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                 v_data: vd_t,
                                                 original_shape: file_shape,
                                             };
+
+                                            // [HYBRID-RESTORE] If loading block 0, it might contain recurrent states for DeltaNet layers
+                                            if b_idx_off == 0 {
+                                                // We need access to the actual model instance to inject state. 
+                                                // Since this is an async background loader, we use the registry's indirect link if possible,
+                                                // but the most reliable way is to ensure the next forward pass checks this cache.
+                                            }
+
                                             if let Ok(mut r) = reg.entries.write() {
                                                 if b_idx < r.len() {
                                                     {
@@ -494,16 +507,37 @@ impl Qwen3VLGenerateModel {
         let logits_or_hidden = self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
         
         if let Some(s_id) = &session_id {
-            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
-            if !path.exists() { fs::create_dir_all(&path)?; }
-            fs::write(path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
+            let kv_dir = crate::utils::paths::get_kv_dir(None);
             
-            // Save the last hidden state for cross-task continuation
-            self.qwen3_vl.save_hidden_states(&path.join("last_hidden.st"), &logits_or_hidden)?;
+            // [FIX] Determine exact subpath consistent with force_flush_all_active_blocks
+            let kv_name_raw = _kv_name.as_deref().unwrap_or("text");
+            let last_part = kv_name_raw.split('/').last().unwrap_or("text");
+            let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { 
+                "text".to_string() 
+            } else { 
+                last_part.to_string() 
+            };
+            
+            let mode = if let ModelVariant::QuantizedVL(m) = &self.qwen3_vl { m.language_model.baking_only } 
+                       else if let ModelVariant::QuantizedText(m) = &self.qwen3_vl { m.language_model.baking_only }
+                       else { false };
+
+            let sub_path = if mode {
+                format!("{}/reference/{}", s_id, kv_type)
+            } else {
+                format!("{}/inference/{}", s_id, kv_type)
+            };
+
+            let full_save_path = kv_dir.join(&sub_path);
+            if !full_save_path.exists() { fs::create_dir_all(&full_save_path)?; }
+            
+            // Save metadata inside the specific context folder
+            fs::write(full_save_path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
+            self.qwen3_vl.save_hidden_states(&full_save_path.join("last_hidden.st"), &logits_or_hidden)?;
             
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
             wait_for_global_io().await; // [SYNC] Ensure SSD write is complete
-            println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk.");
+            println!("[PREFILL-SAVE] All active context (KV + Hidden) safely persisted to: {}", sub_path);
         }
         Ok((total_toks, logits_or_hidden))
     }
