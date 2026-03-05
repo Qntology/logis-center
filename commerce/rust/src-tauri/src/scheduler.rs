@@ -440,62 +440,14 @@ async fn process_task(
     if task.r#type == "image_extraction" {
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
         if !image_path.is_empty() {
-            println!("[Scheduler] Starting VISION BAKER (1-Layer 2B) for {}", task.id);
+            println!("[Scheduler] Starting Image Extraction for {}", task.id);
             
             let snapshot_id = format!("{}_img", task.id);
-            let prompt = crate::model::get_image_extraction_prompt("kr", "korean", "tracking", "");
-
-            // [ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think
-
-            // 1. [Vision Baker] Load 1-layer 2B model and bake image
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer 2B)...", "spinner": "⠋" }));
             
-            // Activate 2B in Baking mode (1 layer, no MLP)
-            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true, None).await?;
+            // [Full Vision] Load full 2B model and analyze
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Analyzing visual context with 2B-VL...", "spinner": "⠋" }));
             
-            // Perform prefill with image to create visual KV cache
-            let model_clone = model.clone();
-            let image_path_clone = image_path.clone();
-            let prompt_clone = prompt.clone();
-            let token_clone = cancellation_token.clone();
-            let session_clone = Some(snapshot_id.clone());
-            let kv_name_clone = kv_name.clone();
-
-            use crate::openai_types::{ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart, ChatCompletionRequestMessageContentPartText, ChatCompletionRequestMessageContentPartImage, ImageURL};
-
-            {
-                let mut gen_guard = model_clone.generator.lock().await;
-                if let Some(worker) = gen_guard.as_mut() {
-                    worker.clear_kv_cache();
-                    
-                    // Create vision message
-                    let params = ChatCompletionParameters {
-                        messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                            content: ChatCompletionRequestUserMessageContent::Array(vec![
-                                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText {
-                                    text: prompt_clone,
-                                }),
-                                ChatCompletionRequestMessageContentPart::ImageURL(ChatCompletionRequestMessageContentPartImage {
-                                    image_url: ImageURL { 
-                                        url: format!("file://{}", image_path_clone),
-                                        detail: None
-                                    }
-                                })
-                            ]),
-                            name: None,
-                        })],
-                        ..Default::default()
-                    };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
-                }
-            }
-
-            model.save_kv_snapshot(&snapshot_id, kv_name.clone(), 0).await?;
-
-            // 2. [Full Vision] Reload full 2B model and inject baked cache
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 2B-VL...", "spinner": "⠋" }));
-            
-            // Transition to full Large model with the baked snapshot
+            // Transition to full Large model. secure_vram_relay will load existing KV if snapshot_id exists.
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             model.extract_from_image(
