@@ -2317,8 +2317,10 @@ impl QuantizedQwen3VLTextModel {
                 }
 
                 // [WORKER-DISPATCH] 각 블록을 독립적인 태스크로 던짐
+                let mut assigned_sids = Vec::new();
                 for dump in dumps_to_send {
                     let sid = SLOT_MANAGER.acquire_write_slot(256).await;
+                    assigned_sids.push(sid);
                     let block_dir = kv_dir.join(&sub_path).join(format!("b{}", b_off));
                     
                     println!("[PARALLEL-PREFILL] Layer {} | Offset {} -> Assigned to Slot {}", layer_idx, b_off, sid);
@@ -2344,44 +2346,29 @@ impl QuantizedQwen3VLTextModel {
                         registry: self.registry.clone(),
                     })).await;
                 }
-            }
-        }
 
-        if aggressive {
-            println!("[ENGINE] Waiting for parallel blocks to hit SSD for Layer {}...", layer_idx);
-            
-            // [ROBUST-SYNC] 메모리 카운터와 파일 시스템 센티널을 동시 모니터링
-            let kv_dir = crate::utils::paths::get_kv_dir(None);
-            let kv_name_base = self.active_kv_name.as_deref().unwrap_or("general");
-            let sentinel_dir = kv_dir.join(session_id).join("sentinels");
-            
-            let mut pending_blocks: std::collections::HashSet<usize> = (block_start..block_end).step_by(256).map(|off| off / 256).collect();
-            let start_wait = std::time::Instant::now();
+                if aggressive {
+                    println!("[ENGINE] Waiting for assigned slots {:?} to hit SSD for Layer {}...", assigned_sids, layer_idx);
+                    let sentinel_dir = kv_dir.join(session_id).join("sentinels");
+                    let start_wait = std::time::Instant::now();
 
-            while !pending_blocks.is_empty() && start_wait.elapsed().as_secs() < 30 {
-                let mut resolved = Vec::new();
-                for &b_idx in &pending_blocks {
-                    // 1. 메모리상 완료 확인
-                    let is_ready = {
-                        let reg = self.registry.entries.read().unwrap();
-                        b_idx < reg.len() && reg[b_idx].location[layer_idx] == KVLocation::SSD
-                    };
-
-                    // 2. 파일 시스템상 완료 확인 (메모리 유실 대비)
-                    let has_done_file = (0..512).any(|sid| sentinel_dir.join(format!("s{}.done", sid)).exists());
-                    
-                    // [FIX] 특정 오프셋/블록에 매칭되는 done 파일이 있는지 더 정밀하게 체크할 수도 있으나, 
-                    // 현재는 전체 IO 카운터가 0이 되거나 블록 상태가 SSD가 되면 패스
-                    if is_ready || crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                        resolved.push(b_idx);
+                    while !assigned_sids.is_empty() && start_wait.elapsed().as_secs() < 30 {
+                        assigned_sids.retain(|&sid| {
+                            let done_path = sentinel_dir.join(format!("s{}.done", sid));
+                            let is_mem_ready = {
+                                let reg = self.registry.entries.read().unwrap();
+                                b_idx < reg.len() && reg[b_idx].location[layer_idx] == KVLocation::SSD
+                            };
+                            // 메모리상 완료되었거나, 파일 시스템상 완료 파일이 존재하면 통과
+                            !(is_mem_ready || done_path.exists())
+                        });
+                        
+                        if !assigned_sids.is_empty() {
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
                     }
                 }
-
-                for b_idx in resolved { pending_blocks.remove(&b_idx); }
-                if !pending_blocks.is_empty() { tokio::time::sleep(std::time::Duration::from_millis(50)).await; }
             }
-            
-            println!("[ENGINE] All blocks for Layer {} confirmed on SSD/Registry. Proceeding.", layer_idx);
         }
         Ok(())
     }
@@ -2399,6 +2386,11 @@ impl QuantizedQwen3VLTextModel {
     ) -> Result<Tensor> {
         self.active_session_id = session_id.clone();
         self.active_kv_name = kv_name.clone(); // [RESTORED]
+
+        // [SSD-INTERLOCK] 추론 시작 전 물리적 Sentinel 상태를 메모리와 동기화하여 좀비 자원 회수
+        if let Some(sid) = &session_id {
+            SLOT_MANAGER.sync_with_sentinels(sid).await;
+        }
 
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         let target_device = self.layers[0].device().clone();

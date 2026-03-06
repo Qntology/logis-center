@@ -305,7 +305,12 @@ pub async fn start_background_worker(
                                     
                                     // [NEW] Automatic OOM Recovery Logic (Forcing SSD-Swap Mode)
                                     if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
-                                        println!("[Scheduler] OOM Detected! Activating SSD-Swap Mode for retry.");
+                                        // [DIAG-OOM] 상세 메모리 상태 로깅
+                                        let mut sys = sysinfo::System::new_all();
+                                        sys.refresh_memory();
+                                        let free_ram = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+                                        println!("[Scheduler-OOM] OOM Detected! RAM Free: {:.2} GB. Activating SSD-Swap Mode for retry.", free_ram);
+
                                         {
                                             let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
                                             if let Some(m) = model_lock.as_ref() {
@@ -355,6 +360,13 @@ async fn process_task(
     app_handle: &tauri::AppHandle,
     device_preference: Option<String>,
 ) -> Result<()> {
+    // [SSD-INTERLOCK] 작업 시작 전, 물리적 Sentinel(.done) 파일을 스캔하여 이전 세션의 좀비 자원을 해제합니다.
+    {
+        use crate::models::qwen3vl::generate::SLOT_MANAGER;
+        SLOT_MANAGER.sync_with_sentinels(&task.id).await;
+        println!("[SCHEDULER] SSD Sentinel check complete for task: {}", task.id);
+    }
+
     // [NEW] Ensure log directory exists at runtime using dynamic path
     let pug_logs_dir = utils::paths::get_pug_logs_dir(Some(app_handle), &task.id);
     println!("[DEBUG] Pug logs directory: {:?}", pug_logs_dir);

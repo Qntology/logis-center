@@ -69,9 +69,38 @@ impl SlotManager {
     }
     pub async fn release_slot(&self, idx: usize) { let _ = self.request_tx.send(SlotRequest::Release { idx, is_bake: false }).await; }
     pub async fn mark_ready(&self, idx: usize) { 
-        // [STRICT] Using try_send or ensuring high-priority delivery for releases
         let _ = self.request_tx.send(SlotRequest::Release { idx, is_bake: true }).await; 
     }
+
+    /// [SSD-INTERLOCK] 물리적 .done 파일을 스캔하여 좀비 슬롯을 강제로 회수합니다.
+    pub async fn sync_with_sentinels(&self, session_id: &str) {
+        let kv_dir = crate::utils::paths::get_kv_dir(None);
+        let sentinel_dir = kv_dir.join(session_id).join("sentinels");
+        if !sentinel_dir.exists() { return; }
+
+        if let Ok(entries) = std::fs::read_dir(&sentinel_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| ext == "done") {
+                    if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                        if name.starts_with('s') {
+                            if let Ok(sid) = name[1..].parse::<usize>() {
+                                if sid < self.slots.len() {
+                                    let s = &self.slots[sid];
+                                    if s.state.load(Ordering::SeqCst) == 1 { // Writing 상태인 경우만 회수
+                                        println!("[SSD-SYNC] Detected .done for slot {}. Forcing reclamation.", sid);
+                                        self.mark_ready(sid).await;
+                                        let _ = std::fs::remove_file(&path); // 처리 완료 후 done 파일 삭제
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn acquire_read_slot(&self) -> usize {
         loop {
             for (i, slot) in self.slots.iter().enumerate() {
