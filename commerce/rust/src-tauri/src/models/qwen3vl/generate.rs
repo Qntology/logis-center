@@ -277,6 +277,8 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                 while found.is_none() {
                     if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
                         for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
+                            // [STRICT-ISOLATION] 오직 완전히 비어있는(0) 슬롯만 배정합니다.
+                            // Ready(2) 상태인 슬롯은 sync_with_sentinels가 Free(0)로 만들기 전까지 절대 재사용하지 않습니다.
                             if slot.state.load(Ordering::SeqCst) == 0 {
                                 if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                                     SLOT_MANAGER.update_counters(0, 1);
@@ -285,31 +287,22 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                                 }
                             }
                         }
-                        if found.is_none() {
-                            for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
-                                if slot.state.load(Ordering::SeqCst) == 2 {
-                                    if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                                        SLOT_MANAGER.update_counters(2, 1);
-                                        SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst);
-                                        found = Some(i); break;
-                                    }
-                                }
-                            }
-                        }
                     }
-                    if found.is_none() { tokio::time::sleep(std::time::Duration::from_millis(2)).await; }
+                    if found.is_none() { tokio::time::sleep(std::time::Duration::from_millis(1)).await; }
                 }
                 let _ = tx.send(found.unwrap());
             },
             SlotRequest::Release { idx, is_bake } => {
                 let s = &SLOT_MANAGER.slots[idx]; 
                 let old = s.state.load(Ordering::SeqCst);
+                // is_bake가 true면 Ready(2)로 가고, false(에러나 정리)면 Free(0)로 갑니다.
                 let new = if is_bake { 2 } else { 0 };
+                
                 if s.state.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                     SLOT_MANAGER.update_counters(old, new);
                     if old == 1 { SLOT_MANAGER.active_write_count.fetch_sub(1, Ordering::SeqCst); }
                     
-                    // [IMMEDIATE-CLEANUP] 슬롯 해제 시 내부에 들고 있던 텐서들을 즉시 해제
+                    // [IMMEDIATE-CLEANUP] 슬롯 해제 시 모든 텐서 참조를 즉시 제거하여 물리적 메모리 해제
                     for k in &s.k_layers { let mut g = k.lock().unwrap(); *g = None; }
                     for v in &s.v_layers { let mut g = v.lock().unwrap(); *g = None; }
                     
@@ -424,6 +417,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let (sid, off, _is_relay, block_idx, registry, kv_name) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone());
                     let loop_count = bake.layers.len();
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
+                    
                     for l_idx in 0..loop_count {
                         let src = bake.layers[l_idx].clone();
                         let act_l = src.layer_idx;
@@ -431,11 +425,22 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let registry_inner = registry.clone();
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
+                        
                         let mut map = std::collections::HashMap::new();
                         let prefix = format!("b{}_l{}_", off, act_l);
-                        map.insert(format!("{}k_data", prefix), src.k_data.clone());
-                        map.insert(format!("{}v_data", prefix), src.v_data.clone());
+                        
+                        // [VRAM-TO-RAM-WORKER] 워커 스레드에서 직접 CPU 복사 수행
+                        let (k_final, v_final) = if let (Some(rk), Some(rv)) = (src.raw_k, src.raw_v) {
+                            (rk.to_device(&Device::Cpu).unwrap_or(src.k_data), 
+                             rv.to_device(&Device::Cpu).unwrap_or(src.v_data))
+                        } else {
+                            (src.k_data, src.v_data)
+                        };
+
+                        map.insert(format!("{}k_data", prefix), k_final.to_dtype(DType::BF16).unwrap_or(k_final));
+                        map.insert(format!("{}v_data", prefix), v_final.to_dtype(DType::BF16).unwrap_or(v_final));
                         map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
+                        
                         let file_path = task_dir.join(format!("l{}.st", act_l));
                         let _ = io_tx_nested.send(SaveTask { 
                             slot_id: sid, path: file_path, tensors: map, is_last: false, 

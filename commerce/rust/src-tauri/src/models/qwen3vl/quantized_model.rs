@@ -2284,19 +2284,15 @@ impl QuantizedQwen3VLTextModel {
                     if b_idx >= kv_blocks.len() { continue; }
                     
                     let mut inner = kv_blocks[b_idx].inner.write().unwrap();
-                    // Prefill 시에는 location과 관계없이 데이터가 있으면 SSD로 보냄
                     if let (Some(k), Some(v)) = (inner.k_cache.take(), inner.v_cache.take()) {
-                        // [VRAM-RELEASE-IMMEDIATE] 메인 스레드에서 즉시 CPU로 복사 후 VRAM 해제
-                        let k_cpu = k.to_device(&Device::Cpu)?;
-                        let v_cpu = v.to_device(&Device::Cpu)?;
-                        
+                        // [VRAM-DIRECT-PASS] 메인 스레드에서 CPU 복사를 하지 않고 VRAM 텐서를 그대로 전달
                         let dump = LayerKVDump {
                             layer_idx,
-                            k_data: k_cpu.to_dtype(DType::BF16)?,
-                            v_data: v_cpu.to_dtype(DType::BF16)?,
-                            k_shape: Tensor::from_vec(vec![1u32, 1, 256, 1024], (4,), &Device::Cpu)?, // [FIX] 0.6B Shape
-                            raw_k: None,
-                            raw_v: None,
+                            k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
+                            v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
+                            k_shape: Tensor::from_vec(k.shape().dims().iter().map(|&x| x as u32).collect::<Vec<u32>>(), (k.rank(),), &Device::Cpu)?,
+                            raw_k: Some(k),
+                            raw_v: Some(v),
                         };
                         dumps_to_send.push(dump);
                         inner.location = KVLocation::SSD;
