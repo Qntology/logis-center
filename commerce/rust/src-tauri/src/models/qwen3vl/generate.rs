@@ -562,15 +562,40 @@ impl Qwen3VLGenerateModel {
             
             if !save_path.exists() { let _ = fs::create_dir_all(&save_path); }
             
-            // [CRITICAL] tokens.json 저장 (인덱스와 같은 위치에 저장하여 엔진이 찾기 쉽게 함)
             let tokens_json = serde_json::to_string(&full_ids)?;
             fs::write(save_path.join("tokens.json"), &tokens_json)?;
-            println!("[PREFILL-SAVE] Saved tokens.json to {:?}", save_path);
+            // [BACKUP] 루트 폴더에도 저장하여 엔진 로더가 찾기 쉽게 함
+            let _ = fs::write(kv_dir.join(s_id).join("tokens.json"), &tokens_json);
+            
+            println!("[PREFILL-SAVE] Saved tokens.json to {:?} and root.", save_path);
 
             let _ = self.force_flush_all_active_blocks(s_id, Some(kv_name_sub)).await;
             wait_for_global_io().await;
         }
         Ok(total_toks)
+    }
+
+    pub async fn prefill_chunk(&mut self, prompt: String, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<usize> {
+        // [FORCE-JSON] 중국어 답변 방지 및 형식을 강제합니다.
+        let mes = ChatCompletionParameters {
+            messages: vec![
+                crate::openai_types::ChatCompletionRequestMessage::System(
+                    crate::openai_types::ChatCompletionRequestSystemMessage {
+                        content: "You are a classifier. Return ONLY a valid JSON object. Example: {\"type\": \"goods\"}".to_string(),
+                        name: None,
+                    }
+                ),
+                crate::openai_types::ChatCompletionRequestMessage::User(
+                    crate::openai_types::ChatCompletionRequestUserMessage {
+                        content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt),
+                        name: None,
+                    }
+                )
+            ],
+            temperature: Some(0.1),
+            ..Default::default()
+        };
+        self.prefill_only(mes, _cancel_flag, session_id, None, None).await
     }
 
     pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {

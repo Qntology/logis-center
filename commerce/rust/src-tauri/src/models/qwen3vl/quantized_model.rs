@@ -1587,41 +1587,35 @@ pub struct QuantizedQwen3VLTextModel {
 }
 
 impl QuantizedQwen3VLTextModel {
-    /// [MEMORY-OPT] 모든 레이어를 한꺼번에 로드합니다. (디코딩 시작 시 호출)
+    /// [MEMORY-OPT] 모든 레이어와 공통 가중치(norm, embed)를 한꺼번에 로드합니다.
     pub async fn reload_all_layers(&mut self) -> Result<()> {
         let count = self.layers.len();
-        println!("[MEMORY-OPT] Prefill complete. Reloading all {} layers for high-speed decoding...", count);
+        println!("[MEMORY-OPT] Prefill complete. Reloading all {} layers and shared weights...", count);
         
-        // [SAFETY] 혹시 모를 잔여 IO 대기
         let start_wait = std::time::Instant::now();
         while crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-            if start_wait.elapsed().as_secs() > 10 {
-                println!("[STUCK-GUARD] IO Counter stuck. Forcing proceed.");
-                crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
-                break;
-            }
+            if start_wait.elapsed().as_secs() > 10 { break; }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
+        let mmap = self.mmap.as_ref().ok_or(anyhow!("Mmap missing"))?;
+        let ct = self.ct.as_ref().ok_or(anyhow!("CT missing"))?;
+        let dev = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) };
+        let mut reader = std::io::Cursor::new(&mmap[..]);
+
+        // [CRITICAL] 공통 가중치(norm, embed) 복구 - 이게 없으면 크래시가 납니다.
+        if self.norm.is_cleared() {
+            let norm_prefix = if ct.tensor_infos.contains_key("output_norm.weight") { "output_norm" } else { &format!("{}.norm", self.base_name) };
+            self.norm = get_rms_norm(ct, &mut reader, norm_prefix, self.config.rms_norm_eps, &dev, self.dtype)?;
+        }
+
         for i in 0..count {
-            if let Err(e) = self.reload_layer(i) {
-                println!("[CRITICAL-ERROR] Failed to reload layer {}: {}", i, e);
-                return Err(e);
-            }
-            // [STABILITY] 윈도우/DirectStorage 안정성을 위해 짧은 대기 및 동기화
-            if i % 4 == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
+            self.reload_layer(i)?;
+            if i % 4 == 0 { tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
         }
-
-        // [CRITICAL-SAFETY] 로딩 완료 후 전체 GPU 동기화 강제 (크래시 방지)
-        if let Some(dev) = self.layers.get(0).map(|l| l.device()) {
-            if dev.is_cuda() {
-                let _ = dev.synchronize();
-            }
-        }
-
-        println!("[MEMORY-OPT] All layers reloaded successfully.");
+        
+        if dev.is_cuda() { let _ = dev.synchronize(); }
+        println!("[MEMORY-OPT] All layers and shared weights reloaded successfully.");
         Ok(())
     }
 
