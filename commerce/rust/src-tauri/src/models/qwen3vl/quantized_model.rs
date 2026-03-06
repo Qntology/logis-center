@@ -1918,43 +1918,45 @@ impl QuantizedQwen3VLTextModel {
         for (chunk_idx, &i) in chunk_offsets.iter().enumerate() {
             let take = (current_seq_len - i).min(chunk_size);
             
-            // [SLIDING-WINDOW-PREFETCH] ... (Prefetch logic remains same)
-            let prefetch_window = 4;
-            let look_ahead_layers = 2;
-            let target_chunks = if chunk_idx == 0 { (0..=prefetch_window).collect::<Vec<_>>() } else { vec![chunk_idx + prefetch_window] };
+            // [SLIDING-WINDOW-PREFETCH] 디코딩 중에는 이미 모든 레이어가 로드되어 있으므로 프리페치 건너뜀
+            if current_seq_len > 1 {
+                let prefetch_window = 4;
+                let look_ahead_layers = 2;
+                let target_chunks = if chunk_idx == 0 { (0..=prefetch_window).collect::<Vec<_>>() } else { vec![chunk_idx + prefetch_window] };
 
-            for t_idx in target_chunks {
-                if t_idx < chunk_offsets.len() {
-                    for l_off in 1..=look_ahead_layers {
-                        let target_layer = layer_idx + l_off;
-                        if target_layer < 28 {
-                            if let Some(block) = self.layers[layer_idx].self_attn.kv_blocks.get(t_idx) {
-                                let (index, path_opt) = {
-                                    let reg = self.registry.entries.read().unwrap();
-                                    let inner = block.inner.read().unwrap();
-                                    if inner.index < reg.len() && reg[inner.index].location[target_layer] == KVLocation::SSD {
-                                        (inner.index, reg[inner.index].ssd_path.clone())
-                                    } else { (999, None) }
-                                };
+                for t_idx in target_chunks {
+                    if t_idx < chunk_offsets.len() {
+                        for l_off in 1..=look_ahead_layers {
+                            let target_layer = layer_idx + l_off;
+                            if target_layer < 28 {
+                                if let Some(block) = self.layers[layer_idx].self_attn.kv_blocks.get(t_idx) {
+                                    let (index, path_opt) = {
+                                        let reg = self.registry.entries.read().unwrap();
+                                        let inner = block.inner.read().unwrap();
+                                        if inner.index < reg.len() && reg[inner.index].location[target_layer] == KVLocation::SSD {
+                                            (inner.index, reg[inner.index].ssd_path.clone())
+                                        } else { (999, None) }
+                                    };
 
-                                if index != 999 && path_opt.is_some() {
-                                    let path = path_opt.unwrap();
-                                    {
-                                        let mut reg = self.registry.entries.write().unwrap();
-                                        reg[index].location[target_layer] = KVLocation::Loading;
-                                    }
-                                    let shared_block = block.clone();
-                                    let reg_clone = self.registry.clone();
-                                    let kv_name_for_load = kv_name.clone();
-                                    tauri::async_runtime::spawn(async move {
-                                        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
-                                        let sid = SLOT_MANAGER.acquire_read_slot().await;
-                                        if let Ok(tx) = get_load_worker().await {
-                                            let _ = tx.send(SlotTask::Load(LoadTask { slot_id: sid, path, layer_idx: target_layer, kv_name: kv_name_for_load, shared_block, registry: reg_clone })).await;
-                                        } else {
-                                            SLOT_MANAGER.release_slot(sid).await;
+                                    if index != 999 && path_opt.is_some() {
+                                        let path = path_opt.unwrap();
+                                        {
+                                            let mut reg = self.registry.entries.write().unwrap();
+                                            reg[index].location[target_layer] = KVLocation::Loading;
                                         }
-                                    });
+                                        let shared_block = block.clone();
+                                        let reg_clone = self.registry.clone();
+                                        let kv_name_for_load = kv_name.clone();
+                                        tauri::async_runtime::spawn(async move {
+                                            use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
+                                            let sid = SLOT_MANAGER.acquire_read_slot().await;
+                                            if let Ok(tx) = get_load_worker().await {
+                                                let _ = tx.send(SlotTask::Load(LoadTask { slot_id: sid, path, layer_idx: target_layer, kv_name: kv_name_for_load, shared_block, registry: reg_clone })).await;
+                                            } else {
+                                                SLOT_MANAGER.release_slot(sid).await;
+                                            }
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -2103,30 +2105,24 @@ impl QuantizedQwen3VLTextModel {
         let input_token_count = xs.dim(1).unwrap_or(0);
         let is_decoding = input_token_count <= 1;
 
-        // [MEMORY-OPT] 레이어 연산 전 로드 (가중치가 없으면 mmap에서 가져옴)
-        // 디코딩 시에는 첫 레이어에서 전체 로드를 시도하되, 개별 레이어에서도 로드를 보장합니다.
+        // [MEMORY-OPT] 레이어 연산 전 로드
+        // 프리필 시에는 현재 레이어를 로드하고, 디코딩 시에는 첫 레이어에서 전체 로드를 시도합니다.
         if is_decoding && layer_idx == 0 {
             let already_loaded = !self.layers[0].self_attn.q_proj.is_cleared();
-            if !already_loaded { 
-                self.reload_all_layers().await?; 
-            }
+            if !already_loaded { self.reload_all_layers().await?; }
         }
         
-        // [SAFETY] 현재 레이어가 비어있다면 반드시 로드합니다.
+        // [SAFETY] 가중치가 비어있으면 로드 (프리필은 여기서 매번 로드됨)
         self.reload_layer(layer_idx)?;
 
         // [STEP 1] 현재 레이어를 GPU로 이동
         let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
-        
         if !self.layers[layer_idx].device().same_device(&target_device) {
             self.layers[layer_idx].to_device(&target_device)?;
-            // GPU 이동 후 RAM 가중치는 자동으로 drop됨
-            if !is_decoding { 
-                let _ = target_device.synchronize(); 
-            }
+            if !is_decoding { let _ = target_device.synchronize(); }
         }
 
-        // [MEMORY-OPT] [PREFETCH] 프리필 중에만 다음 레이어를 RAM으로 미리 로드
+        // [MEMORY-OPT] [PREFETCH] 프리필 중 다음 레이어 미리 로드
         if !is_decoding && layer_idx + 1 < self.layers.len() {
             let _ = self.reload_layer(layer_idx + 1);
         }
@@ -2140,21 +2136,18 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [MEMORY-OPT] [IMMEDIATE-PURGE] 연산 직후 가중치 즉시 소각
-        // KV 대피(IO)는 시간이 걸릴 수 있으므로, 그 전에 가중치를 먼저 지워서 VRAM 공간 확보
+        // [MEMORY-OPT] [IMMEDIATE-PURGE] 프리필 시 연산 직후 가중치 즉시 소각
         if !is_decoding {
             self.layers[layer_idx].clear();
-            if target_device.is_cuda() { 
-                let _ = target_device.synchronize(); // GPU 메모리 해제 확정
-            }
-            println!("[MEMORY-OPT] Layer {} Weights Purged. (RAM/VRAM cleared)", layer_idx);
+            if target_device.is_cuda() { let _ = target_device.synchronize(); }
+            println!("[MEMORY-OPT] Layer {} Weights Purged.", layer_idx);
         }
 
         // [STEP 4] 자원 반납 및 KV 대피 (Fire-and-Forget)
         let sid_opt = self.active_session_id.clone();
         if let Some(sid) = sid_opt {
             let is_prefill = !is_decoding;
-            // [SYNC-PREFILL] Prefill 상황에서도 워커를 기다리지 않고 즉시 던지기만 합니다.
+            // 워커를 기다리지 않고 작업을 던집니다.
             let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count, false).await;
             
             // [LAYER-BY-LAYER-CLEANUP] 프리필 단계에서는 레이어 1개가 끝날 때마다 몰아서 정리
@@ -2162,10 +2155,6 @@ impl QuantizedQwen3VLTextModel {
                 SLOT_MANAGER.sync_with_sentinels(&sid).await;
             }
         }
-
-        // [STABILITY-FIX] 디코딩 중 연산 직후 가중치를 즉시 비우는 로직을 제거합니다.
-        // 이것이 Access Violation (0xc0000005)의 주된 원인이었습니다.
-        // 가중치 유지는 이제 rebalance_layers의 VRAM 모니터링에 맡깁니다.
 
         Ok(next_xs)
     }
