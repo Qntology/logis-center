@@ -1733,6 +1733,8 @@ impl QuantizedQwen3VLTextModel {
         println!("[MEMORY-OPT] Prefill complete. Reloading all {} layers for high-speed decoding...", count);
         for i in 0..count {
             self.reload_layer(i)?;
+            // [STABILITY] 너무 빠른 로딩으로 인한 리소스 쇼크 방지 (Windows/저사양 환경 최적화)
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         Ok(())
     }
@@ -2335,7 +2337,7 @@ impl QuantizedQwen3VLTextModel {
                     // [SINGLE-INCREMENT] 여기서만 카운터 증가 (워커 중복 제거)
                     GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-                    let _ = tx.send(SlotTask::Bake(BakeTask {
+                    if let Err(e) = tx.send(SlotTask::Bake(BakeTask {
                         slot_id: sid,
                         task_dir: block_dir,
                         kv_name: Some(sub_path.clone()),
@@ -2344,23 +2346,25 @@ impl QuantizedQwen3VLTextModel {
                         is_relay_baking: self.baking_only,
                         block_idx: Some(b_idx),
                         registry: self.registry.clone(),
-                    })).await;
+                    })).await {
+                        println!("[ENGINE-ERROR] Failed to send bake task: {}. Reclaiming counter.", e);
+                        GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
+                    }
                 }
 
                 if aggressive {
-                    println!("[ENGINE] Waiting for assigned slots {:?} to hit SSD for Layer {}...", assigned_sids, layer_idx);
-                    let sentinel_dir = kv_dir.join(session_id).join("sentinels");
                     let start_wait = std::time::Instant::now();
 
                     while !assigned_sids.is_empty() && start_wait.elapsed().as_secs() < 30 {
+                        // [SSD-INTERLOCK] 물리적 파일 스캔 및 슬롯 상태 강제 업데이트
+                        SLOT_MANAGER.sync_with_sentinels(session_id).await;
+
                         assigned_sids.retain(|&sid| {
-                            let done_path = sentinel_dir.join(format!("s{}.done", sid));
-                            let is_mem_ready = {
-                                let reg = self.registry.entries.read().unwrap();
-                                b_idx < reg.len() && reg[b_idx].location[layer_idx] == KVLocation::SSD
-                            };
-                            // 메모리상 완료되었거나, 파일 시스템상 완료 파일이 존재하면 통과
-                            !(is_mem_ready || done_path.exists())
+                            let s = &SLOT_MANAGER.slots[sid];
+                            let current_state = s.state.load(std::sync::atomic::Ordering::SeqCst);
+                            
+                            // 2: Ready(Baking 완료) 상태가 되면 대기 리스트에서 제거
+                            current_state != 2
                         });
                         
                         if !assigned_sids.is_empty() {
