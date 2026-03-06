@@ -760,31 +760,40 @@ impl QuantizedQwen3VLTextAttention {
                 if k_cpu.is_none() {
                     let ssd_path = { let reg = self.registry.entries.read().unwrap(); if index < reg.len() { reg[index].ssd_path.clone() } else { None } };
                     if let Some(p) = ssd_path {
-                        let mut full_path = p.clone();
-                        if full_path.is_relative() && !full_path.starts_with("tmp") { full_path = crate::utils::paths::get_kv_dir(None).join(full_path); }
-                        let block_file = full_path.join(format!("l{}.st", self.layer_idx));
+                        // [SENTINEL-VERIFY] Forward loop에서도 영수증 확인 (Access Violation 방지)
+                        let mut verified = false;
+                        for _ in 0..5 {
+                            if self.verify_sentinel_receipt(&p, b_off).unwrap_or(false) { verified = true; break; }
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
 
-                        // [HYBRID-KV-LOADER] mmap을 사용하여 SSD에서 VRAM/RAM으로 직접 스트리밍
-                        if let Ok(file) = std::fs::File::open(&block_file) {
-                            if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().map(&file) } {
-                                if let Ok(st) = safetensors::SafeTensors::deserialize(&mmap) {
-                                    let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
-                                    let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
-                                    
-                                    if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
-                                        let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                                        let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                        if verified {
+                            let mut full_path = p.clone();
+                            if full_path.is_relative() && !full_path.starts_with("tmp") { full_path = crate::utils::paths::get_kv_dir(None).join(full_path); }
+                            let block_file = full_path.join(format!("l{}.st", self.layer_idx));
 
-                                        // 1. Host-side Tensor (mmap 데이터 참조)
-                                        let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
-                                        let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
-
-                                        // 2. Device 전송 (GPU가 있으면 VRAM으로, 없으면 RAM 유지)
-                                        bulk_ks.push(self.decompress_from_bf16(&kd_t, &meta_os, dev)?);
-                                        bulk_vs.push(self.decompress_from_bf16(&vd_t, &meta_os, dev)?);
+                            // [HYBRID-KV-LOADER] mmap을 사용하여 SSD에서 VRAM/RAM으로 직접 스트리밍
+                            if let Ok(file) = std::fs::File::open(&block_file) {
+                                if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().map(&file) } {
+                                    if let Ok(st) = safetensors::SafeTensors::deserialize(&mmap) {
+                                        let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
+                                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
                                         
-                                        // [STABILITY] Removed VirtualUnlock to prevent Access Violation
-                                        ssd_count += 1;
+                                        if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                            let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+
+                                            // 1. Host-side Tensor (mmap 데이터 참조)
+                                            let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+                                            let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+
+                                            // 2. Device 전송 (GPU가 있으면 VRAM으로, 없으면 RAM 유지)
+                                            bulk_ks.push(self.decompress_from_bf16(&kd_t, &meta_os, dev)?);
+                                            bulk_vs.push(self.decompress_from_bf16(&vd_t, &meta_os, dev)?);
+                                            
+                                            // [STABILITY] Removed VirtualUnlock
+                                            ssd_count += 1;
+                                        }
                                     }
                                 }
                             }
