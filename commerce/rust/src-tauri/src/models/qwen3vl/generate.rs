@@ -615,6 +615,20 @@ impl Qwen3VLGenerateModel {
     pub async fn drop_kv_storage(&mut self) -> Result<()> { self.qwen3_vl.drop_kv_storage().await }
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { self.qwen3_vl.force_flush_all_active_blocks(session_id, kv_name).await }
     pub fn clear_kv_cache(&mut self) { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.clear_kv_cache(), ModelVariant::QuantizedText(m) => m.language_model.clear_kv_cache(), _ => {} } }
+    
+    pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.language_model.truncate_kv_cache(len),
+            ModelVariant::QuantizedText(m) => m.language_model.truncate_kv_cache(len),
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn prefill_chunk(&mut self, mes: ChatCompletionParameters, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<usize> {
+        // 기존 prefill_only 로직을 활용하여 청크 단위 프리필 수행
+        self.prefill_only(mes, _cancel_flag, session_id, None, None).await
+    }
+
     pub fn save_kv_to_disk(&mut self, path: &Path, kv_name: Option<&str>, offset: usize) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.save_kv_cache(path, false, offset, kv_name), ModelVariant::QuantizedText(m) => m.language_model.save_kv_cache(path, false, offset, kv_name), _ => Ok(()) } }
     pub fn load_kv_from_disk(&mut self, path: &Path, kv_name: Option<&str>) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.load_kv_cache(path, &self.text_device, 0, 128, kv_name), ModelVariant::QuantizedText(m) => m.language_model.load_kv_cache(path, &self.text_device, 0, 128, kv_name), _ => Ok(()) } }
 }
