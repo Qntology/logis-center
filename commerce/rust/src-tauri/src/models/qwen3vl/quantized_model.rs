@@ -709,12 +709,7 @@ impl QuantizedQwen3VLTextAttention {
                                         bulk_ks.push(self.decompress_from_bf16(&kd_t, &meta_os, dev)?);
                                         bulk_vs.push(self.decompress_from_bf16(&vd_t, &meta_os, dev)?);
                                         
-                                        // [RAM-DISCARD] 전송 직후 OS RAM 페이지 캐시 해제 힌트
-                                        #[cfg(windows)]
-                                        unsafe {
-                                            use windows::Win32::System::Memory::VirtualUnlock;
-                                            let _ = VirtualUnlock(mmap.as_ptr() as *const _, mmap.len());
-                                        }
+                                        // [STABILITY] Removed VirtualUnlock to prevent Access Violation
                                         ssd_count += 1;
                                     }
                                 }
