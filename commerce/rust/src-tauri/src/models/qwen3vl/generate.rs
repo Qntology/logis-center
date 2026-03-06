@@ -396,7 +396,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         }
     });
 
-    // VRAM -> RAM 변환 워커
+    // VRAM -> RAM 변환 워커 (이제는 단순 중계 역할)
     tokio::spawn(async move {
         while let Some(task) = rx.recv().await {
             match task {
@@ -404,34 +404,31 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let io_tx_inner = io_tx.clone();
                     let (sid, off, _is_relay, block_idx, registry, kv_name) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone());
                     let loop_count = bake.layers.len();
-                    
-                    // [SAFETY-COUNTER] 전체 레이어 개수 설정
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
                     
                     for l_idx in 0..loop_count {
-                        let mut src = bake.layers[l_idx].clone();
+                        let src = bake.layers[l_idx].clone();
+                        let act_l = src.layer_idx;
                         let task_dir = bake.task_dir.clone();
                         let registry_inner = registry.clone();
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
                         
-                        tokio::task::spawn_blocking(move || {
-                            let (k_final, v_final) = if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
-                                (rk.to_device(&Device::Cpu).unwrap(), rv.to_device(&Device::Cpu).unwrap())
-                            } else { (src.k_data, src.v_data) };
-
-                            let mut map = std::collections::HashMap::new();
-                            let prefix = format!("b{}_l{}_", off, src.layer_idx);
-                            map.insert(format!("{}k_data", prefix), k_final.to_dtype(DType::BF16).unwrap());
-                            map.insert(format!("{}v_data", prefix), v_final.to_dtype(DType::BF16).unwrap());
-                            map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
-                            
-                            let file_path = task_dir.join(format!("l{}.st", src.layer_idx));
-                            // 블록킹 맥락에서 전송
-                            let _ = tauri::async_runtime::block_on(io_tx_nested.send(SaveTask { 
+                        // [SIMPLE-PASS] 이미 RAM에 있는 데이터를 저장 큐로 전달
+                        let mut map = std::collections::HashMap::new();
+                        let prefix = format!("b{}_l{}_", off, act_l);
+                        
+                        map.insert(format!("{}k_data", prefix), src.k_data);
+                        map.insert(format!("{}v_data", prefix), src.v_data);
+                        map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
+                        
+                        let file_path = task_dir.join(format!("l{}.st", act_l));
+                        
+                        tokio::spawn(async move {
+                            let _ = io_tx_nested.send(SaveTask { 
                                 slot_id: sid, path: file_path, tensors: map, is_last: false, 
                                 block_idx, registry: Some(registry_inner), kv_name: kv_name_inner 
-                            }));
+                            }).await;
                         });
                     }
                 },
