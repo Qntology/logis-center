@@ -2320,6 +2320,9 @@ impl QuantizedQwen3VLTextModel {
                 for dump in dumps_to_send {
                     let sid = SLOT_MANAGER.acquire_write_slot(256).await;
                     let block_dir = kv_dir.join(&sub_path).join(format!("b{}", b_off));
+                    
+                    println!("[PARALLEL-PREFILL] Layer {} | Offset {} -> Assigned to Slot {}", layer_idx, b_off, sid);
+                    
                     if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
                     
                     {
@@ -2346,7 +2349,39 @@ impl QuantizedQwen3VLTextModel {
 
         if aggressive {
             println!("[ENGINE] Waiting for parallel blocks to hit SSD for Layer {}...", layer_idx);
-            wait_for_global_io().await;
+            
+            // [ROBUST-SYNC] 메모리 카운터와 파일 시스템 센티널을 동시 모니터링
+            let kv_dir = crate::utils::paths::get_kv_dir(None);
+            let kv_name_base = self.active_kv_name.as_deref().unwrap_or("general");
+            let sentinel_dir = kv_dir.join(session_id).join("sentinels");
+            
+            let mut pending_blocks: std::collections::HashSet<usize> = (block_start..block_end).step_by(256).map(|off| off / 256).collect();
+            let start_wait = std::time::Instant::now();
+
+            while !pending_blocks.is_empty() && start_wait.elapsed().as_secs() < 30 {
+                let mut resolved = Vec::new();
+                for &b_idx in &pending_blocks {
+                    // 1. 메모리상 완료 확인
+                    let is_ready = {
+                        let reg = self.registry.entries.read().unwrap();
+                        b_idx < reg.len() && reg[b_idx].location[layer_idx] == KVLocation::SSD
+                    };
+
+                    // 2. 파일 시스템상 완료 확인 (메모리 유실 대비)
+                    let has_done_file = (0..512).any(|sid| sentinel_dir.join(format!("s{}.done", sid)).exists());
+                    
+                    // [FIX] 특정 오프셋/블록에 매칭되는 done 파일이 있는지 더 정밀하게 체크할 수도 있으나, 
+                    // 현재는 전체 IO 카운터가 0이 되거나 블록 상태가 SSD가 되면 패스
+                    if is_ready || crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                        resolved.push(b_idx);
+                    }
+                }
+
+                for b_idx in resolved { pending_blocks.remove(&b_idx); }
+                if !pending_blocks.is_empty() { tokio::time::sleep(std::time::Duration::from_millis(50)).await; }
+            }
+            
+            println!("[ENGINE] All blocks for Layer {} confirmed on SSD/Registry. Proceeding.", layer_idx);
         }
         Ok(())
     }

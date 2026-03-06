@@ -259,6 +259,7 @@ struct SlotCompletionGuard {
     sid: usize,
     is_last: bool,
     active: bool,
+    sentinel_path: Option<PathBuf>, // [NEW] 파일 기반 보고 경로
 }
 
 impl Drop for SlotCompletionGuard {
@@ -266,8 +267,18 @@ impl Drop for SlotCompletionGuard {
         if self.active {
             let sid = self.sid;
             let is_last = self.is_last;
+            let s_path = self.sentinel_path.clone();
             // [STRICT-REPORT] 패닉 상황에서도 보고될 수 있도록 별도 스코프로 실행
             tauri::async_runtime::spawn(async move {
+                // 1. 파일 시스템 보고 (SSD에 흔적 남기기)
+                if let Some(path) = s_path {
+                    let done_path = path.with_extension("done");
+                    let _ = fs::File::create(&done_path);
+                    let _ = fs::remove_file(&path); // pending 삭제
+                    println!("[WORKER-SENTINEL] Slot {} marked as DONE on disk.", sid);
+                }
+
+                // 2. 메모리 보고
                 let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
                 if rem == 1 || is_last {
                     println!("[WORKER-REPORT] Slot {} reached completion. Reporting to central control.", sid);
@@ -293,17 +304,28 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 impl Drop for IoGuard { fn drop(&mut self) { if GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } } }
                 let _io_guard = IoGuard;
 
+                // [SENTINEL-SETUP] SSD에 진행 상태 표시 파일 생성
+                let sentinel_dir = tp.parent().and_then(|p| p.parent()).and_then(|p| p.parent()).map(|p| p.join("sentinels"));
+                let mut s_path = None;
+                if let Some(sd) = sentinel_dir {
+                    if !sd.exists() { let _ = fs::create_dir_all(&sd); }
+                    let p_path = sd.join(format!("s{}.pending", sid));
+                    let _ = fs::File::create(&p_path);
+                    s_path = Some(p_path);
+                }
+
                 // [SLOT-GUARD] 슬롯 회수 보장 가드
-                let mut slot_guard = SlotCompletionGuard { sid, is_last, active: true };
+                let _slot_guard = SlotCompletionGuard { sid, is_last, active: true, sentinel_path: s_path };
                 
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 
+                let tp_for_blocking = tp.clone(); // [FIX] Clone path for blocking task
                 let save_res = tokio::task::spawn_blocking(move || {
                     if let Ok(data) = safetensors::serialize(&ts, &None) {
                         drop(ts);
-                        save_kv_block(&tp, &data)
+                        save_kv_block(&tp_for_blocking, &data)
                     } else {
-                        Err(anyhow!("Serialization failed for {:?}", tp))
+                        Err(anyhow!("Serialization failed for {:?}", tp_for_blocking))
                     }
                 }).await;
 
