@@ -2138,8 +2138,9 @@ impl QuantizedQwen3VLTextModel {
 
         // [MEMORY-OPT] [IMMEDIATE-PURGE] 프리필 시 연산 직후 가중치 즉시 소각
         if !is_decoding {
-            self.layers[layer_idx].clear();
+            // [CRITICAL-SAFETY] GPU 연산이 끝나기 전에 메모리를 지우면 크래시가 납니다.
             if target_device.is_cuda() { let _ = target_device.synchronize(); }
+            self.layers[layer_idx].clear();
             println!("[MEMORY-OPT] Layer {} Weights Purged.", layer_idx);
         }
 
