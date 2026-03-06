@@ -308,6 +308,11 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                 if s.state.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                     SLOT_MANAGER.update_counters(old, new);
                     if old == 1 { SLOT_MANAGER.active_write_count.fetch_sub(1, Ordering::SeqCst); }
+                    
+                    // [IMMEDIATE-CLEANUP] 슬롯 해제 시 내부에 들고 있던 텐서들을 즉시 해제
+                    for k in &s.k_layers { let mut g = k.lock().unwrap(); *g = None; }
+                    for v in &s.v_layers { let mut g = v.lock().unwrap(); *g = None; }
+                    
                     SLOT_MANAGER.handoff_notifier.notify_waiters();
                 }
             }
@@ -367,8 +372,11 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 let tp_for_blocking = tp.clone();
                 let save_res = tokio::task::spawn_blocking(move || {
-                    if let Ok(data) = safetensors::serialize(&ts, &None) {
-                        drop(ts);
+                    let serialized = safetensors::serialize(&ts, &None);
+                    // [IMMEDIATE-DROP] 시리얼라이즈 직후 원본 텐서 맵 파괴
+                    drop(ts); 
+                    
+                    if let Ok(data) = serialized {
                         save_kv_block(&tp_for_blocking, &data)
                     } else {
                         Err(anyhow!("Serialization failed"))
