@@ -2166,15 +2166,15 @@ impl QuantizedQwen3VLTextModel {
             // [SYNC-PREFILL] Prefill 상황에서도 워커를 기다리지 않고 즉시 던지기만 합니다.
             let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count, false).await;
             
-            // [LAYER-BY-LAYER-CLEANUP] 프리필 단계에서는 레이어 1개가 끝날 때마다 몰아서 정리 (메모리 포지션 해제)
+            // [LAYER-BY-LAYER-CLEANUP] 프리필 단계에서는 레이어 1개가 끝날 때마다 몰아서 정리
             if is_prefill {
                 SLOT_MANAGER.sync_with_sentinels(&sid).await;
             }
         }
 
-        if is_decoding {
-            self.layers[layer_idx].clear();
-        }
+        // [STABILITY-FIX] 디코딩 중 연산 직후 가중치를 즉시 비우는 로직을 제거합니다.
+        // 이것이 Access Violation (0xc0000005)의 주된 원인이었습니다.
+        // 가중치 유지는 이제 rebalance_layers의 VRAM 모니터링에 맡깁니다.
 
         Ok(next_xs)
     }
