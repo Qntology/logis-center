@@ -2164,16 +2164,21 @@ impl QuantizedQwen3VLTextModel {
             println!("[MEMORY-OPT] Layer {} Weights Purged. (RAM/VRAM cleared)", layer_idx);
         }
 
-        // [STEP 4] 자원 반납 및 KV 대피
+        // [STEP 4] 자원 반납 및 KV 대피 (Fire-and-Forget)
         let sid_opt = self.active_session_id.clone();
         if let Some(sid) = sid_opt {
-            // [SYNC-PREFILL] Prefill(!is_decoding) 상황에서는 즉시 SSD 저장 및 VRAM 해제 강제
-            let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count, !is_decoding).await;
+            let is_prefill = !is_decoding;
+            // [SYNC-PREFILL] Prefill 상황에서도 워커를 기다리지 않고 즉시 던지기만 합니다.
+            let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count, false).await;
+            
+            // [LAYER-BY-LAYER-CLEANUP] 프리필 단계에서는 레이어 1개가 끝날 때마다 몰아서 정리 (메모리 포지션 해제)
+            if is_prefill {
+                SLOT_MANAGER.sync_with_sentinels(&sid).await;
+            }
         }
 
         if is_decoding {
-            let is_small_model = self.layers.len() <= 36;
-            if !is_small_model { self.layers[layer_idx].clear(); }
+            self.layers[layer_idx].clear();
         }
 
         Ok(next_xs)
