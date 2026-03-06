@@ -105,7 +105,8 @@ impl SlotManager {
                                 if sid < self.slots.len() {
                                     match ext {
                                         "done" => {
-                                            self.mark_ready(sid).await;
+                                            // [FULL-RECLAMATION] 엔진이 확인했으므로 즉시 Free(0)로 전환하여 재사용 가능하게 함
+                                            let _ = self.request_tx.send(SlotRequest::Release { idx: sid, is_bake: false }).await;
                                             let _ = std::fs::remove_file(&path);
                                         },
                                         "error" => {
@@ -275,10 +276,9 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                 let max_writes = 512;
                 let mut found = None;
                 while found.is_none() {
+                    // [BACKPRESSURE] 워커가 너무 바쁘면(Writing 중인 슬롯이 많으면) 대기
                     if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
                         for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
-                            // [STRICT-ISOLATION] 오직 완전히 비어있는(0) 슬롯만 배정합니다.
-                            // Ready(2) 상태인 슬롯은 sync_with_sentinels가 Free(0)로 만들기 전까지 절대 재사용하지 않습니다.
                             if slot.state.load(Ordering::SeqCst) == 0 {
                                 if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                                     SLOT_MANAGER.update_counters(0, 1);
@@ -288,7 +288,8 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                             }
                         }
                     }
-                    if found.is_none() { tokio::time::sleep(std::time::Duration::from_millis(1)).await; }
+                    // 배정 시마다 1ms만 쉬어도 엔진 속도가 워커 속도와 어느 정도 맞춰집니다.
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
                 let _ = tx.send(found.unwrap());
             },

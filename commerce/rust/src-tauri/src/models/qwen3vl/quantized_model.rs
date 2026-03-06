@@ -1613,6 +1613,14 @@ impl QuantizedQwen3VLTextModel {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         }
+
+        // [CRITICAL-SAFETY] 로딩 완료 후 전체 GPU 동기화 강제 (크래시 방지)
+        if let Some(dev) = self.layers.get(0).map(|l| l.device()) {
+            if dev.is_cuda() {
+                let _ = dev.synchronize();
+            }
+        }
+
         println!("[MEMORY-OPT] All layers reloaded successfully.");
         Ok(())
     }
@@ -2285,12 +2293,12 @@ impl QuantizedQwen3VLTextModel {
                     
                     let mut inner = kv_blocks[b_idx].inner.write().unwrap();
                     if let (Some(k), Some(v)) = (inner.k_cache.take(), inner.v_cache.take()) {
-                        // [VRAM-DIRECT-PASS] 메인 스레드에서 CPU 복사를 하지 않고 VRAM 텐서를 그대로 전달
+                        // [VRAM-DIRECT-PASS] 메인 스레드 대기 없이 VRAM 텐서를 워커에게 토스
                         let dump = LayerKVDump {
                             layer_idx,
                             k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
                             v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
-                            k_shape: Tensor::from_vec(k.shape().dims().iter().map(|&x| x as u32).collect::<Vec<u32>>(), (k.rank(),), &Device::Cpu)?,
+                            k_shape: Tensor::zeros((1,), DType::U32, &Device::Cpu).unwrap(),
                             raw_k: Some(k),
                             raw_v: Some(v),
                         };
@@ -2314,7 +2322,6 @@ impl QuantizedQwen3VLTextModel {
                         if b_idx < reg_w.len() { reg_w[b_idx].ssd_path = Some(block_dir.clone()); }
                     }
 
-                    // [SINGLE-INCREMENT] 카운터 증가
                     GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                     if let Err(e) = tx.send(SlotTask::Bake(BakeTask {
