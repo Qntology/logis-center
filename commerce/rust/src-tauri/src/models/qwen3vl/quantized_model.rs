@@ -1597,8 +1597,39 @@ pub struct QuantizedQwen3VLTextModel {
 }
 
 impl QuantizedQwen3VLTextModel {
+    /// [MEMORY-OPT] 모든 레이어를 한꺼번에 로드합니다. (디코딩 시작 시 호출)
+    pub fn reload_all_layers(&mut self) -> Result<()> {
+        let count = self.layers.len();
+        println!("[MEMORY-OPT] Prefill complete. Reloading all {} layers for high-speed decoding...", count);
+        
+        // [SAFETY] 혹시 모를 잔여 IO 대기
+        // (주의: wait_for_global_io는 비동기 함수이므로 동기 맥락에서 호출 시 주의가 필요함)
+        // 현재는 생성된 IO가 다 끝날 때까지 아주 짧은 대기 루프로 대체 가능
+        let start_wait = std::time::Instant::now();
+        while crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            if start_wait.elapsed().as_secs() > 5 { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        for i in 0..count {
+            if let Err(e) = self.reload_layer(i) {
+                println!("[CRITICAL-ERROR] Failed to reload layer {}: {}", i, e);
+                return Err(e);
+            }
+            // [STABILITY] 윈도우/DirectStorage 안정성을 위해 짧은 대기 및 동기화
+            if i % 4 == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        println!("[MEMORY-OPT] All layers reloaded successfully.");
+        Ok(())
+    }
+
     /// [MEMORY-OPT] 특정 레이어의 가중치를 mmap에서 다시 로드합니다.
     pub fn reload_layer(&mut self, layer_idx: usize) -> Result<()> {
+        if layer_idx >= self.layers.len() { return Ok(()); }
+        
+        // 가중치가 이미 로드되어 있는지 체크 (q_proj가 유효한 텐서를 가지고 있는지 확인)
         if !self.layers[layer_idx].self_attn.q_proj.is_cleared() {
             return Ok(());
         }
@@ -1609,23 +1640,20 @@ impl QuantizedQwen3VLTextModel {
 
         // [HYBRID-LOADER] GPU 가용 시 DirectStorage 사용, 아니면 Mmap 릴레이
         if target_device.is_cuda() {
-            println!("[ENGINE] DirectStorage: SSD -> VRAM Loading Layer {}...", layer_idx);
-            // 1. Skeleton 레이어 생성 (이때 실제 가중치 로딩 로직을 DirectStorage로 대체)
             let gguf_blk = format!("blk.{layer_idx}");
             let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{}.layers.{layer_idx}", self.base_name) };
 
-            // [NEW] DirectStorage 기반의 레이어 로딩 (내부적으로 load_to_gpu 호출)
             let new_layer = QuantizedQwen3VLTextDecoderLayer::new_direct(
                 &self.config, ct, mmap, &prefix, &target_device, self.dtype, layer_idx, self.baking_only, self.registry.clone()
             )?;
 
+            // 기존 KV 캐시 및 설정 보존
             let old_kv_blocks = self.layers[layer_idx].self_attn.kv_blocks.clone();
             let old_active_kv = self.layers[layer_idx].self_attn.active_kv_name.clone();
             self.layers[layer_idx] = new_layer;
             self.layers[layer_idx].self_attn.kv_blocks = old_kv_blocks;
             self.layers[layer_idx].self_attn.active_kv_name = old_active_kv;
         } else {
-            // CPU 모드: Mmap 로딩 후 즉시 VirtualUnlock으로 RAM 해제 유도
             let mut reader = std::io::Cursor::new(&mmap[..]);
             let gguf_blk = format!("blk.{layer_idx}");
             let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{}.layers.{layer_idx}", self.base_name) };
@@ -1634,13 +1662,10 @@ impl QuantizedQwen3VLTextModel {
                 &self.config, ct, &mut reader, &prefix, &Device::Cpu, self.dtype, layer_idx, self.baking_only, self.registry.clone()
             )?;
 
-            // [RAM-DISCARD] Windows API를 사용하여 읽어들인 가중치 데이터가 RAM(Page Cache)에 남지 않도록 해제
             #[cfg(windows)]
             unsafe {
-                use windows::Win32::System::Memory::{VirtualUnlock, MEM_RESERVE};
+                use windows::Win32::System::Memory::VirtualUnlock;
                 let _ = VirtualUnlock(mmap.as_ptr() as *const _, mmap.len());
-                // VirtualUnlock은 Lock되지 않은 메모리에 대해 에러를 반환할 수 있지만, 
-                // 이는 OS에게 해당 페이지를 작업 집합에서 제거하도록 하는 힌트로 작동합니다.
             }
 
             let old_kv_blocks = self.layers[layer_idx].self_attn.kv_blocks.clone();
@@ -1725,60 +1750,6 @@ impl QuantizedQwen3VLTextModel {
             base_name: base_name.to_string(),
             dtype,
         })
-    }
-
-    /// [MEMORY-OPT] 모든 레이어를 한꺼번에 로드합니다. (디코딩 시작 시 호출)
-    pub fn reload_all_layers(&mut self) -> Result<()> {
-        let count = self.layers.len();
-        println!("[MEMORY-OPT] Prefill complete. Reloading all {} layers for high-speed decoding...", count);
-        
-        // [SAFETY] 혹시 모를 잔여 IO 대기
-        crate::models::qwen3vl::generate::wait_for_global_io();
-
-        for i in 0..count {
-            if let Err(e) = self.reload_layer(i) {
-                println!("[CRITICAL-ERROR] Failed to reload layer {}: {}", i, e);
-                return Err(e);
-            }
-            // [STABILITY] 윈도우/DirectStorage 안정성을 위해 짧은 대기 및 동기화
-            if i % 4 == 0 {
-                // 주기적으로 디바이스 동기화를 시도하거나 짧은 sleep
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-        println!("[MEMORY-OPT] All layers reloaded successfully.");
-        Ok(())
-    }
-
-    pub fn reload_layer(&mut self, layer_idx: usize) -> Result<()> {
-        if layer_idx >= self.layers.len() { return Ok(()); }
-        
-        // 이미 로드된 상태면 스킵
-        if self.layers[layer_idx].weights.is_some() { return Ok(()); }
-
-        let device = self.device.clone();
-        
-        // [SAFETY] Mmap이 유효한지 확인
-        if self.mmap_source.is_none() {
-            return Err(anyhow!("Mmap source is missing for reload"));
-        }
-
-        // 레이어 로딩 (기존 로직 활용하되, 에러 전파 확실하게)
-        // 여기서는 self.layers[layer_idx].load_weights(...) 같은 메서드가 있다면 호출
-        // 현재 구조상 직접 weights를 채워넣거나 내부 메서드를 써야 함.
-        // 기존 구현을 참고하여 안전하게 로드.
-        
-        // [FIX] 기존에 unload된 가중치를 복구하는 로직이 필요함.
-        // 현재 코드 맥락상 reload_layer의 구체적 구현이 생략되어 있을 수 있으므로,
-        // 가장 안전한 방법은 '필요할 때 읽는다'는 플래그만 설정하거나,
-        // 실제 데이터를 읽어서 weights에 할당하는 것임.
-        
-        // 임시 조치: 실제 로딩 로직이 복잡하므로, Access Violation을 막기 위해
-        // 해당 레이어가 '로드됨' 상태가 되도록 유도.
-        
-        // (실제 구현은 파일의 나머지 부분에 있는 load_layer_weights 등을 호출해야 함)
-        // 여기서는 안전하게 리턴하도록 수정하여 크래시 방지 우선.
-        Ok(())
     }
 
     pub fn new<R: std::io::Seek + std::io::Read>(
