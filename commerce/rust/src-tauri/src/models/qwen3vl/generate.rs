@@ -379,13 +379,33 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 }).await;
 
                 if let Ok(Ok(_)) = save_res {
-                    // (레지스트리 업데이트 로직 생략 - 기존 유지)
+                    // [INDEX-UPDATE] 저장이 성공하면 인덱스 파일(layerN.json) 업데이트 신호를 보냄
+                    if let Some(kv_name) = kv_n {
+                        if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
+                            if let Ok(l_idx) = l_str.parse::<usize>() {
+                                let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
+                                let offset = offset_str.parse::<usize>().unwrap_or(0);
+                                let _ = INDEX_TX.send(SlotTask::IndexUpdate { 
+                                    kv_name, 
+                                    layer_idx: l_idx, 
+                                    offset, 
+                                    len: 256, 
+                                    file_name: format!("b{}/l{}.st", offset, l_idx) 
+                                }).await;
+                            }
+                        }
+                    }
                     if let (Some(r), Some(idx)) = (reg, b_idx) {
                         if let Ok(mut entries) = r.entries.write() {
                             if idx < entries.len() {
+                                let e = &mut entries[idx]; 
                                 if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
                                     if let Ok(l_idx) = l_str.parse::<usize>() { 
-                                        if l_idx < 28 { entries[idx].location[l_idx] = KVLocation::SSD; }
+                                        if l_idx < 28 { 
+                                            e.location[l_idx] = KVLocation::SSD; 
+                                            e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                                            if let Ok(mut cache) = e.bitkv_cache.write() { if l_idx < cache.len() { cache[l_idx] = None; } }
+                                        } 
                                     }
                                 }
                             }
