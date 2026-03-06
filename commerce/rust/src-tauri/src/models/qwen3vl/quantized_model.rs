@@ -2103,16 +2103,17 @@ impl QuantizedQwen3VLTextModel {
         let input_token_count = xs.dim(1).unwrap_or(0);
         let is_decoding = input_token_count <= 1;
 
-        // [MEMORY-OPT] 디코딩 단계 진입 시 모든 레이어를 미리 로드
+        // [MEMORY-OPT] 레이어 연산 전 로드 (가중치가 없으면 mmap에서 가져옴)
+        // 디코딩 시에는 첫 레이어에서 전체 로드를 시도하되, 개별 레이어에서도 로드를 보장합니다.
         if is_decoding && layer_idx == 0 {
             let already_loaded = !self.layers[0].self_attn.q_proj.is_cleared();
-            if !already_loaded { self.reload_all_layers().await?; }
+            if !already_loaded { 
+                self.reload_all_layers().await?; 
+            }
         }
-
-        // [MEMORY-OPT] Prefill 시 현재 레이어 로드
-        if !is_decoding {
-            self.reload_layer(layer_idx)?;
-        }
+        
+        // [SAFETY] 현재 레이어가 비어있다면 반드시 로드합니다.
+        self.reload_layer(layer_idx)?;
 
         // [STEP 1] 현재 레이어를 GPU로 이동
         let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
@@ -2120,10 +2121,12 @@ impl QuantizedQwen3VLTextModel {
         if !self.layers[layer_idx].device().same_device(&target_device) {
             self.layers[layer_idx].to_device(&target_device)?;
             // GPU 이동 후 RAM 가중치는 자동으로 drop됨
-            if !is_decoding { let _ = target_device.synchronize(); }
+            if !is_decoding { 
+                let _ = target_device.synchronize(); 
+            }
         }
 
-        // [MEMORY-OPT] [PREFETCH] 다음 레이어를 RAM으로 미리 로드
+        // [MEMORY-OPT] [PREFETCH] 프리필 중에만 다음 레이어를 RAM으로 미리 로드
         if !is_decoding && layer_idx + 1 < self.layers.len() {
             let _ = self.reload_layer(layer_idx + 1);
         }
