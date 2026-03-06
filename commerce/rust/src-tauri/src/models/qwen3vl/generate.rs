@@ -1,4 +1,4 @@
-use crate::models::qwen3vl::quantized_model::{KVLocation, KVBlock, KVRegistry, BitKVMetadata, QuantizedQwen3VLModel, MemorySlot};
+use crate::models::qwen3vl::quantized_model::{KVLocation, KVBlock, KVRegistry, QuantizedQwen3VLModel, MemorySlot};
 use anyhow::{Result, anyhow};
 use candle_core::{quantized::gguf_file, DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -166,9 +166,15 @@ pub struct BakeTask {
 }
 
 pub struct SaveTask {
-    pub slot_id: usize, pub path: PathBuf, pub tensors: std::collections::HashMap<String, Tensor>,
-    pub is_last: bool, pub block_idx: Option<usize>, pub registry: Option<KVRegistry>,
+    pub slot_id: usize,
+    pub path: PathBuf,
+    pub tensors: std::collections::HashMap<String, Tensor>,
+    pub is_last: bool,
+    pub block_idx: Option<usize>,
+    pub registry: Option<KVRegistry>,
     pub kv_name: Option<String>,
+    pub offset: usize,
+    pub len: usize,
 }
 
 pub enum SlotTask { 
@@ -331,6 +337,8 @@ struct SlotCompletionGuard {
     is_last: bool,
     active: bool,
     sentinel_path: Option<PathBuf>,
+    offset: usize,
+    len: usize,
 }
 
 impl Drop for SlotCompletionGuard {
@@ -339,11 +347,26 @@ impl Drop for SlotCompletionGuard {
             let sid = self.sid;
             let is_last = self.is_last;
             let s_path = self.sentinel_path.clone();
+            let offset = self.offset;
+            let len = self.len;
             tauri::async_runtime::spawn(async move {
                 if let Some(path) = s_path {
                     let done_path = path.with_extension("done");
-                    let _ = fs::File::create(&done_path);
-                    let _ = fs::remove_file(&path);
+                    let receipt = serde_json::json!({
+                        "offset": offset,
+                        "len": len,
+                        "slot_id": sid,
+                        "status": "FLUSHED",
+                        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+                    });
+                    if let Ok(json) = serde_json::to_string(&receipt) {
+                        if let Ok(mut file) = fs::File::create(&done_path) {
+                            use std::io::Write;
+                            let _ = file.write_all(json.as_bytes());
+                            let _ = file.sync_all(); // [CRITICAL] 물리적 쓰기 보장
+                        }
+                    }
+                    let _ = fs::remove_file(&path); // .pending 삭제
                 }
                 let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
                 if rem == 1 || is_last {
@@ -379,7 +402,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 }
                 
                 // [SLOT-GUARD] 이 레이어의 저장이 끝나면 레퍼런스 카운트 감소
-                let _slot_guard = SlotCompletionGuard { sid, is_last, active: true, sentinel_path: s_path };
+                let _slot_guard = SlotCompletionGuard { sid, is_last, active: true, sentinel_path: s_path, offset: task.offset, len: task.len };
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 
                 let tp_for_blocking = tp.clone();
@@ -459,7 +482,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         tokio::spawn(async move {
                             let _ = io_tx_nested.send(SaveTask { 
                                 slot_id: sid, path: file_path, tensors: map, is_last: false, 
-                                block_idx, registry: Some(registry_inner), kv_name: kv_name_inner 
+                                block_idx, registry: Some(registry_inner), kv_name: kv_name_inner,
+                                offset: off, len: 256
                             }).await;
                         });
                     }
@@ -579,12 +603,6 @@ impl Qwen3VLGenerateModel {
         // [FORCE-JSON] 중국어 답변 방지 및 형식을 강제합니다.
         let mes = ChatCompletionParameters {
             messages: vec![
-                crate::openai_types::ChatCompletionRequestMessage::System(
-                    crate::openai_types::ChatCompletionRequestSystemMessage {
-                        content: "You are a classifier. Return ONLY a valid JSON object. Example: {\"type\": \"goods\"}".to_string(),
-                        name: None,
-                    }
-                ),
                 crate::openai_types::ChatCompletionRequestMessage::User(
                     crate::openai_types::ChatCompletionRequestUserMessage {
                         content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt),
@@ -633,12 +651,12 @@ impl Qwen3VLGenerateModel {
         wait_for_global_io().await;
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         let mut gen_ids = vec![];
-        let think_token_id = 151643;
+        let _think_token_id = 151643;
         for i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
             let mut logits_tensor = logits.flatten_all()?.to_dtype(DType::F32)?;
             if !gen_ids.is_empty() { logits_tensor = apply_repetition_penalty(&logits_tensor, 1.2, &gen_ids)?; }
-            let mut next_id = lp.sample(&logits_tensor)?;
+            let next_id = lp.sample(&logits_tensor)?;
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             gen_ids.push(next_id);
             gen_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
@@ -660,23 +678,6 @@ impl Qwen3VLGenerateModel {
             ModelVariant::QuantizedText(m) => m.language_model.truncate_kv_cache(len),
             _ => Ok(()),
         }
-    }
-
-    pub async fn prefill_chunk(&mut self, prompt: String, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<usize> {
-        // [FORCE-JSON] 모델이 중국어 등으로 답변하지 않게 시스템 프롬프트를 강제합니다.
-        let mes = ChatCompletionParameters {
-            messages: vec![
-                crate::openai_types::ChatCompletionRequestMessage::User(
-                    crate::openai_types::ChatCompletionRequestUserMessage {
-                        content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt),
-                        name: None,
-                    }
-                )
-            ],
-            temperature: Some(0.1),
-            ..Default::default()
-        };
-        self.prefill_only(mes, _cancel_flag, session_id, None, None).await
     }
 
     pub fn save_kv_to_disk(&mut self, path: &Path, kv_name: Option<&str>, offset: usize) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.save_kv_cache(path, false, offset, kv_name), ModelVariant::QuantizedText(m) => m.language_model.save_kv_cache(path, false, offset, kv_name), _ => Ok(()) } }

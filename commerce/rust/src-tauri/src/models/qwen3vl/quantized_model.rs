@@ -538,6 +538,80 @@ impl QuantizedQwen3VLTextAttention {
         })
     }
 
+    fn verify_sentinel_receipt(&self, ssd_path: &Path, offset: usize) -> Result<bool> {
+        let sentinel_dir = ssd_path.parent().map(|p| p.join("sentinels"));
+        if let Some(sd) = sentinel_dir {
+            // 모든 슬롯 번호에 대해 .done 파일 확인
+            for sid in 0..512 {
+                let done_path = sd.join(format!("s{}.done", sid));
+                if done_path.exists() {
+                    if let Ok(data) = std::fs::read_to_string(&done_path) {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
+                            if json["offset"].as_u64() == Some(offset as u64) && json["status"] == "FLUSHED" {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn reload_kv_block(&mut self, block_idx: usize, device: &Device) -> Result<()> {
+        if block_idx >= self.kv_blocks.len() { return Ok(()); }
+        let block = &self.kv_blocks[block_idx];
+        
+        let (index, offset, ssd_path_opt) = {
+            let inner = block.inner.read().unwrap();
+            (inner.index, inner.offset, inner.ssd_path.clone())
+        };
+
+        if let Some(ssd_path) = ssd_path_opt {
+            // [SENTINEL-VERIFY] 사용자 아이디어: 영수증 확인 후 안전할 때만 로드
+            let mut verified = false;
+            for _ in 0..5 { // 최대 50ms 대기
+                if self.verify_sentinel_receipt(&ssd_path, offset)? {
+                    verified = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            if !verified {
+                return Ok(()); // 아직 준비 안 됨
+            }
+
+            let file_path = ssd_path.join(format!("l{}.st", self.layer_idx));
+            if file_path.exists() {
+                let content = crate::utils::direct_loader::load_kv_block(&file_path)?;
+                let st = safetensors::SafeTensors::deserialize(&content).map_err(|e| anyhow!("Safetensors error: {}", e))?;
+                let prefix = format!("b{}_l{}_", offset, self.layer_idx);
+                let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+
+                if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                    let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                    
+                    let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+                    let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+
+                    let k_final = self.decompress_from_bf16(&kd_t, &meta_os, device)?;
+                    let v_final = self.decompress_from_bf16(&vd_t, &meta_os, device)?;
+
+                    let mut inner = block.inner.write().unwrap();
+                    inner.k_cache = Some(k_final);
+                    inner.v_cache = Some(v_final);
+                    inner.location = KVLocation::VRAM;
+                    
+                    let mut reg = self.registry.entries.write().unwrap();
+                    if index < reg.len() { reg[index].location[self.layer_idx] = KVLocation::VRAM; }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn forward(
         &mut self,
         xs: &Tensor,
@@ -1452,7 +1526,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
         registry: KVRegistry,
     ) -> Result<Self> {
         // 1. Skeleton 생성 (빈 텐서 상태)
-        let mut layer = Self::new_skeleton(config, base_name, device, dtype, layer_idx, baking_only, registry)?;
+        let layer = Self::new_skeleton(config, base_name, device, dtype, layer_idx, baking_only, registry)?;
         
         // 2. 표준 로더를 사용하되, mmap의 특정 슬라이스만 접근하도록 하여 OS RAM 점유 최소화
         // [OPTIMIZATION] mmap 전체가 아닌 필요한 레이어 영역만 Reader로 전달
@@ -1619,10 +1693,9 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    /// [MEMORY-OPT] 특정 레이어의 가중치를 mmap에서 다시 로드합니다.
     pub fn reload_layer(&mut self, layer_idx: usize) -> Result<()> {
         if layer_idx >= self.layers.len() { return Ok(()); }
-        
+
         // 가중치가 이미 로드되어 있는지 체크 (q_proj가 유효한 텐서를 가지고 있는지 확인)
         if !self.layers[layer_idx].self_attn.q_proj.is_cleared() {
             return Ok(());
@@ -1630,7 +1703,9 @@ impl QuantizedQwen3VLTextModel {
 
         let mmap = self.mmap.as_ref().ok_or(anyhow!("Mmap handle missing for reload"))?;
         let ct = self.ct.as_ref().ok_or(anyhow!("GGUF Content missing for reload"))?;
-        let target_device = self.layers[layer_idx].device().clone();
+
+        // [FIX] 레이어의 현재 장치(이미 삭제되어 CPU일 수 있음)가 아닌, 모델 전체의 설정 장치를 사용합니다.
+        let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) };
 
         // [HYBRID-LOADER] GPU 가용 시 DirectStorage 사용, 아니면 Mmap 릴레이
         if target_device.is_cuda() {
@@ -1655,7 +1730,7 @@ impl QuantizedQwen3VLTextModel {
             let new_layer = QuantizedQwen3VLTextDecoderLayer::new(
                 &self.config, ct, &mut reader, &prefix, &Device::Cpu, self.dtype, layer_idx, self.baking_only, self.registry.clone()
             )?;
-            
+
             // [STABILITY] Removed VirtualUnlock
             let _ = mmap; // keep reference
 
@@ -1668,6 +1743,7 @@ impl QuantizedQwen3VLTextModel {
 
         Ok(())
     }
+
     pub fn new_with_mmap(
         config: &Qwen3VLTextConfig,
         ct: Arc<gguf_file::Content>,
@@ -1676,7 +1752,7 @@ impl QuantizedQwen3VLTextModel {
         device: &Device,
         device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
@@ -1751,7 +1827,7 @@ impl QuantizedQwen3VLTextModel {
         device: &Device,
         device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
@@ -2103,7 +2179,7 @@ impl QuantizedQwen3VLTextModel {
         kv_name: Option<String>,
         baking_only: bool,
     ) -> Result<Tensor> {
-        let start_layer_time = std::time::Instant::now();
+        let _start_layer_time = std::time::Instant::now();
         let input_token_count = xs.dim(1).unwrap_or(0);
         let is_decoding = input_token_count <= 1;
 
@@ -2263,8 +2339,8 @@ impl QuantizedQwen3VLTextModel {
     }
 
     /// [NEW-STRICT] 계층형 메모리 관리 (VRAM -> RAM -> SSD)
-    async fn evacuate_layer_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, start_off: usize, len: usize, aggressive: bool) -> Result<()> {
-        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump, wait_for_global_io, GLOBAL_IO_COUNTER};
+    async fn evacuate_layer_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, start_off: usize, len: usize, _aggressive: bool) -> Result<()> {
+        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump, GLOBAL_IO_COUNTER};
         
         let block_start = (start_off / 256) * 256;
         let block_end = ((start_off + len + 255) / 256) * 256;
@@ -2632,7 +2708,7 @@ impl QuantizedQwen3VLModel {
         let vb_visual = from_gguf_content(config, &ct_vision, &mut reader_vision, vision_device, vision_dtype)?;
         let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
 
-        let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
+        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
         // [OPTIMIZATION] Baking is now integrated into full layer-by-layer prefill
         if baking_only {
@@ -2676,7 +2752,7 @@ impl QuantizedQwen3VLModel {
         let vb_visual = from_gguf_content(config, &ct_vision, reader_vision, vision_device, vision_dtype)?;
         let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
         
-        let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
+        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
         // [OPTIMIZATION] Baking is now integrated into full layer-by-layer prefill
         if baking_only {
