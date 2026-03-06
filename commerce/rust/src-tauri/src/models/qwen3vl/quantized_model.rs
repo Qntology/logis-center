@@ -2293,19 +2293,16 @@ impl QuantizedQwen3VLTextModel {
                     
                     let mut inner = kv_blocks[b_idx].inner.write().unwrap();
                     if let (Some(k), Some(v)) = (inner.k_cache.take(), inner.v_cache.take()) {
-                        // [SAFE-CPU-COPY] CUDA 컨텍스트 에러 방지를 위해 메인 스레드에서 복사
-                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
-                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
-                        
-                        // 원본 VRAM 텐서는 여기서 즉시 drop 됨 (inner.k_cache.take()에 의해)
+                        // [VRAM-DIRECT-PASS] 메인 스레드에서 복사하지 않고 VRAM 텐서 자체를 워커에게 토스
+                        let k_shape_raw = k.shape().dims().iter().map(|&x| x as u32).collect::<Vec<u32>>();
 
                         let dump = LayerKVDump {
                             layer_idx,
-                            k_data: k_cpu,
-                            v_data: v_cpu,
-                            k_shape: Tensor::zeros((1,), DType::U32, &Device::Cpu).unwrap(),
-                            raw_k: None,
-                            raw_v: None,
+                            k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
+                            v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
+                            k_shape: Tensor::from_vec(k_shape_raw, (4,), &Device::Cpu).unwrap(),
+                            raw_k: Some(k),
+                            raw_v: Some(v),
                         };
                         dumps_to_send.push(dump);
                         inner.location = KVLocation::SSD;
