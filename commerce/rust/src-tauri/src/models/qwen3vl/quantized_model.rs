@@ -1588,17 +1588,19 @@ pub struct QuantizedQwen3VLTextModel {
 
 impl QuantizedQwen3VLTextModel {
     /// [MEMORY-OPT] 모든 레이어를 한꺼번에 로드합니다. (디코딩 시작 시 호출)
-    pub fn reload_all_layers(&mut self) -> Result<()> {
+    pub async fn reload_all_layers(&mut self) -> Result<()> {
         let count = self.layers.len();
         println!("[MEMORY-OPT] Prefill complete. Reloading all {} layers for high-speed decoding...", count);
         
         // [SAFETY] 혹시 모를 잔여 IO 대기
-        // (주의: wait_for_global_io는 비동기 함수이므로 동기 맥락에서 호출 시 주의가 필요함)
-        // 현재는 생성된 IO가 다 끝날 때까지 아주 짧은 대기 루프로 대체 가능
         let start_wait = std::time::Instant::now();
         while crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-            if start_wait.elapsed().as_secs() > 5 { break; }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            if start_wait.elapsed().as_secs() > 10 {
+                println!("[STUCK-GUARD] IO Counter stuck. Forcing proceed.");
+                crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
         for i in 0..count {
@@ -1608,7 +1610,7 @@ impl QuantizedQwen3VLTextModel {
             }
             // [STABILITY] 윈도우/DirectStorage 안정성을 위해 짧은 대기 및 동기화
             if i % 4 == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         }
         println!("[MEMORY-OPT] All layers reloaded successfully.");
@@ -2104,7 +2106,7 @@ impl QuantizedQwen3VLTextModel {
         // [MEMORY-OPT] 디코딩 단계 진입 시 모든 레이어를 미리 로드
         if is_decoding && layer_idx == 0 {
             let already_loaded = !self.layers[0].self_attn.q_proj.is_cleared();
-            if !already_loaded { self.reload_all_layers()?; }
+            if !already_loaded { self.reload_all_layers().await?; }
         }
 
         // [MEMORY-OPT] Prefill 시 현재 레이어 로드
