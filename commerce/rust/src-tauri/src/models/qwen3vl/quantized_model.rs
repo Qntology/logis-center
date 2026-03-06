@@ -1459,13 +1459,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let mut reader = std::io::Cursor::new(&mmap[..]);
         let new_layer = Self::new(config, ct, &mut reader, base_name, device, dtype, layer_idx, baking_only, layer.self_attn.registry.clone())?;
         
-        // [RAM-DISCARD] GPU로 전송이 완료된 직후, OS에게 이 mmap 영역(RAM Page Cache)이 더이상 필요없음을 알림
-        #[cfg(windows)]
-        unsafe {
-            use windows::Win32::System::Memory::VirtualUnlock;
-            let _ = VirtualUnlock(mmap.as_ptr() as *const _, mmap.len());
-        }
-        
+        // [STABILITY] Removed VirtualUnlock
+        let _ = mmap; // keep reference
         Ok(new_layer)
     }
 
@@ -1656,12 +1651,9 @@ impl QuantizedQwen3VLTextModel {
             let new_layer = QuantizedQwen3VLTextDecoderLayer::new(
                 &self.config, ct, &mut reader, &prefix, &Device::Cpu, self.dtype, layer_idx, self.baking_only, self.registry.clone()
             )?;
-
-            #[cfg(windows)]
-            unsafe {
-                use windows::Win32::System::Memory::VirtualUnlock;
-                let _ = VirtualUnlock(mmap.as_ptr() as *const _, mmap.len());
-            }
+            
+            // [STABILITY] Removed VirtualUnlock
+            let _ = mmap; // keep reference
 
             let old_kv_blocks = self.layers[layer_idx].self_attn.kv_blocks.clone();
             let old_active_kv = self.layers[layer_idx].self_attn.active_kv_name.clone();
@@ -2010,18 +2002,12 @@ impl QuantizedQwen3VLTextModel {
 
     /// [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로 이동
     async fn evacuate_vram_to_ram_only(&mut self, layer_idx: usize) -> Result<()> {
-        // [OPTIMIZATION] 0.6B (Small) 모델은 모든 문맥을 VRAM에 박제하여 PCIe 병목 제거
-        let is_small_model = self.layers.len() <= 36;
-        if is_small_model { return Ok(()); }
-
-        // [DYNAMIC-LIMITS] 시스템 자원 상황에 따라 임계값 유동적 조절 (OOM 방지)
+        // [STRICT-MODE] 시스템 자원 상황에 따라 임계값 유동적 조절
         let vram_limit = {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-
-            // [FIX] VRAM 한도를 대폭 상향하여 불필요한 RAM 대피 방지 (기존 64 -> 1024)
-            if free_ram_gb > 4.0 { 1024 } else if free_ram_gb > 2.0 { 512 } else { 128 }
+            if free_ram_gb > 4.0 { 512 } else { 128 }
         };
         let mut vram_evicted = false;
 
