@@ -2325,14 +2325,10 @@ impl QuantizedQwen3VLTextModel {
                     }
                 }
 
-                // [WORKER-DISPATCH] 각 블록을 독립적인 태스크로 던짐
-                let mut assigned_sids = Vec::new();
+                // [WORKER-DISPATCH] 각 블록을 독립적인 태스크로 던짐 (Fire-and-Forget)
                 for dump in dumps_to_send {
                     let sid = SLOT_MANAGER.acquire_write_slot(256).await;
-                    assigned_sids.push(sid);
                     let block_dir = kv_dir.join(&sub_path).join(format!("b{}", b_off));
-                    
-                    println!("[PARALLEL-PREFILL] Layer {} | Offset {} -> Assigned to Slot {}", layer_idx, b_off, sid);
                     
                     if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
                     
@@ -2341,7 +2337,7 @@ impl QuantizedQwen3VLTextModel {
                         if b_idx < reg_w.len() { reg_w[b_idx].ssd_path = Some(block_dir.clone()); }
                     }
 
-                    // [SINGLE-INCREMENT] 여기서만 카운터 증가 (워커 중복 제거)
+                    // [SINGLE-INCREMENT] 카운터 증가
                     GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                     if let Err(e) = tx.send(SlotTask::Bake(BakeTask {
@@ -2356,27 +2352,6 @@ impl QuantizedQwen3VLTextModel {
                     })).await {
                         println!("[ENGINE-ERROR] Failed to send bake task: {}. Reclaiming counter.", e);
                         GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
-                    }
-                }
-
-                if aggressive {
-                    let start_wait = std::time::Instant::now();
-
-                    while !assigned_sids.is_empty() && start_wait.elapsed().as_secs() < 30 {
-                        // [SSD-INTERLOCK] 물리적 파일 스캔 및 슬롯 상태 강제 업데이트
-                        SLOT_MANAGER.sync_with_sentinels(session_id).await;
-
-                        assigned_sids.retain(|&sid| {
-                            let s = &SLOT_MANAGER.slots[sid];
-                            let current_state = s.state.load(std::sync::atomic::Ordering::SeqCst);
-                            
-                            // 2: Ready(Baking 완료) 상태가 되면 대기 리스트에서 제거
-                            current_state != 2
-                        });
-                        
-                        if !assigned_sids.is_empty() {
-                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                        }
                     }
                 }
             }
