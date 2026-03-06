@@ -541,9 +541,16 @@ impl QuantizedQwen3VLTextAttention {
     fn verify_sentinel_receipt(&self, ssd_path: &Path, offset: usize) -> Result<bool> {
         let sentinel_dir = ssd_path.parent().map(|p| p.join("sentinels"));
         if let Some(sd) = sentinel_dir {
-            // 모든 슬롯 번호에 대해 .done 파일 확인
+            // 모든 슬롯 번호에 대해 파일 확인
             for sid in 0..512 {
                 let done_path = sd.join(format!("s{}.done", sid));
+                let error_path = sd.join(format!("s{}.error", sid));
+
+                // [NEW] 에러 파일이 있으면 즉시 실패 반환
+                if error_path.exists() {
+                    return Err(anyhow!("SSD Save error detected in sentinel s{}.error", sid));
+                }
+
                 if done_path.exists() {
                     if let Ok(data) = std::fs::read_to_string(&done_path) {
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {

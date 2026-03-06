@@ -336,6 +336,7 @@ struct SlotCompletionGuard {
     sid: usize,
     is_last: bool,
     active: bool,
+    error: bool, // [NEW] 에러 발생 여부 추적
     sentinel_path: Option<PathBuf>,
     offset: usize,
     len: usize,
@@ -349,21 +350,30 @@ impl Drop for SlotCompletionGuard {
             let s_path = self.sentinel_path.clone();
             let offset = self.offset;
             let len = self.len;
+            let is_err = self.error; // [NEW]
+
             tauri::async_runtime::spawn(async move {
                 if let Some(path) = s_path {
-                    let done_path = path.with_extension("done");
-                    let receipt = serde_json::json!({
-                        "offset": offset,
-                        "len": len,
-                        "slot_id": sid,
-                        "status": "FLUSHED",
-                        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
-                    });
-                    if let Ok(json) = serde_json::to_string(&receipt) {
-                        if let Ok(mut file) = fs::File::create(&done_path) {
-                            use std::io::Write;
-                            let _ = file.write_all(json.as_bytes());
-                            let _ = file.sync_all(); // [CRITICAL] 물리적 쓰기 보장
+                    if is_err {
+                        // [NEW] 에러 발생 시 .error 파일 생성
+                        let error_path = path.with_extension("error");
+                        let _ = fs::File::create(&error_path);
+                    } else {
+                        // 정상 종료 시 .done 영수증 생성
+                        let done_path = path.with_extension("done");
+                        let receipt = serde_json::json!({
+                            "offset": offset,
+                            "len": len,
+                            "slot_id": sid,
+                            "status": "FLUSHED",
+                            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+                        });
+                        if let Ok(json) = serde_json::to_string(&receipt) {
+                            if let Ok(mut file) = fs::File::create(&done_path) {
+                                use std::io::Write;
+                                let _ = file.write_all(json.as_bytes());
+                                let _ = file.sync_all();
+                            }
                         }
                     }
                     let _ = fs::remove_file(&path); // .pending 삭제
@@ -402,7 +412,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 }
                 
                 // [SLOT-GUARD] 이 레이어의 저장이 끝나면 레퍼런스 카운트 감소
-                let _slot_guard = SlotCompletionGuard { sid, is_last, active: true, sentinel_path: s_path, offset: task.offset, len: task.len };
+                let mut slot_guard = SlotCompletionGuard { sid, is_last, active: true, error: false, sentinel_path: s_path, offset: task.offset, len: task.len };
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 
                 let tp_for_blocking = tp.clone();
@@ -446,6 +456,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             }
                         }
                     }
+                } else {
+                    // [ERROR-SET] 저장이 실패한 경우 가드에 에러 상태 표시
+                    slot_guard.error = true;
+                    println!("[SSD-ERROR] Failed to save KV block to {:?}", tp);
                 }
             });
         }
