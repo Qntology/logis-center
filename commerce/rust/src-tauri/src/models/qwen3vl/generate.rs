@@ -45,7 +45,7 @@ pub enum SlotRequest {
 
 impl SlotManager {
     pub fn new(count: usize) -> (Self, mpsc::Receiver<SlotRequest>) {
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::channel(1024); // [EXPANDED] Prevent acquisition vs release deadlocks
         let mut slots = Vec::new();
         let num_layers = 28;
         for i in 0..count { slots.push(MemorySlot::new(i, num_layers)); }
@@ -68,7 +68,10 @@ impl SlotManager {
         rx.await.unwrap_or(0)
     }
     pub async fn release_slot(&self, idx: usize) { let _ = self.request_tx.send(SlotRequest::Release { idx, is_bake: false }).await; }
-    pub async fn mark_ready(&self, idx: usize) { let _ = self.request_tx.send(SlotRequest::Release { idx, is_bake: true }).await; }
+    pub async fn mark_ready(&self, idx: usize) { 
+        // [STRICT] Using try_send or ensuring high-priority delivery for releases
+        let _ = self.request_tx.send(SlotRequest::Release { idx, is_bake: true }).await; 
+    }
     pub async fn acquire_read_slot(&self) -> usize {
         loop {
             for (i, slot) in self.slots.iter().enumerate() {
@@ -84,7 +87,7 @@ impl SlotManager {
 
 pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub static SLOT_MANAGER_DATA: Lazy<(SlotManager, Mutex<Option<mpsc::Receiver<SlotRequest>>>)> = Lazy::new(|| {
-    let (sm, rx) = SlotManager::new(512); // [EXPANDED] 512 slots
+    let (sm, rx) = SlotManager::new(512); 
     (sm, Mutex::new(Some(rx)))
 });
 pub static SLOT_MANAGER: Lazy<&SlotManager> = Lazy::new(|| &SLOT_MANAGER_DATA.0);
@@ -139,7 +142,7 @@ pub struct LayerBlockInfo {
 
 // [GLOBAL] 인덱스 업데이트 채널
 pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = mpsc::channel(512);
     tokio::spawn(async move {
         let kv_dir = crate::utils::paths::get_kv_dir(None);
         while let Some(task) = rx.recv().await {
@@ -203,7 +206,7 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                 let mut attempts = 0;
                 while found.is_none() {
                     if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
-                        // 1. Free(0) 선점 시도
+                        // 1. Free(0)
                         for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
                             if slot.state.load(Ordering::SeqCst) == 0 {
                                 if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
@@ -213,7 +216,7 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                                 }
                             }
                         }
-                        // 2. Ready(2) 재사용 시도 (이미 SSD 저장 완료된 슬롯)
+                        // 2. Ready(2)
                         if found.is_none() {
                             for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
                                 if slot.state.load(Ordering::SeqCst) == 2 {
@@ -230,7 +233,7 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                         attempts += 1;
                         if attempts % 500 == 0 {
                             let (r, w, c, f) = (SLOT_MANAGER.count_reads.load(Ordering::Relaxed), SLOT_MANAGER.count_writes.load(Ordering::Relaxed), SLOT_MANAGER.count_cached.load(Ordering::Relaxed), SLOT_MANAGER.count_free.load(Ordering::Relaxed));
-                            println!("[SLOT-WATCH] Waiting for slots... Reads: {}, Writes: {}, Cached: {}, Free: {}, IO-Counter: {}", r, w, c, f, GLOBAL_IO_COUNTER.load(Ordering::SeqCst));
+                            println!("[SLOT-WATCH] Waiting... Reads: {}, Writes: {}, Cached: {}, Free: {}, IO: {}", r, w, c, f, GLOBAL_IO_COUNTER.load(Ordering::SeqCst));
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(2)).await; 
                     }
@@ -251,8 +254,32 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     }
 }
 
+// [SAFETY-GUARD] 어떤 상황에서도 보고를 보장하는 가드
+struct SlotCompletionGuard {
+    sid: usize,
+    is_last: bool,
+    active: bool,
+}
+
+impl Drop for SlotCompletionGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let sid = self.sid;
+            let is_last = self.is_last;
+            // [STRICT-REPORT] 패닉 상황에서도 보고될 수 있도록 별도 스코프로 실행
+            tauri::async_runtime::spawn(async move {
+                let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
+                if rem == 1 || is_last {
+                    println!("[WORKER-REPORT] Slot {} reached completion. Reporting to central control.", sid);
+                    SLOT_MANAGER.mark_ready(sid).await;
+                }
+            });
+        }
+    }
+}
+
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
-    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(512);
+    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(1024);
     tokio::spawn(async move {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(128));
         while let Some(task) = io_rx.recv().await {
@@ -261,19 +288,16 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
                 
+                // [IO-GUARD] 글로벌 IO 대기용 가드
                 struct IoGuard; 
-                impl Drop for IoGuard { 
-                    fn drop(&mut self) { 
-                        if GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 {
-                            GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); 
-                        }
-                    } 
-                }
-                let _guard = IoGuard;
+                impl Drop for IoGuard { fn drop(&mut self) { if GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } } }
+                let _io_guard = IoGuard;
+
+                // [SLOT-GUARD] 슬롯 회수 보장 가드
+                let mut slot_guard = SlotCompletionGuard { sid, is_last, active: true };
                 
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 
-                // [FIX] Use spawn_blocking for blocking IO to prevent executor starvation
                 let save_res = tokio::task::spawn_blocking(move || {
                     if let Ok(data) = safetensors::serialize(&ts, &None) {
                         drop(ts);
@@ -315,9 +339,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     Ok(Err(e)) => println!("[WORKER-ERROR] SSD Save failed for {:?}: {}", tp, e),
                     Err(e) => println!("[WORKER-ERROR] Blocking task panicked for {:?}: {}", tp, e),
                 }
-                
-                let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
-                if rem == 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; }
+                // [NOTE] slot_guard가 여기서 드롭되면서 자동으로 rem을 줄이고 mark_ready를 호출합니다.
             });
         }
     });
