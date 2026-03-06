@@ -638,14 +638,17 @@ impl Qwen3VLGenerateModel {
     }
 
     pub async fn prefill_chunk(&mut self, prompt: String, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<usize> {
-        // openai_types의 정확한 구조에 맞춰 ChatCompletionParameters 구성
+        // [FORCE-JSON] 모델이 중국어 등으로 답변하지 않게 시스템 프롬프트를 강제합니다.
         let mes = ChatCompletionParameters {
-            messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(
-                crate::openai_types::ChatCompletionRequestUserMessage {
-                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt),
-                    name: None,
-                }
-            )],
+            messages: vec![
+                crate::openai_types::ChatCompletionRequestMessage::User(
+                    crate::openai_types::ChatCompletionRequestUserMessage {
+                        content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt),
+                        name: None,
+                    }
+                )
+            ],
+            temperature: Some(0.1),
             ..Default::default()
         };
         self.prefill_only(mes, _cancel_flag, session_id, None, None).await
