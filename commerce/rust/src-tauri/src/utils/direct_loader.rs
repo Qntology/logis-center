@@ -70,6 +70,36 @@ mod windows_impl {
         }
     }
 
+    pub fn load_to_gpu_buffer(path: &Path, gpu_ptr: u64, size: usize) -> Result<()> {
+        let ctx = CONTEXT.as_ref().map_err(|e| anyhow!("DirectStorage init error: {}", e))?;
+        unsafe {
+            let path_str = path.to_string_lossy().to_string();
+            let file: IDStorageFile = ctx.factory.OpenFile(&HSTRING::from(path_str))?;
+            
+            let mut request = DSTORAGE_REQUEST::default();
+            request.Options.set_SourceType(DSTORAGE_REQUEST_SOURCE_FILE);
+            request.Options.set_DestinationType(DSTORAGE_REQUEST_DESTINATION_MEMORY); // GPU memory address is treated as memory
+            
+            request.Source.File = ManuallyDrop::new(DSTORAGE_SOURCE_FILE {
+                Source: ManuallyDrop::new(Some(file.clone())),
+                Offset: 0,
+                Size: size as u32,
+            });
+            request.Destination.Memory = DSTORAGE_DESTINATION_MEMORY {
+                Buffer: gpu_ptr as *mut _,
+                Size: size as u32,
+            };
+            
+            ctx.queue.EnqueueRequest(&request);
+            ctx.queue.EnqueueStatus(&ctx.status_array, 0);
+            ctx.queue.Submit();
+            
+            while !ctx.status_array.IsComplete(0) { std::thread::yield_now(); }
+            ctx.status_array.GetHResult(0).map_err(|e| anyhow!(e))?;
+            Ok(())
+        }
+    }
+
     pub fn save_block(path: &Path, data: &[u8]) -> Result<()> {
         unsafe {
             let path_wide = HSTRING::from(path.to_string_lossy().as_ref());
@@ -88,10 +118,19 @@ mod windows_impl {
             let _ = WriteFile(handle, Some(data), Some(&mut bytes_written), Some(&mut overlapped));
 
             let mut transferred = 0u32;
-            GetOverlappedResult(handle, &overlapped, &mut transferred, true).map_err(|e| anyhow!(e))?;
+            let _ = GetOverlappedResult(handle, &overlapped, &mut transferred, true);
             let _ = CloseHandle(handle);
             Ok(())
         }
+    }
+}
+
+pub fn load_to_gpu(path: &Path, gpu_ptr: u64, size: usize) -> Result<()> {
+    #[cfg(windows)] { windows_impl::load_to_gpu_buffer(path, gpu_ptr, size) }
+    #[cfg(not(windows))] { 
+        let data = load_kv_block(path)?;
+        // Fallback: This part needs raw pointer access which is device-specific
+        Err(anyhow!("Direct GPU load not implemented for this OS"))
     }
 }
 

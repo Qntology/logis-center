@@ -199,7 +199,8 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {
         match req {
             SlotRequest::Acquire { total_tokens: _total_tokens, tx } => {
-                let max_writes = 64; let mut found = None;
+                let max_writes = 256; // [EXPANDED] 0.6B 모델의 작은 블록들을 위해 슬롯 대폭 확장
+                let mut found = None;
                 while found.is_none() {
                     if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
                         for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
@@ -207,15 +208,8 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                                 if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { SLOT_MANAGER.update_counters(0, 1); SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); found = Some(i); break; }
                             }
                         }
-                        if found.is_none() {
-                            for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
-                                if slot.state.load(Ordering::SeqCst) == 2 {
-                                    if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { SLOT_MANAGER.update_counters(2, 1); SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); found = Some(i); break; }
-                                }
-                            }
-                        }
                     }
-                    if found.is_none() { tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
+                    if found.is_none() { tokio::time::sleep(std::time::Duration::from_millis(2)).await; }
                 }
                 let _ = tx.send(found.unwrap());
             },
@@ -233,36 +227,28 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
 }
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
-    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(100); 
+    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(512); // [EXPANDED]
     tokio::spawn(async move {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(48)); 
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(128)); // [PARALLEL-IO] 병렬 저장 한도 상향
         while let Some(task) = io_rx.recv().await {
             let sem = semaphore.clone();
             let (tp, ts, reg, b_idx, sid, is_last, kv_n) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone());
             tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
-                struct IoGuard; impl Drop for IoGuard { fn drop(&mut self) { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } }
+                struct IoGuard; 
+                impl Drop for IoGuard { fn drop(&mut self) { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } }
                 let _guard = IoGuard;
+                
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 if let Ok(data) = safetensors::serialize(&ts, &None) {
                     drop(ts); let _ = save_kv_block(&tp, &data);
                     
-                    // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
                     if let Some(kv_name) = kv_n {
                         if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
                             if let Ok(l_idx) = l_str.parse::<usize>() {
-                                // 오프셋 추출 (파일명 b{offset}_l{idx}_k_anchors 에서 추출하거나 SaveTask에 추가 가능)
-                                // 현재는 tp.parent() 폴더명이 b{offset} 이므로 이를 활용
                                 let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
                                 let offset = offset_str.parse::<usize>().unwrap_or(0);
-                                
-                                let _ = INDEX_TX.send(SlotTask::IndexUpdate {
-                                    kv_name,
-                                    layer_idx: l_idx,
-                                    offset,
-                                    len: 256,
-                                    file_name: format!("b{}/l{}.st", offset, l_idx),
-                                }).await;
+                                let _ = INDEX_TX.send(SlotTask::IndexUpdate { kv_name, layer_idx: l_idx, offset, len: 256, file_name: format!("b{}/l{}.st", offset, l_idx) }).await;
                             }
                         }
                     }
@@ -276,10 +262,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         if l_idx < 28 { 
                                             e.location[l_idx] = KVLocation::SSD; 
                                             e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                                            // [MEMORY-RELEASE] SSD 저장 완료 즉시 RAM 메모리 해제
-                                            if let Ok(mut cache) = e.bitkv_cache.write() {
-                                                if l_idx < cache.len() { cache[l_idx] = None; }
-                                            }
+                                            if let Ok(mut cache) = e.bitkv_cache.write() { if l_idx < cache.len() { cache[l_idx] = None; } }
                                         } 
                                     }
                                 }
@@ -303,48 +286,26 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
                     
                     for l_idx in 0..loop_count {
-                        let mut src = bake.layers[l_idx].clone();
+                        let src = bake.layers[l_idx].clone(); // raw_k/v are already moved to CPU in caller
                         let act_l = src.layer_idx;
                         let task_dir = bake.task_dir.clone();
                         let registry_inner = registry.clone();
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
 
-                        // [BACK-COMPRESSION] 압축 및 직렬화 작업 자체를 백그라운드로 완전히 분리
-                        tokio::spawn(async move {
-                            // [FIX] Convert raw tensors to BF16 (or F32 fallback)
-                            // [CRITICAL] 텐서가 GPU에 있는 경우, to_device는 해당 스레드의 컨텍스트를 필요로 함
-                            if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
-                                // 워커 스레드에서 안전하게 CPU로 이동
-                                // [STABILITY] to_device 호출 시 장치 컨텍스트가 자동으로 보장되지 않을 수 있으므로
-                                // candle-core의 Device 스코프 내에서 실행되도록 유도 (필요시)
-                                let k_cpu = rk.to_device(&Device::Cpu).unwrap_or(rk);
-                                let v_cpu = rv.to_device(&Device::Cpu).unwrap_or(rv);
-                                
-                                src.k_data = k_cpu.to_dtype(DType::BF16).unwrap_or(k_cpu);
-                                src.v_data = v_cpu.to_dtype(DType::BF16).unwrap_or(v_cpu);
-                            }
-
-                            let mut map = std::collections::HashMap::new();
-                            let prefix = format!("b{}_l{}_", off, act_l);
-                            map.insert(format!("{}k_data", prefix), src.k_data.clone());
-                            map.insert(format!("{}v_data", prefix), src.v_data.clone());
-                            map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
-                            
-                            let file_path = task_dir.join(format!("l{}.st", act_l));
-                            
-                            // [FIX] Send to IO worker after confirming all tensors are on CPU
-                            GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-                            let _ = io_tx_nested.send(SaveTask { 
-                                slot_id: sid, 
-                                path: file_path.clone(), 
-                                tensors: map, 
-                                is_last: false, 
-                                block_idx, 
-                                registry: Some(registry_inner), 
-                                kv_name: kv_name_inner 
-                            }).await;
-                        });
+                        let mut map = std::collections::HashMap::new();
+                        let prefix = format!("b{}_l{}_", off, act_l);
+                        map.insert(format!("{}k_data", prefix), src.k_data.clone());
+                        map.insert(format!("{}v_data", prefix), src.v_data.clone());
+                        map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
+                        
+                        let file_path = task_dir.join(format!("l{}.st", act_l));
+                        
+                        // [FIX] REMOVED DOUBLE INCREMENT HERE. Counter is managed by the sender.
+                        let _ = io_tx_nested.send(SaveTask { 
+                            slot_id: sid, path: file_path, tensors: map, is_last: false, 
+                            block_idx, registry: Some(registry_inner), kv_name: kv_name_inner 
+                        }).await;
                     }
                 },
                 SlotTask::Load(load) => {
@@ -569,7 +530,7 @@ impl Qwen3VLGenerateModel {
             
             // [REFINED-RELAY-LOGIC] Trust restored kv_len and skip prefill if it matches or covers the prompt.
             let mut gen_text = String::new();
-            let (input_ids, offset) = if kv_len > 0 && !is_reference_snapshot {
+            let (input_ids, offset) = if kv_len > 0 {
                 if kv_len >= total_toks {
                     println!("[SKIP-PREFILL] Snapshot covers entire prompt (Detected: {}, Needed: {}). Capping offset.", kv_len, total_toks);
                     // [FIX] Strictly cap offset at total_toks - 1 to prevent double offset
@@ -582,11 +543,7 @@ impl Qwen3VLGenerateModel {
                     (Tensor::from_vec(missing_ids, (1, missing_len), &self.text_device)?, kv_len)
                 }
             } else {
-                if is_reference_snapshot {
-                    println!("[FULL-PREFILL] Reference context found. Computing entire prompt to fill all 28 layers (Len: {}).", total_toks);
-                } else {
-                    println!("[FULL-PREFILL] No context found. Computing entire prompt (Len: {}).", total_toks);
-                }
+                println!("[FULL-PREFILL] No context found. Computing entire prompt (Len: {}).", total_toks);
                 (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
             };
             
