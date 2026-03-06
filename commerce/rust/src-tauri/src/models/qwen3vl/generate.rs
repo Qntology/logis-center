@@ -242,12 +242,21 @@ pub async fn get_load_worker() -> Result<mpsc::Sender<SlotTask>> { LOAD_TX.get()
 pub async fn wait_for_global_io() { 
     let start = std::time::Instant::now();
     while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { 
+        if start.elapsed().as_millis() % 2000 == 0 {
+            let f = SLOT_MANAGER.count_free.load(Ordering::SeqCst);
+            let w = SLOT_MANAGER.count_writes.load(Ordering::SeqCst);
+            let c = SLOT_MANAGER.count_cached.load(Ordering::SeqCst);
+            let r = SLOT_MANAGER.count_reads.load(Ordering::SeqCst);
+            println!("[IO-WAIT] Pending: {} | Slots: Free={}, Writing={}, Cached={}, Reading={}", 
+                GLOBAL_IO_COUNTER.load(Ordering::SeqCst), f, w, c, r);
+        }
+
         if start.elapsed().as_secs() > 10 {
             println!("[STUCK-GUARD] IO Counter stuck at {}. Forcing proceed.", GLOBAL_IO_COUNTER.load(Ordering::SeqCst));
             GLOBAL_IO_COUNTER.store(0, Ordering::SeqCst);
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await; 
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await; 
     } 
 }
 
