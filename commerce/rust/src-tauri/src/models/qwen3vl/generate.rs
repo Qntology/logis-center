@@ -199,13 +199,30 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {
         match req {
             SlotRequest::Acquire { total_tokens: _total_tokens, tx } => {
-                let max_writes = 256; // [EXPANDED] 0.6B 모델의 작은 블록들을 위해 슬롯 대폭 확장
+                let max_writes = 512; // [EXPANDED] 512 slots
                 let mut found = None;
                 while found.is_none() {
                     if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
+                        // 1. Try Free(0) slots first
                         for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
                             if slot.state.load(Ordering::SeqCst) == 0 {
-                                if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { SLOT_MANAGER.update_counters(0, 1); SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); found = Some(i); break; }
+                                if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                                    SLOT_MANAGER.update_counters(0, 1);
+                                    SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst);
+                                    found = Some(i); break;
+                                }
+                            }
+                        }
+                        // 2. Fallback to Ready(2) slots
+                        if found.is_none() {
+                            for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
+                                if slot.state.load(Ordering::SeqCst) == 2 {
+                                    if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                                        SLOT_MANAGER.update_counters(2, 1);
+                                        SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst);
+                                        found = Some(i); break;
+                                    }
+                                }
                             }
                         }
                     }
