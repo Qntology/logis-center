@@ -1,4 +1,4 @@
-use crate::models::qwen3vl::quantized_model::{KVLocation, KVBlock, KVRegistry, QuantizedQwen3VLModel, MemorySlot};
+use crate::models::qwen3vl::quantized_model::{KVLocation, KVBlock, KVRegistry, BitKVMetadata, QuantizedQwen3VLModel, MemorySlot};
 use anyhow::{Result, anyhow};
 use candle_core::{quantized::gguf_file, DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -105,8 +105,7 @@ impl SlotManager {
                                 if sid < self.slots.len() {
                                     match ext {
                                         "done" => {
-                                            // [FULL-RECLAMATION] 엔진이 확인했으므로 즉시 Free(0)로 전환하여 재사용 가능하게 함
-                                            let _ = self.request_tx.send(SlotRequest::Release { idx: sid, is_bake: false }).await;
+                                            self.mark_ready(sid).await;
                                             let _ = std::fs::remove_file(&path);
                                         },
                                         "error" => {
@@ -166,15 +165,9 @@ pub struct BakeTask {
 }
 
 pub struct SaveTask {
-    pub slot_id: usize,
-    pub path: PathBuf,
-    pub tensors: std::collections::HashMap<String, Tensor>,
-    pub is_last: bool,
-    pub block_idx: Option<usize>,
-    pub registry: Option<KVRegistry>,
+    pub slot_id: usize, pub path: PathBuf, pub tensors: std::collections::HashMap<String, Tensor>,
+    pub is_last: bool, pub block_idx: Option<usize>, pub registry: Option<KVRegistry>,
     pub kv_name: Option<String>,
-    pub offset: usize,
-    pub len: usize,
 }
 
 pub enum SlotTask { 
@@ -209,12 +202,7 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
         let kv_dir = crate::utils::paths::get_kv_dir(None);
         while let Some(task) = rx.recv().await {
             if let SlotTask::IndexUpdate { kv_name, layer_idx, offset, len, file_name } = task {
-                let index_dir = kv_dir.join(&kv_name);
-                let index_path = index_dir.join(format!("layer{}.json", layer_idx));
-                
-                // [INDEX-DIR-ENSURE] 부모 디렉토리가 없으면 생성
-                if !index_dir.exists() { let _ = fs::create_dir_all(&index_dir); }
-
+                let index_path = kv_dir.join(&kv_name).join(format!("layer{}.json", layer_idx));
                 let mut index = if index_path.exists() {
                     if let Ok(data) = load_kv_block(&index_path) {
                         String::from_utf8(data).ok()
@@ -224,6 +212,7 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
                         LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] }
                     }
                 } else {
+                    let _ = fs::create_dir_all(index_path.parent().unwrap());
                     LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] }
                 };
 
@@ -232,9 +221,7 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
                     index.blocks.sort_by_key(|b| b.offset);
                     index.total_tokens = index.blocks.iter().map(|b| b.len).sum();
                     if let Ok(json) = serde_json::to_string_pretty(&index) {
-                        if let Ok(_) = save_kv_block(&index_path, json.as_bytes()) {
-                            if layer_idx == 0 { println!("[INDEX] Successfully updated layer0.json at {:?}", index_dir); }
-                        }
+                        let _ = save_kv_block(&index_path, json.as_bytes());
                     }
                 }
             }
@@ -285,14 +272,10 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {
         match req {
             SlotRequest::Acquire { total_tokens: _total_tokens, tx } => {
-                // [DYNAMIC-DEFERRAL] 저사양 환경에서는 동시 쓰기 작업을 제한하여 RAM 폭증을 막습니다.
-                let max_simultaneous_writes = 32; 
+                let max_writes = 512;
                 let mut found = None;
-                
                 while found.is_none() {
-                    let active_writes = SLOT_MANAGER.active_write_count.load(Ordering::SeqCst);
-                    
-                    if active_writes < max_simultaneous_writes {
+                    if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
                         for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
                             if slot.state.load(Ordering::SeqCst) == 0 {
                                 if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
@@ -302,26 +285,31 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                                 }
                             }
                         }
+                        if found.is_none() {
+                            for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
+                                if slot.state.load(Ordering::SeqCst) == 2 {
+                                    if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                                        SLOT_MANAGER.update_counters(2, 1);
+                                        SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst);
+                                        found = Some(i); break;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    
-                    if found.is_none() {
-                        // [DEFER] 자리가 날 때까지 아주 잠깐 대기 (Fixed Delay가 아닌 자원 기반 대기)
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    }
+                    if found.is_none() { tokio::time::sleep(std::time::Duration::from_millis(2)).await; }
                 }
                 let _ = tx.send(found.unwrap());
             },
             SlotRequest::Release { idx, is_bake } => {
                 let s = &SLOT_MANAGER.slots[idx]; 
                 let old = s.state.load(Ordering::SeqCst);
-                // is_bake가 true면 Ready(2)로 가고, false(에러나 정리)면 Free(0)로 갑니다.
                 let new = if is_bake { 2 } else { 0 };
-                
                 if s.state.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                     SLOT_MANAGER.update_counters(old, new);
                     if old == 1 { SLOT_MANAGER.active_write_count.fetch_sub(1, Ordering::SeqCst); }
                     
-                    // [IMMEDIATE-CLEANUP] 슬롯 해제 시 모든 텐서 참조를 즉시 제거하여 물리적 메모리 해제
+                    // [IMMEDIATE-CLEANUP] 슬롯 해제 시 내부에 들고 있던 텐서들을 즉시 해제
                     for k in &s.k_layers { let mut g = k.lock().unwrap(); *g = None; }
                     for v in &s.v_layers { let mut g = v.lock().unwrap(); *g = None; }
                     
@@ -336,10 +324,7 @@ struct SlotCompletionGuard {
     sid: usize,
     is_last: bool,
     active: bool,
-    error: bool, // [NEW] 에러 발생 여부 추적
     sentinel_path: Option<PathBuf>,
-    offset: usize,
-    len: usize,
 }
 
 impl Drop for SlotCompletionGuard {
@@ -348,35 +333,11 @@ impl Drop for SlotCompletionGuard {
             let sid = self.sid;
             let is_last = self.is_last;
             let s_path = self.sentinel_path.clone();
-            let offset = self.offset;
-            let len = self.len;
-            let is_err = self.error; // [NEW]
-
             tauri::async_runtime::spawn(async move {
                 if let Some(path) = s_path {
-                    if is_err {
-                        // [NEW] 에러 발생 시 .error 파일 생성
-                        let error_path = path.with_extension("error");
-                        let _ = fs::File::create(&error_path);
-                    } else {
-                        // 정상 종료 시 .done 영수증 생성
-                        let done_path = path.with_extension("done");
-                        let receipt = serde_json::json!({
-                            "offset": offset,
-                            "len": len,
-                            "slot_id": sid,
-                            "status": "FLUSHED",
-                            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
-                        });
-                        if let Ok(json) = serde_json::to_string(&receipt) {
-                            if let Ok(mut file) = fs::File::create(&done_path) {
-                                use std::io::Write;
-                                let _ = file.write_all(json.as_bytes());
-                                let _ = file.sync_all();
-                            }
-                        }
-                    }
-                    let _ = fs::remove_file(&path); // .pending 삭제
+                    let done_path = path.with_extension("done");
+                    let _ = fs::File::create(&done_path);
+                    let _ = fs::remove_file(&path);
                 }
                 let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
                 if rem == 1 || is_last {
@@ -389,10 +350,8 @@ impl Drop for SlotCompletionGuard {
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(1024);
-    
-    // SSD 저장 워커
     tokio::spawn(async move {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(32)); // 더욱 보수적으로 조절
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(128));
         while let Some(task) = io_rx.recv().await {
             let sem = semaphore.clone();
             let (tp, ts, reg, b_idx, sid, is_last, kv_n) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone());
@@ -401,7 +360,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 struct IoGuard; 
                 impl Drop for IoGuard { fn drop(&mut self) { if GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } } }
                 let _io_guard = IoGuard;
-                
                 let sentinel_dir = if let Some(p) = tp.parent() { p.parent().map(|p2| p2.join("sentinels")) } else { None };
                 let mut s_path = None;
                 if let Some(sd) = sentinel_dir {
@@ -410,62 +368,54 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let _ = fs::File::create(&p_path);
                     s_path = Some(p_path);
                 }
-                
-                // [SLOT-GUARD] 이 레이어의 저장이 끝나면 레퍼런스 카운트 감소
-                let mut slot_guard = SlotCompletionGuard { sid, is_last, active: true, error: false, sentinel_path: s_path, offset: task.offset, len: task.len };
+                let _slot_guard = SlotCompletionGuard { sid, is_last, active: true, sentinel_path: s_path };
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
-                
                 let tp_for_blocking = tp.clone();
                 let save_res = tokio::task::spawn_blocking(move || {
                     let serialized = safetensors::serialize(&ts, &None);
-                    drop(ts); // 시리얼라이즈 직후 즉시 파괴
-                    if let Ok(data) = serialized { save_kv_block(&tp_for_blocking, &data) }
-                    else { Err(anyhow!("Serialization failed")) }
+                    // [IMMEDIATE-DROP] 시리얼라이즈 직후 원본 텐서 맵 파괴
+                    drop(ts); 
+                    
+                    if let Ok(data) = serialized {
+                        save_kv_block(&tp_for_blocking, &data)
+                    } else {
+                        Err(anyhow!("Serialization failed"))
+                    }
                 }).await;
-
-                if let Ok(Ok(_)) = save_res {
-                    // [INDEX-UPDATE] 저장이 성공하면 인덱스 파일(layerN.json) 업데이트 신호를 보냄
-                    if let Some(kv_name) = kv_n {
-                        if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
-                            if let Ok(l_idx) = l_str.parse::<usize>() {
-                                let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
-                                let offset = offset_str.parse::<usize>().unwrap_or(0);
-                                let _ = INDEX_TX.send(SlotTask::IndexUpdate { 
-                                    kv_name, 
-                                    layer_idx: l_idx, 
-                                    offset, 
-                                    len: 256, 
-                                    file_name: format!("b{}/l{}.st", offset, l_idx) 
-                                }).await;
+                match save_res {
+                    Ok(Ok(_)) => {
+                        if let Some(kv_name) = kv_n {
+                            if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
+                                if let Ok(l_idx) = l_str.parse::<usize>() {
+                                    let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
+                                    let offset = offset_str.parse::<usize>().unwrap_or(0);
+                                    let _ = INDEX_TX.send(SlotTask::IndexUpdate { kv_name, layer_idx: l_idx, offset, len: 256, file_name: format!("b{}/l{}.st", offset, l_idx) }).await;
+                                }
                             }
                         }
-                    }
-                    if let (Some(r), Some(idx)) = (reg, b_idx) {
-                        if let Ok(mut entries) = r.entries.write() {
-                            if idx < entries.len() {
-                                let e = &mut entries[idx]; 
-                                if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
-                                    if let Ok(l_idx) = l_str.parse::<usize>() { 
-                                        if l_idx < 28 { 
-                                            e.location[l_idx] = KVLocation::SSD; 
-                                            e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                                            if let Ok(mut cache) = e.bitkv_cache.write() { if l_idx < cache.len() { cache[l_idx] = None; } }
-                                        } 
+                        if let (Some(r), Some(idx)) = (reg, b_idx) {
+                            if let Ok(mut entries) = r.entries.write() {
+                                if idx < entries.len() {
+                                    let e = &mut entries[idx]; 
+                                    if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
+                                        if let Ok(l_idx) = l_str.parse::<usize>() { 
+                                            if l_idx < 28 { 
+                                                e.location[l_idx] = KVLocation::SSD; 
+                                                e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                                                if let Ok(mut cache) = e.bitkv_cache.write() { if l_idx < cache.len() { cache[l_idx] = None; } }
+                                            } 
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                } else {
-                    // [ERROR-SET] 저장이 실패한 경우 가드에 에러 상태 표시
-                    slot_guard.error = true;
-                    println!("[SSD-ERROR] Failed to save KV block to {:?}", tp);
+                    },
+                    _ => {}
                 }
             });
         }
     });
 
-    // VRAM -> RAM 변환 워커 (이제는 단순 중계 역할)
     tokio::spawn(async move {
         while let Some(task) = rx.recv().await {
             match task {
@@ -474,7 +424,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let (sid, off, _is_relay, block_idx, registry, kv_name) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone());
                     let loop_count = bake.layers.len();
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
-                    
                     for l_idx in 0..loop_count {
                         let src = bake.layers[l_idx].clone();
                         let act_l = src.layer_idx;
@@ -482,25 +431,52 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let registry_inner = registry.clone();
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
-                        
-                        // [SIMPLE-PASS] 이미 RAM에 있는 데이터를 저장 큐로 전달
                         let mut map = std::collections::HashMap::new();
                         let prefix = format!("b{}_l{}_", off, act_l);
-                        
-                        map.insert(format!("{}k_data", prefix), src.k_data);
-                        map.insert(format!("{}v_data", prefix), src.v_data);
+                        map.insert(format!("{}k_data", prefix), src.k_data.clone());
+                        map.insert(format!("{}v_data", prefix), src.v_data.clone());
                         map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
-                        
                         let file_path = task_dir.join(format!("l{}.st", act_l));
-                        
-                        tokio::spawn(async move {
-                            let _ = io_tx_nested.send(SaveTask { 
-                                slot_id: sid, path: file_path, tensors: map, is_last: false, 
-                                block_idx, registry: Some(registry_inner), kv_name: kv_name_inner,
-                                offset: off, len: 256
-                            }).await;
-                        });
+                        let _ = io_tx_nested.send(SaveTask { 
+                            slot_id: sid, path: file_path, tensors: map, is_last: false, 
+                            block_idx, registry: Some(registry_inner), kv_name: kv_name_inner 
+                        }).await;
                     }
+                },
+                SlotTask::Load(load) => {
+                    let sid = load.slot_id; let reg = load.registry.clone(); let shared_block = load.shared_block.clone();
+                    let provided_path = load.path.clone(); let kv_name = load.kv_name.clone();
+                    tokio::spawn(async move {
+                        let _guard = ReadSlotGuard { sid, active: true };
+                        let (b_idx_off, b_idx) = { match shared_block.inner.read() { Ok(inner) => (inner.offset, inner.index), _ => (0, 999) } };
+                        let mut root = provided_path.clone();
+                        while !root.to_string_lossy().ends_with("kv") && root.parent().is_some() { root = root.parent().unwrap().to_path_buf(); }
+                        let block_root = root.join(kv_name.as_deref().unwrap_or("inference")).join(format!("b{}", b_idx_off));
+                        for l_idx in 0..28 {
+                            let file_path = block_root.join(format!("l{}.st", l_idx));
+                            if file_path.is_file() {
+                                if let Ok(content) = load_kv_block(&file_path) {
+                                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                                        let prefix = format!("b{}_l{}_", b_idx_off, l_idx);
+                                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                                        if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                            let file_shape: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                                            let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &file_shape, &Device::Cpu).unwrap();
+                                            let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &file_shape, &Device::Cpu).unwrap();
+                                            let meta = BitKVMetadata { k_data: kd_t, v_data: vd_t, original_shape: file_shape };
+                                            if let Ok(mut r) = reg.entries.write() {
+                                                if b_idx < r.len() {
+                                                    { let mut cache = r[b_idx].bitkv_cache.write().unwrap(); cache[l_idx] = Some(meta); }
+                                                    r[b_idx].location[l_idx] = KVLocation::RAM;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
                 },
                 _ => {}
             }
@@ -585,49 +561,20 @@ impl Qwen3VLGenerateModel {
         self.clear_kv_cache();
         if let ModelVariant::QuantizedVL(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
         if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
-        
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_toks = full_ids.len();
-        
         self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
-        
         if let Some(s_id) = &session_id {
-            let kv_dir = crate::utils::paths::get_kv_dir(None);
-            let kv_name_sub = _kv_name.as_deref().unwrap_or("inference/text");
-            let save_path = kv_dir.join(s_id).join(kv_name_sub);
-            
-            if !save_path.exists() { let _ = fs::create_dir_all(&save_path); }
-            
-            let tokens_json = serde_json::to_string(&full_ids)?;
-            fs::write(save_path.join("tokens.json"), &tokens_json)?;
-            // [BACKUP] 루트 폴더에도 저장하여 엔진 로더가 찾기 쉽게 함
-            let _ = fs::write(kv_dir.join(s_id).join("tokens.json"), &tokens_json);
-            
-            println!("[PREFILL-SAVE] Saved tokens.json to {:?} and root.", save_path);
-
-            let _ = self.force_flush_all_active_blocks(s_id, Some(kv_name_sub)).await;
+            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+            if !path.exists() { fs::create_dir_all(&path)?; }
+            fs::write(path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
+            let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
             wait_for_global_io().await;
+            println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk.");
         }
         Ok(total_toks)
-    }
-
-    pub async fn prefill_chunk(&mut self, prompt: String, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<usize> {
-        // [FORCE-JSON] 중국어 답변 방지 및 형식을 강제합니다.
-        let mes = ChatCompletionParameters {
-            messages: vec![
-                crate::openai_types::ChatCompletionRequestMessage::User(
-                    crate::openai_types::ChatCompletionRequestUserMessage {
-                        content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt),
-                        name: None,
-                    }
-                )
-            ],
-            temperature: Some(0.1),
-            ..Default::default()
-        };
-        self.prefill_only(mes, _cancel_flag, session_id, None, None).await
     }
 
     pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
@@ -665,12 +612,12 @@ impl Qwen3VLGenerateModel {
         wait_for_global_io().await;
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         let mut gen_ids = vec![];
-        let _think_token_id = 151643;
+        let think_token_id = 151643;
         for i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
             let mut logits_tensor = logits.flatten_all()?.to_dtype(DType::F32)?;
             if !gen_ids.is_empty() { logits_tensor = apply_repetition_penalty(&logits_tensor, 1.2, &gen_ids)?; }
-            let next_id = lp.sample(&logits_tensor)?;
+            let mut next_id = lp.sample(&logits_tensor)?;
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             gen_ids.push(next_id);
             gen_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
@@ -692,6 +639,20 @@ impl Qwen3VLGenerateModel {
             ModelVariant::QuantizedText(m) => m.language_model.truncate_kv_cache(len),
             _ => Ok(()),
         }
+    }
+
+    pub async fn prefill_chunk(&mut self, prompt: String, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<usize> {
+        // openai_types의 정확한 구조에 맞춰 ChatCompletionParameters 구성
+        let mes = ChatCompletionParameters {
+            messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(
+                crate::openai_types::ChatCompletionRequestUserMessage {
+                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt),
+                    name: None,
+                }
+            )],
+            ..Default::default()
+        };
+        self.prefill_only(mes, _cancel_flag, session_id, None, None).await
     }
 
     pub fn save_kv_to_disk(&mut self, path: &Path, kv_name: Option<&str>, offset: usize) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.save_kv_cache(path, false, offset, kv_name), ModelVariant::QuantizedText(m) => m.language_model.save_kv_cache(path, false, offset, kv_name), _ => Ok(()) } }
