@@ -203,7 +203,12 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
         let kv_dir = crate::utils::paths::get_kv_dir(None);
         while let Some(task) = rx.recv().await {
             if let SlotTask::IndexUpdate { kv_name, layer_idx, offset, len, file_name } = task {
-                let index_path = kv_dir.join(&kv_name).join(format!("layer{}.json", layer_idx));
+                let index_dir = kv_dir.join(&kv_name);
+                let index_path = index_dir.join(format!("layer{}.json", layer_idx));
+                
+                // [INDEX-DIR-ENSURE] 부모 디렉토리가 없으면 생성
+                if !index_dir.exists() { let _ = fs::create_dir_all(&index_dir); }
+
                 let mut index = if index_path.exists() {
                     if let Ok(data) = load_kv_block(&index_path) {
                         String::from_utf8(data).ok()
@@ -213,7 +218,6 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
                         LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] }
                     }
                 } else {
-                    let _ = fs::create_dir_all(index_path.parent().unwrap());
                     LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] }
                 };
 
@@ -222,7 +226,9 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
                     index.blocks.sort_by_key(|b| b.offset);
                     index.total_tokens = index.blocks.iter().map(|b| b.len).sum();
                     if let Ok(json) = serde_json::to_string_pretty(&index) {
-                        let _ = save_kv_block(&index_path, json.as_bytes());
+                        if let Ok(_) = save_kv_block(&index_path, json.as_bytes()) {
+                            if layer_idx == 0 { println!("[INDEX] Successfully updated layer0.json at {:?}", index_dir); }
+                        }
                     }
                 }
             }
@@ -273,11 +279,14 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {
         match req {
             SlotRequest::Acquire { total_tokens: _total_tokens, tx } => {
-                let max_writes = 512;
+                // [DYNAMIC-DEFERRAL] 저사양 환경에서는 동시 쓰기 작업을 제한하여 RAM 폭증을 막습니다.
+                let max_simultaneous_writes = 32; 
                 let mut found = None;
+                
                 while found.is_none() {
-                    // [BACKPRESSURE] 워커가 너무 바쁘면(Writing 중인 슬롯이 많으면) 대기
-                    if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
+                    let active_writes = SLOT_MANAGER.active_write_count.load(Ordering::SeqCst);
+                    
+                    if active_writes < max_simultaneous_writes {
                         for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
                             if slot.state.load(Ordering::SeqCst) == 0 {
                                 if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
@@ -288,8 +297,11 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                             }
                         }
                     }
-                    // 배정 시마다 1ms만 쉬어도 엔진 속도가 워커 속도와 어느 정도 맞춰집니다.
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    
+                    if found.is_none() {
+                        // [DEFER] 자리가 날 때까지 아주 잠깐 대기 (Fixed Delay가 아닌 자원 기반 대기)
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
                 }
                 let _ = tx.send(found.unwrap());
             },
@@ -535,18 +547,28 @@ impl Qwen3VLGenerateModel {
         self.clear_kv_cache();
         if let ModelVariant::QuantizedVL(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
         if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
+        
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_toks = full_ids.len();
+        
         self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
+        
         if let Some(s_id) = &session_id {
-            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
-            if !path.exists() { fs::create_dir_all(&path)?; }
-            fs::write(path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
-            let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
+            let kv_dir = crate::utils::paths::get_kv_dir(None);
+            let kv_name_sub = _kv_name.as_deref().unwrap_or("inference/text");
+            let save_path = kv_dir.join(s_id).join(kv_name_sub);
+            
+            if !save_path.exists() { let _ = fs::create_dir_all(&save_path); }
+            
+            // [CRITICAL] tokens.json 저장 (인덱스와 같은 위치에 저장하여 엔진이 찾기 쉽게 함)
+            let tokens_json = serde_json::to_string(&full_ids)?;
+            fs::write(save_path.join("tokens.json"), &tokens_json)?;
+            println!("[PREFILL-SAVE] Saved tokens.json to {:?}", save_path);
+
+            let _ = self.force_flush_all_active_blocks(s_id, Some(kv_name_sub)).await;
             wait_for_global_io().await;
-            println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk.");
         }
         Ok(total_toks)
     }
