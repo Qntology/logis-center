@@ -2120,10 +2120,40 @@ impl QuantizedQwen3VLTextModel {
         let input_token_count = xs.dim(1).unwrap_or(0);
         let is_decoding = input_token_count <= 1;
 
-        // [MEMORY-OPT] 디코딩 단계 진입 시 모든 레이어를 미리 로드
+        // [BARRIER] Decoding 진입 시점에만 실행되는 전역 동기화 및 레이어 재로딩
         if is_decoding && layer_idx == 0 {
+            // 1. 가중치가 이미 로드되어 있는지 확인
             let already_loaded = !self.layers[0].self_attn.q_proj.is_cleared();
-            if !already_loaded { self.reload_all_layers()?; }
+            
+            if !already_loaded {
+                println!("[SSD-BRIDGE] Initializing safety bridge inside model...");
+                
+                // 2. 비동기 I/O가 끝날 때까지 대기 (Async Barrier)
+                crate::models::qwen3vl::generate::wait_for_global_io().await;
+                
+                // 3. 레이어 전체 로딩 (Safe-Mode)
+                self.reload_all_layers()?; 
+                
+                // [FIX] KV 캐시 장부의 포인터 오염을 막기 위해 현재 세션의 데이터를 SSD 기반으로 재구축
+                let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) };
+                if let Some(sid) = &self.active_session_id {
+                    println!("[SSD-BRIDGE] Purging live pointers and rebuilding from SSD...");
+                    // 모든 레이어의 KV 블록을 즉시 비움 (좀비 포인터 제거)
+                    for layer in self.layers.iter_mut() {
+                        layer.self_attn.kv_blocks.clear();
+                    }
+                    
+                    // SSD에서 깨끗한 상태의 장부를 다시 로드
+                    let snapshot_path = crate::utils::paths::get_kv_dir(None).join(sid);
+                    let _ = self.load_kv_cache(&snapshot_path, &target_device, 0, 128, kv_name.as_deref());
+                    
+                    // 재구축 후 한 번 더 동기화
+                    crate::models::qwen3vl::generate::wait_for_global_io().await;
+                }
+
+                if target_device.is_cuda() { let _ = target_device.synchronize(); }
+                println!("[SSD-BRIDGE] Model environment hard-reset complete. Safe to decode.");
+            }
         }
 
         // [MEMORY-OPT] Prefill 시 현재 레이어 로드
