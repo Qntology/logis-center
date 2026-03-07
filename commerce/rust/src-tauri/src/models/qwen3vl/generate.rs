@@ -712,17 +712,30 @@ impl Qwen3VLGenerateModel {
         wait_for_global_io().await;
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         
-        // [SSD-BRIDGE] Seamless Transition Mode: Flush only (No Clear, No Reload)
+        // [SSD-BRIDGE] Hybrid Transition Mode: Registry Rebuild (0-26) + VRAM Persistent (27)
         if let Some(s_id) = &session_id {
-            println!("[SSD-BRIDGE] Transitioning to Decoding. Keeping prefill KV in VRAM...");
+            println!("[SSD-BRIDGE] Initiating Hybrid Bridge. Rebuilding Context for Layers 0-26...");
+            let actual_len = self.get_kv_len();
             
-            // 1. 잔여 데이터 SSD 백업 (보험용, 삭제 안 함)
+            // 1. 잔여 데이터 SSD 백업 (보험용)
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
             wait_for_global_io().await;
             
-            // [STABILITY] 리셋 없이 현재 길이를 그대로 동기화
-            total_tokens_after_prefill = self.get_kv_len();
-            println!("[SSD-BRIDGE] Seamless transition complete. Offset: {}", total_tokens_after_prefill);
+            // 2. SSD 장부(Registry) 재구축
+            // [NOTE] 이 함수는 SSD에 있는 0~26번 레이어의 맥락을 찾아 연결합니다.
+            // 27번 레이어는 이미 process_single_layer에서 보존되어 있으므로 장부만 업데이트됩니다.
+            let kv_type = _kv_name.as_deref().unwrap_or("text");
+            let snapshot_path = crate::utils::paths::get_kv_dir(None).join(s_id).join("inference").join(kv_type);
+            let device_clone = self.text_device.clone();
+            
+            let _ = self.load_kv_cache(&snapshot_path, &device_clone, actual_len, 0, None);
+            wait_for_global_io().await;
+            
+            let verified_len = self.get_kv_len();
+            println!("[SSD-BRIDGE] Hybrid Bridge Established. Global Len: {} (L0-26: SSD, L27: VRAM)", verified_len);
+
+            total_tokens_after_prefill = verified_len;
+            println!("[SSD-BRIDGE] Syncing decoding start pos to: {}", total_tokens_after_prefill);
         }
 
             let mut gen_ids = vec![];

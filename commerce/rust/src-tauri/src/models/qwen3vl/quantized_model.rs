@@ -713,8 +713,10 @@ impl QuantizedQwen3VLTextAttention {
                                 let k_gpu = self.decompress_from_bf16(&kd_t, &meta_os, dev)?;
                                 let v_gpu = self.decompress_from_bf16(&vd_t, &meta_os, dev)?;
 
-                                // [JIT-CACHE] 디코딩 효율을 위해 이번에 로드된 데이터를 VRAM에 안착시킴
-                                {
+                                // [HYBRID-CACHE-STRATEGY] 
+                                // 마지막 레이어(27)만 VRAM에 고정하고, 0~26번은 연산 후 버립니다.
+                                // 이를 통해 OOM 없이 수만 토큰의 문맥을 처리할 수 있습니다.
+                                if q_len == 1 && self.layer_idx == 27 {
                                     let mut inner_w = block.inner.write().unwrap();
                                     inner_w.k_cache = Some(k_gpu.clone());
                                     inner_w.v_cache = Some(v_gpu.clone());
@@ -2236,25 +2238,31 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [KV-EVICTION] KV 캐시 대피 (메인 스레드 즉시 캡처)
+        // [KV-EVICTION] KV 캐시 대피 (0~26번 레이어만 대상)
         if let Some(sid) = sid_opt {
             if !is_decoding {
-                // 1. 프리필 시에만 CPU로 캡처하여 SSD 워커로 전달
-                let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count, false).await;
-                
-                // [RESOURCE-RECLAMATION] 레이어 단위로 즉시 슬롯 및 센티널 정리
-                // 이전 레이어들의 백업이 완료되었다면 슬롯을 즉시 비워 다음 레이어를 준비합니다.
-                crate::models::qwen3vl::generate::wait_for_global_io().await;
-                SLOT_MANAGER.sync_with_sentinels(&sid).await;
+                // [HYBRID-STRATEGY] 마지막 레이어(27)는 VRAM에 남겨두어 디코딩으로 즉시 인계합니다.
+                if layer_idx < 27 {
+                    let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count, false).await;
+                    crate::models::qwen3vl::generate::wait_for_global_io().await;
+                    SLOT_MANAGER.sync_with_sentinels(&sid).await;
+                } else {
+                    println!("[HYBRID-BRIDGE] Layer 27 context pinned in VRAM for instant decoding transition.");
+                }
             }
         }
 
-        // [STRICT-PURGE] 연산 완료 즉시 가중치 소각
+        // [STRICT-PURGE] 연산 완료 즉시 가중치 소각 (마지막 레이어 제외)
         if !is_decoding {
             if layer_idx > 0 && !self.layers[layer_idx-1].self_attn.q_proj.is_cleared() {
                 self.layers[layer_idx - 1].clear();
             }
-            self.layers[layer_idx].clear();
+            
+            // 마지막 레이어는 디코딩 시작을 위해 VRAM에 남겨둡니다.
+            if layer_idx < 27 {
+                self.layers[layer_idx].clear();
+            }
+            
             if layer_idx % 7 == 0 { println!("[SPEED-OPT] Layer {}/28 logic optimized. Slots reclaimed.", layer_idx); }
         }
 
