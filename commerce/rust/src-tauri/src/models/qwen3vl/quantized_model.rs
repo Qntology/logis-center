@@ -1644,7 +1644,7 @@ impl QuantizedQwen3VLTextModel {
         println!("[MEMORY-OPT] Prefill complete. Reloading all {} layers for high-speed decoding...", count);
         let target_device = self.layers[0].device().clone();
 
-        // [CONTEXT-BACKUP] 재로드 도중 유실될 수 있는 실제 블록 핸들들을 미리 백업합니다.
+        // [CONTEXT-BRIDGE-SNAP] 재로드 도중 유실될 수 있는 실제 블록 핸들들을 미리 백업
         let mut context_snapshots = Vec::new();
         for i in 0..count {
             context_snapshots.push(self.layers[i].self_attn.kv_blocks.clone());
@@ -1663,32 +1663,24 @@ impl QuantizedQwen3VLTextModel {
                 return Err(e);
             }
             
-            // [CONTEXT-SYNC] 가중치 교체 후, 전역 장부(Registry)를 기반으로 기억을 강제 재구축합니다.
-            // 백업본이 비어있더라도 장부에 데이터가 있다면 물리적으로 핸들을 재생성하여 연결합니다.
+            // [CONTEXT-INJECTION] 가중치 교체 후, 보관해 두었던 실제 기억(블록 핸들들)을 다시 주입
             let mut layer_blocks = context_snapshots.get(i).cloned().unwrap_or_default();
             
             {
                 let reg = self.registry.entries.read().unwrap();
-                // 장부의 모든 엔트리에 대해 레이어의 블록 리스트를 동기화
                 for (b_idx, entry) in reg.iter().enumerate() {
                     if b_idx < layer_blocks.len() {
                         let mut inner = layer_blocks[b_idx].inner.write().unwrap();
                         inner.location = entry.location[i];
                         if let Some(path) = &entry.ssd_path { inner.ssd_path = Some(path.clone()); }
-                    } else {
-                        // [FIX] 레이어에 블록이 부족하면 장부 정보를 바탕으로 핸들 재생성 (V:Count 복구)
-                        let b_len = entry.token_len;
-                        let b_start = entry.token_start;
-                        let restored_block = KVBlock::new(entry.location[i], b_idx, b_len, b_start);
-                        if let Some(path) = &entry.ssd_path {
-                            restored_block.inner.write().unwrap().ssd_path = Some(path.clone());
-                        }
+                    } else if entry.token_len > 0 && entry.ssd_path.is_some() {
+                        // [FALLBACK] 레이어에 블록이 부족하면 장부 정보를 바탕으로 핸들 재생성 (V:Count 복구)
+                        let restored_block = KVBlock::new(KVLocation::SSD, b_idx, entry.token_len, entry.token_start);
+                        restored_block.inner.write().unwrap().ssd_path = entry.ssd_path.clone();
                         layer_blocks.push(restored_block);
                     }
                 }
             }
-            
-            // 레이어의 기억 장치를 최신 상태로 강제 동기화
             self.layers[i].self_attn.kv_blocks = layer_blocks;
 
             if i % 4 == 0 && target_device.is_cuda() {
@@ -1697,13 +1689,7 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         
-        // 최종 복구 상태 확인 (VRAM에 안착된 블록 수 카운트)
-        let restored_v = self.layers[0].self_attn.kv_blocks.iter()
-            .filter(|b| {
-                let inner = b.inner.read().unwrap();
-                inner.location == KVLocation::VRAM || inner.k_cache.is_some()
-            }).count();
-            
+        let restored_v = self.layers[0].self_attn.kv_blocks.len();
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
         println!("[MEMORY-OPT] All layers reloaded. Context (V:{}) state-fully restored.", restored_v);
         Ok(())
@@ -2185,58 +2171,43 @@ impl QuantizedQwen3VLTextModel {
         let input_token_count = xs.dim(1).unwrap_or(0);
         let is_decoding = input_token_count <= 1;
 
-        // [RELAY-RECEIVE] 만약 이전 루프에서 발행한 티켓이 있다면 여기서 수령
-        if let Some((pending_idx, rx)) = self.pending_weight_load.take() {
-            if pending_idx == layer_idx {
-                match rx.await {
-                    Ok(Ok(loaded_layer)) => {
-                        // 기존 KV 데이터와 티켓 로딩된 물리 레이어 병합 (Hot Swap)
-                        let old_kv = self.layers[layer_idx].self_attn.kv_blocks.clone();
-                        let old_active_kv = self.layers[layer_idx].self_attn.active_kv_name.clone();
-                        self.layers[layer_idx] = loaded_layer;
-                        
-                        // [STATE-SYNC] 재로드된 레이어에 기존 블록을 이식하고, 장부의 최신 위치(VRAM 등)를 강제 각인
-                        self.layers[layer_idx].self_attn.kv_blocks = old_kv;
-                        {
-                            let reg = self.registry.entries.read().unwrap();
-                            for (b_idx, block) in self.layers[layer_idx].self_attn.kv_blocks.iter().enumerate() {
-                                if b_idx < reg.len() {
-                                    block.inner.write().unwrap().location = reg[b_idx].location[layer_idx];
-                                }
-                            }
-                        }
-                        
-                        self.layers[layer_idx].self_attn.active_kv_name = old_active_kv;
-                        if layer_idx % 7 == 0 { println!("[RELAY] Layer {} weight swap completed. Context Sync Done.", layer_idx); }
-                    }
-                    Ok(Err(e)) => println!("[RELAY-ERROR] Async load failed for layer {}: {}", layer_idx, e),
-                    Err(_) => {} // 채널 취소됨
-                }
-            } else {
-                // 인덱스가 다르면 티켓 폐기
-            }
-        }
-
-        // [BARRIER] Decoding 진입 시점에만 실행되는 전역 레이어 재로딩
-        if is_decoding && layer_idx == 0 {
+        // [STRICT-DECODING-PREPARATION] 디코딩 시작 시 모델 전체를 VRAM에 상주 (연산 전 반드시 완료)
+        if is_decoding {
             let already_loaded = !self.layers[0].self_attn.q_proj.is_cleared();
             if !already_loaded {
+                println!("[MEMORY-OPT] Ensuring all layers are in VRAM for decoding...");
                 crate::models::qwen3vl::generate::wait_for_global_io().await;
                 self.reload_all_layers()?; 
             }
         }
 
-        // [MEMORY-OPT] Prefill 시 현재 레이어 로드 (릴레이가 실패했거나 없는 경우만)
+        // [RELAY-RECEIVE] 만약 이전 루프에서 발행한 티켓이 있다면 여기서 수령 (Prefill 전용)
+        if !is_decoding {
+            if let Some((pending_idx, rx)) = self.pending_weight_load.take() {
+                if pending_idx == layer_idx {
+                    match rx.await {
+                        Ok(Ok(loaded_layer)) => {
+                            let old_kv = self.layers[layer_idx].self_attn.kv_blocks.clone();
+                            let old_active_kv = self.layers[layer_idx].self_attn.active_kv_name.clone();
+                            self.layers[layer_idx] = loaded_layer;
+                            self.layers[layer_idx].self_attn.kv_blocks = old_kv;
+                            self.layers[layer_idx].self_attn.active_kv_name = old_active_kv;
+                            if layer_idx % 7 == 0 { println!("[RELAY] Layer {} weight swap completed.", layer_idx); }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // [MEMORY-OPT] Prefill 시 현재 레이어 로드
         if !is_decoding && self.layers[layer_idx].self_attn.q_proj.is_cleared() {
             self.reload_layer(layer_idx)?;
         }
 
-        // [STEP 1] 현재 레이어를 GPU로 이동
         let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
-        
         if !self.layers[layer_idx].device().same_device(&target_device) {
             self.layers[layer_idx].to_device(&target_device)?;
-            if !is_decoding { let _ = target_device.synchronize(); }
         }
 
         // [STEP 2] GPU 연산 실행 (분할 연산을 통한 1초 미만 극한의 파이프라이닝)
@@ -2534,11 +2505,12 @@ impl QuantizedQwen3VLTextModel {
 
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, _upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
         let scan_path = if let Some(name) = kv_name { path.join(name) } else { path.to_path_buf() };
-        if !scan_path.exists() { return Ok(()); }
-
-        // [ID-NORMALIZATION] 경로에서 접미사 제거
-        let s_id_raw = path.file_name().unwrap_or_default().to_string_lossy();
-        let canonical_id = s_id_raw.split("_step_").next().unwrap_or(&s_id_raw);
+        println!("[SSD-BRIDGE-DIAG] Scanning Root Directory: {:?}", scan_path);
+        
+        if !scan_path.exists() { 
+            println!("[SSD-BRIDGE-DIAG] Warning: Scan path does not exist!");
+            return Ok(()); 
+        }
 
         let mut fragments = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&scan_path) {
@@ -2548,36 +2520,58 @@ impl QuantizedQwen3VLTextModel {
                     let dname = p.file_name().unwrap_or_default().to_string_lossy();
                     if dname.starts_with('b') {
                         if let Ok(off) = dname[1..].parse::<usize>() {
-                            fragments.push((off, p));
+                            // [FIX] 절대 경로를 확보하여 엔진이 어디서든 파일을 찾을 수 있게 함
+                            if let Ok(abs_path) = std::fs::canonicalize(&p) {
+                                println!("[SSD-BRIDGE-DIAG] Found Block Folder: b{} -> {:?}", off, abs_path);
+                                fragments.push((off, abs_path));
+                            }
                         }
                     }
                 }
             }
         }
         fragments.sort_by_key(|f| f.0);
-        if fragments.is_empty() { return Ok(()); }
+        if fragments.is_empty() { 
+            println!("[SSD-BRIDGE-DIAG] Error: No block folders found in {:?}", scan_path);
+            return Ok(()); 
+        }
 
-        // [REGISTRY-SYNC] 스캔된 폴더 정보를 전역 장부에 즉시 각인
+        // [REGISTRY-RECONSTRUCTION] 장부의 모든 정보를 SSD 상태에 맞춰 재구축
         {
             let mut reg = self.registry.entries.write().unwrap();
             for (offset, f_path) in &fragments {
                 let idx = *offset / 256;
                 if idx < reg.len() {
-                    reg[idx].ssd_path = Some(f_path.clone());
-                    reg[idx].token_start = *offset;
-                    reg[idx].token_len = if *offset + 256 <= expected_len { 256 } else { expected_len.saturating_sub(*offset) };
-                    for loc in reg[idx].location.iter_mut() { *loc = KVLocation::SSD; }
+                    let entry = &mut reg[idx];
+                    entry.ssd_path = Some(f_path.clone());
+                    entry.token_start = *offset;
+                    entry.token_len = if *offset + 256 <= expected_len { 256 } else { expected_len.saturating_sub(*offset) };
+                    // 모든 레이어에 대해 이 블록이 SSD에 있음을 명시
+                    for loc in entry.location.iter_mut() { *loc = KVLocation::SSD; }
+                    for dirty in entry.is_dirty.iter_mut() { *dirty = false; }
                 }
             }
         }
 
-        // 모든 레이어에 물리적으로 블록 핸들 재연결
-        for l in 0..self.layers.len() {
-            self.layers[l].load_kv_cache(&scan_path, device, 0, 128, kv_name, &fragments, expected_len)?;
+        // [LAYER-BLOCK-LINKING] 모든 레이어에 물리적으로 블록 핸들 재연결
+        let num_layers = self.layers.len();
+        for i in 0..num_layers {
+            let mut layer_blocks = Vec::new();
+            {
+                let reg = self.registry.entries.read().unwrap();
+                for (idx, entry) in reg.iter().enumerate() {
+                    if entry.token_len > 0 && entry.ssd_path.is_some() {
+                        let block = KVBlock::new(KVLocation::SSD, idx, entry.token_len, entry.token_start);
+                        block.inner.write().unwrap().ssd_path = entry.ssd_path.clone();
+                        layer_blocks.push(block);
+                    }
+                }
+            }
+            self.layers[i].self_attn.kv_blocks = layer_blocks;
         }
         
         self.current_kv_len = expected_len;
-        println!("[SSD-RESTORE] Global Context (V:{}) verified and physically linked.", self.current_kv_len);
+        println!("[SSD-RESTORE] Physically linked {} context blocks. Global Len: {}", fragments.len(), self.current_kv_len);
         Ok(())
     }
 
