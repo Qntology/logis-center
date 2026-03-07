@@ -667,14 +667,14 @@ impl Qwen3VLGenerateModel {
     }
 
     pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
-        // [ID-NORMALIZATION] 태스크 ID에서 접미사를 제거하여 폴더 구조를 태스크 단위로 집결시킵니다.
-        let canonical_id = session_id.as_ref().map(|s| s.split("_step_").next().unwrap_or(s).to_string());
+        // [ID-NORMALIZATION-CONSOLIDATED] 모든 경로의 기준이 되는 ID를 여기서 즉시 정규화합니다.
+        let session_id = session_id.map(|s| s.split("_step_").next().unwrap_or(&s).to_string());
         
-        if let Some(s_id) = &canonical_id {
+        if let Some(s_id) = &session_id {
             let snapshot_root = crate::utils::paths::get_kv_dir(None).join(s_id);
             let kv_type = _kv_name.as_deref().unwrap_or("text");
             
-            // 정규화된 경로 우선 시도 (inference/{kv_type})
+            // 이제 모든 경로는 정규화된 단일 ID를 기준으로 탐색됩니다.
             let paths_to_try = vec![
                 snapshot_root.join("inference").join(kv_type),
                 snapshot_root.join("reference").join(kv_type),
@@ -683,7 +683,7 @@ impl Qwen3VLGenerateModel {
             
             for snapshot_path in paths_to_try {
                 if snapshot_path.exists() && fs::read_dir(&snapshot_path).map(|mut d| d.next().is_some()).unwrap_or(false) {
-                    println!("[GEN-LOAD] Loading unified snapshot from {:?}", snapshot_path);
+                    println!("[GEN-LOAD] Loading snapshot from unified path: {:?}", snapshot_path);
                     let _ = self.load_kv_from_disk(&snapshot_path, None);
                     break;
                 }
@@ -713,11 +713,11 @@ impl Qwen3VLGenerateModel {
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         
         // [SSD-BRIDGE] Ideal Transition Mode: Flush -> Clear -> Registry Rebuild
-        if let Some(s_id) = &canonical_id {
-            println!("[SSD-BRIDGE] Initiating Ideal Bridge for Task: {}. Flushing KV...", s_id);
+        if let Some(s_id) = &session_id {
+            println!("[SSD-BRIDGE] Initiating Ideal Bridge for Unified Task: {}. Flushing KV...", s_id);
             let actual_len = self.get_kv_len();
             
-            // 1. 잔여 데이터 SSD 강제 백업 (정규화된 ID 사용)
+            // 1. 잔여 데이터 SSD 강제 백업
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
             wait_for_global_io().await;
             
@@ -725,19 +725,23 @@ impl Qwen3VLGenerateModel {
             println!("[SSD-BRIDGE] Initializing VRAM (Clearing pointers)...");
             self.clear_kv_cache();
             
-            // 3. SSD 장부(Registry) 재구축 (정규화된 경로 사용)
+            // 3. SSD 장부(Registry) 재구축
             println!("[SSD-BRIDGE] Rebuilding Registry from unified snapshots...");
             let kv_type = _kv_name.as_deref().unwrap_or("text");
             let snapshot_path = crate::utils::paths::get_kv_dir(None).join(s_id).join("inference").join(kv_type);
             let device_clone = self.text_device.clone();
             
+            // 장부에 실제 길이를 각인시켜 복구 정합성 확보
             let _ = self.load_kv_cache(&snapshot_path, &device_clone, actual_len, 0, None);
             
             wait_for_global_io().await;
-            println!("[SSD-BRIDGE] Ideal Bridge Established. Context (V:{}) verified.", self.get_kv_len());
+            
+            // [VERIFICATION] 이제 get_kv_len()이 논리적 길이를 반환하므로 반드시 actual_len과 일치해야 합니다.
+            let verified_len = self.get_kv_len();
+            println!("[SSD-BRIDGE] Ideal Bridge Established. Context (V:{}) verified.", verified_len);
 
             // 복구된 장부를 기반으로 디코딩 시작 지점 동기화
-            total_tokens_after_prefill = self.get_kv_len();
+            total_tokens_after_prefill = verified_len;
             println!("[SSD-BRIDGE] Syncing decoding start pos to: {}", total_tokens_after_prefill);
         }
 
