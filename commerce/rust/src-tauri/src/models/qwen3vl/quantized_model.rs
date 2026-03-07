@@ -1251,7 +1251,7 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_blocks.clear();
         let mut total_restored_len = 0;
 
-        for (i, (offset, frag_path)) in fragments.iter().enumerate() {
+        for (_i, (offset, frag_path)) in fragments.iter().enumerate() {
             let b_len = if *offset < current_kv_len {
                 (current_kv_len - *offset).min(256)
             } else { 256 };
@@ -1454,7 +1454,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
         registry: KVRegistry,
     ) -> Result<Self> {
         // 1. Skeleton 생성 (빈 텐서 상태)
-        let mut layer = Self::new_skeleton(config, base_name, device, dtype, layer_idx, baking_only, registry)?;
+        let layer = Self::new_skeleton(config, base_name, device, dtype, layer_idx, baking_only, registry)?;
         
         // 2. 표준 로더를 사용하되, mmap의 특정 슬라이스만 접근하도록 하여 OS RAM 점유 최소화
         // [OPTIMIZATION] mmap 전체가 아닌 필요한 레이어 영역만 Reader로 전달
@@ -1683,7 +1683,7 @@ impl QuantizedQwen3VLTextModel {
         device: &Device,
         device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
@@ -1758,7 +1758,7 @@ impl QuantizedQwen3VLTextModel {
         device: &Device,
         device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
@@ -2115,10 +2115,31 @@ impl QuantizedQwen3VLTextModel {
         kv_name: Option<String>,
         baking_only: bool,
     ) -> Result<Tensor> {
-        let sid_opt = self.active_session_id.clone(); // [FIX] sid_opt 정의를 최상단으로 이동
-        let start_layer_time = std::time::Instant::now();
+        let sid_opt = self.active_session_id.clone();
+        let _start_layer_time = std::time::Instant::now();
         let input_token_count = xs.dim(1).unwrap_or(0);
         let is_decoding = input_token_count <= 1;
+
+        // [RELAY-RECEIVE] 만약 이전 루프에서 발행한 티켓이 있다면 여기서 수령
+        if let Some((pending_idx, rx)) = self.pending_weight_load.take() {
+            if pending_idx == layer_idx {
+                match rx.await {
+                    Ok(Ok(loaded_layer)) => {
+                        // 기존 KV 데이터와 티켓 로딩된 물리 레이어 병합 (Hot Swap)
+                        let old_kv = self.layers[layer_idx].self_attn.kv_blocks.clone();
+                        let old_active_kv = self.layers[layer_idx].self_attn.active_kv_name.clone();
+                        self.layers[layer_idx] = loaded_layer;
+                        self.layers[layer_idx].self_attn.kv_blocks = old_kv;
+                        self.layers[layer_idx].self_attn.active_kv_name = old_active_kv;
+                        if layer_idx % 7 == 0 { println!("[RELAY] Layer {} weight swap completed.", layer_idx); }
+                    }
+                    Ok(Err(e)) => println!("[RELAY-ERROR] Async load failed for layer {}: {}", layer_idx, e),
+                    Err(_) => {} // 채널 취소됨
+                }
+            } else {
+                // 인덱스가 다르면 티켓 폐기
+            }
+        }
 
         // [BARRIER] Decoding 진입 시점에만 실행되는 전역 레이어 재로딩
         if is_decoding && layer_idx == 0 {
@@ -2129,8 +2150,8 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
-        // [MEMORY-OPT] Prefill 시 현재 레이어 로드
-        if !is_decoding {
+        // [MEMORY-OPT] Prefill 시 현재 레이어 로드 (릴레이가 실패했거나 없는 경우만)
+        if !is_decoding && self.layers[layer_idx].self_attn.q_proj.is_cleared() {
             self.reload_layer(layer_idx)?;
         }
 
@@ -2139,14 +2160,29 @@ impl QuantizedQwen3VLTextModel {
         
         if !self.layers[layer_idx].device().same_device(&target_device) {
             self.layers[layer_idx].to_device(&target_device)?;
-            // GPU 이동 후 RAM 가중치는 자동으로 drop됨
             if !is_decoding { let _ = target_device.synchronize(); }
         }
 
-        // [MEMORY-OPT] [PREFETCH-WINDOW] 다음 레이어를 연산 시작 전에 미리 로드하여 IO-Compute 오버랩 구현
-        if !is_decoding && layer_idx + 1 < self.layers.len() {
-            // [SPEED-UP] 다음 레이어 로딩을 먼저 시작 (비동기 효과 유도)
-            let _ = self.reload_layer(layer_idx + 1);
+        // [RELAY-TRIGGER] 현재 레이어 연산을 시작하기 "전에" 다음 레이어 로딩 티켓 발행
+        if !is_decoding && layer_idx + 1 < self.layers.len() && self.layers[layer_idx+1].self_attn.q_proj.is_cleared() {
+            if let Ok(tx) = crate::models::qwen3vl::generate::get_weight_worker().await {
+                let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+                let task = crate::models::qwen3vl::generate::WeightLoadTask {
+                    layer_idx: layer_idx + 1,
+                    config: self.config.clone(),
+                    ct: self.ct.as_ref().unwrap().clone(),
+                    mmap: self.mmap.as_ref().unwrap().clone(),
+                    device: target_device.clone(),
+                    dtype: self.dtype,
+                    base_name: self.base_name.clone(),
+                    registry: self.registry.clone(),
+                    baking_only: self.baking_only,
+                    response_tx: res_tx,
+                };
+                if tx.send(crate::models::qwen3vl::generate::SlotTask::WeightLoad(task)).await.is_ok() {
+                    self.pending_weight_load = Some((layer_idx + 1, res_rx));
+                }
+            }
         }
 
         // [STEP 3] GPU 연산 실행
@@ -2160,30 +2196,20 @@ impl QuantizedQwen3VLTextModel {
 
         // [MEMORY-OPT] [LAZY-PURGE] 연산 종료 후 가중치 소각
         if !is_decoding {
-            // [CRITICAL-TRANSITION] 마지막 프리필 레이어가 끝나는 시점에 하드 리셋 대신 "전원 복구" 수행
             if layer_idx == self.layers.len() - 1 {
                 println!("[SSD-BRIDGE] Last prefill layer finished. Initiating Hot Handover to Decoding...");
-                
-                // 1. 모든 IO 작업 완료 대기 (SSD에 데이터가 다 써졌는지 확인)
                 crate::models::qwen3vl::generate::wait_for_global_io().await;
                 if target_device.is_cuda() { let _ = target_device.synchronize(); }
                 
-                // 2. [VRAM-ANCHOR] 현재 레이어(27번)를 지우지 않고 유지한 상태에서 0~26번을 순차 로드
-                // 이것이 0xc0000005를 막는 핵심 'Hot Handover' 로직입니다.
                 for l in 0..layer_idx {
                     if let Err(e) = self.reload_layer(l) {
                         println!("[SSD-BRIDGE-ERROR] Failed to reload layer {}: {}", l, e);
                     }
-                    if l % 4 == 0 && target_device.is_cuda() {
-                        let _ = target_device.synchronize();
-                        // OS 페이지 테이블 안정을 위해 미세 대기
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
+                    if l % 4 == 0 && target_device.is_cuda() { let _ = target_device.synchronize(); std::thread::sleep(std::time::Duration::from_millis(5)); }
                 }
                 if target_device.is_cuda() { let _ = target_device.synchronize(); }
                 println!("[SSD-BRIDGE] All layers anchored to VRAM. No purge performed.");
 
-                // 3. [PHYSICAL-RESTORE] SSD에서 문맥 장부를 물리적으로 복구
                 let sid_owned = sid_opt.clone().unwrap_or_default();
                 let snapshot_root = crate::utils::paths::get_kv_dir(None).join(&sid_owned).join("inference").join(kv_name.as_deref().unwrap_or("text"));
                 
@@ -2205,7 +2231,6 @@ impl QuantizedQwen3VLTextModel {
                     if !fragments.is_empty() {
                         let total_len = fragments.iter().map(|f| f.0).max().unwrap_or(0) + 256; 
                         for l in 0..self.layers.len() {
-                            // 각 레이어에 SSD 스냅샷 정보 주입 (이미 가중치가 로드된 상태이므로 안전함)
                             let _ = self.layers[l].load_kv_cache(&snapshot_root, &target_device, 0, 128, kv_name.as_deref(), &fragments, total_len);
                         }
                         self.current_kv_len = total_len;
@@ -2213,30 +2238,17 @@ impl QuantizedQwen3VLTextModel {
                     }
                 }
             } else {
-                // 마지막 레이어가 아닐 때는 기존의 Sliding Window 소각 로직 유지
-                if layer_idx > 0 {
-                    self.layers[layer_idx - 1].clear();
-                }
-                // 현재 레이어 소각
+                if layer_idx > 0 { self.layers[layer_idx - 1].clear(); }
                 self.layers[layer_idx].clear();
-                println!("[SPEED-OPT] Layer {} cleared, moving window.", layer_idx);
+                if layer_idx % 7 == 0 { println!("[SPEED-OPT] Layer {} cleared, moving window.", layer_idx); }
             }
         }
 
-        // [STEP 4] 자원 반납 및 KV 대피 (Fire-and-Forget)
         if let Some(sid) = sid_opt {
             let is_prefill = !is_decoding;
-            // [SYNC-PREFILL] Prefill 상황에서도 워커를 기다리지 않고 즉시 던지기만 합니다.
             let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count, false).await;
-            
-            // [LAYER-BY-LAYER-CLEANUP] 프리필 단계에서는 레이어 1개가 끝날 때마다 몰아서 정리 (메모리 포지션 해제)
-            if is_prefill {
-                SLOT_MANAGER.sync_with_sentinels(&sid).await;
-            }
+            if is_prefill { SLOT_MANAGER.sync_with_sentinels(&sid).await; }
         }
-
-        // [FIX] 디코딩 중 레이어를 매번 삭제하던 로직을 제거하여 가중치 상주(Persistent) 디코딩을 구현합니다.
-        // 기존의 'if is_decoding { self.layers[layer_idx].clear(); }' 코드를 삭제함
 
         Ok(next_xs)
     }
@@ -2342,8 +2354,8 @@ impl QuantizedQwen3VLTextModel {
     }
 
     /// [NEW-STRICT] 계층형 메모리 관리 (VRAM -> RAM -> SSD)
-    async fn evacuate_layer_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, start_off: usize, len: usize, aggressive: bool) -> Result<()> {
-        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump, wait_for_global_io, GLOBAL_IO_COUNTER};
+    async fn evacuate_layer_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, start_off: usize, len: usize, _aggressive: bool) -> Result<()> {
+        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump, GLOBAL_IO_COUNTER};
         
         let block_start = (start_off / 256) * 256;
         let block_end = ((start_off + len + 255) / 256) * 256;
@@ -2716,7 +2728,7 @@ impl QuantizedQwen3VLModel {
         let vb_visual = from_gguf_content(config, &ct_vision, &mut reader_vision, vision_device, vision_dtype)?;
         let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
 
-        let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
+        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
         // [OPTIMIZATION] Baking is now integrated into full layer-by-layer prefill
         if baking_only {
@@ -2760,7 +2772,7 @@ impl QuantizedQwen3VLModel {
         let vb_visual = from_gguf_content(config, &ct_vision, reader_vision, vision_device, vision_dtype)?;
         let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
         
-        let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
+        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
         // [OPTIMIZATION] Baking is now integrated into full layer-by-layer prefill
         if baking_only {

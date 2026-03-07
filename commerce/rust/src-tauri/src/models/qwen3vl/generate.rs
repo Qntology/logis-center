@@ -289,14 +289,46 @@ pub async fn wait_for_global_io() {
     } 
 }
 
-pub fn init_bake_worker() {
-    let (btx, brx) = mpsc::channel(256); let (ltx, lrx) = mpsc::channel(256);
-    let _ = BAKE_TX.set(btx); let _ = LOAD_TX.set(ltx);
-    if let Some(rx) = SLOT_MANAGER_DATA.1.lock().unwrap().take() { tauri::async_runtime::spawn(async move { spawn_slot_dispatcher(rx).await; }); }
-    tauri::async_runtime::spawn(async move { spawn_slot_worker(brx); }); 
-    tauri::async_runtime::spawn(async move { spawn_slot_worker(lrx); });
+async fn spawn_weight_loader_worker(mut rx: mpsc::Receiver<SlotTask>) {
+    while let Some(task) = rx.recv().await {
+        if let SlotTask::WeightLoad(t) = task {
+            let (tx, layer_idx) = (t.response_tx, t.layer_idx);
+            let (config, ct, mmap, device, dtype, base_name, registry, baking_only) = (t.config, t.ct, t.mmap, t.device, t.dtype, t.base_name, t.registry, t.baking_only);
+
+            // Use spawn_blocking for CPU-intensive weight creation and GPU transfer
+            let _ = tokio::task::spawn_blocking(move || {
+                let gguf_blk = format!("blk.{}", layer_idx);
+                let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { 
+                    gguf_blk 
+                } else { 
+                    format!("{}.layers.{}", base_name, layer_idx) 
+                };
+
+                let res = crate::models::qwen3vl::quantized_model::QuantizedQwen3VLTextDecoderLayer::new_direct(
+                    &config, &ct, &mmap, &prefix, &device, dtype, layer_idx, baking_only, registry
+                );
+                let _ = tx.send(res);
+            }).await;
+        }
+    }
 }
 
+pub fn init_bake_worker() {
+    let (btx, brx) = mpsc::channel(256); 
+    let (ltx, lrx) = mpsc::channel(256);
+    let (wtx, wrx) = mpsc::channel(128); // [NEW] Weight relay channel
+
+    let _ = BAKE_TX.set(btx); 
+    let _ = LOAD_TX.set(ltx);
+    let _ = WEIGHT_TX.set(wtx); // [NEW] Global weight transmitter
+
+    if let Some(rx) = SLOT_MANAGER_DATA.1.lock().unwrap().take() { 
+        tauri::async_runtime::spawn(async move { spawn_slot_dispatcher(rx).await; }); 
+    }
+    tauri::async_runtime::spawn(async move { spawn_slot_worker(brx); });
+    tauri::async_runtime::spawn(async move { spawn_slot_worker(lrx); });
+    tauri::async_runtime::spawn(async move { spawn_weight_loader_worker(wrx).await; }); // [NEW] Async weight loader
+}
 async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {
         match req {
@@ -664,10 +696,16 @@ impl Qwen3VLGenerateModel {
             
             // [CRITICAL-FIX] 복구된 문맥 길이를 기준으로 디코딩 오프셋을 재설정하여 맥락 소실 방지
             total_tokens_after_prefill = self.get_kv_len();
+            // 디코딩 첫 토큰은 이미 위에서 forward를 한 번 수행했으므로, 
+            // 루프 시작 시점의 logits는 total_tokens_after_prefill - 1 위치의 결과입니다.
         }
 
         let mut gen_ids = vec![];
         let _think_token_id = 151643;
+        
+        // [FIX] 루프 진입 전 현재 오프셋 확정
+        let mut current_decode_pos = total_tokens_after_prefill;
+
         for i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
             let mut logits_tensor = logits.flatten_all()?.to_dtype(DType::F32)?;
@@ -676,9 +714,12 @@ impl Qwen3VLGenerateModel {
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             gen_ids.push(next_id);
             gen_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
-            let current_pos = total_tokens_after_prefill + i as usize;
+            
+            // [IO-SYNC] 다음 토큰 연산 전 이전 IO(SSD 저장 등) 완료 대기
             wait_for_global_io().await;
-            logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;
+            
+            logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_decode_pos, current_decode_pos + 1, session_id.clone(), _kv_name.clone()).await?;
+            current_decode_pos += 1;
         }
         Ok(gen_text)
     }
