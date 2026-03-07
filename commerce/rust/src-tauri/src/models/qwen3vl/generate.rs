@@ -755,14 +755,6 @@ impl Qwen3VLGenerateModel {
             current_decode_pos += 1;
         }
 
-        // [SAFE-BRIDGE] 디코딩(답변 생성)이 완료된 후, VRAM에만 머물러 있던 마지막 맥락을 SSD로 안전하게 보관합니다.
-        if let Some(s_id) = &session_id {
-            if let ModelVariant::QuantizedText(ref mut m) = self.qwen3_vl {
-                println!("[SSD-BRIDGE] Finalizing Decoding Context... (EOS/Limit Reached)");
-                let _ = m.language_model.flush_decoding_kv_to_ssd(s_id).await;
-            }
-        }
-
         Ok(gen_text)
     }
 

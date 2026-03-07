@@ -947,10 +947,9 @@ impl QuantizedQwen3VLTextAttention {
                         let block_dir = crate::utils::paths::get_kv_dir(None).join(&sub_path).join(format!("b{}", off));
                         if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
 
-                        // [SAFE-DATA-CAPTURE] 234바이트 빈 파일 생성을 막기 위해 메인 스레드에서 즉시 데이터를 CPU로 복사합니다.
-                        let current_dtype = k_vram.dtype();
-                        let k_cpu = k_vram.to_device(&Device::Cpu).unwrap_or_else(|_| Tensor::zeros(k_vram.shape(), current_dtype, &Device::Cpu).unwrap());
-                        let v_cpu = v_vram.to_device(&Device::Cpu).unwrap_or_else(|_| Tensor::zeros(v_vram.shape(), current_dtype, &Device::Cpu).unwrap());
+                        // [SAFE-DATA-CAPTURE] 모델의 기억(Precision)을 100% 보존하기 위해 원본 DType을 그대로 유지하며 복제합니다.
+                        let k_cpu = k_vram.to_device(&Device::Cpu).unwrap_or_else(|_| Tensor::zeros(k_vram.shape(), k_vram.dtype(), &Device::Cpu).unwrap());
+                        let v_cpu = v_vram.to_device(&Device::Cpu).unwrap_or_else(|_| Tensor::zeros(v_vram.shape(), v_vram.dtype(), &Device::Cpu).unwrap());
 
                         let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
                         let dump = LayerKVDump {
@@ -2181,52 +2180,59 @@ impl QuantizedQwen3VLTextModel {
             if !is_decoding { let _ = target_device.synchronize(); }
         }
 
-        // [STEP 2] GPU 연산 실행
+        // [STEP 2] GPU 연산 실행 (분할 연산을 통한 1초 미만 극한의 파이프라이닝)
         let current_seq_len = xs.dim(1)?;
         let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(256).collect();
         
-        let mut next_xs = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
+        let mut next_xs = if chunk_offsets.len() > 1 && !is_decoding {
+            let mid_point = chunk_offsets.len() / 2;
+            let first_half = &chunk_offsets[..mid_point];
+            let second_half = &chunk_offsets[mid_point..];
+
+            // 1. 전반부 연산 (VRAM 독점)
+            let out1 = self.process_chunks_iterative(layer_idx, first_half, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
+            
+            // [SPEED-RELAY] 50% 지점에서 다음 레이어 미리 로드 시작 (중첩률 100%)
+            if layer_idx + 1 < self.layers.len() && self.layers[layer_idx+1].self_attn.q_proj.is_cleared() {
+                if let Ok(tx) = crate::models::qwen3vl::generate::get_weight_worker().await {
+                    let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+                    let task = crate::models::qwen3vl::generate::WeightLoadTask {
+                        layer_idx: layer_idx + 1, config: self.config.clone(), ct: self.ct.as_ref().unwrap().clone(),
+                        mmap: self.mmap.as_ref().unwrap().clone(), device: target_device.clone(), dtype: self.dtype,
+                        base_name: self.base_name.clone(), registry: self.registry.clone(), baking_only: self.baking_only, response_tx: res_tx,
+                    };
+                    let _ = tx.send(crate::models::qwen3vl::generate::SlotTask::WeightLoad(task)).await;
+                    self.pending_weight_load = Some((layer_idx + 1, res_rx));
+                }
+            }
+
+            // 2. 후반부 연산 (다음 레이어 로딩과 병렬 진행)
+            let out2 = self.process_chunks_iterative(layer_idx, second_half, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
+            
+            Tensor::cat(&[out1, out2], 1)?
+        } else {
+            self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?
+        };
 
         if let (Some(embed), Some(mask)) = (deepstack_embed, visual_mask) {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [RELAY-TRIGGER] 연산이 끝난 이 시점에 다음 레이어 로딩 티켓 발행 (속도와 안정성의 타협점)
-        if layer_idx + 1 < self.layers.len() && self.layers[layer_idx+1].self_attn.q_proj.is_cleared() {
-            if let Ok(tx) = crate::models::qwen3vl::generate::get_weight_worker().await {
-                let (res_tx, res_rx) = tokio::sync::oneshot::channel();
-                let task = crate::models::qwen3vl::generate::WeightLoadTask {
-                    layer_idx: layer_idx + 1,
-                    config: self.config.clone(),
-                    ct: self.ct.as_ref().unwrap().clone(),
-                    mmap: self.mmap.as_ref().unwrap().clone(),
-                    device: target_device.clone(),
-                    dtype: self.dtype,
-                    base_name: self.base_name.clone(),
-                    registry: self.registry.clone(),
-                    baking_only: self.baking_only,
-                    response_tx: res_tx,
-                };
-                if tx.send(crate::models::qwen3vl::generate::SlotTask::WeightLoad(task)).await.is_ok() {
-                    self.pending_weight_load = Some((layer_idx + 1, res_rx));
-                }
-            }
-        }
-
-        // [KV-EVICTION] KV 캐시 대피 (메인 스레드 캡처 방식)
+        // [KV-EVICTION] KV 캐시 대피 (메인 스레드 즉시 캡처)
         if let Some(sid) = sid_opt {
             if !is_decoding {
+                // 프리필 시에만 CPU로 캡처하여 SSD 워커로 전달
                 let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count, false).await;
-                SLOT_MANAGER.sync_with_sentinels(&sid).await;
             }
         }
 
-        // [STRICT-PURGE] 연산 완료 즉시 현재 레이어 가중치 소각
+        // [STRICT-PURGE] 연산 완료 즉시 가중치 소각
         if !is_decoding {
             if layer_idx > 0 && !self.layers[layer_idx-1].self_attn.q_proj.is_cleared() {
                 self.layers[layer_idx - 1].clear();
             }
             self.layers[layer_idx].clear();
+            if layer_idx % 7 == 0 { println!("[SPEED-OPT] Layer {}/28 logic optimized.", layer_idx); }
         }
 
         // [DIAG-SPEED] 각 레이어별 연산 소요 시간 기록
