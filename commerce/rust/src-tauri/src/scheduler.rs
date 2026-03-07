@@ -251,7 +251,7 @@ pub async fn start_background_worker(
                                 {
                                     let mut model_lock = model.lock().await;
                                     if let Some(m) = model_lock.as_ref() {
-                                        m.deep_purge_resources().await;
+                                        m.deep_purge_resources(Some(task.id.clone())).await;
                                     }
                                     // 모델 인스턴스 자체를 None으로 만들어 완전히 초기화 (다음 작업 시 필요하면 다시 로드)
                                     *model_lock = None;
@@ -280,7 +280,7 @@ pub async fn start_background_worker(
                                     let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
                                     if let Some(m) = model_lock.as_ref() {
                                         println!("[Scheduler] Error detected. Performing emergency memory release...");
-                                        m.deep_purge_resources().await;
+                                        m.deep_purge_resources(Some(task.id.clone())).await;
                                     }
                                     *model_lock = None;
                                 }
@@ -314,7 +314,7 @@ pub async fn start_background_worker(
                                         {
                                             let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
                                             if let Some(m) = model_lock.as_ref() {
-                                                let _ = m.deep_purge_resources().await;
+                                                let _ = m.deep_purge_resources(Some(task.id.clone())).await;
                                             }
                                             *model_lock = None; 
                                         }
@@ -611,7 +611,7 @@ async fn process_task(
         }
         
         if page_type.is_empty() || page_type == "unknown" { 
-            model.deep_purge_resources().await;
+            model.deep_purge_resources(Some(task.id.clone())).await;
             return Ok(()); 
         }
     }
@@ -619,7 +619,7 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     // [CRITICAL-CLEANUP] Clear the cache from Step A before Step B (git e8260c5 parity)
-    model.deep_purge_resources().await;
+    model.deep_purge_resources(Some(task.id.clone())).await;
     wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
 
     // --- STEP B: SELECTORS (Disk Bridge Relay) ---
@@ -789,7 +789,7 @@ async fn process_task(
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model..." }));
         
         // 1. Explicitly Unload to free VRAM for Embedding Model
-        model.deep_purge_resources().await;
+        model.deep_purge_resources(Some(task.id.clone())).await;
         
         // 2. Wait for VRAM to settle (Driver latency)
         wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
