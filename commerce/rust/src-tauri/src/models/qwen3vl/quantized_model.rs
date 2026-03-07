@@ -1285,9 +1285,10 @@ impl QuantizedQwen3VLTextAttention {
                             let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                             let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
 
-                            // [SAFE-OWNERSHIP] from_raw_buffer 대신 from_vec을 사용하여 텐서가 데이터를 소유하게 함 (크래시 방지)
-                            let kd_t = Tensor::from_vec(kd.data().to_vec(), meta_os.as_slice(), &Device::Cpu)?;
-                            let vd_t = Tensor::from_vec(vd.data().to_vec(), meta_os.as_slice(), &Device::Cpu)?;
+                            // [SAFE-OWNERSHIP] from_raw_buffer를 사용하여 데이터 타입을 정확히 BF16으로 해석하고,
+                            // copy()를 통해 텐서가 메모리를 완전히 소유하도록 함 (오염 및 크래시 방지)
+                            let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, meta_os.as_slice(), &Device::Cpu)?.copy()?;
+                            let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, meta_os.as_slice(), &Device::Cpu)?.copy()?;
 
                             // 즉시 VRAM으로 전송하여 추론 대기열에 올림
                             let mut inner_block = KVBlockInner {
