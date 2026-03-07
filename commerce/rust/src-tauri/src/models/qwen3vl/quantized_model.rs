@@ -2323,7 +2323,10 @@ impl QuantizedQwen3VLTextModel {
                 let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
                 if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
 
-                let _ = tx.send(SlotTask::Bake(BakeTask {
+                // [CRITICAL-FIX] 카운터를 여기서 증가시켜야 wait_for_global_io가 정상 대기합니다.
+                crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                if let Err(e) = tx.send(SlotTask::Bake(BakeTask {
                     slot_id: sid,
                     task_dir: block_dir,
                     kv_name: Some(sub_path.clone()),
@@ -2332,7 +2335,10 @@ impl QuantizedQwen3VLTextModel {
                     is_relay_baking: mode,
                     block_idx: Some(off / 256),
                     registry: self.registry.clone(),
-                })).await;
+                })).await {
+                    println!("[ENGINE-ERROR] Failed to send flush task: {}. Reclaiming counter.", e);
+                    crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
+                }
             }
         }
         Ok(())
