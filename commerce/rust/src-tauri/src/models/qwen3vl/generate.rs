@@ -76,58 +76,51 @@ impl SlotManager {
         let kv_dir = crate::utils::paths::get_kv_dir(None).join(session_id);
         if !kv_dir.exists() { return; }
 
-        fn find_sentinel_dirs(dir: &Path, dirs: &mut Vec<PathBuf>) {
+        // [RECURSIVE-SCAN] 세션 디렉토리 하위의 모든 sentinels 폴더를 찾습니다.
+        fn scan_sentinels(dir: &Path, sm: &SlotManager) {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_dir() {
                         if path.file_name().map_or(false, |n| n == "sentinels") {
-                            dirs.push(path);
-                        } else {
-                            find_sentinel_dirs(&path, dirs);
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut sentinel_dirs = Vec::new();
-        find_sentinel_dirs(&kv_dir, &mut sentinel_dirs);
-
-        for s_dir in sentinel_dirs {
-            if let Ok(entries) = std::fs::read_dir(&s_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                        if name.starts_with('s') {
-                            if let Ok(sid) = name[1..].parse::<usize>() {
-                                if sid < self.slots.len() {
-                                    match ext {
-                                        "done" => {
-                                            self.mark_ready(sid).await;
-                                            let _ = std::fs::remove_file(&path);
-                                        },
-                                        "error" => {
-                                            let _ = self.request_tx.send(SlotRequest::Release { idx: sid, is_bake: false }).await;
-                                            let _ = std::fs::remove_file(&path);
-                                        },
-                                        "pending" => {
-                                            // [FIX] 카운터가 0인데 펜딩 파일이 남아있다면, 이는 I/O가 이미 끝났음을 의미하므로 강제 회수
-                                            if GLOBAL_IO_COUNTER.load(Ordering::SeqCst) == 0 {
-                                                self.mark_ready(sid).await;
-                                                let _ = std::fs::remove_file(&path);
+                            // 센티널 폴더 발견 시 파일 처리
+                            if let Ok(s_entries) = std::fs::read_dir(&path) {
+                                for s_entry in s_entries.flatten() {
+                                    let s_path = s_entry.path();
+                                    let ext = s_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                                    if let Some(name) = s_path.file_stem().and_then(|s| s.to_str()) {
+                                        if name.starts_with('s') {
+                                            if let Ok(sid) = name[1..].parse::<usize>() {
+                                                if sid < sm.slots.len() {
+                                                    match ext {
+                                                        "done" => {
+                                                            // 비동기 런타임이므로 블로킹 방지를 위해 별도 실행
+                                                            let sm_clone = sm.handoff_notifier.clone();
+                                                            let s = &sm.slots[sid];
+                                                            let old = s.state.load(Ordering::SeqCst);
+                                                            if s.state.compare_exchange(old, 2, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                                                                sm.update_counters(old, 2);
+                                                                sm_clone.notify_waiters();
+                                                            }
+                                                            let _ = std::fs::remove_file(&s_path);
+                                                        },
+                                                        _ => {}
+                                                    }
+                                                }
                                             }
-                                        },
-                                        _ => {}
+                                        }
                                     }
                                 }
                             }
+                        } else {
+                            scan_sentinels(&path, sm);
                         }
                     }
                 }
             }
         }
+
+        scan_sentinels(&kv_dir, self);
     }
 
     pub async fn acquire_read_slot(&self) -> usize {
