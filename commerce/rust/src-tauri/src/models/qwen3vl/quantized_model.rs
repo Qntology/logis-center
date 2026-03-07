@@ -681,65 +681,53 @@ impl QuantizedQwen3VLTextAttention {
             if let (Some(k), Some(v)) = (k_vram, v_vram) {
                 bulk_ks.push(k); bulk_vs.push(v);
             } else {
-                // [STRICT-VRAM-CHECK] 디코딩 중에는 SSD/RAM 로딩을 차단하고 VRAM 상주 데이터만 신뢰합니다.
-                // 만약 Ideal Bridge가 데이터를 VRAM으로 다 올리지 못했다면 여기서 명시적인 로딩을 수행합니다.
-                let mut k_cpu = None;
-                let mut v_cpu = None;
+                // [STREAMING-DECODER] VRAM에 데이터가 없는 경우 SSD에서 mmap으로 즉시 스트리밍 로드
+                let (ssd_path, b_len, b_start) = { 
+                    let reg = self.registry.entries.read().unwrap(); 
+                    if index < reg.len() { 
+                        (reg[index].ssd_path.clone(), reg[index].token_len, reg[index].token_start) 
+                    } else { (None, 0, 0) } 
+                };
                 
-                if q_len > 1 {
-                    // 프리필 시에는 SSD/RAM 파이프라인 허용
-                    let reg = self.registry.entries.read().unwrap();
-                    let cache = reg[index].bitkv_cache.read().unwrap();
-                    if let Some(m) = &cache[self.layer_idx] {
-                        k_cpu = Some(self.decompress_from_bf16(&m.k_data, &m.original_shape, &Device::Cpu)?);
-                        v_cpu = Some(self.decompress_from_bf16(&m.v_data, &m.original_shape, &Device::Cpu)?);
-                        ram_count += 1;
+                if let Some(p) = ssd_path {
+                    let mut full_path = p.clone();
+                    // [FIX] 절대 경로인 경우 join을 생략하여 윈도우 경로 오류 방지
+                    if !full_path.is_absolute() { 
+                        full_path = crate::utils::paths::get_kv_dir(None).join(full_path); 
                     }
-                }
+                    let block_file = full_path.join(format!("l{}.st", self.layer_idx));
 
-                if k_cpu.is_none() && q_len > 1 {
-                    // 프리필 시에만 SSD 파일 직접 로딩 수행
-                    let ssd_path = { let reg = self.registry.entries.read().unwrap(); if index < reg.len() { reg[index].ssd_path.clone() } else { None } };
-                    if let Some(p) = ssd_path {
-                        // ... (SSD 로딩 로직 유지) ...
-                    }
-                }
-                
-                if let Some(k) = k_cpu {
-                    bulk_ks.push(k.to_device(dev)?.to_dtype(target_dtype)?);
-                    bulk_vs.push(v_cpu.unwrap().to_device(dev)?.to_dtype(target_dtype)?);
-                } else if q_len == 1 {
-                    // [DECODING-FALLBACK] 디코딩 중 데이터가 없으면 SSD에서 긴급하게 1개만 로드 (하지만 JIT-LOAD가 선행되어야 함)
-                    let ssd_path = { let reg = self.registry.entries.read().unwrap(); if index < reg.len() { reg[index].ssd_path.clone() } else { None } };
-                    if let Some(p) = ssd_path {
-                         let mut full_path = p.clone();
-                         if full_path.is_relative() && !full_path.starts_with("tmp") { full_path = crate::utils::paths::get_kv_dir(None).join(full_path); }
-                         let block_file = full_path.join(format!("l{}.st", self.layer_idx));
-                         if let Ok(data) = crate::utils::direct_loader::load_kv_block(&block_file) {
-                             if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
-                                 // [JIT-VRAM-HYDRATION] 로드된 데이터를 VRAM에 즉시 안착시켜 다음 토큰에서는 SSD를 안 보게 함
-                                 let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
-                                 let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
-                                 if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
-                                     let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                                     let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
-                                     let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
-                                     let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
-                                     let k_gpu = self.decompress_from_bf16(&kd_t, &meta_os, dev)?;
-                                     let v_gpu = self.decompress_from_bf16(&vd_t, &meta_os, dev)?;
-                                     
-                                     // [LOCK-AND-LOAD] 레이어 캐시에 실물 데이터 주입
-                                     let mut inner = block.inner.write().unwrap();
-                                     inner.k_cache = Some(k_gpu.clone());
-                                     inner.v_cache = Some(v_gpu.clone());
-                                     inner.location = KVLocation::VRAM;
-                                     
-                                     bulk_ks.push(k_gpu);
-                                     bulk_vs.push(v_gpu);
-                                     ssd_count += 1;
-                                 }
-                             }
-                         }
+                    // [FAST-MMAP-STREAM] 파일을 즉시 메모리 맵핑하여 VRAM으로 전송
+                    if let Ok(data) = crate::utils::direct_loader::load_kv_block(&block_file) {
+                        if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
+                            let prefix = format!("b{}_l{}_", b_start, self.layer_idx);
+                            let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                            
+                            if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+
+                                let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+                                let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+
+                                let k_gpu = self.decompress_from_bf16(&kd_t, &meta_os, dev)?;
+                                let v_gpu = self.decompress_from_bf16(&vd_t, &meta_os, dev)?;
+
+                                // [JIT-CACHE] 디코딩 효율을 위해 이번에 로드된 데이터를 VRAM에 안착시킴
+                                {
+                                    let mut inner_w = block.inner.write().unwrap();
+                                    inner_w.k_cache = Some(k_gpu.clone());
+                                    inner_w.v_cache = Some(v_gpu.clone());
+                                    inner_w.location = KVLocation::VRAM;
+                                    inner_w.len = b_len;
+                                    inner_w.offset = b_start;
+                                }
+
+                                bulk_ks.push(k_gpu);
+                                bulk_vs.push(v_gpu);
+                                ssd_count += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -2314,8 +2302,8 @@ impl QuantizedQwen3VLTextModel {
                     } else { true }
                 };
 
-                // [VRAM-RELEASE-IMMEDIATE] 데이터를 꺼내오면서 VRAM을 즉시 비웁니다 (take 사용)
-                if let (Some(k), Some(v)) = (inner.k_cache.take(), inner.v_cache.take()) {
+                // [CONTEXT-PRESERVATION] 데이터를 꺼내오면서 VRAM을 비우지 않습니다 (clone 사용)
+                if let (Some(k), Some(v)) = (inner.k_cache.as_ref(), inner.v_cache.as_ref()) {
                     let k_cpu = k.to_device(&Device::Cpu)?;
                     let v_cpu = v.to_device(&Device::Cpu)?;
                     let k_shape_u32: Vec<u32> = k_cpu.shape().dims().iter().map(|&x| x as u32).collect();
@@ -2329,11 +2317,12 @@ impl QuantizedQwen3VLTextModel {
                         raw_v: None,
                     });
                     
-                    inner.location = KVLocation::SSD;
+                    // 장부 상태 업데이트 (위치는 여전히 VRAM임을 명시)
                     let mut reg = self.registry.entries.write().unwrap();
                     if inner.index < reg.len() {
                         if l_idx < reg[inner.index].is_dirty.len() { reg[inner.index].is_dirty[l_idx] = false; }
-                        reg[inner.index].location[l_idx] = KVLocation::SSD;
+                        // [KEEP-VRAM] 위치를 SSD로 바꾸지 않고 VRAM 유지
+                        reg[inner.index].location[l_idx] = KVLocation::VRAM;
                     }
                 }
             }

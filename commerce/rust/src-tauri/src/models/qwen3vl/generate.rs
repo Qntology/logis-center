@@ -712,37 +712,17 @@ impl Qwen3VLGenerateModel {
         wait_for_global_io().await;
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         
-        // [SSD-BRIDGE] Ideal Transition Mode: Flush -> Clear -> Registry Rebuild
+        // [SSD-BRIDGE] Seamless Transition Mode: Flush only (No Clear, No Reload)
         if let Some(s_id) = &session_id {
-            println!("[SSD-BRIDGE] Initiating Ideal Bridge for Unified Task: {}. Flushing KV...", s_id);
-            let actual_len = self.get_kv_len();
+            println!("[SSD-BRIDGE] Transitioning to Decoding. Keeping prefill KV in VRAM...");
             
-            // 1. 잔여 데이터 SSD 강제 백업
+            // 1. 잔여 데이터 SSD 백업 (보험용, 삭제 안 함)
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
             wait_for_global_io().await;
             
-            // 2. VRAM 초기화
-            println!("[SSD-BRIDGE] Initializing VRAM (Clearing pointers)...");
-            self.clear_kv_cache();
-            
-            // 3. SSD 장부(Registry) 재구축
-            println!("[SSD-BRIDGE] Rebuilding Registry from unified snapshots...");
-            let kv_type = _kv_name.as_deref().unwrap_or("text");
-            let snapshot_path = crate::utils::paths::get_kv_dir(None).join(s_id).join("inference").join(kv_type);
-            let device_clone = self.text_device.clone();
-            
-            // 장부에 실제 길이를 각인시켜 복구 정합성 확보
-            let _ = self.load_kv_cache(&snapshot_path, &device_clone, actual_len, 0, None);
-            
-            wait_for_global_io().await;
-            
-            // [VERIFICATION] 이제 get_kv_len()이 논리적 길이를 반환하므로 반드시 actual_len과 일치해야 합니다.
-            let verified_len = self.get_kv_len();
-            println!("[SSD-BRIDGE] Ideal Bridge Established. Context (V:{}) verified.", verified_len);
-
-            // 복구된 장부를 기반으로 디코딩 시작 지점 동기화
-            total_tokens_after_prefill = verified_len;
-            println!("[SSD-BRIDGE] Syncing decoding start pos to: {}", total_tokens_after_prefill);
+            // [STABILITY] 리셋 없이 현재 길이를 그대로 동기화
+            total_tokens_after_prefill = self.get_kv_len();
+            println!("[SSD-BRIDGE] Seamless transition complete. Offset: {}", total_tokens_after_prefill);
         }
 
             let mut gen_ids = vec![];
