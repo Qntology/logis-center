@@ -667,12 +667,12 @@ impl Qwen3VLGenerateModel {
         }
 
         let mut gen_ids = vec![];
-        let think_token_id = 151643;
+        let _think_token_id = 151643;
         for i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
             let mut logits_tensor = logits.flatten_all()?.to_dtype(DType::F32)?;
             if !gen_ids.is_empty() { logits_tensor = apply_repetition_penalty(&logits_tensor, 1.2, &gen_ids)?; }
-            let mut next_id = lp.sample(&logits_tensor)?;
+            let next_id = lp.sample(&logits_tensor)?;
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             gen_ids.push(next_id);
             gen_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
