@@ -2137,8 +2137,9 @@ impl QuantizedQwen3VLTextModel {
             if !is_decoding { let _ = target_device.synchronize(); }
         }
 
-        // [MEMORY-OPT] [PREFETCH] 다음 레이어를 RAM으로 미리 로드
+        // [MEMORY-OPT] [PREFETCH-WINDOW] 다음 레이어를 연산 시작 전에 미리 로드하여 IO-Compute 오버랩 구현
         if !is_decoding && layer_idx + 1 < self.layers.len() {
+            // [SPEED-UP] 다음 레이어 로딩을 먼저 시작 (비동기 효과 유도)
             let _ = self.reload_layer(layer_idx + 1);
         }
 
@@ -2151,14 +2152,24 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [MEMORY-OPT] [IMMEDIATE-PURGE] 연산 직후 가중치 즉시 소각
-        // KV 대피(IO)는 시간이 걸릴 수 있으므로, 그 전에 가중치를 먼저 지워서 VRAM 공간 확보
+        // [MEMORY-OPT] [LAZY-PURGE] 연산 종료 후 가중치 소각
+        // 다음 레이어 연산에 방해되지 않도록 연산 결과가 나온 직후에만 수행
         if !is_decoding {
-            self.layers[layer_idx].clear();
-            if target_device.is_cuda() { 
-                let _ = target_device.synchronize(); // GPU 메모리 해제 확정
+            // [SPEED-UP] 이전 레이어(layer_idx - 1)가 혹시 남아있다면 여기서 확실히 제거 (Sliding Window)
+            if layer_idx > 0 {
+                self.layers[layer_idx - 1].clear();
             }
-            println!("[MEMORY-OPT] Layer {} Weights Purged. (RAM/VRAM cleared)", layer_idx);
+            
+            // 현재 레이어 소각 (마지막 레이어 제외)
+            // 마지막 레이어는 디코딩 전환 시점에 generate.rs에서 처리하도록 하여 오버헤드 감소
+            if layer_idx < self.layers.len() - 1 {
+                self.layers[layer_idx].clear();
+            } else {
+                // 마지막 레이어는 연산 후 즉시 동기화하여 결과 확정
+                if target_device.is_cuda() { let _ = target_device.synchronize(); }
+            }
+            
+            println!("[SPEED-OPT] Layer {} processed and sliding window moved.", layer_idx);
         }
 
         // [STEP 4] 자원 반납 및 KV 대피 (Fire-and-Forget)
