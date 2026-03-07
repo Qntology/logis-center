@@ -647,6 +647,15 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
+        // [ACCUMULATOR-INTEGRITY] 
+        // 1. seqlen_offset이 0이면 새로운 세션이므로 모든 누산기 초기화
+        // 2. 현재 kv_blocks와 merged_vram_block_count가 다르면(복구 등) 강제 초기화
+        if seqlen_offset == 0 || self.merged_vram_block_count != self.kv_blocks.len() {
+            self.vram_merged_k = None;
+            self.vram_merged_v = None;
+            self.merged_vram_block_count = 0;
+        }
+
         // 3. [SEQUENTIAL-KV-LOADER] Strictly Ordered Hybrid Pipeline
         let mut bulk_ks: Vec<Tensor> = Vec::new();
         let mut bulk_vs: Vec<Tensor> = Vec::new();
@@ -1248,11 +1257,11 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn load_kv_cache(&mut self, _path: &Path, _device: &Device, _expected_len: usize, _upscale_refill_len: usize, _kv_name: Option<&str>, fragments: &[(usize, std::path::PathBuf)], current_kv_len: usize) -> Result<()> {
+    pub fn load_kv_cache(&mut self, _path: &Path, device: &Device, _expected_len: usize, _upscale_refill_len: usize, _kv_name: Option<&str>, fragments: &[(usize, std::path::PathBuf)], current_kv_len: usize) -> Result<()> {
         if fragments.is_empty() { return Ok(()); }
         
-        // [CONTEXT-RESET] Clear current session's live blocks before loading snapshot
-        self.kv_blocks.clear();
+        // [CRITICAL] 이전 상태 완벽 초기화 (Dangling Pointer 방지)
+        self.clear_kv_cache();
         let mut total_restored_len = 0;
 
         for (_i, (offset, frag_path)) in fragments.iter().enumerate() {
@@ -1261,32 +1270,54 @@ impl QuantizedQwen3VLTextAttention {
             } else { 256 };
             total_restored_len += b_len;
             
-            let idx = *offset / 256; // [FIX] 오프셋 기반의 정확한 장부 인덱스 계산
-            let new_block = KVBlock::new(KVLocation::SSD, idx, b_len, *offset); // [FIX] i 대신 idx 사용
-            {
-                let mut inner = new_block.inner.write().unwrap();
-                inner.len = b_len;
-                inner.location = KVLocation::SSD;
-                // [FIX] 개별 블록 객체에도 실제 SSD 경로를 정확히 기록
-                inner.ssd_path = Some(frag_path.clone());
-            }
-            self.kv_blocks.push(new_block);
-
-            let mut reg = self.registry.entries.write().unwrap();
-            if idx >= reg.len() {
-                reg.push(crate::models::qwen3vl::quantized_model::RegistryEntry::new(*offset, b_len, 28));
-            }
+            let idx = *offset / 256;
             
-            if idx < reg.len() {
-                reg[idx].location[self.layer_idx] = KVLocation::SSD;
-                reg[idx].ssd_path = Some(frag_path.clone());
-                reg[idx].token_start = *offset; // [FIX] 장부 시작점 동기화
-                reg[idx].token_len = b_len;
+            // [FAST-DIRECT-LOAD] SSD -> (Direct I/O) -> VRAM 파이프라인
+            let block_file = frag_path.join(format!("l{}.st", self.layer_idx));
+            if block_file.exists() {
+                // direct_loader를 사용하여 OS 캐시 없이 파일을 직접 Vec으로 읽어옴
+                if let Ok(content) = crate::utils::direct_loader::load_kv_block(&block_file) {
+                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                        let prefix = format!("b{}_l{}_", offset, self.layer_idx);
+                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                        
+                        if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                            let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+
+                            // [SAFE-OWNERSHIP] from_raw_buffer 대신 from_vec을 사용하여 텐서가 데이터를 소유하게 함 (크래시 방지)
+                            let kd_t = Tensor::from_vec(kd.data().to_vec(), meta_os.as_slice(), &Device::Cpu)?;
+                            let vd_t = Tensor::from_vec(vd.data().to_vec(), meta_os.as_slice(), &Device::Cpu)?;
+
+                            // 즉시 VRAM으로 전송하여 추론 대기열에 올림
+                            let mut inner_block = KVBlockInner {
+                                location: KVLocation::VRAM,
+                                index: idx,
+                                k_cache: Some(kd_t.to_device(device)?.to_dtype(if device.is_cuda() { DType::BF16 } else { DType::F32 })?),
+                                v_cache: Some(vd_t.to_device(device)?.to_dtype(if device.is_cuda() { DType::BF16 } else { DType::F32 })?),
+                                ssd_path: Some(frag_path.clone()),
+                                len: b_len,
+                                offset: *offset,
+                                bitkv_metadata: None,
+                            };
+                            
+                            self.kv_blocks.push(KVBlock { inner: Arc::new(std::sync::RwLock::new(inner_block)) });
+
+                            // 전역 장부 동기화
+                            let mut reg = self.registry.entries.write().unwrap();
+                            if idx >= reg.len() {
+                                reg.push(crate::models::qwen3vl::quantized_model::RegistryEntry::new(*offset, b_len, 28));
+                            }
+                            reg[idx].location[self.layer_idx] = KVLocation::VRAM;
+                            reg[idx].token_len = b_len;
+                        }
+                    }
+                }
             }
         }
 
         if self.layer_idx == 0 {
-            println!("[SSD-RESTORE] Restored {} tokens across {} blocks.", total_restored_len, fragments.len());
+            println!("[SSD-RESTORE] Fast-streamed {} blocks directly to VRAM.", fragments.len());
         }
         Ok(())
     }
@@ -1627,11 +1658,10 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    /// [MEMORY-OPT] 특정 레이어의 가중치를 mmap에서 다시 로드합니다.
+    /// [MEMORY-OPT] 특정 레이어의 가중치를 mmap에서 다시 로드합니다. (In-place Swap)
     pub fn reload_layer(&mut self, layer_idx: usize) -> Result<()> {
         if layer_idx >= self.layers.len() { return Ok(()); }
         
-        // 가중치가 이미 로드되어 있는지 체크 (q_proj가 유효한 텐서를 가지고 있는지 확인)
         if !self.layers[layer_idx].self_attn.q_proj.is_cleared() {
             return Ok(());
         }
@@ -1640,41 +1670,32 @@ impl QuantizedQwen3VLTextModel {
         let ct = self.ct.as_ref().ok_or(anyhow!("GGUF Content missing for reload"))?;
         let target_device = self.layers[layer_idx].device().clone();
 
-        // [HYBRID-LOADER] GPU 가용 시 DirectStorage 사용, 아니면 Mmap 릴레이
-        if target_device.is_cuda() {
-            let gguf_blk = format!("blk.{layer_idx}");
-            let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{}.layers.{layer_idx}", self.base_name) };
+        let gguf_blk = format!("blk.{layer_idx}");
+        let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{}.layers.{layer_idx}", self.base_name) };
 
-            let new_layer = QuantizedQwen3VLTextDecoderLayer::new_direct(
-                &self.config, ct, mmap, &prefix, &target_device, self.dtype, layer_idx, self.baking_only, self.registry.clone()
-            )?;
+        // [IN-PLACE-RELOAD] 레이어 객체 전체를 바꾸지 않고 내부 가중치만 새로 읽어 주입합니다.
+        let mut reader = std::io::Cursor::new(&mmap[..]);
+        let new_layer_data = QuantizedQwen3VLTextDecoderLayer::new(
+            &self.config, ct, &mut reader, &prefix, &target_device, self.dtype, layer_idx, self.baking_only, self.registry.clone()
+        )?;
 
-            // 기존 KV 캐시 및 설정 보존
-            let old_kv_blocks = self.layers[layer_idx].self_attn.kv_blocks.clone();
-            let old_active_kv = self.layers[layer_idx].self_attn.active_kv_name.clone();
-            self.layers[layer_idx] = new_layer;
-            self.layers[layer_idx].self_attn.kv_blocks = old_kv_blocks;
-            self.layers[layer_idx].self_attn.active_kv_name = old_active_kv;
-        } else {
-            let mut reader = std::io::Cursor::new(&mmap[..]);
-            let gguf_blk = format!("blk.{layer_idx}");
-            let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{}.layers.{layer_idx}", self.base_name) };
+        let layer = &mut self.layers[layer_idx];
+        layer.self_attn.q_proj = new_layer_data.self_attn.q_proj;
+        layer.self_attn.k_proj = new_layer_data.self_attn.k_proj;
+        layer.self_attn.v_proj = new_layer_data.self_attn.v_proj;
+        layer.self_attn.o_proj = new_layer_data.self_attn.o_proj;
+        layer.self_attn.q_norm = new_layer_data.self_attn.q_norm;
+        layer.self_attn.k_norm = new_layer_data.self_attn.k_norm;
+        layer.mlp_gate = new_layer_data.mlp_gate;
+        layer.mlp_up = new_layer_data.mlp_up;
+        layer.mlp_down = new_layer_data.mlp_down;
+        layer.input_layernorm = new_layer_data.input_layernorm;
+        layer.post_attention_layernorm = new_layer_data.post_attention_layernorm;
 
-            let new_layer = QuantizedQwen3VLTextDecoderLayer::new(
-                &self.config, ct, &mut reader, &prefix, &Device::Cpu, self.dtype, layer_idx, self.baking_only, self.registry.clone()
-            )?;
-
-            #[cfg(windows)]
-            unsafe {
-                use windows::Win32::System::Memory::VirtualUnlock;
-                let _ = VirtualUnlock(mmap.as_ptr() as *const _, mmap.len());
-            }
-
-            let old_kv_blocks = self.layers[layer_idx].self_attn.kv_blocks.clone();
-            let old_active_kv = self.layers[layer_idx].self_attn.active_kv_name.clone();
-            self.layers[layer_idx] = new_layer;
-            self.layers[layer_idx].self_attn.kv_blocks = old_kv_blocks;
-            self.layers[layer_idx].self_attn.active_kv_name = old_active_kv;
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::System::Memory::VirtualUnlock;
+            let _ = VirtualUnlock(mmap.as_ptr() as *const _, mmap.len());
         }
 
         Ok(())
@@ -2200,53 +2221,9 @@ impl QuantizedQwen3VLTextModel {
 
         // [MEMORY-OPT] [LAZY-PURGE] 연산 종료 후 가중치 소각
         if !is_decoding {
-            if layer_idx == self.layers.len() - 1 {
-                println!("[SSD-BRIDGE] Last prefill layer finished. Initiating Hot Handover to Decoding...");
-                crate::models::qwen3vl::generate::wait_for_global_io().await;
-                if target_device.is_cuda() { let _ = target_device.synchronize(); }
-                
-                for l in 0..layer_idx {
-                    if let Err(e) = self.reload_layer(l) {
-                        println!("[SSD-BRIDGE-ERROR] Failed to reload layer {}: {}", l, e);
-                    }
-                    if l % 4 == 0 && target_device.is_cuda() { let _ = target_device.synchronize(); std::thread::sleep(std::time::Duration::from_millis(5)); }
-                }
-                if target_device.is_cuda() { let _ = target_device.synchronize(); }
-                println!("[SSD-BRIDGE] All layers anchored to VRAM. No purge performed.");
-
-                let sid_owned = sid_opt.clone().unwrap_or_default();
-                let snapshot_root = crate::utils::paths::get_kv_dir(None).join(&sid_owned).join("inference").join(kv_name.as_deref().unwrap_or("text"));
-                
-                if snapshot_root.exists() {
-                    let mut fragments = Vec::new();
-                    if let Ok(entries) = std::fs::read_dir(&snapshot_root) {
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            if p.is_dir() {
-                                let dname = p.file_name().unwrap_or_default().to_string_lossy();
-                                if dname.starts_with('b') {
-                                    if let Ok(off) = dname[1..].parse::<usize>() { fragments.push((off, p)); }
-                                }
-                            }
-                        }
-                    }
-                    fragments.sort_by_key(|f| f.0);
-                    
-                    if !fragments.is_empty() {
-                        // [FIX] 하드코딩된 +256 대신 실제 연산된 총 길이를 사용
-                        let actual_total_len = seqlen_offset + input_token_count;
-                        for l in 0..self.layers.len() {
-                            let _ = self.layers[l].load_kv_cache(&snapshot_root, &target_device, 0, 128, kv_name.as_deref(), &fragments, actual_total_len);
-                        }
-                        self.current_kv_len = actual_total_len;
-                        println!("[SSD-BRIDGE] Context restored to active VRAM layers. Total tokens: {}", actual_total_len);
-                    }
-                }
-            } else {
-                if layer_idx > 0 { self.layers[layer_idx - 1].clear(); }
-                self.layers[layer_idx].clear();
-                if layer_idx % 7 == 0 { println!("[SPEED-OPT] Layer {} cleared, moving window.", layer_idx); }
-            }
+            if layer_idx > 0 { self.layers[layer_idx - 1].clear(); }
+            self.layers[layer_idx].clear();
+            if layer_idx % 7 == 0 { println!("[SPEED-OPT] Layer {} cleared, moving window.", layer_idx); }
         }
 
         if let Some(sid) = sid_opt {
