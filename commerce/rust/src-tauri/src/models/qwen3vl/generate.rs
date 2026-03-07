@@ -113,7 +113,9 @@ impl SlotManager {
                                             let _ = std::fs::remove_file(&path);
                                         },
                                         "pending" => {
+                                            // [FIX] 카운터가 0인데 펜딩 파일이 남아있다면, 이는 I/O가 이미 끝났음을 의미하므로 강제 회수
                                             if GLOBAL_IO_COUNTER.load(Ordering::SeqCst) == 0 {
+                                                self.mark_ready(sid).await;
                                                 let _ = std::fs::remove_file(&path);
                                             }
                                         },
@@ -436,7 +438,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
                 struct IoGuard; 
-                impl Drop for IoGuard { fn drop(&mut self) { if GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } } }
+                impl Drop for IoGuard { 
+                    fn drop(&mut self) { 
+                        // [SAFE-SUB] 언더플로우 방지: 0보다 클 때만 깎습니다.
+                        let current = GLOBAL_IO_COUNTER.load(Ordering::SeqCst);
+                        if current > 0 { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); }
+                    } 
+                }
                 let _io_guard = IoGuard;
                 let sentinel_dir = if let Some(p) = tp.parent() { p.parent().map(|p2| p2.join("sentinels")) } else { None };
                 let mut s_path = None;
@@ -521,6 +529,11 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         map.insert(format!("{}v_data", prefix), src.v_data.clone());
                         map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
                         let file_path = task_dir.join(format!("l{}.st", act_l));
+
+                        // [CRITICAL-FIX] 레이어 하나를 저장 큐에 넣을 때마다 카운터를 1씩 올립니다.
+                        // 이를 통해 워커 내부의 IoGuard와 1:1 대응을 맞추어 언더플로우를 방지합니다.
+                        GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
+
                         let _ = io_tx_nested.send(SaveTask { 
                             slot_id: sid, path: file_path, tensors: map, is_last: false, 
                             block_idx, registry: Some(registry_inner), kv_name: kv_name_inner 
