@@ -267,7 +267,7 @@ impl RegistryEntry {
 }
 
 // [NEW] 모델 전체가 공유하는 2차원 KV 목차
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct KVRegistry {
     pub entries: Arc<std::sync::RwLock<Vec<RegistryEntry>>>,
 }
@@ -1745,6 +1745,7 @@ impl QuantizedQwen3VLTextModel {
             ct: Some(ct),
             base_name: base_name.to_string(),
             dtype,
+            pending_weight_load: None, // [FIX] 필드 초기화
         })
     }
 
@@ -1778,7 +1779,7 @@ impl QuantizedQwen3VLTextModel {
         let mut patched_config = config.clone();
         patched_config.hidden_size = actual_hidden_size;
         let config = &patched_config;
-        let registry = KVRegistry::new();
+        let registry = KVRegistry { device: device.clone(), entries: Arc::new(std::sync::RwLock::new(Vec::new())) };
         
         let mut pinned_layer_count = 0;
         let num_layers_to_load = config.num_hidden_layers;
@@ -1815,6 +1816,7 @@ impl QuantizedQwen3VLTextModel {
             ct: Some(ct),
             base_name: base_name.to_string(),
             dtype,
+            pending_weight_load: None, // [FIX] 필드 초기화
         })
     }
 
