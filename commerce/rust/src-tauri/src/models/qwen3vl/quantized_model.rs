@@ -1655,23 +1655,33 @@ impl QuantizedQwen3VLTextModel {
                 return Err(e);
             }
             
-            // [CONTEXT-SYNC] 가중치 교체 후, 백업해 두었던 블록 핸들들을 다시 주입하고 장부와 상태를 동기화합니다.
-            if i < context_snapshots.len() && !context_snapshots[i].is_empty() {
-                self.layers[i].self_attn.kv_blocks = context_snapshots[i].clone();
-                
-                // [STATE-RECONSTRUCTION] 장부(Registry)를 뒤져서 각 블록의 최신 위치 정보를 레이어에 강제 이식합니다.
+            // [CONTEXT-SYNC] 가중치 교체 후, 전역 장부(Registry)를 기반으로 기억을 강제 재구축합니다.
+            // 백업본이 비어있더라도 장부에 데이터가 있다면 물리적으로 핸들을 재생성하여 연결합니다.
+            let mut layer_blocks = context_snapshots.get(i).cloned().unwrap_or_default();
+            
+            {
                 let reg = self.registry.entries.read().unwrap();
+                // 장부의 모든 엔트리에 대해 레이어의 블록 리스트를 동기화
                 for (b_idx, entry) in reg.iter().enumerate() {
-                    if let Some(block) = self.layers[i].self_attn.kv_blocks.get(b_idx) {
-                        let mut inner = block.inner.write().unwrap();
-                        // 장부에 기록된 위치(VRAM 등)를 실제 블록 상태에 동기화
+                    if b_idx < layer_blocks.len() {
+                        let mut inner = layer_blocks[b_idx].inner.write().unwrap();
                         inner.location = entry.location[i];
+                        if let Some(path) = &entry.ssd_path { inner.ssd_path = Some(path.clone()); }
+                    } else {
+                        // [FIX] 레이어에 블록이 부족하면 장부 정보를 바탕으로 핸들 재생성 (V:Count 복구)
+                        let b_len = entry.token_len;
+                        let b_start = entry.token_start;
+                        let restored_block = KVBlock::new(entry.location[i], b_idx, b_len, b_start);
                         if let Some(path) = &entry.ssd_path {
-                            inner.ssd_path = Some(path.clone());
+                            restored_block.inner.write().unwrap().ssd_path = Some(path.clone());
                         }
+                        layer_blocks.push(restored_block);
                     }
                 }
             }
+            
+            // 레이어의 기억 장치를 최신 상태로 강제 동기화
+            self.layers[i].self_attn.kv_blocks = layer_blocks;
 
             if i % 4 == 0 && target_device.is_cuda() {
                 let _ = target_device.synchronize();
