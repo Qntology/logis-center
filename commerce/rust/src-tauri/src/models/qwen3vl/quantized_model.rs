@@ -1006,21 +1006,23 @@ impl QuantizedQwen3VLTextAttention {
             
             if let Ok(content) = crate::utils::direct_loader::load_kv_block(&file_path) {
                 if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                    // [FIX] 모든 저장/로드 프리픽스를 b{offset}_l{layer}_ 형식으로 통일
-                    let prefix = format!("b{}_l{}_", block_info.offset, self.layer_idx);
-                    let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+        // [RESTORATION] 저장 시와 동일한 프리픽스 형식 사용: b{offset}_l{layer}_
+        let prefix = format!("b{}_l{}_", block_info.offset, self.layer_idx);
+        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
 
-                    if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
-                        println!("[DIAG-KV] Layer {} Block {} data verified and loaded from SSD.", self.layer_idx, block_info.offset);
-                        let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                        let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
-                        
-                        let dev = &Device::Cpu;
-                        let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, dev)?;
-                        let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, dev)?;
+        if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+            println!("[DIAG-KV] Layer {} Block {} loading... (Type: {:?})", self.layer_idx, block_info.offset, kd.dtype());
+            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+            
+            // [STABILITY-FIX] from_raw_buffer 후 copy()를 통해 메모리 소유권을 완전히 가져오고, 
+            // DType을 모델의 기본 연산 타입(BF16)으로 즉시 고정하여 노이즈 발생 차단
+            let dev = &Device::Cpu;
+            let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, meta_os.as_slice(), dev)?.copy()?;
+            let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, meta_os.as_slice(), dev)?.copy()?;
 
-                        let mut k_raw = self.decompress_from_bf16(&kd_t, &meta_os, dev)?;
-                        let mut v_raw = self.decompress_from_bf16(&vd_t, &meta_os, dev)?;
+            let mut k_raw = kd_t.to_device(self.q_proj.device())?;
+            let mut v_raw = vd_t.to_device(self.q_proj.device())?;
 
                         // [KV-BRIDGE] 0.6B -> 0.6B 상황에서도 규격이 다르면 정렬 (커밋 261fe0ef 매커니즘)
                         let target_heads = self.num_key_value_heads;
