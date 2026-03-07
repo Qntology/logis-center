@@ -431,7 +431,7 @@ async fn process_task(
             let wants_cpu = effective_device_pref == Some("cpu");
             if m.is_cpu_mode != wants_cpu {
                 println!("[Scheduler] Device preference mismatch (Current CPU: {}, Wants CPU: {}). Reloading model...", m.is_cpu_mode, wants_cpu);
-                m.deep_purge_resources().await;
+                m.deep_purge_resources(Some(task.id.clone())).await;
                 *model_lock = None;
             }
         }
