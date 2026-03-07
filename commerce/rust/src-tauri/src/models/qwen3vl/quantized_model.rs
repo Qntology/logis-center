@@ -1267,17 +1267,7 @@ impl QuantizedQwen3VLTextAttention {
 
             let mut reg = self.registry.entries.write().unwrap();
             if idx >= reg.len() {
-                reg.push(crate::models::qwen3vl::quantized_model::RegistryEntry {
-                    location: vec![KVLocation::SSD; 28],
-                    slot_ids: vec![None; 28],
-                    token_start: *offset,
-                    token_len: b_len,
-                    ssd_path: Some(frag_path.clone()),
-                    hidden_states_path: vec![None; 28],
-                    is_dirty: vec![false; 28], 
-                    last_accessed: std::time::Instant::now(),
-                    bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; 28])),
-                });
+                reg.push(crate::models::qwen3vl::quantized_model::RegistryEntry::new(*offset, b_len, 28));
             }
             
             if idx < reg.len() {
