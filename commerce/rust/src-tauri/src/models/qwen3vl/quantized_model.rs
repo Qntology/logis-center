@@ -2018,11 +2018,13 @@ impl QuantizedQwen3VLTextModel {
             if target_device.is_cuda() { let _ = target_device.synchronize(); }
         }
 
-        // [OPTIMIZATION] 프리필(청크 연산)이 모두 끝난 후 레이어 단위로 단 한 번 SSD 백업 트리거
+        // [OPTIMIZATION] 프리필(대량 입력)이 모두 끝난 후 레이어 단위로 단 한 번 SSD 백업 트리거
+        // 디코딩(1토큰씩 생성) 시에는 성능을 위해 SSD 저장을 완전히 건너뜁니다.
         if let Some(sid) = &session_id {
             let is_prefill = current_seq_len > 1;
-            // 프리필 중에는 루프 밖에서 일괄 처리, 디코딩(seq_len=1)일 때는 루프와 동일하게 작동
-            let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, !is_prefill);
+            if is_prefill {
+                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, false);
+            }
         }
         
         final_output.ok_or_else(|| anyhow::anyhow!("No output generated from chunks"))
