@@ -169,9 +169,23 @@ pub struct SaveTask {
     pub is_last: bool, pub block_idx: Option<usize>, pub registry: Option<KVRegistry>,
     pub kv_name: Option<String>,
 }
+#[derive(Debug)]
+pub struct WeightLoadTask {
+    pub layer_idx: usize,
+    pub config: crate::models::qwen3vl::config::Qwen3VLTextConfig,
+    pub ct: Arc<gguf_file::Content>,
+    pub mmap: Arc<memmap2::Mmap>,
+    pub device: Device,
+    pub dtype: DType,
+    pub base_name: String,
+    pub registry: KVRegistry,
+    pub baking_only: bool,
+    pub response_tx: tokio::sync::oneshot::Sender<Result<crate::models::qwen3vl::quantized_model::QuantizedQwen3VLTextDecoderLayer>>,
+}
 
-pub enum SlotTask { 
-    Bake(BakeTask), 
+#[derive(Debug)]
+pub enum SlotTask {
+    Bake(BakeTask),
     Load(LoadTask),
     IndexUpdate {
         kv_name: String,
@@ -180,7 +194,12 @@ pub enum SlotTask {
         len: usize,
         file_name: String,
     },
+    WeightLoad(WeightLoadTask),
 }
+
+// [NEW] 가중치 로딩 전담 워커 채널
+pub static WEIGHT_TX: OnceCell<mpsc::Sender<SlotTask>> = OnceCell::const_new();
+pub async fn get_weight_worker() -> Result<mpsc::Sender<SlotTask>> { WEIGHT_TX.get().cloned().ok_or(anyhow!("Weight worker init error")) }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct LayerIndex {

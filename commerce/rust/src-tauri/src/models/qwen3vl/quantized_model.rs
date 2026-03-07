@@ -1588,6 +1588,8 @@ pub struct QuantizedQwen3VLTextModel {
     pub ct: Option<Arc<gguf_file::Content>>,
     pub base_name: String,
     pub dtype: DType,
+    // [NEW] 가중치 비동기 릴레이를 위한 필드
+    pub pending_weight_load: Option<(usize, tokio::sync::oneshot::Receiver<Result<QuantizedQwen3VLTextDecoderLayer>>)>,
 }
 
 impl QuantizedQwen3VLTextModel {
@@ -2110,6 +2112,7 @@ impl QuantizedQwen3VLTextModel {
         kv_name: Option<String>,
         baking_only: bool,
     ) -> Result<Tensor> {
+        let sid_opt = self.active_session_id.clone(); // [FIX] sid_opt 정의를 최상단으로 이동
         let start_layer_time = std::time::Instant::now();
         let input_token_count = xs.dim(1).unwrap_or(0);
         let is_decoding = input_token_count <= 1;
@@ -2218,7 +2221,6 @@ impl QuantizedQwen3VLTextModel {
         }
 
         // [STEP 4] 자원 반납 및 KV 대피 (Fire-and-Forget)
-        let sid_opt = self.active_session_id.clone();
         if let Some(sid) = sid_opt {
             let is_prefill = !is_decoding;
             // [SYNC-PREFILL] Prefill 상황에서도 워커를 기다리지 않고 즉시 던지기만 합니다.
