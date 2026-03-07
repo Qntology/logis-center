@@ -1006,12 +1006,12 @@ impl QuantizedQwen3VLTextAttention {
             
             if let Ok(content) = crate::utils::direct_loader::load_kv_block(&file_path) {
                 if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                    // [RESTORATION] 프리픽스 매칭 로직 복구
-                    let is_l0 = file_path.to_string_lossy().contains("l0.st");
-                    let prefix = if is_l0 { format!("b{}_l0_", block_info.offset) } else { format!("b{}_l{}_", block_info.offset, self.layer_idx) };
+                    // [FIX] 모든 저장/로드 프리픽스를 b{offset}_l{layer}_ 형식으로 통일
+                    let prefix = format!("b{}_l{}_", block_info.offset, self.layer_idx);
                     let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
 
                     if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                        println!("[DIAG-KV] Layer {} Block {} data verified and loaded from SSD.", self.layer_idx, block_info.offset);
                         let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                         let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
                         
@@ -2973,13 +2973,20 @@ impl QuantizedQwen3VLModel {
             if l_max > 100.0 || l_max.is_nan() {
                 println!("[DIAG-WARN] Potential Tensor Explosion! Max Logit: {}", l_max);
             }
-        }
-        
-        Ok(logits)
+            }
+
+            Ok(logits)
+            }
+
+    pub fn clear_kv_cache(&mut self) { 
+        self.language_model.clear_kv_cache(); 
+        // [CRITICAL-FIX] 시각적 위치 정보인 rope_deltas를 반드시 초기화해야 
+        // 디코딩 첫 토큰에서 좌표계가 꼬이지 않고 정상적인 언어로 답변합니다.
+        self.rope_deltas = None; 
+        println!("[DIAG-KV] VL Model state and position deltas reset.");
     }
 
-    pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
-    pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> { self.language_model.inject_live_kv(k_list, v_list, k_scale, v_scale) }
+            pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> { self.language_model.inject_live_kv(k_list, v_list, k_scale, v_scale) }
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> { self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales) }
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.save_kv_cache(path, clear, offset, kv_name) }
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { self.language_model.force_flush_all_active_blocks(session_id, kv_name).await }
@@ -3123,7 +3130,10 @@ impl QuantizedQwen3TextModel {
         Ok(logits)
     }
 
-    pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
+    pub fn clear_kv_cache(&mut self) { 
+        self.language_model.clear_kv_cache(); 
+        println!("[DIAG-KV] Text Model state fully reset.");
+    }
     pub fn get_kv_len(&self) -> usize { self.language_model.get_kv_len() }
     pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> { self.language_model.inject_live_kv(k_list, v_list, k_scale, v_scale) }
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> { self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales) }

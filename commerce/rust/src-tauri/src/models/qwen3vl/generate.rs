@@ -446,20 +446,26 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let _ = fs::File::create(&p_path);
                     s_path = Some(p_path);
                 }
-                let _slot_guard = SlotCompletionGuard { sid, is_last, active: true, sentinel_path: s_path };
+                
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 let tp_for_blocking = tp.clone();
                 let save_res = tokio::task::spawn_blocking(move || {
                     let serialized = safetensors::serialize(&ts, &None);
-                    // [IMMEDIATE-DROP] 시리얼라이즈 직후 원본 텐서 맵 파괴
                     drop(ts); 
-                    
-                    if let Ok(data) = serialized {
-                        save_kv_block(&tp_for_blocking, &data)
-                    } else {
-                        Err(anyhow!("Serialization failed"))
-                    }
+                    if let Ok(data) = serialized { save_kv_block(&tp_for_blocking, &data) } else { Err(anyhow!("Serialization failed")) }
                 }).await;
+
+                // [RESOURCE-RECOVERY] 레이어 하나가 완료될 때마다 카운트 감소 및 센티널 관리
+                if let Some(path) = s_path {
+                    let _ = fs::File::create(path.with_extension("done"));
+                    let _ = fs::remove_file(&path);
+                }
+                let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
+                if rem == 1 {
+                    // 이 블록의 모든 레이어(28개)가 SSD에 기록되었을 때만 슬롯을 Ready로 전환
+                    SLOT_MANAGER.mark_ready(sid).await;
+                }
+
                 match save_res {
                     Ok(Ok(_)) => {
                         if let Some(kv_name) = kv_n {
@@ -748,7 +754,13 @@ impl Qwen3VLGenerateModel {
     pub fn get_kv_len(&self) -> usize { match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.get_kv_len(), ModelVariant::QuantizedText(m) => m.language_model.get_kv_len(), _ => 0 } }
     pub async fn drop_kv_storage(&mut self) -> Result<()> { self.qwen3_vl.drop_kv_storage().await }
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> { self.qwen3_vl.force_flush_all_active_blocks(session_id, kv_name).await }
-    pub fn clear_kv_cache(&mut self) { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.clear_kv_cache(), ModelVariant::QuantizedText(m) => m.language_model.clear_kv_cache(), _ => {} } }
+    pub fn clear_kv_cache(&mut self) { 
+        match &mut self.qwen3_vl { 
+            ModelVariant::QuantizedVL(m) => m.clear_kv_cache(), 
+            ModelVariant::QuantizedText(m) => m.clear_kv_cache(), 
+            _ => {} 
+        } 
+    }
     
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
         match &mut self.qwen3_vl {
