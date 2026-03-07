@@ -2505,6 +2505,42 @@ impl QuantizedQwen3VLTextModel {
         Ok(xs.apply(&self.norm)?)
     }
 
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, _expected_len: usize, _upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
+        let scan_path = if let Some(name) = kv_name { path.join(name) } else { path.to_path_buf() };
+        if !scan_path.exists() { return Ok(()); }
+
+        let mut fragments = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&scan_path) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    let dname = p.file_name().unwrap_or_default().to_string_lossy();
+                    if dname.starts_with('b') {
+                        if let Ok(off) = dname[1..].parse::<usize>() {
+                            fragments.push((off, p));
+                        }
+                    }
+                }
+            }
+        }
+        fragments.sort_by_key(|f| f.0);
+        
+        if fragments.is_empty() { return Ok(()); }
+        
+        // [CRITICAL] Calculate correct total length from fragments
+        // 마지막 블록의 인덱스 + 256을 기본값으로 하되, 실제 파일 크기 체크는 하위 메서드에서 수행
+        let total_len = fragments.iter().map(|f| f.0).max().unwrap_or(0) + 256;
+        
+        for l in 0..self.layers.len() {
+            self.layers[l].load_kv_cache(&scan_path, device, 0, 128, kv_name, &fragments, total_len)?;
+        }
+        
+        // [FIX] Update global model offset to prevent gibberish output
+        self.current_kv_len = total_len;
+        println!("[SSD-RESTORE] Global current_kv_len synchronized to: {}", total_len);
+        Ok(())
+    }
+
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
@@ -2586,63 +2622,6 @@ impl QuantizedQwen3VLTextModel {
 
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
         self.save_kv_cache(path, true, block_size, None)
-    }
-
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
-        if !path.exists() { return Ok(()); }
-
-        let mut fragments = Vec::new();
-        let mut max_offset = 0;
-
-        // [FIX] Scan for b{offset} folders to build fragments list
-        let scan_path = if let Some(name) = kv_name { path.join(name) } else { path.to_path_buf() };
-        if !scan_path.exists() { return Ok(()); }
-
-        if let Ok(entries) = std::fs::read_dir(&scan_path) {
-            for entry in entries.flatten() {
-                let path_buf = entry.path();
-                if path_buf.is_dir() {
-                    let dname = path_buf.file_name().unwrap_or_default().to_string_lossy();
-                    if dname.starts_with('b') {
-                        if let Ok(offset) = dname[1..].parse::<usize>() {
-                            if offset > max_offset { max_offset = offset; }
-                            fragments.push((offset, path_buf));
-                        }
-                    }
-                }
-            }
-        }
-        
-        if fragments.is_empty() { return Ok(()); }
-        fragments.sort_by_key(|f| f.0);
-
-        // [ROBUST-LENGTH-DETECTION] Get actual length of the last block
-        let mut last_chunk_len = 256;
-        let (_, last_st_path) = fragments.last().unwrap();
-        if let Ok(content) = crate::utils::direct_loader::load_kv_block(&last_st_path.join("l0.st")) {
-            if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                if let Some(name) = st.names().iter().find(|n| n.contains("k_shape")) {
-                    if let Ok(view) = st.tensor(name) {
-                        let data = view.data();
-                        if data.len() >= 12 {
-                            last_chunk_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
-                        }
-                    }
-                }
-            }
-        }
-        
-        let total_kv_len = max_offset + last_chunk_len;
-        self.current_kv_len = total_kv_len;
-        println!("[SSD-GLOBAL] Snapshot loaded. Total context length: {} tokens.", total_kv_len);
-
-        self.layers.iter_mut().try_for_each(|layer| {
-            layer.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name, &fragments, total_kv_len)
-        })?;
-        
-        // [STABILITY-FIX] Double check if all layers have the same current_kv_len
-        self.current_kv_len = total_kv_len;
-        Ok(())
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {

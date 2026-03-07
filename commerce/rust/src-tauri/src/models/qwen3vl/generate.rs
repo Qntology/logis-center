@@ -687,26 +687,27 @@ impl Qwen3VLGenerateModel {
             
             // 4. SSD에 저장된 데이터를 기반으로 장부를 다시 구축 (Safe Loader)
             println!("[SSD-BRIDGE] Rebuilding KV registry from SSD snapshots...");
-            let snapshot_path = crate::utils::paths::get_kv_dir(None).join(s_id);
-            let _ = self.load_kv_from_disk(&snapshot_path, _kv_name.as_deref());
+            let snapshot_path = crate::utils::paths::get_kv_dir(None).join(s_id).join("inference");
+            // [FIX] Borrow checker 위반 해결을 위해 장치를 미리 복제
+            let device_clone = self.text_device.clone();
+            let _ = self.load_kv_cache(&snapshot_path, &device_clone, 0, 0, _kv_name.as_deref());
             
             // 5. 비동기 뒷정리 대기
             wait_for_global_io().await;
             println!("[SSD-BRIDGE] Bridge established. Starting clean decoding loop.");
-            
+
             // [CRITICAL-FIX] 복구된 문맥 길이를 기준으로 디코딩 오프셋을 재설정하여 맥락 소실 방지
             total_tokens_after_prefill = self.get_kv_len();
-            // 디코딩 첫 토큰은 이미 위에서 forward를 한 번 수행했으므로, 
-            // 루프 시작 시점의 logits는 total_tokens_after_prefill - 1 위치의 결과입니다.
+            println!("[SSD-BRIDGE] Syncing decoding start pos to: {}", total_tokens_after_prefill);
         }
 
-        let mut gen_ids = vec![];
-        let _think_token_id = 151643;
-        
-        // [FIX] 루프 진입 전 현재 오프셋 확정
-        let mut current_decode_pos = total_tokens_after_prefill;
+            let mut gen_ids = vec![];
+            let _think_token_id = 151643;
 
-        for i in 0..mes.max_tokens.unwrap_or(2048) {
+            // [FIX] 루프 진입 전 현재 오프셋 확정 (이미 로드된 KV 이후부터 시작)
+            let mut current_decode_pos = total_tokens_after_prefill;
+
+            for _i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
             let mut logits_tensor = logits.flatten_all()?.to_dtype(DType::F32)?;
             if !gen_ids.is_empty() { logits_tensor = apply_repetition_penalty(&logits_tensor, 1.2, &gen_ids)?; }
@@ -752,7 +753,11 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn save_kv_to_disk(&mut self, path: &Path, kv_name: Option<&str>, offset: usize) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.save_kv_cache(path, false, offset, kv_name), ModelVariant::QuantizedText(m) => m.language_model.save_kv_cache(path, false, offset, kv_name), _ => Ok(()) } }
-    pub fn load_kv_from_disk(&mut self, path: &Path, kv_name: Option<&str>) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.load_kv_cache(path, &self.text_device, 0, 128, kv_name), ModelVariant::QuantizedText(m) => m.language_model.load_kv_cache(path, &self.text_device, 0, 128, kv_name), _ => Ok(()) } }
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name), ModelVariant::QuantizedText(m) => m.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name), _ => Ok(()) } }
+    pub fn load_kv_from_disk(&mut self, path: &Path, kv_name: Option<&str>) -> Result<()> { 
+        let device_clone = self.text_device.clone();
+        self.load_kv_cache(path, &device_clone, 0, 128, kv_name) 
+    }
 }
 
 fn apply_repetition_penalty(logits: &Tensor, penalty: f32, previous_tokens: &[u32]) -> Result<Tensor> {
