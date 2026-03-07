@@ -2231,8 +2231,13 @@ impl QuantizedQwen3VLTextModel {
             // [OPTIMIZATION] sync_with_sentinels는 프리필 도중 매 레이어마다 할 필요가 없으므로 제거하여 I/O 병목 해소
         }
 
+        // [DIAG-SPEED] 각 레이어별 연산 소요 시간 기록
+        if !is_decoding {
+            println!("[LAYER-SPEED] Layer {}/28 finished in {:?}", layer_idx + 1, _start_layer_time.elapsed());
+        }
+
         Ok(next_xs)
-    }
+        }
 
     /// [DEC-SPEED-UP] 디코딩 속도를 위해 모든 레이어를 GPU에 상주 시킴
     pub async fn pin_all_layers_to_gpu(&mut self) -> Result<()> {
