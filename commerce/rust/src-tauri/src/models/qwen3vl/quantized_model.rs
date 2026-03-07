@@ -978,6 +978,8 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn get_kv_len(&self) -> usize {
+        // [ROPE-FIX] 물리적 캐시 크기가 아닌 전역 장부에 기록된 논리적 길이를 반환합니다.
+        // 이를 통해 VRAM을 비우고 SSD에서 복구하는 과정에서도 오프셋 정합성을 유지합니다.
         self.kv_blocks.iter().map(|b| b.inner.read().unwrap().len).sum()
     }
 
@@ -2308,18 +2310,21 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    /// [MANUAL-FLUSH] 세션 종료 시 RAM에 남아있는 활성 블록(Active Block)을 강제로 SSD에 저장합니다. (보존형 백업)
+    /// [MANUAL-FLUSH] 세션 종료 시 RAM에 남아있는 활성 블록(Active Block)을 강제로 SSD에 저장합니다. (파괴적 백업)
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> {
         use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
+        
+        // [ID-NORMALIZATION] 저장 경로를 순수 태스크 ID로 통일
+        let canonical_id = session_id.split("_step_").next().unwrap_or(session_id);
         
         let mut groups_sent = 0;
         let mut block_groups: std::collections::HashMap<usize, Vec<LayerKVDump>> = std::collections::HashMap::new();
         
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
             for block in &mut layer.self_attn.kv_blocks {
-                let inner = block.inner.read().unwrap();
+                let mut inner = block.inner.write().unwrap();
                 
-                // [DIRTY-CHECK] Only bake if dirty for THIS layer
+                // [DIRTY-CHECK]
                 let is_dirty = {
                     let reg = self.registry.entries.read().unwrap();
                     if inner.index < reg.len() { 
@@ -2327,11 +2332,8 @@ impl QuantizedQwen3VLTextModel {
                     } else { true }
                 };
 
-                if inner.k_cache.is_some() && is_dirty {
-                    let k = inner.k_cache.as_ref().unwrap();
-                    let v = inner.v_cache.as_ref().unwrap();
-                    
-                    // [SAFE-DATA-CAPTURE] 모델 기억 보존을 위해 원본 DType 유지하며 즉시 캡처
+                // [VRAM-RELEASE-IMMEDIATE] 데이터를 꺼내오면서 VRAM을 즉시 비웁니다 (take 사용)
+                if let (Some(k), Some(v)) = (inner.k_cache.take(), inner.v_cache.take()) {
                     let k_cpu = k.to_device(&Device::Cpu)?;
                     let v_cpu = v.to_device(&Device::Cpu)?;
                     let k_shape_u32: Vec<u32> = k_cpu.shape().dims().iter().map(|&x| x as u32).collect();
@@ -2345,12 +2347,11 @@ impl QuantizedQwen3VLTextModel {
                         raw_v: None,
                     });
                     
-                    // 장부 상태 업데이트 (Dirty 플래그 즉시 리셋)
-                    {
-                        let mut reg = self.registry.entries.write().unwrap();
-                        if inner.index < reg.len() {
-                            if l_idx < reg[inner.index].is_dirty.len() { reg[inner.index].is_dirty[l_idx] = false; }
-                        }
+                    inner.location = KVLocation::SSD;
+                    let mut reg = self.registry.entries.write().unwrap();
+                    if inner.index < reg.len() {
+                        if l_idx < reg[inner.index].is_dirty.len() { reg[inner.index].is_dirty[l_idx] = false; }
+                        reg[inner.index].location[l_idx] = KVLocation::SSD;
                     }
                 }
             }
@@ -2364,7 +2365,7 @@ impl QuantizedQwen3VLTextModel {
             let kv_name_raw = kv_name.unwrap_or("text");
             let last_part = kv_name_raw.split('/').last().unwrap_or("text");
             let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text".to_string() } else { last_part.to_string() };
-            let sub_path = format!("{}/inference/{}", session_id, kv_type);
+            let sub_path = format!("{}/inference/{}", canonical_id, kv_type);
 
             for (off, layers) in block_groups {
                 let sid = SLOT_MANAGER.acquire_write_slot(256).await;
@@ -2378,7 +2379,7 @@ impl QuantizedQwen3VLTextModel {
                 groups_sent += 1;
             }
         }
-        println!("[SSD-FLUSH] Force-flushed {} block groups to SSD safely.", groups_sent);
+        println!("[SSD-FLUSH] Canonical Path: {}. Safely flushed {} block groups.", canonical_id, groups_sent);
         Ok(())
     }
 
@@ -2386,29 +2387,28 @@ impl QuantizedQwen3VLTextModel {
     async fn evacuate_layer_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, start_off: usize, len: usize, _aggressive: bool) -> Result<()> {
         use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump, GLOBAL_IO_COUNTER};
         
+        // [ID-NORMALIZATION] 저장 경로를 순수 태스크 ID로 통일 (V:0 맥락 유실 해결)
+        let canonical_id = session_id.split("_step_").next().unwrap_or(session_id);
+        
         let block_start = (start_off / 256) * 256;
         let block_end = ((start_off + len + 255) / 256) * 256;
 
         if let Some(tx) = BAKE_TX.get() {
             let kv_dir = crate::utils::paths::get_kv_dir(None);
-            let kv_name_base = self.active_kv_name.as_deref().unwrap_or("general");
-            let sub_path = if self.baking_only { format!("{}/reference/{}", session_id, kv_name_base) } 
-                          else { format!("{}/inference/{}", session_id, kv_name_base) };
+            let kv_name_base = self.active_kv_name.as_deref().unwrap_or("text");
+            let sub_path = format!("{}/inference/{}", canonical_id, kv_name_base);
 
-            // [PARALLEL-BLOCK-ASSIGNMENT] 토큰 256개 단위로 블록을 쪼개어 병렬 워커 배정
             for b_off in (block_start..block_end).step_by(256) {
                 let b_idx = b_off / 256;
                 let mut dumps_to_send = Vec::new();
 
                 {
-                    // KV 블록 상태 확인 및 데이터 추출
                     let kv_blocks = &mut self.layers[layer_idx].self_attn.kv_blocks;
                     if b_idx >= kv_blocks.len() { continue; }
                     
                     let mut inner = kv_blocks[b_idx].inner.write().unwrap();
-                    // [CONTEXT-SAFE-EVACUATION] take() 대신 clone()을 사용하여 백업 중에도 VRAM 기억을 유지합니다.
-                    if let (Some(k), Some(v)) = (inner.k_cache.as_ref(), inner.v_cache.as_ref()) {
-                        // [VRAM-COPY] 메인 스레드에서 즉시 CPU로 복사 (워커 전송용)
+                    // [VRAM-RELEASE-IMMEDIATE] 데이터를 CPU로 복사한 직후 VRAM을 즉시 비웁니다.
+                    if let (Some(k), Some(v)) = (inner.k_cache.take(), inner.v_cache.take()) {
                         let k_cpu = k.to_device(&Device::Cpu)?;
                         let v_cpu = v.to_device(&Device::Cpu)?;
                         
@@ -2424,40 +2424,27 @@ impl QuantizedQwen3VLTextModel {
                         };
                         dumps_to_send.push(dump);
                         
-                        // [STABILITY] SSD 백업 완료 전까지는 VRAM 상태를 유지합니다.
-                        // 나중에 시스템이 진짜 VRAM 부족을 느낄 때만 trigger_realtime_incremental_bake가 지우게 됩니다.
+                        // [PURGE] VRAM 기억 삭제 및 위치 업데이트
+                        inner.location = KVLocation::SSD;
+                        let mut reg = self.registry.entries.write().unwrap();
+                        if b_idx < reg.len() { reg[b_idx].location[layer_idx] = KVLocation::SSD; }
                     }
                 }
 
-                // [WORKER-DISPATCH] 각 블록을 독립적인 태스크로 던짐 (Fire-and-Forget)
+                // [WORKER-DISPATCH]
                 for dump in dumps_to_send {
                     let sid = SLOT_MANAGER.acquire_write_slot(256).await;
                     let block_dir = kv_dir.join(&sub_path).join(format!("b{}", b_off));
-                    
                     if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
-                    
                     {
                         let mut reg_w = self.registry.entries.write().unwrap();
-                        // [FIX] 중앙 장부에 블록별 실제 SSD 경로를 정확히 기록
                         if b_idx < reg_w.len() { reg_w[b_idx].ssd_path = Some(block_dir.clone()); }
                     }
 
-                    // [NOTE] 카운터 증가는 이제 generate.rs의 SlotTask::Bake 수신부에서 레이어별로 수행됩니다.
-                    // 중복 카운팅 방지를 위해 여기서 fetch_add를 호출하지 않습니다.
-
-                    if let Err(e) = tx.send(SlotTask::Bake(BakeTask {
-                        slot_id: sid,
-                        task_dir: block_dir,
-                        kv_name: Some(sub_path.clone()),
-                        offset: b_off,
-                        layers: vec![dump],
-                        is_relay_baking: self.baking_only,
-                        block_idx: Some(b_idx),
-                        registry: self.registry.clone(),
-                    })).await {
-                        println!("[ENGINE-ERROR] Failed to send bake task: {}. Reclaiming counter.", e);
-                        GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
-                    }
+                    let _ = tx.send(SlotTask::Bake(BakeTask {
+                        slot_id: sid, task_dir: block_dir, kv_name: Some(sub_path.clone()),
+                        offset: b_off, layers: vec![dump], is_relay_baking: self.baking_only, block_idx: Some(b_idx), registry: self.registry.clone(),
+                    })).await;
                 }
             }
         }
@@ -2604,7 +2591,13 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn get_kv_len(&self) -> usize {
-        self.current_kv_len
+        // [CRITICAL] VRAM 초기화 시에도 오프셋을 잃지 않도록 논리적 진행 상황을 반환합니다.
+        if self.current_kv_len > 0 {
+            self.current_kv_len
+        } else {
+            // 초기화 전이라면 물리적 합산 수행
+            self.layers[0].self_attn.get_kv_len()
+        }
     }
 
     pub fn compress_to_bf16(&self, t: &Tensor) -> Result<(Tensor, Vec<usize>)> {
