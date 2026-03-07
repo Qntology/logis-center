@@ -847,11 +847,15 @@ impl QuantizedQwen3VLTextAttention {
             if let Some(id) = slot_id {
                 // 비동기 호출을 위해 spawn 사용 (clear_kv_cache는 동기 함수)
                 tauri::async_runtime::spawn(async move {
-                    SLOT_MANAGER.release_slot(id).await;
+                    crate::models::qwen3vl::generate::SLOT_MANAGER.release_slot(id).await;
                 });
             }
         }
         self.kv_blocks.clear();
+        // [CRITICAL] Clear merged VRAM cache to prevent Access Violation from dangling pointers
+        self.vram_merged_k = None;
+        self.vram_merged_v = None;
+        self.merged_vram_block_count = 0;
     }
 
     pub fn trigger_realtime_incremental_bake(&self, session_id: &str, is_last_chunk: bool, baking_only: bool, is_decoding: bool) -> Result<()> {
@@ -2229,12 +2233,13 @@ impl QuantizedQwen3VLTextModel {
                     fragments.sort_by_key(|f| f.0);
                     
                     if !fragments.is_empty() {
-                        let total_len = fragments.iter().map(|f| f.0).max().unwrap_or(0) + 256; 
+                        // [FIX] 하드코딩된 +256 대신 실제 연산된 총 길이를 사용
+                        let actual_total_len = seqlen_offset + input_token_count;
                         for l in 0..self.layers.len() {
-                            let _ = self.layers[l].load_kv_cache(&snapshot_root, &target_device, 0, 128, kv_name.as_deref(), &fragments, total_len);
+                            let _ = self.layers[l].load_kv_cache(&snapshot_root, &target_device, 0, 128, kv_name.as_deref(), &fragments, actual_total_len);
                         }
-                        self.current_kv_len = total_len;
-                        println!("[SSD-BRIDGE] Context restored to active VRAM layers. System stabilized.");
+                        self.current_kv_len = actual_total_len;
+                        println!("[SSD-BRIDGE] Context restored to active VRAM layers. Total tokens: {}", actual_total_len);
                     }
                 }
             } else {
@@ -2505,7 +2510,7 @@ impl QuantizedQwen3VLTextModel {
         Ok(xs.apply(&self.norm)?)
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, _expected_len: usize, _upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, _upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
         let scan_path = if let Some(name) = kv_name { path.join(name) } else { path.to_path_buf() };
         if !scan_path.exists() { return Ok(()); }
 
@@ -2527,15 +2532,34 @@ impl QuantizedQwen3VLTextModel {
         
         if fragments.is_empty() { return Ok(()); }
         
-        // [CRITICAL] Calculate correct total length from fragments
-        // 마지막 블록의 인덱스 + 256을 기본값으로 하되, 실제 파일 크기 체크는 하위 메서드에서 수행
-        let total_len = fragments.iter().map(|f| f.0).max().unwrap_or(0) + 256;
+        // [FIX] 만약 명시적인 기대 길이(expected_len)가 주어졌다면, 파일 추측 로직을 생략하고 이를 절대 신뢰합니다.
+        let total_len = if expected_len > 0 {
+            expected_len
+        } else {
+            // [ROBUST-LENGTH-DETECTION] 마지막 블록의 실제 길이를 파일 메타데이터에서 추출
+            let (last_off, last_path) = fragments.last().unwrap();
+            let mut last_block_actual_len = 256;
+            
+            let last_file = last_path.join("l0.st");
+            if last_file.exists() {
+                if let Ok(content) = crate::utils::direct_loader::load_kv_block(&last_file) {
+                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                        if let Some(view) = st.names().iter().find(|n| n.contains("k_shape")).and_then(|n| st.tensor(n).ok()) {
+                            let data = view.data();
+                            if data.len() >= 12 {
+                                last_block_actual_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+                            }
+                        }
+                    }
+                }
+            }
+            last_off + last_block_actual_len
+        };
         
         for l in 0..self.layers.len() {
             self.layers[l].load_kv_cache(&scan_path, device, 0, 128, kv_name, &fragments, total_len)?;
         }
         
-        // [FIX] Update global model offset to prevent gibberish output
         self.current_kv_len = total_len;
         println!("[SSD-RESTORE] Global current_kv_len synchronized to: {}", total_len);
         Ok(())

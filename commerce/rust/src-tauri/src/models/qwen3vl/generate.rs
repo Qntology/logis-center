@@ -675,28 +675,31 @@ impl Qwen3VLGenerateModel {
         // [SSD-BRIDGE] Prefill -> Decoding 전이 시점의 하드 리셋
         if let Some(s_id) = &session_id {
             println!("[SSD-BRIDGE] Activating safety bridge. Flushing prefill KV to disk...");
+            // [CRITICAL] 리셋 전 실제 연산된 정확한 길이를 먼저 확보합니다.
+            let prefill_actual_len = self.get_kv_len();
+            
             // 1. 현재 VRAM/RAM에 있는 프리필 KV 데이터를 SSD로 강제 저장
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
             
-            // 2. 모든 IO가 완료될 때까지 확실히 대기 (포인터 안전 확보)
+            // 2. 모든 IO가 완료될 때까지 확실히 대기
             wait_for_global_io().await;
             
-            // 3. 모델 내부의 라이브 KV 캐시 장부를 완전히 비움 (Nuclear Option)
+            // 3. 모델 내부의 라이브 KV 캐시 장부를 완전히 비움
             println!("[SSD-BRIDGE] Clearing live memory pointers...");
             self.clear_kv_cache();
             
-            // 4. SSD에 저장된 데이터를 기반으로 장부를 다시 구축 (Safe Loader)
+            // 4. SSD에 저장된 데이터를 기반으로 장부를 다시 구축
             println!("[SSD-BRIDGE] Rebuilding KV registry from SSD snapshots...");
             let snapshot_path = crate::utils::paths::get_kv_dir(None).join(s_id).join("inference");
-            // [FIX] Borrow checker 위반 해결을 위해 장치를 미리 복제
             let device_clone = self.text_device.clone();
-            let _ = self.load_kv_cache(&snapshot_path, &device_clone, 0, 0, _kv_name.as_deref());
+            // [FIX] prefill_actual_len을 명시적으로 넘겨서 11008과 같은 오차 발생을 원천 차단합니다.
+            let _ = self.load_kv_cache(&snapshot_path, &device_clone, prefill_actual_len, 0, _kv_name.as_deref());
             
             // 5. 비동기 뒷정리 대기
             wait_for_global_io().await;
             println!("[SSD-BRIDGE] Bridge established. Starting clean decoding loop.");
 
-            // [CRITICAL-FIX] 복구된 문맥 길이를 기준으로 디코딩 오프셋을 재설정하여 맥락 소실 방지
+            // [CRITICAL-FIX] 복구된 문맥 길이를 기준으로 디코딩 오프셋을 재설정
             total_tokens_after_prefill = self.get_kv_len();
             println!("[SSD-BRIDGE] Syncing decoding start pos to: {}", total_tokens_after_prefill);
         }
