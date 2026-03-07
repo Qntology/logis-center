@@ -1006,13 +1006,13 @@ impl QuantizedQwen3VLTextAttention {
             
             if let Ok(content) = crate::utils::direct_loader::load_kv_block(&file_path) {
                 if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-        // [RESTORATION] 저장 시와 동일한 프리픽스 형식 사용: b{offset}_l{layer}_
-        let prefix = format!("b{}_l{}_", block_info.offset, self.layer_idx);
-        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                    // [RESTORATION] 저장 시와 동일한 프리픽스 형식 사용: b{offset}_l{layer}_
+                    let prefix = format!("b{}_l{}_", block_info.offset, self.layer_idx);
+                    let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
 
-        if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
-            println!("[DIAG-KV] Layer {} Block {} loading... (Type: {:?})", self.layer_idx, block_info.offset, kd.dtype());
-            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                        println!("[DIAG-KV] Layer {} Block {} data verified and loaded from SSD.", self.layer_idx, block_info.offset);
+                        let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
             
             // [STABILITY-FIX] from_raw_buffer 후 copy()를 통해 메모리 소유권을 완전히 가져오고, 
@@ -1167,8 +1167,8 @@ impl QuantizedQwen3VLTextAttention {
         
         let structured_path = block_dir.join(format!("l{}.st", self.layer_idx));
         let mut map = HashMap::new();
-        // [FIX] 로드 로직과 일치하도록 접두어에 언더바(_) 추가: b{offset}_l{layer}_
-        let prefix = format!("{}_l{}_", b_str, self.layer_idx);
+        // [FIX] 모든 저장/로드 프리픽스를 b{offset}_l{layer}_ 형식으로 완전 통일
+        let prefix = format!("b{}_l{}_", offset, self.layer_idx);
 
         let mut ks = Vec::new();
         let mut vs = Vec::new();
@@ -1635,10 +1635,9 @@ impl QuantizedQwen3VLTextModel {
     pub fn reload_all_layers(&mut self) -> Result<()> {
         let count = self.layers.len();
         println!("[MEMORY-OPT] Prefill complete. Reloading all {} layers for high-speed decoding...", count);
+        let target_device = self.layers[0].device().clone();
         
         // [SAFETY] 혹시 모를 잔여 IO 대기
-        // (주의: wait_for_global_io는 비동기 함수이므로 동기 맥락에서 호출 시 주의가 필요함)
-        // 현재는 생성된 IO가 다 끝날 때까지 아주 짧은 대기 루프로 대체 가능
         let start_wait = std::time::Instant::now();
         while crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.load(std::sync::atomic::Ordering::SeqCst) > 0 {
             if start_wait.elapsed().as_secs() > 5 { break; }
@@ -1651,10 +1650,13 @@ impl QuantizedQwen3VLTextModel {
                 return Err(e);
             }
             // [STABILITY] 윈도우/DirectStorage 안정성을 위해 짧은 대기 및 동기화
-            if i % 4 == 0 {
+            if i % 4 == 0 && target_device.is_cuda() {
+                let _ = target_device.synchronize();
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
+        
+        if target_device.is_cuda() { let _ = target_device.synchronize(); }
         println!("[MEMORY-OPT] All layers reloaded successfully.");
         Ok(())
     }
@@ -2200,30 +2202,25 @@ impl QuantizedQwen3VLTextModel {
         // [STEP 3] GPU 연산 실행 (분할 연산을 통한 레이어간 병렬화 유도)
         let current_seq_len = xs.dim(1)?;
         let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(256).collect();
-        let mid_point = chunk_offsets.len() / 2;
         
-        // 전반부와 후반부를 나누어 처리하여 파이프라이닝 기회 창출
-        let first_half = &chunk_offsets[..mid_point];
-        let second_half = &chunk_offsets[mid_point..];
+        let mut next_xs = if chunk_offsets.len() > 1 && !is_decoding {
+            // [PIPELINING] 전반부와 후반부를 나누어 처리하여 파이프라이닝 기회 창출
+            let mid_point = chunk_offsets.len() / 2;
+            let first_half = &chunk_offsets[..mid_point];
+            let second_half = &chunk_offsets[mid_point..];
 
-        // 1. 전반부 연산
-        let mut next_xs = self.process_chunks_iterative(layer_idx, first_half, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
-        
-        // [EARLY-ACTIVATION] 전반부가 끝나면 다음 레이어 가중치 로딩 상태를 확인하고 우선순위 상향
-        if !is_decoding && layer_idx + 1 < self.layers.len() {
-            // 다음 레이어가 이미 로드되었다면 VRAM 안착 속도를 높이도록 유도
-            if let Some((p_idx, _)) = &self.pending_weight_load {
-                if *p_idx == layer_idx + 1 {
-                    // 여기서 다음 레이어의 준비 신호를 미리 체크할 수 있음
-                }
-            }
-        }
-
-        // 2. 후반부 연산 (이 동안 백그라운드에서는 다음 레이어가 스왑 준비를 마침)
-        let next_xs_second = self.process_chunks_iterative(layer_idx, second_half, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
-        
-        // 결과 병합
-        next_xs = Tensor::cat(&[next_xs, next_xs_second], 1)?;
+            // 1. 전반부 연산
+            let out1 = self.process_chunks_iterative(layer_idx, first_half, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
+            
+            // 2. 후반부 연산
+            let out2 = self.process_chunks_iterative(layer_idx, second_half, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
+            
+            // 결과 병합
+            Tensor::cat(&[out1, out2], 1)?
+        } else {
+            // 디코딩(seq_len=1) 또는 매우 작은 입력은 분할 없이 처리 (No output 에러 해결)
+            self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?
+        };
 
         if let (Some(embed), Some(mask)) = (deepstack_embed, visual_mask) {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
@@ -2352,8 +2349,8 @@ impl QuantizedQwen3VLTextModel {
                 let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
                 if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
 
-                // [CRITICAL-FIX] 카운터를 여기서 증가시켜야 wait_for_global_io가 정상 대기합니다.
-                crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // [NOTE] 카운터 증가는 이제 generate.rs의 SlotTask::Bake 수신부에서 레이어별로 수행됩니다.
+                // 중복 카운팅 방지를 위해 여기서 fetch_add를 호출하지 않습니다.
 
                 if let Err(e) = tx.send(SlotTask::Bake(BakeTask {
                     slot_id: sid,
@@ -2436,8 +2433,8 @@ impl QuantizedQwen3VLTextModel {
                         if b_idx < reg_w.len() { reg_w[b_idx].ssd_path = Some(block_dir.clone()); }
                     }
 
-                    // [SINGLE-INCREMENT] 카운터 증가
-                    GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // [NOTE] 카운터 증가는 이제 generate.rs의 SlotTask::Bake 수신부에서 레이어별로 수행됩니다.
+                    // 중복 카운팅 방지를 위해 여기서 fetch_add를 호출하지 않습니다.
 
                     if let Err(e) = tx.send(SlotTask::Bake(BakeTask {
                         slot_id: sid,
