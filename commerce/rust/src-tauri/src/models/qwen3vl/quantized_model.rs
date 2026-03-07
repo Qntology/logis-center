@@ -1646,33 +1646,36 @@ impl QuantizedQwen3VLTextModel {
         }
 
         for i in 0..count {
+            // 1. 레이어 가중치 재로드 (mmap)
             if let Err(e) = self.reload_layer(i) {
                 println!("[CRITICAL-ERROR] Failed to reload layer {}: {}", i, e);
                 return Err(e);
             }
             
-            // [CONTEXT-RECONSTRUCTION] 사용자 지적 반영: 단순 대입이 아닌 장부를 기반으로 기억 재구축
-            // 전역 Registry에 등록된 모든 블록을 이 레이어의 kv_blocks에 강제로 채워 넣습니다.
+            // 2. [CONTEXT-RECONSTRUCTION] 장부를 기반으로 기억(kv_blocks)을 물리적으로 재구축
+            // 레이어 가중치를 새로 로드한 후, 유실된 블록 핸들을 전역 장부 정보를 참조하여 재생성합니다.
             let mut layer_blocks = Vec::new();
             {
                 let reg = self.registry.entries.read().unwrap();
                 for (b_idx, entry) in reg.iter().enumerate() {
-                    // 데이터가 실제로 존재하는 블록만 유효한 것으로 간주 (V:Count에 반영됨)
-                    if entry.location[i] != KVLocation::Loading {
-                        if let Some(block) = self.layers[i].self_attn.kv_blocks.get(b_idx) {
-                            layer_blocks.push(block.clone());
-                        } else {
-                            // 레이어에 블록이 부족하면 Registry에서 새로운 참조를 만들어 연결
-                            // (이 부분이 V:1을 V:43으로 만드는 핵심 연결 고리입니다)
-                        }
+                    // 장부에 기록된 각 블록의 실제 길이와 시작 오프셋을 기반으로 핸들 생성
+                    let b_len = entry.token_len;
+                    let b_start = entry.token_start;
+                    
+                    // 새 레이어 객체에 Registry와 연결된 블록 핸들을 주입 (V:Count 복구)
+                    let restored_block = KVBlock::new(KVLocation::SSD, b_idx, b_len, b_start);
+                    
+                    // SSD 경로 정보 동기화
+                    if let Some(path) = &entry.ssd_path {
+                        restored_block.inner.write().unwrap().ssd_path = Some(path.clone());
                     }
+                    
+                    layer_blocks.push(restored_block);
                 }
             }
             
-            // 레이어의 기억 장치를 최신 상태로 강제 업데이트
-            if !layer_blocks.is_empty() {
-                self.layers[i].self_attn.kv_blocks = layer_blocks;
-            }
+            // 레이어의 기억 장치를 최신 장부 상태로 강제 동기화
+            self.layers[i].self_attn.kv_blocks = layer_blocks;
 
             if i % 4 == 0 && target_device.is_cuda() {
                 let _ = target_device.synchronize();
@@ -1682,7 +1685,7 @@ impl QuantizedQwen3VLTextModel {
         
         let restored_v = self.layers[0].self_attn.kv_blocks.len();
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
-        println!("[MEMORY-OPT] All layers reloaded. Context (V:{}) verified and connected.", restored_v);
+        println!("[MEMORY-OPT] All layers reloaded. Context (V:{}) physically reconstructed from Registry.", restored_v);
         Ok(())
     }
 
