@@ -701,36 +701,19 @@ impl Qwen3VLGenerateModel {
         wait_for_global_io().await;
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         
-        // [SSD-BRIDGE] Prefill -> Decoding 전이 시점의 하드 리셋
+        // [SSD-BRIDGE] Prefill -> Decoding 전이 (VRAM 보존 모드)
         if let Some(s_id) = &session_id {
-            println!("[SSD-BRIDGE] Activating safety bridge. Flushing prefill KV to disk...");
-            // [CRITICAL] 리셋 전 실제 연산된 정확한 길이를 먼저 확보합니다.
-            let prefill_actual_len = self.get_kv_len();
+            println!("[SSD-BRIDGE] Keeping VRAM active for high-speed decoding transition.");
             
-            // 1. 현재 VRAM/RAM에 있는 프리필 KV 데이터를 SSD로 강제 저장
-            let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
+            // [OPTIMIZATION] force_flush_all_active_blocks 호출을 제거합니다.
+            // 이미 process_single_layer에서 레이어별로 실시간 백업이 이루어지고 있습니다.
+            // 중복 호출은 3초 이상의 지연과 VRAM 삭제(V:0)를 유발합니다.
             
-            // 2. 모든 IO가 완료될 때까지 확실히 대기
             wait_for_global_io().await;
-            
-            // 3. 모델 내부의 라이브 KV 캐시 장부를 완전히 비움
-            println!("[SSD-BRIDGE] Clearing live memory pointers...");
-            self.clear_kv_cache();
-            
-            // 4. SSD에 저장된 데이터를 기반으로 장부를 다시 구축
-            println!("[SSD-BRIDGE] Rebuilding KV registry from SSD snapshots...");
-            let snapshot_path = crate::utils::paths::get_kv_dir(None).join(s_id).join("inference");
-            let device_clone = self.text_device.clone();
-            // [FIX] prefill_actual_len을 명시적으로 넘겨서 11008과 같은 오차 발생을 원천 차단합니다.
-            let _ = self.load_kv_cache(&snapshot_path, &device_clone, prefill_actual_len, 0, _kv_name.as_deref());
-            
-            // 5. 비동기 뒷정리 대기
-            wait_for_global_io().await;
-            println!("[SSD-BRIDGE] Bridge established. Starting clean decoding loop.");
+            println!("[SSD-BRIDGE] VRAM context preserved. Transitioning to decoding loop.");
 
-            // [CRITICAL-FIX] 복구된 문맥 길이를 기준으로 디코딩 오프셋을 재설정
             total_tokens_after_prefill = self.get_kv_len();
-            println!("[SSD-BRIDGE] Syncing decoding start pos to: {}", total_tokens_after_prefill);
+            println!("[SSD-BRIDGE] Decoding offset synchronized: {}", total_tokens_after_prefill);
         }
 
             let mut gen_ids = vec![];

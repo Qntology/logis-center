@@ -439,7 +439,7 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    /// [MEMORY-OPT] 가중치를 메모리에서 완전히 해제합니다.
+    /// [MEMORY-OPT] 가중치를 메모리에서 완전히 해제합니다. (KV 캐시는 보존)
     pub fn clear(&mut self) {
         self.q_proj.clear();
         self.k_proj.clear();
@@ -448,10 +448,8 @@ impl QuantizedQwen3VLTextAttention {
         self.q_norm.clear();
         self.k_norm.clear();
         
-        // VRAM 병합 캐시도 삭제
-        self.vram_merged_k = None;
-        self.vram_merged_v = None;
-        self.merged_vram_block_count = 0;
+        // [SAFETY] vram_merged_k/v는 연산 엔진의 '기억'이므로 clear 시점에 지우지 않습니다.
+        // 이 데이터는 clear_kv_cache()나 drop_kv_storage()가 호출될 때만 명시적으로 삭제됩니다.
     }
 
     pub fn new<R: std::io::Seek + std::io::Read>(
@@ -1638,6 +1636,12 @@ impl QuantizedQwen3VLTextModel {
         println!("[MEMORY-OPT] Prefill complete. Reloading all {} layers for high-speed decoding...", count);
         let target_device = self.layers[0].device().clone();
 
+        // [CONTEXT-BACKUP] 재로드 도중 유실될 수 있는 실제 블록 핸들들을 미리 백업합니다.
+        let mut context_snapshots = Vec::new();
+        for i in 0..count {
+            context_snapshots.push(self.layers[i].self_attn.kv_blocks.clone());
+        }
+
         // [SAFETY] 잔여 IO 대기
         let start_wait = std::time::Instant::now();
         while crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.load(std::sync::atomic::Ordering::SeqCst) > 0 {
@@ -1646,36 +1650,28 @@ impl QuantizedQwen3VLTextModel {
         }
 
         for i in 0..count {
-            // 1. 레이어 가중치 재로드 (mmap)
             if let Err(e) = self.reload_layer(i) {
                 println!("[CRITICAL-ERROR] Failed to reload layer {}: {}", i, e);
                 return Err(e);
             }
             
-            // 2. [CONTEXT-RECONSTRUCTION] 장부를 기반으로 기억(kv_blocks)을 물리적으로 재구축
-            // 레이어 가중치를 새로 로드한 후, 유실된 블록 핸들을 전역 장부 정보를 참조하여 재생성합니다.
-            let mut layer_blocks = Vec::new();
-            {
+            // [CONTEXT-SYNC] 가중치 교체 후, 백업해 두었던 블록 핸들들을 다시 주입하고 장부와 상태를 동기화합니다.
+            if i < context_snapshots.len() && !context_snapshots[i].is_empty() {
+                self.layers[i].self_attn.kv_blocks = context_snapshots[i].clone();
+                
+                // [STATE-RECONSTRUCTION] 장부(Registry)를 뒤져서 각 블록의 최신 위치 정보를 레이어에 강제 이식합니다.
                 let reg = self.registry.entries.read().unwrap();
                 for (b_idx, entry) in reg.iter().enumerate() {
-                    // 장부에 기록된 각 블록의 실제 길이와 시작 오프셋을 기반으로 핸들 생성
-                    let b_len = entry.token_len;
-                    let b_start = entry.token_start;
-                    
-                    // 새 레이어 객체에 Registry와 연결된 블록 핸들을 주입 (V:Count 복구)
-                    let restored_block = KVBlock::new(KVLocation::SSD, b_idx, b_len, b_start);
-                    
-                    // SSD 경로 정보 동기화
-                    if let Some(path) = &entry.ssd_path {
-                        restored_block.inner.write().unwrap().ssd_path = Some(path.clone());
+                    if let Some(block) = self.layers[i].self_attn.kv_blocks.get(b_idx) {
+                        let mut inner = block.inner.write().unwrap();
+                        // 장부에 기록된 위치(VRAM 등)를 실제 블록 상태에 동기화
+                        inner.location = entry.location[i];
+                        if let Some(path) = &entry.ssd_path {
+                            inner.ssd_path = Some(path.clone());
+                        }
                     }
-                    
-                    layer_blocks.push(restored_block);
                 }
             }
-            
-            // 레이어의 기억 장치를 최신 장부 상태로 강제 동기화
-            self.layers[i].self_attn.kv_blocks = layer_blocks;
 
             if i % 4 == 0 && target_device.is_cuda() {
                 let _ = target_device.synchronize();
@@ -1683,9 +1679,15 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         
-        let restored_v = self.layers[0].self_attn.kv_blocks.len();
+        // 최종 복구 상태 확인 (VRAM에 안착된 블록 수 카운트)
+        let restored_v = self.layers[0].self_attn.kv_blocks.iter()
+            .filter(|b| {
+                let inner = b.inner.read().unwrap();
+                inner.location == KVLocation::VRAM || inner.k_cache.is_some()
+            }).count();
+            
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
-        println!("[MEMORY-OPT] All layers reloaded. Context (V:{}) physically reconstructed from Registry.", restored_v);
+        println!("[MEMORY-OPT] All layers reloaded. Context (V:{}) state-fully restored.", restored_v);
         Ok(())
     }
 
@@ -2174,9 +2176,20 @@ impl QuantizedQwen3VLTextModel {
                         let old_kv = self.layers[layer_idx].self_attn.kv_blocks.clone();
                         let old_active_kv = self.layers[layer_idx].self_attn.active_kv_name.clone();
                         self.layers[layer_idx] = loaded_layer;
+                        
+                        // [STATE-SYNC] 재로드된 레이어에 기존 블록을 이식하고, 장부의 최신 위치(VRAM 등)를 강제 각인
                         self.layers[layer_idx].self_attn.kv_blocks = old_kv;
+                        {
+                            let reg = self.registry.entries.read().unwrap();
+                            for (b_idx, block) in self.layers[layer_idx].self_attn.kv_blocks.iter().enumerate() {
+                                if b_idx < reg.len() {
+                                    block.inner.write().unwrap().location = reg[b_idx].location[layer_idx];
+                                }
+                            }
+                        }
+                        
                         self.layers[layer_idx].self_attn.active_kv_name = old_active_kv;
-                        if layer_idx % 7 == 0 { println!("[RELAY] Layer {} weight swap completed.", layer_idx); }
+                        if layer_idx % 7 == 0 { println!("[RELAY] Layer {} weight swap completed. Context Sync Done.", layer_idx); }
                     }
                     Ok(Err(e)) => println!("[RELAY-ERROR] Async load failed for layer {}: {}", layer_idx, e),
                     Err(_) => {} // 채널 취소됨
@@ -2400,29 +2413,26 @@ impl QuantizedQwen3VLTextModel {
                     if b_idx >= kv_blocks.len() { continue; }
                     
                     let mut inner = kv_blocks[b_idx].inner.write().unwrap();
-                    // Prefill 시에는 location과 관계없이 데이터가 있으면 SSD로 보냄
-                    if let (Some(k), Some(v)) = (inner.k_cache.take(), inner.v_cache.take()) {
-                        // [VRAM-RELEASE-IMMEDIATE] 메인 스레드에서 즉시 CPU로 복사 후 VRAM 해제
+                    // [CONTEXT-SAFE-EVACUATION] take() 대신 clone()을 사용하여 백업 중에도 VRAM 기억을 유지합니다.
+                    if let (Some(k), Some(v)) = (inner.k_cache.as_ref(), inner.v_cache.as_ref()) {
+                        // [VRAM-COPY] 메인 스레드에서 즉시 CPU로 복사 (워커 전송용)
                         let k_cpu = k.to_device(&Device::Cpu)?;
                         let v_cpu = v.to_device(&Device::Cpu)?;
                         
-                        // [FIX] 실제 텐서에서 Shape 정보를 동적으로 추출
                         let k_shape_u32: Vec<u32> = k_cpu.shape().dims().iter().map(|&x| x as u32).collect();
 
                         let dump = LayerKVDump {
                             layer_idx,
                             k_data: k_cpu.to_dtype(DType::BF16)?,
                             v_data: v_cpu.to_dtype(DType::BF16)?,
-                            // [FIX] 하드코딩된 Shape 대신 실제 텐서의 Shape를 동적으로 저장
                             k_shape: Tensor::from_vec(k_shape_u32.clone(), (k_shape_u32.len(),), &Device::Cpu)?,
                             raw_k: None,
                             raw_v: None,
                         };
                         dumps_to_send.push(dump);
-                        inner.location = KVLocation::SSD;
                         
-                        let mut reg = self.registry.entries.write().unwrap();
-                        if b_idx < reg.len() { reg[b_idx].location[layer_idx] = KVLocation::SSD; }
+                        // [STABILITY] SSD 백업 완료 전까지는 VRAM 상태를 유지합니다.
+                        // 나중에 시스템이 진짜 VRAM 부족을 느낄 때만 trigger_realtime_incremental_bake가 지우게 됩니다.
                     }
                 }
 
