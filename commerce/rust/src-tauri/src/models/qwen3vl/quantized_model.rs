@@ -72,7 +72,7 @@ impl Module for RmsNorm {
 }
 
 // Wrapper for QMatMul to act like Linear
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct QLinear {
     inner: QMatMul,
     bias: Option<Tensor>,
@@ -224,7 +224,7 @@ impl MemorySlot {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct KVBlock {
     pub inner: Arc<std::sync::RwLock<KVBlockInner>>,
 }
@@ -234,7 +234,7 @@ fn default_bitkv_cache() -> Arc<std::sync::RwLock<Vec<Option<BitKVMetadata>>>> {
 }
 
 // [NEW] 중앙 집중식 KV 목차의 각 항목 (별도 고정 슬롯 관리용)
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct RegistryEntry {
     pub location: Vec<KVLocation>, // [Layer Index] -> Location
     pub slot_ids: Vec<Option<usize>>, // [Layer Index] -> Slot ID
@@ -269,11 +269,12 @@ impl RegistryEntry {
 // [NEW] 모델 전체가 공유하는 2차원 KV 목차
 #[derive(Clone, Debug)]
 pub struct KVRegistry {
+    pub device: Device,
     pub entries: Arc<std::sync::RwLock<Vec<RegistryEntry>>>,
 }
 
 impl KVRegistry {
-    pub fn new() -> Self {
+    pub fn new(device: Device) -> Self {
         // [FIX] 장부를 128개 미리 할당하되, 실제 데이터 길이는 0으로 초기화합니다.
         // 이를 통해 RoPE 오프셋이 32512로 점프하는 대참사를 막습니다.
         let mut entries = Vec::with_capacity(128);
@@ -282,6 +283,7 @@ impl KVRegistry {
             entries.push(entry);
         }
         Self {
+            device,
             entries: Arc::new(std::sync::RwLock::new(entries)),
         }
     }
@@ -339,6 +341,7 @@ impl KVRegistry {
     }
 }
 
+#[derive(Debug)]
 pub struct KVBlockInner {
     pub location: KVLocation,
     pub index: usize,
@@ -367,14 +370,14 @@ impl KVBlock {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BitKVMetadata {
     pub k_data: Tensor,
     pub v_data: Tensor,
     pub original_shape: Vec<usize>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct QuantizedQwen3VLTextAttention {
     pub q_proj: QLinear,
     pub k_proj: QLinear,
@@ -1293,7 +1296,7 @@ impl QuantizedQwen3VLTextAttention {
                     
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct QuantizedQwen3VLTextDecoderLayer {
     pub self_attn: QuantizedQwen3VLTextAttention,
     pub mlp_gate: Option<QLinear>,
@@ -1567,7 +1570,6 @@ impl QuantizedQwen3VLTextDecoderLayer {
     }
 }
 
-#[derive(Clone)]
 pub struct QuantizedQwen3VLTextModel {
     pub embed_tokens: Embedding, 
     pub layers: Vec<QuantizedQwen3VLTextDecoderLayer>,
@@ -1706,9 +1708,8 @@ impl QuantizedQwen3VLTextModel {
         patched_config.hidden_size = actual_hidden_size;
         let config = &patched_config;
 
-        let current_device = device.clone(); 
-        let registry = KVRegistry::new();
-        let num_layers_to_load = if baking_only { 1 } else { config.num_hidden_layers };
+        let current_device = device.clone();
+        let registry = KVRegistry::new(current_device.clone());        let num_layers_to_load = if baking_only { 1 } else { config.num_hidden_layers };
 
         // [ZERO-RAM-STARTUP] 최초 로딩 시 레이어 가중치를 전혀 읽지 않고 껍데기만 생성합니다.
         let mut layers = Vec::with_capacity(num_layers_to_load);
@@ -2681,7 +2682,6 @@ impl QuantizedQwen3VLTextModel {
     }
 }
 
-#[derive(Clone)]
 pub struct QuantizedQwen3VLModel {
     pub config: Qwen3VLConfig,
     pub visual: Qwen3VLVisionModel, 
@@ -2982,7 +2982,6 @@ impl QuantizedQwen3VLModel {
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, total_len) }
 }
 
-#[derive(Clone)]
 pub struct QuantizedQwen3TextModel {
     pub language_model: QuantizedQwen3VLTextModel,
     pub lm_head: Option<QLinear>,

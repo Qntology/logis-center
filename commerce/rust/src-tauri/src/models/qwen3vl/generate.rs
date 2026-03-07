@@ -148,7 +148,7 @@ pub static SLOT_MANAGER_DATA: Lazy<(SlotManager, Mutex<Option<mpsc::Receiver<Slo
 });
 pub static SLOT_MANAGER: Lazy<&SlotManager> = Lazy::new(|| &SLOT_MANAGER_DATA.0);
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LayerKVDump {
     pub layer_idx: usize,
     pub k_data: Tensor,
@@ -158,12 +158,14 @@ pub struct LayerKVDump {
     pub raw_v: Option<Tensor>,
 }
 
+#[derive(Debug)]
 pub struct BakeTask {
     pub slot_id: usize, pub task_dir: PathBuf, pub kv_name: Option<String>,
     pub offset: usize, pub layers: Vec<LayerKVDump>, pub is_relay_baking: bool,
     pub block_idx: Option<usize>, pub registry: KVRegistry,
 }
 
+#[derive(Debug)]
 pub struct SaveTask {
     pub slot_id: usize, pub path: PathBuf, pub tensors: std::collections::HashMap<String, Tensor>,
     pub is_last: bool, pub block_idx: Option<usize>, pub registry: Option<KVRegistry>,
@@ -256,6 +258,7 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
     tx
 });
 
+#[derive(Debug)]
 pub struct LoadTask { pub slot_id: usize, pub path: PathBuf, pub layer_idx: usize, pub kv_name: Option<String>, pub shared_block: KVBlock, pub registry: KVRegistry }
 
 pub static BAKE_TX: OnceCell<mpsc::Sender<SlotTask>> = OnceCell::const_new();
@@ -513,7 +516,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 struct ReadSlotGuard { sid: usize, active: bool }
 impl Drop for ReadSlotGuard { fn drop(&mut self) { if self.active { let sid = self.sid; tauri::async_runtime::spawn(async move { SLOT_MANAGER.release_slot(sid).await; }); } } }
 
-#[derive(Clone)]
 pub enum ModelVariant { Standard(Qwen3VLModel), QuantizedVL(QuantizedQwen3VLModel), QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel) }
 
 impl ModelVariant {
