@@ -203,10 +203,11 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
         while let Some(task) = rx.recv().await {
             if let SlotTask::IndexUpdate { kv_name, layer_idx, offset, len, file_name } = task {
                 let index_path = kv_dir.join(&kv_name).join(format!("layer{}.json", layer_idx));
+                
+                // [FIX] 기존 인덱스 파일을 더 확실하게 읽어옴 (Overwrite 방지)
                 let mut index = if index_path.exists() {
-                    if let Ok(data) = load_kv_block(&index_path) {
-                        String::from_utf8(data).ok()
-                            .and_then(|s| serde_json::from_str::<LayerIndex>(&s).ok())
+                    if let Ok(data) = std::fs::read(&index_path) {
+                        serde_json::from_slice::<LayerIndex>(&data)
                             .unwrap_or(LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] })
                     } else {
                         LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] }
@@ -216,12 +217,18 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
                     LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] }
                 };
 
+                // [FIX] 중복 체크 및 정렬된 삽입
                 if !index.blocks.iter().any(|b| b.offset == offset) {
                     index.blocks.push(LayerBlockInfo { offset, len, file: file_name });
                     index.blocks.sort_by_key(|b| b.offset);
-                    index.total_tokens = index.blocks.iter().map(|b| b.len).sum();
+                    
+                    // [CRITICAL] 전체 토큰 길이는 마지막 블록의 오프셋 + 길이임
+                    if let Some(last) = index.blocks.last() {
+                        index.total_tokens = last.offset + last.len;
+                    }
+                    
                     if let Ok(json) = serde_json::to_string_pretty(&index) {
-                        let _ = save_kv_block(&index_path, json.as_bytes());
+                        let _ = std::fs::write(&index_path, json.as_bytes());
                     }
                 }
             }
@@ -633,6 +640,9 @@ impl Qwen3VLGenerateModel {
             // 5. 비동기 뒷정리 대기
             wait_for_global_io().await;
             println!("[SSD-BRIDGE] Bridge established. Starting clean decoding loop.");
+            
+            // [CRITICAL-FIX] 복구된 문맥 길이를 기준으로 디코딩 오프셋을 재설정하여 맥락 소실 방지
+            total_tokens_after_prefill = self.get_kv_len();
         }
 
         let mut gen_ids = vec![];

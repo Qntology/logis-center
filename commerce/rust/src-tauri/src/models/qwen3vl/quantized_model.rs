@@ -1249,28 +1249,30 @@ impl QuantizedQwen3VLTextAttention {
         let mut total_restored_len = 0;
 
         for (i, (offset, frag_path)) in fragments.iter().enumerate() {
-            // [FIX] Calculate block length based on current total context
             let b_len = if *offset < current_kv_len {
                 (current_kv_len - *offset).min(256)
             } else { 256 };
             total_restored_len += b_len;
             
-            let new_block = KVBlock::new(KVLocation::SSD, i, b_len, *offset);
+            let idx = *offset / 256; // [FIX] 오프셋 기반의 정확한 장부 인덱스 계산
+            let new_block = KVBlock::new(KVLocation::SSD, idx, b_len, *offset); // [FIX] i 대신 idx 사용
             {
                 let mut inner = new_block.inner.write().unwrap();
                 inner.len = b_len;
                 inner.location = KVLocation::SSD;
+                // [FIX] 개별 블록 객체에도 실제 SSD 경로를 정확히 기록
+                inner.ssd_path = Some(frag_path.clone());
             }
             self.kv_blocks.push(new_block);
 
             let mut reg = self.registry.entries.write().unwrap();
-            if i >= reg.len() {
+            if idx >= reg.len() {
                 reg.push(crate::models::qwen3vl::quantized_model::RegistryEntry {
                     location: vec![KVLocation::SSD; 28],
                     slot_ids: vec![None; 28],
                     token_start: *offset,
                     token_len: b_len,
-                    ssd_path: Some(frag_path.parent().unwrap().to_path_buf()),
+                    ssd_path: Some(frag_path.clone()),
                     hidden_states_path: vec![None; 28],
                     is_dirty: vec![false; 28], 
                     last_accessed: std::time::Instant::now(),
@@ -1278,9 +1280,11 @@ impl QuantizedQwen3VLTextAttention {
                 });
             }
             
-            if i < reg.len() {
-                reg[i].location[self.layer_idx] = KVLocation::SSD;
-                reg[i].ssd_path = Some(frag_path.parent().unwrap().to_path_buf());
+            if idx < reg.len() {
+                reg[idx].location[self.layer_idx] = KVLocation::SSD;
+                reg[idx].ssd_path = Some(frag_path.clone());
+                reg[idx].token_start = *offset; // [FIX] 장부 시작점 동기화
+                reg[idx].token_len = b_len;
             }
         }
 
@@ -2316,11 +2320,15 @@ impl QuantizedQwen3VLTextModel {
                         let k_cpu = k.to_device(&Device::Cpu)?;
                         let v_cpu = v.to_device(&Device::Cpu)?;
                         
+                        // [FIX] 실제 텐서에서 Shape 정보를 동적으로 추출
+                        let k_shape_u32: Vec<u32> = k_cpu.shape().dims().iter().map(|&x| x as u32).collect();
+
                         let dump = LayerKVDump {
                             layer_idx,
                             k_data: k_cpu.to_dtype(DType::BF16)?,
                             v_data: v_cpu.to_dtype(DType::BF16)?,
-                            k_shape: Tensor::from_vec(vec![1u32, 1, 256, 1024], (4,), &Device::Cpu)?, // [FIX] 0.6B Shape
+                            // [FIX] 하드코딩된 Shape 대신 실제 텐서의 Shape를 동적으로 저장
+                            k_shape: Tensor::from_vec(k_shape_u32.clone(), (k_shape_u32.len(),), &Device::Cpu)?,
                             raw_k: None,
                             raw_v: None,
                         };
@@ -2341,6 +2349,7 @@ impl QuantizedQwen3VLTextModel {
                     
                     {
                         let mut reg_w = self.registry.entries.write().unwrap();
+                        // [FIX] 중앙 장부에 블록별 실제 SSD 경로를 정확히 기록
                         if b_idx < reg_w.len() { reg_w[b_idx].ssd_path = Some(block_dir.clone()); }
                     }
 
