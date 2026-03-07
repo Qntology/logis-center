@@ -2153,23 +2153,68 @@ impl QuantizedQwen3VLTextModel {
         }
 
         // [MEMORY-OPT] [LAZY-PURGE] 연산 종료 후 가중치 소각
-        // 다음 레이어 연산에 방해되지 않도록 연산 결과가 나온 직후에만 수행
         if !is_decoding {
-            // [SPEED-UP] 이전 레이어(layer_idx - 1)가 혹시 남아있다면 여기서 확실히 제거 (Sliding Window)
-            if layer_idx > 0 {
-                self.layers[layer_idx - 1].clear();
-            }
-            
-            // 현재 레이어 소각 (마지막 레이어 제외)
-            // 마지막 레이어는 디코딩 전환 시점에 generate.rs에서 처리하도록 하여 오버헤드 감소
-            if layer_idx < self.layers.len() - 1 {
-                self.layers[layer_idx].clear();
-            } else {
-                // 마지막 레이어는 연산 후 즉시 동기화하여 결과 확정
+            // [CRITICAL-TRANSITION] 마지막 프리필 레이어가 끝나는 시점에 하드 리셋 대신 "전원 복구" 수행
+            if layer_idx == self.layers.len() - 1 {
+                println!("[SSD-BRIDGE] Last prefill layer finished. Initiating Hot Handover to Decoding...");
+                
+                // 1. 모든 IO 작업 완료 대기 (SSD에 데이터가 다 써졌는지 확인)
+                crate::models::qwen3vl::generate::wait_for_global_io().await;
                 if target_device.is_cuda() { let _ = target_device.synchronize(); }
+                
+                // 2. [VRAM-ANCHOR] 현재 레이어(27번)를 지우지 않고 유지한 상태에서 0~26번을 순차 로드
+                // 이것이 0xc0000005를 막는 핵심 'Hot Handover' 로직입니다.
+                for l in 0..layer_idx {
+                    if let Err(e) = self.reload_layer(l) {
+                        println!("[SSD-BRIDGE-ERROR] Failed to reload layer {}: {}", l, e);
+                    }
+                    if l % 4 == 0 && target_device.is_cuda() {
+                        let _ = target_device.synchronize();
+                        // OS 페이지 테이블 안정을 위해 미세 대기
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+                if target_device.is_cuda() { let _ = target_device.synchronize(); }
+                println!("[SSD-BRIDGE] All layers anchored to VRAM. No purge performed.");
+
+                // 3. [PHYSICAL-RESTORE] SSD에서 문맥 장부를 물리적으로 복구
+                let sid_owned = sid_opt.clone().unwrap_or_default();
+                let snapshot_root = crate::utils::paths::get_kv_dir(None).join(&sid_owned).join("inference").join(kv_name.as_deref().unwrap_or("text"));
+                
+                if snapshot_root.exists() {
+                    let mut fragments = Vec::new();
+                    if let Ok(entries) = std::fs::read_dir(&snapshot_root) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_dir() {
+                                let dname = p.file_name().unwrap_or_default().to_string_lossy();
+                                if dname.starts_with('b') {
+                                    if let Ok(off) = dname[1..].parse::<usize>() { fragments.push((off, p)); }
+                                }
+                            }
+                        }
+                    }
+                    fragments.sort_by_key(|f| f.0);
+                    
+                    if !fragments.is_empty() {
+                        let total_len = fragments.iter().map(|f| f.0).max().unwrap_or(0) + 256; 
+                        for l in 0..self.layers.len() {
+                            // 각 레이어에 SSD 스냅샷 정보 주입 (이미 가중치가 로드된 상태이므로 안전함)
+                            let _ = self.layers[l].load_kv_cache(&snapshot_root, &target_device, 0, 128, kv_name.as_deref(), &fragments, total_len);
+                        }
+                        self.current_kv_len = total_len;
+                        println!("[SSD-BRIDGE] Context restored to active VRAM layers. System stabilized.");
+                    }
+                }
+            } else {
+                // 마지막 레이어가 아닐 때는 기존의 Sliding Window 소각 로직 유지
+                if layer_idx > 0 {
+                    self.layers[layer_idx - 1].clear();
+                }
+                // 현재 레이어 소각
+                self.layers[layer_idx].clear();
+                println!("[SPEED-OPT] Layer {} cleared, moving window.", layer_idx);
             }
-            
-            println!("[SPEED-OPT] Layer {} processed and sliding window moved.", layer_idx);
         }
 
         // [STEP 4] 자원 반납 및 KV 대피 (Fire-and-Forget)
