@@ -2226,8 +2226,13 @@ impl QuantizedQwen3VLTextModel {
 
         if let Some(sid) = sid_opt {
             let is_prefill = !is_decoding;
-            let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count, false).await;
-            // [OPTIMIZATION] sync_with_sentinels는 프리필 도중 매 레이어마다 할 필요가 없으므로 제거하여 I/O 병목 해소
+            // [CRITICAL] 디코딩 중에는 이미 VRAM에 상주한 데이터를 SSD로 대피시키지 않습니다. (맥락 유지)
+            if is_prefill {
+                let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count, false).await;
+                // [RESOURCE-MANAGEMENT] 사용자 요청에 따라 레이어 하나가 끝날 때마다 즉시 슬롯 자원을 회수합니다.
+                // 이를 통해 511개 센티널 적체 현상을 해결하고 실시간 슬롯 가용성을 확보합니다.
+                SLOT_MANAGER.sync_with_sentinels(&sid).await;
+            }
         }
 
         // [DIAG-SPEED] 각 레이어별 연산 소요 시간 기록
@@ -2237,7 +2242,6 @@ impl QuantizedQwen3VLTextModel {
 
         Ok(next_xs)
         }
-
     /// [DEC-SPEED-UP] 디코딩 속도를 위해 모든 레이어를 GPU에 상주 시킴
     pub async fn pin_all_layers_to_gpu(&mut self) -> Result<()> {
         println!("[DEC-SPEED-UP] Pinning disabled for long-context stability. Using On-Demand serial loading.");
@@ -2487,8 +2491,11 @@ impl QuantizedQwen3VLTextModel {
 
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
 
-        // [FLUSH-COMMIT] 베이킹 모드일 경우 이미 레이어별 루프에서 즉시 SSD 저장이 실행되었습니다.
-        // 따라서 여기서 중복으로 전체 flush를 수행할 필요가 없으므로 제거하여 병목을 방지합니다.
+        // [RESOURCE-MANAGEMENT] 28개 레이어 전체 연산이 끝난 후 딱 한 번 슬롯 자원을 회수합니다.
+        // 이를 통해 511개나 쌓인 센티널을 정상적으로 비우고 시스템 중단을 방지합니다.
+        if let Some(sid) = &session_id {
+            SLOT_MANAGER.sync_with_sentinels(sid).await;
+        }
 
         self.current_kv_len = seqlen_offset + seq_len;
         let norm_dev = self.norm.weight().device();
