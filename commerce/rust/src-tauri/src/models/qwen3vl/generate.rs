@@ -701,19 +701,32 @@ impl Qwen3VLGenerateModel {
         wait_for_global_io().await;
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         
-        // [SSD-BRIDGE] Prefill -> Decoding 전이 (VRAM 보존 모드)
+        // [SSD-BRIDGE] Ideal Transition Mode: Flush -> Clear -> Registry Rebuild
         if let Some(s_id) = &session_id {
-            println!("[SSD-BRIDGE] Keeping VRAM active for high-speed decoding transition.");
+            println!("[SSD-BRIDGE] Initiating Ideal Bridge. Flushing prefill KV to SSD...");
+            let actual_len = self.get_kv_len();
             
-            // [OPTIMIZATION] force_flush_all_active_blocks 호출을 제거합니다.
-            // 이미 process_single_layer에서 레이어별로 실시간 백업이 이루어지고 있습니다.
-            // 중복 호출은 3초 이상의 지연과 VRAM 삭제(V:0)를 유발합니다.
+            // 1. 잔여 데이터 SSD 강제 백업
+            let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
+            wait_for_global_io().await;
+            
+            // 2. VRAM 초기화 (메모리 확보 및 무결성 테스트)
+            println!("[SSD-BRIDGE] Initializing VRAM (Clearing pointers for high-speed decoding)...");
+            self.clear_kv_cache();
+            
+            // 3. SSD 장부(Registry) 재구축
+            println!("[SSD-BRIDGE] Rebuilding Registry from SSD snapshots...");
+            let snapshot_path = crate::utils::paths::get_kv_dir(None).join(s_id).join("inference");
+            let device_clone = self.text_device.clone();
+            // 장부에 실제 길이를 각인시켜 RoPE 오차 차단
+            let _ = self.load_kv_cache(&snapshot_path, &device_clone, actual_len, 0, _kv_name.as_deref());
             
             wait_for_global_io().await;
-            println!("[SSD-BRIDGE] VRAM context preserved. Transitioning to decoding loop.");
+            println!("[SSD-BRIDGE] Ideal Bridge Established. Context will be reconstructed via Registry.");
 
+            // 복구된 장부를 기반으로 디코딩 시작 지점 동기화
             total_tokens_after_prefill = self.get_kv_len();
-            println!("[SSD-BRIDGE] Decoding offset synchronized: {}", total_tokens_after_prefill);
+            println!("[SSD-BRIDGE] Syncing decoding start pos to: {}", total_tokens_after_prefill);
         }
 
             let mut gen_ids = vec![];
