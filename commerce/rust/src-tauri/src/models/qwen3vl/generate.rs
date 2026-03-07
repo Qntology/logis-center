@@ -197,11 +197,16 @@ pub enum SlotTask {
         file_name: String,
     },
     WeightLoad(WeightLoadTask),
+    // [NEW] 가중치 비동기 소각을 위한 태스크
+    Evict(crate::models::qwen3vl::quantized_model::QuantizedQwen3VLTextDecoderLayer),
 }
 
-// [NEW] 가중치 로딩 전담 워커 채널
+// [NEW] 가중치 로딩 및 소각 전담 워커 채널
 pub static WEIGHT_TX: OnceCell<mpsc::Sender<SlotTask>> = OnceCell::const_new();
+pub static EVICT_TX: OnceCell<mpsc::Sender<SlotTask>> = OnceCell::const_new();
+
 pub async fn get_weight_worker() -> Result<mpsc::Sender<SlotTask>> { WEIGHT_TX.get().cloned().ok_or(anyhow!("Weight worker init error")) }
+pub async fn get_evict_worker() -> Result<mpsc::Sender<SlotTask>> { EVICT_TX.get().cloned().ok_or(anyhow!("Evict worker init error")) }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct LayerIndex {
@@ -295,7 +300,7 @@ async fn spawn_weight_loader_worker(mut rx: mpsc::Receiver<SlotTask>) {
             let (tx, layer_idx) = (t.response_tx, t.layer_idx);
             let (config, ct, mmap, device, dtype, base_name, registry, baking_only) = (t.config, t.ct, t.mmap, t.device, t.dtype, t.base_name, t.registry, t.baking_only);
 
-            // Use spawn_blocking for CPU-intensive weight creation and GPU transfer
+            // [OPTIMIZATION] .await를 제거하여 워커가 즉시 다음 메시지를 받을 수 있도록 함 (True Async)
             let _ = tokio::task::spawn_blocking(move || {
                 let gguf_blk = format!("blk.{}", layer_idx);
                 let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { 
@@ -308,7 +313,16 @@ async fn spawn_weight_loader_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     &config, &ct, &mmap, &prefix, &device, dtype, layer_idx, baking_only, registry
                 );
                 let _ = tx.send(res);
-            }).await;
+            });
+        }
+    }
+}
+async fn spawn_evict_worker(mut rx: mpsc::Receiver<SlotTask>) {
+    while let Some(task) = rx.recv().await {
+        if let SlotTask::Evict(mut layer) = task {
+            // [NON-BLOCKING-DROP] 메인 스레드 밖에서 무거운 텐서 파괴 수행
+            layer.clear();
+            drop(layer);
         }
     }
 }
@@ -317,10 +331,12 @@ pub fn init_bake_worker() {
     let (btx, brx) = mpsc::channel(256); 
     let (ltx, lrx) = mpsc::channel(256);
     let (wtx, wrx) = mpsc::channel(128); // [NEW] Weight relay channel
+    let (etx, erx) = mpsc::channel(128); // [NEW] Evict channel
 
     let _ = BAKE_TX.set(btx); 
     let _ = LOAD_TX.set(ltx);
     let _ = WEIGHT_TX.set(wtx); // [NEW] Global weight transmitter
+    let _ = EVICT_TX.set(etx); // [NEW] Global evict transmitter
 
     if let Some(rx) = SLOT_MANAGER_DATA.1.lock().unwrap().take() { 
         tauri::async_runtime::spawn(async move { spawn_slot_dispatcher(rx).await; }); 
@@ -328,6 +344,7 @@ pub fn init_bake_worker() {
     tauri::async_runtime::spawn(async move { spawn_slot_worker(brx); });
     tauri::async_runtime::spawn(async move { spawn_slot_worker(lrx); });
     tauri::async_runtime::spawn(async move { spawn_weight_loader_worker(wrx).await; }); // [NEW] Async weight loader
+    tauri::async_runtime::spawn(async move { spawn_evict_worker(erx).await; }); // [NEW] Async evict worker
 }
 async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {

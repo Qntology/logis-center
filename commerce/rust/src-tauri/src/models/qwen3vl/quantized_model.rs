@@ -2019,20 +2019,6 @@ impl QuantizedQwen3VLTextModel {
             // 프리필 중에는 루프 밖에서 일괄 처리, 디코딩(seq_len=1)일 때는 루프와 동일하게 작동
             let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, !is_prefill);
         }
-
-        if current_seq_len > 1 {
-            // [STRICT-PURGE] 모든 모델은 프리필 후 VRAM 캐시를 즉시 비워 메모리를 확보합니다.
-            for block in &self.layers[layer_idx].self_attn.kv_blocks {
-                let mut inner = block.inner.write().unwrap();
-                inner.k_cache = None;
-                inner.v_cache = None;
-                if inner.location == KVLocation::VRAM { inner.location = KVLocation::SSD; }
-            }
-            self.layers[layer_idx].self_attn.vram_merged_k = None;
-            self.layers[layer_idx].self_attn.vram_merged_v = None;
-            self.layers[layer_idx].self_attn.merged_vram_block_count = 0;
-            println!("[ENGINE-TRACE] Layer {} Prefill Cache Evicted (Strict Mode).", layer_idx);
-        }
         
         final_output.ok_or_else(|| anyhow::anyhow!("No output generated from chunks"))
     }
@@ -2219,17 +2205,30 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [MEMORY-OPT] [LAZY-PURGE] 연산 종료 후 가중치 소각
+        // [MEMORY-OPT] [LAZY-PURGE] 연산 종료 후 가중치 소각 최적화
         if !is_decoding {
-            if layer_idx > 0 { self.layers[layer_idx - 1].clear(); }
-            self.layers[layer_idx].clear();
-            if layer_idx % 7 == 0 { println!("[SPEED-OPT] Layer {} cleared, moving window.", layer_idx); }
+            // [OPTIMIZATION] 현재 레이어를 즉시 지우는 대신, 이전 레이어만 확실히 지우고 현재 레이어는 
+            // 다음 루프의 reload_layer가 처리하거나 스왑 시점에 자연스럽게 해제되도록 유도합니다.
+            if layer_idx > 0 {
+                // [NEW-STRICT-ASYNCHRONOUS-EVICTION]
+                // 메인 스레드에서 직접 clear()를 호출하면 CUDA 파괴 작업으로 지연이 발생합니다.
+                // 대신 레이어의 소유권을 워커에게 던져서 백그라운드에서 소각되도록 합니다.
+                if let Ok(tx) = crate::models::qwen3vl::generate::get_evict_worker().await {
+                    // 레이어 객체의 복제본을 생성하여 워커에게 전달 (원본은 비워짐)
+                    let layer_to_evict = self.layers[layer_idx - 1].clone();
+                    self.layers[layer_idx - 1].clear(); // 메인에서는 메타데이터만 빠르게 리셋
+                    let _ = tx.send(crate::models::qwen3vl::generate::SlotTask::Evict(layer_to_evict)).await;
+                } else {
+                    self.layers[layer_idx - 1].clear();
+                }
+            }
+            if layer_idx % 7 == 0 { println!("[SPEED-OPT] Layer {} transition overlap optimized.", layer_idx); }
         }
 
         if let Some(sid) = sid_opt {
             let is_prefill = !is_decoding;
             let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count, false).await;
-            if is_prefill { SLOT_MANAGER.sync_with_sentinels(&sid).await; }
+            // [OPTIMIZATION] sync_with_sentinels는 프리필 도중 매 레이어마다 할 필요가 없으므로 제거하여 I/O 병목 해소
         }
 
         Ok(next_xs)
