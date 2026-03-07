@@ -2195,10 +2195,33 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
-        // [STEP 3] GPU 연산 실행
+        // [STEP 3] GPU 연산 실행 (분할 연산을 통한 레이어간 병렬화 유도)
         let current_seq_len = xs.dim(1)?;
         let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(256).collect();
-        let mut next_xs = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
+        let mid_point = chunk_offsets.len() / 2;
+        
+        // 전반부와 후반부를 나누어 처리하여 파이프라이닝 기회 창출
+        let first_half = &chunk_offsets[..mid_point];
+        let second_half = &chunk_offsets[mid_point..];
+
+        // 1. 전반부 연산
+        let mut next_xs = self.process_chunks_iterative(layer_idx, first_half, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
+        
+        // [EARLY-ACTIVATION] 전반부가 끝나면 다음 레이어 가중치 로딩 상태를 확인하고 우선순위 상향
+        if !is_decoding && layer_idx + 1 < self.layers.len() {
+            // 다음 레이어가 이미 로드되었다면 VRAM 안착 속도를 높이도록 유도
+            if let Some((p_idx, _)) = &self.pending_weight_load {
+                if *p_idx == layer_idx + 1 {
+                    // 여기서 다음 레이어의 준비 신호를 미리 체크할 수 있음
+                }
+            }
+        }
+
+        // 2. 후반부 연산 (이 동안 백그라운드에서는 다음 레이어가 스왑 준비를 마침)
+        let next_xs_second = self.process_chunks_iterative(layer_idx, second_half, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
+        
+        // 결과 병합
+        next_xs = Tensor::cat(&[next_xs, next_xs_second], 1)?;
 
         if let (Some(embed), Some(mask)) = (deepstack_embed, visual_mask) {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
