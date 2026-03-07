@@ -2575,7 +2575,27 @@ impl QuantizedQwen3VLTextModel {
         self.layers[0].self_attn.compress_to_bf16(t)
     }
 
+    /// [SAFE-BRIDGE] 디코딩 중 VRAM에만 머물러 있던 KV 데이터를 SSD로 강제 동기화합니다.
+    /// 답변이 완료되었거나 모델을 교체(Deep Purge)하기 직전에 호출하여 맥락 소실을 방지합니다.
+    pub async fn flush_decoding_kv_to_ssd(&self, session_id: &str) -> Result<()> {
+        let _start = std::time::Instant::now();
+        println!("[SSD-BRIDGE] Flushing decoding context to SSD for session: {}", session_id);
+
+        for (l_idx, layer) in self.layers.iter().enumerate() {
+            // [SYNC-TRIGGER] 디코딩 시 건너뛰었던 SSD 저장을 이 시점에 강제로 트리거합니다.
+            // true, true, false 옵션을 주어 즉시 굽기(Bake)를 수행하게 합니다.
+            let _ = layer.self_attn.trigger_realtime_incremental_bake(session_id, true, self.baking_only, true);
+        }
+
+        // SSD 워커가 작업을 마칠 때까지 대기
+        crate::models::qwen3vl::generate::wait_for_global_io().await;
+        println!("[SSD-BRIDGE] Context synchronization complete in {:?}", _start.elapsed());
+        Ok(())
+    }
+
     pub fn drop_kv_storage(&mut self) -> Result<()> {
+        println!("[MEMORY] Hard Resetting Language Model Registry & Layers...");
+        // [SAFETY] 파괴 전 마지막 동기화는 상위 레벨(generate.rs)에서 세션 ID와 함께 호출되어야 합니다.
         for layer in self.layers.iter_mut() {
             layer.drop_kv_storage()?;
         }
