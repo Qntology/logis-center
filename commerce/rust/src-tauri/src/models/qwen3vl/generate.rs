@@ -611,6 +611,30 @@ impl Qwen3VLGenerateModel {
         let total_tokens_after_prefill = offset + input_ids.dim(1)?;
         wait_for_global_io().await;
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
+        
+        // [SSD-BRIDGE] Prefill -> Decoding 전이 시점의 하드 리셋
+        if let Some(s_id) = &session_id {
+            println!("[SSD-BRIDGE] Activating safety bridge. Flushing prefill KV to disk...");
+            // 1. 현재 VRAM/RAM에 있는 프리필 KV 데이터를 SSD로 강제 저장
+            let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
+            
+            // 2. 모든 IO가 완료될 때까지 확실히 대기 (포인터 안전 확보)
+            wait_for_global_io().await;
+            
+            // 3. 모델 내부의 라이브 KV 캐시 장부를 완전히 비움 (Nuclear Option)
+            println!("[SSD-BRIDGE] Clearing live memory pointers...");
+            self.clear_kv_cache();
+            
+            // 4. SSD에 저장된 데이터를 기반으로 장부를 다시 구축 (Safe Loader)
+            println!("[SSD-BRIDGE] Rebuilding KV registry from SSD snapshots...");
+            let snapshot_path = crate::utils::paths::get_kv_dir(None).join(s_id);
+            let _ = self.load_kv_from_disk(&snapshot_path, _kv_name.as_deref());
+            
+            // 5. 비동기 뒷정리 대기
+            wait_for_global_io().await;
+            println!("[SSD-BRIDGE] Bridge established. Starting clean decoding loop.");
+        }
+
         let mut gen_ids = vec![];
         let think_token_id = 151643;
         for i in 0..mes.max_tokens.unwrap_or(2048) {
