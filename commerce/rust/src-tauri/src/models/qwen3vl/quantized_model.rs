@@ -1159,16 +1159,14 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, _kv_name: Option<&str>) -> Result<()> {
-        // [SSD-ALIGNMENT] 실제 오프셋을 폴더명으로 사용
         let b_str = format!("b{}", offset);
         let block_dir = path.join(&b_str);
         if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
         
         let structured_path = block_dir.join(format!("l{}.st", self.layer_idx));
-        
         let mut map = HashMap::new();
-        // [PREFIX-FIX] 저장 시에도 실제 오프셋 이름을 접두어로 사용
-        let prefix = format!("{}l{}_", b_str, self.layer_idx);
+        // [FIX] 로드 로직과 일치하도록 접두어에 언더바(_) 추가: b{offset}_l{layer}_
+        let prefix = format!("{}_l{}_", b_str, self.layer_idx);
 
         let mut ks = Vec::new();
         let mut vs = Vec::new();
