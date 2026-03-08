@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::fs;
 use std::path::PathBuf;
 
-// --- [MEMORY OPTIMIZATION] Task Data Manager (RAII) --- 
+// --- [MEMORY OPTIMIZATION] Task Data Manager (RAII) ---
 // Handles offloading of large text data to disk to prevent RAM/VRAM bloating.
 // Automatically cleans up files when the task scope ends.
 struct TaskDataManager {
@@ -251,7 +251,7 @@ pub async fn start_background_worker(
                                 {
                                     let mut model_lock = model.lock().await;
                                     if let Some(m) = model_lock.as_ref() {
-                                        m.deep_purge_resources(Some(task.id.clone())).await;
+                                        m.deep_purge_resources().await;
                                     }
                                     // 모델 인스턴스 자체를 None으로 만들어 완전히 초기화 (다음 작업 시 필요하면 다시 로드)
                                     *model_lock = None;
@@ -280,7 +280,7 @@ pub async fn start_background_worker(
                                     let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
                                     if let Some(m) = model_lock.as_ref() {
                                         println!("[Scheduler] Error detected. Performing emergency memory release...");
-                                        m.deep_purge_resources(Some(task.id.clone())).await;
+                                        m.deep_purge_resources().await;
                                     }
                                     *model_lock = None;
                                 }
@@ -305,16 +305,11 @@ pub async fn start_background_worker(
                                     
                                     // [NEW] Automatic OOM Recovery Logic (Forcing SSD-Swap Mode)
                                     if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
-                                        // [DIAG-OOM] 상세 메모리 상태 로깅
-                                        let mut sys = sysinfo::System::new_all();
-                                        sys.refresh_memory();
-                                        let free_ram = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-                                        println!("[Scheduler-OOM] OOM Detected! RAM Free: {:.2} GB. Activating SSD-Swap Mode for retry.", free_ram);
-
+                                        println!("[Scheduler] OOM Detected! Activating SSD-Swap Mode for retry.");
                                         {
                                             let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
                                             if let Some(m) = model_lock.as_ref() {
-                                                let _ = m.deep_purge_resources(Some(task.id.clone())).await;
+                                                let _ = m.deep_purge_resources().await;
                                             }
                                             *model_lock = None; 
                                         }
@@ -360,13 +355,6 @@ async fn process_task(
     app_handle: &tauri::AppHandle,
     device_preference: Option<String>,
 ) -> Result<()> {
-    // [SSD-INTERLOCK] 작업 시작 전, 물리적 Sentinel(.done) 파일을 스캔하여 이전 세션의 좀비 자원을 해제합니다.
-    {
-        use crate::models::qwen3vl::generate::SLOT_MANAGER;
-        SLOT_MANAGER.sync_with_sentinels(&task.id).await;
-        println!("[SCHEDULER] SSD Sentinel check complete for task: {}", task.id);
-    }
-
     // [NEW] Ensure log directory exists at runtime using dynamic path
     let pug_logs_dir = utils::paths::get_pug_logs_dir(Some(app_handle), &task.id);
     println!("[DEBUG] Pug logs directory: {:?}", pug_logs_dir);
@@ -431,7 +419,7 @@ async fn process_task(
             let wants_cpu = effective_device_pref == Some("cpu");
             if m.is_cpu_mode != wants_cpu {
                 println!("[Scheduler] Device preference mismatch (Current CPU: {}, Wants CPU: {}). Reloading model...", m.is_cpu_mode, wants_cpu);
-                m.deep_purge_resources(Some(task.id.clone())).await;
+                m.deep_purge_resources().await;
                 *model_lock = None;
             }
         }
@@ -611,7 +599,7 @@ async fn process_task(
         }
         
         if page_type.is_empty() || page_type == "unknown" { 
-            model.deep_purge_resources(Some(task.id.clone())).await;
+            model.deep_purge_resources().await;
             return Ok(()); 
         }
     }
@@ -619,7 +607,7 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     // [CRITICAL-CLEANUP] Clear the cache from Step A before Step B (git e8260c5 parity)
-    model.deep_purge_resources(Some(task.id.clone())).await;
+    model.deep_purge_resources().await;
     wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
 
     // --- STEP B: SELECTORS (Disk Bridge Relay) ---
@@ -789,7 +777,7 @@ async fn process_task(
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model..." }));
         
         // 1. Explicitly Unload to free VRAM for Embedding Model
-        model.deep_purge_resources(Some(task.id.clone())).await;
+        model.deep_purge_resources().await;
         
         // 2. Wait for VRAM to settle (Driver latency)
         wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;

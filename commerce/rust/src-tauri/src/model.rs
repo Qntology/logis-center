@@ -208,31 +208,22 @@ impl LogisModel {
     }
 
     /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced with Diagnostics)
-    pub async fn deep_purge_resources(&self, session_id: Option<String>) {
+    pub async fn deep_purge_resources(&self) {
         println!("[DIAG-PURGE] Step 0: Waiting for background IO to finish...");
         crate::models::qwen3vl::generate::wait_for_global_io().await;
 
-        // [SAFETY-BRIDGE] 모델을 파괴하기 전, 메모리에만 있던 디코딩 답변을 SSD로 안전하게 대피시킵니다.
-        if let Some(sid) = session_id {
-            let mut gen = self.generator.lock().await;
-            if let Some(g) = gen.as_mut() {
-                if let crate::models::qwen3vl::generate::ModelVariant::QuantizedText(ref mut m) = g.qwen3_vl {
-                    println!("[DIAG-PURGE] Safety Bridge: Flushing context for session {} before purge...", sid);
-                    let _ = m.language_model.flush_decoding_kv_to_ssd(&sid).await;
-                }
-            }
-        }
-
         println!("[DIAG-PURGE] Step 1: Clearing ALL Generation Slots...");
+        
         {
             let mut gen = self.generator.lock().await;
             if let Some(mut g) = gen.take() {
                 println!("[DIAG-PURGE] Dropping Active Generator (0.6B/2B)...");
                 let _ = g.clear_kv_cache();
-                let _ = g.qwen3_vl.drop_kv_storage();
-                drop(g);
+                let _ = g.qwen3_vl.drop_kv_storage(); 
+                drop(g); 
             }
-        }        {
+        }
+        {
             let mut s_hib = self.small_hibernation.lock().await;
             if let Some(mut g) = s_hib.take() { 
                 println!("[DIAG-PURGE] Dropping Small Hibernation...");
@@ -440,7 +431,7 @@ impl LogisModel {
         
         // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
         println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
-        self.deep_purge_resources(None).await;
+        self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {
             // VRAM이 실제로 비워질 때까지 대기
