@@ -670,7 +670,9 @@ impl QuantizedQwen3VLTextAttention {
                 {
                     let inner = block.inner.read().unwrap();
                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                        // [VRAM-DIRECT] 이미 VRAM에 있다면 복사 없이 참조 활용
+                        // [FIX] 장치가 다르면(CPU에 대피된 상태라면) 목표 장치로 이동
+                        let k = if !k.device().same_device(dev) { k.to_device(dev)? } else { k.clone() };
+                        let v = if !v.device().same_device(dev) { v.to_device(dev)? } else { v.clone() };
                         k_vram = Some(k.to_dtype(target_dtype)?);
                         v_vram = Some(v.to_dtype(target_dtype)?);
                         vram_count += 1;
