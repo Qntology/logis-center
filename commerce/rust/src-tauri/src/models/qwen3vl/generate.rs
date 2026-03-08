@@ -302,6 +302,24 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 if let Ok(_) = candle_core::safetensors::save(&ts, &tp) {
                     drop(ts);
                     
+                    // [CENTRALIZED-INDEX-UPDATE] Restore index update logic
+                    if let Some(kv_name) = kv_n {
+                        if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
+                            if let Ok(l_idx) = l_str.parse::<usize>() {
+                                let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
+                                let offset = offset_str.parse::<usize>().unwrap_or(0);
+                                
+                                let _ = INDEX_TX.send(SlotTask::IndexUpdate {
+                                    kv_name,
+                                    layer_idx: l_idx,
+                                    offset,
+                                    len: 256,
+                                    file_name: format!("b{}/l{}.st", offset, l_idx),
+                                }).await;
+                            }
+                        }
+                    }
+
                     // 1. Registry Update (SSD 위치 등록)
                     if let (Some(r), Some(idx)) = (reg, b_idx) {
                         if let Ok(mut entries) = r.entries.write() {
@@ -311,7 +329,12 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     if let Ok(l_idx) = l_str.parse::<usize>() { 
                                         if l_idx < 28 { 
                                             e.location[l_idx] = KVLocation::SSD; 
-                                            e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                                            // [FIX] 절대 경로로 저장하여 로드 시 혼선 방지
+                                            if let Ok(abs_path) = fs::canonicalize(tp.parent().unwrap()) {
+                                                e.ssd_path = Some(abs_path);
+                                            } else {
+                                                e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                                            }
                                             if let Ok(mut cache) = e.bitkv_cache.write() {
                                                 if l_idx < cache.len() { cache[l_idx] = None; }
                                             }
@@ -378,14 +401,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             let mut map = std::collections::HashMap::new();
                             let prefix = format!("b{}_l{}_", off, act_l);
 
-                            // [DIRECT-SAVE] Skip compression, save RAW tensors (BF16/F32)
+                            // [DIRECT-SAVE] BF16으로 통일하여 저장 (파일 크기 1MB로 유지)
                             if let (Some(rk), Some(rv)) = (src.raw_k, src.raw_v) {
-                                // [STABILITY] Ensure tensors are contiguous and on CPU for saving
-                                let rk_cpu = if !rk.device().is_cpu() { rk.to_device(&Device::Cpu).unwrap_or(rk) } else { rk };
-                                let rv_cpu = if !rv.device().is_cpu() { rv.to_device(&Device::Cpu).unwrap_or(rv) } else { rv };
+                                let rk_bf16 = rk.to_device(&Device::Cpu).unwrap_or(rk).to_dtype(DType::BF16).unwrap();
+                                let rv_bf16 = rv.to_device(&Device::Cpu).unwrap_or(rv).to_dtype(DType::BF16).unwrap();
                                 
-                                map.insert(format!("{}k_raw", prefix), rk_cpu);
-                                map.insert(format!("{}v_raw", prefix), rv_cpu);
+                                map.insert(format!("{}k_raw", prefix), rk_bf16);
+                                map.insert(format!("{}v_raw", prefix), rv_bf16);
                             } else {
                                 // Fallback for pre-compressed or empty data
                                 map.insert(format!("{}k_data", prefix), src.k_data);
@@ -647,13 +669,14 @@ impl Qwen3VLGenerateModel {
             
             let total_tokens_after_prefill = offset + input_ids.dim(1)?;
         
-        println!("[GEN-SYNC] Waiting for all background KV baking to complete...");
-        wait_for_global_io().await; // [CRITICAL] Ensure all layers are on SSD/RAM before first forward
-        
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         
+        // [CRITICAL-SYNC] Prefill 연산 직후 발생한 백그라운드 IO(대피 및 저장)가 완료될 때까지 반드시 대기
+        println!("[GEN-SYNC] Prefill computation done. Waiting for background KV backup to finish...");
+        wait_for_global_io().await; 
+        
         // [DEBUG-SAMPLING] 첫 번째 토큰 샘플링 전 로그
-        println!("[DEBUG-GEN] Prefill Complete. EOS IDs: {}, {}. Sampling first token...", self.eos_token_id1, self.eos_token_id2);
+        println!("[DEBUG-GEN] Prefill & Backup Complete. Sampling first token...");
 
         let mut gen_ids = vec![];
 

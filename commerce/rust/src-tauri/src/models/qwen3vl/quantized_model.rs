@@ -566,45 +566,66 @@ impl QuantizedQwen3VLTextAttention {
         for (idx, block) in self.kv_blocks.iter().enumerate() {
             let mut k_final = None;
             let mut v_final = None;
+            let mut retries = 0;
 
-            // 1. Check RAM/VRAM
-            {
-                let inner = block.inner.read().unwrap();
-                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    k_final = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
-                    v_final = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
-                }
-            }
-
-            // 2. Load from SSD if missing
-            if k_final.is_none() {
-                let (ssd_path, b_off, b_idx) = {
-                    let reg = self.registry.entries.read().unwrap();
+            while retries < 5 && k_final.is_none() {
+                // 1. Check RAM/VRAM
+                {
                     let inner = block.inner.read().unwrap();
-                    (reg[inner.index].ssd_path.clone(), inner.offset, inner.index)
-                };
-
-                if let Some(p) = ssd_path {
-                    let mut full_path = p.clone();
-                    if full_path.is_relative() && !full_path.starts_with("tmp") { 
-                        full_path = crate::utils::paths::get_kv_dir(None).join(full_path); 
+                    if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                        k_final = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
+                        v_final = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
                     }
-                    let block_file = full_path.join(format!("l{}.st", self.layer_idx));
-                    if let Ok(data) = crate::utils::direct_loader::load_kv_block(&block_file) {
-                        if let Ok(st_map) = candle_core::safetensors::load_buffer(&data, &Device::Cpu) {
-                            let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
-                            let get_t = |s: &str| st_map.get(&format!("{}{}", prefix, s)).or_else(|| st_map.get(s)).cloned();
-                            
-                            if let (Some(kr_t), Some(vr_t)) = (get_t("k_raw"), get_t("v_raw")) {
-                                k_final = Some(kr_t.to_device(dev)?.to_dtype(target_dtype)?);
-                                v_final = Some(vr_t.to_device(dev)?.to_dtype(target_dtype)?);
-                            } else if let (Some(kd_t), Some(vd_t), Some(sh_t), Some(ks_t), Some(vs_t)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape"), get_t("k_scale"), get_t("v_scale")) {
-                                let sh_u32: Vec<u32> = sh_t.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.flatten_all()?.to_vec1()?;
-                                let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
-                                k_final = Some(self.decompress_from_1bit(&kd_t.to_device(dev)?, &ks_t.to_device(dev)?, &meta_os)?);
-                                v_final = Some(self.decompress_from_1bit(&vd_t.to_device(dev)?, &vs_t.to_device(dev)?, &meta_os)?);
+                }
+
+                // 2. Load from SSD if missing
+                if k_final.is_none() {
+                    let (ssd_path, b_off) = {
+                        let reg = self.registry.entries.read().unwrap();
+                        let inner = block.inner.read().unwrap();
+                        if inner.index < reg.len() {
+                            (reg[inner.index].ssd_path.clone(), inner.offset)
+                        } else { (None, inner.offset) }
+                    };
+
+                    if let Some(p) = ssd_path {
+                        let mut full_path = p.clone();
+                        // [FIX] 절대 경로가 아닐 경우에만 get_kv_dir을 결합
+                        if full_path.is_relative() { 
+                            full_path = crate::utils::paths::get_kv_dir(None).join(full_path); 
+                        }
+                        
+                        let block_file = full_path.join(format!("l{}.st", self.layer_idx));
+                        match crate::utils::direct_loader::load_kv_block(&block_file) {
+                            Ok(data) => {
+                                if let Ok(st_map) = candle_core::safetensors::load_buffer(&data, &Device::Cpu) {
+                                    let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
+                                    let get_t = |s: &str| st_map.get(&format!("{}{}", prefix, s)).or_else(|| st_map.get(s)).cloned();
+                                    
+                                    if let (Some(kr_t), Some(vr_t)) = (get_t("k_raw"), get_t("v_raw")) {
+                                        k_final = Some(kr_t.to_device(dev)?.to_dtype(target_dtype)?);
+                                        v_final = Some(vr_t.to_device(dev)?.to_dtype(target_dtype)?);
+                                    } else if let (Some(kd_t), Some(vd_t), Some(sh_t), Some(ks_t), Some(vs_t)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape"), get_t("k_scale"), get_t("v_scale")) {
+                                        let sh_u32: Vec<u32> = sh_t.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.flatten_all()?.to_vec1()?;
+                                        let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                                        k_final = Some(self.decompress_from_1bit(&kd_t.to_device(dev)?, &ks_t.to_device(dev)?, &meta_os)?);
+                                        v_final = Some(self.decompress_from_1bit(&vd_t.to_device(dev)?, &vs_t.to_device(dev)?, &meta_os)?);
+                                    }
+                                }
+                            },
+                            Err(e) => {
+                                if retries >= 4 {
+                                    println!("[VRAM-WARMUP-WARN] Failed to read block file after retries: {:?}. Error: {:?}", block_file, e);
+                                }
                             }
                         }
+                    }
+                }
+
+                if k_final.is_none() {
+                    retries += 1;
+                    if retries < 5 {
+                        std::thread::sleep(std::time::Duration::from_millis(50)); // [RACE-GUARD] Wait for background worker
                     }
                 }
             }
@@ -613,7 +634,7 @@ impl QuantizedQwen3VLTextAttention {
                 bulk_ks.push(k);
                 bulk_vs.push(v);
             } else {
-                return Err(anyhow!("Critical: Layer {} block {} missing in VRAM/RAM/SSD", self.layer_idx, idx));
+                return Err(anyhow!("Critical: Layer {} block {} missing in VRAM/RAM/SSD after retries. SSD Path: {:?}", self.layer_idx, idx, self.registry.entries.read().unwrap().get(idx).and_then(|e| e.ssd_path.clone())));
             }
         }
 
@@ -724,13 +745,18 @@ impl QuantizedQwen3VLTextAttention {
                 }
                 
                 // [SSD-TRIGGER] Initialize and mark dirty for new blocks
-                let mut reg = self.registry.entries.write().unwrap();
-                if index < reg.len() {
-                    let entry = &mut reg[index];
-                    entry.token_start = current_total;
-                    entry.token_len = take;
-                    if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = true; }
-                    if self.layer_idx < entry.location.len() { entry.location[self.layer_idx] = KVLocation::VRAM; }
+                {
+                    let mut reg = self.registry.entries.write().unwrap();
+                    if index >= reg.len() {
+                        reg.push(RegistryEntry::new(current_total, take, 28));
+                    }
+                    if index < reg.len() {
+                        let entry = &mut reg[index];
+                        entry.token_start = current_total;
+                        entry.token_len = take;
+                        if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = true; }
+                        if self.layer_idx < entry.location.len() { entry.location[self.layer_idx] = KVLocation::VRAM; }
+                    }
                 }
                 self.kv_blocks.push(new_block);
                 tokens_to_process -= take; chunk_offset += take;
