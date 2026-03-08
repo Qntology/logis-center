@@ -780,47 +780,6 @@ impl QuantizedQwen3VLTextAttention {
         Ok(t.to_dtype(target_dtype)?)
     }
 
-    pub fn decompress_from_1bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
-        let device = packed.device();
-        let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
-        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let last_dim = original_shape[original_shape.len() - 1];
-        let total_elements: usize = original_shape.iter().product();
-        let mut decoded = vec![0.0f32; total_elements];
-        use rayon::prelude::*;
-        decoded.par_chunks_mut(last_dim).enumerate().for_each(|(v_idx, vector_out)| {
-            let s = scales_vec[v_idx];
-            let t_start = v_idx * last_dim;
-            for i in 0..last_dim {
-                let global_idx = t_start + i;
-                let is_set = (packed_vec[global_idx / 8] & (1 << (global_idx % 8))) != 0;
-                vector_out[i] = if is_set { s } else { -s };
-            }
-        });
-        let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
-        Ok(t.to_device(device)?)
-    }
-
-    pub fn decompress_from_8bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
-        let device = packed.device();
-        let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
-        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let last_dim = original_shape[original_shape.len() - 1];
-        let total_elements: usize = original_shape.iter().product();
-        let mut decoded = vec![0.0f32; total_elements];
-        use rayon::prelude::*;
-        decoded.par_chunks_mut(last_dim).enumerate().for_each(|(v_idx, vector_out)| {
-            let s = scales_vec[v_idx];
-            let packed_start = v_idx * last_dim;
-            let packed_vector = &packed_vec[packed_start..packed_start + last_dim];
-            for (i, &p) in packed_vector.iter().enumerate() {
-                vector_out[i] = (p as i8) as f32 * s;
-            }
-        });
-        let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
-        Ok(t.to_device(device)?)
-    }
-
     pub fn clear_kv_cache(&mut self) {
         // [CLEANUP] 슬롯 자원 명시적 반납
         for block in &self.kv_blocks {
@@ -2595,7 +2554,7 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
-        // 임계값 설정 (안전성 위주로 재조정)
+        // 임계값 설정 (안전성 위주로 재조정) 
         let danger_zone = 500_000_000; // 500MB 이하: 위험 (내리기 시작)
         let safe_zone = 1_000_000_000; // 1GB 이상: 여유 (올리기 시작)
 
