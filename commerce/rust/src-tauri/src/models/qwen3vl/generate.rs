@@ -199,23 +199,37 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {
         match req {
             SlotRequest::Acquire { total_tokens: _total_tokens, tx } => {
-                let max_writes = 64; let mut found = None;
+                let max_writes = 128; // [EXPANDED]
+                let mut found = None;
+                let mut retry_count = 0;
                 while found.is_none() {
                     if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
                         for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
                             if slot.state.load(Ordering::SeqCst) == 0 {
-                                if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { SLOT_MANAGER.update_counters(0, 1); SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); found = Some(i); break; }
+                                if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { 
+                                    SLOT_MANAGER.update_counters(0, 1); 
+                                    SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); 
+                                    found = Some(i); break; 
+                                }
                             }
                         }
                         if found.is_none() {
                             for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
                                 if slot.state.load(Ordering::SeqCst) == 2 {
-                                    if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { SLOT_MANAGER.update_counters(2, 1); SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); found = Some(i); break; }
+                                    if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { 
+                                        SLOT_MANAGER.update_counters(2, 1); 
+                                        SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); 
+                                        found = Some(i); break; 
+                                    }
                                 }
                             }
                         }
                     }
-                    if found.is_none() { tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
+                    if found.is_none() { 
+                        retry_count += 1;
+                        if retry_count % 100 == 0 { println!("[SLOT-WARN] High congestion. Active writes: {}", SLOT_MANAGER.active_write_count.load(Ordering::SeqCst)); }
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await; 
+                    }
                 }
                 let _ = tx.send(found.unwrap());
             },
@@ -244,8 +258,11 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 struct IoGuard; impl Drop for IoGuard { fn drop(&mut self) { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } }
                 let _guard = IoGuard;
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
-                if let Ok(data) = safetensors::serialize(&ts, &None) {
-                    drop(ts); let _ = save_kv_block(&tp, &data);
+                
+                // [FIX] Use candle_core::safetensors::save for consistency
+                if let Ok(_) = candle_core::safetensors::save(&ts, &tp) {
+                    println!("[IO-WORKER] Successfully saved KV block to {:?}", tp);
+                    drop(ts);
                     
                     // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
                     if let Some(kv_name) = kv_n {
@@ -359,32 +376,35 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             let file_path = block_root.join(format!("l{}.st", l_idx));
                             if file_path.is_file() {
                                 if let Ok(content) = load_kv_block(&file_path) {
-                                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                                    // [FIX] Use candle_core::safetensors::load_buffer with device
+                                    if let Ok(st_map) = candle_core::safetensors::load_buffer(&content, &Device::Cpu) {
                                         let prefix = format!("b{}_l{}_", b_idx_off, l_idx);
-                                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).ok();
+                                        let get_t = |s: &str| st_map.get(&format!("{}{}", prefix, s)).cloned();
                                         
                                         // [MODIFIED] BF16 Direct Load
-                                        if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
-                                            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                                            let file_shape: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
-
-                                            let dev = &Device::Cpu;
-                                            let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &file_shape, dev).unwrap();
-                                            let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &file_shape, dev).unwrap();
-
-                                            let meta = BitKVMetadata {
-                                                k_data: kd_t,
-                                                v_data: vd_t,
-                                                original_shape: file_shape,
-                                            };
-                                            if let Ok(mut r) = reg.entries.write() {
-                                                if b_idx < r.len() {
-                                                    {
-                                                        let mut cache = r[b_idx].bitkv_cache.write().unwrap();
-                                                        cache[l_idx] = Some(meta);
+                                        if let (Some(kd_t), Some(vd_t), Some(sh_t)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                            let res: Result<()> = (|| {
+                                                let sh_u32: Vec<u32> = sh_t.to_dtype(DType::U32)?.flatten_all()?.to_vec1()?;
+                                                let file_shape: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                                                
+                                                let meta = BitKVMetadata {
+                                                    k_data: kd_t,
+                                                    v_data: vd_t,
+                                                    original_shape: file_shape,
+                                                };
+                                                if let Ok(mut r) = reg.entries.write() {
+                                                    if b_idx < r.len() {
+                                                        {
+                                                            let mut cache = r[b_idx].bitkv_cache.write().unwrap();
+                                                            cache[l_idx] = Some(meta);
+                                                        }
+                                                        r[b_idx].location[l_idx] = KVLocation::RAM;
                                                     }
-                                                    r[b_idx].location[l_idx] = KVLocation::RAM;
                                                 }
+                                                Ok(())
+                                            })();
+                                            if let Err(e) = res {
+                                                println!("[LOAD-ERROR] Failed to process loaded KV: {:?}", e);
                                             }
                                         }
                                     }
@@ -490,11 +510,12 @@ impl Qwen3VLGenerateModel {
         self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
         if let Some(s_id) = &session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(s_id);
-            if !path.exists() { fs::create_dir_all(&path)?; }
+            // [STABILITY] Create full inference path to ensure worker doesn't fail
+            let inf_path = path.join("inference").join("text");
+            if !inf_path.exists() { fs::create_dir_all(&inf_path)?; }
+            
             fs::write(path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
-            let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
-            wait_for_global_io().await; // [SYNC] Ensure SSD write is complete
-            println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk.");
+            println!("[PREFILL-SAVE] Tokens persisted. Inference directory ready at {:?}", inf_path);
         }
         Ok(total_toks)
     }
@@ -671,8 +692,8 @@ impl Qwen3VLGenerateModel {
             logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;
         }
         if let Some(s_id) = &session_id {
-            let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
-            println!("[GEN-SAVE] All active KV blocks flushed to disk.");
+            // [REMOVED] Redundant force_flush_all_active_blocks
+            println!("[GEN-SAVE] Generation complete. Remaining KV blocks flushing in background.");
         }
         Ok(gen_text)
     }
