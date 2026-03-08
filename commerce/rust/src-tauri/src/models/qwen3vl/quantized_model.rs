@@ -628,10 +628,8 @@ impl QuantizedQwen3VLTextAttention {
                                     let get_t = |s: &str| st_map.get(&format!("{}{}", prefix, s)).or_else(|| st_map.get(s)).cloned();
                                     
                                     if let (Some(kr_t), Some(vr_t)) = (get_t("k_raw"), get_t("v_raw")) {
-                                        // [MATCH-RAM-BEHAVIOR] SSD에서 읽은 데이터를 즉시 GPU/BF16으로 바꾸지 않고, 
-                                        // 일단 CPU에서 F32 정밀도로 온전하게 복구합니다. (기존 RAM 대피 방식과 동일)
-                                        k_final = Some(kr_t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?);
-                                        v_final = Some(vr_t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?);
+                                        k_final = Some(kr_t.to_device(dev)?.to_dtype(target_dtype)?);
+                                        v_final = Some(vr_t.to_device(dev)?.to_dtype(target_dtype)?);
                                     } else if let (Some(kd_t), Some(vd_t), Some(sh_t), Some(ks_t), Some(vs_t)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape"), get_t("k_scale"), get_t("v_scale")) {
                                         let sh_u32: Vec<u32> = sh_t.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.flatten_all()?.to_vec1()?;
                                         let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
@@ -667,16 +665,8 @@ impl QuantizedQwen3VLTextAttention {
 
         if !bulk_ks.is_empty() {
             let mut merger = self.vram_cache_merger.write().unwrap();
-            
-            // [CRITICAL] CPU에서 로드된 블록들을 최종적으로 GPU로 이동시킨 뒤 병합합니다.
-            let mut gpu_ks = Vec::with_capacity(bulk_ks.len());
-            let mut gpu_vs = Vec::with_capacity(bulk_vs.len());
-            
-            for t in bulk_ks { gpu_ks.push(t.to_device(dev)?.to_dtype(target_dtype)?); }
-            for t in bulk_vs { gpu_vs.push(t.to_device(dev)?.to_dtype(target_dtype)?); }
-            
-            merger.k = Some(Tensor::cat(&gpu_ks, 2)?);
-            merger.v = Some(Tensor::cat(&gpu_vs, 2)?);
+            merger.k = Some(Tensor::cat(&bulk_ks, 2)?);
+            merger.v = Some(Tensor::cat(&bulk_vs, 2)?);
             merger.block_count = self.kv_blocks.len();
         }
         Ok(())
@@ -814,13 +804,6 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // [MATCH-CONTEXT] 과거 캐시(bulk_ks)와 현재 토큰(key_states)을 결합합니다.
-        // 디코딩 중에는 key_states가 1개 토큰 분량이며, 이를 과거 컨텍스트 뒤에 붙여야 정상이 됩니다.
-        if !baking_only || seqlen_offset > 0 {
-            bulk_ks.push(key_states.to_dtype(target_dtype)?);
-            bulk_vs.push(value_states.to_dtype(target_dtype)?);
-        }
-
         if bulk_ks.is_empty() {
             if baking_only && seqlen_offset == 0 {
                 // Prefill(Baking) 중에는 방금 생성한 텐서(key_states/value_states)를 직접 사용
@@ -894,25 +877,26 @@ impl QuantizedQwen3VLTextAttention {
             v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
         }
 
-        // [FORCE-TYPE-STRICT] Ensure matmul operands are perfectly matched and in high precision
-        let lhs = query_states.to_dtype(DType::F32)?;
-        let rhs = k.transpose(2, 3)?.to_dtype(DType::F32)?;
+        // [FORCE-TYPE-STRICT] Ensure matmul operands are perfectly matched
+        let lhs = query_states.to_dtype(target_dtype)?;
+        let rhs = k.transpose(2, 3)?.to_dtype(target_dtype)?;
 
-        // Scores in F32 precision for stability at high offsets
+        // Scores in F32 precision for stability
         let mut attn_weights = lhs.matmul(&rhs)?
+            .to_dtype(DType::F32)?
             .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?;
 
         // Apply Internally Generated Causal Mask
         if let Some(mask) = &attention_mask {
             let m_len = mask.dim(D::Minus1)?;
             if final_kv_len <= m_len {
-                attn_weights = attn_weights.broadcast_add(&mask.narrow(D::Minus1, 0, final_kv_len)?.to_dtype(DType::F32)?)?;
+                attn_weights = attn_weights.broadcast_add(&mask.narrow(D::Minus1, 0, final_kv_len)?)?;
             }
         }
 
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
         
-        // [FINAL-DTYPE-STRICT] Convert back to target dtype for output
+        // [FINAL-DTYPE-STRICT] Force match for second matmul
         let weights_final = attn_weights.to_dtype(target_dtype)?;
         let v_final = v.to_dtype(target_dtype)?;
         let attn_output = weights_final.matmul(&v_final)?;
