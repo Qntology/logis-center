@@ -645,139 +645,109 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // [ACCUMULATOR-INTEGRITY] 
-        // 1. seqlen_offset이 0이면 새로운 세션이므로 모든 누산기 초기화
-        // 2. 현재 kv_blocks와 merged_vram_block_count가 다르면(복구 등) 강제 초기화
-        if seqlen_offset == 0 || self.merged_vram_block_count != self.kv_blocks.len() {
-            self.vram_merged_k = None;
-            self.vram_merged_v = None;
-            self.merged_vram_block_count = 0;
-        }
-
-        // 3. [SEQUENTIAL-KV-LOADER] Strictly Ordered Hybrid Pipeline
-        let mut bulk_ks: Vec<Tensor> = Vec::new();
-        let mut bulk_vs: Vec<Tensor> = Vec::new();
+        // 3. [TRUE-CHUNKED-STREAMING] Online Softmax Accumulation
+        // 모든 블록을 한꺼번에 로드하지 않고, 소량씩 읽어 계산한 뒤 즉시 VRAM에서 해제합니다.
+        let mut global_max_logits = Tensor::full(f32::NEG_INFINITY, (b_sz, self.num_attention_heads, q_len, 1), dev)?.to_dtype(target_dtype)?;
+        let mut global_sum_exp = Tensor::zeros((b_sz, self.num_attention_heads, q_len, 1), target_dtype, dev)?;
+        let mut global_weighted_v = Tensor::zeros((b_sz, self.num_attention_heads, q_len, self.head_dim), target_dtype, dev)?;
 
         let total_tokens_now = seqlen_offset + q_len;
         for block in &self.kv_blocks {
-            let (index, b_off, _b_len) = {
+            let (index, b_off, b_len) = {
                 let inner = block.inner.read().unwrap();
                 (inner.index, inner.offset, inner.len)
             };
             if b_off >= total_tokens_now { continue; }
 
-            // Check physical VRAM presence
-            let mut k_vram = None;
-            let mut v_vram = None;
+            // [STREAM-LOAD] 필요한 블록만 VRAM으로 소환
+            let mut k_chunk = None;
+            let mut v_chunk = None;
+            let mut loaded_from_ssd = false;
+
             {
                 let inner = block.inner.read().unwrap();
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    k_vram = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
-                    v_vram = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
-                    vram_count += 1;
+                    k_chunk = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
+                    v_chunk = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
                 }
             }
 
-            if let (Some(k), Some(v)) = (k_vram, v_vram) {
-                bulk_ks.push(k); bulk_vs.push(v);
-            } else {
-                // [STREAMING-DECODER] VRAM에 데이터가 없는 경우 SSD에서 mmap으로 즉시 스트리밍 로드
-                let (ssd_path, b_len, b_start) = { 
+            if k_chunk.is_none() {
+                // SSD에서 스트리밍 로드 (mmap)
+                let (ssd_path, b_start) = { 
                     let reg = self.registry.entries.read().unwrap(); 
-                    if index < reg.len() { 
-                        (reg[index].ssd_path.clone(), reg[index].token_len, reg[index].token_start) 
-                    } else { (None, 0, 0) } 
+                    if index < reg.len() { (reg[index].ssd_path.clone(), reg[index].token_start) } else { (None, 0) } 
                 };
-                
                 if let Some(p) = ssd_path {
                     let mut full_path = p.clone();
-                    // [FIX] 절대 경로인 경우 join을 생략하여 윈도우 경로 오류 방지
-                    if !full_path.is_absolute() { 
-                        full_path = crate::utils::paths::get_kv_dir(None).join(full_path); 
-                    }
+                    if !full_path.is_absolute() { full_path = crate::utils::paths::get_kv_dir(None).join(full_path); }
                     let block_file = full_path.join(format!("l{}.st", self.layer_idx));
-
-                    // [FAST-MMAP-STREAM] 파일을 즉시 메모리 맵핑하여 VRAM으로 전송
                     if let Ok(data) = crate::utils::direct_loader::load_kv_block(&block_file) {
                         if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
                             let prefix = format!("b{}_l{}_", b_start, self.layer_idx);
                             let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
-                            
                             if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
                                 let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                                 let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
-
                                 let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
                                 let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
-
-                                let k_gpu = self.decompress_from_bf16(&kd_t, &meta_os, dev)?;
-                                let v_gpu = self.decompress_from_bf16(&vd_t, &meta_os, dev)?;
-
-                                // [HYBRID-CACHE-STRATEGY] 
-                                // 마지막 레이어(27)만 VRAM에 고정하고, 0~26번은 연산 후 버립니다.
-                                // 이를 통해 OOM 없이 수만 토큰의 문맥을 처리할 수 있습니다.
-                                if q_len == 1 && self.layer_idx == 27 {
-                                    let mut inner_w = block.inner.write().unwrap();
-                                    inner_w.k_cache = Some(k_gpu.clone());
-                                    inner_w.v_cache = Some(v_gpu.clone());
-                                    inner_w.location = KVLocation::VRAM;
-                                    inner_w.len = b_len;
-                                    inner_w.offset = b_start;
-                                }
-
-                                bulk_ks.push(k_gpu);
-                                bulk_vs.push(v_gpu);
+                                k_chunk = Some(self.decompress_from_bf16(&kd_t, &meta_os, dev)?);
+                                v_chunk = Some(self.decompress_from_bf16(&vd_t, &meta_os, dev)?);
+                                loaded_from_ssd = true;
                                 ssd_count += 1;
                             }
                         }
                     }
                 }
             }
-        }
 
-        if bulk_ks.is_empty() { return Err(anyhow!("No KV data found")); }
+            if let (Some(k), Some(v)) = (k_chunk, v_chunk) {
+                // [PARTIAL-ATTENTION] 현재 청크에 대해서만 어텐션 계산
+                let mut k_eff = k;
+                let mut v_eff = v;
+                if self.num_kv_groups > 1 {
+                    let (b, h, s, d) = k_eff.dims4()?;
+                    k_eff = k_eff.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                    v_eff = v_eff.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                }
 
-        // 4. [BULK-ATTENTION] GPU Parallel Concatenation
-        let k = Tensor::cat(&bulk_ks, 2)?;
-        let v = Tensor::cat(&bulk_vs, 2)?;
-        let final_kv_len = k.dim(2)?;
+                let logits = query_states.matmul(&k_eff.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?;
+                
+                // [ONLINE-SOFTMAX-UPDATE]
+                let chunk_max = logits.max_keepdim(D::Minus1)?;
+                let new_max = global_max_logits.broadcast_maximum(&chunk_max)?;
+                
+                let exp_scale_old = global_max_logits.sub(&new_max)?.exp()?;
+                let exp_scale_chunk = chunk_max.sub(&new_max)?.exp()?;
+                
+                let chunk_exp_sum = logits.sub(&chunk_max)?.exp()?.sum_keepdim(D::Minus1)?;
+                global_sum_exp = global_sum_exp.broadcast_mul(&exp_scale_old)?.broadcast_add(&chunk_exp_sum.broadcast_mul(&exp_scale_chunk)?)?;
+                
+                let chunk_weighted_v = logits.sub(&chunk_max)?.exp()?.matmul(&v_eff)?;
+                global_weighted_v = global_weighted_v.broadcast_mul(&exp_scale_old)?.broadcast_add(&chunk_weighted_v.broadcast_mul(&exp_scale_chunk)?)?;
+                
+                global_max_logits = new_max;
 
-        let (mut k, mut v) = (k, v);
-        if self.num_kv_groups > 1 {
-            let (b, h, s, d) = k.dims4()?;
-            k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-            v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-        }
-
-        // [FORCE-TYPE-STRICT] Ensure matmul operands are perfectly matched
-        let lhs = query_states.to_dtype(target_dtype)?;
-        let rhs = k.transpose(2, 3)?.to_dtype(target_dtype)?;
-
-        // Scores in F32 precision for stability
-        let mut attn_weights = lhs.matmul(&rhs)?
-            .to_dtype(DType::F32)?
-            .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?;
-
-        // Apply Internally Generated Causal Mask
-        if let Some(mask) = &attention_mask {
-            let m_len = mask.dim(D::Minus1)?;
-            if final_kv_len <= m_len {
-                attn_weights = attn_weights.broadcast_add(&mask.narrow(D::Minus1, 0, final_kv_len)?)?;
+                // [MEMORY-RELEASE] 0~26번 레이어이고 SSD에서 로드했다면 즉시 VRAM 해제
+                if loaded_from_ssd && self.layer_idx < 27 {
+                    // k, v 변수가 스코프를 벗어나며 GPU 메모리 반납 유도
+                } else if self.layer_idx == 27 && q_len == 1 {
+                    // 마지막 레이어는 캐시에 보관
+                    let mut inner_w = block.inner.write().unwrap();
+                    inner_w.k_cache = Some(k_eff);
+                    inner_w.v_cache = Some(v_eff);
+                    inner_w.location = KVLocation::VRAM;
+                }
             }
         }
 
-        let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-        
-        // [FINAL-DTYPE-STRICT] Force match for second matmul
-        let weights_final = attn_weights.to_dtype(target_dtype)?;
-        let v_final = v.to_dtype(target_dtype)?;
-        let attn_output = weights_final.matmul(&v_final)?;
-
+        // 4. [FINAL-NORMALIZATION]
+        let attn_output = global_weighted_v.broadcast_div(&global_sum_exp)?;
         let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
         let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
         
         if self.layer_idx == 0 {
-            println!("[SPEED] Token {} | R:{} S:{} V:{} | Attn: {:?}", total_tokens_now, ram_count, ssd_count, vram_count, start_attn.elapsed());
+            println!("[STREAM-SPEED] Token {} | SSD:{} | Attn: {:?}", total_tokens_now, ssd_count, start_attn.elapsed());
         }
         Ok(attn_output)
     }
