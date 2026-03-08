@@ -712,18 +712,21 @@ impl Qwen3VLGenerateModel {
         wait_for_global_io().await;
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         
-        // [SSD-BRIDGE] Hybrid Transition Mode: Registry Rebuild (0-26) + VRAM Persistent (27)
+        // [SSD-BRIDGE] Ideal Transition Mode: Flush -> Clear -> Registry Rebuild
         if let Some(s_id) = &session_id {
-            println!("[SSD-BRIDGE] Initiating Hybrid Bridge. Rebuilding Context for Layers 0-26...");
+            println!("[SSD-BRIDGE] Initiating Ideal Bridge for Unified Task: {}. Flushing KV...", s_id);
             let actual_len = self.get_kv_len();
             
-            // 1. 잔여 데이터 SSD 백업 (보험용)
+            // 1. 잔여 데이터 SSD 강제 백업
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
             wait_for_global_io().await;
             
-            // 2. SSD 장부(Registry) 재구축
-            // [NOTE] 이 함수는 SSD에 있는 0~26번 레이어의 맥락을 찾아 연결합니다.
-            // 27번 레이어는 이미 process_single_layer에서 보존되어 있으므로 장부만 업데이트됩니다.
+            // 2. VRAM 초기화 (모든 레이어 리셋)
+            println!("[SSD-BRIDGE] Initializing VRAM (Clearing pointers)...");
+            self.clear_kv_cache();
+            
+            // 3. SSD 장부(Registry) 재구축 (0-27 모든 레이어 복구)
+            println!("[SSD-BRIDGE] Rebuilding Registry from unified snapshots...");
             let kv_type = _kv_name.as_deref().unwrap_or("text");
             let snapshot_path = crate::utils::paths::get_kv_dir(None).join(s_id).join("inference").join(kv_type);
             let device_clone = self.text_device.clone();
@@ -732,7 +735,7 @@ impl Qwen3VLGenerateModel {
             wait_for_global_io().await;
             
             let verified_len = self.get_kv_len();
-            println!("[SSD-BRIDGE] Hybrid Bridge Established. Global Len: {} (L0-26: SSD, L27: VRAM)", verified_len);
+            println!("[SSD-BRIDGE] Ideal Bridge Established. Context (V:{}) verified.", verified_len);
 
             total_tokens_after_prefill = verified_len;
             println!("[SSD-BRIDGE] Syncing decoding start pos to: {}", total_tokens_after_prefill);
