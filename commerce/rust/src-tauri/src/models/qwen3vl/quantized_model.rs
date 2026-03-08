@@ -1141,11 +1141,15 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
         
-        // [VRAM-FLUSH] 레이어 자신의 VRAM 병합 캐시를 비워 메모리를 확보합니다.
-        if let Ok(mut merger) = self.vram_cache_merger.write() {
-            merger.k = None;
-            merger.v = None;
-            merger.block_count = 0;
+        // [VRAM-FLUSH] Prefill(Baking) 모드일 때만 레이어 자신의 VRAM 병합 캐시를 비워 메모리를 확보합니다.
+        // 디코딩 중에는 이 캐시를 유지해야 다음 토큰 생성 시 속도가 보장됩니다.
+        if baking_only {
+            if let Ok(mut merger) = self.vram_cache_merger.write() {
+                merger.k = None;
+                merger.v = None;
+                merger.block_count = 0;
+                println!("[VRAM-FLUSH] Layer {} merged cache cleared (Prefill complete).", self.layer_idx);
+            }
         }
         
         Ok(())
@@ -2283,24 +2287,23 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [PIPELINE-OPTIMIZATION] Prefill(Baking) 상황에서만 무거운 IO 로직 수행
-        if baking_only && session_id.is_some() {
+        // [PIPELINE-OPTIMIZATION] Prefill(Baking) 상황(seqlen_offset == 0)에서만 무거운 IO 로직 수행
+        if baking_only && seqlen_offset == 0 && session_id.is_some() {
             let sid = session_id.unwrap();
             
-            // 1. VRAM -> RAM 대피 (Prefill 중 VRAM 부족 방지)
+            // 1. VRAM -> RAM 대피
             let _ = self.layers[layer_idx].self_attn.evacuate_vram_to_cache();
             
             let layer_ptr = self.layers[layer_idx].clone();
-            let baking_only_clone = baking_only;
             
             // 2. SSD 저장 트리거 (IO 작업은 백그라운드)
             tauri::async_runtime::spawn(async move {
-                let _ = layer_ptr.self_attn.trigger_realtime_incremental_bake(&sid, true, baking_only_clone, false);
+                let _ = layer_ptr.self_attn.trigger_realtime_incremental_bake(&sid, true, true, false);
             });
         }
 
-        // [MEMORY-OPT] [IMMEDIATE-PURGE] 가중치 소각 (Prefill 중에만 수행하여 VRAM 확보)
-        if baking_only {
+        // [MEMORY-OPT] [IMMEDIATE-PURGE] 가중치 소각 (Prefill 중에만 수행)
+        if baking_only && seqlen_offset == 0 {
             self.layers[layer_idx].clear();
             println!("[PIPELINE] Prefill Layer {} complete. Weights purged.", layer_idx);
         }
