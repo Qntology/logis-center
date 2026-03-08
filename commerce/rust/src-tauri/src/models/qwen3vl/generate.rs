@@ -286,9 +286,10 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
 }
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
-    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(100); 
+    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(1024); 
     tokio::spawn(async move {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(48)); 
+        // [SCALABLE-IO] 전역 동시성 제한을 256으로 늘려 여러 레이어가 독립적으로 대역폭 사용 가능하게 함
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(256)); 
         while let Some(task) = io_rx.recv().await {
             let sem = semaphore.clone();
             let (tp, ts, reg, b_idx, sid, is_last, kv_n, shared_block) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone(), task.shared_block.clone());
@@ -298,40 +299,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 let _guard = IoGuard;
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 
-                // [FIX] Use candle_core::safetensors::save for consistency
                 if let Ok(_) = candle_core::safetensors::save(&ts, &tp) {
-                    println!("[IO-WORKER] Successfully saved KV block to {:?}", tp);
                     drop(ts);
                     
-                    // [MEMORY-RELEASE] Clear original KVBlock RAM/VRAM cache immediately after SSD save
-                    if let Some(block) = shared_block {
-                        if let Ok(mut inner) = block.inner.write() {
-                            inner.k_cache = None;
-                            inner.v_cache = None;
-                            println!("[MEMORY-RELEASE] RAM/VRAM cache cleared for block at {:?}", tp.parent());
-                        }
-                    }
-
-                    // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
-                    if let Some(kv_name) = kv_n {
-                        if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
-                            if let Ok(l_idx) = l_str.parse::<usize>() {
-                                // 오프셋 추출 (파일명 b{offset}_l{idx}_k_anchors 에서 추출하거나 SaveTask에 추가 가능)
-                                // 현재는 tp.parent() 폴더명이 b{offset} 이므로 이를 활용
-                                let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
-                                let offset = offset_str.parse::<usize>().unwrap_or(0);
-                                
-                                let _ = INDEX_TX.send(SlotTask::IndexUpdate {
-                                    kv_name,
-                                    layer_idx: l_idx,
-                                    offset,
-                                    len: 256,
-                                    file_name: format!("b{}/l{}.st", offset, l_idx),
-                                }).await;
-                            }
-                        }
-                    }
-
+                    // 1. Registry Update (SSD 위치 등록)
                     if let (Some(r), Some(idx)) = (reg, b_idx) {
                         if let Ok(mut entries) = r.entries.write() {
                             if idx < entries.len() {
@@ -341,7 +312,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         if l_idx < 28 { 
                                             e.location[l_idx] = KVLocation::SSD; 
                                             e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                                            // [MEMORY-RELEASE] SSD 저장 완료 즉시 RAM 메모리 해제
                                             if let Ok(mut cache) = e.bitkv_cache.write() {
                                                 if l_idx < cache.len() { cache[l_idx] = None; }
                                             }
@@ -351,9 +321,21 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             }
                         }
                     }
+
+                    // 2. Immediate Block Memory Release
+                    if let Some(block) = shared_block {
+                        if let Ok(mut inner) = block.inner.write() {
+                            inner.k_cache = None;
+                            inner.v_cache = None;
+                        }
+                    }
                 }
+                
+                // 3. Slot (Layer Batch) Completion Check
                 let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
-                if rem == 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; }
+                if rem == 1 || is_last { 
+                    SLOT_MANAGER.mark_ready(sid).await; 
+                }
             });
         }
     });
@@ -396,23 +378,19 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             let mut map = std::collections::HashMap::new();
                             let prefix = format!("b{}_l{}_", off, act_l);
 
-                            // 원본 데이터가 있다면 여기서 압축 수행
-                            let (k_packed, k_scales, v_packed, v_scales) = if let (Some(rk), Some(rv)) = (src.raw_k, src.raw_v) {
-                                let (kp, ks) = compress_1bit_worker(&rk).unwrap();
-                                let (vp, vs) = compress_1bit_worker(&rv).unwrap();
-                                (kp, ks, vp, vs)
+                            // [DIRECT-SAVE] Skip compression, save RAW tensors (BF16/F32)
+                            if let (Some(rk), Some(rv)) = (src.raw_k, src.raw_v) {
+                                // [STABILITY] Ensure tensors are contiguous and on CPU for saving
+                                let rk_cpu = if !rk.device().is_cpu() { rk.to_device(&Device::Cpu).unwrap_or(rk) } else { rk };
+                                let rv_cpu = if !rv.device().is_cpu() { rv.to_device(&Device::Cpu).unwrap_or(rv) } else { rv };
+                                
+                                map.insert(format!("{}k_raw", prefix), rk_cpu);
+                                map.insert(format!("{}v_raw", prefix), rv_cpu);
                             } else {
-                                (src.k_data, src.k_shape, src.v_data, Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap())
-                            };
-                            
-                            let k_shape_u32 = vec![1u32, 8u32, 256u32, 128u32];
-                            let k_shape_t = Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap();
-
-                            map.insert(format!("{}k_data", prefix), k_packed);
-                            map.insert(format!("{}v_data", prefix), v_packed);
-                            map.insert(format!("{}k_scale", prefix), k_scales);
-                            map.insert(format!("{}v_scale", prefix), v_scales);
-                            map.insert(format!("{}k_shape", prefix), k_shape_t);
+                                // Fallback for pre-compressed or empty data
+                                map.insert(format!("{}k_data", prefix), src.k_data);
+                                map.insert(format!("{}v_data", prefix), src.v_data);
+                            }
                             
                             let file_path = task_dir.join(format!("l{}.st", act_l));
                             GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -669,7 +647,9 @@ impl Qwen3VLGenerateModel {
             
             let total_tokens_after_prefill = offset + input_ids.dim(1)?;
         
-        wait_for_global_io().await; // [SYNC] Ensure disk is ready before inference
+        println!("[GEN-SYNC] Waiting for all background KV baking to complete...");
+        wait_for_global_io().await; // [CRITICAL] Ensure all layers are on SSD/RAM before first forward
+        
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         
         // [DEBUG-SAMPLING] 첫 번째 토큰 샘플링 전 로그
