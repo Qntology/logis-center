@@ -702,15 +702,7 @@ impl QuantizedQwen3VLTextAttention {
 
         let cos = cos.to_dtype(target_dtype)?;
         let sin = sin.to_dtype(target_dtype)?;
-        
-        // [FIX] RoPE Alignment: Decoding 시 현재 토큰 위치(seqlen_offset)에 맞게 cos/sin 조정
-        let (cos_aligned, sin_aligned) = if cos.dim(D::Minus2)? > q_len {
-            (cos.narrow(D::Minus2, 0, q_len)?, sin.narrow(D::Minus2, 0, q_len)?)
-        } else {
-            (cos, sin)
-        };
-
-        let (query_states, key_states) = apply_rotary_pos_emb(&query_states.to_dtype(target_dtype)?, &key_states.to_dtype(target_dtype)?, &cos_aligned, &sin_aligned, false)?;
+        let (query_states, key_states) = apply_rotary_pos_emb(&query_states.to_dtype(target_dtype)?, &key_states.to_dtype(target_dtype)?, &cos, &sin, false)?;
         let query_states = query_states.to_dtype(target_dtype)?;
         let key_states = key_states.to_dtype(target_dtype)?;
         
@@ -775,27 +767,18 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // 3. [KV-LOAD] Build bulk_ks for Attention
-        let mut bulk_ks = Vec::new();
-        let mut bulk_vs = Vec::new();
+        // 3. [SEQUENTIAL-KV-LOADER] Strictly Ordered Hybrid Pipeline
+        let mut bulk_ks: Vec<Tensor> = Vec::new();
+        let mut bulk_vs: Vec<Tensor> = Vec::new();
 
         let total_tokens_now = seqlen_offset + q_len;
-
-        // [VRAM-SYNC] Use and INCREMENTALLY UPDATE merged cache
-        if !baking_only && seqlen_offset > 0 {
-            let mut merger = self.vram_cache_merger.write().unwrap();
-            if let (Some(mk), Some(mv)) = (merger.k.take(), merger.v.take()) {
-                // [FIX] Combine existing context with NEW tokens
-                let k_full = Tensor::cat(&[mk, key_states.to_dtype(target_dtype)?], 2)?;
-                let v_full = Tensor::cat(&[mv, value_states.to_dtype(target_dtype)?], 2)?;
-                
-                // Update merger for next step
-                merger.k = Some(k_full.clone());
-                merger.v = Some(v_full.clone());
-                merger.block_count = self.kv_blocks.len();
-                
-                bulk_ks.push(k_full);
-                bulk_vs.push(v_full);
+        
+        // [VRAM-SYNC] Use merged cache if available
+        {
+            let merger = self.vram_cache_merger.read().unwrap();
+            if let (Some(mk), Some(mv)) = (&merger.k, &merger.v) {
+                bulk_ks.push(mk.clone());
+                bulk_vs.push(mv.clone());
                 vram_count += merger.block_count;
             }
         }
@@ -806,7 +789,7 @@ impl QuantizedQwen3VLTextAttention {
                 bulk_ks.push(key_states.to_dtype(target_dtype)?);
                 bulk_vs.push(value_states.to_dtype(target_dtype)?);
             } else {
-                // [FALLBACK] If no merged cache, load blocks individually (includes tokens just added in step 2)
+                // [FALLBACK] If no merged cache, load blocks individually (should be rare with warmup)
                 for block in &self.kv_blocks {
                     let (index, b_off) = { let inner = block.inner.read().unwrap(); (inner.index, inner.offset) };
                     if b_off >= total_tokens_now { continue; }
@@ -817,52 +800,56 @@ impl QuantizedQwen3VLTextAttention {
                         if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                             bulk_ks.push(k.to_device(dev)?.to_dtype(target_dtype)?);
                             bulk_vs.push(v.to_device(dev)?.to_dtype(target_dtype)?);
-                            vram_count += 1; loaded = true;
+                            vram_count += 1;
+                            loaded = true;
                         }
                     }
+                    
                     if !loaded {
-                        // SSD 로직 (생략 가능하지만 안전을 위해 유지)
+                        // SSD 로직 (생략 가능하지만 안전을 위해 최소한으로 유지)
                         let ssd_path = { let reg = self.registry.entries.read().unwrap(); if index < reg.len() { reg[index].ssd_path.clone() } else { None } };
                         if let Some(p) = ssd_path {
                             let mut full_path = p.clone();
                             if full_path.is_relative() && !full_path.starts_with("tmp") { full_path = crate::utils::paths::get_kv_dir(None).join(full_path); }
                             let block_file = full_path.join(format!("l{}.st", self.layer_idx));
-                            let data_res = std::fs::read(&block_file).or_else(|_| crate::utils::direct_loader::load_kv_block(&block_file));
-                            if let Ok(data) = data_res {
+                            if let Ok(data) = crate::utils::direct_loader::load_kv_block(&block_file) {
                                 if let Ok(st_map) = candle_core::safetensors::load_buffer(&data, &Device::Cpu) {
                                     let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
                                     let get_t = |s: &str| st_map.get(&format!("{}{}", prefix, s)).or_else(|| st_map.get(s)).cloned();
                                     if let (Some(kr_t), Some(vr_t)) = (get_t("k_raw"), get_t("v_raw")) {
                                         bulk_ks.push(kr_t.to_device(dev)?.to_dtype(target_dtype)?);
                                         bulk_vs.push(vr_t.to_device(dev)?.to_dtype(target_dtype)?);
-                                        ssd_count += 1; loaded = true;
+                                        ssd_count += 1;
+                                        loaded = true;
                                     }
                                 }
                             }
                         }
                     }
+                    
                     if !loaded { return Err(anyhow!("Layer {} block {} could not be loaded", self.layer_idx, index)); }
-                }
-                
-                // If we loaded from blocks, update merger for next step
-                // [FIX] q_len > 1 (prefill) 상황에서도 merger를 업데이트하여 다음 청크에서 재사용 가능하게 함
-                if seqlen_offset > 0 {
-                    let mut merger = self.vram_cache_merger.write().unwrap();
-                    merger.k = Some(Tensor::cat(&bulk_ks, 2)?);
-                    merger.v = Some(Tensor::cat(&bulk_vs, 2)?);
-                    merger.block_count = self.kv_blocks.len();
                 }
             }
         }
 
         if bulk_ks.is_empty() { return Err(anyhow!("No KV data found")); }
 
-        // 4. [BULK-ATTENTION] GPU Parallel Concatenation (Single tensor if merger used)
-        let k_final = if bulk_ks.len() == 1 { bulk_ks[0].clone() } else { Tensor::cat(&bulk_ks, 2)? };
-        let v_final = if bulk_vs.len() == 1 { bulk_vs[0].clone() } else { Tensor::cat(&bulk_vs, 2)? };
+        // 4. [BULK-ATTENTION] GPU Parallel Concatenation
+        let k_cat = Tensor::cat(&bulk_ks, 2)?;
+        let v_cat = Tensor::cat(&bulk_vs, 2)?;
         
-        let final_kv_len = k_final.dim(2)?;
-        let (mut k, mut v) = (k_final, v_final);
+        // [UPDATE-MERGED-CACHE] If this was a decoding step, update the merged cache
+        if !baking_only && seqlen_offset > 0 {
+            if let Ok(mut merger) = self.vram_cache_merger.write() {
+                merger.k = Some(k_cat.clone());
+                merger.v = Some(v_cat.clone());
+                merger.block_count = self.kv_blocks.len();
+            }
+        }
+
+        let final_kv_len = k_cat.dim(2)?;
+
+        let (mut k, mut v) = (k_cat, v_cat);
         if self.num_kv_groups > 1 {
             let (b, h, s, d) = k.dims4()?;
             k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
@@ -1870,8 +1857,7 @@ impl QuantizedQwen3VLTextModel {
 
         let current_device = device.clone(); 
         let registry = KVRegistry::new();
-        // [FIX] baking_only 여부와 관계없이 전체 레이어 구조를 생성해야 28개 레이어를 순차적으로 처리할 수 있습니다.
-        let num_layers_to_load = config.num_hidden_layers;
+        let num_layers_to_load = if baking_only { 1 } else { config.num_hidden_layers };
 
         // [ZERO-RAM-STARTUP] 최초 로딩 시 레이어 가중치를 전혀 읽지 않고 껍데기만 생성합니다.
         let mut layers = Vec::with_capacity(num_layers_to_load);
@@ -2153,14 +2139,6 @@ impl QuantizedQwen3VLTextModel {
                 None => Some(out),
                 Some(prev) => Some(Tensor::cat(&[prev, out], 1)?),
             };
-
-            // [STRICT-CHUNK-EVACUATION] 청크 하나가 끝나면 즉시 VRAM에서 RAM으로 KV 대피 (OOM 방지)
-            // seqlen_offset == 0 은 이 레이어의 첫 번째 '거대 뭉치' 처리 중임을 의미 (Prefill)
-            if seqlen_offset == 0 {
-                let _ = self.layers[layer_idx].self_attn.evacuate_vram_to_cache();
-                let dev = self.layers[layer_idx].device();
-                if dev.is_cuda() { let _ = dev.synchronize(); }
-            }
         }
 
         final_output.ok_or_else(|| anyhow::anyhow!("No output generated from chunks"))
@@ -2906,8 +2884,11 @@ impl QuantizedQwen3VLModel {
 
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
-        // [FIX] baking_only 모드에서도 모든 레이어를 유지해야 28개 레이어를 순차적으로 처리할 수 있습니다.
-        // 레이어 개수를 1개로 축소하던 이전 로직을 제거합니다.
+        // [OPTIMIZATION] If baking only, limit to 1 layer to save massive VRAM/RAM
+        if baking_only {
+            println!("[MODEL] Vision Baker Mode: Reducing LLM to 1 layer.");
+            t_config.num_hidden_layers = 1;
+        }
 
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
             &t_config, ct_main.clone(), main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
@@ -3191,8 +3172,7 @@ impl QuantizedQwen3TextModel {
     ) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
-        // [FIX] single_layer_mode 여부와 상관없이 모든 레이어 구조를 생성합니다.
-        // t_config.num_hidden_layers = 1 로 강제하던 이전 로직 제거.
+        if single_layer_mode { t_config.num_hidden_layers = 1; }
         
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
             &t_config, ct_main.clone(), mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
@@ -3221,8 +3201,7 @@ impl QuantizedQwen3TextModel {
     ) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
-        // [FIX] single_layer_mode 여부와 상관없이 모든 레이어 구조를 생성합니다.
-        // t_config.num_hidden_layers = 1 로 강제하던 이전 로직 제거.
+        if single_layer_mode { t_config.num_hidden_layers = 1; }
 
         let language_model = QuantizedQwen3VLTextModel::new(
             &t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only

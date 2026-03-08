@@ -566,8 +566,7 @@ async fn process_task(
         
         // 1. [0.6B] Load & Generate (Direct 28-Layer Generation)
         {
-            // [FIX] Prefill stage: Force baking_only: true for maximum VRAM efficiency
-            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), true, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -626,8 +625,7 @@ async fn process_task(
 
         // 1. [Small] Load & Generate (Direct 28-Layer Generation)
         {
-            // [FIX] Force baking_only: true for prefill stability
-            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), true, Some("inference".to_string())).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -743,8 +741,7 @@ async fn process_task(
 
             // 1. [Small] Load & Generate (Direct 28-Layer Generation)
             {
-                // [FIX] Force baking_only: true for prefill stability
-                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), true, Some("inference".to_string())).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 

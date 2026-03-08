@@ -595,24 +595,20 @@ impl LogisModel {
         let shared_path_clone = shared_path.map(|s| s.to_string());
         let handle_clone = self.app_handle.clone();
 
-        // [VRAM-STRATEGY] Prefill(Baking) 요청 시 무조건 Single-Layer 모드 사용
-        // Large 모델의 경우 저사양 환경 보호를 위해 추가적으로 체크할 수 있으나, 
-        // 스케줄러에서 이미 true를 넘겨주므로 그대로 따름.
-        let force_baking = baking_only;
-
         let gen = tokio::task::spawn_blocking(move || {
             let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
-                shared_path_clone.as_deref(),
-                shared_path_clone.as_deref(),
+                shared_path_clone.as_deref(), 
+                shared_path_clone.as_deref(), 
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
                 force_text_only,
-                force_baking, // [FIXED]
-                is_disk_swap, 
+                baking_only,
+                is_disk_swap,
                 kv_root
             )
         }).await??;
+
         // Move current main to slot
         if let Some(old_m) = gen_guard.take() {
             if let Some(old_size) = *current_size_guard {
