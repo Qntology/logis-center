@@ -105,12 +105,14 @@ pub struct BakeTask {
     pub slot_id: usize, pub task_dir: PathBuf, pub kv_name: Option<String>,
     pub offset: usize, pub layers: Vec<LayerKVDump>, pub is_relay_baking: bool,
     pub block_idx: Option<usize>, pub registry: KVRegistry,
+    pub shared_block: Option<KVBlock>,
 }
 
 pub struct SaveTask {
     pub slot_id: usize, pub path: PathBuf, pub tensors: std::collections::HashMap<String, Tensor>,
     pub is_last: bool, pub block_idx: Option<usize>, pub registry: Option<KVRegistry>,
     pub kv_name: Option<String>,
+    pub shared_block: Option<KVBlock>,
 }
 
 pub enum SlotTask { 
@@ -148,11 +150,10 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
             if let SlotTask::IndexUpdate { kv_name, layer_idx, offset, len, file_name } = task {
                 let index_path = kv_dir.join(&kv_name).join(format!("layer{}.json", layer_idx));
                 
-                // [DIRECT-IO] Use OS-accelerated read for index metadata
+                // [FIX] Use standard fs for JSON metadata to prevent DirectStorage sync/corruption issues
                 let mut index = if index_path.exists() {
-                    if let Ok(data) = load_kv_block(&index_path) {
-                        String::from_utf8(data).ok()
-                            .and_then(|s| serde_json::from_str::<LayerIndex>(&s).ok())
+                    if let Ok(data) = fs::read(&index_path) {
+                        serde_json::from_slice::<LayerIndex>(&data)
                             .unwrap_or(LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] })
                     } else {
                         LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] }
@@ -167,8 +168,7 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
                     index.blocks.sort_by_key(|b| b.offset);
                     index.total_tokens = index.blocks.iter().map(|b| b.len).sum();
                     if let Ok(json) = serde_json::to_string_pretty(&index) {
-                        // [DIRECT-IO] Use OS-accelerated write for index metadata
-                        let _ = save_kv_block(&index_path, json.as_bytes());
+                        let _ = fs::write(&index_path, json.as_bytes());
                     }
                 }
             }
@@ -300,7 +300,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 
                 // [FIX] Use candle_core::safetensors::save for consistency
                 if let Ok(_) = candle_core::safetensors::save(&ts, &tp) {
-                    println!("[IO-WORKER] Successfully saved KV block to {:?}", tp);
+                    // println!("[IO-WORKER] Successfully saved KV block to {:?}", tp);
                     drop(ts);
                     
                     // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
