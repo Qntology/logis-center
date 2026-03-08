@@ -1870,7 +1870,8 @@ impl QuantizedQwen3VLTextModel {
 
         let current_device = device.clone(); 
         let registry = KVRegistry::new();
-        let num_layers_to_load = if baking_only { 1 } else { config.num_hidden_layers };
+        // [FIX] baking_only 여부와 관계없이 전체 레이어 구조를 생성해야 28개 레이어를 순차적으로 처리할 수 있습니다.
+        let num_layers_to_load = config.num_hidden_layers;
 
         // [ZERO-RAM-STARTUP] 최초 로딩 시 레이어 가중치를 전혀 읽지 않고 껍데기만 생성합니다.
         let mut layers = Vec::with_capacity(num_layers_to_load);
@@ -2905,11 +2906,8 @@ impl QuantizedQwen3VLModel {
 
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
-        // [OPTIMIZATION] If baking only, limit to 1 layer to save massive VRAM/RAM
-        if baking_only {
-            println!("[MODEL] Vision Baker Mode: Reducing LLM to 1 layer.");
-            t_config.num_hidden_layers = 1;
-        }
+        // [FIX] baking_only 모드에서도 모든 레이어를 유지해야 28개 레이어를 순차적으로 처리할 수 있습니다.
+        // 레이어 개수를 1개로 축소하던 이전 로직을 제거합니다.
 
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
             &t_config, ct_main.clone(), main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
@@ -3193,7 +3191,8 @@ impl QuantizedQwen3TextModel {
     ) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
-        if single_layer_mode { t_config.num_hidden_layers = 1; }
+        // [FIX] single_layer_mode 여부와 상관없이 모든 레이어 구조를 생성합니다.
+        // t_config.num_hidden_layers = 1 로 강제하던 이전 로직 제거.
         
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
             &t_config, ct_main.clone(), mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
@@ -3222,7 +3221,8 @@ impl QuantizedQwen3TextModel {
     ) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
-        if single_layer_mode { t_config.num_hidden_layers = 1; }
+        // [FIX] single_layer_mode 여부와 상관없이 모든 레이어 구조를 생성합니다.
+        // t_config.num_hidden_layers = 1 로 강제하던 이전 로직 제거.
 
         let language_model = QuantizedQwen3VLTextModel::new(
             &t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only
