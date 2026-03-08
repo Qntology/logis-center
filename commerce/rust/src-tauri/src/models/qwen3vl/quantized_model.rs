@@ -919,30 +919,27 @@ impl QuantizedQwen3VLTextAttention {
     pub fn trigger_realtime_incremental_bake(&self, session_id: &str, is_last_chunk: bool, baking_only: bool, is_decoding: bool) -> Result<()> {
         use crate::models::qwen3vl::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
 
-        let total_blocks = self.kv_blocks.len();
-        // [VRAM-GUARD] 디코딩 시에는 최신 3개만 VRAM에 유지 (SSD에는 모두 백업)
-        let vram_limit_idx = if is_decoding { total_blocks.saturating_sub(3) } else { 0 };
+        // [VRAM-MERGED-RECOVERY] 병합된 캐시 데이터 확보
+        let merged_k: Option<Tensor> = self.vram_merged_k.clone();
+        let merged_v: Option<Tensor> = self.vram_merged_v.clone();
 
         let target_indices: Vec<usize> = self.kv_blocks.iter().enumerate().filter_map(|(i, b)| {
             let inner = b.inner.read().unwrap();
-            let is_full = inner.len == 256;
-            
-            // [DIRTY-CHECK] Only bake if THIS layer is dirty for this block
             let is_dirty = {
                 let reg = self.registry.entries.read().unwrap();
                 if i < reg.len() { 
                     if self.layer_idx < reg[i].is_dirty.len() { reg[i].is_dirty[self.layer_idx] } else { true }
                 } else { true }
             };
-
-            // [BACKUP-STRATEGY] 
-            // 1. VRAM에 데이터가 있고
-            // 2. 아직 저장이 안 된(dirty) 경우라면 무조건 백업 대상
-            if inner.k_cache.is_some() && is_dirty { Some(i) } else { None }
+            // 데이터가 개별적으로 있거나 병합되어 있는 경우 모두 포함
+            if (inner.k_cache.is_some() || merged_k.is_some()) && is_dirty { Some(i) } else { None }
         }).collect();
 
+        if target_indices.is_empty() { return Ok(()); }
+        println!("[SSD-BACKUP] Layer {} found {} blocks to save.", self.layer_idx, target_indices.len());
+
         for idx in target_indices {
-            // [DIRTY-RESET] Clear dirty flag immediately for THIS layer
+            // [DIRTY-RESET]
             {
                 let mut reg = self.registry.entries.write().unwrap();
                 if idx < reg.len() {
@@ -950,56 +947,53 @@ impl QuantizedQwen3VLTextAttention {
                 }
             }
 
-            let block = self.kv_blocks[idx].clone();
-            let (k_opt, v_opt, off, b_idx, b_len) = {
-                let mut inner = block.inner.write().unwrap();
-                let snapshot = (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len);
+            let block = &self.kv_blocks[idx];
+            let (k_snapshot, v_snapshot, off, b_idx, b_len) = {
+                let inner = block.inner.read().unwrap();
                 
-                // [OFFLOAD] VRAM 상주 한계를 넘은 블록만 실제 데이터를 비움 (SSD 백업은 별개)
-                if is_decoding && idx < vram_limit_idx {
-                    inner.k_cache = None;
-                    inner.v_cache = None;
-                    inner.location = KVLocation::SSD;
+                // [FIX] 병합 텐서에서의 정확한 위치 계산
+                let mut offset_in_merged = 0;
+                for i in 0..idx {
+                    offset_in_merged += self.kv_blocks[i].inner.read().unwrap().len;
                 }
-                snapshot
+
+                let k_res = if let Some(k) = &inner.k_cache { Some(k.clone()) } 
+                            else if let Some(mk) = &merged_k { Some(mk.narrow(2, offset_in_merged, inner.len)?) }
+                            else { None };
+                let v_res = if let Some(v) = &inner.v_cache { Some(v.clone()) } 
+                            else if let Some(mv) = &merged_v { Some(mv.narrow(2, offset_in_merged, inner.len)?) }
+                            else { None };
+                
+                let snap: (Option<Tensor>, Option<Tensor>, usize, usize, usize) = (k_res, v_res, inner.offset, inner.index, inner.len);
+                snap
             };
 
-            if let (Some(k), Some(v)) = (k_opt, v_opt) {
-                // [FRONTEND-1BIT-COMPRESSION] 메인 스레드에서 확실하게 압축하여 전달
-                let (k_packed, k_scales) = self.compress_to_1bit(&k)?;
-                let (v_packed, v_scales) = self.compress_to_1bit(&v)?;
-                
+            if let (Some(k), Some(v)) = (k_snapshot, v_snapshot) {
                 let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
                 let last_part = kv_name_raw.split('/').last().unwrap_or("text");
-                let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { 
-                    "text".to_string() 
-                } else { 
-                    last_part.to_string() 
-                };
+                let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text".to_string() } else { last_part.to_string() };
                 
                 let session_id_owned = session_id.to_string();
                 let registry_clone = self.registry.clone();
                 let layer_idx = self.layer_idx;
+                let baking_only_clone = baking_only;
 
+                // [OFFLOAD-TO-WORKER] 압축 연산까지 워커로 완전히 넘김
                 tokio::spawn(async move {
                     if let Some(tx) = BAKE_TX.get() {
-                        let sub_path = if baking_only {
-                            format!("{}/reference/{}", session_id_owned, kv_type)
-                        } else {
-                            format!("{}/inference/{}", session_id_owned, kv_type)
-                        };
+                        let sub_path = if baking_only_clone { format!("{}/reference/{}", session_id_owned, kv_type) } 
+                                       else { format!("{}/inference/{}", session_id_owned, kv_type) };
 
                         let block_dir = crate::utils::paths::get_kv_dir(None).join(&sub_path).join(format!("b{}", off));
                         if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
 
-                        // 이미 압축된 데이터를 담아 워커에게 토스
                         let dump = LayerKVDump {
                             layer_idx,
-                            k_data: k_packed, // 1-bit packed
-                            v_data: v_packed, // 1-bit packed
-                            k_shape: k_scales, // scale 정보를 shape 자리에 임시 전송 (워커 호환용)
-                            raw_k: None, // 이미 압축됨
-                            raw_v: Some(v_scales), // scale 정보를 여기에 담아 전송
+                            k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(), // 더미
+                            v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(), // 더미
+                            k_shape: Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap(), // 더미
+                            raw_k: Some(k), // 원본 데이터를 넘김 (압축은 워커에서)
+                            raw_v: Some(v), 
                         };
 
                         let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
@@ -1009,7 +1003,7 @@ impl QuantizedQwen3VLTextAttention {
                             kv_name: Some(sub_path),
                             offset: off,
                             layers: vec![dump],
-                            is_relay_baking: baking_only,
+                            is_relay_baking: baking_only_clone,
                             block_idx: Some(b_idx),
                             registry: registry_clone,
                         })).await;
@@ -2152,32 +2146,23 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [MEMORY-OPT] [IMMEDIATE-PURGE] 연산 직후 가중치 즉시 소각
-        // KV 대피(IO)는 시간이 걸릴 수 있으므로, 그 전에 가중치를 먼저 지워서 VRAM 공간 확보
-        if !is_decoding {
+        // [BACKUP-BEFORE-PURGE] 레이어 연산 종료 즉시 백업 트리거
+        if let Some(sid) = session_id.as_ref() {
+            // 가중치를 비우기 전에 VRAM에서 대피된 데이터를 포함하여 SSD 저장을 트리거합니다.
+            let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, false);
+        }
+
+        // [MEMORY-OPT] [IMMEDIATE-PURGE] 백업 요청 후 즉시 무게추 소각하여 VRAM 확보
+        if baking_only {
             self.layers[layer_idx].clear();
-            if target_device.is_cuda() { 
+            if target_device.is_cuda() {
                 let _ = target_device.synchronize(); // GPU 메모리 해제 확정
             }
-            println!("[MEMORY-OPT] Layer {} Weights Purged. (RAM/VRAM cleared)", layer_idx);
-        }
-
-        // [STEP 4] 자원 반납 및 KV 대피
-        let sid_opt = self.active_session_id.clone();
-        if let Some(sid) = sid_opt {
-            if !self.baking_only {
-                let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count).await;
-            }
-        }
-
-        if is_decoding {
-            let is_small_model = self.layers.len() <= 36;
-            if !is_small_model { self.layers[layer_idx].clear(); }
+            println!("[MEMORY-OPT] Layer {} Weights Purged. (KV Safe)", layer_idx);
         }
 
         Ok(next_xs)
     }
-
     /// [DEC-SPEED-UP] 디코딩 속도를 위해 모든 레이어를 GPU에 상주 시킴
     pub async fn pin_all_layers_to_gpu(&mut self) -> Result<()> {
         println!("[DEC-SPEED-UP] Pinning disabled for long-context stability. Using On-Demand serial loading.");
@@ -2485,21 +2470,6 @@ impl QuantizedQwen3VLTextModel {
 
             let deepstack_embed = deepstack_visual_embeds.as_ref().and_then(|v| v.get(layer_idx));
             xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks, session_id.clone(), kv_name.clone(), self.baking_only).await?;
-
-            // [VRAM-SAFETY] 베이킹 모드(Prefill)일 때의 리소스 관리
-            if self.baking_only {
-                // 1. [KV-BACKUP] 가중치를 비우기 전에 반드시 KV 데이터를 SSD 워커로 전송
-                if let Some(sid) = &session_id {
-                    // process_chunks_iterative 내부에서 이미 대피된 데이터를 SSD로 덤프
-                    let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, true, false);
-                }
-
-                // 2. [WEIGHT-PURGE] 데이터 전송(복사) 완료 후 가중치 해제
-                self.layers[layer_idx].clear();
-                if target_device.is_cuda() {
-                    let _ = target_device.synchronize();
-                }
-            }
         }
 
         if target_device.is_cuda() { let _ = target_device.synchronize(); }

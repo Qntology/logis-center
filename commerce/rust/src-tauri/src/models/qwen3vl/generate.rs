@@ -179,6 +179,40 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
 
 pub struct LoadTask { pub slot_id: usize, pub path: PathBuf, pub layer_idx: usize, pub kv_name: Option<String>, pub shared_block: KVBlock, pub registry: KVRegistry }
 
+// [BACKGROUND-COMPRESSOR] 워커 스레드에서 실행되는 1비트 압축 함수
+fn compress_1bit_worker(t: &Tensor) -> Result<(Tensor, Tensor)> {
+    let device = t.device();
+    let t_cpu = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+    let dims = t_cpu.dims();
+    let last_dim = dims[dims.len() - 1];
+    let row_elements = dims.iter().rev().nth(1).cloned().unwrap_or(1) * last_dim;
+    let total_elements = t_cpu.elem_count();
+    
+    let t_vec = t_cpu.flatten_all()?.to_vec1::<f32>()?;
+    let mut packed = vec![0u8; (total_elements + 7) / 8];
+    let mut scales = Vec::new();
+
+    // 행(Row) 단위로 스케일 계산 및 비트 패킹 수행
+    for chunk in t_vec.chunks(last_dim) {
+        let mut max_abs = 0.0f32;
+        for &v in chunk { if v.abs() > max_abs { max_abs = v.abs(); } }
+        scales.push(max_abs);
+    }
+
+    // [PARALLEL-BIT-PACKING] 비트 연산은 CPU 부하가 크므로 최대한 효율적으로 처리
+    for (i, &v) in t_vec.iter().enumerate() {
+        if v > 0.0 {
+            packed[i / 8] |= 1 << (i % 8);
+        }
+    }
+
+    let scales_len = scales.len();
+    let packed_t = Tensor::from_vec(packed, (total_elements + 7) / 8, &Device::Cpu)?;
+    let scales_t = Tensor::from_vec(scales, (scales_len,), &Device::Cpu)?;
+    
+    Ok((packed_t, scales_t))
+}
+
 pub static BAKE_TX: OnceCell<mpsc::Sender<SlotTask>> = OnceCell::const_new();
 pub static LOAD_TX: OnceCell<mpsc::Sender<SlotTask>> = OnceCell::const_new();
 use tokio::sync::OnceCell;
@@ -234,11 +268,16 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                 let _ = tx.send(found.unwrap());
             },
             SlotRequest::Release { idx, is_bake } => {
-                let s = &SLOT_MANAGER.slots[idx]; let old = s.state.load(Ordering::SeqCst);
-                let new = if is_bake { 2 } else { 0 };
+                let s = &SLOT_MANAGER.slots[idx];
+                let old = s.state.load(Ordering::SeqCst);
+                let new = if is_bake { 2 } else { 0 }; // 2: BakedCache, 0: Free
+                
                 if s.state.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                     SLOT_MANAGER.update_counters(old, new);
-                    if old == 1 { SLOT_MANAGER.active_write_count.fetch_sub(1, Ordering::SeqCst); }
+                    if old == 1 { // 1: Write
+                        SLOT_MANAGER.active_write_count.fetch_sub(1, Ordering::SeqCst);
+                        println!("[SLOT-RECLAIM] Write Slot {} reclaimed. Active: {}", idx, SLOT_MANAGER.active_write_count.load(Ordering::SeqCst));
+                    }
                     SLOT_MANAGER.handoff_notifier.notify_waiters();
                 }
             }
@@ -327,18 +366,39 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
 
-                        // [BACK-COMPRESSION] 메인 스레드에서 이미 압축된 데이터를 받아 저장만 수행
+                        // [WORKER-COMPRESSION] 워커 내에서 비동기 압축 수행
                         tokio::spawn(async move {
+                            // [RAII-GUARD] 어떤 경우에도 카운트를 줄이고 슬롯을 관리하는 가드
+                            struct SlotGuard { sid: usize, is_last: bool }
+                            impl Drop for SlotGuard {
+                                fn drop(&mut self) {
+                                    let sid = self.sid;
+                                    let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
+                                    if rem <= 1 || self.is_last {
+                                        let _ = tauri::async_runtime::spawn(async move {
+                                            SLOT_MANAGER.mark_ready(sid).await;
+                                        });
+                                    }
+                                }
+                            }
+                            let _guard = SlotGuard { sid, is_last: false };
+
                             let mut map = std::collections::HashMap::new();
                             let prefix = format!("b{}_l{}_", off, act_l);
 
-                            // 메인 스레드에서 보낸 1비트 압축 데이터 추출
-                            let k_packed = src.k_data;
-                            let v_packed = src.v_data;
-                            let k_scales = src.k_shape; 
-                            let v_scales = src.raw_v.unwrap(); 
+                            // 원본 데이터가 있다면 여기서 압축 수행
+                            let (k_packed, k_scales, v_packed, v_scales) = if let (Some(rk), Some(rv)) = (src.raw_k, src.raw_v) {
+                                // 임시 모델 인스턴스 없이 정적 메서드로 압축 호출 (로직은 동일하게 구현 필요하거나 crate::utils 활용)
+                                // 여기서는 단순화를 위해 전송된 src 구조를 활용하되, 실제로는 QuantizedQwen3VLTextAttention::compress_to_1bit_static 등 필요
+                                // 일단 메인에서 압축해서 보내는 구조가 실패했으므로, 워커에서도 동일한 로직 호출 보장
+                                // [IMPORTANT] 아래는 예시이며 실제 압축 로직이 접근 가능해야 함
+                                let (kp, ks) = compress_1bit_worker(&rk).unwrap();
+                                let (vp, vs) = compress_1bit_worker(&rv).unwrap();
+                                (kp, ks, vp, vs)
+                            } else {
+                                (src.k_data, src.k_shape, src.v_data, Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap())
+                            };
                             
-                            // 원본 shape 정보 생성 (256 토큰 기준)
                             let k_shape_u32 = vec![1u32, 8u32, 256u32, 128u32];
                             let k_shape_t = Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap();
 
@@ -349,17 +409,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             map.insert(format!("{}k_shape", prefix), k_shape_t);
                             
                             let file_path = task_dir.join(format!("l{}.st", act_l));
-                            
                             GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-                            let _ = io_tx_nested.send(SaveTask { 
-                                slot_id: sid, 
-                                path: file_path.clone(), 
-                                tensors: map, 
-                                is_last: false, 
-                                block_idx, 
-                                registry: Some(registry_inner), 
-                                kv_name: kv_name_inner 
-                            }).await;
+                            let _ = io_tx_nested.send(SaveTask { slot_id: sid, path: file_path, tensors: map, is_last: false, block_idx, registry: Some(registry_inner), kv_name: kv_name_inner }).await;
                         });
                     }
                 },
