@@ -596,7 +596,11 @@ impl QuantizedQwen3VLTextAttention {
                         }
                         
                         let block_file = full_path.join(format!("l{}.st", self.layer_idx));
-                        match crate::utils::direct_loader::load_kv_block(&block_file) {
+                        
+                        // [FIX] Try standard fs::read first for small files (1MB) to avoid DirectStorage issues
+                        let data_res = std::fs::read(&block_file).or_else(|_| crate::utils::direct_loader::load_kv_block(&block_file));
+                        
+                        match data_res {
                             Ok(data) => {
                                 if let Ok(st_map) = candle_core::safetensors::load_buffer(&data, &Device::Cpu) {
                                     let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
@@ -615,7 +619,7 @@ impl QuantizedQwen3VLTextAttention {
                             },
                             Err(e) => {
                                 if retries >= 4 {
-                                    println!("[VRAM-WARMUP-WARN] Failed to read block file after retries: {:?}. Error: {:?}", block_file, e);
+                                    println!("[VRAM-WARMUP-WARN] Failed to read block file: {:?}. Error: {:?}", block_file, e);
                                 }
                             }
                         }
@@ -2279,26 +2283,26 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [PIPELINE-OPTIMIZATION] KV 대피 및 백업을 백업 스레드로 완전히 분리 (Non-blocking)
-        if let Some(sid) = session_id {
+        // [PIPELINE-OPTIMIZATION] Prefill(Baking) 상황에서만 무거운 IO 로직 수행
+        if baking_only && session_id.is_some() {
+            let sid = session_id.unwrap();
+            
+            // 1. VRAM -> RAM 대피 (Prefill 중 VRAM 부족 방지)
+            let _ = self.layers[layer_idx].self_attn.evacuate_vram_to_cache();
+            
             let layer_ptr = self.layers[layer_idx].clone();
             let baking_only_clone = baking_only;
             
-            // [OFFLOAD] 다음 레이어 연산을 방해하지 않도록 별도 태스크로 분리
+            // 2. SSD 저장 트리거 (IO 작업은 백그라운드)
             tauri::async_runtime::spawn(async move {
-                // 1. VRAM -> RAM 대피 (여기서 발생하는 지연은 메인 스레드에 영향을 주지 않음)
-                let _ = layer_ptr.self_attn.evacuate_vram_to_cache();
-                
-                // 2. SSD 저장 트리거 (백그라운드 IO 워커로 태스크 전달)
                 let _ = layer_ptr.self_attn.trigger_realtime_incremental_bake(&sid, true, baking_only_clone, false);
             });
         }
 
-        // [MEMORY-OPT] [IMMEDIATE-PURGE] 가중치 소각은 연산 직후 즉시 수행
+        // [MEMORY-OPT] [IMMEDIATE-PURGE] 가중치 소각 (Prefill 중에만 수행하여 VRAM 확보)
         if baking_only {
             self.layers[layer_idx].clear();
-            // synchronize() 제거: 드라이버가 알아서 비동기 처리하도록 맡김
-            println!("[PIPELINE] Layer {} outputs ready. Moving to next layer immediately.", layer_idx);
+            println!("[PIPELINE] Prefill Layer {} complete. Weights purged.", layer_idx);
         }
 
         Ok(next_xs)
