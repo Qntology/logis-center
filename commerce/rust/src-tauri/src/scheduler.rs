@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::fs;
 use std::path::PathBuf;
 
-// --- [MEMORY OPTIMIZATION] Task Data Manager (RAII) ---
+// --- [MEMORY OPTIMIZATION] Task Data Manager (RAII) --- 
 // Handles offloading of large text data to disk to prevent RAM/VRAM bloating.
 // Automatically cleans up files when the task scope ends.
 struct TaskDataManager {
