@@ -765,19 +765,47 @@ impl QuantizedQwen3VLTextAttention {
     }
 
 
-    // [REPLACED] Direct BF16 Storage (16-bit precision, no compression)
-    pub fn compress_to_bf16(&self, t: &Tensor) -> Result<(Tensor, Vec<usize>)> {
-        let original_shape = t.shape().dims().to_vec();
-        // Convert to BF16 on CPU
-        let t_bf16 = t.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
-        Ok((t_bf16, original_shape))
+    // [INT8-QUANTIZATION] U8 기반 대칭 양자화 (I8 미지원 환경 대응)
+    pub fn compress_to_i8(&self, t: &Tensor) -> Result<(Tensor, f32)> {
+        let dev = t.device();
+        let abs_max = t.abs()?.max_all()?.to_vec1::<f32>()?[0];
+        let scale = abs_max / 127.0f32;
+        
+        if scale == 0.0 {
+            return Ok((Tensor::zeros(t.shape(), DType::U8, dev)?, 0.0));
+        }
+
+        // F32 변환 -> 스케일링 -> 반올림 -> U8 이동 (오프셋 128 적용으로 음수 표현)
+        let t_u8 = ((t.to_dtype(DType::F32)? / scale as f64)?
+            .round()?
+            .affine(1.0, 128.0)? // [-127, 127] -> [1, 255]
+            .to_dtype(DType::U8)?);
+            
+        Ok((t_u8, scale))
+    }
+
+    pub fn decompress_from_i8(&self, data: &Tensor, scale: f32, device: &Device) -> Result<Tensor> {
+        let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+        let t_gpu = data.to_device(device)?;
+        // U8 -> F32 -> 오프셋 제거 -> 스케일 복구 -> BF16
+        let t_restored = (t_gpu.to_dtype(DType::F32)?
+            .affine(1.0, -128.0)?
+            .broadcast_mul(&Tensor::new(&[scale], device)?.to_dtype(DType::F32)?)?
+            .to_dtype(target_dtype)?);
+        Ok(t_restored)
     }
 
     pub fn decompress_from_bf16(&self, data: &Tensor, _original_shape: &[usize], device: &Device) -> Result<Tensor> {
         let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-        // Data is already BF16 tensor (loaded from safetensors), just move to device and cast
         let t = data.to_device(device)?;
         Ok(t.to_dtype(target_dtype)?)
+    }
+
+    // [LEGACY]
+    pub fn compress_to_bf16(&self, t: &Tensor) -> Result<(Tensor, Vec<usize>)> {
+        let original_shape = t.shape().dims().to_vec();
+        let t_bf16 = t.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
+        Ok((t_bf16, original_shape))
     }
 
     pub fn decompress_from_1bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
@@ -988,11 +1016,27 @@ impl QuantizedQwen3VLTextAttention {
                         let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
                         
                         let dev = &Device::Cpu;
-                        let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, dev)?;
-                        let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, dev)?;
-
-                        let mut k_raw = self.decompress_from_bf16(&kd_t, &meta_os, dev)?;
-                        let mut v_raw = self.decompress_from_bf16(&vd_t, &meta_os, dev)?;
+                        // [AUTO-DETECT-DTYPE] 원본이 BF16인지 U8(양자화)인지 확인
+                        let (mut k_raw, mut v_raw) = if kd.dtype() == safetensors::Dtype::I8 || kd.dtype() == safetensors::Dtype::U8 {
+                            // INT8(U8) 양자화 경로: 스케일 로드 및 역양자화
+                            let ks = get_t("k_scale").map(|v| {
+                                let t = Tensor::from_raw_buffer(v.data(), DType::F32, &[1], dev).unwrap();
+                                t.to_vec1::<f32>().unwrap()[0]
+                            }).unwrap_or(1.0);
+                            let vs = get_t("v_scale").map(|v| {
+                                let t = Tensor::from_raw_buffer(v.data(), DType::F32, &[1], dev).unwrap();
+                                t.to_vec1::<f32>().unwrap()[0]
+                            }).unwrap_or(1.0);
+                            
+                            let kd_t = Tensor::from_raw_buffer(kd.data(), DType::U8, &meta_os, dev)?;
+                            let vd_t = Tensor::from_raw_buffer(vd.data(), DType::U8, &meta_os, dev)?;
+                            (self.decompress_from_i8(&kd_t, ks, dev)?, self.decompress_from_i8(&vd_t, vs, dev)?)
+                        } else {
+                            // 기존 BF16 경로
+                            let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, dev)?;
+                            let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, dev)?;
+                            (self.decompress_from_bf16(&kd_t, &meta_os, dev)?, self.decompress_from_bf16(&vd_t, &meta_os, dev)?)
+                        };
 
                         // [KV-BRIDGE] 0.6B -> 0.6B 상황에서도 규격이 다르면 정렬 (커밋 261fe0ef 매커니즘)
                         let target_heads = self.num_key_value_heads;
@@ -1155,18 +1199,26 @@ impl QuantizedQwen3VLTextAttention {
         if !ks.is_empty() {
             let k = Tensor::cat(&ks, 2)?;
             let v = Tensor::cat(&vs, 2)?;
+            let k_shape = k.shape().dims().to_vec();
             
-            let (kd, k_shape) = self.compress_to_bf16(&k)?;
-            let (vd, _) = self.compress_to_bf16(&v)?;
+            // [GPU-ACCELERATED-INT8] 
+            let (kd_i8, k_scale) = self.compress_to_i8(&k)?;
+            let (vd_i8, v_scale) = self.compress_to_i8(&v)?;
             
-            map.insert(format!("{}k_data", prefix), kd);
-            map.insert(format!("{}v_data", prefix), vd);
+            // CPU 이동 (절반 크기의 데이터만 이동!)
+            let kd_cpu = kd_i8.to_device(&Device::Cpu)?;
+            let vd_cpu = vd_i8.to_device(&Device::Cpu)?;
+            
+            map.insert(format!("{}k_data", prefix), kd_cpu);
+            map.insert(format!("{}v_data", prefix), vd_cpu);
+            map.insert(format!("{}k_scale", prefix), Tensor::new(&[k_scale], &Device::Cpu)?);
+            map.insert(format!("{}v_scale", prefix), Tensor::new(&[v_scale], &Device::Cpu)?);
             map.insert(format!("{}k_shape", prefix), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect::<Vec<u32>>(), (k_shape.len(),), &Device::Cpu)?);
             
-            // [DIRECT-IO] Use OS-accelerated high-speed write instead of standard IO
+            // [DIRECT-IO]
             if let Ok(data) = safetensors::serialize(&map, &None) {
                 let _ = crate::utils::direct_loader::save_kv_block(&structured_path, &data);
-                println!("[SSD-SAVE-FAST] Layer {} Block {} saved via DirectStorage/Overlapped.", self.layer_idx, offset);
+                println!("[SSD-SAVE-INT8] Layer {} Block {} quantized and saved.", self.layer_idx, offset);
             }
             
             if let Ok(mut reg) = self.registry.entries.write() {
