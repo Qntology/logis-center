@@ -845,7 +845,8 @@ impl QuantizedQwen3VLTextAttention {
                 }
                 
                 // If we loaded from blocks, update merger for next step
-                if !baking_only && seqlen_offset > 0 {
+                // [FIX] q_len > 1 (prefill) 상황에서도 merger를 업데이트하여 다음 청크에서 재사용 가능하게 함
+                if seqlen_offset > 0 {
                     let mut merger = self.vram_cache_merger.write().unwrap();
                     merger.k = Some(Tensor::cat(&bulk_ks, 2)?);
                     merger.v = Some(Tensor::cat(&bulk_vs, 2)?);
@@ -2151,6 +2152,14 @@ impl QuantizedQwen3VLTextModel {
                 None => Some(out),
                 Some(prev) => Some(Tensor::cat(&[prev, out], 1)?),
             };
+
+            // [STRICT-CHUNK-EVACUATION] 청크 하나가 끝나면 즉시 VRAM에서 RAM으로 KV 대피 (OOM 방지)
+            // seqlen_offset == 0 은 이 레이어의 첫 번째 '거대 뭉치' 처리 중임을 의미 (Prefill)
+            if seqlen_offset == 0 {
+                let _ = self.layers[layer_idx].self_attn.evacuate_vram_to_cache();
+                let dev = self.layers[layer_idx].device();
+                if dev.is_cuda() { let _ = dev.synchronize(); }
+            }
         }
 
         final_output.ok_or_else(|| anyhow::anyhow!("No output generated from chunks"))
