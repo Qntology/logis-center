@@ -989,6 +989,7 @@ impl QuantizedQwen3VLTextAttention {
                 let registry_clone = self.registry.clone();
                 let layer_idx = self.layer_idx;
                 let baking_only_clone = baking_only;
+                let block_owned = block.clone();
 
                 // [OFFLOAD-TO-WORKER] 압축 연산까지 워커로 완전히 넘김
                 tokio::spawn(async move {
@@ -1018,6 +1019,7 @@ impl QuantizedQwen3VLTextAttention {
                             is_relay_baking: baking_only_clone,
                             block_idx: Some(b_idx),
                             registry: registry_clone,
+                            shared_block: Some(block_owned),
                         })).await;
                     }
                 });

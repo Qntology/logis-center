@@ -291,7 +291,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(48)); 
         while let Some(task) = io_rx.recv().await {
             let sem = semaphore.clone();
-            let (tp, ts, reg, b_idx, sid, is_last, kv_n) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone());
+            let (tp, ts, reg, b_idx, sid, is_last, kv_n, shared_block) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone(), task.shared_block.clone());
             tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
                 struct IoGuard; impl Drop for IoGuard { fn drop(&mut self) { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } }
@@ -300,9 +300,18 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 
                 // [FIX] Use candle_core::safetensors::save for consistency
                 if let Ok(_) = candle_core::safetensors::save(&ts, &tp) {
-                    // println!("[IO-WORKER] Successfully saved KV block to {:?}", tp);
+                    println!("[IO-WORKER] Successfully saved KV block to {:?}", tp);
                     drop(ts);
                     
+                    // [MEMORY-RELEASE] Clear original KVBlock RAM/VRAM cache immediately after SSD save
+                    if let Some(block) = shared_block {
+                        if let Ok(mut inner) = block.inner.write() {
+                            inner.k_cache = None;
+                            inner.v_cache = None;
+                            println!("[MEMORY-RELEASE] RAM/VRAM cache cleared for block at {:?}", tp.parent());
+                        }
+                    }
+
                     // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
                     if let Some(kv_name) = kv_n {
                         if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
@@ -354,7 +363,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             match task {
                 SlotTask::Bake(bake) => {
                     let io_tx_inner = io_tx.clone();
-                    let (sid, off, _is_relay, block_idx, registry, kv_name) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone());
+                    let (sid, off, _is_relay, block_idx, registry, kv_name, shared_block) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone(), bake.shared_block.clone());
                     let loop_count = bake.layers.len();
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
                     
@@ -365,6 +374,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let registry_inner = registry.clone();
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
+                        let shared_block_inner = shared_block.clone();
 
                         // [WORKER-COMPRESSION] 워커 내에서 비동기 압축 수행
                         tokio::spawn(async move {
@@ -388,10 +398,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 
                             // 원본 데이터가 있다면 여기서 압축 수행
                             let (k_packed, k_scales, v_packed, v_scales) = if let (Some(rk), Some(rv)) = (src.raw_k, src.raw_v) {
-                                // 임시 모델 인스턴스 없이 정적 메서드로 압축 호출 (로직은 동일하게 구현 필요하거나 crate::utils 활용)
-                                // 여기서는 단순화를 위해 전송된 src 구조를 활용하되, 실제로는 QuantizedQwen3VLTextAttention::compress_to_1bit_static 등 필요
-                                // 일단 메인에서 압축해서 보내는 구조가 실패했으므로, 워커에서도 동일한 로직 호출 보장
-                                // [IMPORTANT] 아래는 예시이며 실제 압축 로직이 접근 가능해야 함
                                 let (kp, ks) = compress_1bit_worker(&rk).unwrap();
                                 let (vp, vs) = compress_1bit_worker(&rv).unwrap();
                                 (kp, ks, vp, vs)
@@ -410,7 +416,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             
                             let file_path = task_dir.join(format!("l{}.st", act_l));
                             GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-                            let _ = io_tx_nested.send(SaveTask { slot_id: sid, path: file_path, tensors: map, is_last: false, block_idx, registry: Some(registry_inner), kv_name: kv_name_inner }).await;
+                            let _ = io_tx_nested.send(SaveTask { slot_id: sid, path: file_path, tensors: map, is_last: false, block_idx, registry: Some(registry_inner), kv_name: kv_name_inner, shared_block: shared_block_inner }).await;
                         });
                     }
                 },
