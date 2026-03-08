@@ -702,7 +702,15 @@ impl QuantizedQwen3VLTextAttention {
 
         let cos = cos.to_dtype(target_dtype)?;
         let sin = sin.to_dtype(target_dtype)?;
-        let (query_states, key_states) = apply_rotary_pos_emb(&query_states.to_dtype(target_dtype)?, &key_states.to_dtype(target_dtype)?, &cos, &sin, false)?;
+        
+        // [FIX] RoPE Alignment: Decoding 시 현재 토큰 위치(seqlen_offset)에 맞게 cos/sin 조정
+        let (cos_aligned, sin_aligned) = if cos.dim(D::Minus2)? > q_len {
+            (cos.narrow(D::Minus2, 0, q_len)?, sin.narrow(D::Minus2, 0, q_len)?)
+        } else {
+            (cos, sin)
+        };
+
+        let (query_states, key_states) = apply_rotary_pos_emb(&query_states.to_dtype(target_dtype)?, &key_states.to_dtype(target_dtype)?, &cos_aligned, &sin_aligned, false)?;
         let query_states = query_states.to_dtype(target_dtype)?;
         let key_states = key_states.to_dtype(target_dtype)?;
         
@@ -767,18 +775,27 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // 3. [SEQUENTIAL-KV-LOADER] Strictly Ordered Hybrid Pipeline
-        let mut bulk_ks: Vec<Tensor> = Vec::new();
-        let mut bulk_vs: Vec<Tensor> = Vec::new();
+        // 3. [KV-LOAD] Build bulk_ks for Attention
+        let mut bulk_ks = Vec::new();
+        let mut bulk_vs = Vec::new();
 
         let total_tokens_now = seqlen_offset + q_len;
-        
-        // [VRAM-SYNC] Use merged cache if available
-        {
-            let merger = self.vram_cache_merger.read().unwrap();
-            if let (Some(mk), Some(mv)) = (&merger.k, &merger.v) {
-                bulk_ks.push(mk.clone());
-                bulk_vs.push(mv.clone());
+
+        // [VRAM-SYNC] Use and INCREMENTALLY UPDATE merged cache
+        if !baking_only && seqlen_offset > 0 {
+            let mut merger = self.vram_cache_merger.write().unwrap();
+            if let (Some(mk), Some(mv)) = (merger.k.take(), merger.v.take()) {
+                // [FIX] Combine existing context with NEW tokens
+                let k_full = Tensor::cat(&[mk, key_states.to_dtype(target_dtype)?], 2)?;
+                let v_full = Tensor::cat(&[mv, value_states.to_dtype(target_dtype)?], 2)?;
+                
+                // Update merger for next step
+                merger.k = Some(k_full.clone());
+                merger.v = Some(v_full.clone());
+                merger.block_count = self.kv_blocks.len();
+                
+                bulk_ks.push(k_full);
+                bulk_vs.push(v_full);
                 vram_count += merger.block_count;
             }
         }
@@ -789,7 +806,7 @@ impl QuantizedQwen3VLTextAttention {
                 bulk_ks.push(key_states.to_dtype(target_dtype)?);
                 bulk_vs.push(value_states.to_dtype(target_dtype)?);
             } else {
-                // [FALLBACK] If no merged cache, load blocks individually (should be rare with warmup)
+                // [FALLBACK] If no merged cache, load blocks individually (includes tokens just added in step 2)
                 for block in &self.kv_blocks {
                     let (index, b_off) = { let inner = block.inner.read().unwrap(); (inner.index, inner.offset) };
                     if b_off >= total_tokens_now { continue; }
@@ -800,56 +817,51 @@ impl QuantizedQwen3VLTextAttention {
                         if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                             bulk_ks.push(k.to_device(dev)?.to_dtype(target_dtype)?);
                             bulk_vs.push(v.to_device(dev)?.to_dtype(target_dtype)?);
-                            vram_count += 1;
-                            loaded = true;
+                            vram_count += 1; loaded = true;
                         }
                     }
-                    
                     if !loaded {
-                        // SSD 로직 (생략 가능하지만 안전을 위해 최소한으로 유지)
+                        // SSD 로직 (생략 가능하지만 안전을 위해 유지)
                         let ssd_path = { let reg = self.registry.entries.read().unwrap(); if index < reg.len() { reg[index].ssd_path.clone() } else { None } };
                         if let Some(p) = ssd_path {
                             let mut full_path = p.clone();
                             if full_path.is_relative() && !full_path.starts_with("tmp") { full_path = crate::utils::paths::get_kv_dir(None).join(full_path); }
                             let block_file = full_path.join(format!("l{}.st", self.layer_idx));
-                            if let Ok(data) = crate::utils::direct_loader::load_kv_block(&block_file) {
+                            let data_res = std::fs::read(&block_file).or_else(|_| crate::utils::direct_loader::load_kv_block(&block_file));
+                            if let Ok(data) = data_res {
                                 if let Ok(st_map) = candle_core::safetensors::load_buffer(&data, &Device::Cpu) {
                                     let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
                                     let get_t = |s: &str| st_map.get(&format!("{}{}", prefix, s)).or_else(|| st_map.get(s)).cloned();
                                     if let (Some(kr_t), Some(vr_t)) = (get_t("k_raw"), get_t("v_raw")) {
                                         bulk_ks.push(kr_t.to_device(dev)?.to_dtype(target_dtype)?);
                                         bulk_vs.push(vr_t.to_device(dev)?.to_dtype(target_dtype)?);
-                                        ssd_count += 1;
-                                        loaded = true;
+                                        ssd_count += 1; loaded = true;
                                     }
                                 }
                             }
                         }
                     }
-                    
                     if !loaded { return Err(anyhow!("Layer {} block {} could not be loaded", self.layer_idx, index)); }
+                }
+                
+                // If we loaded from blocks, update merger for next step
+                if !baking_only && seqlen_offset > 0 {
+                    let mut merger = self.vram_cache_merger.write().unwrap();
+                    merger.k = Some(Tensor::cat(&bulk_ks, 2)?);
+                    merger.v = Some(Tensor::cat(&bulk_vs, 2)?);
+                    merger.block_count = self.kv_blocks.len();
                 }
             }
         }
 
         if bulk_ks.is_empty() { return Err(anyhow!("No KV data found")); }
 
-        // 4. [BULK-ATTENTION] GPU Parallel Concatenation
-        let k_cat = Tensor::cat(&bulk_ks, 2)?;
-        let v_cat = Tensor::cat(&bulk_vs, 2)?;
+        // 4. [BULK-ATTENTION] GPU Parallel Concatenation (Single tensor if merger used)
+        let k_final = if bulk_ks.len() == 1 { bulk_ks[0].clone() } else { Tensor::cat(&bulk_ks, 2)? };
+        let v_final = if bulk_vs.len() == 1 { bulk_vs[0].clone() } else { Tensor::cat(&bulk_vs, 2)? };
         
-        // [UPDATE-MERGED-CACHE] If this was a decoding step, update the merged cache
-        if !baking_only && seqlen_offset > 0 {
-            if let Ok(mut merger) = self.vram_cache_merger.write() {
-                merger.k = Some(k_cat.clone());
-                merger.v = Some(v_cat.clone());
-                merger.block_count = self.kv_blocks.len();
-            }
-        }
-
-        let final_kv_len = k_cat.dim(2)?;
-
-        let (mut k, mut v) = (k_cat, v_cat);
+        let final_kv_len = k_final.dim(2)?;
+        let (mut k, mut v) = (k_final, v_final);
         if self.num_kv_groups > 1 {
             let (b, h, s, d) = k.dims4()?;
             k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
