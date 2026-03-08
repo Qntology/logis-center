@@ -219,7 +219,19 @@ use tokio::sync::OnceCell;
 
 pub async fn get_worker_channel() -> Result<mpsc::Sender<SlotTask>> { BAKE_TX.get().cloned().ok_or(anyhow!("Bake init error")) }
 pub async fn get_load_worker() -> Result<mpsc::Sender<SlotTask>> { LOAD_TX.get().cloned().ok_or(anyhow!("Load init error")) }
-pub async fn wait_for_global_io() { while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { tokio::time::sleep(std::time::Duration::from_millis(10)).await; } }
+pub async fn wait_for_global_io() {
+    let mut last_log = std::time::Instant::now();
+    loop {
+        let count = GLOBAL_IO_COUNTER.load(Ordering::SeqCst);
+        if count == 0 { break; }
+        
+        if last_log.elapsed() >= std::time::Duration::from_secs(1) {
+            println!("[SYNC-WAIT] Waiting for background KV backup... Remaining tasks: {}", count);
+            last_log = std::time::Instant::now();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
 
 pub fn init_bake_worker() {
     let (btx, brx) = mpsc::channel(64); let (ltx, lrx) = mpsc::channel(64);
@@ -415,7 +427,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             }
                             
                             let file_path = task_dir.join(format!("l{}.st", act_l));
-                            GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
+                            // [CRITICAL] Redundant fetch_add removed here! (Handled by quantized_model.rs)
                             let _ = io_tx_nested.send(SaveTask { slot_id: sid, path: file_path, tensors: map, is_last: false, block_idx, registry: Some(registry_inner), kv_name: kv_name_inner, shared_block: shared_block_inner }).await;
                         });
                     }

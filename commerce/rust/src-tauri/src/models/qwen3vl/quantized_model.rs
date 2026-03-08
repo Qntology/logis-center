@@ -7,6 +7,7 @@ use std::path::Path;
 use std::fs;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use memmap2::Mmap;
 
 use crate::{
@@ -399,7 +400,6 @@ pub struct QuantizedQwen3VLTextAttention {
     pub registry: KVRegistry,
     pub layer_idx: usize,
     pub active_kv_name: Option<String>,
-    // [ACCUMULATOR] Interior Mutability를 사용하여 &self에서도 캐시 관리 가능
     pub vram_cache_merger: Arc<std::sync::RwLock<VramCacheMerger>>,
 }
 
@@ -546,6 +546,27 @@ impl QuantizedQwen3VLTextAttention {
         })
     }
 
+    /// [KV-SET-SYNC] 전역 레지스트리를 기준으로 개별 레이어의 kv_blocks 리스트를 동기화합니다.
+    /// 프리필 과정에서 레이어마다 생성된 블록들을 디코딩 직전에 모든 레이어가 공유하도록 맞춥니다.
+    pub fn sync_kv_blocks_with_registry(&mut self) -> Result<()> {
+        let registry_entries = self.registry.entries.read().unwrap();
+        let total_blocks_in_registry = registry_entries.len();
+        
+        // 현재 레이어의 활성 블록 수가 장부보다 적다면 부족한 만큼 채워넣음
+        while self.kv_blocks.len() < total_blocks_in_registry {
+            let idx = self.kv_blocks.len();
+            let entry = &registry_entries[idx];
+            
+            // [STABILITY] 실제 데이터가 있는 블록만 동기화
+            if entry.token_len == 0 { break; }
+
+            let loc = entry.location[self.layer_idx];
+            let new_block = KVBlock::new(loc, idx, entry.token_len, entry.token_start);
+            self.kv_blocks.push(new_block);
+        }
+        Ok(())
+    }
+
     pub fn warm_up_vram_cache(&self) -> Result<()> {
         let dev = self.q_proj.device();
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
@@ -596,7 +617,11 @@ impl QuantizedQwen3VLTextAttention {
                         }
                         
                         let block_file = full_path.join(format!("l{}.st", self.layer_idx));
-                        match crate::utils::direct_loader::load_kv_block(&block_file) {
+                        
+                        // [FIX] 표준 fs::read를 우선 시도하여 DirectStorage 미지원 환경에서의 에러를 방지함
+                        let data_res = std::fs::read(&block_file).or_else(|_| crate::utils::direct_loader::load_kv_block(&block_file));
+                        
+                        match data_res {
                             Ok(data) => {
                                 if let Ok(st_map) = candle_core::safetensors::load_buffer(&data, &Device::Cpu) {
                                     let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
@@ -1033,8 +1058,12 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_blocks.clear();
     }
 
-    pub fn trigger_realtime_incremental_bake(&self, session_id: &str, is_last_chunk: bool, baking_only: bool, is_decoding: bool) -> Result<()> {
-        use crate::models::qwen3vl::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
+    pub fn trigger_realtime_incremental_bake(&self, session_id: &str, _is_last_chunk: bool, baking_only: bool, is_decoding: bool) -> Result<()> {
+        // [VRAM-PERFORMANCE-GUARD] 디코딩 중에는 실시간 백업을 수행하지 않습니다.
+        // 디코딩은 1토큰씩 발생하므로 매번 SSD IO를 발생시키면 생성이 매우 느려지고 데드락 위험이 있습니다.
+        if is_decoding { return Ok(()); }
+
+        use crate::models::qwen3vl::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump, GLOBAL_IO_COUNTER};
 
         // [VRAM-MERGED-RECOVERY] 병합된 캐시 데이터 확보 (Interior Mutability)
         let (merged_k, merged_v) = {
@@ -1102,6 +1131,9 @@ impl QuantizedQwen3VLTextAttention {
                 let k_cpu = k.to_device(&Device::Cpu)?;
                 let v_cpu = v.to_device(&Device::Cpu)?;
 
+                // [CRITICAL-SYNC] 워커로 넘기기 전에 카운터를 올려서 wait_for_global_io가 누락되지 않게 함
+                GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
+
                 // [OFFLOAD-TO-WORKER] 압축 연산까지 워커로 완전히 넘김
                 tokio::spawn(async move {
                     if let Some(tx) = BAKE_TX.get() {
@@ -1113,10 +1145,10 @@ impl QuantizedQwen3VLTextAttention {
 
                         let dump = LayerKVDump {
                             layer_idx,
-                            k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(), // 더미
-                            v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(), // 더미
-                            k_shape: Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap(), // 더미
-                            raw_k: Some(k_cpu), // CPU 데이터를 넘김
+                            k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
+                            v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
+                            k_shape: Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap(),
+                            raw_k: Some(k_cpu),
                             raw_v: Some(v_cpu), 
                         };
 
@@ -1132,6 +1164,9 @@ impl QuantizedQwen3VLTextAttention {
                             registry: registry_clone,
                             shared_block: Some(block_owned),
                         })).await;
+                    } else {
+                        // 전송 실패 시 카운터 원복
+                        GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
                     }
                 });
             }
@@ -2280,18 +2315,26 @@ impl QuantizedQwen3VLTextModel {
         }
 
         // [PIPELINE-OPTIMIZATION] KV 대피 및 백업을 백업 스레드로 완전히 분리 (Non-blocking)
-        if let Some(sid) = session_id {
-            let layer_ptr = self.layers[layer_idx].clone();
-            let baking_only_clone = baking_only;
-            
-            // [OFFLOAD] 다음 레이어 연산을 방해하지 않도록 별도 태스크로 분리
-            tauri::async_runtime::spawn(async move {
-                // 1. VRAM -> RAM 대피 (여기서 발생하는 지연은 메인 스레드에 영향을 주지 않음)
-                let _ = layer_ptr.self_attn.evacuate_vram_to_cache();
+        if !is_decoding {
+            if let Some(sid) = session_id {
+                let layer_ptr = self.layers[layer_idx].clone();
+                let baking_only_clone = baking_only;
                 
-                // 2. SSD 저장 트리거 (백그라운드 IO 워커로 태스크 전달)
-                let _ = layer_ptr.self_attn.trigger_realtime_incremental_bake(&sid, true, baking_only_clone, false);
-            });
+                // [CRITICAL-SYNC] 스폰 전 카운터를 올려서 wait_for_global_io가 즉시 대기하게 함
+                crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
+                
+                // [OFFLOAD] 다음 레이어 연산을 방해하지 않도록 별도 태스크로 분리
+                tauri::async_runtime::spawn(async move {
+                    // 1. VRAM -> RAM 대피
+                    let _ = layer_ptr.self_attn.evacuate_vram_to_cache();
+                    
+                    // 2. SSD 저장 트리거
+                    let _ = layer_ptr.self_attn.trigger_realtime_incremental_bake(&sid, true, baking_only_clone, false);
+                    
+                    // [SYNC-COMPLETE] 태스크 완료 후 카운터 감소
+                    crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
         }
 
         // [MEMORY-OPT] [IMMEDIATE-PURGE] 가중치 소각은 연산 직후 즉시 수행
@@ -2562,10 +2605,18 @@ impl QuantizedQwen3VLTextModel {
     /// [VRAM-WARMUP] 모든 레이어의 KV 캐시를 VRAM으로 한꺼번에 로드 및 병합합니다.
     pub fn warm_up_all_layers(&mut self) -> Result<()> {
         let count = self.layers.len();
-        println!("[VRAM-WARMUP] Synchronizing KV context across all {} layers before decoding...", count);
+        println!("[VRAM-WARMUP] Synchronizing Offset Sets across all {} layers before decoding...", count);
+        
+        // [STEP 1] 모든 레이어의 블록 리스트를 장부(Registry)와 일치시킴
+        for i in 0..count {
+            self.layers[i].self_attn.sync_kv_blocks_with_registry()?;
+        }
+
+        // [STEP 2] 모든 레이어의 KV 데이터를 VRAM 병합 캐시로 로드
         for i in 0..count {
             self.layers[i].self_attn.warm_up_vram_cache()?;
         }
+        
         if count > 0 {
             self.current_kv_len = self.layers[0].self_attn.get_kv_len();
         }
@@ -2595,7 +2646,7 @@ impl QuantizedQwen3VLTextModel {
         }
 
         self.active_session_id = session_id.clone();
-        self.active_kv_name = kv_name.clone(); // [RESTORED]
+        self.active_kv_name = kv_name.clone(); 
 
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         let target_device = self.layers[0].device().clone();
