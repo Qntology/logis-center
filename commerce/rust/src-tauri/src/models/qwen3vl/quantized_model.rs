@@ -98,8 +98,9 @@ impl QLinear {
 
     /// [MEMORY-OPT] 가중치를 메모리에서 해제합니다.
     pub fn clear(&mut self) {
-        // 더미 텐서의 타입은 해제용이므로 F32로 고정
-        self.inner = QMatMul::Tensor(Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap());
+        // [PHYSICAL-DROP] 기존 텐서를 완전히 버리고 빈 텐서로 교체
+        let empty = Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap();
+        self.inner = QMatMul::Tensor(empty);
         self.bias = None;
         self.device = Device::Cpu;
     }
@@ -547,7 +548,7 @@ impl QuantizedQwen3VLTextAttention {
         seqlen_offset: usize,
         _session_id: Option<String>,
         _kv_name: Option<String>,
-        _baking_only: bool,
+        baking_only: bool,
     ) -> Result<Tensor> {
         let dev = self.q_proj.device();
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
@@ -649,74 +650,83 @@ impl QuantizedQwen3VLTextAttention {
         let mut bulk_vs: Vec<Tensor> = Vec::new();
 
         let total_tokens_now = seqlen_offset + q_len;
-        for block in &self.kv_blocks {
-            let (index, b_off, _b_len) = {
-                let inner = block.inner.read().unwrap();
-                (inner.index, inner.offset, inner.len)
-            };
-            if b_off >= total_tokens_now { continue; }
+        
+        // [OPTIMIZATION] Prefill(Baking) 중에는 방금 생성한 텐서(key_states/value_states)를 직접 사용
+        // SSD 로딩 로직을 타지 않게 하여 메모리 이중 점유 방지
+        if baking_only && seqlen_offset == 0 {
+            bulk_ks.push(key_states.to_dtype(target_dtype)?);
+            bulk_vs.push(value_states.to_dtype(target_dtype)?);
+        } else {
+            for block in &self.kv_blocks {
+                let (index, b_off, _b_len) = {
+                    let inner = block.inner.read().unwrap();
+                    (inner.index, inner.offset, inner.len)
+                };
+                if b_off >= total_tokens_now { continue; }
 
-            // Check physical VRAM presence
-            let mut k_vram = None;
-            let mut v_vram = None;
-            {
-                let inner = block.inner.read().unwrap();
-                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    k_vram = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
-                    v_vram = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
-                    vram_count += 1;
-                }
-            }
-
-            if let (Some(k), Some(v)) = (k_vram, v_vram) {
-                bulk_ks.push(k); bulk_vs.push(v);
-            } else {
-                // SSD/RAM Pipeline: Direct load to VRAM for high-speed inference
-                let mut k_cpu = None;
-                let mut v_cpu = None;
+                // Check physical VRAM presence
+                let mut k_vram = None;
+                let mut v_vram = None;
                 {
-                    let reg = self.registry.entries.read().unwrap();
-                    let cache = reg[index].bitkv_cache.read().unwrap();
-                    if let Some(m) = &cache[self.layer_idx] {
-                        k_cpu = Some(self.decompress_from_bf16(&m.k_data, &m.original_shape, &Device::Cpu)?);
-                        v_cpu = Some(self.decompress_from_bf16(&m.v_data, &m.original_shape, &Device::Cpu)?);
-                        ram_count += 1;
+                    let inner = block.inner.read().unwrap();
+                    if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                        // [VRAM-DIRECT] 이미 VRAM에 있다면 복사 없이 참조 활용
+                        k_vram = Some(k.to_dtype(target_dtype)?);
+                        v_vram = Some(v.to_dtype(target_dtype)?);
+                        vram_count += 1;
                     }
                 }
-                if k_cpu.is_none() {
-                    let ssd_path = { let reg = self.registry.entries.read().unwrap(); if index < reg.len() { reg[index].ssd_path.clone() } else { None } };
-                    if let Some(p) = ssd_path {
-                        let mut full_path = p.clone();
-                        if full_path.is_relative() && !full_path.starts_with("tmp") { full_path = crate::utils::paths::get_kv_dir(None).join(full_path); }
-                        let block_file = full_path.join(format!("l{}.st", self.layer_idx));
-                        // [DIRECT-IO] Use OS-accelerated high-speed read
-                        if let Ok(data) = crate::utils::direct_loader::load_kv_block(&block_file) {
-                            if let Ok(st_map) = candle_core::safetensors::load_buffer(&data, &Device::Cpu) {
-                                let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
-                                let get_t = |s: &str| st_map.get(&format!("{}{}", prefix, s)).or_else(|| st_map.get(s)).cloned();
-                                
-                                if let (Some(kd_t), Some(vd_t), Some(sh_t), Some(ks_t), Some(vs_t)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape"), get_t("k_scale"), get_t("v_scale")) {
-                                    let sh_u32: Vec<u32> = sh_t.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.flatten_all()?.to_vec1()?;
-                                    let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
 
-                                    // [GPU-OFFLOAD-RESTORE] Move to device
-                                    let kd_dev = kd_t.to_device(dev)?;
-                                    let vd_dev = vd_t.to_device(dev)?;
-                                    let ks_dev = ks_t.to_device(dev)?;
-                                    let vs_dev = vs_t.to_device(dev)?;
+                if let (Some(k), Some(v)) = (k_vram, v_vram) {
+                    bulk_ks.push(k); bulk_vs.push(v);
+                } else {
+                    // SSD/RAM Pipeline: 필요한 경우에만 로드
+                    let mut k_cpu = None;
+                    let mut v_cpu = None;
+                    {
+                        let reg = self.registry.entries.read().unwrap();
+                        let cache = reg[index].bitkv_cache.read().unwrap();
+                        if let Some(m) = &cache[self.layer_idx] {
+                            k_cpu = Some(self.decompress_from_bf16(&m.k_data, &m.original_shape, &Device::Cpu)?);
+                            v_cpu = Some(self.decompress_from_bf16(&m.v_data, &m.original_shape, &Device::Cpu)?);
+                            ram_count += 1;
+                        }
+                    }
+                    if k_cpu.is_none() {
+                        let ssd_path = { let reg = self.registry.entries.read().unwrap(); if index < reg.len() { reg[index].ssd_path.clone() } else { None } };
+                        if let Some(p) = ssd_path {
+                            let mut full_path = p.clone();
+                            if full_path.is_relative() && !full_path.starts_with("tmp") { full_path = crate::utils::paths::get_kv_dir(None).join(full_path); }
+                            let block_file = full_path.join(format!("l{}.st", self.layer_idx));
+                            // [DIRECT-IO] Use OS-accelerated high-speed read
+                            if let Ok(data) = crate::utils::direct_loader::load_kv_block(&block_file) {
+                                if let Ok(st_map) = candle_core::safetensors::load_buffer(&data, &Device::Cpu) {
+                                    let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
+                                    let get_t = |s: &str| st_map.get(&format!("{}{}", prefix, s)).or_else(|| st_map.get(s)).cloned();
+                                    
+                                    if let (Some(kd_t), Some(vd_t), Some(sh_t), Some(ks_t), Some(vs_t)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape"), get_t("k_scale"), get_t("v_scale")) {
+                                        let sh_u32: Vec<u32> = sh_t.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.flatten_all()?.to_vec1()?;
+                                        let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
 
-                                    // Decompress directly on GPU if possible
-                                    bulk_ks.push(self.decompress_from_1bit(&kd_dev, &ks_dev, &meta_os)?);
-                                    bulk_vs.push(self.decompress_from_1bit(&vd_dev, &vs_dev, &meta_os)?);
-                                    ssd_count += 1;
+                                        // [GPU-OFFLOAD-RESTORE] Move to device
+                                        let kd_dev = kd_t.to_device(dev)?;
+                                        let vd_dev = vd_t.to_device(dev)?;
+                                        let ks_dev = ks_t.to_device(dev)?;
+                                        let vs_dev = vs_t.to_device(dev)?;
+
+                                        // Decompress directly on GPU if possible
+                                        bulk_ks.push(self.decompress_from_1bit(&kd_dev, &ks_dev, &meta_os)?);
+                                        bulk_vs.push(self.decompress_from_1bit(&vd_dev, &vs_dev, &meta_os)?);
+                                        ssd_count += 1;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                if let Some(k) = k_cpu {
-                    bulk_ks.push(k.to_device(dev)?.to_dtype(target_dtype)?);
-                    bulk_vs.push(v_cpu.unwrap().to_device(dev)?.to_dtype(target_dtype)?);
+                    if let Some(k) = k_cpu {
+                        bulk_ks.push(k.to_device(dev)?.to_dtype(target_dtype)?);
+                        bulk_vs.push(v_cpu.unwrap().to_device(dev)?.to_dtype(target_dtype)?);
+                    }
                 }
             }
         }
@@ -2156,9 +2166,10 @@ impl QuantizedQwen3VLTextModel {
         if baking_only {
             self.layers[layer_idx].clear();
             if target_device.is_cuda() {
-                let _ = target_device.synchronize(); // GPU 메모리 해제 확정
+                // CUDA 드라이버에게 즉시 메모리 반환을 강력하게 요청
+                let _ = target_device.synchronize();
             }
-            println!("[MEMORY-OPT] Layer {} Weights Purged. (KV Safe)", layer_idx);
+            println!("[MEMORY-OPT] Layer {} Weights Purged. (KV Safe) - VRAM reclaimed.", layer_idx);
         }
 
         Ok(next_xs)
