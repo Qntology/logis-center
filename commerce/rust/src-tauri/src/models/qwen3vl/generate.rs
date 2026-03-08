@@ -310,30 +310,29 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
 
-                        // [BACK-COMPRESSION] 압축 및 직렬화 작업 자체를 백그라운드로 완전히 분리
+                        // [BACK-COMPRESSION] 메인 스레드에서 이미 압축된 데이터를 받아 저장만 수행
                         tokio::spawn(async move {
-                            // [FIX] Convert raw tensors to BF16 (or F32 fallback)
-                            // [CRITICAL] 텐서가 GPU에 있는 경우, to_device는 해당 스레드의 컨텍스트를 필요로 함
-                            if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
-                                // 워커 스레드에서 안전하게 CPU로 이동
-                                // [STABILITY] to_device 호출 시 장치 컨텍스트가 자동으로 보장되지 않을 수 있으므로
-                                // candle-core의 Device 스코프 내에서 실행되도록 유도 (필요시)
-                                let k_cpu = rk.to_device(&Device::Cpu).unwrap_or(rk);
-                                let v_cpu = rv.to_device(&Device::Cpu).unwrap_or(rv);
-                                
-                                src.k_data = k_cpu.to_dtype(DType::BF16).unwrap_or(k_cpu);
-                                src.v_data = v_cpu.to_dtype(DType::BF16).unwrap_or(v_cpu);
-                            }
-
                             let mut map = std::collections::HashMap::new();
                             let prefix = format!("b{}_l{}_", off, act_l);
-                            map.insert(format!("{}k_data", prefix), src.k_data.clone());
-                            map.insert(format!("{}v_data", prefix), src.v_data.clone());
-                            map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
+
+                            // 메인 스레드에서 보낸 1비트 압축 데이터 추출
+                            let k_packed = src.k_data;
+                            let v_packed = src.v_data;
+                            let k_scales = src.k_shape; 
+                            let v_scales = src.raw_v.unwrap(); 
+                            
+                            // 원본 shape 정보 생성 (256 토큰 기준)
+                            let k_shape_u32 = vec![1u32, 8u32, 256u32, 128u32];
+                            let k_shape_t = Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap();
+
+                            map.insert(format!("{}k_data", prefix), k_packed);
+                            map.insert(format!("{}v_data", prefix), v_packed);
+                            map.insert(format!("{}k_scale", prefix), k_scales);
+                            map.insert(format!("{}v_scale", prefix), v_scales);
+                            map.insert(format!("{}k_shape", prefix), k_shape_t);
                             
                             let file_path = task_dir.join(format!("l{}.st", act_l));
                             
-                            // [FIX] Send to IO worker after confirming all tensors are on CPU
                             GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
                             let _ = io_tx_nested.send(SaveTask { 
                                 slot_id: sid, 
