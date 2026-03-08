@@ -599,8 +599,16 @@ impl QuantizedQwen3VLTextAttention {
                 let free_space = 256usize.saturating_sub(inner.len);
                 if inner.location == KVLocation::VRAM && free_space > 0 {
                     let take = tokens_to_process.min(free_space);
-                    let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
-                    let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
+                    let mut k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
+                    let mut v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
+
+                    // [GQA-EXPANSION-GUARD] 캐시에 합치기 전 헤드 수 확장 (16 heads 정렬)
+                    if self.num_kv_groups > 1 {
+                        let (b, h, s, d) = k_piece.dims4()?;
+                        k_piece = k_piece.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                        v_piece = v_piece.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                    }
+
                     if let (Some(pk), Some(pv)) = (inner.k_cache.take(), inner.v_cache.take()) {
                         let pk = if !pk.device().same_device(dev) { pk.to_device(dev)? } else { pk };
                         let pv = if !pv.device().same_device(dev) { pv.to_device(dev)? } else { pv };
