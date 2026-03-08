@@ -702,7 +702,7 @@ impl QuantizedQwen3VLTextAttention {
             }
 
             if let (Some(k), Some(v)) = (k_chunk, v_chunk) {
-                // [PARTIAL-ATTENTION] 현재 청크에 대해서만 어텐션 계산
+                // [GQA-EXPANSION] 텐서 누산 전 KV 헤드 수를 Query 헤드 수(16)에 맞게 확장
                 let mut k_eff = k;
                 let mut v_eff = v;
                 if self.num_kv_groups > 1 {
@@ -711,26 +711,28 @@ impl QuantizedQwen3VLTextAttention {
                     v_eff = v_eff.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
                 }
 
-                let logits = query_states.matmul(&k_eff.transpose(2, 3)?)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?;
+                // [FIX] Scaling 상수의 DType을 target_dtype(BF16)으로 맞추어 크래시 방지
+                let scale_factor = Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?;
+                let logits = query_states.matmul(&k_eff.transpose(2, 3)?)?.broadcast_mul(&scale_factor)?;
                 
                 // [ONLINE-SOFTMAX-UPDATE]
                 let chunk_max = logits.max_keepdim(D::Minus1)?;
                 let new_max = global_max_logits.broadcast_maximum(&chunk_max)?;
                 
-                let exp_scale_old = global_max_logits.sub(&new_max)?.exp()?;
-                let exp_scale_chunk = chunk_max.sub(&new_max)?.exp()?;
+                let exp_scale_old = global_max_logits.broadcast_sub(&new_max)?.exp()?;
+                let exp_scale_chunk = chunk_max.broadcast_sub(&new_max)?.exp()?;
                 
-                let chunk_exp_sum = logits.sub(&chunk_max)?.exp()?.sum_keepdim(D::Minus1)?;
+                let chunk_exp_sum = logits.broadcast_sub(&chunk_max)?.exp()?.sum_keepdim(D::Minus1)?;
                 global_sum_exp = global_sum_exp.broadcast_mul(&exp_scale_old)?.broadcast_add(&chunk_exp_sum.broadcast_mul(&exp_scale_chunk)?)?;
                 
-                let chunk_weighted_v = logits.sub(&chunk_max)?.exp()?.matmul(&v_eff)?;
+                let chunk_weighted_v = logits.broadcast_sub(&chunk_max)?.exp()?.matmul(&v_eff)?;
                 global_weighted_v = global_weighted_v.broadcast_mul(&exp_scale_old)?.broadcast_add(&chunk_weighted_v.broadcast_mul(&exp_scale_chunk)?)?;
                 
                 global_max_logits = new_max;
 
                 // [MEMORY-RELEASE] 0~26번 레이어이고 SSD에서 로드했다면 즉시 VRAM 해제
                 if loaded_from_ssd && self.layer_idx < 27 {
-                    // k, v 변수가 스코프를 벗어나며 GPU 메모리 반납 유도
+                    // k_eff, v_eff 가 스코프를 벗어나며 GPU 메모리 반납 유도
                 } else if self.layer_idx == 27 && q_len == 1 {
                     // 마지막 레이어는 캐시에 보관
                     let mut inner_w = block.inner.write().unwrap();
@@ -2269,6 +2271,9 @@ impl QuantizedQwen3VLTextModel {
         let mut block_groups: std::collections::HashMap<usize, Vec<LayerKVDump>> = std::collections::HashMap::new();
         
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
+            // [HYBRID-BRIDGE-PROTECTION] 마지막 레이어(27)는 VRAM에 보존하므로 SSD 플러시 대상에서 제외합니다.
+            if l_idx == 27 { continue; }
+
             for block in &mut layer.self_attn.kv_blocks {
                 let mut inner = block.inner.write().unwrap();
                 
@@ -2520,9 +2525,12 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
-        // [LAYER-BLOCK-LINKING] 모든 레이어에 물리적으로 블록 핸들 재연결
+        // [LAYER-BLOCK-LINKING] 0~26번 레이어만 SSD 맥락과 물리적으로 재연결
+        // 마지막 레이어(27)는 VRAM에 데이터가 상주해 있으므로 연결 과정을 건너뜁니다.
         let num_layers = self.layers.len();
         for i in 0..num_layers {
+            if i == 27 { continue; } // [FIX] 27번 레이어 보호
+
             let mut layer_blocks = Vec::new();
             {
                 let reg = self.registry.entries.read().unwrap();
@@ -2538,15 +2546,17 @@ impl QuantizedQwen3VLTextModel {
         }
         
         self.current_kv_len = expected_len;
-        println!("[SSD-RESTORE] Physically linked {} context blocks. Global Len: {}", fragments.len(), self.current_kv_len);
+        println!("[SSD-RESTORE] Linked Layers 0-26 to SSD. Layer 27 remains in VRAM. Global Len: {}", self.current_kv_len);
         Ok(())
     }
 
     pub fn clear_kv_cache(&mut self) {
-        for layer in self.layers.iter_mut() {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            // [HYBRID-PROTECTION] 디코딩 전이를 위해 27번 레이어는 비우지 않습니다.
+            if i == 27 { continue; }
             layer.clear_kv_cache()
         }
-        self.current_kv_len = 0;
+        // [FIX] 27번 레이어의 데이터를 존중하여 전체 길이를 0으로 리셋하지 않습니다.
     }
 
     pub fn evacuate_vram_to_cache(&mut self) -> Result<()> {
