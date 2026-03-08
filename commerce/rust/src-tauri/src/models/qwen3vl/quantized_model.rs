@@ -71,7 +71,7 @@ impl Module for RmsNorm {
     }
 }
 
-// Wrapper for QMatMul to act like Linear
+// Wrapper for QMatMul to act like Linear 
 #[derive(Clone)]
 pub struct QLinear {
     inner: QMatMul,
@@ -596,11 +596,7 @@ impl QuantizedQwen3VLTextAttention {
                         }
                         
                         let block_file = full_path.join(format!("l{}.st", self.layer_idx));
-                        
-                        // [FIX] Try standard fs::read first for small files (1MB) to avoid DirectStorage issues
-                        let data_res = std::fs::read(&block_file).or_else(|_| crate::utils::direct_loader::load_kv_block(&block_file));
-                        
-                        match data_res {
+                        match crate::utils::direct_loader::load_kv_block(&block_file) {
                             Ok(data) => {
                                 if let Ok(st_map) = candle_core::safetensors::load_buffer(&data, &Device::Cpu) {
                                     let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
@@ -619,7 +615,7 @@ impl QuantizedQwen3VLTextAttention {
                             },
                             Err(e) => {
                                 if retries >= 4 {
-                                    println!("[VRAM-WARMUP-WARN] Failed to read block file: {:?}. Error: {:?}", block_file, e);
+                                    println!("[VRAM-WARMUP-WARN] Failed to read block file after retries: {:?}. Error: {:?}", block_file, e);
                                 }
                             }
                         }
@@ -1141,15 +1137,11 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
         
-        // [VRAM-FLUSH] Prefill(Baking) 모드일 때만 레이어 자신의 VRAM 병합 캐시를 비워 메모리를 확보합니다.
-        // 디코딩 중에는 이 캐시를 유지해야 다음 토큰 생성 시 속도가 보장됩니다.
-        if baking_only {
-            if let Ok(mut merger) = self.vram_cache_merger.write() {
-                merger.k = None;
-                merger.v = None;
-                merger.block_count = 0;
-                println!("[VRAM-FLUSH] Layer {} merged cache cleared (Prefill complete).", self.layer_idx);
-            }
+        // [VRAM-FLUSH] 레이어 자신의 VRAM 병합 캐시를 비워 메모리를 확보합니다.
+        if let Ok(mut merger) = self.vram_cache_merger.write() {
+            merger.k = None;
+            merger.v = None;
+            merger.block_count = 0;
         }
         
         Ok(())
@@ -2287,25 +2279,26 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [PIPELINE-OPTIMIZATION] Prefill(Baking) 상황(seqlen_offset == 0)에서만 무거운 IO 로직 수행
-        if baking_only && seqlen_offset == 0 && session_id.is_some() {
-            let sid = session_id.unwrap();
-            
-            // 1. VRAM -> RAM 대피
-            let _ = self.layers[layer_idx].self_attn.evacuate_vram_to_cache();
-            
+        // [PIPELINE-OPTIMIZATION] KV 대피 및 백업을 백업 스레드로 완전히 분리 (Non-blocking)
+        if let Some(sid) = session_id {
             let layer_ptr = self.layers[layer_idx].clone();
+            let baking_only_clone = baking_only;
             
-            // 2. SSD 저장 트리거 (IO 작업은 백그라운드)
+            // [OFFLOAD] 다음 레이어 연산을 방해하지 않도록 별도 태스크로 분리
             tauri::async_runtime::spawn(async move {
-                let _ = layer_ptr.self_attn.trigger_realtime_incremental_bake(&sid, true, true, false);
+                // 1. VRAM -> RAM 대피 (여기서 발생하는 지연은 메인 스레드에 영향을 주지 않음)
+                let _ = layer_ptr.self_attn.evacuate_vram_to_cache();
+                
+                // 2. SSD 저장 트리거 (백그라운드 IO 워커로 태스크 전달)
+                let _ = layer_ptr.self_attn.trigger_realtime_incremental_bake(&sid, true, baking_only_clone, false);
             });
         }
 
-        // [MEMORY-OPT] [IMMEDIATE-PURGE] 가중치 소각 (Prefill 중에만 수행)
-        if baking_only && seqlen_offset == 0 {
+        // [MEMORY-OPT] [IMMEDIATE-PURGE] 가중치 소각은 연산 직후 즉시 수행
+        if baking_only {
             self.layers[layer_idx].clear();
-            println!("[PIPELINE] Prefill Layer {} complete. Weights purged.", layer_idx);
+            // synchronize() 제거: 드라이버가 알아서 비동기 처리하도록 맡김
+            println!("[PIPELINE] Layer {} outputs ready. Moving to next layer immediately.", layer_idx);
         }
 
         Ok(next_xs)
