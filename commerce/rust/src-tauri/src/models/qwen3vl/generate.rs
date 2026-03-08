@@ -288,7 +288,7 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                     SLOT_MANAGER.update_counters(old, new);
                     if old == 1 { // 1: Write
                         SLOT_MANAGER.active_write_count.fetch_sub(1, Ordering::SeqCst);
-                        println!("[SLOT-RECLAIM] Write Slot {} reclaimed. Active: {}", idx, SLOT_MANAGER.active_write_count.load(Ordering::SeqCst));
+                        // println!("[SLOT-RECLAIM] Write Slot {} reclaimed. Active: {}", idx, SLOT_MANAGER.active_write_count.load(Ordering::SeqCst));
                     }
                     SLOT_MANAGER.handoff_notifier.notify_waiters();
                 }
@@ -395,40 +395,49 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 
                         // [WORKER-COMPRESSION] 워커 내에서 비동기 압축 수행
                         tokio::spawn(async move {
-                            // [RAII-GUARD] 어떤 경우에도 카운트를 줄이고 슬롯을 관리하는 가드
-                            struct SlotGuard { sid: usize, is_last: bool }
-                            impl Drop for SlotGuard {
-                                fn drop(&mut self) {
-                                    let sid = self.sid;
-                                    let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
-                                    if rem <= 1 || self.is_last {
-                                        let _ = tauri::async_runtime::spawn(async move {
-                                            SLOT_MANAGER.mark_ready(sid).await;
-                                        });
+                            let res: Result<()> = (|| {
+                                // [RAII-GUARD] 어떤 경우에도 카운트를 줄이고 슬롯을 관리하는 가드
+                                struct SlotGuard { sid: usize, is_last: bool }
+                                impl Drop for SlotGuard {
+                                    fn drop(&mut self) {
+                                        let sid = self.sid;
+                                        let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
+                                        if rem <= 1 || self.is_last {
+                                            let _ = tauri::async_runtime::spawn(async move {
+                                                SLOT_MANAGER.mark_ready(sid).await;
+                                            });
+                                        }
                                     }
                                 }
-                            }
-                            let _guard = SlotGuard { sid, is_last: false };
+                                let _guard = SlotGuard { sid, is_last: false };
 
-                            let mut map = std::collections::HashMap::new();
-                            let prefix = format!("b{}_l{}_", off, act_l);
+                                let mut map = std::collections::HashMap::new();
+                                let prefix = format!("b{}_l{}_", off, act_l);
 
-                            // [DIRECT-SAVE] BF16으로 통일하여 저장 (파일 크기 1MB로 유지)
-                            if let (Some(rk), Some(rv)) = (src.raw_k, src.raw_v) {
-                                let rk_bf16 = rk.to_device(&Device::Cpu).unwrap_or(rk).to_dtype(DType::BF16).unwrap();
-                                let rv_bf16 = rv.to_device(&Device::Cpu).unwrap_or(rv).to_dtype(DType::BF16).unwrap();
+                                // [DIRECT-SAVE] RAM 대피(evacuate_vram_to_cache)와 동일하게 F32 정밀도를 유지하고, 연속성(Contiguous)을 강제함
+                                if let (Some(rk), Some(rv)) = (src.raw_k, src.raw_v) {
+                                    // [CRITICAL] narrow()된 뷰일 수 있으므로 반드시 contiguous()를 호출해야만 
+                                    // safetensors가 올바른 메모리 영역을 디스크에 기록합니다.
+                                    let rk_f32 = rk.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.contiguous()?;
+                                    let rv_f32 = rv.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.contiguous()?;
+                                    
+                                    map.insert(format!("{}k_raw", prefix), rk_f32);
+                                    map.insert(format!("{}v_raw", prefix), rv_f32);
+                                } else {
+                                    // Fallback for pre-compressed or empty data
+                                    map.insert(format!("{}k_data", prefix), src.k_data);
+                                    map.insert(format!("{}v_data", prefix), src.v_data);
+                                }
                                 
-                                map.insert(format!("{}k_raw", prefix), rk_bf16);
-                                map.insert(format!("{}v_raw", prefix), rv_bf16);
-                            } else {
-                                // Fallback for pre-compressed or empty data
-                                map.insert(format!("{}k_data", prefix), src.k_data);
-                                map.insert(format!("{}v_data", prefix), src.v_data);
-                            }
+                                let file_path = task_dir.join(format!("l{}.st", act_l));
+                                // [CRITICAL] Redundant fetch_add removed here! (Handled by quantized_model.rs)
+                                let _ = io_tx_nested.try_send(SaveTask { slot_id: sid, path: file_path, tensors: map, is_last: false, block_idx, registry: Some(registry_inner), kv_name: kv_name_inner, shared_block: shared_block_inner });
+                                Ok(())
+                            })();
                             
-                            let file_path = task_dir.join(format!("l{}.st", act_l));
-                            // [CRITICAL] Redundant fetch_add removed here! (Handled by quantized_model.rs)
-                            let _ = io_tx_nested.send(SaveTask { slot_id: sid, path: file_path, tensors: map, is_last: false, block_idx, registry: Some(registry_inner), kv_name: kv_name_inner, shared_block: shared_block_inner }).await;
+                            if let Err(e) = res {
+                                println!("[SSD-SAVE-ERROR] Failed to process bake task: {:?}", e);
+                            }
                         });
                     }
                 },
@@ -660,8 +669,9 @@ impl Qwen3VLGenerateModel {
             let mut gen_text = String::new();
             let (input_ids, offset) = if kv_len > 0 && !is_reference_snapshot {
                 if kv_len >= total_toks {
-                    println!("[SKIP-PREFILL] Snapshot covers entire prompt (Detected: {}, Needed: {}). Capping offset.", kv_len, total_toks);
-                    // [FIX] Strictly cap offset at total_toks - 1 to prevent double offset
+                    println!("[SKIP-PREFILL] Snapshot covers entire prompt (Detected: {}, Needed: {}). Using prompt context.", kv_len, total_toks);
+                    // [FIX] Prompt가 이미 KV 캐시에 꽉 차 있다면, 굳이 또 토큰을 먹일 필요 없이 
+                    // KV 캐시의 마지막 상태를 logits로 가져오기 위해 마지막 토큰만 feed합니다.
                     let last_id = *f_ids.last().unwrap_or(&0);
                     (Tensor::from_vec(vec![last_id], (1, 1), &self.text_device)?, total_toks - 1)
                 } else {
