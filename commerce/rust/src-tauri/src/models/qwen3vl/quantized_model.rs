@@ -2272,6 +2272,7 @@ impl QuantizedQwen3VLTextModel {
                     is_relay_baking: mode,
                     block_idx: Some(off / 256),
                     registry: self.registry.clone(),
+                    shared_block: None,
                 })).await;
             }
         }
@@ -2423,6 +2424,7 @@ impl QuantizedQwen3VLTextModel {
                         is_relay_baking: mode,
                         block_idx: Some(off / 256),
                         registry: self.registry.clone(),
+                        shared_block: None,
                     })).await;
                 }
             }
