@@ -1123,7 +1123,7 @@ impl QuantizedQwen3VLTextAttention {
             map.insert(format!("{}k_shape", prefix), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect::<Vec<u32>>(), (k_shape.len(),), &Device::Cpu)?);
             
             // [DIRECT-IO] Use OS-accelerated high-speed write instead of standard IO
-            if let Ok(data) = safetensors::serialize(&map, &None) {
+            if let Ok(data) = safetensors::serialize(&map, None) {
                 let _ = crate::utils::direct_loader::save_kv_block(&structured_path, &data);
                 println!("[SSD-SAVE-FAST] Layer {} Block {} saved via DirectStorage/Overlapped.", self.layer_idx, offset);
             }
@@ -1562,7 +1562,7 @@ impl QuantizedQwen3VLTextModel {
         device: &Device,
         device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
@@ -1647,7 +1647,7 @@ impl QuantizedQwen3VLTextModel {
         device: &Device,
         device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
@@ -2009,7 +2009,6 @@ impl QuantizedQwen3VLTextModel {
         kv_name: Option<String>,
         baking_only: bool,
     ) -> Result<Tensor> {
-        let start_layer_time = std::time::Instant::now();
         let input_token_count = xs.dim(1).unwrap_or(0);
         let is_decoding = input_token_count <= 1;
 
@@ -2368,7 +2367,15 @@ impl QuantizedQwen3VLTextModel {
                     layer.self_attn.active_kv_name = kv_name.clone();
                 }
         
-                for layer_idx in 0..total_layers {
+        for layer_idx in 0..total_layers {
+            // [NON-BLOCKING-PREFETCH] 현재 레이어 로드 (이미 로드되어 있다면 즉시 반환)
+            self.reload_layer(layer_idx)?;
+
+            // [PREFETCH-NEXT] 현재 레이어 연산 시작 전에 다음 레이어 로드를 백그라운드에서 시작
+            if layer_idx + 1 < total_layers {
+                let _ = self.reload_layer(layer_idx + 1);
+            }
+
             if layer_idx % 7 == 0 || layer_idx == total_layers - 1 {
                 println!("[ENGINE] Running Layer {}/{}", layer_idx + 1, total_layers);
             }
@@ -2601,7 +2608,7 @@ impl QuantizedQwen3VLModel {
         vision_device: &Device,
         _vision_device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool, // [NEW] Support for 1-layer vision baker
     ) -> Result<Self> {
         let mmproj_mmap = mmproj_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
@@ -2620,7 +2627,7 @@ impl QuantizedQwen3VLModel {
         }
 
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
-            &t_config, ct_main.clone(), main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
+            &t_config, ct_main.clone(), main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, _kv_reserve, baking_only
         )?;
 
         let main_mmap = main_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
@@ -2648,7 +2655,7 @@ impl QuantizedQwen3VLModel {
         vision_device: &Device,
         _vision_device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool, // [NEW]
     ) -> Result<Self> {
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
@@ -2664,7 +2671,7 @@ impl QuantizedQwen3VLModel {
             t_config.num_hidden_layers = 1;
         }
 
-        let language_model = QuantizedQwen3VLTextModel::new(&t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
+        let language_model = QuantizedQwen3VLTextModel::new(&t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, _kv_reserve, baking_only)?;
         
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
         let lm_head = if !baking_only {
@@ -2895,7 +2902,7 @@ impl QuantizedQwen3TextModel {
         text_device: &Device,
         text_device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
         single_layer_mode: bool,
     ) -> Result<Self> {
@@ -2904,7 +2911,7 @@ impl QuantizedQwen3TextModel {
         if single_layer_mode { t_config.num_hidden_layers = 1; }
         
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
-            &t_config, ct_main.clone(), mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
+            &t_config, ct_main.clone(), mmap_handle.clone(), "model", text_device, text_device_id, dtype, _kv_reserve, baking_only
         )?;
         let lm_head = if !baking_only {
             let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
@@ -2924,7 +2931,7 @@ impl QuantizedQwen3TextModel {
         text_device: &Device,
         text_device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
         single_layer_mode: bool,
     ) -> Result<Self> {
@@ -2933,7 +2940,7 @@ impl QuantizedQwen3TextModel {
         if single_layer_mode { t_config.num_hidden_layers = 1; }
 
         let language_model = QuantizedQwen3VLTextModel::new(
-            &t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only
+            &t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, _kv_reserve, baking_only
         )?;
         let lm_head = if !baking_only {
             let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };

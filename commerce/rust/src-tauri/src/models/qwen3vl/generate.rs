@@ -244,8 +244,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 struct IoGuard; impl Drop for IoGuard { fn drop(&mut self) { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } }
                 let _guard = IoGuard;
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
-                if let Ok(data) = safetensors::serialize(&ts, &None) {
-                    drop(ts); let _ = save_kv_block(&tp, &data);
+                
+                // [FIX] Use candle-native save to avoid safetensors version mismatch
+                if let Ok(_) = candle_core::safetensors::save(&ts, &tp) {
+                    drop(ts);
                     
                     // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
                     if let Some(kv_name) = kv_n {
