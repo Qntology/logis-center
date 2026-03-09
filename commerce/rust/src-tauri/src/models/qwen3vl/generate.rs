@@ -99,7 +99,6 @@ pub struct LayerKVDump {
     pub k_shape: Tensor,
     pub raw_k: Option<Tensor>,
     pub raw_v: Option<Tensor>,
-    pub block_inner: Option<Arc<std::sync::RwLock<crate::models::qwen3vl::quantized_model::KVBlockInner>>>,
 }
 
 pub struct BakeTask {
@@ -112,7 +111,6 @@ pub struct SaveTask {
     pub slot_id: usize, pub path: PathBuf, pub tensors: std::collections::HashMap<String, Tensor>,
     pub is_last: bool, pub block_idx: Option<usize>, pub registry: Option<KVRegistry>,
     pub kv_name: Option<String>,
-    pub block_inner: Option<Arc<std::sync::RwLock<crate::models::qwen3vl::quantized_model::KVBlockInner>>>,
 }
 
 pub enum SlotTask { 
@@ -240,21 +238,21 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(48)); 
         while let Some(task) = io_rx.recv().await {
             let sem = semaphore.clone();
-            let (tp, ts, reg, b_idx, sid, is_last, kv_n, b_inner) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone(), task.block_inner.clone());
+            let (tp, ts, reg, b_idx, sid, is_last, kv_n) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone());
             tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
                 struct IoGuard; impl Drop for IoGuard { fn drop(&mut self) { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } }
                 let _guard = IoGuard;
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
-                
-                // [FIX] Use candle-native save to avoid safetensors version mismatch
-                if let Ok(_) = candle_core::safetensors::save(&ts, &tp) {
-                    drop(ts);
+                if let Ok(data) = safetensors::serialize(&ts, &None) {
+                    drop(ts); let _ = save_kv_block(&tp, &data);
                     
                     // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
                     if let Some(kv_name) = kv_n {
                         if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
                             if let Ok(l_idx) = l_str.parse::<usize>() {
+                                // 오프셋 추출 (파일명 b{offset}_l{idx}_k_anchors 에서 추출하거나 SaveTask에 추가 가능)
+                                // 현재는 tp.parent() 폴더명이 b{offset} 이므로 이를 활용
                                 let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
                                 let offset = offset_str.parse::<usize>().unwrap_or(0);
                                 
@@ -278,19 +276,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         if l_idx < 28 { 
                                             e.location[l_idx] = KVLocation::SSD; 
                                             e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                                            
-                                            // [MEMORY-RELEASE] RAM 메모리 해제 (bitkv_cache)
+                                            // [MEMORY-RELEASE] SSD 저장 완료 즉시 RAM 메모리 해제
                                             if let Ok(mut cache) = e.bitkv_cache.write() {
                                                 if l_idx < cache.len() { cache[l_idx] = None; }
-                                            }
-                                            
-                                            // [MEMORY-RELEASE] KVBlockInner의 캐시도 해제하여 RAM 점유율 최소화
-                                            if let Some(inner_arc) = &b_inner {
-                                                if let Ok(mut inner) = inner_arc.write() {
-                                                    inner.k_cache = None;
-                                                    inner.v_cache = None;
-                                                    inner.location = KVLocation::SSD;
-                                                }
                                             }
                                         } 
                                     }
@@ -321,10 +309,15 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let registry_inner = registry.clone();
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
-                        let block_inner = src.block_inner.clone();
 
+                        // [BACK-COMPRESSION] 압축 및 직렬화 작업 자체를 백그라운드로 완전히 분리
                         tokio::spawn(async move {
+                            // [FIX] Convert raw tensors to BF16 (or F32 fallback)
+                            // [CRITICAL] 텐서가 GPU에 있는 경우, to_device는 해당 스레드의 컨텍스트를 필요로 함
                             if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
+                                // 워커 스레드에서 안전하게 CPU로 이동
+                                // [STABILITY] to_device 호출 시 장치 컨텍스트가 자동으로 보장되지 않을 수 있으므로
+                                // candle-core의 Device 스코프 내에서 실행되도록 유도 (필요시)
                                 let k_cpu = rk.to_device(&Device::Cpu).unwrap_or(rk);
                                 let v_cpu = rv.to_device(&Device::Cpu).unwrap_or(rv);
                                 
@@ -340,6 +333,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             
                             let file_path = task_dir.join(format!("l{}.st", act_l));
                             
+                            // [FIX] Send to IO worker after confirming all tensors are on CPU
                             GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
                             let _ = io_tx_nested.send(SaveTask { 
                                 slot_id: sid, 
@@ -348,8 +342,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 is_last: false, 
                                 block_idx, 
                                 registry: Some(registry_inner), 
-                                kv_name: kv_name_inner,
-                                block_inner
+                                kv_name: kv_name_inner 
                             }).await;
                         });
                     }
