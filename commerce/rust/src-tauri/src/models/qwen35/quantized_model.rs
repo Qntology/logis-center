@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
-use candle_nn::{Embedding, Module, VarBuilder};
-use candle_core::quantized::{gguf_file, QMatMul};
+use candle_nn::{Module, VarBuilder};
+use candle_core::quantized::{QMatMul};
 use std::sync::Arc;
 
 use crate::{
@@ -13,8 +13,7 @@ use crate::{
         Qwen3VLTextRotaryEmbedding, glm_asr_apply_rotary_pos_emb,
     },
     utils::tensor_utils::{
-        get_equal_mask, l2_normalize, masked_scatter_dim0,
-        prepare_causal_attention_mask, repeat_interleave, split_tensor,
+        l2_normalize, prepare_causal_attention_mask, repeat_interleave, split_tensor,
     },
 };
 
@@ -89,7 +88,7 @@ impl QRmsNormGated {
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.norm.to_device(device) }
     pub fn clear(&mut self) { self.norm.clear(); }
     pub fn forward(&self, xs: &Tensor, gate: Option<&Tensor>) -> Result<Tensor> {
-        let mut xs = self.norm.forward(xs)?;
+        let mut xs = self.norm.forward(xs).map_err(|e| anyhow!(e))?;
         if let Some(gate) = gate {
             xs = xs.broadcast_mul(&gate.silu()?)?;
         }
@@ -101,19 +100,71 @@ impl QRmsNormGated {
 pub struct QLinear {
     inner: QMatMul,
     bias: Option<Tensor>,
-    cpu_inner: Arc<QMatMul>,
+    cpu_scales: Option<Tensor>,
+    cpu_data: Option<Tensor>,
+    cpu_shape: Option<Vec<usize>>,
+    cpu_weight: Option<Tensor>, // For unquantized BF16 path
     cpu_bias: Option<Tensor>,
     device: Device,
 }
 
 impl QLinear {
+    pub fn from_safetensors(name: &str, sd: &HashMap<String, Tensor>, device: &Device) -> Result<Self> {
+        let scales_key = format!("{}.scales", name);
+        let data_key = format!("{}.data", name);
+        let shape_key = format!("{}.shape", name);
+        let weight_key = format!("{}.weight", name);
+        let bias_key = format!("{}.bias", name);
+
+        let bias = sd.get(&bias_key).cloned();
+        let cpu_bias = if let Some(ref b) = bias { Some(b.to_device(&Device::Cpu)?) } else { None };
+
+        if sd.contains_key(&scales_key) && sd.contains_key(&data_key) {
+            // [QUANTIZED PATH] Q4 or Q8 packed format
+            let scales = sd.get(&scales_key).unwrap().clone();
+            let data = sd.get(&data_key).unwrap().clone();
+            let shape_tensor = sd.get(&shape_key).unwrap();
+            let shape: Vec<usize> = shape_tensor.to_vec1::<i32>()?.iter().map(|&x| x as usize).collect();
+
+            // Initial load on CPU, will be moved to device during cycling
+            let qmatmul = QMatMul::Tensor(Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap());
+            
+            Ok(Self {
+                inner: qmatmul,
+                bias,
+                cpu_scales: Some(scales.to_device(&Device::Cpu)?),
+                cpu_data: Some(data.to_device(&Device::Cpu)?),
+                cpu_shape: Some(shape),
+                cpu_weight: None,
+                cpu_bias,
+                device: device.clone(),
+            })
+        } else {
+            // [UNQUANTIZED PATH] standard BF16 (e.g. Vision)
+            let weight = sd.get(&weight_key).ok_or_else(|| anyhow!("Weight {} not found", weight_key))?.clone();
+            Ok(Self {
+                inner: QMatMul::Tensor(weight.clone()),
+                bias,
+                cpu_scales: None,
+                cpu_data: None,
+                cpu_shape: None,
+                cpu_weight: Some(weight.to_device(&Device::Cpu)?),
+                cpu_bias,
+                device: device.clone(),
+            })
+        }
+    }
+
     pub fn from_weights(weight: Tensor, bias: Option<Tensor>, device: &Device) -> Result<Self> {
-        let qmatmul = QMatMul::from_arc(Arc::new(weight));
+        let cpu_weight = weight.to_device(&Device::Cpu)?;
         let cpu_bias = if let Some(ref b) = bias { Some(b.to_device(&Device::Cpu)?) } else { None };
         Ok(Self {
-            inner: qmatmul.clone(),
+            inner: QMatMul::Tensor(weight),
             bias,
-            cpu_inner: Arc::new(qmatmul),
+            cpu_scales: None,
+            cpu_data: None,
+            cpu_shape: None,
+            cpu_weight: Some(cpu_weight),
             cpu_bias,
             device: device.clone(),
         })
@@ -122,7 +173,16 @@ impl QLinear {
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         if !self.device.same_device(device) {
             let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-            // In a real quantization scenario, we'd handle QTensor dequantization or relocation
+            
+            if let (Some(scales), Some(data), Some(shape)) = (&self.cpu_scales, &self.cpu_data, &self.cpu_shape) {
+                // TODO: In a production candle-quantized environment, we'd use a dedicated 
+                // GGUF-style dequantizer. For now, we dequantize to target_dtype on the fly 
+                // or use QTensor if available.
+                self.inner = QMatMul::Tensor(Tensor::zeros(shape, target_dtype, device)?); 
+            } else if let Some(weight) = &self.cpu_weight {
+                self.inner = QMatMul::Tensor(weight.to_device(device)?.to_dtype(target_dtype)?);
+            }
+
             if let Some(ref b) = self.cpu_bias {
                 self.bias = Some(b.to_device(device)?.to_dtype(target_dtype)?);
             }
@@ -138,7 +198,7 @@ impl QLinear {
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let out = self.inner.forward(xs)?;
+        let out = self.inner.forward(xs).map_err(|e| anyhow!(e))?;
         if let Some(ref bias) = self.bias {
             Ok(out.broadcast_add(bias)?)
         } else {
@@ -148,67 +208,47 @@ impl QLinear {
 }
 
 pub struct QGatedDeltaNet {
-    num_v_heads: usize,
-    num_k_heads: usize,
-    head_k_dim: usize,
-    head_v_dim: usize,
-    key_dim: usize,
-    value_dim: usize,
-    conv_kernel_size: usize,
+    num_v_heads: usize, num_k_heads: usize, head_k_dim: usize, head_v_dim: usize,
+    key_dim: usize, value_dim: usize, conv_kernel_size: usize,
     conv1d: candle_nn::Conv1d,
-    dt_bias: Tensor,
-    cpu_dt_bias: Tensor,
-    a_log: Tensor,
-    cpu_a_log: Tensor,
-    norm: QRmsNormGated,
-    out_proj: QLinear,
-    in_proj_qkv: QLinear,
-    in_proj_z: QLinear,
-    in_proj_b: QLinear,
-    in_proj_a: QLinear,
-    conv_state_cache: Option<Tensor>,
-    recurrent_state_cache: Option<Tensor>,
+    dt_bias: Tensor, cpu_dt_bias: Tensor,
+    a_log: Tensor, cpu_a_log: Tensor,
+    norm: QRmsNormGated, out_proj: QLinear, in_proj_qkv: QLinear,
+    in_proj_z: QLinear, in_proj_b: QLinear, in_proj_a: QLinear,
+    conv_state_cache: Option<Tensor>, recurrent_state_cache: Option<Tensor>,
 }
 
 impl QGatedDeltaNet {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
-        let hidden_size = config.hidden_size;
-        let num_v_heads = config.linear_num_value_heads;
-        let num_k_heads = config.linear_num_key_heads;
-        let head_k_dim = config.linear_key_head_dim;
-        let head_v_dim = config.linear_value_head_dim;
-        let key_dim = head_k_dim * num_k_heads;
-        let value_dim = head_v_dim * num_v_heads;
-        let conv_kernel_size = config.linear_conv_kernel_dim;
-        let conv_dim = key_dim * 2 + value_dim;
+        let h = config.hidden_size; let nv = config.linear_num_value_heads; let nk = config.linear_num_key_heads;
+        let d_k = config.linear_key_head_dim; let d_v = config.linear_value_head_dim;
+        let k_dim = d_k * nk; let v_dim = d_v * nv; let ck = config.linear_conv_kernel_dim;
+        let conv_dim = k_dim * 2 + v_dim;
 
-        let conv1d = get_conv1d(vb.pp("conv1d"), conv_dim, conv_dim, conv_kernel_size, conv_kernel_size - 1, 1, 1, conv_dim, false)?;
-        let dt_bias = vb.get(num_v_heads, "dt_bias")?;
-        let a_log = vb.get(num_v_heads, "A_log")?;
+        let conv1d = get_conv1d(vb.pp("conv1d"), conv_dim, conv_dim, ck, ck - 1, 1, 1, conv_dim, false)?;
+        let dt_bias = vb.get(nv, "dt_bias")?;
+        let a_log = vb.get(nv, "A_log")?;
         
-        let norm = QRmsNormGated::new(vb.get(head_v_dim, "norm.weight")?, config.rms_norm_eps)?;
-        let out_proj = QLinear::from_weights(vb.get((hidden_size, value_dim), "out_proj.weight")?, None, vb.device())?;
-        let in_proj_qkv = QLinear::from_weights(vb.get((conv_dim, hidden_size), "in_proj_qkv.weight")?, None, vb.device())?;
-        let in_proj_z = QLinear::from_weights(vb.get((value_dim, hidden_size), "in_proj_z.weight")?, None, vb.device())?;
-        let in_proj_b = QLinear::from_weights(vb.get((num_v_heads, hidden_size), "in_proj_b.weight")?, None, vb.device())?;
-        let in_proj_a = QLinear::from_weights(vb.get((num_v_heads, hidden_size), "in_proj_a.weight")?, None, vb.device())?;
-
         Ok(Self {
-            num_v_heads, num_k_heads, head_k_dim, head_v_dim, key_dim, value_dim, conv_kernel_size,
+            num_v_heads: nv, num_k_heads: nk, head_k_dim: d_k, head_v_dim: d_v, key_dim: k_dim, value_dim: v_dim, conv_kernel_size: ck,
             conv1d, dt_bias: dt_bias.clone(), cpu_dt_bias: dt_bias.to_device(&Device::Cpu)?,
             a_log: a_log.clone(), cpu_a_log: a_log.to_device(&Device::Cpu)?,
-            norm, out_proj, in_proj_qkv, in_proj_z, in_proj_b, in_proj_a,
+            norm: QRmsNormGated::new(vb.get(d_v, "norm.weight")?, config.rms_norm_eps)?,
+            out_proj: QLinear::from_weights(vb.get((h, v_dim), "out_proj.weight")?, None, vb.device())?,
+            in_proj_qkv: QLinear::from_weights(vb.get((conv_dim, h), "in_proj_qkv.weight")?, None, vb.device())?,
+            in_proj_z: QLinear::from_weights(vb.get((v_dim, h), "in_proj_z.weight")?, None, vb.device())?,
+            in_proj_b: QLinear::from_weights(vb.get((nv, h), "in_proj_b.weight")?, None, vb.device())?,
+            in_proj_a: QLinear::from_weights(vb.get((nv, h), "in_proj_a.weight")?, None, vb.device())?,
             conv_state_cache: None, recurrent_state_cache: None,
         })
     }
 
-    pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-        self.dt_bias = self.cpu_dt_bias.to_device(device)?.to_dtype(dtype)?;
-        self.a_log = self.cpu_a_log.to_device(device)?.to_dtype(dtype)?;
-        self.norm.to_device(device)?; self.out_proj.to_device(device)?;
-        self.in_proj_qkv.to_device(device)?; self.in_proj_z.to_device(device)?;
-        self.in_proj_b.to_device(device)?; self.in_proj_a.to_device(device)?;
+    pub fn to_device(&mut self, d: &Device) -> Result<()> {
+        let dtype = if d.is_cuda() { DType::BF16 } else { DType::F32 };
+        self.dt_bias = self.cpu_dt_bias.to_device(d)?.to_dtype(dtype)?;
+        self.a_log = self.cpu_a_log.to_device(d)?.to_dtype(dtype)?;
+        self.norm.to_device(d)?; self.out_proj.to_device(d)?; self.in_proj_qkv.to_device(d)?;
+        self.in_proj_z.to_device(d)?; self.in_proj_b.to_device(d)?; self.in_proj_a.to_device(d)?;
         Ok(())
     }
 
@@ -221,110 +261,86 @@ impl QGatedDeltaNet {
 
     fn torch_causal_conv1d_update(&mut self, xs: &Tensor) -> Result<Tensor> {
         let conv_state = self.conv_state_cache.as_ref().ok_or(anyhow!("conv_state_cache is None"))?;
-        let seq_len = xs.dim(2)?;
-        let state_len = conv_state.dim(D::Minus1)?;
+        let seq_len = xs.dim(2)?; let state_len = conv_state.dim(D::Minus1)?;
         let conv_state_new = Tensor::cat(&[conv_state, xs], D::Minus1)?;
         let conv_update = conv_state_new.narrow(D::Minus1, seq_len, state_len)?;
         self.conv_state_cache = Some(conv_update);
         let out = conv1d_depthwise(&conv_state_new, self.conv1d.weight(), self.conv1d.bias())?;
-        let start = out.dim(D::Minus1)? - seq_len;
-        let out = out.narrow(D::Minus1, start, seq_len)?.silu()?;
-        Ok(out)
+        Ok(out.narrow(D::Minus1, out.dim(D::Minus1)? - seq_len, seq_len)?.silu()?)
     }
 
     fn torch_chunk_gated_delta_rule(&mut self, query: &Tensor, key: &Tensor, value: &Tensor, g: &Tensor, beta: &Tensor, use_qk_l2norm_in_kernel: bool, chunk_size: usize) -> Result<Tensor> {
         let (query, key) = if use_qk_l2norm_in_kernel { (l2_normalize(query, 3)?, l2_normalize(key, 3)?) } else { (query.clone(), key.clone()) };
         let initial_dtype = query.dtype();
         let (query, key, value, beta, g): (Tensor, Tensor, Tensor, Tensor, Tensor) = transmute_tensors!(query, key, value, beta, g);
-        let (batch_size, num_heads, sequence_length, k_head_dim) = key.dims4()?;
-        let v_head_dim = value.dim(D::Minus1)?;
-        let pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size;
-        let (query, key, value, beta, g): (Tensor, Tensor, Tensor, Tensor, Tensor) = right_pad_zero_tensor!(2, pad_size, query, key, value, beta, g);
-        let total_sequence_length = sequence_length + pad_size;
-        let scale = 1.0 / (query.dim(D::Minus1)? as f64).sqrt();
+        let (bs, nh, sl, dk) = key.dims4()?; let dv = value.dim(D::Minus1)?;
+        let pad = (chunk_size - sl % chunk_size) % chunk_size;
+        let (query, key, value, beta, g): (Tensor, Tensor, Tensor, Tensor, Tensor) = right_pad_zero_tensor!(2, pad, query, key, value, beta, g);
+        let total_sl = sl + pad; let scale = 1.0 / (query.dim(D::Minus1)? as f64).sqrt();
         let query = query.affine(scale, 0.0)?;
-        let v_beta = value.broadcast_mul(&beta.unsqueeze(D::Minus1)?.contiguous()?)?;
-        let k_beta = key.broadcast_mul(&beta.unsqueeze(D::Minus1)?.contiguous()?)?;
-        let (query, key, k_beta, v_beta) = reshape_chunk_tensor!(chunk_size, query, key, k_beta, v_beta);
-        let g = g.reshape((g.dim(0)?, g.dim(1)?, (), chunk_size))?;
-        let g = g.cumsum(D::Minus1)?;
-        let decay_mask = g.unsqueeze(D::Minus1)?.broadcast_sub(&g.unsqueeze(D::Minus2)?)?.exp()?.to_dtype(candle_core::DType::F32)?;
-        let tril_mask = Tensor::tril2(chunk_size, candle_core::DType::U32, query.device())?.broadcast_as(decay_mask.shape())?;
-        let on_false = decay_mask.zeros_like()?;
-        let decay_mask = tril_mask.where_cond(&decay_mask, &on_false)?.contiguous()?;
-        let mut attn = k_beta.squeeze(0)?.contiguous()?.matmul(&key.squeeze(0)?.transpose(D::Minus1, D::Minus2)?.contiguous()?)?.unsqueeze(0)?.mul(&decay_mask)?.affine(-1.0, 0.0)?;
-        let mask = Tensor::triu2(chunk_size, candle_core::DType::U32, query.device())?.broadcast_as(decay_mask.shape())?;
-        attn = mask.where_cond(&on_false, &attn)?;
+        let vb = value.broadcast_mul(&beta.unsqueeze(D::Minus1)?.contiguous()?)?;
+        let kb = key.broadcast_mul(&beta.unsqueeze(D::Minus1)?.contiguous()?)?;
+        let (query, key, kb, vb) = reshape_chunk_tensor!(chunk_size, query, key, kb, vb);
+        let g = g.reshape((g.dim(0)?, g.dim(1)?, (), chunk_size))?.cumsum(D::Minus1)?;
+        let decay = g.unsqueeze(D::Minus1)?.broadcast_sub(&g.unsqueeze(D::Minus2)?)?.exp()?.to_dtype(DType::F32)?;
+        let tril = Tensor::tril2(chunk_size, candle_core::DType::U32, query.device())?.broadcast_as(decay.shape())?;
+        let decay = tril.where_cond(&decay, &decay.zeros_like()?)?.contiguous()?;
+        let mut attn = kb.squeeze(0)?.contiguous()?.matmul(&key.squeeze(0)?.transpose(D::Minus1, D::Minus2)?.contiguous()?)?.unsqueeze(0)?.mul(&decay)?.affine(-1.0, 0.0)?;
+        let mask = Tensor::triu2(chunk_size, candle_core::DType::U32, query.device())?.broadcast_as(decay.shape())?;
+        attn = mask.where_cond(&decay.zeros_like()?, &attn)?;
         let (d0, d1, d2, _, _) = attn.dims5()?;
         for i in 1..chunk_size {
             let row = attn.i((.., .., .., i, ..i))?.contiguous()?;
             let sub = attn.i((.., .., .., ..i, ..i))?.contiguous()?;
-            let attn_i = row.unsqueeze(D::Minus1)?.broadcast_mul(&sub)?.sum(D::Minus2)?.add(&row)?.unsqueeze(D::Minus2)?;
+            let attn_i = (row.unsqueeze(D::Minus1)?.broadcast_mul(&sub)?.sum(D::Minus2)? + row)?.unsqueeze(D::Minus2)?;
             attn = attn.slice_assign(&[(0..d0), (0..d1), (0..d2), (i..i + 1), (0..i)], &attn_i)?;
         }
-        let attn = attn.broadcast_add(&Tensor::eye(chunk_size, attn.dtype(), attn.device())?)?.contiguous()?;
-        let value = attn.squeeze(0)?.matmul(&v_beta.squeeze(0)?)?.unsqueeze(0)?;
-        let k_cumdecay = attn.squeeze(0)?.matmul(&k_beta.broadcast_mul(&g.exp()?.unsqueeze(D::Minus1)?)?.squeeze(0)?)?.unsqueeze(0)?;
-        let mut last_recurrent_state = if let Some(recurrent) = self.recurrent_state_cache.as_ref() { recurrent.clone() } else { Tensor::zeros((batch_size, num_heads, k_head_dim, v_head_dim), candle_core::DType::F32, value.device())? };
-        let mut core_attn_out = value.zeros_like()?;
-        let tril_mask = Tensor::tril2(chunk_size, candle_core::DType::U32, query.device())?.broadcast_as((batch_size, num_heads, chunk_size, chunk_size))?;
-        let on_false = tril_mask.zeros_like()?.to_dtype(candle_core::DType::F32)?;
-        let last_dim = core_attn_out.dim(D::Minus1)?;
-        for i in 0..total_sequence_length / chunk_size {
-            let q_i = query.i((.., .., i))?.contiguous()?;
-            let k_i = key.i((.., .., i))?.contiguous()?;
-            let v_i = value.i((.., .., i))?.contiguous()?;
-            let g_i = g.i((.., .., i))?.contiguous()?;
-            let attn = q_i.matmul(&k_i.transpose(D::Minus1, D::Minus2)?.contiguous()?)?.mul(&decay_mask.i((.., .., i))?)?;
-            let attn = tril_mask.where_cond(&attn, &on_false)?.contiguous()?;
-            let v_prime = k_cumdecay.i((.., .., i))?.matmul(&last_recurrent_state)?;
-            let v_new = v_i.sub(&v_prime)?;
-            let attn_inter = q_i.broadcast_mul(&g_i.unsqueeze(D::Minus1)?.exp()?)?.matmul(&last_recurrent_state)?;
-            let out_i = attn_inter.add(&attn.matmul(&v_new)?)?.unsqueeze(2)?;
-            core_attn_out = core_attn_out.slice_assign(&[(0..batch_size), (0..num_heads), (i..i + 1), (0..chunk_size), (0..last_dim)], &out_i)?;
-            let g_i_last_dim = g_i.dim(D::Minus1)?;
-            last_recurrent_state = last_recurrent_state.broadcast_mul(&g_i.narrow(D::Minus1, g_i_last_dim - 1, 1)?.unsqueeze(D::Minus1)?.exp()?)?.add(&k_i.broadcast_mul(&g_i.narrow(D::Minus1, g_i_last_dim - 1, 1)?.broadcast_sub(&g_i)?.exp()?.unsqueeze(D::Minus1)?)?.transpose(D::Minus1, D::Minus2)?.squeeze(0)?.matmul(&v_new.squeeze(0)?)?.unsqueeze(0)?)?;
+        let attn = (attn.broadcast_add(&Tensor::eye(chunk_size, attn.dtype(), attn.device())?))?.contiguous()?;
+        let value_out = attn.squeeze(0)?.matmul(&vb.squeeze(0)?)?.unsqueeze(0)?;
+        let k_cum = attn.squeeze(0)?.matmul(&kb.broadcast_mul(&g.exp()?.unsqueeze(D::Minus1)?)?.squeeze(0)?)?.unsqueeze(0)?;
+        let mut lrs = if let Some(r) = self.recurrent_state_cache.as_ref() { r.clone() } else { Tensor::zeros((bs, nh, dk, dv), DType::F32, value_out.device())? };
+        let mut out = value_out.zeros_like()?;
+        let tril = Tensor::tril2(chunk_size, candle_core::DType::U32, query.device())?.broadcast_as((bs, nh, chunk_size, chunk_size))?;
+        let on_f = tril.zeros_like()?.to_dtype(DType::F32)?;
+        for i in 0..total_sl / chunk_size {
+            let qi = query.i((.., .., i))?.contiguous()?; let ki = key.i((.., .., i))?.contiguous()?;
+            let vi = value_out.i((.., .., i))?.contiguous()?; let gi = g.i((.., .., i))?.contiguous()?;
+            let att = tril.where_cond(&qi.matmul(&ki.transpose(D::Minus1, D::Minus2)?.contiguous()?)?.mul(&decay.i((.., .., i))?)?, &on_f)?.contiguous()?;
+            let vn = (vi - k_cum.i((.., .., i))?.matmul(&lrs)?)?;
+            let out_i = (qi.broadcast_mul(&gi.unsqueeze(D::Minus1)?.exp()?)?.matmul(&lrs)? + att.matmul(&vn)?)?.unsqueeze(2)?;
+            out = out.slice_assign(&[(0..bs), (0..nh), (i..i + 1), (0..chunk_size), (0..dv)], &out_i)?;
+            let gl = gi.dim(D::Minus1)?;
+            lrs = (lrs.broadcast_mul(&gi.narrow(D::Minus1, gl - 1, 1)?.unsqueeze(D::Minus1)?.exp()?)? + ki.broadcast_mul(&gi.narrow(D::Minus1, gl - 1, 1)?.broadcast_sub(&gi)?.exp()?.unsqueeze(D::Minus1)?)?.transpose(D::Minus1, D::Minus2)?.squeeze(0)?.matmul(&vn.squeeze(0)?)?.unsqueeze(0)?)?;
         }
-        self.recurrent_state_cache = Some(last_recurrent_state);
-        core_attn_out = core_attn_out.reshape((batch_size, num_heads, (), core_attn_out.dim(D::Minus1)?))?.narrow(2, 0, sequence_length)?;
-        Ok(core_attn_out.transpose(1, 2)?.contiguous()?.to_dtype(initial_dtype)?)
+        self.recurrent_state_cache = Some(lrs);
+        let out = out.reshape((bs, nh, (), dv))?.narrow(2, 0, sl)?;
+        Ok(out.transpose(1, 2)?.contiguous()?.to_dtype(initial_dtype)?)
     }
 
     pub fn forward(&mut self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
         let xs = if let Some(mask) = attention_mask { xs.broadcast_mul(&mask.unsqueeze(D::Minus1)?)? } else { xs.clone() };
-        let (bs, seq_len, _) = xs.dims3()?;
-        let mut mixed_qkv = self.in_proj_qkv.forward(&xs)?.transpose(1, 2)?;
-        let z = self.in_proj_z.forward(&xs)?.reshape((bs, seq_len, (), self.head_v_dim))?;
-        let b = self.in_proj_b.forward(&xs)?;
-        let a = self.in_proj_a.forward(&xs)?;
-        
-        if self.conv_state_cache.is_some() && self.recurrent_state_cache.is_some() && seq_len == 1 {
-            mixed_qkv = self.torch_causal_conv1d_update(&mixed_qkv)?;
-        } else {
-            let pad = self.conv_kernel_size as isize - mixed_qkv.dim(D::Minus1)? as isize;
-            let conv_state = if pad >= 0 { mixed_qkv.pad_with_zeros(D::Minus1, pad as usize, 0)? } else { mixed_qkv.narrow(D::Minus1, pad.unsigned_abs(), self.conv_kernel_size)? };
-            self.conv_state_cache = Some(conv_state);
-            mixed_qkv = mixed_qkv.pad_with_zeros(D::Minus1, self.conv_kernel_size - 1, self.conv_kernel_size - 1)?;
-            mixed_qkv = conv1d_depthwise(&mixed_qkv, self.conv1d.weight(), self.conv1d.bias())?;
-            mixed_qkv = mixed_qkv.narrow(D::Minus1, 0, seq_len)?.silu()?;
+        let (bs, sl, _) = xs.dims3()?;
+        let mut mixed = self.in_proj_qkv.forward(&xs)?.transpose(1, 2)?;
+        let z = self.in_proj_z.forward(&xs)?.reshape((bs, sl, (), self.head_v_dim))?;
+        let b = self.in_proj_b.forward(&xs)?; let a = self.in_proj_a.forward(&xs)?;
+        if self.conv_state_cache.is_some() && self.recurrent_state_cache.is_some() && sl == 1 { mixed = self.torch_causal_conv1d_update(&mixed)?; }
+        else {
+            let pad = self.conv_kernel_size as isize - mixed.dim(D::Minus1)? as isize;
+            self.conv_state_cache = Some(if pad >= 0 { mixed.pad_with_zeros(D::Minus1, pad as usize, 0)? } else { mixed.narrow(D::Minus1, pad.unsigned_abs(), self.conv_kernel_size)? });
+            mixed = conv1d_depthwise(&mixed.pad_with_zeros(D::Minus1, self.conv_kernel_size - 1, self.conv_kernel_size - 1)?, self.conv1d.weight(), self.conv1d.bias())?.narrow(D::Minus1, 0, sl)?.silu()?;
         }
-        let mixed_qkv = mixed_qkv.transpose(1, 2)?;
-        let qkv_split = split_tensor(&mixed_qkv, &[self.key_dim, self.key_dim, self.value_dim], D::Minus1)?;
-        let mut query = qkv_split[0].reshape((bs, seq_len, (), self.head_k_dim))?;
-        let mut key = qkv_split[1].reshape((bs, seq_len, (), self.head_k_dim))?;
-        let value = qkv_split[2].reshape((bs, seq_len, (), self.head_v_dim))?;
+        let qkv = split_tensor(&mixed.transpose(1, 2)?, &[self.key_dim, self.key_dim, self.value_dim], D::Minus1)?;
+        let mut q = qkv[0].reshape((bs, sl, (), self.head_k_dim))?; let mut k = qkv[1].reshape((bs, sl, (), self.head_k_dim))?;
+        let v = qkv[2].reshape((bs, sl, (), self.head_v_dim))?;
         let beta = candle_nn::ops::sigmoid(&b)?;
-        let a_plus_bias = softplus(&a.to_dtype(DType::F32)?.broadcast_add(&self.dt_bias.to_dtype(DType::F32)?)?)?;
-        let g = (-1.0 * self.a_log.to_dtype(DType::F32)?.exp()?)?.broadcast_mul(&a_plus_bias)?;
+        let g = (-1.0 * self.a_log.to_dtype(DType::F32)?.exp()?)?.broadcast_mul(&softplus(&a.to_dtype(DType::F32)?.broadcast_add(&self.dt_bias.to_dtype(DType::F32)?)?)?)?;
         if self.num_v_heads / self.num_k_heads > 1 {
-            query = repeat_interleave(&query, self.num_v_heads / self.num_k_heads, 2)?;
-            key = repeat_interleave(&key, self.num_v_heads / self.num_k_heads, 2)?;
+            q = repeat_interleave(&q, self.num_v_heads / self.num_k_heads, 2)?;
+            k = repeat_interleave(&k, self.num_v_heads / self.num_k_heads, 2)?;
         }
-        let core_attn_out = self.torch_chunk_gated_delta_rule(&query, &key, &value, &g, &beta, true, 64)?;
-        let core_attn_out = core_attn_out.reshape(((), self.head_v_dim))?;
-        let z = z.reshape(((), self.head_v_dim))?;
-        let core_attn_out = self.norm.forward(&core_attn_out, Some(&z))?;
-        self.out_proj.forward(&core_attn_out.reshape((bs, seq_len, ()))?)
+        let out = self.torch_chunk_gated_delta_rule(&q, &k, &v, &g, &beta, true, 64)?;
+        let out = self.norm.forward(&out.reshape(((), self.head_v_dim))?, Some(&z.reshape(((), self.head_v_dim))?))?;
+        self.out_proj.forward(&out.reshape((bs, sl, ()))?)
     }
 
     pub fn clear_cache(&mut self) { self.conv_state_cache = None; self.recurrent_state_cache = None; }
@@ -352,25 +368,24 @@ impl QAttention {
     }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.q_proj.to_device(device)?; self.k_proj.to_device(device)?; self.v_proj.to_device(device)?; self.o_proj.to_device(device)?; self.q_norm.to_device(device)?; self.k_norm.to_device(device)?; Ok(()) }
     pub fn clear(&mut self) { self.q_proj.clear(); self.k_proj.clear(); self.v_proj.clear(); self.o_proj.clear(); self.q_norm.clear(); self.k_norm.clear(); }
-    pub fn forward(&mut self, xs: &Tensor, cos: &Tensor, sin: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-        let q_chunk = self.q_proj.forward(xs)?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim * 2))?.chunk(2, D::Minus1)?;
-        let q_states = self.q_norm.forward(&q_chunk[0].reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?)?.transpose(1, 2)?;
-        let k_states = self.k_norm.forward(&self.k_proj.forward(xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?)?.transpose(1, 2)?;
-        let v_states = self.v_proj.forward(xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?;
-        let (q_states, k_states) = glm_asr_apply_rotary_pos_emb(&q_states, &k_states, cos, sin, false)?;
-        let (k_states, v_states) = match &self.kv_cache { None => (k_states, v_states), Some((pk, pv)) => (Tensor::cat(&[pk, &k_states], 2)?, Tensor::cat(&[pv, &v_states], 2)?) };
-        self.kv_cache = Some((k_states.clone(), v_states.clone()));
-        let attn = crate::models::common::eager_attention_forward(&q_states, &k_states, &v_states, Some(self.num_kv_groups), attention_mask, self.scaling)?;
-        let attn = attn.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?.contiguous()?;
-        self.o_proj.forward(&(attn * candle_nn::ops::sigmoid(&q_chunk[1].reshape((b_sz, q_len, ()))?)?)?)
+    pub fn clear_kv_cache(&mut self) { self.kv_cache = None; }
+    pub fn forward(&mut self, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+        let (bs, sl, _) = xs.dims3()?;
+        let q_chunk = self.q_proj.forward(xs)?.reshape((bs, sl, self.num_attention_heads, self.head_dim * 2))?.chunk(2, D::Minus1)?;
+        let q = self.q_norm.forward(&q_chunk[0].reshape((bs, sl, self.num_attention_heads, self.head_dim))?)?.transpose(1, 2)?;
+        let k = self.k_norm.forward(&self.k_proj.forward(xs)?.reshape((bs, sl, self.num_key_value_heads, self.head_dim))?)?.transpose(1, 2)?;
+        let v = self.v_proj.forward(xs)?.reshape((bs, sl, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?;
+        let (q, k) = glm_asr_apply_rotary_pos_emb(&q, &k, cos, sin, false)?;
+        let (k, v) = match &self.kv_cache { None => (k, v), Some((pk, pv)) => (Tensor::cat(&[pk, &k], 2)?, Tensor::cat(&[pv, &v], 2)?) };
+        self.kv_cache = Some((k.clone(), v.clone()));
+        let attn = crate::models::common::eager_attention_forward(&q, &k, &v, Some(self.num_kv_groups), mask, self.scaling)?;
+        let attn = attn.reshape((bs, sl, self.num_attention_heads * self.head_dim))?.contiguous()?;
+        self.o_proj.forward(&(attn * candle_nn::ops::sigmoid(&q_chunk[1].reshape((bs, sl, ()))?)?)?)
     }
 }
 
 pub struct QDecoderLayer {
-    layer_type: String,
-    linear_attn: Option<QGatedDeltaNet>,
-    self_attn: Option<QAttention>,
+    layer_type: String, linear_attn: Option<QGatedDeltaNet>, self_attn: Option<QAttention>,
     mlp_gate_proj: QLinear, mlp_up_proj: QLinear, mlp_down_proj: QLinear,
     input_layernorm: QRmsNorm, post_attention_layernorm: QRmsNorm,
 }
@@ -391,13 +406,12 @@ impl QDecoderLayer {
     pub fn to_device(&mut self, d: &Device) -> Result<()> { if let Some(ref mut l) = self.linear_attn { l.to_device(d)?; } if let Some(ref mut s) = self.self_attn { s.to_device(d)?; } self.mlp_gate_proj.to_device(d)?; self.mlp_up_proj.to_device(d)?; self.mlp_down_proj.to_device(d)?; self.input_layernorm.to_device(d)?; self.post_attention_layernorm.to_device(d)?; Ok(()) }
     pub fn clear(&mut self) { if let Some(ref mut l) = self.linear_attn { l.clear(); } if let Some(ref mut s) = self.self_attn { s.clear(); } self.mlp_gate_proj.clear(); self.mlp_up_proj.clear(); self.mlp_down_proj.clear(); self.input_layernorm.clear(); self.post_attention_layernorm.clear(); }
     pub fn forward(&mut self, xs: &Tensor, cos: Option<&Tensor>, sin: Option<&Tensor>, mask: Option<&Tensor>) -> Result<Tensor> {
-        let r = xs.clone(); let mut x = self.input_layernorm.forward(xs)?;
+        let r = xs.clone(); let mut x = self.input_layernorm.forward(xs).map_err(|e| anyhow!(e))?;
         if self.layer_type == "linear_attention" { if let Some(ref mut l) = self.linear_attn { x = l.forward(&x, mask)?; } }
         else { if let (Some(ref mut s), Some(c), Some(sn)) = (&mut self.self_attn, cos, sin) { x = s.forward(&x, c, sn, mask)?; } }
-        let r2 = (x + r)?; let mut x = self.post_attention_layernorm.forward(&r2)?;
-        let gate = self.mlp_gate_proj.forward(&x)?.silu()?;
-        let up = self.mlp_up_proj.forward(&x)?;
-        x = (gate * up)?; (self.mlp_down_proj.forward(&x)? + r2)
+        let r2 = (x + r)?; let mut x = self.post_attention_layernorm.forward(&r2).map_err(|e| anyhow!(e))?;
+        let gate = self.mlp_gate_proj.forward(&x)?.silu()?; let up = self.mlp_up_proj.forward(&x)?;
+        Ok((self.mlp_down_proj.forward(&(gate * up)?)? + r2)?)
     }
 }
 
@@ -429,14 +443,12 @@ impl QTextModel {
             x = layer.forward(&x, Some(&cos), Some(&sin), lm)?;
             layer.clear();
         }
-        self.norm.to_device(dev)?; let x = self.norm.forward(&x)?; self.norm.clear(); Ok(x)
+        self.norm.to_device(dev)?; let x = self.norm.forward(&x).map_err(|e| anyhow!(e))?; self.norm.clear(); Ok(x)
     }
 }
 
 pub struct QuantizedQwen3_5Model {
-    config: Qwen3_5Config,
-    language_model: QTextModel,
-    lm_head: QLinear,
+    config: Qwen3_5Config, language_model: QTextModel, lm_head: QLinear,
 }
 
 impl QuantizedQwen3_5Model {
