@@ -445,7 +445,7 @@ async fn process_task(
             let snapshot_id = format!("{}_img", task.id);
             
             // [Full Vision] Load full 2B model and analyze
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Analyzing visual context with 2B-VL...", "spinner": "⠋" }));
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Analyzing visual context with Qwen 3.5 0.8B (Vision)...", "spinner": "⠋" }));
             
             // Transition to full Large model. secure_vram_relay will load existing KV if snapshot_id exists.
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
@@ -579,9 +579,9 @@ async fn process_task(
                 ..Default::default()
             };
 
-            if let Some(gen) = model.generator.lock().await.as_mut() {
+            if let Some(variant) = model.generator.lock().await.as_ref() {
                 println!("[Scheduler] 0.6B Step A: Asking classification question...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
+                let res = variant.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
                 println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
                 
                 let _ = data_manager.offload(&res, "step_a_res");
@@ -636,9 +636,9 @@ async fn process_task(
                 ..Default::default()
             };
 
-            if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] Small Step B: Asking selector question...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
+            if let Some(variant) = model.generator.lock().await.as_ref() {
+                println!("[Scheduler] Qwen 3.5 0.8B Step B: Asking selector question...");
+                let res = variant.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
                 println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
 
                 // [DEBUG] AI 응답 저장
@@ -753,13 +753,12 @@ async fn process_task(
                 };
 
                 // 3. Small Instant Inference
-                if let Some(gen) = model.generator.lock().await.as_mut() {
+                if let Some(variant) = model.generator.lock().await.as_ref() {
                     println!("[Scheduler] Small Step C: Asking extraction question...");
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Small Inference..." }));
-                    
-                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), Some("inference".to_string())).await?;
-                    println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
 
+                    let res = variant.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), Some("inference".to_string())).await?;
+                    println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
                     // [DEBUG] AI 응답 저장
                     let _ = data_manager.offload(&res, "step_c_res");
 

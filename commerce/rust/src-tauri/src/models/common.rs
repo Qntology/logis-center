@@ -1,12 +1,16 @@
 use anyhow::Result;
-use candle_core::{D, DType, Device, Tensor};
+use candle_core::{D, IndexOp, Tensor};
 use candle_nn::{
-    Activation, BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig, LayerNorm, LayerNormConfig,
-    Linear, Module, RmsNorm, VarBuilder, batch_norm, conv2d, conv2d_no_bias, layer_norm, linear,
-    linear_no_bias, rms_norm,
+    Activation, BatchNorm, BatchNormConfig, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig,
+    ConvTranspose1d, ConvTranspose1dConfig, Embedding, LayerNorm, LayerNormConfig, Linear, Module,
+    ModuleT, RmsNorm, VarBuilder, batch_norm, conv1d, conv1d_no_bias, conv2d, conv2d_no_bias,
+    embedding, layer_norm, linear_b, linear_no_bias, ops::sigmoid, rms_norm,
 };
 
-use crate::{models::rope::apply_rotary_pos_emb, utils::tensor_utils::repeat_kv};
+use crate::{
+    position_embed::rope::{apply_rotary_pos_emb},
+    utils::tensor_utils::{prepare_causal_attention_mask, repeat_kv},
+};
 
 #[derive(Debug, Clone)]
 pub struct GateUpDownMLP {
@@ -23,20 +27,16 @@ impl GateUpDownMLP {
         intermediate_size: usize,
         act_fn: Activation,
         bias: bool,
+        gate_pp_name: Option<&str>,
+        up_pp_name: Option<&str>,
+        down_pp_name: Option<&str>,
     ) -> Result<Self> {
-        let (gate_proj, up_proj, down_proj) = if bias {
-            (
-                linear(hidden_size, intermediate_size, vb.pp("gate_proj"))?,
-                linear(hidden_size, intermediate_size, vb.pp("up_proj"))?,
-                linear(intermediate_size, hidden_size, vb.pp("down_proj"))?,
-            )
-        } else {
-            (
-                linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?,
-                linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?,
-                linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?,
-            )
-        };
+        let gate_pp_name = gate_pp_name.unwrap_or("gate_proj");
+        let up_pp_name = up_pp_name.unwrap_or("up_proj");
+        let down_pp_name = down_pp_name.unwrap_or("down_proj");
+        let gate_proj = linear_b(hidden_size, intermediate_size, bias, vb.pp(gate_pp_name))?;
+        let up_proj = linear_b(hidden_size, intermediate_size, bias, vb.pp(up_pp_name))?;
+        let down_proj = linear_b(intermediate_size, hidden_size, bias, vb.pp(down_pp_name))?;
         Ok(Self {
             gate_proj,
             up_proj,
@@ -45,15 +45,13 @@ impl GateUpDownMLP {
         })
     }
 
-    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+    pub fn to_device(&mut self, device: &candle_core::Device) -> Result<()> {
         let g_w = self.gate_proj.weight().to_device(device)?;
         let g_b = self.gate_proj.bias().map(|b| b.to_device(device)).transpose()?;
         self.gate_proj = Linear::new(g_w, g_b);
-
         let u_w = self.up_proj.weight().to_device(device)?;
         let u_b = self.up_proj.bias().map(|b| b.to_device(device)).transpose()?;
         self.up_proj = Linear::new(u_w, u_b);
-
         let d_w = self.down_proj.weight().to_device(device)?;
         let d_b = self.down_proj.bias().map(|b| b.to_device(device)).transpose()?;
         self.down_proj = Linear::new(d_w, d_b);
@@ -79,42 +77,25 @@ pub struct TwoLinearMLP {
 impl TwoLinearMLP {
     pub fn new(
         vb: VarBuilder,
-        embedding_dim: usize,
-        mlp_dim: usize,
+        // embedding_dim: usize,
+        // mlp_dim: usize,
+        in_dim: usize,
+        middle_dim: usize,
+        out_dim: usize,
         act: Activation,
         bias: bool,
         linear1_pp_name: &str,
         linear2_pp_name: &str,
     ) -> Result<Self> {
-        let (linear1, linear2) = if bias {
-            (
-                linear(embedding_dim, mlp_dim, vb.pp(linear1_pp_name))?,
-                linear(mlp_dim, embedding_dim, vb.pp(linear2_pp_name))?,
-            )
-        } else {
-            (
-                linear_no_bias(embedding_dim, mlp_dim, vb.pp(linear1_pp_name))?,
-                linear_no_bias(mlp_dim, embedding_dim, vb.pp(linear2_pp_name))?,
-            )
-        };
+        let linear1 = linear_b(in_dim, middle_dim, bias, vb.pp(linear1_pp_name))?;
+        let linear2 = linear_b(middle_dim, out_dim, bias, vb.pp(linear2_pp_name))?;
+
         Ok(Self {
             linear1,
             linear2,
             act,
         })
     }
-
-    pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        let l1_w = self.linear1.weight().to_device(device)?;
-        let l1_b = self.linear1.bias().map(|b| b.to_device(device)).transpose()?;
-        self.linear1 = Linear::new(l1_w, l1_b);
-
-        let l2_w = self.linear2.weight().to_device(device)?;
-        let l2_b = self.linear2.bias().map(|b| b.to_device(device)).transpose()?;
-        self.linear2 = Linear::new(l2_w, l2_b);
-        Ok(())
-    }
-
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = xs
             .apply(&self.linear1)?
@@ -122,10 +103,19 @@ impl TwoLinearMLP {
             .apply(&self.linear2)?;
         Ok(xs)
     }
+
+    pub fn to_device(&mut self, device: &candle_core::Device) -> Result<()> {
+        let l1_w = self.linear1.weight().to_device(device)?;
+        let l1_b = self.linear1.bias().map(|b| b.to_device(device)).transpose()?;
+        self.linear1 = Linear::new(l1_w, l1_b);
+        let l2_w = self.linear2.weight().to_device(device)?;
+        let l2_b = self.linear2.bias().map(|b| b.to_device(device)).transpose()?;
+        self.linear2 = Linear::new(l2_w, l2_b);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
-// pub struct AttentionNobias {
 pub struct NaiveAttention {
     q_proj: Linear,
     k_proj: Linear,
@@ -147,6 +137,9 @@ impl NaiveAttention {
         num_key_value_heads: usize,
         head_dim: Option<usize>,
         bias: bool,
+        q_proj_pp_name: Option<&str>,
+        k_proj_pp_name: Option<&str>,
+        v_proj_pp_name: Option<&str>,
         o_proj_pp_name: Option<&str>,
     ) -> Result<Self> {
         let num_kv_groups = num_attention_heads / num_key_value_heads;
@@ -154,30 +147,34 @@ impl NaiveAttention {
             None => hidden_size / num_attention_heads,
             Some(dim) => dim,
         };
+        let q_proj_pp_name = q_proj_pp_name.unwrap_or("q_proj");
+        let k_proj_pp_name = k_proj_pp_name.unwrap_or("k_proj");
+        let v_proj_pp_name = v_proj_pp_name.unwrap_or("v_proj");
         let o_proj_pp_name = o_proj_pp_name.unwrap_or("o_proj");
-        let (q_proj, k_proj, v_proj, o_proj) = if bias {
-            (
-                linear(hidden_size, num_attention_heads * head_dim, vb.pp("q_proj"))?,
-                linear(hidden_size, num_key_value_heads * head_dim, vb.pp("k_proj"))?,
-                linear(hidden_size, num_key_value_heads * head_dim, vb.pp("v_proj"))?,
-                linear(
-                    num_attention_heads * head_dim,
-                    hidden_size,
-                    vb.pp(o_proj_pp_name),
-                )?,
-            )
-        } else {
-            (
-                linear_no_bias(hidden_size, num_attention_heads * head_dim, vb.pp("q_proj"))?,
-                linear_no_bias(hidden_size, num_key_value_heads * head_dim, vb.pp("k_proj"))?,
-                linear_no_bias(hidden_size, num_key_value_heads * head_dim, vb.pp("v_proj"))?,
-                linear_no_bias(
-                    num_attention_heads * head_dim,
-                    hidden_size,
-                    vb.pp(o_proj_pp_name),
-                )?,
-            )
-        };
+        let q_proj = linear_b(
+            hidden_size,
+            num_attention_heads * head_dim,
+            bias,
+            vb.pp(q_proj_pp_name),
+        )?;
+        let k_proj = linear_b(
+            hidden_size,
+            num_key_value_heads * head_dim,
+            bias,
+            vb.pp(k_proj_pp_name),
+        )?;
+        let v_proj = linear_b(
+            hidden_size,
+            num_key_value_heads * head_dim,
+            bias,
+            vb.pp(v_proj_pp_name),
+        )?;
+        let o_proj = linear_b(
+            num_attention_heads * head_dim,
+            hidden_size,
+            bias,
+            vb.pp(o_proj_pp_name),
+        )?;
 
         Ok(Self {
             q_proj,
@@ -191,29 +188,6 @@ impl NaiveAttention {
             middle_size: num_attention_heads * head_dim,
             kv_cache: None,
         })
-    }
-
-    pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        let q_w = self.q_proj.weight().to_device(device)?;
-        let q_b = self.q_proj.bias().map(|b| b.to_device(device)).transpose()?;
-        self.q_proj = Linear::new(q_w, q_b);
-
-        let k_w = self.k_proj.weight().to_device(device)?;
-        let k_b = self.k_proj.bias().map(|b| b.to_device(device)).transpose()?;
-        self.k_proj = Linear::new(k_w, k_b);
-
-        let v_w = self.v_proj.weight().to_device(device)?;
-        let v_b = self.v_proj.bias().map(|b| b.to_device(device)).transpose()?;
-        self.v_proj = Linear::new(v_w, v_b);
-
-        let o_w = self.o_proj.weight().to_device(device)?;
-        let o_b = self.o_proj.bias().map(|b| b.to_device(device)).transpose()?;
-        self.o_proj = Linear::new(o_w, o_b);
-
-        if let Some((k, v)) = &self.kv_cache {
-            self.kv_cache = Some((k.to_device(device)?, v.to_device(device)?));
-        }
-        Ok(())
     }
 
     pub fn forward(
@@ -237,12 +211,8 @@ impl NaiveAttention {
         let value_states = value_states
             .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let (query_states, key_states) = if let Some(cos) = cos {
-            if let Some(sin) = sin {
-                apply_rotary_pos_emb(&query_states, &key_states, cos, sin, tof32)?
-            } else {
-                (query_states, key_states)
-            }
+        let (query_states, key_states) = if let (Some(cos), Some(sin)) = (cos, sin) {
+            apply_rotary_pos_emb(&query_states, &key_states, cos, sin, tof32)?
         } else {
             (query_states, key_states)
         };
@@ -313,244 +283,6 @@ impl NaiveAttention {
     }
 }
 
-pub struct NaiveAttnTwoLinearMLPBlock {
-    self_attn: NaiveAttention,
-    mlp: TwoLinearMLP,
-    input_layernorm: LayerNorm,
-    post_attention_layernorm: LayerNorm,
-}
-
-impl NaiveAttnTwoLinearMLPBlock {
-    pub fn new(
-        vb: VarBuilder,
-        hidden_size: usize,
-        num_attention_heads: usize,
-        num_key_value_heads: Option<usize>,
-        head_dim: Option<usize>,
-        attn_bias: bool,
-        attn_pp_name: &str,
-        o_proj_pp_name: Option<&str>,
-        intermediate_size: usize,
-        hidden_act: Activation,
-        mlp_bias: bool,
-        mlp_pp_name: &str,
-        linear1_pp_name: &str,
-        linear2_pp_name: &str,
-        norm_eps: f64,
-        input_norm_pp_name: &str,
-        post_norm_pp_name: &str,
-    ) -> Result<Self> {
-        let num_key_value_heads = match num_key_value_heads {
-            Some(heads) => heads,
-            None => num_attention_heads,
-        };
-        let self_attn = NaiveAttention::new(
-            vb.pp(attn_pp_name),
-            hidden_size,
-            num_attention_heads,
-            num_key_value_heads,
-            head_dim,
-            attn_bias,
-            o_proj_pp_name,
-        )?;
-        let mlp = TwoLinearMLP::new(
-            vb.pp(mlp_pp_name),
-            hidden_size,
-            intermediate_size,
-            hidden_act,
-            mlp_bias,
-            linear1_pp_name,
-            linear2_pp_name,
-        )?;
-
-        let input_layernorm = get_layer_norm(vb.pp(input_norm_pp_name), norm_eps, hidden_size)?;
-        let post_attention_layernorm =
-            get_layer_norm(vb.pp(post_norm_pp_name), norm_eps, hidden_size)?;
-        Ok(Self {
-            self_attn,
-            mlp,
-            input_layernorm,
-            post_attention_layernorm,
-        })
-    }
-
-    pub fn forward(
-        &self,
-        xs: &Tensor,
-        cos: Option<&Tensor>,
-        sin: Option<&Tensor>,
-        attention_mask: Option<&Tensor>,
-        tof32: bool,
-    ) -> Result<Tensor> {
-        let residual = xs.clone();
-        let xs = self.input_layernorm.forward(xs)?;
-        let xs = self
-            .self_attn
-            .forward(&xs, cos, sin, attention_mask, tof32)?;
-        let residual = residual.add(&xs)?;
-        let xs = self.post_attention_layernorm.forward(&residual)?;
-        let xs = self.mlp.forward(&xs)?;
-        let xs = residual.add(&xs)?;
-        Ok(xs)
-    }
-}
-
-pub struct NaiveAttnGateUpDownMLPBlock {
-    self_attn: NaiveAttention,
-    mlp: GateUpDownMLP,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
-}
-
-impl NaiveAttnGateUpDownMLPBlock {
-    pub fn new(
-        vb: VarBuilder,
-        hidden_size: usize,
-        num_attention_heads: usize,
-        num_key_value_heads: Option<usize>,
-        head_dim: Option<usize>,
-        attn_bias: bool,
-        attn_pp_name: &str,
-        o_proj_pp_name: Option<&str>,
-        intermediate_size: usize,
-        hidden_act: Activation,
-        mlp_bias: bool,
-        mlp_pp_name: &str,
-        norm_eps: f64,
-        input_norm_pp_name: &str,
-        post_norm_pp_name: &str,
-    ) -> Result<Self> {
-        let num_key_value_heads = match num_key_value_heads {
-            Some(heads) => heads,
-            None => num_attention_heads,
-        };
-        let self_attn = NaiveAttention::new(
-            vb.pp(attn_pp_name),
-            hidden_size,
-            num_attention_heads,
-            num_key_value_heads,
-            head_dim,
-            attn_bias,
-            o_proj_pp_name,
-        )?;
-        let mlp = GateUpDownMLP::new(
-            vb.pp(mlp_pp_name),
-            hidden_size,
-            intermediate_size,
-            hidden_act,
-            mlp_bias,
-        )?;
-        let input_layernorm = rms_norm(hidden_size, norm_eps, vb.pp(input_norm_pp_name))?;
-        let post_attention_layernorm = rms_norm(hidden_size, norm_eps, vb.pp(post_norm_pp_name))?;
-        Ok(Self {
-            self_attn,
-            mlp,
-            input_layernorm,
-            post_attention_layernorm,
-        })
-    }
-
-    pub fn forward(
-        &mut self,
-        xs: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        attention_mask: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        let residual = xs.clone();
-        let xs = self.input_layernorm.forward(xs)?;
-        let xs = self
-            .self_attn
-            .forward_with_cache(&xs, cos, sin, attention_mask, false)?;
-        let residual = residual.add(&xs)?;
-        let xs = self.post_attention_layernorm.forward(&residual)?;
-        let xs = self.mlp.forward(&xs)?;
-        let xs = residual.add(&xs)?;
-        Ok(xs)
-    }
-    pub fn clear_kv_cache(&mut self) {
-        self.self_attn.clear_kv_cache()
-    }
-}
-
-pub fn decoding_attention_parallel(
-    query_states: &Tensor,
-    key_states: &Tensor,
-    value_states: &Tensor,
-    scaling: f64,
-) -> Result<Tensor> {
-    // Flash-Decoding style optimization for seq_len = 1 (Decoding)
-    // Splits KV into chunks and parallelizes attention calculation
-    let (_b_sz, n_heads, q_len, _head_dim) = query_states.dims4()?;
-    
-    // [FIX] Early exit if not a decoding step (q_len > 1)
-    if q_len != 1 {
-        return eager_attention_forward(query_states, key_states, value_states, None, None, scaling);
-    }
-
-    // [FIX] GQA Support: Repeat KV heads if they are fewer than query heads
-    let n_kv_heads = key_states.dim(1)?;
-    let (key_states, value_states) = if n_heads != n_kv_heads {
-        let groups = n_heads / n_kv_heads;
-        (
-            repeat_kv(key_states.clone(), groups)?.contiguous()?,
-            repeat_kv(value_states.clone(), groups)?.contiguous()?,
-        )
-    } else {
-        (key_states.clone(), value_states.clone())
-    };
-
-    let kv_seq_len = key_states.dim(2)?;
-    let chunk_size = 128; // Optimal chunk size for parallel reduction
-    
-    if kv_seq_len <= chunk_size {
-        // [FIX] Pass by reference to resolve E0308
-        return eager_attention_forward(query_states, &key_states, &value_states, None, None, scaling);
-    }
-
-    let num_chunks = (kv_seq_len + chunk_size - 1) / chunk_size;
-    let mut chunk_outputs = Vec::with_capacity(num_chunks);
-    let mut chunk_logsumexp = Vec::with_capacity(num_chunks);
-
-    for i in 0..num_chunks {
-        let start = i * chunk_size;
-        let end = (start + chunk_size).min(kv_seq_len);
-        let k_chunk = key_states.narrow(2, start, end - start)?;
-        let v_chunk = value_states.narrow(2, start, end - start)?;
-
-        // [DTYPE-GUARD] Ensure query_states matches the chunk dtype (likely BF16 from SSD)
-        let q_aligned = query_states.to_dtype(k_chunk.dtype())?;
-        let attn_weights = (q_aligned.matmul(&k_chunk.transpose(2, 3)?)? * scaling)?;
-        let max_logits = attn_weights.max_keepdim(D::Minus1)?;
-        let exp_weights = attn_weights.broadcast_sub(&max_logits)?.exp()?;
-        let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
-        
-        let out_chunk = exp_weights.to_dtype(v_chunk.dtype())?.matmul(&v_chunk)?;
-        let lse = (sum_exp.log()? + max_logits)?;
-
-        chunk_outputs.push(out_chunk);
-        chunk_logsumexp.push(lse);
-    }
-
-    // Parallel Reduction
-    let mut final_output = chunk_outputs[0].clone();
-    let mut max_lse = chunk_logsumexp[0].clone();
-
-    for i in 1..num_chunks {
-        let lse_i = &chunk_logsumexp[i];
-        let out_i = &chunk_outputs[i];
-
-        let new_max_lse = max_lse.broadcast_maximum(lse_i)?;
-        let exp_a = max_lse.broadcast_sub(&new_max_lse)?.exp()?;
-        let exp_b = lse_i.broadcast_sub(&new_max_lse)?.exp()?;
-
-        final_output = (final_output.broadcast_mul(&exp_a)? + out_i.broadcast_mul(&exp_b)?)?;
-        max_lse = new_max_lse;
-    }
-
-    Ok(final_output)
-}
-
 pub fn eager_attention_forward(
     query_states: &Tensor,
     key_states: &Tensor,
@@ -559,11 +291,8 @@ pub fn eager_attention_forward(
     attention_mask: Option<&Tensor>,
     scaling: f64,
 ) -> Result<Tensor> {
-    // [FLASH-DECODING] 5만 토큰 이상의 초장문 문맥을 위한 블록 단위 어텐션 최적화
-    let (_b_sz, _n_heads, _q_len, _d_head) = query_states.dims4()?;
-    let kv_seq_len = key_states.dim(2)?;
-    
-    // GQA/MQA 그룹 반복
+    // input q shape:(b, num_head, seq_len, dim)
+    // input k/v shape:(b, num_kv_head, seq_len, dim)
     let key_states = match num_key_value_groups {
         Some(g) => repeat_kv(key_states.clone(), g)?.contiguous()?,
         None => key_states.clone(),
@@ -572,106 +301,41 @@ pub fn eager_attention_forward(
         Some(g) => repeat_kv(value_states.clone(), g)?.contiguous()?,
         None => value_states.clone(),
     };
-
-    // 블록 크기 설정 (GPU SM 효율 및 VRAM 고려)
-    let block_size = 4096;
-    
-    // 일반적인 짧은 문장이나 Flash-Attn 지원 시 기존 방식 사용
-    #[cfg(feature = "flash-attn")]
-    {
-        let query_states = query_states.transpose(1, 2)?;
-        let key_states = key_states.transpose(1, 2)?;
-        let value_states = value_states.transpose(1, 2)?;
-        let attn_output = candle_flash_attn::flash_attn(
-            &query_states,
-            &key_states,
-            &value_states,
-            scaling as f32,
-            attention_mask.is_some(),
-        )?
-        .transpose(1, 2)?;
-        return Ok(attn_output.transpose(1, 2)?.contiguous()?);
-    }
-
-    if kv_seq_len <= block_size {
-        let q_aligned = query_states.to_dtype(key_states.dtype())?;
-        let attn_weights = q_aligned.matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?;
-        let attn_weights = (attn_weights * scaling)?;
-        let attn_weights = match attention_mask {
-            None => attn_weights,
-            Some(mask) => {
-                let mask_f32 = mask.to_dtype(DType::F32)?;
-                let weights_f32 = attn_weights.to_dtype(DType::F32)?;
-                weights_f32.broadcast_add(&mask_f32)?.to_dtype(attn_weights.dtype())?
-            }
-        };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.to_dtype(value_states.dtype())?.matmul(&value_states)?;
-        return Ok(attn_output.transpose(1, 2)?.contiguous()?);
-    }
-
-    // --- Flash-Decoding 병렬 연산 구간 ---
-    let num_blocks = (kv_seq_len + block_size - 1) / block_size;
-    let mut block_outputs = Vec::with_capacity(num_blocks);
-    let mut block_lse = Vec::with_capacity(num_blocks);
-
-    for i in 0..num_blocks {
-        let start = i * block_size;
-        let end = (start + block_size).min(kv_seq_len);
-        let k_block = key_states.narrow(2, start, end - start)?;
-        let v_block = value_states.narrow(2, start, end - start)?;
-
-        // [DTYPE-GUARD] Ensure query_states matches the block dtype
-        let q_aligned = query_states.to_dtype(k_block.dtype())?;
-        let attn_weights = (q_aligned.matmul(&k_block.transpose(2, 3)?)? * scaling)?;
-        
-        // 마스크 처리
-        let attn_weights = if let Some(mask) = attention_mask {
-            let m_len = mask.dim(D::Minus1)?;
-            if start < m_len {
-                let m_end = end.min(m_len);
-                let sub_mask = mask.narrow(D::Minus1, start, m_end - start)?;
-                let w_f32 = attn_weights.to_dtype(DType::F32)?;
-                let m_f32 = sub_mask.to_dtype(DType::F32)?;
-                w_f32.broadcast_add(&m_f32)?.to_dtype(attn_weights.dtype())?
-            } else {
-                attn_weights
-            }
-        } else {
-            attn_weights
-        };
-
-        // 수치적 안정성을 위한 Max 로짓 추출 및 통합 준비
-        let max_logits = attn_weights.max_keepdim(D::Minus1)?;
-        let exp_weights = attn_weights.broadcast_sub(&max_logits)?.exp()?;
-        let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
-        
-        let out_block = exp_weights.to_dtype(v_block.dtype())?.matmul(&v_block)?;
-        let lse = (sum_exp.log()? + max_logits)?;
-
-        block_outputs.push(out_block);
-        block_lse.push(lse);
-    }
-
-    // 블록 결과 통합 (Merging)
-    let mut final_output = block_outputs[0].clone();
-    let mut max_lse = block_lse[0].clone();
-
-    for i in 1..num_blocks {
-        let lse_i = &block_lse[i];
-        let out_i = &block_outputs[i];
-
-        let new_max_lse = max_lse.broadcast_maximum(lse_i)?;
-        let exp_a = max_lse.broadcast_sub(&new_max_lse)?.exp()?;
-        let exp_b = lse_i.broadcast_sub(&new_max_lse)?.exp()?;
-
-        final_output = (final_output.broadcast_mul(&exp_a)? + out_i.broadcast_mul(&exp_b)?)?;
-        max_lse = new_max_lse;
-    }
-
-    // 최종 정규화 및 차원 복구
-    let final_output = final_output.broadcast_div(&max_lse.exp()?)?;
-    let attn_output = final_output.transpose(1, 2)?.contiguous()?;
+    let query_states = query_states.contiguous()?;
+    let key_states = key_states.contiguous()?;
+    let value_states = value_states.contiguous()?;
+    let attn_output = {
+        #[cfg(not(feature = "flash-attn"))]
+        {
+            let attn_weights = query_states.matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?;
+            let attn_weights = (attn_weights * scaling)?;
+            let attn_weights = match attention_mask {
+                None => attn_weights,
+                Some(mask) => attn_weights.broadcast_add(&mask.to_dtype(attn_weights.dtype())?)?,
+            };
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            attn_weights.matmul(&value_states)?
+        }
+        #[cfg(feature = "flash-attn")]
+        {
+            // use flash-attn,
+            // flash-attn shape: (bs, seq_len, num_head, head_dim)
+            let query_states = query_states.transpose(1, 2)?;
+            let key_states = key_states.transpose(1, 2)?;
+            let value_states = value_states.transpose(1, 2)?;
+            let attn_output = candle_flash_attn::flash_attn(
+                &query_states,
+                &key_states,
+                &value_states,
+                scaling as f32,
+                attention_mask.is_some(),
+            )?
+            .transpose(1, 2)?;
+            attn_output
+        }
+    };
+    //(b, n_head, seq_len, dim) -> (b, seq_len, n_head, dim)
+    let attn_output = attn_output.transpose(1, 2)?.contiguous()?;
 
     Ok(attn_output)
 }
@@ -702,120 +366,84 @@ pub fn get_conv2d(
     Ok(conv2d)
 }
 
-pub fn get_layer_norm(vb: VarBuilder, eps: f64, dim: usize) -> Result<LayerNorm> {
+pub fn get_conv1d(
+    vb: VarBuilder,
+    in_c: usize,
+    out_c: usize,
+    kernel_size: usize,
+    padding: usize,
+    stride: usize,
+    dilation: usize,
+    groups: usize,
+    bias: bool,
+) -> Result<Conv1d> {
+    let cfg = Conv1dConfig {
+        padding,
+        stride,
+        dilation,
+        groups,
+        cudnn_fwd_algo: None,
+    };
+    let conv1d = if bias {
+        conv1d(in_c, out_c, kernel_size, cfg, vb)?
+    } else {
+        conv1d_no_bias(in_c, out_c, kernel_size, cfg, vb)?
+    };
+    Ok(conv1d)
+}
+
+pub fn get_layer_norm(vb: VarBuilder, eps: f64, dim: usize, affine: bool) -> Result<LayerNorm> {
     let ln_config = LayerNormConfig {
         eps,
         remove_mean: true, // true for layernorm, false for RMSNorm
-        affine: true,      // true for with bias, false for without bias
+        affine,            // true for with bias, false for without bias
     };
     let norm = layer_norm(dim, ln_config, vb)?;
     Ok(norm)
 }
 
-pub fn get_batch_norm(vb: VarBuilder, eps: f64, dim: usize) -> Result<BatchNorm> {
+pub fn get_batch_norm(vb: VarBuilder, eps: f64, dim: usize, affine: bool) -> Result<BatchNorm> {
     let bn_config = BatchNormConfig {
         eps,
         remove_mean: true,
-        affine: true,
+        affine,
         momentum: 0.1,
     };
     let norm = batch_norm(dim, bn_config, vb)?;
     Ok(norm)
 }
 
-pub fn deform_conv2d_kernel(
-    input: &Tensor,
-    weight: &Tensor,
-    bias: Option<&Tensor>,
-    offset: &Tensor,
-    mask: Option<&Tensor>,
-    stride: usize,
-    padding: usize,
-) -> Result<Tensor> {
-    // 不考虑空洞卷积, bs = 1
-    let (_, in_c, in_h, in_w) = input.dims4()?;
-    let (out_channel, _, ker_h, ker_w) = weight.dims4()?;
-    let out_h = ((in_h + 2 * padding - ker_h) / stride) + 1;
-    let out_w = ((in_w + 2 * padding - ker_w) / stride) + 1;
+pub fn softplus(xs: &Tensor) -> Result<Tensor> {
+    // ln(1 + exp(x))
+    Ok((xs.exp()? + 1.0)?.log()?)
+}
 
-    let num_kernels = in_c * out_h * out_w;
-    let mask_vec = if let Some(mask) = mask {
-        Some(mask.squeeze(0)?.to_vec3::<f32>()?)
-    } else {
-        None
-    };
-    let offset_vec = offset.squeeze(0)?.to_vec3::<f32>()?;
-    let input_vec = input.squeeze(0)?.to_vec3::<f32>()?;
-    let mut columns_vec = vec![vec![0.0f32; out_h * out_w]; in_c * ker_h * ker_w];
-    for index in 0..num_kernels {
-        let out_x = index % out_w;
-        let out_y = (index / out_w) % out_h;
-        let in_c = index / (out_w * out_h);
-        let out_c = in_c * ker_h * ker_w;
-
-        for i in 0..ker_h {
-            for j in 0..ker_w {
-                let mask_idx = i * ker_w + j;
-                let offset_idx = 2 * mask_idx;
-                let mask_value = if mask.is_some() {
-                    mask_vec.as_ref().unwrap()[mask_idx][out_y][out_x]
-                } else {
-                    1.0
-                };
-                let offset_h = offset_vec[offset_idx][out_y][out_x];
-                let offset_w = offset_vec[offset_idx + 1][out_y][out_x];
-                let y = ((out_y * stride - padding) + i) as f32 + offset_h;
-                let x = ((out_x * stride - padding) + j) as f32 + offset_w;
-                let val = if y <= -1.0 || in_h as f32 <= y || x <= -1.0 || in_w as f32 <= x {
-                    0.0
-                } else {
-                    let h_low = y.floor();
-                    let w_low = x.floor();
-                    let h_high = h_low + 1.0;
-                    let w_high = w_low + 1.0;
-                    let lh = y - h_low;
-                    let lw = x - w_low;
-                    let hh = 1.0 - lh;
-                    let hw = 1.0 - lw;
-                    let w1 = hh * hw;
-                    let w2 = hh * lw;
-                    let w3 = lh * hw;
-                    let w4 = lh * lw;
-                    let v1 = if h_low >= 0.0 && w_low >= 0.0 {
-                        input_vec[in_c][h_low as usize][w_low as usize]
-                    } else {
-                        0.0
-                    };
-                    let v2 = if h_low >= 0.0 && w_high <= (in_w - 1) as f32 {
-                        input_vec[in_c][h_low as usize][w_high as usize]
-                    } else {
-                        0.0
-                    };
-                    let v3 = if h_high <= (in_h - 1) as f32 && w_low >= 0.0 {
-                        input_vec[in_c][h_high as usize][w_low as usize]
-                    } else {
-                        0.0
-                    };
-                    let v4 = if h_high <= (in_h - 1) as f32 && w_high <= (in_w - 1) as f32 {
-                        input_vec[in_c][h_high as usize][w_high as usize]
-                    } else {
-                        0.0
-                    };
-                    w1 * v1 + w2 * v2 + w3 * v3 + w4 * v4
-                };
-                columns_vec[out_c + i * ker_w + j][out_y * out_w + out_x] = mask_value * val;
-            }
+// refer to https://github.com/huggingface/candle/issues/3389
+pub fn conv1d_depthwise(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    // group = dim, stride= 1
+    // input: (bs, dim, len)
+    // weight: (dim, 1, k) -> (dim, k)
+    // input already padding
+    let len_in = input.dim(2)?;
+    let weight = weight.squeeze(1)?;
+    let kernel_size = weight.dim(1)?;
+    // len_out = (len_in - k + 2p) / s + 1, p = 0, s = 1
+    let len_out = len_in - kernel_size + 1;
+    let mut out = input
+        .narrow(2, 0, len_out)?
+        .broadcast_mul(&weight.narrow(1, 0, 1)?.unsqueeze(0)?)?;
+    for k in 1..kernel_size {
+        out = (out
+            + input
+                .narrow(2, k, len_out)?
+                .broadcast_mul(&weight.narrow(1, k, 1)?.unsqueeze(0)?)?)?;
+    }
+    match bias {
+        None => Ok(out),
+        Some(bias) => {
+            let b = bias.dims1()?;
+            let bias = bias.reshape((1, b, 1))?;
+            Ok(out.broadcast_add(&bias)?)
         }
     }
-
-    let columns = Tensor::new(columns_vec, weight.device())?;
-    let mut out =
-        weight
-            .flatten_from(1)?
-            .matmul(&columns)?
-            .reshape((1, out_channel, out_h, out_w))?;
-    if let Some(bias) = bias {
-        out = out.broadcast_add(bias)?;
-    }
-    Ok(out)
 }

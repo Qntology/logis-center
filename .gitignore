@@ -9,6 +9,7 @@
 *.gg
 *.st
 *.safetensors
+*.crdownload
 
 # Virtual Environment
 trade/venv/

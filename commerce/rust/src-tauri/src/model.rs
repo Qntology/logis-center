@@ -128,6 +128,90 @@ pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
 use tokio::sync::Mutex as TokioMutex;
 use std::time::{Duration, Instant};
 
+use crate::models::qwen35::generate::Qwen3_5GenerateModel;
+
+#[derive(Clone)]
+pub enum ModelVariant {
+    Qwen3VL(Arc<TokioMutex<Qwen3VLGenerateModel>>),
+    Qwen3_5(Arc<TokioMutex<Qwen3_5GenerateModel>>),
+}
+
+impl ModelVariant {
+    pub async fn generate(&self, params: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
+        match self {
+            ModelVariant::Qwen3VL(m) => {
+                let mut gen = m.lock().await;
+                gen.generate(params, cancel_flag, session_id, kv_name).await
+            },
+            ModelVariant::Qwen3_5(m) => {
+                let mut gen = m.lock().await;
+                gen.generate(params, cancel_flag).await
+            }
+        }
+    }
+
+    pub async fn clear_kv_cache(&self) -> anyhow::Result<()> {
+        match self {
+            ModelVariant::Qwen3VL(m) => { 
+                let mut gen = m.lock().await;
+                gen.clear_kv_cache(); 
+                Ok(()) 
+            },
+            ModelVariant::Qwen3_5(_) => Ok(())
+        }
+    }
+
+    pub async fn drop_kv_storage(&self) -> anyhow::Result<()> {
+        match self {
+            ModelVariant::Qwen3VL(m) => { 
+                let mut gen = m.lock().await;
+                gen.drop_kv_storage().await
+            },
+            ModelVariant::Qwen3_5(_m) => Ok(())
+        }
+    }
+
+    pub fn save_kv_to_disk(&self, path: &std::path::Path, kv_name: Option<&str>, offset: usize) -> anyhow::Result<()> {
+        match self {
+            ModelVariant::Qwen3VL(m) => {
+                let mut gen = m.blocking_lock();
+                gen.save_kv_to_disk(path, kv_name, offset)
+            },
+            ModelVariant::Qwen3_5(_) => Ok(()),
+        }
+    }
+
+    pub fn load_kv_from_disk(&self, path: &std::path::Path, kv_name: Option<&str>) -> anyhow::Result<()> {
+        match self {
+            ModelVariant::Qwen3VL(m) => {
+                let mut gen = m.blocking_lock();
+                gen.load_kv_from_disk(path, kv_name)
+            },
+            ModelVariant::Qwen3_5(_) => Ok(()),
+        }
+    }
+
+    pub fn truncate_kv_cache(&self, len: usize) -> anyhow::Result<()> {
+        match self {
+            ModelVariant::Qwen3VL(m) => {
+                let mut gen = m.blocking_lock();
+                gen.truncate_kv_cache(len)
+            },
+            ModelVariant::Qwen3_5(_) => Ok(()),
+        }
+    }
+
+    pub async fn prefill_chunk(&self, text: String, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<usize> {
+        match self {
+            ModelVariant::Qwen3VL(m) => {
+                let mut gen = m.lock().await;
+                gen.prefill_chunk(text, cancel_token, None).await
+            },
+            ModelVariant::Qwen3_5(_) => Ok(0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelSize {
     Small, // 0.6B for Ingestion
@@ -137,9 +221,9 @@ pub enum ModelSize {
 #[derive(Clone)]
 pub struct LogisModel {
     pub app_handle: tauri::AppHandle,
-    pub generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // Primary Active Slot (GPU)
-    pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.6B RAM Slot
-    pub large_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 2B RAM Slot
+    pub generator: Arc<TokioMutex<Option<ModelVariant>>>, // Primary Active Slot (GPU)
+    pub small_hibernation: Arc<TokioMutex<Option<ModelVariant>>>, // 0.6B RAM Slot
+    pub large_hibernation: Arc<TokioMutex<Option<ModelVariant>>>, // 2B RAM Slot
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     
     pub is_cpu_mode: bool, 
@@ -216,28 +300,28 @@ impl LogisModel {
         
         {
             let mut gen = self.generator.lock().await;
-            if let Some(mut g) = gen.take() {
-                println!("[DIAG-PURGE] Dropping Active Generator (0.6B/2B)...");
-                let _ = g.clear_kv_cache();
-                let _ = g.qwen3_vl.drop_kv_storage(); 
+            if let Some(g) = gen.take() {
+                println!("[DIAG-PURGE] Dropping Active Generator...");
+                let _ = g.clear_kv_cache().await;
+                let _ = g.drop_kv_storage().await; 
                 drop(g); 
             }
         }
         {
             let mut s_hib = self.small_hibernation.lock().await;
-            if let Some(mut g) = s_hib.take() { 
+            if let Some(g) = s_hib.take() { 
                 println!("[DIAG-PURGE] Dropping Small Hibernation...");
-                let _ = g.clear_kv_cache();
-                let _ = g.qwen3_vl.drop_kv_storage();
+                let _ = g.clear_kv_cache().await;
+                let _ = g.drop_kv_storage().await;
                 drop(g); 
             }
         }
         {
             let mut l_hib = self.large_hibernation.lock().await;
-            if let Some(mut g) = l_hib.take() { 
+            if let Some(g) = l_hib.take() { 
                 println!("[DIAG-PURGE] Dropping Large Hibernation...");
-                let _ = g.clear_kv_cache();
-                let _ = g.qwen3_vl.drop_kv_storage();
+                let _ = g.clear_kv_cache().await;
+                let _ = g.drop_kv_storage().await;
                 drop(g); 
             }
         }
@@ -466,7 +550,7 @@ impl LogisModel {
             let mut gen_guard = self.generator.lock().await;
             if let Some(gen) = gen_guard.as_mut() {
                 // Just prefill, no generation needed for base context
-                gen.prefill_chunk(prompt, cancel_token.clone(), None).await?;
+                gen.prefill_chunk(prompt, cancel_token.clone()).await?;
             }
         }
 
@@ -597,18 +681,32 @@ impl LogisModel {
 
         let gen = tokio::task::spawn_blocking(move || {
             let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
-            Qwen3VLGenerateModel::init_with_config(
-                &path_clone, 
-                shared_path_clone.as_deref(), 
-                shared_path_clone.as_deref(), 
-                Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
-                force_text_only,
-                baking_only,
-                is_disk_swap,
-                kv_root
-            )
-        }).await??;
 
+            if path_clone.contains("Qwen3.5") {
+                // [QWEN3.5] Split Loading Logic
+                let is_small = size == ModelSize::Small;
+                let gen_35 = Qwen3_5GenerateModel::init(
+                    &path_clone,
+                    Some(&target_device),
+                    dtype,
+                    is_small // force_text_only if Small
+                )?;
+                Ok::<ModelVariant, anyhow::Error>(ModelVariant::Qwen3_5(Arc::new(TokioMutex::new(gen_35))))
+            } else {
+                // [LEGACY] Qwen3VL GGUF Loading
+                let gen_vl = Qwen3VLGenerateModel::init_with_config(
+                    &path_clone,
+                    shared_path_clone.as_deref(),
+                    shared_path_clone.as_deref(),
+                    Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
+                    force_text_only,
+                    baking_only,
+                    is_disk_swap,
+                    kv_root
+                )?;
+                Ok::<ModelVariant, anyhow::Error>(ModelVariant::Qwen3VL(Arc::new(TokioMutex::new(gen_vl))))
+            }
+        }).await??;
         // Move current main to slot
         if let Some(old_m) = gen_guard.take() {
             if let Some(old_size) = *current_size_guard {
@@ -707,8 +805,8 @@ impl LogisModel {
             }
         };
 
-        let small_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf"));
-        let large_model_path = normalize_path(base_path.join("Qwen3-VL-2B-Instruct-gguf"));
+        let small_model_path = normalize_path(base_path.join("Qwen3.5-0.8B-Split"));
+        let large_model_path = normalize_path(base_path.join("Qwen3.5-0.8B-Split"));
         let embedding_path = base_path.join("embeddinggemma-300m");
 
         let max_tokens_limit = 65536; 
@@ -743,7 +841,7 @@ impl LogisModel {
     ) -> anyhow::Result<()> {
         // [VISION-FIX] 이미지 추출은 반드시 2B (Large) 모델을 사용해야 합니다.
         {
-            let gen_guard = self.generator.lock().await;
+            let mut gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
                 drop(gen_guard);
                 self.ensure_generator(ModelSize::Large).await?;
@@ -832,7 +930,7 @@ impl LogisModel {
     pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
         // [FIX] Default to Small (0.6B) for all chat tasks to align with 0.6B-focused architecture.
         {
-            let gen_guard = self.generator.lock().await;
+            let mut gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
                 drop(gen_guard);
                 self.ensure_generator(ModelSize::Small).await?;
@@ -933,7 +1031,7 @@ impl LogisModel {
     ) -> anyhow::Result<String> {
         // [FIX] Ensure we stay on Small (0.6B).
         {
-            let gen_guard = self.generator.lock().await;
+            let mut gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
                 drop(gen_guard);
                 self.ensure_generator(ModelSize::Small).await?;
@@ -959,9 +1057,11 @@ impl LogisModel {
         }
 
         let mut gen_guard = self.generator.lock().await;
-        let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
-    }
+        let variant = gen_guard.as_ref().ok_or_else(|| anyhow!("Generator is unloaded"))?;
+
+        let response = variant.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))?;
+        Ok(response)
+        }
 
     pub async fn chat_with_image_spinner(
         &self, 
