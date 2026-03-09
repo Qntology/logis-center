@@ -1,0 +1,84 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+jobs:
+  format:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Run fmt
+        run: make fmt
+
+  cargo-clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+       # This action will configure Rust cache automatically:
+       # https://github.com/actions-rust-lang/setup-rust-toolchain?tab=readme-ov-file#inputs
+      - name: Setup toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install make dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      - name: Install FFmpeg dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            ffmpeg \
+            libavutil-dev \
+            libavcodec-dev \
+            libavformat-dev \
+            libavfilter-dev \
+            libavdevice-dev \
+            libswresample-dev \
+            libswscale-dev  
+
+      - run: make lint
+
+  build-and-test:
+    name: build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install make dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+          
+      - name: Install FFmpeg development packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            ffmpeg \
+            libavutil-dev \
+            libavcodec-dev \
+            libavformat-dev \
+            libavfilter-dev \
+            libavdevice-dev \
+            libswresample-dev \
+            libswscale-dev
+
+      - name: Build
+        run: make build
+
+#      - name: Run Unit Test
+#        run: make test
