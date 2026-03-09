@@ -11,7 +11,7 @@ use crate::{
         qwen35::config::{Qwen3_5Config, Qwen3_5TextConfig},
         qwen3vl::model::Qwen3VLVisionModel,
     },
-    position_embed::rope::{apply_rotary_pos_emb, Qwen3VLTextRotaryEmbedding},
+    position_embed::rope::{apply_rotary_pos_emb, glm_asr_apply_rotary_pos_emb, Qwen3VLTextRotaryEmbedding},
     utils::tensor_utils::{
         get_equal_mask, get_vision_next_indices, l2_normalize, masked_scatter_dim0, nonzero_index,
         prepare_causal_attention_mask, repeat_interleave, split_tensor, zero_index,
@@ -569,7 +569,7 @@ impl Qwen3_5Attention {
             .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?
             .transpose(1, 2)?;
         let (query_states, key_states) =
-            apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
+            glm_asr_apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
