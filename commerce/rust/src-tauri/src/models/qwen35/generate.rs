@@ -3,11 +3,12 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::collections::HashMap;
 
 use crate::{
     chat_template::ChatTemplate,
     models::{
-        qwen35::{config::Qwen3_5Config, model::Qwen3_5Model},
+        qwen35::{config::Qwen3_5Config, quantized_model::QuantizedQwen3_5Model},
         qwen3vl::processor::Qwen3VLProcessor,
     },
     tokenizer::TokenizerModel,
@@ -21,7 +22,7 @@ pub struct Qwen3_5GenerateModel {
     pub chat_template: ChatTemplate,
     pub tokenizer: TokenizerModel,
     pub pre_processor: Qwen3VLProcessor,
-    pub qwen3_5: Qwen3_5Model,
+    pub qwen3_5: QuantizedQwen3_5Model,
     pub device: Device,
     pub eos_token_id: u32,
     pub model_name: String,
@@ -38,19 +39,24 @@ impl Qwen3_5GenerateModel {
         let dtype = get_dtype(dtype, cfg_dtype);
         let pre_processor = Qwen3VLProcessor::new(path, &device, dtype)?;
         
-        let mut model_list = find_type_files(path, "st")?; // Use .st files as per split structure
-        
+        let mut model_list = find_type_files(path, "st")?;
         if force_text_only {
-            // Remove vision.st from the loading list to save VRAM and load as "Small" model
             model_list.retain(|f| !f.contains("vision.st"));
-            println!("[MODEL-QWEN35] Loading in TEXT-ONLY mode (Small).");
-        } else {
-            println!("[MODEL-QWEN35] Loading in FULL mode (Large/Vision).");
         }
 
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_list, dtype, &device)? };
-        let eos_token_id = cfg.text_config.eos_token_id;
-        let qwen3_5 = Qwen3_5Model::new(vb, cfg)?;
+        // [DYNAMIC REGISTRY] Map tensor names to file paths instead of loading all to RAM/VRAM
+        let mut registry = HashMap::new();
+        for p in &model_list {
+            let tensors = candle_core::safetensors::load(p, &Device::Cpu)?;
+            for k in tensors.keys() {
+                registry.insert(k.clone(), p.clone());
+            }
+        }
+
+        let vb_dummy = VarBuilder::zeros(DType::F32, &device);
+        let qwen3_5 = QuantizedQwen3_5Model::new(vb_dummy, cfg.clone(), &registry)?;
+
+        println!("[MODEL-QWEN35] Quantized dynamic registry loaded. Ready for Layer Cycling.");
 
         Ok(Self {
             chat_template,
@@ -58,7 +64,7 @@ impl Qwen3_5GenerateModel {
             pre_processor,
             qwen3_5,
             device,
-            eos_token_id,
+            eos_token_id: cfg.text_config.eos_token_id,
             model_name: "qwen3.5".to_string(),
         })
     }
@@ -83,12 +89,6 @@ impl Qwen3_5GenerateModel {
         let full_seq_len = full_input_ids.dim(1)?;
         
         let mut seqlen_offset = 0;
-        let mut pixel_values = input.pixel_values.as_ref();
-        let image_grid_thw = input.image_grid_thw.as_ref();
-        let mut pixel_values_video = input.pixel_values_video.as_ref();
-        let video_grid_thw = input.video_grid_thw.as_ref();
-        
-        // [OPTIMIZATION] Chunked Prefill: Process long prompt in 512-token steps
         let chunk_size = 512;
         let mut last_logits = None;
 
@@ -101,38 +101,25 @@ impl Qwen3_5GenerateModel {
             let current_chunk = remaining.min(chunk_size);
             let input_ids = full_input_ids.narrow(1, seqlen_offset, current_chunk)?;
 
-            let logits = self.qwen3_5.forward(
-                &input_ids,
-                pixel_values,
-                image_grid_thw,
-                pixel_values_video,
-                video_grid_thw,
-                seqlen_offset,
-            )?;
+            let logits = self.qwen3_5.forward(&input_ids, seqlen_offset)?;
             
             seqlen_offset += current_chunk;
             last_logits = Some(logits);
 
-            // Vision/Initial inputs only used in first chunk
-            pixel_values = None;
-            pixel_values_video = None;
-            
             if full_seq_len > chunk_size {
                 println!("[PREFILL] Processed {}/{} tokens...", seqlen_offset, full_seq_len);
             }
         }
 
         let mut logits = last_logits.ok_or(anyhow::anyhow!("No logits generated"))?;
-        let mut generate = Vec::new();
         let mut gen_text = String::new();
         let sample_len = mes.max_tokens.unwrap_or(1024);
 
-        for i in 0..sample_len {
+        for _i in 0..sample_len {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) { break; }
             }
 
-            // Sample from the last token's logits
             let current_logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             let next_token = logit_processor.sample(&current_logits)?;
             
@@ -140,20 +127,11 @@ impl Qwen3_5GenerateModel {
                 break;
             }
 
-            generate.push(next_token);
             let piece = self.tokenizer.token_decode(vec![next_token])?;
             gen_text.push_str(&piece);
 
-            // Preparation for next token (Decoding step)
             let input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
-            logits = self.qwen3_5.forward(
-                &input_ids,
-                None,
-                None,
-                None,
-                None,
-                seqlen_offset,
-            )?;
+            logits = self.qwen3_5.forward(&input_ids, seqlen_offset)?;
             seqlen_offset += 1;
         }
 

@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use candle_core::{D, Device, IndexOp, Tensor};
+use std::collections::HashMap;
 use candle_nn::{
     Conv1d, Embedding, Linear, Module, RmsNorm, VarBuilder, embedding, linear_b, linear_no_bias,
     ops::sigmoid, rms_norm,
@@ -870,6 +871,26 @@ impl Qwen3_5Embedding {
         let weight = vb.get((vocab_size, hidden_size), "weight")?;
         let cpu_weight = weight.to_device(&Device::Cpu)?;
         Ok(Self { weight, cpu_weight, device: vb.device().clone() })
+    }
+
+    pub fn init_from_tensors(&mut self, sd: &HashMap<String, Tensor>) -> Result<()> {
+        let name = "model.language_model.embed_tokens";
+        let scales_key = format!("{}.scales", name);
+        let data_key = format!("{}.data", name);
+        let weight_key = format!("{}.weight", name);
+
+        if sd.contains_key(&scales_key) && sd.contains_key(&data_key) {
+            // Special handling for quantized embedding if needed, 
+            // but usually we just load the weights for simplicity here
+            self.weight = sd.get(&weight_key).cloned().unwrap_or_else(|| {
+                // If weight not found, we assume it's packed and dequantize or load scale/data
+                sd.get(&scales_key).unwrap().clone() 
+            });
+        } else {
+            self.weight = sd.get(&weight_key).ok_or_else(|| anyhow!("Embedding weight not found"))?.clone();
+        }
+        self.cpu_weight = self.weight.to_device(&Device::Cpu)?;
+        Ok(())
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
