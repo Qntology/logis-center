@@ -1876,12 +1876,7 @@ impl QuantizedQwen3VLTextModel {
             if target_device.is_cuda() { let _ = target_device.synchronize(); }
         }
 
-        // [OPTIMIZATION] 프리필(청크 연산)이 모두 끝난 후 레이어 단위로 단 한 번 SSD 백업 트리거
-        if let Some(sid) = &session_id {
-            let is_prefill = current_seq_len > 1;
-            // 프리필 중에는 루프 밖에서 일괄 처리, 디코딩(seq_len=1)일 때는 루프와 동일하게 작동
-            let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, !is_prefill);
-        }
+
 
         if current_seq_len > 1 {
             // [OPTIMIZATION] 0.6B (Small) 모델은 프리필 후에도 VRAM 캐시를 유지하여 즉시 디코딩 진입 보장
@@ -2046,22 +2041,37 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [MEMORY-OPT] [IMMEDIATE-PURGE] 연산 직후 가중치 즉시 소각
-        // KV 대피(IO)는 시간이 걸릴 수 있으므로, 그 전에 가중치를 먼저 지워서 VRAM 공간 확보
+        // [PIPELINE-OPTIMIZATION] KV 저장 및 백업을 백업 스레드로 완전히 분리 (Non-blocking)
         if !is_decoding {
-            self.layers[layer_idx].clear();
-            if target_device.is_cuda() { 
-                let _ = target_device.synchronize(); // GPU 메모리 해제 확정
-            }
-            println!("[MEMORY-OPT] Layer {} Weights Purged. (RAM/VRAM cleared)", layer_idx);
-        }
+             let sid_opt = self.active_session_id.clone();
+             if let Some(sid) = sid_opt {
+                 let mut model_clone = self.clone();
+                 let baking_only_clone = self.baking_only;
+                 
+                 // [CRITICAL-SYNC] 스폰 전 카운터를 올려 wait_for_global_io가 즉시 대기하게 함
+                 crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        // [STEP 4] 자원 반납 및 KV 대피
-        let sid_opt = self.active_session_id.clone();
-        if let Some(sid) = sid_opt {
-            if !self.baking_only {
-                let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count).await;
-            }
+                 // [OFFLOAD] 다음 레이어 연산을 방해하지 않도록 별도 태스크로 분리
+                 tauri::async_runtime::spawn(async move {
+                     // [MEMORY-DROP] 백그라운드 클론에서도 가중치 참조를 즉시 해제하여 VRAM 반환 유도
+                     model_clone.layers[layer_idx].clear();
+
+                     // 1. VRAM -> RAM -> SSD
+                     let _ = model_clone.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count).await;
+
+                     // [RESTORED] Trigger Realtime Bake (Async)
+                     let is_prefill = input_token_count > 1;
+                     let _ = model_clone.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(&sid, true, baking_only_clone, !is_prefill);
+
+                     // [SYNC-COMPLETE] 태스크 완료 시 카운트 감소
+                     crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                 });
+             }
+
+            // [MEMORY-OPT] [IMMEDIATE-PURGE] 연산 직후 가중치 즉시 소각
+            self.layers[layer_idx].clear();
+            // synchronize() 제거: 드라이버가 알아서 비동기 처리하도록 맡김
+            println!("[PIPELINE] Layer {} outputs ready. Moving to next layer immediately.", layer_idx);
         }
 
         if is_decoding {
