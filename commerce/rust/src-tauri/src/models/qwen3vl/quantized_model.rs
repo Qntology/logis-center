@@ -645,10 +645,149 @@ impl QuantizedQwen3VLTextAttention {
         }
 
         // 3. [SEQUENTIAL-KV-LOADER] Strictly Ordered Hybrid Pipeline
+        let total_tokens_now = seqlen_offset + q_len;
+
+        // [MEMORY-EFFICIENT-DECODING]
+        // 디코딩(q_len=1) 시에는 전체 KV를 VRAM에 모으지 않고 블록 단위로 연산(Online Softmax)하여
+        // VRAM 사용량을 획기적으로 줄입니다. (마치 스트리밍하듯이 필요한 오프셋만 가져와서 계산하고 버림)
+        if q_len == 1 {
+            let mut running_max = Tensor::ones((b_sz, self.num_attention_heads, 1, 1), DType::F32, dev)?.broadcast_mul(&Tensor::new(&[f32::NEG_INFINITY], dev)?)?;
+            let mut running_sum = Tensor::zeros((b_sz, self.num_attention_heads, 1, 1), DType::F32, dev)?;
+            let mut running_out = Tensor::zeros((b_sz, self.num_attention_heads, 1, self.head_dim), target_dtype, dev)?;
+            
+            let query_states_f32 = query_states.to_dtype(DType::F32)?; // Accumulate in F32 for precision
+
+            for block in &self.kv_blocks {
+                let (index, b_off, b_len) = {
+                    let inner = block.inner.read().unwrap();
+                    (inner.index, inner.offset, inner.len)
+                };
+                if b_off >= total_tokens_now { continue; }
+
+                // [ON-DEMAND-LOAD] Load single block to VRAM
+                let (k_block, v_block) = {
+                    let mut k_res = None;
+                    let mut v_res = None;
+                    
+                    // 1. Try VRAM
+                    {
+                        let inner = block.inner.read().unwrap();
+                        if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                            k_res = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
+                            v_res = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
+                        }
+                    }
+
+                    // 2. Try RAM/SSD if not in VRAM
+                    if k_res.is_none() {
+                        let mut k_cpu = None;
+                        let mut v_cpu = None;
+                        
+                        // RAM
+                        {
+                            let reg = self.registry.entries.read().unwrap();
+                            let cache = reg[index].bitkv_cache.read().unwrap();
+                            if let Some(m) = &cache[self.layer_idx] {
+                                k_cpu = Some(self.decompress_from_bf16(&m.k_data, &m.original_shape, &Device::Cpu)?);
+                                v_cpu = Some(self.decompress_from_bf16(&m.v_data, &m.original_shape, &Device::Cpu)?);
+                            }
+                        }
+
+                        // SSD
+                        if k_cpu.is_none() {
+                            let ssd_path = { let reg = self.registry.entries.read().unwrap(); if index < reg.len() { reg[index].ssd_path.clone() } else { None } };
+                            if let Some(p) = ssd_path {
+                                let mut full_path = p.clone();
+                                if full_path.is_relative() && !full_path.starts_with("tmp") { full_path = crate::utils::paths::get_kv_dir(None).join(full_path); }
+                                let block_file = full_path.join(format!("l{}.st", self.layer_idx));
+                                if let Ok(data) = crate::utils::direct_loader::load_kv_block(&block_file) {
+                                    if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
+                                        let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
+                                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                                        if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                            let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                                            let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+                                            let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+                                            k_cpu = Some(self.decompress_from_bf16(&kd_t, &meta_os, dev)?); // Directly to dev
+                                            v_cpu = Some(self.decompress_from_bf16(&vd_t, &meta_os, dev)?);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let (Some(kc), Some(vc)) = (k_cpu, v_cpu) {
+                            k_res = Some(kc.to_device(dev)?.to_dtype(target_dtype)?);
+                            v_res = Some(vc.to_device(dev)?.to_dtype(target_dtype)?);
+                        }
+                    }
+                    (k_res, v_res)
+                };
+
+                if let (Some(k), Some(v)) = (k_block, v_block) {
+                    // [BLOCK-ATTENTION] Compute Attention for this block
+                    let mut k = k;
+                    let mut v = v;
+
+                    // Expand for GQA
+                    if self.num_kv_groups > 1 {
+                        let (b, h, s, d) = k.dims4()?;
+                        k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                        v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                    }
+
+                    let rhs = k.transpose(2, 3)?.to_dtype(DType::F32)?; // F32 for Score
+                    let mut attn_score = query_states_f32.matmul(&rhs)?.broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?;
+
+                    // Apply Mask Slice
+                    if let Some(mask) = &attention_mask {
+                        let m_len = mask.dim(D::Minus1)?;
+                        if b_off < m_len {
+                            let end = (b_off + b_len).min(m_len);
+                            let slice_len = end - b_off;
+                            // Ensure dimensions match for broadcast
+                            let mask_slice = mask.narrow(D::Minus1, b_off, slice_len)?;
+                            attn_score = attn_score.broadcast_add(&mask_slice)?;
+                        }
+                    }
+
+                    // Online Softmax Update
+                    let m_block = attn_score.max(D::Minus1)?.unsqueeze(3)?; // (B, H, 1, 1)
+                    let p_block = attn_score.broadcast_sub(&m_block)?.exp()?; // (B, H, 1, S_block)
+                    let l_block = p_block.sum(D::Minus1)?.unsqueeze(3)?; // (B, H, 1, 1)
+                    
+                    let v_f32 = v.to_dtype(DType::F32)?;
+                    let o_block = p_block.matmul(&v_f32)?; // (B, H, 1, D)
+
+                    // Update Global State
+                    let m_new = running_max.maximum(&m_block)?;
+                    
+                    let alpha = running_max.broadcast_sub(&m_new)?.exp()?;
+                    let beta = m_block.broadcast_sub(&m_new)?.exp()?;
+
+                    running_sum = (running_sum.mul(&alpha)? + l_block.mul(&beta)?)?;
+                    running_out = (running_out.to_dtype(DType::F32)?.broadcast_mul(&alpha)? + o_block.broadcast_mul(&beta)?)?.to_dtype(target_dtype)?;
+                    running_max = m_new;
+                }
+            }
+            
+            // Finalize
+            let output = running_out.to_dtype(DType::F32)?.broadcast_div(&running_sum)?;
+            let output = output.to_dtype(target_dtype)?;
+            
+            let (b_sz, n_h, q_len, d_h) = output.dims4()?;
+            let attn_output = self.o_proj.forward(&output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
+            
+            if self.layer_idx == 0 {
+                 println!("[DEC-STREAM] Online Softmax Complete. VRAM Conserved.");
+            }
+            return Ok(attn_output);
+        }
+
         let mut bulk_ks: Vec<Tensor> = Vec::new();
         let mut bulk_vs: Vec<Tensor> = Vec::new();
 
-        let total_tokens_now = seqlen_offset + q_len;
         for block in &self.kv_blocks {
             let (index, b_off, _b_len) = {
                 let inner = block.inner.read().unwrap();
