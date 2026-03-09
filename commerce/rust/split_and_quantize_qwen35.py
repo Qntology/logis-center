@@ -82,6 +82,7 @@ def run_hybrid_quantization():
     # 1. Quantize Text Layers (Q4)
     for i in range(24):
         path = os.path.join(model_dir, f"layer_{i}.st")
+        temp_path = path + ".tmp"
         if os.path.exists(path):
             print(f"Applying actual Q4_0 packing to {path}...")
             sd = load_file(path)
@@ -93,11 +94,18 @@ def run_hybrid_quantization():
                     new_sd[f"{name}.data"] = q["data"]
                     new_sd[f"{name}.shape"] = q["shape"]
                 else:
-                    new_sd[name] = tensor # Keep bias or small tensors as is
-            save_file(new_sd, path, metadata={"quantization": "q4_0_packed"})
+                    new_sd[name] = tensor
+            
+            save_file(new_sd, temp_path, metadata={"quantization": "q4_0_packed"})
+            # Try to replace the original file
+            try:
+                os.replace(temp_path, path)
+            except OSError as e:
+                print(f"Warning: Could not replace {path} due to locking. Quantized file saved as {temp_path}")
 
     # 2. Quantize Shared (Q8)
     shared_path = os.path.join(model_dir, "shared.st")
+    temp_shared_path = shared_path + ".tmp"
     if os.path.exists(shared_path):
         print(f"Applying actual Q8_0 packing to {shared_path}...")
         sd = load_file(shared_path)
@@ -110,7 +118,12 @@ def run_hybrid_quantization():
                 new_sd[f"{name}.shape"] = q["shape"]
             else:
                 new_sd[name] = tensor
-        save_file(new_sd, shared_path, metadata={"quantization": "q8_0_packed"})
+        
+        save_file(new_sd, temp_shared_path, metadata={"quantization": "q8_0_packed"})
+        try:
+            os.replace(temp_shared_path, shared_path)
+        except OSError:
+            print(f"Warning: Could not replace shared.st. Saved as {temp_shared_path}")
 
     print("\n[SUCCESS] Actual block-wise quantization complete.")
     print("Files updated with .scales and .data packed format.")

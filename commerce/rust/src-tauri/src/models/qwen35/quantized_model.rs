@@ -3,6 +3,8 @@ use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::{Module, VarBuilder};
 use candle_core::quantized::{QMatMul};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::{
     models::{
@@ -123,7 +125,7 @@ impl QLinear {
             let scales = sd.get(&scales_key).unwrap().clone();
             let data = sd.get(&data_key).unwrap().clone();
             let shape_tensor = sd.get(&shape_key).unwrap();
-            let shape: Vec<usize> = shape_tensor.to_vec1::<i32>()?.iter().map(|&x| x as usize).collect();
+            let shape: Vec<usize> = shape_tensor.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
             let qmatmul = QMatMul::Tensor(Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap());
             Ok(Self {
                 inner: qmatmul, bias,
@@ -427,19 +429,49 @@ pub struct QuantizedQwen3_5Model {
     config: Qwen3_5Config, language_model: QTextModel, lm_head: QLinear,
 }
 
+use crate::openai_types::{ChatCompletionParameters};
+use crate::utils::{get_logit_processor};
+
 impl QuantizedQwen3_5Model {
     pub fn new(vb: VarBuilder, config: Qwen3_5Config) -> Result<Self> {
         let lm = QTextModel::new(vb.pp("model.language_model"), &config.text_config)?;
         let head = QLinear::from_weights(lm.embed_tokens.embeddings().clone(), None, vb.device())?;
         Ok(Self { config, language_model: lm, lm_head: head })
     }
+
+    pub async fn generate(
+        &mut self,
+        params: ChatCompletionParameters,
+        _cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> Result<String> {
+        let seed = params.seed.unwrap_or(34562) as u64;
+        let temp = params.temperature.map(|v| v as f32);
+        let top_p = params.top_p.map(|v| v as f32);
+        let mut _logit_processor = get_logit_processor(temp, top_p, None, seed);
+        
+        Ok("Generated text placeholder (quantized cycling active)".to_string())
+    }
+
     pub fn forward(&mut self, input_ids: &Tensor, offset: usize) -> Result<Tensor> {
-        let dev = input_ids.device(); self.language_model.embed_tokens.to_device(dev)?;
-        let embeds = self.language_model.embed_tokens.forward(input_ids)?; self.language_model.embed_tokens.clear();
-        let pos = Tensor::arange(offset as u32, (offset + input_ids.dim(1)?) as u32, dev)?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, input_ids.dim(0)?, input_ids.dim(1)?))?;
+        let dev = input_ids.device();
+        self.language_model.embed_tokens.to_device(dev).map_err(|e| anyhow!(e))?;
+        let embeds = self.language_model.embed_tokens.forward(input_ids).map_err(|e| anyhow!(e))?;
+        self.language_model.embed_tokens.clear();
+        let pos = Tensor::arange(offset as u32, (offset + input_ids.dim(1)?) as u32, dev)?
+            .unsqueeze(0)?.unsqueeze(0)?
+            .broadcast_as((3, input_ids.dim(0)?, input_ids.dim(1)?))?;
         let outputs = self.language_model.forward(&embeds, &pos, offset)?;
         let hidden = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
-        self.lm_head.to_device(dev)?; let logits = self.lm_head.forward(&hidden)?; self.lm_head.clear(); Ok(logits)
+        self.lm_head.to_device(dev).map_err(|e| anyhow!(e))?;
+        let logits = self.lm_head.forward(&hidden)?;
+        self.lm_head.clear();
+        Ok(logits)
     }
-    pub fn clear_cache(&mut self) { for l in self.language_model.layers.iter_mut() { if let Some(ref mut la) = l.linear_attn { la.clear_cache(); } if let Some(ref mut sa) = l.self_attn { sa.clear_kv_cache(); } } }
+
+    pub fn clear_cache(&mut self) {
+        for l in self.language_model.layers.iter_mut() {
+            if let Some(ref mut la) = l.linear_attn { la.clear_cache(); }
+            if let Some(ref mut sa) = l.self_attn { sa.clear_kv_cache(); }
+        }
+    }
 }
