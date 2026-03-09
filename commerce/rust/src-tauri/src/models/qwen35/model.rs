@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use candle_core::{D, IndexOp, Tensor};
+use candle_core::{D, Device, IndexOp, Tensor};
 use candle_nn::{
     Conv1d, Embedding, Linear, Module, RmsNorm, VarBuilder, embedding, linear_b, linear_no_bias,
     ops::sigmoid, rms_norm,
@@ -21,13 +21,32 @@ use crate::{
 pub struct Qwen3_5RMSNorm {
     eps: f64,
     weight: Tensor,
+    cpu_weight: Tensor, // Keep a master copy in RAM
+    device: Device,
 }
 
 impl Qwen3_5RMSNorm {
     pub fn new(vb: VarBuilder, dim: usize, eps: f64) -> Result<Self> {
         let weight = vb.get(dim, "weight")?;
-        let weight = weight.to_dtype(candle_core::DType::F32)?.affine(1.0, 1.0)?;
-        Ok(Self { eps, weight })
+        let cpu_weight = weight.to_device(&Device::Cpu)?;
+        Ok(Self { 
+            eps, 
+            weight, 
+            cpu_weight,
+            device: vb.device().clone()
+        })
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let target_dtype = if device.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+        self.weight = self.cpu_weight.to_device(device)?.to_dtype(target_dtype)?;
+        self.device = device.clone();
+        Ok(())
+    }
+
+    pub fn clear(&mut self) {
+        self.weight = Tensor::zeros((1,), self.cpu_weight.dtype(), &Device::Cpu).unwrap();
+        self.device = Device::Cpu;
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
@@ -38,19 +57,27 @@ impl Qwen3_5RMSNorm {
             .affine(1.0, self.eps)?
             .sqrt()?;
         let norm = x.broadcast_div(&norm_)?;
-        let norm = norm.broadcast_mul(&self.weight)?.to_dtype(xs.dtype())?;
+        let norm = norm.broadcast_mul(&self.weight.to_dtype(candle_core::DType::F32)?)?.to_dtype(xs.dtype())?;
         Ok(norm)
     }
 }
 
 pub struct Qwen3_5RMSNormGated {
-    norm: RmsNorm,
+    norm: Qwen3_5RMSNorm,
 }
 
 impl Qwen3_5RMSNormGated {
     pub fn new(vb: VarBuilder, hidden_size: usize, eps: f64) -> Result<Self> {
-        let norm = rms_norm(hidden_size, eps, vb)?;
+        let norm = Qwen3_5RMSNorm::new(vb, hidden_size, eps)?;
         Ok(Self { norm })
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.norm.to_device(device)
+    }
+
+    pub fn clear(&mut self) {
+        self.norm.clear();
     }
 
     pub fn forward(&self, xs: &Tensor, gate: Option<&Tensor>) -> Result<Tensor> {
@@ -59,6 +86,71 @@ impl Qwen3_5RMSNormGated {
             xs = xs.broadcast_mul(&gate.silu()?)?;
         }
         Ok(xs)
+    }
+}
+
+pub struct Qwen3_5Linear {
+    weight: Tensor,
+    bias: Option<Tensor>,
+    cpu_weight: Tensor,
+    cpu_bias: Option<Tensor>,
+    device: Device,
+}
+
+impl Qwen3_5Linear {
+    pub fn new(vb: VarBuilder, in_dim: usize, out_dim: usize, has_bias: bool) -> Result<Self> {
+        let weight = vb.get((out_dim, in_dim), "weight")?;
+        let bias = if has_bias { Some(vb.get(out_dim, "bias")?) } else { None };
+        let cpu_weight = weight.to_device(&Device::Cpu)?;
+        let cpu_bias = if let Some(ref b) = bias { Some(b.to_device(&Device::Cpu)?) } else { None };
+        Ok(Self {
+            weight,
+            bias,
+            cpu_weight,
+            cpu_bias,
+            device: vb.device().clone(),
+        })
+    }
+
+    pub fn from_weights(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
+        let cpu_weight = weight.to_device(&Device::Cpu)?;
+        let cpu_bias = if let Some(ref b) = bias { Some(b.to_device(&Device::Cpu)?) } else { None };
+        let device = weight.device().clone();
+        Ok(Self {
+            weight,
+            bias,
+            cpu_weight,
+            cpu_bias,
+            device,
+        })
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let target_dtype = if device.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+        self.weight = self.cpu_weight.to_device(device)?.to_dtype(target_dtype)?;
+        if let Some(ref b) = self.cpu_bias {
+            self.bias = Some(b.to_device(device)?.to_dtype(target_dtype)?);
+        }
+        self.device = device.clone();
+        Ok(())
+    }
+
+    pub fn clear(&mut self) {
+        self.weight = Tensor::zeros((1,), self.cpu_weight.dtype(), &Device::Cpu).unwrap();
+        self.bias = None;
+        self.device = Device::Cpu;
+    }
+
+    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let (b, s, h) = xs.dims3()?;
+        let xs_flat = xs.reshape((b * s, h))?;
+        let res = xs_flat.matmul(&self.weight.t()?)?;
+        let res = if let Some(ref b) = self.bias {
+            res.broadcast_add(b)?
+        } else {
+            res
+        };
+        Ok(res.reshape((b, s, ()))?)
     }
 }
 
@@ -98,16 +190,21 @@ pub struct Qwen3_5GatedDeltaNet {
     value_dim: usize,
     conv_kernel_size: usize,
     conv1d: Conv1d,
+    cpu_conv1d_weight: Tensor,
+    cpu_conv1d_bias: Option<Tensor>,
     dt_bias: Tensor,
+    cpu_dt_bias: Tensor,
     a_log: Tensor,
+    cpu_a_log: Tensor,
     norm: Qwen3_5RMSNormGated,
-    out_proj: Linear,
-    in_proj_qkv: Linear,
-    in_proj_z: Linear,
-    in_proj_b: Linear,
-    in_proj_a: Linear,
+    out_proj: Qwen3_5Linear,
+    in_proj_qkv: Qwen3_5Linear,
+    in_proj_z: Qwen3_5Linear,
+    in_proj_b: Qwen3_5Linear,
+    in_proj_a: Qwen3_5Linear,
     conv_state_cache: Option<Tensor>,
     recurrent_state_cache: Option<Tensor>,
+    device: Device,
 }
 
 impl Qwen3_5GatedDeltaNet {
@@ -133,14 +230,21 @@ impl Qwen3_5GatedDeltaNet {
             conv_dim,
             false,
         )?;
+        let cpu_conv1d_weight = conv1d.weight().to_device(&Device::Cpu)?;
+        let cpu_conv1d_bias = if let Some(b) = conv1d.bias() { Some(b.to_device(&Device::Cpu)?) } else { None };
+
         let dt_bias = vb.get(num_v_heads, "dt_bias")?;
+        let cpu_dt_bias = dt_bias.to_device(&Device::Cpu)?;
         let a_log = vb.get(num_v_heads, "A_log")?;
+        let cpu_a_log = a_log.to_device(&Device::Cpu)?;
+        
         let norm = Qwen3_5RMSNormGated::new(vb.pp("norm"), head_v_dim, layer_norm_epsilon)?;
-        let out_proj = linear_no_bias(value_dim, hidden_size, vb.pp("out_proj"))?;
-        let in_proj_qkv = linear_no_bias(hidden_size, conv_dim, vb.pp("in_proj_qkv"))?;
-        let in_proj_z = linear_no_bias(hidden_size, value_dim, vb.pp("in_proj_z"))?;
-        let in_proj_b = linear_no_bias(hidden_size, num_v_heads, vb.pp("in_proj_b"))?;
-        let in_proj_a = linear_no_bias(hidden_size, num_v_heads, vb.pp("in_proj_a"))?;
+        let out_proj = Qwen3_5Linear::new(vb.pp("out_proj"), value_dim, hidden_size, false)?;
+        let in_proj_qkv = Qwen3_5Linear::new(vb.pp("in_proj_qkv"), hidden_size, conv_dim, false)?;
+        let in_proj_z = Qwen3_5Linear::new(vb.pp("in_proj_z"), hidden_size, value_dim, false)?;
+        let in_proj_b = Qwen3_5Linear::new(vb.pp("in_proj_b"), hidden_size, num_v_heads, false)?;
+        let in_proj_a = Qwen3_5Linear::new(vb.pp("in_proj_a"), hidden_size, num_v_heads, false)?;
+
         Ok(Self {
             num_v_heads,
             num_k_heads,
@@ -150,8 +254,12 @@ impl Qwen3_5GatedDeltaNet {
             value_dim,
             conv_kernel_size,
             conv1d,
+            cpu_conv1d_weight,
+            cpu_conv1d_bias,
             dt_bias,
+            cpu_dt_bias,
             a_log,
+            cpu_a_log,
             norm,
             out_proj,
             in_proj_qkv,
@@ -160,11 +268,44 @@ impl Qwen3_5GatedDeltaNet {
             in_proj_a,
             conv_state_cache: None,
             recurrent_state_cache: None,
+            device: vb.device().clone(),
         })
     }
 
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let target_dtype = if device.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+        
+        // Reload Conv1d by reconstructing it or updating weights if Candle allows
+        // Since Conv1d doesn't expose public weight mutability easily, we keep the original vb.pp if possible, 
+        // but the most stable way for Layer cycling is custom Conv1d or keeping it small.
+        // For now, we update the tensors we control.
+        self.dt_bias = self.cpu_dt_bias.to_device(device)?.to_dtype(target_dtype)?;
+        self.a_log = self.cpu_a_log.to_device(device)?.to_dtype(target_dtype)?;
+        
+        self.norm.to_device(device)?;
+        self.out_proj.to_device(device)?;
+        self.in_proj_qkv.to_device(device)?;
+        self.in_proj_z.to_device(device)?;
+        self.in_proj_b.to_device(device)?;
+        self.in_proj_a.to_device(device)?;
+        self.device = device.clone();
+        Ok(())
+    }
+
+    pub fn clear(&mut self) {
+        self.dt_bias = Tensor::zeros((1,), self.cpu_dt_bias.dtype(), &Device::Cpu).unwrap();
+        self.a_log = Tensor::zeros((1,), self.cpu_a_log.dtype(), &Device::Cpu).unwrap();
+        self.norm.clear();
+        self.out_proj.clear();
+        self.in_proj_qkv.clear();
+        self.in_proj_z.clear();
+        self.in_proj_b.clear();
+        self.in_proj_a.clear();
+        self.device = Device::Cpu;
+    }
+
     fn torch_causal_conv1d_update(&mut self, xs: &Tensor) -> Result<Tensor> {
-        let conv_state = self.conv_state_cache.as_ref().unwrap();
+        let conv_state = self.conv_state_cache.as_ref().ok_or(anyhow!("conv_state_cache is None"))?;
         let seq_len = xs.dim(2)?;
         let state_len = conv_state.dim(D::Minus1)?;
         let conv_state_new = Tensor::cat(&[conv_state, xs], D::Minus1)?;
@@ -475,10 +616,10 @@ impl Qwen3_5GatedDeltaNet {
 }
 
 pub struct Qwen3_5Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: Qwen3_5Linear,
+    k_proj: Qwen3_5Linear,
+    v_proj: Qwen3_5Linear,
+    o_proj: Qwen3_5Linear,
     q_norm: Qwen3_5RMSNorm,
     k_norm: Qwen3_5RMSNorm,
     num_attention_heads: usize,
@@ -487,6 +628,7 @@ pub struct Qwen3_5Attention {
     head_dim: usize,
     scaling: f64,
     kv_cache: Option<(Tensor, Tensor)>,
+    device: Device,
 }
 
 impl Qwen3_5Attention {
@@ -497,32 +639,15 @@ impl Qwen3_5Attention {
         let num_key_value_heads = config.num_key_value_heads;
         let num_kv_groups = num_attention_heads / num_key_value_heads;
         let scaling = 1f64 / f64::sqrt(head_dim as f64);
-        let q_proj = linear_b(
-            hidden_size,
-            num_attention_heads * head_dim * 2,
-            config.attention_bias,
-            vb.pp("q_proj"),
-        )?;
-        let k_proj = linear_b(
-            hidden_size,
-            num_key_value_heads * head_dim,
-            config.attention_bias,
-            vb.pp("k_proj"),
-        )?;
-        let v_proj = linear_b(
-            hidden_size,
-            num_key_value_heads * head_dim,
-            config.attention_bias,
-            vb.pp("v_proj"),
-        )?;
-        let o_proj = linear_b(
-            num_attention_heads * head_dim,
-            hidden_size,
-            config.attention_bias,
-            vb.pp("o_proj"),
-        )?;
+        
+        let q_proj = Qwen3_5Linear::new(vb.pp("q_proj"), hidden_size, num_attention_heads * head_dim * 2, config.attention_bias)?;
+        let k_proj = Qwen3_5Linear::new(vb.pp("k_proj"), hidden_size, num_key_value_heads * head_dim, config.attention_bias)?;
+        let v_proj = Qwen3_5Linear::new(vb.pp("v_proj"), hidden_size, num_key_value_heads * head_dim, config.attention_bias)?;
+        let o_proj = Qwen3_5Linear::new(vb.pp("o_proj"), num_attention_heads * head_dim, hidden_size, config.attention_bias)?;
+        
         let q_norm = Qwen3_5RMSNorm::new(vb.pp("q_norm"), head_dim, config.rms_norm_eps)?;
         let k_norm = Qwen3_5RMSNorm::new(vb.pp("k_norm"), head_dim, config.rms_norm_eps)?;
+        
         Ok(Self {
             q_proj,
             k_proj,
@@ -536,7 +661,29 @@ impl Qwen3_5Attention {
             head_dim,
             scaling,
             kv_cache: None,
+            device: vb.device().clone(),
         })
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.q_proj.to_device(device)?;
+        self.k_proj.to_device(device)?;
+        self.v_proj.to_device(device)?;
+        self.o_proj.to_device(device)?;
+        self.q_norm.to_device(device)?;
+        self.k_norm.to_device(device)?;
+        self.device = device.clone();
+        Ok(())
+    }
+
+    pub fn clear(&mut self) {
+        self.q_proj.clear();
+        self.k_proj.clear();
+        self.v_proj.clear();
+        self.o_proj.clear();
+        self.q_norm.clear();
+        self.k_norm.clear();
+        self.device = Device::Cpu;
     }
 
     pub fn forward(
@@ -591,7 +738,7 @@ impl Qwen3_5Attention {
             .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?
             .contiguous()?;
         let attn_output = attn_output.mul(&sigmoid(&gate)?)?;
-        let attn_output = attn_output.apply(&self.o_proj)?;
+        let attn_output = self.o_proj.forward(&attn_output)?;
         Ok(attn_output)
     }
 
@@ -604,7 +751,9 @@ pub struct Qwen3_5DecoderLayer {
     layer_type: String,
     linear_attn: Option<Qwen3_5GatedDeltaNet>,
     self_attn: Option<Qwen3_5Attention>,
-    mlp: GateUpDownMLP,
+    mlp_gate_proj: Qwen3_5Linear,
+    mlp_up_proj: Qwen3_5Linear,
+    mlp_down_proj: Qwen3_5Linear,
     input_layernorm: Qwen3_5RMSNorm,
     post_attention_layernorm: Qwen3_5RMSNorm,
 }
@@ -612,6 +761,7 @@ pub struct Qwen3_5DecoderLayer {
 impl Qwen3_5DecoderLayer {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig, layer_idx: usize) -> Result<Self> {
         let hidden_size = config.hidden_size;
+        let intermediate_size = config.intermediate_size;
         let layer_type = config.layer_types[layer_idx].clone();
         let (linear_attn, self_attn) = if layer_type.eq("linear_attention") {
             let linear_attn = Qwen3_5GatedDeltaNet::new(vb.pp("linear_attn"), config)?;
@@ -620,16 +770,12 @@ impl Qwen3_5DecoderLayer {
             let self_attn = Qwen3_5Attention::new(vb.pp("self_attn"), config)?;
             (None, Some(self_attn))
         };
-        let mlp = GateUpDownMLP::new(
-            vb.pp("mlp"),
-            hidden_size,
-            config.intermediate_size,
-            config.hidden_act,
-            false,
-            None,
-            None,
-            None,
-        )?;
+        
+        // Re-implement MLP using Qwen3_5Linear for memory control
+        let mlp_gate_proj = Qwen3_5Linear::new(vb.pp("mlp.gate_proj"), hidden_size, intermediate_size, false)?;
+        let mlp_up_proj = Qwen3_5Linear::new(vb.pp("mlp.up_proj"), hidden_size, intermediate_size, false)?;
+        let mlp_down_proj = Qwen3_5Linear::new(vb.pp("mlp.down_proj"), intermediate_size, hidden_size, false)?;
+
         let input_layernorm =
             Qwen3_5RMSNorm::new(vb.pp("input_layernorm"), hidden_size, config.rms_norm_eps)?;
         let post_attention_layernorm = Qwen3_5RMSNorm::new(
@@ -641,10 +787,33 @@ impl Qwen3_5DecoderLayer {
             layer_type,
             linear_attn,
             self_attn,
-            mlp,
+            mlp_gate_proj,
+            mlp_up_proj,
+            mlp_down_proj,
             input_layernorm,
             post_attention_layernorm,
         })
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        if let Some(ref mut l) = self.linear_attn { l.to_device(device)?; }
+        if let Some(ref mut s) = self.self_attn { s.to_device(device)?; }
+        self.mlp_gate_proj.to_device(device)?;
+        self.mlp_up_proj.to_device(device)?;
+        self.mlp_down_proj.to_device(device)?;
+        self.input_layernorm.to_device(device)?;
+        self.post_attention_layernorm.to_device(device)?;
+        Ok(())
+    }
+
+    pub fn clear(&mut self) {
+        if let Some(ref mut l) = self.linear_attn { l.clear(); }
+        if let Some(ref mut s) = self.self_attn { s.clear(); }
+        self.mlp_gate_proj.clear();
+        self.mlp_up_proj.clear();
+        self.mlp_down_proj.clear();
+        self.input_layernorm.clear();
+        self.post_attention_layernorm.clear();
     }
 
     pub fn forward(
@@ -668,8 +837,14 @@ impl Qwen3_5DecoderLayer {
             }
         }
         let residual = xs.add(&residual)?;
-        xs = self.post_attention_layernorm.forward(&residual)?;
-        xs = self.mlp.forward(&xs)?;
+        
+        // MLP Forward
+        let mut xs = self.post_attention_layernorm.forward(&residual)?;
+        let gate = self.mlp_gate_proj.forward(&xs)?.silu()?;
+        let up = self.mlp_up_proj.forward(&xs)?;
+        xs = gate.broadcast_mul(&up)?;
+        xs = self.mlp_down_proj.forward(&xs)?;
+        
         xs = xs.add(&residual)?;
         Ok(xs)
     }
@@ -684,8 +859,45 @@ impl Qwen3_5DecoderLayer {
     }
 }
 
+pub struct Qwen3_5Embedding {
+    weight: Tensor,
+    cpu_weight: Tensor,
+    device: Device,
+}
+
+impl Qwen3_5Embedding {
+    pub fn new(vb: VarBuilder, vocab_size: usize, hidden_size: usize) -> Result<Self> {
+        let weight = vb.get((vocab_size, hidden_size), "weight")?;
+        let cpu_weight = weight.to_device(&Device::Cpu)?;
+        Ok(Self { weight, cpu_weight, device: vb.device().clone() })
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let target_dtype = if device.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+        self.weight = self.cpu_weight.to_device(device)?.to_dtype(target_dtype)?;
+        self.device = device.clone();
+        Ok(())
+    }
+
+    pub fn clear(&mut self) {
+        self.weight = Tensor::zeros((1,), self.cpu_weight.dtype(), &Device::Cpu).unwrap();
+        self.device = Device::Cpu;
+    }
+
+    pub fn forward(&self, indexes: &Tensor) -> Result<Tensor> {
+        let (b, s) = indexes.dims2()?;
+        let indexes_flat = indexes.flatten_all()?;
+        let res = self.weight.index_select(&indexes_flat, 0)?;
+        Ok(res.reshape((b, s, ()))?)
+    }
+
+    pub fn embeddings(&self) -> &Tensor {
+        &self.weight
+    }
+}
+
 pub struct Qwen3_5TextModel {
-    embed_tokens: Embedding,
+    embed_tokens: Qwen3_5Embedding, // Replaced Embedding with Qwen3_5Embedding
     layers: Vec<Qwen3_5DecoderLayer>,
     norm: Qwen3_5RMSNorm,
     rotary_emb: Qwen3VLTextRotaryEmbedding,
@@ -694,7 +906,7 @@ pub struct Qwen3_5TextModel {
 
 impl Qwen3_5TextModel {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
-        let embed_tokens = embedding(config.vocab_size, config.hidden_size, vb.pp("embed_tokens"))?;
+        let embed_tokens = Qwen3_5Embedding::new(vb.pp("embed_tokens"), config.vocab_size, config.hidden_size)?;
         let mut layers = vec![];
         let vb_layers = vb.pp("layers");
         for i in 0..config.num_hidden_layers {
@@ -715,8 +927,9 @@ impl Qwen3_5TextModel {
         })
     }
 
-    pub fn forward(&mut self, inputs_embeds: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
+    pub fn forward(&mut self, inputs_embeds: &Tensor, position_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
+        let dev = inputs_embeds.device();
 
         let (cos, sin) = self.rotary_emb.forward(
             position_ids,
@@ -724,19 +937,24 @@ impl Qwen3_5TextModel {
             self.mrope_section.clone(),
         )?;
         let mut xs = inputs_embeds.clone();
+        
+        // ... (mask logic) ...
         let attention_mask: Option<Tensor> = {
-            if seq_len <= 1 {
+            if seq_len <= 1 && seqlen_offset == 0 {
                 None
             } else {
                 Some(prepare_causal_attention_mask(
                     b_size,
                     seq_len,
-                    0,
+                    seqlen_offset,
                     inputs_embeds.device(),
                 )?)
             }
         };
-        for layer in self.layers.iter_mut() {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            // [CRITICAL] VRAM Cycle Start: Load weights for this layer only
+            layer.to_device(dev)?;
+
             let layer_mask =
                 if layer.layer_type.ne("linear_attention") || (seq_len != 1 && b_size != 1) {
                     attention_mask.clone()
@@ -744,8 +962,16 @@ impl Qwen3_5TextModel {
                     None
                 };
             xs = layer.forward(&xs, Some(&cos), Some(&sin), layer_mask.as_ref())?;
+
+            // [CRITICAL] VRAM Cycle End: Free weights immediately after computation
+            layer.clear();
         }
+        
+        // Ensure final norm has weights on device
+        self.norm.to_device(dev)?;
         xs = self.norm.forward(&xs)?;
+        self.norm.clear();
+
         Ok(xs)
     }
 
@@ -760,7 +986,7 @@ pub struct Qwen3_5Model {
     config: Qwen3_5Config,
     visual: Option<Qwen3VLVisionModel>,
     language_model: Qwen3_5TextModel,
-    lm_head: Linear,
+    lm_head: Qwen3_5Linear, // Replaced Linear with Qwen3_5Linear
     rope_deltas: Option<Tensor>,
 }
 
@@ -776,15 +1002,14 @@ impl Qwen3_5Model {
         };
 
         let language_model = Qwen3_5TextModel::new(vb_m, &config.text_config)?;
+        
         let lm_head = if config.tie_word_embeddings {
-            Linear::new(language_model.embed_tokens.embeddings().clone(), None)
+            // [OPTIMIZATION] Reuse embedding weights instead of loading from file
+            Qwen3_5Linear::from_weights(language_model.embed_tokens.embeddings().clone(), None)?
         } else {
-            linear_no_bias(
-                config.text_config.hidden_size,
-                config.text_config.vocab_size,
-                vb.pp("lm_head"),
-            )?
+            Qwen3_5Linear::new(vb.pp("lm_head"), config.text_config.hidden_size, config.text_config.vocab_size, false)?
         };
+        
         Ok(Self {
             config,
             visual,
@@ -1062,7 +1287,13 @@ impl Qwen3_5Model {
         video_grid_thw: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
+        let dev = input_ids.device();
+        
+        // [CRITICAL] VRAM Cycle: Embedding
+        self.language_model.embed_tokens.to_device(dev)?;
         let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
+        self.language_model.embed_tokens.clear();
+
         if let (Some(visual), Some(pixel_values), Some(image_grid_thw)) = (&self.visual, pixel_values, image_grid_thw) {
             let (image_embeds, _) = visual.forward(pixel_values, image_grid_thw)?;
             let vision_mask = get_equal_mask(input_ids, self.config.image_token_id)?;
@@ -1097,14 +1328,24 @@ impl Qwen3_5Model {
             video_grid_thw,
             seqlen_offset,
         )?;
-        let outputs = self.language_model.forward(&inputs_embeds, &position_ids)?;
+        let outputs = self.language_model.forward(&inputs_embeds, &position_ids, seqlen_offset)?;
+        
+        // [OPTIMIZATION] Drop large input tensors immediately after language model forward
+        drop(inputs_embeds);
+        drop(position_ids);
+
         let seq_len = outputs.dim(1)?;
         let hidden_state = outputs.narrow(1, seq_len - 1, 1)?;
         let logits = self.lm_head.forward(&hidden_state)?;
+        
+        // [CRITICAL] Drop outputs to free VRAM for logits
+        drop(outputs);
+
         Ok(logits)
     }
 
     pub fn clear_cache(&mut self) {
         self.language_model.clear_cache();
+        self.rope_deltas = None; // Reset rope deltas for next task
     }
 }

@@ -79,23 +79,27 @@ impl Qwen3_5GenerateModel {
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         
-        let mut input_ids = self.tokenizer.text_encode(input.replace_text.clone(), &self.device)?;
-        let mut seq_len = input_ids.dim(1)?;
-        let mut seqlen_offset = 0;
+        let full_input_ids = self.tokenizer.text_encode(input.replace_text.clone(), &self.device)?;
+        let full_seq_len = full_input_ids.dim(1)?;
         
+        let mut seqlen_offset = 0;
         let mut pixel_values = input.pixel_values.as_ref();
         let image_grid_thw = input.image_grid_thw.as_ref();
         let mut pixel_values_video = input.pixel_values_video.as_ref();
         let video_grid_thw = input.video_grid_thw.as_ref();
         
-        let mut generate = Vec::new();
-        let mut gen_text = String::new();
-        let sample_len = mes.max_tokens.unwrap_or(1024);
+        // [OPTIMIZATION] Chunked Prefill: Process long prompt in 512-token steps
+        let chunk_size = 512;
+        let mut last_logits = None;
 
-        for _i in 0..sample_len {
+        while seqlen_offset < full_seq_len {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) { break; }
             }
+
+            let remaining = full_seq_len - seqlen_offset;
+            let current_chunk = remaining.min(chunk_size);
+            let input_ids = full_input_ids.narrow(1, seqlen_offset, current_chunk)?;
 
             let logits = self.qwen3_5.forward(
                 &input_ids,
@@ -105,9 +109,32 @@ impl Qwen3_5GenerateModel {
                 video_grid_thw,
                 seqlen_offset,
             )?;
+            
+            seqlen_offset += current_chunk;
+            last_logits = Some(logits);
 
-            let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-            let next_token = logit_processor.sample(&logits)?;
+            // Vision/Initial inputs only used in first chunk
+            pixel_values = None;
+            pixel_values_video = None;
+            
+            if full_seq_len > chunk_size {
+                println!("[PREFILL] Processed {}/{} tokens...", seqlen_offset, full_seq_len);
+            }
+        }
+
+        let mut logits = last_logits.ok_or(anyhow::anyhow!("No logits generated"))?;
+        let mut generate = Vec::new();
+        let mut gen_text = String::new();
+        let sample_len = mes.max_tokens.unwrap_or(1024);
+
+        for i in 0..sample_len {
+            if let Some(flag) = &cancel_flag {
+                if flag.load(Ordering::Relaxed) { break; }
+            }
+
+            // Sample from the last token's logits
+            let current_logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+            let next_token = logit_processor.sample(&current_logits)?;
             
             if next_token == self.eos_token_id {
                 break;
@@ -117,13 +144,17 @@ impl Qwen3_5GenerateModel {
             let piece = self.tokenizer.token_decode(vec![next_token])?;
             gen_text.push_str(&piece);
 
-            seqlen_offset += seq_len;
-            seq_len = 1;
-            input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
-            
-            // Vision inputs only used in first step (prefill)
-            pixel_values = None;
-            pixel_values_video = None;
+            // Preparation for next token (Decoding step)
+            let input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
+            logits = self.qwen3_5.forward(
+                &input_ids,
+                None,
+                None,
+                None,
+                None,
+                seqlen_offset,
+            )?;
+            seqlen_offset += 1;
         }
 
         self.qwen3_5.clear_cache();
