@@ -105,14 +105,12 @@ pub struct BakeTask {
     pub slot_id: usize, pub task_dir: PathBuf, pub kv_name: Option<String>,
     pub offset: usize, pub layers: Vec<LayerKVDump>, pub is_relay_baking: bool,
     pub block_idx: Option<usize>, pub registry: KVRegistry,
-    pub shared_block: Option<KVBlock>,
 }
 
 pub struct SaveTask {
     pub slot_id: usize, pub path: PathBuf, pub tensors: std::collections::HashMap<String, Tensor>,
     pub is_last: bool, pub block_idx: Option<usize>, pub registry: Option<KVRegistry>,
     pub kv_name: Option<String>,
-    pub shared_block: Option<KVBlock>,
 }
 
 pub enum SlotTask { 
@@ -150,10 +148,11 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
             if let SlotTask::IndexUpdate { kv_name, layer_idx, offset, len, file_name } = task {
                 let index_path = kv_dir.join(&kv_name).join(format!("layer{}.json", layer_idx));
                 
-                // [FIX] Use standard fs for JSON metadata to prevent DirectStorage sync/corruption issues
+                // [DIRECT-IO] Use OS-accelerated read for index metadata
                 let mut index = if index_path.exists() {
-                    if let Ok(data) = fs::read(&index_path) {
-                        serde_json::from_slice::<LayerIndex>(&data)
+                    if let Ok(data) = load_kv_block(&index_path) {
+                        String::from_utf8(data).ok()
+                            .and_then(|s| serde_json::from_str::<LayerIndex>(&s).ok())
                             .unwrap_or(LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] })
                     } else {
                         LayerIndex { layer_idx, total_tokens: 0, blocks: vec![] }
@@ -168,7 +167,8 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
                     index.blocks.sort_by_key(|b| b.offset);
                     index.total_tokens = index.blocks.iter().map(|b| b.len).sum();
                     if let Ok(json) = serde_json::to_string_pretty(&index) {
-                        let _ = fs::write(&index_path, json.as_bytes());
+                        // [DIRECT-IO] Use OS-accelerated write for index metadata
+                        let _ = save_kv_block(&index_path, json.as_bytes());
                     }
                 }
             }
@@ -179,59 +179,13 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
 
 pub struct LoadTask { pub slot_id: usize, pub path: PathBuf, pub layer_idx: usize, pub kv_name: Option<String>, pub shared_block: KVBlock, pub registry: KVRegistry }
 
-// [BACKGROUND-COMPRESSOR] 워커 스레드에서 실행되는 1비트 압축 함수
-fn compress_1bit_worker(t: &Tensor) -> Result<(Tensor, Tensor)> {
-    let device = t.device();
-    let t_cpu = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-    let dims = t_cpu.dims();
-    let last_dim = dims[dims.len() - 1];
-    let row_elements = dims.iter().rev().nth(1).cloned().unwrap_or(1) * last_dim;
-    let total_elements = t_cpu.elem_count();
-    
-    let t_vec = t_cpu.flatten_all()?.to_vec1::<f32>()?;
-    let mut packed = vec![0u8; (total_elements + 7) / 8];
-    let mut scales = Vec::new();
-
-    // 행(Row) 단위로 스케일 계산 및 비트 패킹 수행
-    for chunk in t_vec.chunks(last_dim) {
-        let mut max_abs = 0.0f32;
-        for &v in chunk { if v.abs() > max_abs { max_abs = v.abs(); } }
-        scales.push(max_abs);
-    }
-
-    // [PARALLEL-BIT-PACKING] 비트 연산은 CPU 부하가 크므로 최대한 효율적으로 처리
-    for (i, &v) in t_vec.iter().enumerate() {
-        if v > 0.0 {
-            packed[i / 8] |= 1 << (i % 8);
-        }
-    }
-
-    let scales_len = scales.len();
-    let packed_t = Tensor::from_vec(packed, (total_elements + 7) / 8, &Device::Cpu)?;
-    let scales_t = Tensor::from_vec(scales, (scales_len,), &Device::Cpu)?;
-    
-    Ok((packed_t, scales_t))
-}
-
 pub static BAKE_TX: OnceCell<mpsc::Sender<SlotTask>> = OnceCell::const_new();
 pub static LOAD_TX: OnceCell<mpsc::Sender<SlotTask>> = OnceCell::const_new();
 use tokio::sync::OnceCell;
 
 pub async fn get_worker_channel() -> Result<mpsc::Sender<SlotTask>> { BAKE_TX.get().cloned().ok_or(anyhow!("Bake init error")) }
 pub async fn get_load_worker() -> Result<mpsc::Sender<SlotTask>> { LOAD_TX.get().cloned().ok_or(anyhow!("Load init error")) }
-pub async fn wait_for_global_io() {
-    let mut last_log = std::time::Instant::now();
-    loop {
-        let count = GLOBAL_IO_COUNTER.load(Ordering::SeqCst);
-        if count == 0 { break; }
-        
-        if last_log.elapsed() >= std::time::Duration::from_secs(1) {
-            println!("[SYNC-WAIT] Waiting for background KV backup... Remaining tasks: {}", count);
-            last_log = std::time::Instant::now();
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-}
+pub async fn wait_for_global_io() { while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { tokio::time::sleep(std::time::Duration::from_millis(10)).await; } }
 
 pub fn init_bake_worker() {
     let (btx, brx) = mpsc::channel(64); let (ltx, lrx) = mpsc::channel(64);
@@ -245,51 +199,32 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     while let Some(req) = rx.recv().await {
         match req {
             SlotRequest::Acquire { total_tokens: _total_tokens, tx } => {
-                let max_writes = 128; // [EXPANDED]
-                let mut found = None;
-                let mut retry_count = 0;
+                let max_writes = 64; let mut found = None;
                 while found.is_none() {
                     if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
                         for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
                             if slot.state.load(Ordering::SeqCst) == 0 {
-                                if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { 
-                                    SLOT_MANAGER.update_counters(0, 1); 
-                                    SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); 
-                                    found = Some(i); break; 
-                                }
+                                if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { SLOT_MANAGER.update_counters(0, 1); SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); found = Some(i); break; }
                             }
                         }
                         if found.is_none() {
                             for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
                                 if slot.state.load(Ordering::SeqCst) == 2 {
-                                    if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { 
-                                        SLOT_MANAGER.update_counters(2, 1); 
-                                        SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); 
-                                        found = Some(i); break; 
-                                    }
+                                    if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { SLOT_MANAGER.update_counters(2, 1); SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); found = Some(i); break; }
                                 }
                             }
                         }
                     }
-                    if found.is_none() { 
-                        retry_count += 1;
-                        if retry_count % 100 == 0 { println!("[SLOT-WARN] High congestion. Active writes: {}", SLOT_MANAGER.active_write_count.load(Ordering::SeqCst)); }
-                        tokio::time::sleep(std::time::Duration::from_millis(2)).await; 
-                    }
+                    if found.is_none() { tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
                 }
                 let _ = tx.send(found.unwrap());
             },
             SlotRequest::Release { idx, is_bake } => {
-                let s = &SLOT_MANAGER.slots[idx];
-                let old = s.state.load(Ordering::SeqCst);
-                let new = if is_bake { 2 } else { 0 }; // 2: BakedCache, 0: Free
-                
+                let s = &SLOT_MANAGER.slots[idx]; let old = s.state.load(Ordering::SeqCst);
+                let new = if is_bake { 2 } else { 0 };
                 if s.state.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                     SLOT_MANAGER.update_counters(old, new);
-                    if old == 1 { // 1: Write
-                        SLOT_MANAGER.active_write_count.fetch_sub(1, Ordering::SeqCst);
-                        // println!("[SLOT-RECLAIM] Write Slot {} reclaimed. Active: {}", idx, SLOT_MANAGER.active_write_count.load(Ordering::SeqCst));
-                    }
+                    if old == 1 { SLOT_MANAGER.active_write_count.fetch_sub(1, Ordering::SeqCst); }
                     SLOT_MANAGER.handoff_notifier.notify_waiters();
                 }
             }
@@ -298,26 +233,26 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
 }
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
-    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(1024); 
+    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(100); 
     tokio::spawn(async move {
-        // [SCALABLE-IO] 전역 동시성 제한을 256으로 늘려 여러 레이어가 독립적으로 대역폭 사용 가능하게 함
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(256)); 
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(48)); 
         while let Some(task) = io_rx.recv().await {
             let sem = semaphore.clone();
-            let (tp, ts, reg, b_idx, sid, is_last, kv_n, shared_block) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone(), task.shared_block.clone());
+            let (tp, ts, reg, b_idx, sid, is_last, kv_n) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone());
             tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
                 struct IoGuard; impl Drop for IoGuard { fn drop(&mut self) { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } }
                 let _guard = IoGuard;
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
-                
-                if let Ok(_) = candle_core::safetensors::save(&ts, &tp) {
-                    drop(ts);
+                if let Ok(data) = safetensors::serialize(&ts, &None) {
+                    drop(ts); let _ = save_kv_block(&tp, &data);
                     
-                    // [CENTRALIZED-INDEX-UPDATE] Restore index update logic
+                    // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
                     if let Some(kv_name) = kv_n {
                         if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
                             if let Ok(l_idx) = l_str.parse::<usize>() {
+                                // 오프셋 추출 (파일명 b{offset}_l{idx}_k_anchors 에서 추출하거나 SaveTask에 추가 가능)
+                                // 현재는 tp.parent() 폴더명이 b{offset} 이므로 이를 활용
                                 let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
                                 let offset = offset_str.parse::<usize>().unwrap_or(0);
                                 
@@ -332,7 +267,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         }
                     }
 
-                    // 1. Registry Update (SSD 위치 등록)
                     if let (Some(r), Some(idx)) = (reg, b_idx) {
                         if let Ok(mut entries) = r.entries.write() {
                             if idx < entries.len() {
@@ -341,12 +275,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     if let Ok(l_idx) = l_str.parse::<usize>() { 
                                         if l_idx < 28 { 
                                             e.location[l_idx] = KVLocation::SSD; 
-                                            // [FIX] 절대 경로로 저장하여 로드 시 혼선 방지
-                                            if let Ok(abs_path) = fs::canonicalize(tp.parent().unwrap()) {
-                                                e.ssd_path = Some(abs_path);
-                                            } else {
-                                                e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                                            }
+                                            e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                                            // [MEMORY-RELEASE] SSD 저장 완료 즉시 RAM 메모리 해제
                                             if let Ok(mut cache) = e.bitkv_cache.write() {
                                                 if l_idx < cache.len() { cache[l_idx] = None; }
                                             }
@@ -356,21 +286,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             }
                         }
                     }
-
-                    // 2. Immediate Block Memory Release
-                    if let Some(block) = shared_block {
-                        if let Ok(mut inner) = block.inner.write() {
-                            inner.k_cache = None;
-                            inner.v_cache = None;
-                        }
-                    }
                 }
-                
-                // 3. Slot (Layer Batch) Completion Check
                 let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
-                if rem == 1 || is_last { 
-                    SLOT_MANAGER.mark_ready(sid).await; 
-                }
+                if rem == 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; }
             });
         }
     });
@@ -380,7 +298,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             match task {
                 SlotTask::Bake(bake) => {
                     let io_tx_inner = io_tx.clone();
-                    let (sid, off, _is_relay, block_idx, registry, kv_name, shared_block) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone(), bake.shared_block.clone());
+                    let (sid, off, _is_relay, block_idx, registry, kv_name) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone());
                     let loop_count = bake.layers.len();
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
                     
@@ -391,44 +309,41 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let registry_inner = registry.clone();
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
-                        let shared_block_inner = shared_block.clone();
 
-                        // [WORKER-COMPRESSION] 워커 내에서 비동기 압축 수행
+                        // [BACK-COMPRESSION] 압축 및 직렬화 작업 자체를 백그라운드로 완전히 분리
                         tokio::spawn(async move {
-                            // [RAII-GUARD] 어떤 경우에도 카운트를 줄이고 슬롯을 관리하는 가드
-                            struct SlotGuard { sid: usize, is_last: bool }
-                            impl Drop for SlotGuard {
-                                fn drop(&mut self) {
-                                    let sid = self.sid;
-                                    let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
-                                    if rem <= 1 || self.is_last {
-                                        let _ = tauri::async_runtime::spawn(async move {
-                                            SLOT_MANAGER.mark_ready(sid).await;
-                                        });
-                                    }
-                                }
+                            // [FIX] Convert raw tensors to BF16 (or F32 fallback)
+                            // [CRITICAL] 텐서가 GPU에 있는 경우, to_device는 해당 스레드의 컨텍스트를 필요로 함
+                            if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
+                                // 워커 스레드에서 안전하게 CPU로 이동
+                                // [STABILITY] to_device 호출 시 장치 컨텍스트가 자동으로 보장되지 않을 수 있으므로
+                                // candle-core의 Device 스코프 내에서 실행되도록 유도 (필요시)
+                                let k_cpu = rk.to_device(&Device::Cpu).unwrap_or(rk);
+                                let v_cpu = rv.to_device(&Device::Cpu).unwrap_or(rv);
+                                
+                                src.k_data = k_cpu.to_dtype(DType::BF16).unwrap_or(k_cpu);
+                                src.v_data = v_cpu.to_dtype(DType::BF16).unwrap_or(v_cpu);
                             }
-                            let _guard = SlotGuard { sid, is_last: false };
 
                             let mut map = std::collections::HashMap::new();
                             let prefix = format!("b{}_l{}_", off, act_l);
-
-                            // [DIRECT-SAVE] BF16으로 통일하여 저장 (파일 크기 1MB로 유지)
-                            if let (Some(rk), Some(rv)) = (src.raw_k, src.raw_v) {
-                                let rk_bf16 = rk.to_device(&Device::Cpu).unwrap_or(rk).to_dtype(DType::BF16).unwrap();
-                                let rv_bf16 = rv.to_device(&Device::Cpu).unwrap_or(rv).to_dtype(DType::BF16).unwrap();
-                                
-                                map.insert(format!("{}k_raw", prefix), rk_bf16);
-                                map.insert(format!("{}v_raw", prefix), rv_bf16);
-                            } else {
-                                // Fallback for pre-compressed or empty data
-                                map.insert(format!("{}k_data", prefix), src.k_data);
-                                map.insert(format!("{}v_data", prefix), src.v_data);
-                            }
+                            map.insert(format!("{}k_data", prefix), src.k_data.clone());
+                            map.insert(format!("{}v_data", prefix), src.v_data.clone());
+                            map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
                             
                             let file_path = task_dir.join(format!("l{}.st", act_l));
-                            // [CRITICAL] Redundant fetch_add removed here! (Handled by quantized_model.rs)
-                            let _ = io_tx_nested.send(SaveTask { slot_id: sid, path: file_path, tensors: map, is_last: false, block_idx, registry: Some(registry_inner), kv_name: kv_name_inner, shared_block: shared_block_inner }).await;
+                            
+                            // [FIX] Send to IO worker after confirming all tensors are on CPU
+                            GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
+                            let _ = io_tx_nested.send(SaveTask { 
+                                slot_id: sid, 
+                                path: file_path.clone(), 
+                                tensors: map, 
+                                is_last: false, 
+                                block_idx, 
+                                registry: Some(registry_inner), 
+                                kv_name: kv_name_inner 
+                            }).await;
                         });
                     }
                 },
@@ -445,35 +360,32 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             let file_path = block_root.join(format!("l{}.st", l_idx));
                             if file_path.is_file() {
                                 if let Ok(content) = load_kv_block(&file_path) {
-                                    // [FIX] Use candle_core::safetensors::load_buffer with device
-                                    if let Ok(st_map) = candle_core::safetensors::load_buffer(&content, &Device::Cpu) {
+                                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
                                         let prefix = format!("b{}_l{}_", b_idx_off, l_idx);
-                                        let get_t = |s: &str| st_map.get(&format!("{}{}", prefix, s)).cloned();
+                                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).ok();
                                         
                                         // [MODIFIED] BF16 Direct Load
-                                        if let (Some(kd_t), Some(vd_t), Some(sh_t)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
-                                            let res: Result<()> = (|| {
-                                                let sh_u32: Vec<u32> = sh_t.to_dtype(DType::U32)?.flatten_all()?.to_vec1()?;
-                                                let file_shape: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
-                                                
-                                                let meta = BitKVMetadata {
-                                                    k_data: kd_t,
-                                                    v_data: vd_t,
-                                                    original_shape: file_shape,
-                                                };
-                                                if let Ok(mut r) = reg.entries.write() {
-                                                    if b_idx < r.len() {
-                                                        {
-                                                            let mut cache = r[b_idx].bitkv_cache.write().unwrap();
-                                                            cache[l_idx] = Some(meta);
-                                                        }
-                                                        r[b_idx].location[l_idx] = KVLocation::RAM;
+                                        if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                            let file_shape: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+
+                                            let dev = &Device::Cpu;
+                                            let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &file_shape, dev).unwrap();
+                                            let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &file_shape, dev).unwrap();
+
+                                            let meta = BitKVMetadata {
+                                                k_data: kd_t,
+                                                v_data: vd_t,
+                                                original_shape: file_shape,
+                                            };
+                                            if let Ok(mut r) = reg.entries.write() {
+                                                if b_idx < r.len() {
+                                                    {
+                                                        let mut cache = r[b_idx].bitkv_cache.write().unwrap();
+                                                        cache[l_idx] = Some(meta);
                                                     }
+                                                    r[b_idx].location[l_idx] = KVLocation::RAM;
                                                 }
-                                                Ok(())
-                                            })();
-                                            if let Err(e) = res {
-                                                println!("[LOAD-ERROR] Failed to process loaded KV: {:?}", e);
                                             }
                                         }
                                     }
@@ -579,12 +491,11 @@ impl Qwen3VLGenerateModel {
         self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
         if let Some(s_id) = &session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(s_id);
-            // [STABILITY] Create full inference path to ensure worker doesn't fail
-            let inf_path = path.join("inference").join("text");
-            if !inf_path.exists() { fs::create_dir_all(&inf_path)?; }
-            
+            if !path.exists() { fs::create_dir_all(&path)?; }
             fs::write(path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
-            println!("[PREFILL-SAVE] Tokens persisted. Inference directory ready at {:?}", inf_path);
+            let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
+            wait_for_global_io().await; // [SYNC] Ensure SSD write is complete
+            println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk.");
         }
         Ok(total_toks)
     }
@@ -681,14 +592,11 @@ impl Qwen3VLGenerateModel {
             
             let total_tokens_after_prefill = offset + input_ids.dim(1)?;
         
+        wait_for_global_io().await; // [SYNC] Ensure disk is ready before inference
         let mut logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         
-        // [CRITICAL-SYNC] Prefill 연산 직후 발생한 백그라운드 IO(대피 및 저장)가 완료될 때까지 반드시 대기
-        println!("[GEN-SYNC] Prefill computation done. Waiting for background KV backup to finish...");
-        wait_for_global_io().await; 
-        
         // [DEBUG-SAMPLING] 첫 번째 토큰 샘플링 전 로그
-        println!("[DEBUG-GEN] Prefill & Backup Complete. Sampling first token...");
+        println!("[DEBUG-GEN] Prefill Complete. EOS IDs: {}, {}. Sampling first token...", self.eos_token_id1, self.eos_token_id2);
 
         let mut gen_ids = vec![];
 
@@ -764,8 +672,8 @@ impl Qwen3VLGenerateModel {
             logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;
         }
         if let Some(s_id) = &session_id {
-            // [REMOVED] Redundant force_flush_all_active_blocks
-            println!("[GEN-SAVE] Generation complete. Remaining KV blocks flushing in background.");
+            let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
+            println!("[GEN-SAVE] All active KV blocks flushed to disk.");
         }
         Ok(gen_text)
     }

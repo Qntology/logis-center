@@ -1,0 +1,253 @@
+            }
+        }
+
+        let max_new_tokens = mes.max_tokens.unwrap_or(2048) as usize;
+        let mut pixel_values = input.pixel_values.take();
+        let image_grid_thw = input.image_grid_thw.take();
+
+        let task_dir_base = if let Some(sid) = &session_id {
+            crate::utils::paths::get_task_specific_dir(None, sid)
+        } else {
+            std::path::PathBuf::new()
+        };
+
+        let mut i: usize = 0;
+        let mut is_reasoning = false;
+
+        while i < max_new_tokens {
+            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+            
+            // --- [ULTRA-SPEED: RECURSIVE SPECULATIVE REASONING] ---
+            let mut speculative_success = false;
+            let lookahead = if is_reasoning { 8 } else { 4 }; 
+
+            let mut final_accepted_ids = vec![];
+            let mut draft_ids = vec![];
+            let start_logical_offset = seqlen_offset;
+
+            // 1. Drafting Phase
+            if let Some(drafter_mutex) = &self.drafter {
+                if let Ok(mut drafter_guard) = drafter_mutex.try_lock() {
+                    let drafter_opt: &mut Option<Qwen3VLGenerateModel> = &mut *drafter_guard;
+                    if let Some(drafter) = drafter_opt.as_mut() {
+                        if drafter.get_kv_len() == 0 && seqlen_offset > 0 {
+                            if let Some(sid) = &session_id {
+                                let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                                if path.exists() { let _ = drafter.load_kv_from_disk(&path, kv_name.as_deref()); }
+                            }
+                        }
+
+                        let mut current_draft_context = all_ids.clone();
+                        for _ in 0..lookahead {
+                            let d_input = Tensor::new(vec![*current_draft_context.last().unwrap()], &self.text_device)?.unsqueeze(0)?;
+                            let d_curr_len = drafter.get_kv_len();
+                            let d_chunk_pos = Tensor::arange(d_curr_len as u32, (d_curr_len + 1) as u32, &self.text_device)?.unsqueeze(0)?;
+                            
+                            if let Ok(d_logits) = drafter.qwen3_vl.forward(&d_input, None, None, None, None, Some(&d_chunk_pos), d_curr_len, total_tokens, None) {
+                                let mut d_logits_f32 = d_logits.squeeze(0)?.i(0)?.to_dtype(DType::F32)?;
+                                let p_context = if current_draft_context.len() > 512 { &current_draft_context[current_draft_context.len()-512..] } else { &current_draft_context[..] };
+                                d_logits_f32 = apply_repeat_penalty(&d_logits_f32, 1.2, p_context)?;
+                                
+                                let d_next_id = logit_processor.sample(&d_logits_f32)?;
+                                draft_ids.push(d_next_id);
+                                current_draft_context.push(d_next_id);
+                                
+                                let dec = self.tokenizer.token_decode(vec![d_next_id]).unwrap_or_default();
+                                if dec.contains("</thought>") { break; }
+                                if d_next_id == self.eos_token_id1 || d_next_id == self.eos_token_id2 { break; }
+                            } else { break; }
+                        }
+                    }
+                }
+            }
+
+            // 2. Verification Phase
+            if !draft_ids.is_empty() {
+                let physical_start = self.get_kv_len();
+                let verify_start_offset = seqlen_offset.saturating_sub(1);
+                
+                let mut full_v_input = vec![*all_ids.last().unwrap()];
+                full_v_input.extend(&draft_ids);
+                
+                let v_input_tensor = Tensor::from_vec(full_v_input, (1, 1 + draft_ids.len()), &self.text_device)?;
+                let v_chunk_pos = Tensor::arange(verify_start_offset as u32, (verify_start_offset + 1 + draft_ids.len()) as u32, &self.text_device)?.unsqueeze(0)?;
+                
+                let _ = self.truncate_kv_cache(physical_start.saturating_sub(1));
+                if let Ok(v_logits) = self.qwen3_vl.forward(&v_input_tensor, None, None, None, None, Some(&v_chunk_pos), verify_start_offset, total_tokens, session_id.clone()) {
+                    let v_logits_sq = v_logits.squeeze(0)?;
+                    let mut rejected = false;
+                    
+                    for (idx, &d_id) in draft_ids.iter().enumerate() {
+                        let v_logit = v_logits_sq.i(idx)?.to_dtype(DType::F32)?;
+                        let v_id = logit_processor.sample(&v_logit)?;
+
+                        if d_id == v_id && !rejected {
+                            final_accepted_ids.push(d_id);
+                        } else {
+                            if !rejected {
+                                final_accepted_ids.push(v_id); 
+                                rejected = true;
+                            }
+                        }
+                    }
+                    
+                    if !rejected {
+                        let last_l = v_logits_sq.i(draft_ids.len())?.to_dtype(DType::F32)?;
+                        let last_id = logit_processor.sample(&last_l)?;
+                        final_accepted_ids.push(last_id);
+                    }
+
+                    let current_physical_len = self.get_kv_len();
+                    let final_physical_len = current_physical_len.saturating_sub(draft_ids.len() + 1).saturating_add(final_accepted_ids.len());
+                    
+                    self.truncate_kv_cache(final_physical_len)?;
+                    if let Some(dm) = &self.drafter {
+                        if let Ok(mut dg) = dm.try_lock() {
+                            if let Some(d) = dg.as_mut() { let _ = d.truncate_kv_cache(final_physical_len); }
+                        }
+                    }
+
+                    for &id in &final_accepted_ids {
+                        all_ids.push(id);
+                        let dec = self.tokenizer.token_decode(vec![id]).unwrap_or_default();
+                        if dec.contains("<thought>") { is_reasoning = true; }
+                        if dec.contains("</thought>") { is_reasoning = false; }
+                        generated_text.push_str(&dec);
+                    }
+
+                    if final_accepted_ids.len() > 1 { println!("[SPEC] Success! Accepted {} tokens.", final_accepted_ids.len()); }
+                    
+                    i += final_accepted_ids.len();
+                    seqlen_offset = start_logical_offset + final_accepted_ids.len();
+                    speculative_success = true;
+                }
+            }
+
+            if !speculative_success {
+                let input_ids = Tensor::new(vec![*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)?;
+                let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + 1) as u32, &self.text_device)?.unsqueeze(0)?;
+                let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
+                
+                let v_logits_sq = logits.squeeze(0)?;
+                let v_logits_f32 = v_logits_sq.i(0)?.to_dtype(DType::F32)?;
+                
+                let p_context = if all_ids.len() > 512 { &all_ids[all_ids.len()-512..] } else { &all_ids[..] };
+                let v_logits_f32 = apply_repeat_penalty(&v_logits_f32, 1.2, p_context)?;
+                let next_id = logit_processor.sample(&v_logits_f32)?;
+                
+                if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
+                all_ids.push(next_id);
+                
+                let dec = self.tokenizer.token_decode(vec![next_id]).unwrap_or_default();
+                if dec.contains("<thought>") { is_reasoning = true; }
+                if dec.contains("</thought>") { is_reasoning = false; }
+                generated_text.push_str(&dec);
+                
+                i += 1;
+                seqlen_offset += 1;
+            }
+
+            if seqlen_offset > 0 && seqlen_offset % 128 == 0 && !task_dir_base.as_os_str().is_empty() {
+                if !task_dir_base.exists() { let _ = std::fs::create_dir_all(&task_dir_base); }
+                let _ = self.save_kv_to_disk(&task_dir_base, kv_name.as_deref(), seqlen_offset);
+                
+                let current_kv_len = self.get_kv_len();
+                if current_kv_len > 4096 {
+                    self.truncate_prefix(current_kv_len - 4096)?;
+                    if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+                    #[cfg(target_os = "windows")]
+                    unsafe {
+                        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                        use windows_sys::Win32::System::Memory::*;
+                        let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                    }
+                }
+
+                if let Some(sid) = &session_id {
+                    let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                    let progress = serde_json::json!({ "text": generated_text, "ids": all_ids });
+                    let _ = std::fs::write(path.join("generation_progress.json"), progress.to_string());
+                }
+            }
+            pixel_values = None;
+        }
+        if let Some(sid) = &session_id { let _ = std::fs::remove_file(crate::utils::paths::get_kv_dir(None).join(sid).join("generation_progress.json")); }
+        Ok(generated_text)
+    }
+
+    pub fn get_kv_len(&self) -> usize {
+        match &self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.language_model.get_kv_len(),
+            ModelVariant::QuantizedText(m) => m.language_model.get_kv_len(),
+            _ => 0,
+        }
+    }
+
+    pub fn get_current_kv(&self) -> (Vec<Tensor>, Vec<Tensor>) {
+        let mut ks = vec![]; let mut vs = vec![];
+        match &self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => { for l in &m.language_model.layers { if let Some((k, v)) = &l.self_attn.kv_cache { ks.push(k.clone()); vs.push(v.clone()); } } },
+            ModelVariant::QuantizedText(m) => { for l in &m.language_model.layers { if let Some((k, v)) = &l.self_attn.kv_cache { ks.push(k.clone()); vs.push(v.clone()); } } },
+            _ => {} 
+        }
+        (ks, vs)
+    }
+
+    pub fn inject_kv_bitkv(&mut self, ka: &[Tensor], kp: &[Tensor], ks: &[Tensor], va: &[Tensor], vp: &[Tensor], vs: &[Tensor], os: &[usize]) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.language_model.inject_live_kv_bitkv(ka, kp, ks, va, vp, vs, os),
+            ModelVariant::QuantizedText(m) => m.language_model.inject_live_kv_bitkv(ka, kp, ks, va, vp, vs, os),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn save_kv_to_disk(&mut self, path: &Path, kv_name: Option<&str>, offset: usize) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.save_kv_cache(path, false, offset, kv_name),
+            ModelVariant::QuantizedText(m) => m.save_kv_cache(path, false, offset, kv_name),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.truncate_kv_cache(len),
+            ModelVariant::QuantizedText(m) => m.truncate_kv_cache(len),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn truncate_prefix(&mut self, len: usize) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.truncate_prefix(len),
+            ModelVariant::QuantizedText(m) => m.truncate_prefix(len),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn load_kv_from_disk(&mut self, path: &Path, kv_name: Option<&str>) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, 0, 128, kv_name),
+            ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, 0, 128, kv_name),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn to_device(&mut self, d: &Device) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.to_device(d)?,
+            ModelVariant::QuantizedText(m) => m.to_device(d)?,
+            _ => {},
+        }
+        self.text_device = d.clone(); self.vision_device = d.clone();
+        Ok(())
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.clear_kv_cache(),
+            ModelVariant::QuantizedText(m) => m.clear_kv_cache(),
+            _ => {},
+        }
+    }
+}
