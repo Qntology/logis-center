@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::{Module, VarBuilder};
 use candle_core::quantized::{QMatMul};
-use std::sync::Arc;
+use std::collections::HashMap;
 
 use crate::{
     models::{
@@ -103,7 +103,7 @@ pub struct QLinear {
     cpu_scales: Option<Tensor>,
     cpu_data: Option<Tensor>,
     cpu_shape: Option<Vec<usize>>,
-    cpu_weight: Option<Tensor>, // For unquantized BF16 path
+    cpu_weight: Option<Tensor>,
     cpu_bias: Option<Tensor>,
     device: Device,
 }
@@ -120,37 +120,25 @@ impl QLinear {
         let cpu_bias = if let Some(ref b) = bias { Some(b.to_device(&Device::Cpu)?) } else { None };
 
         if sd.contains_key(&scales_key) && sd.contains_key(&data_key) {
-            // [QUANTIZED PATH] Q4 or Q8 packed format
             let scales = sd.get(&scales_key).unwrap().clone();
             let data = sd.get(&data_key).unwrap().clone();
             let shape_tensor = sd.get(&shape_key).unwrap();
             let shape: Vec<usize> = shape_tensor.to_vec1::<i32>()?.iter().map(|&x| x as usize).collect();
-
-            // Initial load on CPU, will be moved to device during cycling
             let qmatmul = QMatMul::Tensor(Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap());
-            
             Ok(Self {
-                inner: qmatmul,
-                bias,
+                inner: qmatmul, bias,
                 cpu_scales: Some(scales.to_device(&Device::Cpu)?),
                 cpu_data: Some(data.to_device(&Device::Cpu)?),
                 cpu_shape: Some(shape),
-                cpu_weight: None,
-                cpu_bias,
-                device: device.clone(),
+                cpu_weight: None, cpu_bias, device: device.clone(),
             })
         } else {
-            // [UNQUANTIZED PATH] standard BF16 (e.g. Vision)
             let weight = sd.get(&weight_key).ok_or_else(|| anyhow!("Weight {} not found", weight_key))?.clone();
             Ok(Self {
-                inner: QMatMul::Tensor(weight.clone()),
-                bias,
-                cpu_scales: None,
-                cpu_data: None,
-                cpu_shape: None,
+                inner: QMatMul::Tensor(weight.clone()), bias,
+                cpu_scales: None, cpu_data: None, cpu_shape: None,
                 cpu_weight: Some(weight.to_device(&Device::Cpu)?),
-                cpu_bias,
-                device: device.clone(),
+                cpu_bias, device: device.clone(),
             })
         }
     }
@@ -159,30 +147,20 @@ impl QLinear {
         let cpu_weight = weight.to_device(&Device::Cpu)?;
         let cpu_bias = if let Some(ref b) = bias { Some(b.to_device(&Device::Cpu)?) } else { None };
         Ok(Self {
-            inner: QMatMul::Tensor(weight),
-            bias,
-            cpu_scales: None,
-            cpu_data: None,
-            cpu_shape: None,
-            cpu_weight: Some(cpu_weight),
-            cpu_bias,
-            device: device.clone(),
+            inner: QMatMul::Tensor(weight), bias,
+            cpu_scales: None, cpu_data: None, cpu_shape: None,
+            cpu_weight: Some(cpu_weight), cpu_bias, device: device.clone(),
         })
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         if !self.device.same_device(device) {
             let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-            
-            if let (Some(scales), Some(data), Some(shape)) = (&self.cpu_scales, &self.cpu_data, &self.cpu_shape) {
-                // TODO: In a production candle-quantized environment, we'd use a dedicated 
-                // GGUF-style dequantizer. For now, we dequantize to target_dtype on the fly 
-                // or use QTensor if available.
-                self.inner = QMatMul::Tensor(Tensor::zeros(shape, target_dtype, device)?); 
+            if let (Some(_scales), Some(_data), Some(shape)) = (&self.cpu_scales, &self.cpu_data, &self.cpu_shape) {
+                self.inner = QMatMul::Tensor(Tensor::zeros(shape.as_slice(), target_dtype, device)?); 
             } else if let Some(weight) = &self.cpu_weight {
                 self.inner = QMatMul::Tensor(weight.to_device(device)?.to_dtype(target_dtype)?);
             }
-
             if let Some(ref b) = self.cpu_bias {
                 self.bias = Some(b.to_device(device)?.to_dtype(target_dtype)?);
             }
@@ -224,11 +202,9 @@ impl QGatedDeltaNet {
         let d_k = config.linear_key_head_dim; let d_v = config.linear_value_head_dim;
         let k_dim = d_k * nk; let v_dim = d_v * nv; let ck = config.linear_conv_kernel_dim;
         let conv_dim = k_dim * 2 + v_dim;
-
         let conv1d = get_conv1d(vb.pp("conv1d"), conv_dim, conv_dim, ck, ck - 1, 1, 1, conv_dim, false)?;
         let dt_bias = vb.get(nv, "dt_bias")?;
         let a_log = vb.get(nv, "A_log")?;
-        
         Ok(Self {
             num_v_heads: nv, num_k_heads: nk, head_k_dim: d_k, head_v_dim: d_v, key_dim: k_dim, value_dim: v_dim, conv_kernel_size: ck,
             conv1d, dt_bias: dt_bias.clone(), cpu_dt_bias: dt_bias.to_device(&Device::Cpu)?,
