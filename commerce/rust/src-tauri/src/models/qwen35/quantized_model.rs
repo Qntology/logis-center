@@ -49,14 +49,11 @@ impl QuantizedRegistry {
     }
     
     pub fn get_q_tensor(&self, full_name: &str, suffix: &str) -> Result<Tensor> {
-        // Try precise names found in available_tensors.txt
-        let names = [
-            format!("{}.{}", full_name, suffix),
-            full_name.to_string(),
-        ];
-        for n in &names {
-            if let Ok(t) = self.get_tensor(n) { return Ok(t); }
-        }
+        let n1 = format!("{}.{}", full_name, suffix);
+        let n2 = format!("{}.weight.{}", full_name, suffix);
+        if let Ok(t) = self.get_tensor(&n1) { return Ok(t); }
+        if let Ok(t) = self.get_tensor(&n2) { return Ok(t); }
+        if suffix == "weight" { if let Ok(t) = self.get_tensor(full_name) { return Ok(t); } }
         anyhow::bail!("Strict find FAILED: {} ({})", full_name, suffix)
     }
 }
@@ -73,10 +70,21 @@ impl QRmsNorm {
         let dev = x.device();
         let w = if let Some(pw) = &self.persistent_weight { pw.clone() } 
                 else { reg.get_q_tensor(&self.full_name, "weight")?.to_device(dev)?.to_dtype(DType::F16)? };
+        let (bs, sl, last_dim) = x.dims3()?;
         let x_f32 = x.to_dtype(DType::F32)?;
-        let var = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
-        let norm = x_f32.broadcast_div(&(var + self.eps)?.sqrt()?)?.to_dtype(DType::F16)?;
-        Ok(norm.broadcast_mul(&w)?)
+        let w_size = w.elem_count();
+        if w_size == last_dim {
+            let var = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
+            let norm = x_f32.broadcast_div(&(var + self.eps)?.sqrt()?)?.to_dtype(DType::F16)?;
+            Ok(norm.broadcast_mul(&w)?)
+        } else {
+            let num_heads = last_dim / w_size;
+            let x_reshaped = x_f32.reshape((bs, sl, num_heads, w_size))?;
+            let var = x_reshaped.sqr()?.mean_keepdim(D::Minus1)?;
+            let norm = x_reshaped.broadcast_div(&(var + self.eps)?.sqrt()?)?.to_dtype(DType::F16)?;
+            let out = norm.broadcast_mul(&w.reshape((1, 1, 1, w_size))?)?;
+            Ok(out.reshape((bs, sl, last_dim))?)
+        }
     }
 }
 
@@ -86,7 +94,6 @@ impl QLinear {
     pub fn clear_vram(&mut self) { self.persistent_weight = None; self.persistent_bias = None; }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         let name = &self.full_name;
-        // Check for quantization first
         if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "q_scales"), reg.get_q_tensor(name, "q_data"), reg.get_q_tensor(name, "q_shape")) {
             let s = s_t.to_device(dev)?.to_dtype(DType::F16)?; let d = d_t.to_device(dev)?.to_dtype(DType::F16)?;
             let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
@@ -125,28 +132,36 @@ fn join_name(p: &str, n: &str) -> String {
     else { format!("{}.{}", p, n) }
 }
 
-pub struct QGatedDeltaNet { in_proj: QLinear, out_proj: QLinear, norm: QRmsNorm, pub h: usize, pub delta_state: Option<Tensor> }
+pub struct QGatedDeltaNet { in_proj_qkv: Option<QLinear>, in_proj_a: Option<QLinear>, in_proj_b: Option<QLinear>, in_proj_z: Option<QLinear>, out_proj: QLinear, norm: QRmsNorm, pub h: usize, pub delta_state: Option<Tensor> }
 impl QGatedDeltaNet {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let p = vb.prefix();
-        Ok(Self { in_proj: QLinear::new(&join_name(&p, "in_proj_qkv"))?, out_proj: QLinear::new(&join_name(&p, "out_proj"))?, norm: QRmsNorm::new(&join_name(&p, "norm"), config.rms_norm_eps)?, h: config.hidden_size, delta_state: None })
+        let in_proj_qkv = if vb.contains_tensor("in_proj_qkv.weight") { Some(QLinear::new(&join_name(&p, "in_proj_qkv"))?) } else { None };
+        let (in_proj_a, in_proj_b, in_proj_z) = if in_proj_qkv.is_none() {
+            (Some(QLinear::new(&join_name(&p, "in_proj_a"))?), Some(QLinear::new(&join_name(&p, "in_proj_b"))?), Some(QLinear::new(&join_name(&p, "in_proj_z"))?))
+        } else { (None, None, None) };
+        Ok(Self { in_proj_qkv, in_proj_a, in_proj_b, in_proj_z, out_proj: QLinear::new(&join_name(&p, "out_proj"))?, norm: QRmsNorm::new(&join_name(&p, "norm"), config.rms_norm_eps)?, h: config.hidden_size, delta_state: None })
     }
-    pub fn clear_vram(&mut self) { self.in_proj.clear_vram(); self.out_proj.clear_vram(); self.norm.clear_vram(); }
-    pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
-        self.in_proj.load_to_vram(reg, dev)?; self.out_proj.load_to_vram(reg, dev)?; self.norm.load_to_vram(reg, dev)?; Ok(())
-    }
+    pub fn clear_vram(&mut self) { if let Some(ref mut l) = self.in_proj_qkv { l.clear_vram(); } if let Some(ref mut l) = self.in_proj_a { l.clear_vram(); } if let Some(ref mut l) = self.in_proj_b { l.clear_vram(); } if let Some(ref mut l) = self.in_proj_z { l.clear_vram(); } self.out_proj.clear_vram(); self.norm.clear_vram(); }
+    pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { if let Some(ref mut l) = self.in_proj_qkv { l.load_to_vram(reg, dev)?; } if let Some(ref mut l) = self.in_proj_a { l.load_to_vram(reg, dev)?; } if let Some(ref mut l) = self.in_proj_b { l.load_to_vram(reg, dev)?; } if let Some(ref mut l) = self.in_proj_z { l.load_to_vram(reg, dev)?; } self.out_proj.load_to_vram(reg, dev)?; self.norm.load_to_vram(reg, dev)?; Ok(()) }
     pub fn forward(&mut self, x: &Tensor, _mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let (bs, sl, _) = x.dims3()?; let h = self.h;
-        let projected = self.in_proj.forward(x, reg)?;
-        let q = projected.narrow(D::Minus1, 0, h)?; let k = projected.narrow(D::Minus1, h, h)?; let v = projected.narrow(D::Minus1, h*2, h)?; let z = projected.narrow(D::Minus1, h*3, h)?;
-        let mut current_state = match self.delta_state.take() { Some(st) => st.to_device(x.device())?, None => Tensor::zeros((bs, h, h), DType::F16, x.device())? };
+        let (q, k, v, z) = if let Some(ref l) = self.in_proj_qkv {
+            let projected = l.forward(x, reg)?;
+            (projected.narrow(D::Minus1, 0, h)?, projected.narrow(D::Minus1, h, h)?, projected.narrow(D::Minus1, h*2, h)?, projected.narrow(D::Minus1, h*3, h)?)
+        } else {
+            (self.in_proj_a.as_ref().unwrap().forward(x, reg)?, self.in_proj_b.as_ref().unwrap().forward(x, reg)?, self.in_proj_b.as_ref().unwrap().forward(x, reg)?, self.in_proj_z.as_ref().unwrap().forward(x, reg)?)
+        };
+        let mut current_state = match self.delta_state.take() {
+            Some(st) => if st.elem_count() == h*h { st.reshape((bs, h, h))?.to_device(x.device())? } else { Tensor::zeros((bs, h, h), DType::F16, x.device())? },
+            None => Tensor::zeros((bs, h, h), DType::F16, x.device())?,
+        };
         let mut outputs = vec![];
         for t in 0..sl {
             let qt = q.narrow(1, t, 1)?.squeeze(1)?; let kt = k.narrow(1, t, 1)?.squeeze(1)?; let vt = v.narrow(1, t, 1)?.squeeze(1)?; 
             let update = vt.unsqueeze(D::Minus1)?.matmul(&kt.unsqueeze(D::Minus2)?)?;
             current_state = (current_state + update)?;
-            let out_t = current_state.matmul(&qt.unsqueeze(D::Minus1)?)?.squeeze(D::Minus1)?;
-            outputs.push(out_t.unsqueeze(1)?);
+            outputs.push(current_state.matmul(&qt.unsqueeze(D::Minus1)?)?.squeeze(D::Minus1)?.unsqueeze(1)?);
         }
         let out = Tensor::cat(&outputs, 1)?; self.delta_state = Some(current_state.detach().to_device(&Device::Cpu)?);
         let res = self.out_proj.forward(&(out * z.silu()?)?, reg)?;
@@ -172,7 +187,8 @@ impl QAttention {
     pub fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let (bs, sl, _) = x.dims3()?;
         let q_raw = self.q_proj.forward(x, reg)?; let k_raw = self.k_proj.forward(x, reg)?; let v_raw = self.v_proj.forward(x, reg)?; 
-        let head_total = self.nh * self.hd; let q_states = q_raw.narrow(D::Minus1, 0, head_total)?; let gate = q_raw.narrow(D::Minus1, head_total, head_total)?;
+        let h_size = self.h;
+        let q_states = q_raw.narrow(D::Minus1, 0, h_size)?; let gate = q_raw.narrow(D::Minus1, h_size, h_size)?;
         let q = self.q_norm.forward(&q_states.reshape((bs, sl, self.nh, self.hd))?, reg)?.transpose(1, 2)?;
         let k = self.k_norm.forward(&k_raw.reshape((bs, sl, self.nkv, k_raw.dim(D::Minus1)? / self.nkv))?, reg)?.transpose(1, 2)?;
         let v = v_raw.reshape((bs, sl, self.nkv, v_raw.dim(D::Minus1)? / self.nkv))?.transpose(1, 2)?;
@@ -193,10 +209,7 @@ impl QDecoderLayer {
         Ok(Self { self_attn: sa, linear_attn: la, mlp_gate: QLinear::new(&join_name(&p, "mlp.gate_proj"))?, mlp_up: QLinear::new(&join_name(&p, "mlp.up_proj"))?, mlp_down: QLinear::new(&join_name(&p, "mlp.down_proj"))?, in_norm: QRmsNorm::new(&join_name(&p, "input_layernorm"), config.rms_norm_eps)?, post_norm: QRmsNorm::new(&join_name(&p, "post_attention_layernorm"), config.rms_norm_eps)? })
     }
     pub fn clear_vram(&mut self) { self.in_norm.clear_vram(); if let Some(ref mut sa) = self.self_attn { sa.clear_vram(); } if let Some(ref mut la) = self.linear_attn { la.clear_vram(); } self.post_norm.clear_vram(); self.mlp_gate.clear_vram(); self.mlp_up.clear_vram(); self.mlp_down.clear_vram(); }
-    pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
-        self.in_norm.load_to_vram(reg, dev)?; if let Some(ref mut sa) = self.self_attn { sa.load_to_vram(reg, dev)?; } if let Some(ref mut la) = self.linear_attn { la.load_to_vram(reg, dev)?; }
-        self.post_norm.load_to_vram(reg, dev)?; self.mlp_gate.load_to_vram(reg, dev)?; self.mlp_up.load_to_vram(reg, dev)?; self.mlp_down.load_to_vram(reg, dev)?; Ok(())
-    }
+    pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { self.in_norm.load_to_vram(reg, dev)?; if let Some(ref mut sa) = self.self_attn { sa.load_to_vram(reg, dev)?; } if let Some(ref mut la) = self.linear_attn { la.load_to_vram(reg, dev)?; } self.post_norm.load_to_vram(reg, dev)?; self.mlp_gate.load_to_vram(reg, dev)?; self.mlp_up.load_to_vram(reg, dev)?; self.mlp_down.load_to_vram(reg, dev)?; Ok(()) }
     pub fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let residual = x.clone(); let mut h = self.in_norm.forward(x, reg)?;
         if let Some(ref mut sa) = self.self_attn { h = sa.forward(&h, cos, sin, mask, reg)?; } else if let Some(ref mut la) = self.linear_attn { h = la.forward(&h, mask, reg)?; }
