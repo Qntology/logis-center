@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     use tauri_app_lib::models::qwen35::generate::Qwen3_5GenerateModel;
     use tauri_app_lib::openai_types::{ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent};
 
-    let mut model = Qwen3_5GenerateModel::init(model_path, Some(&device), Some(DType::BF16), true)?;
+    let mut model = Qwen3_5GenerateModel::init(model_path, Some(&device), Some(DType::F16), true)?;
     println!("✅ Model initialized successfully.");
 
     let params = ChatCompletionParameters {
