@@ -91,16 +91,12 @@ impl QLinear {
             reg.get_tensor(name).or_else(|_| reg.get_tensor(&format!("{}.weight", name)))?.to_device(dev)?
         };
 
-        // [STRICT-SHAPE-FIX] Correct orientation for matmul
+        // Use broadcast_matmul for more flexible dimension matching
         let x_in_dim = x.dim(D::Minus1)?;
-        let w = if w_raw.dim(1)? == x_in_dim { 
-            w_raw.t()?.contiguous()? 
-        } else { 
-            w_raw.contiguous()? 
-        };
-        let w = w.to_dtype(DType::F16)?;
+        let w = if w_raw.dim(1)? == x_in_dim { w_raw.t()? } else { w_raw };
+        let w = w.to_dtype(DType::F16)?.contiguous()?;
         
-        let res = x.matmul(&w)?;
+        let res = x.broadcast_matmul(&w)?;
 
         if let Ok(b) = reg.get_q_tensor(name, "bias").or_else(|_| reg.get_tensor(&format!("{}.bias", name))) {
             return Ok(res.broadcast_add(&b.to_device(dev)?.to_dtype(DType::F16)?)?);
@@ -124,11 +120,10 @@ impl QGatedDeltaNet {
     }
     pub fn forward(&mut self, x: &Tensor, _mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let projected = self.in_proj.forward(x, reg)?;
-        let h = self.h;
-        // Correct chunking using narrow to be safe
-        let q = projected.narrow(D::Minus1, 0, h)?;
-        let z = projected.narrow(D::Minus1, h*3, h)?;
-        let res = self.out_proj.forward(&(q.silu()? * z.silu()?)?, reg)?;
+        let chunks = projected.chunk(6, D::Minus1)?;
+        let (q, _k, _v, z, _b, _a) = (&chunks[0], &chunks[1], &chunks[2], &chunks[3], &chunks[4], &chunks[5]);
+        let gate = z.silu()?;
+        let res = self.out_proj.forward(&(q.silu()? * gate)?, reg)?;
         Ok(self.norm.forward(&res, reg)?)
     }
 }
@@ -153,12 +148,8 @@ impl QAttention {
     pub fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let (bs, sl, _) = x.dims3()?;
         let qkv_raw = self.qkv_proj.forward(x, reg)?;
-        let h = self.h;
-        
-        let q_raw = qkv_raw.narrow(D::Minus1, 0, h)?;
-        let k_raw = qkv_raw.narrow(D::Minus1, h, h)?;
-        let v_raw = qkv_raw.narrow(D::Minus1, h*2, h)?;
-        let g_raw = qkv_raw.narrow(D::Minus1, h*3, h)?;
+        let chunks = qkv_raw.chunk(4, D::Minus1)?;
+        let (q_raw, k_raw, v_raw, g_raw) = (&chunks[0], &chunks[1], &chunks[2], &chunks[3]);
 
         let q = self.q_norm.forward(&q_raw.reshape((bs, sl, self.nh, self.hd))?, reg)?.transpose(1, 2)?;
         let k = self.k_norm.forward(&k_raw.reshape((bs, sl, self.nkv, self.hd))?, reg)?.transpose(1, 2)?;
