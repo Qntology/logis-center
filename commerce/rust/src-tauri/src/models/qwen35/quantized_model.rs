@@ -114,7 +114,6 @@ impl QGatedDeltaNet {
         let q = projected.narrow(D::Minus1, 0, h)?;
         let z = projected.narrow(D::Minus1, h*3, h)?;
         let gate = z.silu()?;
-        // Broadcast gate accurately to match q dimension
         let q_dim = q.dim(D::Minus1)?;
         let gate_expanded = if q_dim != h {
              gate.unsqueeze(D::Minus1)?.broadcast_as((bs, sl, h, q_dim / h))?.reshape((bs, sl, q_dim))?
@@ -140,26 +139,23 @@ impl QAttention {
         let k_raw = qkv_raw.narrow(D::Minus1, h, h)?;
         let v_raw = qkv_raw.narrow(D::Minus1, h*2, h)?;
         let g_raw = qkv_raw.narrow(D::Minus1, h*3, h)?;
-
         let q = self.q_norm.forward(&q_raw.reshape((bs, sl, self.nh, h / self.nh))?, reg)?.transpose(1, 2)?;
         let k = self.k_norm.forward(&k_raw.reshape((bs, sl, self.nkv, h / self.nkv))?, reg)?.transpose(1, 2)?;
         let v = v_raw.reshape((bs, sl, self.nkv, h / self.nkv))?.transpose(1, 2)?;
-
         let (q, k) = glm_asr_apply_rotary_pos_emb(&q, &k, cos, sin, false)?;
         let (k, v) = match &self.kv_cache { None => (k, v), Some((pk, pv)) => (Tensor::cat(&[pk, &k], 2)?, Tensor::cat(&[pv, &v], 2)?) };
         self.kv_cache = Some((k.clone(), v.clone()));
         let attn = crate::models::common::eager_attention_forward(&q, &k, &v, Some(self.nh / self.nkv), mask, self.scaling)?;
         let out = attn.reshape((bs, sl, ()))?.contiguous()?;
-        
         let gate = g_raw.silu()?;
         let out_dim = out.dim(D::Minus1)?;
-        let gate_expanded = if out_dim != h {
-             gate.unsqueeze(D::Minus1)?.broadcast_as((bs, sl, h, out_dim / h))?.reshape((bs, sl, out_dim))?
+        let g_dim = gate.dim(D::Minus1)?;
+        let out_gated = if out_dim != g_dim {
+             (out * gate.unsqueeze(D::Minus1)?.broadcast_as((bs, sl, g_dim, out_dim / g_dim))?.reshape((bs, sl, out_dim))?)?
         } else {
-             gate
+             (out * gate)?
         };
-
-        let projected = self.o_proj.forward(&(out * gate_expanded)?, reg)?;
+        let projected = self.o_proj.forward(&out_gated, reg)?;
         if projected.dim(D::Minus1)? != h { Ok(projected.narrow(D::Minus1, 0, h)?) }
         else { Ok(projected) }
     }
@@ -191,7 +187,7 @@ impl QDecoderLayer {
 
 pub struct QEmbedding { name: String }
 impl QEmbedding {
-    pub fn new(name: &str) -> Self { Ok(Self { name: name.to_string() }) }
+    pub fn new(name: &str) -> Self { Self { name: name.to_string() } }
     pub fn forward(&self, ids: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
         let (b, s) = ids.dims2()?; let dev = ids.device();
         let ids_cpu = ids.flatten_all()?.to_device(&Device::Cpu)?.to_dtype(DType::U32)?;
