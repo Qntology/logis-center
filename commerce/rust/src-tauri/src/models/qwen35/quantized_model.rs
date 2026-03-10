@@ -142,7 +142,7 @@ fn join_name(p: &str, n: &str) -> String {
 }
 
 pub struct QGatedDeltaNet { 
-    in_proj_qkv: Option<QLinear>, in_proj_a: Option<QLinear>, in_proj_b: Option<QLinear>, in_proj_z: Option<QLinear>, 
+    in_proj_qkv: QLinear, in_proj_z: QLinear, in_proj_b: QLinear, in_proj_a: QLinear, 
     out_proj: QLinear, norm: QRmsNorm, 
     pub nk: usize, pub dk: usize, pub nv: usize, pub dv: usize,
     pub conv1d: Option<candle_nn::Conv1d>,
@@ -154,14 +154,11 @@ impl QGatedDeltaNet {
         let p = vb.prefix();
         let nk = config.linear_num_key_heads; let dk = config.linear_key_head_dim;
         let nv = config.linear_num_value_heads; let dv = config.linear_value_head_dim;
-        
-        let in_proj_qkv = if vb.contains_tensor("in_proj_qkv.weight") { Some(QLinear::new(&join_name(&p, "in_proj_qkv"))?) } else { None };
-        let in_proj_a = if vb.contains_tensor("in_proj_a.weight") { Some(QLinear::new(&join_name(&p, "in_proj_a"))?) } else { None };
-        let in_proj_b = if vb.contains_tensor("in_proj_b.weight") { Some(QLinear::new(&join_name(&p, "in_proj_b"))?) } else { None };
-        let in_proj_z = if vb.contains_tensor("in_proj_z.weight") { Some(QLinear::new(&join_name(&p, "in_proj_z"))?) } else { None };
-        
         Ok(Self { 
-            in_proj_qkv, in_proj_a, in_proj_b, in_proj_z, 
+            in_proj_qkv: QLinear::new(&join_name(&p, "in_proj_qkv"))?,
+            in_proj_z: QLinear::new(&join_name(&p, "in_proj_z"))?,
+            in_proj_b: QLinear::new(&join_name(&p, "in_proj_b"))?,
+            in_proj_a: QLinear::new(&join_name(&p, "in_proj_a"))?,
             out_proj: QLinear::new(&join_name(&p, "out_proj"))?, 
             norm: QRmsNorm::new(&join_name(&p, "norm"), config.rms_norm_eps)?, 
             nk, dk, nv, dv,
@@ -170,24 +167,17 @@ impl QGatedDeltaNet {
         })
     }
     pub fn clear_vram(&mut self) { 
-        if let Some(ref mut l) = self.in_proj_qkv { l.clear_vram(); } 
-        if let Some(ref mut l) = self.in_proj_a { l.clear_vram(); } 
-        if let Some(ref mut l) = self.in_proj_b { l.clear_vram(); } 
-        if let Some(ref mut l) = self.in_proj_z { l.clear_vram(); } 
+        self.in_proj_qkv.clear_vram(); self.in_proj_z.clear_vram(); self.in_proj_b.clear_vram(); self.in_proj_a.clear_vram();
         self.out_proj.clear_vram(); self.norm.clear_vram(); 
         self.dt_bias = None; self.a_log = None; self.conv1d = None;
     }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { 
-        if let Some(ref mut l) = self.in_proj_qkv { l.load_to_vram(reg, dev)?; } 
-        if let Some(ref mut l) = self.in_proj_a { l.load_to_vram(reg, dev)?; } 
-        if let Some(ref mut l) = self.in_proj_b { l.load_to_vram(reg, dev)?; } 
-        if let Some(ref mut l) = self.in_proj_z { l.load_to_vram(reg, dev)?; } 
+        self.in_proj_qkv.load_to_vram(reg, dev)?; self.in_proj_z.load_to_vram(reg, dev)?; self.in_proj_b.load_to_vram(reg, dev)?; self.in_proj_a.load_to_vram(reg, dev)?;
         self.out_proj.load_to_vram(reg, dev)?; self.norm.load_to_vram(reg, dev)?; 
-        
         let p = self.norm.full_name.replace(".norm", ".linear_attn");
         if let Ok(dt) = reg.get_tensor(&format!("{}.dt_bias", p)) { self.dt_bias = Some(dt.to_device(dev)?.to_dtype(DType::F16)?); }
         if let Ok(a) = reg.get_tensor(&format!("{}.A_log", p)) { self.a_log = Some(a.to_device(dev)?.to_dtype(DType::F16)?); }
-        
+        else if let Ok(a) = reg.get_tensor(&format!("{}.a_log", p)) { self.a_log = Some(a.to_device(dev)?.to_dtype(DType::F16)?); }
         if let Ok(cw) = reg.get_tensor(&format!("{}.conv1d.weight", p)) {
             let cb = reg.get_tensor(&format!("{}.conv1d.bias", p)).ok();
             let c_w = cw.to_device(dev)?.to_dtype(DType::F16)?;
@@ -199,55 +189,58 @@ impl QGatedDeltaNet {
     }
     pub fn forward(&mut self, x: &Tensor, _mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let (bs, sl, _) = x.dims3()?; let (nk, dk, nv, dv) = (self.nk, self.dk, self.nv, self.dv);
-        let (mut q, mut k, mut v, z) = if let Some(ref l) = self.in_proj_qkv {
-            let proj = l.forward(x, reg)?;
-            let q = proj.narrow(D::Minus1, 0, nk * dk)?;
-            let k = proj.narrow(D::Minus1, nk * dk, nk * dk)?;
-            let v = proj.narrow(D::Minus1, nk * dk * 2, nv * dv)?;
-            let z = if let Some(ref lz) = self.in_proj_z { lz.forward(x, reg)? } else { x.clone() };
-            (q, k, v, z)
-        } else {
-            (self.in_proj_a.as_ref().unwrap().forward(x, reg)?, self.in_proj_b.as_ref().unwrap().forward(x, reg)?, self.in_proj_b.as_ref().unwrap().forward(x, reg)?, self.in_proj_z.as_ref().unwrap().forward(x, reg)?)
-        };
+        let mut mixed_qkv = self.in_proj_qkv.forward(x, reg)?;
+        let z = self.in_proj_z.forward(x, reg)?.reshape((bs, sl, nv, dv))?;
+        let b = self.in_proj_b.forward(x, reg)?; // (bs, sl, nv)
+        let a = self.in_proj_a.forward(x, reg)?; // (bs, sl, nv)
         
         if let Some(ref conv) = self.conv1d {
-            let mut c_in = Tensor::cat(&[&q, &k, &v], D::Minus1)?.transpose(1, 2)?;
+            let mut c_in = mixed_qkv.transpose(1, 2)?; // (bs, dim, sl)
             if let Some(ref pc) = self.conv_state { c_in = Tensor::cat(&[pc, &c_in], 2)?; }
             self.conv_state = Some(c_in.narrow(2, c_in.dim(2)? - conv.weight().dim(2)? + 1, conv.weight().dim(2)? - 1)?.detach());
-            let c_out = conv.forward(&c_in)?.transpose(1, 2)?;
-            q = c_out.narrow(D::Minus1, 0, nk * dk)?;
-            k = c_out.narrow(D::Minus1, nk * dk, nk * dk)?;
-            v = c_out.narrow(D::Minus1, nk * dk * 2, nv * dv)?;
+            mixed_qkv = conv.forward(&c_in)?.transpose(1, 2)?.silu()?;
         }
+        let q = mixed_qkv.narrow(D::Minus1, 0, nk * dk)?.reshape((bs, sl, nk, dk))?;
+        let k = mixed_qkv.narrow(D::Minus1, nk * dk, nk * dk)?.reshape((bs, sl, nk, dk))?;
+        let v = mixed_qkv.narrow(D::Minus1, nk * dk * 2, nv * dv)?.reshape((bs, sl, nv, dv))?;
 
-        let q = q.reshape((bs, sl, nk, dk))?; let k = k.reshape((bs, sl, nk, dk))?; let v = v.reshape((bs, sl, nv, dv))?;
+        // Official QK normalization
+        let q = crate::utils::tensor_utils::l2_normalize(&q, 3)?;
+        let k = crate::utils::tensor_utils::l2_normalize(&k, 3)?;
+        let scale = 1.0 / (dk as f64).sqrt();
+        let q = q.affine(scale, 0.0)?;
         
-        // Gating parameters
-        let dt = if let Some(ref d) = self.dt_bias { d.reshape((1, 1, nv, 1))?.broadcast_as((bs, sl, nv, 1))? } else { Tensor::ones((bs, sl, nv, 1), DType::F16, x.device())? };
-        let a = if let Some(ref al) = self.a_log { al.exp()?.neg()?.reshape((1, 1, nv, 1))?.broadcast_as((bs, sl, nv, 1))? } else { Tensor::zeros((bs, sl, nv, 1), DType::F16, x.device())? };
-        
-        let mut state = self.delta_state.take().unwrap_or_else(|| Tensor::zeros((bs, nk, dk, dv), DType::F16, x.device()).unwrap());
+        // Official g and beta processing
+        let beta = if let Some(ref db) = self.dt_bias { softplus(&b.broadcast_add(db)?)? } else { softplus(&b)? };
+        let g = if let Some(ref al) = self.a_log {
+            let a_log = al.reshape((1, 1, nk))?;
+            a.broadcast_add(&a_log.exp()?.neg()?)?
+        } else {
+            a.clone()
+        };
+
+        let mut state = self.delta_state.take().unwrap_or_else(|| Tensor::zeros((bs, nk, dk, dv), DType::F32, x.device()).unwrap()).to_dtype(DType::F32)?;
         let mut outputs = vec![];
         
         for t in 0..sl {
-            let qt = q.narrow(1, t, 1)?.squeeze(1)?; // (bs, nk, dk)
-            let kt = k.narrow(1, t, 1)?.squeeze(1)?; // (bs, nk, dk)
-            let vt = v.narrow(1, t, 1)?.squeeze(1)?; // (bs, nv, dv)
-            let dtt = softplus(&dt.narrow(1, t, 1)?.squeeze(1)?)?; // (bs, nv, 1)
-            let at = a.narrow(1, t, 1)?.squeeze(1)?.mul(&dtt)?.exp()?; // (bs, nv, 1)
+            let qt = q.narrow(1, t, 1)?.transpose(1, 2)?.squeeze(D::Minus1)?.to_dtype(DType::F32)?; // (bs, nk, dk)
+            let kt = k.narrow(1, t, 1)?.transpose(1, 2)?.squeeze(D::Minus1)?.to_dtype(DType::F32)?; // (bs, nk, dk)
+            let vt = v.narrow(1, t, 1)?.transpose(1, 2)?.squeeze(D::Minus1)?.to_dtype(DType::F32)?; // (bs, nv, dv)
+            let gt = g.narrow(1, t, 1)?.squeeze(1)?.to_dtype(DType::F32)?.exp()?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?; // exp(g)
+            let bt = beta.narrow(1, t, 1)?.squeeze(1)?.to_dtype(DType::F32)?.unsqueeze(D::Minus1)?;
+
+            state = state.broadcast_mul(&gt)?;
+            let kv_mem = state.broadcast_mul(&kt.unsqueeze(D::Minus1)?)?.sum(D::Minus2)?; // (bs, nk, dv)
+            let delta = vt.sub(&kv_mem)?.broadcast_mul(&bt)?; 
+            state = state.add(&kt.unsqueeze(D::Minus1)?.broadcast_mul(&delta.unsqueeze(D::Minus2)?)?)?;
             
-            // Linear recurrence: S = S * A + (dt * K^T * V)
-            let update = kt.unsqueeze(D::Minus1)?.matmul(&vt.unsqueeze(D::Minus2)?)?; // (bs, nk, dk, dv)
-            let scaled_update = update.broadcast_mul(&dtt.unsqueeze(D::Minus1)?)?;
-            state = state.broadcast_mul(&at.unsqueeze(D::Minus1)?)?.add(&scaled_update)?;
-            
-            let out_t = qt.unsqueeze(D::Minus2)?.matmul(&state)?.squeeze(D::Minus2)?; // (bs, nv, dv)
-            outputs.push(out_t.unsqueeze(1)?);
+            let out_t = state.broadcast_mul(&qt.unsqueeze(D::Minus1)?)?.sum_keepdim(D::Minus2)?.squeeze(D::Minus2)?;
+            outputs.push(out_t.unsqueeze(1)?.to_dtype(DType::F16)?);
         }
         let out = Tensor::cat(&outputs, 1)?.reshape((bs, sl, nv * dv))?;
-        self.delta_state = Some(state.detach());
-        let res = self.out_proj.forward(&(out * z.silu()?)?, reg)?;
-        self.norm.forward(&res, reg)
+        self.delta_state = Some(state.detach().to_device(&Device::Cpu)?);
+        let gated_out = self.norm.forward(&out, reg)?;
+        self.out_proj.forward(&(gated_out * z.reshape((bs, sl, nv * dv))?.silu()?)?, reg)
     }
 }
 
