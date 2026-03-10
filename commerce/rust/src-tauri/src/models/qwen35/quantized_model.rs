@@ -70,20 +70,17 @@ impl QRmsNorm {
         let dev = x.device();
         let w = if let Some(pw) = &self.persistent_weight { pw.clone() } 
                 else { reg.get_q_tensor(&self.full_name, "weight")?.to_device(dev)?.to_dtype(DType::F16)? };
-        let (bs, sl, last_dim) = x.dims3()?;
         let x_f32 = x.to_dtype(DType::F32)?;
+        let var = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
+        let norm = x_f32.broadcast_div(&(var + self.eps)?.sqrt()?)?.to_dtype(DType::F16)?;
+        
         let w_size = w.elem_count();
+        let last_dim = x.dim(D::Minus1)?;
         if w_size == last_dim {
-            let var = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
-            let norm = x_f32.broadcast_div(&(var + self.eps)?.sqrt()?)?.to_dtype(DType::F16)?;
             Ok(norm.broadcast_mul(&w)?)
         } else {
-            let num_heads = last_dim / w_size;
-            let x_reshaped = x_f32.reshape((bs, sl, num_heads, w_size))?;
-            let var = x_reshaped.sqr()?.mean_keepdim(D::Minus1)?;
-            let norm = x_reshaped.broadcast_div(&(var + self.eps)?.sqrt()?)?.to_dtype(DType::F16)?;
-            let out = norm.broadcast_mul(&w.reshape((1, 1, 1, w_size))?)?;
-            Ok(out.reshape((bs, sl, last_dim))?)
+            // Per-head normalization: broadcast weight over heads
+            Ok(norm.broadcast_mul(&w.reshape(vec![1; x.rank() - 1].into_iter().chain(std::iter::once(w_size)).collect::<Vec<_>>())?)?)
         }
     }
 }
@@ -136,11 +133,13 @@ pub struct QGatedDeltaNet { in_proj_qkv: Option<QLinear>, in_proj_a: Option<QLin
 impl QGatedDeltaNet {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let p = vb.prefix();
+        let h_delta = config.linear_num_key_heads * config.linear_key_head_dim;
+        println!("[DEBUG-DELTA] nk: {}, dk: {}, h_delta: {}", config.linear_num_key_heads, config.linear_key_head_dim, h_delta);
         let in_proj_qkv = if vb.contains_tensor("in_proj_qkv.weight") { Some(QLinear::new(&join_name(&p, "in_proj_qkv"))?) } else { None };
         let (in_proj_a, in_proj_b, in_proj_z) = if in_proj_qkv.is_none() {
             (Some(QLinear::new(&join_name(&p, "in_proj_a"))?), Some(QLinear::new(&join_name(&p, "in_proj_b"))?), Some(QLinear::new(&join_name(&p, "in_proj_z"))?))
         } else { (None, None, None) };
-        Ok(Self { in_proj_qkv, in_proj_a, in_proj_b, in_proj_z, out_proj: QLinear::new(&join_name(&p, "out_proj"))?, norm: QRmsNorm::new(&join_name(&p, "norm"), config.rms_norm_eps)?, h: config.hidden_size, delta_state: None })
+        Ok(Self { in_proj_qkv, in_proj_a, in_proj_b, in_proj_z, out_proj: QLinear::new(&join_name(&p, "out_proj"))?, norm: QRmsNorm::new(&join_name(&p, "norm"), config.rms_norm_eps)?, h: h_delta, delta_state: None })
     }
     pub fn clear_vram(&mut self) { if let Some(ref mut l) = self.in_proj_qkv { l.clear_vram(); } if let Some(ref mut l) = self.in_proj_a { l.clear_vram(); } if let Some(ref mut l) = self.in_proj_b { l.clear_vram(); } if let Some(ref mut l) = self.in_proj_z { l.clear_vram(); } self.out_proj.clear_vram(); self.norm.clear_vram(); }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { if let Some(ref mut l) = self.in_proj_qkv { l.load_to_vram(reg, dev)?; } if let Some(ref mut l) = self.in_proj_a { l.load_to_vram(reg, dev)?; } if let Some(ref mut l) = self.in_proj_b { l.load_to_vram(reg, dev)?; } if let Some(ref mut l) = self.in_proj_z { l.load_to_vram(reg, dev)?; } self.out_proj.load_to_vram(reg, dev)?; self.norm.load_to_vram(reg, dev)?; Ok(()) }
@@ -148,18 +147,25 @@ impl QGatedDeltaNet {
         let (bs, sl, _) = x.dims3()?; let h = self.h;
         let (q, k, v, z) = if let Some(ref l) = self.in_proj_qkv {
             let projected = l.forward(x, reg)?;
-            (projected.narrow(D::Minus1, 0, h)?, projected.narrow(D::Minus1, h, h)?, projected.narrow(D::Minus1, h*2, h)?, projected.narrow(D::Minus1, h*3, h)?)
+            let q = projected.narrow(D::Minus1, 0, h)?;
+            let k = projected.narrow(D::Minus1, h, h)?;
+            let v = projected.narrow(D::Minus1, h*2, h)?;
+            let z = if let Some(ref lz) = self.in_proj_z { lz.forward(x, reg)? } else { x.clone() };
+            (q, k, v, z)
         } else {
             (self.in_proj_a.as_ref().unwrap().forward(x, reg)?, self.in_proj_b.as_ref().unwrap().forward(x, reg)?, self.in_proj_b.as_ref().unwrap().forward(x, reg)?, self.in_proj_z.as_ref().unwrap().forward(x, reg)?)
         };
+        println!("[DEBUG-DELTA] q shape: {:?}, k shape: {:?}, v shape: {:?}", q.shape(), k.shape(), v.shape());
         let mut current_state = match self.delta_state.take() {
             Some(st) => if st.elem_count() == h*h { st.reshape((bs, h, h))?.to_device(x.device())? } else { Tensor::zeros((bs, h, h), DType::F16, x.device())? },
             None => Tensor::zeros((bs, h, h), DType::F16, x.device())?,
         };
+        println!("[DEBUG-DELTA] current_state shape: {:?}", current_state.shape());
         let mut outputs = vec![];
         for t in 0..sl {
             let qt = q.narrow(1, t, 1)?.squeeze(1)?; let kt = k.narrow(1, t, 1)?.squeeze(1)?; let vt = v.narrow(1, t, 1)?.squeeze(1)?; 
             let update = vt.unsqueeze(D::Minus1)?.matmul(&kt.unsqueeze(D::Minus2)?)?;
+            if t == 0 { println!("[DEBUG-DELTA] vt shape: {:?}, kt shape: {:?}, update shape: {:?}", vt.shape(), kt.shape(), update.shape()); }
             current_state = (current_state + update)?;
             outputs.push(current_state.matmul(&qt.unsqueeze(D::Minus1)?)?.squeeze(D::Minus1)?.unsqueeze(1)?);
         }
@@ -187,8 +193,8 @@ impl QAttention {
     pub fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let (bs, sl, _) = x.dims3()?;
         let q_raw = self.q_proj.forward(x, reg)?; let k_raw = self.k_proj.forward(x, reg)?; let v_raw = self.v_proj.forward(x, reg)?; 
-        let h_size = self.h;
-        let q_states = q_raw.narrow(D::Minus1, 0, h_size)?; let gate = q_raw.narrow(D::Minus1, h_size, h_size)?;
+        let q_h = self.nh * self.hd;
+        let q_states = q_raw.narrow(D::Minus1, 0, q_h)?; let gate = q_raw.narrow(D::Minus1, q_h, q_h)?;
         let q = self.q_norm.forward(&q_states.reshape((bs, sl, self.nh, self.hd))?, reg)?.transpose(1, 2)?;
         let k = self.k_norm.forward(&k_raw.reshape((bs, sl, self.nkv, k_raw.dim(D::Minus1)? / self.nkv))?, reg)?.transpose(1, 2)?;
         let v = v_raw.reshape((bs, sl, self.nkv, v_raw.dim(D::Minus1)? / self.nkv))?.transpose(1, 2)?;

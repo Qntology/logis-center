@@ -44,9 +44,6 @@ impl Qwen3_5GenerateModel {
             None => Device::Cpu,
         };
 
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[] as &[&str], DType::F16, &dev)? };
-        let qwen3_5 = QuantizedQwen3_5Model::new(vb, config)?;
-
         let mut model_files = vec![];
         for entry in std::fs::read_dir(model_path)? {
             let entry = entry?;
@@ -55,6 +52,10 @@ impl Qwen3_5GenerateModel {
                 model_files.push(path.to_str().unwrap().to_string());
             }
         }
+
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, DType::F16, &dev)? };
+        let qwen3_5 = QuantizedQwen3_5Model::new(vb, config)?;
+
         let registry = QuantizedRegistry::new(&model_files)?;
 
         let chat_template = ChatTemplate::init(model_path.to_str().unwrap())?;
