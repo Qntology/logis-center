@@ -11,6 +11,8 @@
 *.safetensors
 *.crdownload
 
+aha-main/
+
 # Virtual Environment
 trade/venv/
 

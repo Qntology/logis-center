@@ -497,17 +497,27 @@ impl QuantizedQwen3_5Model {
         Ok(Self { config, language_model: lm, lm_head: head })
     }
 
-    pub fn forward(&mut self, input_ids: &Tensor, offset: usize, registry: &QuantizedRegistry) -> Result<Tensor> {
+    pub fn forward(&mut self, input_ids: &Tensor, offset: usize, registry: &QuantizedRegistry, img_thw: Option<&Tensor>) -> Result<Tensor> {
         let dev = input_ids.device();
         self.language_model.embed_tokens.to_device(dev).map_err(|e| anyhow!(e))?;
         let embeds = self.language_model.embed_tokens.forward(input_ids).map_err(|e| anyhow!(e))?;
         self.language_model.embed_tokens.clear();
 
         let seq_len = input_ids.dim(1)?;
-        let pos = Tensor::arange(offset as u32, (offset + seq_len) as u32, dev)?
-            .to_dtype(DType::U32)?
-            .unsqueeze(0)?.unsqueeze(0)?
-            .broadcast_as((3, input_ids.dim(0)?, seq_len))?;
+        let pos = if let Some(_) = img_thw {
+            // [VISION] 3D M-RoPE Position IDs (Simplified for now, forced to U32)
+            Tensor::arange(0_u32, seq_len as u32, dev)?
+                .unsqueeze(0)?.unsqueeze(0)?
+                .broadcast_as((3, input_ids.dim(0)?, seq_len))?
+                .contiguous()?
+        } else {
+            // [TEXT] Standard Position IDs
+            Tensor::arange(offset as u32, (offset + seq_len) as u32, dev)?
+                .to_dtype(DType::U32)?
+                .unsqueeze(0)?.unsqueeze(0)?
+                .broadcast_as((3, input_ids.dim(0)?, seq_len))?
+                .contiguous()?
+        };
 
         let outputs = self.language_model.forward(&embeds, &pos, offset, registry)?;
         let hidden = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;

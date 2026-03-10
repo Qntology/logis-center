@@ -3,14 +3,10 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::collections::HashMap;
 
 use crate::{
     chat_template::ChatTemplate,
-    models::{
-        qwen35::{config::Qwen3_5Config, quantized_model::QuantizedQwen3_5Model},
-        qwen3vl::processor::Qwen3VLProcessor,
-    },
+    models::qwen35::{config::Qwen3_5Config, quantized_model::QuantizedQwen3_5Model},
     tokenizer::TokenizerModel,
     utils::{
         find_type_files, get_device, get_dtype, get_logit_processor,
@@ -21,7 +17,6 @@ use crate::{
 pub struct Qwen3_5GenerateModel {
     pub chat_template: ChatTemplate,
     pub tokenizer: TokenizerModel,
-    pub pre_processor: Qwen3VLProcessor,
     pub qwen3_5: QuantizedQwen3_5Model,
     pub registry: crate::models::qwen35::quantized_model::QuantizedRegistry,
     pub device: Device,
@@ -30,7 +25,7 @@ pub struct Qwen3_5GenerateModel {
 }
 
 impl Qwen3_5GenerateModel {
-    pub fn init(path: &str, device: Option<&Device>, dtype: Option<DType>, force_text_only: bool) -> Result<Self> {
+    pub fn init(path: &str, device: Option<&Device>, dtype: Option<DType>, _force_text_only: bool) -> Result<Self> {
         let chat_template = ChatTemplate::init(path)?;
         let tokenizer = TokenizerModel::init(path)?;
         let config_path = std::path::Path::new(path).join("config.json");
@@ -39,16 +34,8 @@ impl Qwen3_5GenerateModel {
         let cfg_dtype = cfg.text_config.dtype.as_str();
         let dtype = get_dtype(dtype, cfg_dtype);
         
-        let pre_processor = if force_text_only {
-            Qwen3VLProcessor::new(path, &Device::Cpu, dtype)?
-        } else {
-            Qwen3VLProcessor::new(path, &device, dtype)?
-        };
-        
         let mut model_list = find_type_files(path, "st")?;
-        if force_text_only {
-            model_list.retain(|f| !f.contains("vision.st"));
-        }
+        model_list.retain(|f| !f.contains("vision.st"));
 
         // [DYNAMIC REGISTRY] Use Mmap-based Registry for extreme VRAM/RAM efficiency
         let registry = crate::models::qwen35::quantized_model::QuantizedRegistry::new(&model_list)?;
@@ -61,7 +48,6 @@ impl Qwen3_5GenerateModel {
         Ok(Self {
             chat_template,
             tokenizer,
-            pre_processor,
             qwen3_5,
             registry,
             device,
@@ -84,9 +70,10 @@ impl Qwen3_5GenerateModel {
         );
         
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
-        let input = self.pre_processor.process_info(&mes, &mes_render)?;
-        
-        let full_input_ids = self.tokenizer.text_encode(input.replace_text.clone(), &self.device)?.to_dtype(DType::U32)?;
+        // Pure text encoding for 0.8B model
+        let full_input_ids = self.tokenizer.text_encode(mes_render, &self.device)?
+            .to_dtype(DType::U32)?;
+            
         let full_seq_len = full_input_ids.dim(1)?;
         
         let mut seqlen_offset = 0;
@@ -100,9 +87,11 @@ impl Qwen3_5GenerateModel {
 
             let remaining = full_seq_len - seqlen_offset;
             let current_chunk = remaining.min(chunk_size);
-            let input_ids = full_input_ids.narrow(1, seqlen_offset, current_chunk)?.to_dtype(DType::U32)?;
+            // [CRITICAL] Force U32 for input IDs to prevent unexpected dtype error
+            let input_ids = full_input_ids.narrow(1, seqlen_offset, current_chunk)?
+                .to_dtype(DType::U32)?;
 
-            let logits = self.qwen3_5.forward(&input_ids, seqlen_offset, &self.registry)?;
+            let logits = self.qwen3_5.forward(&input_ids, seqlen_offset, &self.registry, None)?;
             
             seqlen_offset += current_chunk;
             last_logits = Some(logits);
@@ -131,13 +120,19 @@ impl Qwen3_5GenerateModel {
             let piece = self.tokenizer.token_decode(vec![next_token])?;
             gen_text.push_str(&piece);
 
-            let input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?.to_dtype(DType::U32)?;
-            logits = self.qwen3_5.forward(&input_ids, seqlen_offset, &self.registry)?;
+            // [CRITICAL] Force U32 for single token input IDs
+            let input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?
+                .to_dtype(DType::U32)?;
+            logits = self.qwen3_5.forward(&input_ids, seqlen_offset, &self.registry, None)?;
             seqlen_offset += 1;
         }
 
         self.qwen3_5.clear_cache();
         Ok(gen_text)
     }
+}
+
+pub fn init_bake_worker() {
+    println!("[MODEL-QWEN35] Bake worker initialized for text-only prefill.");
 }
 

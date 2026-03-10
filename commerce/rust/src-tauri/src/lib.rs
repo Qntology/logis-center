@@ -939,9 +939,6 @@ pub fn run() {
             cancellation_token: cancellation_token.clone(),
         })
         .setup(|app| {
-            // [INIT] KV Bake Worker (Immediate)
-            crate::models::qwen3vl::generate::init_bake_worker();
-
             // [FIX] Reset stop signals immediately on app startup
             let setup_cancel = app.state::<AppState>().cancellation_token.clone();
             setup_cancel.store(false, Ordering::SeqCst);
