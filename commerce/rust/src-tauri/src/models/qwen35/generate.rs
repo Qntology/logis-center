@@ -107,7 +107,8 @@ impl Qwen3_5GenerateModel {
                 }
                 if let Some(ref mut la) = layer.linear_attn {
                     if let Some(st) = &la.delta_state {
-                        disk_manager.save_layer_context(i, &crate::models::qwen35::quantized_model::LayerContext::DeltaNet { state: st.clone() })?;
+                        let state: Tensor = st.clone();
+                        disk_manager.save_layer_context(i, &crate::models::qwen35::quantized_model::LayerContext::DeltaNet { state })?;
                         la.delta_state = None; // Free VRAM
                     }
                 }

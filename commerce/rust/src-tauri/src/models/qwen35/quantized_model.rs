@@ -4,6 +4,7 @@ use candle_nn::{VarBuilder};
 use std::collections::HashMap;
 use std::sync::Arc;
 use candle_core::safetensors::MmapedSafetensors;
+use candle_core::f16;
 
 use crate::{
     models::{
@@ -133,7 +134,7 @@ impl QLinear {
     }
 }
 
-pub struct QGatedDeltaNet { in_proj: QLinear, out_proj: QLinear, norm: QRmsNorm, h: usize, delta_state: Option<Tensor> }
+pub struct QGatedDeltaNet { in_proj: QLinear, out_proj: QLinear, norm: QRmsNorm, h: usize, pub delta_state: Option<Tensor> }
 impl QGatedDeltaNet {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let p = vb.prefix();
@@ -248,7 +249,7 @@ impl QAttention {
     }
 }
 
-pub struct QDecoderLayer { self_attn: Option<QAttention>, linear_attn: Option<QGatedDeltaNet>, mlp_gate: QLinear, mlp_up: QLinear, mlp_down: QLinear, in_norm: QRmsNorm, post_norm: QRmsNorm }
+pub struct QDecoderLayer { pub self_attn: Option<QAttention>, pub linear_attn: Option<QGatedDeltaNet>, mlp_gate: QLinear, mlp_up: QLinear, mlp_down: QLinear, in_norm: QRmsNorm, post_norm: QRmsNorm }
 impl QDecoderLayer {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig, idx: usize) -> Result<Self> {
         let lt = config.layer_types[idx].clone(); let p = vb.prefix();
@@ -440,6 +441,6 @@ impl DiskStateManager {
     fn read_tensor(&self, offset: usize, shape: &Shape, dev: &Device) -> Result<Tensor> {
         let byte_len = shape.elem_count() * 2;
         let raw_slice = &self.mmap[offset..offset + byte_len];
-        Tensor::from_raw_buffer(raw_slice, DType::F16, shape, dev)
+        Ok(Tensor::from_raw_buffer(raw_slice, DType::F16, shape.dims(), dev)?)
     }
 }
