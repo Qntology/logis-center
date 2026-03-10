@@ -142,7 +142,7 @@ impl Qwen3_5GenerateModel {
                            sa.kv_cache = Some((k, v));
                        }
                    } else if let Some(ref mut la) = layer.linear_attn {
-                       let s_state = candle_core::Shape::from((1, la.h, la.h)); 
+                       let s_state = candle_core::Shape::from((1, la.nk, la.dk, la.dv)); 
                        if let Ok(LayerContext::DeltaNet { state }) = disk_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
                            la.delta_state = Some(state.to_device(&self.device)?);
                        }
@@ -239,7 +239,7 @@ impl Qwen3_5GenerateModel {
                         sa.kv_cache = Some((k, v));
                     }
                 } else if let Some(ref mut la) = layer.linear_attn {
-                    let s_state = candle_core::Shape::from((1, la.h, la.h)); 
+                    let s_state = candle_core::Shape::from((1, la.nk, la.dk, la.dv)); 
                     if let Ok(LayerContext::DeltaNet { state }) = disk_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
                         la.delta_state = Some(state.to_device(&self.device)?);
                     }

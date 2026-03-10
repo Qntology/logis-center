@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use candle_core::{D, DType, Device, IndexOp, Tensor};
+use candle_core::{D, DType, Device, IndexOp, Tensor, Module};
 use candle_nn::{VarBuilder};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -141,46 +141,107 @@ fn join_name(p: &str, n: &str) -> String {
     else { format!("{}.{}", p, n) }
 }
 
-pub struct QGatedDeltaNet { in_proj_qkv: Option<QLinear>, in_proj_a: Option<QLinear>, in_proj_b: Option<QLinear>, in_proj_z: Option<QLinear>, out_proj: QLinear, norm: QRmsNorm, pub h: usize, pub delta_state: Option<Tensor> }
+pub struct QGatedDeltaNet { 
+    in_proj_qkv: Option<QLinear>, in_proj_a: Option<QLinear>, in_proj_b: Option<QLinear>, in_proj_z: Option<QLinear>, 
+    out_proj: QLinear, norm: QRmsNorm, 
+    pub nk: usize, pub dk: usize, pub nv: usize, pub dv: usize,
+    pub conv1d: Option<candle_nn::Conv1d>,
+    pub dt_bias: Option<Tensor>, pub a_log: Option<Tensor>,
+    pub delta_state: Option<Tensor>, pub conv_state: Option<Tensor> 
+}
 impl QGatedDeltaNet {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let p = vb.prefix();
-        let h_delta = config.linear_num_key_heads * config.linear_key_head_dim;
+        let nk = config.linear_num_key_heads; let dk = config.linear_key_head_dim;
+        let nv = config.linear_num_value_heads; let dv = config.linear_value_head_dim;
+        
         let in_proj_qkv = if vb.contains_tensor("in_proj_qkv.weight") { Some(QLinear::new(&join_name(&p, "in_proj_qkv"))?) } else { None };
         let in_proj_a = if vb.contains_tensor("in_proj_a.weight") { Some(QLinear::new(&join_name(&p, "in_proj_a"))?) } else { None };
         let in_proj_b = if vb.contains_tensor("in_proj_b.weight") { Some(QLinear::new(&join_name(&p, "in_proj_b"))?) } else { None };
         let in_proj_z = if vb.contains_tensor("in_proj_z.weight") { Some(QLinear::new(&join_name(&p, "in_proj_z"))?) } else { None };
-        Ok(Self { in_proj_qkv, in_proj_a, in_proj_b, in_proj_z, out_proj: QLinear::new(&join_name(&p, "out_proj"))?, norm: QRmsNorm::new(&join_name(&p, "norm"), config.rms_norm_eps)?, h: h_delta, delta_state: None })
+        
+        Ok(Self { 
+            in_proj_qkv, in_proj_a, in_proj_b, in_proj_z, 
+            out_proj: QLinear::new(&join_name(&p, "out_proj"))?, 
+            norm: QRmsNorm::new(&join_name(&p, "norm"), config.rms_norm_eps)?, 
+            nk, dk, nv, dv,
+            conv1d: None, dt_bias: None, a_log: None,
+            delta_state: None, conv_state: None 
+        })
     }
-    pub fn clear_vram(&mut self) { if let Some(ref mut l) = self.in_proj_qkv { l.clear_vram(); } if let Some(ref mut l) = self.in_proj_a { l.clear_vram(); } if let Some(ref mut l) = self.in_proj_b { l.clear_vram(); } if let Some(ref mut l) = self.in_proj_z { l.clear_vram(); } self.out_proj.clear_vram(); self.norm.clear_vram(); }
-    pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { if let Some(ref mut l) = self.in_proj_qkv { l.load_to_vram(reg, dev)?; } if let Some(ref mut l) = self.in_proj_a { l.load_to_vram(reg, dev)?; } if let Some(ref mut l) = self.in_proj_b { l.load_to_vram(reg, dev)?; } if let Some(ref mut l) = self.in_proj_z { l.load_to_vram(reg, dev)?; } self.out_proj.load_to_vram(reg, dev)?; self.norm.load_to_vram(reg, dev)?; Ok(()) }
+    pub fn clear_vram(&mut self) { 
+        if let Some(ref mut l) = self.in_proj_qkv { l.clear_vram(); } 
+        if let Some(ref mut l) = self.in_proj_a { l.clear_vram(); } 
+        if let Some(ref mut l) = self.in_proj_b { l.clear_vram(); } 
+        if let Some(ref mut l) = self.in_proj_z { l.clear_vram(); } 
+        self.out_proj.clear_vram(); self.norm.clear_vram(); 
+        self.dt_bias = None; self.a_log = None; self.conv1d = None;
+    }
+    pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { 
+        if let Some(ref mut l) = self.in_proj_qkv { l.load_to_vram(reg, dev)?; } 
+        if let Some(ref mut l) = self.in_proj_a { l.load_to_vram(reg, dev)?; } 
+        if let Some(ref mut l) = self.in_proj_b { l.load_to_vram(reg, dev)?; } 
+        if let Some(ref mut l) = self.in_proj_z { l.load_to_vram(reg, dev)?; } 
+        self.out_proj.load_to_vram(reg, dev)?; self.norm.load_to_vram(reg, dev)?; 
+        
+        let p = self.norm.full_name.replace(".norm", ".linear_attn");
+        if let Ok(dt) = reg.get_tensor(&format!("{}.dt_bias", p)) { self.dt_bias = Some(dt.to_device(dev)?.to_dtype(DType::F16)?); }
+        if let Ok(a) = reg.get_tensor(&format!("{}.A_log", p)) { self.a_log = Some(a.to_device(dev)?.to_dtype(DType::F16)?); }
+        
+        if let Ok(cw) = reg.get_tensor(&format!("{}.conv1d.weight", p)) {
+            let cb = reg.get_tensor(&format!("{}.conv1d.bias", p)).ok();
+            let c_w = cw.to_device(dev)?.to_dtype(DType::F16)?;
+            let c_b = if let Some(b) = cb { Some(b.to_device(dev)?.to_dtype(DType::F16)?) } else { None };
+            let (out_c, in_c, k) = c_w.dims3()?;
+            self.conv1d = Some(candle_nn::conv1d(in_c, out_c, k, candle_nn::Conv1dConfig { padding: k - 1, groups: in_c, ..Default::default() }, vb_from_weights(c_w, c_b, dev)?)?);
+        }
+        Ok(()) 
+    }
     pub fn forward(&mut self, x: &Tensor, _mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
-        let (bs, sl, _) = x.dims3()?; let h = self.h;
-        let (q, k, v, z) = if let Some(ref l) = self.in_proj_qkv {
-            let projected = l.forward(x, reg)?;
-            let q = projected.narrow(D::Minus1, 0, h)?;
-            let k = projected.narrow(D::Minus1, h, h)?;
-            let v = projected.narrow(D::Minus1, h*2, h)?;
+        let (bs, sl, _) = x.dims3()?; let (nk, dk, nv, dv) = (self.nk, self.dk, self.nv, self.dv);
+        let (mut q, mut k, mut v, z) = if let Some(ref l) = self.in_proj_qkv {
+            let proj = l.forward(x, reg)?;
+            let q = proj.narrow(D::Minus1, 0, nk * dk)?;
+            let k = proj.narrow(D::Minus1, nk * dk, nk * dk)?;
+            let v = proj.narrow(D::Minus1, nk * dk * 2, nv * dv)?;
             let z = if let Some(ref lz) = self.in_proj_z { lz.forward(x, reg)? } else { x.clone() };
             (q, k, v, z)
         } else {
             (self.in_proj_a.as_ref().unwrap().forward(x, reg)?, self.in_proj_b.as_ref().unwrap().forward(x, reg)?, self.in_proj_b.as_ref().unwrap().forward(x, reg)?, self.in_proj_z.as_ref().unwrap().forward(x, reg)?)
         };
-        let mut current_state = match self.delta_state.take() {
-            Some(st) => if st.elem_count() == h*h { st.reshape((bs, h, h))?.to_device(x.device())? } else { Tensor::zeros((bs, h, h), DType::F16, x.device())? },
-            None => Tensor::zeros((bs, h, h), DType::F16, x.device())?,
-        };
-        let mut outputs = vec![];
-        for t in 0..sl {
-            let qt = q.narrow(1, t, 1)?.squeeze(1)?; let kt = k.narrow(1, t, 1)?.squeeze(1)?; let vt = v.narrow(1, t, 1)?.squeeze(1)?; 
-            let update = vt.unsqueeze(D::Minus1)?.matmul(&kt.unsqueeze(D::Minus2)?)?;
-            current_state = (current_state + update)?;
-            outputs.push(current_state.matmul(&qt.unsqueeze(D::Minus1)?)?.squeeze(D::Minus1)?.unsqueeze(1)?);
+        
+        if let Some(ref conv) = self.conv1d {
+            let mut c_in = Tensor::cat(&[&q, &k, &v], D::Minus1)?.transpose(1, 2)?;
+            if let Some(ref pc) = self.conv_state { c_in = Tensor::cat(&[pc, &c_in], 2)?; }
+            self.conv_state = Some(c_in.narrow(2, c_in.dim(2)? - conv.weight().dim(2)? + 1, conv.weight().dim(2)? - 1)?.detach());
+            let c_out = conv.forward(&c_in)?.transpose(1, 2)?;
+            q = c_out.narrow(D::Minus1, 0, nk * dk)?;
+            k = c_out.narrow(D::Minus1, nk * dk, nk * dk)?;
+            v = c_out.narrow(D::Minus1, nk * dk * 2, nv * dv)?;
         }
-        let out = Tensor::cat(&outputs, 1)?; self.delta_state = Some(current_state.detach().to_device(&Device::Cpu)?);
+
+        let q = q.reshape((bs, sl, nk, dk))?; let k = k.reshape((bs, sl, nk, dk))?; let v = v.reshape((bs, sl, nv, dv))?;
+        let mut state = self.delta_state.take().unwrap_or_else(|| Tensor::zeros((bs, nk, dk, dv), DType::F16, x.device()).unwrap());
+        let mut outputs = vec![];
+        
+        for t in 0..sl {
+            let qt = q.narrow(1, t, 1)?.squeeze(1)?; let kt = k.narrow(1, t, 1)?.squeeze(1)?; let vt = v.narrow(1, t, 1)?.squeeze(1)?;
+            let update = kt.unsqueeze(D::Minus1)?.matmul(&vt.unsqueeze(D::Minus2)?)?;
+            state = (state + update)?;
+            let out_t = qt.unsqueeze(D::Minus2)?.matmul(&state)?.squeeze(D::Minus2)?;
+            outputs.push(out_t.unsqueeze(1)?);
+        }
+        let out = Tensor::cat(&outputs, 1)?.reshape((bs, sl, nv * dv))?;
+        self.delta_state = Some(state.detach());
         let res = self.out_proj.forward(&(out * z.silu()?)?, reg)?;
         self.norm.forward(&res, reg)
     }
+}
+
+fn vb_from_weights(w: Tensor, b: Option<Tensor>, dev: &Device) -> Result<VarBuilder> {
+    let mut map = HashMap::new(); map.insert("weight".to_string(), w);
+    if let Some(bv) = b { map.insert("bias".to_string(), bv); }
+    Ok(VarBuilder::from_tensors(map, DType::F16, dev))
 }
 
 pub struct QAttention { q_proj: QLinear, k_proj: QLinear, v_proj: QLinear, o_proj: QLinear, q_norm: QRmsNorm, k_norm: QRmsNorm, pub nh: usize, pub nkv: usize, pub hd: usize, scaling: f64, pub h: usize, pub kv_cache: Option<(Tensor, Tensor)> }
