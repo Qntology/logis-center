@@ -98,10 +98,10 @@ impl Qwen3_5GenerateModel {
 
         let num_layers = self.qwen3_5.model.layers.len();
 
-        println!("[MODEL-QWEN35] Starting HYBRID Prefill (True Layer-by-Layer Relay)...");
+        println!("[MODEL-QWEN35] Starting FULL-RELAY Prefill (Layer-by-Layer weights & cache)...");
 
         // ====================================================================
-        // [PHASE 1] PREFILL: Layer-by-Layer (VRAM-safe)
+        // [PHASE 1] PREFILL: Layer-by-Layer Relay (VRAM minimum)
         // ====================================================================
         while seqlen_offset < full_seq_len {
             if let Some(flag) = &cancel_flag {
@@ -112,30 +112,35 @@ impl Qwen3_5GenerateModel {
             let current_chunk = remaining.min(chunk_size);
             let input_ids = full_input_ids.narrow(1, seqlen_offset, current_chunk)?;
 
-            // 1. Embeddings
+            // 1. Embeddings (Dynamic Load/Drop)
+            self.qwen3_5.model.embed.load_to_vram(&self.registry, &self.device)?;
             let mut h = self.qwen3_5.model.embed.forward(&input_ids, &self.registry)?;
+            self.qwen3_5.model.embed.clear_vram();
             
-            // RoPE
+            // RoPE & Mask
             let pos_vec: Vec<u32> = (seqlen_offset as u32..(seqlen_offset + current_chunk) as u32).collect();
             let pos = Tensor::from_vec(pos_vec, (1, current_chunk), &self.device)?.unsqueeze(0)?.broadcast_as((3, input_ids.dim(0)?, current_chunk))?.contiguous()?;
             let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos, DType::F16, self.qwen3_5.model.mrope.clone())?;
-            
-            // Mask
             let mask = if current_chunk <= 1 && seqlen_offset == 0 { None } else { 
                 Some(crate::utils::tensor_utils::prepare_causal_attention_mask(input_ids.dim(0)?, current_chunk, seqlen_offset, &self.device)?.to_dtype(DType::F16)?) 
             };
 
             // 2. Layer Relay
             for i in 0..num_layers {
-                // [SSD -> VRAM] Load previous context for THIS layer
+                let layer = &mut self.qwen3_5.model.layers[i];
+                
+                // [WEIGHTS UP]
+                layer.load_to_vram(&self.registry, &self.device)?;
+
+                // [KV LOAD]
                 if seqlen_offset > 0 {
-                   if let Some(ref mut sa) = self.qwen3_5.model.layers[i].self_attn {
+                   if let Some(ref mut sa) = layer.self_attn {
                        let s_k = candle_core::Shape::from((1, sa.nkv, seqlen_offset, sa.hd));
                        let s_v = s_k.clone();
                        if let Ok(LayerContext::Attention { k, v }) = disk_manager.load_layer_context(i, "attention", &s_k, &s_v, &self.device) {
                            sa.kv_cache = Some((k, v));
                        }
-                   } else if let Some(ref mut la) = self.qwen3_5.model.layers[i].linear_attn {
+                   } else if let Some(ref mut la) = layer.linear_attn {
                        let s_state = candle_core::Shape::from((1, la.h, la.h)); 
                        if let Ok(LayerContext::DeltaNet { state }) = disk_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
                            la.delta_state = Some(state.to_device(&self.device)?);
@@ -143,50 +148,58 @@ impl Qwen3_5GenerateModel {
                    }
                 }
 
-                // Computation
-                h = self.qwen3_5.model.layers[i].forward(&h, &cos, &sin, mask.as_ref(), &self.registry)?;
+                // [COMPUTE]
+                h = layer.forward(&h, &cos, &sin, mask.as_ref(), &self.registry)?;
 
-                // [VRAM -> SSD] Offload & Clear VRAM immediately
-                if let Some(ref mut sa) = self.qwen3_5.model.layers[i].self_attn {
+                // [KV SAVE]
+                if let Some(ref mut sa) = layer.self_attn {
                     if let Some((k, v)) = sa.kv_cache.take() { 
                         disk_manager.save_layer_context(i, &LayerContext::Attention { k, v })?;
                     }
                 }
-                if let Some(ref mut la) = self.qwen3_5.model.layers[i].linear_attn {
+                if let Some(ref mut la) = layer.linear_attn {
                     if let Some(st) = la.delta_state.take() {
                         disk_manager.save_layer_context(i, &LayerContext::DeltaNet { state: st })?;
                     }
                 }
 
+                // [WEIGHTS DOWN]
+                layer.clear_vram();
+
                 #[cfg(feature = "cuda")]
                 self.device.synchronize()?; 
+                
+                if i % 4 == 0 || i == num_layers - 1 {
+                    println!("[VRAM-RELAY] Prefill Chunk {}/{} - Layer {}/{} Weights(↑↓) Cache(IO)", seqlen_offset + current_chunk, full_seq_len, i+1, num_layers);
+                }
             }
 
-            // Head
+            // Head (Dynamic Load/Drop)
+            self.qwen3_5.model.norm.load_to_vram(&self.registry, &self.device)?;
             let last_h = self.qwen3_5.model.norm.forward(&h, &self.registry)?;
+            self.qwen3_5.model.norm.clear_vram();
+
+            self.qwen3_5.head.load_to_vram(&self.registry, &self.device)?;
             let logits = self.qwen3_5.head.forward(&last_h.narrow(1, current_chunk - 1, 1)?, &self.registry)?;
+            self.qwen3_5.head.clear_vram();
             
             seqlen_offset += current_chunk;
             last_logits = Some(logits);
-
-            println!("[PREFILL-RELAY] Processed {}/{} tokens...", seqlen_offset, full_seq_len);
         }
 
         // ====================================================================
-        // [PHASE 2] TRANSITION: Loading weights to VRAM for Decode
+        // [PHASE 2] TRANSITION: (Skip load_all_to_vram for FULL RELAY mode)
         // ====================================================================
-        println!("[MODEL-QWEN35] Prefill complete. Loading weights to VRAM for Decode...");
-        self.qwen3_5.load_all_to_vram(&self.registry, &self.device)?;
+        println!("[MODEL-QWEN35] Prefill complete. Starting FULL-RELAY Decoding...");
 
         // ====================================================================
-        // [PHASE 3] DECODING: Streaming Relay
+        // [PHASE 3] DECODING: Full Relay (Weights & Cache per layer)
         // ====================================================================
-        println!("[MODEL-QWEN35] Starting Streaming Decoding...");
         let mut logits = last_logits.ok_or(anyhow::anyhow!("No logits generated"))?;
         let mut gen_text = String::new();
         let sample_len = mes.max_tokens.unwrap_or(1024);
 
-        for _i in 0..sample_len {
+        for step in 0..sample_len {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) { break; }
             }
@@ -197,55 +210,81 @@ impl Qwen3_5GenerateModel {
             if next_token == self.eos_token_id { break; }
 
             let piece = self.tokenizer.token_decode(vec![next_token])?;
+            print!("{}", piece); // Stream to console
             gen_text.push_str(&piece);
 
             let input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?.to_dtype(DType::U32)?;
             
+            // Embeddings (Relay)
+            self.qwen3_5.model.embed.load_to_vram(&self.registry, &self.device)?;
             let mut h = self.qwen3_5.model.embed.forward(&input_ids, &self.registry)?; 
+            self.qwen3_5.model.embed.clear_vram();
+
             let pos_vec: Vec<u32> = vec![seqlen_offset as u32];
             let pos = Tensor::from_vec(pos_vec, (1, 1), &self.device)?.unsqueeze(0)?.broadcast_as((3, 1, 1))?.contiguous()?;
             let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos, DType::F16, self.qwen3_5.model.mrope.clone())?;
 
             for i in 0..num_layers {
-                // SSD -> VRAM Load (Dynamic shape per layer instance)
-                if let Some(ref mut sa) = self.qwen3_5.model.layers[i].self_attn {
+                let layer = &mut self.qwen3_5.model.layers[i];
+
+                // [WEIGHTS UP]
+                layer.load_to_vram(&self.registry, &self.device)?;
+
+                // [KV LOAD]
+                if let Some(ref mut sa) = layer.self_attn {
                     let s_k = candle_core::Shape::from((1, sa.nkv, seqlen_offset, sa.hd));
                     let s_v = s_k.clone();
                     if let Ok(LayerContext::Attention { k, v }) = disk_manager.load_layer_context(i, "attention", &s_k, &s_v, &self.device) {
                         sa.kv_cache = Some((k, v));
                     }
-                } else if let Some(ref mut la) = self.qwen3_5.model.layers[i].linear_attn {
+                } else if let Some(ref mut la) = layer.linear_attn {
                     let s_state = candle_core::Shape::from((1, la.h, la.h)); 
                     if let Ok(LayerContext::DeltaNet { state }) = disk_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
                         la.delta_state = Some(state.to_device(&self.device)?);
                     }
                 }
 
-                h = self.qwen3_5.model.layers[i].forward(&h, &cos, &sin, None, &self.registry)?;
+                // [COMPUTE]
+                h = layer.forward(&h, &cos, &sin, None, &self.registry)?;
 
-                // VRAM -> SSD Save & Clear
-                if let Some(ref mut sa) = self.qwen3_5.model.layers[i].self_attn {
+                // [KV SAVE]
+                if let Some(ref mut sa) = layer.self_attn {
                     if let Some((k, v)) = sa.kv_cache.take() { 
                         disk_manager.save_layer_context(i, &LayerContext::Attention { k, v })?;
                     }
                 }
-                if let Some(ref mut la) = self.qwen3_5.model.layers[i].linear_attn {
+                if let Some(ref mut la) = layer.linear_attn {
                     if let Some(st) = la.delta_state.take() {
                         disk_manager.save_layer_context(i, &LayerContext::DeltaNet { state: st })?;
                     }
                 }
 
+                // [WEIGHTS DOWN]
+                layer.clear_vram();
+
                 #[cfg(feature = "cuda")]
                 self.device.synchronize()?; 
             }
 
+            // Norm & Head (Relay)
+            self.qwen3_5.model.norm.load_to_vram(&self.registry, &self.device)?;
             let last_h = self.qwen3_5.model.norm.forward(&h, &self.registry)?;
+            self.qwen3_5.model.norm.clear_vram();
+
+            self.qwen3_5.head.load_to_vram(&self.registry, &self.device)?;
             logits = self.qwen3_5.head.forward(&last_h, &self.registry)?;
+            self.qwen3_5.head.clear_vram();
             
             seqlen_offset += 1;
+            
+            if step % 5 == 0 {
+                // Subtle log to avoid flooding console during decode
+                // println!("[DECODE] Token {} generated (All Layers Relayed)", step);
+            }
         }
 
         self.qwen3_5.clear_cache();
+        println!("\n[MODEL-QWEN35] Generation complete.");
         Ok(gen_text)
     }
 }
