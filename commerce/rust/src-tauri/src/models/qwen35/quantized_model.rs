@@ -93,8 +93,12 @@ impl QLinear {
 
         // [STRICT-SHAPE-FIX] Correct orientation for matmul
         let x_in_dim = x.dim(D::Minus1)?;
-        let w = if w_raw.dim(1)? == x_in_dim { w_raw.t()? } else { w_raw };
-        let w = w.to_dtype(DType::F16)?.contiguous()?;
+        let w = if w_raw.dim(1)? == x_in_dim { 
+            w_raw.t()?.contiguous()? 
+        } else { 
+            w_raw.contiguous()? 
+        };
+        let w = w.to_dtype(DType::F16)?;
         
         let res = x.matmul(&w)?;
 
