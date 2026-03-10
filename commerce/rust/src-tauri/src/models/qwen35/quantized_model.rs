@@ -49,13 +49,17 @@ impl QuantizedRegistry {
     }
     
     pub fn get_q_tensor(&self, full_name: &str, suffix: &str) -> Result<Tensor> {
-        // Strict lookup: exact name or exact name with .weight
-        if let Ok(t) = self.get_tensor(&format!("{}.q_{}", full_name, suffix)) { return Ok(t); }
-        if let Ok(t) = self.get_tensor(&format!("{}.weight.q_{}", full_name, suffix)) { return Ok(t); }
-        if let Ok(t) = self.get_tensor(&format!("{}.{}", full_name, suffix)) { return Ok(t); }
-        if let Ok(t) = self.get_tensor(&format!("{}.weight", full_name)) { return Ok(t); }
-        if let Ok(t) = self.get_tensor(full_name) { return Ok(t); }
-        anyhow::bail!("FAILED to find tensor: {} ({})", full_name, suffix)
+        // Very strict matching to avoid accidental overlap with other tensors
+        let name_with_suffix = format!("{}.{}", full_name, suffix);
+        let name_with_weight_suffix = format!("{}.weight.{}", full_name, suffix);
+        let name_only = full_name.to_string();
+        
+        if let Ok(t) = self.get_tensor(&name_with_suffix) { return Ok(t); }
+        if let Ok(t) = self.get_tensor(&name_with_weight_suffix) { return Ok(t); }
+        if suffix == "weight" {
+            if let Ok(t) = self.get_tensor(&name_only) { return Ok(t); }
+        }
+        anyhow::bail!("Strict find FAILED: {} ({})", full_name, suffix)
     }
 }
 
@@ -65,17 +69,21 @@ impl QRmsNorm {
     pub fn clear_vram(&mut self) { self.persistent_weight = None; }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         let w = reg.get_q_tensor(&self.full_name, "weight")?.to_device(dev)?.to_dtype(DType::F16)?;
+        if w.rank() != 1 { anyhow::bail!("RMSNorm weights must be rank 1, but got {} for {}", w.rank(), self.full_name); }
         self.persistent_weight = Some(w); Ok(())
     }
     pub fn forward(&self, x: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
         let dev = x.device();
         let w = if let Some(pw) = &self.persistent_weight { pw.clone() } 
-                else { reg.get_q_tensor(&self.full_name, "weight")?.to_device(dev)?.to_dtype(DType::F16)? };
+                else { 
+                    let t = reg.get_q_tensor(&self.full_name, "weight")?.to_device(dev)?.to_dtype(DType::F16)?;
+                    if t.rank() != 1 { anyhow::bail!("RMSNorm weights rank 1 mismatch"); }
+                    t
+                };
         let x_f32 = x.to_dtype(DType::F32)?;
         let var = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
         let norm = x_f32.broadcast_div(&(var + self.eps)?.sqrt()?)?.to_dtype(DType::F16)?;
-        if w.rank() == 1 { Ok(norm.broadcast_mul(&w)?) }
-        else { Ok(norm.broadcast_mul(&w.reshape(((), w.dim(D::Minus1)?))?)?.reshape(norm.dims())?) }
+        Ok(norm.broadcast_mul(&w)?)
     }
 }
 
@@ -85,7 +93,7 @@ impl QLinear {
     pub fn clear_vram(&mut self) { self.persistent_weight = None; self.persistent_bias = None; }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         let name = &self.full_name;
-        let w_raw = if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "scales"), reg.get_q_tensor(name, "data"), reg.get_q_tensor(name, "shape")) {
+        let w_raw = if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "q_scales"), reg.get_q_tensor(name, "q_data"), reg.get_q_tensor(name, "q_shape")) {
             let s = s_t.to_device(dev)?.to_dtype(DType::F16)?; let d = d_t.to_device(dev)?.to_dtype(DType::F16)?;
             let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
             let high = (d.clone() / 16.0)?.floor()?; let low = d.sub(&(high.clone() * 16.0)?)?;
@@ -99,7 +107,7 @@ impl QLinear {
     pub fn forward(&self, x: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
         let dev = x.device(); let name = &self.full_name;
         let w_raw = if let Some(pw) = &self.persistent_weight { pw.clone() } 
-        else if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "scales"), reg.get_q_tensor(name, "data"), reg.get_q_tensor(name, "shape")) {
+        else if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "q_scales"), reg.get_q_tensor(name, "q_data"), reg.get_q_tensor(name, "q_shape")) {
             let s = s_t.to_device(dev)?.to_dtype(DType::F16)?; let d = d_t.to_device(dev)?.to_dtype(DType::F16)?;
             let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
             let high = (d.clone() / 16.0)?.floor()?; let low = d.sub(&(high.clone() * 16.0)?)?;
@@ -114,11 +122,17 @@ impl QLinear {
     }
 }
 
+fn join_name(p: &str, n: &str) -> String {
+    if p.is_empty() { n.to_string() }
+    else if p.ends_with('.') { format!("{}{}", p, n) }
+    else { format!("{}.{}", p, n) }
+}
+
 pub struct QGatedDeltaNet { in_proj: QLinear, out_proj: QLinear, norm: QRmsNorm, pub h: usize, pub delta_state: Option<Tensor> }
 impl QGatedDeltaNet {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let p = vb.prefix();
-        Ok(Self { in_proj: QLinear::new(&format!("{}.in_proj_qkv", p))?, out_proj: QLinear::new(&format!("{}.out_proj", p))?, norm: QRmsNorm::new(&format!("{}.norm", p), config.rms_norm_eps)?, h: config.hidden_size, delta_state: None })
+        Ok(Self { in_proj: QLinear::new(&join_name(&p, "in_proj_qkv"))?, out_proj: QLinear::new(&join_name(&p, "out_proj"))?, norm: QRmsNorm::new(&join_name(&p, "norm"), config.rms_norm_eps)?, h: config.hidden_size, delta_state: None })
     }
     pub fn clear_vram(&mut self) { self.in_proj.clear_vram(); self.out_proj.clear_vram(); self.norm.clear_vram(); }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
@@ -148,8 +162,8 @@ impl QAttention {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let p = vb.prefix();
         Ok(Self {
-            q_proj: QLinear::new(&format!("{}.q_proj", p))?, k_proj: QLinear::new(&format!("{}.k_proj", p))?, v_proj: QLinear::new(&format!("{}.v_proj", p))?, o_proj: QLinear::new(&format!("{}.o_proj", p))?,
-            q_norm: QRmsNorm::new(&format!("{}.q_norm", p), config.rms_norm_eps)?, k_norm: QRmsNorm::new(&format!("{}.k_norm", p), config.rms_norm_eps)?,
+            q_proj: QLinear::new(&join_name(&p, "q_proj"))?, k_proj: QLinear::new(&join_name(&p, "k_proj"))?, v_proj: QLinear::new(&join_name(&p, "v_proj"))?, o_proj: QLinear::new(&join_name(&p, "o_proj"))?,
+            q_norm: QRmsNorm::new(&join_name(&p, "q_norm"), config.rms_norm_eps)?, k_norm: QRmsNorm::new(&join_name(&p, "k_norm"), config.rms_norm_eps)?,
             nh: config.num_attention_heads, nkv: config.num_key_value_heads, hd: config.head_dim, scaling: 1.0 / (config.head_dim as f64).sqrt(), h: config.hidden_size, kv_cache: None,
         })
     }
@@ -179,7 +193,7 @@ impl QDecoderLayer {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig, idx: usize) -> Result<Self> {
         let lt = config.layer_types[idx].clone(); let p = vb.prefix();
         let (sa, la) = if lt == "linear_attention" { (None, Some(QGatedDeltaNet::new(vb.pp("linear_attn"), config)?)) } else { (Some(QAttention::new(vb.pp("self_attn"), config)?), None) };
-        Ok(Self { self_attn: sa, linear_attn: la, mlp_gate: QLinear::new(&format!("{}.mlp.gate_proj", p))?, mlp_up: QLinear::new(&format!("{}.mlp.up_proj", p))?, mlp_down: QLinear::new(&format!("{}.mlp.down_proj", p))?, in_norm: QRmsNorm::new(&format!("{}.input_layernorm", p), config.rms_norm_eps)?, post_norm: QRmsNorm::new(&format!("{}.post_attention_layernorm", p), config.rms_norm_eps)? })
+        Ok(Self { self_attn: sa, linear_attn: la, mlp_gate: QLinear::new(&join_name(&p, "mlp.gate_proj"))?, mlp_up: QLinear::new(&join_name(&p, "mlp.up_proj"))?, mlp_down: QLinear::new(&join_name(&p, "mlp.down_proj"))?, in_norm: QRmsNorm::new(&join_name(&p, "input_layernorm"), config.rms_norm_eps)?, post_norm: QRmsNorm::new(&join_name(&p, "post_attention_layernorm"), config.rms_norm_eps)? })
     }
     pub fn clear_vram(&mut self) { self.in_norm.clear_vram(); if let Some(ref mut sa) = self.self_attn { sa.clear_vram(); } if let Some(ref mut la) = self.linear_attn { la.clear_vram(); } self.post_norm.clear_vram(); self.mlp_gate.clear_vram(); self.mlp_up.clear_vram(); self.mlp_down.clear_vram(); }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
@@ -201,7 +215,7 @@ impl QEmbedding {
     pub fn clear_vram(&mut self) { self.persistent_weight = None; }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         let name = &self.full_name;
-        let w = if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "scales"), reg.get_q_tensor(name, "data"), reg.get_q_tensor(name, "shape")) {
+        let w = if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "q_scales"), reg.get_q_tensor(name, "q_data"), reg.get_q_tensor(name, "q_shape")) {
             let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
             let s = s_t.to_device(dev)?.to_dtype(DType::F16)?; let d = d_t.to_device(dev)?.to_dtype(DType::F16)?;
             let high = (d.clone() / 16.0)?.floor()?; let low = d.sub(&(high.clone() * 16.0)?)?;
@@ -222,7 +236,7 @@ impl QTextModel {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let mut layers = vec![]; for i in 0..config.num_hidden_layers { layers.push(QDecoderLayer::new(vb.pp("layers").pp(i), config, i)?); }
         let p = vb.prefix();
-        Ok(Self { embed: QEmbedding::new(&format!("{}.embed_tokens", p)), layers, norm: QRmsNorm::new(&format!("{}.norm", p), config.rms_norm_eps)?, rotary: Qwen3_5TextRotaryEmbedding::new((config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize, config.rope_parameters.rope_theta), mrope: config.rope_parameters.mrope_section.clone() })
+        Ok(Self { embed: QEmbedding::new(&join_name(&p, "embed_tokens")), layers, norm: QRmsNorm::new(&join_name(&p, "norm"), config.rms_norm_eps)?, rotary: Qwen3_5TextRotaryEmbedding::new((config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize, config.rope_parameters.rope_theta), mrope: config.rope_parameters.mrope_section.clone() })
     }
     pub fn forward(&mut self, _ids: &Tensor, _pos: &Tensor, _offset: usize, _reg: &QuantizedRegistry) -> Result<Tensor> { anyhow::bail!("Not used") }
 }
@@ -230,7 +244,8 @@ impl QTextModel {
 pub struct QuantizedQwen3_5Model { pub model: QTextModel, pub head: QLinear }
 impl QuantizedQwen3_5Model {
     pub fn new(vb: VarBuilder, config: Qwen3_5Config) -> Result<Self> {
-        Ok(Self { model: QTextModel::new(vb.pp("model.language_model"), &config.text_config)?, head: QLinear::new("model.language_model.embed_tokens")? })
+        let p = vb.prefix();
+        Ok(Self { model: QTextModel::new(vb.pp("model.language_model"), &config.text_config)?, head: QLinear::new(&join_name(&p, "model.language_model.embed_tokens"))? })
     }
     pub fn load_all_to_vram(&mut self, _reg: &QuantizedRegistry, _dev: &Device) -> Result<()> { Ok(()) }
     pub fn forward(&mut self, _ids: &Tensor, _offset: usize, _reg: &QuantizedRegistry, _img: Option<&Tensor>) -> Result<Tensor> { anyhow::bail!("Not used") }
