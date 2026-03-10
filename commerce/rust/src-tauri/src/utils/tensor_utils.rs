@@ -121,7 +121,7 @@ pub fn nonzero_index(mask: &Tensor) -> Result<Tensor> {
         }
         1 => {
             let index_vec = nonzero_index_vec(mask)?;
-            Tensor::from_slice(&index_vec, index_vec.len(), mask.device())?
+            Tensor::from_slice(&index_vec, index_vec.len(), mask.device())?.to_dtype(DType::U32)?
         }
         _ => {
             return Err(anyhow!(format!(
@@ -161,7 +161,7 @@ pub fn zero_index_vec(mask: &Tensor) -> Result<Vec<u32>> {
 
 pub fn zero_index(mask: &Tensor) -> Result<Tensor> {
     let index_vec = zero_index_vec(mask)?;
-    let indices_tensor = Tensor::from_slice(&index_vec, index_vec.len(), mask.device())?;
+    let indices_tensor = Tensor::from_slice(&index_vec, index_vec.len(), mask.device())?.to_dtype(DType::U32)?;
     Ok(indices_tensor)
 }
 
@@ -356,7 +356,7 @@ pub fn prod_tensor_last_dim(t: &Tensor) -> Result<Tensor> {
 }
 
 pub fn mask_index_add(original: &Tensor, mask: &Tensor, add: &Tensor) -> Result<Tensor> {
-    let visual_nonzero_index = nonzero_index(mask)?;
+    let visual_nonzero_index = nonzero_index(mask)?.to_dtype(DType::U32)?;
     let xs = original.index_add(&visual_nonzero_index, add, 0)?;
     Ok(xs)
 }
@@ -757,7 +757,7 @@ pub fn index_select_2d(t: &Tensor, index: &Tensor) -> Result<Tensor> {
     let mut res_vec = Vec::new();
     let index_dim0 = index.dim(0)?;
     for i in 0..index_dim0 {
-        let index_i = index.i(i)?;
+        let index_i = index.i(i)?.to_dtype(DType::U32)?;
         let rel_i = t.index_select(&index_i, 0)?;
         res_vec.push(rel_i);
     }
@@ -775,7 +775,8 @@ pub fn topk(weight: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
     let topk_idx = weight
         .arg_sort_last_dim(false)?
         .narrow(D::Minus1, 0, topk)?
-        .contiguous()?;
+        .contiguous()?
+        .to_dtype(DType::U32)?;
     let topk_weight = weight.gather(&topk_idx, D::Minus1)?;
     Ok((topk_weight, topk_idx))
 }

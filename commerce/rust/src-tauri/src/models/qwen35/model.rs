@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use candle_core::{D, Device, IndexOp, Tensor};
+use candle_core::{D, DType, Device, IndexOp, Tensor};
 use std::collections::HashMap;
 use candle_nn::{
     Conv1d, Embedding, Linear, Module, RmsNorm, VarBuilder, embedding, linear_b, linear_no_bias,
@@ -907,7 +907,7 @@ impl Qwen3_5Embedding {
 
     pub fn forward(&self, indexes: &Tensor) -> Result<Tensor> {
         let (b, s) = indexes.dims2()?;
-        let indexes_flat = indexes.flatten_all()?;
+        let indexes_flat = indexes.flatten_all()?.to_dtype(DType::U32)?;
         let res = self.weight.index_select(&indexes_flat, 0)?;
         Ok(res.reshape((b, s, ()))?)
     }
@@ -1088,7 +1088,7 @@ impl Qwen3_5Model {
                 let mut input_ids_i = total_input_ids.i(i)?;
                 let mask_i = mask_.i(i)?;
                 if mask_i.sum_all()?.to_scalar::<u32>()? != mask_i.dim(0)? as u32 {
-                    let nonzero_idx = nonzero_index(&mask_i)?;
+                    let nonzero_idx = nonzero_index(&mask_i)?.to_dtype(DType::U32)?;
                     input_ids_i = input_ids_i.gather(&nonzero_idx, 0)?;
                 }
                 let mut text_start = 0;
@@ -1099,7 +1099,7 @@ impl Qwen3_5Model {
 
                 match vision_indices {
                     Ok(indeices) => {
-                        let vision_tokens = input_ids_i.gather(&indeices, 0)?.to_vec1::<u32>()?;
+                        let vision_tokens = input_ids_i.gather(&indeices.to_dtype(DType::U32)?, 0)?.to_vec1::<u32>()?;
                         let vision_indices_vec = indeices.to_vec1::<u32>()?;
                         for (j, &token) in vision_tokens.iter().enumerate() {
                             if token == image_token_id {
@@ -1222,7 +1222,7 @@ impl Qwen3_5Model {
                 let mut position_ids_i = position_ids.i(i)?;
                 let mask_i = mask.i(i)?;
                 if mask_i.sum_all()?.to_scalar::<u32>()? != mask_i.dim(0)? as u32 {
-                    let zero_indices = zero_index(&mask_i)?;
+                    let zero_indices = zero_index(&mask_i)?.to_dtype(DType::U32)?;
                     let replace_1 = Tensor::ones(
                         zero_indices.dim(0)?,
                         candle_core::DType::U32,

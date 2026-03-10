@@ -214,16 +214,16 @@ impl ModelVariant {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelSize {
-    Small, // 0.6B for Ingestion
-    Large, // 2B-VL for Inference
+    Small, // 0.8B for Ingestion
+    Large, // 0.8B for Inference
 }
 
 #[derive(Clone)]
 pub struct LogisModel {
     pub app_handle: tauri::AppHandle,
     pub generator: Arc<TokioMutex<Option<ModelVariant>>>, // Primary Active Slot (GPU)
-    pub small_hibernation: Arc<TokioMutex<Option<ModelVariant>>>, // 0.6B RAM Slot
-    pub large_hibernation: Arc<TokioMutex<Option<ModelVariant>>>, // 2B RAM Slot
+    pub small_hibernation: Arc<TokioMutex<Option<ModelVariant>>>, // 0.8B RAM Slot
+    pub large_hibernation: Arc<TokioMutex<Option<ModelVariant>>>, // 0.8B RAM Slot
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     
     pub is_cpu_mode: bool, 

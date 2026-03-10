@@ -529,9 +529,9 @@ impl Qwen3VLVisionModel {
             pos_ids_vec.push(coords);
         }
         let pos_ids = Tensor::cat(&pos_ids_vec, 0)?;
-        let pos_ids_h = pos_ids.i((.., 0))?.contiguous()?;
+        let pos_ids_h = pos_ids.i((.., 0))?.contiguous()?.to_dtype(DType::U32)?;
         // 第二列是w维度的索引
-        let pos_ids_w = pos_ids.i((.., 1))?.contiguous()?;
+        let pos_ids_w = pos_ids.i((.., 1))?.contiguous()?.to_dtype(DType::U32)?;
         let rotary_pos_emb_h = freq_table.index_select(&pos_ids_h, 0)?;
         let rotary_pos_emb_w = freq_table.index_select(&pos_ids_w, 0)?;
         // 每个patch融合h索引和w索引两个的位置编码信息
@@ -963,7 +963,7 @@ impl Qwen3VLModel {
                 let mask_i = mask_.i(i)?;
                 // 推理时, attention_mask如果是全1向量,取非0索引的操作没必要
                 if mask_i.sum_all()?.to_scalar::<u32>()? != mask_i.dim(0)? as u32 {
-                    let nonzero_idx = nonzero_index(&mask_i)?;
+                    let nonzero_idx = nonzero_index(&mask_i)?.to_dtype(DType::U32)?;
                     input_ids_i = input_ids_i.gather(&nonzero_idx, 0)?;
                 }
                 let mut text_start = 0;
@@ -976,7 +976,7 @@ impl Qwen3VLModel {
 
                 match vision_indices {
                     Ok(indeices) => {
-                        let vision_tokens = input_ids_i.gather(&indeices, 0)?.to_vec1::<u32>()?;
+                        let vision_tokens = input_ids_i.gather(&indeices.to_dtype(DType::U32)?, 0)?.to_vec1::<u32>()?;
                         let vision_indices_vec = indeices.to_vec1::<u32>()?;
                         for (j, &token) in vision_tokens.iter().enumerate() {
                             if token == image_token_id as u32 {
@@ -1101,7 +1101,7 @@ impl Qwen3VLModel {
                 // 如果有pad, 将填充位置置为1
                 // 当bs>1, 可能存在不同序列长度，需要添加pad使seq_len长度一致
                 if mask_i.sum_all()?.to_scalar::<u32>()? != mask_i.dim(0)? as u32 {
-                    let zero_indices = zero_index(&mask_i)?;
+                    let zero_indices = zero_index(&mask_i)?.to_dtype(DType::U32)?;
                     let replace_1 = Tensor::ones(
                         zero_indices.dim(0)?,
                         candle_core::DType::U32,
@@ -1206,11 +1206,11 @@ impl Qwen3VLModel {
                 let image_mask_ = image_mask_.squeeze(0)?;
                 let video_mask_ = video_mask_.squeeze(0)?;
                 let visual_mask = bitor_tensor(&image_mask_, &video_mask_)?;
-                let visual_none_zero_index = nonzero_index(&visual_mask)?;
+                let visual_none_zero_index = nonzero_index(&visual_mask)?.to_dtype(DType::U32)?;
                 let image_mask_joint = image_mask_.gather(&visual_none_zero_index, 0)?;
-                let image_nonzero_joint = nonzero_index(&image_mask_joint)?;
+                let image_nonzero_joint = nonzero_index(&image_mask_joint)?.to_dtype(DType::U32)?;
                 let video_mask_joint = video_mask_.gather(&visual_none_zero_index, 0)?;
-                let video_nonzero_joint = nonzero_index(&video_mask_joint)?;
+                let video_nonzero_joint = nonzero_index(&video_mask_joint)?.to_dtype(DType::U32)?;
                 let mut deepstack_embeds = vec![];
                 let visual_len = visual_none_zero_index.dim(0)?;
                 for (img_embed, vid_embed) in deepstack_image_embeds

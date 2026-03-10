@@ -2812,13 +2812,13 @@ impl QuantizedQwen3VLModel {
             
             // Tensor로 변환 및 삽입
             for d in 0..3 {
-                let d_tensor = Tensor::from_vec(llm_pos_ids[d].clone(), (1, seq_len), input_ids.device())?;
+                let d_tensor = Tensor::from_vec(llm_pos_ids[d].clone(), (1, seq_len), input_ids.device())?.to_dtype(DType::U32)?;
                 position_ids = position_ids.slice_assign(&[(d..d+1), (b..b+1), (0..seq_len)], &d_tensor)?;
             }
             mrope_position_deltas.push(curr_pos as i64 - seq_len as i64);
         }
 
-        let deltas = Tensor::from_vec(mrope_position_deltas, (b_sz, 1), input_ids.device())?.to_dtype(input_ids.dtype())?;
+        let deltas = Tensor::from_vec(mrope_position_deltas, (b_sz, 1), input_ids.device())?.to_dtype(DType::U32)?;
         Ok((position_ids, deltas))
     }
 
@@ -2859,6 +2859,7 @@ impl QuantizedQwen3VLModel {
                 let delta = deltas.i(b)?.to_scalar::<i64>()?;
                 let real_start = (seqlen_offset as i64 + delta) as u32;
                 let p_id = Tensor::arange(real_start, real_start + seq_len as u32, input_ids.device())?
+                    .to_dtype(DType::U32)?
                     .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, seq_len))?;
                 p_ids_vec.push(p_id);
             }
@@ -3001,11 +3002,11 @@ impl QuantizedQwen3TextModel {
         
         let position_ids = if let Some(cp) = cache_position { 
             let start = cp.flatten_all()?.i(0)?.to_scalar::<u32>()?; 
-            Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))? 
+            Tensor::arange(start, start + seq_len as u32, input_ids.device())?.to_dtype(DType::U32)?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))? 
         } else {
             // [ROPE-CORRECTION] Use the updated seqlen_offset for position IDs
             let start = seqlen_offset as u32;
-            Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?
+            Tensor::arange(start, start + seq_len as u32, input_ids.device())?.to_dtype(DType::U32)?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?
         };
         
         self.language_model.active_session_id = session_id.clone();

@@ -130,7 +130,7 @@ impl Qwen3_5GenerateModel {
             let piece = self.tokenizer.token_decode(vec![next_token])?;
             gen_text.push_str(&piece);
 
-            let input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
+            let input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?.to_dtype(DType::U32)?;
             logits = self.qwen3_5.forward(&input_ids, seqlen_offset)?;
             seqlen_offset += 1;
         }
