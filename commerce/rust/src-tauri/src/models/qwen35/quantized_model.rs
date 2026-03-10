@@ -72,7 +72,7 @@ impl QLinear {
     pub fn forward(&self, x: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
         let dev = x.device();
         let name = &self.weight_name;
-        let w = if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "scales"), reg.get_q_tensor(name, "data"), reg.get_q_tensor(name, "shape")) {
+        let w_raw = if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "scales"), reg.get_q_tensor(name, "data"), reg.get_q_tensor(name, "shape")) {
             let s = s_t.to_device(dev)?.to_dtype(DType::F32)?;
             let d = d_t.to_device(dev)?;
             let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
@@ -86,20 +86,17 @@ impl QLinear {
                 let s_exp = s.unsqueeze(D::Minus1)?.broadcast_as((s.dim(0)?, 32))?.flatten_all()?;
                 d_f32.affine(1.0, -128.0)?.broadcast_mul(&s_exp)?
             };
-            restored.reshape(shape.as_slice())?.to_dtype(DType::F16)?
+            restored.reshape(shape.as_slice())?
         } else {
-            reg.get_tensor(name).or_else(|_| reg.get_tensor(&format!("{}.weight", name)))?.to_device(dev)?.to_dtype(DType::F16)?
+            reg.get_tensor(name).or_else(|_| reg.get_tensor(&format!("{}.weight", name)))?.to_device(dev)?
         };
 
-        let x = x.contiguous()?;
-        let w = w.contiguous()?;
-        let x_last_dim = x.dim(D::Minus1)?;
+        // [STRICT-SHAPE-FIX] Correct orientation for matmul
+        let x_in_dim = x.dim(D::Minus1)?;
+        let w = if w_raw.dim(1)? == x_in_dim { w_raw.t()? } else { w_raw };
+        let w = w.to_dtype(DType::F16)?.contiguous()?;
         
-        let res = if w.dim(1)? == x_last_dim {
-            x.matmul(&w.t()?)?
-        } else {
-            x.matmul(&w)?
-        };
+        let res = x.matmul(&w)?;
 
         if let Ok(b) = reg.get_q_tensor(name, "bias").or_else(|_| reg.get_tensor(&format!("{}.bias", name))) {
             return Ok(res.broadcast_add(&b.to_device(dev)?.to_dtype(DType::F16)?)?);
@@ -124,13 +121,10 @@ impl QGatedDeltaNet {
     pub fn forward(&mut self, x: &Tensor, _mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let projected = self.in_proj.forward(x, reg)?;
         let h = self.h;
-        // Output dimension might be h*6 (6144)
-        let actual_out = projected.dim(D::Minus1)?;
-        let chunk_size = actual_out / 6;
-        let chunks = split_tensor(&projected, &[chunk_size, chunk_size, chunk_size, chunk_size, chunk_size, chunk_size], D::Minus1)?;
-        let (q, _k, _v, z, _b, _a) = (&chunks[0], &chunks[1], &chunks[2], &chunks[3], &chunks[4], &chunks[5]);
-        let gate = z.silu()?;
-        let res = self.out_proj.forward(&(q.silu()? * gate)?, reg)?;
+        // Correct chunking using narrow to be safe
+        let q = projected.narrow(D::Minus1, 0, h)?;
+        let z = projected.narrow(D::Minus1, h*3, h)?;
+        let res = self.out_proj.forward(&(q.silu()? * z.silu()?)?, reg)?;
         Ok(self.norm.forward(&res, reg)?)
     }
 }
@@ -155,10 +149,12 @@ impl QAttention {
     pub fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let (bs, sl, _) = x.dims3()?;
         let qkv_raw = self.qkv_proj.forward(x, reg)?;
-        let actual_out = qkv_raw.dim(D::Minus1)?;
-        let chunk_size = actual_out / 4;
-        let chunks = split_tensor(&qkv_raw, &[chunk_size, chunk_size, chunk_size, chunk_size], D::Minus1)?;
-        let (q_raw, k_raw, v_raw, gate_raw) = (&chunks[0], &chunks[1], &chunks[2], &chunks[3]);
+        let h = self.h;
+        
+        let q_raw = qkv_raw.narrow(D::Minus1, 0, h)?;
+        let k_raw = qkv_raw.narrow(D::Minus1, h, h)?;
+        let v_raw = qkv_raw.narrow(D::Minus1, h*2, h)?;
+        let g_raw = qkv_raw.narrow(D::Minus1, h*3, h)?;
 
         let q = self.q_norm.forward(&q_raw.reshape((bs, sl, self.nh, self.hd))?, reg)?.transpose(1, 2)?;
         let k = self.k_norm.forward(&k_raw.reshape((bs, sl, self.nkv, self.hd))?, reg)?.transpose(1, 2)?;
@@ -170,7 +166,7 @@ impl QAttention {
         
         let attn = crate::models::common::eager_attention_forward(&q, &k, &v, Some(self.nh / self.nkv), mask, self.scaling)?;
         let out = attn.reshape((bs, sl, ()))?.contiguous()?;
-        self.o_proj.forward(&(out * gate_raw.silu()?)?, reg)
+        self.o_proj.forward(&(out * g_raw.silu()?)?, reg)
     }
 }
 
