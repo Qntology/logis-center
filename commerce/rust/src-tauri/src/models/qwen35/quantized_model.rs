@@ -49,16 +49,11 @@ impl QuantizedRegistry {
     }
     
     pub fn get_q_tensor(&self, full_name: &str, suffix: &str) -> Result<Tensor> {
-        // Very strict matching to avoid accidental overlap with other tensors
-        let name_with_suffix = format!("{}.{}", full_name, suffix);
-        let name_with_weight_suffix = format!("{}.weight.{}", full_name, suffix);
-        let name_only = full_name.to_string();
-        
-        if let Ok(t) = self.get_tensor(&name_with_suffix) { return Ok(t); }
-        if let Ok(t) = self.get_tensor(&name_with_weight_suffix) { return Ok(t); }
-        if suffix == "weight" {
-            if let Ok(t) = self.get_tensor(&name_only) { return Ok(t); }
-        }
+        let n1 = format!("{}.{}", full_name, suffix);
+        let n2 = format!("{}.weight.{}", full_name, suffix);
+        if let Ok(t) = self.get_tensor(&n1) { return Ok(t); }
+        if let Ok(t) = self.get_tensor(&n2) { return Ok(t); }
+        if suffix == "weight" { if let Ok(t) = self.get_tensor(full_name) { return Ok(t); } }
         anyhow::bail!("Strict find FAILED: {} ({})", full_name, suffix)
     }
 }
@@ -69,21 +64,22 @@ impl QRmsNorm {
     pub fn clear_vram(&mut self) { self.persistent_weight = None; }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         let w = reg.get_q_tensor(&self.full_name, "weight")?.to_device(dev)?.to_dtype(DType::F16)?;
-        if w.rank() != 1 { anyhow::bail!("RMSNorm weights must be rank 1, but got {} for {}", w.rank(), self.full_name); }
         self.persistent_weight = Some(w); Ok(())
     }
     pub fn forward(&self, x: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
         let dev = x.device();
         let w = if let Some(pw) = &self.persistent_weight { pw.clone() } 
-                else { 
-                    let t = reg.get_q_tensor(&self.full_name, "weight")?.to_device(dev)?.to_dtype(DType::F16)?;
-                    if t.rank() != 1 { anyhow::bail!("RMSNorm weights rank 1 mismatch"); }
-                    t
-                };
+                else { reg.get_q_tensor(&self.full_name, "weight")?.to_device(dev)?.to_dtype(DType::F16)? };
         let x_f32 = x.to_dtype(DType::F32)?;
         let var = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
         let norm = x_f32.broadcast_div(&(var + self.eps)?.sqrt()?)?.to_dtype(DType::F16)?;
-        Ok(norm.broadcast_mul(&w)?)
+        let x_last = norm.dim(D::Minus1)?;
+        let w_size = w.elem_count();
+        if w_size == x_last { Ok(norm.broadcast_mul(&w)?) }
+        else {
+            let target_w = if w_size > x_last { w.narrow(0, 0, x_last)? } else { w };
+            Ok(norm.broadcast_mul(&target_w)?)
+        }
     }
 }
 
@@ -94,8 +90,8 @@ impl QLinear {
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         let name = &self.full_name;
         let w_raw = if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "q_scales"), reg.get_q_tensor(name, "q_data"), reg.get_q_tensor(name, "q_shape")) {
-            let s = s_t.to_device(dev)?.to_dtype(DType::F16)?; let d = d_t.to_device(dev)?.to_dtype(DType::F16)?;
             let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
+            let s = s_t.to_device(dev)?.to_dtype(DType::F16)?; let d = d_t.to_device(dev)?.to_dtype(DType::F16)?;
             let high = (d.clone() / 16.0)?.floor()?; let low = d.sub(&(high.clone() * 16.0)?)?;
             let combined = Tensor::stack(&[low.affine(1.0, -8.0)?, high.affine(1.0, -8.0)?], D::Minus1)?.reshape(((), 32))?;
             combined.broadcast_mul(&s.unsqueeze(D::Minus1)?)?.reshape(shape.as_slice())?
@@ -108,8 +104,8 @@ impl QLinear {
         let dev = x.device(); let name = &self.full_name;
         let w_raw = if let Some(pw) = &self.persistent_weight { pw.clone() } 
         else if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "q_scales"), reg.get_q_tensor(name, "q_data"), reg.get_q_tensor(name, "q_shape")) {
-            let s = s_t.to_device(dev)?.to_dtype(DType::F16)?; let d = d_t.to_device(dev)?.to_dtype(DType::F16)?;
             let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
+            let s = s_t.to_device(dev)?.to_dtype(DType::F16)?; let d = d_t.to_device(dev)?.to_dtype(DType::F16)?;
             let high = (d.clone() / 16.0)?.floor()?; let low = d.sub(&(high.clone() * 16.0)?)?;
             let combined = Tensor::stack(&[low.affine(1.0, -8.0)?, high.affine(1.0, -8.0)?], D::Minus1)?.reshape(((), 32))?;
             combined.broadcast_mul(&s.unsqueeze(D::Minus1)?)?.reshape(shape.as_slice())?
