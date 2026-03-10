@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
-use candle_nn::{Module, VarBuilder};
+use candle_nn::{VarBuilder};
 use std::collections::HashMap;
 use std::sync::Arc;
 use candle_core::safetensors::MmapedSafetensors;
@@ -8,13 +8,13 @@ use candle_core::safetensors::MmapedSafetensors;
 use crate::{
     models::{
         qwen35::config::{Qwen3_5Config, Qwen3_5TextConfig},
-        common::{conv1d_depthwise, get_conv1d, softplus},
+        common::{get_conv1d},
     },
     position_embed::rope::{
         Qwen3_5TextRotaryEmbedding, glm_asr_apply_rotary_pos_emb,
     },
     utils::tensor_utils::{
-        prepare_causal_attention_mask, split_tensor,
+        prepare_causal_attention_mask,
     },
 };
 
@@ -63,9 +63,9 @@ impl QRmsNorm {
         let var = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
         let norm = x_f32.broadcast_div(&(var + self.eps)?.sqrt()?)?;
         let norm_f16 = norm.to_dtype(DType::F16)?;
-        if w.dim(0)? == norm_f16.dim(D::Minus1)? { Ok(norm_f16.broadcast_mul(&w)?) }
+        let w_size = w.dim(0)?;
+        if w_size == norm_f16.dim(D::Minus1)? { Ok(norm_f16.broadcast_mul(&w)?) }
         else {
-            let w_size = w.dim(0)?;
             let mul = norm_f16.reshape(((), w_size))?.broadcast_mul(&w)?;
             Ok(mul.reshape(norm_f16.dims())?)
         }
@@ -108,11 +108,20 @@ impl QGatedDeltaNet {
         Ok(Self { in_proj: QLinear::new(&format!("{}.in_proj_qkv", p)), out_proj: QLinear::new(&format!("{}.out_proj", p)), norm: QRmsNorm::new(&format!("{}.norm", p), config.rms_norm_eps)?, h: config.hidden_size })
     }
     pub fn forward(&mut self, x: &Tensor, _mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
+        let (bs, sl, _) = x.dims3()?;
         let projected = self.in_proj.forward(x, reg)?;
         let h = self.h;
         let q = projected.narrow(D::Minus1, 0, h)?;
         let z = projected.narrow(D::Minus1, h*3, h)?;
-        let res = self.out_proj.forward(&(q.silu()? * z.silu()?)?, reg)?;
+        let gate = z.silu()?;
+        // Broadcast gate accurately to match q dimension
+        let q_dim = q.dim(D::Minus1)?;
+        let gate_expanded = if q_dim != h {
+             gate.unsqueeze(D::Minus1)?.broadcast_as((bs, sl, h, q_dim / h))?.reshape((bs, sl, q_dim))?
+        } else {
+             gate
+        };
+        let res = self.out_proj.forward(&(q * gate_expanded)?, reg)?;
         self.norm.forward(&res, reg)
     }
 }
@@ -131,16 +140,28 @@ impl QAttention {
         let k_raw = qkv_raw.narrow(D::Minus1, h, h)?;
         let v_raw = qkv_raw.narrow(D::Minus1, h*2, h)?;
         let g_raw = qkv_raw.narrow(D::Minus1, h*3, h)?;
-        let q = self.q_norm.forward(&q_raw.reshape((bs, sl, self.nh, self.hd))?, reg)?.transpose(1, 2)?;
-        let k = self.k_norm.forward(&k_raw.reshape((bs, sl, self.nkv, self.hd))?, reg)?.transpose(1, 2)?;
-        let v = v_raw.reshape((bs, sl, self.nkv, self.hd))?.transpose(1, 2)?;
+
+        let q = self.q_norm.forward(&q_raw.reshape((bs, sl, self.nh, h / self.nh))?, reg)?.transpose(1, 2)?;
+        let k = self.k_norm.forward(&k_raw.reshape((bs, sl, self.nkv, h / self.nkv))?, reg)?.transpose(1, 2)?;
+        let v = v_raw.reshape((bs, sl, self.nkv, h / self.nkv))?.transpose(1, 2)?;
+
         let (q, k) = glm_asr_apply_rotary_pos_emb(&q, &k, cos, sin, false)?;
         let (k, v) = match &self.kv_cache { None => (k, v), Some((pk, pv)) => (Tensor::cat(&[pk, &k], 2)?, Tensor::cat(&[pv, &v], 2)?) };
         self.kv_cache = Some((k.clone(), v.clone()));
         let attn = crate::models::common::eager_attention_forward(&q, &k, &v, Some(self.nh / self.nkv), mask, self.scaling)?;
         let out = attn.reshape((bs, sl, ()))?.contiguous()?;
-        // Final projection to Hidden Size (1024)
-        self.o_proj.forward(&(out * g_raw.silu()?)?, reg)
+        
+        let gate = g_raw.silu()?;
+        let out_dim = out.dim(D::Minus1)?;
+        let gate_expanded = if out_dim != h {
+             gate.unsqueeze(D::Minus1)?.broadcast_as((bs, sl, h, out_dim / h))?.reshape((bs, sl, out_dim))?
+        } else {
+             gate
+        };
+
+        let projected = self.o_proj.forward(&(out * gate_expanded)?, reg)?;
+        if projected.dim(D::Minus1)? != h { Ok(projected.narrow(D::Minus1, 0, h)?) }
+        else { Ok(projected) }
     }
 }
 
@@ -156,20 +177,21 @@ impl QDecoderLayer {
         let mut h = self.in_norm.forward(x, reg)?;
         if let Some(ref mut sa) = self.self_attn { h = sa.forward(&h, cos, sin, mask, reg)?; }
         else if let Some(ref mut la) = self.linear_attn { h = la.forward(&h, mask, reg)?; }
-        let h2 = (h + residual)?;
-        let residual = h2.clone();
+        let h2 = if h.dims() != residual.dims() { (h.narrow(D::Minus1, 0, residual.dim(D::Minus1)?)? + residual)? }
+        else { (h + residual)? };
+        let residual_2 = h2.clone();
         let h = self.post_norm.forward(&h2, reg)?;
         let gate = self.mlp_gate.forward(&h, reg)?.silu()?;
         let up = self.mlp_up.forward(&h, reg)?;
-        let out = (self.mlp_down.forward(&(gate * up)?, reg)? + residual)?;
-        if x.device().is_cuda() { let _ = x.device().synchronize(); }
-        Ok(out)
+        let mlp_out = self.mlp_down.forward(&(gate * up)?, reg)?;
+        if mlp_out.dims() != residual_2.dims() { Ok((mlp_out.narrow(D::Minus1, 0, residual_2.dim(D::Minus1)?)? + residual_2)?) }
+        else { Ok((mlp_out + residual_2)?) }
     }
 }
 
 pub struct QEmbedding { name: String }
 impl QEmbedding {
-    pub fn new(name: &str) -> Result<Self> { Ok(Self { name: name.to_string() }) }
+    pub fn new(name: &str) -> Self { Ok(Self { name: name.to_string() }) }
     pub fn forward(&self, ids: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
         let (b, s) = ids.dims2()?; let dev = ids.device();
         let ids_cpu = ids.flatten_all()?.to_device(&Device::Cpu)?.to_dtype(DType::U32)?;
@@ -196,7 +218,7 @@ impl QTextModel {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let mut layers = vec![]; for i in 0..config.num_hidden_layers { layers.push(QDecoderLayer::new(vb.pp("layers").pp(i), config, i)?); }
         let p = vb.prefix();
-        Ok(Self { embed: QEmbedding::new(&format!("{}.embed_tokens", p))?, layers, norm: QRmsNorm::new(&format!("{}.norm", p), config.rms_norm_eps)?, rotary: Qwen3_5TextRotaryEmbedding::new((config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize, config.rope_parameters.rope_theta), mrope: config.rope_parameters.mrope_section.clone() })
+        Ok(Self { embed: QEmbedding::new(&format!("{}.embed_tokens", p)), layers, norm: QRmsNorm::new(&format!("{}.norm", p), config.rms_norm_eps)?, rotary: Qwen3_5TextRotaryEmbedding::new((config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize, config.rope_parameters.rope_theta), mrope: config.rope_parameters.mrope_section.clone() })
     }
     pub fn forward(&mut self, ids: &Tensor, pos: &Tensor, offset: usize, reg: &QuantizedRegistry) -> Result<Tensor> {
         let bs = ids.dim(0)?; let sl = ids.dim(1)?; let mut x = self.embed.forward(ids, reg)?;
