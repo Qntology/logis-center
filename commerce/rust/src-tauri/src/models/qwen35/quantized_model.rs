@@ -218,10 +218,12 @@ impl QGatedDeltaNet {
         // --- [STEP 3] GATING PARAMETERS (ALPHA & BETA) ---
         // Match official implementation's log-domain gate processing
         let beta = if let Some(ref db) = self.dt_bias { softplus(&b.broadcast_add(db)?)? } else { softplus(&b)? };
+        let beta = beta.to_dtype(DType::F32)?;
         let g = if let Some(ref al) = self.a_log {
             let al_reshaped = al.reshape((1, 1, nk))?;
             a.broadcast_add(&al_reshaped.exp()?.neg()?)?
         } else { a.clone() };
+        let g = g.to_dtype(DType::F32)?;
 
         // --- [STEP 4] LINEAR RECURRENCE (DELTA RULE) ---
         // Using F32 internally to prevent accumulation errors during sequential decoding
