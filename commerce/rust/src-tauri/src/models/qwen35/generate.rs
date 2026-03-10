@@ -127,6 +127,7 @@ impl Qwen3_5GenerateModel {
 
             // 2. Layer Relay
             for i in 0..num_layers {
+                // [SSD -> VRAM] Load previous context for THIS layer
                 if seqlen_offset > 0 {
                    if let Some(ref mut sa) = self.qwen3_5.model.layers[i].self_attn {
                        let s_k = candle_core::Shape::from((1, sa.nkv, seqlen_offset, sa.hd));
@@ -135,16 +136,17 @@ impl Qwen3_5GenerateModel {
                            sa.kv_cache = Some((k, v));
                        }
                    } else if let Some(ref mut la) = self.qwen3_5.model.layers[i].linear_attn {
-                       let s_state = candle_core::Shape::from((1, 1, la.h)); 
+                       let s_state = candle_core::Shape::from((1, la.h, la.h)); 
                        if let Ok(LayerContext::DeltaNet { state }) = disk_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
                            la.delta_state = Some(state.to_device(&self.device)?);
                        }
                    }
                 }
 
+                // Computation
                 h = self.qwen3_5.model.layers[i].forward(&h, &cos, &sin, mask.as_ref(), &self.registry)?;
 
-                // Offload & Clear VRAM
+                // [VRAM -> SSD] Offload & Clear VRAM immediately
                 if let Some(ref mut sa) = self.qwen3_5.model.layers[i].self_attn {
                     if let Some((k, v)) = sa.kv_cache.take() { 
                         disk_manager.save_layer_context(i, &LayerContext::Attention { k, v })?;
@@ -171,7 +173,7 @@ impl Qwen3_5GenerateModel {
         }
 
         // ====================================================================
-        // [PHASE 2] TRANSITION
+        // [PHASE 2] TRANSITION: Loading weights to VRAM for Decode
         // ====================================================================
         println!("[MODEL-QWEN35] Prefill complete. Loading weights to VRAM for Decode...");
         self.qwen3_5.load_all_to_vram(&self.registry, &self.device)?;
@@ -205,7 +207,7 @@ impl Qwen3_5GenerateModel {
             let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos, DType::F16, self.qwen3_5.model.mrope.clone())?;
 
             for i in 0..num_layers {
-                // SSD -> VRAM Load (Dynamic shape per layer)
+                // SSD -> VRAM Load (Dynamic shape per layer instance)
                 if let Some(ref mut sa) = self.qwen3_5.model.layers[i].self_attn {
                     let s_k = candle_core::Shape::from((1, sa.nkv, seqlen_offset, sa.hd));
                     let s_v = s_k.clone();
@@ -213,7 +215,7 @@ impl Qwen3_5GenerateModel {
                         sa.kv_cache = Some((k, v));
                     }
                 } else if let Some(ref mut la) = self.qwen3_5.model.layers[i].linear_attn {
-                    let s_state = candle_core::Shape::from((1, 1, la.h)); 
+                    let s_state = candle_core::Shape::from((1, la.h, la.h)); 
                     if let Ok(LayerContext::DeltaNet { state }) = disk_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
                         la.delta_state = Some(state.to_device(&self.device)?);
                     }

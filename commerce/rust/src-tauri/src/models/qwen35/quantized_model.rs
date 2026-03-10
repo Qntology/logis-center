@@ -143,27 +143,38 @@ impl QGatedDeltaNet {
         let projected = self.in_proj.forward(x, reg)?;
         let h = self.h;
         let q = projected.narrow(D::Minus1, 0, h)?;
+        let k = projected.narrow(D::Minus1, h, h)?;
+        let v = projected.narrow(D::Minus1, h*2, h)?;
         let z = projected.narrow(D::Minus1, h*3, h)?;
         
-        // [SIMPLIFIED GatedDeltaNet State update for 0.8B]
-        // This should normally use a more complex recurrent update.
-        // For the purpose of relay testing, we'll store/load the state.
-        if sl > 1 {
-             // Prefill mode
-             self.delta_state = Some(q.narrow(1, sl-1, 1)?.detach().to_device(&Device::Cpu)?);
-        } else {
-             // Decoding mode
-             self.delta_state = Some(q.detach().to_device(&Device::Cpu)?);
+        // [Recurrent State Update for DeltaNet]
+        // state = state + v * k^T (Simplified)
+        // For shape compatibility in relay mode, we store the accumulated context.
+        let mut current_state = match self.delta_state.take() {
+            Some(st) => st.to_device(x.device())?,
+            None => Tensor::zeros((bs, h, h), DType::F16, x.device())?,
+        };
+
+        let mut outputs = vec![];
+        for t in 0..sl {
+            let qt = q.narrow(1, t, 1)?.squeeze(1)?; // [bs, h]
+            let kt = k.narrow(1, t, 1)?.squeeze(1)?; // [bs, h]
+            let vt = v.narrow(1, t, 1)?.squeeze(1)?; // [bs, h]
+            
+            // update: state = state + vt.unsqueeze(-1) * kt.unsqueeze(-2)
+            let update = vt.unsqueeze(D::Minus1)?.matmul(&kt.unsqueeze(D::Minus2)?)?;
+            current_state = (current_state + update)?;
+            
+            // out = state * qt
+            let out_t = current_state.matmul(&qt.unsqueeze(D::Minus1)?)?.squeeze(D::Minus1)?;
+            outputs.push(out_t.unsqueeze(1)?);
         }
+        
+        let out = Tensor::cat(&outputs, 1)?;
+        self.delta_state = Some(current_state.detach().to_device(&Device::Cpu)?);
 
         let gate = z.silu()?;
-        let q_dim = q.dim(D::Minus1)?;
-        let gate_expanded = if q_dim != h {
-             gate.unsqueeze(D::Minus1)?.broadcast_as((bs, sl, h, q_dim / h))?.reshape((bs, sl, q_dim))?
-        } else {
-             gate
-        };
-        let res = self.out_proj.forward(&(q * gate_expanded)?, reg)?;
+        let res = self.out_proj.forward(&(out * gate)?, reg)?;
         self.norm.forward(&res, reg)
     }
 }
@@ -212,12 +223,13 @@ impl QAttention {
     ) -> Result<Tensor> {
         let (bs, sl, _) = x.dims3()?;
         
-        let q_raw = self.q_proj.forward(x, reg)?; // [bs, sl, 4096]
-        let k_raw = self.k_proj.forward(x, reg)?; // [bs, sl, 512]
-        let v_raw = self.v_proj.forward(x, reg)?; // [bs, sl, 512]
+        let q_raw = self.q_proj.forward(x, reg)?; 
+        let k_raw = self.k_proj.forward(x, reg)?; 
+        let v_raw = self.v_proj.forward(x, reg)?; 
 
-        let q_states = q_raw.narrow(D::Minus1, 0, 2048)?;
-        let gate = q_raw.narrow(D::Minus1, 2048, 2048)?;
+        let head_total = self.nh * self.hd;
+        let q_states = q_raw.narrow(D::Minus1, 0, head_total)?;
+        let gate = q_raw.narrow(D::Minus1, head_total, head_total)?;
         
         let q = self.q_norm.forward(&q_states.reshape((bs, sl, self.nh, self.hd))?, reg)?.transpose(1, 2)?;
         let k = self.k_norm.forward(&k_raw.reshape((bs, sl, self.nkv, k_raw.dim(D::Minus1)? / self.nkv))?, reg)?.transpose(1, 2)?;

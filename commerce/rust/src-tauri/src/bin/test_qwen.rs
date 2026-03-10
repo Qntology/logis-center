@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
     let params = ChatCompletionParameters {
         messages: vec![
             ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Text("1+1=?".to_string()),
+                content: ChatCompletionRequestUserMessageContent::Text("1+1=? NO EXPLANATION. NO THINKING. /no_think".to_string()),
                 name: None,
             }),
         ],
