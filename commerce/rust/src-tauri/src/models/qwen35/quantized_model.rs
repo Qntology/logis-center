@@ -14,7 +14,7 @@ use crate::{
         Qwen3_5TextRotaryEmbedding, glm_asr_apply_rotary_pos_emb,
     },
     utils::tensor_utils::{
-        prepare_causal_attention_mask, split_tensor, repeat_interleave, l2_normalize,
+        prepare_causal_attention_mask, split_tensor,
     },
 };
 
@@ -62,8 +62,7 @@ impl QRmsNorm {
         let x_f32 = x.to_dtype(DType::F32)?;
         let var = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
         let norm = x_f32.broadcast_div(&(var + self.eps)?.sqrt()?)?;
-        let res = norm.to_dtype(DType::F16)?.broadcast_mul(&w)?;
-        Ok(res)
+        Ok(norm.to_dtype(DType::F16)?.broadcast_mul(&w)?)
     }
 }
 
@@ -92,7 +91,10 @@ impl QLinear {
             reg.get_tensor(name).or_else(|_| reg.get_tensor(&format!("{}.weight", name)))?.to_device(dev)?.to_dtype(DType::F16)?
         };
 
+        let x = x.contiguous()?;
+        let w = w.contiguous()?;
         let x_last_dim = x.dim(D::Minus1)?;
+        
         let res = if w.dim(1)? == x_last_dim {
             x.matmul(&w.t()?)?
         } else {
@@ -122,7 +124,10 @@ impl QGatedDeltaNet {
     pub fn forward(&mut self, x: &Tensor, _mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let projected = self.in_proj.forward(x, reg)?;
         let h = self.h;
-        let chunks = split_tensor(&projected, &[h, h, h, h, h, h], D::Minus1)?;
+        // Output dimension might be h*6 (6144)
+        let actual_out = projected.dim(D::Minus1)?;
+        let chunk_size = actual_out / 6;
+        let chunks = split_tensor(&projected, &[chunk_size, chunk_size, chunk_size, chunk_size, chunk_size, chunk_size], D::Minus1)?;
         let (q, _k, _v, z, _b, _a) = (&chunks[0], &chunks[1], &chunks[2], &chunks[3], &chunks[4], &chunks[5]);
         let gate = z.silu()?;
         let res = self.out_proj.forward(&(q.silu()? * gate)?, reg)?;
@@ -150,8 +155,9 @@ impl QAttention {
     pub fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let (bs, sl, _) = x.dims3()?;
         let qkv_raw = self.qkv_proj.forward(x, reg)?;
-        let h = self.h;
-        let chunks = split_tensor(&qkv_raw, &[h, h, h, h], D::Minus1)?;
+        let actual_out = qkv_raw.dim(D::Minus1)?;
+        let chunk_size = actual_out / 4;
+        let chunks = split_tensor(&qkv_raw, &[chunk_size, chunk_size, chunk_size, chunk_size], D::Minus1)?;
         let (q_raw, k_raw, v_raw, gate_raw) = (&chunks[0], &chunks[1], &chunks[2], &chunks[3]);
 
         let q = self.q_norm.forward(&q_raw.reshape((bs, sl, self.nh, self.hd))?, reg)?.transpose(1, 2)?;
