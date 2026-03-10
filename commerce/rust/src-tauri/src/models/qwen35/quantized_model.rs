@@ -120,8 +120,8 @@ impl QLinear {
 pub struct QGatedDeltaNet { in_proj: QLinear, out_proj: QLinear, norm: QRmsNorm, pub h: usize, pub delta_state: Option<Tensor> }
 impl QGatedDeltaNet {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
-        let p = vb.prefix(); let sep = if p.is_empty() || p.ends_with('.') { "" } else { "." };
-        Ok(Self { in_proj: QLinear::new(&format!("{}{}.in_proj_qkv", p, sep))?, out_proj: QLinear::new(&format!("{}{}.out_proj", p, sep))?, norm: QRmsNorm::new(&format!("{}{}.norm", p, sep), config.rms_norm_eps)?, h: config.hidden_size, delta_state: None })
+        let p = vb.prefix();
+        Ok(Self { in_proj: QLinear::new(&format!("{}in_proj_qkv", p))?, out_proj: QLinear::new(&format!("{}out_proj", p))?, norm: QRmsNorm::new(&format!("{}norm", p), config.rms_norm_eps)?, h: config.hidden_size, delta_state: None })
     }
     pub fn clear_vram(&mut self) { self.in_proj.clear_vram(); self.out_proj.clear_vram(); self.norm.clear_vram(); }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
@@ -149,10 +149,10 @@ impl QGatedDeltaNet {
 pub struct QAttention { q_proj: QLinear, k_proj: QLinear, v_proj: QLinear, o_proj: QLinear, q_norm: QRmsNorm, k_norm: QRmsNorm, pub nh: usize, pub nkv: usize, pub hd: usize, scaling: f64, pub h: usize, pub kv_cache: Option<(Tensor, Tensor)> }
 impl QAttention {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
-        let p = vb.prefix(); let sep = if p.is_empty() || p.ends_with('.') { "" } else { "." };
+        let p = vb.prefix();
         Ok(Self {
-            q_proj: QLinear::new(&format!("{}{}.q_proj", p, sep))?, k_proj: QLinear::new(&format!("{}{}.k_proj", p, sep))?, v_proj: QLinear::new(&format!("{}{}.v_proj", p, sep))?, o_proj: QLinear::new(&format!("{}{}.o_proj", p, sep))?,
-            q_norm: QRmsNorm::new(&format!("{}{}.q_norm", p, sep), config.rms_norm_eps)?, k_norm: QRmsNorm::new(&format!("{}{}.k_norm", p, sep), config.rms_norm_eps)?,
+            q_proj: QLinear::new(&format!("{}q_proj", p))?, k_proj: QLinear::new(&format!("{}k_proj", p))?, v_proj: QLinear::new(&format!("{}v_proj", p))?, o_proj: QLinear::new(&format!("{}o_proj", p))?,
+            q_norm: QRmsNorm::new(&format!("{}q_norm", p), config.rms_norm_eps)?, k_norm: QRmsNorm::new(&format!("{}k_norm", p), config.rms_norm_eps)?,
             nh: config.num_attention_heads, nkv: config.num_key_value_heads, hd: config.head_dim, scaling: 1.0 / (config.head_dim as f64).sqrt(), h: config.hidden_size, kv_cache: None,
         })
     }
@@ -180,9 +180,9 @@ impl QAttention {
 pub struct QDecoderLayer { pub self_attn: Option<QAttention>, pub linear_attn: Option<QGatedDeltaNet>, mlp_gate: QLinear, mlp_up: QLinear, mlp_down: QLinear, in_norm: QRmsNorm, post_norm: QRmsNorm }
 impl QDecoderLayer {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig, idx: usize) -> Result<Self> {
-        let lt = config.layer_types[idx].clone(); let p = vb.prefix(); let sep = if p.is_empty() || p.ends_with('.') { "" } else { "." };
+        let lt = config.layer_types[idx].clone(); let p = vb.prefix();
         let (sa, la) = if lt == "linear_attention" { (None, Some(QGatedDeltaNet::new(vb.pp("linear_attn"), config)?)) } else { (Some(QAttention::new(vb.pp("self_attn"), config)?), None) };
-        Ok(Self { self_attn: sa, linear_attn: la, mlp_gate: QLinear::new(&format!("{}{}.mlp.gate_proj", p, sep))?, mlp_up: QLinear::new(&format!("{}{}.mlp.up_proj", p, sep))?, mlp_down: QLinear::new(&format!("{}{}.mlp.down_proj", p, sep))?, in_norm: QRmsNorm::new(&format!("{}{}.input_layernorm", p, sep), config.rms_norm_eps)?, post_norm: QRmsNorm::new(&format!("{}{}.post_attention_layernorm", p, sep), config.rms_norm_eps)? })
+        Ok(Self { self_attn: sa, linear_attn: la, mlp_gate: QLinear::new(&format!("{}mlp.gate_proj", p))?, mlp_up: QLinear::new(&format!("{}mlp.up_proj", p))?, mlp_down: QLinear::new(&format!("{}mlp.down_proj", p))?, in_norm: QRmsNorm::new(&format!("{}input_layernorm", p), config.rms_norm_eps)?, post_norm: QRmsNorm::new(&format!("{}post_attention_layernorm", p), config.rms_norm_eps)? })
     }
     pub fn clear_vram(&mut self) { self.in_norm.clear_vram(); if let Some(ref mut sa) = self.self_attn { sa.clear_vram(); } if let Some(ref mut la) = self.linear_attn { la.clear_vram(); } self.post_norm.clear_vram(); self.mlp_gate.clear_vram(); self.mlp_up.clear_vram(); self.mlp_down.clear_vram(); }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
@@ -224,8 +224,8 @@ pub struct QTextModel { pub embed: QEmbedding, pub layers: Vec<QDecoderLayer>, p
 impl QTextModel {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let mut layers = vec![]; for i in 0..config.num_hidden_layers { layers.push(QDecoderLayer::new(vb.pp("layers").pp(i), config, i)?); }
-        let p = vb.prefix(); let sep = if p.is_empty() || p.ends_with('.') { "" } else { "." };
-        Ok(Self { embed: QEmbedding::new(&format!("{}{}.embed_tokens", p, sep)), layers, norm: QRmsNorm::new(&format!("{}{}.norm", p, sep), config.rms_norm_eps)?, rotary: Qwen3_5TextRotaryEmbedding::new((config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize, config.rope_parameters.rope_theta), mrope: config.rope_parameters.mrope_section.clone() })
+        let p = vb.prefix();
+        Ok(Self { embed: QEmbedding::new(&format!("{}embed_tokens", p)), layers, norm: QRmsNorm::new(&format!("{}norm", p), config.rms_norm_eps)?, rotary: Qwen3_5TextRotaryEmbedding::new((config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize, config.rope_parameters.rope_theta), mrope: config.rope_parameters.mrope_section.clone() })
     }
     pub fn forward(&mut self, _ids: &Tensor, _pos: &Tensor, _offset: usize, _reg: &QuantizedRegistry) -> Result<Tensor> { anyhow::bail!("Not used") }
 }
@@ -233,8 +233,8 @@ impl QTextModel {
 pub struct QuantizedQwen3_5Model { pub model: QTextModel, pub head: QLinear }
 impl QuantizedQwen3_5Model {
     pub fn new(vb: VarBuilder, config: Qwen3_5Config) -> Result<Self> {
-        let p = vb.prefix(); let sep = if p.is_empty() || p.ends_with('.') { "" } else { "." };
-        Ok(Self { model: QTextModel::new(vb.pp("model.language_model"), &config.text_config)?, head: QLinear::new(&format!("{}{}.model.language_model.embed_tokens", p, sep))? })
+        let p = vb.prefix();
+        Ok(Self { model: QTextModel::new(vb.pp("model.language_model"), &config.text_config)?, head: QLinear::new(&format!("{}model.language_model.embed_tokens", p))? })
     }
     pub fn load_all_to_vram(&mut self, _reg: &QuantizedRegistry, _dev: &Device) -> Result<()> { Ok(()) }
     pub fn forward(&mut self, _ids: &Tensor, _offset: usize, _reg: &QuantizedRegistry, _img: Option<&Tensor>) -> Result<Tensor> { anyhow::bail!("Not used") }
