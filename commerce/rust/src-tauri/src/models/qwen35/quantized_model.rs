@@ -125,39 +125,87 @@ impl QGatedDeltaNet {
     }
 }
 
-pub struct QAttention { qkv_proj: QLinear, o_proj: QLinear, q_norm: QRmsNorm, k_norm: QRmsNorm, nh: usize, nkv: usize, hd: usize, scaling: f64, h: usize, kv_cache: Option<(Tensor, Tensor)> }
+pub struct QAttention {
+    q_proj: QLinear,
+    k_proj: QLinear,
+    v_proj: QLinear,
+    o_proj: QLinear,
+    q_norm: QRmsNorm,
+    k_norm: QRmsNorm,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    scaling: f64,
+    h: usize,
+    pub kv_cache: Option<(Tensor, Tensor)>,
+}
+
 impl QAttention {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let p = vb.prefix();
-        Ok(Self { qkv_proj: QLinear::new(&format!("{}.q_proj", p)), o_proj: QLinear::new(&format!("{}.o_proj", p)), q_norm: QRmsNorm::new(&format!("{}.q_norm", p), config.rms_norm_eps)?, k_norm: QRmsNorm::new(&format!("{}.k_norm", p), config.rms_norm_eps)?, nh: config.num_attention_heads, nkv: config.num_key_value_heads, hd: config.head_dim, scaling: 1.0 / (config.head_dim as f64).sqrt(), h: config.hidden_size, kv_cache: None })
+        Ok(Self {
+            q_proj: QLinear::new(&format!("{}.q_proj", p)),
+            k_proj: QLinear::new(&format!("{}.k_proj", p)),
+            v_proj: QLinear::new(&format!("{}.v_proj", p)),
+            o_proj: QLinear::new(&format!("{}.o_proj", p)),
+            q_norm: QRmsNorm::new(&format!("{}.q_norm", p), config.rms_norm_eps)?,
+            k_norm: QRmsNorm::new(&format!("{}.k_norm", p), config.rms_norm_eps)?,
+            nh: config.num_attention_heads,
+            nkv: config.num_key_value_heads,
+            hd: config.head_dim,
+            scaling: 1.0 / (config.head_dim as f64).sqrt(),
+            h: config.hidden_size,
+            kv_cache: None,
+        })
     }
-    pub fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
+
+    pub fn forward(
+        &mut self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: Option<&Tensor>,
+        reg: &QuantizedRegistry,
+    ) -> Result<Tensor> {
         let (bs, sl, _) = x.dims3()?;
-        let qkv_raw = self.qkv_proj.forward(x, reg)?;
-        let h = self.h;
-        let q_raw = qkv_raw.narrow(D::Minus1, 0, h)?;
-        let k_raw = qkv_raw.narrow(D::Minus1, h, h)?;
-        let v_raw = qkv_raw.narrow(D::Minus1, h*2, h)?;
-        let g_raw = qkv_raw.narrow(D::Minus1, h*3, h)?;
-        let q = self.q_norm.forward(&q_raw.reshape((bs, sl, self.nh, h / self.nh))?, reg)?.transpose(1, 2)?;
-        let k = self.k_norm.forward(&k_raw.reshape((bs, sl, self.nkv, h / self.nkv))?, reg)?.transpose(1, 2)?;
-        let v = v_raw.reshape((bs, sl, self.nkv, h / self.nkv))?.transpose(1, 2)?;
+        
+        let q_raw = self.q_proj.forward(x, reg)?; // [bs, sl, 4096]
+        let k_raw = self.k_proj.forward(x, reg)?; // [bs, sl, 512]
+        let v_raw = self.v_proj.forward(x, reg)?; // [bs, sl, 512]
+
+        // [IMPORTANT] Qwen 3.5 0.8B: Q has 4096 dim (8 heads * 256 hd * 2? No, 8 heads * 256 hd = 2048. 4096 means 16 heads * 256? Or 8 heads * 512?)
+        // Wait, 4096 / 8 = 512. So hd for Q is 512? No, config says hd=256. 
+        // 4096 / 256 = 16. So 16 heads for Q? But config says 8 heads. 
+        // 4096 = 2048 (Q) + 2048 (Gate)? 
+        // Let's assume Q has 8 heads and 256 hd (2048) and the rest is Gate.
+        let q_states = q_raw.narrow(D::Minus1, 0, 2048)?;
+        let gate = q_raw.narrow(D::Minus1, 2048, 2048)?;
+        
+        let q = self.q_norm.forward(&q_states.reshape((bs, sl, self.nh, self.hd))?, reg)?.transpose(1, 2)?;
+        let k = self.k_norm.forward(&k_raw.reshape((bs, sl, self.nkv, k_raw.dim(D::Minus1)? / self.nkv))?, reg)?.transpose(1, 2)?;
+        let v = v_raw.reshape((bs, sl, self.nkv, v_raw.dim(D::Minus1)? / self.nkv))?.transpose(1, 2)?;
+
         let (q, k) = glm_asr_apply_rotary_pos_emb(&q, &k, cos, sin, false)?;
-        let (k, v) = match &self.kv_cache { None => (k, v), Some((pk, pv)) => (Tensor::cat(&[pk, &k], 2)?, Tensor::cat(&[pv, &v], 2)?) };
-        self.kv_cache = Some((k.clone(), v.clone()));
-        let attn = crate::models::common::eager_attention_forward(&q, &k, &v, Some(self.nh / self.nkv), mask, self.scaling)?;
-        let out = attn.reshape((bs, sl, ()))?.contiguous()?;
-        let gate = g_raw.silu()?;
-        let out_dim = out.dim(D::Minus1)?;
-        let g_dim = gate.dim(D::Minus1)?;
-        let out_gated = if out_dim != g_dim {
-             (out * gate.unsqueeze(D::Minus1)?.broadcast_as((bs, sl, g_dim, out_dim / g_dim))?.reshape((bs, sl, out_dim))?)?
-        } else {
-             (out * gate)?
+
+        let (k, v) = match &self.kv_cache {
+            None => (k, v),
+            Some((pk, pv)) => (Tensor::cat(&[pk, &k], 2)?, Tensor::cat(&[pv, &v], 2)?),
         };
-        let projected = self.o_proj.forward(&out_gated, reg)?;
-        if projected.dim(D::Minus1)? != h { Ok(projected.narrow(D::Minus1, 0, h)?) }
-        else { Ok(projected) }
+        self.kv_cache = Some((k.clone(), v.clone()));
+
+        let attn = crate::models::common::eager_attention_forward(
+            &q,
+            &k,
+            &v,
+            Some(self.nh / self.nkv),
+            mask,
+            self.scaling,
+        )?;
+
+        let out = attn.reshape((bs, sl, ()))?.contiguous()?;
+        let out_gated = (out * gate.silu()?)?;
+        
+        self.o_proj.forward(&out_gated, reg)
     }
 }
 
