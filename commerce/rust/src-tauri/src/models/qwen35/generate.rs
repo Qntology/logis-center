@@ -96,11 +96,7 @@ impl Qwen3_5GenerateModel {
         self.qwen3_5.clear_cache();
         let mut disk_manager = DiskStateManager::new(self.qwen3_5.model.layers.len())?;
 
-        // 0.8B default hyperparams for Relay I/O
         let num_layers = self.qwen3_5.model.layers.len();
-        let num_kv_heads = 4; 
-        let head_dim = 128;   
-        let hidden_size = 1024; 
 
         println!("[MODEL-QWEN35] Starting HYBRID Prefill (True Layer-by-Layer Relay)...");
 
@@ -132,17 +128,16 @@ impl Qwen3_5GenerateModel {
             // 2. Layer Relay
             for i in 0..num_layers {
                 if seqlen_offset > 0 {
-                   let lt = if self.qwen3_5.model.layers[i].self_attn.is_some() { "attention" } else { "linear_attention" };
-                   if lt == "attention" {
-                       let s_k = candle_core::Shape::from((1, num_kv_heads, seqlen_offset, head_dim));
+                   if let Some(ref mut sa) = self.qwen3_5.model.layers[i].self_attn {
+                       let s_k = candle_core::Shape::from((1, sa.nkv, seqlen_offset, sa.hd));
                        let s_v = s_k.clone();
-                       if let Ok(LayerContext::Attention { k, v }) = disk_manager.load_layer_context(i, lt, &s_k, &s_v, &self.device) {
-                           self.qwen3_5.model.layers[i].self_attn.as_mut().unwrap().kv_cache = Some((k, v));
+                       if let Ok(LayerContext::Attention { k, v }) = disk_manager.load_layer_context(i, "attention", &s_k, &s_v, &self.device) {
+                           sa.kv_cache = Some((k, v));
                        }
-                   } else {
-                       let s_state = candle_core::Shape::from((1, 1, hidden_size)); 
-                       if let Ok(LayerContext::DeltaNet { state }) = disk_manager.load_layer_context(i, lt, &s_state, &s_state, &self.device) {
-                           self.qwen3_5.model.layers[i].linear_attn.as_mut().unwrap().delta_state = Some(state.to_device(&self.device)?);
+                   } else if let Some(ref mut la) = self.qwen3_5.model.layers[i].linear_attn {
+                       let s_state = candle_core::Shape::from((1, 1, la.h)); 
+                       if let Ok(LayerContext::DeltaNet { state }) = disk_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
+                           la.delta_state = Some(state.to_device(&self.device)?);
                        }
                    }
                 }
@@ -210,19 +205,17 @@ impl Qwen3_5GenerateModel {
             let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos, DType::F16, self.qwen3_5.model.mrope.clone())?;
 
             for i in 0..num_layers {
-                let lt = if self.qwen3_5.model.layers[i].self_attn.is_some() { "attention" } else { "linear_attention" };
-                
-                // SSD -> VRAM Load
-                if lt == "attention" {
-                    let s_k = candle_core::Shape::from((1, num_kv_heads, seqlen_offset, head_dim));
+                // SSD -> VRAM Load (Dynamic shape per layer)
+                if let Some(ref mut sa) = self.qwen3_5.model.layers[i].self_attn {
+                    let s_k = candle_core::Shape::from((1, sa.nkv, seqlen_offset, sa.hd));
                     let s_v = s_k.clone();
-                    if let Ok(LayerContext::Attention { k, v }) = disk_manager.load_layer_context(i, lt, &s_k, &s_v, &self.device) {
-                        self.qwen3_5.model.layers[i].self_attn.as_mut().unwrap().kv_cache = Some((k, v));
+                    if let Ok(LayerContext::Attention { k, v }) = disk_manager.load_layer_context(i, "attention", &s_k, &s_v, &self.device) {
+                        sa.kv_cache = Some((k, v));
                     }
-                } else {
-                    let s_state = candle_core::Shape::from((1, 1, hidden_size)); 
-                    if let Ok(LayerContext::DeltaNet { state }) = disk_manager.load_layer_context(i, lt, &s_state, &s_state, &self.device) {
-                        self.qwen3_5.model.layers[i].linear_attn.as_mut().unwrap().delta_state = Some(state.to_device(&self.device)?);
+                } else if let Some(ref mut la) = self.qwen3_5.model.layers[i].linear_attn {
+                    let s_state = candle_core::Shape::from((1, 1, la.h)); 
+                    if let Ok(LayerContext::DeltaNet { state }) = disk_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
+                        la.delta_state = Some(state.to_device(&self.device)?);
                     }
                 }
 

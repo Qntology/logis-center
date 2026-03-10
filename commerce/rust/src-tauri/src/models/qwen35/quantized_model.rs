@@ -132,7 +132,7 @@ impl QLinear {
     }
 }
 
-pub struct QGatedDeltaNet { in_proj: QLinear, out_proj: QLinear, norm: QRmsNorm, h: usize, pub delta_state: Option<Tensor> }
+pub struct QGatedDeltaNet { in_proj: QLinear, out_proj: QLinear, norm: QRmsNorm, pub h: usize, pub delta_state: Option<Tensor> }
 impl QGatedDeltaNet {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let p = vb.prefix();
@@ -175,11 +175,11 @@ pub struct QAttention {
     o_proj: QLinear,
     q_norm: QRmsNorm,
     k_norm: QRmsNorm,
-    nh: usize,
-    nkv: usize,
-    hd: usize,
+    pub nh: usize,
+    pub nkv: usize,
+    pub hd: usize,
     scaling: f64,
-    h: usize,
+    pub h: usize,
     pub kv_cache: Option<(Tensor, Tensor)>,
 }
 
