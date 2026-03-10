@@ -78,8 +78,20 @@ impl QRmsNorm {
         let last_dim = x.dim(D::Minus1)?;
         if w_size == last_dim {
             Ok(norm.broadcast_mul(&w)?)
+        } else if last_dim % w_size == 0 {
+            // Per-head normalization
+            let num_heads = last_dim / w_size;
+            let mut dims = x.dims().to_vec();
+            dims.pop();
+            dims.push(num_heads);
+            dims.push(w_size);
+            let norm_reshaped = norm.reshape(dims.as_slice())?;
+            let mut w_dims = vec![1; dims.len()];
+            w_dims[dims.len() - 1] = w_size;
+            let out = norm_reshaped.broadcast_mul(&w.reshape(w_dims.as_slice())?)?;
+            Ok(out.reshape(x.dims())?)
         } else {
-            // Per-head normalization: broadcast weight over heads
+            // Fallback: simple broadcast if possible
             Ok(norm.broadcast_mul(&w.reshape(vec![1; x.rank() - 1].into_iter().chain(std::iter::once(w_size)).collect::<Vec<_>>())?)?)
         }
     }
@@ -134,11 +146,10 @@ impl QGatedDeltaNet {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let p = vb.prefix();
         let h_delta = config.linear_num_key_heads * config.linear_key_head_dim;
-        println!("[DEBUG-DELTA] nk: {}, dk: {}, h_delta: {}", config.linear_num_key_heads, config.linear_key_head_dim, h_delta);
         let in_proj_qkv = if vb.contains_tensor("in_proj_qkv.weight") { Some(QLinear::new(&join_name(&p, "in_proj_qkv"))?) } else { None };
-        let (in_proj_a, in_proj_b, in_proj_z) = if in_proj_qkv.is_none() {
-            (Some(QLinear::new(&join_name(&p, "in_proj_a"))?), Some(QLinear::new(&join_name(&p, "in_proj_b"))?), Some(QLinear::new(&join_name(&p, "in_proj_z"))?))
-        } else { (None, None, None) };
+        let in_proj_a = if vb.contains_tensor("in_proj_a.weight") { Some(QLinear::new(&join_name(&p, "in_proj_a"))?) } else { None };
+        let in_proj_b = if vb.contains_tensor("in_proj_b.weight") { Some(QLinear::new(&join_name(&p, "in_proj_b"))?) } else { None };
+        let in_proj_z = if vb.contains_tensor("in_proj_z.weight") { Some(QLinear::new(&join_name(&p, "in_proj_z"))?) } else { None };
         Ok(Self { in_proj_qkv, in_proj_a, in_proj_b, in_proj_z, out_proj: QLinear::new(&join_name(&p, "out_proj"))?, norm: QRmsNorm::new(&join_name(&p, "norm"), config.rms_norm_eps)?, h: h_delta, delta_state: None })
     }
     pub fn clear_vram(&mut self) { if let Some(ref mut l) = self.in_proj_qkv { l.clear_vram(); } if let Some(ref mut l) = self.in_proj_a { l.clear_vram(); } if let Some(ref mut l) = self.in_proj_b { l.clear_vram(); } if let Some(ref mut l) = self.in_proj_z { l.clear_vram(); } self.out_proj.clear_vram(); self.norm.clear_vram(); }
@@ -155,17 +166,14 @@ impl QGatedDeltaNet {
         } else {
             (self.in_proj_a.as_ref().unwrap().forward(x, reg)?, self.in_proj_b.as_ref().unwrap().forward(x, reg)?, self.in_proj_b.as_ref().unwrap().forward(x, reg)?, self.in_proj_z.as_ref().unwrap().forward(x, reg)?)
         };
-        println!("[DEBUG-DELTA] q shape: {:?}, k shape: {:?}, v shape: {:?}", q.shape(), k.shape(), v.shape());
         let mut current_state = match self.delta_state.take() {
             Some(st) => if st.elem_count() == h*h { st.reshape((bs, h, h))?.to_device(x.device())? } else { Tensor::zeros((bs, h, h), DType::F16, x.device())? },
             None => Tensor::zeros((bs, h, h), DType::F16, x.device())?,
         };
-        println!("[DEBUG-DELTA] current_state shape: {:?}", current_state.shape());
         let mut outputs = vec![];
         for t in 0..sl {
             let qt = q.narrow(1, t, 1)?.squeeze(1)?; let kt = k.narrow(1, t, 1)?.squeeze(1)?; let vt = v.narrow(1, t, 1)?.squeeze(1)?; 
             let update = vt.unsqueeze(D::Minus1)?.matmul(&kt.unsqueeze(D::Minus2)?)?;
-            if t == 0 { println!("[DEBUG-DELTA] vt shape: {:?}, kt shape: {:?}, update shape: {:?}", vt.shape(), kt.shape(), update.shape()); }
             current_state = (current_state + update)?;
             outputs.push(current_state.matmul(&qt.unsqueeze(D::Minus1)?)?.squeeze(D::Minus1)?.unsqueeze(1)?);
         }
