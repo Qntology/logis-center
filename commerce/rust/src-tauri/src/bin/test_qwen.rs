@@ -23,7 +23,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let device = Device::new_cuda(0).unwrap_or(Device::Cpu);
+    // [DEVICE SELECTION] Prefer Discrete GPU (usually ID 1) over Integrated (ID 0)
+    let device = Device::new_cuda(1)
+        .or_else(|_| Device::new_cuda(0))
+        .unwrap_or(Device::Cpu);
     println!("💻 Using device: {:?}", device);
 
     // [INIT] Initialize Generator
@@ -47,7 +50,7 @@ async fn main() -> Result<()> {
     };
 
     println!("🤔 Asking: 1+1=?");
-    let response = model.generate(params, None).await?;
+    let response = model.generate(params, None, None, None).await?;
 
     println!("\n✨ Result: {}", response);
     println!("\n✅ Test completed successfully!");

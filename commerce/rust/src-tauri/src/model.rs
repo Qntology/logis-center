@@ -43,11 +43,11 @@ pub enum ModelVariant {
 }
 
 impl ModelVariant {
-    pub async fn generate(&self, params: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, _session_id: Option<String>, _kv_name: Option<String>) -> anyhow::Result<String> {
+    pub async fn generate(&self, params: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
         match self {
             ModelVariant::Qwen3_5(m) => {
                 let mut gen = m.lock().await;
-                gen.generate(params, cancel_flag).await
+                gen.generate(params, cancel_flag, session_id, kv_name).await
             }
         }
     }

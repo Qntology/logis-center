@@ -4,7 +4,7 @@ use candle_nn::{VarBuilder};
 use std::collections::HashMap;
 use std::sync::Arc;
 use candle_core::safetensors::MmapedSafetensors;
-use candle_core::f16;
+use half::f16;
 
 use crate::{
     models::{
@@ -85,20 +85,19 @@ impl QLinear {
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         let name = &self.weight_name;
         let w_raw = if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "scales"), reg.get_q_tensor(name, "data"), reg.get_q_tensor(name, "shape")) {
-            let s = s_t.to_device(dev)?.to_dtype(DType::F32)?; let d = d_t.to_device(dev)?;
+            let s = s_t.to_device(dev)?.to_dtype(DType::F16)?; let d = d_t.to_device(dev)?.to_dtype(DType::F16)?;
             let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
-            let d_f32 = d.to_dtype(DType::F32)?;
             let restored = if d.dim(D::Minus1)? * 2 == shape.iter().product::<usize>() {
-                let high = (d_f32.clone() / 16.0)?.floor()?; let low = d_f32.sub(&(high.clone() * 16.0)?)?;
+                let high = (d.clone() / 16.0)?.floor()?; let low = d.sub(&(high.clone() * 16.0)?)?;
                 let combined = Tensor::stack(&[low.affine(1.0, -8.0)?, high.affine(1.0, -8.0)?], D::Minus1)?.flatten_all()?;
                 let s_exp = s.unsqueeze(D::Minus1)?.broadcast_as((s.dim(0)?, 32))?.flatten_all()?;
                 combined.broadcast_mul(&s_exp)?
             } else {
                 let s_exp = s.unsqueeze(D::Minus1)?.broadcast_as((s.dim(0)?, 32))?.flatten_all()?;
-                d_f32.affine(1.0, -128.0)?.broadcast_mul(&s_exp)?
+                d.affine(1.0, -128.0)?.broadcast_mul(&s_exp)?
             };
             restored.reshape(shape.as_slice())?
-        } else { reg.get_tensor(name).or_else(|_| reg.get_tensor(&format!("{}.weight", name)))?.to_device(dev)? };
+        } else { reg.get_tensor(name).or_else(|_| reg.get_tensor(&format!("{}.weight", name)))?.to_device(dev)?.to_dtype(DType::F16)? };
         self.persistent_weight = Some(w_raw.to_dtype(DType::F16)?);
         if let Ok(b) = reg.get_q_tensor(name, "bias").or_else(|_| reg.get_tensor(&format!("{}.bias", name))) {
             self.persistent_bias = Some(b.to_device(dev)?.to_dtype(DType::F16)?);
@@ -109,20 +108,19 @@ impl QLinear {
         let dev = x.device(); let name = &self.weight_name;
         let w_raw = if let Some(pw) = &self.persistent_weight { pw.clone() } 
         else if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "scales"), reg.get_q_tensor(name, "data"), reg.get_q_tensor(name, "shape")) {
-            let s = s_t.to_device(dev)?.to_dtype(DType::F32)?; let d = d_t.to_device(dev)?;
+            let s = s_t.to_device(dev)?.to_dtype(DType::F16)?; let d = d_t.to_device(dev)?.to_dtype(DType::F16)?;
             let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
-            let d_f32 = d.to_dtype(DType::F32)?;
             let restored = if d.dim(D::Minus1)? * 2 == shape.iter().product::<usize>() {
-                let high = (d_f32.clone() / 16.0)?.floor()?; let low = d_f32.sub(&(high.clone() * 16.0)?)?;
+                let high = (d.clone() / 16.0)?.floor()?; let low = d.sub(&(high.clone() * 16.0)?)?;
                 let combined = Tensor::stack(&[low.affine(1.0, -8.0)?, high.affine(1.0, -8.0)?], D::Minus1)?.flatten_all()?;
                 let s_exp = s.unsqueeze(D::Minus1)?.broadcast_as((s.dim(0)?, 32))?.flatten_all()?;
                 combined.broadcast_mul(&s_exp)?
             } else {
                 let s_exp = s.unsqueeze(D::Minus1)?.broadcast_as((s.dim(0)?, 32))?.flatten_all()?;
-                d_f32.affine(1.0, -128.0)?.broadcast_mul(&s_exp)?
+                d.affine(1.0, -128.0)?.broadcast_mul(&s_exp)?
             };
             restored.reshape(shape.as_slice())?
-        } else { reg.get_tensor(name).or_else(|_| reg.get_tensor(&format!("{}.weight", name)))?.to_device(dev)? };
+        } else { reg.get_tensor(name).or_else(|_| reg.get_tensor(&format!("{}.weight", name)))?.to_device(dev)?.to_dtype(DType::F16)? };
         let x_in_dim = x.dim(D::Minus1)?;
         let w = if w_raw.dim(1)? == x_in_dim { w_raw.t()? } else { w_raw };
         let res = x.contiguous()?.broadcast_matmul(&w.to_dtype(DType::F16)?.contiguous()?)?;
@@ -300,19 +298,19 @@ impl QEmbedding {
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         let w = if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(&self.name, "scales"), reg.get_q_tensor(&self.name, "data"), reg.get_q_tensor(&self.name, "shape")) {
             let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
-            let d_f32 = d_t.to_dtype(DType::F32)?; let s_f32 = s_t.to_dtype(DType::F32)?;
+            let d_f16 = d_t.to_device(dev)?.to_dtype(DType::F16)?; let s_f16 = s_t.to_device(dev)?.to_dtype(DType::F16)?;
             let restored = if d_t.dim(D::Minus1)? * 2 == shape.iter().product::<usize>() {
-                let high = (d_f32.clone() / 16.0)?.floor()?; let low = d_f32.sub(&(high.clone() * 16.0)?)?;
+                let high = (d_f16.clone() / 16.0)?.floor()?; let low = d_f16.sub(&(high.clone() * 16.0)?)?;
                 let combined = Tensor::stack(&[low.affine(1.0, -8.0)?, high.affine(1.0, -8.0)?], D::Minus1)?.flatten_all()?;
-                let s_exp = s_f32.unsqueeze(D::Minus1)?.broadcast_as((s_f32.dim(0)?, 32))?.flatten_all()?;
+                let s_exp = s_f16.unsqueeze(D::Minus1)?.broadcast_as((s_f16.dim(0)?, 32))?.flatten_all()?;
                 combined.broadcast_mul(&s_exp)?
             } else {
-                let s_exp = s_f32.unsqueeze(D::Minus1)?.broadcast_as((s_f32.dim(0)?, 32))?.flatten_all()?;
-                d_f32.affine(1.0, -128.0)?.broadcast_mul(&s_exp)?
+                let s_exp = s_f16.unsqueeze(D::Minus1)?.broadcast_as((s_f16.dim(0)?, 32))?.flatten_all()?;
+                d_f16.affine(1.0, -128.0)?.broadcast_mul(&s_exp)?
             };
             restored.reshape(shape.as_slice())?
-        } else { reg.get_tensor(&self.name).or_else(|_| reg.get_tensor(&format!("{}.weight", self.name)))? };
-        self.persistent_weight = Some(w.to_device(dev)?.to_dtype(DType::F16)?);
+        } else { reg.get_tensor(&self.name).or_else(|_| reg.get_tensor(&format!("{}.weight", self.name)))?.to_device(dev)?.to_dtype(DType::F16)? };
+        self.persistent_weight = Some(w);
         Ok(())
     }
     pub fn forward(&self, ids: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
@@ -321,23 +319,23 @@ impl QEmbedding {
         let w = if let Some(pw) = &self.persistent_weight { pw.clone() }
         else if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(&self.name, "scales"), reg.get_q_tensor(&self.name, "data"), reg.get_q_tensor(&self.name, "shape")) {
             let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
-            let d_f32 = d_t.to_dtype(DType::F32)?; let s_f32 = s_t.to_dtype(DType::F32)?;
+            let d_f16 = d_t.to_device(dev)?.to_dtype(DType::F16)?; let s_f16 = s_t.to_device(dev)?.to_dtype(DType::F16)?;
             let restored = if d_t.dim(D::Minus1)? * 2 == shape.iter().product::<usize>() {
-                let high = (d_f32.clone() / 16.0)?.floor()?; let low = d_f32.sub(&(high.clone() * 16.0)?)?;
+                let high = (d_f16.clone() / 16.0)?.floor()?; let low = d_f16.sub(&(high.clone() * 16.0)?)?;
                 let combined = Tensor::stack(&[low.affine(1.0, -8.0)?, high.affine(1.0, -8.0)?], D::Minus1)?.flatten_all()?;
-                let s_exp = s_f32.unsqueeze(D::Minus1)?.broadcast_as((s_f32.dim(0)?, 32))?.flatten_all()?;
+                let s_exp = s_f16.unsqueeze(D::Minus1)?.broadcast_as((s_f16.dim(0)?, 32))?.flatten_all()?;
                 combined.broadcast_mul(&s_exp)?
             } else {
-                let s_exp = s_f32.unsqueeze(D::Minus1)?.broadcast_as((s_f32.dim(0)?, 32))?.flatten_all()?;
-                d_f32.affine(1.0, -128.0)?.broadcast_mul(&s_exp)?
+                let s_exp = s_f16.unsqueeze(D::Minus1)?.broadcast_as((s_f16.dim(0)?, 32))?.flatten_all()?;
+                d_f16.affine(1.0, -128.0)?.broadcast_mul(&s_exp)?
             };
-            restored.reshape(shape.as_slice())?.to_device(dev)?.to_dtype(DType::F16)?
+            restored.reshape(shape.as_slice())?
         } else { reg.get_tensor(&self.name).or_else(|_| reg.get_tensor(&format!("{}.weight", self.name)))?.to_device(dev)?.to_dtype(DType::F16)? };
         Ok(w.index_select(&ids_u32, 0)?.reshape((b, s, ()))?.to_device(dev)?.to_dtype(DType::F16)?)
     }
 }
 
-pub struct QTextModel { pub embed: QEmbedding, pub layers: Vec<QDecoderLayer>, pub norm: QRmsNorm, rotary: Qwen3_5TextRotaryEmbedding, mrope: Vec<usize> }
+pub struct QTextModel { pub embed: QEmbedding, pub layers: Vec<QDecoderLayer>, pub norm: QRmsNorm, pub rotary: Qwen3_5TextRotaryEmbedding, pub mrope: Vec<usize> }
 impl QTextModel {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let mut layers = vec![]; for i in 0..config.num_hidden_layers { layers.push(QDecoderLayer::new(vb.pp("layers").pp(i), config, i)?); }
@@ -348,7 +346,11 @@ impl QTextModel {
         let bs = ids.dim(0)?; let sl = ids.dim(1)?; let mut x = self.embed.forward(ids, reg)?;
         let (cos, sin) = self.rotary.forward(pos, DType::F16, self.mrope.clone())?;
         let mask = if sl <= 1 && offset == 0 { None } else { Some(prepare_causal_attention_mask(bs, sl, offset, ids.device())?.to_dtype(DType::F16)?) };
-        for l in self.layers.iter_mut() { x = l.forward(&x, &cos, &sin, mask.as_ref(), reg)?; }
+        for l in self.layers.iter_mut() { 
+            x = l.forward(&x, &cos, &sin, mask.as_ref(), reg)?; 
+            #[cfg(feature = "cuda")]
+            x.device().synchronize()?;
+        }
         self.norm.forward(&x, reg)
     }
 }
