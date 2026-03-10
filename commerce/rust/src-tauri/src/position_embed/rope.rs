@@ -455,11 +455,12 @@ impl Qwen3_5TextRotaryEmbedding {
         dtype: DType,
         mrope_section: Vec<usize>,
     ) -> Result<(Tensor, Tensor)> {
+        let position_ids = position_ids.to_dtype(DType::U32)?;
         let position_ids = if position_ids.rank() == 2 {
             let (bs, len) = position_ids.dims2()?;
             position_ids.unsqueeze(0)?.expand((3, bs, len))?
         } else {
-            position_ids.clone()
+            position_ids
         };
         let position_ids_expanded = position_ids
             .unsqueeze(D::Minus2)?

@@ -41,7 +41,9 @@ impl QuantizedRegistry {
         
         for path in model_list {
             let mmap = unsafe { Arc::new(MmapedSafetensors::new(path)?) };
-            for name in mmap.tensors().iter().map(|(n, _)| n.clone()) {
+            let tensors = mmap.tensors();
+            println!("[REGISTRY] Loading {} tensors from {:?}", tensors.len(), path);
+            for name in tensors.iter().map(|(n, _)| n.clone()) {
                 tensor_to_file.insert(name, path.clone());
             }
             mmaps.insert(path.clone(), mmap);
@@ -426,8 +428,37 @@ impl QEmbedding {
         Self { weight: None, tensor_name: name.to_string() }
     }
     pub fn to_device(&mut self, device: &Device, registry: &QuantizedRegistry) -> Result<()> {
-        let w = registry.get_tensor(&self.tensor_name, device)?;
-        self.weight = Some(w);
+        let name = &self.tensor_name;
+        let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+
+        let s_t = registry.get_tensor(&format!("{}.scales", name), device);
+        let d_t = registry.get_tensor(&format!("{}.data", name), device);
+        let sh_t = registry.get_tensor(&format!("{}.shape", name), &Device::Cpu);
+
+        if let (Ok(s), Ok(d), Ok(sh)) = (s_t, d_t, sh_t) {
+            let shape: Vec<usize> = sh.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
+            let d_f32 = d.to_dtype(DType::F32)?;
+            let s_f32 = s.to_dtype(DType::F32)?;
+            
+            // Reconstruct quantized embedding weights (4-bit/8-bit reconstruction logic)
+            let restored = if d.dim(D::Minus1)? * 2 == shape.iter().product::<usize>() {
+                // 4-bit case
+                let high = (d_f32.clone() / 16.0)?.floor()?;
+                let low = d_f32.sub(&(high.clone() * 16.0)?)?;
+                let combined = Tensor::stack(&[low.affine(1.0, -8.0)?, high.affine(1.0, -8.0)?], D::Minus1)?.flatten_all()?;
+                let s_exp = s_f32.unsqueeze(D::Minus1)?.broadcast_as((s_f32.dim(0)?, 32))?.flatten_all()?;
+                combined.broadcast_mul(&s_exp)?
+            } else {
+                // 8-bit case
+                let s_exp = s_f32.unsqueeze(D::Minus1)?.broadcast_as((s_f32.dim(0)?, 32))?.flatten_all()?;
+                d_f32.affine(1.0, -128.0)?.broadcast_mul(&s_exp)?
+            };
+            self.weight = Some(restored.reshape(shape.as_slice())?.to_dtype(target_dtype)?);
+        } else {
+            // Fallback to direct weight load
+            let w = registry.get_tensor(name, device)?;
+            self.weight = Some(w.to_dtype(target_dtype)?);
+        }
         Ok(())
     }
     pub fn clear(&mut self) { self.weight = None; }
@@ -496,13 +527,15 @@ impl QuantizedQwen3_5Model {
 
         let seq_len = input_ids.dim(1)?;
         let pos = if let Some(_) = img_thw {
-            Tensor::arange(0_u32, seq_len as u32, dev)?
-                .unsqueeze(0)?.unsqueeze(0)?
+            let v_pos: Vec<u32> = (0..seq_len as u32).collect();
+            Tensor::from_vec(v_pos, (1, seq_len), dev)?
+                .unsqueeze(0)?
                 .broadcast_as((3, input_ids.dim(0)?, seq_len))?
                 .contiguous()?
         } else {
-            Tensor::arange(offset as u32, (offset + seq_len) as u32, dev)?
-                .unsqueeze(0)?.unsqueeze(0)?
+            let pos_vec: Vec<u32> = (offset as u32..(offset + seq_len) as u32).collect();
+            Tensor::from_vec(pos_vec, (1, seq_len), dev)?
+                .unsqueeze(0)?
                 .broadcast_as((3, input_ids.dim(0)?, seq_len))?
                 .contiguous()?
         };
