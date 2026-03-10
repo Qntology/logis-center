@@ -56,7 +56,14 @@ impl QuantizedRegistry {
         let file_path = self.tensor_to_file.get(name)
             .ok_or_else(|| anyhow!("Tensor {} not found in registry", name))?;
         let mmap = self.mmaps.get(file_path).unwrap();
-        Ok(mmap.load(name, device)?)
+        let t = mmap.load(name, device)?;
+        
+        // [CRITICAL FIX] Candle index_select/gather strictly requires U32. 
+        // Force conversion if the loaded tensor is I64 or I32.
+        match t.dtype() {
+            DType::I64 => Ok(t.to_dtype(DType::U32)?),
+            _ => Ok(t),
+        }
     }
 }
 
@@ -139,7 +146,7 @@ impl QLinear {
             if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (s_t, d_t, sh_t) {
                 let s = s_t.to_device(device)?.to_dtype(DType::F32)?;
                 let d = d_t.to_device(device)?;
-                let shape: Vec<usize> = sh_t.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
+                let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
                 
                 let d_f32 = d.to_dtype(DType::F32)?;
                 let restored = if d.dim(D::Minus1)? * 2 == shape.iter().product::<usize>() {
@@ -464,9 +471,15 @@ impl QEmbedding {
     pub fn clear(&mut self) { self.weight = None; }
     pub fn forward(&self, ids: &Tensor) -> Result<Tensor> {
         let w = self.weight.as_ref().ok_or_else(|| anyhow!("Embedding weight not on device"))?;
+        let dev = ids.device();
         let (b, s) = ids.dims2()?;
-        let ids_flat = ids.flatten_all()?.to_dtype(DType::U32)?;
-        Ok(w.index_select(&ids_flat, 0)?.reshape((b, s, ()))?)
+        
+        // [VRAM-OPTIMIZATION] Always perform embedding lookup on CPU if weights are large
+        let ids_cpu = ids.flatten_all()?.to_device(&Device::Cpu)?.to_dtype(DType::U32)?;
+        let w_cpu = w.to_device(&Device::Cpu)?;
+        
+        let embedded = w_cpu.index_select(&ids_cpu, 0)?;
+        Ok(embedded.reshape((b, s, ()))?.to_device(dev)?)
     }
 }
 
@@ -529,12 +542,14 @@ impl QuantizedQwen3_5Model {
         let pos = if let Some(_) = img_thw {
             let v_pos: Vec<u32> = (0..seq_len as u32).collect();
             Tensor::from_vec(v_pos, (1, seq_len), dev)?
+                .to_dtype(DType::U32)?
                 .unsqueeze(0)?
                 .broadcast_as((3, input_ids.dim(0)?, seq_len))?
                 .contiguous()?
         } else {
             let pos_vec: Vec<u32> = (offset as u32..(offset + seq_len) as u32).collect();
             Tensor::from_vec(pos_vec, (1, seq_len), dev)?
+                .to_dtype(DType::U32)?
                 .unsqueeze(0)?
                 .broadcast_as((3, input_ids.dim(0)?, seq_len))?
                 .contiguous()?

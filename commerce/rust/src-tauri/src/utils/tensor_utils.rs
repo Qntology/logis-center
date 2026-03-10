@@ -9,11 +9,15 @@ pub fn prepare_causal_attention_mask(
     device: &Device,
 ) -> Result<Tensor> {
     let arange = Tensor::arange(0u32, tgt_len as u32, device)?;
-    let arange = arange.unsqueeze(1)?.broadcast_as((tgt_len, tgt_len))?;
-    let upper_triangle = arange.t()?.gt(&arange)?;
+    let arange_row = arange.unsqueeze(1)?.broadcast_as((tgt_len, tgt_len))?;
+    let arange_col = arange.unsqueeze(0)?.broadcast_as((tgt_len, tgt_len))?;
+    
+    // Condition must be U8 for where_cond
+    let upper_triangle = arange_col.gt(&arange_row)?.to_dtype(DType::U8)?;
+    
     let mask = upper_triangle.where_cond(
-        &Tensor::new(f32::NEG_INFINITY, device)?.broadcast_as(arange.shape())?,
-        &Tensor::new(0f32, device)?.broadcast_as(arange.shape())?,
+        &Tensor::new(f32::NEG_INFINITY, device)?.broadcast_as((tgt_len, tgt_len))?,
+        &Tensor::new(0f32, device)?.broadcast_as((tgt_len, tgt_len))?,
     )?;
     let mask = if seqlen_offset > 0 {
         let mask0 = Tensor::zeros((tgt_len, seqlen_offset), DType::F32, device)?;
