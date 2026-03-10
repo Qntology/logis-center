@@ -190,7 +190,7 @@ impl QGatedDeltaNet {
         let (bs, sl, _) = x.dims3()?;
         let (nk, dk, nv, dv) = (self.nk, self.dk, self.nv, self.dv);
 
-        // --- [STEP 1] PROJECTIONS ---
+        // --- 1. Projections & Conv1d ---
         let mut mixed_qkv = self.in_proj_qkv.forward(x, reg)?;
         let z = self.in_proj_z.forward(x, reg)?;
         let b = self.in_proj_b.forward(x, reg)?;
@@ -203,7 +203,7 @@ impl QGatedDeltaNet {
             mixed_qkv = conv.forward(&c_in)?.transpose(1, 2)?.silu()?;
         }
 
-        // --- [STEP 2] QKV SPLIT & NORM ---
+        // --- 2. QKV Split & Official Normalize ---
         let q = mixed_qkv.narrow(D::Minus1, 0, nk * dk)?.reshape((bs, sl, nk, dk))?;
         let k = mixed_qkv.narrow(D::Minus1, nk * dk, nk * dk)?.reshape((bs, sl, nk, dk))?;
         let v = mixed_qkv.narrow(D::Minus1, nk * dk * 2, nv * dv)?.reshape((bs, sl, nv, dv))?;
@@ -212,7 +212,7 @@ impl QGatedDeltaNet {
         let k = crate::utils::tensor_utils::l2_normalize(&k, 3)?;
         let q = q.affine(1.0 / (dk as f64).sqrt(), 0.0)?;
         
-        // --- [STEP 3] GATE PROCESSING ---
+        // --- 3. Gate Processing (Official Recurrent Formula) ---
         let beta = if let Some(ref db) = self.dt_bias { softplus(&b.broadcast_add(db)?)? } else { softplus(&b)? };
         let beta = beta.to_dtype(DType::F32)?;
         let g = if let Some(ref al) = self.a_log {
@@ -221,7 +221,7 @@ impl QGatedDeltaNet {
         } else { a.clone() };
         let g = g.to_dtype(DType::F32)?;
 
-        // --- [STEP 4] RECURRENCE WITH NUMERICAL CLAMPING ---
+        // --- 4. Delta Rule Linear Recurrence ---
         let mut state = self.delta_state.take()
             .unwrap_or_else(|| Tensor::zeros((bs, nk, dk, dv), DType::F32, x.device()).unwrap())
             .to_dtype(DType::F32)?;
@@ -232,22 +232,31 @@ impl QGatedDeltaNet {
             let kt = k.narrow(1, t, 1)?.reshape((bs, nk, dk))?.to_dtype(DType::F32)?;
             let vt = v.narrow(1, t, 1)?.reshape((bs, nv, dv))?.to_dtype(DType::F32)?;
             
-            // Numerical stability: clamp gate before exp
+            // Forget Gate: decay existing state
             let gt = g.narrow(1, t, 1)?.reshape((bs, nk, 1, 1))?.clamp(-10.0f32, 0.0f32)?.exp()?;
             state = state.broadcast_mul(&gt)?;
 
-            let kv_mem = state.broadcast_mul(&kt.unsqueeze(D::Minus1)?)?.sum(D::Minus2)?; 
+            // Delta Rule Update: S = S + beta * kt.T @ (vt - kt @ S)
             let bt = beta.narrow(1, t, 1)?.reshape((bs, nk, 1))?;
-            let delta = vt.sub(&kv_mem)?.broadcast_mul(&bt)?;
             
-            // state update: kt^T @ delta
-            let update = kt.unsqueeze(D::Minus1)?.broadcast_matmul(&delta.unsqueeze(D::Minus2)?)?;
+            // v_prime = kt @ state (bs, nk, dv)
+            let v_prime = kt.unsqueeze(D::Minus2)?.broadcast_matmul(&state)?.squeeze(D::Minus2)?; 
+            
+            // error = vt - v_prime (bs, nk, dv)
+            let error = vt.sub(&v_prime)?;
+            
+            // update = beta * kt.T @ error (bs, nk, dk, dv)
+            let update = kt.unsqueeze(D::Minus1)?.broadcast_matmul(&error.unsqueeze(D::Minus2)?)?
+                .broadcast_mul(&bt.unsqueeze(D::Minus1)?)?;
+            
             state = state.add(&update)?;
             
-            let out_t = state.broadcast_mul(&qt.unsqueeze(D::Minus1)?)?.sum(D::Minus2)?; 
+            // Current Output: qt @ state
+            let out_t = qt.unsqueeze(D::Minus2)?.broadcast_matmul(&state)?.squeeze(D::Minus2)?; 
             outputs.push(out_t.unsqueeze(1)?.to_dtype(DType::F16)?);
         }
 
+        // --- 5. Final Gating & Output ---
         let out = Tensor::cat(&outputs, 1)?.reshape((bs, sl, nv * dv))?;
         self.delta_state = Some(state.detach().to_device(&Device::Cpu)?);
         
