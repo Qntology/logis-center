@@ -12,7 +12,7 @@ use crate::{
         qwen35::config::{Qwen3_5Config, Qwen3_5TextConfig},
         qwen3vl::model::Qwen3VLVisionModel,
     },
-    position_embed::rope::{apply_rotary_pos_emb, glm_asr_apply_rotary_pos_emb, Qwen3VLTextRotaryEmbedding},
+    position_embed::rope::{apply_rotary_pos_emb, glm_asr_apply_rotary_pos_emb, Qwen3_5TextRotaryEmbedding},
     utils::tensor_utils::{
         get_equal_mask, get_vision_next_indices, l2_normalize, masked_scatter_dim0, nonzero_index,
         prepare_causal_attention_mask, repeat_interleave, split_tensor, zero_index,
@@ -921,7 +921,7 @@ pub struct Qwen3_5TextModel {
     embed_tokens: Qwen3_5Embedding, // Replaced Embedding with Qwen3_5Embedding
     layers: Vec<Qwen3_5DecoderLayer>,
     norm: Qwen3_5RMSNorm,
-    rotary_emb: Qwen3VLTextRotaryEmbedding,
+    rotary_emb: Qwen3_5TextRotaryEmbedding,
     mrope_section: Vec<usize>,
 }
 
@@ -938,7 +938,7 @@ impl Qwen3_5TextModel {
         let rope_dim =
             (config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize;
         let rotary_emb =
-            Qwen3VLTextRotaryEmbedding::new(rope_dim, config.rope_parameters.rope_theta);
+            Qwen3_5TextRotaryEmbedding::new(rope_dim, config.rope_parameters.rope_theta);
         Ok(Self {
             embed_tokens,
             layers,

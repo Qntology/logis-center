@@ -355,11 +355,11 @@ impl Qwen2_5VisionRotaryEmbedding {
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLTextRotaryEmbedding {
+pub struct Qwen3_5TextRotaryEmbedding {
     inv_freq: Vec<f32>,
 }
 
-impl Qwen3VLTextRotaryEmbedding {
+impl Qwen3_5TextRotaryEmbedding {
     pub fn new(dim: usize, theta_base: f32) -> Self {
         let inv_freq = compute_default_rope_parameters(dim, theta_base);
         Self { inv_freq }
@@ -378,12 +378,13 @@ impl Qwen3VLTextRotaryEmbedding {
                 .to_dtype(DType::U32)?;
             let src = freqs.i(dim)?.contiguous()?; 
             let src = src.index_select(&idx, D::Minus1)?.contiguous()?;
-            let idx = idx
+            let idx_u32 = idx
                 .unsqueeze(0)?
                 .unsqueeze(0)?
                 .broadcast_as(src.shape())?
+                .to_dtype(DType::U32)?
                 .contiguous()?;
-            freqs_t = freqs_t.scatter(&idx, &src, D::Minus1)?;
+            freqs_t = freqs_t.scatter(&idx_u32, &src, D::Minus1)?;
         }
         Ok(freqs_t)
     }
@@ -402,12 +403,13 @@ impl Qwen3VLTextRotaryEmbedding {
                 .to_dtype(DType::U32)?;
             let src = freqs.i(dim)?.contiguous()?; 
             let src = src.index_select(&idx, D::Minus1)?.contiguous()?;
-            let idx = idx
+            let idx_u32 = idx
                 .unsqueeze(0)?
                 .unsqueeze(0)?
                 .broadcast_as(src.shape())?
+                .to_dtype(DType::U32)?
                 .contiguous()?;
-            freqs_t = freqs_t.scatter(&idx, &src, D::Minus1)?;
+            freqs_t = freqs_t.scatter(&idx_u32, &src, D::Minus1)?;
         }
         Ok(freqs_t)
     }

@@ -726,40 +726,32 @@ impl LogisModel {
     pub async fn ensure_embedding(&self) -> anyhow::Result<()> {
         let current_size = { *self.current_size.lock().await };
         
-        // [STRATEGY] High-priority exclusion logic
-        match current_size {
+        // [VRAM-OPTIMIZATION] Determine target device: CPU if Large OR Small is active, else GPU
+        let target_device = match current_size {
             Some(ModelSize::Large) => {
-                // If Large is active, Embedding must stay on CPU to avoid OOM
                 println!("[MODEL] Large model active. Forcing Embedding to CPU to prevent swapping.");
+                Device::Cpu
             },
             Some(ModelSize::Small) => {
-                // Small and Embedding can coexist. 
-                println!("[MODEL] Small model active. Embedding and 0.6B will coexist.");
+                println!("[MODEL] Small model active. Embedding and 0.8B will coexist. Forcing Embedding to CPU.");
+                Device::Cpu
             },
             None => {
-                // No generator active, safe to clean up any leftovers
-                self.unload_generator().await;
+                if self.is_cpu_mode { Device::Cpu } else { Device::new_cuda(0).unwrap_or(Device::Cpu) }
             }
-        }
+        };
 
         let mut emb_guard = self.embedding_model.lock().await;
         if emb_guard.is_none() {
             let self_clone = self.embedding_path.clone();
-            
-            // Determine target device: CPU if Large is active, else use default GPU
-            let target_device = if current_size == Some(ModelSize::Large) { 
-                candle_core::Device::Cpu 
-            } else { 
-                self.device_config.device.clone() 
-            };
-            
-            println!("[MODEL] Loading Embedding Model on {:?}...", if target_device.is_cpu() { "CPU" } else { "GPU" });
-            
             let target_device_clone = target_device.clone();
+            
+            println!("[MODEL] Loading Embedding Model on {:?}...", if target_device_clone.is_cpu() { "CPU" } else { "GPU" });
+
             let emb = tokio::task::spawn_blocking(move || {
                 EmbeddingModel::new_with_device(&self_clone, &target_device_clone)
             }).await??;
-            
+
             *emb_guard = Some(emb);
         }
         Ok(())
@@ -839,7 +831,7 @@ impl LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
-        // [VISION-FIX] 이미지 추출은 반드시 2B (Large) 모델을 사용해야 합니다.
+        // [VISION-FIX] 이미지 추출은 반드시 0.8B (Large) 모델을 사용해야 합니다.
         {
             let mut gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
@@ -858,7 +850,7 @@ impl LogisModel {
                 Some(dynamic_image), 
                 app_handle, 
                 "extraction-progress", 
-                json!({ "category": "Vision Analysis", "summary": "Analyzing image with 2B model..." }), 
+                json!({ "category": "Vision Analysis", "summary": "Analyzing image with 0.8B model..." }), 
                 1024, 
                 cancel_token.clone(), 
                 Some(task_id.clone()),
@@ -928,7 +920,7 @@ impl LogisModel {
     }
 
     pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        // [FIX] Default to Small (0.6B) for all chat tasks to align with 0.6B-focused architecture.
+        // [FIX] Default to Small (0.8B) for all chat tasks to align with 0.8B-focused architecture.
         {
             let mut gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
@@ -1029,7 +1021,7 @@ impl LogisModel {
         session_id: Option<String>,
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
-        // [FIX] Ensure we stay on Small (0.6B).
+        // [FIX] Ensure we stay on Small (0.8B).
         {
             let mut gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
@@ -1047,10 +1039,6 @@ impl LogisModel {
             }
         }
 
-        // [FIX] Removed periodic UI emits from low-level model calls.
-        // Higher-level scheduler will manage the initial and final UI states.
-        // let _ = app_handle.emit(event_name, &base_payload);
-        
         // [LOG] Save to task history if task_id exists
         if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
             crate::scheduler::log_task_progress(app_handle, task_id, &base_payload);
@@ -1077,9 +1065,6 @@ impl LogisModel {
     ) -> anyhow::Result<String> {
         // Ensure generator is loaded
         self.ensure_generator(ModelSize::Large).await?;
-
-        // [FIX] Removed redundant emit. Only log the progress if needed.
-        // let _ = app_handle.emit(event_name, base_payload);
 
         let mut gen_guard = self.generator.lock().await;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
@@ -1121,7 +1106,7 @@ impl LogisModel {
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.6B (Small)
+        // [VISION-DYNAMIC] 이미지가 있으면 0.8B (Large), 없으면 0.8B (Small)
         let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
         self.ensure_generator(target_size).await?;
         
@@ -1175,7 +1160,7 @@ impl LogisModel {
         session_id: Option<String>,
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
-        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.6B (Small)
+        // [VISION-DYNAMIC] 이미지가 있으면 0.8B (Large), 없으면 0.8B (Small)
         let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
         self.ensure_generator(target_size).await?;
 

@@ -35,7 +35,7 @@ impl TokenizerModel {
     }
     pub fn text_encode(&self, text: String, device: &Device) -> Result<Tensor> {
         let token_id = self.text_encode_vec(text, true)?;
-        let token_tensor = Tensor::from_slice(&token_id, (1, token_id.len()), device)?;
+        let token_tensor = Tensor::from_slice(&token_id, (1, token_id.len()), device)?.to_dtype(candle_core::DType::U32)?;
         Ok(token_tensor)
     }
 

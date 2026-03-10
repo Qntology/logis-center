@@ -5,6 +5,7 @@ use candle_core::quantized::{QMatMul};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use candle_core::safetensors::MmapedSafetensors;
 
 use crate::{
     models::{
@@ -12,7 +13,7 @@ use crate::{
         common::{conv1d_depthwise, get_conv1d, softplus},
     },
     position_embed::rope::{
-        Qwen3VLTextRotaryEmbedding, glm_asr_apply_rotary_pos_emb,
+        Qwen3_5TextRotaryEmbedding, glm_asr_apply_rotary_pos_emb,
     },
     utils::tensor_utils::{
         l2_normalize, prepare_causal_attention_mask, repeat_interleave, split_tensor,
@@ -25,36 +26,38 @@ use crate::{
  * STRATEGY: 
  * 1. Layer-wise Cycling: Load weights to GPU ONLY during the specific layer's forward pass.
  * 2. True 4-bit Residency: Avoid dequantizing large weights into BF16 on GPU VRAM.
- * 3. Mask Stripping: Skip 500MB Attention Mask generation for Linear Attention layers.
- * 4. Recurrent State Preservation: Qwen 3.5's Gated DeltaNet state is tiny but precision-critical.
- *    Keep these states in RAM/VRAM and ONLY swap weights to SSD/Registry.
+ * 3. Mmap-based loading: Avoid reading the whole safetensors file into RAM repeatedly.
  */
 
-macro_rules! transmute_tensors {
-    ($($tensor:expr),*) => {
-        ($(
-            $tensor.transpose(1, 2)?.contiguous()?.to_dtype(candle_core::DType::F32)?,
-        )*)
-    };
+// [VRAM-OPTIMIZATION] Shared Mmap Registry to prevent repeated file reads
+pub struct QuantizedRegistry {
+    mmaps: HashMap<String, Arc<MmapedSafetensors>>,
+    tensor_to_file: HashMap<String, String>,
 }
 
-macro_rules! right_pad_zero_tensor {
-    ($dim:expr, $pad_size:expr, $($tensor:expr),+) => {
-        ($(
-            $tensor.pad_with_zeros($dim, 0, $pad_size)?.contiguous()?,
-        )+)
-    };
-}
+impl QuantizedRegistry {
+    pub fn new(model_list: &[String]) -> Result<Self> {
+        let mut mmaps = HashMap::new();
+        let mut tensor_to_file = HashMap::new();
+        
+        for path in model_list {
+            // [SECURITY] MmapedSafetensors::new is unsafe because it depends on file integrity
+            let mmap = unsafe { Arc::new(MmapedSafetensors::new(path)?) };
+            for name in mmap.tensors().iter().map(|(n, _)| n.clone()) {
+                tensor_to_file.insert(name, path.clone());
+            }
+            mmaps.insert(path.clone(), mmap);
+        }
+        
+        Ok(Self { mmaps, tensor_to_file })
+    }
 
-macro_rules! reshape_chunk_tensor {
-    ($chunk_size:expr, $($tensor:expr),*) => {
-        ($(
-            {
-                let (bs, head, _, dim) = $tensor.dims4()?;
-                $tensor.reshape((bs, head, (), $chunk_size, dim))?.contiguous()?
-            },
-        )*)
-    };
+    pub fn get_tensor(&self, name: &str, device: &Device) -> Result<Tensor> {
+        let file_path = self.tensor_to_file.get(name)
+            .ok_or_else(|| anyhow!("Tensor {} not found in registry", name))?;
+        let mmap = self.mmaps.get(file_path).unwrap();
+        Ok(mmap.load(name, device)?)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -107,71 +110,59 @@ impl QRmsNormGated {
 pub struct QLinear {
     inner: QMatMul,
     bias: Option<Tensor>,
-    file_path: Option<String>,
     tensor_name: String,
     device: Device,
 }
 
 impl QLinear {
-    pub fn from_registry(name: &str, registry: &HashMap<String, String>, device: &Device) -> Result<Self> {
-        let name_s = name.to_string();
-        let path = registry.get(name)
-            .or_else(|| registry.get(&format!("{}.weight", name)))
-            .or_else(|| registry.get(&format!("{}.weight.scales", name)))
-            .or_else(|| registry.get(&format!("{}.scales", name)))
-            .or_else(|| registry.get(&format!("{}.weight.data", name)))
-            .or_else(|| registry.get(&format!("{}.data", name)))
-            .ok_or_else(|| anyhow!("Tensor {} not found in registry", name))?;
-        
-        Ok(Self {
+    pub fn new(name: &str) -> Self {
+        Self {
             inner: QMatMul::Tensor(Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap()),
             bias: None,
-            file_path: Some(path.clone()),
-            tensor_name: name_s,
+            tensor_name: name.to_string(),
             device: Device::Cpu,
-        })
+        }
     }
 
-    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+    pub fn to_device(&mut self, device: &Device, registry: &QuantizedRegistry) -> Result<()> {
         if !self.device.same_device(device) {
             let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-            if let Some(path) = &self.file_path {
-                let tensors = candle_core::safetensors::load(path, &Device::Cpu)?;
-                let name = &self.tensor_name;
-                
-                let s_t = tensors.get(&format!("{}.weight.scales", name)).or_else(|| tensors.get(&format!("{}.scales", name)));
-                let d_t = tensors.get(&format!("{}.weight.data", name)).or_else(|| tensors.get(&format!("{}.data", name)));
-                let sh_t = tensors.get(&format!("{}.weight.shape", name)).or_else(|| tensors.get(&format!("{}.shape", name)));
+            let name = &self.tensor_name;
 
-                if let (Some(s_t), Some(d_t), Some(sh_t)) = (s_t, d_t, sh_t) {
-                    // [QUANT-CRITICAL] TRUE 4-BIT RESIDENCY
-                    let s = s_t.to_device(device)?.to_dtype(DType::F32)?;
-                    let d = d_t.to_device(device)?;
-                    let shape: Vec<usize> = sh_t.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
-                    
-                    let d_f32 = d.to_dtype(DType::F32)?;
-                    let restored = if d.dim(D::Minus1)? * 2 == shape.iter().product::<usize>() {
-                        // Q4 unpack logic
-                        let high = (d_f32.clone() / 16.0)?.floor()?;
-                        let low = d_f32.sub(&(high.clone() * 16.0)?)?;
-                        let combined = Tensor::stack(&[low.affine(1.0, -8.0)?, high.affine(1.0, -8.0)?], D::Minus1)?.flatten_all()?;
-                        let s_exp = s.unsqueeze(D::Minus1)?.broadcast_as((s.dim(0)?, 32))?.flatten_all()?;
-                        combined.broadcast_mul(&s_exp)?
-                    } else {
-                        // Q8 unpack logic
-                        let s_exp = s.unsqueeze(D::Minus1)?.broadcast_as((s.dim(0)?, 32))?.flatten_all()?;
-                        d_f32.affine(1.0, -128.0)?.broadcast_mul(&s_exp)?
-                    };
-                    // DEQUANTIZE only current layer, and ensure small footprint
-                    self.inner = QMatMul::Tensor(restored.reshape(shape.as_slice())?.to_dtype(target_dtype)?);
+            // Try loading quantized parts first
+            let s_t = registry.get_tensor(&format!("{}.weight.scales", name), &Device::Cpu)
+                .or_else(|_| registry.get_tensor(&format!("{}.scales", name), &Device::Cpu));
+            let d_t = registry.get_tensor(&format!("{}.weight.data", name), &Device::Cpu)
+                .or_else(|_| registry.get_tensor(&format!("{}.data", name), &Device::Cpu));
+            let sh_t = registry.get_tensor(&format!("{}.weight.shape", name), &Device::Cpu)
+                .or_else(|_| registry.get_tensor(&format!("{}.shape", name), &Device::Cpu));
+
+            if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (s_t, d_t, sh_t) {
+                let s = s_t.to_device(device)?.to_dtype(DType::F32)?;
+                let d = d_t.to_device(device)?;
+                let shape: Vec<usize> = sh_t.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
+                
+                let d_f32 = d.to_dtype(DType::F32)?;
+                let restored = if d.dim(D::Minus1)? * 2 == shape.iter().product::<usize>() {
+                    let high = (d_f32.clone() / 16.0)?.floor()?;
+                    let low = d_f32.sub(&(high.clone() * 16.0)?)?;
+                    let combined = Tensor::stack(&[low.affine(1.0, -8.0)?, high.affine(1.0, -8.0)?], D::Minus1)?.flatten_all()?;
+                    let s_exp = s.unsqueeze(D::Minus1)?.broadcast_as((s.dim(0)?, 32))?.flatten_all()?;
+                    combined.broadcast_mul(&s_exp)?
                 } else {
-                    let w = tensors.get(&format!("{}.weight", name)).or_else(|| tensors.get(name))
-                        .ok_or_else(|| anyhow!("Weight for {} not found", name))?;
-                    self.inner = QMatMul::Tensor(w.to_device(device)?.to_dtype(target_dtype)?);
-                }
-                if let Some(b) = tensors.get(&format!("{}.weight.bias", name)).or_else(|| tensors.get(&format!("{}.bias", name))) {
-                    self.bias = Some(b.to_device(device)?.to_dtype(target_dtype)?);
-                }
+                    let s_exp = s.unsqueeze(D::Minus1)?.broadcast_as((s.dim(0)?, 32))?.flatten_all()?;
+                    d_f32.affine(1.0, -128.0)?.broadcast_mul(&s_exp)?
+                };
+                self.inner = QMatMul::Tensor(restored.reshape(shape.as_slice())?.to_dtype(target_dtype)?);
+            } else {
+                let w = registry.get_tensor(&format!("{}.weight", name), device)
+                    .or_else(|_| registry.get_tensor(name, device))?;
+                self.inner = QMatMul::Tensor(w.to_dtype(target_dtype)?);
+            }
+
+            if let Ok(b) = registry.get_tensor(&format!("{}.weight.bias", name), device)
+                .or_else(|_| registry.get_tensor(&format!("{}.bias", name), device)) {
+                self.bias = Some(b.to_dtype(target_dtype)?);
             }
             self.device = device.clone();
         }
@@ -190,6 +181,33 @@ impl QLinear {
     }
 }
 
+macro_rules! transmute_tensors {
+    ($($tensor:expr),*) => {
+        ($(
+            $tensor.transpose(1, 2)?.contiguous()?.to_dtype(candle_core::DType::F32)?,
+        )*)
+    };
+}
+
+macro_rules! right_pad_zero_tensor {
+    ($dim:expr, $pad_size:expr, $($tensor:expr),+) => {
+        ($(
+            $tensor.pad_with_zeros($dim, 0, $pad_size)?.contiguous()?,
+        )+)
+    };
+}
+
+macro_rules! reshape_chunk_tensor {
+    ($chunk_size:expr, $($tensor:expr),*) => {
+        ($(
+            {
+                let (bs, head, _, dim) = $tensor.dims4()?;
+                $tensor.reshape((bs, head, (), $chunk_size, dim))?.contiguous()?
+            },
+        )*)
+    };
+}
+
 pub struct QGatedDeltaNet {
     num_v_heads: usize, num_k_heads: usize, head_k_dim: usize, head_v_dim: usize,
     key_dim: usize, value_dim: usize, conv_kernel_size: usize,
@@ -198,11 +216,12 @@ pub struct QGatedDeltaNet {
     norm: QRmsNormGated, out_proj: QLinear, in_proj_qkv: QLinear,
     in_proj_z: QLinear, in_proj_b: QLinear, in_proj_a: QLinear,
     conv_state_cache: Option<Tensor>, recurrent_state_cache: Option<Tensor>,
+    cpu_conv_state: Option<Tensor>, cpu_recurrent_state: Option<Tensor>,
 }
 
 impl QGatedDeltaNet {
-    pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig, registry: &HashMap<String, String>) -> Result<Self> {
-        let h = config.hidden_size; let nv = config.linear_num_value_heads; let nk = config.linear_num_key_heads;
+    pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
+        let _h = config.hidden_size; let nv = config.linear_num_value_heads; let nk = config.linear_num_key_heads;
         let d_k = config.linear_key_head_dim; let d_v = config.linear_value_head_dim;
         let ck = config.linear_conv_kernel_dim;
         let conv_dim = (d_k * nk) * 2 + (d_v * nv);
@@ -214,25 +233,32 @@ impl QGatedDeltaNet {
             conv1d, dt_bias: dt_bias.clone(), cpu_dt_bias: dt_bias.to_device(&Device::Cpu)?,
             a_log: a_log.clone(), cpu_a_log: a_log.to_device(&Device::Cpu)?,
             norm: QRmsNormGated::new(vb.get(d_v, "norm.weight")?, config.rms_norm_eps)?,
-            out_proj: QLinear::from_registry(&format!("{}.out_proj", p), registry, vb.device())?,
-            in_proj_qkv: QLinear::from_registry(&format!("{}.in_proj_qkv", p), registry, vb.device())?,
-            in_proj_z: QLinear::from_registry(&format!("{}.in_proj_z", p), registry, vb.device())?,
-            in_proj_b: QLinear::from_registry(&format!("{}.in_proj_b", p), registry, vb.device())?,
-            in_proj_a: QLinear::from_registry(&format!("{}.in_proj_a", p), registry, vb.device())?,
+            out_proj: QLinear::new(&format!("{}.out_proj", p)),
+            in_proj_qkv: QLinear::new(&format!("{}.in_proj_qkv", p)),
+            in_proj_z: QLinear::new(&format!("{}.in_proj_z", p)),
+            in_proj_b: QLinear::new(&format!("{}.in_proj_b", p)),
+            in_proj_a: QLinear::new(&format!("{}.in_proj_a", p)),
             conv_state_cache: None, recurrent_state_cache: None,
+            cpu_conv_state: None, cpu_recurrent_state: None,
         })
     }
 
-    pub fn to_device(&mut self, d: &Device) -> Result<()> {
+    pub fn to_device(&mut self, d: &Device, registry: &QuantizedRegistry) -> Result<()> {
         let dtype = if d.is_cuda() { DType::BF16 } else { DType::F32 };
         self.dt_bias = self.cpu_dt_bias.to_device(d)?.to_dtype(dtype)?;
         self.a_log = self.cpu_a_log.to_device(d)?.to_dtype(dtype)?;
-        self.norm.to_device(d)?; self.out_proj.to_device(d)?; self.in_proj_qkv.to_device(d)?;
-        self.in_proj_z.to_device(d)?; self.in_proj_b.to_device(d)?; self.in_proj_a.to_device(d)?;
+        self.norm.to_device(d)?; 
+        self.out_proj.to_device(d, registry)?; self.in_proj_qkv.to_device(d, registry)?;
+        self.in_proj_z.to_device(d, registry)?; self.in_proj_b.to_device(d, registry)?; self.in_proj_a.to_device(d, registry)?;
+        
+        if let Some(s) = self.cpu_conv_state.take() { self.conv_state_cache = Some(s.to_device(d)?); }
+        if let Some(r) = self.cpu_recurrent_state.take() { self.recurrent_state_cache = Some(r.to_device(d)?); }
         Ok(())
     }
 
     pub fn clear(&mut self) {
+        if let Some(s) = self.conv_state_cache.take() { self.cpu_conv_state = Some(s.to_device(&Device::Cpu).unwrap()); }
+        if let Some(r) = self.recurrent_state_cache.take() { self.cpu_recurrent_state = Some(r.to_device(&Device::Cpu).unwrap()); }
         self.norm.clear(); self.out_proj.clear(); self.in_proj_qkv.clear();
         self.in_proj_z.clear(); self.in_proj_b.clear(); self.in_proj_a.clear();
     }
@@ -261,11 +287,14 @@ impl QGatedDeltaNet {
         let (query, key, kb, vb) = reshape_chunk_tensor!(chunk_size, query, key, kb, vb);
         let g = g.reshape((g.dim(0)?, g.dim(1)?, (), chunk_size))?.cumsum(D::Minus1)?;
         let decay = g.unsqueeze(D::Minus1)?.broadcast_sub(&g.unsqueeze(D::Minus2)?)?.exp()?.to_dtype(DType::F32)?;
-        let tril = Tensor::tril2(chunk_size, candle_core::DType::U32, query.device())?.broadcast_as(decay.shape())?;
+        
+        // [FIX] Ensure U32 for all indexing and masks
+        let tril = Tensor::tril2(chunk_size, DType::U32, query.device())?.broadcast_as(decay.shape())?;
         let decay = tril.where_cond(&decay, &decay.zeros_like()?)?.contiguous()?;
         let mut attn = kb.squeeze(0)?.contiguous()?.matmul(&key.squeeze(0)?.transpose(D::Minus1, D::Minus2)?.contiguous()?)?.unsqueeze(0)?.mul(&decay)?.affine(-1.0, 0.0)?;
-        let mask = Tensor::triu2(chunk_size, candle_core::DType::U32, query.device())?.broadcast_as(decay.shape())?;
+        let mask = Tensor::triu2(chunk_size, DType::U32, query.device())?.broadcast_as(decay.shape())?;
         attn = mask.where_cond(&decay.zeros_like()?, &attn)?;
+        
         let (d0, d1, d2, _, _) = attn.dims5()?;
         for i in 1..chunk_size {
             let row = attn.i((.., .., .., i, ..i))?.contiguous()?;
@@ -278,7 +307,8 @@ impl QGatedDeltaNet {
         let k_cum = attn.squeeze(0)?.matmul(&kb.broadcast_mul(&g.exp()?.unsqueeze(D::Minus1)?)?.squeeze(0)?)?.unsqueeze(0)?;
         let mut lrs = if let Some(r) = self.recurrent_state_cache.as_ref() { r.clone() } else { Tensor::zeros((bs, nh, dk, dv), DType::F32, value_out.device())? };
         let mut out = value_out.zeros_like()?;
-        let tril = Tensor::tril2(chunk_size, candle_core::DType::U32, query.device())?.broadcast_as((bs, nh, chunk_size, chunk_size))?;
+        
+        let tril = Tensor::tril2(chunk_size, DType::U32, query.device())?.broadcast_as((bs, nh, chunk_size, chunk_size))?;
         let on_f = tril.zeros_like()?.to_dtype(DType::F32)?;
         for i in 0..total_sl / chunk_size {
             let qi = query.i((.., .., i))?.contiguous()?; let ki = key.i((.., .., i))?.contiguous()?;
@@ -328,26 +358,44 @@ pub struct QAttention {
     q_proj: QLinear, k_proj: QLinear, v_proj: QLinear, o_proj: QLinear,
     q_norm: QRmsNorm, k_norm: QRmsNorm,
     num_attention_heads: usize, num_key_value_heads: usize, num_kv_groups: usize,
-    head_dim: usize, scaling: f64, kv_cache: Option<(Tensor, Tensor)>,
+    head_dim: usize, scaling: f64, 
+    kv_cache: Option<(Tensor, Tensor)>,
+    cpu_kv_cache: Option<(Tensor, Tensor)>,
 }
 
 impl QAttention {
-    pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig, registry: &HashMap<String, String>) -> Result<Self> {
-        let h = config.hidden_size; let n = config.num_attention_heads; let d = config.head_dim; let n_kv = config.num_key_value_heads;
+    pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
+        let _h = config.hidden_size; let n = config.num_attention_heads; let d = config.head_dim; let n_kv = config.num_key_value_heads;
         let p = vb.prefix();
         Ok(Self {
-            q_proj: QLinear::from_registry(&format!("{}.q_proj", p), registry, vb.device())?,
-            k_proj: QLinear::from_registry(&format!("{}.k_proj", p), registry, vb.device())?,
-            v_proj: QLinear::from_registry(&format!("{}.v_proj", p), registry, vb.device())?,
-            o_proj: QLinear::from_registry(&format!("{}.o_proj", p), registry, vb.device())?,
+            q_proj: QLinear::new(&format!("{}.q_proj", p)),
+            k_proj: QLinear::new(&format!("{}.k_proj", p)),
+            v_proj: QLinear::new(&format!("{}.v_proj", p)),
+            o_proj: QLinear::new(&format!("{}.o_proj", p)),
             q_norm: QRmsNorm::new(vb.get(d, "q_norm.weight")?, config.rms_norm_eps)?,
             k_norm: QRmsNorm::new(vb.get(d, "k_norm.weight")?, config.rms_norm_eps)?,
-            num_attention_heads: n, num_key_value_heads: n_kv, num_kv_groups: n / n_kv, head_dim: d, scaling: 1.0 / (d as f64).sqrt(), kv_cache: None,
+            num_attention_heads: n, num_key_value_heads: n_kv, num_kv_groups: n / n_kv, head_dim: d, scaling: 1.0 / (d as f64).sqrt(), 
+            kv_cache: None,
+            cpu_kv_cache: None,
         })
     }
-    pub fn to_device(&mut self, device: &Device) -> Result<()> { self.q_proj.to_device(device)?; self.k_proj.to_device(device)?; self.v_proj.to_device(device)?; self.o_proj.to_device(device)?; self.q_norm.to_device(device)?; self.k_norm.to_device(device)?; Ok(()) }
-    pub fn clear(&mut self) { self.q_proj.clear(); self.k_proj.clear(); self.v_proj.clear(); self.o_proj.clear(); self.q_norm.clear(); self.k_norm.clear(); }
-    pub fn clear_kv_cache(&mut self) { self.kv_cache = None; }
+    pub fn to_device(&mut self, device: &Device, registry: &QuantizedRegistry) -> Result<()> { 
+        self.q_proj.to_device(device, registry)?; self.k_proj.to_device(device, registry)?; 
+        self.v_proj.to_device(device, registry)?; self.o_proj.to_device(device, registry)?; 
+        self.q_norm.to_device(device)?; self.k_norm.to_device(device)?; 
+        
+        if let Some((k, v)) = self.cpu_kv_cache.take() {
+            self.kv_cache = Some((k.to_device(device)?, v.to_device(device)?));
+        }
+        Ok(()) 
+    }
+    pub fn clear(&mut self) { 
+        if let Some((k, v)) = self.kv_cache.take() {
+            self.cpu_kv_cache = Some((k.to_device(&Device::Cpu).unwrap(), v.to_device(&Device::Cpu).unwrap()));
+        }
+        self.q_proj.clear(); self.k_proj.clear(); self.v_proj.clear(); self.o_proj.clear(); self.q_norm.clear(); self.k_norm.clear(); 
+    }
+    pub fn clear_kv_cache(&mut self) { self.kv_cache = None; self.cpu_kv_cache = None; }
     pub fn forward(&mut self, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let (bs, sl, _) = xs.dims3()?;
         let q_chunk = self.q_proj.forward(xs)?.reshape((bs, sl, self.num_attention_heads, self.head_dim * 2))?.chunk(2, D::Minus1)?;
@@ -370,26 +418,32 @@ pub struct QDecoderLayer {
 }
 
 impl QDecoderLayer {
-    pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig, layer_idx: usize, registry: &HashMap<String, String>) -> Result<Self> {
-        let h = config.hidden_size; let lt = config.layer_types[layer_idx].clone();
-        let (la, sa) = if lt == "linear_attention" { (Some(QGatedDeltaNet::new(vb.pp("linear_attn"), config, registry)?), None) } else { (None, Some(QAttention::new(vb.pp("self_attn"), config, registry)?)) };
+    pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig, layer_idx: usize) -> Result<Self> {
+        let _h = config.hidden_size; let lt = config.layer_types[layer_idx].clone();
+        let (la, sa) = if lt == "linear_attention" { (Some(QGatedDeltaNet::new(vb.pp("linear_attn"), config)?), None) } else { (None, Some(QAttention::new(vb.pp("self_attn"), config)?)) };
         let p = vb.prefix();
         Ok(Self {
             layer_type: lt, linear_attn: la, self_attn: sa,
-            mlp_gate_proj: QLinear::from_registry(&format!("{}.mlp.gate_proj", p), registry, vb.device())?,
-            mlp_up_proj: QLinear::from_registry(&format!("{}.mlp.up_proj", p), registry, vb.device())?,
-            mlp_down_proj: QLinear::from_registry(&format!("{}.mlp.down_proj", p), registry, vb.device())?,
-            input_layernorm: QRmsNorm::new(vb.get(h, "input_layernorm.weight")?, config.rms_norm_eps)?,
-            post_attention_layernorm: QRmsNorm::new(vb.get(h, "post_attention_layernorm.weight")?, config.rms_norm_eps)?,
+            mlp_gate_proj: QLinear::new(&format!("{}.mlp.gate_proj", p)),
+            mlp_up_proj: QLinear::new(&format!("{}.mlp.up_proj", p)),
+            mlp_down_proj: QLinear::new(&format!("{}.mlp.down_proj", p)),
+            input_layernorm: QRmsNorm::new(vb.get(config.hidden_size, "input_layernorm.weight")?, config.rms_norm_eps)?,
+            post_attention_layernorm: QRmsNorm::new(vb.get(config.hidden_size, "post_attention_layernorm.weight")?, config.rms_norm_eps)?,
         })
     }
-    pub fn to_device(&mut self, d: &Device) -> Result<()> { if let Some(ref mut l) = self.linear_attn { l.to_device(d)?; } if let Some(ref mut s) = self.self_attn { s.to_device(d)?; } self.mlp_gate_proj.to_device(d)?; self.mlp_up_proj.to_device(d)?; self.mlp_down_proj.to_device(d)?; self.input_layernorm.to_device(d)?; self.post_attention_layernorm.to_device(d)?; Ok(()) }
+    pub fn to_device(&mut self, d: &Device, registry: &QuantizedRegistry) -> Result<()> { 
+        if let Some(ref mut l) = self.linear_attn { l.to_device(d, registry)?; } 
+        if let Some(ref mut s) = self.self_attn { s.to_device(d, registry)?; } 
+        self.mlp_gate_proj.to_device(d, registry)?; self.mlp_up_proj.to_device(d, registry)?; 
+        self.mlp_down_proj.to_device(d, registry)?; self.input_layernorm.to_device(d)?; 
+        self.post_attention_layernorm.to_device(d)?; Ok(()) 
+    }
     pub fn clear(&mut self) { if let Some(ref mut l) = self.linear_attn { l.clear(); } if let Some(ref mut s) = self.self_attn { s.clear(); } self.mlp_gate_proj.clear(); self.mlp_up_proj.clear(); self.mlp_down_proj.clear(); self.input_layernorm.clear(); self.post_attention_layernorm.clear(); }
     pub fn forward(&mut self, xs: &Tensor, cos: Option<&Tensor>, sin: Option<&Tensor>, mask: Option<&Tensor>) -> Result<Tensor> {
         let r = xs.clone(); let mut x = self.input_layernorm.forward(xs).map_err(|e| anyhow!(e))?;
         if self.layer_type == "linear_attention" { if let Some(ref mut l) = self.linear_attn { x = l.forward(&x, mask)?; } }
         else { if let (Some(ref mut s), Some(c), Some(sn)) = (&mut self.self_attn, cos, sin) { x = s.forward(&x, c, sn, mask)?; } }
-        let r2 = (x + r)?; let mut x = self.post_attention_layernorm.forward(&r2).map_err(|e| anyhow!(e))?;
+        let r2 = (x + r)?; let x = self.post_attention_layernorm.forward(&r2).map_err(|e| anyhow!(e))?;
         let gate = self.mlp_gate_proj.forward(&x)?.silu()?; let up = self.mlp_up_proj.forward(&x)?;
         Ok((self.mlp_down_proj.forward(&(gate * up)?)? + r2)?)
     }
@@ -398,37 +452,32 @@ impl QDecoderLayer {
 pub struct QTextModel {
     embed_tokens: crate::models::qwen35::model::Qwen3_5Embedding,
     layers: Vec<QDecoderLayer>, norm: QRmsNorm,
-    rotary_emb: Qwen3VLTextRotaryEmbedding, mrope_section: Vec<usize>,
+    rotary_emb: Qwen3_5TextRotaryEmbedding, mrope_section: Vec<usize>,
 }
 
 impl QTextModel {
-    pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig, registry: &HashMap<String, String>) -> Result<Self> {
-        let mut layers = vec![]; for i in 0..config.num_hidden_layers { layers.push(QDecoderLayer::new(vb.pp("layers").pp(i), config, i, registry)?); }
+    pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
+        let mut layers = vec![]; for i in 0..config.num_hidden_layers { layers.push(QDecoderLayer::new(vb.pp("layers").pp(i), config, i)?); }
         let rope_dim = (config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize;
         Ok(Self {
             embed_tokens: crate::models::qwen35::model::Qwen3_5Embedding::new(vb.pp("embed_tokens"), config.vocab_size, config.hidden_size)?,
             layers, norm: QRmsNorm::new(vb.get(config.hidden_size, "norm.weight")?, config.rms_norm_eps)?,
-            rotary_emb: Qwen3VLTextRotaryEmbedding::new(rope_dim, config.rope_parameters.rope_theta),
+            rotary_emb: Qwen3_5TextRotaryEmbedding::new(rope_dim, config.rope_parameters.rope_theta),
             mrope_section: config.rope_parameters.mrope_section.clone(),
         })
     }
-    pub fn forward(&mut self, inputs: &Tensor, pos: &Tensor, offset: usize) -> Result<Tensor> {
+    pub fn forward(&mut self, inputs: &Tensor, pos: &Tensor, offset: usize, registry: &QuantizedRegistry) -> Result<Tensor> {
         let (bs, sl, _) = inputs.dims3()?; let dev = inputs.device();
         let (cos, sin) = self.rotary_emb.forward(pos, inputs.dtype(), self.mrope_section.clone())?;
         let mut x = inputs.clone();
         
-        // [500MB CAP] Selective Masking: Linear layers don't need this massive tensor.
-        let mask = if sl > 1024 { 
-            None 
-        } else if sl <= 1 && offset == 0 { 
-            None 
-        } else { 
+        let mask = if sl > 1024 { None } else if sl <= 1 && offset == 0 { None } else { 
             let m = prepare_causal_attention_mask(bs, sl, offset, dev)?;
             Some(m.to_dtype(DType::F16)?)
         };
 
         for layer in self.layers.iter_mut() {
-            layer.to_device(dev)?;
+            layer.to_device(dev, registry)?;
             let lm = if layer.layer_type == "linear_attention" { None } else { mask.as_ref() };
             x = layer.forward(&x, Some(&cos), Some(&sin), lm)?;
             layer.clear();
@@ -441,32 +490,29 @@ pub struct QuantizedQwen3_5Model {
     config: Qwen3_5Config, language_model: QTextModel, lm_head: QLinear,
 }
 
-use crate::openai_types::{ChatCompletionParameters};
-use crate::utils::{get_logit_processor};
-
 impl QuantizedQwen3_5Model {
-    pub fn new(vb: VarBuilder, config: Qwen3_5Config, registry: &HashMap<String, String>) -> Result<Self> {
-        let lm = QTextModel::new(vb.pp("model.language_model"), &config.text_config, registry)?;
-        let head = QLinear::from_registry("model.language_model.embed_tokens", registry, vb.device())?;
+    pub fn new(vb: VarBuilder, config: Qwen3_5Config) -> Result<Self> {
+        let lm = QTextModel::new(vb.pp("model.language_model"), &config.text_config)?;
+        let head = QLinear::new("model.language_model.embed_tokens");
         Ok(Self { config, language_model: lm, lm_head: head })
     }
 
-    pub fn forward(&mut self, input_ids: &Tensor, offset: usize) -> Result<Tensor> {
+    pub fn forward(&mut self, input_ids: &Tensor, offset: usize, registry: &QuantizedRegistry) -> Result<Tensor> {
         let dev = input_ids.device();
         self.language_model.embed_tokens.to_device(dev).map_err(|e| anyhow!(e))?;
         let embeds = self.language_model.embed_tokens.forward(input_ids).map_err(|e| anyhow!(e))?;
         self.language_model.embed_tokens.clear();
 
-        // [FIX] Force U32 to prevent "unexpected dtype" error
         let seq_len = input_ids.dim(1)?;
         let pos = Tensor::arange(offset as u32, (offset + seq_len) as u32, dev)?
             .to_dtype(DType::U32)?
             .unsqueeze(0)?.unsqueeze(0)?
             .broadcast_as((3, input_ids.dim(0)?, seq_len))?;
 
-        let outputs = self.language_model.forward(&embeds, &pos, offset)?;
+        let outputs = self.language_model.forward(&embeds, &pos, offset, registry)?;
         let hidden = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
-        self.lm_head.to_device(dev).map_err(|e| anyhow!(e))?;
+        
+        self.lm_head.to_device(dev, registry).map_err(|e| anyhow!(e))?;
         let logits = self.lm_head.forward(&hidden)?;
         self.lm_head.clear();
         Ok(logits)

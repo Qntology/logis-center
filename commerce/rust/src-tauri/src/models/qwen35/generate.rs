@@ -23,6 +23,7 @@ pub struct Qwen3_5GenerateModel {
     pub tokenizer: TokenizerModel,
     pub pre_processor: Qwen3VLProcessor,
     pub qwen3_5: QuantizedQwen3_5Model,
+    pub registry: crate::models::qwen35::quantized_model::QuantizedRegistry,
     pub device: Device,
     pub eos_token_id: u32,
     pub model_name: String,
@@ -37,24 +38,23 @@ impl Qwen3_5GenerateModel {
         let device = get_device(device);
         let cfg_dtype = cfg.text_config.dtype.as_str();
         let dtype = get_dtype(dtype, cfg_dtype);
-        let pre_processor = Qwen3VLProcessor::new(path, &device, dtype)?;
+        
+        let pre_processor = if force_text_only {
+            Qwen3VLProcessor::new(path, &Device::Cpu, dtype)?
+        } else {
+            Qwen3VLProcessor::new(path, &device, dtype)?
+        };
         
         let mut model_list = find_type_files(path, "st")?;
         if force_text_only {
             model_list.retain(|f| !f.contains("vision.st"));
         }
 
-        // [DYNAMIC REGISTRY] Map tensor names to file paths instead of loading all to RAM/VRAM
-        let mut registry = HashMap::new();
-        for p in &model_list {
-            let tensors = candle_core::safetensors::load(p, &Device::Cpu)?;
-            for k in tensors.keys() {
-                registry.insert(k.clone(), p.clone());
-            }
-        }
+        // [DYNAMIC REGISTRY] Use Mmap-based Registry for extreme VRAM/RAM efficiency
+        let registry = crate::models::qwen35::quantized_model::QuantizedRegistry::new(&model_list)?;
 
-        let vb_dummy = VarBuilder::zeros(DType::F32, &device);
-        let qwen3_5 = QuantizedQwen3_5Model::new(vb_dummy, cfg.clone(), &registry)?;
+        let vb_dummy = VarBuilder::zeros(DType::F32, &Device::Cpu);
+        let qwen3_5 = QuantizedQwen3_5Model::new(vb_dummy, cfg.clone())?;
 
         println!("[MODEL-QWEN35] Quantized dynamic registry loaded. Ready for Layer Cycling.");
 
@@ -63,6 +63,7 @@ impl Qwen3_5GenerateModel {
             tokenizer,
             pre_processor,
             qwen3_5,
+            registry,
             device,
             eos_token_id: cfg.text_config.eos_token_id,
             model_name: "qwen3.5".to_string(),
@@ -85,7 +86,7 @@ impl Qwen3_5GenerateModel {
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         
-        let full_input_ids = self.tokenizer.text_encode(input.replace_text.clone(), &self.device)?;
+        let full_input_ids = self.tokenizer.text_encode(input.replace_text.clone(), &self.device)?.to_dtype(DType::U32)?;
         let full_seq_len = full_input_ids.dim(1)?;
         
         let mut seqlen_offset = 0;
@@ -99,9 +100,9 @@ impl Qwen3_5GenerateModel {
 
             let remaining = full_seq_len - seqlen_offset;
             let current_chunk = remaining.min(chunk_size);
-            let input_ids = full_input_ids.narrow(1, seqlen_offset, current_chunk)?;
+            let input_ids = full_input_ids.narrow(1, seqlen_offset, current_chunk)?.to_dtype(DType::U32)?;
 
-            let logits = self.qwen3_5.forward(&input_ids, seqlen_offset)?;
+            let logits = self.qwen3_5.forward(&input_ids, seqlen_offset, &self.registry)?;
             
             seqlen_offset += current_chunk;
             last_logits = Some(logits);
@@ -131,7 +132,7 @@ impl Qwen3_5GenerateModel {
             gen_text.push_str(&piece);
 
             let input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?.to_dtype(DType::U32)?;
-            logits = self.qwen3_5.forward(&input_ids, seqlen_offset)?;
+            logits = self.qwen3_5.forward(&input_ids, seqlen_offset, &self.registry)?;
             seqlen_offset += 1;
         }
 
@@ -139,3 +140,4 @@ impl Qwen3_5GenerateModel {
         Ok(gen_text)
     }
 }
+

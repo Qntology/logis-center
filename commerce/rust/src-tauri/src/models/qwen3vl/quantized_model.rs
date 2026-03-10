@@ -15,7 +15,7 @@ use crate::{
         qwen3vl::model::Qwen3VLVisionModel,
     },
     position_embed::rope::{
-        Qwen3VLTextRotaryEmbedding, apply_rotary_pos_emb,
+        Qwen3_5TextRotaryEmbedding, apply_rotary_pos_emb,
     },
     utils::tensor_utils::{
         mask_index_add, masked_scatter_dim0,
@@ -1533,12 +1533,11 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
 #[derive(Clone)]
 pub struct QuantizedQwen3VLTextModel {
-    pub embed_tokens: Embedding, 
+    pub embed_tokens: Embedding,
     pub layers: Vec<QuantizedQwen3VLTextDecoderLayer>,
     pub norm: RmsNorm,
-    pub rotary_emb: Qwen3VLTextRotaryEmbedding,
-    pub mrope_section: Vec<usize>,
-    pub device_id: usize, 
+    pub rotary_emb: Qwen3_5TextRotaryEmbedding,
+    pub mrope_section: Vec<usize>,    pub device_id: usize, 
     pub mmap: Option<Arc<Mmap>>, 
     pub registry: KVRegistry, 
     pub baking_only: bool,
@@ -1652,7 +1651,7 @@ impl QuantizedQwen3VLTextModel {
             embed_tokens, 
             layers, 
             norm, 
-            rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), 
+            rotary_emb: Qwen3_5TextRotaryEmbedding::new(config.head_dim, config.rope_theta), 
             mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_else(|| if config.head_dim == 128 { vec![16, 24, 24] } else { vec![] }), 
             device_id,
             mmap: mmap_handle, 
@@ -1732,7 +1731,7 @@ impl QuantizedQwen3VLTextModel {
             embed_tokens, 
             layers, 
             norm, 
-            rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), 
+            rotary_emb: Qwen3_5TextRotaryEmbedding::new(config.head_dim, config.rope_theta), 
             mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_else(|| if config.head_dim == 128 { vec![16, 24, 24] } else { vec![] }), 
             device_id,
             mmap: None, 

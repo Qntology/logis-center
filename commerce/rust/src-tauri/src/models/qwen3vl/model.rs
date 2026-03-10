@@ -11,7 +11,7 @@ use crate::{
         qwen3vl::config::{Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig},
     },
     position_embed::rope::{
-        Qwen2_5VisionRotaryEmbedding, Qwen3VLTextRotaryEmbedding, apply_rotary_pos_emb,
+        Qwen2_5VisionRotaryEmbedding, Qwen3_5TextRotaryEmbedding, apply_rotary_pos_emb,
         apply_rotary_pos_emb_vision,
     },
     utils::tensor_utils::{
@@ -770,7 +770,7 @@ pub struct Qwen3VLTextModel {
     pub embed_tokens: Embedding,
     pub layers: Vec<Qwen3VLTextDecoderLayer>,
     pub norm: RmsNorm,
-    pub rotary_emb: Qwen3VLTextRotaryEmbedding,
+    pub rotary_emb: Qwen3_5TextRotaryEmbedding,
     pub mrope_section: Vec<usize>,
 }
 
@@ -786,7 +786,7 @@ impl Qwen3VLTextModel {
         }
         let norm = rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
         let head_dim = config.head_dim;
-        let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
+        let rotary_emb = Qwen3_5TextRotaryEmbedding::new(config.head_dim, config.rope_theta);
         // [FIX] rope_scaling is now optional. Assuming it exists if we are here, or panic/default.
         // Given Qwen3 config flow, if it was missing it should have failed earlier or defaults populated.
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
