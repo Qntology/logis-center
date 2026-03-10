@@ -9,7 +9,7 @@ use half::f16;
 use crate::{
     models::{
         qwen35::config::{Qwen3_5Config, Qwen3_5TextConfig},
-        common::{get_conv1d},
+        common::{get_conv1d, softplus},
     },
     position_embed::rope::{
         Qwen3_5TextRotaryEmbedding, glm_asr_apply_rotary_pos_emb,
@@ -221,14 +221,27 @@ impl QGatedDeltaNet {
         }
 
         let q = q.reshape((bs, sl, nk, dk))?; let k = k.reshape((bs, sl, nk, dk))?; let v = v.reshape((bs, sl, nv, dv))?;
+        
+        // Gating parameters
+        let dt = if let Some(ref d) = self.dt_bias { d.reshape((1, 1, nv, 1))?.broadcast_as((bs, sl, nv, 1))? } else { Tensor::ones((bs, sl, nv, 1), DType::F16, x.device())? };
+        let a = if let Some(ref al) = self.a_log { al.exp()?.neg()?.reshape((1, 1, nv, 1))?.broadcast_as((bs, sl, nv, 1))? } else { Tensor::zeros((bs, sl, nv, 1), DType::F16, x.device())? };
+        
         let mut state = self.delta_state.take().unwrap_or_else(|| Tensor::zeros((bs, nk, dk, dv), DType::F16, x.device()).unwrap());
         let mut outputs = vec![];
         
         for t in 0..sl {
-            let qt = q.narrow(1, t, 1)?.squeeze(1)?; let kt = k.narrow(1, t, 1)?.squeeze(1)?; let vt = v.narrow(1, t, 1)?.squeeze(1)?;
-            let update = kt.unsqueeze(D::Minus1)?.matmul(&vt.unsqueeze(D::Minus2)?)?;
-            state = (state + update)?;
-            let out_t = qt.unsqueeze(D::Minus2)?.matmul(&state)?.squeeze(D::Minus2)?;
+            let qt = q.narrow(1, t, 1)?.squeeze(1)?; // (bs, nk, dk)
+            let kt = k.narrow(1, t, 1)?.squeeze(1)?; // (bs, nk, dk)
+            let vt = v.narrow(1, t, 1)?.squeeze(1)?; // (bs, nv, dv)
+            let dtt = softplus(&dt.narrow(1, t, 1)?.squeeze(1)?)?; // (bs, nv, 1)
+            let at = a.narrow(1, t, 1)?.squeeze(1)?.mul(&dtt)?.exp()?; // (bs, nv, 1)
+            
+            // Linear recurrence: S = S * A + (dt * K^T * V)
+            let update = kt.unsqueeze(D::Minus1)?.matmul(&vt.unsqueeze(D::Minus2)?)?; // (bs, nk, dk, dv)
+            let scaled_update = update.broadcast_mul(&dtt.unsqueeze(D::Minus1)?)?;
+            state = state.broadcast_mul(&at.unsqueeze(D::Minus1)?)?.add(&scaled_update)?;
+            
+            let out_t = qt.unsqueeze(D::Minus2)?.matmul(&state)?.squeeze(D::Minus2)?; // (bs, nv, dv)
             outputs.push(out_t.unsqueeze(1)?);
         }
         let out = Tensor::cat(&outputs, 1)?.reshape((bs, sl, nv * dv))?;
