@@ -62,7 +62,20 @@ impl QRmsNorm {
         let x_f32 = x.to_dtype(DType::F32)?;
         let var = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
         let norm = x_f32.broadcast_div(&(var + self.eps)?.sqrt()?)?;
-        Ok(norm.to_dtype(DType::F16)?.broadcast_mul(&w)?)
+        let norm_f16 = norm.to_dtype(DType::F16)?;
+        
+        // Dynamic broadcast match
+        let res = if w.dim(0)? == norm_f16.dim(D::Minus1)? {
+            norm_f16.broadcast_mul(&w)?
+        } else {
+            // Handle head-wise normalization if shapes differ
+            let last_dim = norm_f16.dim(D::Minus1)?;
+            let w_size = w.dim(0)?;
+            let reshaped_x = norm_f16.reshape(((), w_size))?;
+            let mul = reshaped_x.broadcast_mul(&w)?;
+            mul.reshape(norm_f16.dims())?
+        };
+        Ok(res)
     }
 }
 
@@ -91,7 +104,6 @@ impl QLinear {
             reg.get_tensor(name).or_else(|_| reg.get_tensor(&format!("{}.weight", name)))?.to_device(dev)?
         };
 
-        // Use broadcast_matmul for more flexible dimension matching
         let x_in_dim = x.dim(D::Minus1)?;
         let w = if w_raw.dim(1)? == x_in_dim { w_raw.t()? } else { w_raw };
         let w = w.to_dtype(DType::F16)?.contiguous()?;
@@ -106,7 +118,7 @@ impl QLinear {
 }
 
 pub struct QGatedDeltaNet {
-    in_proj: QLinear, out_proj: QLinear, norm: QRmsNorm, h: usize,
+    in_proj: QLinear, out_proj: QLinear, norm: QRmsNorm,
 }
 impl QGatedDeltaNet {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
@@ -115,22 +127,20 @@ impl QGatedDeltaNet {
             in_proj: QLinear::new(&format!("{}.in_proj_qkv", p)),
             out_proj: QLinear::new(&format!("{}.out_proj", p)),
             norm: QRmsNorm::new(&format!("{}.norm", p), config.rms_norm_eps)?,
-            h: config.hidden_size,
         })
     }
     pub fn forward(&mut self, x: &Tensor, _mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let projected = self.in_proj.forward(x, reg)?;
         let chunks = projected.chunk(6, D::Minus1)?;
         let (q, _k, _v, z, _b, _a) = (&chunks[0], &chunks[1], &chunks[2], &chunks[3], &chunks[4], &chunks[5]);
-        let gate = z.silu()?;
-        let res = self.out_proj.forward(&(q.silu()? * gate)?, reg)?;
+        let res = self.out_proj.forward(&(q.silu()? * z.silu()?)?, reg)?;
         Ok(self.norm.forward(&res, reg)?)
     }
 }
 
 pub struct QAttention {
     qkv_proj: QLinear, o_proj: QLinear, q_norm: QRmsNorm, k_norm: QRmsNorm,
-    nh: usize, nkv: usize, hd: usize, scaling: f64, h: usize,
+    nh: usize, nkv: usize, hd: usize, scaling: f64,
     kv_cache: Option<(Tensor, Tensor)>,
 }
 impl QAttention {
@@ -142,7 +152,7 @@ impl QAttention {
             q_norm: QRmsNorm::new(&format!("{}.q_norm", p), config.rms_norm_eps)?,
             k_norm: QRmsNorm::new(&format!("{}.k_norm", p), config.rms_norm_eps)?,
             nh: config.num_attention_heads, nkv: config.num_key_value_heads, hd: config.head_dim,
-            scaling: 1.0 / (config.head_dim as f64).sqrt(), h: config.hidden_size, kv_cache: None,
+            scaling: 1.0 / (config.head_dim as f64).sqrt(), kv_cache: None,
         })
     }
     pub fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
