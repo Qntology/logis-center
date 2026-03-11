@@ -390,10 +390,17 @@ impl QAttention {
         )?;
         
         // Attention Gating (vllm style)
-        // attn_output shape: (B, NH, S, D)
-        // query_chunk[1] (gate) shape: (B, S, NH, D)
+        // gate shape: (B, S, NH, D)
         let gate = candle_nn::ops::sigmoid(&query_chunk[1].to_dtype(DType::F32)?)?;
-        let attn_output = attn_output.transpose(1, 2)?.broadcast_mul(&gate)?; // (B, S, NH, D)
+        
+        // Ensure attn_output is (B, S, NH, D)
+        let attn_output = if attn_output.dim(1)? == self.nh {
+            attn_output.transpose(1, 2)?
+        } else {
+            attn_output
+        };
+        
+        let attn_output = attn_output.broadcast_mul(&gate)?;
         let attn_output = attn_output.reshape((b_sz, q_len, ()))?.contiguous()?;
         
         self.o_proj.forward(&attn_output.to_dtype(DType::F16)?, reg)
