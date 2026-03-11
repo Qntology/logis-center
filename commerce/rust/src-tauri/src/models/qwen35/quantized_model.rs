@@ -117,33 +117,59 @@ impl QLinear {
     pub fn clear_vram(&mut self) { self.persistent_weight = None; self.persistent_bias = None; }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         let name = &self.full_name;
-        if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "q_scales"), reg.get_q_tensor(name, "q_data"), reg.get_q_tensor(name, "q_shape")) {
+        let t = reg.get_q_tensor(name, "weight")?.to_device(dev)?;
+        
+        // 1. Check if this is a Q2-combined blob [num_blocks, 10]
+        if t.rank() == 2 && t.dim(1)? == 10 && t.dtype() == DType::U8 {
+            let num_blocks = t.dim(0)?;
+            let scale_bytes = t.narrow(1, 0, 2)?; // [N, 2]
+            let data_bytes = t.narrow(1, 2, 8)?;  // [N, 8]
+            
+            // Reconstruct FP16 scales
+            let scales = Tensor::from_raw_buffer(&scale_bytes.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?, DType::F16, &[num_blocks], dev)?;
+
+            // Unpack 2-bit data (0,1,2,3) using arithmetic
+            let mut parts = vec![];
+            let d_f32 = data_bytes.to_dtype(DType::F32)?;
+            for i in 0..4 {
+                let div = (1 << (i * 2)) as f64;
+                let vals = d_f32.affine(1.0 / div, 0.0)?;
+                // Emulate bitwise AND with modulo: (x / 2^n) % 4
+                // Candle doesn't have a direct modulo, so we use: x - floor(x/4)*4
+                let floor_val = vals.affine(1.0 / 4.0, 0.0)?.floor()?.affine(4.0, 0.0)?;
+                let bit_vals = vals.sub(&floor_val)?;
+                parts.push(bit_vals.to_dtype(DType::F16)?);
+            }
+            let combined = Tensor::stack(&parts, D::Minus1)?.reshape(((), 32))?;
+            
+            // Dequantize: (val - 1.5) * scale
+            let offset = Tensor::new(1.5f32, dev)?.to_dtype(DType::F16)?;
+            let dequant = combined.broadcast_sub(&offset)?.broadcast_mul(&scales.unsqueeze(D::Minus1)?)?;
+            self.persistent_weight = Some(dequant.reshape(((), num_blocks * 32 / dequant.dim(0)?))?);
+        } 
+        // 2. Check if this is a Legacy Q4 format (with suffixes)
+        else if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "q_scales"), reg.get_q_tensor(name, "q_data"), reg.get_q_tensor(name, "q_shape")) {
             let s = s_t.to_device(dev)?.to_dtype(DType::F16)?; let d = d_t.to_device(dev)?.to_dtype(DType::F16)?;
             let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
             let high = (d.clone() / 16.0)?.floor()?; let low = d.sub(&(high.clone() * 16.0)?)?;
             let combined = Tensor::stack(&[low.affine(1.0, -8.0)?, high.affine(1.0, -8.0)?], D::Minus1)?.reshape(((), 32))?;
             self.persistent_weight = Some(combined.broadcast_mul(&s.unsqueeze(D::Minus1)?)?.reshape(shape.as_slice())?);
-        } else {
-            self.persistent_weight = Some(reg.get_q_tensor(name, "weight")?.to_device(dev)?.to_dtype(DType::F16)?);
         }
+        // 3. Original format (FP16)
+        else {
+            self.persistent_weight = Some(t.to_dtype(DType::F16)?);
+        }
+
         if let Ok(b) = reg.get_q_tensor(name, "bias") { self.persistent_bias = Some(b.to_device(dev)?.to_dtype(DType::F16)?); }
         Ok(())
     }
     pub fn forward(&self, x: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
         let dev = x.device(); let name = &self.full_name;
-        let w_raw = if let Some(pw) = &self.persistent_weight { pw.clone() } 
-        else { 
-            if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "q_scales"), reg.get_q_tensor(name, "q_data"), reg.get_q_tensor(name, "q_shape")) {
-                let s = s_t.to_device(dev)?.to_dtype(DType::F16)?; let d = d_t.to_device(dev)?.to_dtype(DType::F16)?;
-                let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
-                let high = (d.clone() / 16.0)?.floor()?; let low = d.sub(&(high.clone() * 16.0)?)?;
-                let combined = Tensor::stack(&[low.affine(1.0, -8.0)?, high.affine(1.0, -8.0)?], D::Minus1)?.reshape(((), 32))?;
-                combined.broadcast_mul(&s.unsqueeze(D::Minus1)?)?.reshape(shape.as_slice())?
-            } else { reg.get_q_tensor(name, "weight")?.to_device(dev)?.to_dtype(DType::F16)? }
-        };
+        let w = if let Some(pw) = &self.persistent_weight { pw.clone() } 
+                else { reg.get_q_tensor(name, "weight")?.to_device(dev)?.to_dtype(DType::F16)? };
         
         let x_in_dim = x.dim(D::Minus1)?;
-        let w = if w_raw.dim(1)? == x_in_dim { w_raw.t()? } else { w_raw };
+        let w = if w.rank() >= 2 && w.dim(1)? == x_in_dim { w.t()? } else { w };
         
         let res = x.contiguous()?.broadcast_matmul(&w.to_dtype(DType::F16)?.contiguous()?)?;
         if let Some(pb) = &self.persistent_bias { Ok(res.broadcast_add(pb)?) }
