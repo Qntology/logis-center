@@ -402,7 +402,7 @@ impl QAttention {
         let query_states = query_states.transpose(1, 2)?; // (B, NH, S, HD)
         let key_states = key_states.transpose(1, 2)?;   // (B, NKV, S, HD)
 
-        let (query_states, key_states) = crate::position_embed::rope::apply_rotary_pos_emb(
+        let (query_states, key_states) = crate::position_embed::rope::apply_rotary_pos_emb_partial(
             &query_states, 
             &key_states, 
             cos, 
@@ -434,16 +434,9 @@ impl QAttention {
 
         // 7. Gating (vllm style)
         // gate_states: (B, S, NH, HD)
+        // attn_output: already (B, S, NH, HD) from eager_attention_forward
         let gate = candle_nn::ops::sigmoid(&gate_states.to_dtype(DType::F32)?)?;
-
-        // Ensure attn_output matches gate shape (B, S, NH, HD)
-        let mut final_attn = attn_output.to_dtype(DType::F32)?;
-        if final_attn.rank() == 4 && final_attn.dim(1)? == self.nh && gate.dim(1)? == q_len {
-            // attn_output is (B, NH, S, HD), gate is (B, S, NH, HD) -> Transpose attn_output
-            final_attn = final_attn.transpose(1, 2)?.contiguous()?;
-        }
-
-        let attn_output = final_attn.broadcast_mul(&gate)?; // Should be (B, S, NH, HD)
+        let attn_output = attn_output.to_dtype(DType::F32)?.broadcast_mul(&gate)?; // (B, S, NH, HD)
 
         let attn_output = attn_output.reshape((b_sz, q_len, ()))?.contiguous()?;
 

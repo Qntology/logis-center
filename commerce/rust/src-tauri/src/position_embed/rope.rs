@@ -109,6 +109,43 @@ pub fn apply_rotary_pos_emb(
     Ok((q_embed, k_embed))
 }
 
+pub fn apply_rotary_pos_emb_partial(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    tof32: bool,
+) -> Result<(Tensor, Tensor)> {
+    let mut cos = cos.clone();
+    let mut sin = sin.clone();
+    if cos.rank() == 2 {
+        cos = cos.unsqueeze(0)?.unsqueeze(0)?;
+        sin = sin.unsqueeze(0)?.unsqueeze(0)?;
+    }
+    if cos.rank() == 3 {
+        cos = cos.unsqueeze(1)?;
+        sin = sin.unsqueeze(1)?;
+    }
+    
+    let rotary_dim = cos.dim(D::Minus1)?;
+    let q_dim = q.dim(D::Minus1)?;
+    
+    if rotary_dim == q_dim {
+        return apply_rotary_pos_emb(q, k, &cos, &sin, tof32);
+    }
+    
+    let q_rot = q.narrow(D::Minus1, 0, rotary_dim)?;
+    let q_pass = q.narrow(D::Minus1, rotary_dim, q_dim - rotary_dim)?;
+    let k_rot = k.narrow(D::Minus1, 0, rotary_dim)?;
+    let k_pass = k.narrow(D::Minus1, rotary_dim, q_dim - rotary_dim)?;
+
+    let (q_embed, k_embed) = apply_rotary_pos_emb(&q_rot, &k_rot, &cos, &sin, tof32)?;
+    
+    let q_embed = Tensor::cat(&[q_embed, q_pass], D::Minus1)?;
+    let k_embed = Tensor::cat(&[k_embed, k_pass], D::Minus1)?;
+    Ok((q_embed, k_embed))
+}
+
 pub fn glm_asr_apply_rotary_pos_emb(
     q: &Tensor,
     k: &Tensor,
