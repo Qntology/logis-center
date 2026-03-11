@@ -3,54 +3,51 @@ use candle_core::{Device, DType};
 use std::path::Path;
 
 /*
- * [TEST BINARY] Qwen3.5-0.8B Standalone Test
- * Purpose: Verify if 1+1=? result can be generated without 'unexpected dtype' error.
+ * [HYBRID ENGINE TEST] Qwen3.5 Custom Hybrid Engine Test
+ * Purpose: Verify if the newly implemented Hybrid Attention logic fixes the output quality.
  */
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("🚀 Starting Qwen3.5 Standalone Test...");
+    println!("🚀 Starting Qwen3.5 Hybrid Engine Test...");
 
-    // Adjust path based on execution location (assumes running from workspace root or src-tauri)
     let model_path = if Path::new("models/Qwen3.5-0.8B-Split").exists() {
         "models/Qwen3.5-0.8B-Split"
     } else {
         "src-tauri/models/Qwen3.5-0.8B-Split"
     };
 
-    if !Path::new(model_path).exists() {
-        println!("❌ Model path not found: {}", model_path);
-        return Ok(());
-    }
-
-    // [DEVICE SELECTION] Prefer Discrete GPU (usually ID 1) over Integrated (ID 0)
     let device = Device::new_cuda(1)
         .or_else(|_| Device::new_cuda(0))
         .unwrap_or(Device::Cpu);
     println!("💻 Using device: {:?}", device);
 
-    // [INIT] Initialize Generator
-    // Note: We use the existing Qwen3_5GenerateModel from the crate
+    // Using our custom optimized implementation
     use tauri_app_lib::models::qwen35::generate::Qwen3_5GenerateModel;
-    use tauri_app_lib::openai_types::{ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent};
+    use tauri_app_lib::tokenizer::TokenizerModel;
 
-    let mut model = Qwen3_5GenerateModel::init(model_path, Some(&device), Some(DType::F16), true)?;
-    println!("✅ Model initialized successfully.");
+    let tokenizer = TokenizerModel::init(model_path)?;
+    let mut model = Qwen3_5GenerateModel::init(model_path, Some(&device), Some(DType::F16), false)?;
+    
+    println!("✅ Hybrid Model initialized successfully.");
 
-    let params = ChatCompletionParameters {
-        messages: vec![
-            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Text("1+1=? NO EXPLANATION. NO THINKING. /no_think".to_string()),
-                name: None,
-            }),
+    let message = r#"
+    {
+        "model": "qwen3.5",
+        "messages": [
+            {
+                "role": "user",
+                "content": "1+1=? NO EXPLANATION. NO THINKING."
+            }
         ],
-        temperature: Some(0.1),
-        max_tokens: Some(50),
-        ..Default::default()
-    };
-
+        "max_tokens": 20
+    }
+    "#;
+    
+    let mes = serde_json::from_str(message)?;
+    
     println!("🤔 Asking: 1+1=?");
-    let response = model.generate(params, None, None, None).await?;
+    let response = model.generate(mes, None, None, None).await?;
 
     println!("\n✨ Result: {}", response);
     println!("\n✅ Test completed successfully!");

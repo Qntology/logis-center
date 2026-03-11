@@ -42,17 +42,18 @@ def pack_q2_k_combined(tensor):
     
     return combined, orig_shape
 def run_q2_quantization():
-    print("\n[QUANT-Q2] Quantizing layers and SHARED weights to save VRAM...")
+    print("\n[QUANT-Q2] Quantizing ONLY layers while KEEPING shared/vision original...")
     base_dir = os.path.dirname(os.path.abspath(__file__))
     model_dir = os.path.join(base_dir, "src-tauri", "models", "Qwen3.5-0.8B-Split")
 
-    # Process all .st files including shared.st
-    files = [f for f in os.listdir(model_dir) if f.endswith(".st") and "vision" not in f]
+    # Process only layer_X.st files
+    files = [f"layer_{i}.st" for i in range(24)]
 
-    for filename in tqdm(files, desc="Processing Models"):
+    for filename in tqdm(files, desc="Processing Layers"):
         path = os.path.join(model_dir, filename)
         if os.path.exists(path):
             sd = load_file(path)
+
             new_sd = {}
             meta = {"precision": "q2_combined_v1"}
 

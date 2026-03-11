@@ -190,12 +190,13 @@ impl Qwen3_5GenerateModel {
         }
 
         // ====================================================================
-        // [PHASE 2] TRANSITION: (Layer-by-Layer mode - weights are not persistent in VRAM)
+        // [PHASE 2] TRANSITION: Load ALL to VRAM for FAST & STABLE Decoding
         // ====================================================================
-        println!("[MODEL-QWEN35] Prefill complete. Starting Layer-by-Layer Decoding...");
+        println!("[MODEL-QWEN35] Prefill complete. Loading ALL weights to VRAM for fast Decoding...");
+        self.qwen3_5.load_all_to_vram(&self.registry, &self.device)?;
 
         // ====================================================================
-        // [PHASE 3] DECODING: Layer-by-Layer (VRAM minimum)
+        // [PHASE 3] DECODING: High Speed (Persistent Weights in VRAM)
         // ====================================================================
         let mut logits = last_logits.ok_or(anyhow::anyhow!("No logits generated"))?;
         let mut gen_text = String::new();
@@ -230,22 +231,22 @@ impl Qwen3_5GenerateModel {
 
             let input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?.to_dtype(DType::U32)?;
             
-            // 1. Embeddings (Dynamic Load/Drop)
-            self.qwen3_5.model.embed.load_to_vram(&self.registry, &self.device)?;
+            // 1. Embeddings (Already in VRAM)
             let mut h = self.qwen3_5.model.embed.forward(&input_ids, &self.registry)?; 
-            self.qwen3_5.model.embed.clear_vram();
 
-            // RoPE
-            let pos_vec: Vec<u32> = vec![seqlen_offset as u32];
-            let pos = Tensor::from_vec(pos_vec, (1, 1), &self.device)?.unsqueeze(0)?.broadcast_as((3, 1, 1))?.contiguous()?;
+            // RoPE: Official way to handle position during decoding
+            let pos = Tensor::from_vec(vec![seqlen_offset as u32], (1, 1), &self.device)?
+                .unsqueeze(0)?
+                .broadcast_as((3, 1, 1))?
+                .contiguous()?;
             let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos, DType::F16, self.qwen3_5.model.mrope.clone())?;
 
-            // 2. Layer Relay (Decoding)
+            // Decoding Mask: Some models require a 1x(N+1) mask to attend to all past tokens
+            let mask = Some(crate::utils::tensor_utils::prepare_causal_attention_mask(1, 1, seqlen_offset, &self.device)?.to_dtype(DType::F16)?);
+
+            // 2. Layer Execution (Already in VRAM)
             for i in 0..num_layers {
                 let layer = &mut self.qwen3_5.model.layers[i];
-
-                // [WEIGHTS UP]
-                layer.load_to_vram(&self.registry, &self.device)?;
 
                 // [KV LOAD] - From Memory Cache
                 if let Some(ref mut sa) = layer.self_attn {
@@ -261,8 +262,8 @@ impl Qwen3_5GenerateModel {
                     }
                 }
 
-                // [COMPUTE]
-                h = layer.forward(&h, &cos, &sin, None, &self.registry)?;
+                // [COMPUTE] - Pass the mask!
+                h = layer.forward(&h, &cos, &sin, mask.as_ref(), &self.registry)?;
 
                 // [KV SAVE] - To Memory Cache
                 if let Some(ref mut sa) = layer.self_attn {
@@ -275,22 +276,11 @@ impl Qwen3_5GenerateModel {
                         kv_manager.save_layer_context(i, LayerContext::DeltaNet { state: st })?;
                     }
                 }
-
-                // [WEIGHTS DOWN]
-                layer.clear_vram();
-
-                #[cfg(feature = "cuda")]
-                self.device.synchronize()?; 
             }
 
-            // 3. Head (Dynamic Load/Drop)
-            self.qwen3_5.model.norm.load_to_vram(&self.registry, &self.device)?;
+            // 3. Head (Already in VRAM)
             let last_h = self.qwen3_5.model.norm.forward(&h, &self.registry)?;
-            self.qwen3_5.model.norm.clear_vram();
-
-            self.qwen3_5.head.load_to_vram(&self.registry, &self.device)?;
             logits = self.qwen3_5.head.forward(&last_h, &self.registry)?;
-            self.qwen3_5.head.clear_vram();
             
             seqlen_offset += 1;
         }

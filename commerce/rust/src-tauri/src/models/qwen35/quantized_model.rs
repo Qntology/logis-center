@@ -9,7 +9,7 @@ use half::f16;
 use crate::{
     models::{
         qwen35::config::{Qwen3_5Config, Qwen3_5TextConfig},
-        common::{get_conv1d, softplus},
+        common::{get_conv1d, softplus, GateUpDownMLP},
     },
     position_embed::rope::{
         Qwen3_5TextRotaryEmbedding, glm_asr_apply_rotary_pos_emb,
@@ -375,29 +375,72 @@ impl QAttention {
     }
 }
 
-pub struct QDecoderLayer { pub self_attn: Option<QAttention>, pub linear_attn: Option<QGatedDeltaNet>, mlp_gate: QLinear, mlp_up: QLinear, mlp_down: QLinear, in_norm: QRmsNorm, post_norm: QRmsNorm }
+pub struct QDecoderLayer { 
+    pub idx: usize,
+    pub self_attn: Option<QAttention>, 
+    pub linear_attn: Option<QGatedDeltaNet>, 
+    mlp_gate: QLinear,
+    mlp_up: QLinear,
+    mlp_down: QLinear,
+    in_norm: QRmsNorm, 
+    post_norm: QRmsNorm 
+}
+
 impl QDecoderLayer {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig, idx: usize) -> Result<Self> {
-        let lt = config.layer_types[idx].clone(); let p = vb.prefix();
-        let (sa, la) = if lt == "linear_attention" { (None, Some(QGatedDeltaNet::new(vb.pp("linear_attn"), config)?)) } else { (Some(QAttention::new(vb.pp("self_attn"), config)?), None) };
+        let p = vb.prefix();
+        let lt = config.layer_types[idx].clone();
+        
+        let (sa, la) = if lt == "linear_attention" {
+            (None, Some(QGatedDeltaNet::new(vb.pp("linear_attn"), config)?))
+        } else {
+            (Some(QAttention::new(vb.pp("self_attn"), config)?), None)
+        };
+
         Ok(Self { 
+            idx,
             self_attn: sa, 
             linear_attn: la, 
-            mlp_gate: QLinear::new(&join_name(&p, "mlp.gate_proj"))?, 
-            mlp_up: QLinear::new(&join_name(&p, "mlp.up_proj"))?, 
-            mlp_down: QLinear::new(&join_name(&p, "mlp.down_proj"))?, 
+            mlp_gate: QLinear::new(&join_name(&p, "mlp.gate_proj"))?,
+            mlp_up: QLinear::new(&join_name(&p, "mlp.up_proj"))?,
+            mlp_down: QLinear::new(&join_name(&p, "mlp.down_proj"))?,
             in_norm: QRmsNorm::new(&join_name(&p, "input_layernorm"), config.rms_norm_eps)?, 
             post_norm: QRmsNorm::new(&join_name(&p, "post_attention_layernorm"), config.rms_norm_eps)? 
         })
     }
-    pub fn clear_vram(&mut self) { self.in_norm.clear_vram(); if let Some(ref mut sa) = self.self_attn { sa.clear_vram(); } if let Some(ref mut la) = self.linear_attn { la.clear_vram(); } self.post_norm.clear_vram(); self.mlp_gate.clear_vram(); self.mlp_up.clear_vram(); self.mlp_down.clear_vram(); }
-    pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { self.in_norm.load_to_vram(reg, dev)?; if let Some(ref mut sa) = self.self_attn { sa.load_to_vram(reg, dev)?; } if let Some(ref mut la) = self.linear_attn { la.load_to_vram(reg, dev)?; } self.post_norm.load_to_vram(reg, dev)?; self.mlp_gate.load_to_vram(reg, dev)?; self.mlp_up.load_to_vram(reg, dev)?; self.mlp_down.load_to_vram(reg, dev)?; Ok(()) }
+
+    pub fn clear_vram(&mut self) {
+        self.in_norm.clear_vram();
+        if let Some(ref mut sa) = self.self_attn { sa.clear_vram(); }
+        if let Some(ref mut la) = self.linear_attn { la.clear_vram(); }
+        self.post_norm.clear_vram();
+        self.mlp_gate.clear_vram();
+        self.mlp_up.clear_vram();
+        self.mlp_down.clear_vram();
+    }
+
+    pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
+        self.in_norm.load_to_vram(reg, dev)?;
+        if let Some(ref mut sa) = self.self_attn { sa.load_to_vram(reg, dev)?; }
+        if let Some(ref mut la) = self.linear_attn { la.load_to_vram(reg, dev)?; }
+        self.post_norm.load_to_vram(reg, dev)?;
+        self.mlp_gate.load_to_vram(reg, dev)?;
+        self.mlp_up.load_to_vram(reg, dev)?;
+        self.mlp_down.load_to_vram(reg, dev)?;
+        Ok(())
+    }
+
     pub fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let residual = x.clone();
         let h = self.in_norm.forward(x, reg)?;
-        let h = if let Some(ref mut sa) = self.self_attn { sa.forward(&h, cos, sin, mask, reg)? } 
-                else if let Some(ref mut la) = self.linear_attn { la.forward(&h, mask, reg)? }
-                else { h };
+        
+        let h = if let Some(ref mut sa) = self.self_attn {
+            sa.forward(&h, cos, sin, mask, reg)?
+        } else if let Some(ref mut la) = self.linear_attn {
+            la.forward(&h, mask, reg)?
+        } else {
+            h
+        };
         
         let h = (h + residual)?;
         let residual = h.clone();
@@ -452,26 +495,32 @@ impl QTextModel {
     pub fn forward(&mut self, _ids: &Tensor, _pos: &Tensor, _offset: usize, _reg: &QuantizedRegistry) -> Result<Tensor> { anyhow::bail!("Not used") }
 }
 
-pub struct QuantizedQwen3_5Model { pub model: QTextModel, pub head: QLinear }
+pub struct QuantizedQwen3_5Model { pub model: QTextModel, pub head: QLinear, tie: bool }
 impl QuantizedQwen3_5Model {
     pub fn new(vb: VarBuilder, config: Qwen3_5Config) -> Result<Self> {
         let p = vb.prefix();
         let head_name = if config.tie_word_embeddings {
             join_name(&p, "model.language_model.embed_tokens")
         } else {
-            // Some models use lm_head, others use embed_tokens even if not tied (but separate weights)
-            // We'll try to find lm_head first if not tied.
             join_name(&p, "model.language_model.lm_head")
         };
-        Ok(Self { model: QTextModel::new(vb.pp("model.language_model"), &config.text_config)?, head: QLinear::new(&head_name)? })
+        Ok(Self { 
+            model: QTextModel::new(vb.pp("model.language_model"), &config.text_config)?, 
+            head: QLinear::new(&head_name)?,
+            tie: config.tie_word_embeddings
+        })
     }
     pub fn load_all_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         self.model.load_all_to_vram(reg, dev)?;
-        if let Err(_) = self.head.load_to_vram(reg, dev) {
-             // Fallback to embed_tokens if lm_head fails
-             let name = self.model.embed.full_name.clone();
-             self.head = QLinear::new(&name)?;
-             self.head.load_to_vram(reg, dev)?;
+        if self.tie {
+            // Share weight from embedding
+            self.head.persistent_weight = self.model.embed.persistent_weight.clone();
+        } else {
+            if let Err(_) = self.head.load_to_vram(reg, dev) {
+                 let name = self.model.embed.full_name.clone();
+                 self.head = QLinear::new(&name)?;
+                 self.head.load_to_vram(reg, dev)?;
+            }
         }
         Ok(())
     }
