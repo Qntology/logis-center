@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
         "messages": [
             {
                 "role": "user",
-                "content": "Calculate 1+1. Just give me the number."
+                "content": "Hello"
             }
         ],
         "max_tokens": 10,

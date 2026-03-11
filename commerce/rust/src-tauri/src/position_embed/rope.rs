@@ -131,7 +131,7 @@ pub fn apply_rotary_pos_emb_partial(
     let q_dim = q.dim(D::Minus1)?;
     
     if rotary_dim == q_dim {
-        return glm_interleaved_apply_rotary_pos_emb(q, k, &cos, &sin, tof32);
+        return apply_rotary_pos_emb(q, k, &cos, &sin, tof32);
     }
 
     let q_rot = q.narrow(D::Minus1, 0, rotary_dim)?;
@@ -139,7 +139,7 @@ pub fn apply_rotary_pos_emb_partial(
     let k_rot = k.narrow(D::Minus1, 0, rotary_dim)?;
     let k_pass = k.narrow(D::Minus1, rotary_dim, k.dim(D::Minus1)? - rotary_dim)?;
 
-    let (q_embed, k_embed) = glm_interleaved_apply_rotary_pos_emb(&q_rot, &k_rot, &cos, &sin, tof32)?;
+    let (q_embed, k_embed) = apply_rotary_pos_emb(&q_rot, &k_rot, &cos, &sin, tof32)?;
 
     let q_embed = Tensor::cat(&[q_embed, q_pass], D::Minus1)?;
     let k_embed = Tensor::cat(&[k_embed, k_pass], D::Minus1)?;
@@ -495,10 +495,8 @@ impl Qwen3_5TextRotaryEmbedding {
         // Apply M-RoPE sectioning to get (B, S, D/2)
         let freqs = self.apply_interleaved_mrope(&freqs, mrope_section)?; 
         
-        // Create interleaved cos/sin: [f1, f1, f2, f2, ...]
-        let emb = freqs.unsqueeze(D::Minus1)?
-            .broadcast_add(&Tensor::zeros((1, 1, 1, 2), DType::F32, dev)?)?
-            .reshape((b_sz, q_len, ()))?;
+        // Create concatenated cos/sin: [f1..f32, f1..f32]
+        let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
             
         let cos = emb.cos()?.to_dtype(dtype)?;
         let sin = emb.sin()?.to_dtype(dtype)?;

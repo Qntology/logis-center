@@ -276,18 +276,22 @@ impl QGatedDeltaNet {
                 .reshape((bs, (), sl))? // (bs, 6144, sl)
                 .to_dtype(DType::F32)?;
             
-            if sl == 1 && self.conv_state_cache.is_some() {
+            let (qkv_conv_new, new_conv_state) = if sl == 1 && self.conv_state_cache.is_some() {
                 let conv_state = self.conv_state_cache.as_ref().unwrap().to_device(x.device())?.to_dtype(DType::F32)?;
                 let conv_state_new = Tensor::cat(&[&conv_state, &qkv_conv], D::Minus1)?;
-                self.conv_state_cache = Some(conv_state_new.narrow(D::Minus1, 1, 3)?.detach());
                 let conv_out = crate::models::common::conv1d_depthwise(&conv_state_new, &conv.weight().to_dtype(DType::F32)?, conv.bias().map(|b| b.to_dtype(DType::F32)).transpose()?.as_ref())?;
-                qkv_conv = conv_out.narrow(D::Minus1, conv_out.dim(D::Minus1)? - 1, 1)?.silu()?;
+                (conv_out.narrow(D::Minus1, conv_out.dim(D::Minus1)? - 1, 1)?.silu()?, conv_state_new.narrow(D::Minus1, 1, 3)?.detach())
             } else {
-                let conv_in = qkv_conv.pad_with_zeros(D::Minus1, 3, 0)?;
-                qkv_conv = crate::models::common::conv1d_depthwise(&conv_in, &conv.weight().to_dtype(DType::F32)?, conv.bias().map(|b| b.to_dtype(DType::F32)).transpose()?.as_ref())?;
-                qkv_conv = qkv_conv.narrow(D::Minus1, 0, sl)?.silu()?;
-                self.conv_state_cache = Some(conv_in.narrow(D::Minus1, sl, 3)?.detach());
-            }
+                let conv_in = if let Some(ref cache) = self.conv_state_cache {
+                    Tensor::cat(&[cache.to_device(x.device())?.to_dtype(DType::F32)?, qkv_conv], D::Minus1)?
+                } else {
+                    qkv_conv.pad_with_zeros(D::Minus1, 3, 0)?
+                };
+                let conv_out = crate::models::common::conv1d_depthwise(&conv_in, &conv.weight().to_dtype(DType::F32)?, conv.bias().map(|b| b.to_dtype(DType::F32)).transpose()?.as_ref())?;
+                (conv_out.narrow(D::Minus1, 0, sl)?.silu()?, conv_in.narrow(D::Minus1, sl, 3)?.detach())
+            };
+            let qkv_conv = qkv_conv_new;
+            self.conv_state_cache = Some(new_conv_state);
             
             let qkv_conv = qkv_conv.reshape((bs, (), sl))?.to_dtype(DType::F16)?;
             let channels_per_head = nk + nk + nv;

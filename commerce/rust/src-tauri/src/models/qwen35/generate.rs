@@ -94,6 +94,7 @@ impl Qwen3_5GenerateModel {
         );
         
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
+        println!("[DEBUG-PROMPT] Rendered prompt: {:?}", mes_render);
         let full_input_ids = self.tokenizer.text_encode(mes_render, &self.device)?;
             
         let full_seq_len = full_input_ids.dim(1)?;
