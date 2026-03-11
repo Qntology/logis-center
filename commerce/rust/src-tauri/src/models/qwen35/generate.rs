@@ -124,7 +124,7 @@ impl Qwen3_5GenerateModel {
 
             // 1. Embeddings (Dynamic Load/Drop)
             self.qwen3_5.model.embed.load_to_vram(&self.registry, &self.device)?;
-            let mut h = self.qwen3_5.model.embed.forward(&input_ids, &self.registry)?;
+            let mut h = self.qwen3_5.model.embed.forward(&input_ids, &self.registry)?.detach();
             self.qwen3_5.model.embed.clear_vram();
             
             // RoPE & Mask
@@ -177,7 +177,8 @@ impl Qwen3_5GenerateModel {
                 }
 
                 // [WEIGHTS DOWN]
-                layer.clear_vram();
+                // Removed clear_vram() to utilize RwLock caching and prevent spikes
+                // layer.clear_vram();
 
                 #[cfg(feature = "cuda")]
                 self.device.synchronize()?; 
@@ -189,11 +190,11 @@ impl Qwen3_5GenerateModel {
 
             // Head (Dynamic Load/Drop)
             self.qwen3_5.model.norm.load_to_vram(&self.registry, &self.device)?;
-            let last_h = self.qwen3_5.model.norm.forward(&h, &self.registry)?;
+            let last_h = self.qwen3_5.model.norm.forward(&h, &self.registry)?.detach();
             self.qwen3_5.model.norm.clear_vram();
 
             self.qwen3_5.head.load_to_vram(&self.registry, &self.device)?;
-            let logits = self.qwen3_5.head.forward(&last_h.narrow(1, current_chunk - 1, 1)?, &self.registry)?;
+            let logits = self.qwen3_5.head.forward(&last_h.narrow(1, current_chunk - 1, 1)?, &self.registry)?.detach();
             self.qwen3_5.head.clear_vram();
             
             seqlen_offset += current_chunk;
@@ -226,7 +227,7 @@ impl Qwen3_5GenerateModel {
             
             // 1. Embeddings (Relay)
             self.qwen3_5.model.embed.load_to_vram(&self.registry, &self.device)?;
-            let mut h = self.qwen3_5.model.embed.forward(&input_ids, &self.registry)?; 
+            let mut h = self.qwen3_5.model.embed.forward(&input_ids, &self.registry)?.detach(); 
             self.qwen3_5.model.embed.clear_vram();
 
             // RoPE
@@ -273,18 +274,19 @@ impl Qwen3_5GenerateModel {
                 }
 
                 // [WEIGHTS DOWN]
-                layer.clear_vram();
+                // Removed clear_vram() to utilize RwLock caching and prevent spikes
+                // layer.clear_vram();
                 #[cfg(feature = "cuda")]
                 self.device.synchronize()?; 
             }
 
             // 3. Head (Relay)
             self.qwen3_5.model.norm.load_to_vram(&self.registry, &self.device)?;
-            let last_h = self.qwen3_5.model.norm.forward(&h, &self.registry)?;
+            let last_h = self.qwen3_5.model.norm.forward(&h, &self.registry)?.detach();
             self.qwen3_5.model.norm.clear_vram();
 
             self.qwen3_5.head.load_to_vram(&self.registry, &self.device)?;
-            logits = self.qwen3_5.head.forward(&last_h, &self.registry)?;
+            logits = self.qwen3_5.head.forward(&last_h, &self.registry)?.detach();
             self.qwen3_5.head.clear_vram();
             
             seqlen_offset += 1;

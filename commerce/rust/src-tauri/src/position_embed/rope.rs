@@ -149,6 +149,46 @@ pub fn glm_asr_apply_rotary_pos_emb(
     Ok((q_embed, k_embed))
 }
 
+pub fn glm_interleaved_apply_rotary_pos_emb(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    tof32: bool,
+) -> Result<(Tensor, Tensor)> {
+    let mut cos = cos.clone();
+    let mut sin = sin.clone();
+    if cos.rank() == 2 {
+        cos = cos.unsqueeze(0)?.unsqueeze(0)?;
+        sin = sin.unsqueeze(0)?.unsqueeze(0)?;
+    }
+    if cos.rank() == 3 {
+        cos = cos.unsqueeze(1)?;
+        sin = sin.unsqueeze(1)?;
+    }
+    let orig_dtype = q.dtype();
+    let q = if tof32 { &q.to_dtype(DType::F32)? } else { q };
+    let k = if tof32 { &k.to_dtype(DType::F32)? } else { k };
+    let cos = cos.to_dtype(q.dtype())?;
+    let sin = sin.to_dtype(q.dtype())?;
+    let rotary_dim = cos.dim(D::Minus1)?;
+    let q_dim = q.dim(D::Minus1)?;
+    let q_rot = q.narrow(D::Minus1, 0, rotary_dim)?;
+    let q_pass = q.narrow(D::Minus1, rotary_dim, q_dim - rotary_dim)?;
+    let k_rot = k.narrow(D::Minus1, 0, rotary_dim)?;
+    let k_pass = k.narrow(D::Minus1, rotary_dim, q_dim - rotary_dim)?;
+
+    let q_embed = q_rot
+        .broadcast_mul(&cos)?
+        .add(&rotate_half_llm(&q_rot)?.broadcast_mul(&sin)?)?;
+    let k_embed = k_rot
+        .broadcast_mul(&cos)?
+        .add(&rotate_half_llm(&k_rot)?.broadcast_mul(&sin)?)?;
+    let q_embed = Tensor::cat(&[q_embed, q_pass], D::Minus1)?.to_dtype(orig_dtype)?;
+    let k_embed = Tensor::cat(&[k_embed, k_pass], D::Minus1)?.to_dtype(orig_dtype)?;
+    Ok((q_embed, k_embed))
+}
+
 fn rotate_half_llm(x: &Tensor) -> Result<Tensor> {
     let last_dim = x.dim(D::Minus1)?;
     let half = last_dim / 2;
@@ -443,7 +483,10 @@ impl Qwen3_5TextRotaryEmbedding {
             .matmul(&position_ids_expanded)?
             .transpose(2, 3)?;
         let freqs = self.apply_interleaved_mrope_asr(&freqs, mrope_section)?;
-        let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?.contiguous()?;
+        let emb = freqs.unsqueeze(D::Minus1)?
+            .broadcast_add(&Tensor::zeros((1, 1, 1, 1, 2), DType::F32, freqs.device())?)?
+            .reshape(freqs.dims().iter().cloned().take(freqs.rank()-1).chain([freqs.dim(D::Minus1)? * 2]).collect::<Vec<_>>())?
+            .contiguous()?;
         let cos = emb.cos()?;
         let sin = emb.sin()?;
         Ok((cos.to_dtype(dtype)?, sin.to_dtype(dtype)?))
@@ -479,7 +522,11 @@ impl Qwen3_5TextRotaryEmbedding {
             .matmul(&position_ids_expanded)?
             .transpose(2, 3)?;
         let freqs = self.apply_interleaved_mrope(&freqs, mrope_section)?;
-        let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?.contiguous()?;
+        // For interleaved RoPE, we want [f1, f1, f2, f2, ...]
+        let emb = freqs.unsqueeze(D::Minus1)?
+            .broadcast_add(&Tensor::zeros((1, 1, 1, 1, 2), DType::F32, freqs.device())?)?
+            .reshape(freqs.dims().iter().cloned().take(freqs.rank()-1).chain([freqs.dim(D::Minus1)? * 2]).collect::<Vec<_>>())?
+            .contiguous()?;
         let cos = emb.cos()?;
         let sin = emb.sin()?;
         Ok((cos.to_dtype(dtype)?, sin.to_dtype(dtype)?))

@@ -909,7 +909,7 @@ pub fn l2_normalize(t: &Tensor, dim: usize) -> Result<Tensor> {
     if dim >= rank {
         return Err(anyhow!(format!("input dim {} must < rank {}", dim, rank)));
     }
-    let l2_norm = t.sqr()?.sum_keepdim(dim)?.affine(1.0, 1e-6)?.sqrt()?;
+    let l2_norm = t.sqr()?.sum_keepdim(dim)?.sqrt()?.affine(1.0, 1e-6)?;
     Ok(t.broadcast_div(&l2_norm)?)
 }
 
