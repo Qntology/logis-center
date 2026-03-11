@@ -152,14 +152,15 @@ impl Qwen3_5GenerateModel {
                        }
                    } else if let Some(ref mut la) = layer.linear_attn {
                        let s_state = candle_core::Shape::from((1, la.nv, la.dk, la.dv)); 
-                       if let Ok(LayerContext::DeltaNet { state }) = kv_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
+                       if let Ok(LayerContext::DeltaNet { state, conv }) = kv_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
                            la.recurrent_state_cache = Some(state.to_device(&self.device)?);
+                           la.conv_state_cache = Some(conv.to_device(&self.device)?);
                        }
                    }
                 }
 
                 // [COMPUTE]
-                h = layer.forward(&h, &cos, &sin, mask.as_ref(), &self.registry)?;
+                h = layer.forward(&h, &cos, &sin, mask.as_ref(), &self.registry)?.detach();
 
                 // [KV SAVE]
                 if let Some(ref mut sa) = layer.self_attn {
@@ -168,8 +169,10 @@ impl Qwen3_5GenerateModel {
                     }
                 }
                 if let Some(ref mut la) = layer.linear_attn {
-                    if let Some(st) = la.recurrent_state_cache.take() {
-                        kv_manager.save_layer_context(i, LayerContext::DeltaNet { state: st })?;
+                    let st = la.recurrent_state_cache.take();
+                    let cv = la.conv_state_cache.take();
+                    if let (Some(st), Some(cv)) = (st, cv) {
+                        kv_manager.save_layer_context(i, LayerContext::DeltaNet { state: st, conv: cv })?;
                     }
                 }
 
@@ -246,13 +249,14 @@ impl Qwen3_5GenerateModel {
                     }
                 } else if let Some(ref mut la) = layer.linear_attn {
                     let s_state = candle_core::Shape::from((1, la.nv, la.dk, la.dv)); 
-                    if let Ok(LayerContext::DeltaNet { state }) = kv_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
+                    if let Ok(LayerContext::DeltaNet { state, conv }) = kv_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
                         la.recurrent_state_cache = Some(state.to_device(&self.device)?);
+                        la.conv_state_cache = Some(conv.to_device(&self.device)?);
                     }
                 }
 
                 // [COMPUTE]
-                h = layer.forward(&h, &cos, &sin, None, &self.registry)?;
+                h = layer.forward(&h, &cos, &sin, None, &self.registry)?.detach();
 
                 // [KV SAVE] - To Memory Cache
                 if let Some(ref mut sa) = layer.self_attn {
@@ -261,8 +265,10 @@ impl Qwen3_5GenerateModel {
                     }
                 }
                 if let Some(ref mut la) = layer.linear_attn {
-                    if let Some(st) = la.recurrent_state_cache.take() {
-                        kv_manager.save_layer_context(i, LayerContext::DeltaNet { state: st })?;
+                    let st = la.recurrent_state_cache.take();
+                    let cv = la.conv_state_cache.take();
+                    if let (Some(st), Some(cv)) = (st, cv) {
+                        kv_manager.save_layer_context(i, LayerContext::DeltaNet { state: st, conv: cv })?;
                     }
                 }
 

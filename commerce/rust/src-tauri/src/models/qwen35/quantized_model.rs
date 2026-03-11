@@ -104,13 +104,14 @@ fn dequantize_q2(t: &Tensor, dev: &Device) -> Result<Tensor> {
     }
 }
 
-pub struct QRmsNorm { pub full_name: String, eps: f64, persistent_weight: Option<Tensor> }
+pub struct QRmsNorm { pub full_name: String, eps: f64, offset: f64, persistent_weight: Option<Tensor> }
 impl QRmsNorm {
-    pub fn new(name: &str, eps: f64) -> Result<Self> { Ok(Self { full_name: name.to_string(), eps, persistent_weight: None }) }
+    pub fn new(name: &str, eps: f64, offset: f64) -> Result<Self> { Ok(Self { full_name: name.to_string(), eps, offset, persistent_weight: None }) }
     pub fn clear_vram(&mut self) { self.persistent_weight = None; }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         let w = reg.get_q_tensor(&self.full_name, "weight")?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let w = w.affine(1.0, 1.0)?.to_dtype(DType::F16)?.to_device(dev)?;
+        let w = if self.offset != 0.0 { w.affine(1.0, self.offset)? } else { w };
+        let w = w.to_dtype(DType::F16)?.to_device(dev)?;
         self.persistent_weight = Some(w); Ok(())
     }
     pub fn forward(&self, x: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
@@ -118,7 +119,8 @@ impl QRmsNorm {
         let w = if let Some(pw) = &self.persistent_weight { pw.clone() } 
                 else { 
                     let w = reg.get_q_tensor(&self.full_name, "weight")?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                    w.affine(1.0, 1.0)?.to_dtype(DType::F16)?.to_device(dev)?
+                    let w = if self.offset != 0.0 { w.affine(1.0, self.offset)? } else { w };
+                    w.to_dtype(DType::F16)?.to_device(dev)?
                 };
         let x_f32 = x.to_dtype(DType::F32)?;
         let original_shape = x.dims().to_vec();
@@ -176,7 +178,7 @@ impl QGatedDeltaNet {
         Ok(Self { 
             in_proj_qkv: QLinear::new(&join_name(&p, "in_proj_qkv"))?, in_proj_z: QLinear::new(&join_name(&p, "in_proj_z"))?,
             in_proj_b: QLinear::new(&join_name(&p, "in_proj_b"))?, in_proj_a: QLinear::new(&join_name(&p, "in_proj_a"))?,
-            out_proj: QLinear::new(&join_name(&p, "out_proj"))?, norm: QRmsNorm::new(&join_name(&p, "norm"), config.rms_norm_eps)?, 
+            out_proj: QLinear::new(&join_name(&p, "out_proj"))?, norm: QRmsNorm::new(&join_name(&p, "norm"), config.rms_norm_eps, 0.0)?, 
             nk: config.linear_num_key_heads, dk: config.linear_key_head_dim, nv: config.linear_num_value_heads, dv: config.linear_value_head_dim,
             conv1d: None, dt_bias: None, a_log: None, recurrent_state_cache: None, conv_state_cache: None 
         })
@@ -202,17 +204,11 @@ impl QGatedDeltaNet {
         Ok(()) 
     }
 
-    pub fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
+    pub fn forward(&mut self, x: &Tensor, _mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let (bs, sl, _) = x.dims3()?; 
         let (nk, dk, nv, dv) = (self.nk, self.dk, self.nv, self.dv);
         
-        let x = if let Some(m) = mask {
-            x.broadcast_mul(&m.to_dtype(x.dtype())?.unsqueeze(D::Minus1)?)?
-        } else {
-            x.clone()
-        };
-
-        let mixed_qkv = self.in_proj_qkv.forward(&x, reg)?; 
+        let mixed_qkv = self.in_proj_qkv.forward(x, reg)?; 
         let z = self.in_proj_z.forward(&x, reg)?;
         let b = self.in_proj_b.forward(&x, reg)?; 
         let a = self.in_proj_a.forward(&x, reg)?;
@@ -305,7 +301,7 @@ impl QAttention {
         let p = vb.prefix();
         Ok(Self {
             q_proj: QLinear::new(&join_name(&p, "q_proj"))?, k_proj: QLinear::new(&join_name(&p, "k_proj"))?, v_proj: QLinear::new(&join_name(&p, "v_proj"))?, o_proj: QLinear::new(&join_name(&p, "o_proj"))?,
-            q_norm: QRmsNorm::new(&join_name(&p, "q_norm"), config.rms_norm_eps)?, k_norm: QRmsNorm::new(&join_name(&p, "k_norm"), config.rms_norm_eps)?,
+            q_norm: QRmsNorm::new(&join_name(&p, "q_norm"), config.rms_norm_eps, 1.0)?, k_norm: QRmsNorm::new(&join_name(&p, "k_norm"), config.rms_norm_eps, 1.0)?,
             nh: config.num_attention_heads, nkv: config.num_key_value_heads, hd: config.head_dim, scaling: 1.0 / (config.head_dim as f64).sqrt(), kv_cache: None,
         })
     }
@@ -325,7 +321,7 @@ impl QAttention {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => (Tensor::cat(&[prev_k, &key_states], 2)?, Tensor::cat(&[prev_v, &value_states], 2)?),
         };
-        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+        self.kv_cache = Some((key_states.detach(), value_states.detach()));
         let attn_output = crate::models::common::eager_attention_forward(&query_states, &key_states, &value_states, Some(self.nh / self.nkv), attention_mask, self.scaling)?;
         let attn_output = attn_output.reshape((b_sz, q_len, self.nh * self.hd))?.contiguous()?.broadcast_mul(&candle_nn::ops::sigmoid(&query_chunk[1].reshape((b_sz, q_len, self.nh * self.hd))?)?.to_dtype(DType::F16)?)?;
         self.o_proj.forward(&attn_output, reg)
@@ -339,7 +335,7 @@ impl QDecoderLayer {
         let (sa, la) = if config.layer_types[idx] == "linear_attention" { (None, Some(QGatedDeltaNet::new(vb.pp("linear_attn"), config)?)) } else { (Some(QAttention::new(vb.pp("self_attn"), config)?), None) };
         Ok(Self { 
             idx, self_attn: sa, linear_attn: la, mlp_gate: QLinear::new(&join_name(&p, "mlp.gate_proj"))?, mlp_up: QLinear::new(&join_name(&p, "mlp.up_proj"))?,
-            mlp_down: QLinear::new(&join_name(&p, "mlp.down_proj"))?, in_norm: QRmsNorm::new(&join_name(&p, "input_layernorm"), config.rms_norm_eps)?, post_norm: QRmsNorm::new(&join_name(&p, "post_attention_layernorm"), config.rms_norm_eps)? 
+            mlp_down: QLinear::new(&join_name(&p, "mlp.down_proj"))?, in_norm: QRmsNorm::new(&join_name(&p, "input_layernorm"), config.rms_norm_eps, 1.0)?, post_norm: QRmsNorm::new(&join_name(&p, "post_attention_layernorm"), config.rms_norm_eps, 1.0)? 
         })
     }
     pub fn clear_vram(&mut self) { self.in_norm.clear_vram(); if let Some(ref mut sa) = self.self_attn { sa.clear_vram(); } if let Some(ref mut la) = self.linear_attn { la.clear_vram(); } self.post_norm.clear_vram(); self.mlp_gate.clear_vram(); self.mlp_up.clear_vram(); self.mlp_down.clear_vram(); }
@@ -380,7 +376,7 @@ impl QTextModel {
         Ok(Self { 
             embed: QEmbedding::new(&join_name(&vb.prefix(), "embed_tokens"), config.vocab_size, config.hidden_size), 
             layers, 
-            norm: QRmsNorm::new(&join_name(&vb.prefix(), "norm"), config.rms_norm_eps)?, 
+            norm: QRmsNorm::new(&join_name(&vb.prefix(), "norm"), config.rms_norm_eps, 1.0)?, 
             rotary: Qwen3_5TextRotaryEmbedding::new((config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize, config.rope_parameters.rope_theta as f32), 
             mrope: config.rope_parameters.mrope_section.clone() 
         })
@@ -399,11 +395,11 @@ impl QuantizedQwen3_5Model {
 }
 
 #[derive(Clone)]
-pub enum LayerContext { Attention { k: Tensor, v: Tensor }, DeltaNet { state: Tensor } }
+pub enum LayerContext { Attention { k: Tensor, v: Tensor }, DeltaNet { state: Tensor, conv: Tensor } }
 pub struct KVStateManager { mmap: Option<memmap2::MmapMut>, layer_stride: usize, memory_cache: Vec<Option<LayerContext>>, use_memory: bool }
 impl KVStateManager {
     pub fn new(num_layers: usize, use_memory: bool) -> Result<Self> {
-        let layer_stride = 32 * 1024 * 1024;
+        let layer_stride = 64 * 1024 * 1024; // Increased stride for double states
         let (mmap, memory_cache) = if use_memory { (None, vec![None; num_layers]) } else {
             let file = std::fs::OpenOptions::new().read(true).write(true).create(true).open(crate::utils::paths::get_kv_dir(None).join("kv_cache_pool.bin"))?;
             file.set_len((num_layers * layer_stride) as u64)?;
@@ -415,14 +411,14 @@ impl KVStateManager {
         if self.use_memory {
             let cpu_ctx = match ctx {
                 LayerContext::Attention { k, v } => LayerContext::Attention { k: k.to_device(&Device::Cpu)?, v: v.to_device(&Device::Cpu)? },
-                LayerContext::DeltaNet { state } => LayerContext::DeltaNet { state: state.to_device(&Device::Cpu)? },
+                LayerContext::DeltaNet { state, conv } => LayerContext::DeltaNet { state: state.to_device(&Device::Cpu)?, conv: conv.to_device(&Device::Cpu)? },
             };
             self.memory_cache[layer_idx] = Some(cpu_ctx); return Ok(());
         }
         let offset = layer_idx * self.layer_stride;
         match &ctx {
             LayerContext::Attention { k, v } => { self.write_tensor(offset, k, DType::F16)?; self.write_tensor(offset + (k.elem_count() * 2), v, DType::F16)?; },
-            LayerContext::DeltaNet { state } => { self.write_tensor(offset, state, DType::F32)?; }
+            LayerContext::DeltaNet { state, conv } => { self.write_tensor(offset, state, DType::F32)?; self.write_tensor(offset + (state.elem_count() * 4), conv, DType::F32)?; }
         }
         Ok(())
     }
@@ -431,13 +427,18 @@ impl KVStateManager {
             if let Some(ctx) = &self.memory_cache[layer_idx] {
                 return match ctx {
                     LayerContext::Attention { k, v } => Ok(LayerContext::Attention { k: k.to_device(dev)?, v: v.to_device(dev)? }),
-                    LayerContext::DeltaNet { state } => Ok(LayerContext::DeltaNet { state: state.to_device(dev)? }),
+                    LayerContext::DeltaNet { state, conv } => Ok(LayerContext::DeltaNet { state: state.to_device(dev)?, conv: conv.to_device(dev)? }),
                 };
             }
             anyhow::bail!("Layer context not found in memory");
         }
         let offset = layer_idx * self.layer_stride;
-        if lt == "linear_attention" { Ok(LayerContext::DeltaNet { state: self.read_tensor(offset, shape_k, DType::F32, dev)? }) } 
+        if lt == "linear_attention" { 
+            let state = self.read_tensor(offset, shape_k, DType::F32, dev)?;
+            let conv_shape = candle_core::Shape::from((1, shape_k.dims()[1] + shape_k.dims()[1] + shape_k.dims()[1], 3)); // (bs, channels, 3)
+            let conv = self.read_tensor(offset + (shape_k.elem_count() * 4), &conv_shape, DType::F32, dev)?;
+            Ok(LayerContext::DeltaNet { state, conv })
+        } 
         else { Ok(LayerContext::Attention { k: self.read_tensor(offset, shape_k, DType::F16, dev)?, v: self.read_tensor(offset + (shape_k.elem_count() * 2), shape_v, DType::F16, dev)? }) }
     }
     fn write_tensor(&mut self, offset: usize, t: &Tensor, dtype: DType) -> Result<()> {
