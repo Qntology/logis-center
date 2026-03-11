@@ -169,20 +169,24 @@ impl Qwen3_5GenerateModel {
                 // [KV SAVE]
                 if let Some(ref mut sa) = layer.self_attn {
                     if let Some((k, v)) = sa.kv_cache.take() { 
-                        kv_manager.save_layer_context(i, LayerContext::Attention { k, v })?;
+                        // Force move to CPU to free GPU memory immediately
+                        let k_cpu = k.to_device(&Device::Cpu)?;
+                        let v_cpu = v.to_device(&Device::Cpu)?;
+                        kv_manager.save_layer_context(i, LayerContext::Attention { k: k_cpu, v: v_cpu })?;
                     }
                 }
                 if let Some(ref mut la) = layer.linear_attn {
                     let st = la.recurrent_state_cache.take();
                     let cv = la.conv_state_cache.take();
                     if let (Some(st), Some(cv)) = (st, cv) {
-                        kv_manager.save_layer_context(i, LayerContext::DeltaNet { state: st, conv: cv })?;
+                        let st_cpu = st.to_device(&Device::Cpu)?;
+                        let cv_cpu = cv.to_device(&Device::Cpu)?;
+                        kv_manager.save_layer_context(i, LayerContext::DeltaNet { state: st_cpu, conv: cv_cpu })?;
                     }
                 }
 
-                // [WEIGHTS DOWN]
-                // Removed clear_vram() to utilize RwLock caching and prevent spikes
-                // layer.clear_vram();
+                // [WEIGHTS DOWN] - Essential for Relay Mode
+                layer.clear_vram();
 
                 #[cfg(feature = "cuda")]
                 self.device.synchronize()?; 
@@ -266,20 +270,23 @@ impl Qwen3_5GenerateModel {
                 // [KV SAVE] - To Memory Cache
                 if let Some(ref mut sa) = layer.self_attn {
                     if let Some((k, v)) = sa.kv_cache.take() { 
-                        kv_manager.save_layer_context(i, LayerContext::Attention { k, v })?;
+                        let k_cpu = k.to_device(&Device::Cpu)?;
+                        let v_cpu = v.to_device(&Device::Cpu)?;
+                        kv_manager.save_layer_context(i, LayerContext::Attention { k: k_cpu, v: v_cpu })?;
                     }
                 }
                 if let Some(ref mut la) = layer.linear_attn {
                     let st = la.recurrent_state_cache.take();
                     let cv = la.conv_state_cache.take();
                     if let (Some(st), Some(cv)) = (st, cv) {
-                        kv_manager.save_layer_context(i, LayerContext::DeltaNet { state: st, conv: cv })?;
+                        let st_cpu = st.to_device(&Device::Cpu)?;
+                        let cv_cpu = cv.to_device(&Device::Cpu)?;
+                        kv_manager.save_layer_context(i, LayerContext::DeltaNet { state: st_cpu, conv: cv_cpu })?;
                     }
                 }
 
                 // [WEIGHTS DOWN]
-                // Removed clear_vram() to utilize RwLock caching and prevent spikes
-                // layer.clear_vram();
+                layer.clear_vram();
                 #[cfg(feature = "cuda")]
                 self.device.synchronize()?; 
             }

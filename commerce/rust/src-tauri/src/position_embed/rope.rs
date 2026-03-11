@@ -411,15 +411,16 @@ impl Qwen3_5TextRotaryEmbedding {
         mrope_section: Vec<usize>,
     ) -> Result<Tensor> {
         // freqs shape: (3, B, S, D/2)
-        // For text-only, we can simplify this. In vllm, they often just use the temporal channel (0).
-        // However, Qwen3.5 M-RoPE expects concatenating segments from different channels.
+        // In M-RoPE, each section of the head_dim uses frequencies from a different channel.
         let mut sections = Vec::new();
         let freqs_split = freqs.split(&vec![1, 1, 1], 0)?; // Vec of (1, B, S, D/2)
         
         let mut current_dim = 0;
         for (i, &section_len) in mrope_section.iter().enumerate() {
             if section_len == 0 { continue; }
+            // Get frequencies for this section from channel i
             let channel_freqs = freqs_split[i].squeeze(0)?; // (B, S, D/2)
+            // Section takes frequencies starting from current_dim index of the channel
             let section = channel_freqs.narrow(D::Minus1, current_dim, section_len)?;
             sections.push(section);
             current_dim += section_len;
@@ -438,7 +439,7 @@ impl Qwen3_5TextRotaryEmbedding {
         mrope_section: Vec<usize>,
     ) -> Result<(Tensor, Tensor)> {
         // position_ids shape: (3, B, S)
-        let (num_channels, b_sz, q_len) = position_ids.dims3()?;
+        let (_num_channels, b_sz, q_len) = position_ids.dims3()?;
         let dev = position_ids.device();
         
         // inv_freq: (D/2)
@@ -453,14 +454,11 @@ impl Qwen3_5TextRotaryEmbedding {
         // (3, B, S, D/2)
         let freqs = pos_expanded.broadcast_mul(&inv_freq_expanded)?;
         
-        // Apply M-RoPE sectioning
-        let freqs = self.apply_interleaved_mrope(&freqs, mrope_section)?; // (B, S, D/2)
+        // Apply M-RoPE sectioning to get (B, S, D/2)
+        let freqs = self.apply_interleaved_mrope(&freqs, mrope_section)?; 
         
-        // Create interleaved: [f1, f1, f2, f2, ...]
-        // (B, S, D/2) -> (B, S, D/2, 2) -> (B, S, D)
-        let emb = freqs.unsqueeze(D::Minus1)?
-            .broadcast_add(&Tensor::zeros((1, 1, 1, 2), DType::F32, dev)?)?
-            .reshape((b_sz, q_len, ()))?;
+        // Create concatenated cos/sin: [f1..f16, f1..f16] (Standard Llama style)
+        let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?; // (B, S, D)
             
         let cos = emb.cos()?.to_dtype(dtype)?;
         let sin = emb.sin()?.to_dtype(dtype)?;

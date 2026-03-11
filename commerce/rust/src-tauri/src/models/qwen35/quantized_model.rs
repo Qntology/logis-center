@@ -357,55 +357,100 @@ impl QAttention {
             nh: config.num_attention_heads, nkv: config.num_key_value_heads, hd: config.head_dim, scaling: 1.0 / (config.head_dim as f64).sqrt(), kv_cache: None,
         })
     }
-    pub fn clear_vram(&mut self) { self.q_proj.clear_vram(); self.k_proj.clear_vram(); self.v_proj.clear_vram(); self.o_proj.clear_vram(); self.q_norm.clear_vram(); self.k_norm.clear_vram(); }
+    pub fn clear_vram(&mut self) {
+        self.q_proj.clear_vram();
+        self.k_proj.clear_vram();
+        self.v_proj.clear_vram();
+        self.o_proj.clear_vram();
+        self.q_norm.clear_vram();
+        self.k_norm.clear_vram();
+        self.kv_cache = None;
+    }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         if self.q_proj.persistent_weight.read().unwrap().is_some() { return Ok(()); }
-        self.q_proj.load_to_vram(reg, dev)?; self.k_proj.load_to_vram(reg, dev)?; self.v_proj.load_to_vram(reg, dev)?; self.o_proj.load_to_vram(reg, dev)?;
-        self.q_norm.load_to_vram(reg, dev)?; self.k_norm.load_to_vram(reg, dev)?; Ok(())
+        self.q_proj.load_to_vram(reg, dev)?;
+        self.k_proj.load_to_vram(reg, dev)?;
+        self.v_proj.load_to_vram(reg, dev)?;
+        self.o_proj.load_to_vram(reg, dev)?;
+        self.q_norm.load_to_vram(reg, dev)?;
+        self.k_norm.load_to_vram(reg, dev)?;
+        Ok(())
     }
+
     pub fn forward(&mut self, xs: &Tensor, cos: &Tensor, sin: &Tensor, attention_mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
-        let query_chunk = self.q_proj.forward(xs, reg)?.reshape((b_sz, q_len, self.nh, self.hd * 2))?.chunk(2, D::Minus1)?;
-        
-        // Qwen3.5 uses per-head Q and K normalization
-        let query_states = self.q_norm.forward(&query_chunk[0], reg)?.transpose(1, 2)?;
-        let key_states = self.k_norm.forward(&self.k_proj.forward(xs, reg)?.reshape((b_sz, q_len, self.nkv, self.hd))?, reg)?.transpose(1, 2)?;
-        let value_states = self.v_proj.forward(xs, reg)?.reshape((b_sz, q_len, self.nkv, self.hd))?.transpose(1, 2)?;
-        
-        let (query_states, key_states) = glm_interleaved_apply_rotary_pos_emb(&query_states, &key_states, cos, sin, true)?;
-        
+        let dev = xs.device();
+
+        // 1. Q-Proj and Split (Q and Gate)
+        // Qwen3.5: q_proj contains [Q, Gate] concatenated in the last dimension
+        let q_raw = self.q_proj.forward(xs, reg)?; // (B, S, NH * HD * 2)
+        let q_gate = q_raw.reshape((b_sz, q_len, self.nh, self.hd * 2))?;
+        let query_states = q_gate.narrow(3, 0, self.hd)?; // (B, S, NH, HD)
+        let gate_states = q_gate.narrow(3, self.hd, self.hd)?; // (B, S, NH, HD)
+
+        // 2. K, V Projs
+        let key_states = self.k_proj.forward(xs, reg)?.reshape((b_sz, q_len, self.nkv, self.hd))?;
+        let value_states = self.v_proj.forward(xs, reg)?.reshape((b_sz, q_len, self.nkv, self.hd))?;
+
+        // 3. Normalization (Per-head RMSNorm)
+        let query_states = self.q_norm.forward(&query_states, reg)?;
+        let key_states = self.k_norm.forward(&key_states, reg)?;
+
+        // 4. RoPE (Rotary Position Embedding)
+        // Expected shape for RoPE: (B, S, NH, HD) or (B, NH, S, HD)
+        // glm_interleaved expects (B, NH, S, HD)
+        let query_states = query_states.transpose(1, 2)?; // (B, NH, S, HD)
+        let key_states = key_states.transpose(1, 2)?;   // (B, NKV, S, HD)
+
+        let (query_states, key_states) = crate::position_embed::rope::apply_rotary_pos_emb(
+            &query_states, 
+            &key_states, 
+            cos, 
+            sin, 
+            true
+        )?;
+
+        // 5. KV Cache
         let (key_states, value_states) = match self.kv_cache.take() {
-            None => (key_states, value_states),
-            Some((prev_k, prev_v)) => (Tensor::cat(&[prev_k, key_states], 2)?, Tensor::cat(&[prev_v, value_states], 2)?),
+            None => (key_states, value_states.transpose(1, 2)?),
+            Some((prev_k, prev_v)) => {
+                let k = Tensor::cat(&[prev_k, key_states], 2)?;
+                let v = Tensor::cat(&[prev_v, value_states.transpose(1, 2)?], 2)?;
+                (k, v)
+            }
         };
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
-        
+
+        // 6. Attention
+        // query: (B, NH, S, HD), key: (B, NKV, S_kv, HD), value: (B, NKV, S_kv, HD)
         let attn_output = crate::models::common::eager_attention_forward(
-            &query_states.to_dtype(DType::F32)?, 
-            &key_states.to_dtype(DType::F32)?, 
-            &value_states.to_dtype(DType::F32)?, 
-            Some(self.nh / self.nkv), 
-            attention_mask, 
+            &query_states.to_dtype(DType::F32)?,
+            &key_states.to_dtype(DType::F32)?,
+            &value_states.to_dtype(DType::F32)?,
+            Some(self.nh / self.nkv),
+            attention_mask,
             self.scaling
-        )?;
-        
-        // Attention Gating (vllm style)
-        // gate shape: (B, S, NH, D)
-        let gate = candle_nn::ops::sigmoid(&query_chunk[1].to_dtype(DType::F32)?)?;
-        
-        // Ensure attn_output is (B, S, NH, D)
-        let attn_output = if attn_output.dim(1)? == self.nh {
-            attn_output.transpose(1, 2)?
-        } else {
-            attn_output
-        };
-        
-        let attn_output = attn_output.broadcast_mul(&gate)?;
+        )?; // Output shape: (B, NH, S, HD)
+
+        // 7. Gating (vllm style)
+        // gate_states: (B, S, NH, HD)
+        let gate = candle_nn::ops::sigmoid(&gate_states.to_dtype(DType::F32)?)?;
+
+        // Ensure attn_output matches gate shape (B, S, NH, HD)
+        let mut final_attn = attn_output.to_dtype(DType::F32)?;
+        if final_attn.rank() == 4 && final_attn.dim(1)? == self.nh && gate.dim(1)? == q_len {
+            // attn_output is (B, NH, S, HD), gate is (B, S, NH, HD) -> Transpose attn_output
+            final_attn = final_attn.transpose(1, 2)?.contiguous()?;
+        }
+
+        let attn_output = final_attn.broadcast_mul(&gate)?; // Should be (B, S, NH, HD)
+
         let attn_output = attn_output.reshape((b_sz, q_len, ()))?.contiguous()?;
-        
+
+        // 8. O-Proj
         self.o_proj.forward(&attn_output.to_dtype(DType::F16)?, reg)
-    }
-}
+        }
+        }
 
 pub struct QDecoderLayer { pub idx: usize, pub self_attn: Option<QAttention>, pub linear_attn: Option<QGatedDeltaNet>, pub mlp_gate: QLinear, pub mlp_up: QLinear, pub mlp_down: QLinear, pub in_norm: QRmsNorm, pub post_norm: QRmsNorm }
 impl QDecoderLayer {
@@ -477,14 +522,20 @@ impl QTextModel {
 pub struct QuantizedQwen3_5Model { pub model: QTextModel, pub head: QLinear, pub tie: bool }
 impl QuantizedQwen3_5Model {
     pub fn new(vb: VarBuilder, config: Qwen3_5Config) -> Result<Self> {
+        let model = QTextModel::new(vb.pp("model.language_model"), &config.text_config)?;
         let head_name = if config.tie_word_embeddings { join_name(&vb.prefix(), "model.language_model.embed_tokens") } else { join_name(&vb.prefix(), "model.language_model.lm_head") };
-        Ok(Self { model: QTextModel::new(vb.pp("model.language_model"), &config.text_config)?, head: QLinear::new(&head_name)?, tie: config.tie_word_embeddings })
+        let mut head = QLinear::new(&head_name)?;
+        
+        if config.tie_word_embeddings {
+            // Share the same persistent weight handle
+            head.persistent_weight = model.embed.persistent_weight.clone();
+        }
+        
+        Ok(Self { model, head, tie: config.tie_word_embeddings })
     }
     pub fn load_all_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { 
         self.model.load_all_to_vram(reg, dev)?; 
-        if self.tie { 
-            *self.head.persistent_weight.write().unwrap() = self.model.embed.persistent_weight.read().unwrap().clone();
-        } else { 
+        if !self.tie { 
             self.head.load_to_vram(reg, dev)?; 
         } 
         Ok(()) 
