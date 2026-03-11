@@ -82,23 +82,23 @@ impl QuantizedRegistry {
 fn dequantize_q2(t: &Tensor, dev: &Device) -> Result<Tensor> {
     if t.dtype() == DType::U8 && t.rank() == 2 && t.dim(1)? == 10 {
         let num_blocks = t.dim(0)?;
-        let t_cpu = t.to_device(&Device::Cpu)?;
-        let data = t_cpu.flatten_all()?.to_vec1::<u8>()?;
-        let mut res_data = vec![f16::ZERO; num_blocks * 32];
-        for i in 0..num_blocks {
-            let offset = i * 10;
-            let s_raw = u16::from_le_bytes([data[offset], data[offset + 1]]);
-            let scale = f16::from_bits(s_raw).to_f32();
-            for j in 0..8 {
-                let byte = data[offset + 2 + j];
-                for k in 0..4 {
-                    let val = (byte >> (k * 2)) & 0x03;
-                    let f_val = (val as f32 - 1.5) * scale;
-                    res_data[i * 32 + j * 4 + k] = f16::from_f32(f_val);
-                }
-            }
+        let t_gpu = t.to_device(dev)?;
+        let scales_u16 = t.narrow(1, 0, 2)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
+        let scales = Tensor::from_raw_buffer(&scales_u16, DType::F16, &[num_blocks], dev)?.unsqueeze(D::Minus1)?;
+        
+        let data_bytes = t_gpu.narrow(1, 2, 8)?.to_dtype(DType::F16)?;
+        let mut final_res = vec![];
+        
+        for i in 0..4 {
+            let div = (1 << (i * 2)) as f64;
+            let shifted = data_bytes.affine(1.0 / div, 0.0)?.floor()?;
+            let floored = shifted.affine(1.0 / 4.0, 0.0)?.floor()?.affine(4.0, 0.0)?;
+            let val = shifted.sub(&floored)?.affine(1.0, -1.5)?;
+            final_res.push(val.broadcast_mul(&scales)?);
         }
-        Ok(Tensor::from_vec(res_data, (num_blocks, 32), dev)?)
+        
+        // Stack results and reshape directly to f16 to save space
+        Ok(Tensor::stack(&final_res, D::Minus1)?.reshape((num_blocks, 32))?)
     } else {
         Ok(t.to_device(dev)?.to_dtype(DType::F16)?)
     }

@@ -103,8 +103,8 @@ impl Qwen3_5GenerateModel {
         let mut last_logits = None;
 
         self.qwen3_5.clear_cache();
-        // Use memory-based KV cache for performance
-        let mut kv_manager = KVStateManager::new(self.qwen3_5.model.layers.len(), true)?;
+        // Use file-based KV cache for memory efficiency
+        let mut kv_manager = KVStateManager::new(self.qwen3_5.model.layers.len(), false)?;
 
         let num_layers = self.qwen3_5.model.layers.len();
 
