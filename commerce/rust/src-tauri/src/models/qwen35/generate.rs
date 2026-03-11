@@ -129,7 +129,11 @@ impl Qwen3_5GenerateModel {
             
             // RoPE & Mask
             let pos_vec: Vec<u32> = (seqlen_offset as u32..(seqlen_offset + current_chunk) as u32).collect();
-            let pos = Tensor::from_vec(pos_vec, (1, current_chunk), &self.device)?.unsqueeze(0)?.broadcast_as((3, input_ids.dim(0)?, current_chunk))?.contiguous()?;
+            let pos = Tensor::from_vec(pos_vec, (1, current_chunk), &self.device)?
+                .unsqueeze(0)?
+                .broadcast_as((3, input_ids.dim(0)?, current_chunk))?
+                .to_dtype(DType::U32)?
+                .contiguous()?;
             let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos, DType::F16, self.qwen3_5.model.mrope.clone())?;
             let mask = if current_chunk <= 1 && seqlen_offset == 0 { None } else { 
                 Some(crate::utils::tensor_utils::prepare_causal_attention_mask(input_ids.dim(0)?, current_chunk, seqlen_offset, &self.device)?.to_dtype(DType::F16)?) 

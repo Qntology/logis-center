@@ -109,6 +109,7 @@ impl QRmsNorm {
     pub fn new(name: &str, eps: f64, offset: f64) -> Result<Self> { Ok(Self { full_name: name.to_string(), eps, offset, persistent_weight: Arc::new(RwLock::new(None)) }) }
     pub fn clear_vram(&mut self) { *self.persistent_weight.write().unwrap() = None; }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
+        if self.persistent_weight.read().unwrap().is_some() { return Ok(()); }
         let w = reg.get_q_tensor(&self.full_name, "weight")?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
         let w = if self.offset != 0.0 { w.affine(1.0, self.offset)? } else { w };
         let w = w.to_dtype(DType::F16)?.to_device(dev)?;
@@ -129,19 +130,11 @@ impl QRmsNorm {
                     *cache = Some(w.clone());
                     w
                 };
+        
         let x_f32 = x.to_dtype(DType::F32)?;
-        let original_shape = x.dims().to_vec();
-        let last_dim = x.dim(D::Minus1)?;
-        let w_size = w.elem_count();
-        let norm_ = x_f32.powf(2.0)?.mean_keepdim(D::Minus1)?.affine(1.0, self.eps)?.sqrt()?;
-        let x_normed = x_f32.broadcast_div(&norm_)?;
-        let res = if w_size == last_dim {
-            x_normed.broadcast_mul(&w.to_dtype(DType::F32)?)?
-        } else {
-            let reshaped = x_normed.reshape(((), w_size))?;
-            let r = reshaped.broadcast_mul(&w.to_dtype(DType::F32)?.reshape((1, w_size))?)?;
-            r.reshape(original_shape)?
-        };
+        let norm = x_f32.powf(2.0)?.mean_keepdim(D::Minus1)?.affine(1.0, self.eps)?.sqrt()?;
+        let x_normed = x_f32.broadcast_div(&norm)?;
+        let res = x_normed.broadcast_mul(&w.to_dtype(DType::F32)?)?;
         Ok(res.to_dtype(DType::F16)?)
     }
 }
@@ -151,6 +144,7 @@ impl QLinear {
     pub fn new(name: &str) -> Result<Self> { Ok(Self { full_name: name.to_string(), persistent_weight: Arc::new(RwLock::new(None)), persistent_bias: Arc::new(RwLock::new(None)) }) }
     pub fn clear_vram(&mut self) { *self.persistent_weight.write().unwrap() = None; *self.persistent_bias.write().unwrap() = None; }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
+        if self.persistent_weight.read().unwrap().is_some() { return Ok(()); }
         let t = reg.get_q_tensor(&self.full_name, "weight")?;
         *self.persistent_weight.write().unwrap() = Some(dequantize_q2(&t, dev)?);
         if let Ok(b) = reg.get_q_tensor(&self.full_name, "bias") { 
@@ -242,6 +236,7 @@ impl QGatedDeltaNet {
         self.out_proj.clear_vram(); self.norm.clear_vram(); self.dt_bias = None; self.a_log = None; self.conv1d = None;
     }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { 
+        if self.in_proj_qkv.persistent_weight.read().unwrap().is_some() { return Ok(()); }
         self.in_proj_qkv.load_to_vram(reg, dev)?; self.in_proj_z.load_to_vram(reg, dev)?; self.in_proj_b.load_to_vram(reg, dev)?; self.in_proj_a.load_to_vram(reg, dev)?;
         self.out_proj.load_to_vram(reg, dev)?; self.norm.load_to_vram(reg, dev)?; 
         let p = self.norm.full_name.replace(".norm", "");
@@ -364,27 +359,42 @@ impl QAttention {
     }
     pub fn clear_vram(&mut self) { self.q_proj.clear_vram(); self.k_proj.clear_vram(); self.v_proj.clear_vram(); self.o_proj.clear_vram(); self.q_norm.clear_vram(); self.k_norm.clear_vram(); }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
+        if self.q_proj.persistent_weight.read().unwrap().is_some() { return Ok(()); }
         self.q_proj.load_to_vram(reg, dev)?; self.k_proj.load_to_vram(reg, dev)?; self.v_proj.load_to_vram(reg, dev)?; self.o_proj.load_to_vram(reg, dev)?;
         self.q_norm.load_to_vram(reg, dev)?; self.k_norm.load_to_vram(reg, dev)?; Ok(())
     }
     pub fn forward(&mut self, xs: &Tensor, cos: &Tensor, sin: &Tensor, attention_mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
         let query_chunk = self.q_proj.forward(xs, reg)?.reshape((b_sz, q_len, self.nh, self.hd * 2))?.chunk(2, D::Minus1)?;
-        let query_states = self.q_norm.forward(&query_chunk[0].reshape((b_sz, q_len, self.nh, self.hd))?, reg)?.transpose(1, 2)?;
+        
+        // Qwen3.5 uses per-head Q and K normalization
+        let query_states = self.q_norm.forward(&query_chunk[0], reg)?.transpose(1, 2)?;
         let key_states = self.k_norm.forward(&self.k_proj.forward(xs, reg)?.reshape((b_sz, q_len, self.nkv, self.hd))?, reg)?.transpose(1, 2)?;
         let value_states = self.v_proj.forward(xs, reg)?.reshape((b_sz, q_len, self.nkv, self.hd))?.transpose(1, 2)?;
         
         let (query_states, key_states) = glm_interleaved_apply_rotary_pos_emb(&query_states, &key_states, cos, sin, true)?;
         
-        let (key_states, value_states) = match &self.kv_cache {
+        let (key_states, value_states) = match self.kv_cache.take() {
             None => (key_states, value_states),
-            Some((prev_k, prev_v)) => (Tensor::cat(&[prev_k, &key_states], 2)?, Tensor::cat(&[prev_v, &value_states], 2)?),
+            Some((prev_k, prev_v)) => (Tensor::cat(&[prev_k, key_states], 2)?, Tensor::cat(&[prev_v, value_states], 2)?),
         };
-        self.kv_cache = Some((key_states.detach(), value_states.detach()));
+        self.kv_cache = Some((key_states.clone(), value_states.clone()));
         
-        let attn_output = crate::models::common::eager_attention_forward(&query_states.to_dtype(DType::F32)?, &key_states.to_dtype(DType::F32)?, &value_states.to_dtype(DType::F32)?, Some(self.nh / self.nkv), attention_mask, self.scaling)?;
-        let gate = candle_nn::ops::sigmoid(&query_chunk[1].to_dtype(DType::F32)?)?.reshape((b_sz, q_len, self.nh * self.hd))?;
-        let attn_output = attn_output.reshape((b_sz, q_len, self.nh * self.hd))?.contiguous()?.broadcast_mul(&gate)?;
+        let attn_output = crate::models::common::eager_attention_forward(
+            &query_states.to_dtype(DType::F32)?, 
+            &key_states.to_dtype(DType::F32)?, 
+            &value_states.to_dtype(DType::F32)?, 
+            Some(self.nh / self.nkv), 
+            attention_mask, 
+            self.scaling
+        )?;
+        
+        // Attention Gating (vllm style)
+        // attn_output shape: (B, NH, S, D)
+        // query_chunk[1] (gate) shape: (B, S, NH, D)
+        let gate = candle_nn::ops::sigmoid(&query_chunk[1].to_dtype(DType::F32)?)?;
+        let attn_output = attn_output.transpose(1, 2)?.broadcast_mul(&gate)?; // (B, S, NH, D)
+        let attn_output = attn_output.reshape((b_sz, q_len, ()))?.contiguous()?;
         
         self.o_proj.forward(&attn_output.to_dtype(DType::F16)?, reg)
     }
@@ -421,6 +431,7 @@ impl QEmbedding {
     pub fn new(name: &str, vocab_size: usize, hidden_size: usize) -> Self { Self { full_name: name.to_string(), persistent_weight: Arc::new(RwLock::new(None)), vocab_size, hidden_size } }
     pub fn clear_vram(&mut self) { *self.persistent_weight.write().unwrap() = None; }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
+        if self.persistent_weight.read().unwrap().is_some() { return Ok(()); }
         let t = reg.get_q_tensor(&self.full_name, "weight")?;
         *self.persistent_weight.write().unwrap() = Some(dequantize_q2(&t, dev)?.reshape((self.vocab_size, self.hidden_size))?); Ok(())
     }

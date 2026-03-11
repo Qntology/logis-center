@@ -410,86 +410,25 @@ impl Qwen3_5TextRotaryEmbedding {
         freqs: &Tensor,
         mrope_section: Vec<usize>,
     ) -> Result<Tensor> {
-        let mut freqs_t = freqs.i(0)?.contiguous()?; 
-
-        for (dim, section) in mrope_section.iter().enumerate().skip(1) {
-            let length = section * 3;
-            let idx = Tensor::arange_step(dim as u32, length as u32, 3, freqs.device())?
-                .to_dtype(DType::U32)?;
-            let src = freqs.i(dim)?.contiguous()?; 
-            let src = src.index_select(&idx, D::Minus1)?.contiguous()?;
-            let idx_u32 = idx
-                .unsqueeze(0)?
-                .unsqueeze(0)?
-                .broadcast_as(src.shape())?
-                .to_dtype(DType::U32)?
-                .contiguous()?;
-            freqs_t = freqs_t.scatter(&idx_u32, &src, D::Minus1)?;
+        // freqs shape: (3, B, S, D/2)
+        // For text-only, we can simplify this. In vllm, they often just use the temporal channel (0).
+        // However, Qwen3.5 M-RoPE expects concatenating segments from different channels.
+        let mut sections = Vec::new();
+        let freqs_split = freqs.split(&vec![1, 1, 1], 0)?; // Vec of (1, B, S, D/2)
+        
+        let mut current_dim = 0;
+        for (i, &section_len) in mrope_section.iter().enumerate() {
+            if section_len == 0 { continue; }
+            let channel_freqs = freqs_split[i].squeeze(0)?; // (B, S, D/2)
+            let section = channel_freqs.narrow(D::Minus1, current_dim, section_len)?;
+            sections.push(section);
+            current_dim += section_len;
         }
-        Ok(freqs_t)
-    }
-
-    pub fn apply_interleaved_mrope_asr(
-        &self,
-        freqs: &Tensor,
-        mrope_section: Vec<usize>,
-    ) -> Result<Tensor> {
-        let mut freqs_t = freqs.i(0)?.contiguous()?; 
-
-        for (dim, offset) in (1..3).enumerate() {
-            let dim = dim + 1;
-            let length = mrope_section[dim];
-            let idx = Tensor::arange_step(offset as u32, length as u32, 3, freqs.device())?
-                .to_dtype(DType::U32)?;
-            let src = freqs.i(dim)?.contiguous()?; 
-            let src = src.index_select(&idx, D::Minus1)?.contiguous()?;
-            let idx_u32 = idx
-                .unsqueeze(0)?
-                .unsqueeze(0)?
-                .broadcast_as(src.shape())?
-                .to_dtype(DType::U32)?
-                .contiguous()?;
-            freqs_t = freqs_t.scatter(&idx_u32, &src, D::Minus1)?;
+        
+        if sections.is_empty() {
+             return Ok(freqs.i(0)?);
         }
-        Ok(freqs_t)
-    }
-
-    pub fn forward_asr(
-        &self,
-        position_ids: &Tensor,
-        dtype: DType,
-        mrope_section: Vec<usize>,
-    ) -> Result<(Tensor, Tensor)> {
-        let position_ids = if position_ids.rank() == 2 {
-            let (bs, len) = position_ids.dims2()?;
-            position_ids.unsqueeze(0)?.expand((3, bs, len))?
-        } else {
-            position_ids.clone()
-        };
-        let position_ids_expanded = position_ids
-            .unsqueeze(D::Minus2)?
-            .to_dtype(DType::F32)?
-            .contiguous()?;
-        let inv_freq_expanded = Tensor::from_vec(
-            self.inv_freq.clone(),
-            (1, 1, self.inv_freq.len(), 1),
-            position_ids.device(),
-        )?
-        .broadcast_as((3, position_ids.dim(1)?, self.inv_freq.len(), 1))?
-        .to_dtype(DType::F32)?
-        .contiguous()?;
-
-        let freqs = inv_freq_expanded
-            .matmul(&position_ids_expanded)?
-            .transpose(2, 3)?;
-        let freqs = self.apply_interleaved_mrope_asr(&freqs, mrope_section)?;
-        let emb = freqs.unsqueeze(D::Minus1)?
-            .broadcast_add(&Tensor::zeros((1, 1, 1, 1, 2), DType::F32, freqs.device())?)?
-            .reshape(freqs.dims().iter().cloned().take(freqs.rank()-1).chain([freqs.dim(D::Minus1)? * 2]).collect::<Vec<_>>())?
-            .contiguous()?;
-        let cos = emb.cos()?;
-        let sin = emb.sin()?;
-        Ok((cos.to_dtype(dtype)?, sin.to_dtype(dtype)?))
+        Ok(Tensor::cat(&sections, D::Minus1)?)
     }
 
     pub fn forward(
@@ -498,38 +437,35 @@ impl Qwen3_5TextRotaryEmbedding {
         dtype: DType,
         mrope_section: Vec<usize>,
     ) -> Result<(Tensor, Tensor)> {
-        let position_ids = position_ids.to_dtype(DType::U32)?;
-        let position_ids = if position_ids.rank() == 2 {
-            let (bs, len) = position_ids.dims2()?;
-            position_ids.unsqueeze(0)?.expand((3, bs, len))?
-        } else {
-            position_ids
-        };
-        let position_ids_expanded = position_ids
-            .unsqueeze(D::Minus2)?
-            .to_dtype(DType::F32)?
-            .contiguous()?;
-        let inv_freq_expanded = Tensor::from_vec(
-            self.inv_freq.clone(),
-            (1, 1, self.inv_freq.len(), 1),
-            position_ids.device(),
-        )?
-        .broadcast_as((3, position_ids.dim(1)?, self.inv_freq.len(), 1))?
-        .to_dtype(DType::F32)?
-        .contiguous()?;
-
-        let freqs = inv_freq_expanded
-            .matmul(&position_ids_expanded)?
-            .transpose(2, 3)?;
-        let freqs = self.apply_interleaved_mrope(&freqs, mrope_section)?;
-        // For interleaved RoPE, we want [f1, f1, f2, f2, ...]
+        // position_ids shape: (3, B, S)
+        let (num_channels, b_sz, q_len) = position_ids.dims3()?;
+        let dev = position_ids.device();
+        
+        // inv_freq: (D/2)
+        let inv_freq = Tensor::from_vec(self.inv_freq.clone(), (self.inv_freq.len(),), dev)?;
+        
+        // Compute freqs for each channel
+        // position_ids: (3, B, S) -> (3, B, S, 1)
+        // inv_freq: (D/2) -> (1, 1, 1, D/2)
+        let pos_expanded = position_ids.unsqueeze(D::Minus1)?.to_dtype(DType::F32)?;
+        let inv_freq_expanded = inv_freq.reshape((1, 1, 1, ()))?;
+        
+        // (3, B, S, D/2)
+        let freqs = pos_expanded.broadcast_mul(&inv_freq_expanded)?;
+        
+        // Apply M-RoPE sectioning
+        let freqs = self.apply_interleaved_mrope(&freqs, mrope_section)?; // (B, S, D/2)
+        
+        // Create interleaved: [f1, f1, f2, f2, ...]
+        // (B, S, D/2) -> (B, S, D/2, 2) -> (B, S, D)
         let emb = freqs.unsqueeze(D::Minus1)?
-            .broadcast_add(&Tensor::zeros((1, 1, 1, 1, 2), DType::F32, freqs.device())?)?
-            .reshape(freqs.dims().iter().cloned().take(freqs.rank()-1).chain([freqs.dim(D::Minus1)? * 2]).collect::<Vec<_>>())?
-            .contiguous()?;
-        let cos = emb.cos()?;
-        let sin = emb.sin()?;
-        Ok((cos.to_dtype(dtype)?, sin.to_dtype(dtype)?))
+            .broadcast_add(&Tensor::zeros((1, 1, 1, 2), DType::F32, dev)?)?
+            .reshape((b_sz, q_len, ()))?;
+            
+        let cos = emb.cos()?.to_dtype(dtype)?;
+        let sin = emb.sin()?.to_dtype(dtype)?;
+        
+        Ok((cos, sin))
     }
 }
 
