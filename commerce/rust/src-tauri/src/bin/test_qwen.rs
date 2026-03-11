@@ -26,12 +26,24 @@ async fn main() -> Result<()> {
     use tauri_app_lib::models::qwen35::generate::Qwen3_5GenerateModel;
     use tauri_app_lib::tokenizer::TokenizerModel;
 
-    let tokenizer = TokenizerModel::init(model_path)?;
-    // Use the original unsplit file from the root
-    let root_weight = "../model.safetensors-00001-of-00001.safetensors";
-    let model_files = vec![root_weight.to_string()];
+    let _tokenizer = TokenizerModel::init(model_path)?;
     
-    let tokenizer = TokenizerModel::init(model_path)?;
+    // Automatically find all .st files in the model path
+    let mut model_files = vec![];
+    for entry in std::fs::read_dir(model_path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("st") {
+            model_files.push(path.to_str().unwrap().to_string());
+        }
+    }
+    
+    if model_files.is_empty() {
+        anyhow::bail!("No .st files found in {}", model_path);
+    }
+
+    println!("📚 Loading {} model files...", model_files.len());
+    
     // Modified init to use our specific root weight
     let mut model = Qwen3_5GenerateModel::init_with_files(&model_files, model_path, Some(&device), Some(DType::F16))?;
     

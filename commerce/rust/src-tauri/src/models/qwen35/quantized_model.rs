@@ -58,14 +58,42 @@ impl QuantizedRegistry {
     }
 }
 
-pub struct QRmsNorm { full_name: String, eps: f64, persistent_weight: Option<Tensor> }
+fn dequantize_q2(t: &Tensor, dev: &Device) -> Result<Tensor> {
+    if t.rank() == 2 && t.dim(1)? == 10 && t.dtype() == DType::U8 {
+        let num_blocks = t.dim(0)?;
+        let scale_bytes = t.narrow(1, 0, 2)?; 
+        let data_bytes = t.narrow(1, 2, 8)?;  
+        
+        let scales = Tensor::from_raw_buffer(&scale_bytes.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?, DType::F16, &[num_blocks], dev)?;
+
+        let mut parts = vec![];
+        let d_f32 = data_bytes.to_dtype(DType::F32)?;
+        for i in 0..4 {
+            let div = (1 << (i * 2)) as f64;
+            let vals = d_f32.affine(1.0 / div, 0.0)?;
+            let floor_val = vals.affine(1.0 / 4.0, 0.0)?.floor()?.affine(4.0, 0.0)?;
+            let bit_vals = vals.sub(&floor_val)?;
+            parts.push(bit_vals.to_dtype(DType::F16)?);
+        }
+        let combined = Tensor::stack(&parts, D::Minus1)?.reshape((num_blocks, 32))?;
+        
+        let offset = Tensor::new(1.5f32, dev)?.to_dtype(DType::F16)?;
+        Ok(combined.broadcast_sub(&offset)?.broadcast_mul(&scales.unsqueeze(D::Minus1)?)?)
+    } else {
+        Ok(t.to_dtype(DType::F16)?)
+    }
+}
+
+pub struct QRmsNorm { full_name: String, eps: f64, persistent_weight: Option<Tensor>, is_gated: bool }
 impl QRmsNorm {
-    pub fn new(name: &str, eps: f64) -> Result<Self> { Ok(Self { full_name: name.to_string(), eps, persistent_weight: None }) }
+    pub fn new(name: &str, eps: f64) -> Result<Self> { Ok(Self { full_name: name.to_string(), eps, persistent_weight: None, is_gated: false }) }
+    pub fn new_gated(name: &str, eps: f64) -> Result<Self> { Ok(Self { full_name: name.to_string(), eps, persistent_weight: None, is_gated: true }) }
     pub fn clear_vram(&mut self) { self.persistent_weight = None; }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         let w = reg.get_q_tensor(&self.full_name, "weight")?.to_device(dev)?.to_dtype(DType::F32)?;
-        // Official aha-main: weight = weight + 1.0
-        let w = w.affine(1.0, 1.0)?.to_dtype(DType::F16)?;
+        // Official aha-main: input/post norm uses weight = weight + 1.0, but gated norm uses raw weight.
+        let w = if self.is_gated { w } else { w.affine(1.0, 1.0)? };
+        let w = w.to_dtype(DType::F16)?;
         self.persistent_weight = Some(w); Ok(())
     }
     pub fn forward(&self, x: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
@@ -73,37 +101,47 @@ impl QRmsNorm {
         let w = if let Some(pw) = &self.persistent_weight { pw.clone() } 
                 else { 
                     let w = reg.get_q_tensor(&self.full_name, "weight")?.to_device(dev)?.to_dtype(DType::F32)?;
-                    w.affine(1.0, 1.0)?.to_dtype(DType::F16)?
+                    let w = if self.is_gated { w } else { w.affine(1.0, 1.0)? };
+                    w.to_dtype(DType::F16)?
                 };
         
         let x_f32 = x.to_dtype(DType::F32)?;
         let original_shape = x.dims().to_vec();
-        // Official formula: x / sqrt(mean(x^2) + eps)
-        let norm_ = x_f32.powf(2.0)?.mean_keepdim(D::Minus1)?.affine(1.0, self.eps)?.sqrt()?;
-        let norm = x_f32.broadcast_div(&norm_)?;
         
-        let w_size = w.elem_count();
         let last_dim = x.dim(D::Minus1)?;
-        
-        let res = if w_size == last_dim {
-            norm.broadcast_mul(&w.to_dtype(DType::F32)?)?
+        let w_size = w.elem_count();
+
+        // Ensure we normalize over the correct dimension (w_size)
+        let (x_normed, current_shape) = if w_size != last_dim {
+            let reshaped = x_f32.reshape(((), w_size))?;
+            (reshaped, vec![0]) // mark as reshaped
         } else {
-            let x_norm_reshaped = norm.reshape(((), w_size))?;
-            let r = x_norm_reshaped.broadcast_mul(&w.to_dtype(DType::F32)?.reshape((1, w_size))?)?;
-            r.reshape(original_shape)?
+            (x_f32, original_shape.clone())
         };
-        Ok(res.to_dtype(DType::F16)?)
+
+        // Official formula: x / sqrt(mean(x^2) + eps)
+        let norm_ = x_normed.powf(2.0)?.mean_keepdim(D::Minus1)?.affine(1.0, self.eps)?.sqrt()?;
+        let x_normed = x_normed.broadcast_div(&norm_)?;
+        
+        let res = x_normed.broadcast_mul(&w.to_dtype(DType::F32)?.reshape((1, w_size))?)?;
+        
+        if w_size != last_dim {
+            Ok(res.reshape(original_shape)?.to_dtype(DType::F16)?)
+        } else {
+            Ok(res.to_dtype(DType::F16)?)
+        }
     }
 }
 
 pub struct QRmsNormGated { norm: QRmsNorm }
 impl QRmsNormGated {
-    pub fn new(name: &str, eps: f64) -> Result<Self> { Ok(Self { norm: QRmsNorm::new(name, eps)? }) }
+    pub fn new(name: &str, eps: f64) -> Result<Self> { Ok(Self { norm: QRmsNorm::new_gated(name, eps)? }) }
     pub fn clear_vram(&mut self) { self.norm.clear_vram(); }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { self.norm.load_to_vram(reg, dev) }
     pub fn forward(&self, x: &Tensor, gate: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
         let x_norm = self.norm.forward(x, reg)?;
-        Ok(x_norm.broadcast_mul(&candle_nn::ops::sigmoid(gate)?.to_dtype(DType::F16)?)?)
+        // Official aha-main: gated norm uses silu (x * sigmoid(x))
+        Ok(x_norm.broadcast_mul(&gate.silu()?.to_dtype(DType::F16)?)?)
     }
 }
 
@@ -114,46 +152,14 @@ impl QLinear {
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         let name = &self.full_name;
         let t = reg.get_q_tensor(name, "weight")?.to_device(dev)?;
-        
-        // 1. Check if this is a Q2-combined blob [num_blocks, 10]
-        if t.rank() == 2 && t.dim(1)? == 10 && t.dtype() == DType::U8 {
-            let num_blocks = t.dim(0)?;
-            let scale_bytes = t.narrow(1, 0, 2)?; 
-            let data_bytes = t.narrow(1, 2, 8)?;  
-            
-            let scales = Tensor::from_raw_buffer(&scale_bytes.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?, DType::F16, &[num_blocks], dev)?;
-
-            let mut parts = vec![];
-            let d_f32 = data_bytes.to_dtype(DType::F32)?;
-            for i in 0..4 {
-                let div = (1 << (i * 2)) as f64;
-                let vals = d_f32.affine(1.0 / div, 0.0)?;
-                let floor_val = vals.affine(1.0 / 4.0, 0.0)?.floor()?.affine(4.0, 0.0)?;
-                let bit_vals = vals.sub(&floor_val)?;
-                parts.push(bit_vals.to_dtype(DType::F16)?);
-            }
-            let combined = Tensor::stack(&parts, D::Minus1)?.reshape((num_blocks, 32))?;
-            
-            let offset = Tensor::new(1.5f32, dev)?.to_dtype(DType::F16)?;
-            let dequant = combined.broadcast_sub(&offset)?.broadcast_mul(&scales.unsqueeze(D::Minus1)?)?;
-            
-            // Critical: Get original shape from metadata if possible, else use default heuristic
-            // For 0.8B Qwen3.5, layers are mostly 1536, 1024, 4096 etc.
-            let total_elements = num_blocks * 32;
-            self.persistent_weight = Some(dequant.reshape(((), total_elements / (total_elements / 32)))?.flatten_all()?.reshape(((), 32))?); // Temporary flat
-            // We'll let forward() handle the final matmul shape
-            self.persistent_weight = Some(dequant.flatten_all()?);
-        } else {
-            self.persistent_weight = Some(t.to_dtype(DType::F16)?);
-        }
-
+        self.persistent_weight = Some(dequantize_q2(&t, dev)?.flatten_all()?);
         if let Ok(b) = reg.get_q_tensor(name, "bias") { self.persistent_bias = Some(b.to_device(dev)?.to_dtype(DType::F16)?); }
         Ok(())
     }
     pub fn forward(&self, x: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
         let dev = x.device(); let name = &self.full_name;
         let w = if let Some(pw) = &self.persistent_weight { pw.clone() } 
-                else { reg.get_q_tensor(name, "weight")?.to_device(dev)?.to_dtype(DType::F16)? };
+                else { dequantize_q2(&reg.get_q_tensor(name, "weight")?.to_device(dev)?, dev)?.flatten_all()? };
         
         let in_features = x.dim(D::Minus1)?;
         let out_features = w.elem_count() / in_features;
@@ -184,7 +190,6 @@ impl QGatedDeltaNet {
         let p = vb.prefix();
         let nk = config.linear_num_key_heads; let dk = config.linear_key_head_dim;
         let nv = config.linear_num_value_heads; let dv = config.linear_value_head_dim;
-        let conv_dim = (nk * dk) * 2 + (nv * dv);
         Ok(Self { 
             in_proj_qkv: QLinear::new(&join_name(&p, "in_proj_qkv"))?,
             in_proj_z: QLinear::new(&join_name(&p, "in_proj_z"))?,
@@ -209,8 +214,11 @@ impl QGatedDeltaNet {
         // Based on available_tensors.txt: model.language_model.layers.N.linear_attn.A_log
         if let Ok(dt) = reg.get_tensor(&format!("{}.dt_bias", p)) { self.dt_bias = Some(dt.to_device(dev)?.to_dtype(DType::F32)?); }
         if let Ok(a) = reg.get_tensor(&format!("{}.A_log", p)) { self.a_log = Some(a.to_device(dev)?.to_dtype(DType::F32)?); }
-        if let Ok(cw) = reg.get_tensor(&format!("{}.conv1d.weight", p)) {
-            let c_w = cw.to_device(dev)?.to_dtype(DType::F16)?;
+        if let Ok(cw) = reg.get_q_tensor(&format!("{}.conv1d", p), "weight") {
+            let cw = cw.to_device(dev)?;
+            let dequant = dequantize_q2(&cw, dev)?;
+            let out_c = (self.nk * self.dk) * 2 + (self.nv * self.dv);
+            let c_w = dequant.reshape((out_c, 1, ()))?;
             let (out_c, in_c, k) = c_w.dims3()?;
             let vb = vb_from_weights(c_w, None, dev)?;
             self.conv1d = Some(crate::models::common::get_conv1d(vb, in_c, out_c, k, k - 1, 1, 1, in_c, false)?);
@@ -454,26 +462,25 @@ impl QDecoderLayer {
     }
 }
 
-pub struct QEmbedding { full_name: String, persistent_weight: Option<Tensor> }
+pub struct QEmbedding { full_name: String, persistent_weight: Option<Tensor>, vocab_size: usize, hidden_size: usize }
 impl QEmbedding {
-    pub fn new(name: &str) -> Self { Self { full_name: name.to_string(), persistent_weight: None } }
+    pub fn new(name: &str, vocab_size: usize, hidden_size: usize) -> Self { Self { full_name: name.to_string(), persistent_weight: None, vocab_size, hidden_size } }
     pub fn clear_vram(&mut self) { self.persistent_weight = None; }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         let name = &self.full_name;
-        if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "q_scales"), reg.get_q_tensor(name, "q_data"), reg.get_q_tensor(name, "q_shape")) {
-            let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
-            let s = s_t.to_device(dev)?.to_dtype(DType::F16)?; let d = d_t.to_device(dev)?.to_dtype(DType::F16)?;
-            let high = (d.clone() / 16.0)?.floor()?; let low = d.sub(&(high.clone() * 16.0)?)?;
-            let combined = Tensor::stack(&[low.affine(1.0, -8.0)?, high.affine(1.0, -8.0)?], D::Minus1)?.reshape(((), 32))?;
-            self.persistent_weight = Some(combined.broadcast_mul(&s.unsqueeze(D::Minus1)?)?.reshape(shape.as_slice())?);
-        } else {
-            self.persistent_weight = Some(reg.get_q_tensor(name, "weight")?.to_device(dev)?.to_dtype(DType::F16)?);
-        }
+        let t = reg.get_q_tensor(name, "weight")?.to_device(dev)?;
+        let dequant = dequantize_q2(&t, dev)?;
+        self.persistent_weight = Some(dequant.reshape((self.vocab_size, self.hidden_size))?);
         Ok(())
     }
     pub fn forward(&self, ids: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
         let (b, s) = ids.dims2()?; let dev = ids.device();
-        let w = if let Some(pw) = &self.persistent_weight { pw.clone() } else { reg.get_q_tensor(&self.full_name, "weight")?.to_device(dev)?.to_dtype(DType::F16)? };
+        let max_id = ids.flatten_all()?.to_dtype(DType::F32)?.max(0)?.to_vec0::<f32>()?;
+        let w = if let Some(pw) = &self.persistent_weight { pw.clone() } else { 
+            let t = reg.get_q_tensor(&self.full_name, "weight")?.to_device(dev)?;
+            dequantize_q2(&t, dev)?.reshape((self.vocab_size, self.hidden_size))?
+        };
+        println!("[DEBUG-EMBED] ids: {:?}, max_id: {}, vocab: {}, w_dims: {:?}", ids.dims(), max_id, self.vocab_size, w.dims());
         let embeds = w.index_select(&ids.flatten_all()?.to_dtype(DType::U32)?, 0)?.reshape((b, s, ()))?.to_device(dev)?.to_dtype(DType::F16)?;
         Ok(embeds)
     }
@@ -487,7 +494,7 @@ impl QTextModel {
         // Official Qwen 3.5 uses 1,000,000 for rope_theta
         let rope_theta = 1000000.0;
         Ok(Self { 
-            embed: QEmbedding::new(&join_name(&p, "embed_tokens")), 
+            embed: QEmbedding::new(&join_name(&p, "embed_tokens"), config.vocab_size, config.hidden_size), 
             layers, 
             norm: QRmsNorm::new(&join_name(&p, "norm"), config.rms_norm_eps)?, 
             rotary: Qwen3_5TextRotaryEmbedding::new((config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize, rope_theta), 
