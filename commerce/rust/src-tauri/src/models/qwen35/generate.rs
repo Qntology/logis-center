@@ -206,6 +206,19 @@ impl Qwen3_5GenerateModel {
             }
 
             let current_logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+            
+            // [DEBUG] Top-5 Tokens
+            if step < 3 {
+                let logits_v = current_logits.to_vec1::<f32>()?;
+                let mut indexed: Vec<(usize, f32)> = logits_v.into_iter().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                println!("\n[DEBUG-TOKEN] Step {}: ", step);
+                for i in 0..5 {
+                    let token_text = self.tokenizer.token_decode(vec![indexed[i].0 as u32]).unwrap_or_default();
+                    println!("  - Top {}: ID={}, Prob={:.4}, Text='{}'", i+1, indexed[i].0, indexed[i].1, token_text);
+                }
+            }
+
             let next_token = logit_processor.sample(&current_logits)?;
             
             if next_token == self.eos_token_id { break; }

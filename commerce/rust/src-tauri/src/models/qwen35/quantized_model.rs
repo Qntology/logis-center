@@ -127,8 +127,8 @@ impl QLinear {
         };
         
         let x_in_dim = x.dim(D::Minus1)?;
-        // Shared Weight(embed_tokens)를 사용할 때만 전치합니다. (그 외 레이어는 그대로 사용)
-        let w = if name.contains("embed_tokens") && w_raw.dim(0)? > w_raw.dim(1)? { w_raw.t()? } else { w_raw };
+        // 대부분의 PyTorch 가중치는 [out, in] 모양이므로, [sl, in] @ [in, out]을 위해 전치합니다.
+        let w = if w_raw.dim(1)? == x_in_dim { w_raw.t()? } else { w_raw };
         
         let res = x.contiguous()?.broadcast_matmul(&w.to_dtype(DType::F16)?.contiguous()?)?;
         if let Some(pb) = &self.persistent_bias { Ok(res.broadcast_add(pb)?) }
@@ -235,20 +235,17 @@ impl QGatedDeltaNet {
             state = state.broadcast_mul(&gt)?;
 
             let bt = beta.narrow(1, t, 1)?.reshape((bs, nk, 1))?;
-            
-            // Standard Linear Attention (GLA) 업데이트: S = S + beta * (kt.T @ vt)
-            let update = kt.unsqueeze(D::Minus1)?.broadcast_matmul(&vt.unsqueeze(D::Minus2)?)?
-                .broadcast_mul(&bt.unsqueeze(D::Minus1)?)?;
-            
+            let v_prime = kt.unsqueeze(D::Minus2)?.broadcast_matmul(&state)?.squeeze(D::Minus2)?; 
+            let error = vt.sub(&v_prime)?.broadcast_mul(&bt)?;
+            let update = kt.unsqueeze(D::Minus1)?.broadcast_matmul(&error.unsqueeze(D::Minus2)?)?;
             state = state.add(&update)?;
             
-            let out_t = state.broadcast_mul(&qt.unsqueeze(D::Minus1)?)?.sum(D::Minus2)?; 
+            let out_t = qt.unsqueeze(D::Minus2)?.broadcast_matmul(&state)?.squeeze(D::Minus2)?; 
             outputs.push(out_t.unsqueeze(1)?.to_dtype(DType::F16)?);
         }
 
         let out = Tensor::cat(&outputs, 1)?.reshape((bs, sl, nv * dv))?;
         self.delta_state = Some(state.detach().to_device(&Device::Cpu)?);
-        
         let gated_out = self.norm.forward(&out, reg)?;
         let z_gate = z.reshape((bs, sl, nv * dv))?.silu()?;
         self.out_proj.forward(&(gated_out * z_gate)?, reg)
@@ -331,7 +328,11 @@ impl QEmbedding {
     pub fn forward(&self, ids: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
         let (b, s) = ids.dims2()?; let dev = ids.device();
         let w = if let Some(pw) = &self.persistent_weight { pw.clone() } else { reg.get_q_tensor(&self.full_name, "weight")?.to_device(dev)?.to_dtype(DType::F16)? };
-        Ok(w.index_select(&ids.flatten_all()?.to_dtype(DType::U32)?, 0)?.reshape((b, s, ()))?.to_device(dev)?.to_dtype(DType::F16)?)
+        let hidden_size = w.dim(1)?;
+        let embeds = w.index_select(&ids.flatten_all()?.to_dtype(DType::U32)?, 0)?.reshape((b, s, ()))?.to_device(dev)?.to_dtype(DType::F16)?;
+        
+        // Qwen 모델은 임베딩 출력에 sqrt(hidden_size) 스케일을 적용하여 수치 범위를 맞춥니다.
+        Ok(embeds.affine((hidden_size as f64).sqrt(), 0.0)?)
     }
 }
 
