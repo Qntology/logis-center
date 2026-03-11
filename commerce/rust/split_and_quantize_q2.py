@@ -1,14 +1,12 @@
 import os
 import torch
-import numpy as np
 from safetensors.torch import save_file, load_file
 from tqdm import tqdm
 
 def pack_q2_k_combined(tensor):
     """
-    Packs scales and data into a single uint8 tensor to keep the original name.
-    Block size: 32.
-    Each block: 2 bytes (FP16 scale) + 8 bytes (32 elements * 2 bits) = 10 bytes total.
+    Packs scales and data into a single uint8 tensor.
+    Block size: 32. 10 bytes per block (2 bytes scale + 8 bytes data).
     """
     orig_shape = tensor.shape
     tensor = tensor.to(torch.float32).flatten()
@@ -20,7 +18,6 @@ def pack_q2_k_combined(tensor):
     num_blocks = tensor.numel() // block_size
     reshaped = tensor.view(num_blocks, block_size)
     
-    # Calculate scales
     abs_max = reshaped.abs().max(dim=1).values
     scales = (abs_max / 1.5).to(torch.float16)
     scales[scales == 0] = 1.0
@@ -29,69 +26,86 @@ def pack_q2_k_combined(tensor):
     # Mapping: -1.5 -> 0, -0.5 -> 1, 0.5 -> 2, 1.5 -> 3
     quantized = torch.round(reshaped / scales.view(-1, 1).to(torch.float32) + 1.5).clamp(0, 3).to(torch.uint8)
     
-    # Pack data: [num_blocks, 8 bytes]
+    # Pack 4 values (2 bits each) into 1 byte
     q_reshaped = quantized.view(num_blocks, 8, 4)
     packed_data = (q_reshaped[:, :, 0] << 0) | \
                   (q_reshaped[:, :, 1] << 2) | \
                   (q_reshaped[:, :, 2] << 4) | \
                   (q_reshaped[:, :, 3] << 6)
     
-    # Combine Scale (2 bytes) + Data (8 bytes) = 10 bytes per block
     scale_bytes = scales.view(torch.uint8).view(num_blocks, 2)
-    combined = torch.cat([scale_bytes, packed_data], dim=1) # [num_blocks, 10]
+    combined = torch.cat([scale_bytes, packed_data], dim=1)
     
     return combined, orig_shape
-def run_q2_quantization():
-    print("\n[QUANT-Q2] Quantizing EVERYTHING except vision.st to Q2...")
+
+def run_full_restoration():
+    print("\n[RESTORE] Starting FULL restoration from original model.safetensors...")
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    model_dir = os.path.join(base_dir, "src-tauri", "models", "Qwen3.5-0.8B-Split")
+    source_file = os.path.join(base_dir, "model.safetensors-00001-of-00001.safetensors")
+    target_dir = os.path.join(base_dir, "src-tauri", "models", "Qwen3.5-0.8B-Split")
+    
+    if not os.path.exists(source_file):
+        print(f"[ERROR] Source file not found: {source_file}")
+        return
 
-    # Process all .st files except vision.st
-    files = [f for f in os.listdir(model_dir) if f.endswith(".st") and "vision" not in f]
-
-    for filename in tqdm(files, desc="Processing Models"):
-        path = os.path.join(model_dir, filename)
-        if os.path.exists(path):
-            sd = load_file(path)
-            new_sd = {}
-            meta = {"precision": "q2_combined_v1"}
-
-            for name, tensor in sd.items():
-                if ("weight" in name or "embed" in name or "head" in name) and tensor.ndim >= 2:
+    print(f"[INFO] Loading original weights from {source_file}...")
+    full_sd = load_file(source_file)
+    
+    # 1. Process layers 0 to 23
+    for i in range(24):
+        layer_prefix = f"model.language_model.layers.{i}."
+        layer_sd = {}
+        meta = {"precision": "q2_combined_v1"}
+        
+        # Extract tensors for this layer
+        for name, tensor in full_sd.items():
+            if name.startswith(layer_prefix):
+                short_name = name[len(layer_prefix):]
+                
+                # Quantize only weights/embeddings larger than 1D
+                if ("weight" in name) and tensor.ndim >= 2:
                     combined, orig_shape = pack_q2_k_combined(tensor)
-                    new_sd[name] = combined
-                    meta[f"shape.{name}"] = ",".join(map(str, orig_shape))
+                    layer_sd[short_name] = combined
+                    meta[f"shape.{short_name}"] = ",".join(map(str, orig_shape))
                 else:
-                    new_sd[name] = tensor
+                    layer_sd[short_name] = tensor
+        
+        if layer_sd:
+            out_path = os.path.join(target_dir, f"layer_{i}.st")
+            save_file(layer_sd, out_path, metadata=meta)
+            print(f" - layer_{i}.st created ({len(layer_sd)} tensors)")
 
-            temp_path = path + ".tmp"
-            save_file(new_sd, temp_path, metadata=meta)
-            try:
-                if os.path.exists(path): os.remove(path)
-                os.rename(temp_path, path)
-            except:
-                print(f"\n[WARN] Failed to replace {path}. Please ensure it's not locked.")
-            new_sd = {}
-            meta = {"precision": "q2_combined_v1"}
+    # 2. Process Shared tensors
+    shared_sd = {}
+    shared_meta = {"precision": "q2_combined_v1"}
+    shared_prefixes = [
+        "model.language_model.embed_tokens.",
+        "model.language_model.norm.",
+        "model.language_model.lm_head." # Might not exist due to tie
+    ]
+    
+    for name, tensor in full_sd.items():
+        is_shared = False
+        for pref in shared_prefixes:
+            if name.startswith(pref):
+                short_name = name[len("model.language_model."):]
+                is_shared = True
+                break
+        
+        if is_shared:
+            if ("weight" in name) and tensor.ndim >= 2:
+                combined, orig_shape = pack_q2_k_combined(tensor)
+                shared_sd[short_name] = combined
+                shared_meta[f"shape.{short_name}"] = ",".join(map(str, orig_shape))
+            else:
+                shared_sd[short_name] = tensor
+                
+    if shared_sd:
+        out_path = os.path.join(target_dir, "shared.st")
+        save_file(shared_sd, out_path, metadata=shared_meta)
+        print(f" - shared.st created ({len(shared_sd)} tensors)")
 
-            for name, tensor in sd.items():
-                # Quantize weights and embeddings
-                if ("weight" in name or "embed" in name or "head" in name) and tensor.ndim >= 2:
-                    combined, orig_shape = pack_q2_k_combined(tensor)
-                    new_sd[name] = combined
-                    meta[f"shape.{name}"] = ",".join(map(str, orig_shape))
-                else:
-                    new_sd[name] = tensor
-
-            temp_path = path + ".tmp"
-            save_file(new_sd, temp_path, metadata=meta)
-            try:
-                if os.path.exists(path): os.remove(path)
-                os.rename(temp_path, path)
-            except:
-                print(f"\n[WARN] Failed to replace {path}. Please ensure it's not locked.")
-
-    print("\n[SUCCESS] All layers quantized. Original tensor names preserved.")
+    print("\n[SUCCESS] Restoration complete. All files regenerated from original source.")
 
 if __name__ == "__main__":
-    run_q2_quantization()
+    run_full_restoration()

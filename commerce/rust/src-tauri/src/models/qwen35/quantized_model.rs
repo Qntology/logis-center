@@ -36,12 +36,29 @@ impl QuantizedRegistry {
     }
 
     pub fn get_tensor(&self, name: &str) -> Result<Tensor> {
-        let file_path = self.tensor_to_file.get(name).ok_or_else(|| anyhow!("Tensor {} not found", name))?;
-        let mmap = self.mmaps.get(file_path).unwrap();
-        let t = mmap.load(name, &Device::Cpu)?;
-        match t.dtype() {
-            DType::I64 => Ok(t.to_dtype(DType::U32)?),
-            _ => Ok(t),
+        if let Some(file_path) = self.tensor_to_file.get(name) {
+            let mmap = self.mmaps.get(file_path).unwrap();
+            let t = mmap.load(name, &Device::Cpu)?;
+            match t.dtype() {
+                DType::I64 => Ok(t.to_dtype(DType::U32)?),
+                _ => Ok(t),
+            }
+        } else {
+            // Fuzzy matching: try components of the name if full name not found
+            let parts: Vec<&str> = name.split('.').collect();
+            if parts.len() >= 2 {
+                let last_two = format!("{}.{}", parts[parts.len()-2], parts[parts.len()-1]);
+                if let Some(file_path) = self.tensor_to_file.get(&last_two) {
+                    let mmap = self.mmaps.get(file_path).unwrap();
+                    return Ok(mmap.load(&last_two, &Device::Cpu)?);
+                }
+            }
+            let last_one = parts.last().unwrap().to_string();
+            if let Some(file_path) = self.tensor_to_file.get(&last_one) {
+                let mmap = self.mmaps.get(file_path).unwrap();
+                return Ok(mmap.load(&last_one, &Device::Cpu)?);
+            }
+            anyhow::bail!("Tensor {} not found even with fuzzy match", name)
         }
     }
     
@@ -61,7 +78,8 @@ fn dequantize_q2(t: &Tensor, dev: &Device) -> Result<Tensor> {
         let scale_bytes = t.narrow(1, 0, 2)?; 
         let data_bytes = t.narrow(1, 2, 8)?;  
         
-        let scales = Tensor::from_raw_buffer(&scale_bytes.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?, DType::F16, &[num_blocks], dev)?;
+        let scales_f32 = Tensor::from_raw_buffer(&scale_bytes.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?, DType::F16, &[num_blocks], dev)?
+            .to_dtype(DType::F32)?;
 
         let mut parts = vec![];
         let d_f32 = data_bytes.to_dtype(DType::F32)?;
@@ -70,12 +88,21 @@ fn dequantize_q2(t: &Tensor, dev: &Device) -> Result<Tensor> {
             let vals = d_f32.affine(1.0 / div, 0.0)?;
             let floor_val = vals.affine(1.0 / 4.0, 0.0)?.floor()?.affine(4.0, 0.0)?;
             let bit_vals = vals.sub(&floor_val)?;
-            parts.push(bit_vals.to_dtype(DType::F16)?);
+            parts.push(bit_vals);
         }
-        let combined = Tensor::stack(&parts, D::Minus1)?.reshape((num_blocks, 32))?;
+        let combined_f32 = Tensor::stack(&parts, D::Minus1)?.reshape((num_blocks, 32))?;
         
-        let offset = Tensor::new(1.5f32, dev)?.to_dtype(DType::F16)?;
-        Ok(combined.broadcast_sub(&offset)?.broadcast_mul(&scales.unsqueeze(D::Minus1)?)?)
+        let offset = Tensor::new(1.5f32, dev)?;
+        let res = combined_f32.broadcast_sub(&offset)?.broadcast_mul(&scales_f32.unsqueeze(D::Minus1)?)?;
+        
+        // Numerical stability check
+        if let Ok(m) = res.abs()?.max_all()?.to_scalar::<f32>() {
+            if m > 1000.0 || m.is_nan() {
+                println!("[WARN-QUANT] Large or NaN value detected: {}", m);
+            }
+        }
+        
+        Ok(res.to_dtype(DType::F16)?)
     } else {
         Ok(t.to_dtype(DType::F16)?)
     }
@@ -200,32 +227,46 @@ impl QGatedDeltaNet {
         let (bs, sl, _) = x.dims3()?;
         let (nk, dk, nv, dv) = (self.nk, self.dk, self.nv, self.dv);
 
-        let mut mixed_qkv = self.in_proj_qkv.forward(x, reg)?.transpose(1, 2)?;
+        let mixed_qkv = self.in_proj_qkv.forward(x, reg)?;
         let z = self.in_proj_z.forward(x, reg)?;
         let b = self.in_proj_b.forward(x, reg)?;
         let a = self.in_proj_a.forward(x, reg)?;
         
-        if let Some(ref conv) = self.conv1d {
-            let kernel_size = 4;
-            let state_len = kernel_size - 1;
+        let q = mixed_qkv.narrow(D::Minus1, 0, nk * dk)?;
+        let k = mixed_qkv.narrow(D::Minus1, nk * dk, nk * dk)?;
+        let v = mixed_qkv.narrow(D::Minus1, nk * dk * 2, nv * dv)?;
+
+        let (mut q, mut k, mut v) = if let Some(ref conv) = self.conv1d {
+            let q_c = q.reshape((bs, sl, nk, dk))?.transpose(1, 2)?;
+            let k_c = k.reshape((bs, sl, nk, dk))?.transpose(1, 2)?;
+            let v_c = v.reshape((bs, sl, nv, dv))?.transpose(1, 2)?;
+            let mut qkv_conv = Tensor::cat(&[&q_c, &k_c, &v_c], 1)?.reshape((bs, (), sl))?;
+
             if sl == 1 && self.conv_state_cache.is_some() {
                 let conv_state = self.conv_state_cache.as_ref().unwrap().to_device(x.device())?;
-                let conv_state_new = Tensor::cat(&[&conv_state, &mixed_qkv], D::Minus1)?;
-                self.conv_state_cache = Some(conv_state_new.narrow(D::Minus1, sl, state_len)?.detach());
+                let conv_state_new = Tensor::cat(&[&conv_state, &qkv_conv], D::Minus1)?;
+                self.conv_state_cache = Some(conv_state_new.narrow(D::Minus1, sl, 3)?.detach());
                 let conv_out = crate::models::common::conv1d_depthwise(&conv_state_new, conv.weight(), conv.bias())?;
-                mixed_qkv = conv_out.narrow(D::Minus1, conv_out.dim(D::Minus1)? - sl, sl)?.silu()?;
+                qkv_conv = conv_out.narrow(D::Minus1, conv_out.dim(D::Minus1)? - sl, sl)?.silu()?;
             } else {
-                let conv_in = mixed_qkv.pad_with_zeros(D::Minus1, state_len, state_len)?;
-                mixed_qkv = crate::models::common::conv1d_depthwise(&conv_in, conv.weight(), conv.bias())?;
-                mixed_qkv = mixed_qkv.narrow(D::Minus1, state_len, sl)?.silu()?;
-                self.conv_state_cache = Some(conv_in.narrow(D::Minus1, sl, state_len)?.detach());
+                let conv_in = qkv_conv.pad_with_zeros(D::Minus1, 3, 0)?;
+                qkv_conv = crate::models::common::conv1d_depthwise(&conv_in, conv.weight(), conv.bias())?;
+                qkv_conv = qkv_conv.narrow(D::Minus1, 0, sl)?.silu()?;
+                self.conv_state_cache = Some(conv_in.narrow(D::Minus1, sl.max(3) - 3, 3)?.detach());
             }
-        }
-        let mixed_qkv = mixed_qkv.transpose(1, 2)?;
+            
+            let qkv_conv = qkv_conv.reshape((bs, (), sl))?;
+            let q_new = qkv_conv.narrow(1, 0, nk * dk)?.reshape((bs, nk, dk, sl))?.transpose(2, 3)?.reshape((bs, sl, nk, dk))?;
+            let k_new = qkv_conv.narrow(1, nk * dk, nk * dk)?.reshape((bs, nk, dk, sl))?.transpose(2, 3)?.reshape((bs, sl, nk, dk))?;
+            let v_new = qkv_conv.narrow(1, nk * dk * 2, nv * dv)?.reshape((bs, nv, dv, sl))?.transpose(2, 3)?.reshape((bs, sl, nv, dv))?;
+            (q_new, k_new, v_new)
+        } else {
+            (q.reshape((bs, sl, nk, dk))?, k.reshape((bs, sl, nk, dk))?, v.reshape((bs, sl, nv, dv))?)
+        };
 
-        let q = mixed_qkv.narrow(D::Minus1, 0, nk * dk)?.reshape((bs, sl, nk, dk))?;
-        let k = mixed_qkv.narrow(D::Minus1, nk * dk, nk * dk)?.reshape((bs, sl, nk, dk))?;
-        let v = mixed_qkv.narrow(D::Minus1, nk * dk * 2, nv * dv)?.reshape((bs, sl, nv, dv))?;
+        let q = q.reshape((bs, sl, nk, dk))?;
+        let k = k.reshape((bs, sl, nk, dk))?;
+        let v = v.reshape((bs, sl, nv, dv))?;
 
         let q = crate::utils::tensor_utils::l2_normalize(&q, 3)?;
         let k = crate::utils::tensor_utils::l2_normalize(&k, 3)?;
