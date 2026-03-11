@@ -42,18 +42,35 @@ def pack_q2_k_combined(tensor):
     
     return combined, orig_shape
 def run_q2_quantization():
-    print("\n[QUANT-Q2] Quantizing ONLY layers while KEEPING shared/vision original...")
+    print("\n[QUANT-Q2] Quantizing EVERYTHING except vision.st to Q2...")
     base_dir = os.path.dirname(os.path.abspath(__file__))
     model_dir = os.path.join(base_dir, "src-tauri", "models", "Qwen3.5-0.8B-Split")
 
-    # Process only layer_X.st files
-    files = [f"layer_{i}.st" for i in range(24)]
+    # Process all .st files except vision.st
+    files = [f for f in os.listdir(model_dir) if f.endswith(".st") and "vision" not in f]
 
-    for filename in tqdm(files, desc="Processing Layers"):
+    for filename in tqdm(files, desc="Processing Models"):
         path = os.path.join(model_dir, filename)
         if os.path.exists(path):
             sd = load_file(path)
+            new_sd = {}
+            meta = {"precision": "q2_combined_v1"}
 
+            for name, tensor in sd.items():
+                if ("weight" in name or "embed" in name or "head" in name) and tensor.ndim >= 2:
+                    combined, orig_shape = pack_q2_k_combined(tensor)
+                    new_sd[name] = combined
+                    meta[f"shape.{name}"] = ",".join(map(str, orig_shape))
+                else:
+                    new_sd[name] = tensor
+
+            temp_path = path + ".tmp"
+            save_file(new_sd, temp_path, metadata=meta)
+            try:
+                if os.path.exists(path): os.remove(path)
+                os.rename(temp_path, path)
+            except:
+                print(f"\n[WARN] Failed to replace {path}. Please ensure it's not locked.")
             new_sd = {}
             meta = {"precision": "q2_combined_v1"}
 

@@ -33,17 +33,6 @@ impl Qwen3_5GenerateModel {
         _dtype: Option<DType>,
         _prefill_bake: bool,
     ) -> Result<Self> {
-        let model_path = std::path::Path::new(model_path);
-        let config_path = model_path.join("config.json");
-        let config: Qwen3_5Config = serde_json::from_slice(&std::fs::read(config_path)?)?;
-        
-        let tokenizer = TokenizerModel::init(model_path.to_str().unwrap())?;
-
-        let dev = match device {
-            Some(d) => d.clone(),
-            None => Device::Cpu,
-        };
-
         let mut model_files = vec![];
         for entry in std::fs::read_dir(model_path)? {
             let entry = entry?;
@@ -52,13 +41,32 @@ impl Qwen3_5GenerateModel {
                 model_files.push(path.to_str().unwrap().to_string());
             }
         }
+        Self::init_with_files(&model_files, model_path, device, _dtype)
+    }
 
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_files, DType::F16, &dev)? };
+    pub fn init_with_files(
+        model_files: &[String],
+        model_path: &str,
+        device: Option<&Device>,
+        _dtype: Option<DType>,
+    ) -> Result<Self> {
+        let model_path_p = std::path::Path::new(model_path);
+        let config_path = model_path_p.join("config.json");
+        let config: Qwen3_5Config = serde_json::from_slice(&std::fs::read(config_path)?)?;
+        
+        let tokenizer = TokenizerModel::init(model_path)?;
+
+        let dev = match device {
+            Some(d) => d.clone(),
+            None => Device::Cpu,
+        };
+
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(model_files, DType::F16, &dev)? };
         let qwen3_5 = QuantizedQwen3_5Model::new(vb, config)?;
 
-        let registry = QuantizedRegistry::new(&model_files)?;
+        let registry = QuantizedRegistry::new(model_files)?;
 
-        let chat_template = ChatTemplate::init(model_path.to_str().unwrap())?;
+        let chat_template = ChatTemplate::init(model_path)?;
 
         Ok(Self {
             qwen3_5,
@@ -190,13 +198,7 @@ impl Qwen3_5GenerateModel {
         }
 
         // ====================================================================
-        // [PHASE 2] TRANSITION: Load ALL to VRAM for FAST & STABLE Decoding
-        // ====================================================================
-        println!("[MODEL-QWEN35] Prefill complete. Loading ALL weights to VRAM for fast Decoding...");
-        self.qwen3_5.load_all_to_vram(&self.registry, &self.device)?;
-
-        // ====================================================================
-        // [PHASE 3] DECODING: High Speed (Persistent Weights in VRAM)
+        // [PHASE 3] DECODING: Strictly Layer-by-Layer (VRAM minimum)
         // ====================================================================
         let mut logits = last_logits.ok_or(anyhow::anyhow!("No logits generated"))?;
         let mut gen_text = String::new();
@@ -209,20 +211,7 @@ impl Qwen3_5GenerateModel {
 
             let current_logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             
-            // [DEBUG] Top-5 Tokens
-            if step < 3 {
-                let logits_v = current_logits.to_vec1::<f32>()?;
-                let mut indexed: Vec<(usize, f32)> = logits_v.into_iter().enumerate().collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                println!("\n[DEBUG-TOKEN] Step {}: ", step);
-                for i in 0..5 {
-                    let token_text = self.tokenizer.token_decode(vec![indexed[i].0 as u32]).unwrap_or_default();
-                    println!("  - Top {}: ID={}, Prob={:.4}, Text='{}'", i+1, indexed[i].0, indexed[i].1, token_text);
-                }
-            }
-
             let next_token = logit_processor.sample(&current_logits)?;
-            
             if next_token == self.eos_token_id { break; }
 
             let piece = self.tokenizer.token_decode(vec![next_token])?;
@@ -231,22 +220,21 @@ impl Qwen3_5GenerateModel {
 
             let input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?.to_dtype(DType::U32)?;
             
-            // 1. Embeddings (Already in VRAM)
+            // 1. Embeddings (Relay)
+            self.qwen3_5.model.embed.load_to_vram(&self.registry, &self.device)?;
             let mut h = self.qwen3_5.model.embed.forward(&input_ids, &self.registry)?; 
+            self.qwen3_5.model.embed.clear_vram();
 
-            // RoPE: Official way to handle position during decoding
-            let pos = Tensor::from_vec(vec![seqlen_offset as u32], (1, 1), &self.device)?
-                .unsqueeze(0)?
-                .broadcast_as((3, 1, 1))?
-                .contiguous()?;
+            // RoPE
+            let pos = Tensor::from_vec(vec![seqlen_offset as u32], (1, 1), &self.device)?.unsqueeze(0)?.broadcast_as((3, 1, 1))?.contiguous()?;
             let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos, DType::F16, self.qwen3_5.model.mrope.clone())?;
 
-            // Decoding Mask: Some models require a 1x(N+1) mask to attend to all past tokens
-            let mask = Some(crate::utils::tensor_utils::prepare_causal_attention_mask(1, 1, seqlen_offset, &self.device)?.to_dtype(DType::F16)?);
-
-            // 2. Layer Execution (Already in VRAM)
+            // 2. Layer Relay (Decoding)
             for i in 0..num_layers {
                 let layer = &mut self.qwen3_5.model.layers[i];
+
+                // [WEIGHTS UP]
+                layer.load_to_vram(&self.registry, &self.device)?;
 
                 // [KV LOAD] - From Memory Cache
                 if let Some(ref mut sa) = layer.self_attn {
@@ -262,8 +250,8 @@ impl Qwen3_5GenerateModel {
                     }
                 }
 
-                // [COMPUTE] - Pass the mask!
-                h = layer.forward(&h, &cos, &sin, mask.as_ref(), &self.registry)?;
+                // [COMPUTE]
+                h = layer.forward(&h, &cos, &sin, None, &self.registry)?;
 
                 // [KV SAVE] - To Memory Cache
                 if let Some(ref mut sa) = layer.self_attn {
@@ -276,11 +264,21 @@ impl Qwen3_5GenerateModel {
                         kv_manager.save_layer_context(i, LayerContext::DeltaNet { state: st })?;
                     }
                 }
+
+                // [WEIGHTS DOWN]
+                layer.clear_vram();
+                #[cfg(feature = "cuda")]
+                self.device.synchronize()?; 
             }
 
-            // 3. Head (Already in VRAM)
+            // 3. Head (Relay)
+            self.qwen3_5.model.norm.load_to_vram(&self.registry, &self.device)?;
             let last_h = self.qwen3_5.model.norm.forward(&h, &self.registry)?;
+            self.qwen3_5.model.norm.clear_vram();
+
+            self.qwen3_5.head.load_to_vram(&self.registry, &self.device)?;
             logits = self.qwen3_5.head.forward(&last_h, &self.registry)?;
+            self.qwen3_5.head.clear_vram();
             
             seqlen_offset += 1;
         }

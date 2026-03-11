@@ -27,7 +27,13 @@ async fn main() -> Result<()> {
     use tauri_app_lib::tokenizer::TokenizerModel;
 
     let tokenizer = TokenizerModel::init(model_path)?;
-    let mut model = Qwen3_5GenerateModel::init(model_path, Some(&device), Some(DType::F16), false)?;
+    // Use the original unsplit file from the root
+    let root_weight = "../model.safetensors-00001-of-00001.safetensors";
+    let model_files = vec![root_weight.to_string()];
+    
+    let tokenizer = TokenizerModel::init(model_path)?;
+    // Modified init to use our specific root weight
+    let mut model = Qwen3_5GenerateModel::init_with_files(&model_files, model_path, Some(&device), Some(DType::F16))?;
     
     println!("✅ Hybrid Model initialized successfully.");
 
@@ -37,10 +43,12 @@ async fn main() -> Result<()> {
         "messages": [
             {
                 "role": "user",
-                "content": "1+1=? NO EXPLANATION. NO THINKING."
+                "content": "Calculate 1+1. Just give me the number."
             }
         ],
-        "max_tokens": 20
+        "max_tokens": 10,
+        "temperature": 0.7,
+        "top_p": 0.9
     }
     "#;
     

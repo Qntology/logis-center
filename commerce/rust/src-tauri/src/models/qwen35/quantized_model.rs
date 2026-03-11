@@ -352,9 +352,9 @@ impl QAttention {
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
-                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
-                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
-                (key_states, value_states)
+                let k = Tensor::cat(&[prev_k, &key_states], 2)?;
+                let v = Tensor::cat(&[prev_v, &value_states], 2)?;
+                (k, v)
             }
         };
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
@@ -484,7 +484,15 @@ impl QTextModel {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let mut layers = vec![]; for i in 0..config.num_hidden_layers { layers.push(QDecoderLayer::new(vb.pp("layers").pp(i), config, i)?); }
         let p = vb.prefix();
-        Ok(Self { embed: QEmbedding::new(&join_name(&p, "embed_tokens")), layers, norm: QRmsNorm::new(&join_name(&p, "norm"), config.rms_norm_eps)?, rotary: Qwen3_5TextRotaryEmbedding::new((config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize, config.rope_parameters.rope_theta), mrope: config.rope_parameters.mrope_section.clone() })
+        // Official Qwen 3.5 uses 1,000,000 for rope_theta
+        let rope_theta = 1000000.0;
+        Ok(Self { 
+            embed: QEmbedding::new(&join_name(&p, "embed_tokens")), 
+            layers, 
+            norm: QRmsNorm::new(&join_name(&p, "norm"), config.rms_norm_eps)?, 
+            rotary: Qwen3_5TextRotaryEmbedding::new((config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize, rope_theta), 
+            mrope: config.rope_parameters.mrope_section.clone() 
+        })
     }
     pub fn load_all_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         self.embed.load_to_vram(reg, dev)?;
