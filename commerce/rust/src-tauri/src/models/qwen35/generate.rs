@@ -215,6 +215,7 @@ impl Qwen3_5GenerateModel {
             if next_token == self.eos_token_id { break; }
 
             let piece = self.tokenizer.token_decode(vec![next_token])?;
+            println!("[DEBUG-DECODE] step: {}, token_id: {}, piece: {:?}", step, next_token, piece);
             print!("{}", piece); // Stream to console
             gen_text.push_str(&piece);
 
