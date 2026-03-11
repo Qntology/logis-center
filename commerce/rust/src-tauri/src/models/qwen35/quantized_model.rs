@@ -260,9 +260,16 @@ impl QGatedDeltaNet {
         let value = v.to_dtype(DType::F32)?;             // [bs, sl, nv, dv]
         let beta = candle_nn::ops::sigmoid(&b)?.to_dtype(DType::F32)?; // [bs, sl, nv]
         
-        let a_plus_bias = softplus(&a.to_dtype(DType::F32)?.broadcast_add(&self.dt_bias.as_ref().map(|t| t.to_dtype(DType::F32)).transpose()?.unwrap_or(Tensor::zeros((nv,), DType::F32, x.device())?))?)?;
-        let a_log_val = self.a_log.as_ref().map(|t| t.to_dtype(DType::F32)).transpose()?.unwrap_or(Tensor::zeros((nv,), DType::F32, x.device())?);
-        let g = a_log_val.exp()?.affine(-1.0, 0.0)?.broadcast_mul(&a_plus_bias)?; // [bs, sl, nv]
+        // Official aha-main: a_plus_bias = softplus(a + dt_bias)
+        let a_plus_bias = softplus(
+            &a.to_dtype(DType::F32)?
+                .broadcast_add(&self.dt_bias.as_ref().unwrap_or(&Tensor::zeros((nv,), DType::F32, x.device())?).to_dtype(DType::F32)?)?
+        )?;
+        // Official aha-main: g = -1.0 * a_log.exp() * a_plus_bias
+        let g = self.a_log.as_ref().unwrap_or(&Tensor::zeros((nv,), DType::F32, x.device())?).to_dtype(DType::F32)?
+            .exp()?
+            .affine(-1.0, 0.0)?
+            .broadcast_mul(&a_plus_bias)?;
         let g = g.to_dtype(DType::F32)?;
 
         if nv / nk > 1 {

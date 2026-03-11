@@ -41,36 +41,37 @@ def pack_q2_k_combined(tensor):
     combined = torch.cat([scale_bytes, packed_data], dim=1) # [num_blocks, 10]
     
     return combined, orig_shape
-
 def run_q2_quantization():
-    print("\n[QUANT-Q2] Quantizing layers while KEEPING original names...")
+    print("\n[QUANT-Q2] Quantizing layers and SHARED weights to save VRAM...")
     base_dir = os.path.dirname(os.path.abspath(__file__))
     model_dir = os.path.join(base_dir, "src-tauri", "models", "Qwen3.5-0.8B-Split")
-    
-    for i in tqdm(range(24), desc="Processing Layers"):
-        path = os.path.join(model_dir, f"layer_{i}.st")
+
+    # Process all .st files including shared.st
+    files = [f for f in os.listdir(model_dir) if f.endswith(".st") and "vision" not in f]
+
+    for filename in tqdm(files, desc="Processing Models"):
+        path = os.path.join(model_dir, filename)
         if os.path.exists(path):
             sd = load_file(path)
             new_sd = {}
             meta = {"precision": "q2_combined_v1"}
-            
+
             for name, tensor in sd.items():
-                if ("weight" in name or "embed" in name) and tensor.ndim >= 2:
+                # Quantize weights and embeddings
+                if ("weight" in name or "embed" in name or "head" in name) and tensor.ndim >= 2:
                     combined, orig_shape = pack_q2_k_combined(tensor)
                     new_sd[name] = combined
                     meta[f"shape.{name}"] = ",".join(map(str, orig_shape))
                 else:
                     new_sd[name] = tensor
-            
-            # Use temporary file then rename to avoid lock issues
+
             temp_path = path + ".tmp"
             save_file(new_sd, temp_path, metadata=meta)
-            # Try to remove original and rename
             try:
                 if os.path.exists(path): os.remove(path)
                 os.rename(temp_path, path)
             except:
-                print(f"\n[WARN] Failed to replace {path}. It might be locked. Please close all programs using it.")
+                print(f"\n[WARN] Failed to replace {path}. Please ensure it's not locked.")
 
     print("\n[SUCCESS] All layers quantized. Original tensor names preserved.")
 
