@@ -64,7 +64,7 @@ impl QRmsNorm {
     pub fn clear_vram(&mut self) { self.persistent_weight = None; }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         let w = reg.get_q_tensor(&self.full_name, "weight")?.to_device(dev)?.to_dtype(DType::F32)?;
-        // Qwen3.5 RMSNorm weights are usually offset by 1.0
+        // Official aha-main: weight = weight + 1.0
         let w = w.affine(1.0, 1.0)?.to_dtype(DType::F16)?;
         self.persistent_weight = Some(w); Ok(())
     }
@@ -75,28 +75,23 @@ impl QRmsNorm {
                     let w = reg.get_q_tensor(&self.full_name, "weight")?.to_device(dev)?.to_dtype(DType::F32)?;
                     w.affine(1.0, 1.0)?.to_dtype(DType::F16)?
                 };
+        
         let x_f32 = x.to_dtype(DType::F32)?;
-        let var = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
-        let norm = x_f32.broadcast_div(&(var + self.eps)?.sqrt()?)?.to_dtype(DType::F16)?;
+        // Official formula: x / sqrt(mean(x^2) + eps)
+        let norm_ = x_f32.powf(2.0)?.mean_keepdim(D::Minus1)?.affine(1.0, self.eps)?.sqrt()?;
+        let norm = x_f32.broadcast_div(&norm_)?;
         
         let w_size = w.elem_count();
         let last_dim = x.dim(D::Minus1)?;
-        if w_size == last_dim {
-            Ok(norm.broadcast_mul(&w)?)
-        } else if last_dim % w_size == 0 {
-            let num_heads = last_dim / w_size;
-            let mut dims = x.dims().to_vec();
-            dims.pop();
-            dims.push(num_heads);
-            dims.push(w_size);
-            let norm_reshaped = norm.reshape(dims.as_slice())?;
-            let mut w_dims = vec![1; dims.len()];
-            w_dims[dims.len() - 1] = w_size;
-            let out = norm_reshaped.broadcast_mul(&w.reshape(w_dims.as_slice())?)?;
-            Ok(out.reshape(x.dims())?)
+        
+        let res = if w_size == last_dim {
+            norm.broadcast_mul(&w.to_dtype(DType::F32)?)?
         } else {
-            Ok(norm.broadcast_mul(&w.reshape(vec![1; x.rank() - 1].into_iter().chain(std::iter::once(w_size)).collect::<Vec<_>>())?)?)
-        }
+            let x_norm_reshaped = norm.reshape(((), w_size))?;
+            let r = x_norm_reshaped.broadcast_mul(&w.to_dtype(DType::F32)?.reshape((1, w_size))?)?;
+            r.reshape(original_shape)?
+        };
+        Ok(res.to_dtype(DType::F16)?)
     }
 }
 
@@ -106,8 +101,8 @@ impl QRmsNormGated {
     pub fn clear_vram(&mut self) { self.norm.clear_vram(); }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { self.norm.load_to_vram(reg, dev) }
     pub fn forward(&self, x: &Tensor, gate: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
-        let x = self.norm.forward(x, reg)?;
-        Ok(x.broadcast_mul(&gate.silu()?)?)
+        let x_norm = self.norm.forward(x, reg)?;
+        Ok(x_norm.broadcast_mul(&candle_nn::ops::sigmoid(gate)?.to_dtype(DType::F16)?)?)
     }
 }
 
@@ -122,41 +117,32 @@ impl QLinear {
         // 1. Check if this is a Q2-combined blob [num_blocks, 10]
         if t.rank() == 2 && t.dim(1)? == 10 && t.dtype() == DType::U8 {
             let num_blocks = t.dim(0)?;
-            let scale_bytes = t.narrow(1, 0, 2)?; // [N, 2]
-            let data_bytes = t.narrow(1, 2, 8)?;  // [N, 8]
+            let scale_bytes = t.narrow(1, 0, 2)?; 
+            let data_bytes = t.narrow(1, 2, 8)?;  
             
-            // Reconstruct FP16 scales
             let scales = Tensor::from_raw_buffer(&scale_bytes.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?, DType::F16, &[num_blocks], dev)?;
 
-            // Unpack 2-bit data (0,1,2,3) using arithmetic
             let mut parts = vec![];
             let d_f32 = data_bytes.to_dtype(DType::F32)?;
             for i in 0..4 {
                 let div = (1 << (i * 2)) as f64;
                 let vals = d_f32.affine(1.0 / div, 0.0)?;
-                // Emulate bitwise AND with modulo: (x / 2^n) % 4
-                // Candle doesn't have a direct modulo, so we use: x - floor(x/4)*4
                 let floor_val = vals.affine(1.0 / 4.0, 0.0)?.floor()?.affine(4.0, 0.0)?;
                 let bit_vals = vals.sub(&floor_val)?;
                 parts.push(bit_vals.to_dtype(DType::F16)?);
             }
-            let combined = Tensor::stack(&parts, D::Minus1)?.reshape(((), 32))?;
+            let combined = Tensor::stack(&parts, D::Minus1)?.reshape((num_blocks, 32))?;
             
-            // Dequantize: (val - 1.5) * scale
             let offset = Tensor::new(1.5f32, dev)?.to_dtype(DType::F16)?;
             let dequant = combined.broadcast_sub(&offset)?.broadcast_mul(&scales.unsqueeze(D::Minus1)?)?;
-            self.persistent_weight = Some(dequant.reshape(((), num_blocks * 32 / dequant.dim(0)?))?);
-        } 
-        // 2. Check if this is a Legacy Q4 format (with suffixes)
-        else if let (Ok(s_t), Ok(d_t), Ok(sh_t)) = (reg.get_q_tensor(name, "q_scales"), reg.get_q_tensor(name, "q_data"), reg.get_q_tensor(name, "q_shape")) {
-            let s = s_t.to_device(dev)?.to_dtype(DType::F16)?; let d = d_t.to_device(dev)?.to_dtype(DType::F16)?;
-            let shape: Vec<usize> = sh_t.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
-            let high = (d.clone() / 16.0)?.floor()?; let low = d.sub(&(high.clone() * 16.0)?)?;
-            let combined = Tensor::stack(&[low.affine(1.0, -8.0)?, high.affine(1.0, -8.0)?], D::Minus1)?.reshape(((), 32))?;
-            self.persistent_weight = Some(combined.broadcast_mul(&s.unsqueeze(D::Minus1)?)?.reshape(shape.as_slice())?);
-        }
-        // 3. Original format (FP16)
-        else {
+            
+            // Critical: Get original shape from metadata if possible, else use default heuristic
+            // For 0.8B Qwen3.5, layers are mostly 1536, 1024, 4096 etc.
+            let total_elements = num_blocks * 32;
+            self.persistent_weight = Some(dequant.reshape(((), total_elements / (total_elements / 32)))?.flatten_all()?.reshape(((), 32))?); // Temporary flat
+            // We'll let forward() handle the final matmul shape
+            self.persistent_weight = Some(dequant.flatten_all()?);
+        } else {
             self.persistent_weight = Some(t.to_dtype(DType::F16)?);
         }
 
@@ -168,10 +154,11 @@ impl QLinear {
         let w = if let Some(pw) = &self.persistent_weight { pw.clone() } 
                 else { reg.get_q_tensor(name, "weight")?.to_device(dev)?.to_dtype(DType::F16)? };
         
-        let x_in_dim = x.dim(D::Minus1)?;
-        let w = if w.rank() >= 2 && w.dim(1)? == x_in_dim { w.t()? } else { w };
+        let in_features = x.dim(D::Minus1)?;
+        let out_features = w.elem_count() / in_features;
+        let w = w.reshape((out_features, in_features))?.t()?;
         
-        let res = x.contiguous()?.broadcast_matmul(&w.to_dtype(DType::F16)?.contiguous()?)?;
+        let res = x.contiguous()?.broadcast_matmul(&w.contiguous()?)?;
         if let Some(pb) = &self.persistent_bias { Ok(res.broadcast_add(pb)?) }
         else if let Ok(b) = reg.get_q_tensor(name, "bias") { Ok(res.broadcast_add(&b.to_device(dev)?.to_dtype(DType::F16)?)?) } else { Ok(res) }
     }
