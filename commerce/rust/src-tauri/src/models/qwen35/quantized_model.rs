@@ -335,24 +335,47 @@ impl QAttention {
         self.q_norm.load_to_vram(reg, dev)?; self.k_norm.load_to_vram(reg, dev)?; Ok(())
     }
     pub fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
-        let (bs, sl, _) = x.dims3()?;
-        let q_raw = self.q_proj.forward(x, reg)?.reshape((bs, sl, self.nh, self.hd * 2))?;
-        let q_chunk = q_raw.chunk(2, D::Minus1)?;
-        let query_states = q_chunk[0].reshape((bs, sl, self.nh, self.hd))?;
-        let gate = q_chunk[1].reshape((bs, sl, ()))?;
+        let (b_sz, q_len, _) = x.dims3()?;
+        let q_raw = self.q_proj.forward(x, reg)?;
+        let q_reshaped = q_raw.reshape((b_sz, q_len, self.nh, self.hd * 2))?;
+        let q_chunk = q_reshaped.chunk(2, D::Minus1)?;
+        
+        let query_states = q_chunk[0].reshape((b_sz, q_len, self.nh, self.hd))?;
+        let gate = q_chunk[1].reshape((b_sz, q_len, ()))?;
 
-        let q = self.q_norm.forward(&query_states, reg)?.transpose(1, 2)?;
-        let k_raw = self.k_proj.forward(x, reg)?.reshape((bs, sl, self.nkv, self.hd))?;
-        let k = self.k_norm.forward(&k_raw, reg)?.transpose(1, 2)?;
-        let v = self.v_proj.forward(x, reg)?.reshape((bs, sl, self.nkv, self.hd))?.transpose(1, 2)?;
+        let query_states = self.q_norm.forward(&query_states, reg)?.transpose(1, 2)?;
+        
+        let k_raw = self.k_proj.forward(x, reg)?;
+        let key_states = k_raw.reshape((b_sz, q_len, self.nkv, self.hd))?;
+        let key_states = self.k_norm.forward(&key_states, reg)?.transpose(1, 2)?;
+        
+        let v_raw = self.v_proj.forward(x, reg)?;
+        let value_states = v_raw.reshape((b_sz, q_len, self.nkv, self.hd))?.transpose(1, 2)?;
 
-        let (q, k) = glm_asr_apply_rotary_pos_emb(&q, &k, cos, sin, false)?;
-        let (k, v) = match &self.kv_cache { None => (k, v), Some((pk, pv)) => (Tensor::cat(&[pk, &k], 2)?, Tensor::cat(&[pv, &v], 2)?) };
-        self.kv_cache = Some((k.clone(), v.clone()));
-        let attn = crate::models::common::eager_attention_forward(&q, &k, &v, Some(self.nh / self.nkv), mask, self.scaling)?;
-        let out = attn.reshape((bs, sl, ()))?.contiguous()?;
-        let out_gated = out.broadcast_mul(&candle_nn::ops::sigmoid(&gate)?)?;
-        self.o_proj.forward(&out_gated, reg)
+        let (query_states, key_states) = glm_asr_apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
+        
+        let (key_states, value_states) = match &self.kv_cache {
+            None => (key_states, value_states),
+            Some((prev_k, prev_v)) => {
+                let k = Tensor::cat(&[prev_k, &key_states], 2)?;
+                let v = Tensor::cat(&[prev_v, &value_states], 2)?;
+                (k, v)
+            }
+        };
+        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+
+        let attn_output = crate::models::common::eager_attention_forward(
+            &query_states,
+            &key_states,
+            &value_states,
+            Some(self.nh / self.nkv),
+            mask,
+            self.scaling,
+        )?;
+
+        let attn_output = attn_output.reshape((b_sz, q_len, self.nh * self.hd))?.contiguous()?;
+        let gated_output = attn_output.broadcast_mul(&candle_nn::ops::sigmoid(&gate)?)?;
+        self.o_proj.forward(&gated_output, reg)
     }
 }
 
@@ -361,16 +384,34 @@ impl QDecoderLayer {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig, idx: usize) -> Result<Self> {
         let lt = config.layer_types[idx].clone(); let p = vb.prefix();
         let (sa, la) = if lt == "linear_attention" { (None, Some(QGatedDeltaNet::new(vb.pp("linear_attn"), config)?)) } else { (Some(QAttention::new(vb.pp("self_attn"), config)?), None) };
-        Ok(Self { self_attn: sa, linear_attn: la, mlp_gate: QLinear::new(&join_name(&p, "mlp.gate_proj"))?, mlp_up: QLinear::new(&join_name(&p, "mlp.up_proj"))?, mlp_down: QLinear::new(&join_name(&p, "mlp.down_proj"))?, in_norm: QRmsNorm::new(&join_name(&p, "input_layernorm"), config.rms_norm_eps)?, post_norm: QRmsNorm::new(&join_name(&p, "post_attention_layernorm"), config.rms_norm_eps)? })
+        Ok(Self { 
+            self_attn: sa, 
+            linear_attn: la, 
+            mlp_gate: QLinear::new(&join_name(&p, "mlp.gate_proj"))?, 
+            mlp_up: QLinear::new(&join_name(&p, "mlp.up_proj"))?, 
+            mlp_down: QLinear::new(&join_name(&p, "mlp.down_proj"))?, 
+            in_norm: QRmsNorm::new(&join_name(&p, "input_layernorm"), config.rms_norm_eps)?, 
+            post_norm: QRmsNorm::new(&join_name(&p, "post_attention_layernorm"), config.rms_norm_eps)? 
+        })
     }
     pub fn clear_vram(&mut self) { self.in_norm.clear_vram(); if let Some(ref mut sa) = self.self_attn { sa.clear_vram(); } if let Some(ref mut la) = self.linear_attn { la.clear_vram(); } self.post_norm.clear_vram(); self.mlp_gate.clear_vram(); self.mlp_up.clear_vram(); self.mlp_down.clear_vram(); }
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { self.in_norm.load_to_vram(reg, dev)?; if let Some(ref mut sa) = self.self_attn { sa.load_to_vram(reg, dev)?; } if let Some(ref mut la) = self.linear_attn { la.load_to_vram(reg, dev)?; } self.post_norm.load_to_vram(reg, dev)?; self.mlp_gate.load_to_vram(reg, dev)?; self.mlp_up.load_to_vram(reg, dev)?; self.mlp_down.load_to_vram(reg, dev)?; Ok(()) }
     pub fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
-        let residual = x.clone(); let mut h = self.in_norm.forward(x, reg)?;
-        if let Some(ref mut sa) = self.self_attn { h = sa.forward(&h, cos, sin, mask, reg)?; } else if let Some(ref mut la) = self.linear_attn { h = la.forward(&h, mask, reg)?; }
-        let h2 = (h + residual)?; let residual_2 = h2.clone(); let h = self.post_norm.forward(&h2, reg)?;
-        let gate = self.mlp_gate.forward(&h, reg)?.silu()?; let up = self.mlp_up.forward(&h, reg)?;
-        Ok((self.mlp_down.forward(&(gate * up)?, reg)? + residual_2)?)
+        let residual = x.clone();
+        let h = self.in_norm.forward(x, reg)?;
+        let h = if let Some(ref mut sa) = self.self_attn { sa.forward(&h, cos, sin, mask, reg)? } 
+                else if let Some(ref mut la) = self.linear_attn { la.forward(&h, mask, reg)? }
+                else { h };
+        
+        let h = (h + residual)?;
+        let residual = h.clone();
+        let h = self.post_norm.forward(&h, reg)?;
+        
+        let gate = self.mlp_gate.forward(&h, reg)?.silu()?;
+        let up = self.mlp_up.forward(&h, reg)?;
+        let mlp_out = self.mlp_down.forward(&(gate * up)?, reg)?;
+        
+        Ok((mlp_out + residual)?)
     }
 }
 

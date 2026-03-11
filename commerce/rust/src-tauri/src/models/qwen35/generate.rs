@@ -190,13 +190,12 @@ impl Qwen3_5GenerateModel {
         }
 
         // ====================================================================
-        // [PHASE 2] TRANSITION: Load ALL to VRAM for FAST Decoding
+        // [PHASE 2] TRANSITION: (Layer-by-Layer mode - weights are not persistent in VRAM)
         // ====================================================================
-        println!("[MODEL-QWEN35] Prefill complete. Loading ALL weights to VRAM for fast Decoding...");
-        self.qwen3_5.load_all_to_vram(&self.registry, &self.device)?;
+        println!("[MODEL-QWEN35] Prefill complete. Starting Layer-by-Layer Decoding...");
 
         // ====================================================================
-        // [PHASE 3] DECODING: High Speed (Persistent Weights in VRAM)
+        // [PHASE 3] DECODING: Layer-by-Layer (VRAM minimum)
         // ====================================================================
         let mut logits = last_logits.ok_or(anyhow::anyhow!("No logits generated"))?;
         let mut gen_text = String::new();
@@ -231,15 +230,22 @@ impl Qwen3_5GenerateModel {
 
             let input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?.to_dtype(DType::U32)?;
             
-            // Embeddings (Already in VRAM)
+            // 1. Embeddings (Dynamic Load/Drop)
+            self.qwen3_5.model.embed.load_to_vram(&self.registry, &self.device)?;
             let mut h = self.qwen3_5.model.embed.forward(&input_ids, &self.registry)?; 
+            self.qwen3_5.model.embed.clear_vram();
 
+            // RoPE
             let pos_vec: Vec<u32> = vec![seqlen_offset as u32];
             let pos = Tensor::from_vec(pos_vec, (1, 1), &self.device)?.unsqueeze(0)?.broadcast_as((3, 1, 1))?.contiguous()?;
             let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos, DType::F16, self.qwen3_5.model.mrope.clone())?;
 
+            // 2. Layer Relay (Decoding)
             for i in 0..num_layers {
                 let layer = &mut self.qwen3_5.model.layers[i];
+
+                // [WEIGHTS UP]
+                layer.load_to_vram(&self.registry, &self.device)?;
 
                 // [KV LOAD] - From Memory Cache
                 if let Some(ref mut sa) = layer.self_attn {
@@ -269,11 +275,22 @@ impl Qwen3_5GenerateModel {
                         kv_manager.save_layer_context(i, LayerContext::DeltaNet { state: st })?;
                     }
                 }
+
+                // [WEIGHTS DOWN]
+                layer.clear_vram();
+
+                #[cfg(feature = "cuda")]
+                self.device.synchronize()?; 
             }
 
-            // Norm & Head (Already in VRAM)
+            // 3. Head (Dynamic Load/Drop)
+            self.qwen3_5.model.norm.load_to_vram(&self.registry, &self.device)?;
             let last_h = self.qwen3_5.model.norm.forward(&h, &self.registry)?;
+            self.qwen3_5.model.norm.clear_vram();
+
+            self.qwen3_5.head.load_to_vram(&self.registry, &self.device)?;
             logits = self.qwen3_5.head.forward(&last_h, &self.registry)?;
+            self.qwen3_5.head.clear_vram();
             
             seqlen_offset += 1;
         }
