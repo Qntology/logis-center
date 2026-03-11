@@ -77,6 +77,7 @@ impl QRmsNorm {
                 };
         
         let x_f32 = x.to_dtype(DType::F32)?;
+        let original_shape = x.dims().to_vec();
         // Official formula: x / sqrt(mean(x^2) + eps)
         let norm_ = x_f32.powf(2.0)?.mean_keepdim(D::Minus1)?.affine(1.0, self.eps)?.sqrt()?;
         let norm = x_f32.broadcast_div(&norm_)?;
@@ -361,8 +362,9 @@ impl QAttention {
         )?;
 
         let attn_output = attn_output.reshape((b_sz, q_len, self.nh * self.hd))?.contiguous()?;
-        let gated_output = attn_output.broadcast_mul(&candle_nn::ops::sigmoid(&gate)?)?;
-        self.o_proj.forward(&gated_output, reg)
+        // Official formula from aha-main: attn_output.mul(&sigmoid(&gate)?)?
+        let attn_output = attn_output.broadcast_mul(&candle_nn::ops::sigmoid(&gate)?.to_dtype(DType::F16)?)?;
+        self.o_proj.forward(&attn_output, reg)
     }
 }
 
