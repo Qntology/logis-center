@@ -214,17 +214,20 @@ impl QGatedDeltaNet {
         let a = self.in_proj_a.forward(x, reg)?;
         
         if let Some(ref conv) = self.conv1d {
+            let kernel_size = conv.weight().dim(2)?;
+            let state_len = kernel_size - 1;
             if sl == 1 && self.conv_state_cache.is_some() {
                 let conv_state = self.conv_state_cache.as_ref().unwrap().to_device(x.device())?;
                 let conv_state_new = Tensor::cat(&[&conv_state, &mixed_qkv], D::Minus1)?;
-                let state_len = conv_state.dim(D::Minus1)?;
-                self.conv_state_cache = Some(conv_state_new.narrow(D::Minus1, 1, state_len)?.detach());
-                mixed_qkv = crate::models::common::conv1d_depthwise(&conv_state_new, conv.weight(), conv.bias())?.narrow(D::Minus1, state_len, 1)?.silu()?;
+                self.conv_state_cache = Some(conv_state_new.narrow(D::Minus1, sl, state_len)?.detach());
+                let conv_out = crate::models::common::conv1d_depthwise(&conv_state_new, conv.weight(), conv.bias())?;
+                let start = conv_out.dim(D::Minus1)? - sl;
+                mixed_qkv = conv_out.narrow(D::Minus1, start, sl)?.silu()?;
             } else {
-                let pad = conv.weight().dim(2)? - 1;
-                let conv_in = mixed_qkv.pad_with_zeros(D::Minus1, pad, pad)?;
-                mixed_qkv = crate::models::common::conv1d_depthwise(&conv_in, conv.weight(), conv.bias())?.narrow(D::Minus1, 0, sl)?.silu()?;
-                self.conv_state_cache = Some(mixed_qkv.narrow(D::Minus1, sl - pad, pad)?.detach());
+                let conv_in = mixed_qkv.pad_with_zeros(D::Minus1, state_len, state_len)?;
+                mixed_qkv = crate::models::common::conv1d_depthwise(&conv_in, conv.weight(), conv.bias())?;
+                mixed_qkv = mixed_qkv.narrow(D::Minus1, state_len, sl)?.silu()?;
+                self.conv_state_cache = Some(conv_in.narrow(D::Minus1, sl, state_len)?.detach());
             }
         }
         let mixed_qkv = mixed_qkv.transpose(1, 2)?;
@@ -235,18 +238,18 @@ impl QGatedDeltaNet {
 
         let query_raw = crate::utils::tensor_utils::l2_normalize(&q, 3)?;
         let key_raw = crate::utils::tensor_utils::l2_normalize(&k, 3)?;
-        let query_raw = query_raw.affine(1.0 / (dk as f64).sqrt(), 0.0)?;
+        let scale = 1.0 / (dk as f64).sqrt();
+        let query_raw = query_raw.affine(scale, 0.0)?;
         
-        let mut query = query_raw.to_dtype(DType::F32)?;
-        let mut key = key_raw.to_dtype(DType::F32)?;
-        let value = v.to_dtype(DType::F32)?;
-        let beta = candle_nn::ops::sigmoid(&b)?.to_dtype(DType::F32)?;
+        let mut query = query_raw.to_dtype(DType::F32)?; // [bs, sl, nk, dk]
+        let mut key = key_raw.to_dtype(DType::F32)?;     // [bs, sl, nk, dk]
+        let value = v.to_dtype(DType::F32)?;             // [bs, sl, nv, dv]
+        let beta = candle_nn::ops::sigmoid(&b)?.to_dtype(DType::F32)?; // [bs, sl, nv]
         
         let a_plus_bias = softplus(&a.to_dtype(DType::F32)?.broadcast_add(&self.dt_bias.as_ref().map(|t| t.to_dtype(DType::F32)).transpose()?.unwrap_or(Tensor::zeros((nv,), DType::F32, x.device())?))?)?;
         let a_log_val = self.a_log.as_ref().map(|t| t.to_dtype(DType::F32)).transpose()?.unwrap_or(Tensor::zeros((nv,), DType::F32, x.device())?);
-        let g_raw = a_log_val.exp()?.affine(-1.0, 0.0)?.broadcast_mul(&a_plus_bias)?;
-
-        let g = g_raw.to_dtype(DType::F32)?;
+        let g = a_log_val.exp()?.affine(-1.0, 0.0)?.broadcast_mul(&a_plus_bias)?; // [bs, sl, nv]
+        let g = g.to_dtype(DType::F32)?;
 
         if nv / nk > 1 {
             query = crate::utils::tensor_utils::repeat_interleave(&query, nv / nk, 2)?;
@@ -260,16 +263,18 @@ impl QGatedDeltaNet {
         
         let mut outputs = vec![];
         for t in 0..sl {
-            let q_i = query.i((.., t))?;
-            let k_i = key.i((.., t))?;
-            let v_i = value.i((.., t))?;
-            let g_i = g.i((.., t))?.exp()?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
-            let beta_i = beta.i((.., t))?.unsqueeze(D::Minus1)?;
+            let q_i = query.i((.., t, ..))?;
+            let k_i = key.i((.., t, ..))?;
+            let v_i = value.i((.., t, ..))?;
+            let g_i = g.i((.., t, ..))?.exp()?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
+            let beta_i = beta.i((.., t, ..))?.unsqueeze(D::Minus1)?;
 
+            // Official Recurrent Rule Implementation
             state = state.broadcast_mul(&g_i)?;
             let kv_mem = state.broadcast_mul(&k_i.unsqueeze(D::Minus1)?)?.sum(D::Minus2)?;
             let delta = v_i.broadcast_sub(&kv_mem)?.broadcast_mul(&beta_i)?;
             state = state.broadcast_add(&k_i.unsqueeze(D::Minus1)?.broadcast_mul(&delta.unsqueeze(D::Minus2)?)?)?;
+            
             let out_i = state.broadcast_mul(&q_i.unsqueeze(D::Minus1)?)?.sum_keepdim(D::Minus2)?;
             outputs.push(out_i.to_dtype(DType::F16)?);
         }
@@ -415,32 +420,58 @@ use memmap2::MmapMut;
 use std::fs::OpenOptions;
 use candle_core::Shape;
 
+#[derive(Clone)]
 pub enum LayerContext { Attention { k: Tensor, v: Tensor }, DeltaNet { state: Tensor } }
-pub struct DiskStateManager { mmap: MmapMut, layer_stride: usize }
-impl DiskStateManager {
-    pub fn new(num_layers: usize) -> Result<Self> {
-        let layer_stride = 32 * 1024 * 1024; // Reduced from 128MB to 32MB
-        let path = crate::utils::paths::get_kv_dir(None).join("kv_cache_pool.bin");
-        let file = OpenOptions::new().read(true).write(true).create(true).open(path)?;
-        file.set_len((num_layers * layer_stride) as u64)?;
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-        Ok(Self { mmap, layer_stride })
+pub struct KVStateManager { 
+    mmap: Option<MmapMut>, 
+    layer_stride: usize,
+    memory_cache: Vec<Option<LayerContext>>,
+    use_memory: bool
+}
+
+impl KVStateManager {
+    pub fn new(num_layers: usize, use_memory: bool) -> Result<Self> {
+        let layer_stride = 32 * 1024 * 1024; // 32MB
+        let (mmap, memory_cache) = if use_memory {
+            (None, vec![None; num_layers])
+        } else {
+            let path = crate::utils::paths::get_kv_dir(None).join("kv_cache_pool.bin");
+            let file = OpenOptions::new().read(true).write(true).create(true).open(path)?;
+            file.set_len((num_layers * layer_stride) as u64)?;
+            let m = unsafe { MmapMut::map_mut(&file)? };
+            (Some(m), vec![])
+        };
+        Ok(Self { mmap, layer_stride, memory_cache, use_memory })
     }
-    pub fn save_layer_context(&mut self, layer_idx: usize, ctx: &LayerContext) -> Result<()> {
+    pub fn save_layer_context(&mut self, layer_idx: usize, ctx: LayerContext) -> Result<()> {
+        if self.use_memory {
+            self.memory_cache[layer_idx] = Some(ctx);
+            return Ok(());
+        }
+        
         let offset = layer_idx * self.layer_stride;
-        match ctx {
+        match &ctx {
             LayerContext::Attention { k, v } => { 
                 self.write_tensor(offset, k, DType::F16)?; 
                 self.write_tensor(offset + (k.elem_count() * 2), v, DType::F16)?; 
             },
             LayerContext::DeltaNet { state } => { 
-                // CRITICAL: Recurrent state MUST be saved in F32 for numerical stability
                 self.write_tensor(offset, state, DType::F32)?; 
             }
         }
         Ok(())
     }
     pub fn load_layer_context(&self, layer_idx: usize, lt: &str, shape_k: &Shape, shape_v: &Shape, dev: &Device) -> Result<LayerContext> {
+        if self.use_memory {
+            if let Some(ctx) = &self.memory_cache[layer_idx] {
+                return match ctx {
+                    LayerContext::Attention { k, v } => Ok(LayerContext::Attention { k: k.to_device(dev)?, v: v.to_device(dev)? }),
+                    LayerContext::DeltaNet { state } => Ok(LayerContext::DeltaNet { state: state.to_device(dev)? }),
+                };
+            }
+            anyhow::bail!("Layer context not found in memory");
+        }
+
         let offset = layer_idx * self.layer_stride;
         if lt == "linear_attention" { 
             Ok(LayerContext::DeltaNet { state: self.read_tensor(offset, shape_k, DType::F32, dev)? }) 
@@ -452,6 +483,7 @@ impl DiskStateManager {
         }
     }
     fn write_tensor(&mut self, offset: usize, t: &Tensor, dtype: DType) -> Result<()> {
+        let mmap = self.mmap.as_mut().ok_or_else(|| anyhow!("Mmap not initialized"))?;
         let t = t.detach().to_device(&Device::Cpu)?.to_dtype(dtype)?;
         let bytes = match dtype {
             DType::F32 => {
@@ -465,11 +497,12 @@ impl DiskStateManager {
                 b.to_vec()
             }
         };
-        self.mmap[offset..offset + bytes.len()].copy_from_slice(&bytes); Ok(())
+        mmap[offset..offset + bytes.len()].copy_from_slice(&bytes); Ok(())
     }
     fn read_tensor(&self, offset: usize, shape: &Shape, dtype: DType, dev: &Device) -> Result<Tensor> {
+        let mmap = self.mmap.as_ref().ok_or_else(|| anyhow!("Mmap not initialized"))?;
         let byte_count = shape.elem_count() * (if dtype == DType::F32 { 4 } else { 2 });
-        let raw_slice = &self.mmap[offset..offset + byte_count];
+        let raw_slice = &mmap[offset..offset + byte_count];
         Ok(Tensor::from_raw_buffer(raw_slice, dtype, shape.dims(), dev)?)
     }
 }
