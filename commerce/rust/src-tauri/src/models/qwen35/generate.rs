@@ -142,9 +142,9 @@ impl Qwen3_5GenerateModel {
                            sa.kv_cache = Some((k, v));
                        }
                    } else if let Some(ref mut la) = layer.linear_attn {
-                       let s_state = candle_core::Shape::from((1, la.nk, la.dk, la.dv)); 
+                       let s_state = candle_core::Shape::from((1, la.nv, la.dk, la.dv)); 
                        if let Ok(LayerContext::DeltaNet { state }) = disk_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
-                           la.delta_state = Some(state.to_device(&self.device)?);
+                           la.recurrent_state_cache = Some(state.to_device(&self.device)?);
                        }
                    }
                 }
@@ -159,7 +159,7 @@ impl Qwen3_5GenerateModel {
                     }
                 }
                 if let Some(ref mut la) = layer.linear_attn {
-                    if let Some(st) = la.delta_state.take() {
+                    if let Some(st) = la.recurrent_state_cache.take() {
                         disk_manager.save_layer_context(i, &LayerContext::DeltaNet { state: st })?;
                     }
                 }
@@ -189,9 +189,9 @@ impl Qwen3_5GenerateModel {
         }
 
         // ====================================================================
-        // [PHASE 2] TRANSITION: (Skip load_all_to_vram for FULL RELAY mode)
+        // [PHASE 2] TRANSITION: (Reverted to FULL-RELAY for decoding)
         // ====================================================================
-        println!("[MODEL-QWEN35] Prefill complete. Starting FULL-RELAY Decoding...");
+        println!("[MODEL-QWEN35] Prefill complete. Starting FULL-RELAY Decoding (Layer-by-Layer)...");
 
         // ====================================================================
         // [PHASE 3] DECODING: Full Relay (Weights & Cache per layer)
@@ -252,9 +252,9 @@ impl Qwen3_5GenerateModel {
                         sa.kv_cache = Some((k, v));
                     }
                 } else if let Some(ref mut la) = layer.linear_attn {
-                    let s_state = candle_core::Shape::from((1, la.nk, la.dk, la.dv)); 
+                    let s_state = candle_core::Shape::from((1, la.nv, la.dk, la.dv)); 
                     if let Ok(LayerContext::DeltaNet { state }) = disk_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
-                        la.delta_state = Some(state.to_device(&self.device)?);
+                        la.recurrent_state_cache = Some(state.to_device(&self.device)?);
                     }
                 }
 
@@ -268,7 +268,7 @@ impl Qwen3_5GenerateModel {
                     }
                 }
                 if let Some(ref mut la) = layer.linear_attn {
-                    if let Some(st) = la.delta_state.take() {
+                    if let Some(st) = la.recurrent_state_cache.take() {
                         disk_manager.save_layer_context(i, &LayerContext::DeltaNet { state: st })?;
                     }
                 }
@@ -290,11 +290,6 @@ impl Qwen3_5GenerateModel {
             self.qwen3_5.head.clear_vram();
             
             seqlen_offset += 1;
-            
-            if step % 5 == 0 {
-                // Subtle log to avoid flooding console during decode
-                // println!("[DECODE] Token {} generated (All Layers Relayed)", step);
-            }
         }
 
         self.qwen3_5.clear_cache();
