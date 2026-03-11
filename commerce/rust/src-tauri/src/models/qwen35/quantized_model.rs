@@ -329,22 +329,22 @@ impl QAttention {
         self.q_proj.load_to_vram(reg, dev)?; self.k_proj.load_to_vram(reg, dev)?; self.v_proj.load_to_vram(reg, dev)?; self.o_proj.load_to_vram(reg, dev)?;
         self.q_norm.load_to_vram(reg, dev)?; self.k_norm.load_to_vram(reg, dev)?; Ok(())
     }
-    pub fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
-        let (b_sz, q_len, _) = x.dims3()?;
-        let q_raw = self.q_proj.forward(x, reg)?;
-        let q_reshaped = q_raw.reshape((b_sz, q_len, self.nh, self.hd * 2))?;
-        let q_chunk = q_reshaped.chunk(2, D::Minus1)?;
+    pub fn forward(&mut self, xs: &Tensor, cos: &Tensor, sin: &Tensor, attention_mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
+        let (b_sz, q_len, _) = xs.dims3()?;
+        let query_chunk = self.q_proj.forward(xs, reg)?
+            .reshape((b_sz, q_len, self.nh, self.hd * 2))?
+            .chunk(2, D::Minus1)?;
         
-        let query_states = q_chunk[0].reshape((b_sz, q_len, self.nh, self.hd))?;
-        let gate = q_chunk[1].reshape((b_sz, q_len, ()))?;
+        let query_states = query_chunk[0].reshape((b_sz, q_len, self.nh, self.hd))?;
+        let gate = query_chunk[1].reshape((b_sz, q_len, ()))?;
 
         let query_states = self.q_norm.forward(&query_states, reg)?.transpose(1, 2)?;
         
-        let k_raw = self.k_proj.forward(x, reg)?;
+        let k_raw = self.k_proj.forward(xs, reg)?;
         let key_states = k_raw.reshape((b_sz, q_len, self.nkv, self.hd))?;
         let key_states = self.k_norm.forward(&key_states, reg)?.transpose(1, 2)?;
         
-        let v_raw = self.v_proj.forward(x, reg)?;
+        let v_raw = self.v_proj.forward(xs, reg)?;
         let value_states = v_raw.reshape((b_sz, q_len, self.nkv, self.hd))?.transpose(1, 2)?;
 
         let (query_states, key_states) = glm_asr_apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
@@ -352,9 +352,9 @@ impl QAttention {
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
-                let k = Tensor::cat(&[prev_k, &key_states], 2)?;
-                let v = Tensor::cat(&[prev_v, &value_states], 2)?;
-                (k, v)
+                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
+                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
+                (key_states, value_states)
             }
         };
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
@@ -364,12 +364,12 @@ impl QAttention {
             &key_states,
             &value_states,
             Some(self.nh / self.nkv),
-            mask,
+            attention_mask,
             self.scaling,
         )?;
 
         let attn_output = attn_output.reshape((b_sz, q_len, self.nh * self.hd))?.contiguous()?;
-        // Official formula from aha-main: attn_output.mul(&sigmoid(&gate)?)?
+        // Official: attn_output.mul(&sigmoid(&gate)?)?
         let attn_output = attn_output.broadcast_mul(&candle_nn::ops::sigmoid(&gate)?.to_dtype(DType::F16)?)?;
         self.o_proj.forward(&attn_output, reg)
     }
