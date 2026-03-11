@@ -202,55 +202,101 @@ impl QGatedDeltaNet {
         Ok(()) 
     }
 
-    pub fn forward(&mut self, x: &Tensor, _mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
-        let (bs, sl, _) = x.dims3()?; let (nk, dk, nv, dv) = (self.nk, self.dk, self.nv, self.dv);
-        let mixed_qkv = self.in_proj_qkv.forward(x, reg)?; let z = self.in_proj_z.forward(x, reg)?;
-        let b = self.in_proj_b.forward(x, reg)?; let a = self.in_proj_a.forward(x, reg)?;
-        let q = mixed_qkv.narrow(D::Minus1, 0, nk * dk)?; let k = mixed_qkv.narrow(D::Minus1, nk * dk, nk * dk)?;
+    pub fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
+        let (bs, sl, _) = x.dims3()?; 
+        let (nk, dk, nv, dv) = (self.nk, self.dk, self.nv, self.dv);
+        
+        let x = if let Some(m) = mask {
+            x.broadcast_mul(&m.to_dtype(x.dtype())?.unsqueeze(D::Minus1)?)?
+        } else {
+            x.clone()
+        };
+
+        let mixed_qkv = self.in_proj_qkv.forward(&x, reg)?; 
+        let z = self.in_proj_z.forward(&x, reg)?;
+        let b = self.in_proj_b.forward(&x, reg)?; 
+        let a = self.in_proj_a.forward(&x, reg)?;
+        
+        let q = mixed_qkv.narrow(D::Minus1, 0, nk * dk)?; 
+        let k = mixed_qkv.narrow(D::Minus1, nk * dk, nk * dk)?;
         let v = mixed_qkv.narrow(D::Minus1, nk * dk * 2, nv * dv)?;
+        
         let (q_out, k_out, v_out) = if let Some(ref conv) = self.conv1d {
-            let q_c = q.reshape((bs, sl, nk, dk))?.transpose(1, 2)?; let k_c = k.reshape((bs, sl, nk, dk))?.transpose(1, 2)?; let v_c = v.reshape((bs, sl, nv, dv))?.transpose(1, 2)?;
+            let q_c = q.reshape((bs, sl, nk, dk))?.transpose(1, 2)?; 
+            let k_c = k.reshape((bs, sl, nk, dk))?.transpose(1, 2)?; 
+            let v_c = v.reshape((bs, sl, nv, dv))?.transpose(1, 2)?;
+            
             let mut qkv_conv = Tensor::cat(&[&q_c, &k_c, &v_c], 1)?.reshape((bs, (), sl))?;
+            
             if sl == 1 && self.conv_state_cache.is_some() {
                 let conv_state = self.conv_state_cache.as_ref().unwrap().to_device(x.device())?;
                 let conv_state_new = Tensor::cat(&[&conv_state, &qkv_conv], D::Minus1)?;
-                self.conv_state_cache = Some(conv_state_new.narrow(D::Minus1, sl, 3)?.detach());
+                self.conv_state_cache = Some(conv_state_new.narrow(D::Minus1, 1, 3)?.detach());
                 let conv_out = crate::models::common::conv1d_depthwise(&conv_state_new, conv.weight(), conv.bias())?;
-                qkv_conv = conv_out.narrow(D::Minus1, conv_out.dim(D::Minus1)? - sl, sl)?.silu()?;
+                qkv_conv = conv_out.narrow(D::Minus1, conv_out.dim(D::Minus1)? - 1, 1)?.silu()?;
             } else {
                 let conv_in = qkv_conv.pad_with_zeros(D::Minus1, 3, 0)?;
                 qkv_conv = crate::models::common::conv1d_depthwise(&conv_in, conv.weight(), conv.bias())?;
                 qkv_conv = qkv_conv.narrow(D::Minus1, 0, sl)?.silu()?;
                 self.conv_state_cache = Some(conv_in.narrow(D::Minus1, sl.max(3) - 3, 3)?.detach());
             }
+            
             let qkv_conv = qkv_conv.reshape((bs, (), sl))?;
-            let q_new = qkv_conv.narrow(1, 0, nk * dk)?.reshape((bs, nk, dk, sl))?.transpose(2, 3)?.reshape((bs, sl, nk, dk))?;
-            let k_new = qkv_conv.narrow(1, nk * dk, nk * dk)?.reshape((bs, nk, dk, sl))?.transpose(2, 3)?.reshape((bs, sl, nk, dk))?;
-            let v_new = qkv_conv.narrow(1, nk * dk * 2, nv * dv)?.reshape((bs, nv, dv, sl))?.transpose(2, 3)?.reshape((bs, sl, nv, dv))?;
+            let channels_per_head = nk + nk + nv;
+            let total_qkv = qkv_conv.reshape((bs, channels_per_head, dk, sl))?.transpose(2, 3)?; // (bs, 48, sl, 128)
+            
+            let q_new = total_qkv.narrow(1, 0, nk)?.transpose(1, 2)?; // (bs, sl, nk, dk)
+            let k_new = total_qkv.narrow(1, nk, nk)?.transpose(1, 2)?; // (bs, sl, nk, dk)
+            let v_new = total_qkv.narrow(1, nk * 2, nv)?.transpose(1, 2)?; // (bs, sl, nv, dv)
+            
             (q_new, k_new, v_new)
-        } else { (q.reshape((bs, sl, nk, dk))?, k.reshape((bs, sl, nk, dk))?, v.reshape((bs, sl, nv, dv))?) };
-        let q_out = crate::utils::tensor_utils::l2_normalize(&q_out, 3)?; let k_out = crate::utils::tensor_utils::l2_normalize(&k_out, 3)?;
+        } else { 
+            (q.reshape((bs, sl, nk, dk))?, k.reshape((bs, sl, nk, dk))?, v.reshape((bs, sl, nv, dv))?) 
+        };
+        
+        let q_out = crate::utils::tensor_utils::l2_normalize(&q_out, 3)?; 
+        let k_out = crate::utils::tensor_utils::l2_normalize(&k_out, 3)?;
+        
         let mut query = q_out.affine(1.0 / (dk as f64).sqrt(), 0.0)?.to_dtype(DType::F32)?;
-        let mut key = k_out.to_dtype(DType::F32)?; let value = v_out.to_dtype(DType::F32)?; let beta = candle_nn::ops::sigmoid(&b)?.to_dtype(DType::F32)?;
+        let mut key = k_out.to_dtype(DType::F32)?; 
+        let value = v_out.to_dtype(DType::F32)?; 
+        let beta = candle_nn::ops::sigmoid(&b)?.to_dtype(DType::F32)?;
+        
         let a_plus_bias = softplus(&a.to_dtype(DType::F32)?.broadcast_add(&self.dt_bias.as_ref().unwrap_or(&Tensor::zeros((nv,), DType::F32, x.device())?).to_dtype(DType::F32)?)?)?;
         let g = self.a_log.as_ref().unwrap_or(&Tensor::zeros((nv,), DType::F32, x.device())?).to_dtype(DType::F32)?.exp()?.affine(-1.0, 0.0)?.broadcast_mul(&a_plus_bias)?;
-        if nv / nk > 1 { query = crate::utils::tensor_utils::repeat_interleave(&query, nv / nk, 2)?; key = crate::utils::tensor_utils::repeat_interleave(&key, nv / nk, 2)?; }
+        
+        if nv / nk > 1 { 
+            query = crate::utils::tensor_utils::repeat_interleave(&query, nv / nk, 2)?; 
+            key = crate::utils::tensor_utils::repeat_interleave(&key, nv / nk, 2)?; 
+        }
+        
         let mut state = self.recurrent_state_cache.take().unwrap_or_else(|| Tensor::zeros((bs, nv, dk, dv), DType::F32, x.device()).unwrap()).to_device(x.device())?.to_dtype(DType::F32)?;
         let mut outputs = vec![];
+        
         for t in 0..sl {
-            let q_i = query.i((.., t, ..))?; let k_i = key.i((.., t, ..))?; let v_i = value.i((.., t, ..))?; let g_i = g.i((.., t, ..))?.exp()?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
+            let q_i = query.i((.., t, ..))?; 
+            let k_i = key.i((.., t, ..))?; 
+            let v_i = value.i((.., t, ..))?; 
+            let g_i = g.i((.., t, ..))?.exp()?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
             let beta_i = beta.i((.., t, ..))?.unsqueeze(D::Minus1)?;
+            
             state = state.broadcast_mul(&g_i)?;
             let kv_mem = state.broadcast_mul(&k_i.unsqueeze(D::Minus1)?)?.sum(D::Minus2)?;
             let delta = v_i.broadcast_sub(&kv_mem)?.broadcast_mul(&beta_i)?;
             state = state.broadcast_add(&k_i.unsqueeze(D::Minus1)?.broadcast_mul(&delta.unsqueeze(D::Minus2)?)?)?;
+            
             outputs.push(state.broadcast_mul(&q_i.unsqueeze(D::Minus1)?)?.sum_keepdim(D::Minus2)?.to_dtype(DType::F16)?);
         }
-        let out = Tensor::cat(&outputs, 1)?.reshape((bs * sl, nv, dv))?; let z_flat = z.reshape((bs * sl, nv, dv))?;
+        
         self.recurrent_state_cache = Some(state.detach());
+        
+        let out = Tensor::cat(&outputs, 2)?.transpose(1, 2)?.reshape((bs * sl, nv, dv))?; 
+        let z_flat = z.reshape((bs * sl, nv, dv))?;
+        
         let gated_out = self.norm.forward(&out, reg)?.broadcast_mul(&z_flat.silu()?.to_dtype(DType::F16)?)?;
         self.out_proj.forward(&gated_out.reshape((bs, sl, nv * dv))?, reg)
     }
+
 }
 
 pub struct QAttention { pub q_proj: QLinear, pub k_proj: QLinear, pub v_proj: QLinear, pub o_proj: QLinear, pub q_norm: QRmsNorm, pub k_norm: QRmsNorm, pub nh: usize, pub nkv: usize, pub hd: usize, scaling: f64, pub kv_cache: Option<(Tensor, Tensor)> }
@@ -331,7 +377,13 @@ pub struct QTextModel { pub embed: QEmbedding, pub layers: Vec<QDecoderLayer>, p
 impl QTextModel {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let mut layers = vec![]; for i in 0..config.num_hidden_layers { layers.push(QDecoderLayer::new(vb.pp("layers").pp(i), config, i)?); }
-        Ok(Self { embed: QEmbedding::new(&join_name(&vb.prefix(), "embed_tokens"), config.vocab_size, config.hidden_size), layers, norm: QRmsNorm::new(&join_name(&vb.prefix(), "norm"), config.rms_norm_eps)?, rotary: Qwen3_5TextRotaryEmbedding::new((config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize, 1000000.0), mrope: config.rope_parameters.mrope_section.clone() })
+        Ok(Self { 
+            embed: QEmbedding::new(&join_name(&vb.prefix(), "embed_tokens"), config.vocab_size, config.hidden_size), 
+            layers, 
+            norm: QRmsNorm::new(&join_name(&vb.prefix(), "norm"), config.rms_norm_eps)?, 
+            rotary: Qwen3_5TextRotaryEmbedding::new((config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize, config.rope_parameters.rope_theta as f32), 
+            mrope: config.rope_parameters.mrope_section.clone() 
+        })
     }
     pub fn load_all_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { self.embed.load_to_vram(reg, dev)?; for layer in self.layers.iter_mut() { layer.load_to_vram(reg, dev)?; } self.norm.load_to_vram(reg, dev)?; Ok(()) }
 }

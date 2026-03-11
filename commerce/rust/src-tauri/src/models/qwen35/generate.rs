@@ -74,7 +74,7 @@ impl Qwen3_5GenerateModel {
             device: dev,
             registry,
             chat_template,
-            eos_token_id: 151643,
+            eos_token_id: 248044,
         })
     }
 
