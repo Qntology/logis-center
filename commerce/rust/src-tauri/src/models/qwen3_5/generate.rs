@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use serde_json;
 use candle_core::{DType, Device, Tensor, D};
 use crate::models::qwen3_5::{Qwen3_5ForCausalLM};
 use crate::models::layers::VarBuilderX;
@@ -33,7 +34,16 @@ impl Qwen3_5GenerateModel {
         
         let config_path = std::path::Path::new(model_path).join("config.json");
         let config_str = std::fs::read_to_string(config_path)?;
-        let config: Config = serde_json::from_str(&config_str)?;
+        let config_value: serde_json::Value = serde_json::from_str(&config_str)?;
+        let config: Config = if let Some(text_config) = config_value.get("text_config") {
+            let mut cfg: Config = serde_json::from_value(text_config.clone())?;
+            if cfg.architectures.is_none() {
+                cfg.architectures = config_value.get("architectures").and_then(|a| serde_json::from_value(a.clone()).ok());
+            }
+            cfg
+        } else {
+            serde_json::from_str(&config_str)?
+        };
         
         let tokenizer = TokenizerModel::init(model_path)?;
         let chat_template = ChatTemplate::init(model_path)?;
@@ -51,7 +61,7 @@ impl Qwen3_5GenerateModel {
         let comm = Rc::new(Comm::default());
         let progress = Arc::new(RwLock::new(Box::new(crate::utils::progress::NoProgress) as Box<dyn ProgressLike>));
         
-        let qwen3_5 = Qwen3_5ForCausalLM::new(&vb, comm, &config, dtype, false, &dev, progress)?;
+        let qwen3_5 = Qwen3_5ForCausalLM::new_with_prefix(&vb, comm, &config, dtype, false, &dev, progress, Some("model.language_model.".to_string()))?;
         
         // Allocate KV cache for Attention layers
         let block_size = 16;
