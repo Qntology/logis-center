@@ -449,7 +449,7 @@ impl QAttention {
         // 7. Gating (vllm style)
         // gate_states: (B, S, NH, HD)
         // attn_output: already (B, S, NH, HD) from eager_attention_forward
-        let gate = candle_nn::ops::sigmoid(&gate_states.to_dtype(DType::F32)?)?;
+        let gate = gate_states.to_dtype(DType::F32)?.silu()?;
         let attn_output = attn_output.to_dtype(DType::F32)?.broadcast_mul(&gate)?; // (B, S, NH, HD)
 
         let attn_output = attn_output.reshape((b_sz, q_len, ()))?.contiguous()?;
@@ -525,7 +525,7 @@ impl QTextModel {
         Ok(Self { 
             embed: QEmbedding::new(&join_name(&vb.prefix(), "embed_tokens"), config.vocab_size, config.hidden_size), 
             layers, 
-            norm: QRmsNorm::new(&join_name(&vb.prefix(), "norm"), config.rms_norm_eps, 1.0)?, 
+            norm: QRmsNorm::new(&join_name(&vb.prefix(), "norm"), config.rms_norm_eps, 0.0)?, 
             rotary: Qwen3_5TextRotaryEmbedding::new((config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize, config.rope_parameters.rope_theta), 
             mrope: config.rope_parameters.mrope_section.clone() 
         })
@@ -540,14 +540,8 @@ impl QuantizedQwen3_5Model {
         let head_name = if config.tie_word_embeddings { join_name(&vb.prefix(), "model.language_model.embed_tokens") } else { join_name(&vb.prefix(), "model.language_model.lm_head") };
         let mut head = QLinear::new(&head_name)?;
         
-        if config.tie_word_embeddings {
-            // Share the same persistent weight handle
-            head.persistent_weight = model.embed.persistent_weight.clone();
-        }
-        
         Ok(Self { model, head, tie: config.tie_word_embeddings })
-    }
-    pub fn load_all_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { 
+    }    pub fn load_all_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { 
         self.model.load_all_to_vram(reg, dev)?; 
         if !self.tie { 
             self.head.load_to_vram(reg, dev)?; 
