@@ -285,7 +285,7 @@ pub fn get_llama4_attn_scale(
     positions: &candle_core::Tensor,
     llama_4_scaling_beta: f64,
     original_max_position_embeddings: f64,
-) -> Result<candle_core::Tensor> {
+) -> candle_core::Result<candle_core::Tensor> {
     let div = (positions.to_dtype(DType::F32)? / original_max_position_embeddings)?;
     let floored = div.floor()?;
 

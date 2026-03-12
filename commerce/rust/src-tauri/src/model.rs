@@ -29,7 +29,7 @@ impl Spinner {
 
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::models::qwen35::generate::Qwen3_5GenerateModel;
+use crate::models::qwen3_5::generate::Qwen3_5GenerateModel;
 
 #[derive(Clone)]
 pub enum ModelVariant {

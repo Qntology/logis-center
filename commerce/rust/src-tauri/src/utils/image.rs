@@ -1,5 +1,5 @@
 use crate::utils::config::ModelType;
-use crate::utils::Config;
+use crate::utils::config::Config;
 use candle_core::{DType, Device, Result, Storage, Tensor};
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView};

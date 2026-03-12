@@ -14,53 +14,53 @@ use kernels::ffi;
 use std::ffi::{c_int, c_void};
 
 #[cfg(feature = "cuda")]
-fn get_cuda_const_ptr(t: &Tensor) -> Result<*const c_void> {
-    use candle::cuda_backend::cudarc::driver::DevicePtr;
+fn get_cuda_const_ptr(t: &Tensor, dev: &candle::CudaDevice) -> Result<*const c_void> {
+    use candle::cuda_backend::cudarc::driver::{DevicePtr, CudaStream};
     let (storage, layout) = t.storage_and_layout();
     let offset = layout.start_offset();
     match (&*storage, t.dtype()) {
         (Storage::Cuda(s), DType::F16) => {
-            Ok(*s.as_cuda_slice::<f16>()?.slice(offset..).device_ptr() as *const c_void)
+            Ok(s.as_cuda_slice::<f16>()?.slice(offset..).device_ptr(dev.cuda_stream()?).0 as *const c_void)
         }
         (Storage::Cuda(s), DType::BF16) => {
-            Ok(*s.as_cuda_slice::<bf16>()?.slice(offset..).device_ptr() as *const c_void)
+            Ok(s.as_cuda_slice::<bf16>()?.slice(offset..).device_ptr(dev.cuda_stream()?).0 as *const c_void)
         }
         (Storage::Cuda(s), DType::F32) => {
-            Ok(*s.as_cuda_slice::<f32>()?.slice(offset..).device_ptr() as *const c_void)
+            Ok(s.as_cuda_slice::<f32>()?.slice(offset..).device_ptr(dev.cuda_stream()?).0 as *const c_void)
         }
         _ => candle_core::bail!("Expected CUDA tensor with f16/bf16/f32 dtype"),
     }
 }
 
 #[cfg(feature = "cuda")]
-fn get_cuda_const_ptr_u32(t: &Tensor) -> Result<*const u32> {
-    use candle::cuda_backend::cudarc::driver::DevicePtr;
+fn get_cuda_const_ptr_u32(t: &Tensor, dev: &candle::CudaDevice) -> Result<*const u32> {
+    use candle::cuda_backend::cudarc::driver::{DevicePtr, CudaStream};
     let (storage, layout) = t.storage_and_layout();
     let offset = layout.start_offset();
     match &*storage {
         Storage::Cuda(s) => {
-            Ok(*s.as_cuda_slice::<u32>()?.slice(offset..).device_ptr() as *const u32)
+            Ok(s.as_cuda_slice::<u32>()?.slice(offset..).device_ptr(dev.cuda_stream()?).0 as *const u32)
         }
         _ => candle_core::bail!("Expected CUDA u32 tensor"),
     }
 }
 
 #[cfg(feature = "cuda")]
-fn get_cuda_const_ptr_i64(t: &Tensor) -> Result<*const i64> {
-    use candle::cuda_backend::cudarc::driver::DevicePtr;
+fn get_cuda_const_ptr_i64(t: &Tensor, dev: &candle::CudaDevice) -> Result<*const i64> {
+    use candle::cuda_backend::cudarc::driver::{DevicePtr, CudaStream};
     let (storage, layout) = t.storage_and_layout();
     let offset = layout.start_offset();
     match &*storage {
         Storage::Cuda(s) => {
-            Ok(*s.as_cuda_slice::<i64>()?.slice(offset..).device_ptr() as *const i64)
+            Ok(s.as_cuda_slice::<i64>()?.slice(offset..).device_ptr(dev.cuda_stream()?).0 as *const i64)
         }
         _ => candle_core::bail!("Expected CUDA i64 tensor"),
     }
 }
 
 #[cfg(feature = "cuda")]
-fn get_cuda_mut_ptr(t: &Tensor) -> Result<*mut c_void> {
-    Ok(get_cuda_const_ptr(t)? as *mut c_void)
+fn get_cuda_mut_ptr(t: &Tensor, dev: &candle::CudaDevice) -> Result<*mut c_void> {
+    Ok(get_cuda_const_ptr(t, dev)? as *mut c_void)
 }
 
 #[cfg(feature = "cuda")]
@@ -105,17 +105,17 @@ pub fn causal_conv1d_fwd(
                 cu.to_dtype(DType::U32)?
             };
 
-            let x_ptr = get_cuda_const_ptr(x)?;
-            let weight_ptr = get_cuda_const_ptr(weight)?;
+            let x_ptr = get_cuda_const_ptr(x, dev)?;
+            let weight_ptr = get_cuda_const_ptr(weight, dev)?;
             let bias_ptr = if let Some(b) = bias {
-                get_cuda_const_ptr(b)?
+                get_cuda_const_ptr(b, dev)?
             } else {
                 std::ptr::null()
             };
-            let state_ptr = get_cuda_mut_ptr(conv_state)?;
-            let out_ptr = get_cuda_mut_ptr(&out)?;
-            let cu_ptr = get_cuda_const_ptr_u32(&cu_u32)?;
-            let stream = *dev.cu_stream() as i64;
+            let state_ptr = get_cuda_mut_ptr(conv_state, dev)?;
+            let out_ptr = get_cuda_mut_ptr(&out, dev)?;
+            let cu_ptr = get_cuda_const_ptr_u32(&cu_u32, dev)?;
+            let stream = *dev.cuda_stream()? as i64;
 
             unsafe {
                 match x.dtype() {
