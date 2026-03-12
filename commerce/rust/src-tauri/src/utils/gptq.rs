@@ -38,7 +38,7 @@ impl GPTQMatMul {
         use candle::cuda_backend::cudarc::driver::DevicePtr;
         use std::ffi::c_void;
         let dev = qweight.device();
-        let stream = dev.cuda_stream();
+        let stream = dev.cu_stream();
         let x_shape = x_l.dims();
         let weight_shape = qweight_l.dims();
 
@@ -62,10 +62,10 @@ impl GPTQMatMul {
         let elem_count = oshape.elem_count();
         let out = unsafe { dev.alloc::<T>(elem_count) }.map_err(candle::Error::wrap)?;
 
-        let out_ptr = out.device_ptr(&stream).0 as *mut c_void;
-        let in_ptr = input.device_ptr(&stream).0 as *const c_void;
-        let qw_ptr = qw.device_ptr(&stream).0 as *const c_void;
-        let qs_ptr = qs.device_ptr(&stream).0 as *const c_void;
+        let out_ptr = out.device_ptr().0 as *mut c_void;
+        let in_ptr = input.device_ptr().0 as *const c_void;
+        let qw_ptr = qw.device_ptr().0 as *const c_void;
+        let qs_ptr = qs.device_ptr().0 as *const c_void;
 
         let qzeros_ptr = if self.qzeros.is_some() {
             let (qzeros, qzeros_l) = self.qzeros.as_ref().unwrap().storage_and_layout();
@@ -75,7 +75,7 @@ impl GPTQMatMul {
             };
             let qzeros_ = qzeros.as_cuda_slice::<u32>()?;
             let qzeros_ = qzeros_.slice(qzeros_l.start_offset()..);
-            qzeros_.device_ptr(&stream).0 as *const c_void
+            qzeros_.device_ptr().0 as *const c_void
         } else {
             std::ptr::null()
         };
@@ -88,7 +88,7 @@ impl GPTQMatMul {
             };
             let g_idx_ = g_idx.as_cuda_slice::<u32>()?;
             let g_idx_ = g_idx_.slice(g_idx_l.start_offset()..);
-            g_idx_.device_ptr(&stream).0 as *const c_void
+            g_idx_.device_ptr().0 as *const c_void
         } else {
             std::ptr::null()
         };
@@ -105,7 +105,7 @@ impl GPTQMatMul {
                     };
                     let workspace_ = workspace.as_cuda_slice::<u32>()?;
                     let workspace_ = workspace_.slice(workspace_l.start_offset()..);
-                    workspace_.device_ptr(&stream).0 as *const c_void
+                    workspace_.device_ptr().0 as *const c_void
                 } else {
                     candle::bail!("workspace is required for marlin matmul!")
                 };
@@ -276,7 +276,7 @@ impl MarlinRepack {
     ) -> Result<(CudaStorage, Shape)> {
         use candle::cuda_backend::cudarc::driver::DevicePtr;
         let dev = qweight.device();
-        let stream = dev.cuda_stream();
+        let stream = dev.cu_stream();
         let q_shape = qweight_l.dims();
         let mut out_shape: Vec<usize> = q_shape.to_vec();
         let pack_factor = (32 / self.bits) as usize;
@@ -294,8 +294,8 @@ impl MarlinRepack {
         let elem_count = oshape.elem_count();
         let out = unsafe { dev.alloc::<u32>(elem_count) }.map_err(candle::Error::wrap)?;
 
-        let out_ptr = out.device_ptr(&stream).0 as *const core::ffi::c_void;
-        let q_ptr = q.device_ptr(&stream).0 as *const core::ffi::c_void;
+        let out_ptr = out.device_ptr().0 as *const core::ffi::c_void;
+        let q_ptr = q.device_ptr().0 as *const core::ffi::c_void;
         let stream_ptr = *stream as *const _ as i64;
 
         unsafe {

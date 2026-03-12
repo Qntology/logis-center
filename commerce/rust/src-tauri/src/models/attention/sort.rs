@@ -39,24 +39,23 @@ impl candle::CustomOp1 for ArgSort {
         let ncols = self.last_dim as i32;
         let nrows = elem_count as i32 / ncols;
         
-        let stream = dev.cuda_stream();
         let mut dst = unsafe { dev.alloc::<u32>(elem_count) }.w()?;
         let stream_ptr = get_raw_stream(dev);
 
         use std::ffi::c_void;
 
         let src_ptr = match &storage.slice {
-            CudaStorageSlice::U8(inp) => inp.device_ptr(&stream).0 as *const c_void,
-            CudaStorageSlice::U32(inp) => inp.device_ptr(&stream).0 as *const c_void,
-            CudaStorageSlice::I64(inp) => inp.device_ptr(&stream).0 as *const c_void,
-            CudaStorageSlice::BF16(inp) => inp.device_ptr(&stream).0 as *const c_void,
-            CudaStorageSlice::F16(inp) => inp.device_ptr(&stream).0 as *const c_void,
-            CudaStorageSlice::F32(inp) => inp.device_ptr(&stream).0 as *const c_void,
-            CudaStorageSlice::F64(inp) => inp.device_ptr(&stream).0 as *const c_void,
+            CudaStorageSlice::U8(inp) => inp.device_ptr().0 as *const c_void,
+            CudaStorageSlice::U32(inp) => inp.device_ptr().0 as *const c_void,
+            CudaStorageSlice::I64(inp) => inp.device_ptr().0 as *const c_void,
+            CudaStorageSlice::BF16(inp) => inp.device_ptr().0 as *const c_void,
+            CudaStorageSlice::F16(inp) => inp.device_ptr().0 as *const c_void,
+            CudaStorageSlice::F32(inp) => inp.device_ptr().0 as *const c_void,
+            CudaStorageSlice::F64(inp) => inp.device_ptr().0 as *const c_void,
             _ => candle_core::bail!("Unsupported dtype for sort"),
         };
         
-        let dst_ptr = dst.device_ptr(&stream).0 as *mut c_void;
+        let dst_ptr = dst.device_ptr().0 as *mut c_void;
         
         unsafe {
             if self.asc {

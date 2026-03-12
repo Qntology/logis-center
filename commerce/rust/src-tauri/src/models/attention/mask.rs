@@ -26,13 +26,12 @@ impl candle_core::InplaceOp1 for CausalMask {
         let (tgt_len, tgt_len1) = input_layout.shape().dims2()?;
         assert!(tgt_len == tgt_len1);
 
-        let stream = dev.cuda_stream();
         let stream_ptr = get_raw_stream(dev);
 
         let src_ptr = match &input.slice {
-            CudaStorageSlice::F32(inp) => inp.device_ptr(&stream).0 as *mut c_void,
-            CudaStorageSlice::F16(inp) => inp.device_ptr(&stream).0 as *mut c_void,
-            CudaStorageSlice::BF16(inp) => inp.device_ptr(&stream).0 as *mut c_void,
+            CudaStorageSlice::F32(inp) => inp.device_ptr().0 as *mut c_void,
+            CudaStorageSlice::F16(inp) => inp.device_ptr().0 as *mut c_void,
+            CudaStorageSlice::BF16(inp) => inp.device_ptr().0 as *mut c_void,
             _ => candle_core::bail!("Unsupported dtype for causal mask"),
         };
 
