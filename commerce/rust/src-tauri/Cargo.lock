@@ -8638,6 +8638,7 @@ dependencies = [
  "nvml-wrapper",
  "once_cell",
  "parking_lot",
+ "rand 0.8.5",
  "rayon",
  "regex",
  "reqwest",

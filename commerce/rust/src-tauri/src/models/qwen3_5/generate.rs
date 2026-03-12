@@ -186,7 +186,8 @@ impl Qwen3_5GenerateModel {
                 false
             )?;
 
-            let next_token = logit_processor.sample(&logits.to_dtype(DType::F32)?)?;
+            let next_tokens = logit_processor.sample(&logits.to_dtype(DType::F32)?, &None)?;
+            let next_token = next_tokens[0];
             if next_token == self.eos_token_id {
                 break;
             }

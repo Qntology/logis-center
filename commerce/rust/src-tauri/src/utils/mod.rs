@@ -234,39 +234,6 @@ pub fn find_type_files(path: &str, extension_type: &str) -> Result<Vec<String>> 
     Ok(files)
 }
 
-pub fn get_logit_processor(
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    top_k: Option<usize>,
-    seed: u64,
-) -> LogitsProcessor {
-    let temperature = temperature.and_then(|v| if v < 1e-7 { None } else { Some(v) });
-    match top_k {
-        None => LogitsProcessor::new(
-            seed,
-            temperature.map(|temp| temp as f64),
-            top_p.map(|tp| tp as f64),
-        ),
-        Some(k) => {
-            let sampling = match temperature {
-                None => Sampling::ArgMax,
-                Some(temperature) => match top_p {
-                    None => Sampling::TopK {
-                        k,
-                        temperature: temperature as f64,
-                    },
-                    Some(p) => Sampling::TopKThenTopP {
-                        k,
-                        p: p as f64,
-                        temperature: temperature as f64,
-                    },
-                },
-            };
-            LogitsProcessor::from_sampling(seed, sampling)
-        }
-    }
-}
-
 pub fn round_by_factor(num: u32, factor: u32) -> u32 {
     let round = (num as f32 / factor as f32).round() as u32;
     round * factor

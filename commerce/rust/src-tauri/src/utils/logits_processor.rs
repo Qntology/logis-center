@@ -336,3 +336,25 @@ impl LogitsProcessor {
         Tensor::from_vec(logits, (batch, logits_len), device)
     }
 }
+
+pub fn get_logit_processor(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    seed: u64,
+) -> LogitsProcessor {
+    let temperature = temperature.and_then(|v| if v < 1e-7 { None } else { Some(v) });
+    match top_k {
+        None => LogitsProcessor::new(
+            seed,
+            temperature,
+            None,
+            top_p,
+        ),
+        Some(k) => {
+            let strategy = LogitsProcessor::get_strategy(temperature, Some(k as isize), top_p);
+            LogitsProcessor::from_sampling(seed, strategy)
+        }
+    }
+}
+

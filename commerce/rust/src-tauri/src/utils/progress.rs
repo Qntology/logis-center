@@ -18,3 +18,9 @@ impl ProgressReporter {
         Self { rank, progress: 0 }
     }
 }
+
+pub struct NoProgress;
+impl ProgressLike for NoProgress {
+    fn set_progress(&mut self, _p: usize) {}
+}
+
