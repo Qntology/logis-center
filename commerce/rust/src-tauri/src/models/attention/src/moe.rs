@@ -483,7 +483,7 @@ pub fn moe_gemm_fp8(
         let input_dtype = input.dtype();
         let dev = input.device().as_cuda_device()?;
         #[cfg(feature = "cutlass")]
-        let sm_version = crate::models::attention::cuda_utils::sm_version(dev).unwrap_or(0) as i32;
+        let sm_version = crate::cuda_utils::sm_version(dev).unwrap_or(0) as i32;
         let data_type = match input_dtype {
             DType::F16 => 0,
             DType::BF16 => 1,

@@ -508,7 +508,7 @@ impl PagedAttention {
                 self.maybe_update_kv_scales(&key, &value)?;
 
                 if let (Some(kc), Some(vc)) = (key_cache.as_ref(), value_cache.as_ref()) {
-                    crate::models::attention::flashinfer::append_kv_cache(
+                    crate::flashinfer::append_kv_cache(
                         &key,
                         &value,
                         kc,
@@ -530,7 +530,7 @@ impl PagedAttention {
                 };
 
                 return if input_metadata.is_prefill {
-                    crate::models::attention::flashinfer::prefill(
+                    crate::flashinfer::prefill(
                         &query,
                         key_cache.as_ref().unwrap(),
                         value_cache.as_ref().unwrap(),
@@ -559,7 +559,7 @@ impl PagedAttention {
                             "flashinfer decode requires decode_plan_info (plan+run path)",
                         )
                     })?;
-                    crate::models::attention::flashinfer::decode_with_plan(
+                    crate::flashinfer::decode_with_plan(
                         &query,
                         key_cache.as_ref().unwrap(),
                         value_cache.as_ref().unwrap(),

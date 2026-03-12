@@ -36,7 +36,6 @@ futures = "0.3"
 either = "1.9"
 parking_lot = "0.12"
 attention_rs = { path = "src/models/attention", features = ["cuda"] }
-kernels = { path = "src/models/attention/kernels" }
 uuid = { version = "1.4", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 tauri-plugin-opener = "2"

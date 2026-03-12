@@ -20,7 +20,7 @@ pub fn swap_blocks(
         block_mapping: &HashMap<usize, usize>,
     ) -> Result<()> {
         use candle_core::cuda_backend::cudarc::driver::{result, DevicePtr};
-        use crate::models::attention::cuda_utils::get_cuda_stream_ptr;
+        use crate::cuda_utils::get_cuda_stream_ptr;
         use std::slice;
         let block_size_elements = src.elem_count() / src.dim(0)?;
         let (src_storage, _) = src.storage_and_layout();

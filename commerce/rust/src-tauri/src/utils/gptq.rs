@@ -1,6 +1,6 @@
 // Original implementation: https://github.com/EricLBuehler/candle-vllm/blob/master/src/backend/gptq.rs
 #[cfg(feature = "cuda")]
-use crate::models::attention::kernels::ffi::{
+use attention_rs::kernels::ffi::{
     awq_repack, gemm_half_q_half_alt, gptq_repack, marlin_4bit_bf16, marlin_4bit_f16,
     marlin_awq_4bit_bf16, marlin_awq_4bit_f16,
 };

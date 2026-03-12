@@ -1,6 +1,6 @@
 use super::config::SamplingParams;
 #[cfg(feature = "cuda")]
-use crate::models::attention::sort::ArgSortOp; //Use our custom sort kernel, fix kernel crash on A100
+use attention_rs::sort::ArgSortOp; //Use our custom sort kernel, fix kernel crash on A100
 use candle_core::D;
 use candle_core::{DType, Error, Result, Tensor};
 use parking_lot::Mutex;
@@ -22,7 +22,7 @@ pub struct LogitsProcessor {
     rng: Arc<Mutex<rand::rngs::StdRng>>,
     pub sampling: Sampling,
     #[cfg(feature = "cuda")]
-    fast_sampler: Arc<std::sync::Mutex<crate::models::attention::sampler::Sampler>>, 
+    fast_sampler: Arc<std::sync::Mutex<attention_rs::sampler::Sampler>>, 
 }
 
 impl LogitsProcessor {
@@ -32,7 +32,7 @@ impl LogitsProcessor {
             rng: Arc::new(Mutex::new(rng)),
             sampling,
             #[cfg(feature = "cuda")]
-            fast_sampler: Arc::new(std::sync::Mutex::new(crate::models::attention::sampler::Sampler::new())),
+            fast_sampler: Arc::new(std::sync::Mutex::new(attention_rs::sampler::Sampler::new())),
         }
     }
 
