@@ -47,7 +47,7 @@ impl candle::InplaceOp1 for CausalMask {
                 candle_core::bail!("Casual mask tensor should has dtype of f16, bf16 or f32!")
             }
         };
-        let stream = *dev.cu_stream() as i64;
+        let stream = *dev.cuda_stream() as i64;
 
         unsafe {
             match input.dtype() {

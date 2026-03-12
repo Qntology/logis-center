@@ -287,7 +287,7 @@ impl PagedAttention {
                         query_start_len_ptr as *const u32,
                         sinks_ptr as *const f32,
                         self.sliding_window as c_int,
-                        *dev.cu_stream() as i64,
+                        *dev.cuda_stream() as i64,
                     )
                 } else {
                     kernels::ffi::paged_attention_prefill(
@@ -318,7 +318,7 @@ impl PagedAttention {
                         query_start_len_ptr as *const u32,
                         sinks_ptr as *const f32,
                         self.sliding_window as c_int,
-                        *dev.cu_stream() as i64,
+                        *dev.cuda_stream() as i64,
                     )
                 }
             }
@@ -347,7 +347,7 @@ impl PagedAttention {
                     internal_type,
                     self.softcapping,
                     self.sliding_window,
-                    *dev.cu_stream() as i64,
+                    *dev.cuda_stream() as i64,
                 )
             }
         } else {
@@ -388,7 +388,7 @@ impl PagedAttention {
                     internal_type,
                     self.softcapping,
                     self.sliding_window,
-                    *dev.cu_stream() as i64,
+                    *dev.cuda_stream() as i64,
                 )
             }
         }
@@ -1033,7 +1033,7 @@ impl ReshapeCache {
                     page_stride as c_int,
                     head_stride as c_int,
                     internal_type,
-                    *dev.cu_stream() as i64,
+                    *dev.cuda_stream() as i64,
                 );
             }
             #[cfg(not(feature = "flashattn"))]
@@ -1054,7 +1054,7 @@ impl ReshapeCache {
                     key_stride,
                     value_stride,
                     internal_type,
-                    *dev.cu_stream() as i64,
+                    *dev.cuda_stream() as i64,
                 );
             }
         }

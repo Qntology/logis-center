@@ -76,7 +76,7 @@ pub fn swap_blocks(
                         result::memcpy_htod_async(
                             *dst_slice.device_ptr(),
                             &src_slice[src_offset..src_offset + block_size_elements],
-                            *dst_dev.cu_stream(),
+                            *dst_dev.cuda_stream(),
                         )
                         .map_err(candle_core::Error::wrap)?
                     }
@@ -139,7 +139,7 @@ pub fn swap_blocks(
                         result::memcpy_dtoh_async(
                             dst_slice,
                             *src_slice.device_ptr(),
-                            *src_dev.cu_stream(),
+                            *src_dev.cuda_stream(),
                         )
                         .map_err(candle_core::Error::wrap)?;
                     }
@@ -208,7 +208,7 @@ pub fn swap_blocks(
                             *dst_slice.device_ptr(),
                             *src_slice.device_ptr(),
                             block_size_elements * dtype_size,
-                            *dst_dev.cu_stream(),
+                            *dst_dev.cuda_stream(),
                         )
                         .map_err(candle_core::Error::wrap)?
                     }

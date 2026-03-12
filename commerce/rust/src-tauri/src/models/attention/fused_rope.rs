@@ -287,7 +287,7 @@ fn launch_fused_rope(
     }
 
     let dev = q.device().as_cuda_device()?;
-    let stream = *dev.cu_stream() as i64;
+    let stream = *dev.cuda_stream() as i64;
 
     let q_storage = q.storage_and_layout().0;
     let k_storage = k.storage_and_layout().0;
@@ -576,7 +576,7 @@ fn launch_fused_rope_partial_token_major(
     }
 
     let dev = q.device().as_cuda_device()?;
-    let stream = *dev.cu_stream() as i64;
+    let stream = *dev.cuda_stream() as i64;
 
     let q_storage = q.storage_and_layout().0;
     let k_storage = k.storage_and_layout().0;

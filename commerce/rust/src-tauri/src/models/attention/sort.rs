@@ -52,7 +52,7 @@ impl candle::CustomOp1 for ArgSort {
         };
         let src_ptr = *src as *const c_void;
         let dst_ptr = *dst.device_ptr() as *mut c_void;
-        let stream = *dev.cu_stream() as i64;
+        let stream = *dev.cuda_stream() as i64;
         unsafe {
             if self.asc {
                 match storage.dtype() {

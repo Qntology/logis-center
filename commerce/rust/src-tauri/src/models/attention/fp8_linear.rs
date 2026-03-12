@@ -142,7 +142,7 @@ pub fn fp8_matmul(
             };
             let output_ptr = *output_slice.device_ptr() as *mut core::ffi::c_void;
 
-            let stream = *dev.cu_stream() as i64;
+            let stream = *dev.cuda_stream() as i64;
 
             unsafe {
                 ffi::fp8_matmul_f16(
@@ -190,7 +190,7 @@ pub fn fp8_matmul(
             };
             let output_ptr = *output_slice.device_ptr() as *mut core::ffi::c_void;
 
-            let stream = *dev.cu_stream() as i64;
+            let stream = *dev.cuda_stream() as i64;
 
             unsafe {
                 ffi::fp8_matmul_bf16(
@@ -331,7 +331,7 @@ pub fn fp8_matmul_flashinfer(
     }
 
     let cu_dev = dev.as_cuda_device()?;
-    let stream = *cu_dev.cu_stream() as i64;
+    let stream = *cu_dev.cuda_stream() as i64;
     let m_padded = (m + 4 - 1) / 4 * 4;
     let out = Tensor::zeros((m, n), DType::BF16, dev)?;
     let k_over_128 = k / 128;
@@ -495,7 +495,7 @@ pub fn fp8_matmul_cutlass(
 
     let mut output = Tensor::zeros((if pad_len > 0 { m_padded } else { m }, n), dtype, dev)?;
     let cu_dev = dev.as_cuda_device()?;
-    let stream = *cu_dev.cu_stream() as i64;
+    let stream = *cu_dev.cuda_stream() as i64;
     let k_over_128 = (k + 127) / 128;
 
     let input_q = Tensor::zeros((m_padded, k), DType::U8, &dev)?;

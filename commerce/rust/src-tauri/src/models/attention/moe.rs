@@ -119,7 +119,7 @@ pub fn flashinfer_fused_moe(
         candle_core::bail!("flashinfer fused moe: input and weight dtype must match");
     }
     let dev = input.device().as_cuda_device()?;
-    let stream = *dev.cu_stream() as i64;
+    let stream = *dev.cuda_stream() as i64;
 
     let output = Tensor::zeros((num_tokens, hidden_size), input.dtype(), input.device())?;
     let status = unsafe {
@@ -212,7 +212,7 @@ pub fn flashinfer_fused_moe_fp8(
     }
     let input_dtype = cuda_dtype_code(input.dtype())?;
     let dev = input.device().as_cuda_device()?;
-    let stream = *dev.cu_stream() as i64;
+    let stream = *dev.cuda_stream() as i64;
 
     let output = Tensor::zeros(
         (num_tokens, hidden_size),
@@ -330,7 +330,7 @@ pub fn moe_gemm(
 
         let output = unsafe { dev.alloc::<T>(size_m * size_n) }.w()?;
 
-        let stream = *dev.cu_stream() as i64;
+        let stream = *dev.cuda_stream() as i64;
         use core::ffi::c_void;
 
         unsafe {
@@ -612,7 +612,7 @@ pub fn moe_gemm_fp8(
                 let expert_counts = unsafe { dev.alloc::<i32>(num_experts).w()? };
                 let expert_offsets = unsafe { dev.alloc::<i32>(num_experts + 1).w()? };
 
-                let stream = *dev.cu_stream() as i64;
+                let stream = *dev.cuda_stream() as i64;
                 use core::ffi::c_void;
                 unsafe {
                     ffi::fp8_quantize_per_token_group_launch(
@@ -742,7 +742,7 @@ pub fn moe_gemm_fp8(
 
         let output = unsafe { dev.alloc::<T>(size_m * size_n) }.w()?;
 
-        let stream = *dev.cu_stream() as i64;
+        let stream = *dev.cuda_stream() as i64;
         use core::ffi::c_void;
 
         unsafe {
@@ -939,7 +939,7 @@ pub fn moe_gemm_gguf(
         };
 
         let output = unsafe { dev.alloc::<f32>(size_m * size_n) }.w()?;
-        let stream = *dev.cu_stream() as i64;
+        let stream = *dev.cuda_stream() as i64;
         use core::ffi::c_void;
 
         assert!(size_k % 8 == 0, "size_k must divisible by 8");

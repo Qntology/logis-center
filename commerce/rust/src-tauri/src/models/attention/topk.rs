@@ -29,7 +29,7 @@ pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
         let topk_weights = unsafe { dev.alloc::<f32>(num_tokens * topk) }.w()?;
         let topk_indices = unsafe { dev.alloc::<u32>(num_tokens * topk) }.w()?;
 
-        let stream = *dev.cu_stream() as i64;
+        let stream = *dev.cuda_stream() as i64;
 
         unsafe {
             ffi::topk_softmax(

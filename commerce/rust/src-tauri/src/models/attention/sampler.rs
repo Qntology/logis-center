@@ -65,7 +65,7 @@ impl Sampler {
         // 2. Alloc output buffer
         let out_tokens = unsafe { dev.alloc::<i32>(b) }.w()?;
         let out_ptr = out_tokens.device_ptr();
-        let stream = *dev.cu_stream() as i64;
+        let stream = *dev.cuda_stream() as i64;
         let out_ptr = *out_ptr as *mut core::ffi::c_void;
 
         // 3. Get pointer and call appropriate FFI based on dtype

@@ -647,7 +647,7 @@ extern "C" {
     );
 
     pub fn topk_softmax(
-        gating_output: *const f32,      // inï¼?[num_tokens, num_experts]
+        gating_output: *const f32,      // [num_tokens, num_experts]
         token_expert_indices: *mut i32, // out: [num_tokens, topk]
         topk_weights: *mut f32,         // out: [num_tokens, topk]
         topk_indices: *mut u32,         // out: [num_tokens, topk]
