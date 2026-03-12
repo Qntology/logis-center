@@ -448,8 +448,7 @@ impl QAttention {
 
         // 7. Gating (vllm style)
         // gate_states: (B, S, NH, HD)
-        // attn_output: already (B, S, NH, HD) from eager_attention_forward
-        let gate = gate_states.to_dtype(DType::F32)?.silu()?;
+        let gate = candle_nn::ops::sigmoid(&gate_states.to_dtype(DType::F32)?)?;
         let attn_output = attn_output.to_dtype(DType::F32)?.broadcast_mul(&gate)?; // (B, S, NH, HD)
 
         let attn_output = attn_output.reshape((b_sz, q_len, ()))?.contiguous()?;

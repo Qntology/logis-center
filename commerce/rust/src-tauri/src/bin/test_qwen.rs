@@ -55,12 +55,12 @@ async fn main() -> Result<()> {
         "messages": [
             {
                 "role": "user",
-                "content": "Hello"
+                "content": "Once upon a time in a faraway kingdom, there was a brave knight who"
             }
         ],
-        "max_tokens": 10,
-        "temperature": 0.7,
-        "top_p": 0.9
+        "max_tokens": 50,
+        "temperature": 0.0,
+        "top_p": 1.0
     }
     "#;
     
