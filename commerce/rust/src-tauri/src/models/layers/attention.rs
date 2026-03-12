@@ -119,7 +119,7 @@ impl Attention {
         shard: candle_nn::var_builder::Shard,
         dtype: DType,
     ) -> Result<Option<Tensor>> {
-        let bias = vb.0.get_with_hints_dtype((out_dim,), "bias", shard, DType::F32);
+        let bias = vb.get_with_hints_dtype((out_dim,), "bias", shard, DType::F32);
         let Ok(bias) = bias else {
             return Ok(None);
         };

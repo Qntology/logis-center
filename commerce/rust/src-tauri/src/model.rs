@@ -56,6 +56,7 @@ impl ModelVariant {
     }
 }
 
+#[derive(Clone)]
 pub struct LogisModel {
     pub device: Device,
     pub model_path: String,

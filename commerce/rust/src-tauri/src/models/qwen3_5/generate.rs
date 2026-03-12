@@ -48,7 +48,7 @@ impl Qwen3_5GenerateModel {
         }
         
         let vb = VarBuilderX::new(&weight_files, dtype, &dev)?;
-        let comm = Rc::new(Comm::new_single());
+        let comm = Rc::new(Comm::default());
         let progress = Arc::new(RwLock::new(Box::new(crate::utils::progress::NoProgress) as Box<dyn ProgressLike>));
         
         let qwen3_5 = Qwen3_5ForCausalLM::new(&vb, comm, &config, dtype, false, &dev, progress)?;

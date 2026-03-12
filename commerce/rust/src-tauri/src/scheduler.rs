@@ -438,6 +438,7 @@ async fn process_task(
 
     // --- Image Extraction Logic (Vision Baker Pipeline) ---
     if task.r#type == "image_extraction" {
+        use crate::openai_types::ChatCompletionParameters;
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
         if !image_path.is_empty() {
             println!("[Scheduler] Starting Image Extraction for {}", task.id);
@@ -448,15 +449,15 @@ async fn process_task(
             log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Analyzing visual context with Qwen 3.5 0.8B (Vision)...", "spinner": "⠋" }));
             
             // Transition to full Large model. secure_vram_relay will load existing KV if snapshot_id exists.
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
+
+            let image_data = std::fs::read(&image_path)?;
+            let params = ChatCompletionParameters::default();
 
             model.extract_from_image(
-                task.id.clone(),
-                image_path,
-                "korean".to_string(),
-                app_handle,
+                image_data,
+                params,
                 Some(cancellation_token.clone()),
-                store_mutex,
             ).await?;
             
             return Ok(()); 
@@ -566,7 +567,7 @@ async fn process_task(
         
         // 1. [0.8B] Load & Generate (Direct 28-Layer Generation)
         {
-            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -625,7 +626,7 @@ async fn process_task(
 
         // 1. [0.8B] Load & Generate (Direct 28-Layer Generation)
         {
-            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -741,7 +742,7 @@ async fn process_task(
 
             // 1. [0.8B] Load & Generate (Direct 28-Layer Generation)
             {
-                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
