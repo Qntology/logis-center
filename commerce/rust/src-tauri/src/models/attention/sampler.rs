@@ -38,7 +38,7 @@ impl Sampler {
         let token_pos = self.next_token_pos();
         use candle_core::cuda_backend::cudarc::driver::{DevicePtr, result};
         use candle_core::cuda_backend::CudaStorageSlice;
-        use crate::cuda_utils::{WrapErr, get_raw_stream};
+        use crate::models::attention::cuda_utils::{WrapErr, get_raw_stream};
         use candle_core::DType;
 
         let (b, v) = logits.dims2()?;

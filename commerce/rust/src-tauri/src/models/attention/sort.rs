@@ -32,7 +32,7 @@ impl candle::CustomOp1 for ArgSort {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
         use candle::cuda_backend::CudaStorageSlice;
-        use crate::cuda_utils::{WrapErr, get_raw_stream};
+        use crate::models::attention::cuda_utils::{WrapErr, get_raw_stream};
         
         let dev = storage.device();
         let elem_count = layout.shape().elem_count();

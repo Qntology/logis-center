@@ -151,8 +151,8 @@ pub struct Config {
     pub max_window_layers: Option<usize>,
     pub partial_rotary_factor: Option<f32>,
     pub hidden_act: candle_nn::Activation,
-    #[serde(alias = "rope_parameters")]
     pub rope_scaling: Option<HashMap<String, RopeScalingValue>>,
+    pub rope_parameters: Option<RopeParameters>,
     pub mamba_ssm_dtype: Option<String>,
     pub quant: Option<String>,
     pub moe_cfg: Option<MoEConfig>,

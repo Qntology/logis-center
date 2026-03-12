@@ -6,7 +6,6 @@ mod logic;
 mod scheduler;
 
 pub mod models;
-pub use crate::models::attention as attention_rs;
 pub mod utils;
 pub mod openai_types;
 pub mod position_embed;

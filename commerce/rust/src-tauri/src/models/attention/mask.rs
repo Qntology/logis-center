@@ -1,6 +1,6 @@
 use candle_core::{DType, Result, Tensor};
 #[cfg(feature = "cuda")]
-use crate::kernels::ffi;
+use crate::models::attention::kernels::ffi;
 
 #[derive(Debug, Clone)]
 struct CausalMask {
@@ -19,7 +19,7 @@ impl candle_core::InplaceOp1 for CausalMask {
         use candle_core::backend::BackendStorage;
         use candle_core::cuda_backend::cudarc::driver::DevicePtr;
         use candle_core::cuda_backend::CudaStorageSlice;
-        use crate::cuda_utils::get_raw_stream;
+        use crate::models::attention::cuda_utils::get_raw_stream;
         use std::ffi::c_void;
 
         let dev = input.device();

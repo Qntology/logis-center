@@ -45,7 +45,7 @@ fn launch_fused_rope(
 ) -> Result<()> {
     use candle_core::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core::cuda_backend::CudaStorageSlice;
-    use crate::cuda_utils::get_raw_stream;
+    use crate::models::attention::cuda_utils::get_raw_stream;
 
     let layout = resolve_rope_layout(q, k)?;
     let positions = if positions.dtype() != DType::I64 { positions.to_dtype(DType::I64)? } else { positions.clone() };
@@ -137,7 +137,7 @@ fn launch_fused_rope_partial_token_major(
 ) -> Result<()> {
     use candle_core::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core::cuda_backend::CudaStorageSlice;
-    use crate::cuda_utils::get_raw_stream;
+    use crate::models::attention::cuda_utils::get_raw_stream;
 
     let (num_tokens, q_heads, full_d) = q.dims3()?;
     let k_heads = k.dim(1)? as u32;

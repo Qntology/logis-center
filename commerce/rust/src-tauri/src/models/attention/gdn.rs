@@ -9,7 +9,7 @@ use candle_core::{Device, Storage};
 #[cfg(feature = "cuda")]
 use half::{bf16, f16};
 #[cfg(feature = "cuda")]
-use crate::kernels::ffi;
+use crate::models::attention::kernels::ffi;
 #[cfg(feature = "cuda")]
 use std::ffi::{c_int, c_void};
 
