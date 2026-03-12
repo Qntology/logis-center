@@ -12,9 +12,11 @@ pub mod wna16;
 
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
+use crate::utils::gguf_varbuilder::VarBuilder as QVarBuilder;
+use either::Either;
 
 #[derive(Clone)]
-pub struct VarBuilderX<'a>(pub VarBuilder<'a>, pub String);
+pub struct VarBuilderX<'a>(pub Either<VarBuilder<'a>, QVarBuilder>, pub String);
 
 impl<'a> VarBuilderX<'a> {
     pub fn new(
@@ -29,23 +31,26 @@ impl<'a> VarBuilderX<'a> {
                 device,
             )?
         };
-        Ok(Self(vb, String::new()))
+        Ok(Self(Either::Left(vb), String::new()))
     }
 
     pub fn from_vb(vb: VarBuilder<'a>) -> Self {
-        Self(vb, String::new())
+        Self(Either::Left(vb), String::new())
     }
 
     pub fn is_var_builder(&self) -> bool {
-        true
+        matches!(self.0, Either::Left(_))
     }
 
     pub fn is_qvar_builder(&self) -> bool {
-        false
+        matches!(self.0, Either::Right(_))
     }
 
     pub fn device(&self) -> Device {
-        self.0.device().clone()
+        match &self.0 {
+            Either::Left(vb) => vb.device().clone(),
+            Either::Right(vb) => vb.device().clone(),
+        }
     }
 
     pub fn pp(&self, name: &str) -> VarBuilderX<'a> {
@@ -54,7 +59,10 @@ impl<'a> VarBuilderX<'a> {
         } else {
             format!("{}.{}", self.1, name)
         };
-        VarBuilderX(self.0.pp(name), next_path)
+        match &self.0 {
+            Either::Left(vb) => VarBuilderX(Either::Left(vb.pp(name)), next_path),
+            Either::Right(vb) => VarBuilderX(Either::Right(vb.pp(name)), next_path),
+        }
     }
 
     pub fn module_path(&self) -> &str {
@@ -62,7 +70,10 @@ impl<'a> VarBuilderX<'a> {
     }
 
     pub fn has_key(&self, name: &str) -> bool {
-        self.0.contains_tensor(name)
+        match &self.0 {
+            Either::Left(vb) => vb.contains_tensor(name),
+            Either::Right(vb) => vb.contains_key(name),
+        }
     }
 
     pub fn get_with_hints_dtype<S: Into<candle_core::Shape>>(
@@ -72,18 +83,23 @@ impl<'a> VarBuilderX<'a> {
         shard: candle_nn::var_builder::Shard,
         dtype: DType,
     ) -> Result<Tensor> {
-        self.0.get_with_hints_dtype(s, name, shard, dtype)
+        match &self.0 {
+            Either::Left(vb) => vb.get_with_hints_dtype(s, name, shard, dtype),
+            Either::Right(vb) => vb.get(s, name).and_then(|x| x.dequantize(vb.device())),
+        }
     }
 
     pub fn get<S: Into<candle_core::Shape>>(&self, s: S, name: &str) -> Result<Tensor> {
-        self.0.get(s, name)
+        match &self.0 {
+            Either::Left(vb) => vb.get(s, name),
+            Either::Right(vb) => vb.get(s, name).and_then(|x| x.dequantize(vb.device())),
+        }
     }
 
     pub fn dtype(&self) -> DType {
-        // ShardedVarBuilder doesn't have a direct dtype method, 
-        // but we can infer it or just store it.
-        // For now, let's assume F32 if not sure, or better yet, don't use it if not needed.
-        DType::F32
+        match &self.0 {
+            Either::Left(_) => DType::F32, // Default to F32 for ShardedVarBuilder if not tracked
+            Either::Right(_) => DType::F32,
+        }
     }
 }
-
