@@ -311,16 +311,7 @@ impl Qwen3_5ForCausalLM {
         let is_qvar_builder = vb.is_qvar_builder();
         let reporter = progress_reporter.clone();
 
-        let tie_word_embeddings = if !is_qvar_builder
-            && vb.has_key("embed_tokens.weight")
-            && !vb.has_key(&format!("{}embed_tokens.weight", prefix))
-        {
-            crate::log_error!("This model does not support decoding!");
-            prefix.clear();
-            Some(true)
-        } else {
-            config.tie_word_embeddings
-        };
+        let tie_word_embeddings = config.tie_word_embeddings;
 
         let (embed_tokens, vocab_size) = embedding(
             config.vocab_size,

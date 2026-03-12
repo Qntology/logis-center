@@ -149,6 +149,16 @@ pub struct Config {
     pub quantization_config: Option<QuantConfig>,
     pub is_multi_model: Option<bool>,
     pub extra_config_json: Option<String>,
+    
+    // Hybrid configuration fields (directly from text_config)
+    pub layer_types: Option<Vec<String>>,
+    pub linear_conv_kernel_dim: Option<usize>,
+    pub full_attention_interval: Option<usize>,
+    pub linear_num_heads: Option<usize>,
+    pub linear_num_key_heads: Option<usize>,
+    pub linear_num_value_heads: Option<usize>,
+    pub linear_key_head_dim: Option<usize>,
+    pub linear_value_head_dim: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -197,10 +207,33 @@ fn qwen3_hybrid_raw_from_extra_config(config: &Config) -> Option<Qwen3HybridRawC
     if !is_qwen3_hybrid_arch(config) {
         return None;
     }
-    let extra = config.extra_config_json.as_ref()?;
-    let root = serde_json::from_str::<serde_json::Value>(extra).ok()?;
-    let cfg = root.get("text_config").cloned().unwrap_or(root);
-    serde_json::from_value::<Qwen3HybridRawConfig>(cfg).ok()
+    
+    // First try extra_config_json (GGUF case)
+    if let Some(extra) = config.extra_config_json.as_ref() {
+        if let Ok(root) = serde_json::from_str::<serde_json::Value>(extra) {
+            let cfg = root.get("text_config").cloned().unwrap_or(root);
+            if let Ok(raw) = serde_json::from_value::<Qwen3HybridRawConfig>(cfg) {
+                return Some(raw);
+            }
+        }
+    }
+    
+    // Fallback: Check if fields are already in Config (JSON case)
+    if config.layer_types.is_some() || config.full_attention_interval.is_some() {
+        return Some(Qwen3HybridRawConfig {
+            layers_block_type: config.layer_types.clone(),
+            conv_kernel_size: config.linear_conv_kernel_dim,
+            full_attention_interval: config.full_attention_interval,
+            linear_num_heads: config.linear_num_heads,
+            linear_num_key_heads: config.linear_num_key_heads,
+            linear_num_value_heads: config.linear_num_value_heads,
+            linear_num_key_value_heads: None,
+            linear_key_head_dim: config.linear_key_head_dim,
+            linear_value_head_dim: config.linear_value_head_dim,
+        });
+    }
+    
+    None
 }
 
 pub fn resolve_qwen3_hybrid_config(config: &Config) -> Qwen3HybridConfig {
@@ -279,4 +312,3 @@ pub struct SamplingParams {
     #[serde(default)]
     pub mcp_mode: Option<bool>,
 }
-
