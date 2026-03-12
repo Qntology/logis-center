@@ -9,13 +9,13 @@ use candle_core::{Device, Storage};
 #[cfg(feature = "cuda")]
 use half::{bf16, f16};
 #[cfg(feature = "cuda")]
-use kernels::ffi;
+use crate::models::attention::kernels::ffi;
 #[cfg(feature = "cuda")]
 use std::ffi::{c_int, c_void};
 
 #[cfg(feature = "cuda")]
 fn get_cuda_const_ptr(t: &Tensor, dev: &candle::CudaDevice) -> Result<*const c_void> {
-    use candle::cuda_backend::cudarc::driver::{DevicePtr, CudaStream};
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
     let (storage, layout) = t.storage_and_layout();
     let offset = layout.start_offset();
     match (&*storage, t.dtype()) {
@@ -34,7 +34,7 @@ fn get_cuda_const_ptr(t: &Tensor, dev: &candle::CudaDevice) -> Result<*const c_v
 
 #[cfg(feature = "cuda")]
 fn get_cuda_const_ptr_u32(t: &Tensor, dev: &candle::CudaDevice) -> Result<*const u32> {
-    use candle::cuda_backend::cudarc::driver::{DevicePtr, CudaStream};
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
     let (storage, layout) = t.storage_and_layout();
     let offset = layout.start_offset();
     match &*storage {
@@ -47,7 +47,7 @@ fn get_cuda_const_ptr_u32(t: &Tensor, dev: &candle::CudaDevice) -> Result<*const
 
 #[cfg(feature = "cuda")]
 fn get_cuda_const_ptr_i64(t: &Tensor, dev: &candle::CudaDevice) -> Result<*const i64> {
-    use candle::cuda_backend::cudarc::driver::{DevicePtr, CudaStream};
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
     let (storage, layout) = t.storage_and_layout();
     let offset = layout.start_offset();
     match &*storage {
@@ -278,17 +278,17 @@ pub fn causal_conv1d_update_slots(
             }
             let out = Tensor::zeros((batch, d_conv), x.dtype(), x.device())?;
 
-            let x_ptr = get_cuda_const_ptr(&x_c)?;
-            let weight_ptr = get_cuda_const_ptr(&weight_c)?;
+            let x_ptr = get_cuda_const_ptr(&x_c, dev)?;
+            let weight_ptr = get_cuda_const_ptr(&weight_c, dev)?;
             let bias_ptr = if let Some(ref b) = bias_c {
-                get_cuda_const_ptr(b)?
+                get_cuda_const_ptr(b, dev)?
             } else {
                 std::ptr::null()
             };
-            let state_ptr = get_cuda_mut_ptr(conv_state)?;
-            let slots_ptr = get_cuda_const_ptr_i64(slots)?;
-            let out_ptr = get_cuda_mut_ptr(&out)?;
-            let stream = *dev.cu_stream() as i64;
+            let state_ptr = get_cuda_mut_ptr(conv_state, dev)?;
+            let slots_ptr = get_cuda_const_ptr_i64(slots, dev)?;
+            let out_ptr = get_cuda_mut_ptr(&out, dev)?;
+            let stream = *dev.cuda_stream()? as i64;
 
             unsafe {
                 match x.dtype() {
@@ -394,13 +394,13 @@ pub fn fused_gdn_gating(
             let g = Tensor::zeros(a.shape(), a.dtype(), a.device())?;
             let beta = Tensor::zeros(a.shape(), a.dtype(), a.device())?;
 
-            let al_ptr = get_cuda_const_ptr(a_log)?;
-            let a_ptr = get_cuda_const_ptr(a)?;
-            let b_ptr = get_cuda_const_ptr(b)?;
-            let dt_ptr = get_cuda_const_ptr(dt_bias)?;
-            let g_ptr = get_cuda_mut_ptr(&g)?;
-            let beta_ptr = get_cuda_mut_ptr(&beta)?;
-            let stream = *dev.cu_stream() as i64;
+            let al_ptr = get_cuda_const_ptr(a_log, dev)?;
+            let a_ptr = get_cuda_const_ptr(a, dev)?;
+            let b_ptr = get_cuda_const_ptr(b, dev)?;
+            let dt_ptr = get_cuda_const_ptr(dt_bias, dev)?;
+            let g_ptr = get_cuda_mut_ptr(&g, dev)?;
+            let beta_ptr = get_cuda_mut_ptr(&beta, dev)?;
+            let stream = *dev.cuda_stream()? as i64;
 
             unsafe {
                 match a.dtype() {
@@ -554,16 +554,16 @@ pub fn gated_rmsnorm_silu_mul(
             };
             let out = Tensor::zeros((rows, value_dim), x.dtype(), x.device())?;
 
-            let x_ptr = get_cuda_const_ptr(&x_c)?;
-            let z_ptr = get_cuda_const_ptr(&z_c)?;
-            let w_ptr = get_cuda_const_ptr(&norm_weight)?;
+            let x_ptr = get_cuda_const_ptr(&x_c, dev)?;
+            let z_ptr = get_cuda_const_ptr(&z_c, dev)?;
+            let w_ptr = get_cuda_const_ptr(&norm_weight, dev)?;
             let b_ptr = if let Some(ref b) = bias {
-                get_cuda_const_ptr(b)?
+                get_cuda_const_ptr(b, dev)?
             } else {
                 std::ptr::null()
             };
-            let out_ptr = get_cuda_mut_ptr(&out)?;
-            let stream = *dev.cu_stream() as i64;
+            let out_ptr = get_cuda_mut_ptr(&out, dev)?;
+            let stream = *dev.cuda_stream()? as i64;
             let eps = eps as f32;
 
             unsafe {
@@ -750,17 +750,17 @@ pub fn gated_delta_rule_recurrence(
             if !state.is_contiguous() {
                 candle_core::bail!("gated_delta_rule_recurrence expects contiguous state");
             }
-            let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
+            let state_ptr = get_cuda_mut_ptr(state, dev)? as *mut f32;
 
             let out = Tensor::zeros((bh, seq_len, v_dim), DType::F32, q_c.device())?;
 
-            let q_ptr = get_cuda_const_ptr(&q_c)?;
-            let k_ptr = get_cuda_const_ptr(&k_c)?;
-            let v_ptr = get_cuda_const_ptr(&v_c)?;
-            let g_ptr = get_cuda_const_ptr(&g_f32)? as *const f32;
-            let beta_ptr = get_cuda_const_ptr(&beta_f32)? as *const f32;
-            let out_ptr = get_cuda_mut_ptr(&out)? as *mut f32;
-            let stream = *dev.cu_stream() as i64;
+            let q_ptr = get_cuda_const_ptr(&q_c, dev)?;
+            let k_ptr = get_cuda_const_ptr(&k_c, dev)?;
+            let v_ptr = get_cuda_const_ptr(&v_c, dev)?;
+            let g_ptr = get_cuda_const_ptr(&g_f32, dev)? as *const f32;
+            let beta_ptr = get_cuda_const_ptr(&beta_f32, dev)? as *const f32;
+            let out_ptr = get_cuda_mut_ptr(&out, dev)? as *mut f32;
+            let stream = *dev.cuda_stream()? as i64;
 
             unsafe {
                 match out_dtype {
@@ -890,8 +890,8 @@ pub fn gated_delta_rule_decode_slots(
                 );
             }
 
-            let slots_ptr = get_cuda_const_ptr_i64(slots)?;
-            let stream = *dev.cu_stream() as i64;
+            let slots_ptr = get_cuda_const_ptr_i64(slots, dev)?;
+            let stream = *dev.cuda_stream()? as i64;
             if q.dtype() == DType::F32 {
                 if state.dtype() != DType::F32 {
                     candle_core::bail!(
@@ -900,13 +900,13 @@ pub fn gated_delta_rule_decode_slots(
                     );
                 }
                 let out = Tensor::zeros((batch, heads, v_dim), DType::F32, q.device())?;
-                let q_ptr = get_cuda_const_ptr(&q_c)? as *const f32;
-                let k_ptr = get_cuda_const_ptr(&k_c)? as *const f32;
-                let v_ptr = get_cuda_const_ptr(&v_c)? as *const f32;
-                let g_ptr = get_cuda_const_ptr(&g_c)? as *const f32;
-                let beta_ptr = get_cuda_const_ptr(&beta_c)? as *const f32;
-                let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
-                let out_ptr = get_cuda_mut_ptr(&out)? as *mut f32;
+                let q_ptr = get_cuda_const_ptr(&q_c, dev)? as *const f32;
+                let k_ptr = get_cuda_const_ptr(&k_c, dev)? as *const f32;
+                let v_ptr = get_cuda_const_ptr(&v_c, dev)? as *const f32;
+                let g_ptr = get_cuda_const_ptr(&g_c, dev)? as *const f32;
+                let beta_ptr = get_cuda_const_ptr(&beta_c, dev)? as *const f32;
+                let state_ptr = get_cuda_mut_ptr(state, dev)? as *mut f32;
+                let out_ptr = get_cuda_mut_ptr(&out, dev)? as *mut f32;
 
                 unsafe {
                     ffi::gated_delta_rule_decode_slots_f32(
@@ -941,13 +941,13 @@ pub fn gated_delta_rule_decode_slots(
                 }
                 // S3: use native-dtype kernel with FP32 state ??no input casts needed
                 let out = Tensor::zeros((batch, heads, v_dim), q.dtype(), q.device())?;
-                let q_ptr = get_cuda_const_ptr(&q_c)?;
-                let k_ptr = get_cuda_const_ptr(&k_c)?;
-                let v_ptr = get_cuda_const_ptr(&v_c)?;
-                let g_ptr = get_cuda_const_ptr(&g_c)?;
-                let beta_ptr = get_cuda_const_ptr(&beta_c)?;
-                let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
-                let out_ptr = get_cuda_mut_ptr(&out)?;
+                let q_ptr = get_cuda_const_ptr(&q_c, dev)?;
+                let k_ptr = get_cuda_const_ptr(&k_c, dev)?;
+                let v_ptr = get_cuda_const_ptr(&v_c, dev)?;
+                let g_ptr = get_cuda_const_ptr(&g_c, dev)?;
+                let beta_ptr = get_cuda_const_ptr(&beta_c, dev)?;
+                let state_ptr = get_cuda_mut_ptr(state, dev)? as *mut f32;
+                let out_ptr = get_cuda_mut_ptr(&out, dev)?;
 
                 match q.dtype() {
                     DType::F16 => unsafe {
@@ -1053,9 +1053,9 @@ pub fn l2_norm_last_dim(input: &Tensor, eps: f64) -> Result<Tensor> {
             let dim = shape.dims()[shape.rank() - 1];
             let rows = shape.elem_count() / dim;
             let output = Tensor::zeros(shape, input.dtype(), input.device())?;
-            let in_ptr = get_cuda_const_ptr(&input_c)?;
-            let out_ptr = get_cuda_mut_ptr(&output)?;
-            let stream = *dev.cu_stream() as i64;
+            let in_ptr = get_cuda_const_ptr(&input_c, dev)?;
+            let out_ptr = get_cuda_mut_ptr(&output, dev)?;
+            let stream = *dev.cuda_stream()? as i64;
 
             match input.dtype() {
                 DType::F32 => unsafe {
@@ -1159,16 +1159,16 @@ pub fn gated_delta_rule_recurrence_varlen(
 
             let out = Tensor::zeros((total_tokens, num_heads, v_dim), q.dtype(), q.device())?;
 
-            let q_ptr = get_cuda_const_ptr(&q_c)?;
-            let k_ptr = get_cuda_const_ptr(&k_c)?;
-            let v_ptr = get_cuda_const_ptr(&v_c)?;
-            let g_ptr = get_cuda_const_ptr(&g_c)?;
-            let beta_ptr = get_cuda_const_ptr(&beta_c)?;
-            let state_ptr = get_cuda_mut_ptr(state)? as *mut f32;
-            let slots_ptr = get_cuda_const_ptr_i64(slots)?;
-            let cu_ptr = get_cuda_const_ptr_u32(cu_seqlens)?;
-            let out_ptr = get_cuda_mut_ptr(&out)?;
-            let stream = *dev.cu_stream() as i64;
+            let q_ptr = get_cuda_const_ptr(&q_c, dev)?;
+            let k_ptr = get_cuda_const_ptr(&k_c, dev)?;
+            let v_ptr = get_cuda_const_ptr(&v_c, dev)?;
+            let g_ptr = get_cuda_const_ptr(&g_c, dev)?;
+            let beta_ptr = get_cuda_const_ptr(&beta_c, dev)?;
+            let state_ptr = get_cuda_mut_ptr(state, dev)? as *mut f32;
+            let slots_ptr = get_cuda_const_ptr_i64(slots, dev)?;
+            let cu_ptr = get_cuda_const_ptr_u32(cu_seqlens, dev)?;
+            let out_ptr = get_cuda_mut_ptr(&out, dev)?;
+            let stream = *dev.cuda_stream()? as i64;
 
             match q.dtype() {
                 DType::F32 => unsafe {
@@ -1820,4 +1820,3 @@ pub fn gated_delta_rule_decode_slots(
 ) -> Result<Tensor> {
     gated_delta_rule_decode_slots_naive(q, k, v, g, beta, state, slots)
 }
-
