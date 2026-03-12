@@ -79,29 +79,10 @@ impl QuantizedRegistry {
     }
 }
 
-fn dequantize_q2(t: &Tensor, dev: &Device) -> Result<Tensor> {
-    if t.dtype() == DType::U8 && t.rank() == 2 && t.dim(1)? == 10 {
-        let num_blocks = t.dim(0)?;
-        let t_gpu = t.to_device(dev)?;
-        let scales_u16 = t.narrow(1, 0, 2)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
-        let scales = Tensor::from_raw_buffer(&scales_u16, DType::F16, &[num_blocks], dev)?.unsqueeze(D::Minus1)?;
-        
-        let data_bytes = t_gpu.narrow(1, 2, 8)?.to_dtype(DType::F16)?;
-        let mut final_res = vec![];
-        
-        for i in 0..4 {
-            let div = (1 << (i * 2)) as f64;
-            let shifted = data_bytes.affine(1.0 / div, 0.0)?.floor()?;
-            let floored = shifted.affine(1.0 / 4.0, 0.0)?.floor()?.affine(4.0, 0.0)?;
-            let val = shifted.sub(&floored)?.affine(1.0, -2.0)?;
-            final_res.push(val.broadcast_mul(&scales)?);
-        }
-        
-        // Stack results and reshape directly to f16 to save space
-        Ok(Tensor::stack(&final_res, D::Minus1)?.reshape((num_blocks, 32))?)
-    } else {
-        Ok(t.to_device(dev)?.to_dtype(DType::F16)?)
-    }
+fn dequantize_q4(t: &Tensor, dev: &Device) -> Result<Tensor> {
+    // We now store weights in FP16/BF16 directly for maximum quality.
+    // Simply move to device and ensure F16 dtype.
+    Ok(t.to_device(dev)?.to_dtype(DType::F16)?)
 }
 
 pub struct QRmsNorm { pub full_name: String, eps: f64, offset: f64, persistent_weight: Arc<RwLock<Option<Tensor>>> }
@@ -146,7 +127,7 @@ impl QLinear {
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         if self.persistent_weight.read().unwrap().is_some() { return Ok(()); }
         let t = reg.get_q_tensor(&self.full_name, "weight")?;
-        *self.persistent_weight.write().unwrap() = Some(dequantize_q2(&t, dev)?);
+        *self.persistent_weight.write().unwrap() = Some(dequantize_q4(&t, dev)?);
         if let Ok(b) = reg.get_q_tensor(&self.full_name, "bias") { 
             *self.persistent_bias.write().unwrap() = Some(b.to_device(dev)?.to_dtype(DType::F16)?); 
         }
@@ -178,7 +159,7 @@ impl QLinear {
             let dequant = if let Some(pw) = &*cache {
                 pw.clone() as Tensor
             } else {
-                dequantize_q2(&reg.get_q_tensor(&self.full_name, "weight")?, dev)?
+                dequantize_q4(&reg.get_q_tensor(&self.full_name, "weight")?, dev)?
             };
             
             let out_features = dequant.elem_count() / in_features;
@@ -243,7 +224,7 @@ impl QGatedDeltaNet {
         if let Ok(dt) = reg.get_tensor(&format!("{}.dt_bias", p)) { self.dt_bias = Some(dt.to_device(dev)?.to_dtype(DType::F32)?); }
         if let Ok(a) = reg.get_tensor(&format!("{}.A_log", p)) { self.a_log = Some(a.to_device(dev)?.to_dtype(DType::F32)?); }
         if let Ok(cw) = reg.get_q_tensor(&format!("{}.conv1d", p), "weight") {
-            let dequant = dequantize_q2(&cw, dev)?;
+            let dequant = dequantize_q4(&cw, dev)?;
             let channels = dequant.elem_count() / 4;
             let c_w = dequant.reshape((channels, 1, 4))?;
             let mut map = HashMap::new(); map.insert("weight".to_string(), c_w);
@@ -381,16 +362,14 @@ impl QAttention {
         Ok(())
     }
 
-    pub fn forward(&mut self, xs: &Tensor, cos: &Tensor, sin: &Tensor, attention_mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
+    pub fn forward(&mut self, xs: &Tensor, cos: &Tensor, sin: &Tensor, attention_mask: Option<&Tensor>, reg: &QuantizedRegistry, interleaved: bool) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
-        let dev = xs.device();
 
         // 1. Q-Proj and Split (Q and Gate)
-        // [VLLM 정합성 수정] Qwen3.5는 Head 단위로 Q와 Gate가 교차 배치됨 (NH, 2, HD)
-        let q_raw = self.q_proj.forward(xs, reg)?; // (B, S, NH * HD * 2)
+        // Qwen3.5 0.8B Full Attention has interleaved Q and Gate: (B, S, NH, 2, HD)
+        let q_raw = self.q_proj.forward(xs, reg)?; // (B, S, NH * HD * 2 = 4096)
         let q_gate = q_raw.reshape((b_sz, q_len, self.nh, 2, self.hd))?;
         
-        // vllm.rs style: 4번째 차원(index 3)에서 0번은 Q, 1번은 Gate
         let query_states = q_gate.narrow(3, 0, 1)?.squeeze(3)?; // (B, S, NH, HD)
         let gate_states = q_gate.narrow(3, 1, 1)?.squeeze(3)?;  // (B, S, NH, HD)
 
@@ -402,17 +381,7 @@ impl QAttention {
         let query_states = self.q_norm.forward(&query_states, reg)?;
         let key_states = self.k_norm.forward(&key_states, reg)?;
 
-        if b_sz > 0 && q_len > 0 {
-            let q_f32 = query_states.to_dtype(DType::F32)?;
-            let k_f32 = key_states.to_dtype(DType::F32)?;
-            println!("[DEBUG-ATTN] Q mean: {:.4}, std: {:.4} | K mean: {:.4}, std: {:.4}", 
-                q_f32.mean_all()?.to_vec0::<f32>()?, q_f32.powf(2.0)?.mean_all()?.to_vec0::<f32>()?.sqrt(),
-                k_f32.mean_all()?.to_vec0::<f32>()?, k_f32.powf(2.0)?.mean_all()?.to_vec0::<f32>()?.sqrt());
-        }
-
         // 4. RoPE (Rotary Position Embedding)
-        // Expected shape for RoPE: (B, S, NH, HD) or (B, NH, S, HD)
-        // glm_interleaved expects (B, NH, S, HD)
         let query_states = query_states.transpose(1, 2)?; // (B, NH, S, HD)
         let key_states = key_states.transpose(1, 2)?;   // (B, NKV, S, HD)
 
@@ -421,6 +390,7 @@ impl QAttention {
             &key_states, 
             cos, 
             sin, 
+            interleaved,
             true
         )?;
 
@@ -436,7 +406,6 @@ impl QAttention {
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
 
         // 6. Attention
-        // query: (B, NH, S, HD), key: (B, NKV, S_kv, HD), value: (B, NKV, S_kv, HD)
         let attn_output = crate::models::common::eager_attention_forward(
             &query_states.to_dtype(DType::F32)?,
             &key_states.to_dtype(DType::F32)?,
@@ -444,28 +413,29 @@ impl QAttention {
             Some(self.nh / self.nkv),
             attention_mask,
             self.scaling
-        )?; // Output shape: (B, NH, S, HD)
+        )?; // Returns (B, S, NH, HD)
 
         // 7. Gating (vllm style)
-        // gate_states: (B, S, NH, HD)
+        // Both attn_output and gate_states are (B, S, NH, HD). Perfect match.
         let gate = candle_nn::ops::sigmoid(&gate_states.to_dtype(DType::F32)?)?;
-        let attn_output = attn_output.to_dtype(DType::F32)?.broadcast_mul(&gate)?; // (B, S, NH, HD)
+        let attn_output = attn_output.broadcast_mul(&gate)?;
 
         let attn_output = attn_output.reshape((b_sz, q_len, ()))?.contiguous()?;
 
         // 8. O-Proj
         self.o_proj.forward(&attn_output.to_dtype(DType::F16)?, reg)
-        }
-        }
+    }
+}
 
-pub struct QDecoderLayer { pub idx: usize, pub self_attn: Option<QAttention>, pub linear_attn: Option<QGatedDeltaNet>, pub mlp_gate: QLinear, pub mlp_up: QLinear, pub mlp_down: QLinear, pub in_norm: QRmsNorm, pub post_norm: QRmsNorm }
+pub struct QDecoderLayer { pub idx: usize, pub self_attn: Option<QAttention>, pub linear_attn: Option<QGatedDeltaNet>, pub mlp_gate: QLinear, pub mlp_up: QLinear, pub mlp_down: QLinear, pub in_norm: QRmsNorm, pub post_norm: QRmsNorm, pub mrope_interleaved: bool }
 impl QDecoderLayer {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig, idx: usize) -> Result<Self> {
         let p = vb.prefix();
         let (sa, la) = if config.layer_types[idx] == "linear_attention" { (None, Some(QGatedDeltaNet::new(vb.pp("linear_attn"), config)?)) } else { (Some(QAttention::new(vb.pp("self_attn"), config)?), None) };
         Ok(Self { 
             idx, self_attn: sa, linear_attn: la, mlp_gate: QLinear::new(&join_name(&p, "mlp.gate_proj"))?, mlp_up: QLinear::new(&join_name(&p, "mlp.up_proj"))?,
-            mlp_down: QLinear::new(&join_name(&p, "mlp.down_proj"))?, in_norm: QRmsNorm::new(&join_name(&p, "input_layernorm"), config.rms_norm_eps, 0.0)?, post_norm: QRmsNorm::new(&join_name(&p, "post_attention_layernorm"), config.rms_norm_eps, 0.0)? 
+            mlp_down: QLinear::new(&join_name(&p, "mlp.down_proj"))?, in_norm: QRmsNorm::new(&join_name(&p, "input_layernorm"), config.rms_norm_eps, 0.0)?, post_norm: QRmsNorm::new(&join_name(&p, "post_attention_layernorm"), config.rms_norm_eps, 0.0)?,
+            mrope_interleaved: config.rope_parameters.mrope_interleaved
         })
     }
     pub fn clear_vram(&mut self) { self.in_norm.clear_vram(); if let Some(ref mut sa) = self.self_attn { sa.clear_vram(); } if let Some(ref mut la) = self.linear_attn { la.clear_vram(); } self.post_norm.clear_vram(); self.mlp_gate.clear_vram(); self.mlp_up.clear_vram(); self.mlp_down.clear_vram(); }
@@ -475,7 +445,7 @@ impl QDecoderLayer {
     }
     pub fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>, reg: &QuantizedRegistry) -> Result<Tensor> {
         let residual = x.clone(); let h = self.in_norm.forward(x, reg)?;
-        let h = if let Some(ref mut sa) = self.self_attn { sa.forward(&h, cos, sin, mask, reg)? } else if let Some(ref mut la) = self.linear_attn { la.forward(&h, mask, reg)? } else { h };
+        let h = if let Some(ref mut sa) = self.self_attn { sa.forward(&h, cos, sin, mask, reg, self.mrope_interleaved)? } else if let Some(ref mut la) = self.linear_attn { la.forward(&h, mask, reg)? } else { h };
         let h = (h + residual)?; let residual = h.clone();
         let h = self.post_norm.forward(&h, reg)?;
         let gate = self.mlp_gate.forward(&h, reg)?.silu()?;
@@ -491,7 +461,7 @@ impl QEmbedding {
     pub fn load_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> {
         if self.persistent_weight.read().unwrap().is_some() { return Ok(()); }
         let t = reg.get_q_tensor(&self.full_name, "weight")?;
-        *self.persistent_weight.write().unwrap() = Some(dequantize_q2(&t, dev)?.reshape((self.vocab_size, self.hidden_size))?); Ok(())
+        *self.persistent_weight.write().unwrap() = Some(dequantize_q4(&t, dev)?.reshape((self.vocab_size, self.hidden_size))?); Ok(())
     }
     pub fn forward(&self, ids: &Tensor, reg: &QuantizedRegistry) -> Result<Tensor> {
         let (b, s) = ids.dims2()?; let dev = ids.device();
@@ -502,7 +472,7 @@ impl QEmbedding {
         let w = if let Some(w) = w { w } 
                 else { 
                     let mut cache = self.persistent_weight.write().unwrap();
-                    let w = dequantize_q2(&reg.get_q_tensor(&self.full_name, "weight")?, dev)?.reshape((self.vocab_size, self.hidden_size))?;
+                    let w = dequantize_q4(&reg.get_q_tensor(&self.full_name, "weight")?, dev)?.reshape((self.vocab_size, self.hidden_size))?;
                     *cache = Some(w.clone());
                     w
                 };
@@ -517,7 +487,7 @@ impl QEmbedding {
     }
 }
 
-pub struct QTextModel { pub embed: QEmbedding, pub layers: Vec<QDecoderLayer>, pub norm: QRmsNorm, pub rotary: Qwen3_5TextRotaryEmbedding, pub mrope: Vec<usize> }
+pub struct QTextModel { pub embed: QEmbedding, pub layers: Vec<QDecoderLayer>, pub norm: QRmsNorm, pub rotary: Qwen3_5TextRotaryEmbedding, pub mrope: Vec<usize>, pub mrope_interleaved: bool }
 impl QTextModel {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let mut layers = vec![]; for i in 0..config.num_hidden_layers { layers.push(QDecoderLayer::new(vb.pp("layers").pp(i), config, i)?); }
@@ -526,25 +496,37 @@ impl QTextModel {
             layers, 
             norm: QRmsNorm::new(&join_name(&vb.prefix(), "norm"), config.rms_norm_eps, 0.0)?, 
             rotary: Qwen3_5TextRotaryEmbedding::new((config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize, config.rope_parameters.rope_theta), 
-            mrope: config.rope_parameters.mrope_section.clone() 
+            mrope: config.rope_parameters.mrope_section.clone(),
+            mrope_interleaved: config.rope_parameters.mrope_interleaved
         })
     }
     pub fn load_all_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { self.embed.load_to_vram(reg, dev)?; for layer in self.layers.iter_mut() { layer.load_to_vram(reg, dev)?; } self.norm.load_to_vram(reg, dev)?; Ok(()) }
 }
 
-pub struct QuantizedQwen3_5Model { pub model: QTextModel, pub head: QLinear, pub tie: bool }
+pub struct QuantizedQwen3_5Model { pub model: QTextModel, pub head: QLinear, pub tie: bool, pub mrope_interleaved: bool }
 impl QuantizedQwen3_5Model {
     pub fn new(vb: VarBuilder, config: Qwen3_5Config) -> Result<Self> {
         let model = QTextModel::new(vb.pp("model.language_model"), &config.text_config)?;
-        let head_name = if config.tie_word_embeddings { join_name(&vb.prefix(), "model.language_model.embed_tokens") } else { join_name(&vb.prefix(), "model.language_model.lm_head") };
-        let mut head = QLinear::new(&head_name)?;
         
-        Ok(Self { model, head, tie: config.tie_word_embeddings })
-    }    pub fn load_all_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { 
+        // Ensure lm_head is correctly identified
+        let head_name = if config.tie_word_embeddings { 
+            "model.language_model.embed_tokens"
+        } else { 
+            "model.language_model.lm_head"
+        };
+        let head = QLinear::new(head_name)?;
+        
+        Ok(Self { 
+            model, 
+            head, 
+            tie: config.tie_word_embeddings, 
+            mrope_interleaved: config.text_config.rope_parameters.mrope_interleaved 
+        })
+    }    
+    pub fn load_all_to_vram(&mut self, reg: &QuantizedRegistry, dev: &Device) -> Result<()> { 
         self.model.load_all_to_vram(reg, dev)?; 
-        if !self.tie { 
-            self.head.load_to_vram(reg, dev)?; 
-        } 
+        // Always load head, even if tied, to ensure it's in the registry and optimized for matmul
+        self.head.load_to_vram(reg, dev)?; 
         Ok(()) 
     }
     pub fn clear_cache(&mut self) { for l in self.model.layers.iter_mut() { if let Some(ref mut sa) = l.self_attn { sa.kv_cache = None; } if let Some(ref mut la) = l.linear_attn { la.recurrent_state_cache = None; la.conv_state_cache = None; } } }
@@ -591,9 +573,7 @@ impl KVStateManager {
         let offset = layer_idx * self.layer_stride;
         if lt == "linear_attention" { 
             let state = self.read_tensor(offset, shape_k, DType::F32, dev)?;
-            let (nk, dk, nv, dv) = (shape_k.dims()[1], shape_k.dims()[2], shape_k.dims()[1], shape_k.dims()[3]); // Assuming nk=nv for simplicity in shape recovery
-            let conv_shape = candle_core::Shape::from((1, (nk + nk + nv) * dk, 3)); 
-            let conv = self.read_tensor(offset + (shape_k.elem_count() * 4), &conv_shape, DType::F32, dev)?;
+            let conv = self.read_tensor(offset + (shape_k.elem_count() * 4), shape_v, DType::F32, dev)?;
             Ok(LayerContext::DeltaNet { state, conv })
         } 
         else { Ok(LayerContext::Attention { k: self.read_tensor(offset, shape_k, DType::F16, dev)?, v: self.read_tensor(offset + (shape_k.elem_count() * 2), shape_v, DType::F16, dev)? }) }

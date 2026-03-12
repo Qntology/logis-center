@@ -86,10 +86,11 @@ impl Qwen3_5GenerateModel {
         _kv_name: Option<String>
     ) -> Result<String> {
         let seed = mes.seed.unwrap_or(34562) as u64;
+        // Increase precision: Use Top-K filtering to remove low-probability noise
         let mut logit_processor = get_logit_processor(
             mes.temperature.map(|t| t as f32), 
             mes.top_p.map(|p| p as f32), 
-            None, 
+            Some(50), // Top-K = 50
             seed
         );
         
@@ -130,12 +131,14 @@ impl Qwen3_5GenerateModel {
             
             // RoPE & Mask
             let pos_vec: Vec<u32> = (seqlen_offset as u32..(seqlen_offset + current_chunk) as u32).collect();
-            let pos = Tensor::from_vec(pos_vec, (1, current_chunk), &self.device)?
-                .unsqueeze(0)?
+            // M-RoPE: Channel 0 = Time (pos), Channel 1,2 = Spatial (0 for text)
+            let pos_time = Tensor::from_vec(pos_vec, (1, current_chunk), &self.device)?;
+            let pos_spatial = Tensor::zeros((1, current_chunk), DType::U32, &self.device)?;
+            let pos = Tensor::stack(&[&pos_time, &pos_spatial, &pos_spatial], 0)? // (3, 1, S)
                 .broadcast_as((3, input_ids.dim(0)?, current_chunk))?
-                .to_dtype(DType::U32)?
                 .contiguous()?;
-            let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos, DType::F16, self.qwen3_5.model.mrope.clone())?;
+                
+            let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos, DType::F16, self.qwen3_5.model.mrope.clone(), self.qwen3_5.mrope_interleaved)?;
             let mask = if current_chunk <= 1 && seqlen_offset == 0 { None } else { 
                 Some(crate::utils::tensor_utils::prepare_causal_attention_mask(input_ids.dim(0)?, current_chunk, seqlen_offset, &self.device)?.to_dtype(DType::F16)?) 
             };
@@ -216,21 +219,43 @@ impl Qwen3_5GenerateModel {
         let mut logits = last_logits.ok_or(anyhow::anyhow!("No logits generated"))?;
         let mut gen_text = String::new();
         let sample_len = mes.max_tokens.unwrap_or(1024);
+        let mut all_tokens = full_input_ids.squeeze(0)?.to_vec1::<u32>()?;
+        let repetition_penalty = 1.2f32;
 
         for step in 0..sample_len {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) { break; }
             }
 
-            let current_logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+            let mut current_logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             
+            // Apply Repetition Penalty
+            if repetition_penalty != 1.0 {
+                let mut logits_vec = current_logits.to_vec1::<f32>()?;
+                for &token in all_tokens.iter() {
+                    let id = token as usize;
+                    if id < logits_vec.len() {
+                        if logits_vec[id] > 0.0 {
+                            logits_vec[id] /= repetition_penalty;
+                        } else {
+                            logits_vec[id] *= repetition_penalty;
+                        }
+                    }
+                }
+                current_logits = Tensor::from_vec(logits_vec, current_logits.dims(), current_logits.device())?;
+            }
+
             let next_token = logit_processor.sample(&current_logits)?;
             if next_token == self.eos_token_id { break; }
 
             let piece = self.tokenizer.token_decode(vec![next_token])?;
-            println!("[DEBUG-DECODE] step: {}, token_id: {}, piece: {:?}", step, next_token, piece);
+            if step % 5 == 0 {
+                println!("[DEBUG-DECODE] step: {}, token_id: {}, piece: {:?}, kv_size: {}", step, next_token, piece, seqlen_offset);
+            }
             print!("{}", piece); // Stream to console
+            std::io::Write::flush(&mut std::io::stdout())?;
             gen_text.push_str(&piece);
+            all_tokens.push(next_token);
 
             let input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?.to_dtype(DType::U32)?;
             
@@ -239,9 +264,14 @@ impl Qwen3_5GenerateModel {
             let mut h = self.qwen3_5.model.embed.forward(&input_ids, &self.registry)?.detach(); 
             self.qwen3_5.model.embed.clear_vram();
 
-            // RoPE
-            let pos = Tensor::from_vec(vec![seqlen_offset as u32], (1, 1), &self.device)?.unsqueeze(0)?.broadcast_as((3, 1, 1))?.contiguous()?;
-            let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos, DType::F16, self.qwen3_5.model.mrope.clone())?;
+            // RoPE: (3, 1, 1) for decoding step
+            let pos_time = Tensor::from_vec(vec![seqlen_offset as u32], (1, 1), &self.device)?;
+            let pos_spatial = Tensor::zeros((1, 1), DType::U32, &self.device)?;
+            let pos = Tensor::stack(&[&pos_time, &pos_spatial, &pos_spatial], 0)?
+                .broadcast_as((3, 1, 1))?
+                .contiguous()?;
+                
+            let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos, DType::F16, self.qwen3_5.model.mrope.clone(), self.qwen3_5.mrope_interleaved)?;
 
             // 2. Layer Relay (Decoding)
             for i in 0..num_layers {
@@ -259,7 +289,8 @@ impl Qwen3_5GenerateModel {
                     }
                 } else if let Some(ref mut la) = layer.linear_attn {
                     let s_state = candle_core::Shape::from((1, la.nv, la.dk, la.dv)); 
-                    if let Ok(LayerContext::DeltaNet { state, conv }) = kv_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
+                    let s_conv = candle_core::Shape::from((1, (la.nk + la.nk + la.nv) * la.dk, 3));
+                    if let Ok(LayerContext::DeltaNet { state, conv }) = kv_manager.load_layer_context(i, "linear_attention", &s_state, &s_conv, &self.device) {
                         la.recurrent_state_cache = Some(state.to_device(&self.device)?);
                         la.conv_state_cache = Some(conv.to_device(&self.device)?);
                     }

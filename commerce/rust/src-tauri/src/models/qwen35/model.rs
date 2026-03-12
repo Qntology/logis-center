@@ -275,6 +275,7 @@ impl Qwen3_5Embedding {
 pub struct Qwen3_5TextModel {
     pub embed_tokens: Qwen3_5Embedding, layers: Vec<Qwen3_5DecoderLayer>, norm: Qwen3_5RMSNorm,
     rotary_emb: Qwen3_5TextRotaryEmbedding, mrope_section: Vec<usize>,
+    mrope_interleaved: bool,
 }
 impl Qwen3_5TextModel {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
@@ -285,11 +286,12 @@ impl Qwen3_5TextModel {
             layers, norm: Qwen3_5RMSNorm::new(vb.pp("norm"), config.hidden_size, config.rms_norm_eps)?,
             rotary_emb: Qwen3_5TextRotaryEmbedding::new(rope_dim, config.rope_parameters.rope_theta),
             mrope_section: config.rope_parameters.mrope_section.clone(),
+            mrope_interleaved: config.rope_parameters.mrope_interleaved,
         })
     }
     pub fn forward(&mut self, embeds: &Tensor, pos_ids: &Tensor, offset: usize) -> Result<Tensor> {
         let (b, s, _) = embeds.dims3()?; let dev = embeds.device();
-        let (cos, sin) = self.rotary_emb.forward(pos_ids, embeds.dtype(), self.mrope_section.clone())?;
+        let (cos, sin) = self.rotary_emb.forward(pos_ids, embeds.dtype(), self.mrope_section.clone(), self.mrope_interleaved)?;
         let mut x = embeds.clone();
         let mask = if s <= 1 && offset == 0 { None } else { Some(prepare_causal_attention_mask(b, s, offset, dev)?) };
         for layer in self.layers.iter_mut() {

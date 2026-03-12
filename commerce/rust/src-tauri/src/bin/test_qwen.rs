@@ -2,11 +2,6 @@ use anyhow::Result;
 use candle_core::{Device, DType};
 use std::path::Path;
 
-/*
- * [HYBRID ENGINE TEST] Qwen3.5 Custom Hybrid Engine Test
- * Purpose: Verify if the newly implemented Hybrid Attention logic fixes the output quality.
- */
-
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("🚀 Starting Qwen3.5 Hybrid Engine Test...");
@@ -22,13 +17,9 @@ async fn main() -> Result<()> {
         .unwrap_or(Device::Cpu);
     println!("💻 Using device: {:?}", device);
 
-    // Using our custom optimized implementation
     use tauri_app_lib::models::qwen35::generate::Qwen3_5GenerateModel;
-    use tauri_app_lib::tokenizer::TokenizerModel;
+    use tauri_app_lib::openai_types::ChatCompletionParameters;
 
-    let _tokenizer = TokenizerModel::init(model_path)?;
-    
-    // Automatically find all .st files in the model path
     let mut model_files = vec![];
     for entry in std::fs::read_dir(model_path)? {
         let entry = entry?;
@@ -43,28 +34,25 @@ async fn main() -> Result<()> {
     }
 
     println!("📚 Loading {} model files...", model_files.len());
-    
-    // Modified init to use our specific root weight
     let mut model = Qwen3_5GenerateModel::init_with_files(&model_files, model_path, Some(&device), Some(DType::F16))?;
     
     println!("✅ Hybrid Model initialized successfully.");
 
-    let message = r#"
+    let message_json = r#"
     {
         "model": "qwen3.5",
         "messages": [
             {
                 "role": "user",
-                "content": "Once upon a time in a faraway kingdom, there was a brave knight who"
+                "content": "1+1="
             }
         ],
-        "max_tokens": 50,
+        "max_tokens": 10,
         "temperature": 0.0,
         "top_p": 1.0
     }
     "#;
-    
-    let mes = serde_json::from_str(message)?;
+    let mes: ChatCompletionParameters = serde_json::from_str(message_json)?;
     
     println!("🤔 Asking: 1+1=?");
     let response = model.generate(mes, None, None, None).await?;
