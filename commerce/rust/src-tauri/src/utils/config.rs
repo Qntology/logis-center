@@ -83,6 +83,21 @@ pub enum RopeScalingValue {
     String(String),
 }
 
+impl RopeScalingValue {
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Number(v) => Some(*v),
+            _ => None,
+        }
+    }
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(v) => Some(v.as_str()),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 pub struct QuantConfig {
     pub quant_method: String,

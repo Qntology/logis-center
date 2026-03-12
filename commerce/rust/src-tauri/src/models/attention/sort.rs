@@ -20,7 +20,7 @@ impl candle::CustomOp1 for ArgSort {
         _: &candle::CpuStorage,
         _: &candle::Layout,
     ) -> Result<(candle::CpuStorage, candle::Shape)> {
-        panic!("not implemented!")
+        candle_core::bail!("ArgSort is CUDA only")
     }
 
     #[cfg(feature = "cuda")]
@@ -32,82 +32,59 @@ impl candle::CustomOp1 for ArgSort {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::cudarc::driver::DevicePtr;
         use candle::cuda_backend::CudaStorageSlice;
-        use candle::cuda_backend::WrapErr;
+        use crate::models::attention::cuda_utils::{WrapErr, get_raw_stream};
+        
         let dev = storage.device();
         let elem_count = layout.shape().elem_count();
         let ncols = self.last_dim as i32;
         let nrows = elem_count as i32 / ncols;
-        let dst = unsafe { dev.alloc::<u32>(elem_count) }.w()?;
+        
+        let stream = dev.cuda_stream();
+        let mut dst = unsafe { dev.alloc::<u32>(elem_count) }.w()?;
+        let stream_ptr = get_raw_stream(dev);
 
         use std::ffi::c_void;
 
-        let src = match &storage.slice {
-            CudaStorageSlice::U8(inp) => inp.device_ptr(),
-            CudaStorageSlice::U32(inp) => inp.device_ptr(),
-            CudaStorageSlice::I64(inp) => inp.device_ptr(),
-            CudaStorageSlice::BF16(inp) => inp.device_ptr(),
-            CudaStorageSlice::F16(inp) => inp.device_ptr(),
-            CudaStorageSlice::F32(inp) => inp.device_ptr(),
-            CudaStorageSlice::F64(inp) => inp.device_ptr(),
+        let src_ptr = match &storage.slice {
+            CudaStorageSlice::U8(inp) => inp.device_ptr(&stream).0 as *const c_void,
+            CudaStorageSlice::U32(inp) => inp.device_ptr(&stream).0 as *const c_void,
+            CudaStorageSlice::I64(inp) => inp.device_ptr(&stream).0 as *const c_void,
+            CudaStorageSlice::BF16(inp) => inp.device_ptr(&stream).0 as *const c_void,
+            CudaStorageSlice::F16(inp) => inp.device_ptr(&stream).0 as *const c_void,
+            CudaStorageSlice::F32(inp) => inp.device_ptr(&stream).0 as *const c_void,
+            CudaStorageSlice::F64(inp) => inp.device_ptr(&stream).0 as *const c_void,
+            _ => candle_core::bail!("Unsupported dtype for sort"),
         };
-        let src_ptr = *src as *const c_void;
-        let dst_ptr = *dst.device_ptr() as *mut c_void;
-        let stream = *dev.cuda_stream() as i64;
+        
+        let dst_ptr = dst.device_ptr(&stream).0 as *mut c_void;
+        
         unsafe {
             if self.asc {
                 match storage.dtype() {
-                    candle::DType::U8 => {
-                        ffi::asort_asc_u8(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
-                    }
-                    candle::DType::U32 => {
-                        ffi::asort_asc_u32(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
-                    }
-                    candle::DType::I64 => {
-                        ffi::asort_asc_i64(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
-                    }
-                    candle::DType::BF16 => {
-                        ffi::asort_asc_bf16(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
-                    }
-                    candle::DType::F16 => {
-                        ffi::asort_asc_f16(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
-                    }
-                    candle::DType::F32 => {
-                        ffi::asort_asc_f32(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
-                    }
-                    candle::DType::F64 => {
-                        ffi::asort_asc_f64(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
-                    }
+                    candle::DType::U8 => ffi::asort_asc_u8(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream_ptr),
+                    candle::DType::U32 => ffi::asort_asc_u32(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream_ptr),
+                    candle::DType::I64 => ffi::asort_asc_i64(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream_ptr),
+                    candle::DType::BF16 => ffi::asort_asc_bf16(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream_ptr),
+                    candle::DType::F16 => ffi::asort_asc_f16(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream_ptr),
+                    candle::DType::F32 => ffi::asort_asc_f32(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream_ptr),
+                    candle::DType::F64 => ffi::asort_asc_f64(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream_ptr),
+                    _ => candle_core::bail!("Unsupported dtype for ArgSort"),
                 }
             } else {
                 match storage.dtype() {
-                    candle::DType::U8 => {
-                        ffi::asort_desc_u8(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
-                    }
-                    candle::DType::U32 => {
-                        ffi::asort_desc_u32(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
-                    }
-                    candle::DType::I64 => {
-                        ffi::asort_desc_i64(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
-                    }
-                    candle::DType::BF16 => {
-                        ffi::asort_desc_bf16(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
-                    }
-                    candle::DType::F16 => {
-                        ffi::asort_desc_f16(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
-                    }
-                    candle::DType::F32 => {
-                        ffi::asort_desc_f32(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
-                    }
-                    candle::DType::F64 => {
-                        ffi::asort_desc_f64(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream)
-                    }
+                    candle::DType::U8 => ffi::asort_desc_u8(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream_ptr),
+                    candle::DType::U32 => ffi::asort_desc_u32(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream_ptr),
+                    candle::DType::I64 => ffi::asort_desc_i64(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream_ptr),
+                    candle::DType::BF16 => ffi::asort_desc_bf16(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream_ptr),
+                    candle::DType::F16 => ffi::asort_desc_f16(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream_ptr),
+                    candle::DType::F32 => ffi::asort_desc_f32(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream_ptr),
+                    candle::DType::F64 => ffi::asort_desc_f64(src_ptr, dst_ptr, nrows, ncols, self.inplace, stream_ptr),
+                    _ => candle_core::bail!("Unsupported dtype for ArgSort"),
                 }
             }
         }
-        let dst_ret = candle::cuda_backend::CudaStorage {
-            slice: CudaStorageSlice::U32(dst),
-            device: dev.clone(),
-        };
+        
+        let dst_ret = candle::cuda_backend::CudaStorage::new(CudaStorageSlice::U32(dst), dev.clone());
         Ok((dst_ret, layout.shape().clone()))
     }
 }
@@ -118,11 +95,6 @@ pub trait ArgSortOp {
 }
 
 impl ArgSortOp for Tensor {
-    /// Returns the indices that sort the tensor along the last dimension.
-    ///
-    /// If `asc` is `true`, sorting is in ascending order. Otherwise sorting is performed in
-    /// descending order. The sort is unstable so there is no guarantees on the final order when it
-    /// comes to ties.
     fn arg_sort(&self, asc: bool) -> Result<Tensor> {
         if !self.is_contiguous() {
             return Err(candle_core::Error::RequiresContiguous { op: "arg_sort" });
@@ -131,37 +103,19 @@ impl ArgSortOp for Tensor {
             Some(last_dim) => *last_dim,
             None => candle_core::bail!("empty last-dim in arg-sort"),
         };
-        // No need for a backward pass for arg sort.
-        self.apply_op1_no_bwd(&ArgSort {
-            asc,
-            last_dim,
-            inplace: false,
-        })
+        self.apply_op1_no_bwd(&ArgSort { asc, last_dim, inplace: false })
     }
 
-    /// Sorts the tensor along the last dimension, returns the sorted tensor together with the
-    /// sorted indexes.
-    ///
-    /// If `asc` is `true`, sorting is in ascending order. Otherwise sorting is performed in
-    /// descending order. The sort is unstable so there is no guarantees on the final order when it
-    /// comes to ties.
     fn sort(&self, asc: bool) -> Result<(Tensor, Tensor)> {
         if !self.is_contiguous() {
-            return Err(candle_core::Error::RequiresContiguous { op: "arg_sort" });
+            return Err(candle_core::Error::RequiresContiguous { op: "sort" });
         }
         let last_dim = match self.dims().last() {
             Some(last_dim) => *last_dim,
-            None => candle_core::bail!("empty last-dim in arg-sort"),
+            None => candle_core::bail!("empty last-dim in sort"),
         };
         let sorted = self.copy()?;
-
-        let asort = sorted.apply_op1_no_bwd(&ArgSort {
-            asc,
-            last_dim,
-            inplace: true,
-        })?;
-
+        let asort = sorted.apply_op1_no_bwd(&ArgSort { asc, last_dim, inplace: true })?;
         Ok((sorted, asort))
     }
 }
-

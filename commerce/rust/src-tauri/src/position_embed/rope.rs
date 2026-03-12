@@ -1,6 +1,5 @@
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
-use candle_transformers::models::deepseek2::SplitOp;
 
 use crate::utils::tensor_utils::{index_select_2d, split_tensor};
 

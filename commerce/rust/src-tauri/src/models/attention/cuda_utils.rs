@@ -1,7 +1,7 @@
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::sys;
 #[cfg(feature = "cuda")]
-use candle_core::cuda_backend::cudarc::driver::CudaDevice;
+use candle_core::CudaDevice;
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::CudaStream;
 #[cfg(feature = "cuda")]
@@ -29,40 +29,26 @@ pub fn compute_capability(dev: &CudaDevice) -> Option<(i32, i32)> {
 
 #[cfg(feature = "cuda")]
 pub fn sm_version(dev: &CudaDevice) -> Option<i32> {
-    // Key by the address of this device instance
     let key = (dev as *const CudaDevice) as usize;
-
     let cache = SM_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-
-    // Fast path: return cached value if present
     if let Some(v) = cache.lock().unwrap().get(&key).copied() {
         return v;
     }
-
-    // Compute outside the lock to keep the critical section small
     let computed = compute_capability(dev).map(|(major, minor)| major * 10 + minor);
-
-    // Store (a second thread might store first; that is fine)
     cache.lock().unwrap().insert(key, computed);
-
     computed
 }
 
 #[cfg(feature = "cuda")]
 pub fn get_raw_stream(dev: &CudaDevice) -> i64 {
-    let stream: Arc<CudaStream> = dev.cuda_stream();
-    // In cudarc, CudaStream doesn't easily expose the raw handle unless using unsafe or specific versions.
-    // However, for kernel launches, we just need a pointer that the kernel expectation matches.
-    // Most kernels expect CUstream which is *mut CUstream_st.
-    // We can use the address of the CudaStream object itself if the kernel was compiled with that assumption,
-    // but usually it wants the ACTUAL CUDA stream handle.
-    // Let's try to get it via a pointer to the inner stream if possible, or just return 0 (default stream) 
-    // if we can't find a better way, but that might hurt performance.
-    
-    // Attempt to get the stream handle by casting the Arc's inner pointer.
-    // This is risky but often how these "hacks" work in these specific repos.
-    let stream_ptr = Arc::as_ptr(&stream);
-    stream_ptr as i64
+    use candle_core::cuda_backend::cudarc::driver::AsRaw;
+    unsafe { *dev.cuda_stream().as_raw() as i64 }
+}
+
+#[cfg(feature = "cuda")]
+pub fn get_cuda_stream_ptr(dev: &CudaDevice) -> *mut sys::CUstream_st {
+    use candle_core::cuda_backend::cudarc::driver::AsRaw;
+    unsafe { *dev.cuda_stream().as_raw() as *mut sys::CUstream_st }
 }
 
 pub trait WrapErr<T> {

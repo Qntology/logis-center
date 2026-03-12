@@ -201,9 +201,10 @@ impl FusedMoe {
                             )?
                             .contiguous()?,
                     };
-                    let (_, gate_n, gate_k) = gate_expert.dims3()?;
-                    let (_, up_n, up_k) = up_expert.dims3()?;
-                    let (_, down_n, down_k) = down_expert.dims3()?;
+                    let (_, gate_n, gate_k): (usize, usize, usize) = gate_expert.dims3()?;
+                    let (_, up_n, up_k): (usize, usize, usize) = up_expert.dims3()?;
+                    let (_, down_n, down_k): (usize, usize, usize) = down_expert.dims3()?;
+
                     if gate_n != up_n
                         || gate_k != up_k
                         || gate_k != cfg.hidden_size

@@ -3,20 +3,21 @@ use candle_core::{CpuStorage, CustomOp1, Error, Layout, Shape, WithDType};
 use candle_core::{Result, Tensor};
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
+
 pub struct NonZero {}
 
 impl NonZero {
-    // Sequential version
-    fn nonzero<T: WithDType>(&self, vs: &[T], layout: &Layout) -> Vec<u32> {
-        let n = layout.dims().len();
+    fn nonzero_t<T: WithDType>(&self, vs: &[T], layout: &Layout) -> Vec<u32> {
+        let dims = layout.dims();
+        let n = dims.len();
         let mut result = Vec::new();
         let mut indices = vec![0u32; n];
         for (i, v) in vs.iter().enumerate() {
             if !v.is_zero() {
                 let mut idx = i;
-                for (dim_index, dim) in layout.dims().iter().enumerate().rev() {
+                for (dim_index, dim) in dims.iter().enumerate().rev() {
                     let d = idx % dim;
-                    indices[dim_index] = u32::try_from(d).unwrap();
+                    indices[dim_index] = d as u32;
                     idx /= dim;
                 }
                 result.extend_from_slice(&indices);
@@ -27,28 +28,22 @@ impl NonZero {
 }
 
 impl CustomOp1 for NonZero {
-    fn name(&self) -> &'static str {
-        "nonzero"
-    }
+    fn name(&self) -> &'static str { "nonzero" }
 
     fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
-        if !layout.is_contiguous() {
-            return Err(Error::RequiresContiguous { op: "nonzero" });
-        }
+        if !layout.is_contiguous() { return Err(Error::RequiresContiguous { op: "nonzero" }); }
         let result = match storage {
-            CpuStorage::U8(vs) => self.nonzero(vs, layout),
-            CpuStorage::U32(vs) => self.nonzero(vs, layout),
-            CpuStorage::I64(vs) => self.nonzero(vs, layout),
-            CpuStorage::BF16(vs) => self.nonzero(vs, layout),
-            CpuStorage::F16(vs) => self.nonzero(vs, layout),
-            CpuStorage::F32(vs) => self.nonzero(vs, layout),
-            CpuStorage::F64(vs) => self.nonzero(vs, layout),
+            CpuStorage::U8(vs) => self.nonzero_t(vs, layout),
+            CpuStorage::U32(vs) => self.nonzero_t(vs, layout),
+            CpuStorage::I64(vs) => self.nonzero_t(vs, layout),
+            CpuStorage::BF16(vs) => self.nonzero_t(vs, layout),
+            CpuStorage::F16(vs) => self.nonzero_t(vs, layout),
+            CpuStorage::F32(vs) => self.nonzero_t(vs, layout),
+            CpuStorage::F64(vs) => self.nonzero_t(vs, layout),
         };
         let index_len = layout.dims().len();
         let result_len = result.len() / index_len;
-        let result = CpuStorage::U32(result);
-        let shape = Shape::from_dims(&[result_len, index_len]);
-        Ok((result, shape))
+        Ok((CpuStorage::U32(result), Shape::from_dims(&[result_len, index_len])))
     }
 }
 
@@ -58,9 +53,6 @@ pub trait NonZeroOp {
 
 impl NonZeroOp for Tensor {
     fn nonzero(&self) -> Result<Tensor> {
-        if !self.is_contiguous() {
-            return Err(candle_core::Error::RequiresContiguous { op: "nonzero" });
-        }
         let original_device = self.device();
         self.to_device(&candle_core::Device::Cpu)?
             .apply_op1_no_bwd(&NonZero {})?
@@ -86,12 +78,8 @@ impl SplitOp for Tensor {
     }
 
     fn split2<D: Dim>(&self, splits: &[usize], dim: D) -> Result<(Tensor, Tensor)> {
-        assert!(splits.len() == 2, "splits must be 2");
-        let dim = dim.to_index(self.shape(), "split")?;
-        Ok((
-            self.narrow(dim, 0, splits[0])?,
-            self.narrow(dim, splits[0], splits[1])?,
-        ))
+        let dim = dim.to_index(self.shape(), "split2")?;
+        Ok((self.narrow(dim, 0, splits[0])?, self.narrow(dim, splits[0], splits[1])?))
     }
 }
 
@@ -99,46 +87,16 @@ pub trait BincountOp {
     fn bincount(&self, minlength: u32) -> Result<Vec<u32>>;
 }
 
-fn bincount(values: &[u32], minlength: u32) -> Vec<u32> {
-    // Find the maximum value in `values` (or zero if empty)
-    let max_val = values.par_iter().max().copied().unwrap_or(0);
-
-    // The final size of the bin counts must be at least `minlength`
-    // and large enough to include the largest value in `values`.
-    let result_len = (max_val + 1).max(minlength);
-
-    // Each thread creates a local histogram (`fold`),
-    // and then they are merged together (`reduce`).
-    values
-        .par_iter()
-        .fold(
-            // Create a local histogram
-            || vec![0u32; result_len as usize],
-            // Update the local histogram
-            |mut local_counts, &val| {
-                local_counts[val as usize] += 1;
-                local_counts
-            },
-        )
-        // Merge histograms from all threads
-        .reduce(
-            // Identity (empty histogram)
-            || vec![0u32; result_len as usize],
-            // Combine two histograms
-            |mut global_counts, local_counts| {
-                for (g, l) in global_counts.iter_mut().zip(local_counts) {
-                    *g += l;
-                }
-                global_counts
-            },
-        )
-}
-
 impl BincountOp for Tensor {
     fn bincount(&self, minlength: u32) -> Result<Vec<u32>> {
         let values = self.to_vec1::<u32>()?;
-
-        Ok(bincount(&values, minlength))
+        let max_val = values.par_iter().max().copied().unwrap_or(0);
+        let result_len = (max_val + 1).max(minlength) as usize;
+        let counts = values.par_iter().fold(|| vec![0u32; result_len], |mut acc, &v| {
+            acc[v as usize] += 1; acc
+        }).reduce(|| vec![0u32; result_len], |mut a, b| {
+            for (i, v) in b.into_iter().enumerate() { a[i] += v; } a
+        });
+        Ok(counts)
     }
 }
-

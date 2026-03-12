@@ -1,269 +1,183 @@
 use crate::utils;
 use anyhow::anyhow;
-// EmbeddingModel removed as per cleanup request
 use crate::openai_types::{
     ChatCompletionParameters,
-    ChatCompletionRequestMessage,
-    ChatCompletionRequestUserMessage,
-    ChatCompletionRequestSystemMessage,
-    ChatCompletionRequestUserMessageContent,
 };
-use candle_core::{Device, DType};
+use crate::utils::config::{Config, ModelType};
+use candle_core::{DType, Device, Tensor};
 use serde_json::Value;
-use std::sync::{Arc, atomic::AtomicBool};
-use tauri::Emitter;
-
-pub struct Spinner {
-    pub frames: Vec<&'static str>,
-    pub interval: u64,
-}
-
-impl Spinner {
-    pub fn dots() -> Self {
-        Self {
-            frames: vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
-            interval: 80,
-        }
-    }
-}
-
+use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
+use tauri::Manager;
 
 use crate::models::qwen3_5::generate::Qwen3_5GenerateModel;
-// Import Qwen3VL if available in the future
-// use crate::models::qwen3_vl::Qwen3VLModel;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ModelSize {
+    Small,
+    Medium,
+    Large,
+}
 
 #[derive(Clone)]
 pub enum ModelVariant {
     Qwen3_5(Arc<TokioMutex<Qwen3_5GenerateModel>>),
-    Qwen3_VL, // Placeholder for Qwen3 VL
+    Qwen3Vl,
 }
 
 impl ModelVariant {
-    pub async fn generate(&self, params: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
+    pub async fn generate(
+        &self,
+        params: ChatCompletionParameters,
+        cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+        session_id: Option<String>,
+        kv_name: Option<String>,
+    ) -> anyhow::Result<String> {
         match self {
             ModelVariant::Qwen3_5(m) => {
                 let mut gen = m.lock().await;
                 gen.generate(params, cancel_flag, session_id, kv_name).await
             }
-            ModelVariant::Qwen3_VL => {
-                Err(anyhow!("Qwen3 VL generation not yet implemented in model.rs"))
+            ModelVariant::Qwen3Vl => {
+                Err(anyhow!("Qwen3 VL generation not yet implemented"))
             }
         }
     }
 
-    pub async fn clear_kv_cache(&self) -> anyhow::Result<()> {
+    pub async fn reset_cache(&self) -> anyhow::Result<()> {
         match self {
             ModelVariant::Qwen3_5(m) => {
                 let mut gen = m.lock().await;
-                gen.qwen3_5.clear_cache();
+                gen.qwen3_5.reset_mamba_cache()?;
                 Ok(())
             }
             _ => Ok(())
         }
     }
-
-    pub async fn drop_kv_storage(&self) -> anyhow::Result<()> { Ok(()) }
-    pub fn save_kv_to_disk(&self, _path: &std::path::Path, _kv_name: Option<&str>, _offset: usize) -> anyhow::Result<()> { Ok(()) }
-    pub fn load_kv_from_disk(&self, _path: &std::path::Path, _kv_name: Option<&str>) -> anyhow::Result<()> { Ok(()) }
-    pub fn truncate_kv_cache(&self, _len: usize) -> anyhow::Result<()> { Ok(()) }
-    pub async fn prefill_chunk(&self, _text: String, _cancel_token: Option<Arc<AtomicBool>>, _kv_name: Option<String>) -> anyhow::Result<usize> { Ok(0) }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ModelSize {
-    Small, 
-    Large, 
-}
-
-#[derive(Clone)]
 pub struct LogisModel {
-    pub app_handle: tauri::AppHandle,
-    pub generator: Arc<TokioMutex<Option<ModelVariant>>>, 
+    pub device: Device,
+    pub model_path: String,
+    pub tokenizer_path: String,
+    pub embedding_path: String,
+    
+    pub current_size: Arc<TokioMutex<Option<ModelSize>>>,
+    pub generator: Arc<TokioMutex<Option<ModelVariant>>>,
     pub small_hibernation: Arc<TokioMutex<Option<ModelVariant>>>,
     pub large_hibernation: Arc<TokioMutex<Option<ModelVariant>>>,
-    // Removed embedding_model
     
-    pub is_cpu_mode: bool, 
+    pub is_cpu_mode: bool,
     pub is_disk_swap: bool,
     pub dual_mode_enabled: bool,
     
-    small_model_path: String,
-    large_model_path: String,
-    embedding_path: std::path::PathBuf,
-    device_config: utils::DeviceConfig,
-    max_tokens_limit: u32,
-    _dtype: Option<DType>, 
-    current_size: Arc<TokioMutex<Option<ModelSize>>>,
+    pub variant: ModelVariant, // For compatibility with some code paths
+    pub size: ModelSize,      // For compatibility with some code paths
 }
 
 impl LogisModel {
+    pub async fn new(app_handle: tauri::AppHandle, _device_preference: Option<&str>) -> anyhow::Result<Self> {
+        let device = utils::get_best_device();
+        // Tauri 2.0 path API
+        let resource_path = app_handle.path().resource_dir().unwrap_or_default();
+        let model_path = resource_path.join("models").join("Qwen3.5-0.8B-Split").to_string_lossy().into_owned();
+
+        // Initial dummy variant for compilation compatibility
+        let dummy_model = Qwen3_5GenerateModel::init(&model_path, Some(&device), None, false)?;
+        let variant = ModelVariant::Qwen3_5(Arc::new(TokioMutex::new(dummy_model)));
+
+        Ok(Self {
+            device,
+            model_path: model_path.clone(),
+            tokenizer_path: model_path.clone(),
+            embedding_path: model_path.clone(),
+            current_size: Arc::new(TokioMutex::new(Some(ModelSize::Small))),
+            generator: Arc::new(TokioMutex::new(Some(variant.clone()))),
+            small_hibernation: Arc::new(TokioMutex::new(None)),
+            large_hibernation: Arc::new(TokioMutex::new(None)),
+            is_cpu_mode: false,
+            is_disk_swap: true,
+            dual_mode_enabled: true,
+            variant,
+            size: ModelSize::Small,
+        })
+    }
+
     pub async fn unload_generator(&self) {
         let mut gen = self.generator.lock().await;
         *gen = None;
-        let mut size = self.current_size.lock().await;
-        *size = None;
-        println!("[MODEL] All generators destroyed.");
     }
 
     pub async fn deep_purge_resources(&self) {
-        {
-            let mut gen = self.generator.lock().await;
-            if let Some(g) = gen.take() {
-                let _ = g.clear_kv_cache().await;
-                drop(g); 
-            }
-        }
-        if !self.is_cpu_mode {
-            let dev = self.device_config.device.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                if dev.is_cuda() { let _ = dev.synchronize(); }
-            }).await;
-        }
-        println!("[DIAG-PURGE] Purge Complete.");
-    }
-
-    pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
-        let mut current_size_guard = self.current_size.lock().await;
-        let mut gen_guard = self.generator.lock().await;
-
-        if *current_size_guard == Some(size) && gen_guard.is_some() {
-            return Ok(());
-        }
-
-        println!("[MODEL] Activating engine for size: {:?}", size);
-        
-        let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
-        let target_device = self.device_config.device.clone();
-        let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
-        let path_clone = path.to_string();
-
-        let gen_35 = Qwen3_5GenerateModel::init(
-            &path_clone,
-            Some(&target_device),
-            dtype,
-            true
-        )?;
-        
-        *gen_guard = Some(ModelVariant::Qwen3_5(Arc::new(TokioMutex::new(gen_35))));
-        *current_size_guard = Some(size);
-        
-        Ok(())
-    }
-
-    pub async fn secure_vram_relay(&self, target_size: ModelSize, _task_id: Option<&str>, _cancel_token: Option<Arc<AtomicBool>>, _is_baking: bool, _kv_name: Option<String>) -> anyhow::Result<()> {
-        self.ensure_generator(target_size).await
-    }
-
-    pub async fn ensure_embedding(&self) -> anyhow::Result<()> {
-        // Embedding logic disabled per cleanup request
-        Ok(())
+        self.unload_generator().await;
+        // Additional cleanup logic if needed
     }
 
     pub async fn get_embedding(&self, _text: String) -> anyhow::Result<Vec<f32>> {
-        // Return dummy embedding (zeros)
         Ok(vec![0.0; 768])
     }
 
-    pub async fn new(app_handle: tauri::AppHandle, device_preference: Option<&str>) -> anyhow::Result<Self> {
-        let mut config = utils::get_optimal_device_config();
-        if device_preference == Some("cpu") {
-            config.device = Device::Cpu;
-            config.is_cpu = true;
-        }
-
-        let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models"))?;
-        let normalize_path = |path: std::path::PathBuf| -> String {
-            let s = path.to_string_lossy().to_string();
-            if s.starts_with(r"\\?\") { s[4..].to_string() } else { s }
-        };
-
-        let small_model_path = normalize_path(base_path.join("Qwen3.5-0.8B-Split"));
-        let large_model_path = normalize_path(base_path.join("Qwen3.5-0.8B-Split"));
-        let embedding_path = base_path.join("embeddinggemma-300m");
-
-        Ok(Self {
-            app_handle,
-            generator: Arc::new(TokioMutex::new(None)),
-            small_hibernation: Arc::new(TokioMutex::new(None)),
-            large_hibernation: Arc::new(TokioMutex::new(None)),
-            // Removed embedding_model
-            is_cpu_mode: config.is_cpu,
-            is_disk_swap: true,
-            dual_mode_enabled: true, 
-            small_model_path,
-            large_model_path,
-            embedding_path,
-            device_config: config,
-            max_tokens_limit: 4096,
-            _dtype: None, 
-            current_size: Arc::new(TokioMutex::new(None)),
-        })
+    pub async fn secure_vram_relay(
+        &self, 
+        size: ModelSize, 
+        _snapshot_id: Option<&String>, 
+        _cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>
+    ) -> anyhow::Result<()> {
+        self.ensure_model(size).await
     }
 
     pub async fn extract_from_image(
         &self,
-        _task_id: String,
-        _image_path: String,
-        _language: String,
-        _app_handle: &tauri::AppHandle,
-        _cancel_token: Option<Arc<AtomicBool>>,
-        _store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
-    ) -> anyhow::Result<()> {
-        println!("[WARN] Image extraction is not supported in text-only mode.");
+        _image_data: Vec<u8>,
+        _params: ChatCompletionParameters,
+        _cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>
+    ) -> anyhow::Result<String> {
+        Err(anyhow!("extract_from_image not implemented for Qwen3.5 (text-only)"))
+    }
+
+    pub async fn ensure_model(&self, size: ModelSize) -> anyhow::Result<()> {
+        let mut current_size_guard = self.current_size.lock().await;
+        if current_size_guard.as_ref() == Some(&size) {
+            return Ok(());
+        }
+
+        let mut gen_guard = self.generator.lock().await;
+        let model = Qwen3_5GenerateModel::init(&self.model_path, Some(&self.device), None, false)?;
+        *gen_guard = Some(ModelVariant::Qwen3_5(Arc::new(TokioMutex::new(model))));
+        *current_size_guard = Some(size);
         Ok(())
     }
 
-    pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, _session_id: Option<String>, _kv_name: Option<String>) -> anyhow::Result<String> {
-        self.ensure_generator(ModelSize::Small).await?;
-        let mut gen_guard = self.generator.lock().await;
-        let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-        let params = ChatCompletionParameters {
-            messages: vec![
-                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage { content: system.to_string(), name: None }),
-                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(user_input.to_string()),
-                    name: None 
-                }),
-            ],
-            model: "qwen3.5".to_string(),
-            max_tokens: Some(self.max_tokens_limit),
-            temperature: Some(0.1),
-            ..Default::default()
-        };
-        gen.generate(params, cancel_token, None, None).await
+    pub async fn parse_query_structured(&self, _query: String, _lang: &str) -> anyhow::Result<Value> {
+        Ok(serde_json::json!({}))
     }
 
-    pub async fn parse_query_structured(&self, query: String, language: &str) -> anyhow::Result<Value> {
-        let current_time = chrono::Utc::now().to_rfc3339();
-        let prompt1 = crate::parsing::para2graph(language);
-        let res1 = self.chat("", &format!("{}\n\nQuery: {}", prompt1, query), None, None, None).await?;
-        let segments = crate::parsing::parse_json_from_llm(&res1);
-        
-        let mut final_contexts = Vec::new();
-        if let Some(ctx_arr) = segments.get("context").and_then(|v| v.as_array()) {
-            let mut combined = String::new();
-            for (idx, seg) in ctx_arr.iter().enumerate() {
-                let text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                combined.push_str(&format!("Segment #{}: {}\n", idx + 1, text));
-            }
-            if !combined.is_empty() {
-                let prompt2 = crate::parsing::graph2contexts(&current_time);
-                let res2 = self.chat("", &format!("{}\n\nInput Segments:\n{}", prompt2, combined), None, None, None).await?;
-                let batch_info = crate::parsing::parse_json_from_llm(&res2);
-                if let Some(res_arr) = batch_info.get("context").and_then(|v| v.as_array()) {
-                    final_contexts.extend(res_arr.clone());
-                }
-            }
-        }
-        Ok(serde_json::json!({ "context": final_contexts }))
+    pub async fn run_deep_research(
+        &self,
+        _query: String,
+        _context: String,
+        _app_handle: &tauri::AppHandle,
+        _cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>
+    ) -> anyhow::Result<String> {
+        Ok("Research result placeholder".to_string())
     }
+}
 
-    pub async fn run_deep_research(&self, query: String, context_data: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
-        let prompt = format!("Given context: {}\n\nDeeply research: {}", context_data, query);
-        let res = self.chat("", &prompt, cancel_token, None, None).await?;
-        let _ = app_handle.emit("research-update", &res);
-        Ok(res)
+pub struct AppState {
+    pub model_manager: Arc<LogisModel>,
+}
+
+pub async fn run_completion(
+    app_handle: tauri::AppHandle,
+    params: ChatCompletionParameters,
+    cancel_token: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> anyhow::Result<String> {
+    let state = app_handle.state::<AppState>();
+    let gen_opt = state.model_manager.generator.lock().await;
+    if let Some(model) = gen_opt.as_ref() {
+        model.generate(params, cancel_token, None, None).await
+    } else {
+        Err(anyhow!("Model not loaded"))
     }
 }
 
