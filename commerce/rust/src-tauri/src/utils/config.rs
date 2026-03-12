@@ -55,22 +55,7 @@ impl Serialize for EosTokenId {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ModelType {
-    Qwen3,
-    Qwen3MoE,
     Qwen3_5,
-    Qwen3_5MoE,
-    LLaMa,
-    Gemma,
-    Gemma3,
-    Phi,
-    Phi4,
-    Mistral,
-    GLM4,
-    GLM4MoE,
-    Yi,
-    StableLM,
-    DeepSeek,
-    Mistral3VL,
     Qwen3VL,
 }
 
@@ -182,10 +167,8 @@ pub fn is_qwen3_hybrid_arch_name(arch: &str) -> bool {
     matches!(
         arch,
         "Qwen3_5ForCausalLM"
-            | "Qwen3_5MoeForCausalLM"
             | "Qwen3NextForCausalLM"
             | "Qwen3_5ForConditionalGeneration"
-            | "Qwen3_5MoeForConditionalGeneration"
             | "Qwen3NextForConditionalGeneration"
     )
 }
