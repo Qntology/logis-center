@@ -1,16 +1,25 @@
 use anyhow::Result;
-use candle_core::{D, IndexOp, Tensor};
+use candle_core::{D, Tensor};
 use candle_nn::{
-    Activation, BatchNorm, BatchNormConfig, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig,
-    ConvTranspose1d, ConvTranspose1dConfig, Embedding, LayerNorm, LayerNormConfig, Linear, Module,
-    ModuleT, RmsNorm, VarBuilder, batch_norm, conv1d, conv1d_no_bias, conv2d, conv2d_no_bias,
-    embedding, layer_norm, linear_b, linear_no_bias, ops::sigmoid, rms_norm,
+    Activation, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, Linear, Module,
+    VarBuilder, conv1d, conv1d_no_bias, conv2d, conv2d_no_bias,
+    linear_b,
 };
+use candle_transformers::generation::LogitsProcessor;
 
 use crate::{
     position_embed::rope::{apply_rotary_pos_emb},
-    utils::tensor_utils::{prepare_causal_attention_mask, repeat_kv},
+    utils::tensor_utils::{repeat_kv},
 };
+
+pub fn get_logit_processor(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    seed: u64,
+) -> LogitsProcessor {
+    LogitsProcessor::new(seed, temperature.map(|v| v as f64), top_p.map(|v| v as f64))
+}
 
 #[derive(Debug, Clone)]
 pub struct GateUpDownMLP {
@@ -77,8 +86,6 @@ pub struct TwoLinearMLP {
 impl TwoLinearMLP {
     pub fn new(
         vb: VarBuilder,
-        // embedding_dim: usize,
-        // mlp_dim: usize,
         in_dim: usize,
         middle_dim: usize,
         out_dim: usize,
@@ -390,27 +397,6 @@ pub fn get_conv1d(
         conv1d_no_bias(in_c, out_c, kernel_size, cfg, vb)?
     };
     Ok(conv1d)
-}
-
-pub fn get_layer_norm(vb: VarBuilder, eps: f64, dim: usize, affine: bool) -> Result<LayerNorm> {
-    let ln_config = LayerNormConfig {
-        eps,
-        remove_mean: true, // true for layernorm, false for RMSNorm
-        affine,            // true for with bias, false for without bias
-    };
-    let norm = layer_norm(dim, ln_config, vb)?;
-    Ok(norm)
-}
-
-pub fn get_batch_norm(vb: VarBuilder, eps: f64, dim: usize, affine: bool) -> Result<BatchNorm> {
-    let bn_config = BatchNormConfig {
-        eps,
-        remove_mean: true,
-        affine,
-        momentum: 0.1,
-    };
-    let norm = batch_norm(dim, bn_config, vb)?;
-    Ok(norm)
 }
 
 pub fn softplus(xs: &Tensor) -> Result<Tensor> {

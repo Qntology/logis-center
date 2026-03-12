@@ -1,64 +1,53 @@
 use anyhow::Result;
-use candle_core::{Device, DType};
-use std::path::Path;
+use candle_core::{DType, Device};
+// [FIX] Use the correct library crate name 'tauri_app_lib'
+use tauri_app_lib::models::qwen35::generate::Qwen3_5GenerateModel;
+use tauri_app_lib::openai_types::ChatCompletionParameters;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+pub async fn run_test() -> Result<()> {
     println!("🚀 Starting Qwen3.5 Hybrid Engine Test...");
 
-    let model_path = if Path::new("models/Qwen3.5-0.8B-Split").exists() {
-        "models/Qwen3.5-0.8B-Split"
+    let device = if candle_core::utils::cuda_is_available() {
+        Device::new_cuda(0)?
     } else {
-        "src-tauri/models/Qwen3.5-0.8B-Split"
+        Device::Cpu
     };
-
-    let device = Device::new_cuda(1)
-        .or_else(|_| Device::new_cuda(0))
-        .unwrap_or(Device::Cpu);
     println!("💻 Using device: {:?}", device);
 
-    use tauri_app_lib::models::qwen35::generate::Qwen3_5GenerateModel;
-    use tauri_app_lib::openai_types::ChatCompletionParameters;
+    let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models"))?;
+    let model_path = base_path.join("Qwen3.5-0.8B-Split").to_str().unwrap().to_string();
 
-    let mut model_files = vec![];
-    for entry in std::fs::read_dir(model_path)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("st") {
-            model_files.push(path.to_str().unwrap().to_string());
-        }
-    }
+    println!("📂 Loading model from {}...", model_path);
     
-    if model_files.is_empty() {
-        anyhow::bail!("No .st files found in {}", model_path);
-    }
+    let mut model = Qwen3_5GenerateModel::init(&model_path, Some(&device), Some(DType::F16), true)?;
 
-    println!("📚 Loading {} model files...", model_files.len());
-    let mut model = Qwen3_5GenerateModel::init_with_files(&model_files, model_path, Some(&device), Some(DType::F16))?;
-    
-    println!("✅ Hybrid Model initialized successfully.");
+    println!("\n✨ Hybrid Model initialized successfully.");
 
-    let message_json = r#"
-    {
+    let message_json = r#"{
         "model": "qwen3.5",
         "messages": [
             {
                 "role": "user",
-                "content": "1+1="
+                "content": "Explain Newton's first law in one sentence."
             }
         ],
-        "max_tokens": 10,
-        "temperature": 0.0,
-        "top_p": 1.0
-    }
-    "#;
-    let mes: ChatCompletionParameters = serde_json::from_str(message_json)?;
-    
-    println!("🤔 Asking: 1+1=?");
-    let response = model.generate(mes, None, None, None).await?;
+        "max_tokens": 50,
+        "temperature": 0.7,
+        "top_p": 0.9
+    }"#;
 
-    println!("\n✨ Result: {}", response);
+    let mes: ChatCompletionParameters = serde_json::from_str(message_json)?;
+    println!("❓ Asking: Explain Newton's first law in one sentence.");
+
+    let result = model.generate(mes, None, None, None).await?;
+
+    println!("\n\n🤖 Result:\n{}", result);
     println!("\n✅ Test completed successfully!");
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    run_test().await
 }

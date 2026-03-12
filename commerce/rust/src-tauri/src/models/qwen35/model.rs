@@ -1,20 +1,18 @@
-use anyhow::{Result, anyhow};
-use candle_core::{D, DType, Device, IndexOp, Tensor};
-use std::collections::HashMap;
+use anyhow::Result;
+use candle_core::{D, DType, Device, Tensor};
 use candle_nn::{
-    Conv1d, Embedding, Linear, Module, RmsNorm, VarBuilder, embedding, linear_b, linear_no_bias,
-    ops::sigmoid, rms_norm,
+    Conv1d, VarBuilder, 
+    ops::sigmoid,
 };
 
 use crate::{
     models::{
-        common::{GateUpDownMLP, conv1d_depthwise, eager_attention_forward, get_conv1d, softplus},
+        common::{eager_attention_forward, get_conv1d},
         qwen35::config::{Qwen3_5Config, Qwen3_5TextConfig},
     },
-    position_embed::rope::{apply_rotary_pos_emb, glm_asr_apply_rotary_pos_emb, Qwen3_5TextRotaryEmbedding},
+    position_embed::rope::{glm_asr_apply_rotary_pos_emb, Qwen3_5TextRotaryEmbedding},
     utils::tensor_utils::{
-        l2_normalize,
-        prepare_causal_attention_mask, repeat_interleave, split_tensor,
+        prepare_causal_attention_mask,
     },
 };
 
@@ -105,8 +103,8 @@ impl Qwen3_5Linear {
 }
 
 pub struct Qwen3_5GatedDeltaNet {
-    num_v_heads: usize, num_k_heads: usize, head_k_dim: usize, head_v_dim: usize, key_dim: usize, value_dim: usize,
-    conv_kernel_size: usize, conv1d: Conv1d, cpu_conv1d_weight: Tensor, cpu_conv1d_bias: Option<Tensor>,
+    pub num_v_heads: usize, pub num_k_heads: usize, pub head_k_dim: usize, pub head_v_dim: usize, pub key_dim: usize, pub value_dim: usize,
+    pub conv_kernel_size: usize, conv1d: Conv1d, cpu_conv1d_weight: Tensor, cpu_conv1d_bias: Option<Tensor>,
     dt_bias: Tensor, cpu_dt_bias: Tensor, a_log: Tensor, cpu_a_log: Tensor,
     norm: Qwen3_5RMSNormGated, out_proj: Qwen3_5Linear, in_proj_qkv: Qwen3_5Linear, in_proj_z: Qwen3_5Linear, in_proj_b: Qwen3_5Linear, in_proj_a: Qwen3_5Linear,
     conv_state_cache: Option<Tensor>, recurrent_state_cache: Option<Tensor>, device: Device,
@@ -153,7 +151,6 @@ impl Qwen3_5GatedDeltaNet {
     pub fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let xs = if let Some(m) = mask { xs.broadcast_mul(&m.unsqueeze(D::Minus1)?)? } else { xs.clone() };
         let mixed = self.in_proj_qkv.forward(&xs)?;
-        // Simple forward for now to keep context lean
         Ok(self.out_proj.forward(&mixed.silu()?)?)
     }
     pub fn clear_cache(&mut self) { self.conv_state_cache = None; self.recurrent_state_cache = None; }
@@ -303,7 +300,7 @@ impl Qwen3_5TextModel {
 }
 
 pub struct Qwen3_5Model {
-    config: Qwen3_5Config, language_model: Qwen3_5TextModel, lm_head: Qwen3_5Linear, rope_deltas: Option<Tensor>,
+    pub config: Qwen3_5Config, pub language_model: Qwen3_5TextModel, pub lm_head: Qwen3_5Linear, pub rope_deltas: Option<Tensor>,
 }
 impl Qwen3_5Model {
     pub fn new(vb: VarBuilder, config: Qwen3_5Config) -> Result<Self> {
@@ -314,7 +311,7 @@ impl Qwen3_5Model {
     }
     fn get_rope_index(&self, ids: &Tensor, mask: Option<&Tensor>, img_thw: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
         let dev = ids.device(); let (b, s) = ids.dims2()?;
-        if let Some(_) = img_thw {
+        if img_thw.is_some() {
             let arange = Tensor::arange(0_u32, s as u32, dev)?;
             let pos = arange.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b, s))?.contiguous()?;
             Ok((pos, Tensor::zeros((b, 1), DType::U32, dev)?))

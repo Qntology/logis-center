@@ -1,247 +1,151 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::models::qwen35::quantized_model::{QuantizedQwen3_5Model, QuantizedRegistry, LayerContext};
+use crate::tokenizer::TokenizerModel;
+use crate::chat_template::ChatTemplate;
+use crate::openai_types::ChatCompletionParameters;
+use crate::models::qwen35::config::Qwen3_5Config;
 use std::sync::Arc;
-
-use crate::{
-    chat_template::ChatTemplate,
-    tokenizer::TokenizerModel,
-    models::qwen35::{
-        config::Qwen3_5Config,
-        quantized_model::{QuantizedQwen3_5Model, QuantizedRegistry, KVStateManager, LayerContext},
-    },
-    openai_types::ChatCompletionParameters,
-    utils::{
-        get_logit_processor,
-    },
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use crate::models::common::get_logit_processor;
 
 pub struct Qwen3_5GenerateModel {
     pub qwen3_5: QuantizedQwen3_5Model,
     pub tokenizer: TokenizerModel,
+    pub chat_template: ChatTemplate,
     pub device: Device,
     pub registry: QuantizedRegistry,
-    pub chat_template: ChatTemplate,
     pub eos_token_id: u32,
+    // [FIX] Persistent cache storage for RELAY mode
+    pub layer_caches: Vec<Option<LayerContext>>,
 }
 
 impl Qwen3_5GenerateModel {
-    pub fn init(
-        model_path: &str,
-        device: Option<&Device>,
-        _dtype: Option<DType>,
-        _prefill_bake: bool,
-    ) -> Result<Self> {
+    pub fn init(model_path: &str, device: Option<&Device>, _dtype: Option<DType>, use_relay: bool) -> Result<Self> {
+        let dev = device.unwrap_or(&Device::Cpu).clone();
+        println!("[MODEL-QWEN35] Initializing Hybrid Engine ({} Mode)...", if use_relay { "RELAY" } else { "FULL" });
+        
+        let config_path = std::path::Path::new(model_path).join("config.json");
+        let config_str = std::fs::read_to_string(config_path)?;
+        let config: Qwen3_5Config = serde_json::from_str(&config_str)?;
+        
+        let tokenizer = TokenizerModel::init(model_path)?;
+        let chat_template = ChatTemplate::init(model_path)?;
+        
         let mut model_files = vec![];
         for entry in std::fs::read_dir(model_path)? {
             let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("safetensors") {
-                model_files.push(path.to_str().unwrap().to_string());
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".st") || name.ends_with(".safetensors") {
+                model_files.push(entry.path().to_str().unwrap().to_string());
             }
         }
-        Self::init_with_files(&model_files, model_path, device, _dtype)
-    }
-
-    pub fn init_with_files(
-        model_files: &[String],
-        model_path: &str,
-        device: Option<&Device>,
-        _dtype: Option<DType>,
-    ) -> Result<Self> {
-        let model_path_p = std::path::Path::new(model_path);
-        let config_path = model_path_p.join("config.json");
-        let config: Qwen3_5Config = serde_json::from_slice(&std::fs::read(config_path)?)?;
+        println!("[MODEL-QWEN35] Loading {} model files...", model_files.len());
+        let registry = QuantizedRegistry::new(&model_files)?;
         
-        let tokenizer = TokenizerModel::init(model_path)?;
-
-        let dev = match device {
-            Some(d) => d.clone(),
-            None => Device::Cpu,
-        };
-
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(model_files, DType::F16, &dev)? };
-        let qwen3_5 = QuantizedQwen3_5Model::new(vb, config)?;
-
-        let registry = QuantizedRegistry::new(model_files)?;
-
-        let chat_template = ChatTemplate::init(model_path)?;
-
+        let map = std::collections::HashMap::new();
+        let vb = candle_nn::VarBuilder::from_tensors(map, DType::F16, &dev);
+        let qwen3_5 = QuantizedQwen3_5Model::new(vb, config.clone())?;
+        
         Ok(Self {
             qwen3_5,
             tokenizer,
+            chat_template,
             device: dev,
             registry,
-            chat_template,
-            eos_token_id: 248044,
+            eos_token_id: 248046, 
+            layer_caches: vec![None; config.text_config.num_hidden_layers],
         })
     }
 
     pub async fn generate(
-        &mut self, 
-        mes: ChatCompletionParameters, 
+        &mut self,
+        mes: ChatCompletionParameters,
         cancel_flag: Option<Arc<AtomicBool>>,
         _session_id: Option<String>,
         _kv_name: Option<String>
     ) -> Result<String> {
         let seed = mes.seed.unwrap_or(34562) as u64;
-        // Increase precision: Use Top-K filtering to remove low-probability noise
         let mut logit_processor = get_logit_processor(
-            mes.temperature.map(|t| t as f32), 
-            mes.top_p.map(|p| p as f32), 
-            Some(50), // Top-K = 50
+            mes.temperature.map(|t| t as f32),
+            mes.top_p.map(|p| p as f32),
+            Some(50),
             seed
         );
-        
-        let mes_render = self.chat_template.apply_chat_template(&mes)?;
-        println!("[DEBUG-PROMPT] Rendered prompt: {:?}", mes_render);
-        let token_ids = self.tokenizer.text_encode_vec(mes_render, true)?;
-        println!("[DEBUG-TOKENS] Encoded IDs: {:?}", token_ids);
-        let full_input_ids = Tensor::from_slice(&token_ids, (1, token_ids.len()), &self.device)?.to_dtype(DType::U32)?;
-            
-        let full_seq_len = full_input_ids.dim(1)?;
-        
-        let mut seqlen_offset = 0;
-        let chunk_size = 64; 
-        let mut last_logits = None;
 
         self.qwen3_5.clear_cache();
-        // Use file-based KV cache for memory efficiency
-        let mut kv_manager = KVStateManager::new(self.qwen3_5.model.layers.len(), false)?;
+        self.layer_caches.iter_mut().for_each(|c| *c = None);
 
-        let num_layers = self.qwen3_5.model.layers.len();
+        let mes_render = self.chat_template.apply_chat_template(&mes)?;
+        let token_ids = self.tokenizer.text_encode_vec(mes_render, true)?;
+        let full_input_ids = Tensor::from_slice(&token_ids, (1, token_ids.len()), &self.device)?.to_dtype(DType::U32)?;
+        let full_seq_len = full_input_ids.dim(1)?;
 
-        println!("[MODEL-QWEN35] Starting FULL-RELAY Prefill (Layer-by-Layer weights & cache)...");
-
-        // ====================================================================
-        // [PHASE 1] PREFILL: Layer-by-Layer Relay (VRAM minimum)
-        // ====================================================================
-        while seqlen_offset < full_seq_len {
-            if let Some(flag) = &cancel_flag {
-                if flag.load(Ordering::Relaxed) { break; }
-            }
-
-            let remaining = full_seq_len - seqlen_offset;
-            let current_chunk = remaining.min(chunk_size);
-            let input_ids = full_input_ids.narrow(1, seqlen_offset, current_chunk)?;
-
-            // 1. Embeddings (Dynamic Load/Drop)
-            self.qwen3_5.model.embed.load_to_vram(&self.registry, &self.device)?;
-            let mut h = self.qwen3_5.model.embed.forward(&input_ids, &self.registry)?.detach();
-            self.qwen3_5.model.embed.clear_vram();
+        println!("[MODEL-QWEN35] Starting FULL-RELAY Prefill...");
+        let mut last_logits = None;
+        
+        // Chunked prefill for memory efficiency
+        for i in 0..full_seq_len {
+            let input_id = full_input_ids.narrow(1, i, 1)?;
+            let mut x = self.qwen3_5.model.embed.forward(&input_id, &self.registry)?;
             
-            // RoPE & Mask
-            let pos_vec: Vec<u32> = (seqlen_offset as u32..(seqlen_offset + current_chunk) as u32).collect();
-            // M-RoPE: Channel 0 = Time (pos), Channel 1,2 = Spatial (0 for text)
-            let pos_time = Tensor::from_vec(pos_vec, (1, current_chunk), &self.device)?;
-            let pos_spatial = Tensor::zeros((1, current_chunk), DType::U32, &self.device)?;
-            let pos = Tensor::stack(&[&pos_time, &pos_spatial, &pos_spatial], 0)? // (3, 1, S)
-                .broadcast_as((3, input_ids.dim(0)?, current_chunk))?
-                .contiguous()?;
-                
-            let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos, DType::F16, self.qwen3_5.model.mrope.clone(), self.qwen3_5.mrope_interleaved)?;
-            let mask = if current_chunk <= 1 && seqlen_offset == 0 { None } else { 
-                Some(crate::utils::tensor_utils::prepare_causal_attention_mask(input_ids.dim(0)?, current_chunk, seqlen_offset, &self.device)?.to_dtype(DType::F16)?) 
-            };
+            let pos_ids = Tensor::new(&[i as u32], &self.device)?.reshape((1, 1))?.broadcast_as((3, 1, 1))?;
+            let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos_ids, DType::F16, self.qwen3_5.model.mrope.clone(), self.qwen3_5.model.mrope_interleaved)?;
 
-            // 2. Layer Relay
-            for i in 0..num_layers {
-                let layer = &mut self.qwen3_5.model.layers[i];
-                
-                // [WEIGHTS UP]
+            for (l_idx, layer) in self.qwen3_5.model.layers.iter_mut().enumerate() {
                 layer.load_to_vram(&self.registry, &self.device)?;
-
-                // [KV LOAD]
-                if seqlen_offset > 0 {
-                   if let Some(ref mut sa) = layer.self_attn {
-                       let s_k = candle_core::Shape::from((1, sa.nkv, seqlen_offset, sa.hd));
-                       let s_v = s_k.clone();
-                       if let Ok(LayerContext::Attention { k, v }) = kv_manager.load_layer_context(i, "attention", &s_k, &s_v, &self.device) {
-                           sa.kv_cache = Some((k, v));
-                       }
-                   } else if let Some(ref mut la) = layer.linear_attn {
-                       let s_state = candle_core::Shape::from((1, la.nv, la.dk, la.dv)); 
-                       if let Ok(LayerContext::DeltaNet { state, conv }) = kv_manager.load_layer_context(i, "linear_attention", &s_state, &s_state, &self.device) {
-                           la.recurrent_state_cache = Some(state.to_device(&self.device)?);
-                           la.conv_state_cache = Some(conv.to_device(&self.device)?);
-                       }
-                   }
-                }
-
-                // [COMPUTE]
-                h = layer.forward(&h, &cos, &sin, mask.as_ref(), &self.registry)?.detach();
-
-                // [KV SAVE]
-                if let Some(ref mut sa) = layer.self_attn {
-                    if let Some((k, v)) = sa.kv_cache.take() { 
-                        // Force move to CPU to free GPU memory immediately
-                        let k_cpu = k.to_device(&Device::Cpu)?;
-                        let v_cpu = v.to_device(&Device::Cpu)?;
-                        kv_manager.save_layer_context(i, LayerContext::Attention { k: k_cpu, v: v_cpu })?;
-                    }
-                }
-                if let Some(ref mut la) = layer.linear_attn {
-                    let st = la.recurrent_state_cache.take();
-                    let cv = la.conv_state_cache.take();
-                    if let (Some(st), Some(cv)) = (st, cv) {
-                        let st_cpu = st.to_device(&Device::Cpu)?;
-                        let cv_cpu = cv.to_device(&Device::Cpu)?;
-                        kv_manager.save_layer_context(i, LayerContext::DeltaNet { state: st_cpu, conv: cv_cpu })?;
-                    }
-                }
-
-                // [WEIGHTS DOWN] - Essential for Relay Mode
-                layer.clear_vram();
-
-                #[cfg(feature = "cuda")]
-                self.device.synchronize()?; 
                 
-                if i % 8 == 0 || i == num_layers - 1 {
-                    println!("[VRAM-RELAY] Prefill Chunk {}/{} - Layer {}/{} Weights(↑↓) Cache(MEM)", seqlen_offset + current_chunk, full_seq_len, i+1, num_layers);
+                // [RESTORE CACHE]
+                if let Some(ctx) = self.layer_caches[l_idx].take() {
+                    match ctx {
+                        LayerContext::Attention { k, v } => if let Some(ref mut sa) = layer.self_attn { sa.kv_cache = Some((k, v)); },
+                        LayerContext::DeltaNet { state, conv } => if let Some(ref mut la) = layer.linear_attn { la.recurrent_state_cache = Some(state); la.conv_state_cache = Some(conv); },
+                    }
                 }
+
+                x = layer.forward(&x, &cos, &sin, None, &self.registry)?;
+                
+                // [SAVE CACHE]
+                if let Some(ref sa) = layer.self_attn { if let Some(ref kv) = sa.kv_cache { self.layer_caches[l_idx] = Some(LayerContext::Attention { k: kv.0.clone(), v: kv.1.clone() }); } }
+                if let Some(ref la) = layer.linear_attn { 
+                    if let (Some(ref s), Some(ref c)) = (&la.recurrent_state_cache, &la.conv_state_cache) {
+                        self.layer_caches[l_idx] = Some(LayerContext::DeltaNet { state: s.clone(), conv: c.clone() });
+                    }
+                }
+
+                layer.clear_vram();
             }
-
-            // Head (Dynamic Load/Drop)
-            self.qwen3_5.model.norm.load_to_vram(&self.registry, &self.device)?;
-            let last_h = self.qwen3_5.model.norm.forward(&h, &self.registry)?.detach();
-            self.qwen3_5.model.norm.clear_vram();
-
-            self.qwen3_5.head.load_to_vram(&self.registry, &self.device)?;
-            let logits = self.qwen3_5.head.forward(&last_h.narrow(1, current_chunk - 1, 1)?, &self.registry)?.detach();
-            self.qwen3_5.head.clear_vram();
             
-            seqlen_offset += current_chunk;
-            last_logits = Some(logits);
+            if i == full_seq_len - 1 {
+                self.qwen3_5.model.norm.load_to_vram(&self.registry, &self.device)?;
+                let out = self.qwen3_5.model.norm.forward(&x, &self.registry)?;
+                self.qwen3_5.model.norm.clear_vram();
+                
+                self.qwen3_5.head.load_to_vram(&self.registry, &self.device)?;
+                let mut logits = self.qwen3_5.head.forward(&out, &self.registry)?;
+                if self.qwen3_5.tie { logits = logits.affine(1.0 / self.qwen3_5.hidden_size.sqrt(), 0.0)?; }
+                last_logits = Some(logits);
+                self.qwen3_5.head.clear_vram();
+            }
         }
 
-        // ====================================================================
-        // [PHASE 3] DECODING: Strictly Layer-by-Layer (VRAM minimum)
-        // ====================================================================
-        let mut logits = last_logits.ok_or(anyhow::anyhow!("No logits generated"))?;
+        let mut logits = last_logits.ok_or(anyhow!("No logits generated"))?;
         let mut gen_text = String::new();
-        let sample_len = mes.max_tokens.unwrap_or(1024);
-        let mut all_tokens = full_input_ids.squeeze(0)?.to_vec1::<u32>()?;
+        let sample_len = mes.max_tokens.unwrap_or(100) as usize;
+        let mut all_tokens = token_ids.clone();
         let repetition_penalty = 1.2f32;
 
         for step in 0..sample_len {
-            if let Some(flag) = &cancel_flag {
-                if flag.load(Ordering::Relaxed) { break; }
-            }
+            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
 
             let mut current_logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-            
-            // Apply Repetition Penalty
             if repetition_penalty != 1.0 {
                 let mut logits_vec = current_logits.to_vec1::<f32>()?;
                 for &token in all_tokens.iter() {
                     let id = token as usize;
                     if id < logits_vec.len() {
-                        if logits_vec[id] > 0.0 {
-                            logits_vec[id] /= repetition_penalty;
-                        } else {
-                            logits_vec[id] *= repetition_penalty;
-                        }
+                        if logits_vec[id] > 0.0 { logits_vec[id] /= repetition_penalty; }
+                        else { logits_vec[id] *= repetition_penalty; }
                     }
                 }
                 current_logits = Tensor::from_vec(logits_vec, current_logits.dims(), current_logits.device())?;
@@ -251,98 +155,52 @@ impl Qwen3_5GenerateModel {
             if next_token == self.eos_token_id { break; }
 
             let piece = self.tokenizer.token_decode(vec![next_token])?;
-            if step % 5 == 0 {
-                println!("[DEBUG-DECODE] step: {}, token_id: {}, piece: {:?}, kv_size: {}", step, next_token, piece, seqlen_offset);
-            }
-            print!("{}", piece); // Stream to console
+            print!("{}", piece);
             std::io::Write::flush(&mut std::io::stdout())?;
             gen_text.push_str(&piece);
             all_tokens.push(next_token);
 
+            // Decoding Step
             let input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?.to_dtype(DType::U32)?;
-            
-            // 1. Embeddings (Relay)
-            self.qwen3_5.model.embed.load_to_vram(&self.registry, &self.device)?;
-            let mut h = self.qwen3_5.model.embed.forward(&input_ids, &self.registry)?.detach(); 
-            self.qwen3_5.model.embed.clear_vram();
+            let mut x = self.qwen3_5.model.embed.forward(&input_ids, &self.registry)?;
+            let pos_ids = Tensor::new(&[(full_seq_len + step) as u32], &self.device)?.reshape((1, 1))?.broadcast_as((3, 1, 1))?;
+            let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos_ids, DType::F16, self.qwen3_5.model.mrope.clone(), self.qwen3_5.model.mrope_interleaved)?;
 
-            // RoPE: (3, 1, 1) for decoding step
-            let pos_time = Tensor::from_vec(vec![seqlen_offset as u32], (1, 1), &self.device)?;
-            let pos_spatial = Tensor::zeros((1, 1), DType::U32, &self.device)?;
-            let pos = Tensor::stack(&[&pos_time, &pos_spatial, &pos_spatial], 0)?
-                .broadcast_as((3, 1, 1))?
-                .contiguous()?;
-                
-            let (cos, sin) = self.qwen3_5.model.rotary.forward(&pos, DType::F16, self.qwen3_5.model.mrope.clone(), self.qwen3_5.mrope_interleaved)?;
-
-            // 2. Layer Relay (Decoding)
-            for i in 0..num_layers {
-                let layer = &mut self.qwen3_5.model.layers[i];
-
-                // [WEIGHTS UP]
+            for (l_idx, layer) in self.qwen3_5.model.layers.iter_mut().enumerate() {
                 layer.load_to_vram(&self.registry, &self.device)?;
-
-                // [KV LOAD] - From Memory Cache
-                if let Some(ref mut sa) = layer.self_attn {
-                    let s_k = candle_core::Shape::from((1, sa.nkv, seqlen_offset, sa.hd));
-                    let s_v = s_k.clone();
-                    if let Ok(LayerContext::Attention { k, v }) = kv_manager.load_layer_context(i, "attention", &s_k, &s_v, &self.device) {
-                        sa.kv_cache = Some((k, v));
-                    }
-                } else if let Some(ref mut la) = layer.linear_attn {
-                    let s_state = candle_core::Shape::from((1, la.nv, la.dk, la.dv)); 
-                    let s_conv = candle_core::Shape::from((1, (la.nk + la.nk + la.nv) * la.dk, 3));
-                    if let Ok(LayerContext::DeltaNet { state, conv }) = kv_manager.load_layer_context(i, "linear_attention", &s_state, &s_conv, &self.device) {
-                        la.recurrent_state_cache = Some(state.to_device(&self.device)?);
-                        la.conv_state_cache = Some(conv.to_device(&self.device)?);
+                
+                // [RESTORE CACHE]
+                if let Some(ctx) = self.layer_caches[l_idx].take() {
+                    match ctx {
+                        LayerContext::Attention { k, v } => if let Some(ref mut sa) = layer.self_attn { sa.kv_cache = Some((k, v)); },
+                        LayerContext::DeltaNet { state, conv } => if let Some(ref mut la) = layer.linear_attn { la.recurrent_state_cache = Some(state); la.conv_state_cache = Some(conv); },
                     }
                 }
 
-                // [COMPUTE]
-                h = layer.forward(&h, &cos, &sin, None, &self.registry)?.detach();
-
-                // [KV SAVE] - To Memory Cache
-                if let Some(ref mut sa) = layer.self_attn {
-                    if let Some((k, v)) = sa.kv_cache.take() { 
-                        let k_cpu = k.to_device(&Device::Cpu)?;
-                        let v_cpu = v.to_device(&Device::Cpu)?;
-                        kv_manager.save_layer_context(i, LayerContext::Attention { k: k_cpu, v: v_cpu })?;
-                    }
-                }
-                if let Some(ref mut la) = layer.linear_attn {
-                    let st = la.recurrent_state_cache.take();
-                    let cv = la.conv_state_cache.take();
-                    if let (Some(st), Some(cv)) = (st, cv) {
-                        let st_cpu = st.to_device(&Device::Cpu)?;
-                        let cv_cpu = cv.to_device(&Device::Cpu)?;
-                        kv_manager.save_layer_context(i, LayerContext::DeltaNet { state: st_cpu, conv: cv_cpu })?;
+                x = layer.forward(&x, &cos, &sin, None, &self.registry)?;
+                
+                // [SAVE CACHE]
+                if let Some(ref sa) = layer.self_attn { if let Some(ref kv) = sa.kv_cache { self.layer_caches[l_idx] = Some(LayerContext::Attention { k: kv.0.clone(), v: kv.1.clone() }); } }
+                if let Some(ref la) = layer.linear_attn { 
+                    if let (Some(ref s), Some(ref c)) = (&la.recurrent_state_cache, &la.conv_state_cache) {
+                        self.layer_caches[l_idx] = Some(LayerContext::DeltaNet { state: s.clone(), conv: c.clone() });
                     }
                 }
 
-                // [WEIGHTS DOWN]
                 layer.clear_vram();
-                #[cfg(feature = "cuda")]
-                self.device.synchronize()?; 
             }
-
-            // 3. Head (Relay)
-            self.qwen3_5.model.norm.load_to_vram(&self.registry, &self.device)?;
-            let last_h = self.qwen3_5.model.norm.forward(&h, &self.registry)?.detach();
-            self.qwen3_5.model.norm.clear_vram();
-
-            self.qwen3_5.head.load_to_vram(&self.registry, &self.device)?;
-            logits = self.qwen3_5.head.forward(&last_h, &self.registry)?.detach();
-            self.qwen3_5.head.clear_vram();
             
-            seqlen_offset += 1;
+            self.qwen3_5.model.norm.load_to_vram(&self.registry, &self.device)?;
+            let out = self.qwen3_5.model.norm.forward(&x, &self.registry)?;
+            self.qwen3_5.model.norm.clear_vram();
+            self.qwen3_5.head.load_to_vram(&self.registry, &self.device)?;
+            let mut next_logits = self.qwen3_5.head.forward(&out, &self.registry)?;
+            if self.qwen3_5.tie { next_logits = next_logits.affine(1.0 / self.qwen3_5.hidden_size.sqrt(), 0.0)?; }
+            logits = next_logits;
+            self.qwen3_5.head.clear_vram();
         }
 
-        self.qwen3_5.clear_cache();
         println!("\n[MODEL-QWEN35] Generation complete.");
         Ok(gen_text)
     }
-}
-
-pub fn init_bake_worker() {
-    println!("[MODEL-QWEN35] Bake worker initialized for text-only prefill.");
 }

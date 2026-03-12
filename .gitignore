@@ -12,6 +12,7 @@
 *.crdownload
 
 aha-main/
+vllm.rs-main/
 
 # Virtual Environment
 trade/venv/

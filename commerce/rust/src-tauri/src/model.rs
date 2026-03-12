@@ -9,14 +9,9 @@ use crate::openai_types::{
     ChatCompletionRequestUserMessageContent,
 };
 use candle_core::{Device, DType};
-use image::DynamicImage;
-use serde_json::{Value, json, Map};
+use serde_json::Value;
 use std::sync::{Arc, atomic::AtomicBool};
 use tauri::Emitter;
-use std::io::Cursor;
-use base64::prelude::BASE64_STANDARD;
-use base64::Engine;
-use sysinfo::System;
 
 pub struct Spinner {
     pub frames: Vec<&'static str>,
@@ -33,7 +28,6 @@ impl Spinner {
 }
 
 use tokio::sync::Mutex as TokioMutex;
-use std::time::{Duration, Instant};
 
 use crate::models::qwen35::generate::Qwen3_5GenerateModel;
 
@@ -269,7 +263,7 @@ impl LogisModel {
                 }
             }
         }
-        Ok(json!({ "context": final_contexts }))
+        Ok(serde_json::json!({ "context": final_contexts }))
     }
 
     pub async fn run_deep_research(&self, query: String, context_data: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
