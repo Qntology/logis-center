@@ -130,7 +130,8 @@ impl ChatTemplate {
             .map_err(|e| anyhow!(format!("render template error {}", e)))?;
         let message_str = template
             .render(context)
-            .map_err(|e| anyhow!(format!("render template error {}", e)))?;
+            .map_err(|e| anyhow!(format!("render template error {}", e)))?
+            .replace("<think>\n\n</think>\n\n", "");
         Ok(message_str)
     }
 }

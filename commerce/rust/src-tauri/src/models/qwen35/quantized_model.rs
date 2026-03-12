@@ -93,7 +93,7 @@ fn dequantize_q2(t: &Tensor, dev: &Device) -> Result<Tensor> {
             let div = (1 << (i * 2)) as f64;
             let shifted = data_bytes.affine(1.0 / div, 0.0)?.floor()?;
             let floored = shifted.affine(1.0 / 4.0, 0.0)?.floor()?.affine(4.0, 0.0)?;
-            let val = shifted.sub(&floored)?.affine(1.0, -1.5)?;
+            let val = shifted.sub(&floored)?.affine(1.0, -2.0)?;
             final_res.push(val.broadcast_mul(&scales)?);
         }
         
@@ -357,7 +357,7 @@ impl QAttention {
         let p = vb.prefix();
         Ok(Self {
             q_proj: QLinear::new(&join_name(&p, "q_proj"))?, k_proj: QLinear::new(&join_name(&p, "k_proj"))?, v_proj: QLinear::new(&join_name(&p, "v_proj"))?, o_proj: QLinear::new(&join_name(&p, "o_proj"))?,
-            q_norm: QRmsNorm::new(&join_name(&p, "q_norm"), config.rms_norm_eps, 1.0)?, k_norm: QRmsNorm::new(&join_name(&p, "k_norm"), config.rms_norm_eps, 1.0)?,
+            q_norm: QRmsNorm::new(&join_name(&p, "q_norm"), config.rms_norm_eps, 0.0)?, k_norm: QRmsNorm::new(&join_name(&p, "k_norm"), config.rms_norm_eps, 0.0)?,
             nh: config.num_attention_heads, nkv: config.num_key_value_heads, hd: config.head_dim, scaling: 1.0 / (config.head_dim as f64).sqrt(), kv_cache: None,
         })
     }
@@ -386,11 +386,13 @@ impl QAttention {
         let dev = xs.device();
 
         // 1. Q-Proj and Split (Q and Gate)
-        // Qwen3.5: q_proj contains [Q, Gate] concatenated in the last dimension
+        // [VLLM 정합성 수정] Qwen3.5는 Head 단위로 Q와 Gate가 교차 배치됨 (NH, 2, HD)
         let q_raw = self.q_proj.forward(xs, reg)?; // (B, S, NH * HD * 2)
-        let q_gate = q_raw.reshape((b_sz, q_len, self.nh, self.hd * 2))?;
-        let query_states = q_gate.narrow(3, 0, self.hd)?; // (B, S, NH, HD)
-        let gate_states = q_gate.narrow(3, self.hd, self.hd)?; // (B, S, NH, HD)
+        let q_gate = q_raw.reshape((b_sz, q_len, self.nh, 2, self.hd))?;
+        
+        // vllm.rs style: 4번째 차원(index 3)에서 0번은 Q, 1번은 Gate
+        let query_states = q_gate.narrow(3, 0, 1)?.squeeze(3)?; // (B, S, NH, HD)
+        let gate_states = q_gate.narrow(3, 1, 1)?.squeeze(3)?;  // (B, S, NH, HD)
 
         // 2. K, V Projs
         let key_states = self.k_proj.forward(xs, reg)?.reshape((b_sz, q_len, self.nkv, self.hd))?;
@@ -399,6 +401,14 @@ impl QAttention {
         // 3. Normalization (Per-head RMSNorm)
         let query_states = self.q_norm.forward(&query_states, reg)?;
         let key_states = self.k_norm.forward(&key_states, reg)?;
+
+        if b_sz > 0 && q_len > 0 {
+            let q_f32 = query_states.to_dtype(DType::F32)?;
+            let k_f32 = key_states.to_dtype(DType::F32)?;
+            println!("[DEBUG-ATTN] Q mean: {:.4}, std: {:.4} | K mean: {:.4}, std: {:.4}", 
+                q_f32.mean_all()?.to_vec0::<f32>()?, q_f32.powf(2.0)?.mean_all()?.to_vec0::<f32>()?.sqrt(),
+                k_f32.mean_all()?.to_vec0::<f32>()?, k_f32.powf(2.0)?.mean_all()?.to_vec0::<f32>()?.sqrt());
+        }
 
         // 4. RoPE (Rotary Position Embedding)
         // Expected shape for RoPE: (B, S, NH, HD) or (B, NH, S, HD)
@@ -456,7 +466,7 @@ impl QDecoderLayer {
         let (sa, la) = if config.layer_types[idx] == "linear_attention" { (None, Some(QGatedDeltaNet::new(vb.pp("linear_attn"), config)?)) } else { (Some(QAttention::new(vb.pp("self_attn"), config)?), None) };
         Ok(Self { 
             idx, self_attn: sa, linear_attn: la, mlp_gate: QLinear::new(&join_name(&p, "mlp.gate_proj"))?, mlp_up: QLinear::new(&join_name(&p, "mlp.up_proj"))?,
-            mlp_down: QLinear::new(&join_name(&p, "mlp.down_proj"))?, in_norm: QRmsNorm::new(&join_name(&p, "input_layernorm"), config.rms_norm_eps, 1.0)?, post_norm: QRmsNorm::new(&join_name(&p, "post_attention_layernorm"), config.rms_norm_eps, 1.0)? 
+            mlp_down: QLinear::new(&join_name(&p, "mlp.down_proj"))?, in_norm: QRmsNorm::new(&join_name(&p, "input_layernorm"), config.rms_norm_eps, 0.0)?, post_norm: QRmsNorm::new(&join_name(&p, "post_attention_layernorm"), config.rms_norm_eps, 0.0)? 
         })
     }
     pub fn clear_vram(&mut self) { self.in_norm.clear_vram(); if let Some(ref mut sa) = self.self_attn { sa.clear_vram(); } if let Some(ref mut la) = self.linear_attn { la.clear_vram(); } self.post_norm.clear_vram(); self.mlp_gate.clear_vram(); self.mlp_up.clear_vram(); self.mlp_down.clear_vram(); }
@@ -497,7 +507,14 @@ impl QEmbedding {
                     *cache = Some(w.clone());
                     w
                 };
-        Ok(w.index_select(&ids.flatten_all()?.to_dtype(DType::U32)?, 0)?.reshape((b, s, ()))?.to_dtype(DType::F16)?)
+        let emb = w.index_select(&ids.flatten_all()?.to_dtype(DType::U32)?, 0)?.reshape((b, s, ()))?.to_dtype(DType::F16)?;
+        if b > 0 && s > 0 {
+            let first_emb = emb.i((0, 0))?.to_dtype(DType::F32)?;
+            let mean = first_emb.mean_all()?.to_vec0::<f32>()?;
+            let std = first_emb.powf(2.0)?.mean_all()?.to_vec0::<f32>()?.sqrt();
+            println!("[DEBUG-EMB] id: {:?}, mean: {:.4}, std: {:.4}", ids.i((0, 0))?.to_vec0::<u32>()?, mean, std);
+        }
+        Ok(emb)
     }
 }
 
@@ -590,9 +607,15 @@ impl KVStateManager {
     }
     fn write_tensor(&mut self, offset: usize, t: &Tensor, dtype: DType) -> Result<()> {
         let mmap = self.mmap.as_mut().ok_or_else(|| anyhow!("Mmap not initialized"))?;
-        let t = t.detach().to_device(&Device::Cpu)?.to_dtype(dtype)?;
-        let bytes = if dtype == DType::F32 { let data = t.flatten_all()?.to_vec1::<f32>()?; unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4).to_vec() } }
-                    else { let data = t.flatten_all()?.to_vec1::<f16>()?; unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2).to_vec() } };
+        let t = t.contiguous()?.detach().to_device(&Device::Cpu)?.to_dtype(dtype)?;
+        let bytes = if dtype == DType::F32 { 
+            let data = t.flatten_all()?.to_vec1::<f32>()?; 
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4).to_vec() } 
+        }
+        else { 
+            let data = t.flatten_all()?.to_vec1::<f16>()?; 
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2).to_vec() } 
+        };
         mmap[offset..offset + bytes.len()].copy_from_slice(&bytes); Ok(())
     }
     fn read_tensor(&self, offset: usize, shape: &candle_core::Shape, dtype: DType, dev: &Device) -> Result<Tensor> {

@@ -19,12 +19,14 @@ def pack_q2_k_combined(tensor):
     reshaped = tensor.view(num_blocks, block_size)
     
     abs_max = reshaped.abs().max(dim=1).values
-    scales = (abs_max / 1.5).to(torch.float16)
+    # Use 2.0 as max to allow symmetric mapping [-2, -1, 0, 1]
+    scales = (abs_max / 2.0).to(torch.float16)
     scales[scales == 0] = 1.0
     
     # Quantize to 0..3 (2 bits)
-    # Mapping: -1.5 -> 0, -0.5 -> 1, 0.5 -> 2, 1.5 -> 3
-    quantized = torch.round(reshaped / scales.view(-1, 1).to(torch.float32) + 1.5).clamp(0, 3).to(torch.uint8)
+    # New Mapping: -2.0 -> 0, -1.0 -> 1, 0.0 -> 2, 1.0 -> 3
+    # This makes 0.0 weights (most common) map exactly to bit value 2.
+    quantized = torch.round(reshaped / scales.view(-1, 1).to(torch.float32) + 2.0).clamp(0, 3).to(torch.uint8)
     
     # Pack 4 values (2 bits each) into 1 byte
     q_reshaped = quantized.view(num_blocks, 8, 4)
