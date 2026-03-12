@@ -12,7 +12,28 @@ pub mod position_embed;
 pub mod chat_template;
 pub mod tokenizer;
 
-use tauri::{State, Manager, Listener}; // Added Manager
+#[macro_export]
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        println!("[INFO] {}", format!($($arg)*));
+    };
+}
+
+#[macro_export]
+macro_rules! log_warn {
+    ($($arg:tt)*) => {
+        println!("[WARN] {}", format!($($arg)*));
+    };
+}
+
+#[macro_export]
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        eprintln!("[ERROR] {}", format!($($arg)*));
+    };
+}
+
+use tauri::{State, Manager, Listener};
 use tokio::sync::Mutex as TokioMutex;
 use model::LogisModel;
 use store::{VectorStore, TradeDocument};

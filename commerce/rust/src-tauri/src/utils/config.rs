@@ -1,12 +1,77 @@
 // src/utils/config.rs
 use serde::{Deserialize, Serialize};
+use serde::de::{Deserializer, Visitor};
 use std::collections::HashMap;
 use std::fmt;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum EosTokenId {
     Single(u32),
     Multiple(Vec<u32>),
+}
+
+impl<'de> Deserialize<'de> for EosTokenId {
+    fn deserialize<D>(deserializer: D) -> Result<EosTokenId, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct EosTokenIdVisitor;
+
+        impl<'de> Visitor<'de> for EosTokenIdVisitor {
+            type Value = EosTokenId;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a u32 or a sequence of u32s")
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(EosTokenId::Single(v as u32))
+            }
+
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let vals = Vec::<u32>::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
+                Ok(EosTokenId::Multiple(vals))
+            }
+        }
+
+        deserializer.deserialize_any(EosTokenIdVisitor)
+    }
+}
+
+impl Serialize for EosTokenId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            EosTokenId::Single(v) => v.serialize(serializer),
+            EosTokenId::Multiple(v) => v.serialize(serializer),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ModelType {
+    Qwen3,
+    Qwen3MoE,
+    Qwen3_5,
+    Qwen3_5MoE,
+    LLaMa,
+    Gemma,
+    Gemma3,
+    Phi,
+    Phi4,
+    Mistral,
+    GLM4,
+    GLM4MoE,
+    Yi,
+    StableLM,
+    DeepSeek,
+    Mistral3VL,
+    Qwen3VL,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

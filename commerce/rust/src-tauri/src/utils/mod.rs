@@ -8,8 +8,19 @@ pub mod direct_loader;
 pub mod config;
 pub mod progress;
 pub mod gptq;
+pub mod image;
+pub mod gguf_varbuilder;
 
 pub use config::{resolve_qwen3_hybrid_config, Qwen3HybridConfig};
+
+#[macro_export]
+macro_rules! serde_default {
+    ($t:ty, $name:ident, $v:expr) => {
+        fn $name() -> $t {
+            $v
+        }
+    };
+}
 
 use candle_core::{Device, DType};
 use anyhow::Result;
@@ -263,6 +274,29 @@ pub fn round_by_factor(num: u32, factor: u32) -> u32 {
 pub fn floor_by_factor(num: f32, factor: u32) -> u32 {
     let floor = (num / factor as f32).floor() as u32;
     floor * factor
+}
+
+pub fn ceil_by_factor(num: f32, factor: u32) -> u32 {
+    let ceil = (num / factor as f32).ceil() as u32;
+    ceil * factor
+}
+
+pub fn get_llama4_attn_scale(
+    positions: &candle_core::Tensor,
+    llama_4_scaling_beta: f64,
+    original_max_position_embeddings: f64,
+) -> Result<candle_core::Tensor> {
+    let div = (positions.to_dtype(DType::F32)? / original_max_position_embeddings)?;
+    let floored = div.floor()?;
+
+    let one = floored.ones_like()?; // tensor filled with 1.0
+    let log_term = (one + floored)?.log()?;
+
+    let scaling = (1f64 + (llama_4_scaling_beta * &log_term)?)?;
+    scaling
+        .unsqueeze(candle_core::D::Minus1)?
+        .unsqueeze(0)?
+        .unsqueeze(0)
 }
 
 pub fn module_path_matches_not_convert(module_path: &str, item: &str) -> bool {
