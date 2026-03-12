@@ -7,9 +7,9 @@ use crate::models::layers::distributed::{
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use crate::utils::resolve_qwen3_hybrid_config;
-use crate::models::attention::gdn;
-use crate::models::attention::mamba_cache::MambaCache;
-use crate::models::attention::InputMetadata;
+use attention_rs::gdn;
+use attention_rs::mamba_cache::MambaCache;
+use attention_rs::InputMetadata;
 use candle_core::{DType, Result, Tensor};
 use candle_nn::var_builder::Shard;
 use std::rc::Rc;

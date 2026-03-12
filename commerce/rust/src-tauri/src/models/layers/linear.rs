@@ -743,7 +743,7 @@ impl LnFp8 {
         .to_dtype(DType::F32)?;
 
         #[cfg(feature = "cuda")]
-        let sm_version = crate::models::attention::cuda_utils::sm_version(vb.device().as_cuda_device()?)
+        let sm_version = attention_rs::cuda_utils::sm_version(vb.device().as_cuda_device()?)
             .unwrap_or(0) as usize;
 
         #[cfg(not(feature = "cuda"))]
@@ -915,7 +915,7 @@ fn load_ln_fp8_with_hints(
 
     #[cfg(feature = "cuda")]
     let sm_version =
-        crate::models::attention::cuda_utils::sm_version(vb.device().as_cuda_device()?).unwrap_or(0) as usize;
+        attention_rs::cuda_utils::sm_version(vb.device().as_cuda_device()?).unwrap_or(0) as usize;
 
     #[cfg(not(feature = "cuda"))]
     let sm_version = 0;
@@ -976,7 +976,7 @@ impl Module for LnFp8 {
 
         #[cfg(feature = "flashinfer")]
         let out = if can_use_flashinfer_fp8 {
-            crate::models::attention::fp8_linear::fp8_matmul_flashinfer(
+            attention_rs::fp8_linear::fp8_matmul_flashinfer(
                 &x_2d,
                 &self.weight,
                 &self.weight_scale,
@@ -989,14 +989,14 @@ impl Module for LnFp8 {
                     .as_ref()
                     .unwrap_or(&self.weight_scale);
                 if self.sm_version >= 90 {
-                    crate::models::attention::fp8_linear::fp8_matmul_cutlass(
+                    attention_rs::fp8_linear::fp8_matmul_cutlass(
                         &x_2d,
                         &self.weight.t()?,
                         weight_scale_cutlass,
                         &self.weight_block_size,
                     )?
                 } else {
-                    crate::models::attention::fp8_linear::fp8_matmul(
+                    attention_rs::fp8_linear::fp8_matmul(
                         &x_2d,
                         &self.weight,
                         &self.weight_scale,
@@ -1007,7 +1007,7 @@ impl Module for LnFp8 {
 
             #[cfg(not(feature = "cutlass"))]
             {
-                crate::models::attention::fp8_linear::fp8_matmul(
+                attention_rs::fp8_linear::fp8_matmul(
                     &x_2d,
                     &self.weight,
                     &self.weight_scale,
@@ -1023,7 +1023,7 @@ impl Module for LnFp8 {
                 .weight_scale_cutlass
                 .as_ref()
                 .unwrap_or(&self.weight_scale);
-            crate::models::attention::fp8_linear::fp8_matmul_cutlass(
+            attention_rs::fp8_linear::fp8_matmul_cutlass(
                 &x_2d,
                 &self.weight.t()?,
                 weight_scale_cutlass,
@@ -1031,7 +1031,7 @@ impl Module for LnFp8 {
             )?
         } else {
             // slower path
-            crate::models::attention::fp8_linear::fp8_matmul(
+            attention_rs::fp8_linear::fp8_matmul(
                 &x_2d,
                 &self.weight,
                 &self.weight_scale,
@@ -1040,7 +1040,7 @@ impl Module for LnFp8 {
         };
 
         #[cfg(all(not(feature = "flashinfer"), not(feature = "cutlass")))]
-        let out = crate::models::attention::fp8_linear::fp8_matmul(
+        let out = attention_rs::fp8_linear::fp8_matmul(
             &x_2d,
             &self.weight,
             &self.weight_scale,

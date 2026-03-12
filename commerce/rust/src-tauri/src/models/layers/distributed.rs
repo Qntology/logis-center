@@ -564,7 +564,7 @@ impl MergedParallelColumnLinear {
 
                     #[cfg(feature = "cuda")]
                     let sm_version =
-                        crate::models::attention::cuda_utils::sm_version(v.device().as_cuda_device()?)
+                        attention_rs::cuda_utils::sm_version(v.device().as_cuda_device()?)
                             .unwrap_or(0) as usize;
 
                     #[cfg(not(feature = "cuda"))]

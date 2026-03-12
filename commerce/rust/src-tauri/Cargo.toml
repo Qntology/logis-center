@@ -35,7 +35,7 @@ flate2 = "1.0"
 futures = "0.3"
 either = "1.9"
 parking_lot = "0.12"
-attention_rs = { path = "src/models/attention", features = ["cuda"] }
+attention_rs = { package = "attention-rs", path = "src/models/attention", features = ["cuda"] }
 uuid = { version = "1.4", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 tauri-plugin-opener = "2"
@@ -80,12 +80,11 @@ io-uring = "0.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.29"
-metal_kernels = { package = "metal-kernels", path = "src/models/attention/metal-kernels" }
 
 [features]
 default = ["cuda"]
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "attention_rs/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "attention_rs/metal"]
 flash-attn = []
 
 

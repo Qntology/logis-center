@@ -4,7 +4,7 @@ use candle_core::{DType, Device, Tensor, D};
 use crate::models::qwen3_5::{Qwen3_5ForCausalLM};
 use crate::models::layers::VarBuilderX;
 use crate::models::layers::distributed::Comm;
-use crate::models::attention::InputMetadata;
+use attention_rs::InputMetadata;
 use crate::tokenizer::TokenizerModel;
 use crate::chat_template::ChatTemplate;
 use crate::openai_types::ChatCompletionParameters;

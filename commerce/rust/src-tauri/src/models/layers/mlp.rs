@@ -203,7 +203,7 @@ impl MLP {
                 let packed_weight = Tensor::cat(&[&gate_weight, &up_weight], 0)?;
                 let packed_scale = Tensor::cat(&[&gate_scale, &up_scale], 0)?;
                 #[cfg(feature = "cuda")]
-                let sm_version = crate::models::attention::cuda_utils::sm_version(vb.device().as_cuda_device()?)
+                let sm_version = attention_rs::cuda_utils::sm_version(vb.device().as_cuda_device()?)
                     .unwrap_or(0) as usize;
                 #[cfg(not(feature = "cuda"))]
                 let sm_version = 0;
@@ -289,7 +289,7 @@ impl MLP {
             let packed_weight = Tensor::cat(&[&gate_weight, &up_weight], 0)?;
             let packed_scale = Tensor::cat(&[&gate_scale, &up_scale], 0)?;
             #[cfg(feature = "cuda")]
-            let sm_version = crate::models::attention::cuda_utils::sm_version(vb.device().as_cuda_device()?)
+            let sm_version = attention_rs::cuda_utils::sm_version(vb.device().as_cuda_device()?)
                 .unwrap_or(0) as usize;
             #[cfg(not(feature = "cuda"))]
             let sm_version = 0;

@@ -79,7 +79,7 @@ impl ApplyRotaryEmbedding for RotaryEmbedding {
         k: &Tensor,
         positions: &Tensor,
     ) -> Result<Option<(Tensor, Tensor)>> {
-        use crate::models::attention::fused_rope::FusedRope;
+        use attention_rs::fused_rope::FusedRope;
         let (_tokens, _q_heads, _head_dim) = q.dims3()?;
         let (_k_tokens, _k_heads, _k_head_dim) = k.dims3()?;
 

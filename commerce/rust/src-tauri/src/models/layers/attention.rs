@@ -6,7 +6,7 @@ use crate::models::layers::others::{rms_norm, NormX};
 use crate::models::layers::rotary_emb::ApplyRotaryEmbedding;
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
-use crate::models::attention::{InputMetadata, PagedAttention};
+use attention_rs::{InputMetadata, PagedAttention};
 use candle_core::{DType, Result, Tensor};
 use either::Either;
 use std::collections::HashMap;
@@ -281,7 +281,7 @@ impl Attention {
             };
 
             #[cfg(feature = "cuda")]
-            let sm_version = crate::models::attention::cuda_utils::sm_version(vb.device().as_cuda_device()?)
+            let sm_version = attention_rs::cuda_utils::sm_version(vb.device().as_cuda_device()?)
                 .unwrap_or(0) as usize;
 
             #[cfg(not(feature = "cuda"))]

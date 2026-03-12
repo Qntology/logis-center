@@ -15,7 +15,7 @@ pub async fn run_test() -> Result<()> {
     println!("💻 Using device: {:?}", device);
 
     // Use simple relative path
-    let model_path = "src-tauri/models/Qwen3.5-0.8B-Full".to_string();
+    let model_path = "models/Qwen3.5-0.8B-Full".to_string();
 
     println!("📂 Loading model from {}...", model_path);
     

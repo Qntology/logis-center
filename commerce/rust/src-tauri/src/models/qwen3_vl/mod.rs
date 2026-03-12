@@ -11,8 +11,8 @@ use crate::models::qwen3_5::Qwen3_5ForCausalLM;
 use crate::utils::config::Config;
 use crate::utils::progress::ProgressLike;
 use crate::{models::layers::distributed::Comm, utils::image::ImageData};
-use crate::models::attention::mamba_cache::MambaCache;
-use crate::models::attention::InputMetadata;
+use attention_rs::mamba_cache::MambaCache;
+use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor, D};
 use config::Qwen3VLConfig;
 use vision::Qwen3VLVisionModel;
@@ -156,7 +156,7 @@ impl Qwen3VLForConditionalGeneration {
                 .unsqueeze(candle_core::D::Minus1)?
                 .broadcast_as(input_embeds.shape().clone())?
                 .to_dtype(DType::U32)?;
-            use crate::models::attention::ops::NonZeroOp;
+            use attention_rs::ops::NonZeroOp;
             let indices = image_mask.flatten_all()?.nonzero()?.squeeze(1)?;
             if indices.shape().dim(0)? > 0 {
                 let hidden = input_embeds.dim(D::Minus1)?;

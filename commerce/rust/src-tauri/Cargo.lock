@@ -628,16 +628,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
-name = "attention_rs"
-version = "0.1.0"
+name = "attention-rs"
+version = "0.4.3"
 dependencies = [
- "anyhow",
- "bytemuck",
  "candle-core 0.8.3",
  "candle-nn",
  "half",
  "kernels",
- "libc",
+ "metal 0.27.0",
+ "metal-kernels",
  "parking_lot",
  "rayon",
  "serde",
@@ -8590,7 +8589,7 @@ dependencies = [
  "anyhow",
  "arrow-array",
  "arrow-schema",
- "attention_rs",
+ "attention-rs",
  "base64 0.22.1",
  "bytemuck",
  "candle-core 0.8.3",
@@ -8610,12 +8609,10 @@ dependencies = [
  "half",
  "image",
  "io-uring",
- "kernels",
  "lancedb",
  "libc",
  "memmap2",
  "metal 0.29.0",
- "metal-kernels",
  "minijinja",
  "num",
  "nvml-wrapper",

@@ -4,8 +4,8 @@ use crate::models::layers::linear::{linear_no_bias_x as linear_no_bias, LinearX 
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use crate::utils::config::QuantConfig;
-use crate::models::attention::moe;
-use crate::models::attention::moe::moe_gemm_fp8;
+use attention_rs::moe;
+use attention_rs::moe::moe_gemm_fp8;
 use candle_core::Module;
 use candle_core::{
     quantized::{GgmlDType, QTensor},
@@ -303,7 +303,7 @@ This usually means packed down_proj / gate_up_proj layout was interpreted incorr
         let (num_tokens, hidden_dim) = xs.dims2()?;
         let router_logits = self.gate.forward(&xs)?;
 
-        let (mut topk_weights, topk_ids) = crate::models::attention::topk::topk_softmax(
+        let (mut topk_weights, topk_ids) = attention_rs::topk::topk_softmax(
             &router_logits.to_dtype(DType::F32)?,
             self.num_experts_per_tok,
         )?;
@@ -338,7 +338,7 @@ This usually means packed down_proj / gate_up_proj layout was interpreted incorr
         let (expert_ids, sorted_token_ids) = if is_prefill {
             #[cfg(feature = "cuda")]
             {
-                use crate::models::attention::sort::ArgSortOp;
+                use attention_rs::sort::ArgSortOp;
                 topk_ids.flatten_all()?.sort(true)?
             }
             #[cfg(not(feature = "cuda"))]
@@ -565,7 +565,7 @@ impl FusedMoeGGUF {
         let router_logits = self.gate.forward(&xs)?;
 
         let (mut topk_weights, topk_ids) =
-            crate::models::attention::topk::topk_softmax(&router_logits, self.num_experts_per_tok)?;
+            attention_rs::topk::topk_softmax(&router_logits, self.num_experts_per_tok)?;
 
         if self.norm_topk_prob {
             topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
@@ -577,7 +577,7 @@ impl FusedMoeGGUF {
         let (expert_ids, sorted_token_ids) = if is_prefill {
             #[cfg(feature = "cuda")]
             {
-                use crate::models::attention::sort::ArgSortOp;
+                use attention_rs::sort::ArgSortOp;
                 topk_ids.flatten_all()?.sort(true)?
             }
             #[cfg(not(feature = "cuda"))]
@@ -884,7 +884,7 @@ impl FusedMoeISQ {
         let router_logits = self.gate.forward(&xs)?;
 
         let (mut topk_weights, topk_ids) =
-            crate::models::attention::topk::topk_softmax(&router_logits, self.num_experts_per_tok)?;
+            attention_rs::topk::topk_softmax(&router_logits, self.num_experts_per_tok)?;
 
         if self.norm_topk_prob {
             topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
@@ -895,7 +895,7 @@ impl FusedMoeISQ {
         let (expert_ids, sorted_token_ids) = if is_prefill {
             #[cfg(feature = "cuda")]
             {
-                use crate::models::attention::sort::ArgSortOp;
+                use attention_rs::sort::ArgSortOp;
                 topk_ids.flatten_all()?.sort(true)?
             }
             #[cfg(not(feature = "cuda"))]
@@ -1209,7 +1209,7 @@ impl FusedMoeFp8 {
         let (num_tokens, hidden_dim) = xs.dims2()?;
         let router_logits = self.gate.forward(&xs)?;
 
-        let (mut topk_weights, topk_ids) = crate::models::attention::topk::topk_softmax(
+        let (mut topk_weights, topk_ids) = attention_rs::topk::topk_softmax(
             &router_logits.to_dtype(DType::F32)?,
             self.num_experts_per_tok,
         )?;
@@ -1251,7 +1251,7 @@ impl FusedMoeFp8 {
         let (expert_ids, sorted_token_ids) = if is_prefill {
             #[cfg(feature = "cuda")]
             {
-                use crate::models::attention::sort::ArgSortOp;
+                use attention_rs::sort::ArgSortOp;
                 topk_ids.flatten_all()?.sort(true)?
             }
             #[cfg(not(feature = "cuda"))]
