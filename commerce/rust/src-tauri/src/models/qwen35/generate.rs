@@ -96,7 +96,9 @@ impl Qwen3_5GenerateModel {
         
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         println!("[DEBUG-PROMPT] Rendered prompt: {:?}", mes_render);
-        let full_input_ids = self.tokenizer.text_encode(mes_render, &self.device)?;
+        let token_ids = self.tokenizer.text_encode_vec(mes_render, true)?;
+        println!("[DEBUG-TOKENS] Encoded IDs: {:?}", token_ids);
+        let full_input_ids = Tensor::from_slice(&token_ids, (1, token_ids.len()), &self.device)?.to_dtype(DType::U32)?;
             
         let full_seq_len = full_input_ids.dim(1)?;
         
