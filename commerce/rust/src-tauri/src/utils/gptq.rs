@@ -36,40 +36,36 @@ impl GPTQMatMul {
         scale_l: &Layout,
     ) -> Result<(CudaStorage, Shape)> {
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::WrapErr;
         use std::ffi::c_void;
         let dev = qweight.device();
+        let stream = dev.cuda_stream();
         let x_shape = x_l.dims();
         let weight_shape = qweight_l.dims();
-        // let zero_shape = self.qzeros.shape().dims();
-        // let scale_shape = scale_l.dims();
 
         let pack_factor: usize = 32 / self.bits as usize;
         let marlin_format = self.workspace.is_some();
-        let size_k = weight_shape[0] * pack_factor * if marlin_format { 2 } else { 1 }; //marlin format
-        let size_n = weight_shape[1] / if marlin_format { 2 } else { 1 }; //marlin format
+        let size_k = weight_shape[0] * pack_factor * if marlin_format { 2 } else { 1 };
+        let size_n = weight_shape[1] / if marlin_format { 2 } else { 1 };
 
         let mut out_shape: Vec<usize> = x_shape.to_vec();
         out_shape[x_shape.len() - 1] = size_n;
         let oshape: Shape = out_shape.into();
 
-        // Get cuda slices for all tensors
         let input = x.as_cuda_slice::<T>()?;
         let qw = qweight.as_cuda_slice::<u32>()?;
         let qs = scale.as_cuda_slice::<T>()?;
 
-        // Get cuda views for all tensors
         let input = input.slice(x_l.start_offset()..);
         let qw = qw.slice(qweight_l.start_offset()..);
         let qs = qs.slice(scale_l.start_offset()..);
 
         let elem_count = oshape.elem_count();
-        let out = unsafe { dev.alloc::<T>(elem_count) }.w()?;
+        let out = unsafe { dev.alloc::<T>(elem_count) }.map_err(candle::Error::wrap)?;
 
-        let out_ptr = *out.device_ptr() as *mut c_void;
-        let in_ptr = *input.device_ptr() as *const c_void;
-        let qw_ptr = *qw.device_ptr() as *const c_void;
-        let qs_ptr = *qs.device_ptr() as *const c_void;
+        let out_ptr = out.device_ptr(&stream).0 as *mut c_void;
+        let in_ptr = input.device_ptr(&stream).0 as *const c_void;
+        let qw_ptr = qw.device_ptr(&stream).0 as *const c_void;
+        let qs_ptr = qs.device_ptr(&stream).0 as *const c_void;
 
         let qzeros_ptr = if self.qzeros.is_some() {
             let (qzeros, qzeros_l) = self.qzeros.as_ref().unwrap().storage_and_layout();
@@ -79,7 +75,7 @@ impl GPTQMatMul {
             };
             let qzeros_ = qzeros.as_cuda_slice::<u32>()?;
             let qzeros_ = qzeros_.slice(qzeros_l.start_offset()..);
-            *qzeros_.device_ptr() as *const c_void
+            qzeros_.device_ptr(&stream).0 as *const c_void
         } else {
             std::ptr::null()
         };
@@ -92,12 +88,13 @@ impl GPTQMatMul {
             };
             let g_idx_ = g_idx.as_cuda_slice::<u32>()?;
             let g_idx_ = g_idx_.slice(g_idx_l.start_offset()..);
-            *g_idx_.device_ptr() as *const c_void
+            g_idx_.device_ptr(&stream).0 as *const c_void
         } else {
             std::ptr::null()
         };
 
         unsafe {
+            let stream_ptr = *stream as *const _ as i64;
             if marlin_format {
                 let workspace_ptr = if self.workspace.is_some() {
                     let (workspace, workspace_l) =
@@ -108,7 +105,7 @@ impl GPTQMatMul {
                     };
                     let workspace_ = workspace.as_cuda_slice::<u32>()?;
                     let workspace_ = workspace_.slice(workspace_l.start_offset()..);
-                    *workspace_.device_ptr() as *const c_void
+                    workspace_.device_ptr(&stream).0 as *const c_void
                 } else {
                     candle::bail!("workspace is required for marlin matmul!")
                 };
@@ -127,7 +124,7 @@ impl GPTQMatMul {
                             size_n as i32,
                             workspace_ptr,
                             self.group_size,
-                            *dev.cu_stream() as i64,
+                            stream_ptr,
                         );
                     } else {
                         marlin_4bit_f16(
@@ -137,12 +134,12 @@ impl GPTQMatMul {
                             qzeros_ptr,
                             g_idx_ptr,
                             out_ptr,
-                            (x_shape[0] * x_shape[1]) as i32, //m
-                            size_k as i32,                    //k
-                            size_n as i32,                    //n
+                            (x_shape[0] * x_shape[1]) as i32,
+                            size_k as i32,
+                            size_n as i32,
                             workspace_ptr,
                             self.group_size,
-                            *dev.cu_stream() as i64,
+                            stream_ptr,
                         );
                     }
                 } else if x.dtype() == DType::BF16 {
@@ -159,7 +156,7 @@ impl GPTQMatMul {
                             size_n as i32,
                             workspace_ptr,
                             self.group_size,
-                            *dev.cu_stream() as i64,
+                            stream_ptr,
                         );
                     } else {
                         marlin_4bit_bf16(
@@ -169,12 +166,12 @@ impl GPTQMatMul {
                             qzeros_ptr,
                             g_idx_ptr,
                             out_ptr,
-                            (x_shape[0] * x_shape[1]) as i32, //m
-                            size_k as i32,                    //k
-                            size_n as i32,                    //n
+                            (x_shape[0] * x_shape[1]) as i32,
+                            size_k as i32,
+                            size_n as i32,
                             workspace_ptr,
                             self.group_size,
-                            *dev.cu_stream() as i64,
+                            stream_ptr,
                         );
                     }
                 }
@@ -191,10 +188,10 @@ impl GPTQMatMul {
                         size_n as i32,
                         size_k as i32,
                         self.bits,
-                        *dev.cu_stream() as i64,
+                        stream_ptr,
                     )
                 } else {
-                    candle::bail!("GPTQMatMul is only supported for f16 non-marlin matmul. Use '--dtype f16' parameter instead.");
+                    candle::bail!("GPTQMatMul is only supported for f16 non-marlin matmul.");
                 }
             }
         }
@@ -265,7 +262,7 @@ pub fn gptq_matmul(
 #[allow(dead_code)]
 struct MarlinRepack {
     bits: i32,
-    is_awq: bool, //awq or gptq
+    is_awq: bool,
 }
 
 impl MarlinRepack {
@@ -278,38 +275,28 @@ impl MarlinRepack {
         qweight_l: &Layout,
     ) -> Result<(CudaStorage, Shape)> {
         use candle::cuda_backend::cudarc::driver::DevicePtr;
-        use candle::cuda_backend::WrapErr;
         let dev = qweight.device();
+        let stream = dev.cuda_stream();
         let q_shape = qweight_l.dims();
         let mut out_shape: Vec<usize> = q_shape.to_vec();
         let pack_factor = (32 / self.bits) as usize;
         if self.is_awq {
-            //in_dim 4096, out_dim 1024 (/pack_factor)
-            //ws shape [4096, 128]
-            //out_shape [256, 2048]
             out_shape[0] = q_shape[0] / pack_factor / 2;
             out_shape[1] = q_shape[1] * pack_factor * 2;
         } else {
-            //in_dim 4096 (/pack_factor), out_dim 1024
-            //ws shape [512, 1024]
-            //out_shape [256, 2048]
             out_shape[0] = q_shape[0] / 2;
             out_shape[1] = q_shape[1] * 2;
         }
 
         let oshape: Shape = out_shape.into();
-
-        // Get cuda slices for all tensors
         let q = qweight.as_cuda_slice::<u32>()?;
-
-        // Get cuda views for all tensors
         let q = q.slice(qweight_l.start_offset()..);
-
         let elem_count = oshape.elem_count();
-        let out = unsafe { dev.alloc::<u32>(elem_count) }.w()?;
+        let out = unsafe { dev.alloc::<u32>(elem_count) }.map_err(candle::Error::wrap)?;
 
-        let out_ptr = *out.device_ptr() as *const core::ffi::c_void;
-        let q_ptr = *q.device_ptr() as *const core::ffi::c_void;
+        let out_ptr = out.device_ptr(&stream).0 as *const core::ffi::c_void;
+        let q_ptr = q.device_ptr(&stream).0 as *const core::ffi::c_void;
+        let stream_ptr = *stream as *const _ as i64;
 
         unsafe {
             if self.is_awq {
@@ -319,7 +306,7 @@ impl MarlinRepack {
                     q_shape[0] as i32,
                     q_shape[1] as i32,
                     self.bits,
-                    *dev.cu_stream() as i64,
+                    stream_ptr,
                 )
             } else {
                 gptq_repack(
@@ -327,7 +314,7 @@ impl MarlinRepack {
                     out_ptr,
                     q_shape[0] as i32,
                     q_shape[1] as i32,
-                    *dev.cu_stream() as i64,
+                    stream_ptr,
                 )
             }
         }

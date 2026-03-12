@@ -244,3 +244,24 @@ pub fn resolve_qwen3_hybrid_config(config: &Config) -> Qwen3HybridConfig {
         value_head_dim,
     }
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SamplingParams {
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<usize>,
+    pub ignore_eos: bool,
+    pub top_k: Option<isize>,
+    pub top_p: Option<f32>,
+    pub session_id: Option<String>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub stop_sequences: Option<Vec<String>>,
+    #[serde(skip)]
+    pub stop_token_ids: Option<Vec<Vec<u32>>>,
+    #[serde(alias = "enable_thinking")]
+    pub thinking: Option<bool>,
+    #[serde(default)]
+    pub mcp_mode: Option<bool>,
+}
+
