@@ -10,6 +10,7 @@ pub mod progress;
 pub mod gptq;
 pub mod image;
 pub mod gguf_varbuilder;
+pub mod logits_processor;
 
 pub use config::{resolve_qwen3_hybrid_config, Qwen3HybridConfig};
 

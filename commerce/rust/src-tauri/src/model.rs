@@ -1,6 +1,6 @@
 use crate::utils;
 use anyhow::anyhow;
-use crate::models::embedding::EmbeddingModel;
+// EmbeddingModel removed as per cleanup request
 use crate::openai_types::{
     ChatCompletionParameters,
     ChatCompletionRequestMessage,
@@ -30,10 +30,13 @@ impl Spinner {
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::models::qwen3_5::generate::Qwen3_5GenerateModel;
+// Import Qwen3VL if available in the future
+// use crate::models::qwen3_vl::Qwen3VLModel;
 
 #[derive(Clone)]
 pub enum ModelVariant {
     Qwen3_5(Arc<TokioMutex<Qwen3_5GenerateModel>>),
+    Qwen3_VL, // Placeholder for Qwen3 VL
 }
 
 impl ModelVariant {
@@ -42,6 +45,9 @@ impl ModelVariant {
             ModelVariant::Qwen3_5(m) => {
                 let mut gen = m.lock().await;
                 gen.generate(params, cancel_flag, session_id, kv_name).await
+            }
+            ModelVariant::Qwen3_VL => {
+                Err(anyhow!("Qwen3 VL generation not yet implemented in model.rs"))
             }
         }
     }
@@ -53,6 +59,7 @@ impl ModelVariant {
                 gen.qwen3_5.clear_cache();
                 Ok(())
             }
+            _ => Ok(())
         }
     }
 
@@ -75,7 +82,7 @@ pub struct LogisModel {
     pub generator: Arc<TokioMutex<Option<ModelVariant>>>, 
     pub small_hibernation: Arc<TokioMutex<Option<ModelVariant>>>,
     pub large_hibernation: Arc<TokioMutex<Option<ModelVariant>>>,
-    pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
+    // Removed embedding_model
     
     pub is_cpu_mode: bool, 
     pub is_disk_swap: bool,
@@ -149,27 +156,13 @@ impl LogisModel {
     }
 
     pub async fn ensure_embedding(&self) -> anyhow::Result<()> {
-        let current_size = { *self.current_size.lock().await };
-        let target_device = if current_size.is_some() { Device::Cpu } else { self.device_config.device.clone() };
-
-        let mut emb_guard = self.embedding_model.lock().await;
-        if emb_guard.is_none() {
-            let path = self.embedding_path.clone();
-            let emb = tokio::task::spawn_blocking(move || {
-                EmbeddingModel::new_with_device(&path, &target_device)
-            }).await??;
-            *emb_guard = Some(emb);
-        }
+        // Embedding logic disabled per cleanup request
         Ok(())
     }
 
-    pub async fn get_embedding(&self, text: String) -> anyhow::Result<Vec<f32>> {
-        self.ensure_embedding().await?;
-        let emb_arc = self.embedding_model.clone();
-        tokio::task::spawn_blocking(move || {
-            let guard = emb_arc.blocking_lock();
-            if let Some(m) = guard.as_ref() { m.embed(&text) } else { Ok(vec![0.0; 768]) }
-        }).await?
+    pub async fn get_embedding(&self, _text: String) -> anyhow::Result<Vec<f32>> {
+        // Return dummy embedding (zeros)
+        Ok(vec![0.0; 768])
     }
 
     pub async fn new(app_handle: tauri::AppHandle, device_preference: Option<&str>) -> anyhow::Result<Self> {
@@ -194,7 +187,7 @@ impl LogisModel {
             generator: Arc::new(TokioMutex::new(None)),
             small_hibernation: Arc::new(TokioMutex::new(None)),
             large_hibernation: Arc::new(TokioMutex::new(None)),
-            embedding_model: Arc::new(TokioMutex::new(None)),
+            // Removed embedding_model
             is_cpu_mode: config.is_cpu,
             is_disk_swap: true,
             dual_mode_enabled: true, 

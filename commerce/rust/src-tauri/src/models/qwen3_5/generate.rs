@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::rc::Rc;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::models::common::get_logit_processor;
+use crate::utils::logits_processor::get_logit_processor;
 
 pub struct Qwen3_5GenerateModel {
     pub qwen3_5: Qwen3_5ForCausalLM,
