@@ -14,9 +14,8 @@ pub async fn run_test() -> Result<()> {
     };
     println!("💻 Using device: {:?}", device);
 
-    // Ensure we use the correct model path without extra 'Q'
-    let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models"))?;
-    let model_path = base_path.join("Qwen3.5-0.8B-Full").to_string_lossy().to_string();
+    // Use simple relative path
+    let model_path = "src-tauri/models/Qwen3.5-0.8B-Full".to_string();
 
     println!("📂 Loading model from {}...", model_path);
     

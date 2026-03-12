@@ -67,12 +67,14 @@ impl Qwen3_5GenerateModel {
                 weight_files.push(path);
             }
         }
+        println!("📂 Found {} weight files.", weight_files.len());
         
         let vb = VarBuilderX::new(&weight_files, dtype, &dev)?;
         let comm = Rc::new(Comm::default());
         let progress = Arc::new(RwLock::new(Box::new(crate::utils::progress::NoProgress) as Box<dyn ProgressLike>));
         
-        let qwen3_5 = Qwen3_5ForCausalLM::new_with_prefix(&vb, comm, &config, dtype, false, &dev, progress, Some("model.language_model.".to_string()))?;
+        let is_interleaved = config.rope_parameters.as_ref().and_then(|p| p.mrope_interleaved).unwrap_or(false);
+        let qwen3_5 = Qwen3_5ForCausalLM::new_with_prefix(&vb, comm, &config, dtype, is_interleaved, &dev, progress, Some("model.language_model.".to_string()))?;
         
         // Allocate KV cache for Attention layers
         let block_size = 16;
@@ -133,6 +135,7 @@ impl Qwen3_5GenerateModel {
         );
 
         let prompt = self.chat_template.apply_chat_template(&params)?;
+        println!("📝 Rendered Prompt:\n---\n{}\n---", prompt);
         let mut tokens = self.tokenizer.text_encode_vec(prompt, true)?;
         let prompt_len = tokens.len();
         
@@ -158,22 +161,27 @@ impl Qwen3_5GenerateModel {
             };
 
             let positions = if is_prefill {
-                Tensor::arange(0u32, current_seq_len as u32, &self.device)?
+                Tensor::arange(0u32, current_seq_len as u32, &self.device)?.to_dtype(DType::I64)?
             } else {
-                Tensor::from_vec(vec![(current_seq_len - 1) as u32], (1,), &self.device)?
+                Tensor::from_vec(vec![(current_seq_len - 1) as u32], (1,), &self.device)?.to_dtype(DType::I64)?
             };
 
             // slot_mapping:
-            // For Mamba/GDN layers, this MUST be the persistent slot index for the sequence.
-            // For sequence 0, we use slot 0 always.
-            let slot_mapping = if is_prefill {
-                // In prefill, slot_mapping should match tokens length
+            // For Mamba/GDN layers (mamba_slot_mapping), this is the sequence index (slot 0 for our single sequence).
+            // For Attention layers (slot_mapping), this is the absolute index in the KV cache.
+            let mamba_slot_mapping = if is_prefill {
                 vec![0i64; current_seq_len]
             } else {
-                // In decode, slot_mapping should match tokens length (1)
                 vec![0i64; 1]
             };
-            let slot_mapping_tensor = Tensor::from_vec(slot_mapping, (input_ids.dim(0)?,), &self.device)?;
+            let attn_slot_mapping = if is_prefill {
+                (0..current_seq_len as i64).collect::<Vec<_>>()
+            } else {
+                vec![(current_seq_len - 1) as i64]
+            };
+            
+            let mamba_slot_mapping_tensor = Tensor::from_vec(mamba_slot_mapping, (input_ids.dim(0)?,), &self.device)?;
+            let attn_slot_mapping_tensor = Tensor::from_vec(attn_slot_mapping, (input_ids.dim(0)?,), &self.device)?;
 
             // context_lens: Total length including the current new token
             let context_lens = Tensor::from_vec(vec![current_seq_len as u32], (1,), &self.device)?;
@@ -181,8 +189,8 @@ impl Qwen3_5GenerateModel {
             let metadata = InputMetadata {
                 is_prefill,
                 sequence_ids: Some(vec![0]),
-                mamba_slot_mapping: Some(slot_mapping_tensor.clone()), // Fix: Provide explicit slot mapping
-                slot_mapping: slot_mapping_tensor,
+                mamba_slot_mapping: Some(mamba_slot_mapping_tensor),
+                slot_mapping: attn_slot_mapping_tensor,
                 block_tables: Some(self.block_tables.clone()),
                 context_lens: Some(context_lens),
                 cu_seqlens_q: if is_prefill {
