@@ -7,6 +7,7 @@ pub mod resources;
 pub mod direct_loader;
 pub mod config;
 pub mod progress;
+pub mod gptq;
 
 pub use config::{resolve_qwen3_hybrid_config, Qwen3HybridConfig};
 
@@ -264,9 +265,23 @@ pub fn floor_by_factor(num: f32, factor: u32) -> u32 {
     floor * factor
 }
 
-pub fn ceil_by_factor(num: f32, factor: u32) -> u32 {
-    let ceil = (num / factor as f32).ceil() as u32;
-    ceil * factor
+pub fn module_path_matches_not_convert(module_path: &str, item: &str) -> bool {
+    let module_path = module_path.trim_end_matches(".weight");
+    let item = item.trim_end_matches(".weight");
+    module_path == item
+        || module_path.ends_with(item)
+        || module_path.ends_with(&format!(".{item}"))
+        || item.ends_with(module_path)
+        || item.ends_with(&format!(".{module_path}"))
+}
+
+pub fn should_skip_fp8_for_module(module_path: &str, cfg: &crate::utils::config::QuantConfig) -> bool {
+    if module_path.is_empty() || cfg.modules_to_not_convert.is_empty() {
+        return false;
+    }
+    cfg.modules_to_not_convert
+        .iter()
+        .any(|item| module_path_matches_not_convert(module_path, item))
 }
 
 // --- GLOBAL EXTRACTION CONTROL ---
