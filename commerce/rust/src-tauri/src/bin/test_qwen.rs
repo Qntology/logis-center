@@ -1,7 +1,7 @@
 use anyhow::Result;
 use candle_core::{DType, Device};
 // [FIX] Use the correct library crate name 'tauri_app_lib'
-use tauri_app_lib::models::qwen35::generate::Qwen3_5GenerateModel;
+use tauri_app_lib::models::qwen3_5::generate::Qwen3_5GenerateModel;
 use tauri_app_lib::openai_types::ChatCompletionParameters;
 
 pub async fn run_test() -> Result<()> {
