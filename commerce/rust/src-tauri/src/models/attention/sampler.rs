@@ -52,15 +52,15 @@ impl Sampler {
             _ => candle_core::bail!("Sampler expects CUDA tensor"),
         };
 
-        let stream = dev.cuda_stream();
+        let stream = dev.cu_stream();
         let out_tokens = unsafe { dev.alloc::<i32>(b) }.w()?;
-        let out_ptr = out_tokens.device_ptr(&stream).0 as *mut i32;
+        let out_ptr = *out_tokens.device_ptr() as *mut i32;
         let stream_ptr = get_raw_stream(dev);
 
         match dtype {
             DType::F32 => {
                 let logits_ptr = match &cuda_storage.slice {
-                    CudaStorageSlice::F32(inp) => inp.device_ptr(&stream).0 as *const f32,
+                    CudaStorageSlice::F32(inp) => *inp.device_ptr() as *const f32,
                     _ => candle_core::bail!("Dtype mismatch"),
                 };
                 unsafe {
@@ -69,7 +69,7 @@ impl Sampler {
             }
             DType::F16 => {
                 let logits_ptr = match &cuda_storage.slice {
-                    CudaStorageSlice::F16(inp) => inp.device_ptr(&stream).0 as *const core::ffi::c_void,
+                    CudaStorageSlice::F16(inp) => *inp.device_ptr() as *const core::ffi::c_void,
                     _ => candle_core::bail!("Dtype mismatch"),
                 };
                 unsafe {
@@ -78,7 +78,7 @@ impl Sampler {
             }
             DType::BF16 => {
                 let logits_ptr = match &cuda_storage.slice {
-                    CudaStorageSlice::BF16(inp) => inp.device_ptr(&stream).0 as *const core::ffi::c_void,
+                    CudaStorageSlice::BF16(inp) => *inp.device_ptr() as *const core::ffi::c_void,
                     _ => candle_core::bail!("Dtype mismatch"),
                 };
                 unsafe {
@@ -90,7 +90,7 @@ impl Sampler {
 
         let mut host_out = vec![0i32; b];
         unsafe {
-            result::memcpy_dtoh_sync(&mut host_out, out_tokens.device_ptr(&stream).0).map_err(candle_core::Error::wrap)?;
+            result::memcpy_dtoh_sync(&mut host_out, *out_tokens.device_ptr()).map_err(candle_core::Error::wrap)?;
         }
 
         Ok(host_out.into_iter().map(|x| x as u32).collect())

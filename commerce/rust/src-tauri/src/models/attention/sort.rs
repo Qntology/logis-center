@@ -45,17 +45,17 @@ impl candle::CustomOp1 for ArgSort {
         use std::ffi::c_void;
 
         let src_ptr = match &storage.slice {
-            CudaStorageSlice::U8(inp) => inp.device_ptr().0 as *const c_void,
-            CudaStorageSlice::U32(inp) => inp.device_ptr().0 as *const c_void,
-            CudaStorageSlice::I64(inp) => inp.device_ptr().0 as *const c_void,
-            CudaStorageSlice::BF16(inp) => inp.device_ptr().0 as *const c_void,
-            CudaStorageSlice::F16(inp) => inp.device_ptr().0 as *const c_void,
-            CudaStorageSlice::F32(inp) => inp.device_ptr().0 as *const c_void,
-            CudaStorageSlice::F64(inp) => inp.device_ptr().0 as *const c_void,
+            CudaStorageSlice::U8(inp) => *inp.device_ptr() as *const c_void,
+            CudaStorageSlice::U32(inp) => *inp.device_ptr() as *const c_void,
+            CudaStorageSlice::I64(inp) => *inp.device_ptr() as *const c_void,
+            CudaStorageSlice::BF16(inp) => *inp.device_ptr() as *const c_void,
+            CudaStorageSlice::F16(inp) => *inp.device_ptr() as *const c_void,
+            CudaStorageSlice::F32(inp) => *inp.device_ptr() as *const c_void,
+            CudaStorageSlice::F64(inp) => *inp.device_ptr() as *const c_void,
             _ => candle_core::bail!("Unsupported dtype for sort"),
         };
         
-        let dst_ptr = dst.device_ptr().0 as *mut c_void;
+        let dst_ptr = *dst.device_ptr() as *mut c_void;
         
         unsafe {
             if self.asc {
@@ -83,7 +83,7 @@ impl candle::CustomOp1 for ArgSort {
             }
         }
         
-        let dst_ret = candle::cuda_backend::CudaStorage::new(CudaStorageSlice::U32(dst), dev.clone());
+        let dst_ret = candle::cuda_backend::CudaStorage::wrap_cuda_slice(dst, dev.clone());
         Ok((dst_ret, layout.shape().clone()))
     }
 }

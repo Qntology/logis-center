@@ -49,8 +49,8 @@ fn get_or_init_flashinfer_fp8_workspace(
         }
 
         let ws = slot.as_ref().unwrap();
-        let stream = dev.cuda_stream();
-        Ok((ws.buffer.device_ptr(&stream).0 as *mut std::ffi::c_void, ws.size))
+        let _stream = dev.cu_stream();
+        Ok((*ws.buffer.device_ptr() as *mut std::ffi::c_void, ws.size))
     })
 }
 
@@ -65,8 +65,8 @@ fn get_cuda_slice<
     match &*storage {
         candle_core::Storage::Cuda(c) => {
             let slice = c.as_cuda_slice::<T>()?;
-            let stream = dev.cuda_stream();
-            Ok(slice.device_ptr(&stream).0)
+            let _stream = dev.cu_stream();
+            Ok(*slice.device_ptr())
         }
         _ => candle_core::bail!("expecting cuda tensor"),
     }
@@ -95,30 +95,30 @@ pub fn fp8_matmul(
     match (dev, dtype) {
         #[cfg(feature = "cuda")]
         (Device::Cuda(cu_dev), DType::F16) => {
-            let stream = cu_dev.cuda_stream();
-            let stream_ptr = *stream as *const _ as i64;
+            let stream = cu_dev.cu_stream();
+            let stream_ptr = *stream as i64;
 
             let (input_storage, _) = input.storage_and_layout();
             let input_ptr = match &*input_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<half::f16>()?.device_ptr(&stream).0 as *const core::ffi::c_void,
+                candle_core::Storage::Cuda(c) => *c.as_cuda_slice::<half::f16>()?.device_ptr() as *const core::ffi::c_void,
                 _ => candle_core::bail!("input must be a cuda tensor"),
             };
 
             let (weight_storage, _) = weight.storage_and_layout();
             let weight_ptr = match &*weight_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<u8>()?.device_ptr(&stream).0 as *const u8,
+                candle_core::Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr() as *const u8,
                 _ => candle_core::bail!("weight must be a cuda tensor"),
             };
 
             let (scale_storage, _) = weight_scale.storage_and_layout();
             let weight_scale_ptr = match &*scale_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?.device_ptr(&stream).0 as *const f32,
+                candle_core::Storage::Cuda(c) => *c.as_cuda_slice::<f32>()?.device_ptr() as *const f32,
                 _ => candle_core::bail!("weight_scale must be a cuda tensor"),
             };
 
             let (output_storage, _) = output.storage_and_layout();
             let output_ptr = match &*output_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<half::f16>()?.device_ptr(&stream).0 as *mut core::ffi::c_void,
+                candle_core::Storage::Cuda(c) => *c.as_cuda_slice::<half::f16>()?.device_ptr() as *mut core::ffi::c_void,
                 _ => candle_core::bail!("output allocation failed"),
             };
 
@@ -132,30 +132,30 @@ pub fn fp8_matmul(
         }
         #[cfg(feature = "cuda")]
         (Device::Cuda(cu_dev), DType::BF16) => {
-            let stream = cu_dev.cuda_stream();
-            let stream_ptr = *stream as *const _ as i64;
+            let stream = cu_dev.cu_stream();
+            let stream_ptr = *stream as i64;
 
             let (input_storage, _) = input.storage_and_layout();
             let input_ptr = match &*input_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<half::bf16>()?.device_ptr(&stream).0 as *const core::ffi::c_void,
+                candle_core::Storage::Cuda(c) => *c.as_cuda_slice::<half::bf16>()?.device_ptr() as *const core::ffi::c_void,
                 _ => candle_core::bail!("input must be a cuda tensor"),
             };
 
             let (weight_storage, _) = weight.storage_and_layout();
             let weight_ptr = match &*weight_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<u8>()?.device_ptr(&stream).0 as *const u8,
+                candle_core::Storage::Cuda(c) => *c.as_cuda_slice::<u8>()?.device_ptr() as *const u8,
                 _ => candle_core::bail!("weight must be a cuda tensor"),
             };
 
             let (scale_storage, _) = weight_scale.storage_and_layout();
             let weight_scale_ptr = match &*scale_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?.device_ptr(&stream).0 as *const f32,
+                candle_core::Storage::Cuda(c) => *c.as_cuda_slice::<f32>()?.device_ptr() as *const f32,
                 _ => candle_core::bail!("weight_scale must be a cuda tensor"),
             };
 
             let (output_storage, _) = output.storage_and_layout();
             let output_ptr = match &*output_storage {
-                candle_core::Storage::Cuda(c) => c.as_cuda_slice::<half::bf16>()?.device_ptr(&stream).0 as *mut core::ffi::c_void,
+                candle_core::Storage::Cuda(c) => *c.as_cuda_slice::<half::bf16>()?.device_ptr() as *mut core::ffi::c_void,
                 _ => candle_core::bail!("output allocation failed"),
             };
 
@@ -207,7 +207,7 @@ pub fn fp8_matmul_flashinfer(
 
     let dev = input.device();
     let cu_dev = dev.as_cuda_device()?;
-    let stream = cu_dev.cuda_stream();
+    let stream = cu_dev.cu_stream();
     let stream_ptr = *stream as *const _ as i64;
 
     let out = Tensor::zeros((m, n), DType::BF16, dev)?;
@@ -256,7 +256,7 @@ pub fn fp8_matmul_cutlass(
     let (k_b, n) = weight.dims2()?;
     let dev = input.device();
     let cu_dev = dev.as_cuda_device()?;
-    let stream = cu_dev.cuda_stream();
+    let stream = cu_dev.cu_stream();
     let stream_ptr = *stream as *const _ as i64;
     let dtype = input.dtype();
     let scale_row_stride = (k + block_size[1] - 1) / block_size[1];

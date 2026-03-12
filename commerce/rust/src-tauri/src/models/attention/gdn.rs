@@ -18,16 +18,15 @@ fn get_cuda_const_ptr(t: &Tensor, dev: &candle::CudaDevice) -> Result<*const c_v
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     let (storage, layout) = t.storage_and_layout();
     let offset = layout.start_offset();
-    let stream = dev.cu_stream();
     match (&*storage, t.dtype()) {
         (Storage::Cuda(s), DType::F16) => {
-            Ok(s.as_cuda_slice::<f16>()?.slice(offset..).device_ptr().0 as *const c_void)
+            Ok(*s.as_cuda_slice::<f16>()?.slice(offset..).device_ptr() as *const c_void)
         }
         (Storage::Cuda(s), DType::BF16) => {
-            Ok(s.as_cuda_slice::<bf16>()?.slice(offset..).device_ptr().0 as *const c_void)
+            Ok(*s.as_cuda_slice::<bf16>()?.slice(offset..).device_ptr() as *const c_void)
         }
         (Storage::Cuda(s), DType::F32) => {
-            Ok(s.as_cuda_slice::<f32>()?.slice(offset..).device_ptr().0 as *const c_void)
+            Ok(*s.as_cuda_slice::<f32>()?.slice(offset..).device_ptr() as *const c_void)
         }
         _ => candle_core::bail!("Expected CUDA tensor with f16/bf16/f32 dtype"),
     }
@@ -38,10 +37,9 @@ fn get_cuda_const_ptr_u32(t: &Tensor, dev: &candle::CudaDevice) -> Result<*const
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     let (storage, layout) = t.storage_and_layout();
     let offset = layout.start_offset();
-    let stream = dev.cu_stream();
     match &*storage {
         Storage::Cuda(s) => {
-            Ok(s.as_cuda_slice::<u32>()?.slice(offset..).device_ptr(&stream).0 as *const u32)
+            Ok(*s.as_cuda_slice::<u32>()?.slice(offset..).device_ptr() as *const u32)
         }
         _ => candle_core::bail!("Expected CUDA u32 tensor"),
     }
@@ -52,10 +50,9 @@ fn get_cuda_const_ptr_i64(t: &Tensor, dev: &candle::CudaDevice) -> Result<*const
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     let (storage, layout) = t.storage_and_layout();
     let offset = layout.start_offset();
-    let stream = dev.cu_stream();
     match &*storage {
         Storage::Cuda(s) => {
-            Ok(s.as_cuda_slice::<i64>()?.slice(offset..).device_ptr(&stream).0 as *const i64)
+            Ok(*s.as_cuda_slice::<i64>()?.slice(offset..).device_ptr() as *const i64)
         }
         _ => candle_core::bail!("Expected CUDA i64 tensor"),
     }

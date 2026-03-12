@@ -29,9 +29,9 @@ impl candle_core::InplaceOp1 for CausalMask {
         let stream_ptr = get_raw_stream(dev);
 
         let src_ptr = match &input.slice {
-            CudaStorageSlice::F32(inp) => inp.device_ptr().0 as *mut c_void,
-            CudaStorageSlice::F16(inp) => inp.device_ptr().0 as *mut c_void,
-            CudaStorageSlice::BF16(inp) => inp.device_ptr().0 as *mut c_void,
+            CudaStorageSlice::F32(inp) => *inp.device_ptr() as *mut c_void,
+            CudaStorageSlice::F16(inp) => *inp.device_ptr() as *mut c_void,
+            CudaStorageSlice::BF16(inp) => *inp.device_ptr() as *mut c_void,
             _ => candle_core::bail!("Unsupported dtype for causal mask"),
         };
 

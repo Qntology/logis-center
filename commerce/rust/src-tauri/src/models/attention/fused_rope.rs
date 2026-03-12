@@ -69,14 +69,14 @@ fn launch_fused_rope(
     let sin_c = match &*sin_s { candle_core::Storage::Cuda(s) => s, _ => candle_core::bail!("CUDA only") };
     let pos_c = match &*pos_s { candle_core::Storage::Cuda(s) => s, _ => candle_core::bail!("CUDA only") };
 
-    let pos_ptr = match &pos_c.slice { CudaStorageSlice::I64(s) => s.device_ptr(&stream).0 as *const i64, _ => candle_core::bail!("I64 only") };
+    let pos_ptr = match &pos_c.slice { CudaStorageSlice::I64(s) => *s.device_ptr() as *const i64, _ => candle_core::bail!("I64 only") };
 
     match q.dtype() {
         DType::F32 => {
-            let q_ptr = match &q_c.slice { CudaStorageSlice::F32(s) => s.device_ptr(&stream).0 as *mut f32, _ => unreachable!() };
-            let k_ptr = match &k_c.slice { CudaStorageSlice::F32(s) => s.device_ptr(&stream).0 as *mut f32, _ => unreachable!() };
-            let cos_ptr = match &cos_c.slice { CudaStorageSlice::F32(s) => s.device_ptr(&stream).0 as *const f32, _ => unreachable!() };
-            let sin_ptr = match &sin_c.slice { CudaStorageSlice::F32(s) => s.device_ptr(&stream).0 as *const f32, _ => unreachable!() };
+            let q_ptr = match &q_c.slice { CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32, _ => unreachable!() };
+            let k_ptr = match &k_c.slice { CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32, _ => unreachable!() };
+            let cos_ptr = match &cos_c.slice { CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32, _ => unreachable!() };
+            let sin_ptr = match &sin_c.slice { CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32, _ => unreachable!() };
             unsafe {
                 match layout {
                     RopeLayout::BatchMajor { q_bh, k_bh, seq_len, d } => {
@@ -91,10 +91,10 @@ fn launch_fused_rope(
             }
         }
         DType::F16 => {
-            let q_ptr = match &q_c.slice { CudaStorageSlice::F16(s) => s.device_ptr(&stream).0 as *mut core::ffi::c_void, _ => unreachable!() };
-            let k_ptr = match &k_c.slice { CudaStorageSlice::F16(s) => s.device_ptr(&stream).0 as *mut core::ffi::c_void, _ => unreachable!() };
-            let cos_ptr = match &cos_c.slice { CudaStorageSlice::F16(s) => s.device_ptr(&stream).0 as *const core::ffi::c_void, _ => unreachable!() };
-            let sin_ptr = match &sin_c.slice { CudaStorageSlice::F16(s) => s.device_ptr(&stream).0 as *const core::ffi::c_void, _ => unreachable!() };
+            let q_ptr = match &q_c.slice { CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void, _ => unreachable!() };
+            let k_ptr = match &k_c.slice { CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void, _ => unreachable!() };
+            let cos_ptr = match &cos_c.slice { CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void, _ => unreachable!() };
+            let sin_ptr = match &sin_c.slice { CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void, _ => unreachable!() };
             unsafe {
                 match layout {
                     RopeLayout::BatchMajor { q_bh, k_bh, seq_len, d } => {
@@ -109,10 +109,10 @@ fn launch_fused_rope(
             }
         }
         DType::BF16 => {
-            let q_ptr = match &q_c.slice { CudaStorageSlice::BF16(s) => s.device_ptr(&stream).0 as *mut core::ffi::c_void, _ => unreachable!() };
-            let k_ptr = match &k_c.slice { CudaStorageSlice::BF16(s) => s.device_ptr(&stream).0 as *mut core::ffi::c_void, _ => unreachable!() };
-            let cos_ptr = match &cos_c.slice { CudaStorageSlice::BF16(s) => s.device_ptr(&stream).0 as *const core::ffi::c_void, _ => unreachable!() };
-            let sin_ptr = match &sin_c.slice { CudaStorageSlice::BF16(s) => s.device_ptr(&stream).0 as *const core::ffi::c_void, _ => unreachable!() };
+            let q_ptr = match &q_c.slice { CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void, _ => unreachable!() };
+            let k_ptr = match &k_c.slice { CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void, _ => unreachable!() };
+            let cos_ptr = match &cos_c.slice { CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void, _ => unreachable!() };
+            let sin_ptr = match &sin_c.slice { CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void, _ => unreachable!() };
             unsafe {
                 match layout {
                     RopeLayout::BatchMajor { q_bh, k_bh, seq_len, d } => {
@@ -142,7 +142,7 @@ fn launch_fused_rope_partial_token_major(
     let (num_tokens, q_heads, full_d) = q.dims3()?;
     let k_heads = k.dim(1)? as u32;
     let dev = q.device().as_cuda_device()?;
-    let stream = dev.cuda_stream();
+    let stream = dev.cu_stream();
     let stream_ptr = get_raw_stream(dev);
 
     let (q_s, _) = q.storage_and_layout();
@@ -157,34 +157,34 @@ fn launch_fused_rope_partial_token_major(
     let sin_c = match &*sin_s { candle_core::Storage::Cuda(s) => s, _ => candle_core::bail!("CUDA only") };
     let pos_c = match &*pos_s { candle_core::Storage::Cuda(s) => s, _ => candle_core::bail!("CUDA only") };
 
-    let pos_ptr = match &pos_c.slice { CudaStorageSlice::I64(s) => s.device_ptr(&stream).0 as *const i64, _ => unreachable!() };
+    let pos_ptr = match &pos_c.slice { CudaStorageSlice::I64(s) => *s.device_ptr() as *const i64, _ => unreachable!() };
 
     match q.dtype() {
         DType::F32 => {
-            let q_ptr = match &q_c.slice { CudaStorageSlice::F32(s) => s.device_ptr(&stream).0 as *mut f32, _ => unreachable!() };
-            let k_ptr = match &k_c.slice { CudaStorageSlice::F32(s) => s.device_ptr(&stream).0 as *mut f32, _ => unreachable!() };
-            let cos_ptr = match &cos_c.slice { CudaStorageSlice::F32(s) => s.device_ptr(&stream).0 as *const f32, _ => unreachable!() };
-            let sin_ptr = match &sin_c.slice { CudaStorageSlice::F32(s) => s.device_ptr(&stream).0 as *const f32, _ => unreachable!() };
+            let q_ptr = match &q_c.slice { CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32, _ => unreachable!() };
+            let k_ptr = match &k_c.slice { CudaStorageSlice::F32(s) => *s.device_ptr() as *mut f32, _ => unreachable!() };
+            let cos_ptr = match &cos_c.slice { CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32, _ => unreachable!() };
+            let sin_ptr = match &sin_c.slice { CudaStorageSlice::F32(s) => *s.device_ptr() as *const f32, _ => unreachable!() };
             unsafe {
                 if is_interleaved { ffi::fused_rope_i_partial_tok_major_f32(q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, num_tokens as u32, q_heads as u32, k_heads, rotary_dim as u32, full_d as u32, stream_ptr); }
                 else { ffi::fused_rope_partial_tok_major_f32(q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, num_tokens as u32, q_heads as u32, k_heads, rotary_dim as u32, full_d as u32, stream_ptr); }
             }
         }
         DType::F16 => {
-            let q_ptr = match &q_c.slice { CudaStorageSlice::F16(s) => s.device_ptr(&stream).0 as *mut core::ffi::c_void, _ => unreachable!() };
-            let k_ptr = match &k_c.slice { CudaStorageSlice::F16(s) => s.device_ptr(&stream).0 as *mut core::ffi::c_void, _ => unreachable!() };
-            let cos_ptr = match &cos_c.slice { CudaStorageSlice::F16(s) => s.device_ptr(&stream).0 as *const core::ffi::c_void, _ => unreachable!() };
-            let sin_ptr = match &sin_c.slice { CudaStorageSlice::F16(s) => s.device_ptr(&stream).0 as *const core::ffi::c_void, _ => unreachable!() };
+            let q_ptr = match &q_c.slice { CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void, _ => unreachable!() };
+            let k_ptr = match &k_c.slice { CudaStorageSlice::F16(s) => *s.device_ptr() as *mut core::ffi::c_void, _ => unreachable!() };
+            let cos_ptr = match &cos_c.slice { CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void, _ => unreachable!() };
+            let sin_ptr = match &sin_c.slice { CudaStorageSlice::F16(s) => *s.device_ptr() as *const core::ffi::c_void, _ => unreachable!() };
             unsafe {
                 if is_interleaved { ffi::fused_rope_i_partial_tok_major_f16(q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, num_tokens as u32, q_heads as u32, k_heads, rotary_dim as u32, full_d as u32, stream_ptr); }
                 else { ffi::fused_rope_partial_tok_major_f16(q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, num_tokens as u32, q_heads as u32, k_heads, rotary_dim as u32, full_d as u32, stream_ptr); }
             }
         }
         DType::BF16 => {
-            let q_ptr = match &q_c.slice { CudaStorageSlice::BF16(s) => s.device_ptr(&stream).0 as *mut core::ffi::c_void, _ => unreachable!() };
-            let k_ptr = match &k_c.slice { CudaStorageSlice::BF16(s) => s.device_ptr(&stream).0 as *mut core::ffi::c_void, _ => unreachable!() };
-            let cos_ptr = match &cos_c.slice { CudaStorageSlice::BF16(s) => s.device_ptr(&stream).0 as *const core::ffi::c_void, _ => unreachable!() };
-            let sin_ptr = match &sin_c.slice { CudaStorageSlice::BF16(s) => s.device_ptr(&stream).0 as *const core::ffi::c_void, _ => unreachable!() };
+            let q_ptr = match &q_c.slice { CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void, _ => unreachable!() };
+            let k_ptr = match &k_c.slice { CudaStorageSlice::BF16(s) => *s.device_ptr() as *mut core::ffi::c_void, _ => unreachable!() };
+            let cos_ptr = match &cos_c.slice { CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void, _ => unreachable!() };
+            let sin_ptr = match &sin_c.slice { CudaStorageSlice::BF16(s) => *s.device_ptr() as *const core::ffi::c_void, _ => unreachable!() };
             unsafe {
                 if is_interleaved { ffi::fused_rope_i_partial_tok_major_bf16(q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, num_tokens as u32, q_heads as u32, k_heads, rotary_dim as u32, full_d as u32, stream_ptr); }
                 else { ffi::fused_rope_partial_tok_major_bf16(q_ptr, k_ptr, cos_ptr, sin_ptr, pos_ptr, num_tokens as u32, q_heads as u32, k_heads, rotary_dim as u32, full_d as u32, stream_ptr); }

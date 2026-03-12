@@ -41,14 +41,12 @@ pub fn sm_version(dev: &CudaDevice) -> Option<i32> {
 
 #[cfg(feature = "cuda")]
 pub fn get_raw_stream(dev: &CudaDevice) -> i64 {
-    use candle_core::cuda_backend::cudarc::driver::AsRaw;
-    unsafe { *dev.cu_stream().as_raw() as i64 }
+    *dev.cu_stream() as i64
 }
 
 #[cfg(feature = "cuda")]
 pub fn get_cuda_stream_ptr(dev: &CudaDevice) -> *mut sys::CUstream_st {
-    use candle_core::cuda_backend::cudarc::driver::AsRaw;
-    unsafe { *dev.cu_stream().as_raw() as *mut sys::CUstream_st }
+    *dev.cu_stream() as *mut sys::CUstream_st
 }
 
 pub trait WrapErr<T> {

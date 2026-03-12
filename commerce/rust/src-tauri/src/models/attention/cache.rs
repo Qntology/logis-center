@@ -34,8 +34,8 @@ pub fn swap_blocks(
                 let cpu_num_blocks = src.dim(0)?;
                 let gpu_num_blocks = dst.dim(0)?;
 
-                let stream = dst_dev.cuda_stream();
-                let dst_ptr = dst_storage.as_cuda_slice::<T>()?.device_ptr(&stream).0;
+                let _stream = dst_dev.cu_stream();
+                let dst_ptr = *dst_storage.as_cuda_slice::<T>()?.device_ptr();
                 let src_slice: &[T] = src_storage.as_slice()?;
                 let stream_ptr = get_cuda_stream_ptr(dst_dev);
 
@@ -54,8 +54,8 @@ pub fn swap_blocks(
                 let gpu_num_blocks = src.dim(0)?;
                 let cpu_num_blocks = dst.dim(0)?;
 
-                let stream = src_dev.cuda_stream();
-                let src_ptr = src_storage.as_cuda_slice::<T>()?.device_ptr(&stream).0;
+                let _stream = src_dev.cu_stream();
+                let src_ptr = *src_storage.as_cuda_slice::<T>()?.device_ptr();
                 let dst_slice: &[T] = dst_storage.as_slice()?;
                 let ptr = dst_slice.as_ptr() as *mut u8;
                 let stream_ptr = get_cuda_stream_ptr(src_dev);
@@ -73,10 +73,10 @@ pub fn swap_blocks(
             (Device::Cuda(src_dev), Device::Cuda(dst_dev)) => {
                 let Storage::Cuda(src_storage) = &*src_storage else { candle_core::bail!("Invalid source kvcache storage!") };
                 let Storage::Cuda(dst_storage) = &*dst_storage else { candle_core::bail!("Invalid dst kvcache storage!") };
-                let src_stream = src_dev.cuda_stream();
-                let dst_stream = dst_dev.cuda_stream();
-                let src_ptr = src_storage.as_cuda_slice::<T>()?.device_ptr(&src_stream).0;
-                let dst_ptr = dst_storage.as_cuda_slice::<T>()?.device_ptr(&dst_stream).0;
+                let _src_stream = src_dev.cu_stream();
+                let _dst_stream = dst_dev.cu_stream();
+                let src_ptr = *src_storage.as_cuda_slice::<T>()?.device_ptr();
+                let dst_ptr = *dst_storage.as_cuda_slice::<T>()?.device_ptr();
                 let stream_ptr = get_cuda_stream_ptr(dst_dev);
 
                 for (src_block_number, dst_block_number) in block_mapping {
@@ -131,8 +131,8 @@ pub fn clear_blocks(cache: &Tensor, block_ids: &Vec<u32>) -> Result<()> {
         let dtype_size = cache.dtype().size_in_bytes();
         let dst_dev = cache.device().as_cuda_device()?;
         let Storage::Cuda(cache_storage) = &*cache_storage else { candle_core::bail!("Invalid kvcache storage!") };
-        let stream = dst_dev.cuda_stream();
-        let cache_ptr = cache_storage.as_cuda_slice::<T>()?.device_ptr(&stream).0;
+        let _stream = dst_dev.cu_stream();
+        let cache_ptr = *cache_storage.as_cuda_slice::<T>()?.device_ptr();
 
         for block_number in block_ids {
             let offset = (*block_number as u64 * block_size_elements as u64 * dtype_size as u64);
