@@ -10,7 +10,7 @@
 *.st
 *.safetensors
 *.crdownload
-
+*.bin
 
 # Virtual Environment
 trade/venv/
