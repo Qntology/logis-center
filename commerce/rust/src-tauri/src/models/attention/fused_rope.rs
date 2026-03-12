@@ -54,7 +54,7 @@ fn launch_fused_rope(
     }
 
     let dev = q.device().as_cuda_device()?;
-    let stream = dev.cuda_stream();
+    let stream = dev.cu_stream();
     let stream_ptr = get_raw_stream(dev);
 
     let (q_s, _) = q.storage_and_layout();

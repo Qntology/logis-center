@@ -59,7 +59,7 @@ impl candle::InplaceOp2 for KvScaleUpdate {
                 panic!("Invalid dtype for kv scale update!")
             }
         };
-        let stream = *dev.cuda_stream() as i64;
+        let stream = *dev.cu_stream() as i64;
 
         let (k_scales, k_scales_layout) = self.k_scales.storage_and_layout();
         let k_scales = match &*k_scales {
