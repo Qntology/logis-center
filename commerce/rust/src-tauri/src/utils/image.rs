@@ -4,6 +4,7 @@ use candle_core::{DType, Device, Result, Storage, Tensor};
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView};
 use serde::{Deserialize, Serialize};
+
 pub const IMAGE_PLACEHOLDER: &str = "<|VLLM-RS-IMAGE|>";
 pub const PLACEHOLDER: &str = "<|VLLM-RS-PLACEHOLDER|>";
 
@@ -36,19 +37,6 @@ pub fn compute_tokens_per_image(
         return Vec::new();
     }
     match cfg.model_type {
-        ModelType::Gemma3 => {
-            if let Some(tokens) = cfg.mm_tokens_per_image {
-                return vec![tokens; image_sizes.len()];
-            }
-            let denom = cfg.patch_size * cfg.spatial_merge_size;
-            if denom == 0 {
-                return vec![0; image_sizes.len()];
-            }
-            image_sizes
-                .iter()
-                .map(|&(h, w)| (h / denom) * (w / denom))
-                .collect()
-        }
         ModelType::Qwen3VL => {
             let merge = cfg.spatial_merge_size;
             let merge_area = merge * merge;
@@ -157,7 +145,7 @@ pub fn compute_image_slice(
     let image_idx = image_idx.min(i32::MAX as usize) as i32;
     Some((image_idx, token_offset))
 }
-// load from url
+
 pub fn load_image_from_url(url: &str) -> Result<DynamicImage> {
     crate::log_info!("Start downloading image from {}", url);
     let bytes = reqwest::blocking::get(url)
@@ -168,7 +156,6 @@ pub fn load_image_from_url(url: &str) -> Result<DynamicImage> {
     Ok(img)
 }
 
-// load from "data:image/jpeg;base64,XXXXX"
 pub fn load_image_from_base64(data: &str) -> Result<DynamicImage> {
     use base64::prelude::{Engine as _, BASE64_STANDARD};
     let base64_part = data.split(",").last().unwrap_or(data);
@@ -240,13 +227,9 @@ pub fn to_tensor(
         let (w, h) = rgb.dimensions();
         let data = rgb.into_raw(); // Vec<f32> in HWC layout, FAST
 
-        // Build tensor from slice
         let t = Tensor::from_vec(data, (h as usize, w as usize, 3), &Device::Cpu)?;
-
-        // Convert HWC → CHW without copying data manually
         let t = t.permute((2, 0, 1))?.contiguous()?; // [H, W, C] -> [C, H, W]
 
-        // Only NOW can we normalize, because we are in Floating Point land
         let t = if let (Some(mean), Some(std)) = (image_mean, image_std) {
             let mean = Tensor::new(&mean[..], &candle_core::Device::Cpu)?.reshape((3, 1, 1))?;
             let std = Tensor::new(&std[..], &candle_core::Device::Cpu)?.reshape((3, 1, 1))?;
@@ -254,8 +237,6 @@ pub fn to_tensor(
         } else {
             t
         };
-
-        // let t = image_to_pixels(image, &Device::Cpu)?;
         pixel_values.push(t.unsqueeze(0)?);
     }
     Ok((Tensor::cat(&pixel_values, 0)?, image_sizes))
@@ -263,10 +244,10 @@ pub fn to_tensor(
 
 #[derive(Clone)]
 pub struct ImageProcessConfig {
-    image_start_token: Option<String>,
-    image_token: String,
-    image_break_token: Option<String>,
-    image_end_token: String,
+    pub image_start_token: Option<String>,
+    pub image_token: String,
+    pub image_break_token: Option<String>,
+    pub image_end_token: String,
     pub spatial_merge_size: usize,
     pub mm_tokens_per_image: Option<usize>,
     pub do_normalize: Option<bool>,
@@ -314,7 +295,7 @@ impl ImageProcessConfig {
             resampling: None,
             scale_factor: None,
             temporal_patch_size: temporal_patch_size,
-            model_type: ModelType::Mistral3VL,
+            model_type: ModelType::Qwen3VL,
             image_token_id: None,
         }
     }
@@ -371,10 +352,6 @@ impl ImageProcessor {
         }
     }
 
-    /// Preprocess input DynamicImages:
-    /// 1. Resize w/ custom rule (padding to uniform size)
-    /// 2. Optional rescale
-    /// 3. Optional normalize
     pub fn preprocess_images(
         &mut self,
         images: &Vec<DynamicImage>,
@@ -444,11 +421,6 @@ impl ImageProcessTrait for ImageProcessor {
         let (pixel_values, image_sizes_all) =
             self.preprocess(images).expect("Preprocessing failed");
 
-        crate::log_info!(
-            "pixel_values tensor shape {:?}, image_sizes_all {:?}",
-            pixel_values.shape(),
-            image_sizes_all
-        );
         let mut image_sizes_all_iter = image_sizes_all.clone().into_iter();
         let mut replace_strings = Vec::new();
         while prompt.contains(IMAGE_PLACEHOLDER) {
@@ -458,9 +430,6 @@ impl ImageProcessTrait for ImageProcessor {
             let num_width_tokens =
                 (width as usize) / (self.cfg.patch_size * self.cfg.spatial_merge_size);
 
-            crate::log_info!(
-                "num_height_tokens {num_height_tokens}, num_width_tokens {num_width_tokens}"
-            );
             let mut replace_tokens = vec![
                 [
                     vec![self.cfg.image_token.clone(); num_width_tokens],
@@ -506,60 +475,6 @@ pub fn get_image_config(
     config: &Config,
 ) -> Result<Option<ImageProcessConfig>> {
     let img_cfg = match model_type {
-        ModelType::Mistral3VL => {
-            use crate::models::mistral3_vl::Mistral3Config;
-            assert!(
-                config.extra_config_json.is_some(),
-                "Multimodel missing vision config!"
-            );
-            let cfg: Mistral3Config =
-                serde_json::from_str(config.extra_config_json.as_ref().unwrap())
-                    .map_err(candle_core::Error::wrap)?;
-
-            let mut img_cfg = ImageProcessConfig::default(
-                None,
-                "[IMG]".to_string(),
-                Some("[IMG_BREAK]".to_string()),
-                "[IMG_END]".to_string(),
-                cfg.spatial_merge_size,
-                None,
-                cfg.vision_config.patch_size,
-                896,
-                false,
-            );
-            img_cfg.model_type = ModelType::Mistral3VL;
-            img_cfg.image_token_id = Some(cfg.image_token_index as u32);
-            Some(img_cfg)
-        }
-        ModelType::Gemma3 => {
-            use crate::models::gemma3::config::Gemma3Config;
-            assert!(
-                config.extra_config_json.is_some(),
-                "Multimodel missing vision config!"
-            );
-            let cfg: Gemma3Config =
-                serde_json::from_str(config.extra_config_json.as_ref().unwrap())
-                    .map_err(candle_core::Error::wrap)?;
-
-            let mut img_cfg = ImageProcessConfig::default(
-                Some("<start_of_image>".to_string()),
-                "<image_soft_token>".to_string(),
-                None,
-                "<end_of_image>".to_string(),
-                4,
-                None,
-                cfg.vision_config.patch_size,
-                896,
-                true,
-            );
-            img_cfg.model_type = ModelType::Gemma3;
-            img_cfg.image_token_id = Some(cfg.image_token_index as u32);
-            img_cfg.mm_tokens_per_image = Some(cfg.mm_tokens_per_image);
-            img_cfg.scale_factor = Some(0.003921567);
-            img_cfg.image_mean = Some([0.5, 0.5, 0.5]);
-            img_cfg.image_std = Some([0.5, 0.5, 0.5]);
-            Some(img_cfg)
-        }
         ModelType::Qwen3VL => {
             use crate::models::qwen3_vl::config::Qwen3VLConfig;
             assert!(
