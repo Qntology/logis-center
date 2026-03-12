@@ -77,7 +77,7 @@ impl Qwen3_5GenerateModel {
         for layer_type in &hybrid.layer_types {
             if layer_type == "full_attention" {
                 let k_cache = Tensor::zeros((num_blocks, num_kv_heads, head_dim / x, block_size, x), dtype, &dev)?;
-                let v_cache = Tensor::zeros((num_blocks, num_kv_heads, head_dim, block_size, 1), dtype, &dev)?;
+                let v_cache = Tensor::zeros((num_blocks, num_kv_heads, head_dim, block_size), dtype, &dev)?;
                 kv_caches.push(Some((k_cache, v_cache)));
             } else {
                 kv_caches.push(None);
