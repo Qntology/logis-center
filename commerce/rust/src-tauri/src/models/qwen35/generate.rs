@@ -16,7 +16,6 @@ pub struct Qwen3_5GenerateModel {
     pub device: Device,
     pub registry: QuantizedRegistry,
     pub eos_token_id: u32,
-    // [FIX] Persistent cache storage for RELAY mode
     pub layer_caches: Vec<Option<LayerContext>>,
 }
 
@@ -66,10 +65,11 @@ impl Qwen3_5GenerateModel {
         _kv_name: Option<String>
     ) -> Result<String> {
         let seed = mes.seed.unwrap_or(34562) as u64;
+        // [VLLM SYNC] Greedy decoding matches SamplingParams::default()
         let mut logit_processor = get_logit_processor(
             mes.temperature.map(|t| t as f32),
             mes.top_p.map(|p| p as f32),
-            Some(50),
+            None,
             seed
         );
 
@@ -84,7 +84,6 @@ impl Qwen3_5GenerateModel {
         println!("[MODEL-QWEN35] Starting FULL-RELAY Prefill...");
         let mut last_logits = None;
         
-        // Chunked prefill for memory efficiency
         for i in 0..full_seq_len {
             let input_id = full_input_ids.narrow(1, i, 1)?;
             let mut x = self.qwen3_5.model.embed.forward(&input_id, &self.registry)?;
@@ -94,25 +93,15 @@ impl Qwen3_5GenerateModel {
 
             for (l_idx, layer) in self.qwen3_5.model.layers.iter_mut().enumerate() {
                 layer.load_to_vram(&self.registry, &self.device)?;
-                
-                // [RESTORE CACHE]
                 if let Some(ctx) = self.layer_caches[l_idx].take() {
                     match ctx {
                         LayerContext::Attention { k, v } => if let Some(ref mut sa) = layer.self_attn { sa.kv_cache = Some((k, v)); },
                         LayerContext::DeltaNet { state, conv } => if let Some(ref mut la) = layer.linear_attn { la.recurrent_state_cache = Some(state); la.conv_state_cache = Some(conv); },
                     }
                 }
-
                 x = layer.forward(&x, &cos, &sin, None, &self.registry)?;
-                
-                // [SAVE CACHE]
                 if let Some(ref sa) = layer.self_attn { if let Some(ref kv) = sa.kv_cache { self.layer_caches[l_idx] = Some(LayerContext::Attention { k: kv.0.clone(), v: kv.1.clone() }); } }
-                if let Some(ref la) = layer.linear_attn { 
-                    if let (Some(ref s), Some(ref c)) = (&la.recurrent_state_cache, &la.conv_state_cache) {
-                        self.layer_caches[l_idx] = Some(LayerContext::DeltaNet { state: s.clone(), conv: c.clone() });
-                    }
-                }
-
+                if let Some(ref la) = layer.linear_attn { if let (Some(ref s), Some(ref c)) = (&la.recurrent_state_cache, &la.conv_state_cache) { self.layer_caches[l_idx] = Some(LayerContext::DeltaNet { state: s.clone(), conv: c.clone() }); } }
                 layer.clear_vram();
             }
             
@@ -122,8 +111,8 @@ impl Qwen3_5GenerateModel {
                 self.qwen3_5.model.norm.clear_vram();
                 
                 self.qwen3_5.head.load_to_vram(&self.registry, &self.device)?;
-                let mut logits = self.qwen3_5.head.forward(&out, &self.registry)?;
-                if self.qwen3_5.tie { logits = logits.affine(1.0 / self.qwen3_5.hidden_size.sqrt(), 0.0)?; }
+                let logits = self.qwen3_5.head.forward(&out, &self.registry)?;
+                // [VLLM SYNC] Remove manual affine scaling
                 last_logits = Some(logits);
                 self.qwen3_5.head.clear_vram();
             }
@@ -133,7 +122,8 @@ impl Qwen3_5GenerateModel {
         let mut gen_text = String::new();
         let sample_len = mes.max_tokens.unwrap_or(100) as usize;
         let mut all_tokens = token_ids.clone();
-        let repetition_penalty = 1.2f32;
+        // [VLLM SYNC] Neutral repetition penalty
+        let repetition_penalty = 1.0f32;
 
         for step in 0..sample_len {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
@@ -160,7 +150,6 @@ impl Qwen3_5GenerateModel {
             gen_text.push_str(&piece);
             all_tokens.push(next_token);
 
-            // Decoding Step
             let input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?.to_dtype(DType::U32)?;
             let mut x = self.qwen3_5.model.embed.forward(&input_ids, &self.registry)?;
             let pos_ids = Tensor::new(&[(full_seq_len + step) as u32], &self.device)?.reshape((1, 1))?.broadcast_as((3, 1, 1))?;
@@ -168,25 +157,15 @@ impl Qwen3_5GenerateModel {
 
             for (l_idx, layer) in self.qwen3_5.model.layers.iter_mut().enumerate() {
                 layer.load_to_vram(&self.registry, &self.device)?;
-                
-                // [RESTORE CACHE]
                 if let Some(ctx) = self.layer_caches[l_idx].take() {
                     match ctx {
                         LayerContext::Attention { k, v } => if let Some(ref mut sa) = layer.self_attn { sa.kv_cache = Some((k, v)); },
                         LayerContext::DeltaNet { state, conv } => if let Some(ref mut la) = layer.linear_attn { la.recurrent_state_cache = Some(state); la.conv_state_cache = Some(conv); },
                     }
                 }
-
                 x = layer.forward(&x, &cos, &sin, None, &self.registry)?;
-                
-                // [SAVE CACHE]
                 if let Some(ref sa) = layer.self_attn { if let Some(ref kv) = sa.kv_cache { self.layer_caches[l_idx] = Some(LayerContext::Attention { k: kv.0.clone(), v: kv.1.clone() }); } }
-                if let Some(ref la) = layer.linear_attn { 
-                    if let (Some(ref s), Some(ref c)) = (&la.recurrent_state_cache, &la.conv_state_cache) {
-                        self.layer_caches[l_idx] = Some(LayerContext::DeltaNet { state: s.clone(), conv: c.clone() });
-                    }
-                }
-
+                if let Some(ref la) = layer.linear_attn { if let (Some(ref s), Some(ref c)) = (&la.recurrent_state_cache, &la.conv_state_cache) { self.layer_caches[l_idx] = Some(LayerContext::DeltaNet { state: s.clone(), conv: c.clone() }); } }
                 layer.clear_vram();
             }
             
@@ -194,8 +173,7 @@ impl Qwen3_5GenerateModel {
             let out = self.qwen3_5.model.norm.forward(&x, &self.registry)?;
             self.qwen3_5.model.norm.clear_vram();
             self.qwen3_5.head.load_to_vram(&self.registry, &self.device)?;
-            let mut next_logits = self.qwen3_5.head.forward(&out, &self.registry)?;
-            if self.qwen3_5.tie { next_logits = next_logits.affine(1.0 / self.qwen3_5.hidden_size.sqrt(), 0.0)?; }
+            let next_logits = self.qwen3_5.head.forward(&out, &self.registry)?;
             logits = next_logits;
             self.qwen3_5.head.clear_vram();
         }

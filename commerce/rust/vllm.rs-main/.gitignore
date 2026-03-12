@@ -1,0 +1,9 @@
+/target
+/Cargo.lock
+.vscode/
+.idea/
+AGENTS.md
+/log
+*.log
+*.code-workspace
+CLAUDE.md
