@@ -68,15 +68,7 @@ impl Qwen3_5GenerateModel {
         let max_seq_len = 2048;
         let num_blocks = (max_seq_len + block_size - 1) / block_size;
         let num_kv_heads = config.num_key_value_heads;
-        let head_dim = config.hidden_size / config.num_attention_heads;
-        let x = match dtype {
-            DType::F32 => 4 / 4, // dummy
-            _ => 2 / 2,
-        };
-        // For PagedAttention, x is actually related to the data type size or specific packing.
-        // vLLM uses x = 16 / size_of::<T>() for some kernels.
-        // Looking at paged_attention.rs: (num_blocks, num_kv_heads, head_size / x, block_size, x)
-        // Usually x = 1 for simple cases.
+        let head_dim = config.head_dim.unwrap_or(config.hidden_size / config.num_attention_heads);
         let x = 1;
 
         let mut kv_caches = Vec::new();
@@ -85,7 +77,7 @@ impl Qwen3_5GenerateModel {
         for layer_type in &hybrid.layer_types {
             if layer_type == "full_attention" {
                 let k_cache = Tensor::zeros((num_blocks, num_kv_heads, head_dim / x, block_size, x), dtype, &dev)?;
-                let v_cache = Tensor::zeros((num_blocks, num_kv_heads, head_dim, block_size), dtype, &dev)?;
+                let v_cache = Tensor::zeros((num_blocks, num_kv_heads, head_dim, block_size, 1), dtype, &dev)?;
                 kv_caches.push(Some((k_cache, v_cache)));
             } else {
                 kv_caches.push(None);
