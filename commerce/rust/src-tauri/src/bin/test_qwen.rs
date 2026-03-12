@@ -16,11 +16,12 @@ pub async fn run_test() -> Result<()> {
 
     // Ensure we use the correct model path without extra 'Q'
     let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models"))?;
-    let model_path = base_path.join("Qwen3.5-0.8B-Split").to_string_lossy().to_string();
+    let model_path = base_path.join("Qwen3.5-0.8B-Full").to_string_lossy().to_string();
 
     println!("📂 Loading model from {}...", model_path);
     
-    let mut model = Qwen3_5GenerateModel::init(&model_path, Some(&device), Some(DType::F16), true)?;
+    // Using BF16 for original model for better precision
+    let mut model = Qwen3_5GenerateModel::init(&model_path, Some(&device), Some(DType::BF16), true)?;
 
     println!("\n✨ Hybrid Model initialized successfully.");
 
@@ -29,16 +30,16 @@ pub async fn run_test() -> Result<()> {
         "messages": [
             {
                 "role": "user",
-                "content": "Explain Newton's first law in one sentence."
+                "content": "Hello, how are you?"
             }
         ],
-        "max_tokens": 50,
-        "temperature": 0.7,
-        "top_p": 0.9
+        "max_tokens": 64,
+        "temperature": 0.0,
+        "top_p": 1.0
     }"#;
 
     let mes: ChatCompletionParameters = serde_json::from_str(message_json)?;
-    println!("❓ Asking: Explain Newton's first law in one sentence.");
+    println!("❓ Asking: Hello, how are you?");
 
     let result = model.generate(mes, None, None, None).await?;
 

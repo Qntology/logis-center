@@ -115,6 +115,15 @@ pub struct QuantConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RopeParameters {
+    pub rope_type: Option<String>,
+    pub rope_theta: Option<f64>,
+    pub partial_rotary_factor: Option<f32>,
+    pub mrope_interleaved: Option<bool>,
+    pub mrope_section: Option<Vec<usize>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     pub architectures: Option<Vec<String>>,
     pub head_dim: Option<usize>,
@@ -143,6 +152,8 @@ pub struct Config {
     pub partial_rotary_factor: Option<f32>,
     pub hidden_act: candle_nn::Activation,
     pub rope_scaling: Option<HashMap<String, RopeScalingValue>>,
+    pub rope_parameters: Option<RopeParameters>,
+    pub mamba_ssm_dtype: Option<String>,
     pub quant: Option<String>,
     pub moe_cfg: Option<MoEConfig>,
     pub fp8_kvcache: Option<bool>,

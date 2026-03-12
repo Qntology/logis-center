@@ -30,12 +30,13 @@ pub struct Qwen3_5GenerateModel {
 impl Qwen3_5GenerateModel {
     pub fn init(model_path: &str, device: Option<&Device>, dtype: Option<DType>, _use_relay: bool) -> Result<Self> {
         let dev = device.unwrap_or(&Device::Cpu).clone();
-        let dtype = dtype.unwrap_or(DType::F16);
+        // Force BF16 for original models if supported by CUDA
+        let dtype = dtype.unwrap_or(DType::BF16);
         
         let config_path = std::path::Path::new(model_path).join("config.json");
         let config_str = std::fs::read_to_string(config_path)?;
         let config_value: serde_json::Value = serde_json::from_str(&config_str)?;
-        let config: Config = if let Some(text_config) = config_value.get("text_config") {
+        let mut config: Config = if let Some(text_config) = config_value.get("text_config") {
             let mut cfg: Config = serde_json::from_value(text_config.clone())?;
             if cfg.architectures.is_none() {
                 cfg.architectures = config_value.get("architectures").and_then(|a| serde_json::from_value(a.clone()).ok());
@@ -44,6 +45,16 @@ impl Qwen3_5GenerateModel {
         } else {
             serde_json::from_str(&config_str)?
         };
+
+        // Propagate nested rope_parameters to root fields for compatibility with ScalingRotaryEmbedding
+        if let Some(ref rp) = config.rope_parameters {
+            if config.rope_theta.is_none() {
+                config.rope_theta = rp.rope_theta;
+            }
+            if config.partial_rotary_factor.is_none() {
+                config.partial_rotary_factor = rp.partial_rotary_factor;
+            }
+        }
         
         let tokenizer = TokenizerModel::init(model_path)?;
         let chat_template = ChatTemplate::init(model_path)?;
@@ -88,6 +99,12 @@ impl Qwen3_5GenerateModel {
         let block_indices: Vec<u32> = (0..num_blocks as u32).collect();
         let block_tables = Tensor::from_vec(block_indices, (1, num_blocks), &dev)?;
 
+        let eos_id = match config.eos_token_id {
+            Some(crate::utils::config::EosTokenId::Single(id)) => id,
+            Some(crate::utils::config::EosTokenId::Multiple(ref ids)) => ids[0],
+            None => 151643, // Fallback
+        };
+
         Ok(Self {
             qwen3_5,
             tokenizer,
@@ -96,7 +113,7 @@ impl Qwen3_5GenerateModel {
             config,
             kv_caches,
             block_tables,
-            eos_token_id: 151643, // Default Qwen EOS, should be read from config
+            eos_token_id: eos_id,
         })
     }
 
@@ -117,12 +134,14 @@ impl Qwen3_5GenerateModel {
 
         let prompt = self.chat_template.apply_chat_template(&params)?;
         let mut tokens = self.tokenizer.text_encode_vec(prompt, true)?;
+        let prompt_len = tokens.len();
         
         let mut gen_text = String::new();
         let max_tokens = params.max_tokens.unwrap_or(128) as usize;
         
         self.qwen3_5.reset_mamba_cache()?;
-        // Reset KV cache context lens (implicitly done by InputMetadata)
+        // Ensure mamba slot 0 is assigned to sequence 0
+        self.qwen3_5.ensure_mamba_slots_for_sequences(&[0])?;
 
         for step in 0..max_tokens {
             if let Some(flag) = &cancel_flag {
@@ -130,49 +149,53 @@ impl Qwen3_5GenerateModel {
             }
 
             let is_prefill = step == 0;
+            let current_seq_len = tokens.len();
+            
             let input_ids = if is_prefill {
-                Tensor::from_vec(tokens.clone(), (tokens.len(),), &self.device)?
+                Tensor::from_vec(tokens.clone(), (current_seq_len,), &self.device)?
             } else {
                 Tensor::from_vec(vec![*tokens.last().unwrap()], (1,), &self.device)?
             };
 
-            let seq_len = tokens.len();
             let positions = if is_prefill {
-                Tensor::arange(0u32, seq_len as u32, &self.device)?
+                Tensor::arange(0u32, current_seq_len as u32, &self.device)?
             } else {
-                Tensor::from_vec(vec![(seq_len - 1) as u32], (1,), &self.device)?
+                Tensor::from_vec(vec![(current_seq_len - 1) as u32], (1,), &self.device)?
             };
 
-            // Prepare InputMetadata
-            let block_size = 16;
+            // slot_mapping:
+            // For Mamba/GDN layers, this MUST be the persistent slot index for the sequence.
+            // For sequence 0, we use slot 0 always.
             let slot_mapping = if is_prefill {
-                let mut mapping = Vec::new();
-                for i in 0..seq_len {
-                    mapping.push(i as i64);
-                }
-                Tensor::from_vec(mapping, (seq_len,), &self.device)?
+                // In prefill, slot_mapping should match tokens length
+                vec![0i64; current_seq_len]
             } else {
-                Tensor::from_vec(vec![(seq_len - 1) as i64], (1,), &self.device)?
+                // In decode, slot_mapping should match tokens length (1)
+                vec![0i64; 1]
             };
+            let slot_mapping_tensor = Tensor::from_vec(slot_mapping, (input_ids.dim(0)?,), &self.device)?;
+
+            // context_lens: Total length including the current new token
+            let context_lens = Tensor::from_vec(vec![current_seq_len as u32], (1,), &self.device)?;
 
             let metadata = InputMetadata {
                 is_prefill,
                 sequence_ids: Some(vec![0]),
-                mamba_slot_mapping: None, // Will be resolved from sequence_ids
-                slot_mapping: slot_mapping.clone(),
+                mamba_slot_mapping: Some(slot_mapping_tensor.clone()), // Fix: Provide explicit slot mapping
+                slot_mapping: slot_mapping_tensor,
                 block_tables: Some(self.block_tables.clone()),
-                context_lens: Some(Tensor::from_vec(vec![seq_len as u32], (1,), &self.device)?),
+                context_lens: Some(context_lens),
                 cu_seqlens_q: if is_prefill {
-                    Some(Tensor::from_vec(vec![0u32, seq_len as u32], (2,), &self.device)?)
+                    Some(Tensor::from_vec(vec![0u32, current_seq_len as u32], (2,), &self.device)?)
                 } else {
-                    None
+                    Some(Tensor::from_vec(vec![0u32, 1u32], (2,), &self.device)?)
                 },
                 cu_seqlens_k: None,
-                max_seqlen_q: if is_prefill { seq_len } else { 1 },
-                max_seqlen_k: seq_len,
-                max_context_len: seq_len,
+                max_seqlen_q: if is_prefill { current_seq_len } else { 1 },
+                max_seqlen_k: current_seq_len,
+                max_context_len: current_seq_len,
                 disable_flash_attn: Some(true),
-                seqlens: Some(vec![seq_len as u32]),
+                seqlens: Some(vec![current_seq_len as u32]),
                 flashinfer_metadata: None,
             };
 
@@ -188,8 +211,11 @@ impl Qwen3_5GenerateModel {
                 false
             )?;
 
+            // Sample from the logits returned by the model. 
+            // The model's forward already performs index_select to return only the last token's logits [1, vocab_size].
             let next_tokens = logit_processor.sample(&logits.to_dtype(DType::F32)?, &None)?;
             let next_token = next_tokens[0];
+            
             if next_token == self.eos_token_id {
                 break;
             }
@@ -199,6 +225,11 @@ impl Qwen3_5GenerateModel {
             gen_text.push_str(&piece);
             print!("{}", piece);
             std::io::Write::flush(&mut std::io::stdout())?;
+            
+            // Check for assistant turn end in Qwen
+            if piece.contains("<|im_end|>") || piece.contains("<|endoftext|>") {
+                break;
+            }
         }
 
         Ok(gen_text)
