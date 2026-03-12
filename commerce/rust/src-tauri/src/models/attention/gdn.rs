@@ -189,16 +189,16 @@ pub fn causal_conv1d_update(
             let kernel_size = weight.dim(2)?;
             let out = Tensor::zeros((batch, d_conv), x.dtype(), x.device())?;
 
-            let x_ptr = get_cuda_const_ptr(x)?;
-            let weight_ptr = get_cuda_const_ptr(weight)?;
+            let x_ptr = get_cuda_const_ptr(x, dev)?;
+            let weight_ptr = get_cuda_const_ptr(weight, dev)?;
             let bias_ptr = if let Some(b) = bias {
-                get_cuda_const_ptr(b)?
+                get_cuda_const_ptr(b, dev)?
             } else {
                 std::ptr::null()
             };
-            let state_ptr = get_cuda_mut_ptr(conv_state)?;
-            let out_ptr = get_cuda_mut_ptr(&out)?;
-            let stream = *dev.cu_stream() as i64;
+            let state_ptr = get_cuda_mut_ptr(conv_state, dev)?;
+            let out_ptr = get_cuda_mut_ptr(&out, dev)?;
+            let stream = *dev.cuda_stream()? as i64;
 
             unsafe {
                 match x.dtype() {

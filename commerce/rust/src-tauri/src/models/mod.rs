@@ -8,3 +8,4 @@ pub mod qwen3_moe;
 pub mod qwen3_5_moe;
 pub mod mistral3_vl;
 pub mod gemma3;
+pub mod llama;

@@ -1,7 +1,7 @@
 #[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::sys;
 #[cfg(feature = "cuda")]
-use candle_core::cuda_backend::cudarc::driver::CudaDevice;
+use candle_core::CudaDevice;
 
 #[cfg(feature = "cuda")]
 use std::{
