@@ -9,7 +9,7 @@ use kernels::ffi;
 #[cfg(feature = "cuda")]
 pub fn topk_softmax(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
     use candle::cuda_backend::cudarc::driver::DevicePtr;
-    use crate::models::attention::cuda_utils::WrapErr;
+    use crate::cuda_utils::WrapErr;
     let (num_tokens, _) = logits.dims2()?;
     
     fn cuda_fwd(logits: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {

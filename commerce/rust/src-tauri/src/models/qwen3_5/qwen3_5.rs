@@ -1,6 +1,4 @@
-// src/models/qwen3_5/mod.rs
-pub mod generate;
-
+// src/models/qwen3_5.rs
 // Qwen3.5 dense model with hybrid attention (full attention + GatedDeltaNet layers)
 use crate::models::layers::attention::Attention;
 use crate::models::layers::deltanet::GatedDeltaNet;
@@ -13,8 +11,8 @@ use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use crate::utils::progress::ProgressLike;
 use crate::utils::resolve_qwen3_hybrid_config;
-use crate::models::attention::mamba_cache::MambaCache;
-use crate::models::attention::InputMetadata;
+use attention_rs::mamba_cache::MambaCache;
+use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::Module;
 use parking_lot::{RwLock, RwLockWriteGuard};
@@ -311,7 +309,16 @@ impl Qwen3_5ForCausalLM {
         let is_qvar_builder = vb.is_qvar_builder();
         let reporter = progress_reporter.clone();
 
-        let tie_word_embeddings = config.tie_word_embeddings;
+        let tie_word_embeddings = if !is_qvar_builder
+            && vb.has_key("embed_tokens.weight")
+            && !vb.has_key(&format!("{}embed_tokens.weight", prefix))
+        {
+            crate::log_error!("This model does not support decoding!");
+            prefix.clear();
+            Some(true)
+        } else {
+            config.tie_word_embeddings
+        };
 
         let (embed_tokens, vocab_size) = embedding(
             config.vocab_size,
@@ -669,3 +676,228 @@ impl Qwen3_5ForCausalLM {
     }
 }
 
+// =============================================================================
+// Inference engine for Qwen3.5 (Integrated by Gemini CLI)
+// =============================================================================
+
+use crate::tokenizer::TokenizerModel;
+use crate::chat_template::ChatTemplate;
+use crate::openai_types::ChatCompletionParameters;
+use crate::utils::logits_processor::get_logit_processor;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+pub struct Qwen3_5GenerateModel {
+    pub qwen3_5: Qwen3_5ForCausalLM,
+    pub tokenizer: TokenizerModel,
+    pub chat_template: ChatTemplate,
+    pub device: Device,
+    pub config: Config,
+    pub kv_caches: Vec<(Tensor, Tensor)>,
+    pub block_tables: Tensor,
+    pub eos_token_id: u32,
+}
+
+impl Qwen3_5GenerateModel {
+    pub fn init(model_path: &str, device: Option<&Device>, dtype: Option<DType>, _use_relay: bool) -> Result<Self> {
+        let dev = device.unwrap_or(&Device::Cpu).clone();
+        let dtype = dtype.unwrap_or(DType::BF16);
+
+        let config_path = std::path::Path::new(model_path).join("config.json");
+        let config_str = std::fs::read_to_string(config_path)?;
+        let config_value: serde_json::Value = serde_json::from_str(&config_str).map_err(candle_core::Error::msg)?;
+        let mut config: Config = if let Some(text_config) = config_value.get("text_config") {
+            let mut cfg: Config = serde_json::from_value(text_config.clone()).map_err(candle_core::Error::msg)?;
+            if cfg.architectures.is_none() {
+                cfg.architectures = config_value.get("architectures").and_then(|a| serde_json::from_value(a.clone()).ok());
+            }
+            cfg
+        } else {
+            serde_json::from_str(&config_str).map_err(candle_core::Error::msg)?
+        };
+
+        // Qwen 3.5 RoPE settings from rope_scaling
+        if let Some(ref rs) = config.rope_scaling {
+            if config.rope_theta.is_none() {
+                config.rope_theta = rs.get("rope_theta").and_then(|v| v.as_f64());
+            }
+            if config.partial_rotary_factor.is_none() {
+                config.partial_rotary_factor = rs.get("partial_rotary_factor").and_then(|v| match v {
+                    crate::utils::config::RopeScalingValue::Number(n) => Some(*n as f32),
+                    _ => None,
+                });
+            }
+        }
+
+        println!("📌 Model Config: rope_theta={:?}, partial_rotary_factor={:?}", config.rope_theta, config.partial_rotary_factor);
+
+        let tokenizer = TokenizerModel::init(model_path).map_err(candle_core::Error::msg)?;
+        let chat_template = ChatTemplate::init(model_path).map_err(candle_core::Error::msg)?;
+
+        let mut weight_files = vec![];
+        for entry in std::fs::read_dir(model_path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "st" || ext == "safetensors") {
+                weight_files.push(path);
+            }
+        }
+
+        let vb = VarBuilderX::new(&weight_files, dtype, &dev)?;
+        let comm = Rc::new(Comm::default());
+        let progress = Arc::new(RwLock::new(Box::new(crate::utils::progress::NoProgress) as Box<dyn ProgressLike>));
+
+        let is_interleaved = config.rope_scaling.as_ref()
+            .and_then(|s| s.get("mrope_interleaved"))
+            .and_then(|v| match v {
+                crate::utils::config::RopeScalingValue::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .unwrap_or(false);
+
+        // Use exact prefix for language model
+        let qwen3_5 = Qwen3_5ForCausalLM::new_with_prefix(&vb, comm, &config, dtype, is_interleaved, &dev, progress, Some("model.language_model.".to_string()))?;
+
+        // vLLM-compatible KV cache layout
+        let block_size = 16;
+        let max_seq_len = 2048;
+        let num_blocks = (max_seq_len + block_size - 1) / block_size;
+        let num_kv_heads = config.num_key_value_heads;
+        let head_dim = config.head_dim.unwrap_or(config.hidden_size / config.num_attention_heads);
+
+        // Critical: alignment factor for CUDA kernels (8 for BF16)
+        let x = 16 / dtype.size_in_bytes();
+
+        let mut kv_caches = Vec::new();
+        let hybrid = crate::utils::resolve_qwen3_hybrid_config(&config);
+
+        for layer_type in &hybrid.layer_types {
+            if layer_type == "full_attention" {
+                let k_cache = Tensor::zeros((num_blocks, num_kv_heads, head_dim / x, block_size, x), dtype, &dev)?;
+                let v_cache = Tensor::zeros((num_blocks, num_kv_heads, head_dim, block_size), dtype, &dev)?;
+                kv_caches.push((k_cache, v_cache));
+            }
+        }
+
+        let block_indices: Vec<u32> = (0..num_blocks as u32).collect();
+        let block_tables = Tensor::from_vec(block_indices, (1, num_blocks), &dev)?;
+
+        let eos_id = match config.eos_token_id {
+            Some(crate::utils::config::EosTokenId::Single(id)) => id,
+            Some(crate::utils::config::EosTokenId::Multiple(ref ids)) => ids[0],
+            None => 151643,
+        };
+
+        Ok(Self {
+            qwen3_5,
+            tokenizer,
+            chat_template,
+            device: dev,
+            config,
+            kv_caches,
+            block_tables,
+            eos_token_id: eos_id,
+        })
+    }
+
+    pub async fn generate(
+        &mut self,
+        params: ChatCompletionParameters,
+        cancel_flag: Option<Arc<AtomicBool>>,
+        _session_id: Option<String>,
+        _kv_name: Option<String>
+    ) -> Result<String> {
+        let seed = params.seed.unwrap_or(34562) as u64;
+        let mut logit_processor = get_logit_processor(
+            params.temperature.map(|t| t as f32),
+            params.top_p.map(|p| p as f32),
+            None,
+            seed
+        );
+
+        let prompt = self.chat_template.apply_chat_template(&params).map_err(candle_core::Error::msg)?;
+        println!("📝 Rendered Prompt:\n---\n{}\n---", prompt);
+        let mut tokens = self.tokenizer.text_encode_vec(prompt, true).map_err(candle_core::Error::msg)?;
+
+        let mut gen_text = String::new();
+        let max_tokens = params.max_tokens.unwrap_or(128) as usize;
+
+        self.qwen3_5.reset_mamba_cache()?;
+
+        for i in 0..max_tokens {
+            if let Some(ref cancel) = cancel_flag {
+                if cancel.load(Ordering::Relaxed) { break; }
+            }
+
+            let is_prefill = i == 0;
+            let current_seq_len = tokens.len();
+            let current_pos = if is_prefill { 0 } else { current_seq_len - 1 };
+            
+            let input_ids = if is_prefill {
+                Tensor::from_vec(tokens.clone(), (current_seq_len,), &self.device)?
+            } else {
+                Tensor::from_vec(vec![*tokens.last().unwrap()], (1,), &self.device)?
+            };
+
+            let positions = if is_prefill {
+                Tensor::from_vec((0..current_seq_len as i64).collect::<Vec<_>>(), (current_seq_len,), &self.device)?
+            } else {
+                Tensor::from_vec(vec![current_pos as i64], (1,), &self.device)?
+            };
+
+            let cu_seqlens = if is_prefill {
+                Tensor::from_vec(vec![0u32, current_seq_len as u32], (2,), &self.device)?
+            } else {
+                Tensor::from_vec(vec![0u32, 1u32], (2,), &self.device)?
+            };
+
+            let slot_mapping = if is_prefill {
+                Tensor::from_vec((0..current_seq_len as i64).collect::<Vec<_>>(), (current_seq_len,), &self.device)?
+            } else {
+                Tensor::from_vec(vec![current_pos as i64], (1,), &self.device)?
+            };
+
+            let metadata = InputMetadata {
+                is_prefill,
+                slot_mapping: slot_mapping.clone(),
+                mamba_slot_mapping: Some(slot_mapping),
+                cu_seqlens_q: Some(cu_seqlens.clone()),
+                cu_seqlens_k: Some(cu_seqlens),
+                block_tables: Some(self.block_tables.clone()),
+                max_seqlen_q: if is_prefill { current_seq_len } else { 0 },
+                max_seqlen_k: if is_prefill { current_seq_len } else { 0 },
+                context_lens: if is_prefill { None } else { Some(Tensor::from_vec(vec![current_pos as u32], (1,), &self.device)?) },
+                max_context_len: if is_prefill { current_seq_len } else { current_pos },
+                disable_flash_attn: None,
+                seqlens: Some(vec![(current_pos + if is_prefill { current_seq_len } else { 1 }) as u32]),
+                sequence_ids: Some(vec![0]),
+                flashinfer_metadata: None,
+            };
+
+            let logits = self.qwen3_5.forward(
+                &input_ids,
+                &positions,
+                Some(&self.kv_caches),
+                &metadata,
+                false
+            )?;
+
+            let next_token_vec = logit_processor.sample(&logits.flatten_all()?, &None).map_err(candle_core::Error::msg)?;
+            let next_token = next_token_vec[0];
+            if next_token == self.eos_token_id {
+                break;
+            }
+
+            tokens.push(next_token);
+            let decoded = self.tokenizer.token_decode(tokens.clone()).map_err(candle_core::Error::msg)?;
+            // Decode only the new token for display
+            let new_decoded = self.tokenizer.token_decode(vec![next_token]).map_err(candle_core::Error::msg)?;
+            print!("{}", new_decoded);
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            gen_text.push_str(&new_decoded);
+        }
+
+        println!();
+        Ok(gen_text)
+    }
+}

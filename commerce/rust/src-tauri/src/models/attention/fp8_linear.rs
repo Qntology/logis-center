@@ -1,9 +1,9 @@
 #[cfg(feature = "cuda")]
-use crate::models::attention::cuda_utils;
+use crate::cuda_utils;
 #[cfg(feature = "cuda")]
-use crate::models::attention::kernels::ffi;
+use crate::kernels::ffi;
 #[cfg(feature = "metal")]
-use crate::models::attention::metal_kernels;
+use crate::metal_kernels;
 #[cfg(all(feature = "cuda", feature = "flashinfer"))]
 use candle_core::cuda_backend::cudarc::driver::CudaSlice;
 #[cfg(feature = "cuda")]

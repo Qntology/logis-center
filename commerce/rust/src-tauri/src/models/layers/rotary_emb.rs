@@ -157,16 +157,15 @@ impl ScalingRotaryEmbedding {
             } else if let Some(factor) = rope_scaling.get("factor").and_then(|v| v.as_f64()) {
                 cfg.max_position_embeddings as f64 / factor
             } else {
-                // crate::log_warn!(
-                //     "original_max_position_embeddings not found in rope_scaling or cfg"
-                // );
                 cfg.max_position_embeddings as f64
             };
 
             let rope_type = rope_scaling
                 .get("rope_type")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| candle_core::Error::msg("rope_type must be a string"))?;
+                .unwrap_or("default");
+
+            let rope_theta = rope_theta.or(cfg.rope_theta).unwrap_or(10000.0);
 
             let rope_result = match rope_type {
                 "linear" => {
@@ -278,7 +277,7 @@ impl ScalingRotaryEmbedding {
                 }
 
                 "default" => Self(RotaryEmbedding::new(
-                    dtype, cfg, dev, is_rope_i, rope_theta, None, None,
+                    dtype, cfg, dev, is_rope_i, Some(rope_theta), None, None,
                 )?),
 
                 "dynamic" => {
