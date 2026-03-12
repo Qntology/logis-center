@@ -8,7 +8,7 @@ use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, ScalingRotaryEmbed
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use crate::utils::progress::ProgressLike;
-use attention_rs::InputMetadata;
+use crate::models::attention::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::Module;
 use parking_lot::RwLock;

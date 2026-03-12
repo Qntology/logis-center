@@ -1,4 +1,4 @@
-﻿use core::ffi::{c_int, c_long, c_void};
+use core::ffi::{c_int, c_long, c_void};
 #[allow(dead_code)]
 extern "C" {
     pub fn call_reshape_and_cache(
@@ -647,7 +647,7 @@ extern "C" {
     );
 
     pub fn topk_softmax(
-        gating_output: *const f32,      // in竊?[num_tokens, num_experts]
+        gating_output: *const f32,      // in�?[num_tokens, num_experts]
         token_expert_indices: *mut i32, // out: [num_tokens, topk]
         topk_weights: *mut f32,         // out: [num_tokens, topk]
         topk_indices: *mut u32,         // out: [num_tokens, topk]

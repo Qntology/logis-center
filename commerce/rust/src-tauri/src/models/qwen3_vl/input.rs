@@ -120,7 +120,7 @@ impl Qwen3VLImageProcessor {
 }
 
 impl ImageProcessTrait for Qwen3VLImageProcessor {
-    /// ðŸ”¹ Main entry: processes prompt + images together
+    /// ?”¹ Main entry: processes prompt + images together
     fn process_inputs(
         &mut self,
         prompt: &mut String,

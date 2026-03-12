@@ -65,28 +65,30 @@ impl candle_core::InplaceOp2 for ScatterRowsUpdate {
         let src_off = src_layout.start_offset();
         let dst_off = dst_layout.start_offset();
 
+        let dev = dst.device();
+        let stream = *dev.cuda_stream()? as i64;
         let elem_size = src.dtype().size_in_bytes();
         let src_ptr = match &src.slice {
             CudaStorageSlice::BF16(s) => {
-                ((*s.device_ptr() as usize) + src_off * elem_size) as *const core::ffi::c_void
+                (s.device_ptr(dev.cuda_stream()?).0 as usize + src_off * elem_size) as *const core::ffi::c_void
             }
             CudaStorageSlice::F16(s) => {
-                ((*s.device_ptr() as usize) + src_off * elem_size) as *const core::ffi::c_void
+                (s.device_ptr(dev.cuda_stream()?).0 as usize + src_off * elem_size) as *const core::ffi::c_void
             }
             CudaStorageSlice::F32(s) => {
-                ((*s.device_ptr() as usize) + src_off * elem_size) as *const core::ffi::c_void
+                (s.device_ptr(dev.cuda_stream()?).0 as usize + src_off * elem_size) as *const core::ffi::c_void
             }
             _ => candle_core::bail!("Unsupported src dtype for mamba scatter"),
         };
         let dst_ptr = match &dst.slice {
             CudaStorageSlice::BF16(s) => {
-                ((*s.device_ptr() as usize) + dst_off * elem_size) as *mut core::ffi::c_void
+                (s.device_ptr(dev.cuda_stream()?).0 as usize + dst_off * elem_size) as *mut core::ffi::c_void
             }
             CudaStorageSlice::F16(s) => {
-                ((*s.device_ptr() as usize) + dst_off * elem_size) as *mut core::ffi::c_void
+                (s.device_ptr(dev.cuda_stream()?).0 as usize + dst_off * elem_size) as *mut core::ffi::c_void
             }
             CudaStorageSlice::F32(s) => {
-                ((*s.device_ptr() as usize) + dst_off * elem_size) as *mut core::ffi::c_void
+                (s.device_ptr(dev.cuda_stream()?).0 as usize + dst_off * elem_size) as *mut core::ffi::c_void
             }
             _ => candle_core::bail!("Unsupported dst dtype for mamba scatter"),
         };
@@ -104,8 +106,7 @@ impl candle_core::InplaceOp2 for ScatterRowsUpdate {
                 num_rows
             );
         }
-        let slots_ptr = *slots.device_ptr() as *const core::ffi::c_long;
-        let stream = *dst.device().cu_stream() as i64;
+        let slots_ptr = slots.device_ptr(dev.cuda_stream()?).0 as *const core::ffi::c_long;
 
         unsafe {
             match dst.dtype() {
@@ -737,8 +738,8 @@ impl MambaCache {
 
     pub fn reset_all(&mut self) -> Result<()> {
         for layer_idx in 0..self.num_gdn_layers {
-            self.conv_states[layer_idx].zero_()?;
-            self.recurrent_states[layer_idx].zero_()?;
+            self.conv_states[layer_idx].zero_set()?;
+            self.recurrent_states[layer_idx].zero_set()?;
         }
         self.seq_to_slot.clear();
         self.free_slots = (0..self.max_batch_size).rev().collect();

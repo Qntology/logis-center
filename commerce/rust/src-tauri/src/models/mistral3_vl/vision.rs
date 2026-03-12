@@ -174,7 +174,7 @@ impl ApplyRotaryEmbedding for RotaryEmbedding {
         k: &Tensor,
         positions: &Tensor,
     ) -> Result<Option<(Tensor, Tensor)>> {
-        use attention_rs::fused_rope::FusedRope;
+        use crate::models::attention::fused_rope::FusedRope;
         let (_tokens, _h, _n_embd) = q.dims3()?;
         let (_k_tokens, _k_h, _k_embd) = k.dims3()?;
         FusedRope::apply_inplace(q, k, &self.cos, &self.sin, positions, false)?;

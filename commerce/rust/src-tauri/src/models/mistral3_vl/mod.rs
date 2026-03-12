@@ -5,14 +5,14 @@ use crate::models::llama::LLaMaForCausalLM;
 use crate::utils::config::Config;
 use crate::utils::image::ImageData;
 use crate::utils::progress::ProgressLike;
-use attention_rs::InputMetadata;
+use crate::models::attention::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor, D};
 use parking_lot::RwLock;
 use std::rc::Rc;
 use std::sync::Arc;
 mod config;
 mod vision;
-use attention_rs::ops::{NonZeroOp, SplitOp};
+use crate::models::attention::ops::{NonZeroOp, SplitOp};
 pub use config::Mistral3Config;
 use vision::VisionModel;
 
