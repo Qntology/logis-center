@@ -1,5 +1,5 @@
 use anyhow::Result;
-use candle_core::{D, DType, Device, Tensor};
+use candle_core::{D, DType, Device, Tensor, Module, IndexOp};
 use candle_nn::{
     Conv1d, VarBuilder, 
     ops::sigmoid,
@@ -7,7 +7,7 @@ use candle_nn::{
 
 use crate::{
     models::{
-        common::{eager_attention_forward, get_conv1d},
+        common::{eager_attention_forward, get_conv1d, softplus},
         qwen35::config::{Qwen3_5Config, Qwen3_5TextConfig},
     },
     position_embed::rope::{glm_asr_apply_rotary_pos_emb, Qwen3_5TextRotaryEmbedding},
@@ -108,6 +108,7 @@ pub struct Qwen3_5GatedDeltaNet {
     dt_bias: Tensor, cpu_dt_bias: Tensor, a_log: Tensor, cpu_a_log: Tensor,
     norm: Qwen3_5RMSNormGated, out_proj: Qwen3_5Linear, in_proj_qkv: Qwen3_5Linear, in_proj_z: Qwen3_5Linear, in_proj_b: Qwen3_5Linear, in_proj_a: Qwen3_5Linear,
     conv_state_cache: Option<Tensor>, recurrent_state_cache: Option<Tensor>, device: Device,
+    scale: f64,
 }
 
 impl Qwen3_5GatedDeltaNet {
@@ -132,6 +133,7 @@ impl Qwen3_5GatedDeltaNet {
             in_proj_b: Qwen3_5Linear::new(vb.pp("in_proj_b"), h, nv, false)?,
             in_proj_a: Qwen3_5Linear::new(vb.pp("in_proj_a"), h, nv, false)?,
             conv_state_cache: None, recurrent_state_cache: None, device: vb.device().clone(),
+            scale: 1.0 / (dk as f64).sqrt(),
         })
     }
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
@@ -148,10 +150,76 @@ impl Qwen3_5GatedDeltaNet {
         self.norm.clear(); self.out_proj.clear(); self.in_proj_qkv.clear(); self.in_proj_z.clear(); self.in_proj_b.clear(); self.in_proj_a.clear();
         self.device = Device::Cpu;
     }
-    pub fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
-        let xs = if let Some(m) = mask { xs.broadcast_mul(&m.unsqueeze(D::Minus1)?)? } else { xs.clone() };
-        let mixed = self.in_proj_qkv.forward(&xs)?;
-        Ok(self.out_proj.forward(&mixed.silu()?)?)
+    pub fn forward(&mut self, xs: &Tensor, _mask: Option<&Tensor>) -> Result<Tensor> {
+        let (bs, sl, _) = xs.dims3()?;
+        let mixed_qkv = self.in_proj_qkv.forward(xs)?;
+        let z = self.in_proj_z.forward(xs)?;
+        let b = self.in_proj_b.forward(xs)?;
+        let a = self.in_proj_a.forward(xs)?;
+        
+        let q = mixed_qkv.narrow(D::Minus1, 0, self.key_dim)?;
+        let k = mixed_qkv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
+        let v = mixed_qkv.narrow(D::Minus1, self.key_dim * 2, self.value_dim)?;
+        
+        // Conv1D part
+        let qkv = Tensor::cat(&[&q, &k, &v], D::Minus1)?;
+        let qkv = qkv.transpose(1, 2)?; // [bs, dim, sl]
+        let qkv_conv = if sl == 1 && self.conv_state_cache.is_some() {
+            let state = self.conv_state_cache.as_ref().unwrap().to_device(xs.device())?;
+            let state_new = Tensor::cat(&[&state, &qkv], D::Minus1)?;
+            let out = self.conv1d.forward(&state_new)?;
+            self.conv_state_cache = Some(state_new.narrow(D::Minus1, 1, self.conv_kernel_size - 1)?);
+            out
+        } else {
+            let state = qkv.pad_with_zeros(D::Minus1, self.conv_kernel_size - 1, 0)?;
+            let out = self.conv1d.forward(&state)?;
+            self.conv_state_cache = Some(state.narrow(D::Minus1, sl, self.conv_kernel_size - 1)?);
+            out
+        };
+        let qkv_conv = qkv_conv.transpose(1, 2)?.silu()?;
+        
+        let q = qkv_conv.narrow(D::Minus1, 0, self.key_dim)?;
+        let k = qkv_conv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
+        let v = qkv_conv.narrow(D::Minus1, self.key_dim * 2, self.value_dim)?;
+        
+        let q = crate::utils::tensor_utils::l2_normalize(&q.reshape((bs, sl, self.num_k_heads, self.head_k_dim))?, 3)?;
+        let k = crate::utils::tensor_utils::l2_normalize(&k.reshape((bs, sl, self.num_k_heads, self.head_k_dim))?, 3)?;
+        let v = v.reshape((bs, sl, self.num_v_heads, self.head_v_dim))?;
+
+        // Gating
+        let soft_a = softplus(&a.broadcast_add(&self.dt_bias)?)?;
+        let g = self.a_log.exp()?.affine(-1.0, 0.0)?.broadcast_mul(&soft_a)?.exp()?;
+        let beta = sigmoid(&b)?;
+
+        let mut state = self.recurrent_state_cache.take().unwrap_or_else(|| Tensor::zeros((bs, self.num_v_heads, self.head_k_dim, self.head_v_dim), DType::F32, xs.device()).unwrap()).to_device(xs.device())?;
+        let mut outputs = vec![];
+        
+        let q = q.to_dtype(DType::F32)?;
+        let k = k.to_dtype(DType::F32)?;
+        let v = v.to_dtype(DType::F32)?;
+        let g = g.to_dtype(DType::F32)?;
+        let beta = beta.to_dtype(DType::F32)?;
+        let z = z.to_dtype(DType::F32)?;
+
+        for t in 0..sl {
+            let q_t = q.i((.., t, ..))?.broadcast_mul(&Tensor::new(&[self.scale as f32], xs.device())?)?;
+            let k_t = k.i((.., t, ..))?;
+            let v_t = v.i((.., t, ..))?;
+            let g_t = g.i((.., t, ..))?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
+            let beta_t = beta.i((.., t, ..))?.unsqueeze(D::Minus1)?;
+
+            state = state.broadcast_mul(&g_t)?;
+            let kv_mem = state.broadcast_mul(&k_t.unsqueeze(D::Minus1)?)?.sum(D::Minus2)?;
+            let delta = v_t.broadcast_sub(&kv_mem)?.broadcast_mul(&beta_t)?;
+            state = state.broadcast_add(&k_t.unsqueeze(D::Minus1)?.broadcast_mul(&delta.unsqueeze(D::Minus2)?)?)?;
+            
+            outputs.push(state.broadcast_mul(&q_t.unsqueeze(D::Minus1)?)?.sum_keepdim(D::Minus2)?);
+        }
+        self.recurrent_state_cache = Some(state);
+        
+        let out = Tensor::cat(&outputs, 2)?.transpose(1, 2)?.reshape((bs, sl, ()))?;
+        let gated_out = self.norm.forward(&out.to_dtype(xs.dtype())?, Some(&z.to_dtype(xs.dtype())?))?;
+        self.out_proj.forward(&gated_out)
     }
     pub fn clear_cache(&mut self) { self.conv_state_cache = None; self.recurrent_state_cache = None; }
 }
@@ -161,13 +229,15 @@ pub struct Qwen3_5Attention {
     q_norm: Qwen3_5RMSNorm, k_norm: Qwen3_5RMSNorm,
     num_attention_heads: usize, num_key_value_heads: usize, num_kv_groups: usize, head_dim: usize, scaling: f64,
     kv_cache: Option<(Tensor, Tensor)>, device: Device,
+    attn_output_gate: bool,
 }
 
 impl Qwen3_5Attention {
     pub fn new(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
         let h = config.hidden_size; let nh = config.num_attention_heads; let hd = config.head_dim; let nkv = config.num_key_value_heads;
+        let q_out_dim = if config.attn_output_gate { nh * hd * 2 } else { nh * hd };
         Ok(Self {
-            q_proj: Qwen3_5Linear::new(vb.pp("q_proj"), h, nh * hd * 2, config.attention_bias)?,
+            q_proj: Qwen3_5Linear::new(vb.pp("q_proj"), h, q_out_dim, config.attention_bias)?,
             k_proj: Qwen3_5Linear::new(vb.pp("k_proj"), h, nkv * hd, config.attention_bias)?,
             v_proj: Qwen3_5Linear::new(vb.pp("v_proj"), h, nkv * hd, config.attention_bias)?,
             o_proj: Qwen3_5Linear::new(vb.pp("o_proj"), nh * hd, h, config.attention_bias)?,
@@ -175,6 +245,7 @@ impl Qwen3_5Attention {
             k_norm: Qwen3_5RMSNorm::new(vb.pp("k_norm"), hd, config.rms_norm_eps)?,
             num_attention_heads: nh, num_key_value_heads: nkv, num_kv_groups: nh / nkv, head_dim: hd, scaling: 1.0 / (hd as f64).sqrt(),
             kv_cache: None, device: vb.device().clone(),
+            attn_output_gate: config.attn_output_gate,
         })
     }
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
@@ -187,21 +258,39 @@ impl Qwen3_5Attention {
     }
     pub fn forward(&mut self, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let (b, ql, _) = xs.dims3()?;
-        let q = self.q_proj.forward(xs)?.reshape((b, ql, self.num_attention_heads, self.head_dim, 2))?;
-        let q_states = q.narrow(D::Minus1, 0, 1)?.squeeze(D::Minus1)?;
-        let gate = q.narrow(D::Minus1, 1, 1)?.squeeze(D::Minus1)?;
+        let q_raw = self.q_proj.forward(xs)?;
+        
+        let (q_states, gate) = if self.attn_output_gate {
+            let q = q_raw.reshape((b, ql, self.num_attention_heads, self.head_dim, 2))?;
+            let qs = q.narrow(D::Minus1, 0, 1)?.squeeze(D::Minus1)?;
+            let gt = q.narrow(D::Minus1, 1, 1)?.squeeze(D::Minus1)?;
+            (qs, Some(gt))
+        } else {
+            (q_raw.reshape((b, ql, self.num_attention_heads, self.head_dim))?, None)
+        };
+
         let q_states = self.q_norm.forward(&q_states)?.transpose(1, 2)?;
         let k_states = self.k_norm.forward(&self.k_proj.forward(xs)?.reshape((b, ql, self.num_key_value_heads, self.head_dim))?)?.transpose(1, 2)?;
         let v_states = self.v_proj.forward(xs)?.reshape((b, ql, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?;
+        
         let (q_states, k_states) = glm_asr_apply_rotary_pos_emb(&q_states, &k_states, cos, sin, false)?;
+        
         if let Some((pk, pv)) = &self.kv_cache {
             let k = Tensor::cat(&[pk, &k_states], 2)?; let v = Tensor::cat(&[pv, &v_states], 2)?;
             self.kv_cache = Some((k.clone(), v.clone()));
         } else { self.kv_cache = Some((k_states.clone(), v_states.clone())); }
+        
         let (k, v) = self.kv_cache.as_ref().unwrap();
         let out = eager_attention_forward(&q_states, k, v, Some(self.num_kv_groups), mask, self.scaling)?;
-        let out = out.reshape((b, ql, ()))?.mul(&sigmoid(&gate)?)?;
-        Ok(self.o_proj.forward(&out)?)
+        let out = out.reshape((b, ql, self.num_attention_heads, self.head_dim))?;
+        
+        let out = if let Some(gate) = gate {
+            out.mul(&sigmoid(&gate)?)?
+        } else {
+            out
+        };
+        
+        Ok(self.o_proj.forward(&out.reshape((b, ql, ()))?)?)
     }
     pub fn clear_kv_cache(&mut self) { self.kv_cache = None; }
 }

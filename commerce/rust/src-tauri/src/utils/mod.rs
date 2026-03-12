@@ -5,6 +5,10 @@ pub mod paths;
 pub mod compression;
 pub mod resources;
 pub mod direct_loader;
+pub mod config;
+pub mod progress;
+
+pub use config::{resolve_qwen3_hybrid_config, Qwen3HybridConfig};
 
 use candle_core::{Device, DType};
 use anyhow::Result;
