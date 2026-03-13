@@ -48,9 +48,14 @@ impl Qwen3_5GenerateModel {
         
         config.extra_config_json = Some(config_str);
 
-        if let Some(ref rp) = config.rope_parameters {
-            if rp.rope_theta.is_some() { config.rope_theta = rp.rope_theta; }
-            if rp.partial_rotary_factor.is_some() { config.partial_rotary_factor = rp.partial_rotary_factor; }
+        // Official vllm-rs uses rope_scaling instead of rope_parameters
+        if let Some(ref rs) = config.rope_scaling {
+            if let Some(v) = rs.get("rope_theta") {
+                if let Some(theta) = v.as_f64() { config.rope_theta = Some(theta); }
+            }
+            if let Some(v) = rs.get("partial_rotary_factor") {
+                if let Some(factor) = v.as_f64() { config.partial_rotary_factor = Some(factor as f32); }
+            }
         }
         
         let tokenizer = TokenizerModel::init(model_path)?;
@@ -65,11 +70,20 @@ impl Qwen3_5GenerateModel {
             }
         }
         
-        let vb = VarBuilderX::new(&weight_files, dtype, &dev)?;
+        let model_pathes = ModelPaths {
+            tokenizer_filename: model_path_buf.join("tokenizer.json"),
+            tokenizer_config_filename: model_path_buf.join("tokenizer_config.json"),
+            config_filename: model_path_buf.join("config.json"),
+            generation_config_filename: model_path_buf.join("generation_config.json"),
+            filenames: weight_files,
+            chat_template_filename: None,
+        };
+        
+        let vb = VarBuilderX::new(&model_pathes, false, dtype, &dev)?;
         let comm = Rc::new(Comm::default());
         let progress = Arc::new(RwLock::new(Box::new(crate::utils::progress::NoProgress) as Box<dyn ProgressLike>));
         
-        let is_interleaved = config.rope_parameters.as_ref().and_then(|p| p.mrope_interleaved).unwrap_or(false);
+        let is_interleaved = false; // Forced to false to match vllm-rs baseline
         let qwen3_5 = Qwen3_5ForCausalLM::new_with_prefix(&vb, comm, &config, dtype, is_interleaved, &dev, progress, Some("model.language_model.".to_string()))?;
         
         let block_size = 16;
@@ -130,8 +144,11 @@ impl Qwen3_5GenerateModel {
 
         let prompt = self.chat_template.apply_chat_template(&params)?;
         println!("📝 Full Prompt (len={}):\n---\n{}\n---", prompt.len(), prompt);
-        let mut tokens = self.tokenizer.text_encode_vec(prompt, true)?;
+        let mut tokens = self.tokenizer.text_encode_vec(prompt, false)?;
         println!("🔢 Tokenized prompt (len={}): {:?}", tokens.len(), tokens);
+        for (i, t) in tokens.iter().enumerate() {
+            println!("  Token[{}]: {}", i, t);
+        }
         
         let mut gen_text = String::new();
         let max_tokens = params.max_tokens.unwrap_or(128) as usize;

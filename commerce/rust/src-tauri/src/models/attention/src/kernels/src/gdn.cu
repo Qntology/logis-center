@@ -92,7 +92,7 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
     __shared__ float q_buf[BK];
     __shared__ float scalars[2]; // decay, beta_t
 
-    // K1: Load state ??state is [K, V], access pattern state[j * v_dim + v_idx]
+    // K1: Load state — state is [K, V], access pattern state[j * v_dim + v_idx]
     // is non-coalesced. Each thread loads its own column (v_idx is unique per thread).
     float s[BK];
 #pragma unroll
@@ -126,7 +126,7 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
 
         const float delta = (v_t - kv_mem) * beta_t;
 
-        // Load q into shared memory (reuse sync from above ??k_buf consumed)
+        // Load q into shared memory (reuse sync from above — k_buf consumed)
         __syncthreads();
 #pragma unroll
         for (int j = tid; j < BK; j += BV) {
@@ -363,7 +363,7 @@ __global__ void gated_delta_rule_decode_slots_kernel(
     const int64_t slot = slots[b];
     if (slot < 0) return;
 
-    // K3: broadcast scalars via shared memory ??one expf instead of BV
+    // K3: broadcast scalars via shared memory — one expf instead of BV
     extern __shared__ float smem[];
     float* q_smem = smem;                  // [BK]
     float* k_smem = smem + BK;             // [BK]
@@ -384,7 +384,7 @@ __global__ void gated_delta_rule_decode_slots_kernel(
     const float decay = scalars[0];
     const float beta_t = scalars[1];
 
-    // K5: state pointer ??stride v_dim between k elements (non-coalesced)
+    // K5: state pointer — stride v_dim between k elements (non-coalesced)
     // We load into registers; cooperative smem load not beneficial for decode
     // because each thread accesses a different v_idx column.
     T* state_bh = state + (((slot * heads + h) * k_dim) * v_dim + v_idx);
@@ -407,7 +407,7 @@ __global__ void gated_delta_rule_decode_slots_kernel(
     const T* v_bh = v + (bh * v_dim);
     const float delta = (to_float(v_bh[v_idx]) - kv_mem) * beta_t;
 
-    // Load q into shared memory (reuse k_smem space ??k no longer needed)
+    // Load q into shared memory (reuse k_smem space — k no longer needed)
     __syncthreads();
     for (int j = tid; j < k_dim; j += BV) {
         q_smem[j] = to_float(q_bh[j]);
@@ -1383,7 +1383,7 @@ extern "C" void gdn_gated_rmsnorm_silu_mul_bf16_wf32(
 }
 
 // =============================================================================
-// Fused L2 Norm (last dim) ??replaces ~8 Candle kernel launches (S5)
+// Fused L2 Norm (last dim) — replaces ~8 Candle kernel launches (S5)
 // =============================================================================
 
 template <typename T, int WARPS_PER_BLOCK>
@@ -1505,7 +1505,7 @@ extern "C" void l2_norm_last_dim_bf16(
 }
 
 // =============================================================================
-// Batched Varlen Recurrence ??process multiple sequences in one launch (S1)
+// Batched Varlen Recurrence — process multiple sequences in one launch (S1)
 // Accepts native dtype inputs, computes in FP32
 // =============================================================================
 
@@ -1692,4 +1692,3 @@ extern "C" void gated_delta_rule_recurrence_varlen_bf16(
         q, k, v, g, beta, state, slots, out, cu_seqlens,
         batch, num_heads, k_dim, v_dim, stream);
 }
-

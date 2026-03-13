@@ -399,4 +399,3 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale) {
 }  // namespace fp8
 
 }  // namespace vllm
-

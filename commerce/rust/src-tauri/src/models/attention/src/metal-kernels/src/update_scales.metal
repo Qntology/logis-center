@@ -117,4 +117,3 @@ kernel void compute_and_update_scales_per_head_kernel(
 instantiate_compute_and_update_scales_per_head(float)
 instantiate_compute_and_update_scales_per_head(half)
 instantiate_compute_and_update_scales_per_head(bfloat16_t)
-

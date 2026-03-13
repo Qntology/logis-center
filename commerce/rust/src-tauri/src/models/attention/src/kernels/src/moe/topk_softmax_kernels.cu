@@ -545,4 +545,3 @@ extern "C" void topk_softmax(
         stream);
     cudaFreeAsync(softmax_workspace, stream);
 }
-

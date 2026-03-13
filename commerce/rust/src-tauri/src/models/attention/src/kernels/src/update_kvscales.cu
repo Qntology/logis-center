@@ -173,4 +173,3 @@ extern "C" void update_kv_scales_per_head_bf16(
         num_heads, head_dim, k_scales, v_scales, stream_);
 #endif
 }
-

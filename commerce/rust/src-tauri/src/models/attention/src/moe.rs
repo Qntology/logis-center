@@ -119,7 +119,7 @@ pub fn flashinfer_fused_moe(
         candle_core::bail!("flashinfer fused moe: input and weight dtype must match");
     }
     let dev = input.device().as_cuda_device()?;
-    let stream = *dev.cuda_stream() as i64;
+    let stream = *dev.cu_stream() as i64;
 
     let output = Tensor::zeros((num_tokens, hidden_size), input.dtype(), input.device())?;
     let status = unsafe {
@@ -212,7 +212,7 @@ pub fn flashinfer_fused_moe_fp8(
     }
     let input_dtype = cuda_dtype_code(input.dtype())?;
     let dev = input.device().as_cuda_device()?;
-    let stream = *dev.cuda_stream() as i64;
+    let stream = *dev.cu_stream() as i64;
 
     let output = Tensor::zeros(
         (num_tokens, hidden_size),
@@ -1053,4 +1053,3 @@ pub fn moe_gemm_gguf(
 ) -> Result<Tensor> {
     candle_core::bail!("moe_gemm_gguf is not implemented on this platform!")
 }
-

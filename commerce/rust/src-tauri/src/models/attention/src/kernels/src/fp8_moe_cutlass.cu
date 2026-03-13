@@ -739,4 +739,3 @@ extern "C" void moe_fp8_grouped_gemm_bf16(
   printf("moe_fp8_grouped_gemm_bf16 unsupported sm_version %d\n", sm_version);
 }
 
-

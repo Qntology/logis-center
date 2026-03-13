@@ -253,4 +253,3 @@ extern "C" void moe_gemm_gguf_small_m(
     
     cudaFreeAsync(y_q8_1, stream);
 }
-

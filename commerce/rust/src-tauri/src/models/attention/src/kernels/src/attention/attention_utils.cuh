@@ -54,4 +54,3 @@ struct Qk_dot {
 };
 
 } // namespace vllm
-

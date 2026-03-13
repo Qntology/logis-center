@@ -650,4 +650,3 @@ __global__ void paged_attention_v2_reduce_kernel(
 #undef MAX
 #undef MIN
 #undef DIVIDE_ROUND_UP
-

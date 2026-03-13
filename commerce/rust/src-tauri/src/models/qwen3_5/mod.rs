@@ -315,6 +315,7 @@ impl Qwen3_5ForCausalLM {
             && vb.has_key("embed_tokens.weight")
             && !vb.has_key(&format!("{}embed_tokens.weight", prefix))
         {
+            crate::log_error!("This model does not support decoding!");
             prefix.clear();
             Some(true)
         } else {

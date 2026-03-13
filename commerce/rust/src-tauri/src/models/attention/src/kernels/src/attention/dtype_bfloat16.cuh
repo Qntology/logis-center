@@ -459,4 +459,3 @@ inline __device__ void zero(__nv_bfloat16& dst) {
 }
 
 } // namespace vllm
-

@@ -478,4 +478,3 @@ template [[host_name("fp8_gemv_bfloat16")]] [[kernel]] void fp8_gemv_kernel<bflo
     uint simd_lane_id [[ thread_index_in_simdgroup ]]
 );
 #endif
-

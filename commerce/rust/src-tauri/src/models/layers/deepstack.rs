@@ -65,4 +65,3 @@ fn deepstack_process(
 
     hidden_states.scatter_add(&linear_index, &visual_embeds, 0)
 }
-

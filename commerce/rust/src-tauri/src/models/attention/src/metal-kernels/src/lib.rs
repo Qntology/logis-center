@@ -1254,4 +1254,3 @@ pub fn call_fp8_matmul(
     }
     Ok(())
 }
-

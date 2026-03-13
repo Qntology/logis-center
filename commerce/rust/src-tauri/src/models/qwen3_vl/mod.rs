@@ -7,7 +7,10 @@ pub mod input;
 pub mod vision;
 
 use crate::models::layers::VarBuilderX;
+use crate::models::qwen3::Qwen3ForCausalLM;
 use crate::models::qwen3_5::Qwen3_5ForCausalLM;
+use crate::models::qwen3_5_moe::Qwen3_5MoEForCausalLM;
+use crate::models::qwen3_moe::Qwen3MoEForCausalLM;
 use crate::utils::config::Config;
 use crate::utils::progress::ProgressLike;
 use crate::{models::layers::distributed::Comm, utils::image::ImageData};
@@ -18,7 +21,10 @@ use config::Qwen3VLConfig;
 use vision::Qwen3VLVisionModel;
 
 pub enum Qwen3TextModel {
+    Dense(Qwen3ForCausalLM),
+    MoE(Qwen3MoEForCausalLM),
     Dense35(Qwen3_5ForCausalLM),
+    MoE35(Qwen3_5MoEForCausalLM),
 }
 
 #[allow(dead_code)]
@@ -59,24 +65,95 @@ impl Qwen3VLForConditionalGeneration {
             cfg.text_config.quantization_config = cfg.quantization_config.clone();
         }
 
+        let arch = cfg
+            .architectures
+            .unwrap_or(vec!["Qwen3VLForConditionalGeneration".to_string()]);
+        let arch = arch[0].as_str();
         crate::log_info!("Loading language model...");
 
         let mut config_text = config.clone();
         if cfg.quantization_config.is_some() {
             config_text.quantization_config = cfg.quantization_config.clone();
         }
+        let next_is_moe = config_text
+            .moe_cfg
+            .as_ref()
+            .and_then(|m| m.num_experts)
+            .unwrap_or(0)
+            > 0;
 
-        // Qwen3.5 (Qwen2.5) based language model
-        let text_model = Qwen3TextModel::Dense35(Qwen3_5ForCausalLM::new_with_prefix(
-            &vb,
-            comm.clone(),
-            &config_text,
-            dtype,
-            is_rope_i,
-            device,
-            progress_reporter,
-            Some("model.language_model.".to_string()),
-        )?);
+        let text_model = match arch {
+            "Qwen3VLMoeForConditionalGeneration" => {
+                Qwen3TextModel::MoE(Qwen3MoEForCausalLM::new_with_prefix(
+                    &vb,
+                    comm.clone(),
+                    &config_text,
+                    dtype,
+                    is_rope_i,
+                    device,
+                    progress_reporter,
+                    Some("model.language_model.".to_string()),
+                )?)
+            }
+            "Qwen3_5MoeForConditionalGeneration" => {
+                Qwen3TextModel::MoE35(Qwen3_5MoEForCausalLM::new_with_prefix(
+                    &vb,
+                    comm.clone(),
+                    &config_text,
+                    dtype,
+                    is_rope_i,
+                    device,
+                    progress_reporter,
+                    Some("model.language_model.".to_string()),
+                )?)
+            }
+            "Qwen3_5ForConditionalGeneration" => {
+                Qwen3TextModel::Dense35(Qwen3_5ForCausalLM::new_with_prefix(
+                    &vb,
+                    comm.clone(),
+                    &config_text,
+                    dtype,
+                    is_rope_i,
+                    device,
+                    progress_reporter,
+                    Some("model.language_model.".to_string()),
+                )?)
+            }
+            "Qwen3NextForConditionalGeneration" if next_is_moe => {
+                Qwen3TextModel::MoE35(Qwen3_5MoEForCausalLM::new_with_prefix(
+                    &vb,
+                    comm.clone(),
+                    &config_text,
+                    dtype,
+                    is_rope_i,
+                    device,
+                    progress_reporter,
+                    Some("model.language_model.".to_string()),
+                )?)
+            }
+            "Qwen3NextForConditionalGeneration" => {
+                Qwen3TextModel::Dense35(Qwen3_5ForCausalLM::new_with_prefix(
+                    &vb,
+                    comm.clone(),
+                    &config_text,
+                    dtype,
+                    is_rope_i,
+                    device,
+                    progress_reporter,
+                    Some("model.language_model.".to_string()),
+                )?)
+            }
+            _ => Qwen3TextModel::Dense(Qwen3ForCausalLM::new_with_prefix(
+                &vb,
+                comm.clone(),
+                &config_text,
+                dtype,
+                is_rope_i,
+                device,
+                progress_reporter,
+                Some("model.language_model.".to_string()),
+            )?),
+        };
 
         Ok(Self {
             text_model,
@@ -98,7 +175,10 @@ impl Qwen3VLForConditionalGeneration {
         images: Option<&ImageData>,
     ) -> Result<Tensor> {
         let (mut input_embeds, dtype) = match &self.text_model {
+            Qwen3TextModel::Dense(m) => (m.embed_forward(input_ids)?, m.dtype()),
+            Qwen3TextModel::MoE(m) => (m.embed_forward(input_ids)?, m.dtype()),
             Qwen3TextModel::Dense35(m) => (m.embed_forward(input_ids)?, m.dtype()),
+            Qwen3TextModel::MoE35(m) => (m.embed_forward(input_ids)?, m.dtype()),
         };
         let device = input_embeds.device().clone();
         let mut visual_pos_masks: Option<Tensor> = None;
@@ -214,7 +294,34 @@ impl Qwen3VLForConditionalGeneration {
         }
 
         match &self.text_model {
+            Qwen3TextModel::Dense(m) => m.forward_with_deepstack(
+                &input_embeds,
+                &positions,
+                kv_caches,
+                input_metadata,
+                true,
+                &visual_pos_masks,
+                &deepstack_visual_embeds,
+            ),
+            Qwen3TextModel::MoE(m) => m.forward_with_deepstack(
+                &input_embeds,
+                &positions,
+                kv_caches,
+                input_metadata,
+                true,
+                &visual_pos_masks,
+                &deepstack_visual_embeds,
+            ),
             Qwen3TextModel::Dense35(m) => m.forward_with_deepstack(
+                &input_embeds,
+                &positions,
+                kv_caches,
+                input_metadata,
+                true,
+                &visual_pos_masks,
+                &deepstack_visual_embeds,
+            ),
+            Qwen3TextModel::MoE35(m) => m.forward_with_deepstack(
                 &input_embeds,
                 &positions,
                 kv_caches,
@@ -228,20 +335,25 @@ impl Qwen3VLForConditionalGeneration {
 
     pub fn get_vocab_size(&self) -> usize {
         match &self.text_model {
+            Qwen3TextModel::Dense(m) => m.get_vocab_size(),
+            Qwen3TextModel::MoE(m) => m.get_vocab_size(),
             Qwen3TextModel::Dense35(m) => m.get_vocab_size(),
+            Qwen3TextModel::MoE35(m) => m.get_vocab_size(),
         }
     }
 
     pub fn uses_hybrid_mamba_text_model(&self) -> bool {
         matches!(
             &self.text_model,
-            Qwen3TextModel::Dense35(_)
+            Qwen3TextModel::Dense35(_) | Qwen3TextModel::MoE35(_)
         )
     }
 
     pub fn release_sequence_state(&self, sequence_id: usize) {
         match &self.text_model {
             Qwen3TextModel::Dense35(m) => m.release_sequence_state(sequence_id),
+            Qwen3TextModel::MoE35(m) => m.release_sequence_state(sequence_id),
+            _ => {}
         }
     }
 
@@ -253,6 +365,8 @@ impl Qwen3VLForConditionalGeneration {
             Qwen3TextModel::Dense35(m) => {
                 Ok(Some(m.ensure_mamba_slots_for_sequences(sequence_ids)?))
             }
+            Qwen3TextModel::MoE35(m) => Ok(Some(m.ensure_mamba_slots_for_sequences(sequence_ids)?)),
+            _ => Ok(None),
         }
     }
 
@@ -262,48 +376,64 @@ impl Qwen3VLForConditionalGeneration {
     ) -> Result<Option<Vec<usize>>> {
         match &self.text_model {
             Qwen3TextModel::Dense35(m) => Ok(Some(m.get_mamba_slots_for_sequences(sequence_ids)?)),
+            Qwen3TextModel::MoE35(m) => Ok(Some(m.get_mamba_slots_for_sequences(sequence_ids)?)),
+            _ => Ok(None),
         }
     }
 
     pub fn lock_mamba_cache_for_graph(&self) -> Option<RwLockWriteGuard<'_, MambaCache>> {
         match &self.text_model {
             Qwen3TextModel::Dense35(m) => Some(m.lock_mamba_cache_for_graph()),
+            Qwen3TextModel::MoE35(m) => Some(m.lock_mamba_cache_for_graph()),
+            _ => None,
         }
     }
 
     pub fn preallocate_mamba_cache(&self, max_num_seqs: usize) -> Result<()> {
         match &self.text_model {
             Qwen3TextModel::Dense35(m) => m.preallocate_mamba_cache(max_num_seqs),
+            Qwen3TextModel::MoE35(m) => m.preallocate_mamba_cache(max_num_seqs),
+            _ => Ok(()),
         }
     }
 
     pub fn set_mamba_prefix_cache_capacity(&self, capacity: usize) {
         match &self.text_model {
             Qwen3TextModel::Dense35(m) => m.set_mamba_prefix_cache_capacity(capacity),
+            Qwen3TextModel::MoE35(m) => m.set_mamba_prefix_cache_capacity(capacity),
+            _ => {}
         }
     }
 
     pub fn capture_mamba_prefix_state(&self, seq_id: usize, hash: u64) -> Result<bool> {
         match &self.text_model {
             Qwen3TextModel::Dense35(m) => m.capture_mamba_prefix_state(seq_id, hash),
+            Qwen3TextModel::MoE35(m) => m.capture_mamba_prefix_state(seq_id, hash),
+            _ => Ok(true),
         }
     }
 
     pub fn has_mamba_prefix_state(&self, hash: u64) -> bool {
         match &self.text_model {
             Qwen3TextModel::Dense35(m) => m.has_mamba_prefix_state(hash),
+            Qwen3TextModel::MoE35(m) => m.has_mamba_prefix_state(hash),
+            _ => true,
         }
     }
 
     pub fn restore_mamba_prefix_state(&self, seq_id: usize, hash: u64) -> Result<bool> {
         match &self.text_model {
             Qwen3TextModel::Dense35(m) => m.restore_mamba_prefix_state(seq_id, hash),
+            Qwen3TextModel::MoE35(m) => m.restore_mamba_prefix_state(seq_id, hash),
+            _ => Ok(true),
         }
     }
 
     pub fn reset_mamba_cache(&self) -> Result<()> {
         match &self.text_model {
             Qwen3TextModel::Dense35(m) => m.reset_mamba_cache(),
+            Qwen3TextModel::MoE35(m) => m.reset_mamba_cache(),
+            _ => Ok(()),
         }
     }
 }

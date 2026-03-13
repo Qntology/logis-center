@@ -9,7 +9,7 @@ pub mod moe;
 pub mod others;
 pub mod rotary_emb;
 pub mod wna16;
-
+use crate::utils::downloader::ModelPaths;
 use crate::utils::gguf_varbuilder::VarBuilder as QVarBuilder;
 use candle_core::DType;
 use candle_core::{Device, Result, Tensor};
@@ -19,24 +19,34 @@ use either::Either;
 #[derive(Clone)]
 pub struct VarBuilderX<'a>(pub Either<VarBuilder<'a>, QVarBuilder>, pub String);
 
-impl<'a> VarBuilderX<'a> {
+impl VarBuilderX<'_> {
     pub fn new(
-        weight_files: &[std::path::PathBuf],
+        model_pathes: &ModelPaths,
+        is_gguf: bool,
         dtype: DType,
         device: &Device,
     ) -> Result<Self> {
-        let vb = unsafe {
-            candle_nn::var_builder::ShardedSafeTensors::var_builder(
-                weight_files,
-                dtype,
+        assert!(
+            !model_pathes.get_weight_filenames().is_empty(),
+            "No weight files found!"
+        );
+        let weight_files = model_pathes.get_weight_filenames();
+        if is_gguf {
+            let vb = crate::utils::gguf_varbuilder::VarBuilder::from_gguf(
+                weight_files[0].clone(),
                 device,
-            )?
-        };
-        Ok(Self(Either::Left(vb), String::new()))
-    }
-
-    pub fn from_vb(vb: VarBuilder<'a>) -> Self {
-        Self(Either::Left(vb), String::new())
+            )?;
+            Ok(Self(Either::Right(vb), String::new()))
+        } else {
+            let vb = unsafe {
+                candle_nn::var_builder::ShardedSafeTensors::var_builder(
+                    &weight_files,
+                    dtype,
+                    device,
+                )?
+            };
+            Ok(Self(Either::Left(vb), String::new()))
+        }
     }
 
     pub fn is_var_builder(&self) -> bool {
@@ -54,7 +64,7 @@ impl<'a> VarBuilderX<'a> {
         }
     }
 
-    pub fn pp(&self, name: &str) -> VarBuilderX<'a> {
+    pub fn pp(&self, name: &str) -> VarBuilderX<'_> {
         let next_path = if self.1.is_empty() {
             name.to_string()
         } else {
@@ -77,10 +87,6 @@ impl<'a> VarBuilderX<'a> {
         }
     }
 
-    pub fn contains_tensor(&self, name: &str) -> bool {
-        self.has_key(name)
-    }
-
     pub fn get_with_hints_dtype<S: Into<candle_core::Shape>>(
         &self,
         s: S,
@@ -90,18 +96,6 @@ impl<'a> VarBuilderX<'a> {
     ) -> Result<Tensor> {
         match &self.0 {
             Either::Left(vb) => vb.get_with_hints_dtype(s, name, shard, dtype),
-            Either::Right(vb) => vb.get(s, name).and_then(|x| x.dequantize(vb.device())),
-        }
-    }
-
-    pub fn get_with_hints<S: Into<candle_core::Shape>>(
-        &self,
-        s: S,
-        name: &str,
-        shard: candle_nn::var_builder::Shard,
-    ) -> Result<Tensor> {
-        match &self.0 {
-            Either::Left(vb) => vb.get_with_hints(s, name, shard),
             Either::Right(vb) => vb.get(s, name).and_then(|x| x.dequantize(vb.device())),
         }
     }

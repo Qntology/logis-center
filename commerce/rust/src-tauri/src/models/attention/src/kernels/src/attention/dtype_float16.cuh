@@ -500,4 +500,3 @@ inline __device__ void zero(uint16_t& dst) {
 }
 
 } // namespace vllm
-

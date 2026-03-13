@@ -99,4 +99,3 @@ extern "C" void causal_mask_f16(half* d_out,
 
     causal_mask_upper_inf<half><<<grid, block, 0, stream>>>(reinterpret_cast<half*>(d_out), tgt_len, sliding_window);
 }
-

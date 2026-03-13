@@ -579,4 +579,3 @@ void run(Data const& data, void* stream) {
 }  // namespace moe::dev::routing
 
 #endif  // USE_FLASHINFER
-

@@ -459,4 +459,3 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
 }  // namespace tensorrt_llm
 
 #endif  // USE_FLASHINFER
-

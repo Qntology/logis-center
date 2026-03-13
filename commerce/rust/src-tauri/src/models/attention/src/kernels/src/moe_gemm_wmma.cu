@@ -9,7 +9,7 @@
  *  performs matrix multiplication using Tensor Cores (WMMA), and accumulates results
  *  into a shared C tile. The final results are written atomically into the global
  *  output buffer to support multi-expert (top-k > 1) routing where tokens appear in
- *  multiple experts??outputs.
+ *  multiple experts’ outputs.
  * 
  * Copyright (c) 2025, Guoqing Bao.  All rights reserved.
  *

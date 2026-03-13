@@ -276,4 +276,3 @@ inline __device__ void zero(float& dst) {
 }
 
 } // namespace vllm
-

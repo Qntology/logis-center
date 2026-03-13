@@ -586,7 +586,7 @@ void runImpl(Data& data, void* stream) {
 
   // Number of blocks we can use in the cooperative kernel
   // The number of blocks must be:
-  //   >= ??numTokens * topK) / (MaxExpandedIdxPerThread * NumThreads)??
+  //   >= ⌈(numTokens * topK) / (MaxExpandedIdxPerThread * NumThreads)⌉
   //   <= numSms, assuming an occupancy of 1 block/SM
   //
   // If too small for the given numTokens, fall back to the less performant two-step method.
@@ -663,4 +663,3 @@ void run(Data& data, void* stream) { runImpl(data, stream); }
 }  // namespace moe::dev::routing
 
 #endif  // USE_FLASHINFER
-

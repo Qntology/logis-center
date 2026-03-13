@@ -960,4 +960,3 @@ void marlin_matmul(const void* A, const void* B, void* s, void* C, int prob_m, i
 }
 
 #endif
-

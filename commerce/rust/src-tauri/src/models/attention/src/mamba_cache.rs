@@ -65,31 +65,28 @@ impl candle_core::InplaceOp2 for ScatterRowsUpdate {
         let src_off = src_layout.start_offset();
         let dst_off = dst_layout.start_offset();
 
-        let dev = dst.device();
-        let stream = dev.cu_stream();
-        let stream_ptr = *stream as *const _ as i64;
         let elem_size = src.dtype().size_in_bytes();
         let src_ptr = match &src.slice {
             CudaStorageSlice::BF16(s) => {
-                (*s.device_ptr() as usize + src_off * elem_size) as *const core::ffi::c_void
+                ((*s.device_ptr() as usize) + src_off * elem_size) as *const core::ffi::c_void
             }
             CudaStorageSlice::F16(s) => {
-                (*s.device_ptr() as usize + src_off * elem_size) as *const core::ffi::c_void
+                ((*s.device_ptr() as usize) + src_off * elem_size) as *const core::ffi::c_void
             }
             CudaStorageSlice::F32(s) => {
-                (*s.device_ptr() as usize + src_off * elem_size) as *const core::ffi::c_void
+                ((*s.device_ptr() as usize) + src_off * elem_size) as *const core::ffi::c_void
             }
             _ => candle_core::bail!("Unsupported src dtype for mamba scatter"),
         };
         let dst_ptr = match &dst.slice {
             CudaStorageSlice::BF16(s) => {
-                (*s.device_ptr() as usize + dst_off * elem_size) as *mut core::ffi::c_void
+                ((*s.device_ptr() as usize) + dst_off * elem_size) as *mut core::ffi::c_void
             }
             CudaStorageSlice::F16(s) => {
-                (*s.device_ptr() as usize + dst_off * elem_size) as *mut core::ffi::c_void
+                ((*s.device_ptr() as usize) + dst_off * elem_size) as *mut core::ffi::c_void
             }
             CudaStorageSlice::F32(s) => {
-                (*s.device_ptr() as usize + dst_off * elem_size) as *mut core::ffi::c_void
+                ((*s.device_ptr() as usize) + dst_off * elem_size) as *mut core::ffi::c_void
             }
             _ => candle_core::bail!("Unsupported dst dtype for mamba scatter"),
         };
@@ -108,6 +105,7 @@ impl candle_core::InplaceOp2 for ScatterRowsUpdate {
             );
         }
         let slots_ptr = *slots.device_ptr() as *const core::ffi::c_long;
+        let stream = *dst.device().cu_stream() as i64;
 
         unsafe {
             match dst.dtype() {
@@ -119,7 +117,7 @@ impl candle_core::InplaceOp2 for ScatterRowsUpdate {
                     row_elems as i32,
                     src_row_stride,
                     dst_row_stride,
-                    stream_ptr,
+                    stream,
                 ),
                 DType::BF16 => ffi::mamba_scatter_rows_bf16(
                     src_ptr,
@@ -129,7 +127,7 @@ impl candle_core::InplaceOp2 for ScatterRowsUpdate {
                     row_elems as i32,
                     src_row_stride,
                     dst_row_stride,
-                    stream_ptr,
+                    stream,
                 ),
                 DType::F32 => ffi::mamba_scatter_rows_f32(
                     src_ptr,
@@ -139,7 +137,7 @@ impl candle_core::InplaceOp2 for ScatterRowsUpdate {
                     row_elems as i32,
                     src_row_stride,
                     dst_row_stride,
-                    stream_ptr,
+                    stream,
                 ),
                 dtype => candle_core::bail!("Unsupported dtype for mamba scatter: {dtype:?}"),
             }
@@ -211,7 +209,7 @@ pub struct MambaCache {
     recurrent_states: Vec<Tensor>,
     /// Available slot indices
     free_slots: Vec<usize>,
-    /// Mapping: sequence_id -> slot_index
+    /// Mapping: sequence_id → slot_index
     seq_to_slot: HashMap<usize, usize>,
     /// Maximum batch size (number of concurrent sequences)
     max_batch_size: usize,
@@ -233,6 +231,18 @@ struct PrefixStateSnapshot {
 
 impl MambaCache {
     /// Create a new MambaCache for GDN/Mamba layers
+    ///
+    /// Arguments:
+    /// - num_gdn_layers: number of GDN layers in the model
+    /// - max_batch_size: maximum number of concurrent sequences
+    /// - d_conv: convolution dimension (typically intermediate_size)
+    /// - conv_kernel_size: convolution kernel size (typically 4)
+    /// - num_heads: number of GDN attention heads
+    /// - head_k_dim: key head dimension for GDN recurrence state
+    /// - head_v_dim: value head dimension for GDN recurrence state
+    /// - conv_dtype: data type for conv state tensors
+    /// - recurrent_dtype: data type for recurrent state tensors
+    /// - device: computation device
     pub fn new(
         num_gdn_layers: usize,
         max_batch_size: usize,
@@ -277,6 +287,7 @@ impl MambaCache {
     }
 
     /// Allocate a cache slot for a new sequence
+    /// Returns the slot index, or an error if no slots are available
     pub fn allocate_slot(&mut self, seq_id: usize) -> Result<usize> {
         if let Some(&existing) = self.seq_to_slot.get(&seq_id) {
             return Ok(existing);
@@ -293,6 +304,8 @@ impl MambaCache {
                 self.max_batch_size
             ))
         })?;
+        // Defensive reset on allocation so reused slots can never carry stale
+        // state even if prior cleanup failed silently.
         if let Err(err) = self.reset_slot_states(slot) {
             self.free_slots.push(slot);
             candle_core::bail!(
@@ -345,6 +358,9 @@ impl MambaCache {
         Ok(())
     }
 
+    /// Ensure the cache is preallocated for at least `new_max_batch_size` sequences.
+    /// This is intended to be called during engine/model initialization so that
+    /// inference can reuse preallocated state buffers.
     pub fn reserve_capacity(&mut self, new_max_batch_size: usize) -> Result<()> {
         self.expand_capacity(new_max_batch_size)
     }
@@ -369,6 +385,7 @@ impl MambaCache {
             .collect()
     }
 
+    /// Resolve slots for known sequences without allocating new slots.
     pub fn get_slots_for_sequences(&self, seq_ids: &[usize]) -> Result<Vec<usize>> {
         seq_ids
             .iter()
@@ -383,8 +400,10 @@ impl MambaCache {
             .collect()
     }
 
+    /// Free a cache slot when a sequence is done
     pub fn free_slot(&mut self, seq_id: usize) {
         if let Some(slot) = self.seq_to_slot.remove(&seq_id) {
+            // Zero out the state for this slot
             if let Err(err) = self.reset_slot_states(slot) {
                 tracing::error!(
                     "MambaCache: failed to reset slot {} for finished sequence {}: {}",
@@ -392,12 +411,14 @@ impl MambaCache {
                     seq_id,
                     err
                 );
+                // Keep the slot out of free-list if reset fails to avoid stale-state reuse.
                 return;
             }
             self.free_slots.push(slot);
         }
     }
 
+    /// Reset (zero out) all states for a given slot
     fn reset_slot_states(&mut self, slot: usize) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
@@ -464,26 +485,36 @@ impl MambaCache {
         }
     }
 
+    /// Get the conv state tensor for a given GDN layer and slot
+    /// Returns a view of shape [d_conv, conv_kernel_size - 1]
     pub fn get_conv_state(&self, gdn_layer_idx: usize, slot: usize) -> Result<Tensor> {
         self.conv_states[gdn_layer_idx].i(slot)
     }
 
+    /// Get the recurrent state tensor for a given GDN layer and slot
+    /// Returns a view of shape [num_heads, head_dim, head_dim]
     pub fn get_recurrent_state(&self, gdn_layer_idx: usize, slot: usize) -> Result<Tensor> {
         self.recurrent_states[gdn_layer_idx].i(slot)
     }
 
+    /// Get mutable reference to the full conv state tensor for a layer
+    /// Shape: [max_batch, d_conv, conv_kernel_size - 1]
     pub fn conv_state_mut(&mut self, gdn_layer_idx: usize) -> &mut Tensor {
         &mut self.conv_states[gdn_layer_idx]
     }
 
+    /// Get mutable reference to the full recurrent state tensor for a layer
+    /// Shape: [max_batch, num_heads, head_dim, head_dim]
     pub fn recurrent_state_mut(&mut self, gdn_layer_idx: usize) -> &mut Tensor {
         &mut self.recurrent_states[gdn_layer_idx]
     }
 
+    /// Get reference to the full conv state tensor for a layer
     pub fn conv_state(&self, gdn_layer_idx: usize) -> &Tensor {
         &self.conv_states[gdn_layer_idx]
     }
 
+    /// Get reference to the full recurrent state tensor for a layer
     pub fn recurrent_state(&self, gdn_layer_idx: usize) -> &Tensor {
         &self.recurrent_states[gdn_layer_idx]
     }
@@ -516,7 +547,7 @@ impl MambaCache {
         {
             let slots_vec = slots.to_vec1::<i64>()?;
             let conv_dim = self.conv_states[gdn_layer_idx].dim(1)?;
-            let conv_window = self.conv_states[layer_idx].dim(2)?;
+            let conv_window = self.conv_states[gdn_layer_idx].dim(2)?;
             for (i, &slot) in slots_vec.iter().enumerate() {
                 let s = slot as usize;
                 let b_slice = batch_state.narrow(0, i, 1)?;
@@ -573,10 +604,13 @@ impl MambaCache {
         }
     }
 
+    /// Get the slot index for a sequence
     pub fn get_slot(&self, seq_id: usize) -> Option<usize> {
         self.seq_to_slot.get(&seq_id).copied()
     }
 
+    /// Get slotted states for a batch of sequences (for CUDA kernel calls)
+    /// Returns tensors indexed by the slot indices for the given sequence IDs
     pub fn get_batch_indices(&self, seq_ids: &[usize]) -> Result<Vec<usize>> {
         seq_ids
             .iter()

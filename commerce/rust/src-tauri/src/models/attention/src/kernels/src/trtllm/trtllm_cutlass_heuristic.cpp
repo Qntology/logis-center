@@ -774,4 +774,3 @@ CutlassGemmConfig estimate_best_config_from_occupancies(
 }  // namespace tensorrt_llm
 
 #endif  // USE_FLASHINFER
-

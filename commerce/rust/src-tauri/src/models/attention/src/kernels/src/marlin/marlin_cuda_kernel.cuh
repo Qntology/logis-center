@@ -1656,4 +1656,3 @@ void marlin_matmul(const void* A, const void* B, void* scales, void* zeros, void
 
 
 #endif
-

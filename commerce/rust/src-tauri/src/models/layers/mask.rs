@@ -52,4 +52,3 @@ pub fn get_attention_causal_mask(
     }
     Some(vec_mask)
 }
-

@@ -27,4 +27,3 @@ void gpu_topk_topp_sample(
     int* out_tokens_d,       // [B]
     const SamplerParams& p,
     cudaStream_t stream);
-

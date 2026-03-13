@@ -81,4 +81,3 @@ struct Utils {
             throw std::runtime_error(msg); \
         } \
     } while (0)
-

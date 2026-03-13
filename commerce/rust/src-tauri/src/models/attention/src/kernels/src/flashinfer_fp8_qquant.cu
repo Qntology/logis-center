@@ -252,4 +252,3 @@ extern "C" void flashinfer_fp8_quantize_kv_scalar(const void* k_in, const void* 
         static_cast<const __nv_bfloat16*>(v_in), static_cast<uint8_t*>(v_out), numel, v_scale);
   }
 }
-

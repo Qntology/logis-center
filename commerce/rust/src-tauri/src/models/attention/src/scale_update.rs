@@ -194,4 +194,3 @@ pub fn kv_scale_update(
     };
     key.inplace_op2(value, &op)
 }
-

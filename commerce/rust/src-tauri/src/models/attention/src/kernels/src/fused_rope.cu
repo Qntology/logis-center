@@ -1225,4 +1225,3 @@ extern "C" void fused_rope_i_partial_tok_major_bf16(
     );
 #endif
 }
-

@@ -97,4 +97,3 @@ class ScalarType<nv_bfloat16> {
 }  // namespace marlin
 
 #endif
-

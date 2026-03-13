@@ -928,7 +928,7 @@ inline uint8_t float_to_softmax_fp8(float f) {
 //       mant = 0;
 //       ++e_fp8;
 //       if (e_fp8 > EXP_MAX)
-//         return uchar((s << 7) | (((1u << EXP_BITS) - 1u) << MAN_BITS)); // ??
+//         return uchar((s << 7) | (((1u << EXP_BITS) - 1u) << MAN_BITS)); // ∞
 //     }
 //     return uchar((s << 7) | (uint(e_fp8) << MAN_BITS) |
 //                  (mant & ((1u << MAN_BITS) - 1u)));

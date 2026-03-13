@@ -96,7 +96,7 @@ __device__ inline T make_zero() {
  * @param[in]  num_kv_heads    Number of KV heads (can be smaller than query heads if sharing).
  * @param[in]  sm_scale        Scaling factor for q·k (usually 1/sqrt(HEAD_SIZE)).
  * @param[in]  block_tables    [num_seqs, block_table_stride] 
- *                             Maps logical block indices ??physical block indices in cache.
+ *                             Maps logical block indices → physical block indices in cache.
  * @param[in]  seq_lens        [num_seqs] 
  *                             Full sequence lengths (used to find valid context length).
  * @param[in]  block_table_stride Stride for indexing block_tables per sequence.
@@ -557,4 +557,3 @@ extern "C" void paged_attention_prefill(
 #undef MAX
 #undef MIN
 #undef DIVIDE_ROUND_UP
-

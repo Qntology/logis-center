@@ -247,4 +247,3 @@ extern "C" void call_reshape_and_cache_flash(
     }
   }
 }
-

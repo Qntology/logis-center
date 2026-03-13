@@ -818,4 +818,3 @@ impl ReplicatedLinear {
         self.linear.forward(x)
     }
 }
-

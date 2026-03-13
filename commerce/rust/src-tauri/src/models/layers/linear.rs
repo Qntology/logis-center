@@ -231,6 +231,13 @@ impl QLinear {
             let ws = ws.dequantize_f16(&vb.device())?;
             let chunk_size = ws.shape().dims()[shards.dim] / shards.world_size;
             if chunk_size % wdtype.block_size() != 0 {
+                // crate::log_warn!(
+                //     "Invalid dim_size to chunk {} (start {}, size {}) for block_size {}, switching to Q8_0 format!",
+                //     ws.shape().dims()[shards.dim],
+                //     shards.rank * chunk_size,
+                //     chunk_size,
+                //     wdtype.block_size()
+                // );
                 wdtype = GgmlDType::Q8_0;
             }
 
@@ -341,6 +348,7 @@ impl QLinear {
             }
         }
     }
+    //in-situ quantization
     pub fn from_linear_x(linear: Linear, quant: String, dtype: DType) -> Result<Self> {
         use quantized::GgmlDType;
         let ggml_dtype = match quant.as_str() {
@@ -700,6 +708,11 @@ impl LnFp8 {
         shard: Shard,
         quant_cfg: &QuantConfig,
     ) -> Result<Self> {
+        // Expected format:
+        // weight: [out_dim, in_dim]
+        // weight_scale: [out_dim, in_dim // block_size[1]]  (assuming block_size_y = 1)
+        // Or weight_scale: [out_dim // block_size_y, in_dim // block_size_x]
+
         let block_size = quant_cfg
             .weight_block_size
             .clone()
@@ -753,6 +766,7 @@ impl LnFp8 {
         #[cfg(not(feature = "cutlass"))]
         let weight_scale_cutlass = None;
 
+        // Load bias if present
         let bias = vb.get((out_dim,), "bias");
         let bias = if bias.is_ok() {
             let bs = bias.unwrap();
@@ -944,6 +958,8 @@ fn load_ln_fp8_with_hints(
 
 impl Module for LnFp8 {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // x: [Batch, Seq, InDim] or [Batch, InDim]
+        // Flatten inputs to [M, K]
         let (b_sz, seq_len, in_dim) = match x.dims() {
             [b, s, d] => (*b, *s, *d),
             [b, d] => (*b, 1, *d),
@@ -955,6 +971,7 @@ impl Module for LnFp8 {
 
         let x_2d = x.reshape((m, k))?;
 
+        // Call FP8 matmul
         #[cfg(feature = "flashinfer")]
         let can_use_flashinfer_fp8 = (90..100).contains(&self.sm_version)
             && x_2d.dtype() == DType::BF16
@@ -1018,6 +1035,7 @@ impl Module for LnFp8 {
                 &self.weight_block_size,
             )?
         } else {
+            // slower path
             attention_rs::fp8_linear::fp8_matmul(
                 &x_2d,
                 &self.weight,
@@ -1034,6 +1052,7 @@ impl Module for LnFp8 {
             &self.weight_block_size,
         )?;
 
+        // Reshape output back
         let (_, out_dim) = out.dims2()?;
         let out = if seq_len > 1 {
             out.reshape((b_sz, seq_len, out_dim))?
@@ -1041,6 +1060,7 @@ impl Module for LnFp8 {
             out
         };
 
+        // Add bias
         match &self.bias {
             None => Ok(out),
             Some(bias) => out.broadcast_add(bias),

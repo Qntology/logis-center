@@ -793,4 +793,3 @@ extern "C" void fp8_matmul_bf16_cutlass(const uint8_t* input_q,
     }
 #endif
 }
-

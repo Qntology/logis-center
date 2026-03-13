@@ -379,7 +379,7 @@ impl candle::CustomOp1 for FlashInferAppend {
                 v_scale_ptr,
                 is_input_f16,
                 data_type,
-                *dev.cuda_stream() as i64,
+                *dev.cu_stream() as i64,
             );
         }
 
@@ -575,7 +575,7 @@ impl FlashInferDecodeWithPlan {
                 self.logits_soft_cap,
                 data_type,
                 out_data_type,
-                *dev.cuda_stream() as i64,
+                *dev.cu_stream() as i64,
             );
         }
 
@@ -733,7 +733,7 @@ pub fn decode_plan(
             data_type,
             out_data_type,
             plan_info.as_mut_ptr(),
-            *dev.cuda_stream() as i64,
+            *dev.cu_stream() as i64,
         );
     }
 
@@ -946,7 +946,7 @@ impl FlashInferPrefill {
                 self.logits_soft_cap,
                 data_type,
                 out_data_type,
-                *dev.cuda_stream() as i64,
+                *dev.cu_stream() as i64,
             );
         }
 
@@ -1103,7 +1103,7 @@ impl FlashInferRaggedPrefill {
                 false,
                 data_type,
                 out_data_type,
-                *dev.cuda_stream() as i64,
+                *dev.cu_stream() as i64,
             );
         }
         let out = CudaStorage::wrap_cuda_slice(out, dev.clone());
@@ -1197,4 +1197,3 @@ pub fn prefill_ragged(
     };
     q.apply_op1(op)
 }
-

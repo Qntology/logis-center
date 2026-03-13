@@ -79,4 +79,3 @@ extern "C" void mamba_scatter_rows_f32(
   launch_scatter_rows<float>(
       src, dst, slots, num_rows, row_elems, src_row_stride, dst_row_stride, stream);
 }
-

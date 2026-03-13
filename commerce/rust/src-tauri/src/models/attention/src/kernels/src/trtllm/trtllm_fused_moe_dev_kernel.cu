@@ -1009,4 +1009,3 @@ void run(Data const& data, void* stream) {
 }  // namespace moe::dev
 
 #endif  // USE_FLASHINFER
-

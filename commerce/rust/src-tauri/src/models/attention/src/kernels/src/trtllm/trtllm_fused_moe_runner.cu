@@ -564,4 +564,3 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 }  // namespace tensorrt_llm
 
 #endif  // USE_FLASHINFER
-

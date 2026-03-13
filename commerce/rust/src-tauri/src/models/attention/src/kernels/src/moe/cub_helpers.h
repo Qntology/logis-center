@@ -16,4 +16,3 @@ namespace cub = hipcub;
 using CubAddOp = hipcub::Sum;
 using CubMaxOp = hipcub::Max;
 #endif  // USE_ROCM
-

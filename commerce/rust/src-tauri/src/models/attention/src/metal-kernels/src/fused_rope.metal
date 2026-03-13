@@ -436,4 +436,3 @@ kernel void fused_rope_bf16(
     ptr[i1] = x1 * c - x2 * s;
     ptr[i2] = x1 * s + x2 * c;
 }
-

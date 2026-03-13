@@ -1332,4 +1332,3 @@ instantiate_prefill_attention(bfloat16_t, bfloat16_t, "")
 instantiate_prefill_attention(float, uint8_t, "_uint8_t")
 instantiate_prefill_attention(half, uint8_t, "_uint8_t")
 instantiate_prefill_attention(bfloat16_t, uint8_t, "_uint8_t")
-

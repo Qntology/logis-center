@@ -9,4 +9,3 @@ extern "C" void marlin_awq_4bit_f16(const void* A, const void* B, void* scales, 
     marlin_matmul<half, ScalarTypeID::kU4, false, true, 4>(A, B, scales, zeros, g_idx, C, prob_m, prob_k, prob_n, workspace, groupsize, stream);
 }
 #endif
-

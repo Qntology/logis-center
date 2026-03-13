@@ -249,4 +249,3 @@ extern "C" void paged_attention_v2(
 
 #undef WARP_SIZE
 #undef DIVIDE_ROUND_UP
-

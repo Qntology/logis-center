@@ -580,12 +580,12 @@ pub fn get_xd_cos_sin(
     let cos_select: Vec<Tensor> = split_tensor(&cos, &xdrope_section, D::Minus1)?
         .iter()
         .enumerate()
-        .map(|(i, m)| m.i((.., .., i % x_dim)).unwrap())
+        .map(|(i, m): (usize, &Tensor)| m.i((.., .., i % x_dim)).unwrap())
         .collect();
     let sin_select: Vec<Tensor> = split_tensor(&sin, &xdrope_section, D::Minus1)?
         .iter()
         .enumerate()
-        .map(|(i, m)| m.i((.., .., i % x_dim)).unwrap())
+        .map(|(i, m): (usize, &Tensor)| m.i((.., .., i % x_dim)).unwrap())
         .collect();
 
     let cos = Tensor::cat(&cos_select, D::Minus1)?;

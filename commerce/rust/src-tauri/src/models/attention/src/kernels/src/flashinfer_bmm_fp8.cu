@@ -157,4 +157,3 @@ extern "C" int flashinfer_fp8_blockscale_fp8(const void*, const float*, const vo
 }
 
 #endif
-

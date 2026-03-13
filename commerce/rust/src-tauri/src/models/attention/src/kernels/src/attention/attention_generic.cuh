@@ -62,4 +62,3 @@ inline __device__ void zero(T& dst) {
 }
 
 } // namespace vllm
-

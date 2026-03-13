@@ -601,4 +601,3 @@ extern "C" void paged_attention_prefill_opt(
 #undef MAX
 #undef MIN
 #undef DIVIDE_ROUND_UP
-

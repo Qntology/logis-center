@@ -462,4 +462,3 @@ extern "C" void sampling_bf16(
     }
   #endif
 }
-

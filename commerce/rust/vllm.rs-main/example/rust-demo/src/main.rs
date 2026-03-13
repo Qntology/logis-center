@@ -4,7 +4,7 @@ use vllm_rs::utils::{config::SamplingParams, log_throughput};
 
 fn main() -> anyhow::Result<()> {
     // Need to leak the string to satisfy &'static str requirement in ModelRepo
-    let model_path: &'static str = Box::leak("../../../src-tauri/models/Qwen3.5-0.8B-Split".to_string().into_boxed_str());
+    let model_path: &'static str = Box::leak("../../../src-tauri/models/Qwen3.5-0.8B-Full".to_string().into_boxed_str());
     
     let mut engine = EngineBuilder::new(ModelRepo::ModelPath(model_path)).build()?;
 

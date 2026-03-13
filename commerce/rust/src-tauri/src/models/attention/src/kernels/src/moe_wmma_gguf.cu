@@ -449,4 +449,3 @@ extern "C" void moe_gemm_gguf_prefill(
     cudaFreeAsync(expert_counts, stream);
     cudaFreeAsync(expert_offsets, stream);
 }
-

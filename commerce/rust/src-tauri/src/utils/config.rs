@@ -1,6 +1,10 @@
 // src/utils/config.rs
-use serde::{Deserialize, Serialize};
+use crate::transfer::PdConfig;
+#[cfg(feature = "python")]
+use pyo3::pyclass;
+use serde::de::value::SeqAccessDeserializer;
 use serde::de::{Deserializer, Visitor};
+use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -15,63 +19,115 @@ impl<'de> Deserialize<'de> for EosTokenId {
     where
         D: Deserializer<'de>,
     {
-        struct EosTokenIdVisitor;
+        if deserializer.is_human_readable() {
+            // For JSON: deserialize as "untagged" using a visitor
+            struct EosTokenIdVisitor;
 
-        impl<'de> Visitor<'de> for EosTokenIdVisitor {
-            type Value = EosTokenId;
+            impl<'de> Visitor<'de> for EosTokenIdVisitor {
+                type Value = EosTokenId;
 
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a u32 or a sequence of u32s")
+                fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                    formatter.write_str("a u32 or a sequence of u32s")
+                }
+
+                // Handle a single number
+                fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+                    Ok(EosTokenId::Single(v as u32))
+                }
+
+                // Handle an array of numbers
+                fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+                where
+                    A: serde::de::SeqAccess<'de>,
+                {
+                    let vals = Vec::<u32>::deserialize(SeqAccessDeserializer::new(seq))?;
+                    Ok(EosTokenId::Multiple(vals))
+                }
             }
 
-            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
-                Ok(EosTokenId::Single(v as u32))
-            }
-
-            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                let vals = Vec::<u32>::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
-                Ok(EosTokenId::Multiple(vals))
-            }
+            deserializer.deserialize_any(EosTokenIdVisitor)
+        } else {
+            // For Bincode: deserialize as "tagged"
+            let bincode_id = BincodeEosTokenId::deserialize(deserializer)?;
+            let id = match bincode_id {
+                BincodeEosTokenId::Single(v) => EosTokenId::Single(v),
+                BincodeEosTokenId::Multiple(v) => EosTokenId::Multiple(v),
+            };
+            Ok(id)
         }
-
-        deserializer.deserialize_any(EosTokenIdVisitor)
     }
 }
 
 impl Serialize for EosTokenId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: serde::Serializer,
+        S: Serializer,
     {
-        match self {
-            EosTokenId::Single(v) => v.serialize(serializer),
-            EosTokenId::Multiple(v) => v.serialize(serializer),
+        if serializer.is_human_readable() {
+            // For JSON: serialize as "untagged"
+            match self {
+                EosTokenId::Single(v) => v.serialize(serializer),
+                EosTokenId::Multiple(v) => v.serialize(serializer),
+            }
+        } else {
+            // For Bincode: serialize as "tagged"
+            let bincode_id = match self {
+                EosTokenId::Single(v) => BincodeEosTokenId::Single(*v),
+                EosTokenId::Multiple(v) => BincodeEosTokenId::Multiple(v.clone()),
+            };
+            bincode_id.serialize(serializer)
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum ModelType {
-    Qwen3,
-    Qwen3_5,
-    Qwen3_5MoE,
-    Qwen3MoE,
-    Qwen3VL,
-    LLaMa,
-    Mistral3VL,
-    GLM4,
-    GLM4MoE,
-    Phi4,
-    Gemma3,
+impl EosTokenId {
+    /// Merge `other` into `self`, returning the combined token set.
+    /// - Single + Single => Multiple([a, b])
+    /// - Single + Multiple => Multiple([a, ...])
+    /// - Multiple + Single => Multiple([... , b])
+    /// - Multiple + Multiple => Multiple([... , ...])
+    pub fn merge(self, other: EosTokenId) -> EosTokenId {
+        let mut out = self.into_vec();
+        out.extend(other.into_vec());
+        EosTokenId::Multiple(out)
+    }
+
+    /// Like merge, but de-duplicates while preserving first-seen order.
+    pub fn merge_dedup(self, other: EosTokenId) -> EosTokenId {
+        use std::collections::HashSet;
+
+        let mut seen = HashSet::<u32>::new();
+        let mut out = Vec::<u32>::new();
+
+        for id in self.into_vec().into_iter().chain(other.into_vec()) {
+            if seen.insert(id) {
+                out.push(id);
+            }
+        }
+        EosTokenId::Multiple(out)
+    }
+
+    fn into_vec(self) -> Vec<u32> {
+        match self {
+            EosTokenId::Single(x) => vec![x],
+            EosTokenId::Multiple(v) => v,
+        }
+    }
+}
+
+// To make the "tagged" logic work for bincode, we need a separate
+// definition of the enum with derived traits. We keep it private inside this module.
+#[derive(Serialize, Deserialize)]
+enum BincodeEosTokenId {
+    Single(u32),
+    Multiple(Vec<u32>),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MoEConfig {
     pub moe_intermediate_size: usize,
     pub shared_expert_intermediate_size: Option<usize>,
+    #[serde(alias = "n_routed_experts")]
     pub num_experts: Option<usize>,
     pub mlp_only_layers: Option<Vec<usize>>,
     pub decoder_sparse_step: Option<usize>,
@@ -95,41 +151,17 @@ pub enum RopeScalingValue {
 impl RopeScalingValue {
     pub fn as_f64(&self) -> Option<f64> {
         match self {
-            Self::Number(v) => Some(*v),
+            RopeScalingValue::Number(v) => Some(*v),
             _ => None,
         }
     }
+
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Self::String(v) => Some(v.as_str()),
+            RopeScalingValue::String(v) => Some(v),
             _ => None,
         }
     }
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
-pub struct QuantConfig {
-    pub quant_method: String,
-    #[serde(default)]
-    pub bits: usize,
-    #[serde(default)]
-    pub group_size: i32,
-    pub sym: Option<bool>,
-    pub desc_act: Option<bool>,
-    pub checkpoint_format: Option<String>,
-    pub fmt: Option<String>,
-    pub weight_block_size: Option<Vec<usize>>,
-    #[serde(default, alias = "ignore")]
-    pub modules_to_not_convert: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct RopeParameters {
-    pub rope_type: Option<String>,
-    pub rope_theta: Option<f64>,
-    pub partial_rotary_factor: Option<f32>,
-    pub mrope_interleaved: Option<bool>,
-    pub mrope_section: Option<Vec<usize>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -159,180 +191,254 @@ pub struct Config {
     pub sliding_window: Option<usize>,
     pub max_window_layers: Option<usize>,
     pub partial_rotary_factor: Option<f32>,
+    #[serde(alias = "hidden_activation")]
     pub hidden_act: candle_nn::Activation,
+    #[serde(alias = "rope_parameters")]
     pub rope_scaling: Option<HashMap<String, RopeScalingValue>>,
-    pub rope_parameters: Option<RopeParameters>,
-    pub mamba_ssm_dtype: Option<String>,
     pub quant: Option<String>,
     pub moe_cfg: Option<MoEConfig>,
     pub fp8_kvcache: Option<bool>,
     pub quantization_config: Option<QuantConfig>,
     pub is_multi_model: Option<bool>,
     pub extra_config_json: Option<String>,
-    
-    // Hybrid configuration fields (directly from text_config)
-    pub layer_types: Option<Vec<String>>,
-    pub linear_conv_kernel_dim: Option<usize>,
-    pub full_attention_interval: Option<usize>,
-    pub linear_num_heads: Option<usize>,
-    pub linear_num_key_heads: Option<usize>,
-    pub linear_num_value_heads: Option<usize>,
-    pub linear_key_head_dim: Option<usize>,
-    pub linear_value_head_dim: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Qwen3HybridRawConfig {
-    #[serde(alias = "layer_types")]
-    pub layers_block_type: Option<Vec<String>>,
-    #[serde(alias = "linear_conv_kernel_dim")]
-    pub conv_kernel_size: Option<usize>,
-    pub full_attention_interval: Option<usize>,
-    pub linear_num_heads: Option<usize>,
-    #[serde(alias = "linear_num_key_heads")]
-    pub linear_num_key_heads: Option<usize>,
-    #[serde(alias = "linear_num_value_heads")]
-    pub linear_num_value_heads: Option<usize>,
-    pub linear_num_key_value_heads: Option<usize>,
-    pub linear_key_head_dim: Option<usize>,
-    pub linear_value_head_dim: Option<usize>,
-}
+impl Config {
+    pub fn apply_generation_cfg(&mut self, generation_cfg: Option<&GenerationConfig>) {
+        let Some(gcfg) = generation_cfg else { return };
 
-#[derive(Debug, Clone)]
-pub struct Qwen3HybridConfig {
-    pub layer_types: Vec<String>,
-    pub conv_kernel_size: usize,
-    pub num_v_heads: usize,
-    pub num_k_heads: usize,
-    pub key_head_dim: usize,
-    pub value_head_dim: usize,
-}
+        // BOS merge (fill if missing; config wins)
+        if self.bos_token_id.is_none() {
+            self.bos_token_id = gcfg.bos_token_id;
+        }
 
-pub fn is_qwen3_hybrid_arch_name(arch: &str) -> bool {
-    matches!(
-        arch,
-        "Qwen3_5ForCausalLM"
-            | "Qwen3NextForCausalLM"
-            | "Qwen3_5ForConditionalGeneration"
-            | "Qwen3NextForConditionalGeneration"
-    )
-}
-
-fn is_qwen3_hybrid_arch(config: &Config) -> bool {
-    let arch = config.architectures.as_ref().and_then(|a| a.first());
-    arch.map(|a| is_qwen3_hybrid_arch_name(a)).unwrap_or(false)
-}
-
-fn qwen3_hybrid_raw_from_extra_config(config: &Config) -> Option<Qwen3HybridRawConfig> {
-    if !is_qwen3_hybrid_arch(config) {
-        return None;
+        // EOS merge (combine if both present)
+        self.eos_token_id = match (self.eos_token_id.take(), gcfg.eos_token_id.as_ref()) {
+            (None, None) => None,
+            (None, Some(e)) => Some(e.clone()),
+            (Some(e), None) => Some(e),
+            (Some(e), Some(other)) => Some(e.merge(other.clone())),
+        };
     }
-    
-    if let Some(extra) = config.extra_config_json.as_ref() {
-        if let Ok(root) = serde_json::from_str::<serde_json::Value>(extra) {
-            let cfg = root.get("text_config").cloned().unwrap_or(root);
-            if let Ok(raw) = serde_json::from_value::<Qwen3HybridRawConfig>(cfg) {
-                return Some(raw);
-            }
+}
+#[cfg(not(feature = "python"))]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EngineConfig {
+    pub model_id: Option<String>,
+    pub weight_path: Option<String>,
+    pub weight_file: Option<String>,
+    pub enforce_parser: Option<String>,
+    pub hf_token: Option<String>,
+    pub hf_token_path: Option<String>,
+    pub num_blocks: usize,
+    pub kv_fraction: Option<f32>, // After loading the model, the remaining percent of gpu used for kvcache
+    pub mamba_fraction: Option<f32>, // Percent of cache budget reserved for hybrid mamba states
+    pub cpu_mem_fold: Option<f32>, // the percentage of gpu kvcache: 0.1x to 10x, default 1.0x
+    pub kvcache_memory_bytes: usize,
+    #[serde(default)]
+    pub mamba_memory_bytes: usize,
+    #[serde(default)]
+    pub mamba_slot_bytes: usize,
+    #[serde(default)]
+    pub mamba_cache_capacity: Option<usize>,
+    pub block_size: usize,
+    pub max_num_seqs: usize,
+    pub max_num_batched_tokens: usize,
+    pub config_model_len: Option<usize>,
+    pub max_model_len: Option<usize>,
+    pub max_tokens: Option<usize>,
+    pub isq: Option<String>,
+    pub num_shards: Option<usize>,
+    pub device_ids: Option<Vec<usize>>,
+    pub generation_cfg: Option<GenerationConfig>,
+    pub seed: Option<u64>,
+    pub prefix_cache: Option<bool>,
+    pub prefix_cache_max_tokens: Option<usize>,
+    pub fp8_kvcache: Option<bool>,
+    pub server_mode: Option<bool>,
+    pub pd_config: Option<PdConfig>,
+    pub mcp_command: Option<String>,
+    pub mcp_config: Option<String>,
+    pub mcp_args: Option<Vec<String>>,
+    pub tool_prompt_template: Option<String>,
+    pub pd_server_prefix_cache_ratio: Option<f32>,
+    pub pd_client_prefix_cache_ratio: Option<f32>,
+}
+
+#[cfg(feature = "python")]
+#[pyclass]
+#[allow(unused_variables)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EngineConfig {
+    #[pyo3(get, set)]
+    pub model_id: Option<String>,
+    #[pyo3(get, set)]
+    pub weight_path: Option<String>,
+    #[pyo3(get, set)]
+    pub weight_file: Option<String>,
+    #[pyo3(get, set)]
+    pub enforce_parser: Option<String>,
+    #[pyo3(get, set)]
+    pub hf_token: Option<String>,
+    #[pyo3(get, set)]
+    pub hf_token_path: Option<String>,
+    #[pyo3(get, set)]
+    pub num_blocks: usize,
+    #[pyo3(get, set)]
+    pub cpu_mem_fold: Option<f32>,
+    #[pyo3(get, set)]
+    pub kv_fraction: Option<f32>,
+    #[pyo3(get, set)]
+    pub mamba_fraction: Option<f32>,
+    pub block_size: usize,
+    pub kvcache_memory_bytes: usize,
+    #[serde(default)]
+    pub mamba_memory_bytes: usize,
+    #[serde(default)]
+    pub mamba_slot_bytes: usize,
+    #[pyo3(get, set)]
+    pub mamba_cache_capacity: Option<usize>,
+    #[pyo3(get, set)]
+    pub max_num_seqs: usize,
+    #[pyo3(get, set)]
+    pub max_num_batched_tokens: usize,
+    #[pyo3(get, set)]
+    pub max_model_len: Option<usize>,
+    #[pyo3(get, set)]
+    pub config_model_len: Option<usize>,
+    #[pyo3(get, set)]
+    pub max_tokens: Option<usize>,
+    #[pyo3(get, set)]
+    pub isq: Option<String>,
+    #[pyo3(get, set)]
+    pub num_shards: Option<usize>,
+    #[pyo3(get, set)]
+    pub device_ids: Option<Vec<usize>>,
+    #[pyo3(get, set)]
+    pub generation_cfg: Option<GenerationConfig>,
+    #[pyo3(get, set)]
+    pub seed: Option<u64>,
+    #[pyo3(get, set)]
+    pub prefix_cache: Option<bool>,
+    #[pyo3(get, set)]
+    pub prefix_cache_max_tokens: Option<usize>,
+    #[pyo3(get, set)]
+    pub fp8_kvcache: Option<bool>,
+    #[pyo3(get, set)]
+    pub server_mode: Option<bool>,
+    #[pyo3(get, set)]
+    pub pd_config: Option<PdConfig>,
+    #[pyo3(get, set)]
+    pub mcp_command: Option<String>,
+    #[pyo3(get, set)]
+    pub mcp_config: Option<String>,
+    #[pyo3(get, set)]
+    pub mcp_args: Option<Vec<String>>,
+    #[pyo3(get, set)]
+    pub tool_prompt_template: Option<String>,
+    #[pyo3(get, set)]
+    pub pd_server_prefix_cache_ratio: Option<f32>,
+    #[pyo3(get, set)]
+    pub pd_client_prefix_cache_ratio: Option<f32>,
+}
+
+#[cfg(not(feature = "python"))]
+impl EngineConfig {
+    pub fn new(
+        model_id: Option<String>,
+        weight_path: Option<String>,
+        weight_file: Option<String>,
+        hf_token: Option<String>,
+        hf_token_path: Option<String>,
+        enforce_parser: Option<String>,
+        max_num_seqs: Option<usize>,
+        config_model_len: Option<usize>,
+        max_model_len: Option<usize>,
+        max_tokens: Option<usize>,
+        isq: Option<String>,
+        num_shards: Option<usize>,
+        device_ids: Option<Vec<usize>>,
+        generation_cfg: Option<GenerationConfig>,
+        seed: Option<u64>,
+        prefix_cache: Option<bool>,
+        prefix_cache_max_tokens: Option<usize>,
+        fp8_kvcache: Option<bool>,
+        server_mode: Option<bool>,
+        cpu_mem_fold: Option<f32>,
+        kv_fraction: Option<f32>,
+        mamba_fraction: Option<f32>,
+        pd_config: Option<PdConfig>,
+        mcp_command: Option<String>,
+        mcp_config: Option<String>,
+        mcp_args: Option<Vec<String>>,
+        tool_prompt_template: Option<String>,
+        pd_server_prefix_cache_ratio: Option<f32>,
+        pd_client_prefix_cache_ratio: Option<f32>,
+    ) -> Self {
+        let mut device_ids = device_ids.unwrap_or_default();
+        if device_ids.is_empty() {
+            device_ids.push(0);
+        }
+
+        if prefix_cache.unwrap_or(false)
+            && fp8_kvcache.unwrap_or(false)
+            && (cfg!(feature = "flashinfer") || cfg!(feature = "flashattn"))
+        {
+            panic!("Error: prefix-cache and fp8 kvcache are not compatible under the current settings!\n\t***Tips: use only one of the two features (`--fp8-kvcache` or `--prefix-cache`).");
+        }
+
+        Self {
+            model_id,
+            weight_path,
+            weight_file,
+            hf_token,
+            hf_token_path,
+            enforce_parser,
+            num_blocks: 128, //placeholder
+            cpu_mem_fold,
+            kv_fraction,
+            mamba_fraction,
+            kvcache_memory_bytes: 0, //placeholder
+            mamba_memory_bytes: 0,
+            mamba_slot_bytes: 0,
+            mamba_cache_capacity: None,
+            block_size: 64,
+            max_num_seqs: max_num_seqs.unwrap_or(32),
+            max_num_batched_tokens: max_num_seqs.unwrap_or(32) * 1024, //placeholder
+            config_model_len,
+            max_model_len, //placeholder
+            max_tokens,
+            isq,
+            num_shards,
+            device_ids: Some(device_ids),
+            generation_cfg,
+            seed,
+            prefix_cache,
+            prefix_cache_max_tokens,
+            fp8_kvcache,
+            server_mode,
+            pd_config,
+            mcp_command,
+            mcp_config,
+            mcp_args,
+            tool_prompt_template,
+            pd_server_prefix_cache_ratio,
+            pd_client_prefix_cache_ratio,
         }
     }
-    
-    None
 }
 
-pub fn resolve_qwen3_hybrid_config(config: &Config) -> Qwen3HybridConfig {
-    let raw_cfg = qwen3_hybrid_raw_from_extra_config(config).unwrap_or_default();
-
-    let mut layer_types = if let Some(layer_types) = raw_cfg.layers_block_type {
-        layer_types
-    } else if let Some(interval) = raw_cfg.full_attention_interval {
-        if interval > 0 {
-            (0..config.num_hidden_layers)
-                .map(|idx| {
-                    if (idx + 1) % interval == 0 {
-                        "full_attention".to_string()
-                    } else {
-                        "linear_attention".to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-        } else {
-            vec!["full_attention".to_string(); config.num_hidden_layers]
-        }
-    } else {
-        vec!["full_attention".to_string(); config.num_hidden_layers]
-    };
-
-    for layer_type in layer_types.iter_mut() {
-        if layer_type == "attention" {
-            *layer_type = "full_attention".to_string();
-        }
-    }
-    if layer_types.len() != config.num_hidden_layers {
-        layer_types = vec!["full_attention".to_string(); config.num_hidden_layers];
-    }
-
-    let num_v_heads = raw_cfg
-        .linear_num_value_heads
-        .or(raw_cfg.linear_num_heads)
-        .unwrap_or(config.num_attention_heads);
-    let num_k_heads = raw_cfg
-        .linear_num_key_heads
-        .or(raw_cfg.linear_num_key_value_heads)
-        .unwrap_or(num_v_heads);
-    let key_head_dim = raw_cfg.linear_key_head_dim.unwrap_or(
-        config
-            .head_dim
-            .unwrap_or(config.hidden_size / config.num_attention_heads),
-    );
-    let value_head_dim = raw_cfg.linear_value_head_dim.unwrap_or(key_head_dim);
-
-    Qwen3HybridConfig {
-        layer_types,
-        conv_kernel_size: raw_cfg.conv_kernel_size.unwrap_or(4),
-        num_v_heads,
-        num_k_heads,
-        key_head_dim,
-        value_head_dim,
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 pub struct TokenizerConfig {
     pub model_max_length: Option<f64>,
     pub add_bos_token: Option<bool>,
     pub add_eos_token: Option<bool>,
     pub chat_template: Option<String>,
-    pub bos_token: Option<serde_json::Value>,
-    pub eos_token: Option<serde_json::Value>,
+    pub bos_token: Option<String>,
+    pub eos_token: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EngineConfig {
-    pub model_id: String,
-    pub weight_path: Option<String>,
-    pub weight_file: Option<String>,
-    pub hf_token: Option<String>,
-    pub hf_token_path: Option<String>,
-    pub isq: Option<String>,
-    pub device_ids: Option<Vec<usize>>,
-    pub num_shards: Option<usize>,
-    pub config_model_len: Option<usize>,
-    pub max_model_len: Option<usize>,
-    pub generation_cfg: Option<GenerationConfig>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GenerationConfig {
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    pub top_k: Option<usize>,
-    pub frequency_penalty: Option<f32>,
-    pub presence_penalty: Option<f32>,
-    pub bos_token_id: Option<usize>,
-    pub eos_token_id: Option<usize>,
-}
-
+#[cfg(not(feature = "python"))]
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SamplingParams {
     pub temperature: Option<f32>,
@@ -348,7 +454,166 @@ pub struct SamplingParams {
     #[serde(skip)]
     pub stop_token_ids: Option<Vec<Vec<u32>>>,
     #[serde(alias = "enable_thinking")]
-    pub thinking: Option<bool>,
+    pub thinking: Option<bool>, // enable reasoning
+    /// Tool mode for tool call handling.
+    /// If Some(true), external tools are enabled and stream finishes at </tool_call>.
     #[serde(default)]
     pub mcp_mode: Option<bool>,
+}
+
+#[cfg(feature = "python")]
+#[pyclass]
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SamplingParams {
+    #[pyo3(get, set)]
+    pub temperature: Option<f32>,
+    #[pyo3(get, set)]
+    pub max_tokens: Option<usize>,
+    #[pyo3(get, set)]
+    pub ignore_eos: bool,
+    #[pyo3(get, set)]
+    pub top_k: Option<isize>,
+    #[pyo3(get, set)]
+    pub top_p: Option<f32>,
+    #[pyo3(get, set)]
+    pub session_id: Option<String>,
+    #[pyo3(get, set)]
+    pub frequency_penalty: Option<f32>,
+    #[pyo3(get, set)]
+    pub presence_penalty: Option<f32>,
+    #[pyo3(get, set)]
+    #[serde(default)]
+    pub stop_sequences: Option<Vec<String>>,
+    #[serde(skip)]
+    pub stop_token_ids: Option<Vec<Vec<u32>>>,
+    /// Tool mode for tool call handling.
+    /// If Some(true), external tools are enabled and stream finishes at </tool_call>.
+    #[pyo3(get, set)]
+    pub mcp_mode: Option<bool>,
+    #[pyo3(get, set)]
+    #[serde(alias = "enable_thinking")]
+    pub thinking: Option<bool>,
+}
+
+#[cfg(not(feature = "python"))]
+impl SamplingParams {
+    pub fn new(
+        temperature: Option<f32>,
+        max_tokens: Option<usize>,
+        ignore_eos: Option<bool>,
+        top_k: Option<isize>,
+        top_p: Option<f32>,
+        session_id: Option<String>,
+        frequency_penalty: Option<f32>,
+        presence_penalty: Option<f32>,
+        thinking: Option<bool>,
+    ) -> Self {
+        Self {
+            temperature,
+            max_tokens,
+            ignore_eos: ignore_eos.unwrap_or(false),
+            top_k,
+            top_p,
+            session_id,
+            frequency_penalty,
+            presence_penalty,
+            mcp_mode: None,
+            stop_sequences: None,
+            stop_token_ids: None,
+            thinking,
+        }
+    }
+
+    pub fn new_with_max_tokens(max_tokens: usize) -> Self {
+        Self {
+            temperature: None,
+            max_tokens: Some(max_tokens),
+            ignore_eos: false,
+            top_k: None,
+            top_p: None,
+            session_id: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            mcp_mode: None,
+            stop_sequences: None,
+            stop_token_ids: None,
+            thinking: None,
+        }
+    }
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self {
+            temperature: None,
+            max_tokens: Some(16384),
+            ignore_eos: false,
+            top_k: None,
+            top_p: None,
+            session_id: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            mcp_mode: None,
+            stop_sequences: None,
+            stop_token_ids: None,
+            thinking: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum ModelType {
+    Qwen3,
+    Qwen3MoE,
+    Qwen3_5,
+    Qwen3_5MoE,
+    LLaMa,
+    Gemma,
+    Gemma3,
+    Phi,
+    Phi4,
+    Mistral,
+    GLM4,
+    GLM4MoE,
+    Yi,
+    StableLM,
+    DeepSeek,
+    Mistral3VL,
+    Qwen3VL,
+}
+
+#[cfg_attr(feature = "python", pyclass)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GenerationConfig {
+    /// Randomness of sampling.
+    /// rec. default = 1
+    pub temperature: Option<f32>,
+    /// Cumulative prob of the top tokens to consider, must be in (0, 1]. Set 1 to consider all toks.  
+    /// rec. default = 1    
+    pub top_p: Option<f32>,
+    /// Control the number of top tokens to consider, set -1 to consider all.
+    /// rec. default = -1
+    pub top_k: Option<isize>,
+
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+
+    pub bos_token_id: Option<usize>,
+    pub eos_token_id: Option<EosTokenId>,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+pub struct QuantConfig {
+    pub quant_method: String,
+    #[serde(default)]
+    pub bits: usize,
+    #[serde(default)]
+    pub group_size: i32,
+    pub sym: Option<bool>,
+    pub desc_act: Option<bool>,
+    pub checkpoint_format: Option<String>,
+    pub fmt: Option<String>,
+    pub weight_block_size: Option<Vec<usize>>,
+    #[serde(default, alias = "ignore")]
+    pub modules_to_not_convert: Vec<String>,
 }
