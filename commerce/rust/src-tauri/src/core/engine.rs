@@ -4,7 +4,7 @@ use super::scheduler::{Scheduler, KVCACHE_SWAP_THRESHOLD};
 use super::sequence::Sequence;
 use crate::core::scheduler::PD_PREFILL_STATUS_CHECK_COOLING_PERIOD;
 use crate::core::sequence::{DecodeSequence, SequenceStatus};
-use crate::core::GenerationOutput;
+use crate::core::{GenerationOutput, ChatCompletionLogger, DecodeStreamTrait, DecodeStreamType, StreamWithTokenizer, ToolConfig, detect_prefilled_reasoning_end_marker};
 use crate::models::layers::distributed::Comm;
 #[cfg(feature = "nccl")]
 use crate::models::layers::distributed::Id;
@@ -1066,8 +1066,9 @@ impl LLMEngine {
             for message in messages {
                 if message.role == "user" {
                     let escaped = prompt_template.escape_text(&message.content);
-                    prompt += &self.default_chat_template.replace("{}", &escaped);
-                    prompt += "\n";
+                    let rendered = self.default_chat_template.replace("{}", &escaped);
+                    prompt.push_str(&rendered);
+                    prompt.push_str("\n");
                 }
             }
             prompt
@@ -1348,10 +1349,13 @@ impl LLMEngine {
                 };
 
                 Ok(UsageResponse {
-                    token_used,
-                    max_model_len,
-                    used_kvcache_tokens: total_kv_cache_tokens - available_kvcache_tokens,
-                    total_kv_cache_tokens,
+                    prompt_tokens: 0, // Placeholder
+                    completion_tokens: 0, // Placeholder
+                    total_tokens: token_used as u32,
+                    token_used: token_used as u32,
+                    max_model_len: max_model_len as u32,
+                    used_kvcache_tokens: (total_kv_cache_tokens - available_kvcache_tokens) as u32,
+                    total_kv_cache_tokens: total_kv_cache_tokens as u32,
                     swap_used,
                     total_swap_memory,
                     session_status,

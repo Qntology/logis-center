@@ -255,7 +255,7 @@ pub struct ToolFormat {}
 impl ToolFormat {
     /// Get tool prompt for a specific model type
     pub fn get_tool_prompt(model_type: &crate::utils::config::ModelType) -> String {
-        use crate::server::parser::ToolConfig;
+        use crate::core::ToolConfig;
         let config = ToolConfig::for_model_type(model_type);
         let start_tag = &config.start_token_str;
         let end_tag = &config.end_token_str;

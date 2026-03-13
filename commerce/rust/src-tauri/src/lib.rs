@@ -9,6 +9,7 @@ pub mod models;
 pub mod utils;
 pub mod core;
 pub mod runner;
+pub mod server;
 pub mod transfer;
 pub mod tools;
 pub mod openai_types;

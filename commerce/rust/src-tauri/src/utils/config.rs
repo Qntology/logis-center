@@ -263,6 +263,7 @@ pub struct EngineConfig {
     pub tool_prompt_template: Option<String>,
     pub pd_server_prefix_cache_ratio: Option<f32>,
     pub pd_client_prefix_cache_ratio: Option<f32>,
+    pub cpu: bool,
 }
 
 #[cfg(feature = "python")]
@@ -340,6 +341,8 @@ pub struct EngineConfig {
     pub pd_server_prefix_cache_ratio: Option<f32>,
     #[pyo3(get, set)]
     pub pd_client_prefix_cache_ratio: Option<f32>,
+    #[pyo3(get, set)]
+    pub cpu: bool,
 }
 
 #[cfg(not(feature = "python"))]
@@ -374,11 +377,14 @@ impl EngineConfig {
         tool_prompt_template: Option<String>,
         pd_server_prefix_cache_ratio: Option<f32>,
         pd_client_prefix_cache_ratio: Option<f32>,
+        cpu: Option<bool>,
     ) -> Self {
         let mut device_ids = device_ids.unwrap_or_default();
         if device_ids.is_empty() {
             device_ids.push(0);
         }
+
+        let cpu = cpu.unwrap_or(false);
 
         if prefix_cache.unwrap_or(false)
             && fp8_kvcache.unwrap_or(false)
@@ -424,6 +430,7 @@ impl EngineConfig {
             tool_prompt_template,
             pd_server_prefix_cache_ratio,
             pd_client_prefix_cache_ratio,
+            cpu,
         }
     }
 }

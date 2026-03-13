@@ -8,7 +8,7 @@ use attention_rs::InputMetadata;
 use crate::tokenizer::TokenizerModel;
 use crate::chat_template::ChatTemplate;
 use crate::openai_types::ChatCompletionParameters;
-use crate::utils::config::Config;
+use crate::utils::config::{Config, SamplingParams};
 use crate::utils::progress::ProgressLike;
 use std::sync::Arc;
 use std::rc::Rc;
@@ -139,7 +139,8 @@ impl Qwen3_5GenerateModel {
         _kv_name: Option<String>
     ) -> Result<String> {
         let seed = params.seed.unwrap_or(34562) as u64;
-        let mut logit_processor = get_logit_processor(seed, &params);
+        let sampling_params = params.to_sampling_params();
+        let mut logit_processor = get_logit_processor(seed, &sampling_params);
 
         let prompt = self.chat_template.apply_chat_template(&params)?;
         println!("📝 Full Prompt (len={}):\n---\n{}\n---", prompt.len(), prompt);

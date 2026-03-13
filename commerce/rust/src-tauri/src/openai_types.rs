@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::utils::config::SamplingParams;
+
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
 pub struct ChatCompletionParameters {
     pub messages: Vec<ChatCompletionRequestMessage>,
@@ -22,6 +24,25 @@ pub struct ChatCompletionParameters {
     pub tools: Option<Vec<ChatCompletionTool>>,
     pub tool_choice: Option<Value>,
     pub user: Option<String>,
+}
+
+impl ChatCompletionParameters {
+    pub fn to_sampling_params(&self) -> SamplingParams {
+        SamplingParams {
+            temperature: self.temperature.map(|t| t as f32),
+            max_tokens: self.max_tokens.map(|t| t as usize),
+            ignore_eos: false,
+            top_k: None,
+            top_p: self.top_p.map(|p| p as f32),
+            session_id: None,
+            frequency_penalty: self.frequency_penalty,
+            presence_penalty: self.presence_penalty,
+            stop_sequences: self.stop.clone(),
+            stop_token_ids: None,
+            thinking: None,
+            mcp_mode: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

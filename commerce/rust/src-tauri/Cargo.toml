@@ -69,8 +69,15 @@ flate2 = "1.0"
 flume = "0.11"
 clap = { version = "4.4", features = ["derive"] }
 
+# server dependencies
+axum = { version = "0.7.4", features = ["tokio"] }
+utoipa = { version = "4.2", features = ["axum_extras"] }
+local-ip-address = "0.6"
+tower-http = { version = "0.5", features = ["cors"] }
+rustchatui = { git = "https://github.com/guoqingbao/rustchatui.git", rev = "68caad9" }
+
 # tauri & UI specific
-tauri = { version = "2.9.5", features = [] }
+tauri = { version = "2.1.1", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
@@ -81,42 +88,3 @@ dirs = "6.0.0"
 fantoccini = "0.19"
 chromiumoxide = { version = "0.8.0", features = ["tokio-runtime"] }
 which = "6.0"
-scraper = "0.25.0"
-lancedb = { version = "0.23.1", default-features = false }
-safetensors = "0.4"
-ethers-core = "2.0"
-ethers-signers = "2.0"
-arrow-array = "56.2.0"
-arrow-schema = "56.2.0"
-ego-tree = "0.10"
-nvml-wrapper = "0.9.0"
-memmap2 = "0.9"
-windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_System_Memory"] }
-libc = "0.2"
-
-[target.'cfg(windows)'.dependencies]
-direct-storage = { path = "./direct-storage" }
-windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Graphics_Direct3D12", "Win32_Security", "Win32_System_IO"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.6"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.29"
-
-[features]
-default = ["cuda"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "attention_rs/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal", "attention_rs/metal"]
-flash-attn = []
-
-[profile.dev]
-opt-level = 0
-incremental = true
-
-[profile.release]
-opt-level = 3
-strip = true
-lto = true
-panic = "abort"
-codegen-units = 16

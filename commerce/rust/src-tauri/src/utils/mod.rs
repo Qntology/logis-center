@@ -1514,7 +1514,7 @@ pub fn get_best_device() -> Device {
 }
 
 pub fn get_optimal_device_config() -> EngineConfig {
-    EngineConfig::new(None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+    EngineConfig::new(None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
 }
 
 // Extraction stop signal logic
@@ -1527,14 +1527,14 @@ pub fn set_extraction_stop_signal(stop: bool) {
 pub fn is_extraction_stopped() -> bool {
     EXTRACTION_STOPPED.load(std::sync::atomic::Ordering::SeqCst)
 }
-pub fn ceil_by_factor(value: u32, factor: u32) -> u32 {
-    ((value + factor - 1) / factor) * factor
+pub fn ceil_by_factor(value: f32, factor: u32) -> u32 {
+    ((value / factor as f32).ceil() * factor as f32) as u32
 }
 
-pub fn floor_by_factor(value: u32, factor: u32) -> u32 {
-    (value / factor) * factor
+pub fn floor_by_factor(value: f32, factor: u32) -> u32 {
+    ((value / factor as f32).floor() * factor as f32) as u32
 }
 
-pub fn round_by_factor(value: u32, factor: u32) -> u32 {
-    ((value as f32 / factor as f32).round() as u32) * factor
+pub fn round_by_factor(value: f32, factor: u32) -> u32 {
+    ((value / factor as f32).round() * factor as f32) as u32
 }

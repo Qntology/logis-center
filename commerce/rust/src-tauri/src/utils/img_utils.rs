@@ -215,8 +215,8 @@ pub fn img_smart_resize(
         )));
     }
     let image_factor = factor;
-    let mut h_bar = std::cmp::max(image_factor, round_by_factor(img_h, image_factor));
-    let mut w_bar = std::cmp::max(image_factor, round_by_factor(img_w, image_factor));
+    let mut h_bar = std::cmp::max(image_factor, round_by_factor(img_h as f32, image_factor));
+    let mut w_bar = std::cmp::max(image_factor, round_by_factor(img_w as f32, image_factor));
 
     if h_bar * w_bar > max_pixels {
         let beta = ((img_h * img_w) as f32 / max_pixels as f32).sqrt();

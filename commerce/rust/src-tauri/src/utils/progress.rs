@@ -15,6 +15,15 @@ pub trait ProgressLike: Send + Sync {
     fn set_progress(&mut self, p: usize);
 }
 
+pub struct NoProgress;
+impl ProgressLike for NoProgress {
+    fn get_progress(&mut self) -> Vec<(usize, usize)> {
+        vec![]
+    }
+
+    fn set_progress(&mut self, _p: usize) {}
+}
+
 pub struct ProgressReporter {
     pub rank: usize,
     pub progress: usize,
