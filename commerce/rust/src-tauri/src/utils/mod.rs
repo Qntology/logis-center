@@ -1,4 +1,4 @@
-pub mod chat_template;
+﻿pub mod chat_template;
 pub mod command;
 pub mod config;
 pub mod downloader;
@@ -14,6 +14,13 @@ pub mod image;
 pub mod kvcache_allocator;
 pub mod logits_processor;
 pub mod progress;
+pub mod hash;
+pub mod paths;
+pub mod compression;
+pub mod tensor_utils;
+pub mod direct_loader;
+pub mod img_utils;
+pub mod resources;
 use crate::core::GenerationOutput;
 use crate::models::gemma3::config::Gemma3Config;
 use crate::utils::config::MoEConfig;
@@ -1472,7 +1479,7 @@ pub fn log_throughput(outputs: &[GenerationOutput]) {
     eprintln!(
         "{}",
         String::from(format!(
-            "⏱️ Prompt tokens: {} in {:.2}s ({:.2} tokens/s)",
+            "?깍툘 Prompt tokens: {} in {:.2}s ({:.2} tokens/s)",
             total_prompt_tokens,
             prompt_time_taken,
             total_prompt_tokens as f32 / prompt_time_taken,
@@ -1483,11 +1490,51 @@ pub fn log_throughput(outputs: &[GenerationOutput]) {
     eprintln!(
         "{}",
         String::from(format!(
-            "⏱️ Decoded tokens: {} in {:.2}s ({:.2} tokens/s)",
+            "?깍툘 Decoded tokens: {} in {:.2}s ({:.2} tokens/s)",
             total_decoded_tokens,
             decode_time_taken,
             total_decoded_tokens as f32 / decode_time_taken,
         ))
         .yellow()
     );
+}
+
+pub fn string_to_static_str(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+pub fn get_best_device() -> Device {
+    if cuda_is_available() {
+        Device::new_cuda(0).unwrap()
+    } else if metal_is_available() {
+        Device::new_metal(0).unwrap()
+    } else {
+        Device::Cpu
+    }
+}
+
+pub fn get_optimal_device_config() -> EngineConfig {
+    EngineConfig::new(None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+}
+
+// Extraction stop signal logic
+static EXTRACTION_STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_extraction_stop_signal(stop: bool) {
+    EXTRACTION_STOPPED.store(stop, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn is_extraction_stopped() -> bool {
+    EXTRACTION_STOPPED.load(std::sync::atomic::Ordering::SeqCst)
+}
+pub fn ceil_by_factor(value: u32, factor: u32) -> u32 {
+    ((value + factor - 1) / factor) * factor
+}
+
+pub fn floor_by_factor(value: u32, factor: u32) -> u32 {
+    (value / factor) * factor
+}
+
+pub fn round_by_factor(value: u32, factor: u32) -> u32 {
+    ((value as f32 / factor as f32).round() as u32) * factor
 }

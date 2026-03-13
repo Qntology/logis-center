@@ -1,9 +1,9 @@
-use crate::models::gemma3::Gemma3ForConditionalGeneration;
+﻿use crate::models::gemma3::Gemma3ForConditionalGeneration;
 // src/core/runner.rs
 use crate::models::layers::distributed::Comm;
 use crate::models::layers::linear::set_fp8_linear_is_prefill;
 use crate::models::layers::VarBuilderX;
-use crate::server::EmbeddingStrategy;
+use crate::core::EmbeddingStrategy;
 use crate::transfer::Transfer;
 #[cfg(all(feature = "cuda", feature = "graph"))]
 use crate::utils::graph::{

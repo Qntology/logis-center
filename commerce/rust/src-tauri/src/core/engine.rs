@@ -1,4 +1,4 @@
-//src/core/engine.rs
+﻿//src/core/engine.rs
 use super::runner::{ModelRunner, RunnerType, Seqs};
 use super::scheduler::{Scheduler, KVCACHE_SWAP_THRESHOLD};
 use super::sequence::Sequence;
@@ -12,9 +12,9 @@ use crate::models::layers::VarBuilderX;
 use crate::runner::{
     receive_local, send_and_expect_ack, send_local, MessageType, RunnerInitRequest,
 };
-use crate::server::logger::ChatCompletionLogger;
-use crate::server::parser::{detect_prefilled_reasoning_end_marker, ToolConfig};
-use crate::server::{EmbeddingStrategy, UsageResponse};
+
+
+use crate::core::{EmbeddingStrategy, UsageResponse};
 use crate::tools::Tool;
 use crate::transfer::PdRole;
 use crate::transfer::Transfer;

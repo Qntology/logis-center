@@ -1,8 +1,8 @@
-// src/core/block_manager.rs
+﻿// src/core/block_manager.rs
 use super::prefix_cache::{PrefixCache, PrefixCacheConfig, PrefixCacheUpdate};
 use super::runner::RunnerType;
 use super::sequence::{Sequence, SequenceStatus};
-use crate::def_broadcast_message_to_runners;
+
 use crate::runner::{receive_local, send_local, MessageType};
 use crate::utils::env::{mamba_snapshot_block_stride_blocks, MAMBA_SNAPSHOT_BLOCK_STRIDE_ENV};
 use crate::utils::image::ImageData;
@@ -871,7 +871,7 @@ impl BlockManager {
             num_blocks,
         );
 
-        // mapping GPU → CPU
+        // mapping GPU ??CPU
         let mut mapping = std::collections::HashMap::new();
         let mut cpu_ids = Vec::with_capacity(num_blocks);
 
@@ -886,7 +886,7 @@ impl BlockManager {
             cpu_ids.push(cpu_bid);
         }
 
-        // Actual data copy GPU → CPU
+        // Actual data copy GPU ??CPU
         self.try_swap_kvcache(mapping.clone(), false)?;
         seq.swapped_time = Some(
             SystemTime::now()
@@ -921,14 +921,14 @@ impl BlockManager {
             candle_core::bail!("Insufficient GPU blocks to swap in sequence {}", seq.id);
         }
 
-        // mapping CPU → GPU (reverse)
+        // mapping CPU ??GPU (reverse)
         let mapping: std::collections::HashMap<usize, usize> = cpu_ids
             .iter()
             .enumerate()
             .map(|(i, &cpu_id)| (cpu_id, seq.block_table[i] as usize))
             .collect();
 
-        // Actual data copy CPU → GPU
+        // Actual data copy CPU ??GPU
         self.try_swap_kvcache(mapping.clone(), true)?;
 
         // Free CPU blocks now that data is back on GPU

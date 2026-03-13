@@ -139,12 +139,7 @@ impl Qwen3_5GenerateModel {
         _kv_name: Option<String>
     ) -> Result<String> {
         let seed = params.seed.unwrap_or(34562) as u64;
-        let mut logit_processor = get_logit_processor(
-            params.temperature.map(|t| t as f32),
-            params.top_p.map(|p| p as f32),
-            None,
-            seed
-        );
+        let mut logit_processor = get_logit_processor(seed, &params);
 
         let prompt = self.chat_template.apply_chat_template(&params)?;
         println!("📝 Full Prompt (len={}):\n---\n{}\n---", prompt.len(), prompt);

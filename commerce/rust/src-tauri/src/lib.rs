@@ -1,4 +1,4 @@
-mod model;
+﻿mod model;
 mod store;
 mod automation;
 mod parsing;
@@ -7,31 +7,16 @@ mod scheduler;
 
 pub mod models;
 pub mod utils;
+pub mod core;
+pub mod runner;
+pub mod transfer;
+pub mod tools;
 pub mod openai_types;
 pub mod position_embed;
 pub mod chat_template;
 pub mod tokenizer;
+pub mod api;
 
-#[macro_export]
-macro_rules! log_info {
-    ($($arg:tt)*) => {
-        println!("[INFO] {}", format!($($arg)*));
-    };
-}
-
-#[macro_export]
-macro_rules! log_warn {
-    ($($arg:tt)*) => {
-        println!("[WARN] {}", format!($($arg)*));
-    };
-}
-
-#[macro_export]
-macro_rules! log_error {
-    ($($arg:tt)*) => {
-        eprintln!("[ERROR] {}", format!($($arg)*));
-    };
-}
 
 use tauri::{State, Manager, Listener};
 use tokio::sync::Mutex as TokioMutex;
@@ -402,7 +387,7 @@ async fn delete_document(
 ) -> Result<String, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        // [DETAIL] 'items' 테이블뿐만 아니라 다른 가능한 테이블에서도 삭제 시도
+        // [DETAIL] 'items' ?뚯씠釉붾퓧留??꾨땲???ㅻⅨ 媛?ν븳 ?뚯씠釉붿뿉?쒕룄 ??젣 ?쒕룄
         let tables = vec!["items", "sales", "tracking", "event", "users", "pages"];
         for table in tables {
             let _ = store.delete_item(table, &uuid).await;
@@ -926,7 +911,7 @@ async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, St
 #[tauri::command]
 async fn check_gpu_availability() -> bool {
     let config = crate::utils::get_optimal_device_config();
-    !config.is_cpu
+    !config.cpu
 }
 
 #[tauri::command]

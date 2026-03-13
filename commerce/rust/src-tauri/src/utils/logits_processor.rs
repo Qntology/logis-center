@@ -1,4 +1,4 @@
-use super::config::SamplingParams;
+﻿use super::config::SamplingParams;
 #[cfg(feature = "cuda")]
 use attention_rs::sort::ArgSortOp; //Use our custom sort kernel, fix kernel crash on A100
 use candle_core::D;
@@ -342,4 +342,13 @@ impl LogitsProcessor {
         let logits = vec_ret.into_iter().flatten().collect();
         Tensor::from_vec(logits, (batch, logits_len), device)
     }
+}
+
+pub fn get_logit_processor(seed: u64, sampling_params: &SamplingParams) -> LogitsProcessor {
+    LogitsProcessor::new(
+        seed,
+        sampling_params.temperature,
+        sampling_params.top_k,
+        sampling_params.top_p,
+    )
 }
