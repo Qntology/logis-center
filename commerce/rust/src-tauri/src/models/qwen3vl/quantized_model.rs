@@ -1603,7 +1603,7 @@ impl QuantizedQwen3VLTextModel {
         device: &Device,
         device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
@@ -1688,7 +1688,7 @@ impl QuantizedQwen3VLTextModel {
         device: &Device,
         device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
@@ -2050,7 +2050,7 @@ impl QuantizedQwen3VLTextModel {
         kv_name: Option<String>,
         baking_only: bool,
     ) -> Result<Tensor> {
-        let start_layer_time = std::time::Instant::now();
+        let _start_layer_time = std::time::Instant::now();
         let input_token_count = xs.dim(1).unwrap_or(0);
         let is_decoding = input_token_count <= 1;
 
@@ -2642,7 +2642,7 @@ impl QuantizedQwen3VLModel {
         vision_device: &Device,
         _vision_device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool, // [NEW] Support for 1-layer vision baker
     ) -> Result<Self> {
         let mmproj_mmap = mmproj_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
@@ -2689,7 +2689,7 @@ impl QuantizedQwen3VLModel {
         vision_device: &Device,
         _vision_device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool, // [NEW]
     ) -> Result<Self> {
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
@@ -2936,7 +2936,7 @@ impl QuantizedQwen3TextModel {
         text_device: &Device,
         text_device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
         single_layer_mode: bool,
     ) -> Result<Self> {
@@ -2965,7 +2965,7 @@ impl QuantizedQwen3TextModel {
         text_device: &Device,
         text_device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
         single_layer_mode: bool,
     ) -> Result<Self> {

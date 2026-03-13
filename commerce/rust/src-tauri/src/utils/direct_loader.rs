@@ -10,8 +10,8 @@ mod windows_impl {
     use super::*;
     use direct_storage::*;
     use windows::core::HSTRING;
-    use windows::Win32::Storage::FileSystem::{CreateFileW, WriteFile, SetFilePointerEx, FILE_SHARE_WRITE, FILE_SHARE_READ, OPEN_EXISTING, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_BEGIN};
-    use windows::Win32::Foundation::{HANDLE, CloseHandle, GENERIC_WRITE, GENERIC_READ};
+    use windows::Win32::Storage::FileSystem::{CreateFileW, WriteFile, FILE_SHARE_WRITE, FILE_SHARE_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED};
+    use windows::Win32::Foundation::{HANDLE, CloseHandle, GENERIC_WRITE};
     use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
     use std::mem::ManuallyDrop;
 

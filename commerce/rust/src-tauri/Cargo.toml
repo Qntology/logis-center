@@ -23,6 +23,8 @@ tokio = { version = "1", features = ["full"] }
 image = { version = "0.25", features = ["jpeg", "png"] }
 base64 = "0.22"
 anyhow = "1.0"
+half = "2.4"
+parking_lot = "0.12"
 regex = "1"
 encoding_rs = "0.8"
 flate2 = "1.0"

@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -6,7 +6,6 @@ use parking_lot::{Mutex, RwLock};
 use memmap2::MmapMut;
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, VecDeque};
-use crate::utils::direct_loader::{load_kv_block_at, save_kv_block_at};
 
 /// [BLOCK-LOCATION] 블록 데이터가 현재 위치한 저장소 계층
 #[repr(u8)]
@@ -158,6 +157,11 @@ impl BlockManager {
         }
         
         Ok(())
+    }
+
+    pub fn get_physical_id(&self, session_id: &str, block_idx: usize) -> Option<usize> {
+        let key = LogicalKey { session_id: session_id.to_string(), block_idx };
+        self.mapping.read().get(&key).cloned()
     }
 
     /// [DOUBLE-BUFFERING] 비동기 로딩을 위한 버퍼 확보

@@ -1,6 +1,6 @@
 use crate::models::qwen3vl::quantized_model::{KVLocation, KVBlock, KVRegistry, BitKVMetadata, QuantizedQwen3VLModel, MemorySlot};
 use anyhow::{Result, anyhow};
-use candle_core::{quantized::gguf_file, DType, Device, Tensor};
+use candle_core::{quantized::gguf_file, DType, Device, Tensor, IndexOp};
 use candle_nn::VarBuilder;
 
 use crate::{
@@ -545,13 +545,13 @@ impl Qwen3VLGenerateModel {
 
                         // 버퍼에 바이트 단위로 복사 (K)
                         for row in k_slice {
-                            let bytes = unsafe { std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len() * 2) };
+                            let bytes = unsafe { std::slice::from_raw_parts(row.as_ptr() as *const half::bf16 as *const u8, row.len() * 2) };
                             buffer[offset..offset + bytes.len()].copy_from_slice(bytes);
                             offset += bytes.len();
                         }
                         // 버퍼에 바이트 단위로 복사 (V)
                         for row in v_slice {
-                            let bytes = unsafe { std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len() * 2) };
+                            let bytes = unsafe { std::slice::from_raw_parts(row.as_ptr() as *const half::bf16 as *const u8, row.len() * 2) };
                             buffer[offset..offset + bytes.len()].copy_from_slice(bytes);
                             offset += bytes.len();
                         }
