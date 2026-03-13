@@ -1,8 +1,0 @@
-.idea/
-.vs/
-/bin
-/lib
-/target
-*.dll
-*.lib
-*.lock

@@ -1,0 +1,14 @@
+C:\Users\HP\Documents\GitHub\cron-logis-center\commerce\rust\src-tauri\target\debug\deps\serde-69b31cb361804a81.d: C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\HP\Documents\GitHub\cron-logis-center\commerce\rust\src-tauri\target\debug\build\serde-e48aef833f6a73f1\out/private.rs
+
+C:\Users\HP\Documents\GitHub\cron-logis-center\commerce\rust\src-tauri\target\debug\deps\libserde-69b31cb361804a81.rlib: C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\HP\Documents\GitHub\cron-logis-center\commerce\rust\src-tauri\target\debug\build\serde-e48aef833f6a73f1\out/private.rs
+
+C:\Users\HP\Documents\GitHub\cron-logis-center\commerce\rust\src-tauri\target\debug\deps\libserde-69b31cb361804a81.rmeta: C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\HP\Documents\GitHub\cron-logis-center\commerce\rust\src-tauri\target\debug\build\serde-e48aef833f6a73f1\out/private.rs
+
+C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs:
+C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs:
+C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs:
+C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs:
+C:\Users\HP\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs:
+C:\Users\HP\Documents\GitHub\cron-logis-center\commerce\rust\src-tauri\target\debug\build\serde-e48aef833f6a73f1\out/private.rs:
+
+# env-dep:OUT_DIR=C:\\Users\\HP\\Documents\\GitHub\\cron-logis-center\\commerce\\rust\\src-tauri\\target\\debug\\build\\serde-e48aef833f6a73f1\\out

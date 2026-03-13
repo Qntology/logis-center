@@ -1,6 +1,0 @@
-[target.x86_64-pc-windows-msvc]
-rustflags = [
-    "-C", "link-arg=/NODEFAULTLIB:libcmt.lib",
-    "-C", "link-arg=/NODEFAULTLIB:libcmtd.lib",
-    "-C", "link-arg=/NODEFAULTLIB:msvcrtd.lib",
-]
