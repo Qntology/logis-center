@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Logis Mobile Hub</title>
+    
+    <!-- External Libraries -->
+    <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+    <script src="./pako.js"></script>
+    <script src="./qrcode.min.js"></script>
+    <script src="./blockies.js"></script>
+    <script src="./marked.js"></script>
+
+    <!-- Main Styles -->
+    
+    <style>
+        /* Build Tag */
+        #build-tag {
+            position: fixed; top: 2px; right: 5px; font-size: 8px; 
+            color: rgba(0,0,0,0.2); z-index: 100002; pointer-events: none;
+        }
+    </style>
+  <script type="module" crossorigin src="./assets/index.js"></script>
+  <link rel="stylesheet" crossorigin href="./assets/index.css">
+</head>
+<body>
+    <div id="build-tag">V137</div>
+
+    <div class="widget-wrapper">
+      <!-- 1. The Pill Nav (Always Visible) -->
+      <nav class="pill-nav">
+        <div class="logo-section"><button id="nav-upload-btn" class="nav-btn">➕</button></div>
+        <div id="search-container" class="search-container">
+            <div id="search-tags-container" class="search-tags-container"></div>
+            <input type="text" id="global-search" class="search-input" placeholder="Disconnected..." disabled />
+        </div>
+        <div class="nav-icons">
+          <button id="btn-submit" class="nav-btn" disabled>🔍</button>
+          <button id="btn-settings" class="nav-btn" disabled>🗨️</button>
+        </div>
+      </nav>
+
+      <!-- 2. The Content Panel -->
+      <section id="content-panel" class="content-panel open">
+        
+        <!-- Disconnected / Intro View (Inside Panel) -->
+        <div id="tab-intro" class="tab-content active" style="display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; flex:1; height:100%;">
+            <p style="font-size:3rem; margin:0;">📡</p>
+            <h3 style="margin:10px 0;">Disconnected</h3>
+            <p style="color: #666; font-size: 0.8rem; margin-bottom:20px;">Scan desktop QR to start</p>
+            <button class="primary-btn" onclick="startCamera()" style="width: auto; padding: 12px 40px; border-radius: 25px;">SCAN START</button>
+        </div>
+
+        <!-- Tab: List (Hidden until connected) -->
+        <div id="tab-list" class="tab-content">
+           <div id="list-view" style="width:100%; height:100%; display:flex; flex-direction:column;">
+               <div class="header-row">
+                    <h2>Results</h2>
+                    <button id="list-refresh-btn" class="nav-btn">🔄</button>
+               </div>
+               <div id="list-scroll-container" class="chat-container" style="flex:1;">
+                 <div id="list-scroll" class="chat-scroll">
+                    <!-- Navigation Categories Overlay -->
+                    <div id="nav-categories" class="nav-categories hidden" style="padding: 10px; background: #fff; border-bottom: 1px solid #eee;">
+                        <div class="nav-section">
+                            <h3 style="font-size:0.8rem; color:var(--primary); text-transform:uppercase; margin-bottom:8px;">Shared Pages</h3>
+                            <div id="nav-list-pages" class="tree-root"></div>
+                        </div>
+                        <div class="nav-section" style="margin-top:15px;">
+                            <h3 style="font-size:0.8rem; color:var(--primary); text-transform:uppercase; margin-bottom:8px;">Team Members</h3>
+                            <div id="nav-list-users" class="tree-root"></div>
+                        </div>
+                    </div>
+                    <div id="doc-list" class="chat-talks"></div>
+                 </div>
+               </div>
+           </div>
+
+           <!-- Detail Overlay -->
+           <div id="detail-view" style="display:none; width:100%; height:100%; flex-direction:column;">
+               <div class="header-row">
+                   <button id="btn-detail-back" class="nav-btn">⬅︎</button>
+                   <h2 id="detail-title">Detail</h2>
+               </div>
+               <div id="detail-content" class="markdown-body" style="flex:1; overflow-y:auto; padding:15px;"></div>
+           </div>
+        </div>
+
+        <!-- Tab: Settings (Chat) -->
+        <div id="tab-settings" class="tab-content">
+           <div class="header-row">
+             <button id="btn-settings-back" class="nav-btn">⬅︎</button>
+             <h2>Remote Hub</h2>
+           </div>
+           <div class="chat-container">
+                <div class="chat-scroll" id="chat-scroll">
+                    <div class="chat-talks"></div>
+                </div>
+                <form name="chat-form" class="chat-form">
+                    <input type="text" name="talk" placeholder="Message..." required autocomplete="off">
+                    <button type="submit" class="primary-btn" style="padding: 5px 15px;">➤</button>
+                </form>
+           </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Scanner & QR Overlays -->
+    <div id="scanner-overlay" style="display:none; position:fixed; inset:0; background:#000; z-index:100000;">
+        <video id="v" playsinline autoplay muted style="width:100%; height:100%; object-fit:cover;"></video>
+        <button onclick="stopCamera()" class="cancel-btn">CANCEL</button>
+    </div>
+
+    <div id="answer-qr-container" style="position:fixed; inset:0; background:white; z-index:99998; display:none; flex-direction:column; align-items:center; justify-content:center;">
+        <div id="answer-qr"></div>
+        <button onclick="closeAnswerQr()" class="primary-btn" style="margin-top:20px; width:auto; padding:10px 40px;">CLOSE</button>
+    </div>
+
+    <div id="log-panel" style="position:fixed; bottom:0; left:0; right:0; height:80px; background:rgba(0,0,0,0.8); color:#0f0; font-size:10px; z-index:100001; pointer-events:none; overflow-y:auto; padding:5px;">Initializing...</div>
+
+    <!-- Hidden File Input for Mobile Upload -->
+    <input type="file" id="mobile-file-input" style="display:none" accept="image/*">
+
+    <script>
+        window.startCamera = () => window.dispatchEvent(new CustomEvent('request-camera-start'));
+        window.stopCamera = () => window.dispatchEvent(new CustomEvent('request-camera-stop'));
+        window.closeAnswerQr = () => document.getElementById('answer-qr-container').style.display = 'none';
+    </script>
+</body>
+</html>

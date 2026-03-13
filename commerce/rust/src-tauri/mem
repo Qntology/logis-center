@@ -1,0 +1,67 @@
+[
+  {
+    "uuid": "844d8cad-7bef-4807-bb7a-3ef87d280ce9",
+    "doc_type": "PO",
+    "doc_number": "PO-2025-KR01",
+    "text": "Mock text",
+    "json_data": "{}",
+    "vector": [],
+    "total_amount": 0.0,
+    "issue_date": "2025-01-01",
+    "vessel": "",
+    "pol": "",
+    "pod": "",
+    "incoterms": "",
+    "name": "TestUser",
+    "related_refs": [],
+    "container_nos": [],
+    "transaction_group": "6a35471d-c1f7-4e21-a8fd-3bce2bf11937",
+    "link_reason": null
+  },
+  {
+    "uuid": "4278484c-ff85-4df9-8368-666fa63d455a",
+    "doc_type": "CI",
+    "doc_number": "INV-999",
+    "text": "Mock text",
+    "json_data": "{}",
+    "vector": [],
+    "total_amount": 0.0,
+    "issue_date": "2025-01-01",
+    "vessel": "",
+    "pol": "",
+    "pod": "",
+    "incoterms": "",
+    "name": "TestUser",
+    "related_refs": [
+      "PO-2025-KR01"
+    ],
+    "container_nos": [],
+    "transaction_group": "6a35471d-c1f7-4e21-a8fd-3bce2bf11937",
+    "link_reason": "Linked with PO (PO-2025-KR01)"
+  },
+  {
+    "uuid": "e6cf408a-9140-4e04-a68c-139d3617e5a0",
+    "doc_type": "PL",
+    "doc_number": "PL-999",
+    "text": "Mock text",
+    "json_data": "{}",
+    "vector": [],
+    "total_amount": 0.0,
+    "issue_date": "2025-01-01",
+    "vessel": "",
+    "pol": "",
+    "pod": "",
+    "incoterms": "",
+    "name": "TestUser",
+    "related_refs": [
+      "INV-999"
+    ],
+    "container_nos": [
+      "CNTR-1234"
+    ],
+    "transaction_group": "6a35471d-c1f7-4e21-a8fd-3bce2bf11937",
+    "link_reason": "Linked with CI (INV-999)"
+  }
+]-777)"
+  }
+]

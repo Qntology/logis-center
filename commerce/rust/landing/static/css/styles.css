@@ -1,0 +1,5 @@
+@media (max-width: 455px) {
+  span[data-i18n="system_status"]{display:none}
+}
+
+[data-i18n="hero_desc"]::first-line{font-size: 1rem !important;}
