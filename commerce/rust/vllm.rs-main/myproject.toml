@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=0.14,<0.15"]
+build-backend = "maturin"
+
+[project]
+name = "vllm-rs"
+description = "A blazing-fast ⚡, lightweight Rust 🦀 implementation of vLLM."
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+]
+
+[tool.maturin]
+python-source = "python"
+include = ["vllm_rs/runner", "vllm_rs/__init__.py", "vllm_rs/__init__.pyi", "py.typed"]
+sdist-include = ["ReadMe.md"]

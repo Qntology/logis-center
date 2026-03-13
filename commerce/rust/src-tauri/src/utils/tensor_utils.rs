@@ -9,11 +9,15 @@ pub fn prepare_causal_attention_mask(
     device: &Device,
 ) -> Result<Tensor> {
     let arange = Tensor::arange(0u32, tgt_len as u32, device)?;
-    let arange = arange.unsqueeze(1)?.broadcast_as((tgt_len, tgt_len))?;
-    let upper_triangle = arange.t()?.gt(&arange)?;
+    let arange_row = arange.unsqueeze(1)?.broadcast_as((tgt_len, tgt_len))?;
+    let arange_col = arange.unsqueeze(0)?.broadcast_as((tgt_len, tgt_len))?;
+    
+    // Condition must be U8 for where_cond
+    let upper_triangle = arange_col.gt(&arange_row)?.to_dtype(DType::U8)?;
+    
     let mask = upper_triangle.where_cond(
-        &Tensor::new(f32::NEG_INFINITY, device)?.broadcast_as(arange.shape())?,
-        &Tensor::new(0f32, device)?.broadcast_as(arange.shape())?,
+        &Tensor::new(f32::NEG_INFINITY, device)?.broadcast_as((tgt_len, tgt_len))?,
+        &Tensor::new(0f32, device)?.broadcast_as((tgt_len, tgt_len))?,
     )?;
     let mask = if seqlen_offset > 0 {
         let mask0 = Tensor::zeros((tgt_len, seqlen_offset), DType::F32, device)?;
@@ -32,12 +36,10 @@ pub fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
         Ok(xs)
     } else {
         let (b_sz, n_kv_head, seq_len, head_dim) = xs.dims4()?;
-        let kv = Tensor::cat(&vec![&xs; n_rep], 2)?.reshape((
-            b_sz,
-            n_kv_head * n_rep,
-            seq_len,
-            head_dim,
-        ))?;
+        let kv = xs
+            .unsqueeze(2)?
+            .expand((b_sz, n_kv_head, n_rep, seq_len, head_dim))?
+            .reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))?;
         Ok(kv)
     }
 }
@@ -121,7 +123,7 @@ pub fn nonzero_index(mask: &Tensor) -> Result<Tensor> {
         }
         1 => {
             let index_vec = nonzero_index_vec(mask)?;
-            Tensor::from_slice(&index_vec, index_vec.len(), mask.device())?
+            Tensor::from_slice(&index_vec, index_vec.len(), mask.device())?.to_dtype(DType::U32)?
         }
         _ => {
             return Err(anyhow!(format!(
@@ -161,7 +163,7 @@ pub fn zero_index_vec(mask: &Tensor) -> Result<Vec<u32>> {
 
 pub fn zero_index(mask: &Tensor) -> Result<Tensor> {
     let index_vec = zero_index_vec(mask)?;
-    let indices_tensor = Tensor::from_slice(&index_vec, index_vec.len(), mask.device())?;
+    let indices_tensor = Tensor::from_slice(&index_vec, index_vec.len(), mask.device())?.to_dtype(DType::U32)?;
     Ok(indices_tensor)
 }
 
@@ -356,7 +358,7 @@ pub fn prod_tensor_last_dim(t: &Tensor) -> Result<Tensor> {
 }
 
 pub fn mask_index_add(original: &Tensor, mask: &Tensor, add: &Tensor) -> Result<Tensor> {
-    let visual_nonzero_index = nonzero_index(mask)?;
+    let visual_nonzero_index = nonzero_index(mask)?.to_dtype(DType::U32)?;
     let xs = original.index_add(&visual_nonzero_index, add, 0)?;
     Ok(xs)
 }
@@ -757,7 +759,7 @@ pub fn index_select_2d(t: &Tensor, index: &Tensor) -> Result<Tensor> {
     let mut res_vec = Vec::new();
     let index_dim0 = index.dim(0)?;
     for i in 0..index_dim0 {
-        let index_i = index.i(i)?;
+        let index_i = index.i(i)?.to_dtype(DType::U32)?;
         let rel_i = t.index_select(&index_i, 0)?;
         res_vec.push(rel_i);
     }
@@ -775,7 +777,8 @@ pub fn topk(weight: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
     let topk_idx = weight
         .arg_sort_last_dim(false)?
         .narrow(D::Minus1, 0, topk)?
-        .contiguous()?;
+        .contiguous()?
+        .to_dtype(DType::U32)?;
     let topk_weight = weight.gather(&topk_idx, D::Minus1)?;
     Ok((topk_weight, topk_idx))
 }
@@ -897,4 +900,39 @@ pub fn unpack_bitkv_gpu(packed: &Tensor, original_shape: &[usize]) -> Result<Vec
         planes.push(plane);
     }
     Ok(planes)
+}
+
+pub fn l2_normalize(t: &Tensor, dim: usize) -> Result<Tensor> {
+    let rank = t.rank();
+    if dim >= rank {
+        return Err(anyhow!(format!("input dim {} must < rank {}", dim, rank)));
+    }
+    let l2_norm = t.sqr()?.sum_keepdim(dim)?.sqrt()?.affine(1.0, 1e-6)?;
+    Ok(t.broadcast_div(&l2_norm)?)
+}
+
+pub fn repeat_interleave(t: &Tensor, repeats: usize, dim: usize) -> Result<Tensor> {
+    if repeats == 1 {
+        return Ok(t.clone());
+    }
+    let rank = t.rank();
+    if dim >= rank {
+        return Err(anyhow!(
+            "Dimension {} is out of range for tensor with {} dimensions",
+            dim,
+            rank
+        ));
+    }
+
+    let dims = t.dims();
+    let mut indices = Vec::with_capacity(dims[dim] * repeats);
+    for i in 0..dims[dim] {
+        for _ in 0..repeats {
+            indices.push(i as u32);
+        }
+    }
+
+    let indices_tensor = Tensor::from_vec(indices, (dims[dim] * repeats,), t.device())?;
+    let t = t.index_select(&indices_tensor, dim)?;
+    Ok(t)
 }

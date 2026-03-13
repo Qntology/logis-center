@@ -5,10 +5,26 @@ pub mod paths;
 pub mod compression;
 pub mod resources;
 pub mod direct_loader;
+pub mod config;
+pub mod progress;
+pub mod gptq;
+pub mod image;
+pub mod gguf_varbuilder;
+pub mod logits_processor;
+
+pub use config::{resolve_qwen3_hybrid_config, Qwen3HybridConfig};
+
+#[macro_export]
+macro_rules! serde_default {
+    ($t:ty, $name:ident, $v:expr) => {
+        fn $name() -> $t {
+            $v
+        }
+    };
+}
 
 use candle_core::{Device, DType};
 use anyhow::Result;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
 use std::process::Command;
 use nvml_wrapper::Nvml;
 use once_cell::sync::Lazy;
@@ -217,39 +233,6 @@ pub fn find_type_files(path: &str, extension_type: &str) -> Result<Vec<String>> 
     Ok(files)
 }
 
-pub fn get_logit_processor(
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    top_k: Option<usize>,
-    seed: u64,
-) -> LogitsProcessor {
-    let temperature = temperature.and_then(|v| if v < 1e-7 { None } else { Some(v) });
-    match top_k {
-        None => LogitsProcessor::new(
-            seed,
-            temperature.map(|temp| temp as f64),
-            top_p.map(|tp| tp as f64),
-        ),
-        Some(k) => {
-            let sampling = match temperature {
-                None => Sampling::ArgMax,
-                Some(temperature) => match top_p {
-                    None => Sampling::TopK {
-                        k,
-                        temperature: temperature as f64,
-                    },
-                    Some(p) => Sampling::TopKThenTopP {
-                        k,
-                        p: p as f64,
-                        temperature: temperature as f64,
-                    },
-                },
-            };
-            LogitsProcessor::from_sampling(seed, sampling)
-        }
-    }
-}
-
 pub fn round_by_factor(num: u32, factor: u32) -> u32 {
     let round = (num as f32 / factor as f32).round() as u32;
     round * factor
@@ -263,6 +246,43 @@ pub fn floor_by_factor(num: f32, factor: u32) -> u32 {
 pub fn ceil_by_factor(num: f32, factor: u32) -> u32 {
     let ceil = (num / factor as f32).ceil() as u32;
     ceil * factor
+}
+
+pub fn get_llama4_attn_scale(
+    positions: &candle_core::Tensor,
+    llama_4_scaling_beta: f64,
+    original_max_position_embeddings: f64,
+) -> candle_core::Result<candle_core::Tensor> {
+    let div = (positions.to_dtype(DType::F32)? / original_max_position_embeddings)?;
+    let floored = div.floor()?;
+
+    let one = floored.ones_like()?; // tensor filled with 1.0
+    let log_term = (one + floored)?.log()?;
+
+    let scaling = (1f64 + (llama_4_scaling_beta * &log_term)?)?;
+    scaling
+        .unsqueeze(candle_core::D::Minus1)?
+        .unsqueeze(0)?
+        .unsqueeze(0)
+}
+
+pub fn module_path_matches_not_convert(module_path: &str, item: &str) -> bool {
+    let module_path = module_path.trim_end_matches(".weight");
+    let item = item.trim_end_matches(".weight");
+    module_path == item
+        || module_path.ends_with(item)
+        || module_path.ends_with(&format!(".{item}"))
+        || item.ends_with(module_path)
+        || item.ends_with(&format!(".{module_path}"))
+}
+
+pub fn should_skip_fp8_for_module(module_path: &str, cfg: &crate::utils::config::QuantConfig) -> bool {
+    if module_path.is_empty() || cfg.modules_to_not_convert.is_empty() {
+        return false;
+    }
+    cfg.modules_to_not_convert
+        .iter()
+        .any(|item| module_path_matches_not_convert(module_path, item))
 }
 
 // --- GLOBAL EXTRACTION CONTROL ---

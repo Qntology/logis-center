@@ -1,6 +1,6 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
-use candle_transformers::models::deepseek2::SplitOp;
+use attention_rs::ops::SplitOp;
 
 use crate::utils::tensor_utils::{index_select_2d, split_tensor};
 
@@ -33,7 +33,7 @@ pub fn apply_multimodel_rotary_pos_emb(
         .split(&mrope_section, D::Minus1)?
         .iter()
         .enumerate()
-        .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
+        .map(|(i, m)| m.i(i % 3).unwrap())
         .collect();
     let cos = Tensor::cat(&cos_select, D::Minus1)?
         .unsqueeze(1)?
@@ -42,7 +42,7 @@ pub fn apply_multimodel_rotary_pos_emb(
         .split(&mrope_section, D::Minus1)?
         .iter()
         .enumerate()
-        .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
+        .map(|(i, m)| m.i(i % 3).unwrap())
         .collect();
     let sin = Tensor::cat(&sin_select, D::Minus1)?
         .unsqueeze(1)?
@@ -80,6 +80,7 @@ pub fn apply_rotary_pos_emb(
     k: &Tensor,
     cos: &Tensor,
     sin: &Tensor,
+    interleaved: bool,
     tof32: bool,
 ) -> Result<(Tensor, Tensor)> {
     let mut cos = cos.clone();
@@ -98,13 +99,266 @@ pub fn apply_rotary_pos_emb(
     let cos = cos.to_dtype(q.dtype())?;
     let sin = sin.to_dtype(q.dtype())?;
 
+    let q_embed = if interleaved {
+        q.broadcast_mul(&cos)?
+            .add(&rotate_half_llm(q)?.broadcast_mul(&sin)?)?
+    } else {
+        q.broadcast_mul(&cos)?
+            .add(&rotate_half(q)?.broadcast_mul(&sin)?)?
+    };
+    let k_embed = if interleaved {
+        k.broadcast_mul(&cos)?
+            .add(&rotate_half_llm(k)?.broadcast_mul(&sin)?)?
+    } else {
+        k.broadcast_mul(&cos)?
+            .add(&rotate_half(k)?.broadcast_mul(&sin)?)?
+    };
+
+    Ok((q_embed.to_dtype(orig_dtype)?, k_embed.to_dtype(orig_dtype)?))
+}
+
+pub fn apply_rotary_pos_emb_partial(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    interleaved: bool,
+    tof32: bool,
+) -> Result<(Tensor, Tensor)> {
+    let mut cos = cos.clone();
+    let mut sin = sin.clone();
+    if cos.rank() == 2 {
+        cos = cos.unsqueeze(0)?.unsqueeze(0)?;
+        sin = sin.unsqueeze(0)?.unsqueeze(0)?;
+    }
+    if cos.rank() == 3 {
+        cos = cos.unsqueeze(1)?;
+        sin = sin.unsqueeze(1)?;
+    }
+    
+    let rotary_dim = cos.dim(D::Minus1)?;
+    let q_dim = q.dim(D::Minus1)?;
+    
+    if rotary_dim == q_dim {
+        return apply_rotary_pos_emb(q, k, &cos, &sin, interleaved, tof32);
+    }
+
+    let q_rot = q.narrow(D::Minus1, 0, rotary_dim)?;
+    let q_pass = q.narrow(D::Minus1, rotary_dim, q_dim - rotary_dim)?;
+    let k_rot = k.narrow(D::Minus1, 0, rotary_dim)?;
+    let k_pass = k.narrow(D::Minus1, rotary_dim, k.dim(D::Minus1)? - rotary_dim)?;
+
+    let (q_embed, k_embed) = apply_rotary_pos_emb(&q_rot, &k_rot, &cos, &sin, interleaved, tof32)?;
+
+    let q_embed = Tensor::cat(&[q_embed, q_pass], D::Minus1)?;
+    let k_embed = Tensor::cat(&[k_embed, k_pass], D::Minus1)?;
+
+    Ok((q_embed, k_embed))
+}
+
+pub fn glm_asr_apply_rotary_pos_emb(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    tof32: bool,
+) -> Result<(Tensor, Tensor)> {
+    let mut cos = cos.clone();
+    let mut sin = sin.clone();
+    if cos.rank() == 2 {
+        cos = cos.unsqueeze(0)?.unsqueeze(0)?;
+        sin = sin.unsqueeze(0)?.unsqueeze(0)?;
+    }
+    if cos.rank() == 3 {
+        cos = cos.unsqueeze(1)?;
+        sin = sin.unsqueeze(1)?;
+    }
+    let orig_dtype = q.dtype();
+    let q = if tof32 { &q.to_dtype(DType::F32)? } else { q };
+    let k = if tof32 { &k.to_dtype(DType::F32)? } else { k };
+    let cos = cos.to_dtype(q.dtype())?;
+    let sin = sin.to_dtype(q.dtype())?;
+    let rotary_dim = cos.dim(D::Minus1)?;
+    let q_dim = q.dim(D::Minus1)?;
+    let q_rot = q.narrow(D::Minus1, 0, rotary_dim)?;
+    let q_pass = q.narrow(D::Minus1, rotary_dim, q_dim - rotary_dim)?;
+    let k_rot = k.narrow(D::Minus1, 0, rotary_dim)?;
+    let k_pass = k.narrow(D::Minus1, rotary_dim, q_dim - rotary_dim)?;
+
+    let q_embed = q_rot
+        .broadcast_mul(&cos)?
+        .add(&rotate_half(&q_rot)?.broadcast_mul(&sin)?)?;
+    let k_embed = k_rot
+        .broadcast_mul(&cos)?
+        .add(&rotate_half(&k_rot)?.broadcast_mul(&sin)?)?;
+    let q_embed = Tensor::cat(&[q_embed, q_pass], D::Minus1)?.to_dtype(orig_dtype)?;
+    let k_embed = Tensor::cat(&[k_embed, k_pass], D::Minus1)?.to_dtype(orig_dtype)?;
+    Ok((q_embed, k_embed))
+}
+
+pub fn glm_interleaved_apply_rotary_pos_emb(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    tof32: bool,
+) -> Result<(Tensor, Tensor)> {
+    let mut cos = cos.clone();
+    let mut sin = sin.clone();
+    if cos.rank() == 2 {
+        cos = cos.unsqueeze(0)?.unsqueeze(0)?;
+        sin = sin.unsqueeze(0)?.unsqueeze(0)?;
+    }
+    if cos.rank() == 3 {
+        cos = cos.unsqueeze(1)?;
+        sin = sin.unsqueeze(1)?;
+    }
+    let orig_dtype = q.dtype();
+    let q = if tof32 { &q.to_dtype(DType::F32)? } else { q };
+    let k = if tof32 { &k.to_dtype(DType::F32)? } else { k };
+    let cos = cos.to_dtype(q.dtype())?;
+    let sin = sin.to_dtype(q.dtype())?;
+    let rotary_dim = cos.dim(D::Minus1)?;
+    let q_dim = q.dim(D::Minus1)?;
+    let q_rot = q.narrow(D::Minus1, 0, rotary_dim)?;
+    let q_pass = q.narrow(D::Minus1, rotary_dim, q_dim - rotary_dim)?;
+    let k_rot = k.narrow(D::Minus1, 0, rotary_dim)?;
+    let k_pass = k.narrow(D::Minus1, rotary_dim, q_dim - rotary_dim)?;
+
+    let q_embed = q_rot
+        .broadcast_mul(&cos)?
+        .add(&rotate_half_llm(&q_rot)?.broadcast_mul(&sin)?)?;
+    let k_embed = k_rot
+        .broadcast_mul(&cos)?
+        .add(&rotate_half_llm(&k_rot)?.broadcast_mul(&sin)?)?;
+    let q_embed = Tensor::cat(&[q_embed, q_pass], D::Minus1)?.to_dtype(orig_dtype)?;
+    let k_embed = Tensor::cat(&[k_embed, k_pass], D::Minus1)?.to_dtype(orig_dtype)?;
+    Ok((q_embed, k_embed))
+}
+
+fn rotate_half_llm(x: &Tensor) -> Result<Tensor> {
+    let last_dim = x.dim(D::Minus1)?;
+    let half = last_dim / 2;
+    let mut pair_shape = x.dims().to_vec();
+    let rank = pair_shape.len();
+    pair_shape[rank - 1] = half;
+    pair_shape.push(2);
+    let x_pairs = x.reshape(pair_shape)?;
+    let x_even = x_pairs.narrow(D::Minus1, 0, 1)?;
+    let x_odd = x_pairs.narrow(D::Minus1, 1, 1)?;
+    let neg_x_odd = x_odd.affine(-1.0, 0.0)?;
+    let result_pairs = Tensor::cat(&[&neg_x_odd, &x_even], D::Minus1)?;
+    Ok(result_pairs.reshape(x.dims().to_vec())?)
+}
+
+pub fn glm_ocr_apply_rotary_pos_emb(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let mut cos = cos.clone();
+    let mut sin = sin.clone();
+
+    cos = cos.unsqueeze(1)?;
+    sin = sin.unsqueeze(1)?;
+
+    let full_dim = cos.dim(D::Minus1)?;
+    let half_dim = full_dim / 2;
+    let cos_half = cos.narrow(D::Minus1, 0, half_dim)?;
+    let sin_half = sin.narrow(D::Minus1, 0, half_dim)?;
+    let cos_interleaved = cos_half
+        .unsqueeze(D::Minus1)?
+        .broadcast_mul(&Tensor::ones(
+            &[1, 1, 1, 1, 2],
+            cos_half.dtype(),
+            cos_half.device(),
+        )?)?
+        .reshape(cos.shape())?;
+    let sin_interleaved = sin_half
+        .unsqueeze(D::Minus1)?
+        .broadcast_mul(&Tensor::ones(
+            &[1, 1, 1, 1, 2],
+            sin_half.dtype(),
+            sin_half.device(),
+        )?)?
+        .reshape(sin.shape())?;
+
+    let cos = cos_interleaved.to_dtype(q.dtype())?;
+    let sin = sin_interleaved.to_dtype(q.dtype())?;
+
+    let rotary_dim = cos.dim(D::Minus1)?;
+    let q_rot = q.narrow(D::Minus1, 0, rotary_dim)?;
+    let q_pass = q.narrow(D::Minus1, rotary_dim, q.dim(D::Minus1)? - rotary_dim)?;
+    let k_rot = k.narrow(D::Minus1, 0, rotary_dim)?;
+    let k_pass = k.narrow(D::Minus1, rotary_dim, k.dim(D::Minus1)? - rotary_dim)?;
+
+    let q_embed = q_rot
+        .broadcast_mul(&cos)?
+        .add(&rotate_half_llm(&q_rot)?.broadcast_mul(&sin)?)?;
+    let k_embed = k_rot
+        .broadcast_mul(&cos)?
+        .add(&rotate_half_llm(&k_rot)?.broadcast_mul(&sin)?)?;
+
+    let q_embed = Tensor::cat(&[&q_embed, &q_pass], D::Minus1)?;
+    let k_embed = Tensor::cat(&[&k_embed, &k_pass], D::Minus1)?;
+    Ok((q_embed, k_embed))
+}
+
+pub fn roformer_rotate(x: &Tensor) -> Result<Tensor> {
+    let dims = x.dims();
+    let last_dim = dims
+        .last()
+        .ok_or(anyhow!("Input tensor must have at least one dimension"))?;
+    if last_dim % 2 != 0 {
+        return Err(anyhow!(
+            "Last dimension size must be even, got {}",
+            last_dim
+        ));
+    }
+    let new_dims: Vec<usize> = dims[..dims.len() - 1]
+        .iter()
+        .copied()
+        .chain([last_dim / 2, 2])
+        .collect();
+    let x_reshape = x.reshape(new_dims)?;
+    let x_chunks = x_reshape.chunk(2, D::Minus1)?;
+    let x1 = &x_chunks[0];
+    let x2 = &x_chunks[1];
+    let x2_neg = x2.affine(-1.0, 0.0)?;
+    let rotate_x = Tensor::cat(&[&x2_neg, x1], D::Minus1)?;
+    Ok(rotate_x.flatten(D::Minus2, D::Minus1)?)
+}
+
+pub fn apply_rotary_pos_emb_roformer(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    tof32: bool,
+) -> Result<(Tensor, Tensor)> {
+    let mut cos = cos.clone();
+    let mut sin = sin.clone();
+    if cos.rank() == 2 {
+        cos = cos.unsqueeze(0)?.unsqueeze(0)?;
+        sin = sin.unsqueeze(0)?.unsqueeze(0)?;
+    }
+    if cos.rank() == 3 {
+        cos = cos.unsqueeze(1)?;
+        sin = sin.unsqueeze(1)?;
+    }
+    let orig_dtype = q.dtype();
+    let q = if tof32 { &q.to_dtype(DType::F32)? } else { q };
+    let k = if tof32 { &k.to_dtype(DType::F32)? } else { k };
+    let cos = cos.to_dtype(q.dtype())?;
+    let sin = sin.to_dtype(q.dtype())?;
     let q_embed = q
         .broadcast_mul(&cos)?
-        .add(&rotate_half(q)?.broadcast_mul(&sin)?)?
+        .add(&roformer_rotate(q)?.broadcast_mul(&sin)?)?
         .to_dtype(orig_dtype)?;
     let k_embed = k
         .broadcast_mul(&cos)?
-        .add(&rotate_half(k)?.broadcast_mul(&sin)?)?
+        .add(&roformer_rotate(k)?.broadcast_mul(&sin)?)?
         .to_dtype(orig_dtype)?;
     Ok((q_embed, k_embed))
 }
@@ -149,7 +403,7 @@ impl Qwen2_5VLTextRotaryEmbedding {
             .split(&mrope_section, D::Minus1)?
             .iter()
             .enumerate()
-            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
+            .map(|(i, m)| m.i(i % 3).unwrap())
             .collect();
         let cos = Tensor::cat(&cos_select, D::Minus1)?
             .unsqueeze(1)?
@@ -158,7 +412,7 @@ impl Qwen2_5VLTextRotaryEmbedding {
             .split(&mrope_section, D::Minus1)?
             .iter()
             .enumerate()
-            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
+            .map(|(i, m)| m.i(i % 3).unwrap())
             .collect();
         let sin = Tensor::cat(&sin_select, D::Minus1)?
             .unsqueeze(1)?
@@ -188,14 +442,41 @@ impl Qwen2_5VisionRotaryEmbedding {
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLTextRotaryEmbedding {
+pub struct Qwen3_5TextRotaryEmbedding {
     inv_freq: Vec<f32>,
 }
 
-impl Qwen3VLTextRotaryEmbedding {
+impl Qwen3_5TextRotaryEmbedding {
     pub fn new(dim: usize, theta_base: f32) -> Self {
         let inv_freq = compute_default_rope_parameters(dim, theta_base);
         Self { inv_freq }
+    }
+
+    pub fn apply_interleaved_mrope(
+        &self,
+        freqs: &Tensor,
+        mrope_section: Vec<usize>,
+    ) -> Result<Tensor> {
+        // freqs shape: (3, B, S, D/2)
+        // In M-RoPE, each section of the head_dim uses frequencies from a different channel.
+        let mut sections = Vec::new();
+        let freqs_split = freqs.split(&vec![1, 1, 1], 0)?; // Vec of (1, B, S, D/2)
+        
+        let mut current_dim = 0;
+        for (i, &section_len) in mrope_section.iter().enumerate() {
+            if section_len == 0 { continue; }
+            // Get frequencies for this section from channel i
+            let channel_freqs = freqs_split[i].squeeze(0)?; // (B, S, D/2)
+            // Section takes frequencies starting from current_dim index of the channel
+            let section = channel_freqs.narrow(D::Minus1, current_dim, section_len)?;
+            sections.push(section);
+            current_dim += section_len;
+        }
+        
+        if sections.is_empty() {
+             return Ok(freqs.i(0)?);
+        }
+        Ok(Tensor::cat(&sections, D::Minus1)?)
     }
 
     pub fn forward(
@@ -203,69 +484,41 @@ impl Qwen3VLTextRotaryEmbedding {
         position_ids: &Tensor,
         dtype: DType,
         mrope_section: Vec<usize>,
+        interleaved: bool,
     ) -> Result<(Tensor, Tensor)> {
-        let position_ids = if position_ids.rank() == 2 {
-            let (bs, len) = position_ids.dims2()?;
-            position_ids.unsqueeze(0)?.expand((3, bs, len))?
-        } else {
-            position_ids.clone()
-        };
-
-        let position_ids_expanded = position_ids
-            .unsqueeze(D::Minus2)?
-            .to_dtype(DType::F32)?
-            .contiguous()?;
-
-        let inv_freq_expanded = Tensor::from_vec(
-            self.inv_freq.clone(),
-            (1, 1, self.inv_freq.len(), 1),
-            position_ids.device(),
-        )?
-        .broadcast_as((3, position_ids.dim(1)?, self.inv_freq.len(), 1))?
-        .to_dtype(DType::F32)?
-        .contiguous()?;
-
-        // Calculate frequencies for T, H, W dimensions
-        let freqs = inv_freq_expanded
-            .matmul(&position_ids_expanded)?
-            .transpose(2, 3)?; // (3, b_sz, seq_len, dim/2)
-
-        // Standard Qwen2-VL/Qwen3-VL block-based mRoPE assembly
-        let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?.contiguous()?;
-        let cos_all = emb.cos()?;
-        let sin_all = emb.sin()?;
-
-        // If no sections defined, fallback to first dimension (Time)
-        if mrope_section.is_empty() {
-            let cos = cos_all.i(0)?.unsqueeze(1)?.to_dtype(dtype)?;
-            let sin = sin_all.i(0)?.unsqueeze(1)?.to_dtype(dtype)?;
-            return Ok((cos, sin));
-        }
-
-        // Split by sections and select based on dimension index
-        let mrope_section_doubled = mrope_section.iter().map(|&s| s * 2).collect::<Vec<_>>();
+        // position_ids shape: (3, B, S)
+        let (_num_channels, b_sz, q_len) = position_ids.dims3()?;
+        let dev = position_ids.device();
         
-        let cos_select: Vec<Tensor> = cos_all
-            .split(&mrope_section_doubled, D::Minus1)?
-            .iter()
-            .enumerate()
-            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
-            .collect();
-        let cos = Tensor::cat(&cos_select, D::Minus1)?
-            .unsqueeze(1)?
-            .contiguous()?;
-
-        let sin_select: Vec<Tensor> = sin_all
-            .split(&mrope_section_doubled, D::Minus1)?
-            .iter()
-            .enumerate()
-            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
-            .collect();
-        let sin = Tensor::cat(&sin_select, D::Minus1)?
-            .unsqueeze(1)?
-            .contiguous()?;
-
-        Ok((cos.to_dtype(dtype)?, sin.to_dtype(dtype)?))
+        // inv_freq: (D/2)
+        let inv_freq = Tensor::from_vec(self.inv_freq.clone(), (self.inv_freq.len(),), dev)?;
+        
+        // Compute freqs for each channel
+        let pos_expanded = position_ids.unsqueeze(D::Minus1)?.to_dtype(DType::F32)?;
+        let inv_freq_expanded = inv_freq.reshape((1, 1, 1, ()))?;
+        
+        // (3, B, S, D/2)
+        let freqs = pos_expanded.broadcast_mul(&inv_freq_expanded)?;
+        
+        // Apply M-RoPE sectioning to get (B, S, D/2)
+        let freqs = self.apply_interleaved_mrope(&freqs, mrope_section)?; 
+        
+        // Create cos/sin
+        let emb = if interleaved {
+            // [f0, f0, f1, f1, ...]
+            let mut dims = freqs.dims().to_vec();
+            let last = dims.len() - 1;
+            dims[last] *= 2;
+            Tensor::stack(&[&freqs, &freqs], D::Minus1)?.reshape(dims)?
+        } else {
+            // [f0..fn, f0..fn]
+            Tensor::cat(&[&freqs, &freqs], D::Minus1)?
+        };
+            
+        let cos = emb.cos()?.to_dtype(dtype)?;
+        let sin = emb.sin()?.to_dtype(dtype)?;
+        
+        Ok((cos, sin))
     }
 }
 
@@ -327,12 +580,12 @@ pub fn get_xd_cos_sin(
     let cos_select: Vec<Tensor> = split_tensor(&cos, &xdrope_section, D::Minus1)?
         .iter()
         .enumerate()
-        .map(|(i, m): (usize, &Tensor)| m.i((.., .., i % x_dim)).unwrap())
+        .map(|(i, m)| m.i((.., .., i % x_dim)).unwrap())
         .collect();
     let sin_select: Vec<Tensor> = split_tensor(&sin, &xdrope_section, D::Minus1)?
         .iter()
         .enumerate()
-        .map(|(i, m): (usize, &Tensor)| m.i((.., .., i % x_dim)).unwrap())
+        .map(|(i, m)| m.i((.., .., i % x_dim)).unwrap())
         .collect();
 
     let cos = Tensor::cat(&cos_select, D::Minus1)?;

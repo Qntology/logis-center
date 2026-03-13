@@ -367,7 +367,7 @@ async fn process_task(
         println!("[PROCESS] Found existing KV cache for task {}. Ready to reuse.", task.id);
     }
 
-    // [SSD-BRIDGE] Start warming up 2B weights in background RAM immediately
+    // [SSD-BRIDGE] Start warming up 0.8B weights in background RAM immediately
     let large_model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3-VL-2B-Instruct-gguf")
         .or_else(|_| std::fs::canonicalize("models/Qwen3-VL-2B-Instruct-gguf")).ok();
     if let Some(p) = large_model_path_hint {
@@ -438,6 +438,7 @@ async fn process_task(
 
     // --- Image Extraction Logic (Vision Baker Pipeline) ---
     if task.r#type == "image_extraction" {
+        use crate::openai_types::ChatCompletionParameters;
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
         if !image_path.is_empty() {
             println!("[Scheduler] Starting Image Extraction for {}", task.id);
@@ -445,18 +446,18 @@ async fn process_task(
             let snapshot_id = format!("{}_img", task.id);
             
             // [Full Vision] Load full 2B model and analyze
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Analyzing visual context with 2B-VL...", "spinner": "⠋" }));
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Analyzing visual context with Qwen 3.5 0.8B (Vision)...", "spinner": "⠋" }));
             
             // Transition to full Large model. secure_vram_relay will load existing KV if snapshot_id exists.
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
+
+            let image_data = std::fs::read(&image_path)?;
+            let params = ChatCompletionParameters::default();
 
             model.extract_from_image(
-                task.id.clone(),
-                image_path,
-                "korean".to_string(),
-                app_handle,
+                image_data,
+                params,
                 Some(cancellation_token.clone()),
-                store_mutex,
             ).await?;
             
             return Ok(()); 
@@ -542,17 +543,17 @@ async fn process_task(
 
     // ==================================================================================
     // [ULTRA-OPTIMIZED PIPELINE]
-    // Step 1: 0.6B Bakes [PUG + Classification Task] -> Save SNAPSHOT_A
-    // Step 2: 0.6B Loads SNAPSHOT_A -> Instant Generation
-    // Step 3: 0.6B Bakes [PUG + Selector Task] -> Save SNAPSHOT_B
-    // Step 4: 0.6B Loads SNAPSHOT_B -> Instant Generation
+    // Step 1: 0.8B Bakes [PUG + Classification Task] -> Save SNAPSHOT_A
+    // Step 2: 0.8B Loads SNAPSHOT_A -> Instant Generation
+    // Step 3: 0.8B Bakes [PUG + Selector Task] -> Save SNAPSHOT_B
+    // Step 4: 0.8B Loads SNAPSHOT_B -> Instant Generation
     // ... 
     // ==================================================================================
 
     // --- STEP A: CLASSIFICATION (Disk Bridge Relay) ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] Starting DISK BRIDGE RELAY (0.6B -> Disk -> 0.6B)");
+        println!("[Scheduler] Starting DISK BRIDGE RELAY (0.8B -> Disk -> 0.8B)");
         
         // [NEW] Log step A start for UI recovery
         log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
@@ -564,24 +565,24 @@ async fn process_task(
         let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] Identify the page type.\n\n[INSTRUCTION]\n{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, type_prompt);
         let snapshot_id = format!("{}_step_a", task.id);
         
-        // 1. [0.6B] Load & Generate (Direct 28-Layer Generation)
+        // 1. [0.8B] Load & Generate (Direct 28-Layer Generation)
         {
-            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
                     content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                     name: None,
                 })],
-                model: "qwen3vl".to_string(), 
+                model: "qwen35".to_string(), 
                 max_tokens: Some(32), // Increased from 128 to 512
                 temperature: Some(0.1),
                 ..Default::default()
             };
 
-            if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 0.6B Step A: Asking classification question...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
+            if let Some(variant) = model.generator.lock().await.as_ref() {
+                println!("[Scheduler] 0.8B Step A: Asking classification question...");
+                let res = variant.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
                 println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
                 
                 let _ = data_manager.offload(&res, "step_a_res");
@@ -623,22 +624,22 @@ async fn process_task(
         let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, selector_prompt);
         let snapshot_id = format!("{}_step_b", task.id);
 
-        // 1. [Small] Load & Generate (Direct 28-Layer Generation)
+        // 1. [0.8B] Load & Generate (Direct 28-Layer Generation)
         {
-            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
                     content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                     name: None,
                 })],
-                model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
+                model: "qwen35".to_string(), max_tokens: Some(128), temperature: Some(0.1),
                 ..Default::default()
             };
 
-            if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] Small Step B: Asking selector question...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
+            if let Some(variant) = model.generator.lock().await.as_ref() {
+                println!("[Scheduler] Qwen 3.5 0.8B Step B: Asking selector question...");
+                let res = variant.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
                 println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
 
                 // [DEBUG] AI 응답 저장
@@ -739,27 +740,26 @@ async fn process_task(
             let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, extraction_instruction);
             let snapshot_id = format!("{}_detail", task.id);
 
-            // 1. [Small] Load & Generate (Direct 28-Layer Generation)
+            // 1. [0.8B] Load & Generate (Direct 28-Layer Generation)
             {
-                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
                         content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                         name: None,
                     })],
-                    model: "qwen3vl".to_string(), max_tokens: Some(256), temperature: Some(0.1),
+                    model: "qwen35".to_string(), max_tokens: Some(256), temperature: Some(0.1),
                     ..Default::default()
                 };
 
-                // 3. Small Instant Inference
-                if let Some(gen) = model.generator.lock().await.as_mut() {
-                    println!("[Scheduler] Small Step C: Asking extraction question...");
-                    log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Small Inference..." }));
-                    
-                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), Some("inference".to_string())).await?;
-                    println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
+                // 3. 0.8B Instant Inference
+                if let Some(variant) = model.generator.lock().await.as_ref() {
+                    println!("[Scheduler] 0.8B Step C: Asking extraction question...");
+                    log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running 0.8B Inference..." }));
 
+                    let res = variant.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), Some("inference".to_string())).await?;
+                    println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
                     // [DEBUG] AI 응답 저장
                     let _ = data_manager.offload(&res, "step_c_res");
 
@@ -1005,7 +1005,7 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
             stable_ticks = 0;
         }
 
-        // [FAST-EXIT] If stable for 1.5 seconds OR we have at least 600MB free (enough for Embedding/0.6B)
+        // [FAST-EXIT] If stable for 1.5 seconds OR we have at least 600MB free (enough for Embedding/0.8B)
         // This prevents being stuck at 0.7GB when target is 1.1GB.
         if (stable_ticks >= 3 && current_vram > 600_000_000) || current_vram > target_vram_bytes {
             println!("[RESOURCE-WATCH] Memory sufficient or stabilized. Proceeding with {:.2} GB free VRAM.", current_vram as f64 / 1e9);
