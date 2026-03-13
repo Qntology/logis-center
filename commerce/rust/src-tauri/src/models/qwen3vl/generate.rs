@@ -1,6 +1,6 @@
 use crate::models::qwen3vl::quantized_model::{KVLocation, KVBlock, KVRegistry, BitKVMetadata, QuantizedQwen3VLModel, MemorySlot};
 use anyhow::{Result, anyhow};
-use candle_core::{quantized::gguf_file, DType, Device, Tensor, IndexOp};
+use candle_core::{quantized::gguf_file, DType, Device, Tensor};
 use candle_nn::VarBuilder;
 
 use crate::{
@@ -437,7 +437,6 @@ pub struct Qwen3VLGenerateModel {
     pub model_name: String,
     pub hard_token_limit: Option<usize>,
     pub kv_root: std::path::PathBuf,
-    pub block_manager: Arc<crate::models::qwen3vl::block_manager::BlockManager>,
 }
 
 impl Qwen3VLGenerateModel {
@@ -452,20 +451,6 @@ impl Qwen3VLGenerateModel {
             let text_config: crate::models::qwen3vl::config::Qwen3VLTextConfig = serde_json::from_value(raw_config.clone())?;
             Qwen3VLConfig { architectures: raw_config.get("architectures").and_then(|v| serde_json::from_value(v.clone()).ok()), auto_map: raw_config.get("auto_map").and_then(|v| serde_json::from_value(v.clone()).ok()), hidden_size: raw_config.get("hidden_size").and_then(|v| v.as_u64()).map(|v| v as usize), image_token_id: raw_config.get("image_token_id").and_then(|v| v.as_u64()).map(|v| v as usize), model_type: raw_config.get("model_type").and_then(|v| v.as_str()).unwrap_or("qwen2").to_string(), text_config: Some(text_config), tie_word_embeddings: raw_config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(true), torch_dtype: raw_config.get("torch_dtype").and_then(|v| v.as_str()).map(|s| s.to_string()), transformers_version: raw_config.get("transformers_version").and_then(|v| v.as_str()).unwrap_or("").to_string(), video_token_id: raw_config.get("video_token_id").and_then(|v| v.as_u64()).map(|v| v as usize), vision_config: None, vision_start_token_id: None, vision_end_token_id: None }
         };
-
-        // [BLOCK-MANAGER-INIT] 
-        let text_cfg = cfg.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
-        let pool_path = kv_root.join("kv_cache_pool.bin");
-        let block_manager = Arc::new(crate::models::qwen3vl::block_manager::BlockManager::new(
-            &pool_path,
-            128, // Max Blocks (32,768 tokens)
-            256, // Tokens per Block
-            text_cfg.num_hidden_layers,
-            text_cfg.num_key_value_heads,
-            text_cfg.head_dim,
-            2, // BF16 = 2 bytes
-        )?);
-
         let t_dev = get_device(text_device); let v_dev = get_device(vision_device); let dtype = get_dtype(dtype, cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16"));
         let gguf_f = find_type_files(path, "gguf")?; let mmproj_p = gguf_f.iter().find(|f| f.contains("mmproj")).cloned();
         let mut m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned();
@@ -490,10 +475,11 @@ impl Qwen3VLGenerateModel {
         let g_p = std::path::Path::new(cfg_path).join("generation_config.json"); let g_cfg = if g_p.exists() { serde_json::from_slice(&std::fs::read(g_p)?)? } else { Qwen3VLGenerationConfig::default() };
         let (e1, e2) = match &g_cfg.eos_token_id { serde_json::Value::Number(n) => { let id = n.as_u64().unwrap_or(151645) as u32; (id, id) }, serde_json::Value::Array(arr) => { (arr.get(0).and_then(|v| v.as_u64()).unwrap_or(151643) as u32, arr.get(1).and_then(|v| v.as_u64()).unwrap_or(151643) as u32) }, _ => (151643, 151643) };
         let loaded_model_name = if m_p.as_ref().map(|p| p.contains("0.6B")).unwrap_or(false) { "0.6B".to_string() } else { "2B".to_string() };
-        Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &v_dev, dtype)?, qwen3_vl, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: loaded_model_name, hard_token_limit, kv_root, block_manager })
+        Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &v_dev, dtype)?, qwen3_vl, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: loaded_model_name, hard_token_limit, kv_root })
     }
 
     pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut Qwen3VLGenerateModel>, _kv_name: Option<String>) -> Result<usize> {
+        // [FIX] Always start prefill from zero to avoid double offset on restart
         self.clear_kv_cache();
         if let ModelVariant::QuantizedVL(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
         if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl { m.language_model.truncate_kv_cache(0)?; }
@@ -502,70 +488,14 @@ impl Qwen3VLGenerateModel {
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_toks = full_ids.len();
-        
-        // 1. GPU Forward 수행 (KV 캐시 생성)
         self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
-        
-        // 2. [SSD-POOL-INTEGRATION] 생성된 KV 캐시를 BlockManager 풀에 영구 저장
         if let Some(s_id) = &session_id {
-            let (k_tensors, v_tensors) = self.qwen3_vl.get_current_kv();
-            if !k_tensors.is_empty() {
-                let num_blocks = (total_toks + 255) / 256;
-                for b_idx in 0..num_blocks {
-                    // 블록 할당
-                    let phys_id = self.block_manager.allocate(s_id, b_idx)?;
-                    let block = &self.block_manager.physical_blocks[phys_id];
-                    
-                    // 상태를 Loading(쓰기 중)으로 변경하여 동시 접근 차단
-                    block.set_status(crate::models::qwen3vl::block_manager::BlockStatus::Loading);
-                    
-                    // [BOTTLE-NECK-FIX] CPU Pinned 버퍼 확보
-                    let mut buffer = self.block_manager.acquire_io_buffer()?;
-                    
-                    // [SERIALIZATION] 각 레이어의 KV 데이터를 블록 버퍼에 직렬화
-                    let mut offset = 0;
-                    let start_token = b_idx * 256;
-                    let end_token = ((b_idx + 1) * 256).min(total_toks);
-                    let actual_len = end_token - start_token;
-
-                    for (k_layer, v_layer) in k_tensors.iter().zip(v_tensors.iter()) {
-                        // K 텐서 슬라이싱 및 복사: [1, num_heads, seq_len, head_dim] -> [actual_len, heads, dim]
-                        let k_slice = k_layer.i((.., .., start_token..end_token, ..))?
-                            .transpose(1, 2)? // [1, actual_len, num_heads, head_dim]
-                            .reshape((actual_len, ()))? // Flatten heads/dim
-                            .to_device(&candle_core::Device::Cpu)?
-                            .to_vec2::<half::bf16>()?;
-                        
-                        // V 텐서 슬라이싱 및 복사
-                        let v_slice = v_layer.i((.., .., start_token..end_token, ..))?
-                            .transpose(1, 2)?
-                            .reshape((actual_len, ()))?
-                            .to_device(&candle_core::Device::Cpu)?
-                            .to_vec2::<half::bf16>()?;
-
-                        // 버퍼에 바이트 단위로 복사 (K)
-                        for row in k_slice {
-                            let bytes = unsafe { std::slice::from_raw_parts(row.as_ptr() as *const half::bf16 as *const u8, row.len() * 2) };
-                            buffer[offset..offset + bytes.len()].copy_from_slice(bytes);
-                            offset += bytes.len();
-                        }
-                        // 버퍼에 바이트 단위로 복사 (V)
-                        for row in v_slice {
-                            let bytes = unsafe { std::slice::from_raw_parts(row.as_ptr() as *const half::bf16 as *const u8, row.len() * 2) };
-                            buffer[offset..offset + bytes.len()].copy_from_slice(bytes);
-                            offset += bytes.len();
-                        }
-                    }
-                    
-                    // SSD 풀의 특정 오프셋에 직접 기록 (DirectStorage/Overlapped)
-                    self.block_manager.pool.read().save_block_async(phys_id, &buffer)?;
-                    
-                    block.set_status(crate::models::qwen3vl::block_manager::BlockStatus::Valid);
-                    block.set_location(crate::models::qwen3vl::block_manager::BlockLocation::SSD);
-                    self.block_manager.release_io_buffer(buffer);
-                }
-            }
-            println!("[PREFILL-POOL] Session {} persisted to KV Cache Pool ({} blocks).", s_id, (total_toks + 255) / 256);
+            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+            if !path.exists() { fs::create_dir_all(&path)?; }
+            fs::write(path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
+            let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
+            wait_for_global_io().await; // [SYNC] Ensure SSD write is complete
+            println!("[PREFILL-SAVE] All active KV blocks safely persisted to disk.");
         }
         Ok(total_toks)
     }
@@ -738,23 +668,6 @@ impl Qwen3VLGenerateModel {
             
             let current_pos = total_tokens_after_prefill + i as usize;
             
-            // [DECODING-POOL-INTEGRATION] 다음 토큰 연산을 위한 블록 프리페칭 및 배리어
-            if let Some(s_id) = &session_id {
-                let block_idx = current_pos / 256;
-                if let Some(phys_id) = self.block_manager.get_physical_id(s_id, block_idx) {
-                    // 1. [PREFETCH] 만약 다음 블록이 곧 필요하다면 미리 RAM으로 로드 시작 (비동기)
-                    let next_block_idx = (current_pos + 1) / 256;
-                    if next_block_idx != block_idx {
-                        if let Some(next_phys_id) = self.block_manager.get_physical_id(s_id, next_block_idx) {
-                           // SSD -> RAM 비동기 로드 트리거 (생략된 백그라운드 워커 호출)
-                        }
-                    }
-
-                    // 2. [BARRIER] 현재 블록의 데이터가 Valid 상태인지 확인 (외계어 방지!)
-                    self.block_manager.wait_for_block_valid(phys_id)?;
-                }
-            }
-
             wait_for_global_io().await; // [SYNC] Wait for any incremental baking
             logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;
         }
