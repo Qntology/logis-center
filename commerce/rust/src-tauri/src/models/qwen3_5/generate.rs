@@ -16,6 +16,9 @@ use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::utils::logits_processor::get_logit_processor;
 
+use crate::utils::downloader::ModelPaths;
+use std::path::PathBuf;
+
 pub struct Qwen3_5GenerateModel {
     pub qwen3_5: Qwen3_5ForCausalLM,
     pub tokenizer: TokenizerModel,
@@ -61,6 +64,7 @@ impl Qwen3_5GenerateModel {
         let tokenizer = TokenizerModel::init(model_path)?;
         let chat_template = ChatTemplate::init(model_path)?;
         
+        let model_path_buf = PathBuf::from(model_path);
         let mut weight_files = vec![];
         for entry in std::fs::read_dir(model_path)? {
             let entry = entry?;

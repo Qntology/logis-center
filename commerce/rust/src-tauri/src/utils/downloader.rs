@@ -363,16 +363,17 @@ impl Downloader {
             _ => "".into(),
         };
 
-        for rfilename in api
-            .info()
-            .map_err(candle_core::Error::wrap)?
+        let info = api.info().map_err(candle_core::Error::wrap)?;
+        let safetensors: Vec<String> = info
             .siblings
-            .iter()
-            .map(|x| x.rfilename.clone())
-            .filter(|x| x.ends_with(".safetensors"))
-        {
+            .into_iter()
+            .map(|x| x.rfilename)
+            .filter(|x: &String| x.ends_with(".safetensors"))
+            .collect();
+
+        for r in safetensors {
             let filename =
-                self.hf_get_with_retry(&api, &rfilename, 5, std::time::Duration::from_secs(5))?;
+                self.hf_get_with_retry(&api, &r, 5, std::time::Duration::from_secs(5))?;
             filenames.push(filename);
         }
 

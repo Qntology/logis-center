@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "rust"
 version = "0.1.0"
 description = "A Tauri App"
@@ -13,65 +13,67 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "test_qwen"
 path = "src/bin/test_qwen.rs"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [build-dependencies]
 tauri-build = { version = "2.5.3", features = [] }
 
 [dependencies]
+# official vllm-rs dependencies
+candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5bed038" }
+candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5bed038" }
+serde = { version = "1.0", features = ["derive"] }
+tokenizers = { version = "0.21.2", features = ["http"] }
+hf-hub = "0.4.1"
+anyhow = "1.0"
 itertools = "0.13.0"
 akin = "0.4.0"
 indicatif = "0.17.11"
+serde_json = "1.0"
 llguidance = "0.6"
 toktrie = "1.4"
+half = { version = "2.7.1", features = ["num-traits", "use-intrinsics", "rand_distr"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-lazy_static = {version = "1.4.0"}
+either = { version = "1.13.0", features = ["serde"] }
+minijinja = { version = "2.10.2", features = ["builtins", "json"] }
+lazy_static = "1.4.0"
 interprocess = "2.2.2"
 serde-big-array = "0.5.1"
-bincode = { version = "1.3.1" }
+bincode = "1.3.1"
 twox-hash = "2.1.1"
+rand = "0.9.0"
+rayon = "1.10"
+thiserror = "1.0.58"
 ahash = "0.8.11"
-tqdm = "0.8.0"
-colored = "3.0.0"
-tool-parser = "1.1.1"
-openai-protocol = "1.2.0"
-tauri = { version = "2.9.5", features = [] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
-# mistralrs = { path = "mistralrs/mistralrs", default-features = false, features = ["cuda"] }
-image = { version = "0.25", features = ["jpeg", "png"] }
-base64 = "0.22"
-anyhow = "1.0"
-half = "2.7.1"
-regex = "1"
-rand = "0.8"
-encoding_rs = "0.8"
-flate2 = "1.0"
-futures = "0.3"
-either = "1.9"
 parking_lot = "0.12"
 attention_rs = { package = "attention-rs", path = "src/models/attention", features = ["cuda"] }
+once_cell = "1.18"
+tqdm = "0.8.0"
+futures = "0.3"
+base64 = "0.22"
 uuid = { version = "1.4", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
+colored = "3.0.0"
+sysinfo = "0.30"
+image = { version = "0.25", features = ["jpeg", "png"] }
+reqwest = { version = "0.12", features = ["json", "native-tls", "blocking"], default-features = false }
+bytemuck = "1.25.0"
+regex = "1"
+url = "2.5.7"
+tool-parser = "1.1.1"
+openai-protocol = "1.2.0"
+
+# local project specific dependencies
+tauri = { version = "2.9.5", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
-reqwest = { version = "0.12", features = ["json", "native-tls", "blocking"], default-features = false }
-sysinfo = "0.30"
-candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5bed038" }
-candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5bed038" }
-tokenizers = "0.21.2"
+chrono = { version = "0.4", features = ["serde"] }
 num = "0.4.3"
-minijinja = "2.12.0"
-rayon = "1.10"
 dirs = "6.0.0"
-url = "2.5.7"
 fantoccini = "0.19"
 chromiumoxide = { version = "0.8.0", features = ["tokio-runtime"] }
 which = "6.0"
-once_cell = "1.18"
 scraper = "0.25.0"
 lancedb = { version = "0.23.1", default-features = false }
 safetensors = "0.4"
@@ -84,8 +86,6 @@ nvml-wrapper = "0.9.0"
 memmap2 = "0.9"
 windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_System_Memory"] }
 libc = "0.2"
-bytemuck = "1.25.0"
-tracing = "0.1.44"
 
 [target.'cfg(windows)'.dependencies]
 direct-storage = { path = "./direct-storage" }
@@ -103,15 +103,13 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "attention_rs/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal", "attention_rs/metal"]
 flash-attn = []
 
-
 [profile.dev]
-opt-level = 0      # 湲곕낯媛?0(理쒖쟻???놁쓬)??2濡??щ젮???ㅽ뻾 ?띾룄瑜?媛쒖꽑?⑸땲??
-incremental = true # 蹂寃쎈맂 遺遺꾨쭔 鍮뚮뱶?댁꽌 ?쒓컙???꾨굧?덈떎.
+opt-level = 0
+incremental = true
 
 [profile.release]
-opt-level = 3   # ?ㅽ뻾 ?띾룄 理쒕?
-strip = true      # 紐⑤뱺 ?щ낵 ?쒓굅 (?⑥닔 ?대쫫 ????젣)
-lto = true        # ?꾩껜 ?꾨줈洹몃옩 理쒖쟻??(肄붾뱶 遺꾩꽍???⑥뵮 ?대졄寃???
-panic = "abort"   # ?먮윭 諛쒖깮 ???뺣낫瑜??④린吏 ?딆쓬
-codegen-units = 16 # 鍮뚮뱶 ?띾룄 媛쒖꽑
-
+opt-level = 3
+strip = true
+lto = true
+panic = "abort"
+codegen-units = 16

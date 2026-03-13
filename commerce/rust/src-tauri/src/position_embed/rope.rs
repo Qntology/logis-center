@@ -33,7 +33,7 @@ pub fn apply_multimodel_rotary_pos_emb(
         .split(&mrope_section, D::Minus1)?
         .iter()
         .enumerate()
-        .map(|(i, m)| m.i(i % 3).unwrap())
+        .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
         .collect();
     let cos = Tensor::cat(&cos_select, D::Minus1)?
         .unsqueeze(1)?
@@ -42,7 +42,7 @@ pub fn apply_multimodel_rotary_pos_emb(
         .split(&mrope_section, D::Minus1)?
         .iter()
         .enumerate()
-        .map(|(i, m)| m.i(i % 3).unwrap())
+        .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
         .collect();
     let sin = Tensor::cat(&sin_select, D::Minus1)?
         .unsqueeze(1)?
@@ -403,7 +403,7 @@ impl Qwen2_5VLTextRotaryEmbedding {
             .split(&mrope_section, D::Minus1)?
             .iter()
             .enumerate()
-            .map(|(i, m)| m.i(i % 3).unwrap())
+            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
             .collect();
         let cos = Tensor::cat(&cos_select, D::Minus1)?
             .unsqueeze(1)?
@@ -412,7 +412,7 @@ impl Qwen2_5VLTextRotaryEmbedding {
             .split(&mrope_section, D::Minus1)?
             .iter()
             .enumerate()
-            .map(|(i, m)| m.i(i % 3).unwrap())
+            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
             .collect();
         let sin = Tensor::cat(&sin_select, D::Minus1)?
             .unsqueeze(1)?
