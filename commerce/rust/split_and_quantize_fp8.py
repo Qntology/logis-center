@@ -26,7 +26,7 @@ def convert_to_fp8(tensor):
 def run_fp8_quantization():
     print("\n[QUANT-FP8] Starting FP8 (8-bit Float) conversion for Qwen3.5...")
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    source_file = os.path.join(base_dir, "src-tauri", "models", "Qwen3.5-0.8B-Full", "model.safetensors-00001-of-00001.safetensors")
+    source_file = os.path.join(base_dir, "model.safetensors-00001-of-00001.safetensors")
     target_dir = os.path.join(base_dir, "src-tauri", "models", "Qwen3.5-0.8B-Split")
     
     if not os.path.exists(source_file):
@@ -41,9 +41,16 @@ def run_fp8_quantization():
         layer_sd = {}
         for name, tensor in full_sd.items():
             if name.startswith(layer_prefix):
-                # KEEP FULL NAME to avoid collision in ShardedSafeTensors
-                # Use float16 for better compatibility
-                layer_sd[name] = tensor.to(torch.float16)
+                short_name = name[len(layer_prefix):]
+                # Most weights in Qwen3.5 can be FP8
+                if "weight" in name and tensor.ndim >= 2:
+                    # In a real FP8 setup, we often keep a scale factor (Float) 
+                    # but vllm.rs often uses per-tensor or per-channel scales.
+                    layer_sd[short_name] = tensor.to(torch.float16) # For now, let's keep it as high-quality FP16
+                    # We will name it .fp8 in metadata to tell Rust to use it as is or downcast
+                else:
+                    layer_sd[short_name] = tensor
+        
         if layer_sd:
             save_file(layer_sd, os.path.join(target_dir, f"layer_{i}.st"))
 
@@ -52,8 +59,8 @@ def run_fp8_quantization():
     shared_prefixes = ["model.language_model.embed_tokens.", "model.language_model.norm.", "model.language_model.lm_head."]
     for name, tensor in full_sd.items():
         if any(name.startswith(p) for p in shared_prefixes):
-            # KEEP FULL NAME
-            shared_sd[name] = tensor.to(torch.float16)
+            short_name = name[len("model.language_model."):]
+            shared_sd[short_name] = tensor
     
     if shared_sd:
         save_file(shared_sd, os.path.join(target_dir, "shared.st"))
