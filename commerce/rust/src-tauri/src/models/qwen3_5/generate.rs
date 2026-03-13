@@ -129,7 +129,9 @@ impl Qwen3_5GenerateModel {
         );
 
         let prompt = self.chat_template.apply_chat_template(&params)?;
+        println!("📝 Full Prompt (len={}):\n---\n{}\n---", prompt.len(), prompt);
         let mut tokens = self.tokenizer.text_encode_vec(prompt, true)?;
+        println!("🔢 Tokenized prompt (len={}): {:?}", tokens.len(), tokens);
         
         let mut gen_text = String::new();
         let max_tokens = params.max_tokens.unwrap_or(128) as usize;
@@ -151,6 +153,7 @@ impl Qwen3_5GenerateModel {
             } else {
                 Tensor::from_vec(vec![*tokens.last().unwrap()], (1,), &self.device)?
             };
+            println!("[Step {}] input_ids shape: {:?}", step, input_ids.shape());
 
             let positions = if is_prefill {
                 Tensor::arange(0u32, current_seq_len as u32, &self.device)?.to_dtype(DType::I64)?
@@ -189,14 +192,18 @@ impl Qwen3_5GenerateModel {
                 cu_seqlens_q: if is_prefill {
                     Some(Tensor::from_vec(vec![0u32, current_seq_len as u32], (2,), &self.device)?)
                 } else {
-                    Some(Tensor::from_vec(vec![0u32, 1u32], (2,), &self.device)?)
+                    None
                 },
-                cu_seqlens_k: None, // Let Attention layer calculate causal mask correctly
-                max_seqlen_q: if is_prefill { current_seq_len } else { 1 },
-                max_seqlen_k: current_seq_len,
+                cu_seqlens_k: if is_prefill {
+                    Some(Tensor::from_vec(vec![0u32, current_seq_len as u32], (2,), &self.device)?)
+                } else {
+                    None
+                },
+                max_seqlen_q: if is_prefill { current_seq_len } else { 0 },
+                max_seqlen_k: if is_prefill { current_seq_len } else { 0 },
                 max_context_len: current_seq_len,
-                disable_flash_attn: Some(true),
-                seqlens: Some(vec![current_seq_len as u32]),
+                disable_flash_attn: None, // Use default (auto)
+                seqlens: if is_prefill { Some(vec![current_seq_len as u32]) } else { None },
                 flashinfer_metadata: None,
             };
 
