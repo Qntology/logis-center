@@ -1555,6 +1555,20 @@ pub struct QuantizedQwen3VLTextModel {
 }
 
 impl QuantizedQwen3VLTextModel {
+    fn get_vram_usage(&self) -> String {
+        use nvml_wrapper::Nvml;
+        if let Ok(nvml) = Nvml::init() {
+            if let Ok(dev) = nvml.device_by_index(self.device_id as u32) {
+                if let Ok(mem) = dev.memory_info() {
+                    let total_mb = mem.total as f64 / 1024.0 / 1024.0;
+                    let used_mb = mem.used as f64 / 1024.0 / 1024.0;
+                    return format!(" | VRAM: {:.2}/{:.2} MB", used_mb, total_mb);
+                }
+            }
+        }
+        "".to_string()
+    }
+
     /// [MEMORY-OPT] 특정 레이어의 가중치를 mmap에서 다시 로드합니다.
     pub fn reload_layer(&mut self, layer_idx: usize) -> Result<()> {
         if !self.layers[layer_idx].self_attn.q_proj.is_cleared() {
@@ -1673,7 +1687,7 @@ impl QuantizedQwen3VLTextModel {
     /// [MEMORY-OPT] 모든 레이어를 한꺼번에 로드합니다. (디코딩 시작 시 호출)
     pub fn reload_all_layers(&mut self) -> Result<()> {
         let count = self.layers.len();
-        println!("[MEMORY-OPT] Prefill complete. Reloading all {} layers for high-speed decoding...", count);
+        println!("[MEMORY-OPT] Prefill complete. Reloading all {} layers for high-speed decoding...{}", count, self.get_vram_usage());
         for i in 0..count {
             self.reload_layer(i)?;
         }
@@ -1938,9 +1952,9 @@ impl QuantizedQwen3VLTextModel {
                 self.layers[layer_idx].self_attn.vram_merged_k = None;
                 self.layers[layer_idx].self_attn.vram_merged_v = None;
                 self.layers[layer_idx].self_attn.merged_vram_block_count = 0;
-                println!("[ENGINE-TRACE] Layer {} Prefill Cache Evicted (Large Model).", layer_idx);
+                println!("[ENGINE-TRACE] Layer {} Prefill Cache Evicted (Large Model).{}", layer_idx, self.get_vram_usage());
             } else {
-                println!("[ENGINE-TRACE] Layer {} Prefill Cache Kept (Small Model).", layer_idx);
+                println!("[ENGINE-TRACE] Layer {} Prefill Cache Kept (Small Model).{}", layer_idx, self.get_vram_usage());
             }
         }
         
@@ -2095,7 +2109,7 @@ impl QuantizedQwen3VLTextModel {
             if target_device.is_cuda() { 
                 let _ = target_device.synchronize(); // GPU 메모리 해제 확정
             }
-            println!("[MEMORY-OPT] Layer {} Weights Purged. (RAM/VRAM cleared)", layer_idx);
+            println!("[MEMORY-OPT] Layer {} Weights Purged. (RAM/VRAM cleared){}", layer_idx, self.get_vram_usage());
         }
 
         // [STEP 4] 자원 반납 및 KV 대피
