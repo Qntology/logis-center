@@ -519,4 +519,3 @@ impl NaiveMLP {
         self.fc2.forward(&down)
     }
 }
-

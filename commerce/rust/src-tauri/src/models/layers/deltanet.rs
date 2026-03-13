@@ -518,7 +518,7 @@ impl GatedDeltaNet {
         let (q, k) = (self.repeat_kv_heads(q)?, self.repeat_kv_heads(k)?);
 
         let output = if is_prefill {
-            // S1: Use batched varlen recurrence ??one CUDA launch for all sequences
+            // S1: Use batched varlen recurrence — one CUDA launch for all sequences
             let q_scaled = (&q * self.scale)?;
 
             let cu_seqlens = input_metadata
@@ -575,4 +575,3 @@ impl GatedDeltaNet {
         self.out_proj.forward(&gated_output.to_dtype(xs.dtype())?)
     }
 }
-

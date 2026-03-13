@@ -219,7 +219,6 @@ fn qwen3_hybrid_raw_from_extra_config(config: &Config) -> Option<Qwen3HybridRawC
         return None;
     }
     
-    // First try extra_config_json (GGUF case)
     if let Some(extra) = config.extra_config_json.as_ref() {
         if let Ok(root) = serde_json::from_str::<serde_json::Value>(extra) {
             let cfg = root.get("text_config").cloned().unwrap_or(root);
@@ -227,21 +226,6 @@ fn qwen3_hybrid_raw_from_extra_config(config: &Config) -> Option<Qwen3HybridRawC
                 return Some(raw);
             }
         }
-    }
-    
-    // Fallback: Check if fields are already in Config (JSON case)
-    if config.layer_types.is_some() || config.full_attention_interval.is_some() {
-        return Some(Qwen3HybridRawConfig {
-            layers_block_type: config.layer_types.clone(),
-            conv_kernel_size: config.linear_conv_kernel_dim,
-            full_attention_interval: config.full_attention_interval,
-            linear_num_heads: config.linear_num_heads,
-            linear_num_key_heads: config.linear_num_key_heads,
-            linear_num_value_heads: config.linear_num_value_heads,
-            linear_num_key_value_heads: None,
-            linear_key_head_dim: config.linear_key_head_dim,
-            linear_value_head_dim: config.linear_value_head_dim,
-        });
     }
     
     None

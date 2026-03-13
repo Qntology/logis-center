@@ -257,4 +257,3 @@ pub fn masked_fill<D: WithDType>(xs: &Tensor, mask: &Tensor, value: D) -> Result
         .where_cond(&on_true, on_false)?;
     Ok(res)
 }
-

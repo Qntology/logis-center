@@ -119,7 +119,12 @@ impl Attention {
         shard: candle_nn::var_builder::Shard,
         dtype: DType,
     ) -> Result<Option<Tensor>> {
-        let bias = vb.get_with_hints_dtype((out_dim,), "bias", shard, DType::F32);
+        let bias = match &vb.0 {
+            Either::Left(inner) => {
+                inner.get_with_hints_dtype((out_dim,), "bias", shard, DType::F32)
+            }
+            Either::Right(_) => return Ok(None),
+        };
         let Ok(bias) = bias else {
             return Ok(None);
         };
@@ -879,4 +884,3 @@ impl NaiveAttention {
         self.o_proj.forward(&att)
     }
 }
-
