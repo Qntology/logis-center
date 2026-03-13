@@ -30,7 +30,7 @@ pub struct Qwen3_5GenerateModel {
 impl Qwen3_5GenerateModel {
     pub fn init(model_path: &str, device: Option<&Device>, dtype: Option<DType>, _use_relay: bool) -> Result<Self> {
         let dev = device.unwrap_or(&Device::Cpu).clone();
-        let dtype = dtype.unwrap_or(DType::BF16);
+        let dtype = dtype.unwrap_or(DType::F16);
         
         let config_path = std::path::Path::new(model_path).join("config.json");
         let config_str = std::fs::read_to_string(config_path)?;
@@ -69,7 +69,7 @@ impl Qwen3_5GenerateModel {
         let comm = Rc::new(Comm::default());
         let progress = Arc::new(RwLock::new(Box::new(crate::utils::progress::NoProgress) as Box<dyn ProgressLike>));
         
-        let is_interleaved = config.rope_parameters.as_ref().and_then(|p| p.mrope_interleaved).unwrap_or(false);
+        let is_interleaved = false; // Qwen models use NeoX style RoPE (half-half pairing)
         let qwen3_5 = Qwen3_5ForCausalLM::new_with_prefix(&vb, comm, &config, dtype, is_interleaved, &dev, progress, Some("model.language_model.".to_string()))?;
         
         let block_size = 16;

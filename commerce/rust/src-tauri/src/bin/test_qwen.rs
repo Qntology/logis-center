@@ -17,10 +17,10 @@ pub async fn run_test() -> Result<()> {
     let model_path = "models/Qwen3.5-0.8B-Split".to_string();
     println!("📂 Loading model from {}...", model_path);
 
-    // Using BF16 for better precision with Qwen3.5
-    let mut model = Qwen3_5GenerateModel::init(&model_path, Some(&device), Some(DType::BF16), true)?;
+    // Using F16 for better compatibility
+    let mut model = Qwen3_5GenerateModel::init(&model_path, Some(&device), Some(DType::F16), true)?;
 
-    println!("\n✨ Hybrid Model initialized successfully (BF16).");
+    println!("\n✨ Hybrid Model initialized successfully (F16).");
 
     let message_json = r#"{
         "model": "qwen3.5",
