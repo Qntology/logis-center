@@ -8,9 +8,10 @@ fn main() -> anyhow::Result<()> {
     
     let mut engine = EngineBuilder::new(ModelRepo::ModelPath(model_path)).build()?;
 
+    let content = std::fs::read_to_string("src/content.txt")?;
     let messages = vec![ChatMessage {
         role: "user".to_string(),
-        content: Some(MessageContentType::PureText("Explain Newton's first law in one sentence.".to_string())),
+        content: Some(MessageContentType::PureText(content)),
         tool_call_id: None,
         tool_calls: None,
     }];
