@@ -17,9 +17,11 @@ path = "src/bin/test_qwen.rs"
 tauri-build = { version = "2.5.3", features = [] }
 
 [dependencies]
-# core dependencies
-candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5bed038" }
-candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5bed038" }
+# core dependencies - Aligned to 0.9.2
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9.2" }
+candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.9.2" }
+candle-transformers = { git = "https://github.com/huggingface/candle.git", version = "0.9.2" }
+
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
@@ -69,14 +71,23 @@ flate2 = "1.0"
 flume = "0.11"
 clap = { version = "4.4", features = ["derive"] }
 
-# server dependencies
-axum = { version = "0.7.4", features = ["tokio"] }
-utoipa = { version = "4.2", features = ["axum_extras"] }
-local-ip-address = "0.6"
-tower-http = { version = "0.5", features = ["cors"] }
-rustchatui = { git = "https://github.com/guoqingbao/rustchatui.git", rev = "68caad9" }
+# Database & Storage - Will be replaced by local path soon
+# lancedb = "0.18" (Removed for local replacement)
+arrow-array = "53"
+arrow-schema = "53"
 
-# tauri & UI specific
+# Utilities & System
+scraper = "0.22"
+ego-tree = "0.10"
+ethers-core = "2.0"
+ethers-signers = "2.0"
+nvml-wrapper = "0.10"
+
+# UI & specialized
+rustchatui = { git = "https://github.com/guoqingbao/rustchatui.git", rev = "68caad9" }
+tower-http = { version = "0.5", features = ["cors"] }
+
+# tauri & system
 tauri = { version = "2.1.1", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"

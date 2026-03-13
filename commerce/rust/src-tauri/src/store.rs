@@ -528,7 +528,7 @@ impl VectorStore {
     
     pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, filter: Option<String>) -> Result<Vec<(String, String, f32)>> {
          let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
-         let table = self.conn.open_table(target).execute().await?;
+         let table: lancedb::table::Table = self.conn.open_table(target).execute().await?;
          let mut combined = std::collections::HashMap::new();
          if !query_text.is_empty() {
              let clean = query_text.replace("'", "''");
@@ -563,8 +563,8 @@ impl VectorStore {
 
     pub async fn find_item_by_property(&self, table_name: &str, property: &str, value: &Value) -> Result<Option<(String, Value)>> {
         let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
-        let table = self.conn.open_table(target).execute().await?;
-        let results = table.query().limit(1000).execute().await?.try_collect::<Vec<_>>().await?;
+        let table: lancedb::table::Table = self.conn.open_table(target).execute().await?;
+        let results: Vec<RecordBatch> = table.query().limit(1000).execute().await?.try_collect::<Vec<_>>().await?;
         let target_str = match value { Value::String(s) => s.clone(), Value::Number(n) => n.to_string(), _ => value.to_string() };
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();

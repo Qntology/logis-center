@@ -58,11 +58,12 @@ macro_rules! def_broadcast_message_to_runners {
                     // Check that all ranks returned the same value
                     match all_results {
                         Ok(mut values) => {
+                            let values: Vec<$return_ty> = values; // Explicit type annotation
                             if values.is_empty() {
                                 candle_core::bail!("No values received from runners for {}", stringify!($fn_name));
                             }
                             // Pop first element to return
-                            let first_val = values.pop().unwrap();
+                            let first_val = values.into_iter().next().unwrap();
                             Ok(first_val)
                         }
                         Err(e) => Err(e),

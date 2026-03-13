@@ -34,7 +34,7 @@ pub struct Message {
 #[cfg(not(feature = "python"))]
 impl Message {
     pub fn new(role: String, content: String, num_images: usize) -> Self {
-        Message {
+        Self {
             role,
             content,
             num_images,
@@ -42,7 +42,16 @@ impl Message {
             tool_call_id: None,
         }
     }
-}
+
+    pub fn set_tool_calls(&mut self, calls: Vec<serde_json::Value>) {
+        self.tool_calls = Some(calls);
+    }
+
+    pub fn set_tool_call_id(&mut self, id: String) {
+        self.tool_call_id = Some(id);
+    }
+    }
+
 
 #[derive(thiserror::Error, Debug)]
 pub enum ApplyChatTemplateError {

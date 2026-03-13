@@ -678,6 +678,7 @@ impl ModelRunner {
             let pooled = match strategy {
                 EmbeddingStrategy::Mean => slice.mean(D::Minus2)?,
                 EmbeddingStrategy::Last => slice.narrow(0, len.saturating_sub(1), 1)?.squeeze(0)?,
+                EmbeddingStrategy::LastToken | EmbeddingStrategy::AllTokens => todo!("New embedding strategies not yet implemented"),
             };
             outputs.push(pooled.to_vec1::<f32>()?);
             start += len;

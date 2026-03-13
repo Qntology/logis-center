@@ -12,12 +12,12 @@ categories = ["algorithms", "hardware-support", "science"]
 license = "MIT"
 
 [dependencies]
-candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5bed038" }
-candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5bed038" }
-#candle-flash-attn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5bed038", optional = true }
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9.2" }
+candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.9.2" }
 serde = { version = "1.0.190", features = ["serde_derive"] }
 serde_json = "1.0.108"
-half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
+half = { version = "2.4.1", features = ["num-traits", "use-intrinsics", "rand_distr"] }
+
 tracing = "0.1.40"
 parking_lot = "0.12.4"
 rayon="1.10.0"
