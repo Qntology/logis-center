@@ -12,28 +12,7 @@ pub mod position_embed;
 pub mod chat_template;
 pub mod tokenizer;
 
-#[macro_export]
-macro_rules! log_info {
-    ($($arg:tt)*) => {
-        println!("[INFO] {}", format!($($arg)*));
-    };
-}
-
-#[macro_export]
-macro_rules! log_warn {
-    ($($arg:tt)*) => {
-        println!("[WARN] {}", format!($($arg)*));
-    };
-}
-
-#[macro_export]
-macro_rules! log_error {
-    ($($arg:tt)*) => {
-        eprintln!("[ERROR] {}", format!($($arg)*));
-    };
-}
-
-use tauri::{State, Manager, Listener};
+use tauri::{State, Manager, Listener}; // Added Manager
 use tokio::sync::Mutex as TokioMutex;
 use model::LogisModel;
 use store::{VectorStore, TradeDocument};
@@ -960,6 +939,9 @@ pub fn run() {
             cancellation_token: cancellation_token.clone(),
         })
         .setup(|app| {
+            // [INIT] KV Bake Worker (Immediate)
+            crate::models::qwen3vl::generate::init_bake_worker();
+
             // [FIX] Reset stop signals immediately on app startup
             let setup_cancel = app.state::<AppState>().cancellation_token.clone();
             setup_cancel.store(false, Ordering::SeqCst);

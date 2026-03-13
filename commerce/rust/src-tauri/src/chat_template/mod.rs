@@ -21,8 +21,14 @@ pub fn get_template(path: String) -> Result<String> {
         .ok_or(anyhow!(format!("chat_template to str error")))?;
     
     let fixed_template = chat_template
-        .replace(".startswith(", " is startingwith(")
-        .replace(".endswith(", " is endingwith(")
+        .replace(
+            "message.content.startswith('<tool_response>')",
+            "message.content is startingwith('<tool_response>')", 
+        )
+        .replace(
+            "message.content.endswith('</tool_response>')",
+            "message.content is endingwith('</tool_response>')", 
+        )
         .replace(
             "content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n')",
             "((content | split('</think>'))[0] | rstrip('\n') | split('<think>'))[-1] | lstrip('\n')", 
@@ -87,14 +93,6 @@ impl ChatTemplate {
             Some(chars_str) => s.trim_end_matches(chars_str.as_str()).to_string(),
             None => s.trim_end().to_string(),
         });
-
-        env.add_test("startingwith", |s: String, prefix: String| {
-            s.starts_with(&prefix)
-        });
-
-        env.add_test("endingwith", |s: String, suffix: String| {
-            s.ends_with(&suffix)
-        });
         
         let _ = env.add_template("chat", template);
 
@@ -130,8 +128,7 @@ impl ChatTemplate {
             .map_err(|e| anyhow!(format!("render template error {}", e)))?;
         let message_str = template
             .render(context)
-            .map_err(|e| anyhow!(format!("render template error {}", e)))?
-            .replace("<think>\n\n</think>\n\n", "");
+            .map_err(|e| anyhow!(format!("render template error {}", e)))?;
         Ok(message_str)
     }
 }

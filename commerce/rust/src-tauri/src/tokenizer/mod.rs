@@ -25,18 +25,17 @@ impl TokenizerModel {
     }
 
     pub fn text_encode_vec(&self, text: String, add_special_token: bool) -> Result<Vec<u32>> {
-        // [FIX] Use encode with 'is_pretokenized=false' but ensure special tokens are handled.
-        // Some tokenizers require a specific call to handle added tokens correctly.
-        let encoding = self
+        let token_id = self
             .tokenizer
             .encode(text, add_special_token)
-            .map_err(|e| anyhow!(format!("tokenizer encode error: {}", e)))?;
-        
-        Ok(encoding.get_ids().to_vec())
+            .map_err(|e| anyhow!(format!("tokenizer encode error: {}", e)))?
+            .get_ids()
+            .to_vec();
+        Ok(token_id)
     }
     pub fn text_encode(&self, text: String, device: &Device) -> Result<Tensor> {
         let token_id = self.text_encode_vec(text, true)?;
-        let token_tensor = Tensor::from_slice(&token_id, (1, token_id.len()), device)?.to_dtype(candle_core::DType::U32)?;
+        let token_tensor = Tensor::from_slice(&token_id, (1, token_id.len()), device)?;
         Ok(token_tensor)
     }
 

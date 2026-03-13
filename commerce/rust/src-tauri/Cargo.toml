@@ -9,10 +9,6 @@ edition = "2021"
 name = "tauri_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-[[bin]]
-name = "test_qwen"
-path = "src/bin/test_qwen.rs"
-
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [build-dependencies]
@@ -27,26 +23,22 @@ tokio = { version = "1", features = ["full"] }
 image = { version = "0.25", features = ["jpeg", "png"] }
 base64 = "0.22"
 anyhow = "1.0"
-half = "2.7.1"
 regex = "1"
-rand = "0.8"
 encoding_rs = "0.8"
 flate2 = "1.0"
 futures = "0.3"
-either = "1.9"
-parking_lot = "0.12"
-attention_rs = { package = "attention-rs", path = "src/models/attention", features = ["cuda"] }
 uuid = { version = "1.4", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
-reqwest = { version = "0.12", features = ["json", "native-tls", "blocking"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
 sysinfo = "0.30"
-candle-core = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5bed038" }
-candle-nn = { git = "https://github.com/guoqingbao/candle.git", version = "0.8.3", rev = "5bed038" }
-tokenizers = "0.21.2"
+candle-core = "0.9.1"
+candle-nn = "0.9.1"
+candle-transformers = "0.9.1"
+tokenizers = "0.22.1"
 num = "0.4.3"
 minijinja = "2.12.0"
 rayon = "1.10"
@@ -68,8 +60,6 @@ nvml-wrapper = "0.9.0"
 memmap2 = "0.9"
 windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_System_Memory"] }
 libc = "0.2"
-bytemuck = "1.25.0"
-tracing = "0.1.44"
 
 [target.'cfg(windows)'.dependencies]
 direct-storage = { path = "./direct-storage" }
@@ -83,8 +73,8 @@ metal = "0.29"
 
 [features]
 default = ["cuda"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "attention_rs/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal", "attention_rs/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 flash-attn = []
 
 
