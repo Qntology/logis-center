@@ -53,7 +53,7 @@ macro_rules! def_broadcast_message_to_runners {
                                 }
                             }
                         })
-                        .collect(); // Collects into a Result<Vec<T>>
+                        .collect();
 
                     // Check that all ranks returned the same value
                     match all_results {
@@ -61,7 +61,7 @@ macro_rules! def_broadcast_message_to_runners {
                             if values.is_empty() {
                                 candle_core::bail!("No values received from runners for {}", stringify!($fn_name));
                             }
-                            // Pop first element to return, then check rest for consistency
+                            // Pop first element to return
                             let first_val = values.pop().unwrap();
                             Ok(first_val)
                         }
@@ -74,6 +74,7 @@ macro_rules! def_broadcast_message_to_runners {
 }
 
 pub mod block_manager;
+pub mod chat;
 pub mod engine;
 pub mod prefix_cache;
 pub mod runner;
@@ -118,7 +119,7 @@ pub struct GenerationOutput {
     pub stop_sequence: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
 pub enum EmbeddingStrategy {
     LastToken,
     AllTokens,
