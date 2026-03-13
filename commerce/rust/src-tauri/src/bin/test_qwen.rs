@@ -14,7 +14,7 @@ pub async fn run_test() -> Result<()> {
     };
     println!("💻 Using device : {:?}", device);
 
-    let model_path = "models/Qwen3.5-0.8B-Split".to_string();
+    let model_path = "models/Qwen3.5-0.8B-Full".to_string();
     println!("📂 Loading model from {}...", model_path);
 
     // Using BF16 for better precision with Qwen3.5

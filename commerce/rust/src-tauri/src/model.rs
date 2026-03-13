@@ -81,7 +81,7 @@ impl LogisModel {
         let device = utils::get_best_device();
         // Tauri 2.0 path API
         let resource_path = app_handle.path().resource_dir().unwrap_or_default();
-        let model_path = resource_path.join("models").join("Qwen3.5-0.8B-Split").to_string_lossy().into_owned();
+        let model_path = resource_path.join("models").join("Qwen3.5-0.8B-Full").to_string_lossy().into_owned();
 
         // Initial dummy variant for compilation compatibility
         let dummy_model = Qwen3_5GenerateModel::init(&model_path, Some(&device), None, false)?;
