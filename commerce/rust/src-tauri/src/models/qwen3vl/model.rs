@@ -6,9 +6,9 @@ use candle_nn::{
 };
 
 use crate::{
-    models::{
+    models::qwen3vl::{
         common::{GateUpDownMLP, TwoLinearMLP, eager_attention_forward, get_layer_norm},
-        qwen3vl::config::{Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig},
+        config::{Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig},
     },
     position_embed::rope::{
         Qwen2_5VisionRotaryEmbedding, Qwen3VLTextRotaryEmbedding, apply_rotary_pos_emb,

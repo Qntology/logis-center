@@ -6,7 +6,7 @@ use candle_nn::{
     linear_no_bias, rms_norm,
 };
 
-use crate::{models::rope::apply_rotary_pos_emb, utils::tensor_utils::repeat_kv};
+use crate::{models::qwen3vl::rope::apply_rotary_pos_emb, utils::tensor_utils::repeat_kv};
 
 #[derive(Debug, Clone)]
 pub struct GateUpDownMLP {
