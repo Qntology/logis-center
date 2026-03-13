@@ -539,4 +539,3 @@ impl YarnRotaryEmbedding {
         Ok(Self { sin, cos })
     }
 }
-

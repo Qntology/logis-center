@@ -55,8 +55,17 @@ impl Serialize for EosTokenId {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ModelType {
+    Qwen3,
     Qwen3_5,
+    Qwen3_5MoE,
+    Qwen3MoE,
     Qwen3VL,
+    LLaMa,
+    Mistral3VL,
+    GLM4,
+    GLM4MoE,
+    Phi4,
+    Gemma3,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -174,7 +183,7 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Qwen3HybridRawConfig {
-    #[serde(alias = "layers_block_type")]
+    #[serde(alias = "layer_types")]
     pub layers_block_type: Option<Vec<String>>,
     #[serde(alias = "linear_conv_kernel_dim")]
     pub conv_kernel_size: Option<usize>,
@@ -189,103 +198,40 @@ pub struct Qwen3HybridRawConfig {
     pub linear_value_head_dim: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
-pub struct Qwen3HybridConfig {
-    pub layer_types: Vec<String>,
-    pub conv_kernel_size: usize,
-    pub num_v_heads: usize,
-    pub num_k_heads: usize,
-    pub key_head_dim: usize,
-    pub value_head_dim: usize,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenizerConfig {
+    pub model_max_length: Option<f64>,
+    pub add_bos_token: Option<bool>,
+    pub add_eos_token: Option<bool>,
+    pub chat_template: Option<String>,
+    pub bos_token: Option<serde_json::Value>,
+    pub eos_token: Option<serde_json::Value>,
 }
 
-pub fn is_qwen3_hybrid_arch_name(arch: &str) -> bool {
-    matches!(
-        arch,
-        "Qwen3_5ForCausalLM"
-            | "Qwen3NextForCausalLM"
-            | "Qwen3_5ForConditionalGeneration"
-            | "Qwen3NextForConditionalGeneration"
-    )
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineConfig {
+    pub model_id: String,
+    pub weight_path: Option<String>,
+    pub weight_file: Option<String>,
+    pub hf_token: Option<String>,
+    pub hf_token_path: Option<String>,
+    pub isq: Option<String>,
+    pub device_ids: Option<Vec<usize>>,
+    pub num_shards: Option<usize>,
+    pub config_model_len: Option<usize>,
+    pub max_model_len: Option<usize>,
+    pub generation_cfg: Option<GenerationConfig>,
 }
 
-fn is_qwen3_hybrid_arch(config: &Config) -> bool {
-    let arch = config.architectures.as_ref().and_then(|a| a.first());
-    arch.map(|a| is_qwen3_hybrid_arch_name(a)).unwrap_or(false)
-}
-
-fn qwen3_hybrid_raw_from_extra_config(config: &Config) -> Option<Qwen3HybridRawConfig> {
-    if !is_qwen3_hybrid_arch(config) {
-        return None;
-    }
-    
-    if let Some(extra) = config.extra_config_json.as_ref() {
-        if let Ok(root) = serde_json::from_str::<serde_json::Value>(extra) {
-            let cfg = root.get("text_config").cloned().unwrap_or(root);
-            if let Ok(raw) = serde_json::from_value::<Qwen3HybridRawConfig>(cfg) {
-                return Some(raw);
-            }
-        }
-    }
-    
-    None
-}
-
-pub fn resolve_qwen3_hybrid_config(config: &Config) -> Qwen3HybridConfig {
-    let raw_cfg = qwen3_hybrid_raw_from_extra_config(config).unwrap_or_default();
-
-    let mut layer_types = if let Some(layer_types) = raw_cfg.layers_block_type {
-        layer_types
-    } else if let Some(interval) = raw_cfg.full_attention_interval {
-        if interval > 0 {
-            (0..config.num_hidden_layers)
-                .map(|idx| {
-                    if (idx + 1) % interval == 0 {
-                        "full_attention".to_string()
-                    } else {
-                        "linear_attention".to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-        } else {
-            vec!["full_attention".to_string(); config.num_hidden_layers]
-        }
-    } else {
-        vec!["full_attention".to_string(); config.num_hidden_layers]
-    };
-
-    for layer_type in layer_types.iter_mut() {
-        if layer_type == "attention" {
-            *layer_type = "full_attention".to_string();
-        }
-    }
-    if layer_types.len() != config.num_hidden_layers {
-        layer_types = vec!["full_attention".to_string(); config.num_hidden_layers];
-    }
-
-    let num_v_heads = raw_cfg
-        .linear_num_value_heads
-        .or(raw_cfg.linear_num_heads)
-        .unwrap_or(config.num_attention_heads);
-    let num_k_heads = raw_cfg
-        .linear_num_key_heads
-        .or(raw_cfg.linear_num_key_value_heads)
-        .unwrap_or(num_v_heads);
-    let key_head_dim = raw_cfg.linear_key_head_dim.unwrap_or(
-        config
-            .head_dim
-            .unwrap_or(config.hidden_size / config.num_attention_heads),
-    );
-    let value_head_dim = raw_cfg.linear_value_head_dim.unwrap_or(key_head_dim);
-
-    Qwen3HybridConfig {
-        layer_types,
-        conv_kernel_size: raw_cfg.conv_kernel_size.unwrap_or(4),
-        num_v_heads,
-        num_k_heads,
-        key_head_dim,
-        value_head_dim,
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationConfig {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub bos_token_id: Option<usize>,
+    pub eos_token_id: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

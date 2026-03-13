@@ -23,7 +23,7 @@ pub struct Qwen3_5GenerateModel {
     pub device: Device,
     pub config: Config,
     pub kv_caches: Vec<Option<(Tensor, Tensor)>>,
-    pub block_tables: Tensor,
+    pub block_tables: Vec<u32>,
     pub eos_token_id: u32,
 }
 
@@ -92,8 +92,8 @@ impl Qwen3_5GenerateModel {
             }
         }
 
-        let block_indices: Vec<u32> = (0..num_blocks as u32).collect();
-        let block_tables = Tensor::from_vec(block_indices, (1, num_blocks), &dev)?;
+        // Use sequential block allocation for simple local runner
+        let block_tables = (0..num_blocks as u32).collect::<Vec<_>>();
 
         let eos_id = match config.eos_token_id {
             Some(crate::utils::config::EosTokenId::Single(id)) => id,
@@ -135,7 +135,7 @@ impl Qwen3_5GenerateModel {
         let max_tokens = params.max_tokens.unwrap_or(128) as usize;
         
         self.qwen3_5.reset_mamba_cache()?;
-        // Official vllm.rs expects slots to be allocated per sequence
+        // IMPORTANT: Let the model handle sequence slot allocation via internal MambaCache
         self.qwen3_5.ensure_mamba_slots_for_sequences(&[0])?;
 
         for step in 0..max_tokens {
@@ -158,32 +158,40 @@ impl Qwen3_5GenerateModel {
                 Tensor::from_vec(vec![(current_seq_len - 1) as u32], (1,), &self.device)?.to_dtype(DType::I64)?
             };
 
-            // CRITICAL: mamba_slot_mapping should be [0] (size 1) for sequence index 0
-            // Even in prefill, it's used to identify which sequence's state slot to update.
-            let mamba_slot_mapping = vec![0i64; 1];
-            
-            let attn_slot_mapping = if is_prefill {
-                (0..current_seq_len as i64).collect::<Vec<_>>()
+            // Calculate attn_slot_mapping using block_table logic (Official runner style)
+            let mut slot_mapping = Vec::new();
+            let block_size = 16;
+            if is_prefill {
+                for i in 0..current_seq_len {
+                    let block_idx = i / block_size;
+                    let block_offset = i % block_size;
+                    let physical_idx = (self.block_tables[block_idx] * block_size as u32) as i64 + block_offset as i64;
+                    slot_mapping.push(physical_idx);
+                }
             } else {
-                vec![(current_seq_len - 1) as i64]
-            };
-            
-            let mamba_slot_mapping_tensor = Tensor::from_vec(mamba_slot_mapping, (1,), &self.device)?;
-            let attn_slot_mapping_tensor = Tensor::from_vec(attn_slot_mapping, (input_ids.dim(0)?,), &self.device)?;
+                let i = current_seq_len - 1;
+                let block_idx = i / block_size;
+                let block_offset = i % block_size;
+                let physical_idx = (self.block_tables[block_idx] * block_size as u32) as i64 + block_offset as i64;
+                slot_mapping.push(physical_idx);
+            }
+            let attn_slot_mapping_tensor = Tensor::from_vec(slot_mapping, (input_ids.dim(0)?,), &self.device)?;
+
+            let block_tables_tensor = Tensor::from_vec(self.block_tables.clone(), (1, self.block_tables.len()), &self.device)?;
 
             let metadata = InputMetadata {
                 is_prefill,
                 sequence_ids: Some(vec![0]),
-                mamba_slot_mapping: Some(mamba_slot_mapping_tensor),
+                mamba_slot_mapping: None, // Let resolve_seq_slots handle it via sequence_ids
                 slot_mapping: attn_slot_mapping_tensor,
-                block_tables: Some(self.block_tables.clone()),
+                block_tables: Some(block_tables_tensor),
                 context_lens: Some(Tensor::from_vec(vec![current_seq_len as u32], (1,), &self.device)?),
                 cu_seqlens_q: if is_prefill {
                     Some(Tensor::from_vec(vec![0u32, current_seq_len as u32], (2,), &self.device)?)
                 } else {
                     Some(Tensor::from_vec(vec![0u32, 1u32], (2,), &self.device)?)
                 },
-                cu_seqlens_k: None,
+                cu_seqlens_k: None, // Let Attention layer calculate causal mask correctly
                 max_seqlen_q: if is_prefill { current_seq_len } else { 1 },
                 max_seqlen_k: current_seq_len,
                 max_context_len: current_seq_len,
@@ -204,13 +212,13 @@ impl Qwen3_5GenerateModel {
                 false
             )?;
 
+            // IMPORTANT: forward already selects the last token's logits
             let logits = logits.reshape((1, ()))?;
 
             let next_tokens = logit_processor.sample(&logits.to_dtype(DType::F32)?, &None)?;
             let next_token = next_tokens[0];
             
             let piece = self.tokenizer.token_decode(vec![next_token])?;
-            // println!("[Step {}] Token ID: {}, Piece: '{}'", step, next_token, piece);
 
             if next_token == self.eos_token_id {
                 break;
