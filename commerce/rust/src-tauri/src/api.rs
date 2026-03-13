@@ -1,6 +1,6 @@
 use crate::core::engine::{LLMEngine, StreamItem, GLOBAL_RT};
 use crate::core::GenerationOutput;
-use crate::server::{build_messages_and_images, run_server, ChatMessage};
+use crate::core::chat::{build_messages_and_images, ChatMessage};
 use crate::tools::Tool;
 use crate::utils::chat_template::Message;
 use crate::utils::config::{EngineConfig, SamplingParams};
@@ -168,18 +168,6 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn start_server(&mut self, port: usize, with_ui_server: bool) -> Result<()> {
-        GLOBAL_RT.block_on(async {
-            run_server(
-                self.engine.clone(),
-                self.econfig.clone(),
-                port,
-                with_ui_server,
-            )
-            .await
-        })
-    }
-
     pub fn generate(
         &mut self,
         params: SamplingParams,
