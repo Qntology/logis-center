@@ -12,6 +12,8 @@
 *.crdownload
 *.bin
 
+aha-main/
+
 # Virtual Environment
 trade/venv/
 
