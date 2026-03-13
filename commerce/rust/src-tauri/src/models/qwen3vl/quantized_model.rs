@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder}; // Removed RmsNorm
 use candle_core::quantized::{gguf_file, QMatMul};
+use safetensors::SafeTensors;
 // use rayon::prelude::*;
 use std::path::Path;
 use std::fs;
@@ -23,6 +24,44 @@ use crate::{
     },
 };
 use crate::models::qwen3vl::generate::SLOT_MANAGER;
+
+pub fn decompress_q2_combined(combined: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
+    let combined_vec = combined.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
+    let block_size = 32;
+    let bytes_per_block = 10; // 2 scale + 8 data
+    let num_blocks = combined_vec.len() / bytes_per_block;
+    
+    let total_elements: usize = original_shape.iter().product();
+    let mut decoded = vec![0.0f32; total_elements];
+    
+    use rayon::prelude::*;
+    decoded.par_chunks_mut(block_size).enumerate().for_each(|(b_idx, block_out)| {
+        if b_idx < num_blocks {
+            let b_start = b_idx * bytes_per_block;
+            
+            // Read scale (FP16, 2 bytes)
+            let s_bytes = [combined_vec[b_start], combined_vec[b_start + 1]];
+            let scale_u16 = u16::from_le_bytes(s_bytes);
+            let scale = half::f16::from_bits(scale_u16).to_f32();
+            
+            // Read 8 bytes of data (each byte contains 4 quantized values of 2 bits each)
+            for i in 0..8 {
+                let byte = combined_vec[b_start + 2 + i];
+                for j in 0..4 {
+                    let val_idx = i * 4 + j;
+                    if val_idx < block_out.len() {
+                        // Extract 2 bits: [0..1], [2..3], [4..5], [6..7]
+                        let q_val = (byte >> (j * 2)) & 0x03;
+                        // Mapping: real = (q - 2.0) * scale
+                        block_out[val_idx] = (q_val as f32 - 2.0) * scale;
+                    }
+                }
+            }
+        }
+    });
+    
+    Tensor::from_vec(decoded, original_shape, &Device::Cpu).map_err(anyhow::Error::from)
+}
 
 // Local RmsNorm implementation exposing weight and device
 #[derive(Clone, Debug)]
@@ -1498,6 +1537,75 @@ impl QuantizedQwen3VLTextDecoderLayer {
         self.self_attn.evacuate_vram_to_cache()
     }
 
+    /// [MEMORY-OPT] .st 파일로부터 레이어 가중치를 로드합니다. (OS 가속 로더 사용)
+    pub fn load_from_st(&mut self, path: &Path, device: &Device, dtype: DType) -> Result<()> {
+        use crate::utils::direct_loader::load_kv_block;
+        
+        let data = load_kv_block(path).map_err(|e| anyhow!("Failed to read layer file via direct_loader {:?}: {}", path, e))?;
+        let st = safetensors::SafeTensors::deserialize(&data)?;
+        
+        // [MANUAL-HEADER-PARSE] safetensors metadata method missing in some environments, parse manually
+        let header_len = u64::from_le_bytes(data[0..8].try_into().map_err(|_| anyhow!("Invalid safetensors header"))?);
+        let header_json: serde_json::Value = serde_json::from_slice(&data[8..(8 + header_len as usize)])?;
+        let metadata = header_json.get("__metadata__");
+
+        let get_t = |name: &str, is_linear: bool| -> Result<Tensor> {
+            let view = st.tensor(name).map_err(|e| anyhow!("Tensor {} not found in {:?}: {}", name, path, e))?;
+            
+            // Get shape from manually parsed metadata
+            let shape_str = metadata.and_then(|m| m.get(&format!("shape.{}", name))).and_then(|v| v.as_str());
+            
+            let mut t = if let Some(s) = shape_str {
+                // Quantized format: q2_combined_v1
+                let original_shape: Vec<usize> = s.split(',')
+                    .filter_map(|v| v.trim().parse::<usize>().ok())
+                    .collect::<Vec<usize>>();
+                let combined = Tensor::from_raw_buffer(view.data(), DType::U8, &view.shape().to_vec(), &Device::Cpu)?;
+                let decompressed = decompress_q2_combined(&combined, &original_shape)?;
+                decompressed.to_device(device)?.to_dtype(dtype)?
+            } else {
+                // Normal format (FP16/BF16/F32)
+                let candle_dtype = match view.dtype() {
+                    safetensors::Dtype::F16 => DType::F16,
+                    safetensors::Dtype::BF16 => DType::BF16,
+                    safetensors::Dtype::F32 => DType::F32,
+                    _ => DType::F32,
+                };
+                let t = Tensor::from_raw_buffer(view.data(), candle_dtype, &view.shape().to_vec(), &Device::Cpu)?;
+                t.to_device(device)?.to_dtype(dtype)?
+            };
+
+            // [CRITICAL] Transpose linear weights from (Out, In) to (In, Out) for Candle matmul
+            if is_linear && t.rank() == 2 {
+                t = t.t()?;
+            }
+            Ok(t)
+        };
+
+        // Attention
+        self.self_attn.q_proj = QLinear::new(QMatMul::Tensor(get_t("self_attn.q_proj.weight", true)?), None, device.clone());
+        self.self_attn.k_proj = QLinear::new(QMatMul::Tensor(get_t("self_attn.k_proj.weight", true)?), None, device.clone());
+        self.self_attn.v_proj = QLinear::new(QMatMul::Tensor(get_t("self_attn.v_proj.weight", true)?), None, device.clone());
+        self.self_attn.o_proj = QLinear::new(QMatMul::Tensor(get_t("self_attn.o_proj.weight", true)?), None, device.clone());
+        self.self_attn.q_norm = RmsNorm::new(get_t("self_attn.q_norm.weight", false)?, self.self_attn.q_norm.eps);
+        self.self_attn.k_norm = RmsNorm::new(get_t("self_attn.k_norm.weight", false)?, self.self_attn.k_norm.eps);
+        
+        // MLP
+        if self.mlp_gate.is_some() {
+            self.mlp_gate = Some(QLinear::new(QMatMul::Tensor(get_t("mlp.gate_proj.weight", true)?), None, device.clone()));
+            self.mlp_up = Some(QLinear::new(QMatMul::Tensor(get_t("mlp.up_proj.weight", true)?), None, device.clone()));
+            self.mlp_down = Some(QLinear::new(QMatMul::Tensor(get_t("mlp.down_proj.weight", true)?), None, device.clone()));
+        }
+        
+        // Norms
+        self.input_layernorm = RmsNorm::new(get_t("input_layernorm.weight", false)?, self.input_layernorm.eps);
+        if self.post_attention_layernorm.is_some() {
+            self.post_attention_layernorm = Some(RmsNorm::new(get_t("post_attention_layernorm.weight", false)?, self.input_layernorm.eps));
+        }
+
+        Ok(())
+    }
+
     pub fn get_kv_len(&self) -> usize {
         self.self_attn.get_kv_len()
     }
@@ -1552,6 +1660,7 @@ pub struct QuantizedQwen3VLTextModel {
     pub ct: Option<Arc<gguf_file::Content>>,
     pub base_name: String,
     pub dtype: DType,
+    pub model_path: std::path::PathBuf,
 }
 
 impl QuantizedQwen3VLTextModel {
@@ -1569,12 +1678,20 @@ impl QuantizedQwen3VLTextModel {
         "".to_string()
     }
 
-    /// [MEMORY-OPT] 특정 레이어의 가중치를 mmap에서 다시 로드합니다.
+    /// [MEMORY-OPT] 특정 레이어의 가중치를 mmap 또는 .st 파일에서 다시 로드합니다.
     pub fn reload_layer(&mut self, layer_idx: usize) -> Result<()> {
         if !self.layers[layer_idx].self_attn.q_proj.is_cleared() {
             return Ok(());
         }
         
+        // 1. .st 파일이 있는지 확인 (커스텀 양자화 우선)
+        let st_path = self.model_path.join(format!("layer_{}.st", layer_idx));
+        if st_path.exists() {
+            println!("[MEMORY-OPT] Reloading layer {} from .st file (Q2_K Combined)...", layer_idx);
+            return self.reload_layer_from_st(layer_idx, &st_path);
+        }
+        
+        // fallback: GGUF에서 로드
         let mmap = self.mmap.as_ref().ok_or(anyhow!("Mmap handle missing for reload"))?;
         let ct = self.ct.as_ref().ok_or(anyhow!("GGUF Content missing for reload"))?;
         let mut reader = std::io::Cursor::new(&mmap[..]);
@@ -1609,6 +1726,17 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
+    /// [MEMORY-OPT] .st 파일로부터 레이어를 로드합니다.
+    pub fn reload_layer_from_st(&mut self, layer_idx: usize, st_path: &Path) -> Result<()> {
+        if !self.layers[layer_idx].self_attn.q_proj.is_cleared() {
+            return Ok(());
+        }
+        
+        // skeleton 레이어에 가중치 주입
+        self.layers[layer_idx].load_from_st(st_path, &Device::Cpu, self.dtype)?;
+        Ok(())
+    }
+
     pub fn new_with_mmap(
         config: &Qwen3VLTextConfig,
         ct: Arc<gguf_file::Content>,
@@ -1617,8 +1745,9 @@ impl QuantizedQwen3VLTextModel {
         device: &Device,
         device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
+        model_path: &Path,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
         let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
@@ -1681,6 +1810,7 @@ impl QuantizedQwen3VLTextModel {
             ct: Some(ct),
             base_name: base_name.to_string(),
             dtype,
+            model_path: model_path.to_path_buf(),
         })
     }
 
@@ -1704,6 +1834,7 @@ impl QuantizedQwen3VLTextModel {
         dtype: DType,
         kv_reserve: u64,
         baking_only: bool,
+        model_path: &Path,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
@@ -1761,6 +1892,7 @@ impl QuantizedQwen3VLTextModel {
             ct: Some(ct),
             base_name: base_name.to_string(),
             dtype,
+            model_path: model_path.to_path_buf(),
         })
     }
 
@@ -2658,6 +2790,7 @@ impl QuantizedQwen3VLModel {
         dtype: DType,
         kv_reserve: u64,
         baking_only: bool, // [NEW] Support for 1-layer vision baker
+        model_path: &Path,
     ) -> Result<Self> {
         let mmproj_mmap = mmproj_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
@@ -2675,7 +2808,7 @@ impl QuantizedQwen3VLModel {
         }
 
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
-            &t_config, ct_main.clone(), main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
+            &t_config, ct_main.clone(), main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only, model_path
         )?;
 
         let main_mmap = main_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
@@ -2705,6 +2838,7 @@ impl QuantizedQwen3VLModel {
         dtype: DType,
         kv_reserve: u64,
         baking_only: bool, // [NEW]
+        model_path: &Path,
     ) -> Result<Self> {
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
         let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { dtype };
@@ -2719,7 +2853,7 @@ impl QuantizedQwen3VLModel {
             t_config.num_hidden_layers = 1;
         }
 
-        let language_model = QuantizedQwen3VLTextModel::new(&t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
+        let language_model = QuantizedQwen3VLTextModel::new(&t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only, model_path)?;
         
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
         let lm_head = if !baking_only {
@@ -2953,13 +3087,14 @@ impl QuantizedQwen3TextModel {
         kv_reserve: u64,
         baking_only: bool,
         single_layer_mode: bool,
+        model_path: &Path,
     ) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         if single_layer_mode { t_config.num_hidden_layers = 1; }
         
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
-            &t_config, ct_main.clone(), mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
+            &t_config, ct_main.clone(), mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only, model_path
         )?;
         let lm_head = if !baking_only {
             let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
@@ -2982,13 +3117,14 @@ impl QuantizedQwen3TextModel {
         kv_reserve: u64,
         baking_only: bool,
         single_layer_mode: bool,
+        model_path: &Path,
     ) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         if single_layer_mode { t_config.num_hidden_layers = 1; }
 
         let language_model = QuantizedQwen3VLTextModel::new(
-            &t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only
+            &t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only, model_path
         )?;
         let lm_head = if !baking_only {
             let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
