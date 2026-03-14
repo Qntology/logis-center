@@ -391,6 +391,7 @@ pub struct QuantizedQwen3VLTextAttention {
     pub registry: KVRegistry, // [NEW] 중앙 목차 참조
     pub layer_idx: usize,
     pub active_kv_name: Option<String>, // [NEW] JIT-LOAD 경로 동기화용
+    pub active_session_id: Option<String>, // [추가] 에러 해결을 위한 필드
     // [ACCUMULATOR] VRAM 내 병합 캐시: 매번 수십개의 블록을 cat하는 오버헤드 제거
     pub vram_merged_k: Option<Tensor>,
     pub vram_merged_v: Option<Tensor>,
@@ -532,6 +533,7 @@ impl QuantizedQwen3VLTextAttention {
             registry,
             layer_idx,
             active_kv_name: None,
+            active_session_id: None, // [추가]
             vram_merged_k: None,
             vram_merged_v: None,
             merged_vram_block_count: 0,
@@ -545,10 +547,15 @@ impl QuantizedQwen3VLTextAttention {
         sin: &Tensor,
         attention_mask_in: Option<&Tensor>,
         seqlen_offset: usize,
-        _session_id: Option<String>,
-        _kv_name: Option<String>,
-        _baking_only: bool,
+        session_id: Option<String>,
+        kv_name: Option<String>,
+        baking_only: bool,
     ) -> Result<Tensor> {
+        self.active_session_id = session_id.clone(); // [추가] 필드 업데이트
+        self.active_kv_name = kv_name; // [추가] 일관성을 위해 함께 업데이트
+        
+        let sid = self.active_session_id.as_deref().unwrap_or("general");
+
         let dev = self.q_proj.device();
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
 
@@ -644,117 +651,151 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // 3. [SEQUENTIAL-KV-LOADER] Strictly Ordered Hybrid Pipeline
-        let mut bulk_ks: Vec<Tensor> = Vec::new();
-        let mut bulk_vs: Vec<Tensor> = Vec::new();
+        // 3. [WHAC-A-MOLE-ATTENTION] Iterative Block Loading (Constant VRAM O(1))
+        // Instead of gathering all blocks, we load, compute, and drop each block one by one.
+        let mut final_out: Option<Tensor> = None;
+        let mut max_logits_acc: Option<Tensor> = None;
+        let mut sum_exp_acc: Option<Tensor> = None;
 
         let total_tokens_now = seqlen_offset + q_len;
         for block in &self.kv_blocks {
-            let (index, b_off, _b_len) = {
+            let (index, b_off, b_len) = {
                 let inner = block.inner.read().unwrap();
                 (inner.index, inner.offset, inner.len)
             };
             if b_off >= total_tokens_now { continue; }
 
-            // Check physical VRAM presence
-            let mut k_vram = None;
-            let mut v_vram = None;
-            {
+            // [STEP A] Load Block to VRAM (Temporary or Pinned)
+            let (k_block, v_block, is_temporary) = {
                 let inner = block.inner.read().unwrap();
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    k_vram = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
-                    v_vram = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
-                    vram_count += 1;
-                }
-            }
-
-            if let (Some(k), Some(v)) = (k_vram, v_vram) {
-                bulk_ks.push(k); bulk_vs.push(v);
-            } else {
-                // SSD/RAM Pipeline: Direct load to VRAM for high-speed inference
-                let mut k_cpu = None;
-                let mut v_cpu = None;
-                {
-                    let reg = self.registry.entries.read().unwrap();
-                    let cache = reg[index].bitkv_cache.read().unwrap();
-                    if let Some(m) = &cache[self.layer_idx] {
-                        k_cpu = Some(self.decompress_from_bf16(&m.k_data, &m.original_shape, &Device::Cpu)?);
-                        v_cpu = Some(self.decompress_from_bf16(&m.v_data, &m.original_shape, &Device::Cpu)?);
-                        ram_count += 1;
+                    // Already in VRAM (Pinned for Small Model or Cache Hit)
+                    (k.to_device(dev)?.to_dtype(target_dtype)?, v.to_device(dev)?.to_dtype(target_dtype)?, false)
+                } else {
+                    // Not in VRAM -> Temporary Load from RAM/SSD
+                    let mut k_cpu = None;
+                    let mut v_cpu = None;
+                    {
+                        let reg = self.registry.entries.read().unwrap();
+                        let cache = reg[index].bitkv_cache.read().unwrap();
+                        if let Some(m) = &cache[self.layer_idx] {
+                            k_cpu = Some(self.decompress_from_bf16(&m.k_data, &m.original_shape, &Device::Cpu)?);
+                            v_cpu = Some(self.decompress_from_bf16(&m.v_data, &m.original_shape, &Device::Cpu)?);
+                            ram_count += 1;
+                        }
                     }
-                }
-                if k_cpu.is_none() {
-                    let ssd_path = { let reg = self.registry.entries.read().unwrap(); if index < reg.len() { reg[index].ssd_path.clone() } else { None } };
-                    if let Some(p) = ssd_path {
-                        let mut full_path = p.clone();
-                        if full_path.is_relative() && !full_path.starts_with("tmp") { full_path = crate::utils::paths::get_kv_dir(None).join(full_path); }
-                        let block_file = full_path.join(format!("l{}.st", self.layer_idx));
-                        // [DIRECT-IO] Use OS-accelerated high-speed read
-                        if let Ok(data) = crate::utils::direct_loader::load_kv_block(&block_file) {
-                            if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
-                                let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
-                                let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
-                                if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
-                                    let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                                    let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
 
-                                    // [VRAM-DIRECT] Move BF16 bytes directly to GPU and decompress (cast) there
-                                    let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
-                                    let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+                    if k_cpu.is_none() {
+                        // [SMART-PATH-DISCOVERY] Registry에 경로가 아직 등록되지 않았더라도 직접 추론하여 로드 시도
+                        let kv_dir = crate::utils::paths::get_kv_dir(None);
+                        let sid = self.active_session_id.as_deref().unwrap_or("general");
+                        
+                        // 현재 세션의 모든 가능성 있는 경로 후보군 생성
+                        let mut path_candidates = Vec::new();
+                        
+                        // 1. Registry에 등록된 경로 (가장 확실)
+                        if let Some(p) = { let reg = self.registry.entries.read().unwrap(); if index < reg.len() { reg[index].ssd_path.clone() } else { None } } {
+                            path_candidates.push(p);
+                        }
+                        
+                        // 2. 현재 세션 컨텍스트 기반 추론 (goods, inference, text 등 자동 대응)
+                        let kv_name_raw = self.active_kv_name.as_deref().unwrap_or("text");
+                        let kv_type = kv_name_raw.split('/').last().unwrap_or("text");
+                        let kv_type = if kv_type == "inference" || kv_type == "reference" || kv_type.is_empty() { "text" } else { kv_type };
+                        
+                        path_candidates.push(kv_dir.join(format!("{}/inference/{}/b{}", sid, kv_type, b_off)));
+                        path_candidates.push(kv_dir.join(format!("{}/reference/{}/b{}", sid, kv_type, b_off)));
+                        path_candidates.push(kv_dir.join(format!("{}/inference/text/b{}", sid, b_off))); // Fallback
 
-                                    bulk_ks.push(self.decompress_from_bf16(&kd_t, &meta_os, dev)?);
-                                    bulk_vs.push(self.decompress_from_bf16(&vd_t, &meta_os, dev)?);
-                                    ssd_count += 1;
+                        for full_path in path_candidates {
+                            let block_file = full_path.join(format!("l{}.st", self.layer_idx));
+                            if block_file.exists() {
+                                if let Ok(data) = crate::utils::direct_loader::load_kv_block(&block_file) {
+                                    if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
+                                        let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
+                                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                                        if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                            let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                                            let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+                                            let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
+                                            k_cpu = Some(self.decompress_from_bf16(&kd_t, &meta_os, &Device::Cpu)?);
+                                            v_cpu = Some(self.decompress_from_bf16(&vd_t, &meta_os, &Device::Cpu)?);
+                                            ssd_count += 1;
+                                            
+                                            // [AUTO-REGISTER] 찾은 경로를 장부에 즉시 업데이트하여 다음 로드 시 가속
+                                            let mut reg = self.registry.entries.write().unwrap();
+                                            if index < reg.len() { reg[index].ssd_path = Some(full_path.clone()); }
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
+
+                    let k_final = k_cpu.ok_or_else(|| anyhow!("Block {} missing. (Session: {}, Layer: {})", index, self.active_session_id.as_deref().unwrap_or("None"), self.layer_idx))?.to_device(dev)?.to_dtype(target_dtype)?;
+                    let v_final = v_cpu.ok_or_else(|| anyhow!("Block {} missing. (Session: {}, Layer: {})", index, self.active_session_id.as_deref().unwrap_or("None"), self.layer_idx))?.to_device(dev)?.to_dtype(target_dtype)?;
+                    (k_final, v_final, true)
                 }
-                if let Some(k) = k_cpu {
-                    bulk_ks.push(k.to_device(dev)?.to_dtype(target_dtype)?);
-                    bulk_vs.push(v_cpu.unwrap().to_device(dev)?.to_dtype(target_dtype)?);
+            };
+
+            if !is_temporary { vram_count += 1; }
+
+            // [STEP B] Partial Attention Computation
+            let (mut k, mut v) = (k_block, v_block);
+            if self.num_kv_groups > 1 {
+                let (b, h, s, d) = k.dims4()?;
+                k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+            }
+
+            let q_aligned = query_states.to_dtype(k.dtype())?;
+            let mut attn_weights = (q_aligned.matmul(&k.transpose(2, 3)?)? * self.scaling)?;
+
+            if let Some(mask) = &attention_mask {
+                let m_len = mask.dim(candle_core::D::Minus1)?;
+                if b_off < m_len {
+                    let take = (m_len - b_off).min(b_len);
+                    let m_sub = mask.narrow(candle_core::D::Minus1, b_off, take)?;
+                    if take < b_len {
+                        let attn_sub = attn_weights.narrow(candle_core::D::Minus1, 0, take)?;
+                        let attn_masked = attn_sub.broadcast_add(&m_sub.to_dtype(attn_weights.dtype())?)?;
+                        attn_weights = attn_weights.slice_assign(&[0..attn_weights.dim(0)?, 0..attn_weights.dim(1)?, 0..attn_weights.dim(2)?, 0..take], &attn_masked)?;
+                    } else {
+                        attn_weights = attn_weights.broadcast_add(&m_sub.to_dtype(attn_weights.dtype())?)?;
+                    }
                 }
+            }
+
+            let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
+            let max_logits = attn_weights_f32.max_keepdim(candle_core::D::Minus1)?;
+            let exp_weights = attn_weights_f32.broadcast_sub(&max_logits)?.exp()?;
+            let sum_exp = exp_weights.sum_keepdim(candle_core::D::Minus1)?;
+            let out_block = exp_weights.to_dtype(v.dtype())?.matmul(&v)?;
+
+            // [STEP C] Merge Logic (Online Softmax)
+            if let (Some(prev_out), Some(prev_max), Some(prev_sum)) = (final_out, max_logits_acc, sum_exp_acc) {
+                let new_max = prev_max.broadcast_maximum(&max_logits)?;
+                let exp_p = prev_max.broadcast_sub(&new_max)?.exp()?;
+                let exp_n = max_logits.broadcast_sub(&new_max)?.exp()?;
+                let new_sum = (prev_sum.broadcast_mul(&exp_p)? + sum_exp.broadcast_mul(&exp_n)?)?;
+                let new_out = (prev_out.broadcast_mul(&exp_p.to_dtype(prev_out.dtype())?)? 
+                             + out_block.broadcast_mul(&exp_n.to_dtype(out_block.dtype())?)?)?;
+                final_out = Some(new_out);
+                max_logits_acc = Some(new_max);
+                sum_exp_acc = Some(new_sum);
+            } else {
+                final_out = Some(out_block);
+                max_logits_acc = Some(max_logits);
+                sum_exp_acc = Some(sum_exp);
             }
         }
 
-        if bulk_ks.is_empty() { return Err(anyhow!("No KV data found")); }
+        let attn_output = final_out.ok_or_else(|| anyhow!("No KV data processed"))?
+            .broadcast_div(&sum_exp_acc.unwrap().to_dtype(target_dtype)?)?;
 
-        // 4. [BULK-ATTENTION] GPU Parallel Concatenation
-        let k = Tensor::cat(&bulk_ks, 2)?;
-        let v = Tensor::cat(&bulk_vs, 2)?;
-        let final_kv_len = k.dim(2)?;
-
-        let (mut k, mut v) = (k, v);
-        if self.num_kv_groups > 1 {
-            let (b, h, s, d) = k.dims4()?;
-            k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-            v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-        }
-
-        // [FORCE-TYPE-STRICT] Ensure matmul operands are perfectly matched
-        let lhs = query_states.to_dtype(target_dtype)?;
-        let rhs = k.transpose(2, 3)?.to_dtype(target_dtype)?;
-
-        // Scores in F32 precision for stability
-        let mut attn_weights = lhs.matmul(&rhs)?
-            .to_dtype(DType::F32)?
-            .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?)?;
-
-        // Apply Internally Generated Causal Mask
-        if let Some(mask) = &attention_mask {
-            let m_len = mask.dim(D::Minus1)?;
-            if final_kv_len <= m_len {
-                attn_weights = attn_weights.broadcast_add(&mask.narrow(D::Minus1, 0, final_kv_len)?)?;
-            }
-        }
-
-        let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-        
-        // [FINAL-DTYPE-STRICT] Force match for second matmul
-        let weights_final = attn_weights.to_dtype(target_dtype)?;
-        let v_final = v.to_dtype(target_dtype)?;
-        let attn_output = weights_final.matmul(&v_final)?;
-
+        // 4. [OUTPUT-PROJECTION]
         let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
         let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
         
@@ -865,87 +906,88 @@ impl QuantizedQwen3VLTextAttention {
             if (is_full || is_last_chunk) && inner.k_cache.is_some() && is_dirty { Some(i) } else { None }
         }).collect();
 
-        for idx in target_indices {
-            // [DIRTY-RESET] Clear dirty flag immediately for THIS layer
-            {
-                let mut reg = self.registry.entries.write().unwrap();
-                if idx < reg.len() {
-                    if self.layer_idx < reg[idx].is_dirty.len() { reg[idx].is_dirty[self.layer_idx] = false; }
-                }
+    // 1. trigger_realtime_incremental_bake 함수 내부의 for idx in target_indices 루프 교체
+    for idx in target_indices {
+        let block = self.kv_blocks[idx].clone();
+        let (k_opt, v_opt, off, b_idx, b_len) = {
+            let mut inner = block.inner.write().unwrap();
+            let snapshot = (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len);
+            if is_decoding && idx < vram_limit_idx {
+                inner.k_cache = None;
+                inner.v_cache = None;
+                inner.location = KVLocation::SSD;
             }
+            snapshot
+        };
 
-            let block = self.kv_blocks[idx].clone();
-            let (k_opt, v_opt, off, b_idx, b_len) = {
-                let mut inner = block.inner.write().unwrap();
-                let snapshot = (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len);
-                
-                // [OFFLOAD] VRAM 상주 한계를 넘은 블록만 실제 데이터를 비움 (SSD 백업은 별개)
-                if is_decoding && idx < vram_limit_idx {
-                    inner.k_cache = None;
-                    inner.v_cache = None;
-                    inner.location = KVLocation::SSD;
-                }
-                snapshot
-            };
+        if let (Some(k), Some(v)) = (k_opt, v_opt) {
+            // [STABILITY FIX] CPU로 이동하고 반드시 연속된(Contiguous) 메모리 상태로 만들어 safetensors 직렬화 실패 원천 차단
+            let k_vram = k.to_device(&Device::Cpu).unwrap_or_else(|_| k.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| k.clone()).contiguous().unwrap_or_else(|_| k.clone());
+            let v_vram = v.to_device(&Device::Cpu).unwrap_or_else(|_| v.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| v.clone()).contiguous().unwrap_or_else(|_| v.clone());
+            
+            let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
+            let last_part = kv_name_raw.split('/').last().unwrap_or("text");
+            let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text".to_string() } else { last_part.to_string() };
+            
+            let session_id_owned = session_id.to_string();
+            let registry_clone = self.registry.clone();
+            let layer_idx = self.layer_idx;
+            let num_kv_h = self.num_key_value_heads;
+            let h_d = self.head_dim;
 
-            if let (Some(k), Some(v)) = (k_opt, v_opt) {
-                // [VRAM-DIRECT-QUEUE] RAM 이동을 메인 스레드에서 하지 않고 VRAM 텐서를 그대로 워커에게 토스
-                // 이를 통해 메인 스레드는 지체 없이 다음 레이어 연산으로 넘어갑니다.
-                let k_vram = k.clone();
-                let v_vram = v.clone();
-                
-                let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
-                let last_part = kv_name_raw.split('/').last().unwrap_or("text");
-                let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { 
-                    "text".to_string() 
-                } else { 
-                    last_part.to_string() 
-                };
-                
-                let session_id_owned = session_id.to_string();
-                let registry_clone = self.registry.clone();
-                let layer_idx = self.layer_idx;
-                let num_kv_h = self.num_key_value_heads;
-                let h_d = self.head_dim;
+            // [CRITICAL FIX] 비동기 스레드를 띄우기 '전'에 카운터를 올려 메인 스레드 통과 차단
+            crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-                tauri::async_runtime::spawn(async move {
-                    if let Some(tx) = BAKE_TX.get() {
-                        let sub_path = if baking_only {
-                            format!("{}/reference/{}", session_id_owned, kv_type)
-                        } else {
-                            format!("{}/inference/{}", session_id_owned, kv_type)
-                        };
+            tauri::async_runtime::spawn(async move {
+                if let Some(tx) = BAKE_TX.get() {
+                    let sub_path = if baking_only { format!("{}/reference/{}", session_id_owned, kv_type) } else { format!("{}/inference/{}", session_id_owned, kv_type) };
+                    let kv_dir = crate::utils::paths::get_kv_dir(None);
+                    let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
+                    if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
 
-                        let block_dir = crate::utils::paths::get_kv_dir(None).join(&sub_path).join(format!("b{}", off));
-                        if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
+                    let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
+                    let dump = LayerKVDump {
+                        layer_idx,
+                        k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
+                        v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
+                        k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
+                        raw_k: Some(k_vram),
+                        raw_v: Some(v_vram),
+                    };
 
-                        let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
-                        let dump = LayerKVDump {
-                            layer_idx,
-                            k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
-                            v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
-                            k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
-                            // [NEW] 워커가 직접 VRAM에서 가져가도록 텐서 전달
-                            raw_k: Some(k_vram),
-                            raw_v: Some(v_vram),
-                        };
-
-                        let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
-                        let _ = tx.send(SlotTask::Bake(BakeTask {
-                            slot_id: sid,
-                            task_dir: block_dir,
-                            kv_name: Some(sub_path),
-                            offset: off,
-                            layers: vec![dump],
-                            is_relay_baking: baking_only,
-                            block_idx: Some(b_idx),
-                            registry: registry_clone,
-                        })).await;
+                    let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
+                    
+                    if tx.send(SlotTask::Bake(BakeTask {
+                        slot_id: sid, task_dir: block_dir, kv_name: Some(sub_path), offset: off, layers: vec![dump],
+                        is_relay_baking: baking_only, block_idx: Some(b_idx), registry: registry_clone,
+                    })).await.is_err() {
+                        crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        SLOT_MANAGER.release_slot(sid).await;
                     }
-                });
-            }
+                } else {
+                    crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
         }
-        Ok(())
+    }
+
+
+    // 2. force_flush_all_active_blocks 함수 내부의 for 루프 교체
+    for (off, layers) in block_groups {
+        let sid = SLOT_MANAGER.acquire_write_slot(256).await;
+        let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
+        if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
+
+        // [CRITICAL FIX] 수동 플러시 시에도 IO 큐를 잠급니다.
+        crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        if tx.send(SlotTask::Bake(BakeTask {
+            slot_id: sid, task_dir: block_dir, kv_name: Some(sub_path.clone()), offset: off, layers,
+            is_relay_baking: mode, block_idx: Some(off / 256), registry: self.registry.clone(),
+        })).await.is_err() {
+            crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            SLOT_MANAGER.release_slot(sid).await;
+        }
     }
 
     pub fn get_kv_len(&self) -> usize {
@@ -1130,17 +1172,18 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, _kv_name: Option<&str>) -> Result<()> {
-        // [SSD-ALIGNMENT] 실제 오프셋을 폴더명으로 사용
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> {
+        // [SSD-ALIGNMENT] 표준화된 경로 구조 생성 (Session/Mode/Type/Block)
+        let kv_type = kv_name.unwrap_or("text");
         let b_str = format!("b{}", offset);
-        let block_dir = path.join(&b_str);
+        let block_dir = path.join(kv_type).join(&b_str);
         if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
         
         let structured_path = block_dir.join(format!("l{}.st", self.layer_idx));
         
         let mut map = HashMap::new();
-        // [PREFIX-FIX] 저장 시에도 실제 오프셋 이름을 접두어로 사용
-        let prefix = format!("{}l{}_", b_str, self.layer_idx);
+        // [PREFIX-FIX] 로드 로직(b{}_l{}_)과 일치하도록 접두어 수정
+        let prefix = format!("b{}_l{}_", offset, self.layer_idx);
 
         let mut ks = Vec::new();
         let mut vs = Vec::new();
@@ -1348,6 +1391,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
             registry,
             layer_idx,
             active_kv_name: None,
+            active_session_id: None,
             vram_merged_k: None,
             vram_merged_v: None,
             merged_vram_block_count: 0,
@@ -1854,13 +1898,22 @@ impl QuantizedQwen3VLTextModel {
         let current_seq_len = xs.dim(1)?;
         let target_device = self.layers[layer_idx].device().clone();
 
+        let total_chunks = chunk_offsets.len();
+
         for (chunk_idx, &i) in chunk_offsets.iter().enumerate() {
             let take = (current_seq_len - i).min(chunk_size);
             
-            // [SLIDING-WINDOW-PREFETCH] ... (Prefetch logic remains same)
-            let prefetch_window = 4;
-            let look_ahead_layers = 2;
-            let target_chunks = if chunk_idx == 0 { (0..=prefetch_window).collect::<Vec<_>>() } else { vec![chunk_idx + prefetch_window] };
+            // [OPTIMIZATION 1] Dynamic Sliding-Window Prefetch
+            // 남은 청크 수에 따라 프리패치 윈도우를 동적으로 조절하여 불필요한 SSD I/O 및 큐 포화 방지
+            let remaining_chunks = total_chunks.saturating_sub(chunk_idx);
+            let prefetch_window = if remaining_chunks > 8 { 4 } else { remaining_chunks.min(2) };
+            let look_ahead_layers = if layer_idx < 26 { 2 } else { 1 }; // 마지막 레이어 근처에서는 미리 읽기 축소
+
+            let target_chunks = if chunk_idx == 0 { 
+                (0..=prefetch_window).collect::<Vec<_>>() 
+            } else { 
+                vec![chunk_idx + prefetch_window] 
+            };
 
             for t_idx in target_chunks {
                 if t_idx < chunk_offsets.len() {
@@ -1913,8 +1966,13 @@ impl QuantizedQwen3VLTextModel {
                 Some(prev) => Some(Tensor::cat(&[prev, out], 1)?),
             };
 
+            // VRAM Evacuation 실행 (CPU에서 비동기 전송 처리)
             let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
-            if target_device.is_cuda() { let _ = target_device.synchronize(); }
+            // if target_device.is_cuda() { let _ = target_device.synchronize(); }
+        }
+
+        if target_device.is_cuda() { 
+            let _ = target_device.synchronize(); 
         }
 
         // [OPTIMIZATION] 프리필(청크 연산)이 모두 끝난 후 레이어 단위로 단 한 번 SSD 백업 트리거
@@ -1926,21 +1984,49 @@ impl QuantizedQwen3VLTextModel {
 
         if current_seq_len > 1 {
             // [OPTIMIZATION] 0.6B (Small) 모델은 프리필 후에도 VRAM 캐시를 유지하여 즉시 디코딩 진입 보장
+            // 하지만 4096 토큰을 초과하는 초장문은 VRAM 보호를 위해 대피를 강제합니다.
             let is_small_model = self.layers.len() <= 36;
+            let current_kv_len = self.layers[layer_idx].get_kv_len();
             
-            if !is_small_model {
-                for block in &self.layers[layer_idx].self_attn.kv_blocks {
-                    let mut inner = block.inner.write().unwrap();
-                    inner.k_cache = None;
-                    inner.v_cache = None;
-                    if inner.location == KVLocation::VRAM { inner.location = KVLocation::Streaming; }
+            if !is_small_model || current_kv_len >= 4096 {
+                for (i, block) in self.layers[layer_idx].self_attn.kv_blocks.iter().enumerate() {
+                    let (k_part, v_part) = {
+                        let inner = block.inner.read().unwrap();
+                        (inner.k_cache.clone(), inner.v_cache.clone())
+                    };
+
+                    if let (Some(k), Some(v)) = (k_part, v_part) {
+                        // [SAFE-EVACUATION] 삭제 대신 RAM으로 즉시 이동 (유실 방지)
+                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
+                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
+                        
+                        let mut inner = block.inner.write().unwrap();
+                        inner.k_cache = None;
+                        inner.v_cache = None;
+                        inner.location = KVLocation::RAM;
+
+                        let mut reg = self.registry.entries.write().unwrap();
+                        if i < reg.len() {
+                            let entry = &mut reg[i];
+                            entry.location[layer_idx] = KVLocation::RAM;
+                            // RAM 캐시(bitkv_cache)에 즉시 등록하여 로드 가능하게 함
+                            let mut cache = entry.bitkv_cache.write().unwrap();
+                            if layer_idx < cache.len() {
+                                cache[layer_idx] = Some(BitKVMetadata {
+                                    k_data: k_cpu,
+                                    v_data: v_cpu,
+                                    original_shape: k.shape().dims().to_vec(),
+                                });
+                            }
+                        }
+                    }
                 }
                 self.layers[layer_idx].self_attn.vram_merged_k = None;
                 self.layers[layer_idx].self_attn.vram_merged_v = None;
                 self.layers[layer_idx].self_attn.merged_vram_block_count = 0;
-                println!("[ENGINE-TRACE] Layer {} Prefill Cache Evicted (Large Model).", layer_idx);
+                println!("[ENGINE-TRACE] Layer {} Prefill Cache Moved to RAM ({} tokens).", layer_idx, current_kv_len);
             } else {
-                println!("[ENGINE-TRACE] Layer {} Prefill Cache Kept (Small Model).", layer_idx);
+                println!("[ENGINE-TRACE] Layer {} Prefill Cache Kept in VRAM (Small Model, {} tokens).", layer_idx, current_kv_len);
             }
         }
         
@@ -1949,9 +2035,18 @@ impl QuantizedQwen3VLTextModel {
 
     /// [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로 이동
     async fn evacuate_vram_to_ram_only(&mut self, layer_idx: usize) -> Result<()> {
-        // [OPTIMIZATION] 0.6B (Small) 모델은 모든 문맥을 VRAM에 박제하여 PCIe 병목 제거
+        // [OPTIMIZATION] 0.6B (Small) 모델은 기본적으로 모든 문맥을 VRAM에 상주시키나,
+        // 문맥이 너무 길어질 경우(예: 4096+) OOM 방지를 위해 RAM으로 대피를 허용합니다.
+        let current_kv_len = self.layers[layer_idx].get_kv_len();
         let is_small_model = self.layers.len() <= 36;
-        if is_small_model { return Ok(()); }
+        if is_small_model && current_kv_len < 4096 { return Ok(()); }
+
+        let vram_limit = 1024; 
+        let mut vram_evicted = false;
+
+        if is_small_model {
+            // println!("[ENGINE-TRACE] Small Model context large ({}). Enabling VRAM evacuation for safety.", current_kv_len);
+        }
 
         // [DYNAMIC-LIMITS] 시스템 자원 상황에 따라 임계값 유동적 조절 (OOM 방지)
         let vram_limit = {
@@ -2054,13 +2149,11 @@ impl QuantizedQwen3VLTextModel {
         let input_token_count = xs.dim(1).unwrap_or(0);
         let is_decoding = input_token_count <= 1;
 
-        // [MEMORY-OPT] 디코딩 단계 진입 시 모든 레이어를 미리 로드
         if is_decoding && layer_idx == 0 {
             let already_loaded = !self.layers[0].self_attn.q_proj.is_cleared();
             if !already_loaded { self.reload_all_layers()?; }
         }
 
-        // [MEMORY-OPT] Prefill 시 현재 레이어 로드
         if !is_decoding {
             self.reload_layer(layer_idx)?;
         }
@@ -2070,13 +2163,13 @@ impl QuantizedQwen3VLTextModel {
         
         if !self.layers[layer_idx].device().same_device(&target_device) {
             self.layers[layer_idx].to_device(&target_device)?;
-            // GPU 이동 후 RAM 가중치는 자동으로 drop됨
-            if !is_decoding { let _ = target_device.synchronize(); }
         }
 
-        // [MEMORY-OPT] [PREFETCH] 다음 레이어를 RAM으로 미리 로드
+        // [MEMORY-OPT] [PREFETCH-PIPELINE] "Fire & Shot" 전략 
+        // 현재 레이어가 연산될 준비를 마쳤으므로, 다음 레이어를 즉시 VRAM으로 밀어 넣습니다. (최대 2개 레이어 활성화)
         if !is_decoding && layer_idx + 1 < self.layers.len() {
             let _ = self.reload_layer(layer_idx + 1);
+            let _ = self.layers[layer_idx + 1].to_device(&target_device); // PCIe H2D 전송 예약
         }
 
         // [STEP 3] GPU 연산 실행
@@ -2088,14 +2181,17 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [MEMORY-OPT] [IMMEDIATE-PURGE] 연산 직후 가중치 즉시 소각 
-        // KV 대피(IO)는 시간이 걸릴 수 있으므로, 그 전에 가중치를 먼저 지워서 VRAM 공간 확보
+        // [MEMORY-OPT] [IMMEDIATE-PURGE] 2-Layer Sliding Window 소각 정책
+        // 현재 레이어를 지우는 대신, 연산이 '완전히' 끝난 '이전' 레이어를 지웁니다.
         if !is_decoding {
-            self.layers[layer_idx].clear();
-            if target_device.is_cuda() { 
-                let _ = target_device.synchronize(); // GPU 메모리 해제 확정
+            if layer_idx > 0 {
+                self.layers[layer_idx - 1].clear();
+                println!("[MEMORY-OPT] Layer {} Weights Purged. (RAM/VRAM cleared)", layer_idx - 1);
             }
-            println!("[MEMORY-OPT] Layer {} Weights Purged. (RAM/VRAM cleared)", layer_idx);
+            if layer_idx == self.layers.len() - 1 {
+                self.layers[layer_idx].clear(); // 마지막 루프에서는 자기 자신을 소각
+                println!("[MEMORY-OPT] Layer {} Weights Purged. (RAM/VRAM cleared)", layer_idx);
+            }
         }
 
         // [STEP 4] 자원 반납 및 KV 대피
@@ -2233,6 +2329,9 @@ impl QuantizedQwen3VLTextModel {
             let r_limit = if free_ram_gb > 4.0 { 5000 } else { 2048 };
             (v_limit, r_limit)
         };
+
+        let v_limit = 2048; 
+        let r_limit = 5000;
 
         let mut vram_evicted = false;
 

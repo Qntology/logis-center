@@ -246,7 +246,26 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 if let Ok(data) = safetensors::serialize(&ts, &None) {
                     drop(ts); let _ = save_kv_block(&tp, &data);
-                    
+
+                    if let (Some(r), Some(idx)) = (reg, b_idx) {
+                        if let Ok(mut entries) = r.entries.write() {
+                            if idx < entries.len() {
+                                let e = &mut entries[idx]; 
+                                if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
+                                    if let Ok(l_idx) = l_str.parse::<usize>() { 
+                                        if l_idx < 28 { 
+                                            e.location[l_idx] = KVLocation::SSD; 
+                                            e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
+                                            if let Ok(mut cache) = e.bitkv_cache.write() {
+                                                if l_idx < cache.len() { cache[l_idx] = None; }
+                                            }
+                                        } 
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // [CENTRALIZED-INDEX-UPDATE] 인덱스 채널로 업데이트 전송
                     if let Some(kv_name) = kv_n {
                         if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
@@ -266,26 +285,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             }
                         }
                     }
-
-                    if let (Some(r), Some(idx)) = (reg, b_idx) {
-                        if let Ok(mut entries) = r.entries.write() {
-                            if idx < entries.len() {
-                                let e = &mut entries[idx]; 
-                                if let Some(l_str) = tp.file_name().and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('l')).and_then(|s| s.strip_suffix(".st")) {
-                                    if let Ok(l_idx) = l_str.parse::<usize>() { 
-                                        if l_idx < 28 { 
-                                            e.location[l_idx] = KVLocation::SSD; 
-                                            e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                                            // [MEMORY-RELEASE] SSD 저장 완료 즉시 RAM 메모리 해제
-                                            if let Ok(mut cache) = e.bitkv_cache.write() {
-                                                if l_idx < cache.len() { cache[l_idx] = None; }
-                                            }
-                                        } 
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
                 let rem = SLOT_MANAGER.slots[sid].remaining_layers.fetch_sub(1, Ordering::SeqCst);
                 if rem == 1 || is_last { SLOT_MANAGER.mark_ready(sid).await; }
@@ -297,9 +296,16 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         while let Some(task) = rx.recv().await {
             match task {
                 SlotTask::Bake(bake) => {
+                    let loop_count = bake.layers.len();
+
+                    // [CRITICAL FIX] 내부 tokio::spawn 작업 개수만큼 미리 IO 카운터를 올려둡니다. (제로-딥 방지)
+                    GLOBAL_IO_COUNTER.fetch_add(loop_count, std::sync::atomic::Ordering::SeqCst);
+                    // 겉포장(Task)에 대한 카운터 1을 차감합니다.
+                    GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
                     let io_tx_inner = io_tx.clone();
                     let (sid, off, _is_relay, block_idx, registry, kv_name) = (bake.slot_id, bake.offset, bake.is_relay_baking, bake.block_idx, bake.registry.clone(), bake.kv_name.clone());
-                    let loop_count = bake.layers.len();
+                    
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
                     
                     for l_idx in 0..loop_count {
@@ -310,21 +316,40 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
 
-                        // [BACK-COMPRESSION] 압축 및 직렬화 작업 자체를 백그라운드로 완전히 분리
+                        // [BACK-COMPRESSION] 압축 및 직렬화 작업
                         tokio::spawn(async move {
-                            // [FIX] Convert raw tensors to BF16 (or F32 fallback)
-                            // [CRITICAL] 텐서가 GPU에 있는 경우, to_device는 해당 스레드의 컨텍스트를 필요로 함
                             if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
-                                // 워커 스레드에서 안전하게 CPU로 이동
-                                // [STABILITY] to_device 호출 시 장치 컨텍스트가 자동으로 보장되지 않을 수 있으므로
-                                // candle-core의 Device 스코프 내에서 실행되도록 유도 (필요시)
-                                let k_cpu = rk.to_device(&Device::Cpu).unwrap_or(rk);
-                                let v_cpu = rv.to_device(&Device::Cpu).unwrap_or(rv);
-                                
+                                let mut k_cpu = rk.to_device(&Device::Cpu).unwrap_or(rk);
+                                let mut v_cpu = rv.to_device(&Device::Cpu).unwrap_or(rv);
+
+                                // [KV-BRIDGE] 0.6B Cross-layer or Cross-session alignment
+                                // Check if current layer shape matches the source tensor
+                                let (_b, h, _s, d) = k_cpu.dims4().unwrap_or((1, 0, 0, 0));
+                                let k_shape_u32 = src.k_shape.to_vec1::<u32>().unwrap_or_default();
+                                if k_shape_u32.len() == 4 {
+                                    let target_heads = k_shape_u32[1] as usize;
+                                    let target_dim = k_shape_u32[3] as usize;
+
+                                    if d > 0 && d < target_dim {
+                                        k_cpu = Tensor::cat(&[&k_cpu, &k_cpu], candle_core::D::Minus1).unwrap_or(k_cpu);
+                                        v_cpu = Tensor::cat(&[&v_cpu, &v_cpu], candle_core::D::Minus1).unwrap_or(v_cpu);
+                                    }
+                                    if h > 0 && h != target_heads {
+                                        let mut k_list = Vec::with_capacity(target_heads);
+                                        let mut v_list = Vec::with_capacity(target_heads);
+                                        for i in 0..target_heads {
+                                            let src_idx = i % h;
+                                            k_list.push(k_cpu.narrow(1, src_idx, 1).unwrap());
+                                            v_list.push(v_cpu.narrow(1, src_idx, 1).unwrap());
+                                        }
+                                        k_cpu = Tensor::cat(&k_list, 1).unwrap_or(k_cpu);
+                                        v_cpu = Tensor::cat(&v_list, 1).unwrap_or(v_cpu);
+                                    }
+                                }
+
                                 src.k_data = k_cpu.to_dtype(DType::BF16).unwrap_or(k_cpu);
                                 src.v_data = v_cpu.to_dtype(DType::BF16).unwrap_or(v_cpu);
                             }
-
                             let mut map = std::collections::HashMap::new();
                             let prefix = format!("b{}_l{}_", off, act_l);
                             map.insert(format!("{}k_data", prefix), src.k_data.clone());
@@ -333,9 +358,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             
                             let file_path = task_dir.join(format!("l{}.st", act_l));
                             
-                            // [FIX] Send to IO worker after confirming all tensors are on CPU
-                            GLOBAL_IO_COUNTER.fetch_add(1, Ordering::SeqCst);
-                            let _ = io_tx_nested.send(SaveTask { 
+                            // [CRITICAL FIX] 여기서 카운터를 올리던 기존 코드(fetch_add)를 삭제했습니다!
+                            // 대신, 전송에 실패할 경우에만 고아(Orphan) 태스크를 방지하기 위해 카운터를 깎습니다.
+                            if io_tx_nested.send(SaveTask { 
                                 slot_id: sid, 
                                 path: file_path.clone(), 
                                 tensors: map, 
@@ -343,7 +368,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 block_idx, 
                                 registry: Some(registry_inner), 
                                 kv_name: kv_name_inner 
-                            }).await;
+                            }).await.is_err() {
+                                GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            }
                         });
                     }
                 },

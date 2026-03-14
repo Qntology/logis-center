@@ -551,6 +551,87 @@ pub fn decoding_attention_parallel(
     Ok(final_output)
 }
 
+pub fn block_wise_attention(
+    query_states: &Tensor,
+    k_blocks: &[Tensor],
+    v_blocks: &[Tensor],
+    num_kv_groups: usize,
+    scaling: f64,
+    attention_mask: Option<&Tensor>,
+) -> Result<Tensor> {
+    let (_b_sz, _n_heads, _q_len, _d_head) = query_states.dims4()?;
+    let mut final_out: Option<Tensor> = None;
+    let mut max_logits_acc: Option<Tensor> = None;
+    let mut sum_exp_acc: Option<Tensor> = None;
+    let mut current_kv_offset = 0;
+
+    for (k_block, v_block) in k_blocks.iter().zip(v_blocks.iter()) {
+        let block_len = k_block.dim(2)?;
+        
+        // GQA support: repeat KV heads if needed
+        let (mut k, mut v) = (k_block.clone(), v_block.clone());
+        if num_kv_groups > 1 {
+            let (b, h, s, d) = k.dims4()?;
+            k = k.unsqueeze(2)?.expand((b, h, num_kv_groups, s, d))?.reshape((b, h * num_kv_groups, s, d))?;
+            v = v.unsqueeze(2)?.expand((b, h, num_kv_groups, s, d))?.reshape((b, h * num_kv_groups, s, d))?;
+        }
+
+        // Attn Scores: Q @ K^T
+        let q_aligned = query_states.to_dtype(k.dtype())?;
+        let mut attn_weights = (q_aligned.matmul(&k.transpose(2, 3)?)? * scaling)?;
+
+        // Apply Mask if present
+        if let Some(mask) = attention_mask {
+            let m_len = mask.dim(D::Minus1)?;
+            if current_kv_offset < m_len {
+                let take = (m_len - current_kv_offset).min(block_len);
+                let m_sub = mask.narrow(D::Minus1, current_kv_offset, take)?;
+                
+                if take < block_len {
+                    let attn_sub = attn_weights.narrow(D::Minus1, 0, take)?;
+                    let attn_masked = attn_sub.broadcast_add(&m_sub.to_dtype(attn_weights.dtype())?)?;
+                    // In Candle, slice_assign takes a slice of ranges. 
+                    // We target the last dimension (dim 3) for the first 'take' elements.
+                    attn_weights = attn_weights.slice_assign(&[0..attn_weights.dim(0)?, 0..attn_weights.dim(1)?, 0..attn_weights.dim(2)?, 0..take], &attn_masked)?;
+                } else {
+                    attn_weights = attn_weights.broadcast_add(&m_sub.to_dtype(attn_weights.dtype())?)?;
+                }
+            }
+        }
+
+        // Online Softmax Logic (Safe Softmax)
+        let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
+        let max_logits = attn_weights_f32.max_keepdim(D::Minus1)?;
+        let exp_weights = attn_weights_f32.broadcast_sub(&max_logits)?.exp()?;
+        let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
+        
+        let out_block = exp_weights.to_dtype(v.dtype())?.matmul(&v)?;
+
+        if let (Some(prev_out), Some(prev_max), Some(prev_sum)) = (final_out, max_logits_acc, sum_exp_acc) {
+            let new_max = prev_max.broadcast_maximum(&max_logits)?;
+            let exp_p = prev_max.broadcast_sub(&new_max)?.exp()?;
+            let exp_n = max_logits.broadcast_sub(&new_max)?.exp()?;
+            
+            let new_sum = (prev_sum.broadcast_mul(&exp_p)? + sum_exp.broadcast_mul(&exp_n)?)?;
+            let new_out = (prev_out.broadcast_mul(&exp_p.to_dtype(prev_out.dtype())?)? 
+                         + out_block.broadcast_mul(&exp_n.to_dtype(out_block.dtype())?)?)?;
+            
+            final_out = Some(new_out);
+            max_logits_acc = Some(new_max);
+            sum_exp_acc = Some(new_sum);
+        } else {
+            final_out = Some(out_block);
+            max_logits_acc = Some(max_logits);
+            sum_exp_acc = Some(sum_exp);
+        }
+        current_kv_offset += block_len;
+    }
+
+    // Final normalization
+    let res = final_out.as_ref().unwrap().broadcast_div(&sum_exp_acc.unwrap().to_dtype(final_out.as_ref().unwrap().dtype())?)?;
+    Ok(res)
+}
+
 pub fn eager_attention_forward(
     query_states: &Tensor,
     key_states: &Tensor,
