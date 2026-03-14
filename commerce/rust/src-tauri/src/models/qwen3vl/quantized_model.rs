@@ -1575,10 +1575,6 @@ impl QuantizedQwen3VLTextDecoderLayer {
                 t.to_device(device)?.to_dtype(dtype)?
             };
 
-            // [CRITICAL] Transpose linear weights from (Out, In) to (In, Out) for Candle matmul
-            if is_linear && t.rank() == 2 {
-                t = t.t()?;
-            }
             Ok(t)
         };
 
