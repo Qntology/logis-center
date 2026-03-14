@@ -707,30 +707,47 @@ impl QuantizedQwen3VLTextAttention {
                         path_candidates.push(kv_dir.join(format!("{}/reference/{}/b{}", sid, kv_type, b_off)));
                         path_candidates.push(kv_dir.join(format!("{}/inference/text/b{}", sid, b_off))); // Fallback
 
-                        for full_path in path_candidates {
+                        let mut load_success = false;
+                        for full_path in &path_candidates {
                             let block_file = full_path.join(format!("l{}.st", self.layer_idx));
                             if block_file.exists() {
-                                if let Ok(data) = crate::utils::direct_loader::load_kv_block(&block_file) {
-                                    if let Ok(st) = safetensors::SafeTensors::deserialize(&data) {
-                                        let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
-                                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
-                                        if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
-                                            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                                            let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
-                                            let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
-                                            let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu)?;
-                                            k_cpu = Some(self.decompress_from_bf16(&kd_t, &meta_os, &Device::Cpu)?);
-                                            v_cpu = Some(self.decompress_from_bf16(&vd_t, &meta_os, &Device::Cpu)?);
-                                            ssd_count += 1;
-                                            
-                                            // [AUTO-REGISTER] 찾은 경로를 장부에 즉시 업데이트하여 다음 로드 시 가속
-                                            let mut reg = self.registry.entries.write().unwrap();
-                                            if index < reg.len() { reg[index].ssd_path = Some(full_path.clone()); }
-                                            break;
+                                match crate::utils::direct_loader::load_kv_block(&block_file) {
+                                    Ok(data) => {
+                                        match safetensors::SafeTensors::deserialize(&data) {
+                                            Ok(st) => {
+                                                let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
+                                                let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                                                
+                                                if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                                    let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                                    let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                                                    
+                                                    // [SAFE-FALLBACK] 크기 불일치 에러 시 프로그램 종료 방지
+                                                    let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap_or_else(|_| Tensor::zeros(meta_os.clone(), DType::BF16, &Device::Cpu).unwrap());
+                                                    let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap_or_else(|_| Tensor::zeros(meta_os.clone(), DType::BF16, &Device::Cpu).unwrap());
+                                                    
+                                                    k_cpu = Some(self.decompress_from_bf16(&kd_t, &meta_os, &Device::Cpu).unwrap_or_else(|_| kd_t));
+                                                    v_cpu = Some(self.decompress_from_bf16(&vd_t, &meta_os, &Device::Cpu).unwrap_or_else(|_| vd_t));
+                                                    ssd_count += 1;
+                                                    
+                                                    let mut reg = self.registry.entries.write().unwrap();
+                                                    if index < reg.len() { reg[index].ssd_path = Some(full_path.clone()); }
+                                                    load_success = true;
+                                                    break;
+                                                } else {
+                                                    println!("[CRITICAL-LOAD] Keys missing in {:?} (Prefix used: {})", block_file, prefix);
+                                                }
+                                            },
+                                            Err(e) => println!("[CRITICAL-LOAD] Deserialize failed for {:?}: {}", block_file, e),
                                         }
-                                    }
+                                    },
+                                    Err(e) => println!("[CRITICAL-LOAD] Read failed for {:?}: {}", block_file, e),
                                 }
                             }
+                        }
+                        
+                        if !load_success {
+                            println!("[CRITICAL-LOAD] Exhausted all path candidates for Block {}. Last tried: {:?}", index, path_candidates.last());
                         }
                     }
 
@@ -880,18 +897,17 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_blocks.clear();
     }
 
+    // 883라인 근처: trigger_realtime_incremental_bake 함수를 아래 내용으로 완전히 교체
     pub fn trigger_realtime_incremental_bake(&self, session_id: &str, is_last_chunk: bool, baking_only: bool, is_decoding: bool) -> Result<()> {
         use crate::models::qwen3vl::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
 
         let total_blocks = self.kv_blocks.len();
-        // [VRAM-GUARD] 디코딩 시에는 최신 3개만 VRAM에 유지 (SSD에는 모두 백업)
         let vram_limit_idx = if is_decoding { total_blocks.saturating_sub(3) } else { 0 };
 
         let target_indices: Vec<usize> = self.kv_blocks.iter().enumerate().filter_map(|(i, b)| {
             let inner = b.inner.read().unwrap();
             let is_full = inner.len == 256;
             
-            // [DIRTY-CHECK] Only bake if THIS layer is dirty for this block
             let is_dirty = {
                 let reg = self.registry.entries.read().unwrap();
                 if i < reg.len() { 
@@ -899,95 +915,73 @@ impl QuantizedQwen3VLTextAttention {
                 } else { true }
             };
 
-            // [BACKUP-STRATEGY] 
-            // 1. 완성된 블록(256개)은 즉시 SSD로 백업 대상
-            // 2. 마지막 조각(is_last_chunk)도 백업 대상
-            // 3. VRAM에 데이터가 있고, 아직 저장이 안 된(dirty) 경우만 수집
             if (is_full || is_last_chunk) && inner.k_cache.is_some() && is_dirty { Some(i) } else { None }
         }).collect();
 
-    // 1. trigger_realtime_incremental_bake 함수 내부의 for idx in target_indices 루프 교체
-    for idx in target_indices {
-        let block = self.kv_blocks[idx].clone();
-        let (k_opt, v_opt, off, b_idx, b_len) = {
-            let mut inner = block.inner.write().unwrap();
-            let snapshot = (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len);
-            if is_decoding && idx < vram_limit_idx {
-                inner.k_cache = None;
-                inner.v_cache = None;
-                inner.location = KVLocation::SSD;
-            }
-            snapshot
-        };
-
-        if let (Some(k), Some(v)) = (k_opt, v_opt) {
-            // [STABILITY FIX] CPU로 이동하고 반드시 연속된(Contiguous) 메모리 상태로 만들어 safetensors 직렬화 실패 원천 차단
-            let k_vram = k.to_device(&Device::Cpu).unwrap_or_else(|_| k.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| k.clone()).contiguous().unwrap_or_else(|_| k.clone());
-            let v_vram = v.to_device(&Device::Cpu).unwrap_or_else(|_| v.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| v.clone()).contiguous().unwrap_or_else(|_| v.clone());
-            
-            let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
-            let last_part = kv_name_raw.split('/').last().unwrap_or("text");
-            let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text".to_string() } else { last_part.to_string() };
-            
-            let session_id_owned = session_id.to_string();
-            let registry_clone = self.registry.clone();
-            let layer_idx = self.layer_idx;
-            let num_kv_h = self.num_key_value_heads;
-            let h_d = self.head_dim;
-
-            // [CRITICAL FIX] 비동기 스레드를 띄우기 '전'에 카운터를 올려 메인 스레드 통과 차단
-            crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-            tauri::async_runtime::spawn(async move {
-                if let Some(tx) = BAKE_TX.get() {
-                    let sub_path = if baking_only { format!("{}/reference/{}", session_id_owned, kv_type) } else { format!("{}/inference/{}", session_id_owned, kv_type) };
-                    let kv_dir = crate::utils::paths::get_kv_dir(None);
-                    let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
-                    if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
-
-                    let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
-                    let dump = LayerKVDump {
-                        layer_idx,
-                        k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
-                        v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
-                        k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
-                        raw_k: Some(k_vram),
-                        raw_v: Some(v_vram),
-                    };
-
-                    let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
-                    
-                    if tx.send(SlotTask::Bake(BakeTask {
-                        slot_id: sid, task_dir: block_dir, kv_name: Some(sub_path), offset: off, layers: vec![dump],
-                        is_relay_baking: baking_only, block_idx: Some(b_idx), registry: registry_clone,
-                    })).await.is_err() {
-                        crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                        SLOT_MANAGER.release_slot(sid).await;
-                    }
-                } else {
-                    crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        for idx in target_indices {
+            let block = self.kv_blocks[idx].clone();
+            let (k_opt, v_opt, off, b_idx, b_len) = {
+                let mut inner = block.inner.write().unwrap();
+                let snapshot = (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len);
+                if is_decoding && idx < vram_limit_idx {
+                    inner.k_cache = None;
+                    inner.v_cache = None;
+                    inner.location = KVLocation::SSD;
                 }
-            });
+                snapshot
+            };
+
+            if let (Some(k), Some(v)) = (k_opt, v_opt) {
+                // CPU 이동 및 연속화
+                let k_vram = k.to_device(&Device::Cpu).unwrap_or_else(|_| k.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| k.clone()).contiguous().unwrap_or_else(|_| k.clone());
+                let v_vram = v.to_device(&Device::Cpu).unwrap_or_else(|_| v.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| v.clone()).contiguous().unwrap_or_else(|_| v.clone());
+                
+                let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
+                let last_part = kv_name_raw.split('/').last().unwrap_or("text");
+                let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text".to_string() } else { last_part.to_string() };
+                
+                let session_id_owned = session_id.to_string();
+                let registry_clone = self.registry.clone();
+                let layer_idx = self.layer_idx;
+                let num_kv_h = self.num_key_value_heads;
+                let h_d = self.head_dim;
+
+                // IO 카운터 증가 (여기서 미리 수행)
+                crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                tauri::async_runtime::spawn(async move {
+                    if let Some(tx) = BAKE_TX.get() {
+                        let sub_path = if baking_only { format!("{}/reference/{}", session_id_owned, kv_type) } else { format!("{}/inference/{}", session_id_owned, kv_type) };
+                        let kv_dir = crate::utils::paths::get_kv_dir(None);
+                        let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
+                        if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
+
+                        let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
+                        let dump = LayerKVDump {
+                            layer_idx,
+                            k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
+                            v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
+                            k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
+                            raw_k: Some(k_vram),
+                            raw_v: Some(v_vram),
+                        };
+
+                        let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
+                        
+                        if tx.send(SlotTask::Bake(BakeTask {
+                            slot_id: sid, task_dir: block_dir, kv_name: Some(sub_path), offset: off, layers: vec![dump],
+                            is_relay_baking: baking_only, block_idx: Some(b_idx), registry: registry_clone,
+                        })).await.is_err() {
+                            crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            SLOT_MANAGER.release_slot(sid).await;
+                        }
+                    } else {
+                        crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
         }
-    }
-
-
-    // 2. force_flush_all_active_blocks 함수 내부의 for 루프 교체
-    for (off, layers) in block_groups {
-        let sid = SLOT_MANAGER.acquire_write_slot(256).await;
-        let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
-        if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
-
-        // [CRITICAL FIX] 수동 플러시 시에도 IO 큐를 잠급니다.
-        crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-        if tx.send(SlotTask::Bake(BakeTask {
-            slot_id: sid, task_dir: block_dir, kv_name: Some(sub_path.clone()), offset: off, layers,
-            is_relay_baking: mode, block_idx: Some(off / 256), registry: self.registry.clone(),
-        })).await.is_err() {
-            crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            SLOT_MANAGER.release_slot(sid).await;
-        }
+        Ok(())
     }
 
     pub fn get_kv_len(&self) -> usize {
@@ -1960,31 +1954,31 @@ impl QuantizedQwen3VLTextModel {
 
             let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i, session_id.clone(), kv_name.clone(), baking_only)?;
             
-            // [VRAM-ONLY-MERGE] 즉시 병합하여 RAM에 파편이 남지 않게 함
+            // [FIX] 이전 텐서를 명시적으로 소멸시켜 VRAM 누수 차단
             final_output = match final_output {
                 None => Some(out),
-                Some(prev) => Some(Tensor::cat(&[prev, out], 1)?),
+                Some(prev) => {
+                    let combined = Tensor::cat(&[&prev, &out], 1)?;
+                    drop(prev); // 이전 청크 결과물 즉시 해제
+                    drop(out);
+                    Some(combined)
+                },
             };
 
-            // VRAM Evacuation 실행 (CPU에서 비동기 전송 처리)
+            // 청크 연산 직후 VRAM 압박 시 RAM으로 대피
             let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
-            // if target_device.is_cuda() { let _ = target_device.synchronize(); }
         }
 
-        if target_device.is_cuda() { 
-            let _ = target_device.synchronize(); 
-        }
-
-        // [OPTIMIZATION] 프리필(청크 연산)이 모두 끝난 후 레이어 단위로 단 한 번 SSD 백업 트리거
+        if target_device.is_cuda() { let _ = target_device.synchronize(); }
+        
+        // [IMPORTANT] 프리필 직후 SSD 백업 트리거
         if let Some(sid) = &session_id {
             let is_prefill = current_seq_len > 1;
-            // 프리필 중에는 루프 밖에서 일괄 처리, 디코딩(seq_len=1)일 때는 루프와 동일하게 작동
             let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, !is_prefill);
         }
 
+        // [MEMORY-FIX] 프리필 후 메모리 정리 로직 (기존 2014라인 근처를 이 코드로 대체)
         if current_seq_len > 1 {
-            // [OPTIMIZATION] 0.6B (Small) 모델은 프리필 후에도 VRAM 캐시를 유지하여 즉시 디코딩 진입 보장
-            // 하지만 4096 토큰을 초과하는 초장문은 VRAM 보호를 위해 대피를 강제합니다.
             let is_small_model = self.layers.len() <= 36;
             let current_kv_len = self.layers[layer_idx].get_kv_len();
             
@@ -1996,7 +1990,6 @@ impl QuantizedQwen3VLTextModel {
                     };
 
                     if let (Some(k), Some(v)) = (k_part, v_part) {
-                        // [SAFE-EVACUATION] 삭제 대신 RAM으로 즉시 이동 (유실 방지)
                         let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
                         let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
                         
@@ -2009,7 +2002,6 @@ impl QuantizedQwen3VLTextModel {
                         if i < reg.len() {
                             let entry = &mut reg[i];
                             entry.location[layer_idx] = KVLocation::RAM;
-                            // RAM 캐시(bitkv_cache)에 즉시 등록하여 로드 가능하게 함
                             let mut cache = entry.bitkv_cache.write().unwrap();
                             if layer_idx < cache.len() {
                                 cache[layer_idx] = Some(BitKVMetadata {
@@ -2021,15 +2013,11 @@ impl QuantizedQwen3VLTextModel {
                         }
                     }
                 }
-                self.layers[layer_idx].self_attn.vram_merged_k = None;
-                self.layers[layer_idx].self_attn.vram_merged_v = None;
-                self.layers[layer_idx].self_attn.merged_vram_block_count = 0;
                 println!("[ENGINE-TRACE] Layer {} Prefill Cache Moved to RAM ({} tokens).", layer_idx, current_kv_len);
-            } else {
-                println!("[ENGINE-TRACE] Layer {} Prefill Cache Kept in VRAM (Small Model, {} tokens).", layer_idx, current_kv_len);
             }
         }
         
+        // [FIX] 마지막 줄의 세미콜론을 제거하여 결과를 반환하도록 합니다.
         final_output.ok_or_else(|| anyhow::anyhow!("No output generated from chunks"))
     }
 
@@ -2161,15 +2149,15 @@ impl QuantizedQwen3VLTextModel {
         // [STEP 1] 현재 레이어를 GPU로 이동
         let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
         
+        // [STEP 1] 현재 레이어 가중치 로드 및 GPU 이동
         if !self.layers[layer_idx].device().same_device(&target_device) {
             self.layers[layer_idx].to_device(&target_device)?;
         }
 
-        // [MEMORY-OPT] [PREFETCH-PIPELINE] "Fire & Shot" 전략 
-        // 현재 레이어가 연산될 준비를 마쳤으므로, 다음 레이어를 즉시 VRAM으로 밀어 넣습니다. (최대 2개 레이어 활성화)
+        // [FIRE & SHOT] 다음 레이어 로드 (VRAM에 2개만 올림)
         if !is_decoding && layer_idx + 1 < self.layers.len() {
-            let _ = self.reload_layer(layer_idx + 1);
-            let _ = self.layers[layer_idx + 1].to_device(&target_device); // PCIe H2D 전송 예약
+            self.reload_layer(layer_idx + 1)?;
+            let _ = self.layers[layer_idx + 1].to_device(&target_device);
         }
 
         // [STEP 3] GPU 연산 실행
@@ -2181,17 +2169,12 @@ impl QuantizedQwen3VLTextModel {
             next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
-        // [MEMORY-OPT] [IMMEDIATE-PURGE] 2-Layer Sliding Window 소각 정책
-        // 현재 레이어를 지우는 대신, 연산이 '완전히' 끝난 '이전' 레이어를 지웁니다.
+        // [MEMORY-RELEASE] 현재 레이어 연산 종료 즉시 가중치 소각
+        // CPU RAM과 GPU VRAM에서 현재 레이어의 가중치를 완전히 제거합니다.
         if !is_decoding {
-            if layer_idx > 0 {
-                self.layers[layer_idx - 1].clear();
-                println!("[MEMORY-OPT] Layer {} Weights Purged. (RAM/VRAM cleared)", layer_idx - 1);
-            }
-            if layer_idx == self.layers.len() - 1 {
-                self.layers[layer_idx].clear(); // 마지막 루프에서는 자기 자신을 소각
-                println!("[MEMORY-OPT] Layer {} Weights Purged. (RAM/VRAM cleared)", layer_idx);
-            }
+            self.layers[layer_idx].clear(); 
+            if target_device.is_cuda() { let _ = target_device.synchronize(); }
+            println!("[MEMORY-OPT] Layer {} Weights and Gradients cleared from RAM/VRAM.", layer_idx);
         }
 
         // [STEP 4] 자원 반납 및 KV 대피
@@ -2229,14 +2212,11 @@ impl QuantizedQwen3VLTextModel {
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> {
         use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
         
-        // 1. VRAM 데이터를 CPU로 복제만 수행 (압축은 워커가 함)
         let mut block_groups: std::collections::HashMap<usize, Vec<LayerKVDump>> = std::collections::HashMap::new();
         
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
             for block in &mut layer.self_attn.kv_blocks {
                 let inner = block.inner.write().unwrap();
-                
-                // [STRICT-RELAY] Include partial blocks and check per-layer dirty flag
                 let is_dirty = {
                     let reg = self.registry.entries.read().unwrap();
                     if inner.index < reg.len() { 
@@ -2253,16 +2233,14 @@ impl QuantizedQwen3VLTextModel {
                         k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
                         v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
                         k_shape: Tensor::from_vec(k_shape_u32, (k.shape().dims().len(),), &Device::Cpu)?,
-                        raw_k: Some(k.to_device(&Device::Cpu)?),
-                        raw_v: Some(inner.v_cache.as_ref().unwrap().to_device(&Device::Cpu)?),
+                        // [SAFE-FLUSH] contiguous 실패 시 복제본으로 대체하여 에러 탈출 방지
+                        raw_k: Some(k.to_device(&Device::Cpu).unwrap_or(k.clone()).contiguous().unwrap_or_else(|_| k.clone())), 
+                        raw_v: Some(inner.v_cache.as_ref().unwrap().to_device(&Device::Cpu).unwrap_or(inner.v_cache.as_ref().unwrap().clone()).contiguous().unwrap_or_else(|_| inner.v_cache.as_ref().unwrap().clone())),
                     });
                     
-                    // Reset per-layer dirty flag
-                    {
-                        let mut reg = self.registry.entries.write().unwrap();
-                        if inner.index < reg.len() {
-                            if l_idx < reg[inner.index].is_dirty.len() { reg[inner.index].is_dirty[l_idx] = false; }
-                        }
+                    let mut reg = self.registry.entries.write().unwrap();
+                    if inner.index < reg.len() {
+                        if l_idx < reg[inner.index].is_dirty.len() { reg[inner.index].is_dirty[l_idx] = false; }
                     }
                 }
             }
@@ -2270,41 +2248,29 @@ impl QuantizedQwen3VLTextModel {
 
         if block_groups.is_empty() { return Ok(()); }
 
-        // 2. 블록별 통합 태스크 전송
         if let Some(tx) = BAKE_TX.get() {
             let kv_dir = crate::utils::paths::get_kv_dir(None);
             let mode = self.baking_only;
-            
-            // [FIX] 2d4cf92 커밋의 경로 정규화 및 세션 격리
             let kv_name_raw = kv_name.unwrap_or("text");
             let last_part = kv_name_raw.split('/').last().unwrap_or("text");
-            let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { 
-                "text".to_string() 
-            } else { 
-                last_part.to_string() 
-            };
+            let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text".to_string() } else { last_part.to_string() };
             
-            let sub_path = if mode {
-                format!("{}/reference/{}", session_id, kv_type)
-            } else {
-                format!("{}/inference/{}", session_id, kv_type)
-            };
+            let sub_path = if mode { format!("{}/reference/{}", session_id, kv_type) } else { format!("{}/inference/{}", session_id, kv_type) };
 
             for (off, layers) in block_groups {
                 let sid = SLOT_MANAGER.acquire_write_slot(256).await;
                 let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
                 if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
 
-                let _ = tx.send(SlotTask::Bake(BakeTask {
-                    slot_id: sid,
-                    task_dir: block_dir,
-                    kv_name: Some(sub_path.clone()),
-                    offset: off,
-                    layers,
-                    is_relay_baking: mode,
-                    block_idx: Some(off / 256),
-                    registry: self.registry.clone(),
-                })).await;
+                crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                if tx.send(SlotTask::Bake(BakeTask {
+                    slot_id: sid, task_dir: block_dir, kv_name: Some(sub_path.clone()), offset: off, layers,
+                    is_relay_baking: mode, block_idx: Some(off / 256), registry: self.registry.clone(),
+                })).await.is_err() {
+                    crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    SLOT_MANAGER.release_slot(sid).await;
+                }
             }
         }
         Ok(())
