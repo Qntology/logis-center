@@ -171,45 +171,16 @@ mod default_impl {
     pub fn save_block(path: &Path, data: &[u8]) -> Result<()> { fs::write(path, data).map_err(|e| anyhow::anyhow!(e)) }
 }
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
-static WARNED_LOAD_FAIL: AtomicBool = AtomicBool::new(false);
-static WARNED_SAVE_FAIL: AtomicBool = AtomicBool::new(false);
-
-fn platform_load_block(path: &Path) -> Result<Vec<u8>> {
+pub fn load_kv_block(path: &Path) -> Result<Vec<u8>> {
     #[cfg(windows)] { windows_impl::load_block(path) }
     #[cfg(target_os = "linux")] { linux_impl::load_block(path) }
     #[cfg(target_os = "macos")] { macos_impl::load_block(path) }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))] { default_impl::load_block(path) }
 }
 
-pub fn load_kv_block(path: &Path) -> Result<Vec<u8>> {
-    match platform_load_block(path) {
-        Ok(data) => Ok(data),
-        Err(e) => {
-            if !WARNED_LOAD_FAIL.swap(true, Ordering::SeqCst) {
-                eprintln!("[WARN] Platform-specific loader failed for {:?}: {}. Switching to standard fs::read for this session.", path, e);
-            }
-            fs::read(path).map_err(|e| anyhow!("Standard fallback failed: {}", e))
-        }
-    }
-}
-
-fn platform_save_block(path: &Path, data: &[u8]) -> Result<()> {
+pub fn save_kv_block(path: &Path, data: &[u8]) -> Result<()> {
     #[cfg(windows)] { windows_impl::save_block(path, data) }
     #[cfg(target_os = "linux")] { linux_impl::save_block(path, data) }
     #[cfg(target_os = "macos")] { macos_impl::save_block(path, data) }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))] { default_impl::save_block(path, data) }
-}
-
-pub fn save_kv_block(path: &Path, data: &[u8]) -> Result<()> {
-    match platform_save_block(path, data) {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            if !WARNED_SAVE_FAIL.swap(true, Ordering::SeqCst) {
-                eprintln!("[WARN] Platform-specific saver failed for {:?}: {}. Switching to standard fs::write for this session.", path, e);
-            }
-            fs::write(path, data).map_err(|e| anyhow!("Standard fallback failed: {}", e))
-        }
-    }
 }
