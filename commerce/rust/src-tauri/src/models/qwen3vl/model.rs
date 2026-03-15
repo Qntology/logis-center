@@ -28,6 +28,24 @@ pub struct Qwen3VLVisionPatchEmbed {
 }
 
 impl Qwen3VLVisionPatchEmbed {
+    pub fn new_skeleton(_cfg: &Qwen3VLVisionConfig, device: &Device, dtype: DType) -> Result<Self> {
+        let zero_t = Tensor::zeros((1,), dtype, device)?;
+        Ok(Self {
+            conv3d_weight: zero_t.clone(),
+            conv3d_bias: zero_t.unsqueeze(0)?,
+        })
+    }
+
+    pub fn reload_from_st(&mut self, st: &safetensors::SafeTensors, device: &Device) -> Result<()> {
+        use crate::models::qwen3vl::quantized_model::load_q8_tensor;
+        let w = load_q8_tensor(st, "visual.patch_embed.proj.weight", device)?;
+        self.conv3d_weight = w.flatten(1, 4)?.t()?;
+        if st.names().contains("visual.patch_embed.proj.bias") {
+            self.conv3d_bias = load_q8_tensor(st, "visual.patch_embed.proj.bias", device)?.unsqueeze(0)?;
+        }
+        Ok(())
+    }
+
     pub fn new(cfg: &Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let patch_size = cfg.patch_size;
         let temporal_patch_size = cfg.temporal_patch_size;
@@ -87,6 +105,31 @@ pub struct Qwen3VLVisionPatchMerger {
 }
 
 impl Qwen3VLVisionPatchMerger {
+    pub fn new_skeleton(config: &Qwen3VLVisionConfig, device: &Device, dtype: DType) -> Result<Self> {
+        let hidden_size = config.hidden_size * config.spatial_merge_size.pow(2);
+        let zero_t = Tensor::zeros((1,), dtype, device)?;
+        Ok(Self {
+            hidden_size,
+            use_postshuffle_norm: false,
+            norm: crate::models::qwen3vl::common::get_layer_norm_skeleton(device, dtype, config.hidden_size, 1e-6)?,
+            linear_fc1: Linear::new(zero_t.clone(), None),
+            act_fn: Activation::Gelu,
+            linear_fc2: Linear::new(zero_t.clone(), None),
+        })
+    }
+
+    pub fn reload_from_st(&mut self, st: &safetensors::SafeTensors, prefix: &str, device: &Device) -> Result<()> {
+        use crate::models::qwen3vl::quantized_model::load_q8_tensor;
+        self.norm = crate::models::qwen3vl::common::reload_layer_norm(st, &format!("{}.norm", prefix), device, 1e-6)?;
+        let w1 = load_q8_tensor(st, &format!("{}.linear_fc1.weight", prefix), device)?;
+        let b1 = if st.names().contains(&format!("{}.linear_fc1.bias", prefix)) { Some(load_q8_tensor(st, &format!("{}.linear_fc1.bias", prefix), device)?) } else { None };
+        self.linear_fc1 = Linear::new(w1, b1);
+        let w2 = load_q8_tensor(st, &format!("{}.linear_fc2.weight", prefix), device)?;
+        let b2 = if st.names().contains(&format!("{}.linear_fc2.bias", prefix)) { Some(load_q8_tensor(st, &format!("{}.linear_fc2.bias", prefix), device)?) } else { None };
+        self.linear_fc2 = Linear::new(w2, b2);
+        Ok(())
+    }
+
     pub fn new(
         config: &Qwen3VLVisionConfig,
         vb: VarBuilder,
@@ -150,6 +193,28 @@ pub struct Qwen3VLVisionAttention {
 }
 
 impl Qwen3VLVisionAttention {
+    pub fn new_skeleton(config: &Qwen3VLVisionConfig, device: &Device, dtype: DType) -> Result<Self> {
+        let zero_t = Tensor::zeros((1,), dtype, device)?;
+        Ok(Self {
+            num_heads: config.num_heads,
+            qkv: Linear::new(zero_t.clone(), None),
+            proj: Linear::new(zero_t.clone(), None),
+            scaling: 1.0 / ((config.hidden_size / config.num_heads) as f64).sqrt(),
+        })
+    }
+
+    pub fn reload_from_st(&mut self, st: &safetensors::SafeTensors, prefix: &str, device: &Device) -> Result<()> {
+        use crate::models::qwen3vl::quantized_model::load_q8_tensor;
+        let w_qkv = load_q8_tensor(st, &format!("{}.qkv.weight", prefix), device)?;
+        let b_qkv = if st.names().contains(&format!("{}.qkv.bias", prefix)) { Some(load_q8_tensor(st, &format!("{}.qkv.bias", prefix), device)?) } else { None };
+        self.qkv = Linear::new(w_qkv, b_qkv);
+
+        let w_proj = load_q8_tensor(st, &format!("{}.proj.weight", prefix), device)?;
+        let b_proj = if st.names().contains(&format!("{}.proj.bias", prefix)) { Some(load_q8_tensor(st, &format!("{}.proj.bias", prefix), device)?) } else { None };
+        self.proj = Linear::new(w_proj, b_proj);
+        Ok(())
+    }
+
     pub fn new(config: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let hidden_size = config.hidden_size;
         let num_heads = config.num_heads;
@@ -235,6 +300,24 @@ pub struct Qwen3VLVisionBlock {
 }
 
 impl Qwen3VLVisionBlock {
+    pub fn new_skeleton(config: Qwen3VLVisionConfig, device: &Device, dtype: DType) -> Result<Self> {
+        Ok(Self {
+            norm1: crate::models::qwen3vl::common::get_layer_norm_skeleton(device, dtype, config.hidden_size, 1e-6)?,
+            norm2: crate::models::qwen3vl::common::get_layer_norm_skeleton(device, dtype, config.hidden_size, 1e-6)?,
+            attn: Qwen3VLVisionAttention::new_skeleton(&config, device, dtype)?,
+            mlp: TwoLinearMLP::new_skeleton(config.hidden_size, config.intermediate_size, device, dtype)?,
+        })
+    }
+
+    pub fn reload_from_st(&mut self, st: &safetensors::SafeTensors, idx: usize, device: &Device) -> Result<()> {
+        let prefix = format!("visual.blocks.{}", idx);
+        self.norm1 = crate::models::qwen3vl::common::reload_layer_norm(st, &format!("{}.norm1", prefix), device, 1e-6)?;
+        self.norm2 = crate::models::qwen3vl::common::reload_layer_norm(st, &format!("{}.norm2", prefix), device, 1e-6)?;
+        self.attn.reload_from_st(st, &format!("{}.attn", prefix), device)?;
+        self.mlp.reload_from_st(st, &prefix, "mlp.linear_fc1", "mlp.linear_fc2", device)?;
+        Ok(())
+    }
+
     pub fn new(config: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let norm1 = get_layer_norm(vb.pp("norm1"), 1e-6, config.hidden_size)?;
         let norm2 = get_layer_norm(vb.pp("norm2"), 1e-6, config.hidden_size)?;
@@ -303,6 +386,64 @@ pub struct Qwen3VLVisionModel {
 }
 
 impl Qwen3VLVisionModel {
+    /// [LAZY-LOAD] 가중치 없이 구조만 생성하여 VRAM을 점유하지 않습니다.
+    pub fn new_skeleton(config: Qwen3VLVisionConfig, device: &Device, dtype: DType) -> Result<Self> {
+        let zero_t = Tensor::zeros((1,), dtype, device)?;
+        let patch_embed = Qwen3VLVisionPatchEmbed::new_skeleton(&config, device, dtype)?;
+        let pos_embed = Embedding::new(zero_t.clone(), config.hidden_size);
+        let num_grid_per_side = (config.num_position_embeddings as f32).sqrt() as u32;
+        let head_dim = config.hidden_size / config.num_heads;
+        let rotary_pos_emb = Qwen2_5VisionRotaryEmbedding::new(head_dim / 2, None);
+        let mut blocks = Vec::new();
+        for _ in 0..config.depth {
+            blocks.push(Qwen3VLVisionBlock::new_skeleton(config.clone(), device, dtype)?);
+        }
+        let merger = Qwen3VLVisionPatchMerger::new_skeleton(&config, device, dtype)?;
+        let deepstack_visual_indexes = config.deepstack_visual_indexes.clone();
+        let mut deepstack_merger_list = Vec::new();
+        for _ in 0..deepstack_visual_indexes.len() {
+            deepstack_merger_list.push(Qwen3VLVisionPatchMerger::new_skeleton(&config, device, dtype)?);
+        }
+
+        Ok(Self {
+            spatial_merge_size: config.spatial_merge_size,
+            patch_embed,
+            pos_embed,
+            num_grid_per_side,
+            rotary_pos_emb,
+            blocks,
+            merger,
+            deepstack_visual_indexes,
+            deepstack_merger_list,
+            dtype,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pos_embed.embeddings().elem_count() <= 1
+    }
+
+    pub fn reload_from_st(&mut self, st: &safetensors::SafeTensors, device: &Device) -> Result<()> {
+        use crate::models::qwen3vl::quantized_model::load_q8_tensor;
+        
+        self.patch_embed.reload_from_st(st, device)?;
+        
+        let p_w = load_q8_tensor(st, "visual.pos_embed.weight", device)?;
+        self.pos_embed = Embedding::new(p_w, self.pos_embed.hidden_size());
+        
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            block.reload_from_st(st, i, device)?;
+        }
+        
+        self.merger.reload_from_st(st, "visual.merger", device)?;
+        for (i, merger) in self.deepstack_merger_list.iter_mut().enumerate() {
+            merger.reload_from_st(st, &format!("visual.deepstack_merger_list.{}", i), device)?;
+        }
+        
+        println!("[MODEL] Vision model weights reloaded from ST into VRAM.");
+        Ok(())
+    }
+
     pub fn new(config: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let spatial_merge_size = config.spatial_merge_size;
         let patch_embed = Qwen3VLVisionPatchEmbed::new(&config, vb.pp("patch_embed"))?;

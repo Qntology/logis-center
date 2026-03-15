@@ -53,3 +53,18 @@ pub fn dequantize_q2_cuda(packed: Tensor, scales: Tensor, shape: &[usize], devic
     // 3. 임시 2비트 텐서는 함수 종료 시 자동 파괴됨 (단일 참조 원칙 준수)
     Ok(out_tensor)
 }
+
+/// [I8-DEQUANTIZE] 8비트(I8) 텐서를 스케일 값을 사용하여 BF16/F32로 복원합니다.
+pub fn dequantize_i8(data: Tensor, scale: Tensor, device: &Device) -> Result<Tensor> {
+    let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+    
+    // 1. I8 데이터를 타겟 장치로 이동 후 float로 변환
+    let data = data.to_device(device)?.to_dtype(DType::F32)?;
+    let scale = scale.to_device(device)?.to_dtype(DType::F32)?;
+    
+    // 2. 스케일 곱하기 (Broadcasting 지원)
+    let out = data.broadcast_mul(&scale)?;
+    
+    // 3. 최종 데이터 타입으로 변환
+    out.to_dtype(target_dtype)
+}

@@ -17,6 +17,32 @@ pub struct GateUpDownMLP {
 }
 
 impl GateUpDownMLP {
+    pub fn new_skeleton(hidden_size: usize, intermediate_size: usize, device: &Device, dtype: DType) -> Result<Self> {
+        let zero_t = Tensor::zeros((1,), dtype, device)?;
+        Ok(Self {
+            gate_proj: Linear::new(zero_t.clone(), None),
+            up_proj: Linear::new(zero_t.clone(), None),
+            down_proj: Linear::new(zero_t.clone(), None),
+            act_fn: Activation::Silu,
+        })
+    }
+
+    pub fn reload_from_st(&mut self, st: &safetensors::SafeTensors, prefix: &str, device: &Device) -> Result<()> {
+        use crate::models::qwen3vl::quantized_model::load_q8_tensor;
+        let w_gate = load_q8_tensor(st, &format!("{}.gate_proj.weight", prefix), device)?;
+        let b_gate = if st.names().contains(&format!("{}.gate_proj.bias", prefix)) { Some(load_q8_tensor(st, &format!("{}.gate_proj.bias", prefix), device)?) } else { None };
+        self.gate_proj = Linear::new(w_gate, b_gate);
+
+        let w_up = load_q8_tensor(st, &format!("{}.up_proj.weight", prefix), device)?;
+        let b_up = if st.names().contains(&format!("{}.up_proj.bias", prefix)) { Some(load_q8_tensor(st, &format!("{}.up_proj.bias", prefix), device)?) } else { None };
+        self.up_proj = Linear::new(w_up, b_up);
+
+        let w_down = load_q8_tensor(st, &format!("{}.down_proj.weight", prefix), device)?;
+        let b_down = if st.names().contains(&format!("{}.down_proj.bias", prefix)) { Some(load_q8_tensor(st, &format!("{}.down_proj.bias", prefix), device)?) } else { None };
+        self.down_proj = Linear::new(w_down, b_down);
+        Ok(())
+    }
+
     pub fn new(
         vb: VarBuilder,
         hidden_size: usize,
@@ -77,6 +103,27 @@ pub struct TwoLinearMLP {
 }
 
 impl TwoLinearMLP {
+    pub fn new_skeleton(embedding_dim: usize, mlp_dim: usize, device: &Device, dtype: DType) -> Result<Self> {
+        let zero_t = Tensor::zeros((1,), dtype, device)?;
+        Ok(Self {
+            linear1: Linear::new(zero_t.clone(), None),
+            linear2: Linear::new(zero_t.clone(), None),
+            act: Activation::Gelu,
+        })
+    }
+
+    pub fn reload_from_st(&mut self, st: &safetensors::SafeTensors, prefix: &str, l1_name: &str, l2_name: &str, device: &Device) -> Result<()> {
+        use crate::models::qwen3vl::quantized_model::load_q8_tensor;
+        let w1 = load_q8_tensor(st, &format!("{}.{}.weight", prefix, l1_name), device)?;
+        let b1 = if st.names().contains(&format!("{}.{}.bias", prefix, l1_name)) { Some(load_q8_tensor(st, &format!("{}.{}.bias", prefix, l1_name), device)?) } else { None };
+        self.linear1 = Linear::new(w1, b1);
+
+        let w2 = load_q8_tensor(st, &format!("{}.{}.weight", prefix, l2_name), device)?;
+        let b2 = if st.names().contains(&format!("{}.{}.bias", prefix, l2_name)) { Some(load_q8_tensor(st, &format!("{}.{}.bias", prefix, l2_name), device)?) } else { None };
+        self.linear2 = Linear::new(w2, b2);
+        Ok(())
+    }
+
     pub fn new(
         vb: VarBuilder,
         embedding_dim: usize,
@@ -781,6 +828,18 @@ pub fn get_conv2d(
         conv2d_no_bias(in_c, out_c, kernel_size, cfg, vb)?
     };
     Ok(conv2d)
+}
+
+pub fn get_layer_norm_skeleton(device: &Device, dtype: DType, dim: usize, eps: f64) -> Result<LayerNorm> {
+    let zero_t = Tensor::zeros((dim,), dtype, device)?;
+    Ok(LayerNorm::new(zero_t.clone(), Some(zero_t), eps))
+}
+
+pub fn reload_layer_norm(st: &safetensors::SafeTensors, prefix: &str, device: &Device, eps: f64) -> Result<LayerNorm> {
+    use crate::models::qwen3vl::quantized_model::load_q8_tensor;
+    let w = load_q8_tensor(st, &format!("{}.weight", prefix), device)?;
+    let b = if st.names().contains(&format!("{}.bias", prefix)) { Some(load_q8_tensor(st, &format!("{}.bias", prefix), device)?) } else { None };
+    Ok(LayerNorm::new(w, b, eps))
 }
 
 pub fn get_layer_norm(vb: VarBuilder, eps: f64, dim: usize) -> Result<LayerNorm> {

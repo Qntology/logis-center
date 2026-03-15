@@ -2865,12 +2865,75 @@ pub struct QuantizedQwen3VLModel {
     pub mmproj_mmap: Option<Arc<Mmap>>,
 }
 
-impl QuantizedQwen3VLModel {
+/// [I8-LOADER] 세이프텐서에서 8비트 양자화된 텐서를 로드하여 복원합니다.
+fn load_q8_tensor(st: &safetensors::SafeTensors, name: &str, device: &Device) -> Result<Tensor> {
+    let data_name = format!("{}.q8_data", name);
+    let scale_name = format!("{}.q8_scale", name);
+    
+    if st.names().contains(&data_name) && st.names().contains(&scale_name) {
+        let d = st.tensor(&data_name)?;
+        let s = st.tensor(&scale_name)?;
+        
+        let d_tensor = Tensor::from_raw_buffer(d.data(), DType::I8, d.shape(), &Device::Cpu)?;
+        let s_tensor = Tensor::from_raw_buffer(s.data(), DType::F16, s.shape(), &Device::Cpu)?;
+        
+        crate::models::qwen3vl::q2_loader::dequantize_i8(d_tensor, s_tensor, device)
+    } else {
+        // 양자화되지 않은 원본이 있을 경우 처리
+        let t = st.tensor(name)?;
+        Tensor::from_raw_buffer(t.data(), t.dtype(), t.shape(), &Device::Cpu)?.to_device(device)
+    }
+}
+
+pub fn load_q8_tensor(st: &safetensors::SafeTensors, name: &str, device: &Device) -> Result<Tensor> {
+    let data_name = format!("{}.q8_data", name);
+    let scale_name = format!("{}.q8_scale", name);
+    
+    // Fix E0308: contains() expects &&String when iterating over names [cite: 651]
+    let names = st.names();
+    if names.iter().any(|n| n == &data_name) && names.iter().any(|n| n == &scale_name) {
+        let d = st.tensor(&data_name)?;
+        let s = st.tensor(&scale_name)?;
+        
+        // Fix E0599: Use DType::I8 if available, otherwise U8 and cast [cite: 653]
+        let d_tensor = Tensor::from_raw_buffer(d.data(), DType::I8, d.shape(), &Device::Cpu)?;
+        let s_tensor = Tensor::from_raw_buffer(s.data(), DType::F16, s.shape(), &Device::Cpu)?;
+        
+        // Fix E0308: Use ? to convert candle error to anyhow error and wrap in Ok() [cite: 653]
+        Ok(crate::models::qwen3vl::q2_loader::dequantize_i8(d_tensor, s_tensor, device)?)
+    } else {
+        let t = st.tensor(name)?;
+        // Fix E0308: Ensure types match for from_raw_buffer [cite: 654]
+        let res = Tensor::from_raw_buffer(t.data(), t.dtype(), t.shape(), &Device::Cpu)?
+            .to_device(device)?;
+        Ok(res)
+    }
+}
+
+
+impl QuantizedQwen3VLModel {  
+    pub fn reload_vision_from_st(&mut self) -> Result<()> {
+        if !self.visual.is_empty() {
+            return Ok(());
+        }
+        let model_dir = &self.language_model.model_dir;
+        let file_path = std::fs::canonicalize(format!("src-tauri/models/{}/vision.st", model_dir))
+            .or_else(|_| std::fs::canonicalize(format!("models/{}/vision.st", model_dir)))
+            .map_err(|e| anyhow!("Failed to find vision.st: {}", e))?;
+            
+        let data = std::fs::read(&file_path)?;
+        let st = safetensors::SafeTensors::deserialize(&data)?;
+        let device = self.visual.patch_embed.conv3d_weight.device(); // Get current device
+        
+        self.visual.reload_from_st(&st, device)?;
+        println!("[MODEL] Vision model weights reloaded from vision.st (8-bit quantized)");
+        Ok(())
+    }
     pub fn new_with_mmap(
         config: &Qwen3VLConfig,
         ct_main: Arc<gguf_file::Content>,
         main_mmap_handle: Option<Arc<Mmap>>,
-        ct_vision: Arc<gguf_file::Content>,
+        ct_vision: Option<Arc<gguf_file::Content>>,
         mmproj_mmap_handle: Option<Arc<Mmap>>,
         text_device: &Device,
         text_device_id: usize,
@@ -2878,14 +2941,23 @@ impl QuantizedQwen3VLModel {
         _vision_device_id: usize,
         dtype: DType,
         kv_reserve: u64,
-        baking_only: bool, // [NEW] Support for 1-layer vision baker
+        baking_only: bool,
     ) -> Result<Self> {
-        let mmproj_mmap = mmproj_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
-        let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { dtype };
-        let mut reader_vision = std::io::Cursor::new(mmproj_mmap);
-        let vb_visual = from_gguf_content(config, &ct_vision, &mut reader_vision, vision_device, vision_dtype)?;
-        let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
+        
+        // [TEXT-ONLY-OPTIMIZATION] 비전 모델 초기 로딩 건너뛰기
+        let visual = if let (Some(ct_v), Some(m_v)) = (ct_vision, mmproj_mmap_handle.clone()) {
+            let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { dtype };
+            let mmproj_mmap = &m_v[..];
+            let mut reader_vision = std::io::Cursor::new(mmproj_mmap);
+            let vb_visual = from_gguf_content(config, &ct_v, &mut reader_vision, vision_device, vision_dtype)?;
+            Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?
+        } else {
+            // 비전 모델이 필요할 때까지 빈 뼈대만 유지 (VRAM 0MB)
+            // 실제 이미지 입력 시 reload_vision_from_st()가 호출되어야 함
+            println!("[MODEL] Text-Only Mode: Vision loading deferred.");
+            Qwen3VLVisionModel::new_skeleton(v_config.clone(), vision_device, dtype)?
+        };
 
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
