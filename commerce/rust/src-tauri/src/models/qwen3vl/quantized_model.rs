@@ -1662,12 +1662,18 @@ pub struct QuantizedQwen3VLTextModel {
     pub ct: Option<Arc<gguf_file::Content>>,
     pub base_name: String,
     pub dtype: DType,
+    pub model_dir: String,
 }
 
 impl QuantizedQwen3VLTextModel {
     // QuantizedQwen3VLTextModel 내부에 함수 추가
     pub fn reload_layer_from_st(&mut self, layer_idx: usize) -> Result<QuantizedQwen3VLTextDecoderLayer> {
-        let file_path = format!("src-tauri/models/Qwen3-0.6B-Instruct-gguf/layer_{}.st", layer_idx);
+        let file_name = format!("layer_{}.st", layer_idx);
+        
+        let file_path = std::fs::canonicalize(format!("src-tauri/models/{}/{}", self.model_dir, file_name))
+            .or_else(|_| std::fs::canonicalize(format!("models/{}/{}", self.model_dir, file_name)))
+            .map_err(|e| anyhow!("Failed to find ST file {} in src-tauri/models/{} or models/{}: {}", file_name, self.model_dir, self.model_dir, e))?;
+            
         let data = std::fs::read(&file_path).map_err(|e| anyhow!("Failed to read ST file {:?}: {}", file_path, e))?;
         let st = safetensors::SafeTensors::deserialize(&data)?;
         let device = crate::utils::get_cuda_device(self.device_id);
@@ -1806,6 +1812,13 @@ impl QuantizedQwen3VLTextModel {
         let norm_prefix = if ct.tensor_infos.contains_key(&format!("{}.weight", alt_norm)) { alt_norm } else { &norm_name };
         let norm = get_rms_norm(&ct, &mut reader, norm_prefix, config.rms_norm_eps, device, dtype)?;
         
+        // [FIX] Detect model size to determine model_dir for reloading
+        let model_dir = if config.num_hidden_layers <= 16 {
+            "Qwen3-0.6B-Instruct-gguf".to_string()
+        } else {
+            "Qwen3-VL-2B-Instruct-gguf".to_string()
+        };
+
         Ok(Self { 
             embed_tokens, 
             layers, 
@@ -1825,6 +1838,7 @@ impl QuantizedQwen3VLTextModel {
             ct: Some(ct),
             base_name: base_name.to_string(),
             dtype,
+            model_dir,
         })
     }
 
