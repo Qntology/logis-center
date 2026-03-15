@@ -39,7 +39,6 @@ tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
 reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
 sysinfo = "0.30"
-cudarc = { version = "0.11", features = ["driver", "cuda-version-from-build-system"] }
 candle-core = "0.9.1"
 candle-nn = "0.9.1"
 candle-transformers = "0.9.1"
