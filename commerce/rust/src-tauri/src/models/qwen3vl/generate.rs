@@ -473,28 +473,49 @@ impl Qwen3VLGenerateModel {
         };
         let t_dev = get_device(text_device); let v_dev = get_device(vision_device); let dtype = get_dtype(dtype, cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16"));
         let gguf_f = find_type_files(path, "gguf")?; let mmproj_p = gguf_f.iter().find(|f| f.contains("mmproj")).cloned();
-        let mut m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned();
-        if m_p.is_none() { m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.6B-Q4_K_M.gguf")).cloned(); }
-        if m_p.is_none() { m_p = gguf_f.iter().find(|f| !f.contains("mmproj")).cloned(); }
+        
+        // [FIX] 모델 폴더 이름을 경로에서 추출합니다.
+        let model_folder_name = Path::new(path).file_name().unwrap_or_default().to_string_lossy().to_string();
+
         let qwen3_vl = if !gguf_f.is_empty() {
-            let kv_res = hard_token_limit.unwrap_or(4096) as u64 * 40000;
+            // [OPTIMIZATION] 무거운 GGUF mmap을 버리고 쪼개진 .st 파일에서 고속 로딩
             if mmproj_p.is_some() && !force_text_only {
-                let m_mmap = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(m_p.as_ref().unwrap())?)? };
-                let mm_mmap = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(&mmproj_p.unwrap())?)? };
-                let ct_main = Arc::new(gguf_file::Content::read(&mut std::io::Cursor::new(&m_mmap[..]))?);
-                let ct_vision = Arc::new(gguf_file::Content::read(&mut std::io::Cursor::new(&mm_mmap[..]))?);
-                
-                ModelVariant::QuantizedVL(QuantizedQwen3VLModel::new_with_mmap(&cfg, ct_main, Some(Arc::new(m_mmap)), Some(ct_vision), Some(Arc::new(mm_mmap)), &t_dev, text_device_id, &v_dev, vision_device_id, dtype, kv_res, baking_only)?)
+                // 1. 비전 + 텍스트 모델 분기
+                ModelVariant::QuantizedVL(crate::models::qwen3vl::quantized_model::QuantizedQwen3VLModel::new_from_split_files(
+                    &cfg, &model_folder_name, &t_dev, text_device_id, &v_dev, dtype, baking_only
+                )?)
             } else {
-                let m_mmap = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(m_p.as_ref().unwrap())?)? };
-                let ct_main = Arc::new(gguf_file::Content::read(&mut std::io::Cursor::new(&m_mmap[..]))?);
-                
-                ModelVariant::QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, ct_main, Some(Arc::new(m_mmap)), &t_dev, text_device_id, dtype, kv_res, baking_only, baking_only)?)
+                // 2. 텍스트 전용 모델 분기
+                let language_model = crate::models::qwen3vl::quantized_model::QuantizedQwen3VLTextModel::new_from_split_files(
+                    cfg.text_config.as_ref().unwrap(), &model_folder_name, &t_dev, text_device_id, dtype, baking_only
+                )?;
+
+                // shared.st에서 lm_head 읽어오기
+                let shared_path = std::fs::canonicalize(format!("src-tauri/models/{}/shared.st", model_folder_name))
+                    .or_else(|_| std::fs::canonicalize(format!("models/{}/shared.st", model_folder_name)))?;
+                let shared_data = std::fs::read(&shared_path)?;
+                let shared_st = safetensors::SafeTensors::deserialize(&shared_data)?;
+
+                let head_w = crate::models::qwen3vl::quantized_model::load_q8_tensor(&shared_st, "lm_head", &t_dev)
+                    .or_else(|_| crate::models::qwen3vl::quantized_model::load_q8_tensor(&shared_st, "output", &t_dev))
+                    .or_else(|_| crate::models::qwen3vl::quantized_model::load_q8_tensor(&shared_st, "model.embed_tokens", &t_dev))?;
+
+                let lm_head = Some(crate::models::qwen3vl::quantized_model::QLinear::new(candle_core::quantized::QMatMul::Tensor(head_w), None, t_dev.clone()));
+
+                ModelVariant::QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel {
+                    language_model,
+                    lm_head,
+                    text_device: t_dev.clone(),
+                    mmap: None,
+                })
             }
         } else { ModelVariant::Standard(Qwen3VLModel::new(cfg, unsafe { VarBuilder::from_mmaped_safetensors(&find_type_files(path, "safetensors")?, dtype, &t_dev)? })?) };
+        
         let g_p = std::path::Path::new(cfg_path).join("generation_config.json"); let g_cfg = if g_p.exists() { serde_json::from_slice(&std::fs::read(g_p)?)? } else { Qwen3VLGenerationConfig::default() };
         let (e1, e2) = match &g_cfg.eos_token_id { serde_json::Value::Number(n) => { let id = n.as_u64().unwrap_or(151645) as u32; (id, id) }, serde_json::Value::Array(arr) => { (arr.get(0).and_then(|v| v.as_u64()).unwrap_or(151643) as u32, arr.get(1).and_then(|v| v.as_u64()).unwrap_or(151643) as u32) }, _ => (151643, 151643) };
-        let loaded_model_name = if m_p.as_ref().map(|p| p.contains("0.6B")).unwrap_or(false) { "0.6B".to_string() } else { "2B".to_string() };
+        
+        // [FIX] GGUF 파일명 대신 폴더명으로 모델 사이즈 추론
+        let loaded_model_name = if model_folder_name.contains("0.6B") { "0.6B".to_string() } else { "2B".to_string() };
         Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &v_dev, dtype)?, qwen3_vl, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: loaded_model_name, hard_token_limit, kv_root })
     }
 
