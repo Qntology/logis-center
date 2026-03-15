@@ -4,6 +4,7 @@ use candle_nn::{
     Activation, Embedding, Init, LayerNorm, Linear, Module, RmsNorm, VarBuilder, embedding, linear,
     linear_no_bias, rms_norm,
 };
+
 use crate::{
     models::qwen3vl::{
         common::{GateUpDownMLP, TwoLinearMLP, eager_attention_forward, get_layer_norm},
@@ -22,36 +23,20 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct Qwen3VLVisionPatchEmbed {
-    pub(crate) conv3d_weight: Tensor,
-    pub(crate) conv3d_bias: Tensor,
+    conv3d_weight: Tensor,
+    conv3d_bias: Tensor,
 }
 
 impl Qwen3VLVisionPatchEmbed {
-    pub fn new_skeleton(_cfg: &Qwen3VLVisionConfig, device: &Device, dtype: DType) -> Result<Self> {
-        let zero_t = Tensor::zeros((1,), dtype, device)?;
-        Ok(Self {
-            conv3d_weight: zero_t.clone(),
-            conv3d_bias: zero_t.unsqueeze(0)?,
-        })
-    }
-
-    pub fn reload_from_st(&mut self, st: &safetensors::SafeTensors, device: &Device) -> Result<()> {
-        use crate::models::qwen3vl::quantized_model::load_q8_tensor;
-        let w = load_q8_tensor(st, "visual.patch_embed.proj.weight", device)?;
-        self.conv3d_weight = w.flatten(1, 4)?.t()?;
-        let names = st.names();
-        if names.iter().any(|n| n.as_str() == "visual.patch_embed.proj.bias") {
-            self.conv3d_bias = load_q8_tensor(st, "visual.patch_embed.proj.bias", device)?.unsqueeze(0)?;
-        }
-        Ok(())
-    }
-
     pub fn new(cfg: &Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let patch_size = cfg.patch_size;
         let temporal_patch_size = cfg.temporal_patch_size;
         let in_channels = cfg.in_channels;
+        // Use embed_dim if present, otherwise fallback to hidden_size
         let embed_dim = cfg.embed_dim.unwrap_or(cfg.hidden_size);
         
+        // conv3d weight key: visual.patch_embed.proj.weight, value: Tensor[dims 1024, 3, 2, 16, 16; bf16, cuda:0]
+        // (1024, 3, 2, 16, 16) -> (1024, 1536) -> (1536, 1024)
         let conv3d_weight = vb
             .get_with_hints(
                 (
@@ -66,6 +51,7 @@ impl Qwen3VLVisionPatchEmbed {
             )?
             .flatten(1, 4)?
             .t()?;
+        // (1024) -> (1, 1024)
         let conv3d_bias = vb
             .get_with_hints((embed_dim,), "proj.bias", Init::Const(0.))?
             .unsqueeze(0)?;
@@ -82,6 +68,8 @@ impl Qwen3VLVisionPatchEmbed {
     }
 
     pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        // hidden_states shape:  (grid_t*grid_h*grid_w, c*temporal_patch_size*patch_size*patch_size)
+        // ((), 1536) matmul (1536, 1024) -> ((), 1024)
         let hidden_states = hidden_states.matmul(&self.conv3d_weight)?;
         let hidden_states = hidden_states.broadcast_add(&self.conv3d_bias)?;
         Ok(hidden_states)
@@ -99,34 +87,6 @@ pub struct Qwen3VLVisionPatchMerger {
 }
 
 impl Qwen3VLVisionPatchMerger {
-    pub fn new_skeleton(config: &Qwen3VLVisionConfig, device: &Device, dtype: DType) -> Result<Self> {
-        let hidden_size = config.hidden_size * config.spatial_merge_size.pow(2);
-        let zero_t = Tensor::zeros((1,), dtype, device)?;
-        Ok(Self {
-            hidden_size,
-            use_postshuffle_norm: false,
-            norm: crate::models::qwen3vl::common::get_layer_norm_skeleton(device, dtype, config.hidden_size, 1e-6)?,
-            linear_fc1: Linear::new(zero_t.clone(), None),
-            act_fn: Activation::Gelu,
-            linear_fc2: Linear::new(zero_t.clone(), None),
-        })
-    }
-
-    pub fn reload_from_st(&mut self, st: &safetensors::SafeTensors, prefix: &str, device: &Device) -> Result<()> {
-        use crate::models::qwen3vl::quantized_model::load_q8_tensor;
-        self.norm = crate::models::qwen3vl::common::reload_layer_norm(st, &format!("{}.norm", prefix), device, 1e-6)?;
-        let w1 = load_q8_tensor(st, &format!("{}.linear_fc1.weight", prefix), device)?;
-        let names = st.names();
-        let b1_name = format!("{}.linear_fc1.bias", prefix);
-        let b1 = if names.iter().any(|n| n.as_str() == b1_name.as_str()) { Some(load_q8_tensor(st, &b1_name, device)?) } else { None };
-        self.linear_fc1 = Linear::new(w1, b1);
-        let w2 = load_q8_tensor(st, &format!("{}.linear_fc2.weight", prefix), device)?;
-        let b2_name = format!("{}.linear_fc2.bias", prefix);
-        let b2 = if names.iter().any(|n| n.as_str() == b2_name.as_str()) { Some(load_q8_tensor(st, &b2_name, device)?) } else { None };
-        self.linear_fc2 = Linear::new(w2, b2);
-        Ok(())
-    }
-
     pub fn new(
         config: &Qwen3VLVisionConfig,
         vb: VarBuilder,
@@ -153,6 +113,7 @@ impl Qwen3VLVisionPatchMerger {
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        // [MEMORY-FIX] LayerNorm/Linear don't have to_device, so we recreate with moved tensors
         let n_w = self.norm.weight().to_device(device)?;
         let n_b = self.norm.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
         self.norm = LayerNorm::new(n_w, n_b, 1e-6);
@@ -166,8 +127,7 @@ impl Qwen3VLVisionPatchMerger {
         self.linear_fc2 = Linear::new(l2_w, l2_b);
         Ok(())
     }
-    
-    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = if self.use_postshuffle_norm {
             xs.reshape(((), self.hidden_size))?
         } else {
@@ -190,31 +150,6 @@ pub struct Qwen3VLVisionAttention {
 }
 
 impl Qwen3VLVisionAttention {
-    pub fn new_skeleton(config: &Qwen3VLVisionConfig, device: &Device, dtype: DType) -> Result<Self> {
-        let zero_t = Tensor::zeros((1,), dtype, device)?;
-        Ok(Self {
-            num_heads: config.num_heads,
-            qkv: Linear::new(zero_t.clone(), None),
-            proj: Linear::new(zero_t.clone(), None),
-            scaling: 1.0 / ((config.hidden_size / config.num_heads) as f64).sqrt(),
-        })
-    }
-
-    pub fn reload_from_st(&mut self, st: &safetensors::SafeTensors, prefix: &str, device: &Device) -> Result<()> {
-        use crate::models::qwen3vl::quantized_model::load_q8_tensor;
-        let w_qkv = load_q8_tensor(st, &format!("{}.qkv.weight", prefix), device)?;
-        let names = st.names();
-        let b_qkv_name = format!("{}.qkv.bias", prefix);
-        let b_qkv = if names.iter().any(|n| n.as_str() == b_qkv_name.as_str()) { Some(load_q8_tensor(st, &b_qkv_name, device)?) } else { None };
-        self.qkv = Linear::new(w_qkv, b_qkv);
-
-        let w_proj = load_q8_tensor(st, &format!("{}.proj.weight", prefix), device)?;
-        let b_proj_name = format!("{}.proj.bias", prefix);
-        let b_proj = if names.iter().any(|n| n.as_str() == b_proj_name.as_str()) { Some(load_q8_tensor(st, &b_proj_name, device)?) } else { None };
-        self.proj = Linear::new(w_proj, b_proj);
-        Ok(())
-    }
-
     pub fn new(config: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let hidden_size = config.hidden_size;
         let num_heads = config.num_heads;
@@ -222,6 +157,7 @@ impl Qwen3VLVisionAttention {
         let qkv = linear(hidden_size, hidden_size * 3, vb.pp("qkv"))?;
         let proj = linear(hidden_size, hidden_size, vb.pp("proj"))?;
         let scaling = 1.0 / (head_dim as f64).sqrt();
+
         Ok(Self {
             num_heads,
             qkv,
@@ -248,36 +184,41 @@ impl Qwen3VLVisionAttention {
         sin: &Tensor,
         cu_seqlens: &Tensor,
     ) -> Result<Tensor> {
+        // xs: (seq_len, hidden_size)
         let seq_length = xs.dim(0)?;
+        // (seq_len, hidden_size) -> (seq_len, hidden_size*3)
+        // -> (seq_len, 3, num_heads, head_dim)
+        // -> (3, seq_len, num_heads, head_dim)
         let qkv_states = xs
             .apply(&self.qkv)?
             .reshape((seq_length, 3, self.num_heads, ()))?
             .permute((1, 0, 2, 3))?;
-            
+        // (seq_len, num_heads, head_dim)
         let query_states = qkv_states.i(0)?.contiguous()?;
         let key_states = qkv_states.i(1)?.contiguous()?;
         let value_states = qkv_states.i(2)?.contiguous()?;
-        
-        let (query_states, key_states) = apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?;
-        
+        let (query_states, key_states) =
+            apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?;
+        // (seq_len, num_heads, head_dim) -> (num_heads, seq_len, head_dim) -> (1, num_heads, seq_len, head_dim)
         let query_states = query_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
         let key_states = key_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
         let value_states = value_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
-        
         let cu_last_id = cu_seqlens.dim(0)? - 1;
         let lengths = cu_seqlens.i(1..)?.sub(&cu_seqlens.i(..cu_last_id)?)?;
-        let chunks: Vec<usize> = lengths.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
-        
+        let chunks: Vec<usize> = lengths
+            .to_vec1::<u32>()?
+            .iter()
+            .map(|&x| x as usize)
+            .collect();
         let q_splits = split_tensor(&query_states, &chunks, 2)?;
         let k_splits = split_tensor(&key_states, &chunks, 2)?;
         let v_splits = split_tensor(&value_states, &chunks, 2)?;
-        
+
         let mut attn_outputs = Vec::new();
         for (q, (k, v)) in q_splits.iter().zip(k_splits.iter().zip(v_splits.iter())) {
             let output = eager_attention_forward(q, k, v, None, None, self.scaling)?;
             attn_outputs.push(output);
         }
-        
         let attn_output = Tensor::cat(&attn_outputs, 1)?;
         let attn_output = attn_output.reshape((seq_length, ()))?.contiguous()?;
         let attn_ouput = attn_output.apply(&self.proj)?;
@@ -294,24 +235,6 @@ pub struct Qwen3VLVisionBlock {
 }
 
 impl Qwen3VLVisionBlock {
-    pub fn new_skeleton(config: Qwen3VLVisionConfig, device: &Device, dtype: DType) -> Result<Self> {
-        Ok(Self {
-            norm1: crate::models::qwen3vl::common::get_layer_norm_skeleton(device, dtype, config.hidden_size, 1e-6)?,
-            norm2: crate::models::qwen3vl::common::get_layer_norm_skeleton(device, dtype, config.hidden_size, 1e-6)?,
-            attn: Qwen3VLVisionAttention::new_skeleton(&config, device, dtype)?,
-            mlp: TwoLinearMLP::new_skeleton(config.hidden_size, config.intermediate_size, device, dtype)?,
-        })
-    }
-
-    pub fn reload_from_st(&mut self, st: &safetensors::SafeTensors, idx: usize, device: &Device) -> Result<()> {
-        let prefix = format!("visual.blocks.{}", idx);
-        self.norm1 = crate::models::qwen3vl::common::reload_layer_norm(st, &format!("{}.norm1", prefix), device, 1e-6)?;
-        self.norm2 = crate::models::qwen3vl::common::reload_layer_norm(st, &format!("{}.norm2", prefix), device, 1e-6)?;
-        self.attn.reload_from_st(st, &format!("{}.attn", prefix), device)?;
-        self.mlp.reload_from_st(st, &prefix, "mlp.linear_fc1", "mlp.linear_fc2", device)?;
-        Ok(())
-    }
-
     pub fn new(config: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let norm1 = get_layer_norm(vb.pp("norm1"), 1e-6, config.hidden_size)?;
         let norm2 = get_layer_norm(vb.pp("norm2"), 1e-6, config.hidden_size)?;
@@ -380,61 +303,6 @@ pub struct Qwen3VLVisionModel {
 }
 
 impl Qwen3VLVisionModel {
-    pub fn new_skeleton(config: Qwen3VLVisionConfig, device: &Device, dtype: DType) -> Result<Self> {
-        let zero_t = Tensor::zeros((1,), dtype, device)?;
-        let patch_embed = Qwen3VLVisionPatchEmbed::new_skeleton(&config, device, dtype)?;
-        let pos_embed = Embedding::new(zero_t.clone(), config.hidden_size);
-        let num_grid_per_side = (config.num_position_embeddings as f32).sqrt() as u32;
-        let head_dim = config.hidden_size / config.num_heads;
-        let rotary_pos_emb = Qwen2_5VisionRotaryEmbedding::new(head_dim / 2, None);
-        let mut blocks = Vec::new();
-        for _ in 0..config.depth {
-            blocks.push(Qwen3VLVisionBlock::new_skeleton(config.clone(), device, dtype)?);
-        }
-        let merger = Qwen3VLVisionPatchMerger::new_skeleton(&config, device, dtype)?;
-        let deepstack_visual_indexes = config.deepstack_visual_indexes.clone();
-        let mut deepstack_merger_list = Vec::new();
-        for _ in 0..deepstack_visual_indexes.len() {
-            deepstack_merger_list.push(Qwen3VLVisionPatchMerger::new_skeleton(&config, device, dtype)?);
-        }
-
-        Ok(Self {
-            spatial_merge_size: config.spatial_merge_size,
-            patch_embed,
-            pos_embed,
-            num_grid_per_side,
-            rotary_pos_emb,
-            blocks,
-            merger,
-            deepstack_visual_indexes,
-            deepstack_merger_list,
-            dtype,
-        })
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.pos_embed.embeddings().elem_count() <= 1
-    }
-
-    pub fn reload_from_st(&mut self, st: &safetensors::SafeTensors, device: &Device) -> Result<()> {
-        use crate::models::qwen3vl::quantized_model::load_q8_tensor;
-        self.patch_embed.reload_from_st(st, device)?;
-        
-        let p_w = load_q8_tensor(st, "visual.pos_embed.weight", device)?;
-        self.pos_embed = Embedding::new(p_w, self.pos_embed.hidden_size());
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            block.reload_from_st(st, i, device)?;
-        }
-        
-        self.merger.reload_from_st(st, "visual.merger", device)?;
-        for (i, merger) in self.deepstack_merger_list.iter_mut().enumerate() {
-            merger.reload_from_st(st, &format!("visual.deepstack_merger_list.{}", i), device)?;
-        }
-        
-        println!("[MODEL] Vision model weights reloaded from ST into VRAM.");
-        Ok(())
-    }
-
     pub fn new(config: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let spatial_merge_size = config.spatial_merge_size;
         let patch_embed = Qwen3VLVisionPatchEmbed::new(&config, vb.pp("patch_embed"))?;
@@ -476,6 +344,7 @@ impl Qwen3VLVisionModel {
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         self.patch_embed.to_device(device)?;
+        
         let p_w = self.pos_embed.embeddings().to_device(device)?;
         self.pos_embed = Embedding::new(p_w, self.pos_embed.hidden_size());
 
@@ -555,6 +424,7 @@ impl Qwen3VLVisionModel {
                     .flatten_all()?
                     .to_vec1::<u32>()?,
             );
+
             let one_sub_dh = Tensor::ones_like(&dh)?.sub(&dh)?;
             let one_sub_dw = Tensor::ones_like(&dw)?.sub(&dw)?;
 
@@ -596,6 +466,7 @@ impl Qwen3VLVisionModel {
             let [t, h, w] = grid_thw.i(i)?.to_vec1::<u32>()?[..] else {
                 return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
             };
+            // let pos_embed = &patch_pos_embeds[i];
             let pos_emebd_last_dim: usize = pos_embed.dim(D::Minus1)?;
             let pos_embed = pos_embed.repeat((t as usize, 1))?;
             let shape = Shape::from(vec![
@@ -658,9 +529,11 @@ impl Qwen3VLVisionModel {
         }
         let pos_ids = Tensor::cat(&pos_ids_vec, 0)?;
         let pos_ids_h = pos_ids.i((.., 0))?.contiguous()?;
+        // 第二列是w维度的索引
         let pos_ids_w = pos_ids.i((.., 1))?.contiguous()?;
         let rotary_pos_emb_h = freq_table.index_select(&pos_ids_h, 0)?;
         let rotary_pos_emb_w = freq_table.index_select(&pos_ids_w, 0)?;
+        // 每个patch融合h索引和w索引两个的位置编码信息
         let rotary_pos_emb = Tensor::cat(&[rotary_pos_emb_h, rotary_pos_emb_w], 1)?.contiguous()?;
         Ok(rotary_pos_emb)
     }
@@ -895,7 +768,6 @@ pub struct Qwen3VLTextModel {
     pub norm: RmsNorm,
     pub rotary_emb: Qwen3VLTextRotaryEmbedding,
     pub mrope_section: Vec<usize>,
-    pub config: Qwen3VLTextConfig,
 }
 
 impl Qwen3VLTextModel {
@@ -911,6 +783,8 @@ impl Qwen3VLTextModel {
         let norm = rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
         let head_dim = config.head_dim;
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
+        // [FIX] rope_scaling is now optional. Assuming it exists if we are here, or panic/default.
+        // Given Qwen3 config flow, if it was missing it should have failed earlier or defaults populated.
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         Ok(Self {
             embed_tokens,
@@ -918,7 +792,6 @@ impl Qwen3VLTextModel {
             norm,
             rotary_emb,
             mrope_section,
-            config: config.clone(), // [FIX] 생성자에 추가!
         })
     }
 
@@ -931,30 +804,22 @@ impl Qwen3VLTextModel {
         deepstack_visual_embeds: Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
-
-        let position_ids_fallback;
-        let p_ids = match position_ids {
-            Some(ids) => ids,
-            None => {
-                position_ids_fallback = Tensor::arange(
-                    seqlen_offset as u32,
-                    (seqlen_offset + seq_len) as u32,
-                    inputs_embeds.device(),
-                )?
-                .unsqueeze(0)?
-                .unsqueeze(0)?
-                .broadcast_as((3, b_size, seq_len))?
-                .contiguous()?;
-                &position_ids_fallback
-            }
+        let position_ids = match position_ids {
+            Some(ids) => ids.clone(),
+            None => Tensor::arange(
+                seqlen_offset as u32,
+                (seq_len + seqlen_offset) as u32,
+                inputs_embeds.device(),
+            )?
+            .unsqueeze(0)?
+            .unsqueeze(0)?
+            .broadcast_as((3, b_size, seq_len))?,
         };
-
         let (cos, sin) = self.rotary_emb.forward(
-            p_ids,
+            &position_ids,
             inputs_embeds.dtype(),
             self.mrope_section.clone(),
         )?;
-
         let mut xs = inputs_embeds.clone();
         let attention_mask: Option<Tensor> = {
             if seq_len <= 1 {
@@ -968,7 +833,6 @@ impl Qwen3VLTextModel {
                 )?)
             }
         };
-
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
@@ -1008,7 +872,10 @@ impl Qwen3VLModel {
         let config = config.clone();
         let v_config = config.vision_config.clone().ok_or(anyhow!("Missing vision_config for Qwen3VLModel"))?;
         let visual = Qwen3VLVisionModel::new(v_config, vb_m.pp("visual"))?;
+        
+        // [FIX] text_config is optional, but required for Qwen3VLModel
         let text_config = config.text_config.clone().ok_or(anyhow!("Missing text_config for Qwen3VLModel"))?;
+        
         let language_model =
             Qwen3VLTextModel::new(text_config.clone(), vb_m.pp("language_model"))?;
         let lm_head = if config.tie_word_embeddings {
@@ -1036,6 +903,7 @@ impl Qwen3VLModel {
     ) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
         let (image_embeds, deepstack_image_embeds) =
             self.visual.forward(pixel_values, image_grid_thw)?;
+        
         let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
         let split_sizes: Vec<usize> = prod_tensor_last_dim(image_grid_thw)?
             .to_vec1::<u32>()?
@@ -1066,6 +934,7 @@ impl Qwen3VLModel {
         video_grid_thw: Option<&Tensor>,
         mask: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
+        // ... (previous logic)
         let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
         let image_token_id = self.config.image_token_id.unwrap_or(0);
         let video_token_id = self.config.video_token_id.unwrap_or(0);
@@ -1088,6 +957,7 @@ impl Qwen3VLModel {
             for i in 0..total_input_ids.dim(0)? {
                 let mut input_ids_i = total_input_ids.i(i)?;
                 let mask_i = mask_.i(i)?;
+                // 推理时, attention_mask如果是全1向量,取非0索引的操作没必要
                 if mask_i.sum_all()?.to_scalar::<u32>()? != mask_i.dim(0)? as u32 {
                     let nonzero_idx = nonzero_index(&mask_i)?;
                     input_ids_i = input_ids_i.gather(&nonzero_idx, 0)?;
@@ -1096,8 +966,10 @@ impl Qwen3VLModel {
                 let mut text_end = 0;
                 let mut thw = vec![];
                 let mut llm_pos_ids_list: Vec<Tensor> = Vec::new();
+                // vision start的下一个索引
                 let vision_indices =
                     get_vision_next_indices(&input_ids_i, vision_start_token_id as u32);
+
                 match vision_indices {
                     Ok(indeices) => {
                         let vision_tokens = input_ids_i.gather(&indeices, 0)?.to_vec1::<u32>()?;
@@ -1205,8 +1077,7 @@ impl Qwen3VLModel {
                 position_ids = position_ids
                     .slice_assign(&[(0..3), (i..i + 1), (0..input_ids.dim(1)?)], &llm_position)?;
                 let position_deltas = llm_position.max_all()?.to_scalar::<u32>()? as i64 + 1
-                    - input_ids_i.dim(0)?
-                    as i64;
+                    - input_ids_i.dim(0)? as i64;
                 mrope_position_deltas.push(position_deltas);
             }
             let mut mrope_position_deltas = Tensor::new(mrope_position_deltas, input_ids.device())?;
@@ -1223,6 +1094,8 @@ impl Qwen3VLModel {
             for i in 0..position_ids.dim(0)? {
                 let mut position_ids_i = position_ids.i(i)?;
                 let mask_i = mask.i(i)?;
+                // 如果有pad, 将填充位置置为1
+                // 当bs>1, 可能存在不同序列长度，需要添加pad使seq_len长度一致
                 if mask_i.sum_all()?.to_scalar::<u32>()? != mask_i.dim(0)? as u32 {
                     let zero_indices = zero_index(&mask_i)?;
                     let replace_1 = Tensor::ones(
@@ -1254,13 +1127,12 @@ impl Qwen3VLModel {
             }
             Ok((position_ids, mrope_position_deltas))
         } else {
-            let (b_size, seq_len) = input_ids.dims2()?;
-            let position_ids = Tensor::arange(0u32, seq_len as u32, input_ids.device())?
-                .unsqueeze(0)?
-                .unsqueeze(0)?
-                .broadcast_as((3, b_size, seq_len))?
-                .contiguous()?; 
-
+            let position_ids =
+                Tensor::arange(0_u32, input_ids.dim(D::Minus1)? as u32, input_ids.device())?
+                    .unsqueeze(0)?
+                    .unsqueeze(0)?
+                    .broadcast_as((3, input_ids.dim(0)?, input_ids.dim(D::Minus1)?))?
+                    .contiguous()?;
             let mrope_position_deltas = Tensor::zeros(
                 (input_ids.dim(0)?, 1),
                 input_ids.dtype(),
@@ -1275,44 +1147,130 @@ impl Qwen3VLModel {
         input_ids: &Tensor,
         pixel_values: Option<&Tensor>,
         image_grid_thw: Option<&Tensor>,
-        _pixel_values_video: Option<&Tensor>,
+        pixel_values_video: Option<&Tensor>,
         video_grid_thw: Option<&Tensor>,
-        _cache_position: Option<&Tensor>,
+        cache_position: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        let (b_sz, seq_len) = input_ids.dims2()?;
-        let flat_input = input_ids.flatten_all()?;
-        let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
-        // [FIX] 명시적으로 hidden_size를 가져와서 텐서 형태 복구 (차원 붕괴 방지)
-        let hidden_size = self.language_model.config.hidden_size;
-        let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, hidden_size))?;
-
-        let mut visual_pos_mask = None;
-        let mut deepstack_visual_embeds = None;
-
-        if let Some(pv) = pixel_values {
-            if let Some(thw) = image_grid_thw {
-                let (image_embeds, deepstack_embeds) = self.get_vision_features(pv, thw)?;
+        let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
+        let mut image_mask = None;
+        let mut video_mask = None;
+        let mut deepstack_image_embeds = None;
+        let mut deepstack_video_embeds = None;
+        if let Some(pixel_values) = pixel_values {
+            if let Some(image_grid_thw) = image_grid_thw {
+                let (image_embeds, deepstack_img_embed) =
+                    self.get_vision_features(pixel_values, image_grid_thw)?;
                 let image_embeds = Tensor::cat(&image_embeds, 0)?;
-                let v_mask = self.get_placeholder_mask(&input_ids, true)?;
-                inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &v_mask)?;
-                visual_pos_mask = Some(v_mask);
-                deepstack_visual_embeds = Some(deepstack_embeds);
+                let vision_mask = self.get_placeholder_mask(input_ids, true)?;
+                let n_image_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
+                if n_image_tokens as usize != image_embeds.dim(0)? {
+                    return Err(anyhow!(format!(
+                        "n_image_token num: {} not equal to image_embed len: {}",
+                        n_image_tokens,
+                        image_embeds.dim(0)?
+                    )));
+                }
+                inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;
+                image_mask = Some(vision_mask);
+                deepstack_image_embeds = Some(deepstack_img_embed);
             }
         }
+        if let Some(pixel_values_video) = pixel_values_video {
+            if let Some(video_grid_thw) = video_grid_thw {
+                let (video_embeds, deepstack_video_embed) =
+                    self.get_vision_features(pixel_values_video, video_grid_thw)?;
+                let video_embeds = Tensor::cat(&video_embeds, 0)?;
+                let vision_mask = self.get_placeholder_mask(input_ids, false)?;
+                let n_video_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
+                if n_video_tokens as usize != video_embeds.dim(0)? {
+                    return Err(anyhow!(format!(
+                        "n_image_token num: {} not equal to image_embed len: {}",
+                        n_video_tokens,
+                        video_embeds.dim(0)?
+                    )));
+                }
+                inputs_embeds = masked_scatter_dim0(&inputs_embeds, &video_embeds, &vision_mask)?;
+                video_mask = Some(vision_mask);
+                deepstack_video_embeds = Some(deepstack_video_embed);
+            }
+        }
+        let mut visual_pos_mask = None;
+        let mut deepstack_visual_embeds = None;
+        if let Some(image_mask_) = image_mask {
+            if let Some(video_mask_) = video_mask {
+                let image_mask_ = image_mask_.squeeze(0)?;
+                let video_mask_ = video_mask_.squeeze(0)?;
+                let visual_mask = bitor_tensor(&image_mask_, &video_mask_)?;
+                let visual_none_zero_index = nonzero_index(&visual_mask)?;
+                let image_mask_joint = image_mask_.gather(&visual_none_zero_index, 0)?;
+                let image_nonzero_joint = nonzero_index(&image_mask_joint)?;
+                let video_mask_joint = video_mask_.gather(&visual_none_zero_index, 0)?;
+                let video_nonzero_joint = nonzero_index(&video_mask_joint)?;
+                let mut deepstack_embeds = vec![];
+                let visual_len = visual_none_zero_index.dim(0)?;
+                for (img_embed, vid_embed) in deepstack_image_embeds
+                    .unwrap()
+                    .iter()
+                    .zip(deepstack_video_embeds.unwrap().iter())
+                {
+                    let embed_joint = Tensor::zeros(
+                        (visual_len, img_embed.dim(D::Minus1)?),
+                        img_embed.dtype(),
+                        img_embed.device(),
+                    )?;
+                    let embed_joint = embed_joint.index_add(&image_nonzero_joint, img_embed, 0)?;
+                    let embed_joint = embed_joint.index_add(&video_nonzero_joint, vid_embed, 0)?;
+                    deepstack_embeds.push(embed_joint);
+                }
+                visual_pos_mask = Some(visual_mask.unsqueeze(0)?);
+                deepstack_visual_embeds = Some(deepstack_embeds);
+            } else {
+                visual_pos_mask = Some(image_mask_);
+                deepstack_visual_embeds = deepstack_image_embeds;
+            }
+        } else if let Some(video_mask_) = video_mask {
+            visual_pos_mask = Some(video_mask_);
+            deepstack_visual_embeds = deepstack_video_embeds;
+        }
 
-        let (position_ids, deltas) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
-        self.rope_deltas = Some(deltas);
-
+        let position_ids;
+        let rope_deltas;
+        if (cache_position.is_some() && cache_position.unwrap().i(0)?.to_scalar::<u32>()? == 0)
+            || self.rope_deltas.is_none()
+        {
+            (position_ids, rope_deltas) =
+                self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
+            self.rope_deltas = Some(rope_deltas);
+        } else {
+            let (bs, seq_len, _) = inputs_embeds.dims3()?;
+            let delta = if let Some(cache_position) = cache_position {
+                cache_position
+                    .i(0)?
+                    .to_dtype(self.rope_deltas.as_ref().unwrap().dtype())?
+                    .broadcast_add(self.rope_deltas.as_ref().unwrap())?
+                    .contiguous()?
+                    .to_dtype(candle_core::DType::U32)?
+            } else {
+                Tensor::zeros(1, inputs_embeds.dtype(), inputs_embeds.device())?
+            };
+            position_ids = Tensor::arange(0u32, seq_len as u32, input_ids.device())?
+                .unsqueeze(0)?
+                .broadcast_as((bs, seq_len))?
+                .broadcast_add(&delta)?
+                .unsqueeze(0)?
+                .broadcast_as((3, bs, seq_len))?
+                .contiguous()?;
+        }
         let outputs = self.language_model.forward(
             &inputs_embeds,
             seqlen_offset,
             Some(&position_ids),
             visual_pos_mask.as_ref(),
-            deepstack_visual_embeds.clone(),
+            deepstack_visual_embeds,
         )?;
-
-        let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
+        let seq_len = outputs.dim(1)?;
+        let hidden_state = outputs.narrow(1, seq_len - 1, 1)?;
         let logits = self.lm_head.forward(&hidden_state)?;
         Ok(logits)
     }

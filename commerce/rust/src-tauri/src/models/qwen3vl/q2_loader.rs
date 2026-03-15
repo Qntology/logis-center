@@ -2,8 +2,6 @@ use candle_core::{Tensor, Result, DType, Device};
 use std::ffi::c_void;
 use rayon::prelude::*;
 
-use candle_core::backend::BackendDevice;
-
 extern "C" {
     fn launch_dequantize_q2_bf16(packed: *const c_void, scales: *const c_void, out: *mut c_void, num_packed_bytes: i32);
 }
@@ -34,50 +32,24 @@ pub fn dequantize_q2_cpu(packed: &[u8], scales: &[half::f16], shape: &[usize]) -
 
 /// [GPU CUDA] 2-bit 데이터를 GPU로 복사한 뒤 VRAM 내부에서 해제합니다.
 pub fn dequantize_q2_cuda(packed: Tensor, scales: Tensor, shape: &[usize], device: &Device) -> Result<Tensor> {
+    // 1. 2비트 텐서를 그대로 GPU로 전송 (PCIe 대역폭 8배 절약)
     let packed_gpu = packed.to_device(device)?;
     let scales_gpu = scales.to_device(device)?;
     
-    // [FIX 1] Allocate output tensor using the actual packed size (including Python padding)
-    let num_packed_bytes = packed.elem_count();
-    let safe_elements = num_packed_bytes * 4;
-    let out_tensor = Tensor::zeros((safe_elements,), DType::BF16, device)?;
+    // 2. 출력용 BF16 텐서 할당
+    let out_tensor = Tensor::zeros(shape, DType::BF16, device)?;
     
-    let num_packed_bytes_i32 = num_packed_bytes as i32;
+    let num_packed_bytes = packed.elem_count() as i32;
     
     unsafe {
+        // (이전에 구현한 get_cuda_raw_ptr 활용)
         let p_ptr = crate::models::qwen3vl::paged_attention::get_cuda_raw_ptr(&packed_gpu)?;
         let s_ptr = crate::models::qwen3vl::paged_attention::get_cuda_raw_ptr(&scales_gpu)?;
         let o_ptr = crate::models::qwen3vl::paged_attention::get_cuda_raw_ptr(&out_tensor)? as *mut c_void;
         
-        launch_dequantize_q2_bf16(p_ptr, s_ptr, o_ptr, num_packed_bytes_i32);
+        launch_dequantize_q2_bf16(p_ptr, s_ptr, o_ptr, num_packed_bytes);
     }
     
-    // [FIX 2] CRITICAL: Synchronize the device BEFORE returning! 
-    // This stops Rust from dropping packed_gpu/scales_gpu while the kernel is still reading them.
-    match device {
-        Device::Cuda(c) => c.synchronize().map_err(candle_core::Error::wrap)?,
-        _ => {}
-    }
-    
-    // [FIX 3] Slice off the padding and reshape back to the expected target shape
-    let orig_elements: usize = shape.iter().product();
-    let final_tensor = out_tensor.narrow(0, 0, orig_elements)?.reshape(shape)?;
-    
-    Ok(final_tensor)
-}
-
-/// [I8-DEQUANTIZE] 8비트(I8) 텐서를 스케일 값을 사용하여 BF16/F32로 복원합니다.
-pub fn dequantize_i8(data: Tensor, scale: Tensor, device: &Device) -> Result<Tensor> {
-    let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-    
-    // [FIX] 데이터(CPU)와 스케일(CPU)을 모두 GPU로 확실히 넘긴 뒤, 
-    // 곱셈이 가능하도록 둘 다 F32 타입으로 맞춰줍니다.
-    let data_f32 = data.to_dtype(DType::F32)?.to_device(device)?;
-    let scale_f32 = scale.to_device(device)?.to_dtype(DType::F32)?;
-    
-    // GPU 위에서 초고속으로 곱셈 수행!
-    let out = data_f32.broadcast_mul(&scale_f32)?;
-    
-    // 최종 데이터 타입(BF16)으로 변환하여 반환
-    out.to_dtype(target_dtype)
+    // 3. 임시 2비트 텐서는 함수 종료 시 자동 파괴됨 (단일 참조 원칙 준수)
+    Ok(out_tensor)
 }

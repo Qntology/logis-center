@@ -17,36 +17,6 @@ pub struct GateUpDownMLP {
 }
 
 impl GateUpDownMLP {
-    pub fn new_skeleton(hidden_size: usize, intermediate_size: usize, device: &Device, dtype: DType) -> Result<Self> {
-        let zero_t = Tensor::zeros((1,), dtype, device)?;
-        Ok(Self {
-            gate_proj: Linear::new(zero_t.clone(), None),
-            up_proj: Linear::new(zero_t.clone(), None),
-            down_proj: Linear::new(zero_t.clone(), None),
-            act_fn: Activation::Silu,
-        })
-    }
-
-    pub fn reload_from_st(&mut self, st: &safetensors::SafeTensors, prefix: &str, device: &Device) -> Result<()> {
-        use crate::models::qwen3vl::quantized_model::load_q8_tensor;
-        let w_gate = load_q8_tensor(st, &format!("{}.gate_proj.weight", prefix), device)?;
-        let names = st.names();
-        let b_gate_name = format!("{}.gate_proj.bias", prefix);
-        let b_gate = if names.iter().any(|n| n.as_str() == b_gate_name.as_str()) { Some(load_q8_tensor(st, &b_gate_name, device)?) } else { None };
-        self.gate_proj = Linear::new(w_gate, b_gate);
-
-        let w_up = load_q8_tensor(st, &format!("{}.up_proj.weight", prefix), device)?;
-        let b_up_name = format!("{}.up_proj.bias", prefix);
-        let b_up = if names.iter().any(|n| n.as_str() == b_up_name.as_str()) { Some(load_q8_tensor(st, &b_up_name, device)?) } else { None };
-        self.up_proj = Linear::new(w_up, b_up);
-
-        let w_down = load_q8_tensor(st, &format!("{}.down_proj.weight", prefix), device)?;
-        let b_down_name = format!("{}.down_proj.bias", prefix);
-        let b_down = if names.iter().any(|n| n.as_str() == b_down_name.as_str()) { Some(load_q8_tensor(st, &b_down_name, device)?) } else { None };
-        self.down_proj = Linear::new(w_down, b_down);
-        Ok(())
-    }
-
     pub fn new(
         vb: VarBuilder,
         hidden_size: usize,
@@ -107,30 +77,6 @@ pub struct TwoLinearMLP {
 }
 
 impl TwoLinearMLP {
-    pub fn new_skeleton(embedding_dim: usize, mlp_dim: usize, device: &Device, dtype: DType) -> Result<Self> {
-        let zero_t = Tensor::zeros((1,), dtype, device)?;
-        Ok(Self {
-            linear1: Linear::new(zero_t.clone(), None),
-            linear2: Linear::new(zero_t.clone(), None),
-            act: Activation::Gelu,
-        })
-    }
-
-    pub fn reload_from_st(&mut self, st: &safetensors::SafeTensors, prefix: &str, l1_name: &str, l2_name: &str, device: &Device) -> Result<()> {
-        use crate::models::qwen3vl::quantized_model::load_q8_tensor;
-        let names = st.names();
-        let w1 = load_q8_tensor(st, &format!("{}.{}.weight", prefix, l1_name), device)?;
-        let b1_name = format!("{}.{}.bias", prefix, l1_name);
-        let b1 = if names.iter().any(|n| n.as_str() == b1_name.as_str()) { Some(load_q8_tensor(st, &b1_name, device)?) } else { None };
-        self.linear1 = Linear::new(w1, b1);
-
-        let w2 = load_q8_tensor(st, &format!("{}.{}.weight", prefix, l2_name), device)?;
-        let b2_name = format!("{}.{}.bias", prefix, l2_name);
-        let b2 = if names.iter().any(|n| n.as_str() == b2_name.as_str()) { Some(load_q8_tensor(st, &b2_name, device)?) } else { None };
-        self.linear2 = Linear::new(w2, b2);
-        Ok(())
-    }
-
     pub fn new(
         vb: VarBuilder,
         embedding_dim: usize,
@@ -835,24 +781,6 @@ pub fn get_conv2d(
         conv2d_no_bias(in_c, out_c, kernel_size, cfg, vb)?
     };
     Ok(conv2d)
-}
-
-pub fn get_layer_norm_skeleton(device: &Device, dtype: DType, dim: usize, eps: f64) -> Result<LayerNorm> {
-    let zero_t = Tensor::zeros((dim,), dtype, device)?;
-    Ok(LayerNorm::new(zero_t.clone(), zero_t, eps))
-}
-
-pub fn reload_layer_norm(st: &safetensors::SafeTensors, prefix: &str, device: &Device, eps: f64) -> Result<LayerNorm> {
-    use crate::models::qwen3vl::quantized_model::load_q8_tensor;
-    let w = load_q8_tensor(st, &format!("{}.weight", prefix), device)?;
-    let b_name = format!("{}.bias", prefix);
-    let names = st.names();
-    let b = if names.iter().any(|n| n.as_str() == b_name.as_str()) {
-        load_q8_tensor(st, &b_name, device)?
-    } else {
-        Tensor::zeros(w.dims(), w.dtype(), w.device())?
-    };
-    Ok(LayerNorm::new(w, b, eps))
 }
 
 pub fn get_layer_norm(vb: VarBuilder, eps: f64, dim: usize) -> Result<LayerNorm> {
