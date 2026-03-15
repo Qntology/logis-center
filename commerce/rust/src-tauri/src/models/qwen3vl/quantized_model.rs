@@ -137,7 +137,9 @@ impl QLinear {
             
             self.inner = match &self.inner {
                 QMatMul::QTensor(q) => {
-                    let t = q.dequantize(device)?.to_dtype(target_dtype)?;
+                    // [FIX] Candle 라이브러리 버그 회피:
+                    // GPU에서 직접 압축을 풀면 레이아웃 에러가 발생하므로, CPU에서 먼저 안전하게 푼 뒤 GPU로 넘깁니다.
+                    let t = q.dequantize(&Device::Cpu)?.to_device(device)?.to_dtype(target_dtype)?;
                     QMatMul::Tensor(t)
                 },
                 QMatMul::Tensor(t) => {
@@ -1737,12 +1739,13 @@ impl QuantizedQwen3VLTextModel {
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
         
-        let (embed_tokens, actual_hidden_size) = if let Ok(tensor) = ct.tensor(&mut reader, &token_emb_name, device) {
-             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
+        let (embed_tokens, actual_hidden_size) = if let Ok(tensor) = ct.tensor(&mut reader, &token_emb_name, &Device::Cpu) {
+             // [FIX] 임베딩 텐서도 안전하게 CPU에서 해제 후 GPU로 보냅니다.
+             let tensor = tensor.dequantize(&Device::Cpu)?.to_device(device)?.to_dtype(dtype)?;
              let h = tensor.dim(1)?;
              (Embedding::new(tensor, h), h)
-        } else if let Ok(tensor) = ct.tensor(&mut reader, alt_token_emb, device) {
-             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
+        } else if let Ok(tensor) = ct.tensor(&mut reader, alt_token_emb, &Device::Cpu) {
+             let tensor = tensor.dequantize(&Device::Cpu)?.to_device(device)?.to_dtype(dtype)?;
              let h = tensor.dim(1)?;
              (Embedding::new(tensor, h), h)
         } else {
@@ -2525,6 +2528,8 @@ impl QuantizedQwen3VLTextModel {
         // [RESTORE GGUF] 1. 첫 번째 레이어 로드 복구
         if self.layers[0].self_attn.q_proj.is_cleared() {
             self.reload_layer(0)?;
+            // [FIX] CPU에 로드된 Layer 0을 GPU(VRAM)로 올립니다. 이 과정에서 압축이 안전하게 해제됩니다.
+            self.layers[0].to_device(&target_device)?;
         }
 
         let mut next_layer_task: Option<tokio::task::JoinHandle<Result<QuantizedQwen3VLTextDecoderLayer>>> = None;
