@@ -1522,14 +1522,13 @@ impl QuantizedQwen3VLTextModel {
         dtype: DType,
         baking_only: bool,
     ) -> Result<Self> {
-        // 1. shared.st 경로 확보 및 로드 
-        let shared_path = std::fs::canonicalize(format!("src-tauri/models/{}/shared.st", model_dir))
-            .or_else(|_| std::fs::canonicalize(format!("models/{}/shared.st", model_dir)))?;
+        // 1. shared.st 경로 확보 및 로드 (생략 없이 유지)
+        let shared_path = std::fs::canonicalize(format!("src-tauri/models/{model_dir}/shared.st"))
+            .or_else(|_| std::fs::canonicalize(format!("models/{model_dir}/shared.st")))?;
         let shared_data = std::fs::read(&shared_path)?;
         let shared_st = safetensors::SafeTensors::deserialize(&shared_data)?;
 
-        // [FIX] Fuzzy Matching: 정확한 이름이나 .weight 유무에 상관없이 
-        // 키워드만으로 파일에서 스스로 텐서 이름을 찾아냅니다.
+        // Fuzzy Matching 로직 (생략 없이 유지)
         let find_base = |kws: &[&str], st: &safetensors::SafeTensors| -> Result<String> {
             for name in st.names() {
                 let lower = name.to_lowercase();
@@ -1542,25 +1541,27 @@ impl QuantizedQwen3VLTextModel {
             anyhow::bail!("Tensor not found matching: {:?}", kws)
         };
 
-        // 'embed' 또는 'embd'가 포함된 텐서를 스스로 찾아냅니다.
         let embed_name = find_base(&["embed"], &shared_st).or_else(|_| find_base(&["embd"], &shared_st))?;
         let embed_w = load_q8_tensor(&shared_st, &embed_name, device)?;
-        let actual_hidden_size = embed_w.dim(1)?;
+        
+        // [FIX] 실제 로드된 가중치의 크기(1024)를 가져와서 설정을 강제로 패치합니다.
+        let actual_hidden_size = embed_w.dim(1)?; 
+        let mut patched_config = config.clone();
+        patched_config.hidden_size = actual_hidden_size; // 2048 -> 1024 자동 수정
+        
         let embed_tokens = Embedding::new(embed_w, actual_hidden_size);
 
-        // 'norm' 또는 'ln_f'가 포함된 텐서를 스스로 찾아냅니다.
         let norm_name = find_base(&["norm"], &shared_st).or_else(|_| find_base(&["ln_f"], &shared_st))?;
         let norm_w = load_q8_tensor(&shared_st, &norm_name, device)?;
-        let norm = RmsNorm::new(norm_w, config.rms_norm_eps);
+        let norm = RmsNorm::new(norm_w, patched_config.rms_norm_eps);
 
-        // 3. 뼈대 레이어 생성 [cite: 374]
         let registry = KVRegistry::new();
-        let num_layers = if baking_only { 1 } else { config.num_hidden_layers };
+        let num_layers = if baking_only { 1 } else { patched_config.num_hidden_layers };
         let mut layers = Vec::with_capacity(num_layers);
         for layer_idx in 0..num_layers {
             let prefix = format!("model.layers.{}", layer_idx);
             layers.push(QuantizedQwen3VLTextDecoderLayer::new_skeleton(
-                config, &prefix, device, dtype, layer_idx, baking_only, registry.clone()
+                &patched_config, &prefix, device, dtype, layer_idx, baking_only, registry.clone()
             )?);
         }
 
@@ -1568,11 +1569,11 @@ impl QuantizedQwen3VLTextModel {
             embed_tokens,
             layers,
             norm,
-            rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta),
-            mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone())
-                .unwrap_or_else(|| vec![config.head_dim, 0, 0]), //
+            rotary_emb: Qwen3VLTextRotaryEmbedding::new(patched_config.head_dim, patched_config.rope_theta),
+            mrope_section: patched_config.rope_scaling.as_ref().map(|r| r.mrope_section.clone())
+                .unwrap_or_else(|| vec![patched_config.head_dim, 0, 0]), 
             device_id,
-            mmap: None, // GGUF mmap 해제! [cite: 332]
+            mmap: None,
             registry,
             baking_only,
             is_forced_cpu: device.is_cpu(),
@@ -1580,8 +1581,8 @@ impl QuantizedQwen3VLTextModel {
             active_kv_name: None,
             pinned_layer_count: if device.is_cuda() { num_layers } else { 0 },
             current_kv_len: 0,
-            config: config.clone(),
-            ct: None, // GGUF 메타데이터 해제!
+            config: patched_config, // [FIX] 수정된 설정을 저장
+            ct: None,
             base_name: "model".to_string(),
             dtype,
             model_dir: model_dir.to_string(),
@@ -1794,7 +1795,7 @@ impl QuantizedQwen3VLTextModel {
             active_kv_name: None, 
             pinned_layer_count: if current_device.is_cuda() { num_layers_to_load } else { 0 }, 
             current_kv_len: 0,
-            config: config.clone(),
+            config: patched_config,
             ct: Some(ct),
             base_name: base_name.to_string(),
             dtype,
@@ -1882,7 +1883,7 @@ impl QuantizedQwen3VLTextModel {
             active_kv_name: None, 
             pinned_layer_count, 
             current_kv_len: 0,
-            config: config.clone(),
+            config: patched_config,
             ct: Some(ct),
             base_name: base_name.to_string(),
             dtype,
@@ -1994,7 +1995,7 @@ impl QuantizedQwen3VLTextModel {
         
         let target_device = self.layers[layer_idx].device().clone();
         // [FIX] 여기서도 타겟 장치에 따라 자르는(take) 크기를 맞춤 설정
-        let chunk_size = if target_device.is_cuda() { 4096 } else { 256 };
+        let chunk_size = 256;
         
         let current_seq_len = xs.dim(1)?;
         let total_chunks = chunk_offsets.len();
@@ -2210,7 +2211,7 @@ impl QuantizedQwen3VLTextModel {
         
         // [FIX] 장치 타입에 따라 동적으로 청크 분할 크기 결정
         let device = self.layers[layer_idx].device();
-        let chunk_size = if device.is_cuda() { 4096 } else { 256 }; 
+        let chunk_size = 256;
         let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(chunk_size).collect();
         
         let mut next_xs = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
@@ -2521,11 +2522,9 @@ impl QuantizedQwen3VLTextModel {
         let mut xs = inputs_embeds.clone();
         let total_layers = self.layers.len();
 
+        // [RESTORE GGUF] 1. 첫 번째 레이어 로드 복구
         if self.layers[0].self_attn.q_proj.is_cleared() {
-            let mut ready_layer = self.reload_layer_from_st(0)?;
-            // [FIX 1] 덮어쓰기 전에 기존 KV 캐시(기억) 복사!
-            ready_layer.self_attn.kv_blocks = self.layers[0].self_attn.kv_blocks.clone();
-            self.layers[0] = ready_layer;
+            self.reload_layer(0)?;
         }
 
         let mut next_layer_task: Option<tokio::task::JoinHandle<Result<QuantizedQwen3VLTextDecoderLayer>>> = None;
@@ -2534,18 +2533,19 @@ impl QuantizedQwen3VLTextModel {
             if layer_idx + 1 < total_layers {
                 let next_idx = layer_idx + 1;
                 
-                // [SPEED-UP FIX] 다음 레이어의 가중치가 이미 비워져(cleared) 있을 때만 SSD에서 다시 로드합니다.
+                // [SPEED-UP FIX] 다음 레이어의 가중치가 이미 비워져(cleared) 있을 때만 GGUF에서 다시 로드합니다.
                 if self.layers[next_idx].self_attn.q_proj.is_cleared() {
                     let mut self_clone = self.clone();
                     let device_for_task = target_device.clone();
 
                     next_layer_task = Some(tokio::task::spawn_blocking(move || {
-                        let mut layer = self_clone.reload_layer_from_st(next_idx)?;
+                        // [RESTORE GGUF] 2. 프리패치 레이어 로드 복구 (mmap에서 안전하게 읽어옵니다)
+                        self_clone.reload_layer(next_idx)?;
+                        let mut layer = self_clone.layers[next_idx].clone();
                         layer.to_device(&device_for_task)?;
                         Ok(layer)
                     }));
                 } else {
-                    // 이미 VRAM에 상주하고 있다면 불필요한 디스크 I/O 및 텐서 생성 작업을 아예 생략!
                     next_layer_task = None;
                 }
             }
@@ -2570,9 +2570,8 @@ impl QuantizedQwen3VLTextModel {
             }
 
             if let Some(handle) = next_layer_task.take() {
-                let mut ready_layer = handle.await??;
-                // [FIX 2] 다음 레이어도 덮어쓰기 전에 기존 KV 캐시(기억) 복사!
-                ready_layer.self_attn.kv_blocks = self.layers[layer_idx + 1].self_attn.kv_blocks.clone();
+                let ready_layer = handle.await??;
+                // [RESTORE GGUF] 3. reload_layer 내부에서 기존 KV 캐시를 이미 유지하므로 덮어쓰기만 하면 됩니다.
                 self.layers[layer_idx + 1] = ready_layer;
             }
         }
@@ -2866,8 +2865,12 @@ impl QuantizedQwen3VLModel {
         let head_w = crate::models::qwen3vl::quantized_model::load_q8_tensor(&shared_st, &head_name, text_device)?;
         let lm_head = QLinear::new(candle_core::quantized::QMatMul::Tensor(head_w), None, text_device.clone());
 
+        // [FIX] 자식(language_model)이 교정한 설정을 부모(Self)의 설정에도 반영합니다.
+        let mut patched_parent_config = config.clone();
+        patched_parent_config.text_config = Some(language_model.config.clone());
+
         Ok(Self {
-            config: config.clone(),
+            config: patched_parent_config,
             visual,
             language_model,
             lm_head,
@@ -2878,7 +2881,7 @@ impl QuantizedQwen3VLModel {
             mmproj_mmap: None,
         })
     }
-    
+
     pub fn reload_vision_from_st(&mut self) -> Result<()> {
         if !self.visual.is_empty() {
             return Ok(());
