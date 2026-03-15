@@ -11,8 +11,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
 [build-dependencies]
 tauri-build = { version = "2.5.3", features = [] }
+cc = "1.0"
 
 [dependencies]
 tauri = { version = "2.9.5", features = [] }
