@@ -1667,7 +1667,7 @@ pub struct QuantizedQwen3VLTextModel {
 impl QuantizedQwen3VLTextModel {
     // QuantizedQwen3VLTextModel 내부에 함수 추가
     pub fn reload_layer_from_st(&mut self, layer_idx: usize) -> Result<QuantizedQwen3VLTextDecoderLayer> {
-        let file_path = format!("src-tauri/models/Qwen3-Split-Q2/layer_{}.st", layer_idx);
+        let file_path = format!("src-tauri/models/Qwen3-0.6B-Instruct-gguf/layer_{}.st", layer_idx);
         let data = std::fs::read(&file_path).map_err(|e| anyhow!("Failed to read ST file {:?}: {}", file_path, e))?;
         let st = safetensors::SafeTensors::deserialize(&data)?;
         let device = crate::utils::get_cuda_device(self.device_id);
