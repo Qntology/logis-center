@@ -2440,13 +2440,15 @@ impl QuantizedQwen3VLTextModel {
         visual_pos_masks: Option<&Tensor>,
         deepstack_visual_embeds: Option<Vec<Tensor>>,
         session_id: Option<String>,
-        kv_name: Option<String>, // [RESTORED]
+        kv_name: Option<String>,
     ) -> Result<Tensor> {
         self.active_session_id = session_id.clone();
-        self.active_kv_name = kv_name.clone(); // [RESTORED]
+        self.active_kv_name = kv_name.clone(); 
 
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
-        let target_device = self.layers[0].device().clone();
+        let is_decoding = seq_len <= 1;
+
+        let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
 
@@ -2456,7 +2458,6 @@ impl QuantizedQwen3VLTextModel {
                 .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_size, seq_len))?,
         };
         
-        // [DIAG-ROPE] 위치 정보 모니터링
         if seqlen_offset % 10 == 0 || seq_len > 1 {
             let p_min = position_ids.flatten_all()?.min(0)?.to_scalar::<u32>()?;
             let p_max = position_ids.flatten_all()?.max(0)?.to_scalar::<u32>()?;
@@ -2464,28 +2465,91 @@ impl QuantizedQwen3VLTextModel {
         }
 
         let (cos, sin) = self.rotary_emb.forward(&position_ids, inputs_embeds.dtype(), self.mrope_section.clone())?;
-        
-        // [FAST-PATH] 0.6B 모델은 수직적(전체) 추론을 사용하여 속도를 극대화합니다.
-        // 각 레이어의 무게추는 이미 메모리에 있으며, KV 캐시만 필요시 SSD에서 읽어옵니다.
-                let total_layers = self.layers.len();
-                
-                // [FIX] 모든 레이어에 현재 세션의 KV 폴더명을 동기화합니다.
-                for layer in self.layers.iter_mut() {
-                    layer.self_attn.active_kv_name = kv_name.clone();
-                }
-        
-                for layer_idx in 0..total_layers {
+        let total_layers = self.layers.len();
+
+        for layer in self.layers.iter_mut() {
+            layer.self_attn.active_kv_name = kv_name.clone();
+        }
+
+        // =========================================================================================
+        // [TRACK 2 PREP] 두 번째 트랙을 위한 백그라운드 태스크 홀더
+        // =========================================================================================
+        let mut next_layer_task: Option<tokio::task::JoinHandle<Result<QuantizedQwen3VLTextDecoderLayer>>> = None;
+
+        // 시작점: 0번 레이어는 첫 루프 진입 전 미리 띄워둡니다.
+        if !is_decoding && self.layers[0].self_attn.q_proj.is_cleared() {
+            self.reload_layer(0)?;
+            self.layers[0].to_device(&target_device)?;
+        } else if is_decoding {
+            let already_loaded = !self.layers[0].self_attn.q_proj.is_cleared();
+            if !already_loaded { self.reload_all_layers()?; }
+        }
+
+        for layer_idx in 0..total_layers {
             if layer_idx % 7 == 0 || layer_idx == total_layers - 1 {
-                println!("[ENGINE] Running Layer {}/{}", layer_idx + 1, total_layers);
+                println!("[ENGINE] Running Layer {}/{} (Two-Track Pipeline Active)", layer_idx + 1, total_layers);
             }
+
+            // =========================================================================
+            // [TRACK 2] 백그라운드 지연 적재 (N+1번째 레이어 미리 로드)
+            // =========================================================================
+            if !is_decoding && layer_idx + 1 < total_layers {
+                let next_idx = layer_idx + 1;
+                
+                // 스레드로 넘겨주기 위한 메타데이터 복제 (오버헤드 거의 없음)
+                let mmap_clone = self.mmap.clone();
+                let ct_clone = self.ct.clone();
+                let config_clone = self.config.clone();
+                let dtype = self.dtype;
+                let registry_clone = self.registry.clone();
+                let baking_only = self.baking_only;
+                let base_name = self.base_name.clone();
+                let dev_clone = target_device.clone();
+
+                next_layer_task = Some(tokio::task::spawn_blocking(move || -> Result<QuantizedQwen3VLTextDecoderLayer> {
+                    let mmap = mmap_clone.ok_or_else(|| anyhow!("Mmap missing"))?;
+                    let ct_arc = ct_clone.ok_or_else(|| anyhow!("GGUF missing"))?;
+                    let mut reader = std::io::Cursor::new(&mmap[..]);
+                    let gguf_blk = format!("blk.{}", next_idx);
+                    let prefix = if ct_arc.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{}.layers.{}", base_name, next_idx) };
+                    
+                    let mut new_layer = QuantizedQwen3VLTextDecoderLayer::new(
+                        &config_clone, &ct_arc, &mut reader, &prefix, &Device::Cpu, dtype, next_idx, baking_only, registry_clone
+                    )?;
+                    
+                    // 핵심: GPU 코어가 N번째를 계산하는 동안, 이 백그라운드 스레드는 PCIe 대역폭을 써서 VRAM에 N+1을 전송해 둡니다.
+                    new_layer.to_device(&dev_clone)?;
+                    Ok(new_layer)
+                }));
+            }
+
+            // =========================================================================
+            // [TRACK 1] 메인 연산 트랙 (N번째 레이어)
+            // =========================================================================
             let deepstack_embed = deepstack_visual_embeds.as_ref().and_then(|v| v.get(layer_idx));
             xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks, session_id.clone(), kv_name.clone(), self.baking_only).await?;
+
+            // Track 1 연산이 끝났으므로 N번째 레이어의 가중치는 VRAM에서 즉시 소각합니다.
+            if !is_decoding {
+                self.layers[layer_idx].clear();
+            }
+
+            // =========================================================================
+            // [TRACK SYNC] 다음 루프로 넘어가기 전, Track 2에서 준비된 N+1 레이어 장착
+            // =========================================================================
+            if let Some(task) = next_layer_task.take() {
+                // 이미 스레드에서 VRAM 전송까지 끝내놨기 때문에 대기시간(await)이 거의 발생하지 않고 즉시 통과됩니다.
+                let mut ready_layer = task.await??; 
+                
+                // KV 캐시 메타데이터는 기존 것을 보존하여 안전하게 덮어씌웁니다.
+                ready_layer.self_attn.kv_blocks = self.layers[layer_idx + 1].self_attn.kv_blocks.clone();
+                ready_layer.self_attn.active_kv_name = self.layers[layer_idx + 1].self_attn.active_kv_name.clone();
+                
+                self.layers[layer_idx + 1] = ready_layer;
+            }
         }
 
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
-
-        // [FLUSH-COMMIT] 베이킹 모드일 경우 이미 레이어별 루프에서 즉시 SSD 저장이 실행되었습니다.
-        // 따라서 여기서 중복으로 전체 flush를 수행할 필요가 없으므로 제거하여 병목을 방지합니다.
 
         self.current_kv_len = seqlen_offset + seq_len;
         let norm_dev = self.norm.weight().device();
