@@ -1900,6 +1900,13 @@ impl QuantizedQwen3VLTextModel {
         let norm_prefix = if ct.tensor_infos.contains_key("output_norm.weight") { "output_norm" } else { &format!("{base_name}.norm") };
         let norm = get_rms_norm(&ct, reader, norm_prefix, config.rms_norm_eps, device, dtype)?;
         
+        // [FIX] Detect model size to determine model_dir for reloading
+        let model_dir = if config.num_hidden_layers <= 16 {
+            "Qwen3-0.6B-Instruct-gguf".to_string()
+        } else {
+            "Qwen3-VL-2B-Instruct-gguf".to_string()
+        };
+
         Ok(Self { 
             embed_tokens, 
             layers, 
@@ -1919,6 +1926,7 @@ impl QuantizedQwen3VLTextModel {
             ct: Some(ct),
             base_name: base_name.to_string(),
             dtype,
+            model_dir,
         })
     }
 
