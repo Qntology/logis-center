@@ -1949,6 +1949,8 @@ impl QuantizedQwen3VLTextModel {
         kv_name: Option<String>,
         baking_only: bool,
     ) -> Result<Tensor> {
+        let chunk_process_start = std::time::Instant::now();
+
         let mut final_output: Option<Tensor> = None;
         let chunk_size = 256;
         let current_seq_len = xs.dim(1)?;
@@ -2044,7 +2046,7 @@ impl QuantizedQwen3VLTextModel {
             let is_small_model = self.layers.len() <= 36;
             let current_kv_len = self.layers[layer_idx].get_kv_len();
             
-            if !is_small_model || current_kv_len >= 4096 {
+            if !is_small_model || current_kv_len >= 1024 {
                 for (i, block) in self.layers[layer_idx].self_attn.kv_blocks.iter().enumerate() {
                     let (k_part, v_part) = {
                         let inner = block.inner.read().unwrap();
@@ -2088,7 +2090,13 @@ impl QuantizedQwen3VLTextModel {
                     }
                 }
 
-                println!("[ENGINE-TRACE] Layer {} Prefill Cache Moved to RAM ({} tokens). | VRAM: {}", layer_idx, current_kv_len, vram_info);
+                println!("[ENGINE-TRACE] Layer {} Prefill Cache Moved to RAM ({} tokens). | VRAM: {} | Took: {:?}", 
+                    layer_idx, current_kv_len, vram_info, chunk_process_start.elapsed());
+            }else{
+                if layer_idx == 0 || layer_idx == self.layers.len() - 1 {
+                    println!("[ENGINE-TRACE] Layer {} Prefill processed ({} tokens). Kept in VRAM. | Took: {:?}", 
+                        layer_idx, current_kv_len, chunk_process_start.elapsed());
+                }
             }
         }
         
@@ -2102,9 +2110,9 @@ impl QuantizedQwen3VLTextModel {
         // 문맥이 너무 길어질 경우(예: 4096+) OOM 방지를 위해 RAM으로 대피를 허용합니다.
         let current_kv_len = self.layers[layer_idx].get_kv_len();
         let is_small_model = self.layers.len() <= 36;
-        if is_small_model && current_kv_len < 4096 { return Ok(()); }
+        if is_small_model && current_kv_len < 1024 { return Ok(()); }
 
-        let vram_limit = 1024; 
+        let vram_limit = 512; 
         let mut vram_evicted = false;
 
         if is_small_model {
@@ -2363,15 +2371,15 @@ impl QuantizedQwen3VLTextModel {
             let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
             
             // VRAM: 28개 레이어 x 40개 블록 = 1,120개. 2,048개까지 VRAM 상주 허용 (속도 극대화)
-            let v_limit = 2048; 
+            let v_limit = 512; 
             
             // RAM: 만약 VRAM에서 쫓겨나더라도 RAM에 5,000개까지는 안전하게 보관
             let r_limit = if free_ram_gb > 4.0 { 5000 } else { 2048 };
             (v_limit, r_limit)
         };
 
-        let v_limit = 2048; 
-        let r_limit = 5000;
+        let v_limit = 512; 
+        let r_limit = 1024;
 
         let mut vram_evicted = false;
 
@@ -2541,6 +2549,8 @@ impl QuantizedQwen3VLTextModel {
         let (cos, sin) = self.rotary_emb.forward(&position_ids, inputs_embeds.dtype(), self.mrope_section.clone())?;
         let total_layers = self.layers.len();
 
+        let forward_start_time = std::time::Instant::now();
+
         for layer in self.layers.iter_mut() {
             layer.self_attn.active_kv_name = kv_name.clone();
         }
@@ -2574,7 +2584,8 @@ impl QuantizedQwen3VLTextModel {
                     }
                 }
 
-                println!("[ENGINE] Running Layer {}/{} (Two-Track Pipeline Active) | VRAM: {}", layer_idx + 1, total_layers, vram_info);
+                println!("[ENGINE] Running Layer {}/{} (Two-Track Pipeline Active) | VRAM: {} | Elapsed: {:?}", 
+                    layer_idx + 1, total_layers, vram_info, forward_start_time.elapsed());
             }
 
             // =========================================================================

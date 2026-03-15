@@ -12,16 +12,17 @@ __inline__ __device__ float warpReduceSum(float val) {
 }
 
 extern "C" __global__ void paged_flash_decoding_bf16_kernel(
-    const __nv_bfloat16* __restrict__ query,       // [1, num_heads, head_dim]
-    const __nv_bfloat16* const* __restrict__ k_blocks, // 포인터 배열
-    const __nv_bfloat16* const* __restrict__ v_blocks, // 포인터 배열
-    __nv_bfloat16* __restrict__ out,               // [1, num_heads, head_dim]
+const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* const* __restrict__ k_blocks,
+    const __nv_bfloat16* const* __restrict__ v_blocks,
+    const int* __restrict__ block_lens, // 추가: 각 블록의 실제 토큰 수
+    __nv_bfloat16* __restrict__ out,
     const int num_blocks,
     const int num_heads,
     const int num_kv_heads,
     const int head_dim,
     const float scale,
-    const int block_size // 256
+    const int max_block_size
 ) {
     // blockIdx.x는 쿼리의 Attention Head 하나를 전담합니다.
     int head_idx = blockIdx.x;
@@ -51,11 +52,13 @@ extern "C" __global__ void paged_flash_decoding_bf16_kernel(
         const __nv_bfloat16* k_block = k_blocks[b];
         const __nv_bfloat16* v_block = v_blocks[b];
 
-        // 해당 블록 내부의 토큰 순회
-        for (int t = 0; t < block_size; ++t) {
-            // [A] Dot Product (Q * K^T) 계산
+        const int actual_len = block_lens[b]; // 이번 블록의 실제 길이
+
+        // 👇 max_block_size 대신 actual_len 사용으로 메모리 초과 방지
+        for (int t = 0; t < actual_len; ++t) {
             float qk = 0.0f;
-            int token_offset = (kv_head_idx * block_size * head_dim) + (t * head_dim);
+            // offset 계산 시 실제 메모리 구조 [heads, len, dim] 고려
+            int token_offset = (kv_head_idx * actual_len * head_dim) + (t * head_dim);
             
             if (tid < head_dim) {
                 float q_val = __bfloat162float(s_query[tid]);
@@ -105,16 +108,9 @@ extern "C" __global__ void paged_flash_decoding_bf16_kernel(
 // --- paged_flash_decoding.cu 파일의 맨 끝에 추가 ---
 
 extern "C" void launch_paged_flash_decoding_wrapper(
-    const void* query, 
-    const void* k_blocks, 
-    const void* v_blocks, 
-    void* out,
-    int num_blocks, 
-    int num_heads, 
-    int num_kv_heads, 
-    int head_dim, 
-    float scale, 
-    int block_size
+    const void* query, const void* k_blocks, const void* v_blocks, 
+    const int* block_lens, void* out, // block_lens 추가
+    int num_blocks, int num_heads, int num_kv_heads, int head_dim, float scale, int block_size
 ) {
     dim3 grid(num_heads);
     dim3 block(head_dim); // 스레드 수를 head_dim(예: 128)으로 맞춤
@@ -123,10 +119,8 @@ extern "C" void launch_paged_flash_decoding_wrapper(
     int shared_mem = (head_dim * sizeof(__nv_bfloat16)) + (32 * sizeof(float)); 
     
     paged_flash_decoding_bf16_kernel<<<grid, block, shared_mem>>>(
-        (const __nv_bfloat16*)query,
-        (const __nv_bfloat16* const*)k_blocks,
-        (const __nv_bfloat16* const*)v_blocks,
-        (__nv_bfloat16*)out,
+        (const __nv_bfloat16*)query, (const __nv_bfloat16* const*)k_blocks, 
+        (const __nv_bfloat16* const*)v_blocks, block_lens, (__nv_bfloat16*)out,
         num_blocks, num_heads, num_kv_heads, head_dim, scale, block_size
     );
 }
