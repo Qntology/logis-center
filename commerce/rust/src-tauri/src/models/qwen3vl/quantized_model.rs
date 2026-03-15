@@ -1813,7 +1813,7 @@ impl QuantizedQwen3VLTextModel {
         let norm = get_rms_norm(&ct, &mut reader, norm_prefix, config.rms_norm_eps, device, dtype)?;
         
         // [FIX] Detect model size to determine model_dir for reloading
-        let model_dir = if config.num_hidden_layers <= 16 {
+        let model_dir = if config.hidden_size <= 1024 {
             "Qwen3-0.6B-Instruct-gguf".to_string()
         } else {
             "Qwen3-VL-2B-Instruct-gguf".to_string()
@@ -1901,7 +1901,7 @@ impl QuantizedQwen3VLTextModel {
         let norm = get_rms_norm(&ct, reader, norm_prefix, config.rms_norm_eps, device, dtype)?;
         
         // [FIX] Detect model size to determine model_dir for reloading
-        let model_dir = if config.num_hidden_layers <= 16 {
+        let model_dir = if config.hidden_size <= 1024 {
             "Qwen3-0.6B-Instruct-gguf".to_string()
         } else {
             "Qwen3-VL-2B-Instruct-gguf".to_string()
