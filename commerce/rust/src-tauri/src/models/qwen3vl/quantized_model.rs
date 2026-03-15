@@ -1528,14 +1528,29 @@ impl QuantizedQwen3VLTextModel {
         let shared_data = std::fs::read(&shared_path)?;
         let shared_st = safetensors::SafeTensors::deserialize(&shared_data)?;
 
-        // [FIX] 텐서 이름 끝에 .weight 를 추가하여 정확한 키를 찾도록 수정
-        let embed_w = load_q8_tensor(&shared_st, "model.embed_tokens.weight", device)
-            .or_else(|_| load_q8_tensor(&shared_st, "token_embd.weight", device))?;
+        // [FIX] Fuzzy Matching: 정확한 이름이나 .weight 유무에 상관없이 
+        // 키워드만으로 파일에서 스스로 텐서 이름을 찾아냅니다.
+        let find_base = |kws: &[&str], st: &safetensors::SafeTensors| -> Result<String> {
+            for name in st.names() {
+                let lower = name.to_lowercase();
+                if kws.iter().all(|&k| lower.contains(k)) {
+                    if let Some(base) = name.strip_suffix(".q8_data") { return Ok(base.to_string()); }
+                    if let Some(base) = name.strip_suffix(".q8_scale") { return Ok(base.to_string()); }
+                    return Ok(name.to_string());
+                }
+            }
+            anyhow::bail!("Tensor not found matching: {:?}", kws)
+        };
+
+        // 'embed' 또는 'embd'가 포함된 텐서를 스스로 찾아냅니다.
+        let embed_name = find_base(&["embed"], &shared_st).or_else(|_| find_base(&["embd"], &shared_st))?;
+        let embed_w = load_q8_tensor(&shared_st, &embed_name, device)?;
         let actual_hidden_size = embed_w.dim(1)?;
         let embed_tokens = Embedding::new(embed_w, actual_hidden_size);
 
-        let norm_w = load_q8_tensor(&shared_st, "model.norm.weight", device)
-            .or_else(|_| load_q8_tensor(&shared_st, "output_norm.weight", device))?;
+        // 'norm' 또는 'ln_f'가 포함된 텐서를 스스로 찾아냅니다.
+        let norm_name = find_base(&["norm"], &shared_st).or_else(|_| find_base(&["ln_f"], &shared_st))?;
+        let norm_w = load_q8_tensor(&shared_st, &norm_name, device)?;
         let norm = RmsNorm::new(norm_w, config.rms_norm_eps);
 
         // 3. 뼈대 레이어 생성 [cite: 374]
@@ -2831,11 +2846,24 @@ impl QuantizedQwen3VLModel {
         let shared_data = std::fs::read(&shared_path)?;
         let shared_st = safetensors::SafeTensors::deserialize(&shared_data)?;
 
-        // [FIX] 텐서 이름 끝에 .weight 를 추가
-        let head_w = load_q8_tensor(&shared_st, "lm_head.weight", text_device)
-            .or_else(|_| load_q8_tensor(&shared_st, "output.weight", text_device))
-            .or_else(|_| load_q8_tensor(&shared_st, "model.embed_tokens.weight", text_device))?; // Tie weights fallback
-        
+        // [FIX] Fuzzy Matching: 하드코딩된 문자열 대신 키워드로 실제 텐서 이름을 찾아냅니다.
+        let find_base = |kws: &[&str], st: &safetensors::SafeTensors| -> anyhow::Result<String> {
+            for name in st.names() {
+                let lower = name.to_lowercase();
+                if kws.iter().all(|&k| lower.contains(k)) {
+                    if let Some(base) = name.strip_suffix(".q8_data") { return Ok(base.to_string()); }
+                    if let Some(base) = name.strip_suffix(".q8_scale") { return Ok(base.to_string()); }
+                    return Ok(name.to_string());
+                }
+            }
+            anyhow::bail!("Tensor not found matching: {:?}", kws)
+        };
+
+        let head_name = find_base(&["head"], &shared_st)
+            .or_else(|_| find_base(&["output"], &shared_st))
+            .or_else(|_| find_base(&["embed"], &shared_st))?;
+
+        let head_w = crate::models::qwen3vl::quantized_model::load_q8_tensor(&shared_st, &head_name, text_device)?;
         let lm_head = QLinear::new(candle_core::quantized::QMatMul::Tensor(head_w), None, text_device.clone());
 
         Ok(Self {

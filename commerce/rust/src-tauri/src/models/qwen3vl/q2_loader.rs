@@ -70,17 +70,14 @@ pub fn dequantize_q2_cuda(packed: Tensor, scales: Tensor, shape: &[usize], devic
 pub fn dequantize_i8(data: Tensor, scale: Tensor, device: &Device) -> Result<Tensor> {
     let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
     
-    // 1. I8 데이터를 타겟 장치로 이동 후 float로 변환
-    let data = if data.dtype() != DType::U8 {
-        data.to_dtype(DType::U8)? 
-    } else {
-        data
-    };
-    let scale = scale.to_device(device)?.to_dtype(DType::F32)?;
+    // [FIX] 데이터(CPU)와 스케일(CPU)을 모두 GPU로 확실히 넘긴 뒤, 
+    // 곱셈이 가능하도록 둘 다 F32 타입으로 맞춰줍니다.
+    let data_f32 = data.to_dtype(DType::F32)?.to_device(device)?;
+    let scale_f32 = scale.to_device(device)?.to_dtype(DType::F32)?;
     
-    // 2. 스케일 곱하기 (Broadcasting 지원)
-    let out = data.broadcast_mul(&scale)?;
+    // GPU 위에서 초고속으로 곱셈 수행!
+    let out = data_f32.broadcast_mul(&scale_f32)?;
     
-    // 3. 최종 데이터 타입으로 변환
+    // 최종 데이터 타입(BF16)으로 변환하여 반환
     out.to_dtype(target_dtype)
 }
