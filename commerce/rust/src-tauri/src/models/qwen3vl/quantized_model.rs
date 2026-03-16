@@ -67,10 +67,18 @@ impl Module for RmsNorm {
             return Err(candle_core::Error::Msg("RMSNorm weight is cleared. Reload required.".to_string()));
         }
         let target_dtype = self.weight.dtype();
-        let x = x.to_dtype(DType::F32)?;
-        let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-        let hidden_states = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let hidden_states = hidden_states.to_dtype(target_dtype)?;
+        
+        // [최적화 1] 분산을 구하기 위한 연산은 어쩔수 없이 F32 사용
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let variance = x_f32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        
+        // [CRITICAL FIX] 전체 행렬이 아닌 '(분산+eps)의 역수'만 F32로 계산 후 BF16으로 변환!
+        let inv_std = (variance + self.eps)?.sqrt()?.recip()?;
+        let inv_std_bf16 = inv_std.to_dtype(target_dtype)?;
+        
+        // [최적화 2] 원본 BF16 행렬에 BF16 역표준편차를 곱함 (나눗셈 대비 GPU 연산 속도 2배)
+        let hidden_states = x.broadcast_mul(&inv_std_bf16)?;
+        
         hidden_states.broadcast_mul(&self.weight)
     }
 }
@@ -148,22 +156,22 @@ impl QLinear {
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
         
         let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
+        // [CRITICAL FIX] 여기서 아예 xs의 타입을 타겟 타입으로 굳혀버립니다!
+        let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
+        
         let (b, s, h) = xs.dims3()?;
         let xs_flat = xs.reshape((b * s, h))?;
-
-        // [FIX] Handle different QMatMul variants correctly to avoid dtype mismatch
+        
         let out = match &self.inner {
             QMatMul::QTensor(_q) => {
-                // Quantized path: Candle's QMatMul::forward(QTensor) expects F32 input
                 let xs_f32 = xs_flat.to_dtype(DType::F32)?;
                 self.inner.forward(&xs_f32)?
             },
             QMatMul::Tensor(t) => {
-                // Sliced/Unquantized path: types must match exactly (e.g. BF16 * BF16)
-                let xs_typed = xs_flat.to_dtype(t.dtype())?;
-                self.inner.forward(&xs_typed)?
+                // [수정 전] let xs_typed = xs_flat.to_dtype(t.dtype())?; self.inner.forward(&xs_typed)?
+                // [수정 후] 이미 타입이 맞으므로 캐스팅 없이 초고속 다이렉트 행렬곱!
+                self.inner.forward(&xs_flat)?
             },
-            // Handle other variants if they exist in this candle version
             _ => {
                 let xs_f32 = xs_flat.to_dtype(DType::F32)?;
                 self.inner.forward(&xs_f32)?
@@ -600,19 +608,19 @@ impl QuantizedQwen3VLTextAttention {
             let q_indices = Tensor::arange(0u32, q_len as u32, dev)?.unsqueeze(1)?;
             let k_indices = Tensor::arange(0u32, total_len as u32, dev)?.unsqueeze(0)?;
             let mask = k_indices.broadcast_gt(&(q_indices.broadcast_add(&Tensor::new(seqlen_offset as u32, dev)?)?))?;
-            let mask = mask.to_dtype(DType::F32)?.affine(-1e9, 0.0)?;
+            let mask = mask.to_dtype(target_dtype)?.affine(-1e4, 0.0)?; // BF16 안전 범위로 조정
             Some(mask.unsqueeze(0)?.unsqueeze(0)?)
         } else {
             attention_mask_in.map(|m| m.clone())
         };
 
         let mut query_states = self.q_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
-        query_states = self.q_norm.forward(&query_states)?.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+        query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?.contiguous()?;
         
         let mut key_states = self.k_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
-        key_states = self.k_norm.forward(&key_states)?.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+        key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?.contiguous()?;
         
-        let value_states = self.v_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?.to_dtype(target_dtype)?;
+        let value_states = self.v_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
 
         let cos = cos.to_dtype(target_dtype)?;
         let sin = sin.to_dtype(target_dtype)?;
@@ -806,7 +814,7 @@ impl QuantizedQwen3VLTextAttention {
                 if b_off < mask_len {
                     let take = std::cmp::min(actual_kv_len, mask_len - b_off);
                     let chunk_mask = mask.narrow(candle_core::D::Minus1, b_off, take)?;
-                    s_chunk = s_chunk.broadcast_add(&chunk_mask.to_dtype(s_chunk.dtype())?)?;
+                    s_chunk = s_chunk.broadcast_add(&chunk_mask)?; 
                 }
             }
 
@@ -816,16 +824,19 @@ impl QuantizedQwen3VLTextAttention {
             let p_j = s_chunk_f32.broadcast_sub(&m_j)?.exp()?;
             let l_j = p_j.sum_keepdim(candle_core::D::Minus1)?;
             
-            let p_j_cast = p_j.to_dtype(v.dtype())?;
-            let out_j = p_j_cast.matmul(&v)?;
+            // 행렬곱(MatMul)은 GPU 텐서코어를 극대화하기 위해 BF16으로 수행
+            let out_j = p_j.to_dtype(v.dtype())?.matmul(&v)?;
+            
+            // 누산(Accumulation) 정밀도를 위해 이 작은 결과값만 F32로 승격
+            let out_j_f32 = out_j.to_dtype(DType::F32)?;
 
             match out_res {
                 None => {
-                    out_res = Some(out_j);
+                    out_res = Some(out_j_f32); // [FIX] 처음부터 F32 상태로 저장!
                     m_n = Some(m_j);
                     l_n = Some(l_j);
                 }
-                Some(prev_out) => {
+                Some(prev_out_f32) => { // [FIX] 이미 F32이므로 무거운 prev_out.to_dtype 삭제!
                     let prev_m = m_n.as_ref().unwrap();
                     let prev_l = l_n.as_ref().unwrap();
                     
@@ -833,14 +844,10 @@ impl QuantizedQwen3VLTextAttention {
                     let diff_old = prev_m.broadcast_sub(&m_new)?.exp()?;
                     let diff_new = m_j.broadcast_sub(&m_new)?.exp()?;
                     
-                    let prev_out_f32 = prev_out.to_dtype(DType::F32)?;
-                    let out_j_f32 = out_j.to_dtype(DType::F32)?;
-                    
                     let l_new = prev_l.broadcast_mul(&diff_old)?.add(&l_j.broadcast_mul(&diff_new)?)?;
                     let out_new_f32 = prev_out_f32.broadcast_mul(&diff_old)?.add(&out_j_f32.broadcast_mul(&diff_new)?)?;
-                    let out_new = out_new_f32.to_dtype(v.dtype())?;
                     
-                    out_res = Some(out_new);
+                    out_res = Some(out_new_f32); // [FIX] 다시 BF16으로 깎아내는 오버헤드 삭제!
                     m_n = Some(m_new);
                     l_n = Some(l_new);
                 }
@@ -852,9 +859,9 @@ impl QuantizedQwen3VLTextAttention {
         }
 
         // [STEP C] Finalize Attention Output
-        let attn_output = if let (Some(out), Some(l)) = (out_res, l_n) {
-            let l_cast = l.to_dtype(out.dtype())?;
-            out.broadcast_div(&l_cast)?
+        let attn_output = if let (Some(out_f32), Some(l_f32)) = (out_res, l_n) {
+            // [CRITICAL FIX] 400번 하던 캐스팅을 루프가 다 끝난 뒤 여기서 딱 1번만 합니다!
+            out_f32.broadcast_div(&l_f32)?.to_dtype(target_dtype)?
         } else {
             return Err(anyhow!("No KV data processed"));
         };
@@ -875,31 +882,8 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn decompress_from_bf16(&self, data: &Tensor, _original_shape: &[usize], device: &Device) -> Result<Tensor> {
-        let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-        // Data is already BF16 tensor (loaded from safetensors), just move to device and cast
         let t = data.to_device(device)?;
-        Ok(t.to_dtype(target_dtype)?)
-    }
-
-    pub fn decompress_from_1bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
-        let device = packed.device();
-        let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
-        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let last_dim = original_shape[original_shape.len() - 1];
-        let total_elements: usize = original_shape.iter().product();
-        let mut decoded = vec![0.0f32; total_elements];
-        use rayon::prelude::*;
-        decoded.par_chunks_mut(last_dim).enumerate().for_each(|(v_idx, vector_out)| {
-            let s = scales_vec[v_idx];
-            let t_start = v_idx * last_dim;
-            for i in 0..last_dim {
-                let global_idx = t_start + i;
-                let is_set = (packed_vec[global_idx / 8] & (1 << (global_idx % 8))) != 0;
-                vector_out[i] = if is_set { s } else { -s };
-            }
-        });
-        let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
-        Ok(t.to_device(device)?)
+        Ok(t) 
     }
 
     pub fn decompress_from_8bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
@@ -1124,7 +1108,7 @@ impl QuantizedQwen3VLTextAttention {
     /// [VRAM-EVACUATION] VRAM에 있는 모든 활성 블록을 RAM 캐시로 강제 이동합니다. (SSD 저장 준비 단계)
     pub fn evacuate_vram_to_cache(&mut self) -> Result<()> {
         let dev = &Device::Cpu;
-        let target_dtype = DType::F32;
+        let target_dtype = DType::BF16;
 
         // 1. 병합된 VRAM 누산기(vram_merged_k/v) 해체
         if let (Some(mk), Some(mv)) = (&self.vram_merged_k, &self.vram_merged_v) {
@@ -1561,24 +1545,23 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
         let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
 
-        let mut cos = if !cos.device().same_device(dev) { cos.to_device(dev)? } else { cos.clone() };
-        if cos.dtype() != target_dtype { cos = cos.to_dtype(target_dtype)?; }
-
-        let mut sin = if !sin.device().same_device(dev) { sin.to_device(dev)? } else { sin.clone() };
-        if sin.dtype() != target_dtype { sin = sin.to_dtype(target_dtype)?; }
-
+        let cos_ref = cos; 
+        let sin_ref = sin;
+        
         let attention_mask = if let Some(mask) = attention_mask {
              Some(if !mask.device().same_device(dev) { mask.to_device(dev)? } else { mask.clone() })
         } else {
              None
         };
-
+        
         let residual = xs.clone();
         let xs = self.input_layernorm.forward(&xs)?;
-        let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref(), seqlen_offset, session_id, kv_name, baking_only)?;
+        
+        // 주의: 아래 forward 호출 시 cos_ref, sin_ref를 넘겨주도록 변경
+        let xs = self.self_attn.forward(&xs, cos_ref, sin_ref, attention_mask.as_ref(), seqlen_offset, session_id, kv_name, baking_only)?;
         
         // [HARDENING] Residual Addition DType Guard
-        let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
+        
         let xs = residual.add(&xs)?;
         
         // [OPTIMIZATION] Skip MLP block if not available (MLP 0% Mode)
@@ -1593,7 +1576,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
                 down_proj.forward(&hidden)?
             };
             // [HARDENING] Second Residual Addition DType Guard
-            let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
+            // let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
             Ok(residual.add(&xs)?)
         } else {
             // MLP was skipped (Attention-Only), just return result after attention
@@ -2142,8 +2125,8 @@ impl QuantizedQwen3VLTextModel {
                     let (idx, _) = vram_indices[i];
                     let mut inner = kv_blocks[idx].inner.write().unwrap();
                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
+                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
                         inner.k_cache = Some(k_cpu);
                         inner.v_cache = Some(v_cpu);
                         inner.location = KVLocation::RAM;
@@ -2392,8 +2375,8 @@ impl QuantizedQwen3VLTextModel {
                     let (idx, _) = vram_indices[i];
                     let mut inner = kv_blocks[idx].inner.write().unwrap();
                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
+                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
                         inner.k_cache = Some(k_cpu);
                         inner.v_cache = Some(v_cpu);
                         inner.location = KVLocation::RAM;

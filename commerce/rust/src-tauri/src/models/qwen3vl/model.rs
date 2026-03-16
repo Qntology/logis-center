@@ -551,8 +551,8 @@ impl Qwen3VLVisionModel {
         let mut hidden_states = hidden_states.reshape((seq_len, ()))?;
         let rotary_pos_emb = rotary_pos_emb.reshape((seq_len, ()))?;
         let emb = Tensor::cat(&[&rotary_pos_emb, &rotary_pos_emb], D::Minus1)?;
-        let cos = emb.cos()?;
-        let sin = emb.sin()?;
+        let cos = emb.cos()?.to_dtype(self.dtype)?;
+        let sin = emb.sin()?.to_dtype(self.dtype)?;
         let cu_seqlens = grid_thw.i((.., 1))?.mul(&grid_thw.i((.., 2))?)?;
         let grid_t = grid_thw.i((.., 0))?.to_vec1::<u32>()?;
         let mut cu_seqlens_repeat = Vec::new();

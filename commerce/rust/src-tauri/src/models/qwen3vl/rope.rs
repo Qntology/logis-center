@@ -64,8 +64,8 @@ pub fn apply_rotary_pos_emb_vision(
 ) -> Result<(Tensor, Tensor)> {
     let cos = cos.unsqueeze(D::Minus2)?;
     let sin = sin.unsqueeze(D::Minus2)?;
-    let cos = cos.to_dtype(q.dtype())?;
-    let sin = sin.to_dtype(q.dtype())?;
+    // let cos = cos.to_dtype(q.dtype())?;
+    // let sin = sin.to_dtype(q.dtype())?;
     let q_embed = q
         .broadcast_mul(&cos)?
         .add(&rotate_half(q)?.broadcast_mul(&sin)?)?;
@@ -100,12 +100,10 @@ pub fn apply_rotary_pos_emb(
 
     let q_embed = q
         .broadcast_mul(&cos)?
-        .add(&rotate_half(q)?.broadcast_mul(&sin)?)?
-        .to_dtype(orig_dtype)?;
+        .add(&rotate_half(q)?.broadcast_mul(&sin)?)?;
     let k_embed = k
         .broadcast_mul(&cos)?
-        .add(&rotate_half(k)?.broadcast_mul(&sin)?)?
-        .to_dtype(orig_dtype)?;
+        .add(&rotate_half(k)?.broadcast_mul(&sin)?)?;
     Ok((q_embed, k_embed))
 }
 
@@ -135,7 +133,6 @@ impl Qwen2_5VLTextRotaryEmbedding {
             position_ids.device(),
         )?
         .broadcast_as((3, position_ids.dim(1)?, self.inv_freq.len(), 1))?
-        .to_dtype(DType::F32)?
         .contiguous()?;
 
         let freqs = inv_freq_expanded
@@ -241,7 +238,6 @@ impl Qwen3VLTextRotaryEmbedding {
             position_ids.device(),
         )?
         .broadcast_as((3, position_ids.dim(1)?, self.inv_freq.len(), 1))?
-        .to_dtype(DType::F32)?
         .contiguous()?;
 
         let freqs = inv_freq_expanded
