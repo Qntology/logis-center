@@ -680,28 +680,24 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // 3. [WHAC-A-MOLE-ATTENTION] Iterative Block Loading (Constant VRAM O(1))
-        // Instead of gathering all blocks, we load, compute, and drop each block one by one.
-        let mut final_out: Option<Tensor> = None;
-        let mut max_logits_acc: Option<Tensor> = None;
-        let mut sum_exp_acc: Option<Tensor> = None;
-
+        // 3. [MERGED-ATTENTION] 모든 블록을 모아서 단 1번의 커널로 연산을 끝냅니다 (CUDA 오버헤드 0)
         let total_tokens_now = seqlen_offset + q_len;
+        let mut k_gathered = Vec::with_capacity(self.kv_blocks.len());
+        let mut v_gathered = Vec::with_capacity(self.kv_blocks.len());
+
         for block in &self.kv_blocks {
-            let (index, b_off, b_len) = {
+            let (index, b_off, _b_len) = {
                 let inner = block.inner.read().unwrap();
                 (inner.index, inner.offset, inner.len)
             };
             if b_off >= total_tokens_now { continue; }
 
-            // [STEP A] Load Block to VRAM (Temporary or Pinned)
+            // [STEP A] Load Block to VRAM (기존의 안전한 Fallback 로딩 로직 유지)
             let (k_block, v_block, is_temporary) = {
                 let inner = block.inner.read().unwrap();
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    // Already in VRAM (Pinned for Small Model or Cache Hit)
                     (k.to_device(dev)?.to_dtype(target_dtype)?, v.to_device(dev)?.to_dtype(target_dtype)?, false)
                 } else {
-                    // Not in VRAM -> Temporary Load from RAM/SSD
                     let mut k_cpu = None;
                     let mut v_cpu = None;
                     {
@@ -715,26 +711,21 @@ impl QuantizedQwen3VLTextAttention {
                     }
 
                     if k_cpu.is_none() {
-                        // [SMART-PATH-DISCOVERY] Registry에 경로가 아직 등록되지 않았더라도 직접 추론하여 로드 시도
                         let kv_dir = crate::utils::paths::get_kv_dir(None);
                         let sid = self.active_session_id.as_deref().unwrap_or("general");
-                        
-                        // 현재 세션의 모든 가능성 있는 경로 후보군 생성
                         let mut path_candidates = Vec::new();
                         
-                        // 1. Registry에 등록된 경로 (가장 확실)
                         if let Some(p) = { let reg = self.registry.entries.read().unwrap(); if index < reg.len() { reg[index].ssd_path.clone() } else { None } } {
                             path_candidates.push(p);
                         }
                         
-                        // 2. 현재 세션 컨텍스트 기반 추론 (goods, inference, text 등 자동 대응)
                         let kv_name_raw = self.active_kv_name.as_deref().unwrap_or("text");
                         let kv_type = kv_name_raw.split('/').last().unwrap_or("text");
                         let kv_type = if kv_type == "inference" || kv_type == "reference" || kv_type.is_empty() { "text" } else { kv_type };
                         
                         path_candidates.push(kv_dir.join(format!("{}/inference/{}/b{}", sid, kv_type, b_off)));
                         path_candidates.push(kv_dir.join(format!("{}/reference/{}/b{}", sid, kv_type, b_off)));
-                        path_candidates.push(kv_dir.join(format!("{}/inference/text/b{}", sid, b_off))); // Fallback
+                        path_candidates.push(kv_dir.join(format!("{}/inference/text/b{}", sid, b_off)));
 
                         let mut load_success = false;
                         for full_path in &path_candidates {
@@ -751,7 +742,6 @@ impl QuantizedQwen3VLTextAttention {
                                                     let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                                                     let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
                                                     
-                                                    // [SAFE-FALLBACK] 크기 불일치 에러 시 프로그램 종료 방지
                                                     let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap_or_else(|_| Tensor::zeros(meta_os.clone(), DType::BF16, &Device::Cpu).unwrap());
                                                     let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap_or_else(|_| Tensor::zeros(meta_os.clone(), DType::BF16, &Device::Cpu).unwrap());
                                                     
@@ -774,10 +764,7 @@ impl QuantizedQwen3VLTextAttention {
                                 }
                             }
                         }
-                        
-                        if !load_success {
-                            println!("[CRITICAL-LOAD] Exhausted all path candidates for Block {}. Last tried: {:?}", index, path_candidates.last());
-                        }
+                        if !load_success { println!("[CRITICAL-LOAD] Exhausted all path candidates for Block {}.", index); }
                     }
 
                     let k_final = k_cpu.ok_or_else(|| anyhow!("Block {} missing. (Session: {}, Layer: {})", index, self.active_session_id.as_deref().unwrap_or("None"), self.layer_idx))?.to_device(dev)?.to_dtype(target_dtype)?;
@@ -785,11 +772,22 @@ impl QuantizedQwen3VLTextAttention {
                     (k_final, v_final, true)
                 }
             };
-
             if !is_temporary { vram_count += 1; }
 
-            // [STEP B] Partial Attention Computation
-            let (mut k, mut v) = (k_block, v_block);
+            // 연산을 수행하지 않고 배열에 모으기만 합니다.
+            k_gathered.push(k_block);
+            v_gathered.push(v_block);
+        }
+
+        // [STEP B & C] 병합된 단일 Attention 연산
+        let attn_output = if !k_gathered.is_empty() {
+            let mut k = Tensor::cat(&k_gathered, 2)?;
+            let mut v = Tensor::cat(&v_gathered, 2)?;
+            
+            // 메모리 압박 방지를 위해 원본 배열 즉시 소각
+            drop(k_gathered);
+            drop(v_gathered);
+
             if self.num_kv_groups > 1 {
                 let (b, h, s, d) = k.dims4()?;
                 k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
@@ -800,54 +798,26 @@ impl QuantizedQwen3VLTextAttention {
             let mut attn_weights = (q_aligned.matmul(&k.transpose(2, 3)?)? * self.scaling)?;
 
             if let Some(mask) = &attention_mask {
-                let m_len = mask.dim(candle_core::D::Minus1)?;
-                if b_off < m_len {
-                    let take = (m_len - b_off).min(b_len);
-                    let m_sub = mask.narrow(candle_core::D::Minus1, b_off, take)?;
-                    if take < b_len {
-                        let attn_sub = attn_weights.narrow(candle_core::D::Minus1, 0, take)?;
-                        let attn_masked = attn_sub.broadcast_add(&m_sub.to_dtype(attn_weights.dtype())?)?;
-                        attn_weights = attn_weights.slice_assign(&[0..attn_weights.dim(0)?, 0..attn_weights.dim(1)?, 0..attn_weights.dim(2)?, 0..take], &attn_masked)?;
-                    } else {
-                        attn_weights = attn_weights.broadcast_add(&m_sub.to_dtype(attn_weights.dtype())?)?;
-                    }
-                }
+                let actual_kv_len = k.dim(2)?;
+                let mask_len = mask.dim(candle_core::D::Minus1)?;
+                let final_mask = if mask_len > actual_kv_len {
+                    mask.narrow(candle_core::D::Minus1, 0, actual_kv_len)?
+                } else {
+                    mask.clone()
+                };
+                attn_weights = attn_weights.broadcast_add(&final_mask.to_dtype(attn_weights.dtype())?)?;
             }
 
-            let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
-            let max_logits = attn_weights_f32.max_keepdim(candle_core::D::Minus1)?;
-            let exp_weights = attn_weights_f32.broadcast_sub(&max_logits)?.exp()?;
-            let sum_exp = exp_weights.sum_keepdim(candle_core::D::Minus1)?;
-            let out_block = exp_weights.to_dtype(v.dtype())?.matmul(&v)?;
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            attn_weights.to_dtype(v.dtype())?.matmul(&v)?
+        } else {
+            return Err(anyhow!("No KV data processed"));
+        };
 
-            // [STEP C] Merge Logic (Online Softmax)
-            if let (Some(prev_out), Some(prev_max), Some(prev_sum)) = (final_out, max_logits_acc, sum_exp_acc) {
-                let new_max = prev_max.broadcast_maximum(&max_logits)?;
-                let exp_p = prev_max.broadcast_sub(&new_max)?.exp()?;
-                let exp_n = max_logits.broadcast_sub(&new_max)?.exp()?;
-                let new_sum = (prev_sum.broadcast_mul(&exp_p)? + sum_exp.broadcast_mul(&exp_n)?)?;
-                let new_out = (prev_out.broadcast_mul(&exp_p.to_dtype(prev_out.dtype())?)? 
-                             + out_block.broadcast_mul(&exp_n.to_dtype(out_block.dtype())?)?)?;
-                final_out = Some(new_out);
-                max_logits_acc = Some(new_max);
-                sum_exp_acc = Some(new_sum);
-            } else {
-                final_out = Some(out_block);
-                max_logits_acc = Some(max_logits);
-                sum_exp_acc = Some(sum_exp);
-            }
-        }
+        // [FIX] Output Projection 복구: 다중 헤드 차원을 하나로 합치고 o_proj(선형 변환) 통과
+        let attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
+        let attn_output = self.o_proj.forward(&attn_output)?;
 
-        let attn_output = final_out.ok_or_else(|| anyhow!("No KV data processed"))?
-            .broadcast_div(&sum_exp_acc.unwrap().to_dtype(target_dtype)?)?;
-
-        // 4. [OUTPUT-PROJECTION]
-        let (b_sz, n_h, q_len, d_h) = attn_output.dims4()?;
-        let attn_output = self.o_proj.forward(&attn_output.transpose(1, 2)?.reshape((b_sz, q_len, n_h * d_h))?)?;
-        
-        if self.layer_idx == 0 {
-            println!("[SPEED] Token {} | R:{} S:{} V:{} | Attn: {:?}", total_tokens_now, ram_count, ssd_count, vram_count, start_attn.elapsed());
-        }
         Ok(attn_output)
     }
 
