@@ -55,6 +55,10 @@ impl RmsNorm {
     pub fn is_cleared(&self) -> bool {
         self.weight.elem_count() <= 1
     }
+
+    pub fn eps(&self) -> f64 {
+        self.eps
+    }
 }
 
 impl Module for RmsNorm {
@@ -538,6 +542,31 @@ impl QuantizedQwen3VLTextAttention {
             vram_merged_v: None,
             merged_vram_block_count: 0,
         })
+    }
+
+    pub fn load_weights_inplace<R: std::io::Seek + std::io::Read>(
+        &mut self,
+        ct: &gguf_file::Content,
+        reader: &mut R,
+        base_name: &str,
+        is_gguf_naming: bool,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<()> {
+        let (q, k, v, o, q_n, k_n) = if is_gguf_naming {
+            ("attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm")
+        } else {
+            ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
+        };
+
+        self.q_proj = get_qlinear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
+        self.k_proj = get_qlinear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?;
+        self.v_proj = get_qlinear(ct, reader, &format!("{base_name}.{v}"), device, dtype)?;
+        self.o_proj = get_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
+        self.q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), self.q_norm.eps(), device, dtype)?;
+        self.k_norm = get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), self.k_norm.eps(), device, dtype)?;
+
+        Ok(())
     }
 
     pub fn forward(
@@ -1470,6 +1499,36 @@ impl QuantizedQwen3VLTextDecoderLayer {
         })
     }
 
+    pub fn load_weights_inplace<R: std::io::Seek + std::io::Read>(
+        &mut self,
+        ct: &gguf_file::Content,
+        reader: &mut R,
+        base_name: &str,
+        device: &Device,
+        dtype: DType,
+        baking_only: bool,
+    ) -> Result<()> {
+        let is_gguf_naming = base_name.starts_with("blk.");
+        let (attn_base, gate, up, down, in_ln, post_ln) = if is_gguf_naming {
+            (base_name.to_string(), "ffn_gate", "ffn_up", "ffn_down", "attn_norm", "ffn_norm")
+        } else {
+            (format!("{}.self_attn", base_name), "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "input_layernorm", "post_attention_layernorm")
+        };
+
+        self.self_attn.load_weights_inplace(ct, reader, &attn_base, is_gguf_naming, device, dtype)?;
+
+        if !baking_only {
+            self.mlp_gate = Some(get_qlinear(ct, reader, &format!("{base_name}.{gate}"), device, dtype)?);
+            self.mlp_up = Some(get_qlinear(ct, reader, &format!("{base_name}.{up}"), device, dtype)?);
+            self.mlp_down = Some(get_qlinear(ct, reader, &format!("{base_name}.{down}"), device, dtype)?);
+            self.post_attention_layernorm = Some(get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), self.input_layernorm.eps(), device, dtype)?);
+        }
+
+        self.input_layernorm = get_rms_norm(ct, reader, &format!("{base_name}.{in_ln}"), self.input_layernorm.eps(), device, dtype)?;
+
+        Ok(())
+    }
+
     pub fn forward(
         &mut self,
         xs: &Tensor,
@@ -1594,6 +1653,7 @@ pub struct QuantizedQwen3VLTextModel {
 
 impl QuantizedQwen3VLTextModel {
     /// [MEMORY-OPT] 특정 레이어의 가중치를 mmap에서 다시 로드합니다.
+    /// [MEMORY-OPT] 특정 레이어의 가중치를 mmap에서 In-place로 덮어씁니다.
     pub fn reload_layer(&mut self, layer_idx: usize) -> Result<()> {
         if !self.layers[layer_idx].self_attn.q_proj.is_cleared() {
             return Ok(());
@@ -1609,26 +1669,11 @@ impl QuantizedQwen3VLTextModel {
         } else {
             format!("{}.layers.{layer_idx}", self.base_name)
         };
-        
-        let new_layer = QuantizedQwen3VLTextDecoderLayer::new(
-            &self.config,
-            ct,
-            &mut reader,
-            &prefix,
-            &Device::Cpu, // 항상 CPU로 먼저 로드
-            self.dtype,
-            layer_idx,
-            self.baking_only,
-            self.registry.clone()
+
+        // [PING-PONG] 새로 레이어를 만들지 않고, 껍데기에 값만 밀어넣음!
+        self.layers[layer_idx].load_weights_inplace(
+            ct, &mut reader, &prefix, &Device::Cpu, self.dtype, self.baking_only
         )?;
-        
-        // 기존 KV 캐시(상태)는 유지하고 가중치만 교체
-        let old_kv_blocks = self.layers[layer_idx].self_attn.kv_blocks.clone();
-        let old_active_kv = self.layers[layer_idx].self_attn.active_kv_name.clone();
-        
-        self.layers[layer_idx] = new_layer;
-        self.layers[layer_idx].self_attn.kv_blocks = old_kv_blocks;
-        self.layers[layer_idx].self_attn.active_kv_name = old_active_kv;
         
         Ok(())
     }
@@ -2155,10 +2200,10 @@ impl QuantizedQwen3VLTextModel {
         }
 
         // [FIRE & SHOT] 다음 레이어 로드 (VRAM에 2개만 올림)
-        if !is_decoding && layer_idx + 1 < self.layers.len() {
-            self.reload_layer(layer_idx + 1)?;
-            let _ = self.layers[layer_idx + 1].to_device(&target_device);
-        }
+        // if !is_decoding && layer_idx + 1 < self.layers.len() {
+        //     self.reload_layer(layer_idx + 1)?;
+        //     let _ = self.layers[layer_idx + 1].to_device(&target_device);
+        // }
 
         // [STEP 3] GPU 연산 실행
         let current_seq_len = xs.dim(1)?;
@@ -2471,10 +2516,12 @@ impl QuantizedQwen3VLTextModel {
             layer.self_attn.active_kv_name = kv_name.clone();
         }
 
-        // =========================================================================================
-        // [TRACK 2 PREP] 두 번째 트랙을 위한 백그라운드 태스크 홀더
-        // =========================================================================================
         let mut next_layer_task: Option<tokio::task::JoinHandle<Result<QuantizedQwen3VLTextDecoderLayer>>> = None;
+        
+        // [PING-PONG CARRIER] 서로 번갈아가며(Ping-Pong) 사용할 단 하나의 여분 껍데기 버퍼입니다.
+        let mut ping_pong_carrier = QuantizedQwen3VLTextDecoderLayer::new_skeleton(
+            &self.config, "dummy", &Device::Cpu, self.dtype, 0, self.baking_only, self.registry.clone()
+        )?;
 
         // 시작점: 0번 레이어는 첫 루프 진입 전 미리 띄워둡니다.
         if !is_decoding && self.layers[0].self_attn.q_proj.is_cleared() {
@@ -2487,7 +2534,7 @@ impl QuantizedQwen3VLTextModel {
 
         for layer_idx in 0..total_layers {
             if layer_idx % 7 == 0 || layer_idx == total_layers - 1 {
-                println!("[ENGINE] Running Layer {}/{} (Two-Track Pipeline Active)", layer_idx + 1, total_layers);
+                println!("[ENGINE] Running Layer {}/{} (Ping-Pong Pipeline Active)", layer_idx + 1, total_layers);
             }
 
             // =========================================================================
@@ -2495,55 +2542,54 @@ impl QuantizedQwen3VLTextModel {
             // =========================================================================
             if !is_decoding && layer_idx + 1 < total_layers {
                 let next_idx = layer_idx + 1;
-                
-                // 스레드로 넘겨주기 위한 메타데이터 복제 (오버헤드 거의 없음)
                 let mmap_clone = self.mmap.clone();
                 let ct_clone = self.ct.clone();
-                let config_clone = self.config.clone();
                 let dtype = self.dtype;
-                let registry_clone = self.registry.clone();
                 let baking_only = self.baking_only;
                 let base_name = self.base_name.clone();
                 let dev_clone = target_device.clone();
+
+                // 이번 턴에 데이터를 채워넣을 빈 껍데기(Carrier)를 백그라운드 스레드로 넘깁니다.
+                let mut carrier = ping_pong_carrier.clone();
 
                 next_layer_task = Some(tokio::task::spawn_blocking(move || -> Result<QuantizedQwen3VLTextDecoderLayer> {
                     let mmap = mmap_clone.ok_or_else(|| anyhow!("Mmap missing"))?;
                     let ct_arc = ct_clone.ok_or_else(|| anyhow!("GGUF missing"))?;
                     let mut reader = std::io::Cursor::new(&mmap[..]);
+            
                     let gguf_blk = format!("blk.{}", next_idx);
                     let prefix = if ct_arc.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{}.layers.{}", base_name, next_idx) };
                     
-                    let mut new_layer = QuantizedQwen3VLTextDecoderLayer::new(
-                        &config_clone, &ct_arc, &mut reader, &prefix, &Device::Cpu, dtype, next_idx, baking_only, registry_clone
-                    )?;
-                    
-                    // 핵심: GPU 코어가 N번째를 계산하는 동안, 이 백그라운드 스레드는 PCIe 대역폭을 써서 VRAM에 N+1을 전송해 둡니다.
-                    new_layer.to_device(&dev_clone)?;
-                    Ok(new_layer)
+                    // [PING-PONG] 새로운 메모리를 할당하지 않고, Carrier에 In-place로 덮어씁니다!
+                    carrier.load_weights_inplace(&ct_arc, &mut reader, &prefix, &Device::Cpu, dtype, baking_only)?;
+                    carrier.to_device(&dev_clone)?;
+                    Ok(carrier)
                 }));
             }
 
             // =========================================================================
-            // [TRACK 1] 메인 연산 트랙 (N번째 레이어)
+            // [TRACK 1] 메인 연산 트랙 (N번째 레이어) - 청크 처리
             // =========================================================================
             let deepstack_embed = deepstack_visual_embeds.as_ref().and_then(|v| v.get(layer_idx));
             xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks, session_id.clone(), kv_name.clone(), self.baking_only).await?;
 
-            // Track 1 연산이 끝났으므로 N번째 레이어의 가중치는 VRAM에서 즉시 소각합니다.
+            // Track 1 연산이 끝났으므로 N번째 레이어의 가중치는 즉시 소각됩니다. 
+            // (process_single_layer 내에서 clear()가 호출됨)
             if !is_decoding {
-                self.layers[layer_idx].clear();
+                // [PING-PONG SWAP] 방금 다 쓰고 비워진 껍데기(현재 레이어)를 복사하여 다음 턴의 빈 그릇으로 재활용합니다!
+                ping_pong_carrier = self.layers[layer_idx].clone();
             }
 
             // =========================================================================
             // [TRACK SYNC] 다음 루프로 넘어가기 전, Track 2에서 준비된 N+1 레이어 장착
             // =========================================================================
             if let Some(task) = next_layer_task.take() {
-                // 이미 스레드에서 VRAM 전송까지 끝내놨기 때문에 대기시간(await)이 거의 발생하지 않고 즉시 통과됩니다.
                 let mut ready_layer = task.await??; 
                 
-                // KV 캐시 메타데이터는 기존 것을 보존하여 안전하게 덮어씌웁니다.
+                // KV 캐시의 메타데이터(장부)는 기존 N+1 레이어의 것을 보존해야 하므로 덮어씌웁니다.
                 ready_layer.self_attn.kv_blocks = self.layers[layer_idx + 1].self_attn.kv_blocks.clone();
                 ready_layer.self_attn.active_kv_name = self.layers[layer_idx + 1].self_attn.active_kv_name.clone();
+                ready_layer.self_attn.layer_idx = layer_idx + 1; 
                 
                 self.layers[layer_idx + 1] = ready_layer;
             }
