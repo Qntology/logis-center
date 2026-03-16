@@ -4,6 +4,4 @@ pub mod generate;
 pub mod model;
 pub mod processor;
 pub mod quantized_model;
-pub mod paged_attention;
-pub mod paged_attention_cpu;
 pub mod rope;

@@ -36,7 +36,6 @@ def quantize_tensor_q2(tensor, block_size=32):
     """LLM 레이어용 Q2_K 양자화 (4:1 패킹)"""
     if tensor.dtype not in [torch.float16, torch.bfloat16, torch.float32] or tensor.numel() < 128:
         return None, None, None
-        
     orig_shape = list(tensor.shape)
     flat = tensor.flatten().float()
     align = max(block_size, 4)
@@ -93,26 +92,18 @@ def process_model(model_path):
 
     print(f"[INFO] Found {len(layers)} LLM layers and {len(vision)} vision tensors.")
 
-    # 1. LLM 레이어 양자화 (Q2_K) -> 0.6B 모델이 깨지므로 일반 I8 양자화나 무압축으로 우회
-    for idx, layer_tensors in tqdm(layers.items(), desc="Quantizing LLM Layers (Fallback to I8)"):
+    # 1. LLM 레이어 양자화 (Q2_K)
+    for idx, layer_tensors in tqdm(layers.items(), desc="Quantizing LLM Layers (Q2)"):
         new_layer_dict = {}
         for name, tensor in layer_tensors.items():
-            # if "weight" in name and tensor.numel() > 1024:
-            #     packed, scales, shape = quantize_tensor_q2(tensor)
-            #     if packed is not None:
-            #         new_layer_dict[f"{name}.q2_packed"] = packed
-            #         new_layer_dict[f"{name}.q2_scales"] = scales
-            #         new_layer_dict[f"{name}.q2_shape"] = shape
-            #         continue
-            
-            # [FIX] 0.6B 모델은 Q2 양자화 대신 8비트(I8) 양자화를 적용합니다.
-            q8_data, q8_scale = quantize_to_i8(tensor)
-            if q8_scale is not None:
-                 new_layer_dict[f"{name}.q8_data"] = q8_data
-                 new_layer_dict[f"{name}.q8_scale"] = q8_scale
-            else:
-                 new_layer_dict[name] = tensor
-                 
+            if "weight" in name and tensor.numel() > 1024:
+                packed, scales, shape = quantize_tensor_q2(tensor)
+                if packed is not None:
+                    new_layer_dict[f"{name}.q2_packed"] = packed
+                    new_layer_dict[f"{name}.q2_scales"] = scales
+                    new_layer_dict[f"{name}.q2_shape"] = shape
+                    continue
+            new_layer_dict[name] = tensor
         save_file(new_layer_dict, os.path.join(model_path, f"layer_{idx}.st"))
 
     # 2. Shared 텐서 양자화 (I8) -> shared.st

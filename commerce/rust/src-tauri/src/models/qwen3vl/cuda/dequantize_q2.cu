@@ -11,8 +11,11 @@ extern "C" __global__ void dequantize_q2_bf16_kernel(
     if (idx >= num_packed_bytes) return;
 
     unsigned char p = packed[idx];
+    
+    // 파이썬 로직: block_size=32. 1 byte = 4 elements. 즉 8 bytes마다 scale 1개.
     float scale = __half2float(scales[idx / 8]); 
 
+    // 역산: (val - 1.5) * scale
     float v0 = (((p >> 6) & 0x03) - 1.5f) * scale;
     float v1 = (((p >> 4) & 0x03) - 1.5f) * scale;
     float v2 = (((p >> 2) & 0x03) - 1.5f) * scale;

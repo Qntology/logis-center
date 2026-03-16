@@ -9,8 +9,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use memmap2::Mmap;
 
-use crate::models::qwen3vl::paged_attention::run_paged_flash_decoding;
-
 use crate::{
     models::{
         qwen3vl::config::{Qwen3VLConfig, Qwen3VLTextConfig},
@@ -98,7 +96,7 @@ impl QLinear {
         }
     }
 
-    /// [MEMORY-OPT] 가중치를 메모리에서 해제합니다.
+    /// [MEMORY-OPT] 가중치를 메모리에서 해제합니다. 
     pub fn clear(&mut self) {
         // 더미 텐서의 타입은 해제용이므로 F32로 고정
         self.inner = QMatMul::Tensor(Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap());
@@ -652,66 +650,6 @@ impl QuantizedQwen3VLTextAttention {
                 tokens_to_process -= take; chunk_offset += take;
             }
         }
-
-        // [FAST PATH] Paged Flash-Decoding (디코딩 단계, q_len == 1 일 때만 작동)
-        if q_len == 1 && !self.kv_blocks.is_empty() {
-            let mut k_tensors = Vec::with_capacity(self.kv_blocks.len());
-            let mut v_tensors = Vec::with_capacity(self.kv_blocks.len());
-            let mut can_use_paged_attn = true;
-
-            // 1. 모든 블록이 현재 Device에 있고 알맞은 상태인지 확인
-            for block in &self.kv_blocks {
-                let inner = block.inner.read().unwrap();
-                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    if k.device().same_device(dev) && v.device().same_device(dev) {
-                        k_tensors.push(k.clone());
-                        v_tensors.push(v.clone());
-                    } else {
-                        can_use_paged_attn = false; break;
-                    }
-                } else {
-                    can_use_paged_attn = false; break;
-                }
-            }
-
-            // 2. 조건이 맞으면 Device에 따라 적절한 커널 호출 후 즉시 리턴
-            if can_use_paged_attn {
-                let k_refs: Vec<&Tensor> = k_tensors.iter().collect();
-                let v_refs: Vec<&Tensor> = v_tensors.iter().collect();
-
-                let paged_result = if dev.is_cuda() {
-                    // [GPU CUDA 커널]
-                    crate::models::qwen3vl::paged_attention::run_paged_flash_decoding(
-                        &query_states, &k_refs, &v_refs, self.num_key_value_heads, self.scaling
-                    )
-                } else {
-                    // [CPU SIMD 커널]
-                    crate::models::qwen3vl::paged_attention_cpu::run_paged_flash_decoding_cpu(
-                        &query_states, &k_refs, &v_refs, self.num_key_value_heads, self.scaling
-                    )
-                };
-
-                match paged_result {
-                    Ok(attn_output) => {
-                        let (b_sz, n_h, _q, d_h): (usize, usize, usize, usize) = attn_output.dims4()?;
-                        let final_output = self.o_proj.forward(
-                            &attn_output.transpose(1, 2)?.reshape((b_sz, 1, n_h * d_h))?
-                        )?;
-                        
-                        if self.layer_idx == 0 {
-                            let hw = if dev.is_cuda() { "GPU CUDA" } else { "CPU SIMD" };
-                            println!("[SPEED-PAGED] Token {} | {} Accelerated | Attn: {:?}", 
-                                seqlen_offset + q_len, hw, start_attn.elapsed());
-                        }
-                        
-                        return Ok(final_output);
-                    },
-                    Err(e) => {
-                        println!("[WARN] Paged Attention failed, falling back to Whac-A-Mole: {}", e);
-                    }
-                }
-            }
-        }      
 
         // 3. [WHAC-A-MOLE-ATTENTION] Iterative Block Loading (Constant VRAM O(1))
         // Instead of gathering all blocks, we load, compute, and drop each block one by one.
@@ -1949,8 +1887,6 @@ impl QuantizedQwen3VLTextModel {
         kv_name: Option<String>,
         baking_only: bool,
     ) -> Result<Tensor> {
-        let chunk_process_start = std::time::Instant::now();
-
         let mut final_output: Option<Tensor> = None;
         let chunk_size = 256;
         let current_seq_len = xs.dim(1)?;
@@ -2046,7 +1982,7 @@ impl QuantizedQwen3VLTextModel {
             let is_small_model = self.layers.len() <= 36;
             let current_kv_len = self.layers[layer_idx].get_kv_len();
             
-            if !is_small_model || current_kv_len >= 1024 {
+            if !is_small_model || current_kv_len >= 4096 {
                 for (i, block) in self.layers[layer_idx].self_attn.kv_blocks.iter().enumerate() {
                     let (k_part, v_part) = {
                         let inner = block.inner.read().unwrap();
@@ -2077,26 +2013,7 @@ impl QuantizedQwen3VLTextModel {
                         }
                     }
                 }
-                // [VRAM 체크] NVML을 사용하여 현재 VRAM 사용량 조회
-                let mut vram_info = String::from("VRAM Info N/A");
-                if let Ok(nvml) = nvml_wrapper::Nvml::init() {
-                    if let Ok(device) = nvml.device_by_index(self.device_id as u32) {
-                        if let Ok(mem) = device.memory_info() {
-                            let used_mb = mem.used as f64 / 1_048_576.0;
-                            let total_mb = mem.total as f64 / 1_048_576.0;
-                            let percent = (used_mb / total_mb) * 100.0;
-                            vram_info = format!("{:.0}MB / {:.0}MB ({:.1}%)", used_mb, total_mb, percent);
-                        }
-                    }
-                }
-
-                println!("[ENGINE-TRACE] Layer {} Prefill Cache Moved to RAM ({} tokens). | VRAM: {} | Took: {:?}", 
-                    layer_idx, current_kv_len, vram_info, chunk_process_start.elapsed());
-            }else{
-                if layer_idx == 0 || layer_idx == self.layers.len() - 1 {
-                    println!("[ENGINE-TRACE] Layer {} Prefill processed ({} tokens). Kept in VRAM. | Took: {:?}", 
-                        layer_idx, current_kv_len, chunk_process_start.elapsed());
-                }
+                println!("[ENGINE-TRACE] Layer {} Prefill Cache Moved to RAM ({} tokens).", layer_idx, current_kv_len);
             }
         }
         
@@ -2110,9 +2027,9 @@ impl QuantizedQwen3VLTextModel {
         // 문맥이 너무 길어질 경우(예: 4096+) OOM 방지를 위해 RAM으로 대피를 허용합니다.
         let current_kv_len = self.layers[layer_idx].get_kv_len();
         let is_small_model = self.layers.len() <= 36;
-        if is_small_model && current_kv_len < 1024 { return Ok(()); }
+        if is_small_model && current_kv_len < 4096 { return Ok(()); }
 
-        let vram_limit = 512; 
+        let vram_limit = 1024; 
         let mut vram_evicted = false;
 
         if is_small_model {
@@ -2128,6 +2045,7 @@ impl QuantizedQwen3VLTextModel {
             // [FIX] VRAM 한도를 대폭 상향하여 불필요한 RAM 대피 방지 (기존 64 -> 1024)
             if free_ram_gb > 4.0 { 1024 } else if free_ram_gb > 2.0 { 512 } else { 128 }
         };
+        let mut vram_evicted = false;
 
         // 1. VRAM -> RAM 계층 관리
         {
@@ -2237,10 +2155,10 @@ impl QuantizedQwen3VLTextModel {
         }
 
         // [FIRE & SHOT] 다음 레이어 로드 (VRAM에 2개만 올림)
-        // if !is_decoding && layer_idx + 1 < self.layers.len() {
-        //     self.reload_layer(layer_idx + 1)?;
-        //     let _ = self.layers[layer_idx + 1].to_device(&target_device);
-        // }
+        if !is_decoding && layer_idx + 1 < self.layers.len() {
+            self.reload_layer(layer_idx + 1)?;
+            let _ = self.layers[layer_idx + 1].to_device(&target_device);
+        }
 
         // [STEP 3] GPU 연산 실행
         let current_seq_len = xs.dim(1)?;
@@ -2255,7 +2173,7 @@ impl QuantizedQwen3VLTextModel {
         // CPU RAM과 GPU VRAM에서 현재 레이어의 가중치를 완전히 제거합니다.
         if !is_decoding {
             self.layers[layer_idx].clear(); 
-            // if target_device.is_cuda() { let _ = target_device.synchronize(); }
+            if target_device.is_cuda() { let _ = target_device.synchronize(); }
             println!("[MEMORY-OPT] Layer {} Weights and Gradients cleared from RAM/VRAM.", layer_idx);
         }
 
@@ -2371,15 +2289,15 @@ impl QuantizedQwen3VLTextModel {
             let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
             
             // VRAM: 28개 레이어 x 40개 블록 = 1,120개. 2,048개까지 VRAM 상주 허용 (속도 극대화)
-            let v_limit = 512; 
+            let v_limit = 2048; 
             
             // RAM: 만약 VRAM에서 쫓겨나더라도 RAM에 5,000개까지는 안전하게 보관
             let r_limit = if free_ram_gb > 4.0 { 5000 } else { 2048 };
             (v_limit, r_limit)
         };
 
-        let v_limit = 512; 
-        let r_limit = 1024;
+        let v_limit = 2048; 
+        let r_limit = 5000;
 
         let mut vram_evicted = false;
 
@@ -2549,8 +2467,6 @@ impl QuantizedQwen3VLTextModel {
         let (cos, sin) = self.rotary_emb.forward(&position_ids, inputs_embeds.dtype(), self.mrope_section.clone())?;
         let total_layers = self.layers.len();
 
-        let forward_start_time = std::time::Instant::now();
-
         for layer in self.layers.iter_mut() {
             layer.self_attn.active_kv_name = kv_name.clone();
         }
@@ -2571,21 +2487,7 @@ impl QuantizedQwen3VLTextModel {
 
         for layer_idx in 0..total_layers {
             if layer_idx % 7 == 0 || layer_idx == total_layers - 1 {
-                // [VRAM 체크] NVML을 사용하여 현재 VRAM 사용량 조회
-                let mut vram_info = String::from("VRAM Info N/A");
-                if let Ok(nvml) = nvml_wrapper::Nvml::init() {
-                    if let Ok(device) = nvml.device_by_index(self.device_id as u32) {
-                        if let Ok(mem) = device.memory_info() {
-                            let used_mb = mem.used as f64 / 1_048_576.0;
-                            let total_mb = mem.total as f64 / 1_048_576.0;
-                            let percent = (used_mb / total_mb) * 100.0;
-                            vram_info = format!("{:.0}MB / {:.0}MB ({:.1}%)", used_mb, total_mb, percent);
-                        }
-                    }
-                }
-
-                println!("[ENGINE] Running Layer {}/{} (Two-Track Pipeline Active) | VRAM: {} | Elapsed: {:?}", 
-                    layer_idx + 1, total_layers, vram_info, forward_start_time.elapsed());
+                println!("[ENGINE] Running Layer {}/{} (Two-Track Pipeline Active)", layer_idx + 1, total_layers);
             }
 
             // =========================================================================
