@@ -2036,12 +2036,17 @@ impl QuantizedQwen3VLTextModel {
             let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
         }
 
-        if target_device.is_cuda() { let _ = target_device.synchronize(); }
+        // if target_device.is_cuda() { let _ = target_device.synchronize(); }
         
-        // [IMPORTANT] 프리필 직후 SSD 백업 트리거
+        // [IMPORTANT] 프리필 직후 SSD 백업 트리거 최적화
         if let Some(sid) = &session_id {
             let is_prefill = current_seq_len > 1;
-            let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, !is_prefill);
+            
+            // [CRITICAL FIX] 프리필 중에는 SSD 쓰기를 중단합니다. 
+            // 이를 통해 PING-PONG 트랙이 SSD 읽기 속도를 100% 독점하게 되어 다음 레이어 로딩이 순식간에 끝납니다!
+            if !is_prefill {
+                let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, true);
+            }
         }
 
         // [MEMORY-FIX] 프리필 후 메모리 정리 로직 (기존 2014라인 근처를 이 코드로 대체)
