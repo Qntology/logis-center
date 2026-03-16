@@ -375,6 +375,8 @@ impl KVBlock {
 pub struct BitKVMetadata {
     pub k_data: Tensor,
     pub v_data: Tensor,
+    pub k_scale: Option<Tensor>, // [W8A8] K 텐서 복원용 Scale
+    pub v_scale: Option<Tensor>, // [W8A8] V 텐서 복원용 Scale
     pub original_shape: Vec<usize>,
 }
 
@@ -708,8 +710,15 @@ impl QuantizedQwen3VLTextAttention {
                         let reg = self.registry.entries.read().unwrap();
                         let cache = reg[index].bitkv_cache.read().unwrap();
                         if let Some(m) = &cache[self.layer_idx] {
-                            k_cpu = Some(self.decompress_from_bf16(&m.k_data, &m.original_shape, &Device::Cpu)?);
-                            v_cpu = Some(self.decompress_from_bf16(&m.v_data, &m.original_shape, &Device::Cpu)?);
+                            // [W8A8] 8비트 스케일이 존재하면 GPU로 직접 전송(U8)하여 고속 압축 해제
+                            if let (Some(ks), Some(vs)) = (&m.k_scale, &m.v_scale) {
+                                k_cpu = Some(self.decompress_from_8bit_gpu(&m.k_data, ks, dev)?);
+                                v_cpu = Some(self.decompress_from_8bit_gpu(&m.v_data, vs, dev)?);
+                            } else {
+                                // 하위 호환: 기존 BF16 캐시인 경우
+                                k_cpu = Some(self.decompress_from_bf16(&m.k_data, &m.original_shape, &Device::Cpu)?);
+                                v_cpu = Some(self.decompress_from_bf16(&m.v_data, &m.original_shape, &Device::Cpu)?);
+                            }
                             ram_count += 1;
                         }
                     }
@@ -858,6 +867,42 @@ impl QuantizedQwen3VLTextAttention {
         // Convert to BF16 on CPU
         let t_bf16 = t.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
         Ok((t_bf16, original_shape))
+    }
+
+    // [W8A8 KV-CACHE] GPU 내에서 8비트로 압축하여 PCIe 전송량을 50% 절감합니다.
+    pub fn compress_to_8bit_gpu(&self, t: &Tensor) -> Result<(Tensor, Tensor)> {
+        let t_f32 = t.to_dtype(DType::F32)?;
+        let max_val = t_f32.abs()?.max_keepdim(candle_core::D::Minus1)?;
+        let scale = (max_val / 127.0f64)?;
+        
+        // 0으로 나누는 것을 방지하기 위해 1e-7 추가
+        let eps = Tensor::new(&[1e-7f32], t.device())?;
+        let safe_scale = scale.broadcast_add(&eps)?;
+        
+        let quantized = t_f32.broadcast_div(&safe_scale)?.round()?;
+        
+        // -127 ~ 127 범위를 0 ~ 254 (U8)로 시프트
+        let offset = Tensor::new(&[127.0f32], t.device())?;
+        let q_u8 = quantized.broadcast_add(&offset)?.to_dtype(DType::U8)?;
+        
+        // RAM에 저장하기 위해 CPU로 복사하여 반환
+        Ok((q_u8.to_device(&Device::Cpu)?, safe_scale.to_device(&Device::Cpu)?))
+    }
+
+    // [W8A8 KV-CACHE] 8비트 데이터를 GPU로 '먼저' 전송한 뒤 GPU 코어를 이용해 고속 압축 해제합니다.
+    pub fn decompress_from_8bit_gpu(&self, packed: &Tensor, scale: &Tensor, device: &Device) -> Result<Tensor> {
+        let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+        
+        // [중요] BF16(16bit) 대신 U8(8bit) 상태로 PCIe 버스를 타기 때문에 속도가 두 배 빨라집니다.
+        let p_gpu = packed.to_device(device)?;
+        let s_gpu = scale.to_device(device)?;
+        
+        let p_f32 = p_gpu.to_dtype(DType::F32)?;
+        let offset = Tensor::new(&[127.0f32], device)?;
+        let p_centered = p_f32.broadcast_sub(&offset)?;
+        
+        let decompressed = p_centered.broadcast_mul(&s_gpu)?;
+        Ok(decompressed.to_dtype(target_dtype)?)
     }
 
     pub fn decompress_from_bf16(&self, data: &Tensor, _original_shape: &[usize], device: &Device) -> Result<Tensor> {
@@ -2023,26 +2068,31 @@ impl QuantizedQwen3VLTextModel {
         }
 
         // [MEMORY-FIX] 프리필 후 메모리 정리 로직 (기존 2014라인 근처를 이 코드로 대체)
+        // [MEMORY-FIX] 프리필 후 메모리 정리 로직 
         if current_seq_len > 1 {
-            let is_small_model = self.layers.len() <= 36;
+            let is_small_model = self.config.hidden_size <= 1024; // 기준 변경 반영
             let current_kv_len = self.layers[layer_idx].get_kv_len();
             
-            if !is_small_model || current_kv_len >= 4096 {
+            // 소형 모델(0.6B)은 최대 10만 토큰까지 VRAM에 상주시켜 속도 극대화
+            let limit = if is_small_model { 100_000 } else { 4096 };
+            
+            if current_kv_len >= limit {
                 for (i, block) in self.layers[layer_idx].self_attn.kv_blocks.iter().enumerate() {
                     let (k_part, v_part) = {
                         let inner = block.inner.read().unwrap();
                         (inner.k_cache.clone(), inner.v_cache.clone())
                     };
-
+                    
                     if let (Some(k), Some(v)) = (k_part, v_part) {
-                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
-                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
+                        // [W8A8] GPU에서 8비트로 압축 후 CPU RAM으로 대피!
+                        let (k_u8, k_scale) = self.layers[layer_idx].self_attn.compress_to_8bit_gpu(&k)?;
+                        let (v_u8, v_scale) = self.layers[layer_idx].self_attn.compress_to_8bit_gpu(&v)?;
                         
                         let mut inner = block.inner.write().unwrap();
                         inner.k_cache = None;
                         inner.v_cache = None;
                         inner.location = KVLocation::RAM;
-
+                        
                         let mut reg = self.registry.entries.write().unwrap();
                         if i < reg.len() {
                             let entry = &mut reg[i];
@@ -2050,15 +2100,17 @@ impl QuantizedQwen3VLTextModel {
                             let mut cache = entry.bitkv_cache.write().unwrap();
                             if layer_idx < cache.len() {
                                 cache[layer_idx] = Some(BitKVMetadata {
-                                    k_data: k_cpu,
-                                    v_data: v_cpu,
+                                    k_data: k_u8,
+                                    v_data: v_u8,
+                                    k_scale: Some(k_scale),
+                                    v_scale: Some(v_scale),
                                     original_shape: k.shape().dims().to_vec(),
                                 });
                             }
                         }
                     }
                 }
-                println!("[ENGINE-TRACE] Layer {} Prefill Cache Moved to RAM ({} tokens).", layer_idx, current_kv_len);
+                println!("[ENGINE-TRACE] Layer {} W8A8 Cache Moved to RAM ({} tokens).", layer_idx, current_kv_len);
             }
         }
         
@@ -2071,7 +2123,7 @@ impl QuantizedQwen3VLTextModel {
         // [OPTIMIZATION] 0.6B (Small) 모델은 기본적으로 모든 문맥을 VRAM에 상주시키나,
         // 문맥이 너무 길어질 경우(예: 4096+) OOM 방지를 위해 RAM으로 대피를 허용합니다.
         let current_kv_len = self.layers[layer_idx].get_kv_len();
-        let is_small_model = self.layers.len() <= 36;
+        let is_small_model = self.config.hidden_size <= 1024;
         if is_small_model && current_kv_len < 4096 { return Ok(()); }
 
         let vram_limit = 1024; 
@@ -2231,7 +2283,7 @@ impl QuantizedQwen3VLTextModel {
         }
 
         if is_decoding {
-            let is_small_model = self.layers.len() <= 36;
+            let is_small_model = self.config.hidden_size <= 1024;
             if !is_small_model { self.layers[layer_idx].clear(); }
         }
 

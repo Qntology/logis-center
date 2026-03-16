@@ -394,7 +394,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                             let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
                                             let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
 
-                                            let meta = BitKVMetadata { k_data: kd_t, v_data: vd_t, original_shape: file_shape };
+                                            let meta = BitKVMetadata { 
+                                                k_data: kd_t, 
+                                                v_data: vd_t, 
+                                                k_scale: None,
+                                                v_scale: None, 
+                                                original_shape: file_shape 
+                                            };
                                             if let Ok(mut r) = reg.entries.write() {
                                                 if b_idx < r.len() {
                                                     {
