@@ -1951,27 +1951,33 @@ impl QuantizedQwen3VLTextModel {
         let current_seq_len = xs.dim(1)?;
         let target_device = self.layers[layer_idx].device().clone();
 
-        let total_chunks = chunk_offsets.len();
+        let current_seq_len = xs.dim(1)?;
+        let is_decoding = current_seq_len <= 1; // 디코딩 여부 확인
+        let target_device = self.layers[layer_idx].device().clone();
+        let total_kv_blocks = self.layers[layer_idx].self_attn.kv_blocks.len(); // [추가] 실제 KV 블록 총 개수
 
+        let total_chunks = chunk_offsets.len();
         for (chunk_idx, &i) in chunk_offsets.iter().enumerate() {
             let take = (current_seq_len - i).min(chunk_size);
-            
-            // [OPTIMIZATION 1] Dynamic Sliding-Window Prefetch
-            // 남은 청크 수에 따라 프리패치 윈도우를 동적으로 조절하여 불필요한 SSD I/O 및 큐 포화 방지
-            let remaining_chunks = total_chunks.saturating_sub(chunk_idx);
-            
-            // 현재 연산 중인 청크 기준으로 딱 다음 1~2개의 청크만, 딱 다음 레이어(+1)만 가져옵니다.
-            let prefetch_window = remaining_chunks.min(2); 
-            let look_ahead_layers = 1; 
 
-            let target_chunks = if chunk_idx == 0 { 
-                (0..=prefetch_window).collect::<Vec<_>>() 
-            } else { 
-                vec![chunk_idx + prefetch_window] 
+            // [CRITICAL FIX] 디코딩 시에는 다음 레이어의 전체 문맥이 필요하므로 전체 블록을 프리패치 큐에 넣습니다.
+            let target_chunks = if is_decoding {
+                (0..total_kv_blocks).collect::<Vec<_>>()
+            } else {
+                let remaining_chunks = total_chunks.saturating_sub(chunk_idx);
+                let prefetch_window = remaining_chunks.min(2);
+                if chunk_idx == 0 {
+                    (0..=prefetch_window).collect::<Vec<_>>()
+                } else {
+                    vec![chunk_idx + prefetch_window]
+                }
             };
 
+            let look_ahead_layers = 1;
+
             for t_idx in target_chunks {
-                if t_idx < chunk_offsets.len() {
+                // [CRITICAL FIX] chunk_offsets.len() 대신 실제 total_kv_blocks 수로 검사!
+                if t_idx < total_kv_blocks {
                     for l_off in 1..=look_ahead_layers {
                         let target_layer = layer_idx + l_off;
                         if target_layer < 28 {
@@ -2247,8 +2253,7 @@ impl QuantizedQwen3VLTextModel {
         }
 
         if is_decoding {
-            let is_small_model = self.layers.len() <= 36;
-            if !is_small_model { self.layers[layer_idx].clear(); }
+            self.layers[layer_idx].clear();
         }
 
         Ok(next_xs)
@@ -2561,7 +2566,7 @@ impl QuantizedQwen3VLTextModel {
             // =========================================================================
             // [TRACK 2] 백그라운드 지연 적재 (N+1번째 레이어 미리 로드)
             // =========================================================================
-            if !is_decoding && layer_idx + 1 < total_layers {
+            if layer_idx + 1 < total_layers {
                 let next_idx = layer_idx + 1;
                 let mmap_clone = self.mmap.clone();
                 let ct_clone = self.ct.clone();
