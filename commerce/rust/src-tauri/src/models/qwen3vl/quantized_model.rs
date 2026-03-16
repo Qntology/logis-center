@@ -101,7 +101,10 @@ impl QLinear {
     }
     
     pub fn new(inner: QMatMul, bias: Option<Tensor>, device: Device) -> Self {
-        Self { inner, bias, device, workspace: None }
+        Self { 
+            inner, bias, device, workspace: None,
+            q2_packed: None, q2_scales: None, q2_shape: None,
+        }
     }
     
     pub fn device(&self) -> &Device {
@@ -642,29 +645,26 @@ impl QuantizedQwen3VLTextAttention {
                 
                 if inner.location == KVLocation::VRAM && free_space > 0 {
                     let take = tokens_to_process.min(free_space);
-                    let k_piece = key_states.narrow(2, chunk_offset, take)?; // contiguous() 제거
-                    let v_piece = value_states.narrow(2, chunk_offset, take)?;
+                    let k_piece = key_states.narrow(2, chunk_offset, take)?.to_dtype(target_dtype)?;
+                    let v_piece = value_states.narrow(2, chunk_offset, take)?.to_dtype(target_dtype)?;
                     
-                    if let (Some(pk), Some(pv)) = (&mut inner.k_cache, &mut inner.v_cache) {
-                        // [핵심 최적화] Tensor::cat을 쓰지 않고, 미리 256으로 할당된 VRAM 공간 중 
-                        // 빈 공간(inner.len)의 인덱스를 찾아 In-place로 덮어씁니다. (할당 오버헤드 0%)
-                        
-                        *pk = pk.slice_assign(
-                            &[.., .., inner.len..(inner.len + take), ..], 
-                            &k_piece.to_dtype(target_dtype)?
-                        )?;
-                        
-                        *pv = pv.slice_assign(
-                            &[.., .., inner.len..(inner.len + take), ..], 
-                            &v_piece.to_dtype(target_dtype)?
-                        )?;
+                    let current_len = inner.len;
+                    let mut updated = false;
 
+                    if let (Some(pk), Some(pv)) = (&mut inner.k_cache, &mut inner.v_cache) {
+                        let pk_narrow = pk.narrow(2, 0, current_len)?;
+                        let pv_narrow = pv.narrow(2, 0, current_len)?;
+                        
+                        *pk = Tensor::cat(&[&pk_narrow, &k_piece], 2)?;
+                        *pv = Tensor::cat(&[&pv_narrow, &v_piece], 2)?;
+                        updated = true;
+                    }
+
+                    if updated {
                         inner.len += take; 
                         tokens_to_process -= take; 
                         chunk_offset += take;
                         appended = true;
-                        
-                        // [SSD-TRIGGER] (생략: 기존 장부 마킹 로직 유지)
                     }
                 }
             }
@@ -682,16 +682,8 @@ impl QuantizedQwen3VLTextAttention {
                     let mut inner = new_block.inner.write().unwrap();
                     let (_b, h, _s, d) = key_states.dims4()?;
                     
-                    // [핵심 최적화] 블록이 생성될 때 무조건 256 길이의 빈 텐서를 한 번만 할당합니다.
-                    let mut k_buffer = Tensor::zeros((1, h, 256, d), target_dtype, dev)?;
-                    let mut v_buffer = Tensor::zeros((1, h, 256, d), target_dtype, dev)?;
-                    
-                    // 처음 들어온 데이터를 채워 넣음
-                    k_buffer = k_buffer.slice_assign(&[.., .., 0..take, ..], &k_piece.to_dtype(target_dtype)?)?;
-                    v_buffer = v_buffer.slice_assign(&[.., .., 0..take, ..], &v_piece.to_dtype(target_dtype)?)?;
-                    
-                    inner.k_cache = Some(k_buffer.contiguous()?); 
-                    inner.v_cache = Some(v_buffer.contiguous()?);
+                    inner.k_cache = Some(k_piece.to_dtype(target_dtype)?.contiguous()?); 
+                    inner.v_cache = Some(v_piece.to_dtype(target_dtype)?.contiguous()?);
                 }
                 
                 // [SSD-TRIGGER] (생략: 기존 장부 초기화 로직 유지)
