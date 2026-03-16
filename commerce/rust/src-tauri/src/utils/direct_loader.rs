@@ -4,7 +4,7 @@ use std::fs;
 use once_cell::sync::Lazy;
 use std::sync::Arc;
 
-// --- Windows Implementation ---
+// --- Windows Implementation --- 
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
