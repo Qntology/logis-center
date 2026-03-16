@@ -185,13 +185,7 @@ use tokio::sync::OnceCell;
 
 pub async fn get_worker_channel() -> Result<mpsc::Sender<SlotTask>> { BAKE_TX.get().cloned().ok_or(anyhow!("Bake init error")) }
 pub async fn get_load_worker() -> Result<mpsc::Sender<SlotTask>> { LOAD_TX.get().cloned().ok_or(anyhow!("Load init error")) }
-pub async fn wait_for_global_io() { 
-    // 기존: 카운터가 0이 될 때까지 무한 대기
-    // 수정: 대기열에 작업이 10개 미만이면 그냥 지나가게 하여 병목 해소
-    while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 10 { 
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await; 
-    } 
-}
+pub async fn wait_for_global_io() { while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { tokio::time::sleep(std::time::Duration::from_millis(10)).await; } }
 
 pub fn init_bake_worker() {
     let (btx, brx) = mpsc::channel(64); let (ltx, lrx) = mpsc::channel(64);
@@ -692,10 +686,8 @@ impl Qwen3VLGenerateModel {
             }
             
             let current_pos = total_tokens_after_prefill + i as usize;
-    
-            // [OPT] 매 토큰마다 동기화하지 않고, 대기열이 꽉 찼을 때만 안전하게 대기
-            wait_for_global_io().await; 
             
+            wait_for_global_io().await; // [SYNC] Wait for any incremental baking
             logits = self.qwen3_vl.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;
         }
         if let Some(s_id) = &session_id {
