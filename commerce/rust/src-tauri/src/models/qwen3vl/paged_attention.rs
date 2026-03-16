@@ -67,12 +67,11 @@ pub fn run_paged_flash_decoding(
     let mut b_lens: Vec<u32> = Vec::with_capacity(num_blocks); 
     
     for (k, v) in k_blocks.iter().zip(v_blocks.iter()) {
-        let kc = if k.is_contiguous() { (*k).clone() } else { k.contiguous()? };
-        let vc = if v.is_contiguous() { (*v).clone() } else { v.contiguous()? };
-        
-        k_ptrs.push(get_cuda_raw_ptr(&kc)? as i64);
-        v_ptrs.push(get_cuda_raw_ptr(&vc)? as i64);
-        b_lens.push(kc.dim(2)? as u32); // u32로 추가
+        // 주의: 모델 로드 및 KV 캐시 저장 단계에서 이미 contiguous()를 보장하도록 구조가 잡혀 있어야 합니다.
+        // (현재 generate.rs의 저장 로직에 contiguous()가 이미 적용되어 있으므로 안전합니다)
+        k_ptrs.push(get_cuda_raw_ptr(k)? as i64);
+        v_ptrs.push(get_cuda_raw_ptr(v)? as i64);
+        b_lens.push(k.dim(2)? as u32);
     }
     
     let k_table_gpu = Tensor::from_vec(k_ptrs, (num_blocks,), device)?;

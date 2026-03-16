@@ -3,7 +3,35 @@ use std::ffi::c_void;
 use rayon::prelude::*;
 
 extern "C" {
+    // 기존 dequantize...
     fn launch_dequantize_q2_bf16(packed: *const c_void, scales: *const c_void, out: *mut c_void, num_packed_bytes: i32);
+    
+    // [NEW] Fused Q2 GEMV 커널
+    fn launch_fused_q2_gemv_bf16(
+        packed_w: *const c_void, 
+        scales: *const c_void, 
+        in_vec: *const c_void, 
+        out_vec: *mut c_void,
+        in_features: i32, 
+        out_features: i32
+    );
+}
+
+// [Rust Wrapper] 안전한 Fused GEMV 호출 함수
+pub fn fused_q2_gemv_cuda(packed_w: &Tensor, scales: &Tensor, in_vec: &Tensor, out_vec: &mut Tensor) -> candle_core::Result<()> {
+    let in_features = in_vec.dim(candle_core::D::Minus1)? as i32;
+    let out_features = out_vec.dim(candle_core::D::Minus1)? as i32;
+    
+    unsafe {
+        let p_ptr = crate::models::qwen3vl::paged_attention::get_cuda_raw_ptr(packed_w)?;
+        let s_ptr = crate::models::qwen3vl::paged_attention::get_cuda_raw_ptr(scales)?;
+        let i_ptr = crate::models::qwen3vl::paged_attention::get_cuda_raw_ptr(in_vec)?;
+        let o_ptr = crate::models::qwen3vl::paged_attention::get_cuda_raw_ptr(out_vec)? as *mut c_void;
+        
+        launch_fused_q2_gemv_bf16(p_ptr, s_ptr, i_ptr, o_ptr, in_features, out_features);
+    }
+    
+    Ok(())
 }
 
 /// [CPU SIMD] CPU 환경에서 Q2를 BF16 텐서로 초고속 해제합니다.
@@ -30,26 +58,18 @@ pub fn dequantize_q2_cpu(packed: &[u8], scales: &[half::f16], shape: &[usize]) -
     Ok(t_f32.to_dtype(DType::BF16)?)
 }
 
-/// [GPU CUDA] 2-bit 데이터를 GPU로 복사한 뒤 VRAM 내부에서 해제합니다.
-pub fn dequantize_q2_cuda(packed: Tensor, scales: Tensor, shape: &[usize], device: &Device) -> Result<Tensor> {
-    // 1. 2비트 텐서를 그대로 GPU로 전송 (PCIe 대역폭 8배 절약)
-    let packed_gpu = packed.to_device(device)?;
-    let scales_gpu = scales.to_device(device)?;
-    
-    // 2. 출력용 BF16 텐서 할당
-    let out_tensor = Tensor::zeros(shape, DType::BF16, device)?;
-    
+// [개선 코드]
+pub fn dequantize_q2_cuda(packed: &Tensor, scales: &Tensor, out_tensor: &mut Tensor) -> candle_core::Result<()> {
     let num_packed_bytes = packed.elem_count() as i32;
     
     unsafe {
-        // (이전에 구현한 get_cuda_raw_ptr 활용)
-        let p_ptr = crate::models::qwen3vl::paged_attention::get_cuda_raw_ptr(&packed_gpu)?;
-        let s_ptr = crate::models::qwen3vl::paged_attention::get_cuda_raw_ptr(&scales_gpu)?;
-        let o_ptr = crate::models::qwen3vl::paged_attention::get_cuda_raw_ptr(&out_tensor)? as *mut c_void;
+        let p_ptr = crate::models::qwen3vl::paged_attention::get_cuda_raw_ptr(packed)?;
+        let s_ptr = crate::models::qwen3vl::paged_attention::get_cuda_raw_ptr(scales)?;
+        // 이미 할당된 out_tensor의 포인터를 바로 넘김 (VRAM 할당 발생 안함!)
+        let o_ptr = crate::models::qwen3vl::paged_attention::get_cuda_raw_ptr(out_tensor)? as *mut c_void;
         
         launch_dequantize_q2_bf16(p_ptr, s_ptr, o_ptr, num_packed_bytes);
     }
     
-    // 3. 임시 2비트 텐서는 함수 종료 시 자동 파괴됨 (단일 참조 원칙 준수)
-    Ok(out_tensor)
+    Ok(())
 }
