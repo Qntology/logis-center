@@ -642,21 +642,23 @@ impl QuantizedQwen3VLTextAttention {
             if let Some(last_block) = self.kv_blocks.last_mut() {
                 let mut inner = last_block.inner.write().unwrap();
                 let free_space = 256usize.saturating_sub(inner.len);
-                
                 if inner.location == KVLocation::VRAM && free_space > 0 {
                     let take = tokens_to_process.min(free_space);
-                    let k_piece = key_states.narrow(2, chunk_offset, take)?.to_dtype(target_dtype)?;
-                    let v_piece = value_states.narrow(2, chunk_offset, take)?.to_dtype(target_dtype)?;
-                    
                     let current_len = inner.len;
                     let mut updated = false;
 
-                    if let (Some(pk), Some(pv)) = (&mut inner.k_cache, &mut inner.v_cache) {
-                        let pk_narrow = pk.narrow(2, 0, current_len)?;
-                        let pv_narrow = pv.narrow(2, 0, current_len)?;
-                        
-                        *pk = Tensor::cat(&[&pk_narrow, &k_piece], 2)?;
-                        *pv = Tensor::cat(&[&pv_narrow, &v_piece], 2)?;
+                    if inner.k_cache.is_some() && inner.v_cache.is_some() {
+                        let k_piece = key_states.narrow(2, chunk_offset, take)?.to_dtype(target_dtype)?;
+                        let v_piece = value_states.narrow(2, chunk_offset, take)?.to_dtype(target_dtype)?;
+
+                        if let Some(pk) = &mut inner.k_cache {
+                            let pk_narrow = pk.narrow(2, 0, current_len)?;
+                            *pk = Tensor::cat(&[&pk_narrow, &k_piece], 2)?;
+                        }
+                        if let Some(pv) = &mut inner.v_cache {
+                            let pv_narrow = pv.narrow(2, 0, current_len)?;
+                            *pv = Tensor::cat(&[&pv_narrow, &v_piece], 2)?;
+                        }
                         updated = true;
                     }
 
