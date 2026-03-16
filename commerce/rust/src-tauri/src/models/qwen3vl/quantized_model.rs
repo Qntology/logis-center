@@ -744,12 +744,27 @@ impl QuantizedQwen3VLTextAttention {
                                                     let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap_or_else(|_| Tensor::zeros(meta_os.clone(), DType::BF16, &Device::Cpu).unwrap());
                                                     let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap_or_else(|_| Tensor::zeros(meta_os.clone(), DType::BF16, &Device::Cpu).unwrap());
                                                     
-                                                    k_cpu = Some(self.decompress_from_bf16(&kd_t, &meta_os, &Device::Cpu).unwrap_or_else(|_| kd_t));
-                                                    v_cpu = Some(self.decompress_from_bf16(&vd_t, &meta_os, &Device::Cpu).unwrap_or_else(|_| vd_t));
+                                                    let cpu_dev = &Device::Cpu;
+                                                    let k_unpacked = self.decompress_from_bf16(&kd_t, &meta_os, cpu_dev).unwrap_or_else(|_| kd_t.clone());
+                                                    let v_unpacked = self.decompress_from_bf16(&vd_t, &meta_os, cpu_dev).unwrap_or_else(|_| vd_t.clone());
+
+                                                    k_cpu = Some(k_unpacked);
+                                                    v_cpu = Some(v_unpacked);
                                                     ssd_count += 1;
-                                                    
+
                                                     let mut reg = self.registry.entries.write().unwrap();
-                                                    if index < reg.len() { reg[index].ssd_path = Some(full_path.clone()); }
+                                                    if index < reg.len() { 
+                                                        reg[index].ssd_path = Some(full_path.clone());
+                                                        reg[index].location[self.layer_idx] = KVLocation::RAM; // 위치를 RAM으로 격상
+                                                        
+                                                        // [CRITICAL FIX] SSD에서 읽은 즉시 RAM에 캐싱하여 다음 턴 재읽기 방지
+                                                        let mut cache = reg[index].bitkv_cache.write().unwrap();
+                                                        cache[self.layer_idx] = Some(BitKVMetadata {
+                                                            k_data: kd_t, // 압축된 형태(BF16)로 RAM에 보관하여 메모리 절약
+                                                            v_data: vd_t,
+                                                            original_shape: meta_os,
+                                                        });
+                                                    }
                                                     load_success = true;
                                                     break;
                                                 }
@@ -1024,7 +1039,11 @@ impl QuantizedQwen3VLTextAttention {
             } else { return Ok(()); }
         }
         
-        let index_json = fs::read_to_string(&index_path)?;
+        let index_json = if let Ok(data) = crate::utils::direct_loader::load_kv_block(&index_path) {
+            String::from_utf8(data).unwrap_or_default()
+        } else { 
+            return Ok(()); 
+        };
         let index: LayerIndex = serde_json::from_str(&index_json)?;
         
         for block_info in index.blocks {
@@ -1940,8 +1959,10 @@ impl QuantizedQwen3VLTextModel {
             // [OPTIMIZATION 1] Dynamic Sliding-Window Prefetch
             // 남은 청크 수에 따라 프리패치 윈도우를 동적으로 조절하여 불필요한 SSD I/O 및 큐 포화 방지
             let remaining_chunks = total_chunks.saturating_sub(chunk_idx);
-            let prefetch_window = if remaining_chunks > 8 { 4 } else { remaining_chunks.min(2) };
-            let look_ahead_layers = if layer_idx < 26 { 2 } else { 1 }; // 마지막 레이어 근처에서는 미리 읽기 축소
+            
+            // 현재 연산 중인 청크 기준으로 딱 다음 1~2개의 청크만, 딱 다음 레이어(+1)만 가져옵니다.
+            let prefetch_window = remaining_chunks.min(2); 
+            let look_ahead_layers = 1; 
 
             let target_chunks = if chunk_idx == 0 { 
                 (0..=prefetch_window).collect::<Vec<_>>() 
@@ -2323,11 +2344,11 @@ impl QuantizedQwen3VLTextModel {
         let block_start = (start_off / 256) * 256;
 
         // [DYNAMIC-LIMITS] 0.6B 모델은 가벼우므로 10k 문맥 전체를 VRAM에 상주시켜 PCIe 병목을 제거합니다.
-        let (vram_limit, ram_limit) = {
-            let mut sys = sysinfo::System::new();
-            sys.refresh_memory();
-            let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-            
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+
+        let (vram_limit, ram_limit) = {            
             // VRAM: 28개 레이어 x 40개 블록 = 1,120개. 2,048개까지 VRAM 상주 허용 (속도 극대화)
             let v_limit = 2048; 
             
@@ -2336,8 +2357,8 @@ impl QuantizedQwen3VLTextModel {
             (v_limit, r_limit)
         };
 
-        let v_limit = 2048; 
-        let r_limit = 5000;
+        let v_limit = if free_ram_gb > 4.0 { 32 } else { 16 }; 
+        let r_limit = if free_ram_gb > 4.0 { 1024 } else { 512 };
 
         let mut vram_evicted = false;
 
@@ -2355,7 +2376,7 @@ impl QuantizedQwen3VLTextModel {
             }
 
             if vram_indices.len() > vram_limit {
-                vram_indices.sort_by_key(|k| k.1);
+                vram_indices.sort_by_key(|k| if k.1 == 0 { usize::MAX } else { k.1 });
                 let num_to_evict = vram_indices.len() - vram_limit;
                 for i in 0..num_to_evict {
                     let (idx, _) = vram_indices[i];
@@ -2395,7 +2416,7 @@ impl QuantizedQwen3VLTextModel {
             }
 
             if ram_indices.len() > ram_limit {
-                ram_indices.sort_by_key(|k| k.1);
+                ram_indices.sort_by_key(|k| if k.1 == 0 { usize::MAX } else { k.1 });
                 let num_to_flush = ram_indices.len() - ram_limit;
                 for i in 0..num_to_flush {
                     let (idx, _) = ram_indices[i];
@@ -2425,7 +2446,12 @@ impl QuantizedQwen3VLTextModel {
                         inner.k_cache = None;
                         inner.v_cache = None;
                         inner.location = KVLocation::SSD;
-                        if inner.index < reg.len() { reg[inner.index].location[layer_idx] = KVLocation::SSD; }
+                        if inner.index < reg.len() { 
+                            reg[inner.index].location[layer_idx] = KVLocation::SSD; 
+                            // [CRITICAL FIX] 좀비 RAM 캐시 완벽 제거
+                            let mut cache = reg[inner.index].bitkv_cache.write().unwrap();
+                            cache[layer_idx] = None; 
+                        }
                     }
                 }
             }
@@ -2542,22 +2568,27 @@ impl QuantizedQwen3VLTextModel {
                 let dtype = self.dtype;
                 let baking_only = self.baking_only;
                 let base_name = self.base_name.clone();
-                let dev_clone = target_device.clone();
+                
+                // [FIX] dev_clone 제거 (더 이상 백그라운드에서 VRAM을 건드리지 않습니다)
 
                 // 이번 턴에 데이터를 채워넣을 빈 껍데기(Carrier)를 백그라운드 스레드로 넘깁니다.
                 let mut carrier = ping_pong_carrier.clone();
-
                 next_layer_task = Some(tokio::task::spawn_blocking(move || -> Result<QuantizedQwen3VLTextDecoderLayer> {
                     let mmap = mmap_clone.ok_or_else(|| anyhow!("Mmap missing"))?;
                     let ct_arc = ct_clone.ok_or_else(|| anyhow!("GGUF missing"))?;
                     let mut reader = std::io::Cursor::new(&mmap[..]);
-            
+
                     let gguf_blk = format!("blk.{}", next_idx);
                     let prefix = if ct_arc.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{}.layers.{}", base_name, next_idx) };
                     
-                    // [PING-PONG] 새로운 메모리를 할당하지 않고, Carrier에 In-place로 덮어씁니다!
+                    // [PING-PONG TRACK 2 최적화]
+                    // SSD -> CPU RAM 로드만 수행합니다. (Quantized 텐서 상태 유지)
+                    // VRAM 할당이나 Dequantization은 메인 스레드로 넘겨 VRAM 스파이크를 원천 차단합니다.
                     carrier.load_weights_inplace(&ct_arc, &mut reader, &prefix, &Device::Cpu, dtype, baking_only)?;
-                    carrier.to_device(&dev_clone)?;
+                    
+                    // [CRITICAL FIX] carrier.to_device(&dev_clone)?; 삭제!!!
+                    // 이전에는 여기서 VRAM으로 넘겨버려서 VRAM 2배 점유와 CUDA 병목이 발생했습니다.
+                    
                     Ok(carrier)
                 }));
             }

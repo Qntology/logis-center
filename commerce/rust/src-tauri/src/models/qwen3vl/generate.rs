@@ -87,7 +87,8 @@ impl SlotManager {
 
 pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub static SLOT_MANAGER_DATA: Lazy<(SlotManager, Mutex<Option<mpsc::Receiver<SlotRequest>>>)> = Lazy::new(|| {
-    let (sm, rx) = SlotManager::new(128); (sm, Mutex::new(Some(rx)))
+    let (sm, rx) = SlotManager::new(32); 
+    (sm, Mutex::new(Some(rx)))
 });
 pub static SLOT_MANAGER: Lazy<&SlotManager> = Lazy::new(|| &SLOT_MANAGER_DATA.0);
 
@@ -236,7 +237,7 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(100); 
     tokio::spawn(async move {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(48)); 
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(16)); 
         while let Some(task) = io_rx.recv().await {
             let sem = semaphore.clone();
             let (tp, ts, reg, b_idx, sid, is_last, kv_n) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone());
@@ -368,41 +369,44 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     }
                 },
                 SlotTask::Load(load) => {
-                    let sid = load.slot_id; let reg = load.registry.clone(); let shared_block = load.shared_block.clone();
-                    let provided_path = load.path.clone(); let kv_name = load.kv_name.clone();
+                    let sid = load.slot_id;
+                    let reg = load.registry.clone(); 
+                    let shared_block = load.shared_block.clone();
+                    let provided_path = load.path.clone(); 
+                    let kv_name = load.kv_name.clone();
+                    let target_layer = load.layer_idx; // [FIX] 요청받은 타겟 레이어!
+
                     tokio::spawn(async move {
                         let _guard = ReadSlotGuard { sid, active: true };
                         let (b_idx_off, b_idx) = { match shared_block.inner.read() { Ok(inner) => (inner.offset, inner.index), _ => (0, 999) } };
                         let mut root = provided_path.clone();
                         while !root.to_string_lossy().ends_with("kv") && root.parent().is_some() { root = root.parent().unwrap().to_path_buf(); }
                         let block_root = root.join(kv_name.as_deref().unwrap_or("inference")).join(format!("b{}", b_idx_off));
-                        for l_idx in 0..28 {
-                            let file_path = block_root.join(format!("l{}.st", l_idx));
-                            if file_path.is_file() {
-                                if let Ok(content) = load_kv_block(&file_path) {
-                                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                        let prefix = format!("b{}_l{}_", b_idx_off, l_idx);
-                                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).ok();
+                        
+                        // [CRITICAL FIX] 0..28 루프를 제거하고, 타겟 레이어 1개만 Direct Load!
+                        let file_path = block_root.join(format!("l{}.st", target_layer));
+                        if file_path.is_file() {
+                            if let Ok(content) = load_kv_block(&file_path) {
+                                if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                                    let prefix = format!("b{}_l{}_", b_idx_off, target_layer);
+                                    let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).ok();
+                                    
+                                    if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                        let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                        let file_shape: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+
+                                        let dev = &Device::Cpu;
+                                        let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
+                                        let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
+                                        let meta = BitKVMetadata { k_data: kd_t, v_data: vd_t, original_shape: file_shape };
                                         
-                                        if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
-                                            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                                            let file_shape: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
-
-                                            let dev = &Device::Cpu;
-                                            
-                                            // [SAFE-LOAD] 예상치 못한 크기 에러 시 프로세스 종료 방지
-                                            let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
-                                            let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
-
-                                            let meta = BitKVMetadata { k_data: kd_t, v_data: vd_t, original_shape: file_shape };
-                                            if let Ok(mut r) = reg.entries.write() {
-                                                if b_idx < r.len() {
-                                                    {
-                                                        let mut cache = r[b_idx].bitkv_cache.write().unwrap();
-                                                        cache[l_idx] = Some(meta);
-                                                    }
-                                                    r[b_idx].location[l_idx] = KVLocation::RAM;
+                                        if let Ok(mut r) = reg.entries.write() {
+                                            if b_idx < r.len() {
+                                                {
+                                                    let mut cache = r[b_idx].bitkv_cache.write().unwrap();
+                                                    cache[target_layer] = Some(meta); // 타겟 레이어에 적재
                                                 }
+                                                r[b_idx].location[target_layer] = KVLocation::RAM;
                                             }
                                         }
                                     }
