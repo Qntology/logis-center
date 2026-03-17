@@ -702,18 +702,20 @@ pub fn eager_attention_forward(
 
     // --- Flash-Decoding 병렬 연산 구간 ---
     let num_blocks = (kv_seq_len + block_size - 1) / block_size;
-    let mut block_outputs = Vec::with_capacity(num_blocks);
-    let mut block_lse = Vec::with_capacity(num_blocks);
+    let mut block_outputs = Vec::with_capacity(num_blocks); 
+    let mut block_lse = Vec::with_capacity(num_blocks); 
+
+    // [CRITICAL FIX] 블록을 순회하기 전에 미리 1번만 캐스팅해둡니다!
+    let q_aligned = query_states.to_dtype(key_states.dtype())?;
 
     for i in 0..num_blocks {
         let start = i * block_size;
-        let end = (start + block_size).min(kv_seq_len);
+        let end = (start + block_size).min(kv_seq_len); 
         let k_block = key_states.narrow(2, start, end - start)?;
-        let v_block = value_states.narrow(2, start, end - start)?;
+        let v_block = value_states.narrow(2, start, end - start)?; 
 
-        // [DTYPE-GUARD] Ensure query_states matches the block dtype
-        let q_aligned = query_states.to_dtype(k_block.dtype())?;
-        let attn_weights = (q_aligned.matmul(&k_block.transpose(2, 3)?)? * scaling)?;
+        // [삭제] 기존 루프 내부에 있던 let q_aligned = ... 제거 완료
+        let attn_weights = (q_aligned.matmul(&k_block.transpose(2, 3)?)? * scaling)?; 
         
         // 마스크 처리
         let attn_weights = if let Some(mask) = attention_mask {

@@ -351,40 +351,45 @@ pub fn interpolate_linear_1d(
     target_size: usize,
     align_corner: Option<bool>,
 ) -> Result<Tensor> {
-    if t.rank() != 3 {
-        return Err(anyhow::anyhow!(
-            "Input rank must have equal to 3 dimensions"
-        ));
-    }
+    if t.rank() != 3 { return Err(anyhow::anyhow!("Input rank must have equal to 3 dimensions")); } 
+    
     let shape = t.dims();
     let orig_size = shape[shape.len() - 1];
-    if orig_size == target_size {
-        return Ok(t.clone());
-    }
+    if orig_size == target_size { return Ok(t.clone()); } 
+    
     let (bs, channels, _) = t.dims3()?;
-    let mut output = Tensor::zeros((bs, channels, target_size), t.dtype(), t.device())?;
-    let coords = compute_1d_coords(orig_size, target_size, align_corner)?;
+    let coords = compute_1d_coords(orig_size, target_size, align_corner)?; 
+
+    // [CRITICAL FIX] 1024번의 무거운 slice_assign 딥카피를 막기 위해 벡터(Vec)를 사용합니다!
+    let mut b_outputs = Vec::with_capacity(bs);
 
     for b in 0..bs {
+        let mut c_outputs = Vec::with_capacity(channels);
         for c in 0..channels {
             let input_slice = t.i((b, c))?;
-            let mut out_i = Vec::new();
+            let mut out_i = Vec::with_capacity(target_size); 
+            
             for &coord in coords.iter().take(target_size) {
                 let coord = if coord < 0.0 { 0.0 } else { coord };
-                let x0 = coord.floor() as usize;
-                let x1 = std::cmp::min(x0 + 1, orig_size - 1);
+                let x0 = coord.floor() as usize; 
+                let x1 = std::cmp::min(x0 + 1, orig_size - 1); 
+                
                 let weight = (coord - x0 as f32) as f64;
-                let value0 = input_slice.get(x0)?;
-                let value1 = input_slice.get(x1)?;
-                let interpolated =
-                    (value0.affine(1.0 - weight, 0.0)? + value1.affine(weight, 0.0)?)?;
-                out_i.push(interpolated);
+                let value0 = input_slice.get(x0)?; 
+                let value1 = input_slice.get(x1)?; 
+                
+                let interpolated = (value0.affine(1.0 - weight, 0.0)? + value1.affine(weight, 0.0)?)?; 
+                out_i.push(interpolated); 
             }
-            let out_i = Tensor::stack(&out_i, 0)?.unsqueeze(0)?.unsqueeze(0)?;
-            output = output.slice_assign(&[(b..b + 1), (c..c + 1), (0..target_size)], &out_i)?;
+            // 채널별 결과를 스택
+            c_outputs.push(Tensor::stack(&out_i, 0)?); 
         }
+        // 배치별 결과를 스택
+        b_outputs.push(Tensor::stack(&c_outputs, 0)?); 
     }
-    output = output.contiguous()?;
+    
+    // [FIX] 루프가 모두 끝난 후 딱 한 번만 전체 텐서를 스택합니다!
+    let output = Tensor::stack(&b_outputs, 0)?.contiguous()?; 
     Ok(output)
 }
 

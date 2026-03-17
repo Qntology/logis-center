@@ -222,7 +222,7 @@ impl Qwen3VLTextRotaryEmbedding {
             pos_f32
         };
         
-        let position_ids_expanded = position_ids.unsqueeze(D::Minus2)?.contiguous()?;
+        let position_ids_expanded = position_ids.unsqueeze(D::Minus2)?;
 
         let inv_freq_expanded = Tensor::from_vec(
             self.inv_freq.clone(),
@@ -230,16 +230,15 @@ impl Qwen3VLTextRotaryEmbedding {
             position_ids.device(),
         )?
         .broadcast_as((3, position_ids.dim(1)?, self.inv_freq.len(), 1))?
-        .to_dtype(DType::F32)?
-        .contiguous()?;
+        .to_dtype(DType::F32)?; // <-- contiguous() 삭제!
 
         // Calculate frequencies for T, H, W dimensions
         let freqs = inv_freq_expanded
             .matmul(&position_ids_expanded)?
             .transpose(2, 3)?; // (3, b_sz, seq_len, dim/2)
 
-        // Standard Qwen2-VL/Qwen3-VL block-based mRoPE assembly
-        let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?.contiguous()?;
+        // [CRITICAL FIX] cat이나 unsqueeze 이후의 contiguous()도 모두 삭제!
+        let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
         let cos_all = emb.cos()?;
         let sin_all = emb.sin()?;
 
@@ -253,25 +252,13 @@ impl Qwen3VLTextRotaryEmbedding {
         // Split by sections and select based on dimension index
         let mrope_section_doubled = mrope_section.iter().map(|&s| s * 2).collect::<Vec<_>>();
         
-        let cos_select: Vec<Tensor> = cos_all
-            .split(&mrope_section_doubled, D::Minus1)?
-            .iter()
-            .enumerate()
-            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
-            .collect();
-        let cos = Tensor::cat(&cos_select, D::Minus1)?
-            .unsqueeze(1)?
-            .contiguous()?;
+        let cos_select: Vec<Tensor> = cos_all.split(&mrope_section_doubled, D::Minus1)?
+            .iter().enumerate().map(|(i, m)| m.i(i % 3).unwrap()).collect();
+        let cos = Tensor::cat(&cos_select, D::Minus1)?.unsqueeze(1)?; // <-- contiguous() 삭제!
 
-        let sin_select: Vec<Tensor> = sin_all
-            .split(&mrope_section_doubled, D::Minus1)?
-            .iter()
-            .enumerate()
-            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
-            .collect();
-        let sin = Tensor::cat(&sin_select, D::Minus1)?
-            .unsqueeze(1)?
-            .contiguous()?;
+        let sin_select: Vec<Tensor> = sin_all.split(&mrope_section_doubled, D::Minus1)?
+            .iter().enumerate().map(|(i, m)| m.i(i % 3).unwrap()).collect();
+        let sin = Tensor::cat(&sin_select, D::Minus1)?.unsqueeze(1)?; // <-- contiguous() 삭제!
 
         Ok((cos.to_dtype(dtype)?, sin.to_dtype(dtype)?))
     }
@@ -315,29 +302,28 @@ pub fn get_xd_cos_sin(
     xdrope_section: Vec<usize>,
 ) -> Result<(Tensor, Tensor)> {
     let x_dim = xdrope_section.len();
-    let mut cos_vec = vec![];
-    let mut sin_vec = vec![];
     let bs = position_ids.dim(0)?;
-    for i in 0..bs {
-        let pos_i = position_ids.i(i)?;
-        let cos_i = index_select_2d(cos, &pos_i)?;
-        let sin_i = index_select_2d(sin, &pos_i)?;
-        cos_vec.push(cos_i);
-        sin_vec.push(sin_i);
-    }
-    let cos = Tensor::stack(&cos_vec, 0)?.permute((0, 2, 1, 3))?;
-    let sin = Tensor::stack(&sin_vec, 0)?.permute((0, 2, 1, 3))?;
+    let seq_len = position_ids.dim(1)?;
+
+    // [CRITICAL FIX] O(N) 루프와 느린 stack, permute를 단 1번의 커널 호출로 압축!
+    // 1. 인덱스를 1차원으로 쭉 폅니다 (이전에 겪으신 에러를 막기 위해 contiguous 보장)
+    let flat_pos = position_ids.flatten_all()?.contiguous()?;
+
+    // 2. 단 한 번의 index_select로 전체 배치의 코사인/사인 값을 가져옵니다.
+    let cos_flat = cos.index_select(&flat_pos, 0)?;
+    let sin_flat = sin.index_select(&flat_pos, 0)?;
+
+    // 3. 목표했던 최종 Shape (bs, 1, seq_len, head_dim)으로 즉시 변환
+    let head_dim = cos_flat.dim(D::Minus1)?;
+    let cos = cos_flat.reshape((bs, seq_len, head_dim))?.unsqueeze(1)?;
+    let sin = sin_flat.reshape((bs, seq_len, head_dim))?.unsqueeze(1)?;
+
+    // 이후 로직은 동일 (메모리 이동 없이 메타데이터만 조작하므로 초고속)
     let xdrope_section: Vec<usize> = xdrope_section.iter().map(|&i| i * 2).collect();
     let cos_select: Vec<Tensor> = split_tensor(&cos, &xdrope_section, D::Minus1)?
-        .iter()
-        .enumerate()
-        .map(|(i, m): (usize, &Tensor)| m.i((.., .., i % x_dim)).unwrap())
-        .collect();
+        .iter().enumerate().map(|(i, m)| m.i((.., .., i % x_dim)).unwrap()).collect();
     let sin_select: Vec<Tensor> = split_tensor(&sin, &xdrope_section, D::Minus1)?
-        .iter()
-        .enumerate()
-        .map(|(i, m): (usize, &Tensor)| m.i((.., .., i % x_dim)).unwrap())
-        .collect();
+        .iter().enumerate().map(|(i, m)| m.i((.., .., i % x_dim)).unwrap()).collect();
 
     let cos = Tensor::cat(&cos_select, D::Minus1)?;
     let sin = Tensor::cat(&sin_select, D::Minus1)?;

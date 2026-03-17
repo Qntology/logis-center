@@ -183,15 +183,17 @@ impl Qwen3VLVisionAttention {
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        chunks: &[usize], // [CRITICAL FIX]
+        chunks: &[usize], 
     ) -> Result<Tensor> {
         let seq_length = xs.dim(0)?;
-        let qkv_states = xs.apply(&self.qkv)?.reshape((seq_length, 3, self.num_heads, ()))?.permute((1, 0, 2, 3))?;
-        let query_states = qkv_states.i(0)?.contiguous()?;
-        let key_states = qkv_states.i(1)?.contiguous()?;
-        let value_states = qkv_states.i(2)?.contiguous()?;
+        let qkv_states = xs.apply(&self.qkv)?.reshape((seq_length, 3, self.num_heads, ()))?.permute((1, 0, 2, 3))?; 
         
-        let (query_states, key_states) = apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?;
+        // [CRITICAL FIX] 메모리 전체 복사를 유발하는 contiguous() 3연타 삭제!
+        let query_states = qkv_states.i(0)?; 
+        let key_states = qkv_states.i(1)?; 
+        let value_states = qkv_states.i(2)?; 
+        
+        let (query_states, key_states) = apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?; 
         let query_states = query_states.transpose(0, 1)?.unsqueeze(0)?;
         let key_states = key_states.transpose(0, 1)?.unsqueeze(0)?;
         let value_states = value_states.transpose(0, 1)?.unsqueeze(0)?;
@@ -390,7 +392,7 @@ impl Qwen3VLVisionModel {
             let base_h_ceil = h_idxs_ceil
                 .affine(self.num_grid_per_side as f64, 0.0)?
                 .unsqueeze(D::Minus1)?;
-                
+
             idx_tensors[0].push(base_h.broadcast_add(&w_idxs_floor.unsqueeze(0)?)?.flatten_all()?);
             idx_tensors[1].push(base_h.broadcast_add(&w_idxs_ceil.unsqueeze(0)?)?.flatten_all()?);
             idx_tensors[2].push(base_h_ceil.broadcast_add(&w_idxs_floor.unsqueeze(0)?)?.flatten_all()?);

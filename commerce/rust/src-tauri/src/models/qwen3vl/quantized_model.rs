@@ -659,8 +659,11 @@ impl QuantizedQwen3VLTextAttention {
             }
             if !appended {
                 let take = tokens_to_process.min(256);
-                let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
-                let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
+                
+                // [CRITICAL FIX] 신규 블록을 만들 때도 VRAM 전체 복사(.contiguous())를 제거하여 속도 향상!
+                let k_piece = key_states.narrow(2, chunk_offset, take)?;
+                let v_piece = value_states.narrow(2, chunk_offset, take)?;
+                
                 let index = self.kv_blocks.len();
                 let current_total = seqlen_offset + chunk_offset;
                 let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
@@ -2959,16 +2962,15 @@ impl QuantizedQwen3VLModel {
         image_grid_thw: Option<&Tensor>,
         _video_grid_thw: Option<&Tensor>,
         _mask: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor, Vec<i64>)> { // [FIX] Vec<i64> 반환 추가
-        // [ROPE-FIX] 이미지 격자 구조를 반영한 실제 3D mRoPE 인덱스 계산 로직
+    ) -> Result<(Tensor, Tensor, Vec<i64>)> { 
         let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
         let image_token_id = self.config.image_token_id.unwrap_or(0);
         let vision_start_token_id = self.config.vision_start_token_id.unwrap_or(0);
-        
         let (b_sz, seq_len) = input_ids.dims2()?;
-        let mut position_ids = Tensor::zeros((3, b_sz, seq_len), DType::U32, input_ids.device())?;
+        
+        // [CRITICAL FIX] 안 쓰이는 Tensor::zeros 초기화 코드를 삭제하여 VRAM 낭비 제거
+        
         let mut mrope_position_deltas = Vec::new();
-
         let input_ids_vec = input_ids.to_vec2::<u32>()?;
         let mut image_idx = 0;
 
@@ -3093,27 +3095,12 @@ impl QuantizedQwen3VLModel {
         
         let head_dev = self.lm_head.device();
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
-        let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };
+        let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)?
+        } else { hidden_state };
         let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state };
-        
         let logits = self.lm_head.forward(&hidden_state)?;
         
-        // [DIAG-LOGITS] 결과값 폭주 여부 확인 및 파일 저장
-        if seqlen_offset % 5 == 0 {
-            let l_max = logits.flatten_all()?.abs()?.max(0)?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-            // [FIX] 동기화를 유발하지 않는 변수들로만 새 log_msg 문자열 정의
-            let log_msg = format!("[DIAG-VL] Off: {} | MaxLogit: {:.4}\n", seqlen_offset, l_max);
-            let log_path = std::path::Path::new("tmp/logs/engine_diag.log");
-            if let Some(parent) = log_path.parent() { let _ = std::fs::create_dir_all(parent); }
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
-                use std::io::Write;
-                let _ = writeln!(file, "{}", log_msg.trim());
-            }
-            
-            if l_max > 100.0 || l_max.is_nan() {
-                println!("[DIAG-WARN] Potential Tensor Explosion! Max Logit: {}", l_max);
-            }
-        }
+        // [CRITICAL FIX] 5토큰마다 발생하던 GPU Sync 및 파일 I/O 디버그 코드 완전 삭제 완료!
         
         Ok(logits)
     }
