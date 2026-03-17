@@ -342,23 +342,19 @@ impl Qwen3VLVisionModel {
     }
 
     pub fn fast_pos_embed_interpolate(&self, grid_thw: &Tensor) -> Result<Tensor> {
-        let mut idx_list = vec![vec![]; 4];
-        let mut weight_list = vec![vec![]; 4];
-        let mut split_idx = vec![];
-        
-        // [CRITICAL FIX] 루프 안에서 지연을 일으키지 않도록 전체 데이터를 CPU로 한 번에 가져옵니다.
-        let grid_thw_cpu = grid_thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
-
-        // [OPTIMIZATION] 루프 밖에서 상수 텐서 미리 생성
         let dev = grid_thw.device();
+        let grid_thw_cpu = grid_thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
+        
         let side_tensor = Tensor::new(self.num_grid_per_side as f64, dev)?;
         let one_t_u32 = Tensor::new(1u32, dev)?;
-        let one_t_f32 = Tensor::new(1.0f32, dev)?;
+        
+        // [OPTIMIZATION] CPU 통신 없이 GPU 상에 텐서 목록만 모아둠
+        let mut idx_tensors: [Vec<Tensor>; 4] = Default::default();
+        let mut weight_tensors: [Vec<Tensor>; 4] = Default::default();
+        let mut split_idx = vec![];
 
         for i in 0..grid_thw.dim(0)? {
-            let [_, h, w] = grid_thw_cpu[i][..] else { 
-                return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
-            };
+            let [_, h, w] = grid_thw_cpu[i][..] else { return Err(anyhow!("...")); };
             split_idx.push((h * w) as usize);
             let num_grid_per_side_sub_one = (self.num_grid_per_side - 1) as f32;
             let h_idxs = linspace(
@@ -392,56 +388,35 @@ impl Qwen3VLVisionModel {
             let base_h_ceil = h_idxs_ceil
                 .affine(self.num_grid_per_side as f64, 0.0)?
                 .unsqueeze(D::Minus1)?;
-            idx_list[0].extend_from_slice(
-                &base_h
-                    .broadcast_add(&w_idxs_floor.unsqueeze(0)?)?
-                    .flatten_all()?
-                    .to_vec1::<u32>()?,
-            );
-            idx_list[1].extend_from_slice(
-                &base_h
-                    .broadcast_add(&w_idxs_ceil.unsqueeze(0)?)?
-                    .flatten_all()?
-                    .to_vec1::<u32>()?,
-            );
-            idx_list[2].extend_from_slice(
-                &base_h_ceil
-                    .broadcast_add(&w_idxs_floor.unsqueeze(0)?)?
-                    .flatten_all()?
-                    .to_vec1::<u32>()?,
-            );
-            idx_list[3].extend_from_slice(
-                &base_h_ceil
-                    .broadcast_add(&w_idxs_ceil.unsqueeze(0)?)?
-                    .flatten_all()?
-                    .to_vec1::<u32>()?,
-            );
+                
+            idx_tensors[0].push(base_h.broadcast_add(&w_idxs_floor.unsqueeze(0)?)?.flatten_all()?);
+            idx_tensors[1].push(base_h.broadcast_add(&w_idxs_ceil.unsqueeze(0)?)?.flatten_all()?);
+            idx_tensors[2].push(base_h_ceil.broadcast_add(&w_idxs_floor.unsqueeze(0)?)?.flatten_all()?);
+            idx_tensors[3].push(base_h_ceil.broadcast_add(&w_idxs_ceil.unsqueeze(0)?)?.flatten_all()?);
 
             let one_sub_dh = dh.affine(-1.0, 1.0)?;
             let one_sub_dw = dw.affine(-1.0, 1.0)?;
 
-            weight_list[0].extend_from_slice(
-                &one_sub_dh
-                    .broadcast_mul(&one_sub_dw)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?,
-            );
-            weight_list[1].extend_from_slice(
-                &one_sub_dh
-                    .broadcast_mul(&dw)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?,
-            );
-            weight_list[2].extend_from_slice(
-                &dh.broadcast_mul(&one_sub_dw)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?,
-            );
-            weight_list[3]
-                .extend_from_slice(&dh.broadcast_mul(&dw)?.flatten_all()?.to_vec1::<f32>()?);
+            weight_tensors[0].push(one_sub_dh.broadcast_mul(&one_sub_dw)?.flatten_all()?);
+            weight_tensors[1].push(one_sub_dh.broadcast_mul(&dw)?.flatten_all()?);
+            weight_tensors[2].push(dh.broadcast_mul(&one_sub_dw)?.flatten_all()?);
+            weight_tensors[3].push(dh.broadcast_mul(&dw)?.flatten_all()?);
         }
-        let idx_tensor = Tensor::new(idx_list, grid_thw.device())?;
-        let weight_tensor = Tensor::new(weight_list, grid_thw.device())?.to_dtype(self.dtype)?;
+
+        // [OPTIMIZATION] 모든 연산이 끝난 후 한 번에 합침 (GPU 병렬성 극대화)
+        let idx_tensor = Tensor::stack(&[
+            Tensor::cat(&idx_tensors[0], 0)?,
+            Tensor::cat(&idx_tensors[1], 0)?,
+            Tensor::cat(&idx_tensors[2], 0)?,
+            Tensor::cat(&idx_tensors[3], 0)?,
+        ], 0)?;
+
+        let weight_tensor = Tensor::stack(&[
+            Tensor::cat(&weight_tensors[0], 0)?,
+            Tensor::cat(&weight_tensors[1], 0)?,
+            Tensor::cat(&weight_tensors[2], 0)?,
+            Tensor::cat(&weight_tensors[3], 0)?,
+        ], 0)?.to_dtype(self.dtype)?;
         let pos_embeds = self
             .pos_embed
             .forward(&idx_tensor)?
@@ -899,17 +874,18 @@ impl Qwen3VLModel {
         &self,
         pixel_values: &Tensor,
         image_grid_thw: &Tensor,
-    ) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+    ) -> Result<(Tensor, Vec<Tensor>)> { // [FIX] 반환형을 단일 Tensor로 변경!
         let (image_embeds, deepstack_image_embeds) =
             self.visual.forward(pixel_values, image_grid_thw)?;
-        
         let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
         let thw_vec = image_grid_thw.to_vec2::<u32>()?;
         let split_sizes: Vec<usize> = thw_vec
             .iter()
             .map(|thw| (thw[0] * thw[1] * thw[2]) as usize / spatial_merge_size.pow(2))
             .collect();
-        let image_embeds = split_tensor(&image_embeds, &split_sizes, 0)?;
+            
+        // [CRITICAL FIX] 쪼개는 로직 삭제하고 원본 텐서를 그대로 반환!
+        // let image_embeds = split_tensor(&image_embeds, &split_sizes, 0)?; 
         Ok((image_embeds, deepstack_image_embeds))
     }
 
@@ -945,21 +921,18 @@ impl Qwen3VLModel {
         let input_ids_vec = input_ids.to_vec2::<u32>()?;
         let mut image_idx = 0;
 
-        // [CRITICAL FIX] 루프 내부의 PCIe 병목을 막기 위해, GPU에 있는 THW 그리드 데이터를 시작 전에 한 방에 CPU RAM으로 끌어옵니다!
-        let image_thw_cpu = if let Some(thw) = image_grid_thw {
-            Some(thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?)
-        } else { None };
+        let image_thw_cpu = if let Some(thw) = image_grid_thw { Some(thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?) } else { None };
+        let video_thw_cpu = if let Some(thw) = _video_grid_thw { Some(thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?) } else { None };
         
-        let video_thw_cpu = if let Some(thw) = _video_grid_thw {
-            Some(thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?)
-        } else { None };
+        // [CRITICAL FIX] 루프 밖에서 전체 데이터를 담을 그릇을 미리 할당합니다.
+        let mut flat_pos_ids = Vec::with_capacity(3 * b_sz * seq_len);
 
         for b in 0..b_sz {
             let ids = &input_ids_vec[b];
             let mut curr_pos = 0u32;
             let mut llm_pos_ids = vec![vec![0u32; seq_len]; 3];
-
             let mut i = 0;
+            
             while i < seq_len {
                 if ids[i] == vision_start_token_id as u32 && i + 1 < seq_len && ids[i+1] == image_token_id as u32 {
                     // 이미지 영역 발견
@@ -1008,12 +981,12 @@ impl Qwen3VLModel {
             
             // Tensor로 변환 및 삽입
             for d in 0..3 {
-                let d_tensor = Tensor::from_vec(llm_pos_ids[d].clone(), (1, seq_len), input_ids.device())?;
-                position_ids = position_ids.slice_assign(&[(d..d+1), (b..b+1), (0..seq_len)], &d_tensor)?;
+                flat_pos_ids.extend_from_slice(&llm_pos_ids[d]);
             }
             mrope_position_deltas.push(curr_pos as i64 - seq_len as i64);
         }
 
+        let position_ids = Tensor::from_vec(flat_pos_ids, (3, b_sz, seq_len), input_ids.device())?;
         let deltas = Tensor::from_vec(mrope_position_deltas, (b_sz, 1), input_ids.device())?.to_dtype(input_ids.dtype())?;
         Ok((position_ids, deltas))
     }
@@ -1038,7 +1011,7 @@ impl Qwen3VLModel {
             if let Some(image_grid_thw) = image_grid_thw {
                 let (image_embeds, deepstack_img_embed) =
                     self.get_vision_features(pixel_values, image_grid_thw)?;
-                let image_embeds = Tensor::cat(&image_embeds, 0)?;
+                // let image_embeds = Tensor::cat(&image_embeds, 0)?;
                 let vision_mask = self.get_placeholder_mask(input_ids, true)?;
                 
                 // [CRITICAL FIX] GPU Sync Stall을 유발하는 sum_all() 검증 로직 삭제 완료
@@ -1052,7 +1025,8 @@ impl Qwen3VLModel {
             if let Some(video_grid_thw) = video_grid_thw {
                 let (video_embeds, deepstack_video_embed) =
                     self.get_vision_features(pixel_values_video, video_grid_thw)?;
-                let video_embeds = Tensor::cat(&video_embeds, 0)?;
+                // [CRITICAL FIX] 쪼개는 로직이 사라졌으므로, 다시 cat으로 합치는 코드도 과감히 삭제!
+                
                 let vision_mask = self.get_placeholder_mask(input_ids, false)?;
                 
                 // [CRITICAL FIX] 비디오 쪽의 sum_all() 검증 로직도 삭제 완료

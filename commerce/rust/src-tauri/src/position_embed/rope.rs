@@ -37,18 +37,14 @@ pub fn apply_multimodel_rotary_pos_emb(
         .enumerate()
         .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
         .collect();
-    let cos = Tensor::cat(&cos_select, D::Minus1)?
-        .unsqueeze(1)?
-        .contiguous()?;
+    let cos = Tensor::cat(&cos_select, D::Minus1)?.unsqueeze(1)?;
     let sin_select: Vec<Tensor> = sin
         .split(&mrope_section, D::Minus1)?
         .iter()
         .enumerate()
         .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
         .collect();
-    let sin = Tensor::cat(&sin_select, D::Minus1)?
-        .unsqueeze(1)?
-        .contiguous()?;
+    let sin = Tensor::cat(&sin_select, D::Minus1)?.unsqueeze(1)?;
     let q_embed = q
         .broadcast_mul(&cos)?
         .add(&rotate_half(q)?.broadcast_mul(&sin)?)?;
@@ -216,17 +212,17 @@ impl Qwen3VLTextRotaryEmbedding {
         dtype: DType,
         mrope_section: Vec<usize>,
     ) -> Result<(Tensor, Tensor)> {
-        let position_ids = if position_ids.rank() == 2 {
-            let (bs, len) = position_ids.dims2()?;
-            position_ids.unsqueeze(0)?.expand((3, bs, len))?
+        // [CRITICAL FIX] 확장을 가상으로만 유지하기 위해 F32 캐스팅을 최우선으로 수행
+        let pos_f32 = position_ids.to_dtype(DType::F32)?;
+        
+        let position_ids = if pos_f32.rank() == 2 {
+            let (bs, len) = pos_f32.dims2()?;
+            pos_f32.unsqueeze(0)?.expand((3, bs, len))? 
         } else {
-            position_ids.clone()
+            pos_f32
         };
-
-        let position_ids_expanded = position_ids
-            .unsqueeze(D::Minus2)?
-            .to_dtype(DType::F32)?
-            .contiguous()?;
+        
+        let position_ids_expanded = position_ids.unsqueeze(D::Minus2)?.contiguous()?;
 
         let inv_freq_expanded = Tensor::from_vec(
             self.inv_freq.clone(),
@@ -329,12 +325,8 @@ pub fn get_xd_cos_sin(
         cos_vec.push(cos_i);
         sin_vec.push(sin_i);
     }
-    let cos = Tensor::stack(&cos_vec, 0)?
-        .permute((0, 2, 1, 3))?
-        .contiguous()?;
-    let sin = Tensor::stack(&sin_vec, 0)?
-        .permute((0, 2, 1, 3))?
-        .contiguous()?;
+    let cos = Tensor::stack(&cos_vec, 0)?.permute((0, 2, 1, 3))?;
+    let sin = Tensor::stack(&sin_vec, 0)?.permute((0, 2, 1, 3))?;
     let xdrope_section: Vec<usize> = xdrope_section.iter().map(|&i| i * 2).collect();
     let cos_select: Vec<Tensor> = split_tensor(&cos, &xdrope_section, D::Minus1)?
         .iter()

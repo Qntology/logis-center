@@ -2946,6 +2946,11 @@ impl QuantizedQwen3VLModel {
         let input_ids_vec = input_ids.to_vec2::<u32>()?;
         let mut image_idx = 0;
 
+        // [CRITICAL FIX] 루프 진입 전 THW 데이터를 한 방에 CPU 배열로 복사!
+        let image_thw_cpu = if let Some(thw) = image_grid_thw {
+            Some(thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?)
+        } else { None };
+
         for b in 0..b_sz {
             let ids = &input_ids_vec[b];
             let mut curr_pos = 0u32;
@@ -2954,11 +2959,10 @@ impl QuantizedQwen3VLModel {
             let mut i = 0;
             while i < seq_len {
                 if ids[i] == vision_start_token_id as u32 && i + 1 < seq_len && ids[i+1] == image_token_id as u32 {
-                    // 이미지 영역 발견
-                    if let Some(thw_tensor) = image_grid_thw {
-                        let thw = thw_tensor.i(image_idx)?.to_vec1::<u32>()?;
+                    // [FIX] 루프 내부 GPU Sync(to_vec1) 삭제 및 CPU 캐시 배열 사용
+                    if let Some(thw_cpu_array) = &image_thw_cpu {
+                        let thw = &thw_cpu_array[image_idx];
                         image_idx += 1;
-                        
                         let (t, h, w) = (thw[0], thw[1] / spatial_merge_size as u32, thw[2] / spatial_merge_size as u32);
                         
                         // vision_start 토큰 위치
@@ -3014,7 +3018,7 @@ impl QuantizedQwen3VLModel {
 
     pub async fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
         // [OPTIMIZATION] 매 토큰이 아닌 16토큰마다 리밸런싱을 수행하여 NVML 오버헤드 제거
-        if seqlen_offset % 16 == 0 || seqlen_offset == 0 {
+        if seqlen_offset == 0 {
             let _ = self.rebalance_layers(self.language_model.device_id, seqlen_offset, total_len);
         }
 
@@ -3041,11 +3045,16 @@ impl QuantizedQwen3VLModel {
         } else {
             // Decoding/Incremental Step
             let deltas = self.rope_deltas.as_ref().unwrap();
+            
+            // [CRITICAL FIX] 루프를 돌며 to_scalar()로 GPU 멱살을 잡는 대신, 
+            // 델타 값 전체를 한 번에 CPU로 내려받아 캐싱합니다!
+            let deltas_cpu = deltas.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.to_vec2::<f32>()?;
             let mut p_ids_vec = Vec::new();
             
             for b in 0..b_sz {
-                let delta = deltas.i(b)?.to_scalar::<i64>()?;
+                let delta = deltas_cpu[b][0] as i64; // [FIX] CPU 캐시에서 즉시 읽어옴 (Zero Sync)
                 let real_start = (seqlen_offset as i64 + delta) as u32;
+                
                 let p_id = Tensor::arange(real_start, real_start + seq_len as u32, input_ids.device())?
                     .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, seq_len))?;
                 p_ids_vec.push(p_id);
@@ -3167,7 +3176,7 @@ impl QuantizedQwen3TextModel {
 
     pub async fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
         // [OPTIMIZATION] 16토큰 주기로 리밸런싱 수행
-        if seqlen_offset % 16 == 0 || seqlen_offset == 0 {
+        if seqlen_offset == 0 {
             let _ = self.rebalance_layers(self.language_model.device_id, seqlen_offset, total_len);
         }
 

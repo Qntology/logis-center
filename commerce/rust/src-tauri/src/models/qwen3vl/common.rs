@@ -569,9 +569,15 @@ pub fn block_wise_attention(
     let mut sum_exp_acc: Option<Tensor> = None;
     let mut current_kv_offset = 0;
 
+    // [CRITICAL FIX] 루프 진입 전에 딱 한 번만 캐스팅합니다! 
+    let q_aligned = if !k_blocks.is_empty() {
+        query_states.to_dtype(k_blocks[0].dtype())?
+    } else {
+        query_states.clone()
+    };
+
     for (k_block, v_block) in k_blocks.iter().zip(v_blocks.iter()) {
         let block_len = k_block.dim(2)?;
-        
         // GQA support: repeat KV heads if needed
         let (mut k, mut v) = (k_block.clone(), v_block.clone());
         if num_kv_groups > 1 {
@@ -581,7 +587,6 @@ pub fn block_wise_attention(
         }
 
         // Attn Scores: Q @ K^T
-        let q_aligned = query_states.to_dtype(k.dtype())?;
         let mut attn_weights = (q_aligned.matmul(&k.transpose(2, 3)?)? * scaling)?;
 
         // Apply Mask if present
@@ -732,30 +737,31 @@ pub fn eager_attention_forward(
         let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
         
         let out_block = exp_weights.to_dtype(v_block.dtype())?.matmul(&v_block)?;
-        let lse = (sum_exp.log()? + max_logits)?;
+        // let lse = (sum_exp.log()? + max_logits)?;
 
         block_outputs.push(out_block);
-        block_lse.push(lse);
+        block_lse.push((sum_exp, max_logits)); // [CRITICAL FIX] 튜플로 묶어서 보관
     }
 
     // 블록 결과 통합 (Merging)
+    let (mut current_exp_sum, mut current_max_logit) = block_lse[0].clone();
     let mut final_output = block_outputs[0].clone();
-    let mut max_lse = block_lse[0].clone();
 
     for i in 1..num_blocks {
-        let lse_i = &block_lse[i];
+        let (next_exp_sum, next_max_logit) = &block_lse[i];
         let out_i = &block_outputs[i];
 
-        let new_max_lse = max_lse.broadcast_maximum(lse_i)?;
-        let exp_a = max_lse.broadcast_sub(&new_max_lse)?.exp()?;
-        let exp_b = lse_i.broadcast_sub(&new_max_lse)?.exp()?;
+        let new_max_logit = current_max_logit.broadcast_maximum(next_max_logit)?;
+        let exp_a = current_max_logit.broadcast_sub(&new_max_logit)?.exp()?;
+        let exp_b = next_max_logit.broadcast_sub(&new_max_logit)?.exp()?;
 
         final_output = (final_output.broadcast_mul(&exp_a)? + out_i.broadcast_mul(&exp_b)?)?;
-        max_lse = new_max_lse;
+        current_exp_sum = (current_exp_sum.broadcast_mul(&exp_a)? + next_exp_sum.broadcast_mul(&exp_b)?)?;
+        current_max_logit = new_max_logit;
     }
 
-    // 최종 정규화 및 차원 복구
-    let final_output = final_output.broadcast_div(&max_lse.exp()?)?;
+    // 3. 루프가 다 끝난 후 마지막에 딱 한 번 정규화!
+    let final_output = final_output.broadcast_div(&current_exp_sum)?;
     let attn_output = final_output.transpose(1, 2)?.contiguous()?;
 
     Ok(attn_output)

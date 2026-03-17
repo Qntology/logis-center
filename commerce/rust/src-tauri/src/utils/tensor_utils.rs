@@ -172,16 +172,19 @@ pub fn zero_index(mask: &Tensor) -> Result<Tensor> {
 }
 
 pub fn nonzero_slice(mask: &Tensor) -> Result<Vec<(usize, usize)>> {
-    let mut index_vec = nonzero_index_vec(mask)?;
+    let index_vec = nonzero_index_vec(mask)?;
     match index_vec.len() {
         0 => Ok(vec![]),
         1 => Ok(vec![(index_vec[0] as usize, (index_vec[0] + 1) as usize)]),
         _ => {
             let mut vec_slice = vec![];
-            let mut start = index_vec.remove(0);
+            
+            // [CRITICAL FIX] O(N) shift를 유발하는 remove(0) 대신 iterator 사용!
+            let mut iter = index_vec.into_iter();
+            let mut start = iter.next().unwrap(); 
             let mut last = start;
-
-            for i in index_vec {
+            
+            for i in iter { // [FIX] 남은 요소들을 메모리 이동 없이 순회
                 if i == (last + 1) {
                     last = i;
                     continue;
@@ -198,26 +201,39 @@ pub fn nonzero_slice(mask: &Tensor) -> Result<Vec<(usize, usize)>> {
 }
 
 pub fn masked_scatter_dim0(original: &Tensor, replace: &Tensor, mask: &Tensor) -> Result<Tensor> {
-    if original.dim(0)? != 1 || mask.dim(0)? != 1 {
-        return Err(anyhow!(format!(
-            "masked_scatter_dim0 original bs: {} or mask bs :{} not equal to 1 ",
-            original.dim(0)?,
-            mask.dim(0)? != 1
-        )));
-    }
-    let mut original = original.squeeze(0)?;
+    if original.dim(0)? != 1 || mask.dim(0)? != 1 { return Err(anyhow!("...")); }
+    
+    let original = original.squeeze(0)?;
     let mask = mask.squeeze(0)?;
     let slices = nonzero_slice(&mask)?;
+    
     let mut sub_start = 0usize;
-    let mut sub_end;
+    let mut parts = Vec::new(); // [CRITICAL FIX] 복사본을 만드는 대신 텐서 조각을 모음
+    let mut last_end = 0usize;
+
     for (start, end) in slices {
-        sub_end = sub_start + (end - start);
+        let sub_end = sub_start + (end - start);
         let sub_replace = replace.i((sub_start..sub_end, ..))?;
-        original = original.slice_assign(&[(start..end), (0..original.dim(1)?)], &sub_replace)?;
+        
+        // 마스크되지 않은 원본 구간 추가
+        if start > last_end {
+            parts.push(original.i((last_end..start, ..))?);
+        }
+        // 마스크된 교체 구간 추가
+        parts.push(sub_replace);
+        
+        last_end = end;
         sub_start = sub_end;
     }
-    original = original.unsqueeze(0)?;
-    Ok(original)
+    
+    // 마지막 남은 원본 구간 추가
+    if last_end < original.dim(0)? {
+        parts.push(original.i((last_end.., ..))?);
+    }
+
+    // [FIX] 루프 내 100번의 VRAM 전체 복사 대참사를 단 1번의 병합으로 최적화!
+    let final_tensor = Tensor::cat(&parts, 0)?.unsqueeze(0)?;
+    Ok(final_tensor)
 }
 
 pub fn get_not_equal_mask(input_ids: &Tensor, token_ids: u32) -> Result<Tensor> {
@@ -819,16 +835,21 @@ pub fn unpack_bitkv_gpu(packed: &Tensor, original_shape: &[usize]) -> Result<Vec
     let tensor_two = Tensor::new(2u8, dev)?;
     let tensor_zero = Tensor::new(0u8, dev)?;
     
+    // [OPTIMIZATION] 루프 안에서 매번 생성되던 8개의 divisor 텐서를 미리 계산하여 재활용!
+    let div_tensors: Vec<Tensor> = (0..8)
+        .map(|i| Tensor::new(1u8 << i, dev).unwrap())
+        .collect();
+
     let mut planes = Vec::new();
     for bit_idx in 0..4 {
         let start = bit_idx * num_u8;
-        let chunk = packed.narrow(0, start, num_u8)?; // [FIX] chunk 변수 선언 위치 확인
+        let chunk = packed.narrow(0, start, num_u8)?; 
         
-        let mut bits = Vec::new(); // [FIX] bits 벡터 초기화 위치 확인
+        let mut bits = Vec::new();
         for i in 0..8 {
-            let divisor = 1u8 << i;
-            let div_t = Tensor::new(divisor, dev)?;
-            let bit = chunk.div(&div_t.broadcast_as(chunk.shape())?)?; // [FIX] 이제 chunk를 찾을 수 있습니다
+            // [FIX] Tensor::new(...)를 삭제하고 밖에서 만든 캐시 텐서 사용
+            let div_t = &div_tensors[i]; 
+            let bit = chunk.div(&div_t.broadcast_as(chunk.shape())?)?; 
             
             let bit_mod = bit.broadcast_sub(&bit.div(&tensor_two)?.broadcast_mul(&tensor_two)?)?
                              .gt(&tensor_zero)?;
