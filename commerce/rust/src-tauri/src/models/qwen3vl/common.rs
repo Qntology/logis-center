@@ -597,11 +597,11 @@ pub fn block_wise_attention(
                 let m_sub = mask.narrow(D::Minus1, current_kv_offset, take)?;
                 
                 if take < block_len {
-                    let attn_sub = attn_weights.narrow(D::Minus1, 0, take)?;
-                    let attn_masked = attn_sub.broadcast_add(&m_sub.to_dtype(attn_weights.dtype())?)?;
-                    // In Candle, slice_assign takes a slice of ranges. 
-                    // We target the last dimension (dim 3) for the first 'take' elements.
-                    attn_weights = attn_weights.slice_assign(&[0..attn_weights.dim(0)?, 0..attn_weights.dim(1)?, 0..attn_weights.dim(2)?, 0..take], &attn_masked)?;
+                    let left_masked = attn_weights.narrow(D::Minus1, 0, take)?
+                        .broadcast_add(&m_sub.to_dtype(attn_weights.dtype())?)?;
+                    let right_unmasked = attn_weights.narrow(D::Minus1, take, block_len - take)?;
+                    
+                    attn_weights = Tensor::cat(&[&left_masked, &right_unmasked], D::Minus1)?;
                 } else {
                     attn_weights = attn_weights.broadcast_add(&m_sub.to_dtype(attn_weights.dtype())?)?;
                 }
@@ -755,7 +755,11 @@ pub fn eager_attention_forward(
         let exp_a = current_max_logit.broadcast_sub(&new_max_logit)?.exp()?;
         let exp_b = next_max_logit.broadcast_sub(&new_max_logit)?.exp()?;
 
-        final_output = (final_output.broadcast_mul(&exp_a)? + out_i.broadcast_mul(&exp_b)?)?;
+        // [CRITICAL FIX] F32로 계산된 exp_a와 exp_b를 원본 BF16 타입으로 되돌린 후 곱셈(Mul) 수행!
+        let exp_a_cast = exp_a.to_dtype(final_output.dtype())?;
+        let exp_b_cast = exp_b.to_dtype(out_i.dtype())?;
+
+        final_output = (final_output.broadcast_mul(&exp_a_cast)? + out_i.broadcast_mul(&exp_b_cast)?)?;
         current_exp_sum = (current_exp_sum.broadcast_mul(&exp_a)? + next_exp_sum.broadcast_mul(&exp_b)?)?;
         current_max_logit = new_max_logit;
     }

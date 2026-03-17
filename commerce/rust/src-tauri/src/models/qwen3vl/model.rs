@@ -9,10 +9,11 @@ use crate::{
     models::qwen3vl::{
         common::{GateUpDownMLP, TwoLinearMLP, eager_attention_forward, get_layer_norm},
         config::{Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig},
-    },
-    position_embed::rope::{
-        Qwen2_5VisionRotaryEmbedding, Qwen3VLTextRotaryEmbedding, apply_rotary_pos_emb,
-        apply_rotary_pos_emb_vision,
+        // [FIX] 올바른 최신 rope.rs 경로로 변경!
+        rope::{
+            Qwen2_5VisionRotaryEmbedding, Qwen3VLTextRotaryEmbedding, apply_rotary_pos_emb,
+            apply_rotary_pos_emb_vision,
+        },
     },
     utils::tensor_utils::{
         bitor_tensor, get_vision_next_indices, linspace, mask_index_add, masked_scatter_dim0,
@@ -191,11 +192,10 @@ impl Qwen3VLVisionAttention {
         let value_states = qkv_states.i(2)?.contiguous()?;
         
         let (query_states, key_states) = apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?;
-        let query_states = query_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
-        let key_states = key_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
-        let value_states = value_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
-
-        // [CRITICAL FIX] 여기서 동기화를 유발하던 lengths.to_vec1() 로직 전체 삭제 완료!
+        let query_states = query_states.transpose(0, 1)?.unsqueeze(0)?;
+        let key_states = key_states.transpose(0, 1)?.unsqueeze(0)?;
+        let value_states = value_states.transpose(0, 1)?.unsqueeze(0)?;
+        
         let q_splits = split_tensor(&query_states, chunks, 2)?;
         let k_splits = split_tensor(&key_states, chunks, 2)?;
         let v_splits = split_tensor(&value_states, chunks, 2)?;
@@ -205,7 +205,9 @@ impl Qwen3VLVisionAttention {
             let output = eager_attention_forward(q, k, v, None, None, self.scaling)?;
             attn_outputs.push(output);
         }
-        let attn_output = Tensor::cat(&attn_outputs, 1)?.reshape((seq_length, ()))?.contiguous()?;
+        
+        // [CRITICAL FIX] 취합 후에도 reshape 시 metadata만 조작하므로 contiguous() 불필요!
+        let attn_output = Tensor::cat(&attn_outputs, 1)?.reshape((seq_length, ()))?;
         Ok(attn_output.apply(&self.proj)?)
     }
 }
@@ -1106,7 +1108,7 @@ impl Qwen3VLModel {
                     .i(0)?
                     .to_dtype(self.rope_deltas.as_ref().unwrap().dtype())?
                     .broadcast_add(self.rope_deltas.as_ref().unwrap())?
-                    .contiguous()?
+                    // [FIX] contiguous() 삭제로 인한 PCIe 대역폭 확보
                     .to_dtype(candle_core::DType::U32)?
             } else {
                 Tensor::zeros(1, inputs_embeds.dtype(), inputs_embeds.device())?

@@ -730,21 +730,3 @@ impl Qwen3VLGenerateModel {
         Ok(chunk_size)
     }
 }
-
-fn apply_repetition_penalty(logits: &Tensor, penalty: f32, previous_tokens: &[u32]) -> Result<Tensor> {
-    let mut logits_vec = logits.to_vec1::<f32>()?;
-    let mut set = std::collections::HashSet::new();
-    for &t in previous_tokens {
-        if !set.contains(&t) {
-            let logit = logits_vec[t as usize];
-            if logit < 0.0 {
-                logits_vec[t as usize] = logit * penalty;
-            } else {
-                logits_vec[t as usize] = logit / penalty;
-            }
-            set.insert(t);
-        }
-    }
-    let dev = logits.device();
-    Ok(Tensor::from_vec(logits_vec, logits.shape(), dev)?)
-}

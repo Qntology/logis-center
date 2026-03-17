@@ -13,9 +13,10 @@ use crate::{
     models::{
         qwen3vl::config::{Qwen3VLConfig, Qwen3VLTextConfig},
         qwen3vl::model::Qwen3VLVisionModel,
-    },
-    position_embed::rope::{
-        Qwen3VLTextRotaryEmbedding, apply_rotary_pos_emb,
+        // [FIX] 올바른 최신 rope.rs 경로로 변경!
+        qwen3vl::rope::{
+            Qwen3VLTextRotaryEmbedding, apply_rotary_pos_emb,
+        },
     },
     utils::tensor_utils::{
         mask_index_add, masked_scatter_dim0,
@@ -606,13 +607,14 @@ impl QuantizedQwen3VLTextAttention {
             attention_mask_in.map(|m| m.clone())
         };
 
+        // [CRITICAL FIX] .contiguous() 삭제로 VRAM 전체 복사 스파이크 원천 차단!
         let mut query_states = self.q_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
-        query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?.contiguous()?;
+        query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?; // contiguous() 제거
         
         let mut key_states = self.k_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
-        key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?.contiguous()?;
+        key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?;     // contiguous() 제거
         
-        let value_states = self.v_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let value_states = self.v_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?; // contiguous() 제거
 
         let cos = cos.to_dtype(target_dtype)?;
         let sin = sin.to_dtype(target_dtype)?;
@@ -631,13 +633,18 @@ impl QuantizedQwen3VLTextAttention {
                 let free_space = 256usize.saturating_sub(inner.len);
                 if inner.location == KVLocation::VRAM && free_space > 0 {
                     let take = tokens_to_process.min(free_space);
-                    let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
-                    let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
+                    // [CRITICAL FIX] 메모리 복사를 유발하는 contiguous() 제거
+                    let k_piece = key_states.narrow(2, chunk_offset, take)?;
+                    let v_piece = value_states.narrow(2, chunk_offset, take)?;
+
                     if let (Some(pk), Some(pv)) = (inner.k_cache.take(), inner.v_cache.take()) {
                         let pk = if !pk.device().same_device(dev) { pk.to_device(dev)? } else { pk };
                         let pv = if !pv.device().same_device(dev) { pv.to_device(dev)? } else { pv };
-                        inner.k_cache = Some(Tensor::cat(&[&pk, &k_piece], 2)?.contiguous()?);
-                        inner.v_cache = Some(Tensor::cat(&[&pv, &v_piece], 2)?.contiguous()?);
+
+                        // [CRITICAL FIX] 병합(cat) 후 메모리 재정렬(contiguous) 오버헤드 완벽 제거!
+                        inner.k_cache = Some(Tensor::cat(&[&pk, &k_piece], 2)?);
+                        inner.v_cache = Some(Tensor::cat(&[&pv, &v_piece], 2)?);
+                        
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
                         
@@ -938,42 +945,45 @@ impl QuantizedQwen3VLTextAttention {
 
         for idx in target_indices {
             let block = self.kv_blocks[idx].clone();
+            
+            // [CRITICAL FIX] 중복 무한 저장을 막기 위해, 큐에 넣기 직전 즉시 dirty 상태 해제!
+            {
+                let mut reg = self.registry.entries.write().unwrap();
+                if idx < reg.len() && self.layer_idx < reg[idx].is_dirty.len() {
+                    reg[idx].is_dirty[self.layer_idx] = false;
+                }
+            }
+
             let (k_opt, v_opt, off, b_idx, b_len) = {
-                let inner = block.inner.read().unwrap(); // [FIX] VRAM 파괴 로직 제거로 인해 read()만 사용
+                let inner = block.inner.read().unwrap();
                 (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len)
-                
-                // [CRITICAL FIX] 
-                // 여기서 is_decoding일 때 k_cache를 None으로 날리던 치명적 로직을 삭제했습니다.
-                // VRAM -> RAM 강등은 이후 호출되는 `evacuate_vram_to_ram_only`가 시스템 메모리 상황을 보고 안전하게 처리합니다.
             };
 
             if let (Some(k), Some(v)) = (k_opt, v_opt) {
-                // SSD 베이킹을 위한 CPU 복제본 생성
-                let k_vram = k.to_device(&Device::Cpu).unwrap_or_else(|_| k.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| k.clone()).contiguous().unwrap_or_else(|_| k.clone());
-                let v_vram = v.to_device(&Device::Cpu).unwrap_or_else(|_| v.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| v.clone()).contiguous().unwrap_or_else(|_| v.clone());
-                
                 let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
                 let last_part = kv_name_raw.split('/').last().unwrap_or("text");
                 let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text".to_string() } else { last_part.to_string() };
-                
                 let session_id_owned = session_id.to_string();
                 let registry_clone = self.registry.clone();
                 let layer_idx = self.layer_idx;
                 let num_kv_h = self.num_key_value_heads;
                 let h_d = self.head_dim;
                 
-                // IO 카운터 증가 (안전장치)
                 crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                
+
                 tauri::async_runtime::spawn(async move {
-                    if let Some(tx) = BAKE_TX.get() {
+                    // [CRITICAL FIX] 메인 스레드(디코딩 루프)를 멈추지 않도록 GPU -> CPU 다운로드를 백그라운드에서 실행!
+                    let k_vram = k.to_device(&Device::Cpu).unwrap_or_else(|_| k.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| k.clone()).contiguous().unwrap_or_else(|_| k.clone());
+                    let v_vram = v.to_device(&Device::Cpu).unwrap_or_else(|_| v.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| v.clone()).contiguous().unwrap_or_else(|_| v.clone());
+                    
+                    if let Some(tx) = crate::models::qwen3vl::generate::BAKE_TX.get() {
                         let sub_path = if baking_only { format!("{}/reference/{}", session_id_owned, kv_type) } else { format!("{}/inference/{}", session_id_owned, kv_type) };
                         let kv_dir = crate::utils::paths::get_kv_dir(None);
                         let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
                         if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
 
                         let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
-                        let dump = LayerKVDump {
+                        let dump = crate::models::qwen3vl::generate::LayerKVDump {
                             layer_idx,
                             k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
                             v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
@@ -981,15 +991,14 @@ impl QuantizedQwen3VLTextAttention {
                             raw_k: Some(k_vram),
                             raw_v: Some(v_vram),
                         };
+                        let sid = crate::models::qwen3vl::generate::SLOT_MANAGER.acquire_write_slot(b_len).await;
                         
-                        let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
-                        
-                        if tx.send(SlotTask::Bake(BakeTask {
+                        if tx.send(crate::models::qwen3vl::generate::SlotTask::Bake(crate::models::qwen3vl::generate::BakeTask {
                             slot_id: sid, task_dir: block_dir, kv_name: Some(sub_path), offset: off, layers: vec![dump],
                             is_relay_baking: baking_only, block_idx: Some(b_idx), registry: registry_clone,
                         })).await.is_err() {
                             crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                            SLOT_MANAGER.release_slot(sid).await;
+                            crate::models::qwen3vl::generate::SLOT_MANAGER.release_slot(sid).await;
                         }
                     } else {
                         crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -1922,17 +1931,17 @@ impl QuantizedQwen3VLTextModel {
         kv_name: Option<String>,
         baking_only: bool,
     ) -> Result<Tensor> {
-        let mut final_output: Option<Tensor> = None;
+        // let mut final_output: Option<Tensor> = None; <-- [삭제]
         let chunk_size = 256;
         let current_seq_len = xs.dim(1)?;
+        let is_decoding = current_seq_len <= 1;
         let target_device = self.layers[layer_idx].device().clone();
-
-        let current_seq_len = xs.dim(1)?;
-        let is_decoding = current_seq_len <= 1; // 디코딩 여부 확인
-        let target_device = self.layers[layer_idx].device().clone();
-        let total_kv_blocks = self.layers[layer_idx].self_attn.kv_blocks.len(); // [추가] 실제 KV 블록 총 개수
-
+        let total_kv_blocks = self.layers[layer_idx].self_attn.kv_blocks.len();
         let total_chunks = chunk_offsets.len();
+
+        // [CRITICAL FIX] 텐서를 매번 합치지 않고 벡터에 모아둘 그릇 준비
+        let mut chunk_outputs = Vec::with_capacity(total_chunks);
+
         for (chunk_idx, &i) in chunk_offsets.iter().enumerate() {
             let take = (current_seq_len - i).min(chunk_size);
 
@@ -1994,21 +2003,12 @@ impl QuantizedQwen3VLTextModel {
             let xs_chunk = xs.narrow(1, i, take)?;
             let cos_chunk = cos.narrow(cos.rank().saturating_sub(2), i, take)?;
             let sin_chunk = sin.narrow(sin.rank().saturating_sub(2), i, take)?;
-
+            
             let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i, session_id.clone(), kv_name.clone(), baking_only)?;
             
-            // [FIX] 이전 텐서를 명시적으로 소멸시켜 VRAM 누수 차단
-            final_output = match final_output {
-                None => Some(out),
-                Some(prev) => {
-                    let combined = Tensor::cat(&[&prev, &out], 1)?;
-                    drop(prev); // 이전 청크 결과물 즉시 해제
-                    drop(out);
-                    Some(combined)
-                },
-            };
-
-            // 청크 연산 직후 VRAM 압박 시 RAM으로 대피
+            // [CRITICAL FIX] VRAM 파편화를 막기 위해 벡터에 단순 추가 (메모리 이동 O(1))
+            chunk_outputs.push(out);
+            
             let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
         }
 
@@ -2065,8 +2065,14 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         
-        // [FIX] 마지막 줄의 세미콜론을 제거하여 결과를 반환하도록 합니다.
-        final_output.ok_or_else(|| anyhow::anyhow!("No output generated from chunks"))
+        // [CRITICAL FIX] 이전의 final_output 관련 잔재를 완전히 삭제하고,
+        // chunk_outputs 벡터가 비어있는지만 체크한 뒤 한 방에 병합(cat)하여 반환합니다!
+        if chunk_outputs.is_empty() {
+            return Err(anyhow::anyhow!("No output generated from chunks"));
+        }
+
+        let final_output_tensor = Tensor::cat(&chunk_outputs, 1)?;
+        Ok(final_output_tensor)
     }
 
     /// [VRAM-EVACUATION] 레이어 연산 직후 VRAM 압박 시 RAM으로 이동
@@ -2806,6 +2812,7 @@ pub struct QuantizedQwen3VLModel {
     pub language_model: QuantizedQwen3VLTextModel,
     pub lm_head: QLinear,
     pub rope_deltas: Option<Tensor>,
+    pub rope_deltas_cpu: Option<Vec<i64>>, // [CRITICAL FIX] CPU 캐시 전용 필드 추가!
     pub text_device: Device,
     pub vision_device: Device,
     pub mmap: Option<Arc<Mmap>>,
@@ -2857,7 +2864,18 @@ impl QuantizedQwen3VLModel {
             get_qlinear(&ct_main, &mut reader_main, "token_embd", text_device, head_dtype)?
         };
 
-        Ok(Self { config: config.clone(), visual, language_model, lm_head, rope_deltas: None, text_device: text_device.clone(), vision_device: vision_device.clone(), mmap: main_mmap_handle, mmproj_mmap: mmproj_mmap_handle })
+        Ok(Self { 
+            config: config.clone(), 
+            visual, 
+            language_model, 
+            lm_head, 
+            rope_deltas: None, 
+            rope_deltas_cpu: None, // <-- 바로 이 부분입니다
+            text_device: text_device.clone(), 
+            vision_device: vision_device.clone(), 
+            mmap: main_mmap_handle, 
+            mmproj_mmap: mmproj_mmap_handle 
+        })
     }
 
     pub fn new<R: std::io::Seek + std::io::Read, R2: std::io::Seek + std::io::Read>(
@@ -2903,20 +2921,28 @@ impl QuantizedQwen3VLModel {
             QLinear::new(QMatMul::Tensor(Tensor::zeros((1, 1), head_dtype, text_device)?), None, text_device.clone())
         };
 
-        Ok(Self { config: config.clone(), visual, language_model, lm_head, rope_deltas: None, text_device: text_device.clone(), vision_device: vision_device.clone(), mmap: None, mmproj_mmap: None })
+        Ok(Self { 
+            config: config.clone(), 
+            visual, 
+            language_model, 
+            lm_head, 
+            rope_deltas: None, 
+            rope_deltas_cpu: None, // <-- 바로 이 부분입니다
+            text_device: text_device.clone(), 
+            vision_device: vision_device.clone(), 
+            mmap: None, 
+            mmproj_mmap: None 
+        })
     }
     
     fn get_vision_features(&self, pixel_values: &Tensor, image_grid_thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
-        let (image_embeds, deepstack_image_embeds) = self.visual.forward(pixel_values, image_grid_thw)?;
         let image_grid_thw = if !image_grid_thw.device().same_device(&self.vision_device) { image_grid_thw.to_device(&self.vision_device)? } else { image_grid_thw.clone() };
         let (image_embeds, deepstack_image_embeds) = self.visual.forward(&pixel_values, &image_grid_thw)?;
-        let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
-        let split_sizes: Vec<usize> = prod_tensor_last_dim(&image_grid_thw)?.to_vec1::<u32>()?.iter().map(|&x| x as usize / spatial_merge_size.pow(2)).collect();
+        
+        // [CRITICAL FIX] spatial_merge_size와 split_sizes를 계산하던 무거운 유령 로직 전체 삭제!
         let image_embeds = image_embeds.to_device(&self.text_device)?;
         let deepstack_image_embeds: Result<Vec<Tensor>> = deepstack_image_embeds.into_iter().map(|t| Ok(t.to_device(&self.text_device)?)).collect();
         
-        // [CRITICAL FIX] 쪼개는 로직 삭제! 원본 텐서 그대로 반환
-        // let image_embeds = split_tensor(&image_embeds, &split_sizes, 0)?; (이 줄 삭제)
         Ok((image_embeds, deepstack_image_embeds?))
     }
 
@@ -2933,7 +2959,7 @@ impl QuantizedQwen3VLModel {
         image_grid_thw: Option<&Tensor>,
         _video_grid_thw: Option<&Tensor>,
         _mask: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor)> {
+    ) -> Result<(Tensor, Tensor, Vec<i64>)> { // [FIX] Vec<i64> 반환 추가
         // [ROPE-FIX] 이미지 격자 구조를 반영한 실제 3D mRoPE 인덱스 계산 로직
         let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
         let image_token_id = self.config.image_token_id.unwrap_or(0);
@@ -2946,17 +2972,19 @@ impl QuantizedQwen3VLModel {
         let input_ids_vec = input_ids.to_vec2::<u32>()?;
         let mut image_idx = 0;
 
-        // [CRITICAL FIX] 루프 진입 전 THW 데이터를 한 방에 CPU 배열로 복사!
         let image_thw_cpu = if let Some(thw) = image_grid_thw {
             Some(thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?)
         } else { None };
+
+        // [CRITICAL FIX] 바깥쪽 선언 시 타입을 <u32>로 명확히 지정!
+        let mut flat_pos_ids: Vec<u32> = Vec::with_capacity(3 * b_sz * seq_len);
 
         for b in 0..b_sz {
             let ids = &input_ids_vec[b];
             let mut curr_pos = 0u32;
             let mut llm_pos_ids = vec![vec![0u32; seq_len]; 3];
-
             let mut i = 0;
+            
             while i < seq_len {
                 if ids[i] == vision_start_token_id as u32 && i + 1 < seq_len && ids[i+1] == image_token_id as u32 {
                     // [FIX] 루프 내부 GPU Sync(to_vec1) 삭제 및 CPU 캐시 배열 사용
@@ -2998,22 +3026,19 @@ impl QuantizedQwen3VLModel {
                 }
             }
             
-            // Tensor로 변환 및 삽입
-            let mut flat_pos_ids = Vec::with_capacity(3 * b_sz * seq_len);
-            for b in 0..b_sz {
-               // ... 위와 동일하게 llm_pos_ids[3][seq_len] 배열을 구함
-               for d in 0..3 {
-                   flat_pos_ids.extend_from_slice(&llm_pos_ids[d]); // 1차원으로 전부 이어붙임
-               }
+            // [CRITICAL FIX] 루프 내부의 중복 선언(let mut flat_pos_ids = ...)은 완전히 삭제했습니다!
+            // 이제 바깥에 만들어둔 거대한 그릇에 1차원으로 계속 이어붙이기만 합니다.
+            for d in 0..3 {
+                flat_pos_ids.extend_from_slice(&llm_pos_ids[d]);
             }
-            // CPU에서 배열 조립을 끝내고, 딱 한 번만 GPU로 전송 후 형태를 맞춤!
-            let position_ids = Tensor::from_vec(flat_pos_ids, (3, b_sz, seq_len), input_ids.device())?;
             mrope_position_deltas.push(curr_pos as i64 - seq_len as i64);
-        }
+        } // 처음 배치 루프 종료
 
+        let position_ids = Tensor::from_vec(flat_pos_ids, (3, b_sz, seq_len), input_ids.device())?;
+        
         let target_dtype = if input_ids.device().is_cuda() { DType::BF16 } else { DType::F32 };
-        let deltas = Tensor::from_vec(mrope_position_deltas, (b_sz, 1), input_ids.device())?.to_dtype(target_dtype)?;
-        Ok((position_ids, deltas))
+        let deltas = Tensor::from_vec(mrope_position_deltas.clone(), (b_sz, 1), input_ids.device())?.to_dtype(target_dtype)?; 
+        Ok((position_ids, deltas, mrope_position_deltas))
     }
 
     pub async fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
@@ -3038,29 +3063,25 @@ impl QuantizedQwen3VLModel {
         }
         
         // 2. Position IDs calculation (Corrected for Long Context & Vision)
-        let (position_ids, _rope_deltas) = if seqlen_offset == 0 || self.rope_deltas.is_none() {
-            let (p_ids, deltas) = self.get_rope_index(&input_ids, image_grid_thw, video_grid_thw, None)?;
-            self.rope_deltas = Some(deltas);
-            (p_ids, self.rope_deltas.as_ref().unwrap().clone())
+        let position_ids = if seqlen_offset == 0 || self.rope_deltas_cpu.is_none() { 
+            let (p_ids, deltas_tensor, deltas_vec) = self.get_rope_index(&input_ids, image_grid_thw, video_grid_thw, None)?; 
+            self.rope_deltas = Some(deltas_tensor);
+            self.rope_deltas_cpu = Some(deltas_vec); // CPU 캐시 저장
+            p_ids
         } else {
-            // Decoding/Incremental Step
-            let deltas = self.rope_deltas.as_ref().unwrap();
-            
-            // [CRITICAL FIX] 루프를 돌며 to_scalar()로 GPU 멱살을 잡는 대신, 
-            // 델타 값 전체를 한 번에 CPU로 내려받아 캐싱합니다!
-            let deltas_cpu = deltas.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-            let mut p_ids_vec = Vec::new();
+            // Decoding/Incremental Step (Zero GPU-CPU Sync!)
+            let deltas_cpu = self.rope_deltas_cpu.as_ref().unwrap();
+            let mut p_ids_vec = Vec::with_capacity(b_sz);
             
             for b in 0..b_sz {
-                let delta = deltas_cpu[b][0] as i64; // [FIX] CPU 캐시에서 즉시 읽어옴 (Zero Sync)
-                let real_start = (seqlen_offset as i64 + delta) as u32;
+                let delta = deltas_cpu[b]; // [FIX] 순수 O(1) RAM 읽기! PCIe 통신 완벽 제거!
+                let real_start = (seqlen_offset as i64 + delta) as u32; 
                 
-                let p_id = Tensor::arange(real_start, real_start + seq_len as u32, input_ids.device())?
-                    .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, seq_len))?;
-                p_ids_vec.push(p_id);
+                let p_id = Tensor::arange(real_start, real_start + seq_len as u32, input_ids.device())? 
+                    .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, seq_len))?; 
+                p_ids_vec.push(p_id); 
             }
-            let p_ids = Tensor::cat(&p_ids_vec, 1)?;
-            (p_ids, deltas.clone())
+            Tensor::cat(&p_ids_vec, 1)?
         };
         
         self.language_model.active_session_id = session_id.clone();
