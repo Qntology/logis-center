@@ -17,7 +17,9 @@ pub fn rotate_half(x: &Tensor) -> Result<Tensor> {
     let x1 = x.narrow(D::Minus1, 0, half_dim)?;
     let x2 = x.narrow(D::Minus1, half_dim, half_dim)?;
     let x2 = x2.affine(-1.0, 0.0)?;
-    let rotate_x = Tensor::cat(&[&x2, &x1], D::Minus1)?.contiguous()?;
+    
+    // [CRITICAL FIX] 매 Attention 마다 발생하는 무거운 메모리 재정렬/복사 오버헤드(.contiguous()) 제거!
+    let rotate_x = Tensor::cat(&[&x2, &x1], D::Minus1)?;
     Ok(rotate_x)
 }
 
@@ -35,18 +37,14 @@ pub fn apply_multimodel_rotary_pos_emb(
         .enumerate()
         .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
         .collect();
-    let cos = Tensor::cat(&cos_select, D::Minus1)?
-        .unsqueeze(1)?
-        .contiguous()?;
+    let cos = Tensor::cat(&cos_select, D::Minus1)?.unsqueeze(1)?;
     let sin_select: Vec<Tensor> = sin
         .split(&mrope_section, D::Minus1)?
         .iter()
         .enumerate()
         .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
         .collect();
-    let sin = Tensor::cat(&sin_select, D::Minus1)?
-        .unsqueeze(1)?
-        .contiguous()?;
+    let sin = Tensor::cat(&sin_select, D::Minus1)?.unsqueeze(1)?;
     let q_embed = q
         .broadcast_mul(&cos)?
         .add(&rotate_half(q)?.broadcast_mul(&sin)?)?;
@@ -62,18 +60,20 @@ pub fn apply_rotary_pos_emb_vision(
     cos: &Tensor,
     sin: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
-    let cos = cos.unsqueeze(D::Minus2)?;
-    let sin = sin.unsqueeze(D::Minus2)?;
+    // 1. 차원 확장만 수행 (메모리 복사 없음)
+    let cos = cos.unsqueeze(D::Minus2)?; 
+    let sin = sin.unsqueeze(D::Minus2)?; 
     
-    // [CRITICAL FIX] 외부에서 이미 타겟 타입으로 변환되어 오므로, 잉여 캐스팅 과감하게 삭제!
+    // [CRITICAL FIX] 이미 외부에서 q.dtype()과 일치하게 넘어오므로 
+    // .to_dtype() 캐스팅 과정을 완전히 삭제하여 GPU Sync Stall을 제거합니다. 
     
     let q_embed = q
         .broadcast_mul(&cos)?
-        .add(&rotate_half(q)?.broadcast_mul(&sin)?)?;
+        .add(&rotate_half(q)?.broadcast_mul(&sin)?)?; 
     let k_embed = k
         .broadcast_mul(&cos)?
-        .add(&rotate_half(k)?.broadcast_mul(&sin)?)?;
-    Ok((q_embed, k_embed))
+        .add(&rotate_half(k)?.broadcast_mul(&sin)?)?; 
+    Ok((q_embed, k_embed)) 
 }
 
 pub fn apply_rotary_pos_emb(
@@ -83,29 +83,38 @@ pub fn apply_rotary_pos_emb(
     sin: &Tensor,
     tof32: bool,
 ) -> Result<(Tensor, Tensor)> {
-    let mut cos = cos.clone();
-    let mut sin = sin.clone();
-    if cos.rank() == 2 {
-        cos = cos.unsqueeze(0)?.unsqueeze(0)?;
-        sin = sin.unsqueeze(0)?.unsqueeze(0)?;
-    }
-    if cos.rank() == 3 {
-        cos = cos.unsqueeze(1)?;
-        sin = sin.unsqueeze(1)?;
-    }
-    let orig_dtype = q.dtype();
-    let q = if tof32 { &q.to_dtype(DType::F32)? } else { q };
-    let k = if tof32 { &k.to_dtype(DType::F32)? } else { k };
-    let cos = cos.to_dtype(q.dtype())?;
-    let sin = sin.to_dtype(q.dtype())?;
+    // 1. [FIX] 무조건적인 clone() 제거. 필요한 랭크일 때만 가상 뷰(unsqueeze) 생성
+    let cos = if cos.rank() == 2 { cos.unsqueeze(0)?.unsqueeze(0)? } 
+              else if cos.rank() == 3 { cos.unsqueeze(1)? } 
+              else { cos.clone() }; 
+    let sin = if sin.rank() == 2 { sin.unsqueeze(0)?.unsqueeze(0)? } 
+              else if sin.rank() == 3 { sin.unsqueeze(1)? } 
+              else { sin.clone() }; 
 
-    let q_embed = q
-        .broadcast_mul(&cos)?
-        .add(&rotate_half(q)?.broadcast_mul(&sin)?)?;
-    let k_embed = k
-        .broadcast_mul(&cos)?
-        .add(&rotate_half(k)?.broadcast_mul(&sin)?)?;
-    Ok((q_embed, k_embed))
+    let orig_dtype = q.dtype();
+    
+    // 2. [FIX] tof32 플래그가 참일 때만 물리적 타입 변환 수행 (No-Op 방지)
+    let (q_work, k_work) = if tof32 { 
+        (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?) 
+    } else { 
+        (q.clone(), k.clone()) 
+    };
+
+    // cos, sin의 타입이 연산 대상(q_work)과 다를 때만 1번 캐스팅
+    let cos = if cos.dtype() != q_work.dtype() { cos.to_dtype(q_work.dtype())? } else { cos }; 
+    let sin = if sin.dtype() != q_work.dtype() { sin.to_dtype(q_work.dtype())? } else { sin }; 
+
+    let q_embed = q_work.broadcast_mul(&cos)?.add(&rotate_half(&q_work)?.broadcast_mul(&sin)?)?; 
+    let k_embed = k_work.broadcast_mul(&cos)?.add(&rotate_half(&k_work)?.broadcast_mul(&sin)?)?; 
+
+    // 3. [FIX] 결과 반환 시에도 불필요한 재캐스팅 방지
+    let (q_final, k_final) = if tof32 {
+        (q_embed.to_dtype(orig_dtype)?, k_embed.to_dtype(orig_dtype)?) 
+    } else {
+        (q_embed, k_embed)
+    };
+
+    Ok((q_final, k_final)) 
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +143,7 @@ impl Qwen2_5VLTextRotaryEmbedding {
             position_ids.device(),
         )?
         .broadcast_as((3, position_ids.dim(1)?, self.inv_freq.len(), 1))?
+        .to_dtype(DType::F32)?
         .contiguous()?;
 
         let freqs = inv_freq_expanded
@@ -196,50 +206,73 @@ impl Qwen3VLTextRotaryEmbedding {
         Self { inv_freq }
     }
 
-    pub fn apply_interleaved_mrope(&self, freqs: &Tensor, mrope_section: Vec<usize>) -> Result<Tensor> {
-        let mut freqs_t = freqs.i(0)?; // [cite: 1773] contiguous() 제거
-
-        for (dim, section) in mrope_section.iter().enumerate().skip(1) {
-            let length = section * 3;
-            let idx = Tensor::arange_step(dim as u32, length as u32, 3, freqs.device())?;
-            let src = freqs.i(dim)?; // [FIX] .contiguous() 제거 [cite: 1771]
-            let src = src.index_select(&idx, D::Minus1)?;
-            let idx = idx.unsqueeze(0)?.unsqueeze(0)?.broadcast_as(src.shape())?; // [cite: 1777] contiguous() 제거
-            freqs_t = freqs_t.scatter(&idx, &src, D::Minus1)?;
-        }
-        Ok(freqs_t.contiguous()?) // 마지막에만 한 번 수행
-    }
     pub fn forward(
         &self,
         position_ids: &Tensor,
         dtype: DType,
         mrope_section: Vec<usize>,
     ) -> Result<(Tensor, Tensor)> {
-        let position_ids = if position_ids.rank() == 2 {
-            let (bs, len) = position_ids.dims2()?;
-            position_ids.unsqueeze(0)?.expand((3, bs, len))?
+        // [CRITICAL FIX] 확장을 가상으로만 유지하기 위해 F32 캐스팅을 최우선으로 수행
+        let pos_f32 = position_ids.to_dtype(DType::F32)?;
+        
+        let position_ids = if pos_f32.rank() == 2 {
+            let (bs, len) = pos_f32.dims2()?;
+            pos_f32.unsqueeze(0)?.expand((3, bs, len))? 
         } else {
-            position_ids.clone()
+            pos_f32
         };
-        let position_ids_expanded = position_ids
-            .unsqueeze(D::Minus2)?
-            .to_dtype(DType::F32)?
-            .contiguous()?;
+        
+        let position_ids_expanded = position_ids.unsqueeze(D::Minus2)?.contiguous()?;
+
         let inv_freq_expanded = Tensor::from_vec(
             self.inv_freq.clone(),
             (1, 1, self.inv_freq.len(), 1),
             position_ids.device(),
         )?
         .broadcast_as((3, position_ids.dim(1)?, self.inv_freq.len(), 1))?
+        .to_dtype(DType::F32)?
         .contiguous()?;
 
+        // Calculate frequencies for T, H, W dimensions
         let freqs = inv_freq_expanded
             .matmul(&position_ids_expanded)?
-            .transpose(2, 3)?;
-        let freqs = self.apply_interleaved_mrope(&freqs, mrope_section)?;
+            .transpose(2, 3)?; // (3, b_sz, seq_len, dim/2)
+
+        // Standard Qwen2-VL/Qwen3-VL block-based mRoPE assembly
         let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?.contiguous()?;
-        let cos = emb.cos()?;
-        let sin = emb.sin()?;
+        let cos_all = emb.cos()?;
+        let sin_all = emb.sin()?;
+
+        // If no sections defined, fallback to first dimension (Time)
+        if mrope_section.is_empty() {
+            let cos = cos_all.i(0)?.unsqueeze(1)?.to_dtype(dtype)?;
+            let sin = sin_all.i(0)?.unsqueeze(1)?.to_dtype(dtype)?;
+            return Ok((cos, sin));
+        }
+
+        // Split by sections and select based on dimension index
+        let mrope_section_doubled = mrope_section.iter().map(|&s| s * 2).collect::<Vec<_>>();
+        
+        let cos_select: Vec<Tensor> = cos_all
+            .split(&mrope_section_doubled, D::Minus1)?
+            .iter()
+            .enumerate()
+            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
+            .collect();
+        let cos = Tensor::cat(&cos_select, D::Minus1)?
+            .unsqueeze(1)?
+            .contiguous()?;
+
+        let sin_select: Vec<Tensor> = sin_all
+            .split(&mrope_section_doubled, D::Minus1)?
+            .iter()
+            .enumerate()
+            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
+            .collect();
+        let sin = Tensor::cat(&sin_select, D::Minus1)?
+            .unsqueeze(1)?
+            .contiguous()?;
+
         Ok((cos.to_dtype(dtype)?, sin.to_dtype(dtype)?))
     }
 }
@@ -292,12 +325,8 @@ pub fn get_xd_cos_sin(
         cos_vec.push(cos_i);
         sin_vec.push(sin_i);
     }
-    let cos = Tensor::stack(&cos_vec, 0)?
-        .permute((0, 2, 1, 3))?
-        .contiguous()?;
-    let sin = Tensor::stack(&sin_vec, 0)?
-        .permute((0, 2, 1, 3))?
-        .contiguous()?;
+    let cos = Tensor::stack(&cos_vec, 0)?.permute((0, 2, 1, 3))?;
+    let sin = Tensor::stack(&sin_vec, 0)?.permute((0, 2, 1, 3))?;
     let xdrope_section: Vec<usize> = xdrope_section.iter().map(|&i| i * 2).collect();
     let cos_select: Vec<Tensor> = split_tensor(&cos, &xdrope_section, D::Minus1)?
         .iter()

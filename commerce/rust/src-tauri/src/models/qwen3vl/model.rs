@@ -500,9 +500,13 @@ impl Qwen3VLVisionModel {
             }
             pos_ids_vec.push(coords);
         }
-        let pos_ids = Tensor::cat(&pos_ids_vec, 0)?; // [FIX] 변수 선언 복구
-        let pos_ids_h = pos_ids.i((.., 0))?;
-        let pos_ids_w = pos_ids.i((.., 1))?;
+        let pos_ids = Tensor::cat(&pos_ids_vec, 0)?;
+
+        // [CRITICAL FIX] 텐서를 잘라낸 직후에는 비연속 메모리가 되므로, 
+        // index_select에 넣기 직전에 반드시 .contiguous()로 묶어줘야 에러가 안 납니다!
+        let pos_ids_h = pos_ids.i((.., 0))?.contiguous()?; 
+        let pos_ids_w = pos_ids.i((.., 1))?.contiguous()?; 
+        
         let rotary_pos_emb_h = freq_table.index_select(&pos_ids_h, 0)?;
         let rotary_pos_emb_w = freq_table.index_select(&pos_ids_w, 0)?;
         
