@@ -67,20 +67,10 @@ impl Module for RmsNorm {
         if self.is_cleared() {
             return Err(candle_core::Error::Msg("RMSNorm weight is cleared. Reload required.".to_string()));
         }
-        let target_dtype = self.weight.dtype();
         
-        // [최적화 1] 분산을 구하기 위한 연산은 어쩔수 없이 F32 사용
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let variance = x_f32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-        
-        // [CRITICAL FIX] 전체 행렬이 아닌 '(분산+eps)의 역수'만 F32로 계산 후 BF16으로 변환!
-        let inv_std = (variance + self.eps)?.sqrt()?.recip()?;
-        let inv_std_bf16 = inv_std.to_dtype(target_dtype)?;
-        
-        // [최적화 2] 원본 BF16 행렬에 BF16 역표준편차를 곱함 (나눗셈 대비 GPU 연산 속도 2배)
-        let hidden_states = x.broadcast_mul(&inv_std_bf16)?;
-        
-        hidden_states.broadcast_mul(&self.weight)
+        // [CRITICAL FIX] VRAM을 2배로 먹고 속도를 떨어뜨리던 수동 분산 계산을 모두 지우고, 
+        // Candle 프레임워크의 초고속 네이티브 C++/CUDA 커널에 연산을 위임합니다!
+        candle_nn::ops::rms_norm(x, &self.weight, self.eps as f32)
     }
 }
 
@@ -975,9 +965,13 @@ impl QuantizedQwen3VLTextAttention {
                 crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                 tauri::async_runtime::spawn(async move {
-                    // [CRITICAL FIX] 메인 스레드(디코딩 루프)를 멈추지 않도록 GPU -> CPU 다운로드를 백그라운드에서 실행!
-                    let k_vram = k.to_device(&Device::Cpu).unwrap_or_else(|_| k.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| k.clone()).contiguous().unwrap_or_else(|_| k.clone());
-                    let v_vram = v.to_device(&Device::Cpu).unwrap_or_else(|_| v.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| v.clone()).contiguous().unwrap_or_else(|_| v.clone());
+                    // [CRITICAL FIX] 무거운 GPU->CPU 다운로드(블로킹 연산)가 비동기 런타임을 마비시키지 않도록
+                    // spawn_blocking으로 완벽하게 격리시켜 디코딩 버벅임(Stuttering)을 차단합니다!
+                    let (k_vram, v_vram) = tokio::task::spawn_blocking(move || {
+                        let k_res = k.to_device(&Device::Cpu).unwrap_or_else(|_| k.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| k.clone()).contiguous().unwrap_or_else(|_| k.clone());
+                        let v_res = v.to_device(&Device::Cpu).unwrap_or_else(|_| v.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| v.clone()).contiguous().unwrap_or_else(|_| v.clone());
+                        (k_res, v_res)
+                    }).await.unwrap_or_else(|_| (Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(), Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap()));
                     
                     if let Some(tx) = crate::models::qwen3vl::generate::BAKE_TX.get() {
                         let sub_path = if baking_only { format!("{}/reference/{}", session_id_owned, kv_type) } else { format!("{}/inference/{}", session_id_owned, kv_type) };

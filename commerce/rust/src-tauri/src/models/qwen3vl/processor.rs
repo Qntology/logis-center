@@ -151,7 +151,9 @@ impl Qwen3VLProcessor {
         let img_tensor = if t % self.img_process_cfg.temporal_patch_size != 0 {
             let repeat_num = self.img_process_cfg.temporal_patch_size
                 - t % self.img_process_cfg.temporal_patch_size;
-            let repeats = img_tensor.i(t - 1)?.repeat((repeat_num, 1, 1, 1))?;
+                
+            // [CRITICAL FIX] .i() 대신 narrow를 사용하여 4D 차원(1, C, H, W)을 안전하게 보존!
+            let repeats = img_tensor.narrow(0, t - 1, 1)?.repeat((repeat_num, 1, 1, 1))?;
             Tensor::cat(&[img_tensor, &repeats], 0)?
         } else {
             img_tensor.clone()

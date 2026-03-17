@@ -479,23 +479,27 @@ impl Qwen3VLVisionModel {
             let intra_row = Tensor::arange(0, merge_size as u32, grid_thw.device())?;
             let intra_col = Tensor::arange(0, merge_size as u32, grid_thw.device())?;
 
+            // [CRITICAL FIX] 증발했던 row_idx와 col_idx의 3D Grid 인덱스 계산 공식을 복구합니다!
             let row_idx = blocks_rows
-                .reshape(((), 1, 1, 1))?
-                .contiguous()?
-                .affine(merge_size as f64, 0.0)?
-                .broadcast_add(&intra_row.reshape((1, 1, (), 1))?.contiguous()?)?;
+                .unsqueeze(1)?.unsqueeze(2)?.unsqueeze(3)?
+                .broadcast_mul(&Tensor::new(merge_size as u32, grid_thw.device())?)?
+                .broadcast_add(&intra_row.unsqueeze(0)?.unsqueeze(1)?.unsqueeze(3)?)?;
+
             let col_idx = blocks_cols
-                .reshape((1, (), 1, 1))?
-                .contiguous()?
-                .affine(merge_size as f64, 0.0)?
-                .broadcast_add(&intra_col.reshape((1, 1, 1, ()))?.contiguous()?)?;
+                .unsqueeze(0)?.unsqueeze(2)?.unsqueeze(3)?
+                .broadcast_mul(&Tensor::new(merge_size as u32, grid_thw.device())?)?
+                .broadcast_add(&intra_col.unsqueeze(0)?.unsqueeze(1)?.unsqueeze(2)?)?;
+
             let row_idx = row_idx
                 .expand((merged_h as usize, merged_w as usize, merge_size, merge_size))?
-                .contiguous()? // <--- 여기에 추가하여 stack 연산 가속
+                .contiguous()? 
                 .flatten_all()?;
+                
             let col_idx = col_idx
                 .expand((merged_h as usize, merged_w as usize, merge_size, merge_size))?
+                .contiguous()? 
                 .flatten_all()?;
+                
             let mut coords = Tensor::stack(&[row_idx, col_idx], D::Minus1)?.contiguous()?;
             if t > 1 {
                 coords = coords.repeat((t as usize, 1))?;
