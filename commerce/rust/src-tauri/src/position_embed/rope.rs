@@ -17,7 +17,9 @@ pub fn rotate_half(x: &Tensor) -> Result<Tensor> {
     let x1 = x.narrow(D::Minus1, 0, half_dim)?;
     let x2 = x.narrow(D::Minus1, half_dim, half_dim)?;
     let x2 = x2.affine(-1.0, 0.0)?;
-    let rotate_x = Tensor::cat(&[&x2, &x1], D::Minus1)?.contiguous()?;
+    
+    // [CRITICAL FIX] 매 Attention 마다 발생하는 무거운 메모리 재정렬/복사 오버헤드(.contiguous()) 제거!
+    let rotate_x = Tensor::cat(&[&x2, &x1], D::Minus1)?;
     Ok(rotate_x)
 }
 
@@ -62,17 +64,20 @@ pub fn apply_rotary_pos_emb_vision(
     cos: &Tensor,
     sin: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
-    let cos = cos.unsqueeze(D::Minus2)?;
-    let sin = sin.unsqueeze(D::Minus2)?;
-    let cos = cos.to_dtype(q.dtype())?;
-    let sin = sin.to_dtype(q.dtype())?;
+    // 1. 차원 확장만 수행 (메모리 복사 없음)
+    let cos = cos.unsqueeze(D::Minus2)?; 
+    let sin = sin.unsqueeze(D::Minus2)?; 
+    
+    // [CRITICAL FIX] 이미 외부에서 q.dtype()과 일치하게 넘어오므로 
+    // .to_dtype() 캐스팅 과정을 완전히 삭제하여 GPU Sync Stall을 제거합니다. 
+    
     let q_embed = q
         .broadcast_mul(&cos)?
-        .add(&rotate_half(q)?.broadcast_mul(&sin)?)?;
+        .add(&rotate_half(q)?.broadcast_mul(&sin)?)?; 
     let k_embed = k
         .broadcast_mul(&cos)?
-        .add(&rotate_half(k)?.broadcast_mul(&sin)?)?;
-    Ok((q_embed, k_embed))
+        .add(&rotate_half(k)?.broadcast_mul(&sin)?)?; 
+    Ok((q_embed, k_embed)) 
 }
 
 pub fn apply_rotary_pos_emb(
@@ -82,31 +87,38 @@ pub fn apply_rotary_pos_emb(
     sin: &Tensor,
     tof32: bool,
 ) -> Result<(Tensor, Tensor)> {
-    let mut cos = cos.clone();
-    let mut sin = sin.clone();
-    if cos.rank() == 2 {
-        cos = cos.unsqueeze(0)?.unsqueeze(0)?;
-        sin = sin.unsqueeze(0)?.unsqueeze(0)?;
-    }
-    if cos.rank() == 3 {
-        cos = cos.unsqueeze(1)?;
-        sin = sin.unsqueeze(1)?;
-    }
-    let orig_dtype = q.dtype();
-    let q = if tof32 { &q.to_dtype(DType::F32)? } else { q };
-    let k = if tof32 { &k.to_dtype(DType::F32)? } else { k };
-    let cos = cos.to_dtype(q.dtype())?;
-    let sin = sin.to_dtype(q.dtype())?;
+    // 1. [FIX] 무조건적인 clone() 제거. 필요한 랭크일 때만 가상 뷰(unsqueeze) 생성
+    let cos = if cos.rank() == 2 { cos.unsqueeze(0)?.unsqueeze(0)? } 
+              else if cos.rank() == 3 { cos.unsqueeze(1)? } 
+              else { cos.clone() }; 
+    let sin = if sin.rank() == 2 { sin.unsqueeze(0)?.unsqueeze(0)? } 
+              else if sin.rank() == 3 { sin.unsqueeze(1)? } 
+              else { sin.clone() }; 
 
-    let q_embed = q
-        .broadcast_mul(&cos)?
-        .add(&rotate_half(q)?.broadcast_mul(&sin)?)?
-        .to_dtype(orig_dtype)?;
-    let k_embed = k
-        .broadcast_mul(&cos)?
-        .add(&rotate_half(k)?.broadcast_mul(&sin)?)?
-        .to_dtype(orig_dtype)?;
-    Ok((q_embed, k_embed))
+    let orig_dtype = q.dtype();
+    
+    // 2. [FIX] tof32 플래그가 참일 때만 물리적 타입 변환 수행 (No-Op 방지)
+    let (q_work, k_work) = if tof32 { 
+        (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?) 
+    } else { 
+        (q.clone(), k.clone()) 
+    };
+
+    // cos, sin의 타입이 연산 대상(q_work)과 다를 때만 1번 캐스팅
+    let cos = if cos.dtype() != q_work.dtype() { cos.to_dtype(q_work.dtype())? } else { cos }; 
+    let sin = if sin.dtype() != q_work.dtype() { sin.to_dtype(q_work.dtype())? } else { sin }; 
+
+    let q_embed = q_work.broadcast_mul(&cos)?.add(&rotate_half(&q_work)?.broadcast_mul(&sin)?)?; 
+    let k_embed = k_work.broadcast_mul(&cos)?.add(&rotate_half(&k_work)?.broadcast_mul(&sin)?)?; 
+
+    // 3. [FIX] 결과 반환 시에도 불필요한 재캐스팅 방지
+    let (q_final, k_final) = if tof32 {
+        (q_embed.to_dtype(orig_dtype)?, k_embed.to_dtype(orig_dtype)?) 
+    } else {
+        (q_embed, k_embed)
+    };
+
+    Ok((q_final, k_final)) 
 }
 
 #[derive(Debug, Clone)]

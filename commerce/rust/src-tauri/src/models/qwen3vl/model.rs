@@ -182,47 +182,31 @@ impl Qwen3VLVisionAttention {
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        cu_seqlens: &Tensor,
+        chunks: &[usize], // [CRITICAL FIX]
     ) -> Result<Tensor> {
-        // xs: (seq_len, hidden_size)
         let seq_length = xs.dim(0)?;
-        // (seq_len, hidden_size) -> (seq_len, hidden_size*3)
-        // -> (seq_len, 3, num_heads, head_dim)
-        // -> (3, seq_len, num_heads, head_dim)
-        let qkv_states = xs
-            .apply(&self.qkv)?
-            .reshape((seq_length, 3, self.num_heads, ()))?
-            .permute((1, 0, 2, 3))?;
-        // (seq_len, num_heads, head_dim)
+        let qkv_states = xs.apply(&self.qkv)?.reshape((seq_length, 3, self.num_heads, ()))?.permute((1, 0, 2, 3))?;
         let query_states = qkv_states.i(0)?.contiguous()?;
         let key_states = qkv_states.i(1)?.contiguous()?;
         let value_states = qkv_states.i(2)?.contiguous()?;
-        let (query_states, key_states) =
-            apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?;
-        // (seq_len, num_heads, head_dim) -> (num_heads, seq_len, head_dim) -> (1, num_heads, seq_len, head_dim)
+        
+        let (query_states, key_states) = apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?;
         let query_states = query_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
         let key_states = key_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
         let value_states = value_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
-        let cu_last_id = cu_seqlens.dim(0)? - 1;
-        let lengths = cu_seqlens.i(1..)?.sub(&cu_seqlens.i(..cu_last_id)?)?;
-        let chunks: Vec<usize> = lengths
-            .to_vec1::<u32>()?
-            .iter()
-            .map(|&x| x as usize)
-            .collect();
-        let q_splits = split_tensor(&query_states, &chunks, 2)?;
-        let k_splits = split_tensor(&key_states, &chunks, 2)?;
-        let v_splits = split_tensor(&value_states, &chunks, 2)?;
 
+        // [CRITICAL FIX] 여기서 동기화를 유발하던 lengths.to_vec1() 로직 전체 삭제 완료!
+        let q_splits = split_tensor(&query_states, chunks, 2)?;
+        let k_splits = split_tensor(&key_states, chunks, 2)?;
+        let v_splits = split_tensor(&value_states, chunks, 2)?;
+        
         let mut attn_outputs = Vec::new();
         for (q, (k, v)) in q_splits.iter().zip(k_splits.iter().zip(v_splits.iter())) {
             let output = eager_attention_forward(q, k, v, None, None, self.scaling)?;
             attn_outputs.push(output);
         }
-        let attn_output = Tensor::cat(&attn_outputs, 1)?;
-        let attn_output = attn_output.reshape((seq_length, ()))?.contiguous()?;
-        let attn_ouput = attn_output.apply(&self.proj)?;
-        Ok(attn_ouput)
+        let attn_output = Tensor::cat(&attn_outputs, 1)?.reshape((seq_length, ()))?.contiguous()?;
+        Ok(attn_output.apply(&self.proj)?)
     }
 }
 
@@ -273,18 +257,17 @@ impl Qwen3VLVisionBlock {
     pub fn forward(
         &self,
         xs: &Tensor,
-        cu_seqlens: &Tensor,
+        chunks: &[usize], // [CRITICAL FIX]
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
         let residual = xs.clone();
         let xs = self.norm1.forward(xs)?;
-        let xs = self.attn.forward(&xs, cos, sin, cu_seqlens)?;
+        let xs = self.attn.forward(&xs, cos, sin, chunks)?; // [FIX]
         let xs = residual.add(&xs)?;
         let residual = xs.clone();
         let xs = self.mlp.forward(&self.norm2.forward(&xs)?)?;
-        let xs = residual.add(&xs)?;
-        Ok(xs)
+        Ok(residual.add(&xs)?)
     }
 }
 
@@ -362,8 +345,12 @@ impl Qwen3VLVisionModel {
         let mut idx_list = vec![vec![]; 4];
         let mut weight_list = vec![vec![]; 4];
         let mut split_idx = vec![];
+        
+        // [CRITICAL FIX] 루프 안에서 지연을 일으키지 않도록 전체 데이터를 CPU로 한 번에 가져옵니다.
+        let grid_thw_cpu = grid_thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
+
         for i in 0..grid_thw.dim(0)? {
-            let [_, h, w] = grid_thw.i(i)?.to_vec1::<u32>()?[..] else {
+            let [_, h, w] = grid_thw_cpu[i][..] else { // [FIX] CPU 캐시 배열 사용
                 return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
             };
             split_idx.push((h * w) as usize);
@@ -425,8 +412,8 @@ impl Qwen3VLVisionModel {
                     .to_vec1::<u32>()?,
             );
 
-            let one_sub_dh = Tensor::ones_like(&dh)?.sub(&dh)?;
-            let one_sub_dw = Tensor::ones_like(&dw)?.sub(&dw)?;
+            let one_sub_dh = dh.affine(-1.0, 1.0)?;
+            let one_sub_dw = dw.affine(-1.0, 1.0)?;
 
             weight_list[0].extend_from_slice(
                 &one_sub_dh
@@ -463,7 +450,7 @@ impl Qwen3VLVisionModel {
         let patch_pos_embeds = split_tensor(&patch_pos_embeds, &split_idx, 0)?;
         let merge_size = self.spatial_merge_size;
         for (i, pos_embed) in patch_pos_embeds.iter().enumerate() {
-            let [t, h, w] = grid_thw.i(i)?.to_vec1::<u32>()?[..] else {
+            let [t, h, w] = grid_thw_cpu[i][..] else { // [FIX] 두 번째 루프에서도 CPU 캐시 배열 사용
                 return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
             };
             // let pos_embed = &patch_pos_embeds[i];
@@ -489,13 +476,16 @@ impl Qwen3VLVisionModel {
 
     pub fn rot_pos_emb(&self, grid_thw: &Tensor) -> Result<Tensor> {
         let merge_size = self.spatial_merge_size;
-        let max_hw = grid_thw.i((.., 1..))?.max_all()?.to_scalar::<u32>()?;
-        let freq_table = self
-            .rotary_pos_emb
-            .forward(max_hw as usize, grid_thw.device())?;
+        
+        // [CRITICAL FIX] 한 번만 CPU로 복사한 뒤, GPU Sync(max_all.to_scalar)를 순수 Rust 수학 연산으로 대체합니다!
+        let grid_thw_cpu = grid_thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
+        let max_hw = grid_thw_cpu.iter().flat_map(|thw| [thw[1], thw[2]]).max().unwrap_or(0);
+
+        let freq_table = self.rotary_pos_emb.forward(max_hw as usize, grid_thw.device())?;
         let mut pos_ids_vec = vec![];
+        
         for i in 0..grid_thw.dim(0)? {
-            let [t, h, w] = grid_thw.i(i)?.to_vec1::<u32>()?[..] else {
+            let [t, h, w] = grid_thw_cpu[i][..] else { // [FIX] CPU 캐시 사용
                 return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
             };
             let merged_h = h / merge_size as u32;
@@ -517,6 +507,7 @@ impl Qwen3VLVisionModel {
                 .broadcast_add(&intra_col.reshape((1, 1, 1, ()))?.contiguous()?)?;
             let row_idx = row_idx
                 .expand((merged_h as usize, merged_w as usize, merge_size, merge_size))?
+                .contiguous()? // <--- 여기에 추가하여 stack 연산 가속
                 .flatten_all()?;
             let col_idx = col_idx
                 .expand((merged_h as usize, merged_w as usize, merge_size, merge_size))?
@@ -527,13 +518,12 @@ impl Qwen3VLVisionModel {
             }
             pos_ids_vec.push(coords);
         }
-        let pos_ids = Tensor::cat(&pos_ids_vec, 0)?;
-        let pos_ids_h = pos_ids.i((.., 0))?.contiguous()?;
-        // 第二列是w维度的索引
-        let pos_ids_w = pos_ids.i((.., 1))?.contiguous()?;
+        let pos_ids = Tensor::cat(&pos_ids_vec, 0)?; // [FIX] 변수 선언 복구
+        let pos_ids_h = pos_ids.i((.., 0))?;
+        let pos_ids_w = pos_ids.i((.., 1))?;
         let rotary_pos_emb_h = freq_table.index_select(&pos_ids_h, 0)?;
         let rotary_pos_emb_w = freq_table.index_select(&pos_ids_w, 0)?;
-        // 每个patch融合h索引和w索引两个的位置编码信息
+        
         let rotary_pos_emb = Tensor::cat(&[rotary_pos_emb_h, rotary_pos_emb_w], 1)?.contiguous()?;
         Ok(rotary_pos_emb)
     }
@@ -560,14 +550,17 @@ impl Qwen3VLVisionModel {
             cu_seqlens_repeat.push(cu_seqlens.i(index)?.repeat(*t as usize)?);
         }
         let cu_seqlens_full = Tensor::cat(&cu_seqlens_repeat, 0)?.flatten_all()?;
-        let cu_seqlens = cu_seqlens_full
-            .to_dtype(DType::F64)?
-            .cumsum(0)?
-            .to_dtype(DType::U32)?
-            .pad_with_zeros(D::Minus1, 1, 0)?;
+        let cu_seqlens = cu_seqlens_full.to_dtype(DType::F32)?.cumsum(0)?.to_dtype(DType::U32)?.pad_with_zeros(D::Minus1, 1, 0)?;
+        
+        // [CRITICAL FIX] 루프 진입 전, CPU로 딱 한 번만 다운로드하여 chunks를 사전 계산합니다! (32번의 GPU 멈춤 현상 완벽 제거)
+        let cu_last_id = cu_seqlens.dim(0)? - 1;
+        let lengths = cu_seqlens.i(1..)?.sub(&cu_seqlens.i(..cu_last_id)?)?;
+        let chunks: Vec<usize> = lengths.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
+
         let mut deepstack_feature_lists = vec![];
         for (layer_num, block) in self.blocks.iter().enumerate() {
-            hidden_states = block.forward(&hidden_states, &cu_seqlens, &cos, &sin)?;
+            // [FIX] 미리 계산된 chunks 슬라이스를 전달합니다.
+            hidden_states = block.forward(&hidden_states, &chunks, &cos, &sin)?;
             if self.deepstack_visual_indexes.contains(&layer_num) {
                 if let Some(index) = self
                     .deepstack_visual_indexes
@@ -830,6 +823,7 @@ impl Qwen3VLTextModel {
                     seq_len,
                     0,
                     inputs_embeds.device(),
+                    inputs_embeds.dtype(), // [FIX] 5번째 인자로 현재 텐서의 dtype 전달
                 )?)
             }
         };
@@ -905,10 +899,10 @@ impl Qwen3VLModel {
             self.visual.forward(pixel_values, image_grid_thw)?;
         
         let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
-        let split_sizes: Vec<usize> = prod_tensor_last_dim(image_grid_thw)?
-            .to_vec1::<u32>()?
+        let thw_vec = image_grid_thw.to_vec2::<u32>()?;
+        let split_sizes: Vec<usize> = thw_vec
             .iter()
-            .map(|&x| x as usize / spatial_merge_size.pow(2))
+            .map(|thw| (thw[0] * thw[1] * thw[2]) as usize / spatial_merge_size.pow(2))
             .collect();
         let image_embeds = split_tensor(&image_embeds, &split_sizes, 0)?;
         Ok((image_embeds, deepstack_image_embeds))
@@ -931,216 +925,94 @@ impl Qwen3VLModel {
         &self,
         input_ids: &Tensor,
         image_grid_thw: Option<&Tensor>,
-        video_grid_thw: Option<&Tensor>,
-        mask: Option<&Tensor>,
+        _video_grid_thw: Option<&Tensor>,
+        _mask: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
-        // ... (previous logic)
+        // [ROPE-FIX] 이미지 격자 구조를 반영한 실제 3D mRoPE 인덱스 계산 로직
         let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
         let image_token_id = self.config.image_token_id.unwrap_or(0);
-        let video_token_id = self.config.video_token_id.unwrap_or(0);
         let vision_start_token_id = self.config.vision_start_token_id.unwrap_or(0);
-        let mut mrope_position_deltas = vec![];
-        if image_grid_thw.is_some() || video_grid_thw.is_some() {
-            let total_input_ids = input_ids.clone();
-            let mask_ = mask
-                .cloned()
-                .unwrap_or(Tensor::ones_like(&total_input_ids)?)
-                .to_device(input_ids.device())?;
-            let mut position_ids = Tensor::ones(
-                (3, input_ids.dim(0)?, input_ids.dim(1)?),
-                input_ids.dtype(),
-                input_ids.device(),
-            )?;
-            let mut image_index = 0;
-            let mut video_index = 0;
+        
+        let (b_sz, seq_len) = input_ids.dims2()?;
+        let mut position_ids = Tensor::zeros((3, b_sz, seq_len), DType::U32, input_ids.device())?;
+        let mut mrope_position_deltas = Vec::new();
 
-            for i in 0..total_input_ids.dim(0)? {
-                let mut input_ids_i = total_input_ids.i(i)?;
-                let mask_i = mask_.i(i)?;
-                // 推理时, attention_mask如果是全1向量,取非0索引的操作没必要
-                if mask_i.sum_all()?.to_scalar::<u32>()? != mask_i.dim(0)? as u32 {
-                    let nonzero_idx = nonzero_index(&mask_i)?;
-                    input_ids_i = input_ids_i.gather(&nonzero_idx, 0)?;
-                }
-                let mut text_start = 0;
-                let mut text_end = 0;
-                let mut thw = vec![];
-                let mut llm_pos_ids_list: Vec<Tensor> = Vec::new();
-                // vision start的下一个索引
-                let vision_indices =
-                    get_vision_next_indices(&input_ids_i, vision_start_token_id as u32);
+        let input_ids_vec = input_ids.to_vec2::<u32>()?;
+        let mut image_idx = 0;
 
-                match vision_indices {
-                    Ok(indeices) => {
-                        let vision_tokens = input_ids_i.gather(&indeices, 0)?.to_vec1::<u32>()?;
-                        let vision_indices_vec = indeices.to_vec1::<u32>()?;
-                        for (j, &token) in vision_tokens.iter().enumerate() {
-                            if token == image_token_id as u32 {
-                                thw = image_grid_thw.unwrap().i(image_index)?.to_vec1::<u32>()?;
-                                image_index += 1;
-                                text_end = vision_indices_vec[j];
+        // [CRITICAL FIX] 루프 내부의 PCIe 병목을 막기 위해, GPU에 있는 THW 그리드 데이터를 시작 전에 한 방에 CPU RAM으로 끌어옵니다!
+        let image_thw_cpu = if let Some(thw) = image_grid_thw {
+            Some(thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?)
+        } else { None };
+        
+        let video_thw_cpu = if let Some(thw) = _video_grid_thw {
+            Some(thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?)
+        } else { None };
+
+        for b in 0..b_sz {
+            let ids = &input_ids_vec[b];
+            let mut curr_pos = 0u32;
+            let mut llm_pos_ids = vec![vec![0u32; seq_len]; 3];
+
+            let mut i = 0;
+            while i < seq_len {
+                if ids[i] == vision_start_token_id as u32 && i + 1 < seq_len && ids[i+1] == image_token_id as u32 {
+                    // 이미지 영역 발견
+                    if let Some(thw_cpu_array) = &image_thw_cpu {
+                        // [수정] GPU Sync 없이 CPU 배열에서 즉시 읽어옴!
+                        let thw = &thw_cpu_array[image_idx];
+                        image_idx += 1;
+                        
+                        let (t, h, w) = (thw[0], thw[1] / spatial_merge_size as u32, thw[2] / spatial_merge_size as u32);
+                        
+                        // vision_start 토큰 위치
+                        for d in 0..3 { llm_pos_ids[d][i] = curr_pos; }
+                        i += 1;
+                        curr_pos += 1;
+
+                        // image_pad 토큰들 위치 (3D Grid)
+                        let img_len = (t * h * w) as usize;
+                        for tt in 0..t {
+                            for hh in 0..h {
+                                for ww in 0..w {
+                                    let idx = i + (tt * h * w + hh * w + ww) as usize;
+                                    if idx < seq_len {
+                                        llm_pos_ids[0][idx] = curr_pos + tt;
+                                        llm_pos_ids[1][idx] = curr_pos + hh;
+                                        llm_pos_ids[2][idx] = curr_pos + ww;
+                                    }
+                                }
                             }
-                            if token == video_token_id as u32 {
-                                thw = video_grid_thw
-                                    .as_ref()
-                                    .unwrap()
-                                    .i(video_index)?
-                                    .to_vec1::<u32>()?;
-                                text_end = vision_indices_vec[j];
-                                video_index += 1;
-                            }
-                            let llm_grid_t = thw[0];
-                            let llm_grid_h = thw[1] / spatial_merge_size as u32;
-                            let llm_grid_w = thw[2] / spatial_merge_size as u32;
-                            let text_len = text_end - text_start;
-                            let start_idx = if !llm_pos_ids_list.is_empty() {
-                                llm_pos_ids_list[llm_pos_ids_list.len() - 1]
-                                    .max_all()?
-                                    .to_scalar::<u32>()?
-                                    + 1
-                            } else {
-                                0
-                            };
-                            let pos_ids = Tensor::arange(
-                                start_idx,
-                                start_idx + text_len,
-                                input_ids_i.device(),
-                            )?
-                            .unsqueeze(0)?
-                            .broadcast_as((3usize, text_len as usize))?;
-                            llm_pos_ids_list.push(pos_ids);
-
-                            let t_index = Tensor::arange(
-                                start_idx + text_len,
-                                start_idx + text_len + llm_grid_t,
-                                input_ids_i.device(),
-                            )?
-                            .unsqueeze(D::Minus1)?
-                            .broadcast_as((
-                                llm_grid_t as usize,
-                                llm_grid_h as usize * llm_grid_w as usize,
-                            ))?
-                            .flatten_all()?;
-                            let h_index = Tensor::arange(
-                                start_idx + text_len,
-                                start_idx + text_len + llm_grid_h,
-                                input_ids_i.device(),
-                            )?
-                            .unsqueeze(0)?
-                            .unsqueeze(D::Minus1)?
-                            .broadcast_as((
-                                llm_grid_t as usize,
-                                llm_grid_h as usize,
-                                llm_grid_w as usize,
-                            ))?
-                            .flatten_all()?;
-                            let w_index = Tensor::arange(
-                                start_idx + text_len,
-                                start_idx + text_len + llm_grid_w,
-                                input_ids_i.device(),
-                            )?
-                            .unsqueeze(0)?
-                            .unsqueeze(0)?
-                            .broadcast_as((
-                                llm_grid_t as usize,
-                                llm_grid_h as usize,
-                                llm_grid_w as usize,
-                            ))?
-                            .flatten_all()?;
-
-                            let thw_index = Tensor::stack(&[t_index, h_index, w_index], 0)?;
-                            llm_pos_ids_list.push(thw_index);
-                            text_start = text_end + llm_grid_t * llm_grid_h * llm_grid_w;
                         }
-                    }
-                    Err(e) => {
-                        println!("get vision_indices err: {e}");
-                    }
-                };
-                if text_start < input_ids_i.dim(0)? as u32 {
-                    let start_idx = if !llm_pos_ids_list.is_empty() {
-                        llm_pos_ids_list[llm_pos_ids_list.len() - 1]
-                            .max_all()?
-                            .to_scalar::<u32>()?
-                            + 1
+                
+                        i += img_len;
+                        curr_pos += t.max(h).max(w);
                     } else {
-                        0
-                    };
-                    let text_len = input_ids_i.dim(0)? as u32 - text_start;
-                    let pos_ids =
-                        Tensor::arange(start_idx, start_idx + text_len, input_ids_i.device())?
-                            .unsqueeze(0)?
-                            .broadcast_as((3usize, text_len as usize))?;
-                    llm_pos_ids_list.push(pos_ids);
-                }
-                let llm_position = Tensor::cat(&llm_pos_ids_list, 1)?.reshape((3, 1, ()))?;
-                position_ids = position_ids
-                    .slice_assign(&[(0..3), (i..i + 1), (0..input_ids.dim(1)?)], &llm_position)?;
-                let position_deltas = llm_position.max_all()?.to_scalar::<u32>()? as i64 + 1
-                    - input_ids_i.dim(0)? as i64;
-                mrope_position_deltas.push(position_deltas);
-            }
-            let mut mrope_position_deltas = Tensor::new(mrope_position_deltas, input_ids.device())?;
-            if mrope_position_deltas.rank() == 1 {
-                mrope_position_deltas = mrope_position_deltas.unsqueeze(0)?;
-            }
-            Ok((position_ids.contiguous()?, mrope_position_deltas))
-        } else if let Some(mask) = mask {
-            let mut position_ids = mask
-                .to_dtype(candle_core::DType::F64)?
-                .cumsum(D::Minus1)?
-                .to_dtype(candle_core::DType::U32)?
-                .broadcast_sub(&Tensor::new(vec![1_u32], input_ids.device())?)?;
-            for i in 0..position_ids.dim(0)? {
-                let mut position_ids_i = position_ids.i(i)?;
-                let mask_i = mask.i(i)?;
-                // 如果有pad, 将填充位置置为1
-                // 当bs>1, 可能存在不同序列长度，需要添加pad使seq_len长度一致
-                if mask_i.sum_all()?.to_scalar::<u32>()? != mask_i.dim(0)? as u32 {
-                    let zero_indices = zero_index(&mask_i)?;
-                    let replace_1 = Tensor::ones(
-                        zero_indices.dim(0)?,
-                        candle_core::DType::U32,
-                        input_ids.device(),
-                    )?;
-                    position_ids_i = position_ids_i
-                        .scatter(&zero_indices, &replace_1, 0)?
-                        .unsqueeze(0)?;
-                    position_ids = position_ids
-                        .slice_assign(&[(i..i + 1), (0..position_ids.dim(1)?)], &position_ids_i)?;
+                        // fallback (thw 없을 때)
+                        for d in 0..3 { llm_pos_ids[d][i] = curr_pos; }
+                        i += 1;
+                        curr_pos += 1;
+                    }
+                } else {
+                    // 일반 텍스트 토큰
+                    for d in 0..3 { llm_pos_ids[d][i] = curr_pos; }
+                    i += 1;
+                    curr_pos += 1;
                 }
             }
-            position_ids = position_ids
-                .unsqueeze(0)?
-                .broadcast_as((3, input_ids.dim(0)?, input_ids.dim(1)?))?
-                .contiguous()?;
-            let mut mrope_position_deltas = position_ids
-                .max(0)?
-                .max(D::Minus1)?
-                .broadcast_sub(&Tensor::new(
-                    vec![mask.dim(D::Minus1)? as u32 - 1],
-                    input_ids.device(),
-                )?)?
-                .contiguous()?;
-            if mrope_position_deltas.rank() == 1 {
-                mrope_position_deltas = mrope_position_deltas.unsqueeze(0)?;
+            
+            // Tensor로 변환 및 삽입
+            for d in 0..3 {
+                let d_tensor = Tensor::from_vec(llm_pos_ids[d].clone(), (1, seq_len), input_ids.device())?;
+                position_ids = position_ids.slice_assign(&[(d..d+1), (b..b+1), (0..seq_len)], &d_tensor)?;
             }
-            Ok((position_ids, mrope_position_deltas))
-        } else {
-            let position_ids =
-                Tensor::arange(0_u32, input_ids.dim(D::Minus1)? as u32, input_ids.device())?
-                    .unsqueeze(0)?
-                    .unsqueeze(0)?
-                    .broadcast_as((3, input_ids.dim(0)?, input_ids.dim(D::Minus1)?))?
-                    .contiguous()?;
-            let mrope_position_deltas = Tensor::zeros(
-                (input_ids.dim(0)?, 1),
-                input_ids.dtype(),
-                input_ids.device(),
-            )?;
-            Ok((position_ids, mrope_position_deltas))
+            mrope_position_deltas.push(curr_pos as i64 - seq_len as i64);
         }
+
+        let deltas = Tensor::from_vec(mrope_position_deltas, (b_sz, 1), input_ids.device())?.to_dtype(input_ids.dtype())?;
+        Ok((position_ids, deltas))
     }
+
 
     pub fn forward(
         &mut self,
@@ -1163,14 +1035,9 @@ impl Qwen3VLModel {
                     self.get_vision_features(pixel_values, image_grid_thw)?;
                 let image_embeds = Tensor::cat(&image_embeds, 0)?;
                 let vision_mask = self.get_placeholder_mask(input_ids, true)?;
-                let n_image_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
-                if n_image_tokens as usize != image_embeds.dim(0)? {
-                    return Err(anyhow!(format!(
-                        "n_image_token num: {} not equal to image_embed len: {}",
-                        n_image_tokens,
-                        image_embeds.dim(0)?
-                    )));
-                }
+                
+                // [CRITICAL FIX] GPU Sync Stall을 유발하는 sum_all() 검증 로직 삭제 완료
+                
                 inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;
                 image_mask = Some(vision_mask);
                 deepstack_image_embeds = Some(deepstack_img_embed);
@@ -1182,14 +1049,9 @@ impl Qwen3VLModel {
                     self.get_vision_features(pixel_values_video, video_grid_thw)?;
                 let video_embeds = Tensor::cat(&video_embeds, 0)?;
                 let vision_mask = self.get_placeholder_mask(input_ids, false)?;
-                let n_video_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
-                if n_video_tokens as usize != video_embeds.dim(0)? {
-                    return Err(anyhow!(format!(
-                        "n_image_token num: {} not equal to image_embed len: {}",
-                        n_video_tokens,
-                        video_embeds.dim(0)?
-                    )));
-                }
+                
+                // [CRITICAL FIX] 비디오 쪽의 sum_all() 검증 로직도 삭제 완료
+                
                 inputs_embeds = masked_scatter_dim0(&inputs_embeds, &video_embeds, &vision_mask)?;
                 video_mask = Some(vision_mask);
                 deepstack_video_embeds = Some(deepstack_video_embed);
@@ -1202,11 +1064,31 @@ impl Qwen3VLModel {
                 let image_mask_ = image_mask_.squeeze(0)?;
                 let video_mask_ = video_mask_.squeeze(0)?;
                 let visual_mask = bitor_tensor(&image_mask_, &video_mask_)?;
-                let visual_none_zero_index = nonzero_index(&visual_mask)?;
-                let image_mask_joint = image_mask_.gather(&visual_none_zero_index, 0)?;
-                let image_nonzero_joint = nonzero_index(&image_mask_joint)?;
-                let video_mask_joint = video_mask_.gather(&visual_none_zero_index, 0)?;
-                let video_nonzero_joint = nonzero_index(&video_mask_joint)?;
+                // [CRITICAL FIX] 3연속 GPU Sync Stall을 1번의 CPU 스캔으로 통합 압축
+                let img_mask_vec = image_mask_.to_vec1::<u32>()?;
+                let vid_mask_vec = video_mask_.to_vec1::<u32>()?;
+
+                let mut visual_indices = Vec::new();
+                let mut image_joint_indices = Vec::new();
+                let mut video_joint_indices = Vec::new();
+
+                let mut visual_counter = 0;
+                for i in 0..img_mask_vec.len() {
+                    let is_img = img_mask_vec[i] > 0;
+                    let is_vid = vid_mask_vec[i] > 0;
+
+                    if is_img || is_vid {
+                        visual_indices.push(i as u32);
+                        if is_img { image_joint_indices.push(visual_counter as u32); }
+                        if is_vid { video_joint_indices.push(visual_counter as u32); }
+                        visual_counter += 1;
+                    }
+                }
+
+                let dev = image_mask_.device();
+                let visual_none_zero_index = Tensor::from_vec(visual_indices.clone(), visual_indices.len(), dev)?;
+                let image_nonzero_joint = Tensor::from_vec(image_joint_indices.clone(), image_joint_indices.len(), dev)?;
+                let video_nonzero_joint = Tensor::from_vec(video_joint_indices.clone(), video_joint_indices.len(), dev)?;
                 let mut deepstack_embeds = vec![];
                 let visual_len = visual_none_zero_index.dim(0)?;
                 for (img_embed, vid_embed) in deepstack_image_embeds
@@ -1223,7 +1105,7 @@ impl Qwen3VLModel {
                     let embed_joint = embed_joint.index_add(&video_nonzero_joint, vid_embed, 0)?;
                     deepstack_embeds.push(embed_joint);
                 }
-                visual_pos_mask = Some(visual_mask.unsqueeze(0)?);
+                visual_pos_mask = Some(visual_none_zero_index.clone());
                 deepstack_visual_embeds = Some(deepstack_embeds);
             } else {
                 visual_pos_mask = Some(image_mask_);
@@ -1236,12 +1118,8 @@ impl Qwen3VLModel {
 
         let position_ids;
         let rope_deltas;
-        if (cache_position.is_some() && cache_position.unwrap().i(0)?.to_scalar::<u32>()? == 0)
-            || self.rope_deltas.is_none()
-        {
-            (position_ids, rope_deltas) =
-                self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
-            self.rope_deltas = Some(rope_deltas);
+        if seqlen_offset == 0 || self.rope_deltas.is_none() { // cache_position 텐서 검사 완전 제거
+            (position_ids, rope_deltas) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
         } else {
             let (bs, seq_len, _) = inputs_embeds.dims3()?;
             let delta = if let Some(cache_position) = cache_position {

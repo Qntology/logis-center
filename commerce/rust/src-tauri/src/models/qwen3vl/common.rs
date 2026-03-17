@@ -646,11 +646,11 @@ pub fn eager_attention_forward(
     
     // GQA/MQA 그룹 반복
     let key_states = match num_key_value_groups {
-        Some(g) => repeat_kv(key_states.clone(), g)?.contiguous()?,
+        Some(g) => repeat_kv(key_states.clone(), g)?,
         None => key_states.clone(),
     };
     let value_states = match num_key_value_groups {
-        Some(g) => repeat_kv(value_states.clone(), g)?.contiguous()?,
+        Some(g) => repeat_kv(value_states.clone(), g)?,
         None => value_states.clone(),
     };
 
@@ -712,9 +712,9 @@ pub fn eager_attention_forward(
             if start < m_len {
                 let m_end = end.min(m_len);
                 let sub_mask = mask.narrow(D::Minus1, start, m_end - start)?;
-                let w_f32 = attn_weights.to_dtype(DType::F32)?;
-                let m_f32 = sub_mask.to_dtype(DType::F32)?;
-                w_f32.broadcast_add(&m_f32)?.to_dtype(attn_weights.dtype())?
+                
+                // [CRITICAL FIX] F32 캐스팅 역주행을 지우고 BF16 상태 그대로 초고속 덧셈!
+                attn_weights.broadcast_add(&sub_mask)?
             } else {
                 attn_weights
             }

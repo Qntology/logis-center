@@ -7,23 +7,30 @@ pub fn prepare_causal_attention_mask(
     tgt_len: usize,
     seqlen_offset: usize,
     device: &Device,
+    dtype: DType, // <-- [NEW] 타겟 타입 명시
 ) -> Result<Tensor> {
     let arange = Tensor::arange(0u32, tgt_len as u32, device)?;
     let arange = arange.unsqueeze(1)?.broadcast_as((tgt_len, tgt_len))?;
     let upper_triangle = arange.t()?.gt(&arange)?;
+    
+    // [CRITICAL FIX] BF16은 -inf를 표현할 수 없으므로 안전한 -1e4 사용
+    let neg_val = if dtype == DType::F32 { f32::NEG_INFINITY } else { -1e4_f32 };
     let mask = upper_triangle.where_cond(
-        &Tensor::new(f32::NEG_INFINITY, device)?.broadcast_as(arange.shape())?,
+        &Tensor::new(neg_val, device)?.broadcast_as(arange.shape())?,
         &Tensor::new(0f32, device)?.broadcast_as(arange.shape())?,
     )?;
+    
     let mask = if seqlen_offset > 0 {
         let mask0 = Tensor::zeros((tgt_len, seqlen_offset), DType::F32, device)?;
         Tensor::cat(&[&mask0, &mask], D::Minus1)?
     } else {
         mask
     };
+    
+    // [FIX] 요청받은 dtype으로 생성하여 Attention 루프 내 캐스팅 원천 차단
     let mask = mask
-        .expand((b_size, 1, tgt_len, tgt_len + seqlen_offset))?
-        .to_dtype(DType::F32)?;
+        .to_dtype(dtype)? 
+        .expand((b_size, 1, tgt_len, tgt_len + seqlen_offset))?;
     Ok(mask)
 }
 
@@ -32,12 +39,11 @@ pub fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
         Ok(xs)
     } else {
         let (b_sz, n_kv_head, seq_len, head_dim) = xs.dims4()?;
-        let kv = Tensor::cat(&vec![&xs; n_rep], 2)?.reshape((
-            b_sz,
-            n_kv_head * n_rep,
-            seq_len,
-            head_dim,
-        ))?;
+        // [CRITICAL FIX] 메모리 복사 없이(Zero-Copy) 올바른 차원(Head) 기준으로 병합
+        let kv = xs
+            .unsqueeze(2)?
+            .expand((b_sz, n_kv_head, n_rep, seq_len, head_dim))?
+            .reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))?;
         Ok(kv)
     }
 }
@@ -86,10 +92,12 @@ pub fn safe_arg_sort_last_dim(t: &Tensor, ascending: bool) -> Result<Tensor> {
 }
 
 pub fn nonzero_index_vec(mask: &Tensor) -> Result<Vec<u32>> {
-    let mut mask = mask.clone();
-    if mask.dtype() != DType::U32 {
-        mask = mask.to_dtype(DType::U32)?;
-    }
+    // 타입이 다를 때만 변환하고, 같으면 원본의 얕은 복사만 수행
+    let mask = if mask.dtype() != DType::U32 {
+        mask.to_dtype(DType::U32)?
+    } else {
+        mask.clone() 
+    };
     match mask.rank() {
         0 => Err(anyhow!(format!(
             "input rank must > 0, the input tensor rank: {}",
@@ -134,10 +142,11 @@ pub fn nonzero_index(mask: &Tensor) -> Result<Tensor> {
 }
 
 pub fn zero_index_vec(mask: &Tensor) -> Result<Vec<u32>> {
-    let mut mask = mask.clone();
-    if mask.dtype() != DType::U32 {
-        mask = mask.to_dtype(DType::U32)?;
-    }
+    let mask = if mask.dtype() != DType::U32 {
+        mask.to_dtype(DType::U32)?
+    } else {
+        mask.clone()
+    };
     match mask.rank() {
         0 => Err(anyhow!(format!(
             "input rank must > 0, the input tensor rank: {}",
@@ -259,9 +268,10 @@ pub fn linspace(start: f32, end: f32, steps: usize, device: &Device) -> Result<T
 pub fn bitor_tensor(mask1: &Tensor, mask2: &Tensor) -> Result<Tensor> {
     assert!(
         mask1.shape() == mask2.shape(),
-        " bitor_tensor two tensor shape mask be equal"
+        "bitor_tensor two tensor shape mask be equal"
     );
-    let bitor = mask1.add(mask2)?.ne(&Tensor::zeros_like(mask1)?)?;
+    // [CRITICAL FIX] zeros_like 텐서 할당을 제거하고, 텐서 내장 maximum 함수를 활용하여 Bitwise OR 효과 달성! (0과 1의 max는 1)
+    let bitor = mask1.maximum(mask2)?;
     Ok(bitor)
 }
 
@@ -355,9 +365,14 @@ pub fn prod_tensor_last_dim(t: &Tensor) -> Result<Tensor> {
     Ok(prod)
 }
 
-pub fn mask_index_add(original: &Tensor, mask: &Tensor, add: &Tensor) -> Result<Tensor> {
-    let visual_nonzero_index = nonzero_index(mask)?;
-    let xs = original.index_add(&visual_nonzero_index, add, 0)?;
+pub fn mask_index_add(original: &Tensor, mask_or_indices: &Tensor, add: &Tensor) -> Result<Tensor> {
+    // 1차원 배열(Rank 1)이면 이미 인덱스로 변환된 것으로 간주하고 그대로 사용
+    let indices = if mask_or_indices.rank() == 1 {
+        mask_or_indices.clone()
+    } else {
+        nonzero_index(mask_or_indices)?
+    };
+    let xs = original.index_add(&indices, add, 0)?;
     Ok(xs)
 }
 
@@ -754,14 +769,12 @@ pub fn index_select_2d(t: &Tensor, index: &Tensor) -> Result<Tensor> {
     if t.rank() != 2 && index.rank() != 2 {
         return Err(anyhow::anyhow!("t and index rank must be equal to 2"));
     }
-    let mut res_vec = Vec::new();
-    let index_dim0 = index.dim(0)?;
-    for i in 0..index_dim0 {
-        let index_i = index.i(i)?;
-        let rel_i = t.index_select(&index_i, 0)?;
-        res_vec.push(rel_i);
-    }
-    let res = Tensor::stack(&res_vec, 0)?;
+    // [CRITICAL FIX] 느려터진 Rust 루프를 제거하고, GPU에서 단 1번의 커널 호출로 처리!
+    let flat_index = index.flatten_all()?;
+    let res = t.index_select(&flat_index, 0)?;
+    
+    // (선택사항) 만약 차원 유지가 필요하다면 원래의 shape으로 reshape 해줍니다.
+    let res = res.unsqueeze(1)?;
     Ok(res)
 }
 
@@ -877,20 +890,23 @@ pub fn unpack_bitkv_gpu(packed: &Tensor, original_shape: &[usize]) -> Result<Vec
     let total_els: usize = original_shape.iter().product();
     let num_u8 = (total_els + 7) / 8;
     
+    let tensor_two = Tensor::new(2u8, dev)?;
+    let tensor_zero = Tensor::new(0u8, dev)?;
+    
     let mut planes = Vec::new();
     for bit_idx in 0..4 {
         let start = bit_idx * num_u8;
-        let chunk = packed.narrow(0, start, num_u8)?;
+        let chunk = packed.narrow(0, start, num_u8)?; // [FIX] chunk 변수 선언 위치 확인
         
-        let mut bits = Vec::new();
+        let mut bits = Vec::new(); // [FIX] bits 벡터 초기화 위치 확인
         for i in 0..8 {
             let divisor = 1u8 << i;
             let div_t = Tensor::new(divisor, dev)?;
-            let bit = chunk.div(&div_t.broadcast_as(chunk.shape())?)?;
-            let bit_mod = bit.broadcast_sub(&bit.div(&Tensor::new(2u8, dev)?)?.broadcast_mul(&Tensor::new(2u8, dev)?)?)?
-                             .gt(&Tensor::new(0u8, dev)?)?;
+            let bit = chunk.div(&div_t.broadcast_as(chunk.shape())?)?; // [FIX] 이제 chunk를 찾을 수 있습니다
             
-            bits.push(bit_mod.to_dtype(DType::F32)?);
+            let bit_mod = bit.broadcast_sub(&bit.div(&tensor_two)?.broadcast_mul(&tensor_two)?)?
+                             .gt(&tensor_zero)?;
+            bits.push(bit_mod.to_dtype(DType::BF16)?); 
         }
         
         let plane = Tensor::stack(&bits, 1)?.flatten_all()?.narrow(0, 0, total_els)?;

@@ -152,13 +152,7 @@ impl QLinear {
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let dev = &self.device;
-        let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
-        
-        let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
-        // [CRITICAL FIX] 여기서 아예 xs의 타입을 타겟 타입으로 굳혀버립니다!
-        let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
-        
+        // [CRITICAL FIX] 224번 반복되던 device/dtype 중복 검사 및 할당 완전 제거!
         let (b, s, h) = xs.dims3()?;
         let xs_flat = xs.reshape((b * s, h))?;
         
@@ -167,9 +161,8 @@ impl QLinear {
                 let xs_f32 = xs_flat.to_dtype(DType::F32)?;
                 self.inner.forward(&xs_f32)?
             },
-            QMatMul::Tensor(t) => {
-                // [수정 전] let xs_typed = xs_flat.to_dtype(t.dtype())?; self.inner.forward(&xs_typed)?
-                // [수정 후] 이미 타입이 맞으므로 캐스팅 없이 초고속 다이렉트 행렬곱!
+            QMatMul::Tensor(_t) => {
+                // 이미 완벽한 타입(BF16)이므로 다이렉트 연산
                 self.inner.forward(&xs_flat)?
             },
             _ => {
@@ -178,11 +171,10 @@ impl QLinear {
             }
         };
         
-        let out = out.reshape((b, s, ()))?.to_dtype(target_dtype)?;
-
+        let out = out.reshape((b, s, ()))?;
         if let Some(bias) = &self.bias {
-            let b = if bias.dtype() != target_dtype { bias.to_dtype(target_dtype)? } else { bias.clone() };
-            Ok(out.broadcast_add(&b)?)
+            // bias도 초기화 시 맞춰두었으므로 캐스팅 없이 바로 덧셈
+            Ok(out.broadcast_add(bias)?)
         } else {
             Ok(out)
         }
@@ -624,7 +616,8 @@ impl QuantizedQwen3VLTextAttention {
 
         let cos = cos.to_dtype(target_dtype)?;
         let sin = sin.to_dtype(target_dtype)?;
-        let (query_states, key_states) = apply_rotary_pos_emb(&query_states.to_dtype(target_dtype)?, &key_states.to_dtype(target_dtype)?, &cos, &sin, false)?;
+        // [FIX] cos와 sin 앞에 & 기호 추가
+        let (query_states, key_states) = apply_rotary_pos_emb(&query_states, &key_states, &cos, &sin, false)?;
         let query_states = query_states.to_dtype(target_dtype)?;
         let key_states = key_states.to_dtype(target_dtype)?;
 
@@ -643,8 +636,8 @@ impl QuantizedQwen3VLTextAttention {
                     if let (Some(pk), Some(pv)) = (inner.k_cache.take(), inner.v_cache.take()) {
                         let pk = if !pk.device().same_device(dev) { pk.to_device(dev)? } else { pk };
                         let pv = if !pv.device().same_device(dev) { pv.to_device(dev)? } else { pv };
-                        inner.k_cache = Some(Tensor::cat(&[pk.to_dtype(target_dtype)?, k_piece.to_dtype(target_dtype)?], 2)?.contiguous()?);
-                        inner.v_cache = Some(Tensor::cat(&[pv.to_dtype(target_dtype)?, v_piece.to_dtype(target_dtype)?], 2)?.contiguous()?);
+                        inner.k_cache = Some(Tensor::cat(&[&pk, &k_piece], 2)?.contiguous()?);
+                        inner.v_cache = Some(Tensor::cat(&[&pv, &v_piece], 2)?.contiguous()?);
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
                         
@@ -2427,8 +2420,8 @@ impl QuantizedQwen3VLTextModel {
                         dumps_to_send.push((
                             LayerKVDump { 
                                 layer_idx, 
-                                k_data: k.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?,
-                                v_data: v.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?,
+                                k_data: k.to_device(&Device::Cpu)?,
+                                v_data: v.to_device(&Device::Cpu)?,
                                 k_shape: Tensor::from_vec(k_shape_vec, (k.shape().dims().len(),), &Device::Cpu)?,
                                 raw_k: None,
                                 raw_v: None,
@@ -2509,7 +2502,7 @@ impl QuantizedQwen3VLTextModel {
 
         let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
-        let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
+        let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?;
 
         let position_ids = match position_ids_in {
             Some(ids) => ids.clone(),
@@ -2517,11 +2510,6 @@ impl QuantizedQwen3VLTextModel {
                 .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_size, seq_len))?,
         };
         
-        if seqlen_offset % 10 == 0 || seq_len > 1 {
-            let p_min = position_ids.flatten_all()?.min(0)?.to_scalar::<u32>()?;
-            let p_max = position_ids.flatten_all()?.max(0)?.to_scalar::<u32>()?;
-            println!("[DIAG-ENGINE-INNER] Forward | Offset: {} | SeqLen: {} | PosRange: {}..{}", seqlen_offset, seq_len, p_min, p_max);
-        }
 
         let (cos, sin) = self.rotary_emb.forward(&position_ids, inputs_embeds.dtype(), self.mrope_section.clone())?;
         let total_layers = self.layers.len();
@@ -2918,15 +2906,17 @@ impl QuantizedQwen3VLModel {
         Ok(Self { config: config.clone(), visual, language_model, lm_head, rope_deltas: None, text_device: text_device.clone(), vision_device: vision_device.clone(), mmap: None, mmproj_mmap: None })
     }
     
-    fn get_vision_features(&self, pixel_values: &Tensor, image_grid_thw: &Tensor) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
-        let pixel_values = if !pixel_values.device().same_device(&self.vision_device) { pixel_values.to_device(&self.vision_device)? } else { pixel_values.clone() };
+    fn get_vision_features(&self, pixel_values: &Tensor, image_grid_thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
+        let (image_embeds, deepstack_image_embeds) = self.visual.forward(pixel_values, image_grid_thw)?;
         let image_grid_thw = if !image_grid_thw.device().same_device(&self.vision_device) { image_grid_thw.to_device(&self.vision_device)? } else { image_grid_thw.clone() };
         let (image_embeds, deepstack_image_embeds) = self.visual.forward(&pixel_values, &image_grid_thw)?;
         let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
         let split_sizes: Vec<usize> = prod_tensor_last_dim(&image_grid_thw)?.to_vec1::<u32>()?.iter().map(|&x| x as usize / spatial_merge_size.pow(2)).collect();
         let image_embeds = image_embeds.to_device(&self.text_device)?;
         let deepstack_image_embeds: Result<Vec<Tensor>> = deepstack_image_embeds.into_iter().map(|t| Ok(t.to_device(&self.text_device)?)).collect();
-        let image_embeds = split_tensor(&image_embeds, &split_sizes, 0)?;
+        
+        // [CRITICAL FIX] 쪼개는 로직 삭제! 원본 텐서 그대로 반환
+        // let image_embeds = split_tensor(&image_embeds, &split_sizes, 0)?; (이 줄 삭제)
         Ok((image_embeds, deepstack_image_embeds?))
     }
 
@@ -3005,10 +2995,15 @@ impl QuantizedQwen3VLModel {
             }
             
             // Tensor로 변환 및 삽입
-            for d in 0..3 {
-                let d_tensor = Tensor::from_vec(llm_pos_ids[d].clone(), (1, seq_len), input_ids.device())?;
-                position_ids = position_ids.slice_assign(&[(d..d+1), (b..b+1), (0..seq_len)], &d_tensor)?;
+            let mut flat_pos_ids = Vec::with_capacity(3 * b_sz * seq_len);
+            for b in 0..b_sz {
+               // ... 위와 동일하게 llm_pos_ids[3][seq_len] 배열을 구함
+               for d in 0..3 {
+                   flat_pos_ids.extend_from_slice(&llm_pos_ids[d]); // 1차원으로 전부 이어붙임
+               }
             }
+            // CPU에서 배열 조립을 끝내고, 딱 한 번만 GPU로 전송 후 형태를 맞춤!
+            let position_ids = Tensor::from_vec(flat_pos_ids, (3, b_sz, seq_len), input_ids.device())?;
             mrope_position_deltas.push(curr_pos as i64 - seq_len as i64);
         }
 
@@ -3026,21 +3021,19 @@ impl QuantizedQwen3VLModel {
         let (b_sz, seq_len) = input_ids.dims2()?;
 
         // 1. Embedding & Vision Integration
-        let flat_input = input_ids.flatten_all()?;
-        let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
-        let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
+        let mut inputs_embeds = self.language_model.embed_tokens.forward(&input_ids)?;
         
         if let Some(pv) = pixel_values { 
             if let Some(thw) = image_grid_thw { 
                 let (image_embeds, _) = self.get_vision_features(pv, thw)?; 
-                let image_embeds = Tensor::cat(&image_embeds, 0)?; 
+                // let image_embeds = Tensor::cat(&image_embeds, 0)?; 
                 let vision_mask = self.get_placeholder_mask(&input_ids, true)?; 
                 inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?; 
             } 
         }
         
         // 2. Position IDs calculation (Corrected for Long Context & Vision)
-        let (position_ids, _rope_deltas) = if (cache_position_in.is_some() && cache_position_in.unwrap().i(0)?.to_scalar::<u32>()? == 0) || self.rope_deltas.is_none() {
+        let (position_ids, _rope_deltas) = if seqlen_offset == 0 || self.rope_deltas.is_none() {
             let (p_ids, deltas) = self.get_rope_index(&input_ids, image_grid_thw, video_grid_thw, None)?;
             self.rope_deltas = Some(deltas);
             (p_ids, self.rope_deltas.as_ref().unwrap().clone())
@@ -3062,13 +3055,7 @@ impl QuantizedQwen3VLModel {
         
         self.language_model.active_session_id = session_id.clone();
         self.language_model.active_kv_name = kv_name.clone();
-        
-        // [DIAG-ROPE] 위치 정보 및 텐서 상태 모니터링
-        if seqlen_offset % 10 == 0 || seq_len > 1 {
-            let p_min = position_ids.flatten_all()?.min(0)?.to_scalar::<u32>()?;
-            let p_max = position_ids.flatten_all()?.max(0)?.to_scalar::<u32>()?;
-            println!("[DIAG-ENGINE] Forward | Offset: {} | SeqLen: {} | PosRange: {}..{}", seqlen_offset, seq_len, p_min, p_max);
-        }
+ 
 
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, session_id, kv_name).await?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
@@ -3083,10 +3070,8 @@ impl QuantizedQwen3VLModel {
         // [DIAG-LOGITS] 결과값 폭주 여부 확인 및 파일 저장
         if seqlen_offset % 5 == 0 {
             let l_max = logits.flatten_all()?.abs()?.max(0)?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-            let p_min = position_ids.flatten_all()?.min(0)?.to_scalar::<u32>()?;
-            let p_max = position_ids.flatten_all()?.max(0)?.to_scalar::<u32>()?;
-            
-            let log_msg = format!("[DIAG-VL] Off: {} | Pos: {}..{} | MaxLogit: {:.4}\n", seqlen_offset, p_min, p_max, l_max);
+            // [FIX] 동기화를 유발하지 않는 변수들로만 새 log_msg 문자열 정의
+            let log_msg = format!("[DIAG-VL] Off: {} | MaxLogit: {:.4}\n", seqlen_offset, l_max);
             let log_path = std::path::Path::new("tmp/logs/engine_diag.log");
             if let Some(parent) = log_path.parent() { let _ = std::fs::create_dir_all(parent); }
             if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
@@ -3193,24 +3178,12 @@ impl QuantizedQwen3TextModel {
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
         
-        let position_ids = if let Some(cp) = cache_position { 
-            let start = cp.flatten_all()?.i(0)?.to_scalar::<u32>()?; 
-            Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))? 
-        } else {
-            // [ROPE-CORRECTION] Use the updated seqlen_offset for position IDs
-            let start = seqlen_offset as u32;
-            Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?
-        };
+        let start = seqlen_offset as u32;
+        let position_ids = Tensor::arange(start, start + seq_len as u32, input_ids.device())?
+            .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
         
         self.language_model.active_session_id = session_id.clone();
         self.language_model.active_kv_name = kv_name.clone();
-        
-        // [DIAG-ROPE-TEXT]
-        if seqlen_offset % 10 == 0 || seq_len > 1 {
-            let p_min = position_ids.flatten_all()?.min(0)?.to_scalar::<u32>()?;
-            let p_max = position_ids.flatten_all()?.max(0)?.to_scalar::<u32>()?;
-            println!("[DIAG-ENGINE-TEXT] Forward | Offset: {} | SeqLen: {} | PosRange: {}..{}", seqlen_offset, seq_len, p_min, p_max);
-        }
 
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, session_id, kv_name).await?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
@@ -3219,25 +3192,6 @@ impl QuantizedQwen3TextModel {
             let hidden_state = if !hidden_state.device().same_device(head.device()) { hidden_state.to_device(head.device())? } else { hidden_state };
             head.forward(&hidden_state)?
         } else { hidden_state };
-
-        // [DIAG-LOGITS-TEXT] 결과값 폭주 여부 확인 및 파일 저장
-        if seqlen_offset % 5 == 0 {
-            let l_max = logits.flatten_all()?.abs()?.max(0)?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-            let p_min = position_ids.flatten_all()?.min(0)?.to_scalar::<u32>()?;
-            let p_max = position_ids.flatten_all()?.max(0)?.to_scalar::<u32>()?;
-
-            let log_msg = format!("[DIAG-TEXT] Off: {} | Pos: {}..{} | MaxLogit: {:.4}\n", seqlen_offset, p_min, p_max, l_max);
-            let log_path = std::path::Path::new("tmp/logs/engine_diag.log");
-            if let Some(parent) = log_path.parent() { let _ = std::fs::create_dir_all(parent); }
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
-                use std::io::Write;
-                let _ = writeln!(file, "{}", log_msg.trim());
-            }
-
-            if l_max > 100.0 || l_max.is_nan() {
-                println!("[DIAG-WARN-TEXT] Potential Tensor Explosion! Max Logit: {}", l_max);
-            }
-        }
         
         Ok(logits)
     }

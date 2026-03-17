@@ -64,8 +64,9 @@ pub fn apply_rotary_pos_emb_vision(
 ) -> Result<(Tensor, Tensor)> {
     let cos = cos.unsqueeze(D::Minus2)?;
     let sin = sin.unsqueeze(D::Minus2)?;
-    // let cos = cos.to_dtype(q.dtype())?;
-    // let sin = sin.to_dtype(q.dtype())?;
+    
+    // [CRITICAL FIX] 외부에서 이미 타겟 타입으로 변환되어 오므로, 잉여 캐스팅 과감하게 삭제!
+    
     let q_embed = q
         .broadcast_mul(&cos)?
         .add(&rotate_half(q)?.broadcast_mul(&sin)?)?;
@@ -195,26 +196,18 @@ impl Qwen3VLTextRotaryEmbedding {
         Self { inv_freq }
     }
 
-    pub fn apply_interleaved_mrope(
-        &self,
-        freqs: &Tensor,
-        mrope_section: Vec<usize>,
-    ) -> Result<Tensor> {
-        let mut freqs_t = freqs.i(0)?.contiguous()?; 
+    pub fn apply_interleaved_mrope(&self, freqs: &Tensor, mrope_section: Vec<usize>) -> Result<Tensor> {
+        let mut freqs_t = freqs.i(0)?; // [cite: 1773] contiguous() 제거
 
         for (dim, section) in mrope_section.iter().enumerate().skip(1) {
             let length = section * 3;
             let idx = Tensor::arange_step(dim as u32, length as u32, 3, freqs.device())?;
-            let src = freqs.i(dim)?.contiguous()?; 
-            let src = src.index_select(&idx, D::Minus1)?.contiguous()?;
-            let idx = idx
-                .unsqueeze(0)?
-                .unsqueeze(0)?
-                .broadcast_as(src.shape())?
-                .contiguous()?;
+            let src = freqs.i(dim)?; // [cite: 1775] contiguous() 제거
+            let src = src.index_select(&idx, D::Minus1)?; // [cite: 1775] contiguous() 제거
+            let idx = idx.unsqueeze(0)?.unsqueeze(0)?.broadcast_as(src.shape())?; // [cite: 1777] contiguous() 제거
             freqs_t = freqs_t.scatter(&idx, &src, D::Minus1)?;
         }
-        Ok(freqs_t)
+        Ok(freqs_t.contiguous()?) // 마지막에만 한 번 수행
     }
     pub fn forward(
         &self,

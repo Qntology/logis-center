@@ -631,28 +631,35 @@ impl Qwen3VLGenerateModel {
         for i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
             
-            let mut logits_tensor = logits.flatten_all()?.to_dtype(DType::F32)?;
-            
-            // [REPETITION-PENALTY]
+            // [CRITICAL FIX] PCIe Thrashing 방지: 단 한 번의 CPU 다운로드로 모든 패널티/바이아스 일괄 처리!
+            let mut logits_vec = logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+            let len = logits_vec.len();
+
+            // 1. Repetition Penalty (In-place 연산)
             if !gen_ids.is_empty() {
-                logits_tensor = apply_repetition_penalty(&logits_tensor, 1.2, &gen_ids)?;
+                let penalty = 1.2;
+                let mut set = std::collections::HashSet::new();
+                for &t in &gen_ids {
+                    if !set.contains(&t) && (t as usize) < len {
+                        let logit = logits_vec[t as usize];
+                        logits_vec[t as usize] = if logit < 0.0 { logit * penalty } else { logit / penalty };
+                        set.insert(t);
+                    }
+                }
             }
 
-            // [DENSE-BIAS] Penalize <think> and < to prevent reasoning mode
-            let mut logits_vec = logits_tensor.to_vec1::<f32>()?;
-            let len = logits_vec.len();
+            // 2. [DENSE-BIAS] Token Biases (In-place 연산)
             if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 100.0; }
-            if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 10.0; } // Bias away from starting any tags
+            if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 10.0; }
             
-            // If it's the very first token, strongly favor '{'
             if i == 0 && (open_bracket_id as usize) < len {
-                logits_vec[open_bracket_id as usize] += 20.0; // [BOOST-HEAVY] Increase boost
-                // [EOS-BAN] Forcibly ban EOS tokens on the first step
+                logits_vec[open_bracket_id as usize] += 20.0;
                 if (self.eos_token_id1 as usize) < len { logits_vec[self.eos_token_id1 as usize] = -1000.0; }
                 if (self.eos_token_id2 as usize) < len { logits_vec[self.eos_token_id2 as usize] = -1000.0; }
             }
-            logits_tensor = Tensor::from_vec(logits_vec, logits_tensor.shape(), logits_tensor.device())?;
-            
+
+            // 모든 수정이 끝난 뒤 딱 한 번만 GPU로 업로드!
+            let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
             let mut next_id = lp.sample(&logits_tensor)?;
             
             // [FORCE-START] If model still tries to output EOS at step 0, override it with '{'
