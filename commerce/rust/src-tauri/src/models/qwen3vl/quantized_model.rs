@@ -1956,17 +1956,15 @@ impl QuantizedQwen3VLTextModel {
         for (chunk_idx, &i) in chunk_offsets.iter().enumerate() {
             let take = (current_seq_len - i).min(chunk_size);
 
-            // [CRITICAL FIX] 디코딩 시에는 다음 레이어의 전체 문맥이 필요하므로 전체 블록을 프리패치 큐에 넣습니다.
-            let target_chunks = if is_decoding {
+            // [CRITICAL FIX] 과거 문맥이 길고 새로운 프롬프트가 짧은 'Incremental Prefill' 상황에서 
+            // 프리패처가 루프를 돌지 않아 발생하는 치명적인 SSD 동기화 렉(Sync Lag)을 원천 차단합니다!
+            let target_chunks = if is_decoding || chunk_idx == 0 {
+                // 디코딩 중이거나 프리필의 '첫 번째 청크'일 때, 다음 레이어 연산에 필요한 
+                // '모든 과거 블록'을 한 번에 비동기 로딩 큐에 밀어 넣습니다.
                 (0..total_kv_blocks).collect::<Vec<_>>()
             } else {
-                let remaining_chunks = total_chunks.saturating_sub(chunk_idx);
-                let prefetch_window = remaining_chunks.min(2);
-                if chunk_idx == 0 {
-                    (0..=prefetch_window).collect::<Vec<_>>()
-                } else {
-                    vec![chunk_idx + prefetch_window]
-                }
+                // 이미 첫 청크에서 모든 로딩 지시를 내렸으므로 추가 지시는 생략합니다.
+                vec![]
             };
 
             let look_ahead_layers = 1;
@@ -2082,7 +2080,13 @@ impl QuantizedQwen3VLTextModel {
             return Err(anyhow::anyhow!("No output generated from chunks"));
         }
 
-        let final_output_tensor = Tensor::cat(&chunk_outputs, 1)?;
+        // [CRITICAL FIX] 디코딩 시 1개의 청크만 있을 때 발생하는 100% VRAM 딥카피 대참사 원천 차단!
+        let final_output_tensor = if chunk_outputs.len() == 1 {
+            chunk_outputs.into_iter().next().unwrap()
+        } else {
+            Tensor::cat(&chunk_outputs, 1)?
+        };
+        
         Ok(final_output_tensor)
     }
 

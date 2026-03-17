@@ -491,14 +491,6 @@ pub fn decoding_attention_parallel(
 
     // [FIX] GQA Support: Repeat KV heads if they are fewer than query heads
     let n_kv_heads = key_states.dim(1)?;
-    let key_states = match num_key_value_groups {
-        Some(g) => repeat_kv(key_states.clone(), g)?, // <-- Add .clone()
-        None => key_states.clone(),                   // <-- Add .clone()
-    };
-    let value_states = match num_key_value_groups {
-        Some(g) => repeat_kv(value_states.clone(), g)?, // <-- Add .clone()
-        None => value_states.clone(),                   // <-- Add .clone()
-    };
 
     let kv_seq_len = key_states.dim(2)?;
     let chunk_size = 128; // Optimal chunk size for parallel reduction
@@ -655,16 +647,8 @@ pub fn eager_attention_forward(
     let (_b_sz, _n_heads, _q_len, _d_head) = query_states.dims4()?;
     let kv_seq_len = key_states.dim(2)?;
     
-    // GQA/MQA 그룹 반복
-    let key_states = match num_key_value_groups {
-        Some(g) => repeat_kv(key_states.clone(), g)?,
-        None => key_states.clone(),
-    };
-    let value_states = match num_key_value_groups {
-        Some(g) => repeat_kv(value_states.clone(), g)?,
-        None => value_states.clone(),
-    };
-
+    // [CRITICAL FIX] 메모리 폭발을 막기 위해 여기서 전체 시퀀스에 대해 repeat_kv를 수행하던 로직을 통째로 삭제합니다!
+    
     // 블록 크기 설정 (GPU SM 효율 및 VRAM 고려)
     let block_size = 4096;
     

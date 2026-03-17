@@ -535,19 +535,18 @@ impl Qwen3VLVisionModel {
         let emb = Tensor::cat(&[&rotary_pos_emb, &rotary_pos_emb], D::Minus1)?;
         let cos = emb.cos()?.to_dtype(self.dtype)?;
         let sin = emb.sin()?.to_dtype(self.dtype)?;
-        let cu_seqlens = grid_thw.i((.., 1))?.mul(&grid_thw.i((.., 2))?)?;
-        let grid_t = grid_thw.i((.., 0))?.to_vec1::<u32>()?;
-        let mut cu_seqlens_repeat = Vec::new();
-        for (index, t) in grid_t.iter().enumerate() {
-            cu_seqlens_repeat.push(cu_seqlens.i(index)?.repeat(*t as usize)?);
-        }
-        let cu_seqlens_full = Tensor::cat(&cu_seqlens_repeat, 0)?.flatten_all()?;
-        let cu_seqlens = cu_seqlens_full.to_dtype(DType::F32)?.cumsum(0)?.to_dtype(DType::U32)?.pad_with_zeros(D::Minus1, 1, 0)?;
         
-        // [CRITICAL FIX] 루프 진입 전, CPU로 딱 한 번만 다운로드하여 chunks를 사전 계산합니다! (32번의 GPU 멈춤 현상 완벽 제거)
-        let cu_last_id = cu_seqlens.dim(0)? - 1;
-        let lengths = cu_seqlens.i(1..)?.sub(&cu_seqlens.i(..cu_last_id)?)?;
-        let chunks: Vec<usize> = lengths.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
+        // [CRITICAL FIX] 수십 개의 GPU 커널과 하드 동기화(to_vec1)를 유발하던 로직을 순수 CPU 수학으로 100% 압축!
+        let grid_thw_cpu = grid_thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
+        let mut chunks = Vec::new();
+        
+        for thw in grid_thw_cpu {
+            let (t, h, w) = (thw[0] as usize, thw[1] as usize, thw[2] as usize);
+            let hw = h * w;
+            for _ in 0..t {
+                chunks.push(hw);
+            }
+        }
 
         let mut deepstack_feature_lists = vec![];
         for (layer_num, block) in self.blocks.iter().enumerate() {

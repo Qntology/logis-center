@@ -268,11 +268,15 @@ impl Qwen3VLProcessor {
         let merge_length = self.img_process_cfg.merge_size.pow(2);
         let mut text = text.to_string();
         if let Some(ref image_grid_thw) = image_grid_thw {
+            // [CRITICAL FIX] while 루프 안에서 매번 GPU를 멈추는 to_vec1 호출을 막기 위해 
+            // 단 한 번만 통째로 CPU 캐시 배열로 복사해 둡니다!
+            let grid_thw_cpu = image_grid_thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
             let mut index = 0;
+            
             while text.contains(&self.image_token) {
-                let grid_i = image_grid_thw.i(index)?;
-                let repeat_num =
-                    grid_i.to_vec1::<u32>()?.iter().product::<u32>() as usize / merge_length;
+                // [FIX] O(1) CPU 배열 직접 접근으로 GPU 스톨(Stall) 완벽 제거
+                let grid_i = &grid_thw_cpu[index];
+                let repeat_num = grid_i.iter().product::<u32>() as usize / merge_length;
                 let replace = "<|placeholder|>".repeat(repeat_num);
                 text = text.replacen(&self.image_token, &replace, 1);
                 index += 1;
