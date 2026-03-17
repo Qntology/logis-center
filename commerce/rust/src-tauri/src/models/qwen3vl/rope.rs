@@ -202,8 +202,8 @@ impl Qwen3VLTextRotaryEmbedding {
         for (dim, section) in mrope_section.iter().enumerate().skip(1) {
             let length = section * 3;
             let idx = Tensor::arange_step(dim as u32, length as u32, 3, freqs.device())?;
-            let src = freqs.i(dim)?; // [cite: 1775] contiguous() 제거
-            let src = src.index_select(&idx, D::Minus1)?; // [cite: 1775] contiguous() 제거
+            let src = freqs.i(dim)?; // [FIX] .contiguous() 제거 [cite: 1771]
+            let src = src.index_select(&idx, D::Minus1)?;
             let idx = idx.unsqueeze(0)?.unsqueeze(0)?.broadcast_as(src.shape())?; // [cite: 1777] contiguous() 제거
             freqs_t = freqs_t.scatter(&idx, &src, D::Minus1)?;
         }

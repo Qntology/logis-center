@@ -3007,7 +3007,8 @@ impl QuantizedQwen3VLModel {
             mrope_position_deltas.push(curr_pos as i64 - seq_len as i64);
         }
 
-        let deltas = Tensor::from_vec(mrope_position_deltas, (b_sz, 1), input_ids.device())?.to_dtype(input_ids.dtype())?;
+        let target_dtype = if input_ids.device().is_cuda() { DType::BF16 } else { DType::F32 };
+        let deltas = Tensor::from_vec(mrope_position_deltas, (b_sz, 1), input_ids.device())?.to_dtype(target_dtype)?;
         Ok((position_ids, deltas))
     }
 

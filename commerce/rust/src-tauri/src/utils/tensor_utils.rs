@@ -98,17 +98,14 @@ pub fn nonzero_index_vec(mask: &Tensor) -> Result<Vec<u32>> {
     } else {
         mask.clone() 
     };
+
     match mask.rank() {
-        0 => Err(anyhow!(format!(
-            "input rank must > 0, the input tensor rank: {}",
-            mask.rank()
-        ))),
         1 => {
             let mask_vector = mask.to_vec1::<u32>()?;
             let indices: Vec<u32> = mask_vector
                 .iter()
                 .enumerate()
-                .filter_map(|(idx, &val)| if val != 0 { Some(idx as u32) } else { None })
+                .filter_map(|(idx, &val)| if val > 0 { Some(idx as u32) } else { None })
                 .collect();
             Ok(indices)
         }
@@ -276,93 +273,22 @@ pub fn bitor_tensor(mask1: &Tensor, mask2: &Tensor) -> Result<Tensor> {
 }
 
 pub fn prod_tensor_last_dim(t: &Tensor) -> Result<Tensor> {
-    let prod = match t.rank() {
-        0 => t.clone(),
+    let dev = t.device();
+    // [CRITICAL FIX] GPU Sync를 최소화하기 위해 한 번만 CPU로 가져옵니다.
+    match t.rank() {
         1 => {
-            let data_type = t.dtype();
-            match data_type {
-                DType::U8 => {
-                    let t_vec = t.to_vec1::<u8>()?;
-                    let prod = t_vec.iter().product::<u8>();
-                    Tensor::from_slice(&[prod], 1, t.device())?
-                }
-                DType::U32 => {
-                    let t_vec = t.to_vec1::<u32>()?;
-                    let prod = t_vec.iter().product::<u32>();
-                    Tensor::from_slice(&[prod], 1, t.device())?
-                }
-                DType::I64 => {
-                    let t_vec = t.to_vec1::<i64>()?;
-                    let prod = t_vec.iter().product::<i64>();
-                    Tensor::from_slice(&[prod], 1, t.device())?
-                }
-                DType::F64 => {
-                    let t_vec = t.to_vec1::<f64>()?;
-                    let prod = t_vec.iter().product::<f64>();
-                    Tensor::from_slice(&[prod], 1, t.device())?
-                }
-                _ => {
-                    let t_vec = t.to_vec1::<f32>()?;
-                    let prod = t_vec.iter().product::<f32>();
-                    Tensor::from_slice(&[prod], 1, t.device())?
-                }
-            }
+            let vec = t.to_vec1::<u32>()?;
+            // 임의의 타입을 u32로 간주 (필요시 타입 매칭)
+            let prod = vec.iter().product::<u32>();
+            Ok(Tensor::new(vec![prod], dev)?) // <-- Wrap in Ok() and add ?
         }
         2 => {
-            let data_type = t.dtype();
-            match data_type {
-                DType::U8 => {
-                    let t_vec = t.to_vec2::<u8>()?;
-                    let mut prod_vec = vec![];
-                    for v in t_vec.iter() {
-                        let prod = v.iter().product::<u8>();
-                        prod_vec.push(prod);
-                    }
-                    Tensor::new(prod_vec, t.device())?
-                }
-                DType::U32 => {
-                    let t_vec = t.to_vec2::<u32>()?;
-                    let mut prod_vec = vec![];
-                    for v in t_vec.iter() {
-                        let prod = v.iter().product::<u32>();
-                        prod_vec.push(prod);
-                    }
-                    Tensor::new(prod_vec, t.device())?
-                }
-                DType::I64 => {
-                    let t_vec = t.to_vec2::<i64>()?;
-                    let mut prod_vec = vec![];
-                    for v in t_vec.iter() {
-                        let prod = v.iter().product::<i64>();
-                        prod_vec.push(prod);
-                    }
-                    Tensor::new(prod_vec, t.device())?
-                }
-                DType::F64 => {
-                    let t_vec = t.to_vec2::<f64>()?;
-                    let mut prod_vec = vec![];
-                    for v in t_vec.iter() {
-                        let prod = v.iter().product::<f64>();
-                        prod_vec.push(prod);
-                    }
-                    Tensor::new(prod_vec, t.device())?
-                }
-                _ => {
-                    let t_vec = t.to_vec2::<f32>()?;
-                    let mut prod_vec = vec![];
-                    for v in t_vec.iter() {
-                        let prod = v.iter().product::<f32>();
-                        prod_vec.push(prod);
-                    }
-                    Tensor::new(prod_vec, t.device())?
-                }
-            }
+            let vec2 = t.to_vec2::<u32>()?;
+            let prods: Vec<u32> = vec2.iter().map(|v| v.iter().product()).collect();
+            Ok(Tensor::new(prods, dev)?)      // <-- Wrap in Ok() and add ?
         }
-        _ => {
-            return Err(anyhow!(format!("can not action this dim")));
-        }
-    };
-    Ok(prod)
+        _ => Err(anyhow!("Unsupported rank")),
+    }
 }
 
 pub fn mask_index_add(original: &Tensor, mask_or_indices: &Tensor, add: &Tensor) -> Result<Tensor> {

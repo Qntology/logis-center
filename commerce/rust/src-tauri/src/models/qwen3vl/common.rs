@@ -477,6 +477,7 @@ pub fn decoding_attention_parallel(
     query_states: &Tensor,
     key_states: &Tensor,
     value_states: &Tensor,
+    num_key_value_groups: Option<usize>, // <-- Add this argument here!
     scaling: f64,
 ) -> Result<Tensor> {
     // Flash-Decoding style optimization for seq_len = 1 (Decoding)
@@ -490,14 +491,13 @@ pub fn decoding_attention_parallel(
 
     // [FIX] GQA Support: Repeat KV heads if they are fewer than query heads
     let n_kv_heads = key_states.dim(1)?;
-    let (key_states, value_states) = if n_heads != n_kv_heads {
-        let groups = n_heads / n_kv_heads;
-        (
-            repeat_kv(key_states.clone(), groups)?.contiguous()?,
-            repeat_kv(value_states.clone(), groups)?.contiguous()?,
-        )
-    } else {
-        (key_states.clone(), value_states.clone())
+    let key_states = match num_key_value_groups {
+        Some(g) => repeat_kv(key_states.clone(), g)?, // <-- Add .clone()
+        None => key_states.clone(),                   // <-- Add .clone()
+    };
+    let value_states = match num_key_value_groups {
+        Some(g) => repeat_kv(value_states.clone(), g)?, // <-- Add .clone()
+        None => value_states.clone(),                   // <-- Add .clone()
     };
 
     let kv_seq_len = key_states.dim(2)?;
@@ -526,29 +526,33 @@ pub fn decoding_attention_parallel(
         let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
         
         let out_chunk = exp_weights.to_dtype(v_chunk.dtype())?.matmul(&v_chunk)?;
-        let lse = (sum_exp.log()? + max_logits)?;
+        // [OPTIMIZATION] log()를 취하지 않고 가중치 합(sum_exp)과 max_logits만 보관
+        let exp_sum_val = sum_exp; 
 
         chunk_outputs.push(out_chunk);
-        chunk_logsumexp.push(lse);
+        chunk_logsumexp.push((exp_sum_val, max_logits)); // 튜플 형태로 저장
     }
 
-    // Parallel Reduction
+    // Parallel Reduction 시작 부분 수정
+    let (mut current_exp_sum, mut current_max_logit) = chunk_logsumexp[0].clone();
     let mut final_output = chunk_outputs[0].clone();
-    let mut max_lse = chunk_logsumexp[0].clone();
 
     for i in 1..num_chunks {
-        let lse_i = &chunk_logsumexp[i];
+        let (next_exp_sum, next_max_logit) = &chunk_logsumexp[i];
         let out_i = &chunk_outputs[i];
 
-        let new_max_lse = max_lse.broadcast_maximum(lse_i)?;
-        let exp_a = max_lse.broadcast_sub(&new_max_lse)?.exp()?;
-        let exp_b = lse_i.broadcast_sub(&new_max_lse)?.exp()?;
+        let new_max_logit = current_max_logit.broadcast_maximum(next_max_logit)?;
+        
+        let alpha = current_max_logit.broadcast_sub(&new_max_logit)?.exp()?;
+        let beta = next_max_logit.broadcast_sub(&new_max_logit)?.exp()?;
 
-        final_output = (final_output.broadcast_mul(&exp_a)? + out_i.broadcast_mul(&exp_b)?)?;
-        max_lse = new_max_lse;
+        final_output = (final_output.broadcast_mul(&alpha)? + out_i.broadcast_mul(&beta)?)?;
+        current_exp_sum = (current_exp_sum.broadcast_mul(&alpha)? + next_exp_sum.broadcast_mul(&beta)?)?;
+        current_max_logit = new_max_logit;
     }
 
-    Ok(final_output)
+    // 루프가 다 끝난 후 마지막에 딱 한 번 정규화
+    Ok(final_output.broadcast_div(&current_exp_sum)?)
 }
 
 pub fn block_wise_attention(

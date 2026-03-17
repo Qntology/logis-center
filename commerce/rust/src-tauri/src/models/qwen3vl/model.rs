@@ -349,8 +349,14 @@ impl Qwen3VLVisionModel {
         // [CRITICAL FIX] 루프 안에서 지연을 일으키지 않도록 전체 데이터를 CPU로 한 번에 가져옵니다.
         let grid_thw_cpu = grid_thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
 
+        // [OPTIMIZATION] 루프 밖에서 상수 텐서 미리 생성
+        let dev = grid_thw.device();
+        let side_tensor = Tensor::new(self.num_grid_per_side as f64, dev)?;
+        let one_t_u32 = Tensor::new(1u32, dev)?;
+        let one_t_f32 = Tensor::new(1.0f32, dev)?;
+
         for i in 0..grid_thw.dim(0)? {
-            let [_, h, w] = grid_thw_cpu[i][..] else { // [FIX] CPU 캐시 배열 사용
+            let [_, h, w] = grid_thw_cpu[i][..] else { 
                 return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
             };
             split_idx.push((h * w) as usize);
@@ -369,9 +375,10 @@ impl Qwen3VLVisionModel {
             )?;
             let h_idxs_floor = h_idxs.to_dtype(candle_core::DType::U32)?;
             let w_idxs_floor = w_idxs.to_dtype(candle_core::DType::U32)?;
-            let h_idxs_ceil = h_idxs_floor
-                .affine(1.0, 1.0)?
+            let h_idxs_ceil = h_idxs_floor.broadcast_add(&one_t_u32)? 
                 .clamp(0u32, num_grid_per_side_sub_one as u32)?;
+            
+            
             let w_idxs_ceil = w_idxs_floor
                 .affine(1.0, 1.0)?
                 .clamp(0u32, num_grid_per_side_sub_one as u32)?;
@@ -381,9 +388,7 @@ impl Qwen3VLVisionModel {
             let dw = w_idxs
                 .sub(&w_idxs_floor.to_dtype(h_idxs.dtype())?)?
                 .unsqueeze(0)?;
-            let base_h = h_idxs_floor
-                .affine(self.num_grid_per_side as f64, 0.0)?
-                .unsqueeze(D::Minus1)?;
+            let base_h = h_idxs_floor.broadcast_mul(&side_tensor)?.unsqueeze(D::Minus1)?;
             let base_h_ceil = h_idxs_ceil
                 .affine(self.num_grid_per_side as f64, 0.0)?
                 .unsqueeze(D::Minus1)?;
