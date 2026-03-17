@@ -512,14 +512,16 @@ pub fn decoding_attention_parallel(
     let mut chunk_outputs = Vec::with_capacity(num_chunks);
     let mut chunk_logsumexp = Vec::with_capacity(num_chunks);
 
+    // [CRITICAL FIX] 루프 내부에서 매번 발생하던 query_states의 형변환을 루프 밖으로 빼내 GPU 스톨을 제거합니다!
+    let q_aligned = query_states.to_dtype(key_states.dtype())?;
+
     for i in 0..num_chunks {
         let start = i * chunk_size;
         let end = (start + chunk_size).min(kv_seq_len);
         let k_chunk = key_states.narrow(2, start, end - start)?;
         let v_chunk = value_states.narrow(2, start, end - start)?;
 
-        // [DTYPE-GUARD] Ensure query_states matches the chunk dtype (likely BF16 from SSD)
-        let q_aligned = query_states.to_dtype(k_chunk.dtype())?;
+        // [삭제] 기존에 있던 let q_aligned = query_states.to_dtype(...) 코드는 삭제합니다.
         let attn_weights = (q_aligned.matmul(&k_chunk.transpose(2, 3)?)? * scaling)?;
         let max_logits = attn_weights.max_keepdim(D::Minus1)?;
         let exp_weights = attn_weights.broadcast_sub(&max_logits)?.exp()?;
@@ -687,12 +689,13 @@ pub fn eager_attention_forward(
         let q_aligned = query_states.to_dtype(key_states.dtype())?;
         let attn_weights = q_aligned.matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?;
         let attn_weights = (attn_weights * scaling)?;
+        
         let attn_weights = match attention_mask {
             None => attn_weights,
             Some(mask) => {
-                let mask_f32 = mask.to_dtype(DType::F32)?;
-                let weights_f32 = attn_weights.to_dtype(DType::F32)?;
-                weights_f32.broadcast_add(&mask_f32)?.to_dtype(attn_weights.dtype())?
+                // [CRITICAL FIX] 거대한 어텐션 행렬을 F32로 복사하는 끔찍한 병목을 제거하고 즉시 덧셈!
+                let mask_aligned = mask.to_dtype(attn_weights.dtype())?;
+                attn_weights.broadcast_add(&mask_aligned)?
             }
         };
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;

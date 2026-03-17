@@ -174,16 +174,16 @@ impl Qwen3VLProcessor {
             self.img_process_cfg.patch_size,
         ]);
         let img_tensor = img_tensor.reshape(shape)?;
-        let img_tensor = img_tensor.permute(vec![0, 3, 6, 4, 7, 2, 1, 5, 8])?;
+        
+        // [CRITICAL FIX] permute 이후에는 메모리가 비연속적으로 변하므로, 
+        // 다음 reshape을 수행하기 전에 반드시 contiguous()를 호출해야 프레임워크가 뻗지(Crash) 않습니다!
+        let img_tensor = img_tensor.permute(vec![0, 3, 6, 4, 7, 2, 1, 5, 8])?.contiguous()?; 
+        
         let img_tensor = img_tensor
             .reshape((
                 grid_t * grid_h * grid_w,
-                channel
-                    * self.img_process_cfg.temporal_patch_size
-                    * self.img_process_cfg.patch_size
-                    * self.img_process_cfg.patch_size,
-            ))?
-            .contiguous()?;
+                channel * self.img_process_cfg.temporal_patch_size * self.img_process_cfg.patch_size * self.img_process_cfg.patch_size,
+            ))?; // 끝에 있던 contiguous()는 위로 당겨졌으므로 여기선 삭제
         let grid_thw = Tensor::from_vec(
             vec![grid_t as u32, grid_h as u32, grid_w as u32],
             (1, 3),

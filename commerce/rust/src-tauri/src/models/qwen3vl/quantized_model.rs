@@ -807,7 +807,16 @@ impl QuantizedQwen3VLTextAttention {
                 if b_off < mask_len {
                     let take = std::cmp::min(actual_kv_len, mask_len - b_off);
                     let chunk_mask = mask.narrow(candle_core::D::Minus1, b_off, take)?;
-                    s_chunk = s_chunk.broadcast_add(&chunk_mask)?; 
+                    
+                    // [CRITICAL FIX] 크기가 다를 경우 발생하는 강제 종료(Panic)를 막고 안전하게 병합!
+                    if take < actual_kv_len {
+                        let left_masked = s_chunk.narrow(candle_core::D::Minus1, 0, take)?
+                            .broadcast_add(&chunk_mask)?;
+                        let right_unmasked = s_chunk.narrow(candle_core::D::Minus1, take, actual_kv_len - take)?;
+                        s_chunk = Tensor::cat(&[&left_masked, &right_unmasked], candle_core::D::Minus1)?;
+                    } else {
+                        s_chunk = s_chunk.broadcast_add(&chunk_mask)?; 
+                    }
                 }
             }
 
@@ -1007,7 +1016,11 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn get_kv_len(&self) -> usize {
-        self.kv_blocks.iter().map(|b| b.inner.read().unwrap().len).sum()
+        // [CRITICAL FIX] 수천 번의 RwLock 획득 오버헤드를 단 1번(O(1))으로 줄여 디코딩 속도 극대화!
+        self.kv_blocks.last().map(|b| {
+            let inner = b.inner.read().unwrap();
+            inner.offset + inner.len
+        }).unwrap_or(0)
     }
 
     pub fn batch_load_layer_kv(&mut self, kv_name: &str) -> Result<()> {
@@ -1081,8 +1094,9 @@ impl QuantizedQwen3VLTextAttention {
                         if b_idx < reg.len() {
                             if let Some(block) = self.kv_blocks.get(b_idx) {
                                 let mut inner = block.inner.write().unwrap();
-                                inner.k_cache = Some(k_raw.to_device(self.q_proj.device())?);
-                                inner.v_cache = Some(v_raw.to_device(self.q_proj.device())?);
+                                // [CRITICAL FIX] RAM 캐싱 단계이므로 절대 VRAM에 올리지 않고 Device::Cpu로 고정!
+                                inner.k_cache = Some(k_raw.to_device(&Device::Cpu)?);
+                                inner.v_cache = Some(v_raw.to_device(&Device::Cpu)?);
                                 inner.location = KVLocation::RAM;
                                 reg[b_idx].location[self.layer_idx] = KVLocation::RAM;
                                 reg[b_idx].ssd_path = Some(file_path.parent().unwrap().to_path_buf());
@@ -2337,17 +2351,16 @@ impl QuantizedQwen3VLTextModel {
         sys.refresh_memory();
         let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
 
+        // [CRITICAL FIX] 기존의 잘못된 섀도잉(덮어쓰기) 변수들을 삭제하여 VRAM 상주 용량을 2048로 정상 적용합니다!
         let (vram_limit, ram_limit) = {            
             // VRAM: 28개 레이어 x 40개 블록 = 1,120개. 2,048개까지 VRAM 상주 허용 (속도 극대화)
-            let v_limit = 2048; 
-            
+            let v_limit = 2048;
             // RAM: 만약 VRAM에서 쫓겨나더라도 RAM에 5,000개까지는 안전하게 보관
             let r_limit = if free_ram_gb > 4.0 { 5000 } else { 2048 };
             (v_limit, r_limit)
         };
-
-        let v_limit = if free_ram_gb > 4.0 { 32 } else { 16 }; 
-        let r_limit = if free_ram_gb > 4.0 { 1024 } else { 512 };
+        // [삭제] let v_limit = if free_ram_gb > 4.0 { 32 } else { 16 };
+        // [삭제] let r_limit = if free_ram_gb > 4.0 { 1024 } else { 512 };
 
         let mut vram_evicted = false;
 
