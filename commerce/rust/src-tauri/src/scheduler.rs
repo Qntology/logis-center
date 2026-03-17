@@ -368,8 +368,7 @@ async fn process_task(
     }
 
     // [SSD-BRIDGE] Start warming up 2B weights in background RAM immediately
-    let large_model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3-VL-2B-Instruct-gguf")
-        .or_else(|_| std::fs::canonicalize("models/Qwen3-VL-2B-Instruct-gguf")).ok();
+    let large_model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3.5-Instruct-gguf").or_else(|_| std::fs::canonicalize("models/Qwen3.5-Instruct-gguf")).ok();
     if let Some(p) = large_model_path_hint {
         let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
     }
