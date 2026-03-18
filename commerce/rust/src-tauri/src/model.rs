@@ -425,6 +425,7 @@ impl LogisModel {
         }).await?
     }
 
+    /// [NEW] Secure VRAM/RAM Transition Logic (Isolation Protocol)
     pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool, kv_name: Option<String>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
@@ -439,9 +440,8 @@ impl LogisModel {
         }
 
         // 2. [LOAD] 새 모델 로드 (이제 VRAM이 최대치로 확보된 상태)
-        // [OPTIMIZATION] If transitioning to Small, force text-only. 
-        // If Large, check if we need vision.
-        let text_only = target_size == ModelSize::Small || (target_size == ModelSize::Large && task_id.is_some() && !is_baking && kv_name.as_deref() != Some("image"));
+        // [OPTIMIZATION] If transitioning to Large for a Relay (task_id present), skip Vision module
+        let text_only = target_size == ModelSize::Large && task_id.is_some() && !is_baking;
         self.ensure_generator_ext(target_size, text_only, is_baking).await?;
 
         // 4. [RESTORE] 디스크 스냅샷 로드
@@ -534,8 +534,7 @@ impl LogisModel {
     }
 
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
-        let text_only = size == ModelSize::Small;
-        self.ensure_generator_ext(size, text_only, false).await
+        self.ensure_generator_ext(size, false, false).await
     }
 
     pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool, baking_only: bool) -> anyhow::Result<()> {
@@ -545,58 +544,34 @@ impl LogisModel {
         let mut large_slot = self.large_hibernation.lock().await;
 
         if *current_size_guard == Some(size) && gen_guard.is_some() && !baking_only {
-            // [CHECK] If force_text_only state matches
-            if let Some(gen) = gen_guard.as_ref() {
-                use crate::models::qwen3vl::generate::ModelVariant;
-                let is_currently_text_only = matches!(gen.qwen3_vl, ModelVariant::QuantizedText(_));
-                if is_currently_text_only == force_text_only {
-                    return Ok(());
-                }
-                println!("[MODEL] force_text_only state mismatch (Current: {}, Wants: {}). Reloading model...", is_currently_text_only, force_text_only);
-            } else {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         println!("[MODEL] Activating engine for size: {:?} (Text-Only: {}, Baking: {})...", size, force_text_only, baking_only);
+        // ... (rest of the switching logic remains similar but uses the new loading)
 
         // 1. [SWITCH] If requested model is already in one of the slots, just move it to main
         let found_in_slot = match size {
             ModelSize::Small => {
                 if let Some(m) = small_slot.take() {
-                    // Even if found in slot, check if variant matches
-                    use crate::models::qwen3vl::generate::ModelVariant;
-                    let is_text_only = matches!(m.qwen3_vl, ModelVariant::QuantizedText(_));
-                    if is_text_only == force_text_only {
-                        if let Some(old_m) = gen_guard.take() {
-                            if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
-                            else if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
-                        }
-                        *gen_guard = Some(m);
-                        *current_size_guard = Some(ModelSize::Small);
-                        true
-                    } else {
-                        *small_slot = Some(m); // Put back
-                        false
+                    if let Some(old_m) = gen_guard.take() {
+                        if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
+                        else if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
                     }
+                    *gen_guard = Some(m);
+                    *current_size_guard = Some(ModelSize::Small);
+                    true
                 } else { false }
             },
             ModelSize::Large => {
                 if let Some(m) = large_slot.take() {
-                    use crate::models::qwen3vl::generate::ModelVariant;
-                    let is_text_only = matches!(m.qwen3_vl, ModelVariant::QuantizedText(_));
-                    if is_text_only == force_text_only {
-                        if let Some(old_m) = gen_guard.take() {
-                            if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
-                            else if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
-                        }
-                        *gen_guard = Some(m);
-                        *current_size_guard = Some(ModelSize::Large);
-                        true
-                    } else {
-                        *large_slot = Some(m); // Put back
-                        false
+                    if let Some(old_m) = gen_guard.take() {
+                        if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
+                        else if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
                     }
+                    *gen_guard = Some(m);
+                    *current_size_guard = Some(ModelSize::Large);
+                    true
                 } else { false }
             }
         };
@@ -607,9 +582,9 @@ impl LogisModel {
         }
 
         // 2. [LOAD] Load from disk if not found in any slot
-        println!("[LOAD] Fresh loading {:?} from disk (Path: {})...", size, if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path });
+        println!("[LOAD] Fresh loading {:?} from disk...", size);
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
-        let shared_path = Some(path.as_str()); 
+        let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
         
         let target_device = self.device_config.device.clone();
         let is_disk_swap = self.is_disk_swap;
@@ -732,8 +707,8 @@ impl LogisModel {
             }
         };
 
-        let small_model_path = normalize_path(base_path.join("Qwen3.5-Instruct-gguf"));
-        let large_model_path = normalize_path(base_path.join("Qwen3.5-Instruct-gguf"));
+        let small_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf"));
+        let large_model_path = normalize_path(base_path.join("Qwen3-VL-2B-Instruct-gguf"));
         let embedding_path = base_path.join("embeddinggemma-300m");
 
         let max_tokens_limit = 65536; 
