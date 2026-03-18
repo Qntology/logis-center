@@ -1,6 +1,6 @@
 use candle_nn::Activation;
 
-use crate::models::qwen3::config::Qwen3Config;
+use crate::models::qwen3_5::qwen3::config::Qwen3Config;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Size {

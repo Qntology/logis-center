@@ -11,7 +11,7 @@ use candle_core::{DType, Device, Tensor};
 use image::{DynamicImage, ImageBuffer, ImageReader, Rgb, RgbImage, imageops};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
-use crate::utils::{ceil_by_factor, floor_by_factor, round_by_factor};
+use crate::models::qwen3_5::utils::{ceil_by_factor, floor_by_factor, round_by_factor};
 
 pub fn load_image_from_url(url: &str) -> Result<DynamicImage> {
     let url = url.to_string();

@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use num::integer::lcm;
 
-use crate::utils::{ceil_by_factor, floor_by_factor, round_by_factor};
+use crate::models::qwen3_5::utils::{ceil_by_factor, floor_by_factor, round_by_factor};
 
 // use std::{fs::File, io::Write};
 // use ffmpeg_next as ffmpeg;

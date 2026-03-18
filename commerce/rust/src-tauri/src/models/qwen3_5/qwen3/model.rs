@@ -7,10 +7,12 @@ use candle_nn::{
 use crate::{
     models::{
         common::{GateUpDownMLP, eager_attention_forward},
-        qwen3::config::Qwen3Config,
+        qwen3_5::{
+            position_embed::rope::{RoPE, apply_rotary_pos_emb},
+            qwen3::config::Qwen3Config,
+            utils::tensor_utils::prepare_causal_attention_mask,
+        },
     },
-    position_embed::rope::{RoPE, apply_rotary_pos_emb},
-    utils::tensor_utils::prepare_causal_attention_mask,
 };
 
 pub struct Qwen3Attention {

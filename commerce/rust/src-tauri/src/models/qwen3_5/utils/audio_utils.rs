@@ -31,8 +31,8 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-use crate::utils::get_default_save_dir;
-use crate::utils::tensor_utils::{
+use crate::models::qwen3_5::utils::get_default_save_dir;
+use crate::models::qwen3_5::utils::tensor_utils::{
     linspace, log10, pad_reflect_last_dim, pad_replicate_last_dim, split_tensor,
 };
 

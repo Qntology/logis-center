@@ -11,8 +11,10 @@ use crate::{
     chat_template::ChatTemplate,
     models::{
         GenerateModel,
-        qwen3::config::Qwen3GenerationConfig,
-        qwen3vl::{config::Qwen3VLConfig, model::Qwen3VLModel, processor::Qwen3VLProcessor},
+        qwen3_5::{
+            qwen3::config::Qwen3GenerationConfig,
+            qwen3vl::{config::Qwen3VLConfig, model::Qwen3VLModel, processor::Qwen3VLProcessor},
+        },
     },
     tokenizer::TokenizerModel,
     utils::{

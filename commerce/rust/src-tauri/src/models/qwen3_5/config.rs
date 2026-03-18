@@ -1,6 +1,6 @@
 use candle_nn::Activation;
 
-use crate::models::qwen3vl::config::Qwen3VLVisionConfig;
+use crate::models::qwen3_5::qwen3vl::config::Qwen3VLVisionConfig;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct RopeParameters {

@@ -15,8 +15,10 @@ use anyhow::anyhow;
 #[cfg(feature = "ffmpeg")]
 use crate::utils::video_utils::video_smart_resize;
 use crate::{
-    models::qwen3vl::config::PreprocessorConfig,
-    utils::img_utils::{get_image, img_smart_resize, img_transform},
+    models::qwen3_5::{
+        qwen3vl::config::PreprocessorConfig,
+        utils::img_utils::{get_image, img_smart_resize, img_transform},
+    },
 };
 
 #[derive(Clone)]

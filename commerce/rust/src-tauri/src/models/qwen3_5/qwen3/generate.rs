@@ -7,8 +7,8 @@ use candle_nn::VarBuilder;
 use rocket::async_stream::stream;
 use rocket::futures::Stream;
 
-use crate::models::qwen3::config::{Qwen3Config, Qwen3GenerationConfig};
-use crate::models::qwen3::model::Qwen3Model;
+use crate::models::qwen3_5::qwen3::config::{Qwen3Config, Qwen3GenerationConfig};
+use crate::models::qwen3_5::qwen3::model::Qwen3Model;
 // use crate::models::GenerateStream;
 use crate::utils::{
     build_completion_chunk_response, build_completion_response, find_type_files, get_device,
