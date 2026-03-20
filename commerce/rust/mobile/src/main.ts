@@ -106,14 +106,14 @@ let mySyncSeed = Math.floor(1000 + Math.random() * 9000);
 // Manual Connection UI Init
 async function initManualConnectUI() {
     try {
-        const myIp = await invoke<string>("get_my_full_ip");
+        const myIp = await invoke<string>("get_mobile_ip");
         const myIpEl = document.getElementById("my-full-ip");
         if (myIpEl) myIpEl.innerText = myIp;
 
         const mySeedEl = document.getElementById("my-sync-seed");
         if (mySeedEl) mySeedEl.innerText = mySyncSeed.toString();
 
-        const prefix = await invoke<string>("get_local_network_prefix");
+        const prefix = await invoke<string>("get_mobile_prefix");
         const prefixEl = document.getElementById("ip-prefix");
         if (prefixEl) prefixEl.innerText = prefix + ".";
 

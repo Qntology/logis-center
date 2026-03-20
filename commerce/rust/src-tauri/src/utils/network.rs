@@ -51,9 +51,9 @@ pub fn get_local_network_prefix() -> String {
     let ip = get_my_full_ip();
     let parts: Vec<&str> = ip.split('.').collect();
     if parts.len() == 4 {
-        format!("{}.{}.{}", parts[0], parts[1], parts[2])
+        format!("{}.{}", parts[0], parts[1])
     } else {
-        "127.0.0".to_string()
+        "192.168".to_string()
     }
 }
 
