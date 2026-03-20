@@ -47,8 +47,25 @@
         <div id="tab-intro" class="tab-content active" style="display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; flex:1; height:100%;">
             <p style="font-size:3rem; margin:0;">📡</p>
             <h3 style="margin:10px 0;">Disconnected</h3>
-            <p style="color: #666; font-size: 0.8rem; margin-bottom:20px;">Scan desktop QR to start</p>
-            <button class="primary-btn" onclick="startCamera()" style="width: auto; padding: 12px 40px; border-radius: 25px;">SCAN START</button>
+            <p style="color: #666; font-size: 0.8rem; margin-bottom:20px;">Scan desktop QR or connect manually</p>
+            
+            <button class="primary-btn" onclick="startCamera()" style="width: auto; padding: 12px 40px; border-radius: 25px; margin-bottom: 20px;">SCAN START</button>
+            
+            <!-- Manual Connection Section -->
+            <div id="manual-connect-ui" style="border: 1px solid #eee; padding: 15px; border-radius: 10px; width: 80%; max-width: 300px;">
+                <div style="font-size: 0.7rem; color: #888; margin-bottom: 10px;">
+                    My IP: <span id="my-full-ip">...</span> | Seed: <span id="my-sync-seed">...</span>
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 8px;">
+                    <div style="display: flex; align-items: center; justify-content: center; gap: 5px;">
+                        <span id="ip-prefix" style="color: #555;">...</span>
+                        <input type="number" id="target-part3" placeholder="xxx" min="0" max="255" style="width: 50px; padding: 5px; text-align: center;"> .
+                        <input type="number" id="target-part4" placeholder="xxx" min="0" max="255" style="width: 50px; padding: 5px; text-align: center;">
+                    </div>
+                    <input type="number" id="target-seed" placeholder="Target Seed (e.g. 777)" style="width: 100%; padding: 8px; text-align: center; border: 1px solid #eee; border-radius: 5px;">
+                    <button id="btn-manual-submit" class="primary-btn" style="width: 100%; padding: 8px;">CONNECT</button>
+                </div>
+            </div>
         </div>
 
         <!-- Tab: List (Hidden until connected) -->

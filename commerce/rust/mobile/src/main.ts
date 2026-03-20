@@ -1,5 +1,7 @@
 
 import { item2html } from "./lib/render";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 declare const jsQR: any;
 declare const QRCode: any;
@@ -15,7 +17,135 @@ function log(msg: string) {
     }
 }
 
+listen("webrtc-offer", async (event) => {
+    const [offerSdp, fromIp] = event.payload as [string, string];
+    log(`Incoming offer from ${fromIp}`);
+    
+    peerConn = new RTCPeerConnection({ iceServers: [] });
+    peerConn.ondatachannel = (e) => {
+        dataChannel = e.channel;
+        setupDataChannel(dataChannel);
+    };
+
+    await peerConn.setRemoteDescription({ type: 'offer', sdp: offerSdp });
+    const answer = await peerConn.createAnswer();
+    await peerConn.setLocalDescription(answer);
+    
+    // [FIXED] Send Answer back
+    try {
+        await invoke("submit_signal_answer", { targetIp: fromIp, sdp: answer.sdp });
+        log(`Answer submitted to ${fromIp}`);
+    } catch (e) {
+        log(`Failed to submit answer: ${e}`);
+    }
+});
+
+async function startWebRtcOfferer(targetIp: string, seed: number) {
+    peerConn = new RTCPeerConnection({ iceServers: [] });
+    dataChannel = peerConn.createDataChannel("logis-sync");
+    setupDataChannel(dataChannel);
+    
+    const offer = await peerConn.createOffer();
+    await peerConn.setLocalDescription(offer);
+    
+    // Wait for ICE
+    await new Promise<void>(resolve => {
+        if (peerConn?.iceGatheringState === 'complete') resolve();
+        else peerConn?.addEventListener('icegatheringstatechange', () => {
+            if (peerConn?.iceGatheringState === 'complete') resolve();
+        });
+        setTimeout(resolve, 2000);
+    });
+
+    const sdp = peerConn.localDescription?.sdp || "";
+    const answerSdp = await invoke<string>("send_signal_offer", { targetIp, seed, sdp });
+    await peerConn.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+    log("Connected via Seed Handshake!");
+}
+
+// --- WebRTC SDP Template for Compact Handshake ---
+const SDP_TEMPLATE = `v=0
+o=- {{sessId}} 2 IN IP4 {{ip}}
+s=-
+t=0 0
+a=group:BUNDLE 0
+a=msid-semantic: WMS
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+c=IN IP4 {{ip}}
+a=ice-ufrag:{{ufrag}}
+a=ice-pwd:{{pwd}}
+a=fingerprint:sha-256 {{fingerprint}}
+a=setup:{{setup}}
+a=mid:0
+a=sctp-port:5000
+a=max-message-size:262144`;
+
+function extractSdp(sdp: string) {
+    return {
+        u: sdp.match(/a=ice-ufrag:(.*)/)?.[1] || "",
+        p: sdp.match(/a=ice-pwd:(.*)/)?.[1] || "",
+        f: sdp.match(/a=fingerprint:sha-256 (.*)/)?.[1] || "",
+        s: sdp.match(/o=- (\d+) /)?.[1] || "0"
+    };
+}
+
+function buildSdp(type: 'offer' | 'answer', ip: string, u: string, p: string, f: string, s: string) {
+    return SDP_TEMPLATE
+        .replace(/{{sessId}}/g, s)
+        .replace(/{{ip}}/g, ip)
+        .replace(/{{ufrag}}/g, u)
+        .replace(/{{pwd}}/g, p)
+        .replace(/{{fingerprint}}/g, f)
+        .replace(/{{setup}}/g, type === 'offer' ? 'actpass' : 'active');
+}
+
 log("Main module loaded. V145 (Nav & Chat Sync) Initializing...");
+
+let mySyncSeed = Math.floor(1000 + Math.random() * 9000); 
+
+// Manual Connection UI Init
+async function initManualConnectUI() {
+    try {
+        const myIp = await invoke<string>("get_my_full_ip");
+        const myIpEl = document.getElementById("my-full-ip");
+        if (myIpEl) myIpEl.innerText = myIp;
+
+        const mySeedEl = document.getElementById("my-sync-seed");
+        if (mySeedEl) mySeedEl.innerText = mySyncSeed.toString();
+
+        const prefix = await invoke<string>("get_local_network_prefix");
+        const prefixEl = document.getElementById("ip-prefix");
+        if (prefixEl) prefixEl.innerText = prefix + ".";
+
+        await invoke("start_listener_command", { seed: mySyncSeed });
+    } catch (e) {
+        log(`Network init err: ${e}`);
+    }
+}
+initManualConnectUI();
+
+document.getElementById("btn-manual-submit")?.addEventListener("click", async () => {
+    const prefixEl = document.getElementById("ip-prefix");
+    const p3 = (document.getElementById("target-part3") as HTMLInputElement).value;
+    const p4 = (document.getElementById("target-part4") as HTMLInputElement).value;
+    const tSeed = (document.getElementById("target-seed") as HTMLInputElement).value;
+    
+    if (!p3 || !p4 || !tSeed) {
+        alert("Enter full target IP and Seed");
+        return;
+    }
+    const prefix = prefixEl?.innerText || "";
+    const fullTargetIp = `${prefix}${p3}.${p4}`;
+    const seed = parseInt(tSeed);
+    
+    log(`Manual connection to ${fullTargetIp} with seed ${seed}`);
+    try {
+        await startWebRtcOfferer(fullTargetIp, seed);
+    } catch (e) {
+        log(`Err: ${e}`);
+        alert("Err: " + e);
+    }
+});
 
 let videoStream: MediaStream | null = null;
 let scanning = false;
@@ -248,6 +378,16 @@ function tick() {
 function handleQrChunk(data: string) {
     try {
         const parsed = JSON.parse(data);
+        // Handle compact Offer
+        if (parsed.t === "offer") {
+            log("Compact Offer Received!");
+            if (parsed.h) localStorage.setItem("last_laptop_hash", parsed.h);
+            const sdp = buildSdp('offer', parsed.i, parsed.u, parsed.p, parsed.f, parsed.s);
+            stopScanning();
+            createPeerConnection(sdp);
+            return;
+        }
+        // Fallback for legacy chunked format
         if (Array.isArray(parsed) && parsed.length >= 3) {
             const [idx, total, chunk, laptopHash] = parsed;
             if (laptopHash) localStorage.setItem("last_laptop_hash", laptopHash);
@@ -292,10 +432,21 @@ async function createPeerConnection(sdp: string) {
     });
 
     const fullSdp = peerConn.localDescription!.sdp;
-    const size = Math.ceil(fullSdp.length / 4);
-    const chunks = [];
-    for(let i=0; i<4; i++) chunks.push(JSON.stringify([i, 4, fullSdp.substring(i*size, (i+1)*size)]));
-    showAnswerSlideQr(chunks);
+    const myIp = await invoke<string>("get_my_full_ip");
+    const parts = extractSdp(fullSdp);
+    
+    const compactAnswer = {
+        t: "answer",
+        i: myIp,
+        u: parts.u,
+        p: parts.p,
+        f: parts.f,
+        s: parts.s
+    };
+
+    const qrData = JSON.stringify(compactAnswer);
+    log(`Answer Generated. Compact Length: ${qrData.length}`);
+    showAnswerSlideQr([qrData]); // Wrap in array to reuse rotation logic or modify it
 }
 
 function showAnswerSlideQr(chunks: string[]) {
@@ -304,7 +455,11 @@ function showAnswerSlideQr(chunks: string[]) {
     const qrDiv = document.getElementById("answer-qr")!;
     let cur = 0;
     const rotate = () => {
-        qrDiv.innerHTML = `<div style="font-weight:bold; margin-bottom:10px;">Part ${cur+1}/${chunks.length}</div>`;
+        if (chunks.length > 1) {
+            qrDiv.innerHTML = `<div style="font-weight:bold; margin-bottom:10px;">Part ${cur+1}/${chunks.length}</div>`;
+        } else {
+            qrDiv.innerHTML = `<div style="font-weight:bold; margin-bottom:10px;">Scan this on Desktop</div>`;
+        }
         const q = document.createElement("div");
         qrDiv.appendChild(q);
         new (window as any).QRCode(q, { text: chunks[cur], width: 250, height: 250 });
@@ -312,7 +467,9 @@ function showAnswerSlideQr(chunks: string[]) {
     };
     if (qrInterval) clearInterval(qrInterval);
     rotate();
-    qrInterval = setInterval(rotate, 1000);
+    if (chunks.length > 1) {
+        qrInterval = setInterval(rotate, 1000);
+    }
 }
 
 // --- Listeners ---

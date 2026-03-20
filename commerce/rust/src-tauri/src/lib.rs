@@ -655,11 +655,40 @@ struct ActiveTaskQuery {
 }
 
 #[tauri::command]
-async fn check_active_task(state: State<'_, AppState>, payload: ActiveTaskQuery) -> Result<bool, String> {
+async fn check_active_task(
+    state: State<'_, AppState>,
+    payload: ActiveTaskQuery,
+) -> Result<bool, String> {
     let store_guard = state.store.lock().await;
-    if let Some(db) = store_guard.as_ref() {
-        db.has_active_task(&payload.cc, &payload.r#ref).await.map_err(|e| e.to_string())
-    } else { Ok(false) }
+    if let Some(store) = store_guard.as_ref() {
+        store.has_active_task(&payload.cc, &payload.r#ref).await.map_err(|e| e.to_string())
+    } else {
+        Ok(false)
+    }
+}
+
+#[tauri::command]
+async fn connect_with_seed(_target_ip: String, _seed: u64) -> Result<(), String> {
+    // [DEPRECATED] UDP 방식은 더 이상 사용하지 않으며, 프론트엔드에서 
+    // 직접 send_signal_offer(TCP)를 호출하도록 변경되었습니다.
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_listener_command(app_handle: tauri::AppHandle, seed: u64) -> Result<(), String> {
+    crate::utils::network::start_signal_listener(app_handle, seed);
+    println!("Signal Listener started on port 9999 with seed: {}", seed);
+    Ok(())
+}
+
+#[tauri::command]
+async fn send_signal_offer(target_ip: String, seed: u64, sdp: String) -> Result<String, String> {
+    crate::utils::network::send_signal_offer(target_ip, seed, sdp).await
+}
+
+#[tauri::command]
+async fn submit_signal_answer(target_ip: String, sdp: String) -> Result<(), String> {
+    crate::utils::network::submit_signal_answer(target_ip, sdp).await
 }
 
 
@@ -1025,7 +1054,7 @@ pub fn run() {
             resize_window, start_drag, move_to_top_center, set_login_state, check_active_task, get_chat_messages, proxy_fetch,
             get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
             upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message, check_gpu_availability,
-            save_mobile_temp_file
+            save_mobile_temp_file, crate::utils::network::get_local_network_prefix, crate::utils::network::get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

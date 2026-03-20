@@ -1044,10 +1044,9 @@ btnDeleteSelected?.addEventListener("click", async () => {
 
 btnSyncQr?.addEventListener("click", async () => {
     const qrContainer = document.getElementById("nav-qr-container");
-    const qrTarget = document.getElementById("sync-qrcode");
     const navOverlay = document.getElementById("nav-categories");
 
-    if (!qrContainer || !qrTarget || !navOverlay) return;
+    if (!qrContainer || !navOverlay) return;
 
     if (navOverlay.classList.contains("hidden")) {
         handleSearchInteraction();
@@ -1056,18 +1055,104 @@ btnSyncQr?.addEventListener("click", async () => {
     const isHidden = qrContainer.classList.contains("hidden");
     if (isHidden) {
         qrContainer.classList.remove("hidden");
-        showPcPairingQr();
+        await initSyncUI(); // [NEW] Initialize IP/Seed view
         listCurrentY = 0;
         updateListTransform(true);
     } else {
         qrContainer.classList.add("hidden");
-        if (qrRotationInterval) {
-            clearInterval(qrRotationInterval);
-            qrRotationInterval = null;
-        }
-        stopDesktopCamera();
     }
 });
+
+// [NEW] Manual Connect Handler
+document.getElementById("btn-manual-connect")?.addEventListener("click", async () => {
+    const p3 = (document.getElementById("target-part3") as HTMLInputElement).value;
+    const p4 = (document.getElementById("target-part4") as HTMLInputElement).value;
+    const tSeed = (document.getElementById("target-seed") as HTMLInputElement).value;
+    
+    if (!p3 || !p4 || !tSeed) {
+        alert("Please enter IP parts and target seed!");
+        return;
+    }
+
+    const prefix = await invoke("get_local_network_prefix") as string;
+    const targetIp = `${prefix}.${p3}.${p4}`;
+    const seed = parseInt(tSeed);
+
+    console.log(`[SYNC] Connecting to ${targetIp} with seed ${seed}...`);
+    try {
+        await startWebRtcOfferer(targetIp, seed);
+    } catch (e) {
+        alert("Connection failed: " + e);
+    }
+});
+
+async function startWebRtcOfferer(targetIp: string, seed: number) {
+    peerConn = new RTCPeerConnection({ iceServers: [] });
+    dataChannel = peerConn.createDataChannel("logis-sync");
+    setupDataChannel(dataChannel);
+    
+    const offer = await peerConn.createOffer();
+    await peerConn.setLocalDescription(offer);
+    
+    // Wait for ICE gathering
+    await new Promise<void>(resolve => {
+        if (peerConn?.iceGatheringState === 'complete') resolve();
+        else {
+            const check = () => { if (peerConn?.iceGatheringState === 'complete') { peerConn?.removeEventListener('icegatheringstatechange', check); resolve(); } };
+            peerConn?.addEventListener('icegatheringstatechange', check);
+            setTimeout(resolve, 2000);
+        }
+    });
+
+    const sdp = peerConn.localDescription?.sdp || "";
+    const answerSdp = await invoke<string>("send_signal_offer", { targetIp, seed, sdp });
+    await peerConn.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+    console.log("[SYNC] Connected via Seed-based handshake!");
+}
+
+listen("webrtc-offer", async (event) => {
+    const [offerSdp, fromIp] = event.payload as [string, string];
+    console.log(`[SYNC] Incoming offer from ${fromIp}`);
+    
+    peerConn = new RTCPeerConnection({ iceServers: [] });
+    peerConn.ondatachannel = (e) => setupDataChannel(e.channel);
+
+    await peerConn.setRemoteDescription({ type: 'offer', sdp: offerSdp });
+    const answer = await peerConn.createAnswer();
+    await peerConn.setLocalDescription(answer);
+
+    // [FIXED] Send Answer back via TCP stream through the backend
+    try {
+        await invoke("submit_signal_answer", { targetIp: fromIp, sdp: answer.sdp });
+        console.log(`[SYNC] Answer submitted for ${fromIp}`);
+    } catch (e) {
+        console.error("[SYNC] Failed to submit answer:", e);
+    }
+});
+
+let mySyncSeed = Math.floor(1000 + Math.random() * 9000); 
+
+async function initSyncUI() {
+    const myFullIpEl = document.getElementById("my-full-ip");
+    const mySyncSeedEl = document.getElementById("my-sync-seed");
+    const ipPrefixEl = document.getElementById("ip-prefix");
+
+    if (myFullIpEl) {
+        const fullIp = await invoke("get_my_full_ip") as string;
+        myFullIpEl.innerText = fullIp;
+    }
+    if (mySyncSeedEl) {
+        mySyncSeedEl.innerText = mySyncSeed.toString();
+    }
+    if (ipPrefixEl) {
+        const prefix = await invoke("get_local_network_prefix") as string;
+        ipPrefixEl.innerText = prefix + ".";
+    }
+    
+    try {
+        await invoke("start_listener_command", { seed: mySyncSeed });
+    } catch (e) { console.error(e); }
+}
 
 let peerConn: RTCPeerConnection | null = null;
 let dataChannel: RTCDataChannel | null = null;
@@ -1248,6 +1333,42 @@ async function sendSignalingMessage(hash: string, payload: any) {
     }
 }
 
+// --- WebRTC SDP Template for Compact Handshake ---
+const SDP_TEMPLATE = `v=0
+o=- {{sessId}} 2 IN IP4 {{ip}}
+s=-
+t=0 0
+a=group:BUNDLE 0
+a=msid-semantic: WMS
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+c=IN IP4 {{ip}}
+a=ice-ufrag:{{ufrag}}
+a=ice-pwd:{{pwd}}
+a=fingerprint:sha-256 {{fingerprint}}
+a=setup:{{setup}}
+a=mid:0
+a=sctp-port:5000
+a=max-message-size:262144`;
+
+function extractSdp(sdp: string) {
+    return {
+        u: sdp.match(/a=ice-ufrag:(.*)/)?.[1] || "",
+        p: sdp.match(/a=ice-pwd:(.*)/)?.[1] || "",
+        f: sdp.match(/a=fingerprint:sha-256 (.*)/)?.[1] || "",
+        s: sdp.match(/o=- (\d+) /)?.[1] || "0"
+    };
+}
+
+function buildSdp(type: 'offer' | 'answer', ip: string, u: string, p: string, f: string, s: string) {
+    return SDP_TEMPLATE
+        .replace(/{{sessId}}/g, s)
+        .replace(/{{ip}}/g, ip)
+        .replace(/{{ufrag}}/g, u)
+        .replace(/{{pwd}}/g, p)
+        .replace(/{{fingerprint}}/g, f)
+        .replace(/{{setup}}/g, type === 'offer' ? 'actpass' : 'active');
+}
+
 async function showPcPairingQr() {
     const qrTarget = document.getElementById("sync-qrcode");
     const pcView = document.getElementById("pc-qr-view");
@@ -1268,6 +1389,9 @@ async function showPcPairingQr() {
     qrTarget.innerHTML = "<div style='padding:20px;'><div class='spinner'></div><p>Generating P2P Offer...</p></div>";
 
     try {
+        // 0. Get Local IP
+        const myIp = await invoke<string>("get_my_full_ip");
+
         // 1. Initialize PeerConnection (No STUN for local only)
         peerConn = new RTCPeerConnection({ iceServers: [] });
         
@@ -1306,49 +1430,30 @@ async function showPcPairingQr() {
         // [Relay] Also post to relay server so mobile can find us without scan next time
         sendSignalingMessage(laptopHash, { type: "offer", sdp: finalSdp });
 
-        const CHUNK_COUNT = 4;
-        const chunkSize = Math.ceil(finalSdp.length / CHUNK_COUNT);
-        const chunks: string[] = [];
+        const parts = extractSdp(finalSdp);
+        const compactOffer = { t: "offer", h: laptopHash, i: await invoke("get_my_full_ip"), u: parts.u, p: parts.p, f: parts.f, s: parts.s };
+        const qrData = JSON.stringify(compactOffer);
         
-        for (let i = 0; i < CHUNK_COUNT; i++) {
-            const chunk = finalSdp.substring(i * chunkSize, (i + 1) * chunkSize);
-            // Include hash in the first chunk or all chunks for identification
-            chunks.push(JSON.stringify([i, CHUNK_COUNT, chunk, laptopHash]));
-        }
+        console.log(`[WebRTC] Offer Generated. Compact Length: ${qrData.length}`);
 
-        console.log(`[WebRTC] Offer Generated. Total Length: ${finalSdp.length}. Split into ${CHUNK_COUNT} chunks.`);
+        // 6. Show Single QR
+        qrTarget.innerHTML = ""; 
+        const header = document.createElement("div");
+        header.style.marginBottom = "10px";
+        header.style.fontWeight = "bold";
+        header.style.color = "var(--primary)";
+        header.innerText = `Scan to Pair (P2P)`;
+        qrTarget.appendChild(header);
 
-        // 6. Rotate QR (Slideshow)
-        let currentChunkIndex = 0;
-        const showChunk = () => {
-            qrTarget.innerHTML = ""; // Clear
-            
-            // Header to indicate progress
-            const header = document.createElement("div");
-            header.style.marginBottom = "5px";
-            header.style.fontWeight = "bold";
-            header.style.color = "var(--primary)";
-            header.innerText = `Offer Part ${currentChunkIndex + 1}/${CHUNK_COUNT}`;
-            qrTarget.appendChild(header);
+        const qrDiv = document.createElement("div");
+        qrTarget.appendChild(qrDiv);
 
-            // QR Container
-            const qrDiv = document.createElement("div");
-            qrTarget.appendChild(qrDiv);
-
-            new (window as any).QRCode(qrDiv, {
-                text: chunks[currentChunkIndex],
-                width: 250, height: 250, 
-                colorDark: "#000000", colorLight: "#ffffff",
-                correctLevel: (window as any).QRCode.CorrectLevel.L
-            });
-
-            currentChunkIndex = (currentChunkIndex + 1) % CHUNK_COUNT;
-        };
-
-        // Start Rotation
-        showChunk();
-        qrRotationInterval = window.setInterval(showChunk, 1000); // Rotate every 1000ms (1s) for better focus
-        
+        new (window as any).QRCode(qrDiv, {
+            text: qrData,
+            width: 250, height: 250, 
+            colorDark: "#000000", colorLight: "#ffffff",
+            correctLevel: (window as any).QRCode.CorrectLevel.M
+        });
         // Clean up interval when view changes
         const cleanup = () => {
             if (qrRotationInterval) clearInterval(qrRotationInterval);
@@ -2481,6 +2586,23 @@ async function startMobileScanning(video: HTMLVideoElement) {
                     if (code) {
                         try {
                             const data = JSON.parse(code.data);
+                            // Handle compact Answer
+                            if (data.t === "answer") {
+                                const sdp = buildSdp('answer', data.i, data.u, data.p, data.f, data.s);
+                                const answer = new RTCSessionDescription({ type: 'answer', sdp });
+                                if (peerConn) {
+                                    await peerConn.setRemoteDescription(answer);
+                                    stopDesktopCamera();
+                                    const profileName = document.getElementById("nav-profile-name");
+                                    if (profileName) {
+                                        profileName.textContent = "✅ Mobile Connected";
+                                        profileName.style.color = "#4ade80";
+                                    }
+                                    document.getElementById("nav-qr-container")?.classList.add("hidden");
+                                }
+                                return;
+                            }
+                            // Fallback for legacy chunked format
                             if (Array.isArray(data) && data.length === 3) {
                                 const [idx, total, chunkStr] = data;
                                 if (expectedTotal === 0) {
