@@ -331,8 +331,8 @@ Based on the provided Pug template, identify the primary category of this webpag
 
 [SCHEMA DEFINITIONS]
 - type: The main category. Must be one of:
-  - "order": Order history, order details, checkout success.
-  - "goods": Product list, product detail, shopping cart.
+  - "order": Order list, Order history, Order details, Checkout success.
+  - "goods": Product list, product detail.
   - "tracking": Shipment tracking status, delivery history.
   - "review": Product reviews, feedback list.
   - "coupon": Coupon list, discount events.
@@ -341,7 +341,7 @@ Based on the provided Pug template, identify the primary category of this webpag
 
 [OUTPUT FORMAT]
 {
-    "type": type
+    "type": "..."
 }"###.to_string() }
 
 pub fn page_selectors_prompt(page_type: &str) -> String {
@@ -353,15 +353,15 @@ Based on the provided Pug template, identify the structural CSS selectors requir
 Analyze the page structure you have already learned and find the repeating CSS Selector patterns.
 
 [SCHEMA DEFINITIONS]
-- item: '{TYPE}' based CSS selector for sibling items(e.g., `div[class="className"]`, `tr[class="className"]`, `li[class="className"]`). Match recurring patterns and exclude header, footer, ads, and pagination.
-- node: '{TYPE}' based CSS selector for the main container wrapping all list items(e.g., `div[id="idName"]`, `ul[id="idName"]`, `ol[id="idName"]`, `div[class="className"]`, `ul[class="className"]`, `ol[class="className"]`). Focus on the direct parent of recurring rows/items, excluding header, footer, ads, and pagination.
+- item: '{TYPE}' based CSS selector for sibling items(e.g., `div[class="..."]`, `tr[class="..."]`, `li[class="..."]`). Match recurring patterns and exclude header, footer, ads, and pagination.
+- node: '{TYPE}' based CSS selector for the main container wrapping all list items(e.g., `div[id="..."]`, `ul[id="..."]`, `ol[id="..."]`, `div[class="..."]`, `ul[class="..."]`, `ol[class="..."]`). Focus on the direct parent of recurring rows/items, excluding header, footer, ads, and pagination.
 - detail: is a detail page or a detail form. Exclude header, footer, ads, pagination.
 
 [OUTPUT FORMAT]
 {
-    "item": "...",
-    "node": "...",
-    "detail": boolean
+    "item": String,
+    "node": String,
+    "detail": Boolean
 }"###;
     template.replace("{TYPE}", page_type)
 }

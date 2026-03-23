@@ -573,7 +573,7 @@ async fn process_task(
                     name: None,
                 })],
                 model: "qwen3vl".to_string(), 
-                max_tokens: Some(32), // Increased from 128 to 512
+                max_tokens: Some(16),
                 temperature: Some(0.1),
                 ..Default::default()
             };
@@ -622,7 +622,7 @@ async fn process_task(
         let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, selector_prompt);
         let snapshot_id = format!("{}_step_b", task.id);
 
-        // 1. [Small] Load & Generate (Direct 28-Layer Generation)
+        // 1. [Large] Load & Generate (Direct 28-Layer Generation)
         {
             model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
@@ -631,7 +631,7 @@ async fn process_task(
                     content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                     name: None,
                 })],
-                model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
+                model: "qwen3vl".to_string(), max_tokens: Some(64), temperature: Some(0.1),
                 ..Default::default()
             };
 
@@ -738,16 +738,16 @@ async fn process_task(
             let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, extraction_instruction);
             let snapshot_id = format!("{}_detail", task.id);
 
-            // 1. [Small] Load & Generate (Direct 28-Layer Generation)
+            // 1. [Large] Load & Generate (Direct 28-Layer Generation)
             {
-                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
                         content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                         name: None,
                     })],
-                    model: "qwen3vl".to_string(), max_tokens: Some(256), temperature: Some(0.1),
+                    model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
                     ..Default::default()
                 };
 
