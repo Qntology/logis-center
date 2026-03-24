@@ -1962,9 +1962,9 @@ impl QuantizedQwen3VLTextModel {
         kv_name: Option<String>,
         baking_only: bool,
     ) -> Result<Tensor> {
-        // let mut final_output: Option<Tensor> = None; <-- [삭제]
-        let chunk_size = 256;
+        // [CRITICAL FIX] 기존 고정값(256) 삭제. chunk_offsets의 간격을 기반으로 chunk_size를 동적 계산합니다.
         let current_seq_len = xs.dim(1)?;
+        let chunk_size = if chunk_offsets.len() > 1 { chunk_offsets[1] - chunk_offsets[0] } else { current_seq_len };
         let is_decoding = current_seq_len <= 1;
         let target_device = self.layers[layer_idx].device().clone();
         let total_kv_blocks = self.layers[layer_idx].self_attn.kv_blocks.len();
@@ -2294,7 +2294,9 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
-        if is_decoding {
+        // [CRITICAL FIX] CPU 모드에서는 디코딩 시 가중치를 버리지 않고 RAM에 F32 상태로 영구 상주시켜,
+        // 매 토큰마다 발생하는 2B 파라미터 압축 해제(Dequantization) 연산 병목을 0으로 만듭니다!
+        if is_decoding && !self.is_forced_cpu {
             self.layers[layer_idx].clear();
         }
 
@@ -2596,6 +2598,9 @@ impl QuantizedQwen3VLTextModel {
             if !already_loaded { self.reload_all_layers()?; }
         }
 
+        // [CRITICAL FIX] CPU 모드의 디코딩(1토큰) 상황에서는 핑퐁 덮어쓰기를 완벽하게 차단합니다!
+        let skip_ping_pong = is_decoding && self.is_forced_cpu;
+
         for layer_idx in 0..total_layers {
             if layer_idx % 7 == 0 || layer_idx == total_layers - 1 {
                 println!("[ENGINE] Running Layer {}/{} (Ping-Pong Pipeline Active)", layer_idx + 1, total_layers);
@@ -2604,7 +2609,7 @@ impl QuantizedQwen3VLTextModel {
             // =========================================================================
             // [TRACK 2] 백그라운드 지연 적재 (N+1번째 레이어 미리 로드)
             // =========================================================================
-            if layer_idx + 1 < total_layers {
+            if layer_idx + 1 < total_layers && !skip_ping_pong { // <-- 조건 추가
                 let next_idx = layer_idx + 1;
                 let mmap_clone = self.mmap.clone();
                 let ct_clone = self.ct.clone();
@@ -2644,7 +2649,7 @@ impl QuantizedQwen3VLTextModel {
 
             // Track 1 연산이 끝났으므로 N번째 레이어의 가중치는 즉시 소각됩니다. 
             // (process_single_layer 내에서 clear()가 호출됨)
-            if !is_decoding {
+            if !is_decoding && !skip_ping_pong { // <-- 조건 추가
                 // [PING-PONG SWAP] 방금 다 쓰고 비워진 껍데기(현재 레이어)를 복사하여 다음 턴의 빈 그릇으로 재활용합니다!
                 ping_pong_carrier = self.layers[layer_idx].clone();
             }
@@ -2652,15 +2657,17 @@ impl QuantizedQwen3VLTextModel {
             // =========================================================================
             // [TRACK SYNC] 다음 루프로 넘어가기 전, Track 2에서 준비된 N+1 레이어 장착
             // =========================================================================
-            if let Some(task) = next_layer_task.take() {
-                let mut ready_layer = task.await??; 
-                
-                // KV 캐시의 메타데이터(장부)는 기존 N+1 레이어의 것을 보존해야 하므로 덮어씌웁니다.
-                ready_layer.self_attn.kv_blocks = self.layers[layer_idx + 1].self_attn.kv_blocks.clone();
-                ready_layer.self_attn.active_kv_name = self.layers[layer_idx + 1].self_attn.active_kv_name.clone();
-                ready_layer.self_attn.layer_idx = layer_idx + 1; 
-                
-                self.layers[layer_idx + 1] = ready_layer;
+            if !skip_ping_pong { // <-- 블록으로 감싸기
+                if let Some(task) = next_layer_task.take() {
+                    let mut ready_layer = task.await??; 
+                    
+                    // KV 캐시의 메타데이터(장부)는 기존 N+1 레이어의 것을 보존해야 하므로 덮어씌웁니다.
+                    ready_layer.self_attn.kv_blocks = self.layers[layer_idx + 1].self_attn.kv_blocks.clone();
+                    ready_layer.self_attn.active_kv_name = self.layers[layer_idx + 1].self_attn.active_kv_name.clone();
+                    ready_layer.self_attn.layer_idx = layer_idx + 1; 
+                    
+                    self.layers[layer_idx + 1] = ready_layer;
+                }
             }
         }
 
