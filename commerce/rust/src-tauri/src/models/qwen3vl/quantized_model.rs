@@ -1943,8 +1943,9 @@ impl QuantizedQwen3VLTextModel {
         kv_name: Option<String>,
         baking_only: bool,
     ) -> Result<Tensor> {
-        // let mut final_output: Option<Tensor> = None; <-- [삭제]
-        let chunk_size = 256;
+        // [CRITICAL FIX] CPU 모드일 때는 루프 오버헤드를 없애고 가속 코어(BLAS)를 
+        // 100% 활용하기 위해 256 대신 대형 청크(8192)를 사용합니다.
+        let chunk_size = if self.is_forced_cpu { 8192 } else { 256 };
         let current_seq_len = xs.dim(1)?;
         let is_decoding = current_seq_len <= 1;
         let target_device = self.layers[layer_idx].device().clone();
@@ -2244,9 +2245,11 @@ impl QuantizedQwen3VLTextModel {
         //     let _ = self.layers[layer_idx + 1].to_device(&target_device);
         // }
 
-        // [STEP 3] GPU 연산 실행
+        // [STEP 3] 메인 연산 실행 (CPU/GPU 아키텍처 분리)
         let current_seq_len = xs.dim(1)?;
-        let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(256).collect();
+        // [CRITICAL FIX] CPU 환경에서는 핑퐁 오버헤드를 막기 위해 청크 오프셋을 크게 잡습니다.
+        let chunk_step = if self.is_forced_cpu { 8192 } else { 256 };
+        let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(chunk_step).collect();
         let mut next_xs = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
 
         if let (Some(embed), Some(mask)) = (deepstack_embed, visual_mask) {
@@ -2571,13 +2574,16 @@ impl QuantizedQwen3VLTextModel {
 
         for layer_idx in 0..total_layers {
             if layer_idx % 7 == 0 || layer_idx == total_layers - 1 {
-                println!("[ENGINE] Running Layer {}/{} (Ping-Pong Pipeline Active)", layer_idx + 1, total_layers);
+                let mode_str = if self.is_forced_cpu { "CPU Sequential" } else { "GPU Ping-Pong" };
+                println!("[ENGINE] Running Layer {}/{} ({})", layer_idx + 1, total_layers, mode_str);
             }
 
             // =========================================================================
-            // [TRACK 2] 백그라운드 지연 적재 (N+1번째 레이어 미리 로드)
+            // [TRACK 2] 백그라운드 지연 적재 (N+1번째 레이어 미리 로드) - GPU 전용
             // =========================================================================
-            if layer_idx + 1 < total_layers {
+            // [CRITICAL FIX] CPU 모드일 때는 무거운 디스크 I/O와 수학 연산이 서로 자원(스레드) 
+            // 경합을 일으켜 멈추는 것을 막기 위해 백그라운드 핑퐁을 끕니다.
+            if !self.is_forced_cpu && layer_idx + 1 < total_layers {
                 let next_idx = layer_idx + 1;
                 let mmap_clone = self.mmap.clone();
                 let ct_clone = self.ct.clone();
@@ -2585,9 +2591,6 @@ impl QuantizedQwen3VLTextModel {
                 let baking_only = self.baking_only;
                 let base_name = self.base_name.clone();
                 
-                // [FIX] dev_clone 제거 (더 이상 백그라운드에서 VRAM을 건드리지 않습니다)
-
-                // 이번 턴에 데이터를 채워넣을 빈 껍데기(Carrier)를 백그라운드 스레드로 넘깁니다.
                 let mut carrier = ping_pong_carrier.clone();
                 next_layer_task = Some(tokio::task::spawn_blocking(move || -> Result<QuantizedQwen3VLTextDecoderLayer> {
                     let mmap = mmap_clone.ok_or_else(|| anyhow!("Mmap missing"))?;
@@ -2597,43 +2600,37 @@ impl QuantizedQwen3VLTextModel {
                     let gguf_blk = format!("blk.{}", next_idx);
                     let prefix = if ct_arc.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{}.layers.{}", base_name, next_idx) };
                     
-                    // [PING-PONG TRACK 2 최적화]
-                    // SSD -> CPU RAM 로드만 수행합니다. (Quantized 텐서 상태 유지)
-                    // VRAM 할당이나 Dequantization은 메인 스레드로 넘겨 VRAM 스파이크를 원천 차단합니다.
                     carrier.load_weights_inplace(&ct_arc, &mut reader, &prefix, &Device::Cpu, dtype, baking_only)?;
-                    
-                    // [CRITICAL FIX] carrier.to_device(&dev_clone)?; 삭제!!!
-                    // 이전에는 여기서 VRAM으로 넘겨버려서 VRAM 2배 점유와 CUDA 병목이 발생했습니다.
-                    
                     Ok(carrier)
                 }));
             }
 
             // =========================================================================
-            // [TRACK 1] 메인 연산 트랙 (N번째 레이어) - 청크 처리
+            // [TRACK 1] 메인 연산 트랙 (N번째 레이어)
             // =========================================================================
             let deepstack_embed = deepstack_visual_embeds.as_ref().and_then(|v| v.get(layer_idx));
+            
+            // CPU 모드일 경우 내부의 reload_layer가 동기적으로 가중치를 로드하여 경합 없이 안전하게 연산합니다.
             xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks, session_id.clone(), kv_name.clone(), self.baking_only).await?;
 
-            // Track 1 연산이 끝났으므로 N번째 레이어의 가중치는 즉시 소각됩니다. 
-            // (process_single_layer 내에서 clear()가 호출됨)
-            if !is_decoding {
-                // [PING-PONG SWAP] 방금 다 쓰고 비워진 껍데기(현재 레이어)를 복사하여 다음 턴의 빈 그릇으로 재활용합니다!
+            if !is_decoding && !self.is_forced_cpu {
+                // [PING-PONG SWAP] GPU 모드일 때만 빈 껍데기 교체
                 ping_pong_carrier = self.layers[layer_idx].clone();
             }
 
             // =========================================================================
-            // [TRACK SYNC] 다음 루프로 넘어가기 전, Track 2에서 준비된 N+1 레이어 장착
+            // [TRACK SYNC] 다음 루프로 넘어가기 전 동기화 (GPU 전용)
             // =========================================================================
-            if let Some(task) = next_layer_task.take() {
-                let mut ready_layer = task.await??; 
-                
-                // KV 캐시의 메타데이터(장부)는 기존 N+1 레이어의 것을 보존해야 하므로 덮어씌웁니다.
-                ready_layer.self_attn.kv_blocks = self.layers[layer_idx + 1].self_attn.kv_blocks.clone();
-                ready_layer.self_attn.active_kv_name = self.layers[layer_idx + 1].self_attn.active_kv_name.clone();
-                ready_layer.self_attn.layer_idx = layer_idx + 1; 
-                
-                self.layers[layer_idx + 1] = ready_layer;
+            if !self.is_forced_cpu {
+                if let Some(task) = next_layer_task.take() {
+                    let mut ready_layer = task.await??; 
+                    
+                    ready_layer.self_attn.kv_blocks = self.layers[layer_idx + 1].self_attn.kv_blocks.clone();
+                    ready_layer.self_attn.active_kv_name = self.layers[layer_idx + 1].self_attn.active_kv_name.clone();
+                    ready_layer.self_attn.layer_idx = layer_idx + 1; 
+                    
+                    self.layers[layer_idx + 1] = ready_layer;
+                }
             }
         }
 
