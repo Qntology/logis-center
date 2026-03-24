@@ -1253,10 +1253,11 @@ impl QuantizedQwen3VLTextAttention {
             map.insert(format!("{}v_data", prefix), vd);
             map.insert(format!("{}k_shape", prefix), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect::<Vec<u32>>(), (k_shape.len(),), &Device::Cpu)?);
             
-            // [DIRECT-IO] Use OS-accelerated high-speed write instead of standard IO
-            if let Ok(data) = safetensors::serialize(&map, &None) {
-                let _ = crate::utils::direct_loader::save_kv_block(&structured_path, &data);
-                println!("[SSD-SAVE-FAST] Layer {} Block {} saved via DirectStorage/Overlapped.", self.layer_idx, offset);
+            // [COMPILATION FIX] 메모리 추출 대신 프레임워크 자체 직렬화 엔진 사용
+            if let Ok(_) = candle_core::safetensors::save(&map, &structured_path) {
+                println!("[SSD-SAVE] Layer {} Block {} saved to disk.", self.layer_idx, offset);
+            } else {
+                println!("[SSD-SAVE-ERROR] Failed to save Layer {} Block {}", self.layer_idx, offset);
             }
             
             if let Ok(mut reg) = self.registry.entries.write() {

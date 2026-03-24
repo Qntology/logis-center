@@ -248,11 +248,11 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 
-                // [CRITICAL FIX] 무거운 압축(serialize)과 디스크 쓰기를 spawn_blocking으로 격리!
+                // [COMPILATION FIX] candle_core::Tensor는 safetensors::View를 직접 지원하지 않으므로
+                // Candle의 내장 save 함수를 사용하여 안전하게 다이렉트로 디스크에 씁니다.
                 let tp_clone = tp.clone();
                 let serialize_result = tokio::task::spawn_blocking(move || {
-                    let data = safetensors::serialize(&ts, &None)?;
-                    save_kv_block(&tp_clone, &data)?;
+                    candle_core::safetensors::save(&ts, &tp_clone)?;
                     Ok::<_, anyhow::Error>(())
                 }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Thread error: {}", e)));
 
