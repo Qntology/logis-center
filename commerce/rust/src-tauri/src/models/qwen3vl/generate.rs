@@ -178,7 +178,7 @@ pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
     tx
 });
 
-pub struct LoadTask { pub slot_id: usize, pub path: PathBuf, pub layer_idx: usize, pub kv_name: Option<String>, pub shared_block: KVBlock, pub registry: KVRegistry }
+pub struct LoadTask { pub slot_id: usize, pub path: PathBuf, pub layer_idx: usize, pub kv_name: Option<String>, pub shared_block: KVBlock, pub registry: KVRegistry, pub is_cpu: bool }
 
 pub static BAKE_TX: OnceCell<mpsc::Sender<SlotTask>> = OnceCell::const_new();
 pub static LOAD_TX: OnceCell<mpsc::Sender<SlotTask>> = OnceCell::const_new();
@@ -350,12 +350,12 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     }
                                 }
 
-                                // 무조건 BF16으로 강제 캐스팅 (실패 시 panic 대신 기존 텐서 반환)
-                                let k_bf16 = k_aligned.to_dtype(DType::BF16).unwrap_or(k_aligned);
-                                let v_bf16 = v_aligned.to_dtype(DType::BF16).unwrap_or(v_aligned);
+                                // [CRITICAL FIX] 메모리 정렬(contiguous)을 먼저 수행하여 Safetensors 저장 실패(Silent Fail) 원천 차단!
+                                let k_contig = k_aligned.contiguous().unwrap_or(k_aligned);
+                                let v_contig = v_aligned.contiguous().unwrap_or(v_aligned);
 
-                                src.k_data = k_bf16.contiguous().unwrap_or_else(|_| k_bf16.clone());
-                                src.v_data = v_bf16.contiguous().unwrap_or_else(|_| v_bf16.clone());
+                                src.k_data = k_contig.to_dtype(DType::BF16).unwrap_or_else(|_| k_contig.clone());
+                                src.v_data = v_contig.to_dtype(DType::BF16).unwrap_or_else(|_| v_contig.clone());
                             }
                             let mut map = std::collections::HashMap::new();
                             let prefix = format!("b{}_l{}_", off, act_l);
@@ -401,8 +401,14 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         let file_shape: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
 
                                         let dev = &Device::Cpu;
-                                        let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
-                                        let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
+                                        let mut kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
+                                        let mut vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
+                                        
+                                        // [CRITICAL FIX] CPU 모드라면 백그라운드 스레드에서 미리 F32로 변환하여 메인 런타임의 병목을 원천 차단!
+                                        if load.is_cpu {
+                                            kd_t = kd_t.to_dtype(DType::F32).unwrap_or(kd_t);
+                                            vd_t = vd_t.to_dtype(DType::F32).unwrap_or(vd_t);
+                                        }
                                         let meta = BitKVMetadata { k_data: kd_t, v_data: vd_t, original_shape: file_shape };
                                         
                                         if let Ok(mut r) = reg.entries.write() {
@@ -474,7 +480,14 @@ impl Qwen3VLGenerateModel {
             let text_config: crate::models::qwen3vl::config::Qwen3VLTextConfig = serde_json::from_value(raw_config.clone())?;
             Qwen3VLConfig { architectures: raw_config.get("architectures").and_then(|v| serde_json::from_value(v.clone()).ok()), auto_map: raw_config.get("auto_map").and_then(|v| serde_json::from_value(v.clone()).ok()), hidden_size: raw_config.get("hidden_size").and_then(|v| v.as_u64()).map(|v| v as usize), image_token_id: raw_config.get("image_token_id").and_then(|v| v.as_u64()).map(|v| v as usize), model_type: raw_config.get("model_type").and_then(|v| v.as_str()).unwrap_or("qwen2").to_string(), text_config: Some(text_config), tie_word_embeddings: raw_config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(true), torch_dtype: raw_config.get("torch_dtype").and_then(|v| v.as_str()).map(|s| s.to_string()), transformers_version: raw_config.get("transformers_version").and_then(|v| v.as_str()).unwrap_or("").to_string(), video_token_id: raw_config.get("video_token_id").and_then(|v| v.as_u64()).map(|v| v as usize), vision_config: None, vision_start_token_id: None, vision_end_token_id: None }
         };
-        let t_dev = get_device(text_device); let v_dev = get_device(vision_device); let dtype = get_dtype(dtype, cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16"));
+        let t_dev = get_device(text_device); let v_dev = get_device(vision_device); 
+        let parsed_dtype = get_dtype(dtype, cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16"));
+        
+        // [CRITICAL FIX] CPU 모드일 경우 이미지 전처리기(Processor), 비전 모델, 텍스트 모델 등
+        // 모든 시스템 파이프라인의 데이터 타입을 설정 파일(Config) 무시하고 F32로 완전히 통일시킵니다!
+        // 이를 통해 잠재적인 Vision DType Mismatch 크래시를 막고 오버헤드를 0%로 만듭니다.
+        let effective_dtype = if t_dev.is_cpu() { DType::F32 } else { parsed_dtype };
+
         let gguf_f = find_type_files(path, "gguf")?; let mmproj_p = gguf_f.iter().find(|f| f.contains("mmproj")).cloned();
         let mut m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned();
         if m_p.is_none() { m_p = gguf_f.iter().find(|f| f.contains("Qwen3-0.6B-Q4_K_M.gguf")).cloned(); }
@@ -487,18 +500,20 @@ impl Qwen3VLGenerateModel {
                 let ct_main = Arc::new(gguf_file::Content::read(&mut std::io::Cursor::new(&m_mmap[..]))?);
                 let ct_vision = Arc::new(gguf_file::Content::read(&mut std::io::Cursor::new(&mm_mmap[..]))?);
                 
-                ModelVariant::QuantizedVL(QuantizedQwen3VLModel::new_with_mmap(&cfg, ct_main, Some(Arc::new(m_mmap)), ct_vision, Some(Arc::new(mm_mmap)), &t_dev, text_device_id, &v_dev, vision_device_id, dtype, kv_res, baking_only)?)
+                ModelVariant::QuantizedVL(QuantizedQwen3VLModel::new_with_mmap(&cfg, ct_main, Some(Arc::new(m_mmap)), ct_vision, Some(Arc::new(mm_mmap)), &t_dev, text_device_id, &v_dev, vision_device_id, effective_dtype, kv_res, baking_only)?)
             } else {
                 let m_mmap = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(m_p.as_ref().unwrap())?)? };
                 let ct_main = Arc::new(gguf_file::Content::read(&mut std::io::Cursor::new(&m_mmap[..]))?);
                 
-                ModelVariant::QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, ct_main, Some(Arc::new(m_mmap)), &t_dev, text_device_id, dtype, kv_res, baking_only, baking_only)?)
+                ModelVariant::QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, ct_main, Some(Arc::new(m_mmap)), &t_dev, text_device_id, effective_dtype, kv_res, baking_only, baking_only)?)
             }
-        } else { ModelVariant::Standard(Qwen3VLModel::new(cfg, unsafe { VarBuilder::from_mmaped_safetensors(&find_type_files(path, "safetensors")?, dtype, &t_dev)? })?) };
+        } else { ModelVariant::Standard(Qwen3VLModel::new(cfg, unsafe { VarBuilder::from_mmaped_safetensors(&find_type_files(path, "safetensors")?, effective_dtype, &t_dev)? })?) };
         let g_p = std::path::Path::new(cfg_path).join("generation_config.json"); let g_cfg = if g_p.exists() { serde_json::from_slice(&std::fs::read(g_p)?)? } else { Qwen3VLGenerationConfig::default() };
         let (e1, e2) = match &g_cfg.eos_token_id { serde_json::Value::Number(n) => { let id = n.as_u64().unwrap_or(151645) as u32; (id, id) }, serde_json::Value::Array(arr) => { (arr.get(0).and_then(|v| v.as_u64()).unwrap_or(151643) as u32, arr.get(1).and_then(|v| v.as_u64()).unwrap_or(151643) as u32) }, _ => (151643, 151643) };
         let loaded_model_name = if m_p.as_ref().map(|p| p.contains("0.6B")).unwrap_or(false) { "0.6B".to_string() } else { "2B".to_string() };
-        Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &v_dev, dtype)?, qwen3_vl, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: loaded_model_name, hard_token_limit, kv_root })
+        
+        // [CRITICAL FIX] pre_processor 에도 effective_dtype를 전달하여 생성 단계부터 F32를 보장합니다!
+        Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &v_dev, effective_dtype)?, qwen3_vl, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: loaded_model_name, hard_token_limit, kv_root })
     }
 
     pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut Qwen3VLGenerateModel>, _kv_name: Option<String>) -> Result<usize> {

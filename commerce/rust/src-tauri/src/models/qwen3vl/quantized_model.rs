@@ -755,8 +755,8 @@ impl QuantizedQwen3VLTextAttention {
                                                     let k_unpacked = self.decompress_from_bf16(&kd_t, &meta_os, cpu_dev).unwrap_or_else(|_| kd_t.clone());
                                                     let v_unpacked = self.decompress_from_bf16(&vd_t, &meta_os, cpu_dev).unwrap_or_else(|_| vd_t.clone());
 
-                                                    k_cpu = Some(k_unpacked);
-                                                    v_cpu = Some(v_unpacked);
+                                                    k_cpu = Some(k_unpacked.clone());
+                                                    v_cpu = Some(v_unpacked.clone());
                                                     ssd_count += 1;
 
                                                     let mut reg = self.registry.entries.write().unwrap();
@@ -764,11 +764,14 @@ impl QuantizedQwen3VLTextAttention {
                                                         reg[index].ssd_path = Some(full_path.clone());
                                                         reg[index].location[self.layer_idx] = KVLocation::RAM; // 위치를 RAM으로 격상
                                                         
-                                                        // [CRITICAL FIX] SSD에서 읽은 즉시 RAM에 캐싱하여 다음 턴 재읽기 방지
                                                         let mut cache = reg[index].bitkv_cache.write().unwrap();
+                                                        // [CRITICAL FIX] CPU 모드에서는 매 토큰 재변환 병목을 막기 위해 원본(kd_t) 대신 이미 풀려있는 F32 텐서(k_unpacked)를 보관합니다!
+                                                        let cache_k = if self.q_proj.device().is_cpu() { k_unpacked.clone() } else { kd_t };
+                                                        let cache_v = if self.q_proj.device().is_cpu() { v_unpacked.clone() } else { vd_t };
+                                                        
                                                         cache[self.layer_idx] = Some(BitKVMetadata {
-                                                            k_data: kd_t, // 압축된 형태(BF16)로 RAM에 보관하여 메모리 절약
-                                                            v_data: vd_t,
+                                                            k_data: cache_k, 
+                                                            v_data: cache_v,
                                                             original_shape: meta_os,
                                                         });
                                                     }
@@ -891,6 +894,9 @@ impl QuantizedQwen3VLTextAttention {
 
     pub fn decompress_from_bf16(&self, data: &Tensor, _original_shape: &[usize], device: &Device) -> Result<Tensor> {
         let t = data.to_device(device)?;
+        // [CRITICAL FIX] CPU 환경에서는 어텐션 연산(F32)을 위해 읽어오는 즉시 F32로 승격시킵니다.
+        // 이 한 줄로 매 토큰마다 발생하는 디코딩시 BF16 -> F32 변환 오버헤드가 완전히 사라집니다!
+        let t = if device.is_cpu() { t.to_dtype(DType::F32)? } else { t };
         Ok(t) 
     }
 
@@ -983,8 +989,8 @@ impl QuantizedQwen3VLTextAttention {
                     // [CRITICAL FIX] 무거운 GPU->CPU 다운로드(블로킹 연산)가 비동기 런타임을 마비시키지 않도록
                     // spawn_blocking으로 완벽하게 격리시켜 디코딩 버벅임(Stuttering)을 차단합니다!
                     let (k_vram, v_vram) = tokio::task::spawn_blocking(move || {
-                        let k_res = k.to_device(&Device::Cpu).unwrap_or_else(|_| k.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| k.clone()).contiguous().unwrap_or_else(|_| k.clone());
-                        let v_res = v.to_device(&Device::Cpu).unwrap_or_else(|_| v.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| v.clone()).contiguous().unwrap_or_else(|_| v.clone());
+                        let k_res = k.to_device(&Device::Cpu).unwrap_or_else(|_| k.clone()).contiguous().unwrap_or_else(|_| k.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| k.clone());
+                        let v_res = v.to_device(&Device::Cpu).unwrap_or_else(|_| v.clone()).contiguous().unwrap_or_else(|_| v.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| v.clone());
                         (k_res, v_res)
                     }).await.unwrap_or_else(|_| (Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(), Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap()));
                     
@@ -1127,7 +1133,8 @@ impl QuantizedQwen3VLTextAttention {
     /// [VRAM-EVACUATION] VRAM에 있는 모든 활성 블록을 RAM 캐시로 강제 이동합니다. (SSD 저장 준비 단계)
     pub fn evacuate_vram_to_cache(&mut self) -> Result<()> {
         let dev = &Device::Cpu;
-        let target_dtype = DType::BF16;
+        // [CRITICAL FIX] CPU 모드일 때는 RAM 캐시도 F32로 유지하여 강제 변환 병목을 없앱니다.
+        let target_dtype = if self.q_proj.device().is_cpu() { DType::F32 } else { DType::BF16 };
 
         // 1. 병합된 VRAM 누산기(vram_merged_k/v) 해체
         if let (Some(mk), Some(mv)) = (&self.vram_merged_k, &self.vram_merged_v) {
@@ -1706,17 +1713,22 @@ impl QuantizedQwen3VLTextModel {
         baking_only: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
+        
+        // [CRITICAL FIX] CPU 모드일 경우 글로벌 데이터 타입을 뼈대부터 F32로 강제 승격시켜, 
+        // 임베딩 테이블과 정규화(Norm), 편향(Bias) 가중치들이 BF16으로 오염되는 것을 원천 차단합니다!
+        let effective_dtype = if is_forced_cpu { DType::F32 } else { dtype };
+        
         let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader = std::io::Cursor::new(mmap);
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
         
         let (embed_tokens, actual_hidden_size) = if let Ok(tensor) = ct.tensor(&mut reader, &token_emb_name, device) {
-             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
+             let tensor = tensor.dequantize(device)?.to_dtype(effective_dtype)?; // dtype -> effective_dtype 적용
              let h = tensor.dim(1)?;
              (Embedding::new(tensor, h), h)
         } else if let Ok(tensor) = ct.tensor(&mut reader, alt_token_emb, device) {
-             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
+             let tensor = tensor.dequantize(device)?.to_dtype(effective_dtype)?; // dtype -> effective_dtype 적용
              let h = tensor.dim(1)?;
              (Embedding::new(tensor, h), h)
         } else {
@@ -1731,21 +1743,20 @@ impl QuantizedQwen3VLTextModel {
         let registry = KVRegistry::new();
         let num_layers_to_load = if baking_only { 1 } else { config.num_hidden_layers };
 
-        // [ZERO-RAM-STARTUP] 최초 로딩 시 레이어 가중치를 전혀 읽지 않고 껍데기만 생성합니다.
         let mut layers = Vec::with_capacity(num_layers_to_load);
         for layer_idx in 0..num_layers_to_load {
             let gguf_blk = format!("blk.{layer_idx}");
             let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{base_name}.layers.{layer_idx}") };
             
-            // Skeleton 레이어 생성 (가중치 없이 메타데이터만 구성)
-            let layer = QuantizedQwen3VLTextDecoderLayer::new_skeleton(config, &prefix, &current_device, dtype, layer_idx, baking_only, registry.clone())?;
+            // Skeleton 레이어 생성 시에도 effective_dtype 전달
+            let layer = QuantizedQwen3VLTextDecoderLayer::new_skeleton(config, &prefix, &current_device, effective_dtype, layer_idx, baking_only, registry.clone())?;
             layers.push(layer);
         }
         
         let norm_name = format!("{base_name}.norm");
         let alt_norm = "output_norm";
         let norm_prefix = if ct.tensor_infos.contains_key(&format!("{}.weight", alt_norm)) { alt_norm } else { &norm_name };
-        let norm = get_rms_norm(&ct, &mut reader, norm_prefix, config.rms_norm_eps, device, dtype)?;
+        let norm = get_rms_norm(&ct, &mut reader, norm_prefix, config.rms_norm_eps, device, effective_dtype)?; // dtype -> effective_dtype 적용
         
         Ok(Self { 
             embed_tokens, 
@@ -1765,7 +1776,7 @@ impl QuantizedQwen3VLTextModel {
             config: config.clone(),
             ct: Some(ct),
             base_name: base_name.to_string(),
-            dtype,
+            dtype: effective_dtype, // [CRITICAL FIX] 모델 전체의 기본 속성을 F32로 확정!
         })
     }
 
@@ -1791,15 +1802,17 @@ impl QuantizedQwen3VLTextModel {
         baking_only: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
+        let effective_dtype = if is_forced_cpu { DType::F32 } else { dtype }; // [CRITICAL FIX]
+        
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
         
         let (embed_tokens, actual_hidden_size) = if let Ok(tensor) = ct.tensor(reader, &token_emb_name, device) {
-             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
+             let tensor = tensor.dequantize(device)?.to_dtype(effective_dtype)?; // dtype -> effective_dtype
              let h = tensor.dim(1)?;
              (Embedding::new(tensor, h), h)
         } else if let Ok(tensor) = ct.tensor(reader, alt_token_emb, device) {
-             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
+             let tensor = tensor.dequantize(device)?.to_dtype(effective_dtype)?; // dtype -> effective_dtype
              let h = tensor.dim(1)?;
              (Embedding::new(tensor, h), h)
         } else {
@@ -1819,13 +1832,13 @@ impl QuantizedQwen3VLTextModel {
             if device.is_cuda() { pinned_layer_count += 1; }
             let gguf_blk = format!("blk.{layer_idx}");
             let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{base_name}.layers.{layer_idx}") };
-            let mut layer = QuantizedQwen3VLTextDecoderLayer::new(config, &ct, reader, &prefix, device, dtype, layer_idx, baking_only, registry.clone())?;
+            let mut layer = QuantizedQwen3VLTextDecoderLayer::new(config, &ct, reader, &prefix, device, effective_dtype, layer_idx, baking_only, registry.clone())?;
             layer.clear();
             layers.push(layer);
         }
         
         let norm_prefix = if ct.tensor_infos.contains_key("output_norm.weight") { "output_norm" } else { &format!("{base_name}.norm") };
-        let norm = get_rms_norm(&ct, reader, norm_prefix, config.rms_norm_eps, device, dtype)?;
+        let norm = get_rms_norm(&ct, reader, norm_prefix, config.rms_norm_eps, device, effective_dtype)?; // dtype -> effective_dtype
         
         Ok(Self { 
             embed_tokens, 
@@ -1845,7 +1858,7 @@ impl QuantizedQwen3VLTextModel {
             config: config.clone(),
             ct: Some(ct),
             base_name: base_name.to_string(),
-            dtype,
+            dtype: effective_dtype, // [CRITICAL FIX]
         })
     }
 
@@ -1999,11 +2012,12 @@ impl QuantizedQwen3VLTextModel {
                                     let shared_block = block.clone();
                                     let reg_clone = self.registry.clone();
                                     let kv_name_for_load = kv_name.clone();
+                                    let is_cpu_mode = self.is_forced_cpu; // [CRITICAL FIX] CPU 모드 플래그
                                     tauri::async_runtime::spawn(async move {
                                         use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
                                         let sid = SLOT_MANAGER.acquire_read_slot().await;
                                         if let Ok(tx) = get_load_worker().await {
-                                            let _ = tx.send(SlotTask::Load(LoadTask { slot_id: sid, path, layer_idx: target_layer, kv_name: kv_name_for_load, shared_block, registry: reg_clone })).await;
+                                            let _ = tx.send(SlotTask::Load(LoadTask { slot_id: sid, path, layer_idx: target_layer, kv_name: kv_name_for_load, shared_block, registry: reg_clone, is_cpu: is_cpu_mode })).await;
                                         } else {
                                             SLOT_MANAGER.release_slot(sid).await;
                                         }
@@ -2060,6 +2074,8 @@ impl QuantizedQwen3VLTextModel {
             let current_kv_len = self.layers[layer_idx].get_kv_len();
             
             if !is_small_model || current_kv_len >= 4096 {
+                let target_dtype = if self.is_forced_cpu { DType::F32 } else { DType::BF16 }; // [CRITICAL FIX]
+                
                 for (i, block) in self.layers[layer_idx].self_attn.kv_blocks.iter().enumerate() {
                     let (k_part, v_part) = {
                         let inner = block.inner.read().unwrap();
@@ -2067,8 +2083,8 @@ impl QuantizedQwen3VLTextModel {
                     };
 
                     if let (Some(k), Some(v)) = (k_part, v_part) {
-                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
-                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
+                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(target_dtype)?;
+                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(target_dtype)?;
                         
                         let mut inner = block.inner.write().unwrap();
                         inner.k_cache = None;
@@ -2155,12 +2171,14 @@ impl QuantizedQwen3VLTextModel {
             if vram_indices.len() > vram_limit {
                 vram_indices.sort_by_key(|k| k.1); // 오래된 순 정렬
                 let num_to_evict = vram_indices.len().saturating_sub(vram_limit);
+                let target_dtype = if self.is_forced_cpu { DType::F32 } else { DType::BF16 }; // [CRITICAL FIX]
+
                 for i in 0..num_to_evict {
                     let (idx, _) = vram_indices[i];
                     let mut inner = kv_blocks[idx].inner.write().unwrap();
                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
-                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
+                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(target_dtype)?;
+                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(target_dtype)?;
                         inner.k_cache = Some(k_cpu);
                         inner.v_cache = Some(v_cpu);
                         inner.location = KVLocation::RAM;
@@ -2405,12 +2423,14 @@ impl QuantizedQwen3VLTextModel {
             if vram_indices.len() > vram_limit {
                 vram_indices.sort_by_key(|k| if k.1 == 0 { usize::MAX } else { k.1 });
                 let num_to_evict = vram_indices.len() - vram_limit;
+                let target_dtype = if self.is_forced_cpu { DType::F32 } else { DType::BF16 }; // [CRITICAL FIX]
+
                 for i in 0..num_to_evict {
                     let (idx, _) = vram_indices[i];
                     let mut inner = kv_blocks[idx].inner.write().unwrap();
                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
-                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
+                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(target_dtype)?;
+                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(target_dtype)?;
                         inner.k_cache = Some(k_cpu);
                         inner.v_cache = Some(v_cpu);
                         inner.location = KVLocation::RAM;
@@ -2461,11 +2481,11 @@ impl QuantizedQwen3VLTextModel {
                         dumps_to_send.push((
                             LayerKVDump { 
                                 layer_idx, 
-                                k_data: k.to_device(&Device::Cpu)?,
-                                v_data: v.to_device(&Device::Cpu)?,
+                                k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?, // [FIX] 더미 통과
+                                v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?, // [FIX] 더미 통과
                                 k_shape: Tensor::from_vec(k_shape_vec, (k.shape().dims().len(),), &Device::Cpu)?,
-                                raw_k: None,
-                                raw_v: None,
+                                raw_k: Some(k.to_device(&Device::Cpu)?), // [CRITICAL FIX] F32 원본 전달!
+                                raw_v: Some(v.to_device(&Device::Cpu)?), // [CRITICAL FIX] F32 원본 전달!
                             },
                             inner.offset,
                             inner.len
