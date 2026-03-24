@@ -576,7 +576,6 @@ impl QuantizedQwen3VLTextAttention {
         session_id: Option<String>,
         kv_name: Option<String>,
         baking_only: bool,
-        is_forced_cpu: bool,
     ) -> Result<Tensor> {
         self.active_session_id = session_id.clone(); 
         self.active_kv_name = kv_name;
@@ -605,18 +604,13 @@ impl QuantizedQwen3VLTextAttention {
         };
 
         // [CRITICAL FIX] .contiguous() 삭제로 VRAM 전체 복사 스파이크 원천 차단!
-        // [TO-BE: 수정된 코드]
         let mut query_states = self.q_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
-        query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?;
-        // [CPU 가속 핵심] CPU 모드일 때는 반드시 메모리를 정렬하여 BLAS 가속 코어를 활성화합니다!
-        if is_forced_cpu { query_states = query_states.contiguous()?; }
-
+        query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?; // contiguous() 제거
+        
         let mut key_states = self.k_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
-        key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?;
-        if is_forced_cpu { key_states = key_states.contiguous()?; }
-
-        let value_states = self.v_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?;
-        let value_states = if is_forced_cpu { value_states.contiguous()? } else { value_states };
+        key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?;     // contiguous() 제거
+        
+        let value_states = self.v_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?; // contiguous() 제거
 
         let cos = cos.to_dtype(target_dtype)?;
         let sin = sin.to_dtype(target_dtype)?;
@@ -689,89 +683,12 @@ impl QuantizedQwen3VLTextAttention {
 
         // 3. [CHUNK-BASED ONLINE SOFTMAX] Zero-VRAM Spikes Attention
         let total_tokens_now = seqlen_offset + q_len;
-
-        // =========================================================================
-        // [CRITICAL FIX] CPU 모드 전용 원샷(One-Shot) F32 초고속 어텐션 파이프라인
-        // 메모리 복사(contiguous)를 0으로 만드는 혁신적인 GQA 브로드캐스팅 기법 적용!
-        // =========================================================================
-        if is_forced_cpu {
-            let mut k_pieces = Vec::with_capacity(self.kv_blocks.len());
-            let mut v_pieces = Vec::with_capacity(self.kv_blocks.len());
-            
-            for block in &self.kv_blocks {
-                let inner = block.inner.read().unwrap();
-                if inner.offset >= total_tokens_now { continue; }
-                
-                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    k_pieces.push(k.clone());
-                    v_pieces.push(v.clone());
-                } else {
-                    let reg = self.registry.entries.read().unwrap();
-                    if inner.index < reg.len() {
-                        let cache = reg[inner.index].bitkv_cache.read().unwrap();
-                        if let Some(m) = &cache[self.layer_idx] {
-                            k_pieces.push(m.k_data.clone());
-                            v_pieces.push(m.v_data.clone());
-                        }
-                    }
-                }
-            }
-
-            if k_pieces.is_empty() { return Err(anyhow!("No KV data processed")); }
-
-            // [FIX] contiguous 없이 순수 합치기만 수행합니다.
-            let k_merged = Tensor::cat(&k_pieces, 2)?.to_dtype(DType::F32)?;
-            let v_merged = Tensor::cat(&v_pieces, 2)?.to_dtype(DType::F32)?;
-            let q_aligned = query_states.to_dtype(DType::F32)?;
-
-            // [ZERO-COPY GQA] 엄청난 병목이었던 expand() + contiguous()를 완전히 제거하고
-            // CPU BLAS가 지원하는 네이티브 브로드캐스트 MatMul을 활용해 즉시 연산합니다!
-            let attn_output = if self.num_kv_groups > 1 {
-                let mut head_outputs = Vec::with_capacity(self.num_attention_heads);
-                
-                // K, V의 헤드 개수(예: 2개)만큼 루프를 돕니다.
-                for kv_idx in 0..self.num_key_value_heads {
-                    // K, V를 1개의 헤드씩 자름: (Batch, 1, Seq_KV, Dim)
-                    let k_head = k_merged.narrow(1, kv_idx, 1)?; 
-                    let v_head = v_merged.narrow(1, kv_idx, 1)?;
-                    
-                    // Q는 해당하는 그룹(예: 4개)만큼 자름: (Batch, Groups, Seq_Q, Dim)
-                    let start_q = kv_idx * self.num_kv_groups;
-                    let q_group = q_aligned.narrow(1, start_q, self.num_kv_groups)?; 
-                    
-                    // [MAGIC] Q(Groups) x K(1) 행렬곱: 물리적 메모리 복사 없이 자동으로 브로드캐스팅 됩니다!
-                    let mut attn_weights = (q_group.matmul(&k_head.transpose(2, 3)?)? * self.scaling)?;
-                    
-                    if let Some(mask) = &attention_mask {
-                        attn_weights = attn_weights.broadcast_add(mask)?;
-                    }
-                    
-                    let attn_probs = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-                    let out_group = attn_probs.matmul(&v_head)?; // (Batch, Groups, Seq_Q, Dim)
-                    head_outputs.push(out_group);
-                }
-                // 처리된 그룹들을 하나로 합칩니다.
-                Tensor::cat(&head_outputs, 1)?
-            } else {
-                crate::models::qwen3vl::common::eager_attention_forward(
-                    &q_aligned, &k_merged, &v_merged, None, attention_mask.as_ref(), self.scaling
-                )?
-            };
-
-            let attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
-            return Ok(self.o_proj.forward(&attn_output)?);
-        }
-
-        // =========================================================================
-        // [GPU 모드 전용] VRAM 절약을 위한 청크 기반 순차 연산 (Online Softmax)
-        // GPU 코어(Tensor Core)의 효율을 극대화하기 위해 완벽한 BF16 타입으로 고정합니다.
-        // =========================================================================
+        
         let mut out_res: Option<Tensor> = None;
         let mut m_n: Option<Tensor> = None;
         let mut l_n: Option<Tensor> = None;
         
-        // GPU 연산의 속도를 위해 Q를 BF16으로 강제 고정합니다!
-        let q_aligned = query_states.to_dtype(DType::BF16)?;
+        let q_aligned = query_states.to_dtype(target_dtype)?;
 
         for block in &self.kv_blocks {
             let (index, b_off, _b_len) = {
@@ -780,7 +697,7 @@ impl QuantizedQwen3VLTextAttention {
             };
             if b_off >= total_tokens_now { continue; }
 
-            // [STEP A] Load Block to VRAM (기존 로직 유지)
+            // [STEP A] Load Block to VRAM
             let (k_block, v_block, is_temporary) = {
                 let inner = block.inner.read().unwrap();
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
@@ -831,11 +748,8 @@ impl QuantizedQwen3VLTextAttention {
                                                     let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                                                     let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
                                                     
-                                                    // [CPU/GPU 동적 타입 지원] 이전 최적화로 인해 F32가 디스크에 저장될 수 있으므로 동적으로 타입을 인식해야 파싱 에러(Garbage Data)가 발생하지 않습니다.
-                                                    let dtype = match kd.dtype() { safetensors::Dtype::F32 => DType::F32, safetensors::Dtype::F16 => DType::F16, _ => DType::BF16 };
-                                                    
-                                                    let kd_t = Tensor::from_raw_buffer(kd.data(), dtype, &meta_os, &Device::Cpu).unwrap_or_else(|_| Tensor::zeros(meta_os.clone(), dtype, &Device::Cpu).unwrap());
-                                                    let vd_t = Tensor::from_raw_buffer(vd.data(), dtype, &meta_os, &Device::Cpu).unwrap_or_else(|_| Tensor::zeros(meta_os.clone(), dtype, &Device::Cpu).unwrap());
+                                                    let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap_or_else(|_| Tensor::zeros(meta_os.clone(), DType::BF16, &Device::Cpu).unwrap());
+                                                    let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap_or_else(|_| Tensor::zeros(meta_os.clone(), DType::BF16, &Device::Cpu).unwrap());
                                                     
                                                     let cpu_dev = &Device::Cpu;
                                                     let k_unpacked = self.decompress_from_bf16(&kd_t, &meta_os, cpu_dev).unwrap_or_else(|_| kd_t.clone());
@@ -878,9 +792,9 @@ impl QuantizedQwen3VLTextAttention {
                     (k_final, v_final, true)
                 }
             };
+            if !is_temporary { vram_count += 1; }
 
-            // --- 이하는 GPU 모드(BF16)용 기존 로직 유지 ---
-            // [STEP B] Online Softmax for this Chunk (CPU & GPU 완벽 공통 파이프라인)
+            // [STEP B] Online Softmax for this Chunk
             let mut k = k_block;
             let mut v = v_block;
 
@@ -889,14 +803,8 @@ impl QuantizedQwen3VLTextAttention {
                 let (b, h, s, d) = k.dims4()?;
                 k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
                 v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                
-                // [CRITICAL FIX] CPU 모드일 때만 비연속 메모리 정렬을 수행해 연산 코어(BLAS) 속도를 극대화합니다.
-                if is_forced_cpu {
-                    k = k.contiguous()?;
-                    v = v.contiguous()?;
-                }
             }
-            
+
             let actual_kv_len = k.dim(2)?;
 
             // 2) Q * K^T * scaling
@@ -979,17 +887,16 @@ impl QuantizedQwen3VLTextAttention {
     // [REPLACED] Direct BF16 Storage (16-bit precision, no compression)
     pub fn compress_to_bf16(&self, t: &Tensor) -> Result<(Tensor, Vec<usize>)> {
         let original_shape = t.shape().dims().to_vec();
-        // [CPU 최적화] CPU 모드일 때는 무거운 BF16 다운캐스팅을 생략하고 F32 원본을 유지합니다.
-        let target_dtype = if self.q_proj.device().is_cpu() { DType::F32 } else { DType::BF16 };
-        let t_out = t.to_device(&Device::Cpu)?.to_dtype(target_dtype)?;
-        Ok((t_out, original_shape))
+        // Convert to BF16 on CPU
+        let t_bf16 = t.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
+        Ok((t_bf16, original_shape))
     }
 
     pub fn decompress_from_bf16(&self, data: &Tensor, _original_shape: &[usize], device: &Device) -> Result<Tensor> {
         let t = data.to_device(device)?;
-        // [CPU 최적화] 데이터가 이미 F32라면 to_dtype는 0비용(No-op)이 되며 즉시 통과합니다.
-        let target_dtype = if device.is_cpu() { DType::F32 } else { DType::BF16 };
-        let t = if t.dtype() != target_dtype { t.to_dtype(target_dtype)? } else { t };
+        // [CRITICAL FIX] CPU 환경에서는 어텐션 연산(F32)을 위해 읽어오는 즉시 F32로 승격시킵니다.
+        // 이 한 줄로 매 토큰마다 발생하는 디코딩시 BF16 -> F32 변환 오버헤드가 완전히 사라집니다!
+        let t = if device.is_cpu() { t.to_dtype(DType::F32)? } else { t };
         Ok(t) 
     }
 
@@ -1082,10 +989,9 @@ impl QuantizedQwen3VLTextAttention {
                     // [CRITICAL FIX] 무거운 GPU->CPU 다운로드(블로킹 연산)가 비동기 런타임을 마비시키지 않도록
                     // spawn_blocking으로 완벽하게 격리시켜 디코딩 버벅임(Stuttering)을 차단합니다!
                     let (k_vram, v_vram) = tokio::task::spawn_blocking(move || {
-                        let k_contig = k.to_device(&Device::Cpu).unwrap_or_else(|_| k.clone()).contiguous().unwrap_or_else(|_| k.clone());
-                        let v_contig = v.to_device(&Device::Cpu).unwrap_or_else(|_| v.clone()).contiguous().unwrap_or_else(|_| v.clone());
-                        // [CPU 최적화] 무조건적인 BF16 다운캐스팅 삭제. 원본(CPU는 F32, GPU는 BF16) 타입 그대로 넘김!
-                        (k_contig, v_contig)
+                        let k_res = k.to_device(&Device::Cpu).unwrap_or_else(|_| k.clone()).contiguous().unwrap_or_else(|_| k.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| k.clone());
+                        let v_res = v.to_device(&Device::Cpu).unwrap_or_else(|_| v.clone()).contiguous().unwrap_or_else(|_| v.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| v.clone());
+                        (k_res, v_res)
                     }).await.unwrap_or_else(|_| (Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(), Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap()));
                     
                     if let Some(tx) = crate::models::qwen3vl::generate::BAKE_TX.get() {
@@ -1169,10 +1075,8 @@ impl QuantizedQwen3VLTextAttention {
                         let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
                         
                         let dev = &Device::Cpu;
-                        // [CPU/GPU 동적 타입 지원] 하드코딩된 BF16 파싱을 제거하여 F32 캐시 로딩 속도 극대화 및 충돌 방지
-                        let dtype = match kd.dtype() { safetensors::Dtype::F32 => DType::F32, safetensors::Dtype::F16 => DType::F16, _ => DType::BF16 };
-                        let kd_t = Tensor::from_raw_buffer(kd.data(), dtype, &meta_os, dev)?;
-                        let vd_t = Tensor::from_raw_buffer(vd.data(), dtype, &meta_os, dev)?;
+                        let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, dev)?;
+                        let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, dev)?;
 
                         let mut k_raw = self.decompress_from_bf16(&kd_t, &meta_os, dev)?;
                         let mut v_raw = self.decompress_from_bf16(&vd_t, &meta_os, dev)?;
@@ -1660,7 +1564,6 @@ impl QuantizedQwen3VLTextDecoderLayer {
         session_id: Option<String>,
         kv_name: Option<String>,
         baking_only: bool,
-        is_forced_cpu: bool, // [NEW] 플래그 파라미터 추가
     ) -> Result<Tensor> {
         let dev = self.input_layernorm.weight().device();
         let target_dtype = self.input_layernorm.weight().dtype();
@@ -1682,10 +1585,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let xs = self.input_layernorm.forward(&xs)?;
         
         // 주의: 아래 forward 호출 시 cos_ref, sin_ref를 넘겨주도록 변경
-        let xs = self.self_attn.forward(
-            &xs, cos_ref, sin_ref, attention_mask.as_ref(), seqlen_offset, 
-            session_id, kv_name, baking_only, is_forced_cpu
-        )?;
+        let xs = self.self_attn.forward(&xs, cos_ref, sin_ref, attention_mask.as_ref(), seqlen_offset, session_id, kv_name, baking_only)?;
         
         // [HARDENING] Residual Addition DType Guard
         
@@ -2062,9 +1962,9 @@ impl QuantizedQwen3VLTextModel {
         kv_name: Option<String>,
         baking_only: bool,
     ) -> Result<Tensor> {
-        // [CRITICAL FIX] 기존 고정값(256) 삭제. chunk_offsets의 간격을 기반으로 chunk_size를 동적 계산합니다.
+        // let mut final_output: Option<Tensor> = None; <-- [삭제]
+        let chunk_size = 256;
         let current_seq_len = xs.dim(1)?;
-        let chunk_size = if chunk_offsets.len() > 1 { chunk_offsets[1] - chunk_offsets[0] } else { current_seq_len };
         let is_decoding = current_seq_len <= 1;
         let target_device = self.layers[layer_idx].device().clone();
         let total_kv_blocks = self.layers[layer_idx].self_attn.kv_blocks.len();
@@ -2075,15 +1975,6 @@ impl QuantizedQwen3VLTextModel {
 
         for (chunk_idx, &i) in chunk_offsets.iter().enumerate() {
             let take = (current_seq_len - i).min(chunk_size);
-            
-            // [LOG-START] Prefill 시작 지점 기록
-            let chunk_start_time = std::time::Instant::now();
-            if self.is_forced_cpu {
-                println!(
-                    "[PREFILL-PROGRESS] Layer {:>2} | Offset: {:>5} / {:>5} | Chunk Size: {:>3}",
-                    layer_idx, i, current_seq_len, take
-                );
-            }
 
             // [CRITICAL FIX] 과거 문맥이 길고 새로운 프롬프트가 짧은 'Incremental Prefill' 상황에서 
             // 프리패처가 루프를 돌지 않아 발생하는 치명적인 SSD 동기화 렉(Sync Lag)을 원천 차단합니다!
@@ -2143,44 +2034,24 @@ impl QuantizedQwen3VLTextModel {
             let cos_chunk = cos.narrow(cos.rank().saturating_sub(2), i, take)?;
             let sin_chunk = sin.narrow(sin.rank().saturating_sub(2), i, take)?;
             
-            // [CRITICAL FIX] 마지막 파라미터로 self.is_forced_cpu 플래그를 명시적으로 주입합니다!
-            let out = self.layers[layer_idx].forward(
-                &xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i, 
-                session_id.clone(), kv_name.clone(), baking_only, self.is_forced_cpu
-            )?;
+            let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i, session_id.clone(), kv_name.clone(), baking_only)?;
             
-            // [CRITICAL FIX] 연산된 청크 결과를 배열에 담아주는 코드를 복구합니다! (CPU/GPU 공통)
             chunk_outputs.push(out);
-            
-            // [LOG-END] 처리 속도 계산 및 출력
-            if self.is_forced_cpu {
-                let elapsed = chunk_start_time.elapsed().as_millis();
-                // 초당 토큰 처리 속도(TPS) 계산
-                let tps = if elapsed > 0 { (take as f32 / (elapsed as f32 / 1000.0)) } else { 0.0 };
-                
-                println!(
-                    "[PREFILL-DONE]     Layer {:>2} | Offset: {:>5} | Time: {:>4}ms | Speed: {:>6.2} tokens/s",
-                    layer_idx, i, elapsed, tps
-                );
-            }
             
             // =========================================================================
             // [CRITICAL FIX] GPU와 CPU의 아키텍처 분리 (기존 GPU 고속 동작 유지)
             // =========================================================================
             if self.is_forced_cpu {
-                // [CPU 모드 최적화] 매 청크마다 I/O를 발생시키면 SlotManager(32개)가 고갈되어 Deadlock이 발생합니다.
-                // 따라서 긴 프롬프트를 처리하는 Prefill 도중에는 Bake를 스킵하고,
-                // '마지막 청크'이거나 '디코딩(1토큰씩 생성)'일 때만 일괄 저장하도록 제어합니다.
-                let is_last = chunk_idx == total_chunks - 1;
-                if is_last || is_decoding {
-                    if let Some(sid) = &session_id {
-                        let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last, baking_only, true);
-                    }
+                // [CPU 모드 전용 아키텍처] 
+                // CPU는 10K 토큰 연산이 끝날 때까지 기다리면 RAM 스왑 병목으로 기절합니다.
+                // 따라서 1개 청크(256토큰) 연산이 끝날 때마다 가득 찬 블록을 즉시 SSD에 구워버립니다.
+                // 이 분기문 덕분에 연산 도중에도 tmp/kv/ 폴더에 파일이 실시간으로 쏟아져 나오게 됩니다!
+                if let Some(sid) = &session_id {
+                    let is_last = chunk_idx == total_chunks - 1;
+                    let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last, baking_only, true);
                 }
-                // 메인 런타임 양보(Yield) 빈도를 조절하여 어텐션 연산(CPU) 스레드 기아 상태 방지
-                if chunk_idx % 4 == 0 || is_last {
-                    tokio::task::yield_now().await;
-                }
+                // 배경에서 SSD 저장이 이루어질 수 있도록 메인 런타임 강제 호흡(양보)
+                tokio::task::yield_now().await;
             } else {
                 // [GPU 모드 전용 아키텍처] 기존 고속 파이프라인 유지
                 let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
@@ -2386,12 +2257,9 @@ impl QuantizedQwen3VLTextModel {
         // [STEP 1] 현재 레이어 가중치를 연산 장치로 세팅 (GPU는 VRAM으로, CPU는 RAM에서 압축 해제)
         let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
         
-        // [CPU 최적화] 이미 F32로 풀려있다면(is_cleared == false), 수백 개의 내부 노드를 
-        // 무의미하게 순회하는 to_device 호출 자체를 원천 차단하여 디코딩 속도를 한계까지 끌어올립니다!
-        let needs_load = self.layers[layer_idx].self_attn.q_proj.is_cleared();
-        
-        if (!self.is_forced_cpu && !self.layers[layer_idx].device().same_device(&target_device)) 
-           || (self.is_forced_cpu && needs_load) {
+        // [CRITICAL FIX] GPU는 디바이스가 달라 자동 호출되지만, CPU는 디바이스가 같아도 
+        // 4bit 압축을 고속 F32로 풀기 위해 to_device를 무조건 호출하도록 분기 처리합니다!
+        if self.is_forced_cpu || !self.layers[layer_idx].device().same_device(&target_device) {
             self.layers[layer_idx].to_device(&target_device)?;
         }
 
@@ -2403,11 +2271,7 @@ impl QuantizedQwen3VLTextModel {
 
         // [STEP 3] GPU 연산 실행
         let current_seq_len = xs.dim(1)?;
-        
-        // [CRITICAL FIX: 롤백] CPU 캐시 파괴를 막기 위해 256 사이즈로 복구합니다.
-        let step_size = 256; 
-        
-        let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(step_size).collect();
+        let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(256).collect();
         let mut next_xs = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
 
         if let (Some(embed), Some(mask)) = (deepstack_embed, visual_mask) {
@@ -2417,14 +2281,9 @@ impl QuantizedQwen3VLTextModel {
         // [MEMORY-RELEASE] 현재 레이어 연산 종료 즉시 가중치 소각
         // CPU RAM과 GPU VRAM에서 현재 레이어의 가중치를 완전히 제거합니다.
         if !is_decoding {
-            // [CPU 최적화] Force CPU 모드에서는 RAM에 전체 가중치(약 2.4GB)가 충분히 올라가므로,
-            // Prefill 단계에서도 소각하지 않고 F32 상태를 영구 유지합니다!
-            // 이렇게 하면 Prefill 직후 첫 토큰을 뱉을 때 발생하는 전체 레이어 재로드 렉(1~2초)이 완전히 사라집니다.
-            if !self.is_forced_cpu {
-                self.layers[layer_idx].clear(); 
-                if target_device.is_cuda() { let _ = target_device.synchronize(); }
-                println!("[MEMORY-OPT] Layer {} Weights and Gradients cleared from RAM/VRAM.", layer_idx);
-            }
+            self.layers[layer_idx].clear(); 
+            if target_device.is_cuda() { let _ = target_device.synchronize(); }
+            println!("[MEMORY-OPT] Layer {} Weights and Gradients cleared from RAM/VRAM.", layer_idx);
         }
 
         // [STEP 4] 자원 반납 및 KV 대피
@@ -2435,9 +2294,7 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
-        // [CRITICAL FIX] CPU 모드에서는 디코딩 시 가중치를 버리지 않고 RAM에 F32 상태로 영구 상주시켜,
-        // 매 토큰마다 발생하는 2B 파라미터 압축 해제(Dequantization) 연산 병목을 0으로 만듭니다!
-        if is_decoding && !self.is_forced_cpu {
+        if is_decoding {
             self.layers[layer_idx].clear();
         }
 
@@ -2484,7 +2341,7 @@ impl QuantizedQwen3VLTextModel {
                         k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
                         v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
                         k_shape: Tensor::from_vec(k_shape_u32, (k.shape().dims().len(),), &Device::Cpu)?,
-                        // [SAFE-FLUSH] contiguous 실패 시 복제본으로 대체하여 에러 탈출 방지
+                        // [SAFE-FLUSH] contiguous 실패 시 복제본으로 대체하여 에러 탈출 방지 
                         raw_k: Some(k.to_device(&Device::Cpu).unwrap_or(k.clone()).contiguous().unwrap_or_else(|_| k.clone())), 
                         raw_v: Some(inner.v_cache.as_ref().unwrap().to_device(&Device::Cpu).unwrap_or(inner.v_cache.as_ref().unwrap().clone()).contiguous().unwrap_or_else(|_| inner.v_cache.as_ref().unwrap().clone())),
                     });
@@ -2739,9 +2596,6 @@ impl QuantizedQwen3VLTextModel {
             if !already_loaded { self.reload_all_layers()?; }
         }
 
-        // [CRITICAL FIX] CPU 모드의 디코딩(1토큰) 상황에서는 핑퐁 덮어쓰기를 완벽하게 차단합니다!
-        let skip_ping_pong = is_decoding && self.is_forced_cpu;
-
         for layer_idx in 0..total_layers {
             if layer_idx % 7 == 0 || layer_idx == total_layers - 1 {
                 println!("[ENGINE] Running Layer {}/{} (Ping-Pong Pipeline Active)", layer_idx + 1, total_layers);
@@ -2750,7 +2604,7 @@ impl QuantizedQwen3VLTextModel {
             // =========================================================================
             // [TRACK 2] 백그라운드 지연 적재 (N+1번째 레이어 미리 로드)
             // =========================================================================
-            if layer_idx + 1 < total_layers && !skip_ping_pong { // <-- 조건 추가
+            if layer_idx + 1 < total_layers {
                 let next_idx = layer_idx + 1;
                 let mmap_clone = self.mmap.clone();
                 let ct_clone = self.ct.clone();
@@ -2790,7 +2644,7 @@ impl QuantizedQwen3VLTextModel {
 
             // Track 1 연산이 끝났으므로 N번째 레이어의 가중치는 즉시 소각됩니다. 
             // (process_single_layer 내에서 clear()가 호출됨)
-            if !is_decoding && !skip_ping_pong { // <-- 조건 추가
+            if !is_decoding {
                 // [PING-PONG SWAP] 방금 다 쓰고 비워진 껍데기(현재 레이어)를 복사하여 다음 턴의 빈 그릇으로 재활용합니다!
                 ping_pong_carrier = self.layers[layer_idx].clone();
             }
@@ -2798,17 +2652,15 @@ impl QuantizedQwen3VLTextModel {
             // =========================================================================
             // [TRACK SYNC] 다음 루프로 넘어가기 전, Track 2에서 준비된 N+1 레이어 장착
             // =========================================================================
-            if !skip_ping_pong { // <-- 블록으로 감싸기
-                if let Some(task) = next_layer_task.take() {
-                    let mut ready_layer = task.await??; 
-                    
-                    // KV 캐시의 메타데이터(장부)는 기존 N+1 레이어의 것을 보존해야 하므로 덮어씌웁니다.
-                    ready_layer.self_attn.kv_blocks = self.layers[layer_idx + 1].self_attn.kv_blocks.clone();
-                    ready_layer.self_attn.active_kv_name = self.layers[layer_idx + 1].self_attn.active_kv_name.clone();
-                    ready_layer.self_attn.layer_idx = layer_idx + 1; 
-                    
-                    self.layers[layer_idx + 1] = ready_layer;
-                }
+            if let Some(task) = next_layer_task.take() {
+                let mut ready_layer = task.await??; 
+                
+                // KV 캐시의 메타데이터(장부)는 기존 N+1 레이어의 것을 보존해야 하므로 덮어씌웁니다.
+                ready_layer.self_attn.kv_blocks = self.layers[layer_idx + 1].self_attn.kv_blocks.clone();
+                ready_layer.self_attn.active_kv_name = self.layers[layer_idx + 1].self_attn.active_kv_name.clone();
+                ready_layer.self_attn.layer_idx = layer_idx + 1; 
+                
+                self.layers[layer_idx + 1] = ready_layer;
             }
         }
 
