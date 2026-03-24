@@ -248,11 +248,16 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 
-                match safetensors::serialize(&ts, &None) {
-                    Ok(data) => {
-                        drop(ts); 
-                        let _ = save_kv_block(&tp, &data);
+                // [CRITICAL FIX] 무거운 압축(serialize)과 디스크 쓰기를 spawn_blocking으로 격리!
+                let tp_clone = tp.clone();
+                let serialize_result = tokio::task::spawn_blocking(move || {
+                    let data = safetensors::serialize(&ts, &None)?;
+                    save_kv_block(&tp_clone, &data)?;
+                    Ok::<_, anyhow::Error>(())
+                }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Thread error: {}", e)));
 
+                match serialize_result {
+                    Ok(_) => {
                         let parsed_layer_idx = tp.file_name()
                             .and_then(|n| n.to_str())
                             .and_then(|s| s.strip_prefix('l'))
