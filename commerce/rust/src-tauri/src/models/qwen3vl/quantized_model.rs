@@ -2016,21 +2016,35 @@ impl QuantizedQwen3VLTextModel {
             
             let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i, session_id.clone(), kv_name.clone(), baking_only)?;
             
-            // [CRITICAL FIX] VRAM 파편화를 막기 위해 벡터에 단순 추가 (메모리 이동 O(1))
             chunk_outputs.push(out);
             
-            let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
-        }
+            // =========================================================================
+            // [CRITICAL FIX] GPU와 CPU의 아키텍처 분리 (기존 GPU 고속 동작 유지)
+            // =========================================================================
+            if self.is_forced_cpu {
+                // [CPU 모드 전용 아키텍처] 
+                // CPU는 10K 토큰 연산이 끝날 때까지 기다리면 RAM 스왑 병목으로 기절합니다.
+                // 따라서 1개 청크(256토큰) 연산이 끝날 때마다 가득 찬 블록을 즉시 SSD에 구워버립니다.
+                // 이 분기문 덕분에 연산 도중에도 tmp/kv/ 폴더에 파일이 실시간으로 쏟아져 나오게 됩니다!
+                if let Some(sid) = &session_id {
+                    let is_last = chunk_idx == total_chunks - 1;
+                    let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last, baking_only, true);
+                }
+                // 배경에서 SSD 저장이 이루어질 수 있도록 메인 런타임 강제 호흡(양보)
+                tokio::task::yield_now().await;
+            } else {
+                // [GPU 모드 전용 아키텍처] 기존 고속 파이프라인 유지
+                let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
+            }
+        } // <-- 청크 루프 종료
 
-        // if target_device.is_cuda() { let _ = target_device.synchronize(); }
-        
-        // [IMPORTANT] 프리필 직후 SSD 백업 트리거 최적화
+        // [IMPORTANT] 잔여 블록 SSD 백업 트리거 (GPU 전용 마무리)
         if let Some(sid) = &session_id {
             let is_prefill = current_seq_len > 1;
             
-            // [CRITICAL FIX] 프리필 중에는 SSD 쓰기를 중단합니다. 
-            // 이를 통해 PING-PONG 트랙이 SSD 읽기 속도를 100% 독점하게 되어 다음 레이어 로딩이 순식간에 끝납니다!
-            if !is_prefill {
+            // CPU 모드는 이미 루프 내부에서 실시간으로 모두 저장했으므로 건너뜁니다.
+            // GPU 모드는 디코딩(1토큰)일 때만 여기서 백업하고, 프리필 중에는 속도를 위해 건너뜁니다. (기존 로직 100% 동일)
+            if !self.is_forced_cpu && !is_prefill {
                 let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, true);
             }
         }
