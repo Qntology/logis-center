@@ -647,10 +647,11 @@ pub fn eager_attention_forward(
     let (_b_sz, _n_heads, _q_len, _d_head) = query_states.dims4()?;
     let kv_seq_len = key_states.dim(2)?;
     
-    // [CRITICAL FIX] 메모리 폭발을 막기 위해 여기서 전체 시퀀스에 대해 repeat_kv를 수행하던 로직을 통째로 삭제합니다!
-    
-    // 블록 크기 설정 (GPU SM 효율 및 VRAM 고려)
-    let block_size = 4096;
+    // [CRITICAL FIX: CPU 가속] 
+    // GPU는 VRAM 한계로 인해 4096 토큰씩 쪼개어 연산(Chunking)해야 뻗지 않지만,
+    // 수십 GB의 거대한 RAM을 가진 CPU는 행렬을 쪼개는 순간 멀티코어 병렬화 효율이 박살납니다.
+    // CPU 모드일 때는 블록 제한을 무한대(usize::MAX)로 풀어 단 한 번의 거대 행렬곱으로 처리속도를 극대화합니다!
+    let block_size = if query_states.device().is_cpu() { usize::MAX } else { 4096 };
     
     // 일반적인 짧은 문장이나 Flash-Attn 지원 시 기존 방식 사용
     #[cfg(feature = "flash-attn")]

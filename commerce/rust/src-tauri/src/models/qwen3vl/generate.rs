@@ -354,8 +354,11 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let k_contig = k_aligned.contiguous().unwrap_or(k_aligned);
                                 let v_contig = v_aligned.contiguous().unwrap_or(v_aligned);
 
-                                src.k_data = k_contig.to_dtype(DType::BF16).unwrap_or_else(|_| k_contig.clone());
-                                src.v_data = v_contig.to_dtype(DType::BF16).unwrap_or_else(|_| v_contig.clone());
+                                // [CPU/GPU 동적 타입 지원] 전달받은 원본 텐서가 F32(CPU)라면 그대로 F32로 저장하여 오버헤드 0% 달성!
+                                let target_dtype = if k_contig.dtype() == DType::F32 { DType::F32 } else { DType::BF16 };
+                                
+                                src.k_data = k_contig.to_dtype(target_dtype).unwrap_or_else(|_| k_contig.clone());
+                                src.v_data = v_contig.to_dtype(target_dtype).unwrap_or_else(|_| v_contig.clone());
                             }
                             let mut map = std::collections::HashMap::new();
                             let prefix = format!("b{}_l{}_", off, act_l);
@@ -401,14 +404,20 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         let file_shape: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
 
                                         let dev = &Device::Cpu;
-                                        let mut kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
-                                        let mut vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
                                         
-                                        // [CRITICAL FIX] CPU 모드라면 백그라운드 스레드에서 미리 F32로 변환하여 메인 런타임의 병목을 원천 차단!
-                                        if load.is_cpu {
+                                        // [CPU 고속화 및 외계어 방지] 디스크에 F32로 저장된 데이터를 
+                                        // 무조건 BF16으로 읽으면 메모리가 깨집니다. 동적 파싱으로 오버헤드 0% 달성!
+                                        let dtype = match kd.dtype() { safetensors::Dtype::F32 => DType::F32, safetensors::Dtype::F16 => DType::F16, _ => DType::BF16 };
+                                        
+                                        let mut kd_t = Tensor::from_raw_buffer(kd.data(), dtype, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), dtype, dev).unwrap());
+                                        let mut vd_t = Tensor::from_raw_buffer(vd.data(), dtype, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), dtype, dev).unwrap());
+                                        
+                                        // 읽어온 데이터가 이미 F32라면 to_dtype는 실행되지 않아 캐스팅 비용이 사라집니다.
+                                        if load.is_cpu && dtype != DType::F32 {
                                             kd_t = kd_t.to_dtype(DType::F32).unwrap_or(kd_t);
                                             vd_t = vd_t.to_dtype(DType::F32).unwrap_or(vd_t);
                                         }
+                                        
                                         let meta = BitKVMetadata { k_data: kd_t, v_data: vd_t, original_shape: file_shape };
                                         
                                         if let Ok(mut r) = reg.entries.write() {
@@ -525,8 +534,33 @@ impl Qwen3VLGenerateModel {
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
+        // 1. 측정 시작점 (함수 진입부 근처)
+        let prefill_start = std::time::Instant::now();
+
         let total_toks = full_ids.len();
-        self.qwen3_vl.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
+        self.qwen3_vl.forward(
+            &Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, 
+            None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()
+        ).await?;
+
+        // 2. CPU 모드 여부 판단 로직
+        let is_cpu_mode = match &self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.language_model.is_forced_cpu,
+            ModelVariant::QuantizedText(m) => m.language_model.is_forced_cpu,
+            _ => self.text_device.is_cpu(), // 세이프 가드
+        };
+
+        // 3. [SUMMARY LOG] CPU 모드일 때만 출력
+        if is_cpu_mode {
+            let total_elapsed = prefill_start.elapsed().as_secs_f32();
+            println!("---------------------------------------------------------");
+            println!("[PREFILL-SUMMARY] Total Tokens: {}", total_toks);
+            println!("[PREFILL-SUMMARY] Total Time  : {:.2}s", total_elapsed);
+            let speed = if total_elapsed > 0.0 { total_toks as f32 / total_elapsed } else { 0.0 };
+            println!("[PREFILL-SUMMARY] Avg Speed   : {:.2} tokens/s (Total Pipeline)", speed);
+            println!("---------------------------------------------------------");
+        }
+
         if let Some(s_id) = &session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(s_id);
             if !path.exists() { fs::create_dir_all(&path)?; }
