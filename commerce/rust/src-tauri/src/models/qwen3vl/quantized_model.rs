@@ -1,3 +1,4 @@
+
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder}; // Removed RmsNorm
@@ -1956,26 +1957,21 @@ impl QuantizedQwen3VLTextModel {
         for (chunk_idx, &i) in chunk_offsets.iter().enumerate() {
             let take = (current_seq_len - i).min(chunk_size);
 
-            // [CRITICAL FIX 1] CPU 모드일 때 Tokio 스레드가 질식하지 않도록 숨통(yield)을 트여주고 진행률을 출력합니다.
-            if self.is_forced_cpu {
-                // 10430 토큰 연산 시 사용자가 멈췄다고 오해하지 않도록 청크 진행 상황을 로그로 보여줍니다.
-                if chunk_idx % 4 == 0 || chunk_idx == total_chunks - 1 {
-                    println!("[CPU-COMPUTE] Layer {}/28 : Processing chunk {}/{} ({} tokens)", layer_idx + 1, chunk_idx + 1, total_chunks, i + take);
-                }
-                tokio::task::yield_now().await; 
-            }
-
-            let target_chunks = if !self.is_forced_cpu && (is_decoding || chunk_idx == 0) {
-                // GPU 모드: 다음 레이어의 KV 캐시를 백그라운드에서 미리 당겨옵니다.
+            // [CRITICAL FIX] 과거 문맥이 길고 새로운 프롬프트가 짧은 'Incremental Prefill' 상황에서 
+            // 프리패처가 루프를 돌지 않아 발생하는 치명적인 SSD 동기화 렉(Sync Lag)을 원천 차단합니다!
+            let target_chunks = if is_decoding || chunk_idx == 0 {
+                // 디코딩 중이거나 프리필의 '첫 번째 청크'일 때, 다음 레이어 연산에 필요한 
+                // '모든 과거 블록'을 한 번에 비동기 로딩 큐에 밀어 넣습니다.
                 (0..total_kv_blocks).collect::<Vec<_>>()
             } else {
-                // CPU 모드: 스레드 고갈 방지
+                // 이미 첫 청크에서 모든 로딩 지시를 내렸으므로 추가 지시는 생략합니다.
                 vec![]
             };
 
             let look_ahead_layers = 1;
 
             for t_idx in target_chunks {
+                // [CRITICAL FIX] chunk_offsets.len() 대신 실제 total_kv_blocks 수로 검사!
                 if t_idx < total_kv_blocks {
                     for l_off in 1..=look_ahead_layers {
                         let target_layer = layer_idx + l_off;
@@ -2020,35 +2016,21 @@ impl QuantizedQwen3VLTextModel {
             
             let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i, session_id.clone(), kv_name.clone(), baking_only)?;
             
+            // [CRITICAL FIX] VRAM 파편화를 막기 위해 벡터에 단순 추가 (메모리 이동 O(1))
             chunk_outputs.push(out);
             
-            // =========================================================================
-            // [CRITICAL FIX] GPU와 CPU의 아키텍처 분리 (기존 GPU 고속 동작 유지)
-            // =========================================================================
-            if self.is_forced_cpu {
-                // [CPU 모드 전용 아키텍처] 
-                // CPU는 10K 토큰 연산이 끝날 때까지 기다리면 RAM 스왑 병목으로 기절합니다.
-                // 따라서 1개 청크(256토큰) 연산이 끝날 때마다 가득 찬 블록을 즉시 SSD에 구워버립니다.
-                // 이 분기문 덕분에 연산 도중에도 tmp/kv/ 폴더에 파일이 실시간으로 쏟아져 나오게 됩니다!
-                if let Some(sid) = &session_id {
-                    let is_last = chunk_idx == total_chunks - 1;
-                    let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, is_last, baking_only, true);
-                }
-                // 배경에서 SSD 저장이 이루어질 수 있도록 메인 런타임 강제 호흡(양보)
-                tokio::task::yield_now().await;
-            } else {
-                // [GPU 모드 전용 아키텍처] 기존 고속 파이프라인 유지
-                let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
-            }
-        } // <-- 청크 루프 종료
+            let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
+        }
 
-        // [IMPORTANT] 잔여 블록 SSD 백업 트리거 (GPU 전용 마무리)
+        // if target_device.is_cuda() { let _ = target_device.synchronize(); }
+        
+        // [IMPORTANT] 프리필 직후 SSD 백업 트리거 최적화
         if let Some(sid) = &session_id {
             let is_prefill = current_seq_len > 1;
             
-            // CPU 모드는 이미 루프 내부에서 실시간으로 모두 저장했으므로 건너뜁니다.
-            // GPU 모드는 디코딩(1토큰)일 때만 여기서 백업하고, 프리필 중에는 속도를 위해 건너뜁니다. (기존 로직 100% 동일)
-            if !self.is_forced_cpu && !is_prefill {
+            // [CRITICAL FIX] 프리필 중에는 SSD 쓰기를 중단합니다. 
+            // 이를 통해 PING-PONG 트랙이 SSD 읽기 속도를 100% 독점하게 되어 다음 레이어 로딩이 순식간에 끝납니다!
+            if !is_prefill {
                 let _ = self.layers[layer_idx].self_attn.trigger_realtime_incremental_bake(sid, true, baking_only, true);
             }
         }
@@ -2230,7 +2212,7 @@ impl QuantizedQwen3VLTextModel {
             if !already_loaded { self.reload_all_layers()?; }
         }
 
-        if !is_decoding && !self.is_forced_cpu {
+        if !is_decoding {
             self.reload_layer(layer_idx)?;
         }
 
@@ -2579,9 +2561,9 @@ impl QuantizedQwen3VLTextModel {
             }
 
             // =========================================================================
-            // [TRACK 2] 백그라운드 지연 적재 (N+1번째 레이어 미리 로드) - GPU 전용
+            // [TRACK 2] 백그라운드 지연 적재 (N+1번째 레이어 미리 로드)
             // =========================================================================
-            if !self.is_forced_cpu && layer_idx + 1 < total_layers {
+            if layer_idx + 1 < total_layers {
                 let next_idx = layer_idx + 1;
                 let mmap_clone = self.mmap.clone();
                 let ct_clone = self.ct.clone();
@@ -2589,6 +2571,9 @@ impl QuantizedQwen3VLTextModel {
                 let baking_only = self.baking_only;
                 let base_name = self.base_name.clone();
                 
+                // [FIX] dev_clone 제거 (더 이상 백그라운드에서 VRAM을 건드리지 않습니다)
+
+                // 이번 턴에 데이터를 채워넣을 빈 껍데기(Carrier)를 백그라운드 스레드로 넘깁니다.
                 let mut carrier = ping_pong_carrier.clone();
                 next_layer_task = Some(tokio::task::spawn_blocking(move || -> Result<QuantizedQwen3VLTextDecoderLayer> {
                     let mmap = mmap_clone.ok_or_else(|| anyhow!("Mmap missing"))?;
@@ -2598,64 +2583,43 @@ impl QuantizedQwen3VLTextModel {
                     let gguf_blk = format!("blk.{}", next_idx);
                     let prefix = if ct_arc.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{}.layers.{}", base_name, next_idx) };
                     
+                    // [PING-PONG TRACK 2 최적화]
+                    // SSD -> CPU RAM 로드만 수행합니다. (Quantized 텐서 상태 유지)
+                    // VRAM 할당이나 Dequantization은 메인 스레드로 넘겨 VRAM 스파이크를 원천 차단합니다.
                     carrier.load_weights_inplace(&ct_arc, &mut reader, &prefix, &Device::Cpu, dtype, baking_only)?;
+                    
+                    // [CRITICAL FIX] carrier.to_device(&dev_clone)?; 삭제!!!
+                    // 이전에는 여기서 VRAM으로 넘겨버려서 VRAM 2배 점유와 CUDA 병목이 발생했습니다.
                     
                     Ok(carrier)
                 }));
             }
 
             // =========================================================================
-            // [TRACK 1] 메인 연산 트랙 (N번째 레이어)
+            // [TRACK 1] 메인 연산 트랙 (N번째 레이어) - 청크 처리
             // =========================================================================
-            // CPU 모드일 경우 process_single_layer 내부의 reload_layer가 동기식으로 짐을 집어 올립니다.
             let deepstack_embed = deepstack_visual_embeds.as_ref().and_then(|v| v.get(layer_idx));
-
-            if self.is_forced_cpu && !is_decoding {
-                // [CRITICAL FIX] CPU 모드라도 디스크(SSD)에서 MMap으로 가중치를 읽는 작업은 매우 무거워
-                // 메인 비동기 루프를 마비시킬 수 있으므로 spawn_blocking으로 격리하여 먼저 읽습니다.
-                let mut layer_to_load = self.layers[layer_idx].clone();
-                let mmap_clone = self.mmap.clone();
-                let ct_clone = self.ct.clone();
-                let dtype = self.dtype;
-                let base_name = self.base_name.clone();
-                let baking_only = self.baking_only;
-
-                layer_to_load = tokio::task::spawn_blocking(move || -> Result<QuantizedQwen3VLTextDecoderLayer> {
-                    let mmap = mmap_clone.ok_or_else(|| anyhow!("Mmap missing"))?;
-                    let ct_arc = ct_clone.ok_or_else(|| anyhow!("GGUF missing"))?;
-                    let mut reader = std::io::Cursor::new(&mmap[..]);
-
-                    let gguf_blk = format!("blk.{}", layer_idx);
-                    let prefix = if ct_arc.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{}.layers.{}", base_name, layer_idx) };
-                    
-                    layer_to_load.load_weights_inplace(&ct_arc, &mut reader, &prefix, &Device::Cpu, dtype, baking_only)?;
-                    Ok(layer_to_load)
-                }).await.unwrap_or_else(|_| Ok(self.layers[layer_idx].clone()))?;
-                
-                self.layers[layer_idx] = layer_to_load;
-            }
-
-            // GPU 모드이거나, CPU 모드의 디코딩(seq_len == 1)일 경우 기존처럼 동기식 연산 진행
             xs = self.process_single_layer(layer_idx, xs, &cos, &sin, seqlen_offset, deepstack_embed, visual_pos_masks, session_id.clone(), kv_name.clone(), self.baking_only).await?;
 
-            if !is_decoding && !self.is_forced_cpu {
-                // [PING-PONG SWAP] GPU 모드일 때만 빈 껍데기 교체
+            // Track 1 연산이 끝났으므로 N번째 레이어의 가중치는 즉시 소각됩니다. 
+            // (process_single_layer 내에서 clear()가 호출됨)
+            if !is_decoding {
+                // [PING-PONG SWAP] 방금 다 쓰고 비워진 껍데기(현재 레이어)를 복사하여 다음 턴의 빈 그릇으로 재활용합니다!
                 ping_pong_carrier = self.layers[layer_idx].clone();
             }
 
             // =========================================================================
-            // [TRACK SYNC] 다음 루프로 넘어가기 전 GPU 모드 동기화
+            // [TRACK SYNC] 다음 루프로 넘어가기 전, Track 2에서 준비된 N+1 레이어 장착
             // =========================================================================
-            if !self.is_forced_cpu {
-                if let Some(task) = next_layer_task.take() {
-                    let mut ready_layer = task.await??; 
-                    
-                    ready_layer.self_attn.kv_blocks = self.layers[layer_idx + 1].self_attn.kv_blocks.clone();
-                    ready_layer.self_attn.active_kv_name = self.layers[layer_idx + 1].self_attn.active_kv_name.clone();
-                    ready_layer.self_attn.layer_idx = layer_idx + 1; 
-                    
-                    self.layers[layer_idx + 1] = ready_layer;
-                }
+            if let Some(task) = next_layer_task.take() {
+                let mut ready_layer = task.await??; 
+                
+                // KV 캐시의 메타데이터(장부)는 기존 N+1 레이어의 것을 보존해야 하므로 덮어씌웁니다.
+                ready_layer.self_attn.kv_blocks = self.layers[layer_idx + 1].self_attn.kv_blocks.clone();
+                ready_layer.self_attn.active_kv_name = self.layers[layer_idx + 1].self_attn.active_kv_name.clone();
+                ready_layer.self_attn.layer_idx = layer_idx + 1; 
+                
+                self.layers[layer_idx + 1] = ready_layer;
             }
         }
 
