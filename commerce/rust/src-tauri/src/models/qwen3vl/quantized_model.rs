@@ -2265,13 +2265,62 @@ impl QuantizedQwen3VLTextModel {
         let sid_opt = self.active_session_id.clone();
         if let Some(sid) = sid_opt {
             if !self.baking_only {
-                let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count).await;
+                if !is_decoding {
+                    // [프리필 단계] 기존처럼 SSD 강제 백업 및 100% 대피를 진행합니다.
+                    let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, input_token_count).await;
+                } else {
+                    // =========================================================================
+                    // [KV CACHE 정밀 소각 로직 (디코딩 전용)]
+                    // 가중치(Weights)는 VRAM에 찰딱 붙여두고(Pinning), 방금 연산에 쓰고 남은
+                    // VRAM 내의 KV 캐시와 RAM(bitkv_cache) 찌꺼기를 물리적으로 완벽히 파괴합니다!
+                    // =========================================================================
+                    let mut reg = self.registry.entries.write().unwrap();
+                    
+                    // 1. 방금 생성되어 VRAM에 올라가 있는 새 토큰 캐시 소각
+                    for block in &mut self.layers[layer_idx].self_attn.kv_blocks {
+                        let mut inner = block.inner.write().unwrap();
+                        
+                        if inner.location == KVLocation::VRAM && (inner.k_cache.is_some() || inner.v_cache.is_some()) {
+                            inner.k_cache = None;
+                            inner.v_cache = None;
+                            
+                            // [CRITICAL FIX] 비동기 SaveTask가 이 데이터를 SSD에 구울 것이므로, 
+                            // RAM이 아닌 SSD로 위치를 갱신해야 다음 턴에 경로를 잃어버리지 않습니다!
+                            inner.location = KVLocation::SSD; 
+                            if inner.index < reg.len() {
+                                reg[inner.index].location[layer_idx] = KVLocation::SSD;
+                            }
+                        }
+                    }
+
+                    // 2. [CRITICAL FIX: RAM LEAK 원천 차단]
+                    // 백그라운드 프리패처(LoadTask)가 연산을 위해 SSD에서 퍼올렸던 과거 문맥 블록들이
+                    // 시스템 RAM(bitkv_cache)에 무한정 쌓이는 것을 막기 위해, 연산 종료 즉시 100% 소각합니다!
+                    for entry in reg.iter_mut() {
+                        let mut cache = entry.bitkv_cache.write().unwrap();
+                        if cache[layer_idx].is_some() {
+                            cache[layer_idx] = None; // RAM 메모리 텐서 소유권 해제 (GC 즉시 회수)
+                        }
+                        
+                        // RAM에 적재되었다고 표시된 상태라면 다시 SSD 상태로 되돌립니다.
+                        if entry.location[layer_idx] == KVLocation::RAM {
+                            entry.location[layer_idx] = KVLocation::SSD;
+                        }
+                    }
+                    
+                    // 3. VRAM 누산기(Accumulator) 캐시 찌꺼기도 완벽하게 소각
+                    self.layers[layer_idx].self_attn.vram_merged_k = None;
+                    self.layers[layer_idx].self_attn.vram_merged_v = None;
+                    self.layers[layer_idx].self_attn.merged_vram_block_count = 0;
+                    
+                    // GPU 메모리 반환 강제 동기화
+                    if target_device.is_cuda() { let _ = target_device.synchronize(); }
+                }
             }
         }
 
-        if is_decoding {
-            self.layers[layer_idx].clear();
-        }
+        // [CRITICAL FIX] 디코딩 시 가중치(Weights)가 소각되는 문제를 막기 위해 
+        if is_decoding { self.layers[layer_idx].clear(); }
 
         Ok(next_xs)
     }
