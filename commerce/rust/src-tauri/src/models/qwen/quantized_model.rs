@@ -12,11 +12,11 @@ use memmap2::Mmap;
 
 use crate::{
     models::{
-        qwen3vl::config::{Qwen3VLConfig, Qwen3VLTextConfig},
-        qwen3vl::model::Qwen3VLVisionModel,
+        qwen::config::{QwenVLConfig, QwenVLTextConfig},
+        qwen::model::QwenVLVisionModel,
         // [FIX] 올바른 최신 rope.rs 경로로 변경!
-        qwen3vl::rope::{
-            Qwen3VLTextRotaryEmbedding, apply_rotary_pos_emb,
+        qwen::rope::{
+            QwenVLTextRotaryEmbedding, apply_rotary_pos_emb,
         },
     },
     utils::tensor_utils::{
@@ -24,7 +24,7 @@ use crate::{
         prod_tensor_last_dim, split_tensor,
     },
 };
-use crate::models::qwen3vl::generate::SLOT_MANAGER;
+use crate::models::qwen::generate::SLOT_MANAGER;
 
 // Local RmsNorm implementation exposing weight and device
 #[derive(Clone, Debug)]
@@ -376,7 +376,7 @@ pub struct BitKVMetadata {
 }
 
 #[derive(Clone)]
-pub struct QuantizedQwen3VLTextAttention {
+pub struct QuantizedQwenVLTextAttention {
     pub q_proj: QLinear,
     pub k_proj: QLinear,
     pub v_proj: QLinear,
@@ -399,7 +399,7 @@ pub struct QuantizedQwen3VLTextAttention {
     pub merged_vram_block_count: usize,
 }
 
-impl QuantizedQwen3VLTextAttention {
+impl QuantizedQwenVLTextAttention {
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         if self.q_proj.is_cleared() {
             return Err(anyhow!("Attention weights are cleared. Reload required."));
@@ -454,7 +454,7 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn new<R: std::io::Seek + std::io::Read>(
-        config: &Qwen3VLTextConfig,
+        config: &QwenVLTextConfig,
         ct: &gguf_file::Content,
         reader: &mut R,
         base_name: &str,
@@ -960,7 +960,7 @@ impl QuantizedQwen3VLTextAttention {
 
     // 883라인 근처: trigger_realtime_incremental_bake 함수를 아래 내용으로 완전히 교체
     pub fn trigger_realtime_incremental_bake(&self, session_id: &str, is_last_chunk: bool, baking_only: bool, is_decoding: bool) -> Result<()> {
-        use crate::models::qwen3vl::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
+        use crate::models::qwen::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
         
         // [FIX] SSD 비동기 저장을 위한 타겟만 추출합니다.
         let target_indices: Vec<usize> = self.kv_blocks.iter().enumerate().filter_map(|(i, b)| {
@@ -1003,7 +1003,7 @@ impl QuantizedQwen3VLTextAttention {
                 let num_kv_h = self.num_key_value_heads;
                 let h_d = self.head_dim;
                 
-                crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                 tauri::async_runtime::spawn(async move {
                     // [CRITICAL FIX] 무거운 GPU->CPU 다운로드(블로킹 연산)가 비동기 런타임을 마비시키지 않도록
@@ -1014,14 +1014,14 @@ impl QuantizedQwen3VLTextAttention {
                         (k_res, v_res)
                     }).await.unwrap_or_else(|_| (Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(), Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap()));
                     
-                    if let Some(tx) = crate::models::qwen3vl::generate::BAKE_TX.get() {
+                    if let Some(tx) = crate::models::qwen::generate::BAKE_TX.get() {
                         let sub_path = if baking_only { format!("{}/reference/{}", session_id_owned, kv_type) } else { format!("{}/inference/{}", session_id_owned, kv_type) };
                         let kv_dir = crate::utils::paths::get_kv_dir(None);
                         let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
                         if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
 
                         let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
-                        let dump = crate::models::qwen3vl::generate::LayerKVDump {
+                        let dump = crate::models::qwen::generate::LayerKVDump {
                             layer_idx,
                             k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
                             v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
@@ -1029,17 +1029,17 @@ impl QuantizedQwen3VLTextAttention {
                             raw_k: Some(k_vram),
                             raw_v: Some(v_vram),
                         };
-                        let sid = crate::models::qwen3vl::generate::SLOT_MANAGER.acquire_write_slot(b_len).await;
+                        let sid = crate::models::qwen::generate::SLOT_MANAGER.acquire_write_slot(b_len).await;
                         
-                        if tx.send(crate::models::qwen3vl::generate::SlotTask::Bake(crate::models::qwen3vl::generate::BakeTask {
+                        if tx.send(crate::models::qwen::generate::SlotTask::Bake(crate::models::qwen::generate::BakeTask {
                             slot_id: sid, task_dir: block_dir, kv_name: Some(sub_path), offset: off, layers: vec![dump],
                             is_relay_baking: baking_only, block_idx: Some(b_idx), registry: registry_clone,
                         })).await.is_err() {
-                            crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                            crate::models::qwen3vl::generate::SLOT_MANAGER.release_slot(sid).await;
+                            crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            crate::models::qwen::generate::SLOT_MANAGER.release_slot(sid).await;
                         }
                     } else {
-                        crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     }
                 });
             }
@@ -1056,7 +1056,7 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn batch_load_layer_kv(&mut self, kv_name: &str) -> Result<()> {
-        use crate::models::qwen3vl::generate::LayerIndex;
+        use crate::models::qwen::generate::LayerIndex;
         let kv_dir = crate::utils::paths::get_kv_dir(None);
         let mut index_path = kv_dir.join(kv_name).join(format!("layer{}.json", self.layer_idx));
         
@@ -1290,7 +1290,7 @@ impl QuantizedQwen3VLTextAttention {
                     if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = false; }
                 } else {
                     // 장부가 비어있거나 부족하면 확장
-                    let mut entry = crate::models::qwen3vl::quantized_model::RegistryEntry::new(offset, k.dim(2)?, 28);
+                    let mut entry = crate::models::qwen::quantized_model::RegistryEntry::new(offset, k.dim(2)?, 28);
                     entry.ssd_path = Some(path.to_path_buf());
                     entry.location[self.layer_idx] = KVLocation::SSD;
                     if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = false; }
@@ -1364,7 +1364,7 @@ impl QuantizedQwen3VLTextAttention {
 
             let mut reg = self.registry.entries.write().unwrap();
             if i >= reg.len() {
-                reg.push(crate::models::qwen3vl::quantized_model::RegistryEntry {
+                reg.push(crate::models::qwen::quantized_model::RegistryEntry {
                     location: vec![KVLocation::SSD; 28],
                     slot_ids: vec![None; 28],
                     token_start: *offset,
@@ -1399,8 +1399,8 @@ impl QuantizedQwen3VLTextAttention {
 }
 
 #[derive(Clone)]
-pub struct QuantizedQwen3VLTextDecoderLayer {
-    pub self_attn: QuantizedQwen3VLTextAttention,
+pub struct QuantizedQwenVLTextDecoderLayer {
+    pub self_attn: QuantizedQwenVLTextAttention,
     pub mlp_gate: Option<QLinear>,
     pub mlp_up: Option<QLinear>,
     pub mlp_down: Option<QLinear>,
@@ -1408,7 +1408,7 @@ pub struct QuantizedQwen3VLTextDecoderLayer {
     pub post_attention_layernorm: Option<RmsNorm>,
 }
 
-impl QuantizedQwen3VLTextDecoderLayer {
+impl QuantizedQwenVLTextDecoderLayer {
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         if self.self_attn.q_proj.is_cleared() {
             return Err(anyhow!("Layer weights are cleared. Reload required."));
@@ -1424,7 +1424,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
     /// [MEMORY-OPT] 가중치 없이 레이어 구조만 생성합니다.
     pub fn new_skeleton(
-        config: &Qwen3VLTextConfig,
+        config: &QwenVLTextConfig,
         base_name: &str,
         device: &Device,
         dtype: DType,
@@ -1448,7 +1448,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let q_norm = RmsNorm::new(zero_t.clone(), config.rms_norm_eps);
         let k_norm = RmsNorm::new(zero_t.clone(), config.rms_norm_eps);
 
-        let mut self_attn = QuantizedQwen3VLTextAttention {
+        let mut self_attn = QuantizedQwenVLTextAttention {
             q_proj, k_proj, v_proj, o_proj, q_norm, k_norm,
             num_attention_heads: config.num_attention_heads,
             num_key_value_heads: config.num_key_value_heads,
@@ -1500,7 +1500,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
     }
 
     pub fn new<R: std::io::Seek + std::io::Read>(
-        config: &Qwen3VLTextConfig,
+        config: &QwenVLTextConfig,
         ct: &gguf_file::Content,
         reader: &mut R,
         base_name: &str,
@@ -1519,7 +1519,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
             (format!("{}.self_attn", base_name), "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "input_layernorm", "post_attention_layernorm")
         };
 
-        let self_attn = QuantizedQwen3VLTextAttention::new(config, ct, reader, &attn_base, is_gguf_naming, device, dtype, layer_idx, registry)?;
+        let self_attn = QuantizedQwenVLTextAttention::new(config, ct, reader, &attn_base, is_gguf_naming, device, dtype, layer_idx, registry)?;
         
         // [OPTIMIZATION] Skip MLP loading if we only need to bake KV cache (MLP 0% Mode)
         let (mlp_gate, mlp_up, mlp_down, post_attention_layernorm) = if !baking_only {
@@ -1673,11 +1673,11 @@ impl QuantizedQwen3VLTextDecoderLayer {
 }
 
 #[derive(Clone)]
-pub struct QuantizedQwen3VLTextModel {
+pub struct QuantizedQwenVLTextModel {
     pub embed_tokens: Embedding, 
-    pub layers: Vec<QuantizedQwen3VLTextDecoderLayer>,
+    pub layers: Vec<QuantizedQwenVLTextDecoderLayer>,
     pub norm: RmsNorm,
-    pub rotary_emb: Qwen3VLTextRotaryEmbedding,
+    pub rotary_emb: QwenVLTextRotaryEmbedding,
     pub mrope_section: Vec<usize>,
     pub device_id: usize, 
     pub mmap: Option<Arc<Mmap>>, 
@@ -1689,13 +1689,13 @@ pub struct QuantizedQwen3VLTextModel {
     pub pinned_layer_count: usize,
     pub current_kv_len: usize,
     // [NEW] 재로딩을 위한 메타데이터
-    pub config: Qwen3VLTextConfig,
+    pub config: QwenVLTextConfig,
     pub ct: Option<Arc<gguf_file::Content>>,
     pub base_name: String,
     pub dtype: DType,
 }
 
-impl QuantizedQwen3VLTextModel {
+impl QuantizedQwenVLTextModel {
     /// [MEMORY-OPT] 특정 레이어의 가중치를 mmap에서 다시 로드합니다.
     /// [MEMORY-OPT] 특정 레이어의 가중치를 mmap에서 In-place로 덮어씁니다.
     pub fn reload_layer(&mut self, layer_idx: usize) -> Result<()> {
@@ -1723,7 +1723,7 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn new_with_mmap(
-        config: &Qwen3VLTextConfig,
+        config: &QwenVLTextConfig,
         ct: Arc<gguf_file::Content>,
         mmap_handle: Option<Arc<Mmap>>,
         base_name: &str,
@@ -1770,7 +1770,7 @@ impl QuantizedQwen3VLTextModel {
             let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{base_name}.layers.{layer_idx}") };
             
             // Skeleton 레이어 생성 시에도 effective_dtype 전달
-            let layer = QuantizedQwen3VLTextDecoderLayer::new_skeleton(config, &prefix, &current_device, effective_dtype, layer_idx, baking_only, registry.clone())?;
+            let layer = QuantizedQwenVLTextDecoderLayer::new_skeleton(config, &prefix, &current_device, effective_dtype, layer_idx, baking_only, registry.clone())?;
             layers.push(layer);
         }
         
@@ -1783,7 +1783,7 @@ impl QuantizedQwen3VLTextModel {
             embed_tokens, 
             layers, 
             norm, 
-            rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), 
+            rotary_emb: QwenVLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), 
             mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_else(|| if config.head_dim == 128 { vec![16, 24, 24] } else { vec![] }), 
             device_id,
             mmap: mmap_handle, 
@@ -1812,7 +1812,7 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn new<R: std::io::Seek + std::io::Read>(
-        config: &Qwen3VLTextConfig,
+        config: &QwenVLTextConfig,
         ct: Arc<gguf_file::Content>,
         reader: &mut R,
         base_name: &str,
@@ -1853,7 +1853,7 @@ impl QuantizedQwen3VLTextModel {
             if device.is_cuda() { pinned_layer_count += 1; }
             let gguf_blk = format!("blk.{layer_idx}");
             let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{base_name}.layers.{layer_idx}") };
-            let mut layer = QuantizedQwen3VLTextDecoderLayer::new(config, &ct, reader, &prefix, device, effective_dtype, layer_idx, baking_only, registry.clone())?;
+            let mut layer = QuantizedQwenVLTextDecoderLayer::new(config, &ct, reader, &prefix, device, effective_dtype, layer_idx, baking_only, registry.clone())?;
             layer.clear();
             layers.push(layer);
         }
@@ -1865,7 +1865,7 @@ impl QuantizedQwen3VLTextModel {
             embed_tokens, 
             layers, 
             norm, 
-            rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), 
+            rotary_emb: QwenVLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), 
             mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_else(|| if config.head_dim == 128 { vec![16, 24, 24] } else { vec![] }), 
             device_id,
             mmap: None, 
@@ -1884,7 +1884,7 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn load_kv_cache_chunked(&mut self, kv_name: &str) -> Result<()> {
-        use crate::models::qwen3vl::generate::LayerIndex;
+        use crate::models::qwen::generate::LayerIndex;
         let kv_dir = crate::utils::paths::get_kv_dir(None);
         let index_path = kv_dir.join(kv_name).join("layer0.json");
         
@@ -2035,7 +2035,7 @@ impl QuantizedQwen3VLTextModel {
                                     let kv_name_for_load = kv_name.clone();
                                     let is_cpu_mode = self.is_forced_cpu; // [CRITICAL FIX] CPU 모드 플래그
                                     tauri::async_runtime::spawn(async move {
-                                        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
+                                        use crate::models::qwen::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
                                         let sid = SLOT_MANAGER.acquire_read_slot().await;
                                         if let Ok(tx) = get_load_worker().await {
                                             let _ = tx.send(SlotTask::Load(LoadTask { slot_id: sid, path, layer_idx: target_layer, kv_name: kv_name_for_load, shared_block, registry: reg_clone, is_cpu: is_cpu_mode })).await;
@@ -2342,7 +2342,7 @@ impl QuantizedQwen3VLTextModel {
 
     /// [MANUAL-FLUSH] 세션 종료 시 RAM에 남아있는 활성 블록(Active Block)을 강제로 SSD에 저장합니다.
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> {
-        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
+        use crate::models::qwen::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
         
         let mut block_groups: std::collections::HashMap<usize, Vec<LayerKVDump>> = std::collections::HashMap::new();
         
@@ -2394,13 +2394,13 @@ impl QuantizedQwen3VLTextModel {
                 let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
                 if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
 
-                crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                 if tx.send(SlotTask::Bake(BakeTask {
                     slot_id: sid, task_dir: block_dir, kv_name: Some(sub_path.clone()), offset: off, layers,
                     is_relay_baking: mode, block_idx: Some(off / 256), registry: self.registry.clone(),
                 })).await.is_err() {
-                    crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     SLOT_MANAGER.release_slot(sid).await;
                 }
             }
@@ -2410,7 +2410,7 @@ impl QuantizedQwen3VLTextModel {
 
     /// [NEW-STRICT] 궁극의 Ping-Pong 계층 관리 (100% 강제 메모리 해제)
     async fn evacuate_layer_kv_to_cpu(&mut self, layer_idx: usize, session_id: &str, start_off: usize, _len: usize) -> Result<()> {
-        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
+        use crate::models::qwen::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
         
         let mut dumps_to_send = Vec::new();
 
@@ -2499,7 +2499,7 @@ impl QuantizedQwen3VLTextModel {
                     }
 
                     // [CRITICAL FIX] 큐에 넣기 직전 작업 카운터를 명시적으로 +1 올려서 Underflow 데드락 원천 차단!
-                    crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                     if tx.send(SlotTask::Bake(BakeTask {
                         slot_id: sid,
@@ -2512,7 +2512,7 @@ impl QuantizedQwen3VLTextModel {
                         registry: self.registry.clone(),
                     })).await.is_err() {
                         // 전송 실패 시 카운터를 다시 원상복구하고 슬롯을 반납하여 시스템 멈춤 방지
-                        crate::models::qwen3vl::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         SLOT_MANAGER.release_slot(sid).await;
                     }
                 }
@@ -2556,10 +2556,10 @@ impl QuantizedQwen3VLTextModel {
             layer.self_attn.active_kv_name = kv_name.clone();
         }
 
-        let mut next_layer_task: Option<tokio::task::JoinHandle<Result<QuantizedQwen3VLTextDecoderLayer>>> = None;
+        let mut next_layer_task: Option<tokio::task::JoinHandle<Result<QuantizedQwenVLTextDecoderLayer>>> = None;
         
         // [PING-PONG CARRIER] 서로 번갈아가며(Ping-Pong) 사용할 단 하나의 여분 껍데기 버퍼입니다.
-        let mut ping_pong_carrier = QuantizedQwen3VLTextDecoderLayer::new_skeleton(
+        let mut ping_pong_carrier = QuantizedQwenVLTextDecoderLayer::new_skeleton(
             &self.config, "dummy", &Device::Cpu, self.dtype, 0, self.baking_only, self.registry.clone()
         )?;
 
@@ -2594,7 +2594,7 @@ impl QuantizedQwen3VLTextModel {
 
                 // 이번 턴에 데이터를 채워넣을 빈 껍데기(Carrier)를 백그라운드 스레드로 넘깁니다.
                 let mut carrier = ping_pong_carrier.clone();
-                next_layer_task = Some(tokio::task::spawn_blocking(move || -> Result<QuantizedQwen3VLTextDecoderLayer> {
+                next_layer_task = Some(tokio::task::spawn_blocking(move || -> Result<QuantizedQwenVLTextDecoderLayer> {
                     let mmap = mmap_clone.ok_or_else(|| anyhow!("Mmap missing"))?;
                     let ct_arc = ct_clone.ok_or_else(|| anyhow!("GGUF missing"))?;
                     let mut reader = std::io::Cursor::new(&mmap[..]);
@@ -2843,10 +2843,10 @@ impl QuantizedQwen3VLTextModel {
 }
 
 #[derive(Clone)]
-pub struct QuantizedQwen3VLModel {
-    pub config: Qwen3VLConfig,
-    pub visual: Qwen3VLVisionModel, 
-    pub language_model: QuantizedQwen3VLTextModel,
+pub struct QuantizedQwenVLModel {
+    pub config: QwenVLConfig,
+    pub visual: QwenVLVisionModel, 
+    pub language_model: QuantizedQwenVLTextModel,
     pub lm_head: QLinear,
     pub rope_deltas: Option<Tensor>,
     pub rope_deltas_cpu: Option<Vec<i64>>, // [CRITICAL FIX] CPU 캐시 전용 필드 추가!
@@ -2856,9 +2856,9 @@ pub struct QuantizedQwen3VLModel {
     pub mmproj_mmap: Option<Arc<Mmap>>,
 }
 
-impl QuantizedQwen3VLModel {
+impl QuantizedQwenVLModel {
     pub fn new_with_mmap(
-        config: &Qwen3VLConfig,
+        config: &QwenVLConfig,
         ct_main: Arc<gguf_file::Content>,
         main_mmap_handle: Option<Arc<Mmap>>,
         ct_vision: Arc<gguf_file::Content>,
@@ -2876,7 +2876,7 @@ impl QuantizedQwen3VLModel {
         let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { dtype };
         let mut reader_vision = std::io::Cursor::new(mmproj_mmap);
         let vb_visual = from_gguf_content(config, &ct_vision, &mut reader_vision, vision_device, vision_dtype)?;
-        let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
+        let visual = QwenVLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
 
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
@@ -2886,7 +2886,7 @@ impl QuantizedQwen3VLModel {
             t_config.num_hidden_layers = 1;
         }
 
-        let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
+        let language_model = QuantizedQwenVLTextModel::new_with_mmap(
             &t_config, ct_main.clone(), main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
         )?;
 
@@ -2916,7 +2916,7 @@ impl QuantizedQwen3VLModel {
     }
 
     pub fn new<R: std::io::Seek + std::io::Read, R2: std::io::Seek + std::io::Read>(
-        config: &Qwen3VLConfig,
+        config: &QwenVLConfig,
         ct_main: Arc<gguf_file::Content>,
         reader_main: &mut R,
         ct_vision: Arc<gguf_file::Content>,
@@ -2932,7 +2932,7 @@ impl QuantizedQwen3VLModel {
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
         let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { dtype };
         let vb_visual = from_gguf_content(config, &ct_vision, reader_vision, vision_device, vision_dtype)?;
-        let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
+        let visual = QwenVLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
         
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
@@ -2942,7 +2942,7 @@ impl QuantizedQwen3VLModel {
             t_config.num_hidden_layers = 1;
         }
 
-        let language_model = QuantizedQwen3VLTextModel::new(&t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
+        let language_model = QuantizedQwenVLTextModel::new(&t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
         
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
         let lm_head = if !baking_only {
@@ -3152,16 +3152,16 @@ impl QuantizedQwen3VLModel {
 }
 
 #[derive(Clone)]
-pub struct QuantizedQwen3TextModel {
-    pub language_model: QuantizedQwen3VLTextModel,
+pub struct QuantizedQwenTextModel {
+    pub language_model: QuantizedQwenVLTextModel,
     pub lm_head: Option<QLinear>,
     pub text_device: Device,
     pub mmap: Option<Arc<Mmap>>,
 }
 
-impl QuantizedQwen3TextModel {
+impl QuantizedQwenTextModel {
     pub fn new_with_mmap(
-        config: &Qwen3VLConfig,
+        config: &QwenVLConfig,
         ct_main: Arc<gguf_file::Content>,
         mmap_handle: Option<Arc<Mmap>>,
         text_device: &Device,
@@ -3175,7 +3175,7 @@ impl QuantizedQwen3TextModel {
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         if single_layer_mode { t_config.num_hidden_layers = 1; }
         
-        let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
+        let language_model = QuantizedQwenVLTextModel::new_with_mmap(
             &t_config, ct_main.clone(), mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
         )?;
         let lm_head = if !baking_only {
@@ -3190,7 +3190,7 @@ impl QuantizedQwen3TextModel {
     }
 
     pub fn new<R: std::io::Seek + std::io::Read>(
-        config: &Qwen3VLConfig,
+        config: &QwenVLConfig,
         ct_main: Arc<gguf_file::Content>,
         reader_main: &mut R,
         text_device: &Device,
@@ -3204,7 +3204,7 @@ impl QuantizedQwen3TextModel {
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         if single_layer_mode { t_config.num_hidden_layers = 1; }
 
-        let language_model = QuantizedQwen3VLTextModel::new(
+        let language_model = QuantizedQwenVLTextModel::new(
             &t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only
         )?;
         let lm_head = if !baking_only {
@@ -3274,7 +3274,7 @@ fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reade
     Ok(RmsNorm::new(weight, eps))
 }
 
-fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, ct: &gguf_file::Content, reader: &mut R, device: &Device, dtype: DType) -> Result<VarBuilder<'static>> {
+fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &QwenVLConfig, ct: &gguf_file::Content, reader: &mut R, device: &Device, dtype: DType) -> Result<VarBuilder<'static>> {
     use std::collections::{HashMap, BTreeMap};
     let mut data = HashMap::new();
     let mut split_tensors: BTreeMap<String, Vec<(usize, Tensor)>> = BTreeMap::new();

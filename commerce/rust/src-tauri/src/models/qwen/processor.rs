@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    models::qwen3vl::config::PreprocessorConfig,
+    models::qwen::config::PreprocessorConfig,
     openai_types::{
         ChatCompletionParameters, ChatCompletionRequestMessage,
         ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart,
@@ -31,7 +31,7 @@ pub struct GeneralInput {
 }
 
 #[allow(unused)]
-pub struct Qwen3VLProcessor {
+pub struct QwenVLProcessor {
     img_process_cfg: PreprocessorConfig,
     device: Device,
     dtype: DType,
@@ -41,7 +41,7 @@ pub struct Qwen3VLProcessor {
     vision_end_token: String,
 }
 
-impl Qwen3VLProcessor {
+impl QwenVLProcessor {
     pub fn new(path: &str, device: &Device, dtype: DType) -> Result<Self> {
         let img_process_cfg_file = std::path::Path::new(path).join("preprocessor_config.json");
         let img_process_cfg: PreprocessorConfig = if img_process_cfg_file.exists() {

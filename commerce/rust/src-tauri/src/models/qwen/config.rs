@@ -3,7 +3,7 @@ use candle_nn::Activation;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
-pub struct Qwen3VLGenerationConfig {
+pub struct QwenVLGenerationConfig {
     pub bos_token_id: u32,
     pub eos_token_id: serde_json::Value, 
     pub pad_token_id: u32,
@@ -14,7 +14,7 @@ pub struct Qwen3VLGenerationConfig {
     pub transformers_version: String,
 }
 
-impl Default for Qwen3VLGenerationConfig {
+impl Default for QwenVLGenerationConfig {
     fn default() -> Self {
         Self {
             bos_token_id: 151643,
@@ -30,7 +30,7 @@ impl Default for Qwen3VLGenerationConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct Qwen3VLVisionConfig {
+pub struct QwenVLVisionConfig {
     pub depth: usize,
     pub embed_dim: Option<usize>,
     pub hidden_act: Activation,
@@ -54,7 +54,7 @@ pub struct RopeScaling {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct Qwen3VLTextConfig {
+pub struct QwenVLTextConfig {
     pub architectural: Option<String>, 
     pub attention_bias: bool,
     pub attention_dropout: f32,
@@ -83,18 +83,18 @@ pub struct Qwen3VLTextConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct Qwen3VLConfig {
+pub struct QwenVLConfig {
     pub architectures: Option<Vec<String>>, 
     pub auto_map: Option<std::collections::HashMap<String, String>>,
     pub hidden_size: Option<usize>,
     pub image_token_id: Option<usize>,
     pub model_type: String, 
-    pub text_config: Option<Qwen3VLTextConfig>,
+    pub text_config: Option<QwenVLTextConfig>,
     pub tie_word_embeddings: bool,
     pub torch_dtype: Option<String>,
     pub transformers_version: String,
     pub video_token_id: Option<usize>,
-    pub vision_config: Option<Qwen3VLVisionConfig>,
+    pub vision_config: Option<QwenVLVisionConfig>,
     pub vision_start_token_id: Option<usize>,
     pub vision_end_token_id: Option<usize>,
 }

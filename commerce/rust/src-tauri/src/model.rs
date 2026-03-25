@@ -1,6 +1,6 @@
 use crate::utils;
 use anyhow::anyhow;
-use crate::models::qwen3vl::generate::Qwen3VLGenerateModel;
+use crate::models::qwen::generate::QwenVLGenerateModel;
 use crate::models::embedding::EmbeddingModel;
 use crate::openai_types::{
     ChatCompletionParameters,
@@ -137,9 +137,9 @@ pub enum ModelSize {
 #[derive(Clone)]
 pub struct LogisModel {
     pub app_handle: tauri::AppHandle,
-    pub generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // Primary Active Slot (GPU)
-    pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.6B RAM Slot
-    pub large_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 2B RAM Slot
+    pub generator: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, // Primary Active Slot (GPU)
+    pub small_hibernation: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, // 0.6B RAM Slot
+    pub large_hibernation: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, // 2B RAM Slot
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     
     pub is_cpu_mode: bool, 
@@ -210,7 +210,7 @@ impl LogisModel {
     /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced with Diagnostics)
     pub async fn deep_purge_resources(&self) {
         println!("[DIAG-PURGE] Step 0: Waiting for background IO to finish...");
-        crate::models::qwen3vl::generate::wait_for_global_io().await;
+        crate::models::qwen::generate::wait_for_global_io().await;
 
         println!("[DIAG-PURGE] Step 1: Clearing ALL Generation Slots...");
         
@@ -219,7 +219,7 @@ impl LogisModel {
             if let Some(mut g) = gen.take() {
                 println!("[DIAG-PURGE] Dropping Active Generator (0.6B/2B)...");
                 let _ = g.clear_kv_cache();
-                let _ = g.qwen3_vl.drop_kv_storage(); 
+                let _ = g.qwen.drop_kv_storage(); 
                 drop(g); 
             }
         }
@@ -228,7 +228,7 @@ impl LogisModel {
             if let Some(mut g) = s_hib.take() { 
                 println!("[DIAG-PURGE] Dropping Small Hibernation...");
                 let _ = g.clear_kv_cache();
-                let _ = g.qwen3_vl.drop_kv_storage();
+                let _ = g.qwen.drop_kv_storage();
                 drop(g); 
             }
         }
@@ -237,7 +237,7 @@ impl LogisModel {
             if let Some(mut g) = l_hib.take() { 
                 println!("[DIAG-PURGE] Dropping Large Hibernation...");
                 let _ = g.clear_kv_cache();
-                let _ = g.qwen3_vl.drop_kv_storage();
+                let _ = g.qwen.drop_kv_storage();
                 drop(g); 
             }
         }
@@ -501,7 +501,7 @@ impl LogisModel {
         self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false, None).await
     }
 
-    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
+    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<QwenVLGenerateModel> {
         println!("[MODEL] Loading Generator from {} (Text-Only: {})...", path, force_text_only);
         let dev = self.device_config.device.clone();
         let dev_id = self.device_config.gpu_id;
@@ -518,7 +518,7 @@ impl LogisModel {
         let generator = tokio::task::spawn_blocking(move || {
             let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
             // [CRITICAL] Use init_with_config to force shared settings (Config + Tokenizer)
-            Qwen3VLGenerateModel::init_with_config(
+            QwenVLGenerateModel::init_with_config(
                 &path_clone, 
                 shared_path.as_deref(), // Tokenizer path
                 shared_path.as_deref(), // Config path
@@ -597,7 +597,7 @@ impl LogisModel {
 
         let gen = tokio::task::spawn_blocking(move || {
             let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
-            Qwen3VLGenerateModel::init_with_config(
+            QwenVLGenerateModel::init_with_config(
                 &path_clone, 
                 shared_path_clone.as_deref(), 
                 shared_path_clone.as_deref(), 
@@ -868,7 +868,7 @@ impl LogisModel {
 
             let params = ChatCompletionParameters {
                 messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
-                model: "qwen3vl".to_string(),
+                model: "qwen".to_string(),
                 max_tokens: Some(max_tok),
                 temperature: Some(0.1),
                 top_p: Some(0.9),
@@ -911,7 +911,7 @@ impl LogisModel {
 
         let params = ChatCompletionParameters {
             messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
-            model: "qwen3vl".to_string(),
+            model: "qwen".to_string(),
             max_tokens: Some(max_tokens as u32),
             temperature: Some(0.1),
             top_p: Some(0.9),
@@ -1010,7 +1010,7 @@ impl LogisModel {
 
         let params = ChatCompletionParameters {
             messages: vec![ChatCompletionRequestMessage::User(message)],
-            model: "qwen3vl".to_string(),
+            model: "qwen".to_string(),
             max_tokens: Some(max_tokens as u32),
             temperature: Some(0.1),
             top_p: Some(0.9),
@@ -1054,7 +1054,7 @@ impl LogisModel {
 
         let params = ChatCompletionParameters {
             messages: vec![ChatCompletionRequestMessage::User(message)],
-            model: "qwen3vl".to_string(),
+            model: "qwen".to_string(),
             max_tokens: Some(self.max_tokens_limit),
             temperature: Some(0.1),
             top_p: Some(0.9),
@@ -1123,7 +1123,7 @@ impl LogisModel {
 
         let params = ChatCompletionParameters {
             messages: vec![ChatCompletionRequestMessage::User(message)],
-            model: "qwen3vl".to_string(),
+            model: "qwen".to_string(),
             max_tokens: Some(max_tok),
             temperature: Some(0.1),
             top_p: Some(0.9),

@@ -196,11 +196,11 @@ impl Qwen2_5VisionRotaryEmbedding {
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLTextRotaryEmbedding {
+pub struct QwenVLTextRotaryEmbedding {
     inv_freq: Vec<f32>,
 }
 
-impl Qwen3VLTextRotaryEmbedding {
+impl QwenVLTextRotaryEmbedding {
     pub fn new(dim: usize, theta_base: f32) -> Self {
         let inv_freq = compute_default_rope_parameters(dim, theta_base);
         Self { inv_freq }

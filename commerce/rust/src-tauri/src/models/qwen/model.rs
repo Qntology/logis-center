@@ -6,12 +6,12 @@ use candle_nn::{
 };
 
 use crate::{
-    models::qwen3vl::{
+    models::qwen::{
         common::{GateUpDownMLP, TwoLinearMLP, eager_attention_forward, get_layer_norm},
-        config::{Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig},
+        config::{QwenVLConfig, QwenVLTextConfig, QwenVLVisionConfig},
         // [FIX] 올바른 최신 rope.rs 경로로 변경!
         rope::{
-            Qwen2_5VisionRotaryEmbedding, Qwen3VLTextRotaryEmbedding, apply_rotary_pos_emb,
+            Qwen2_5VisionRotaryEmbedding, QwenVLTextRotaryEmbedding, apply_rotary_pos_emb,
             apply_rotary_pos_emb_vision,
         },
     },
@@ -23,13 +23,13 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLVisionPatchEmbed {
+pub struct QwenVLVisionPatchEmbed {
     conv3d_weight: Tensor,
     conv3d_bias: Tensor,
 }
 
-impl Qwen3VLVisionPatchEmbed {
-    pub fn new(cfg: &Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
+impl QwenVLVisionPatchEmbed {
+    pub fn new(cfg: &QwenVLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let patch_size = cfg.patch_size;
         let temporal_patch_size = cfg.temporal_patch_size;
         let in_channels = cfg.in_channels;
@@ -78,7 +78,7 @@ impl Qwen3VLVisionPatchEmbed {
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLVisionPatchMerger {
+pub struct QwenVLVisionPatchMerger {
     hidden_size: usize,
     use_postshuffle_norm: bool,
     norm: LayerNorm,
@@ -87,9 +87,9 @@ pub struct Qwen3VLVisionPatchMerger {
     linear_fc2: Linear,
 }
 
-impl Qwen3VLVisionPatchMerger {
+impl QwenVLVisionPatchMerger {
     pub fn new(
-        config: &Qwen3VLVisionConfig,
+        config: &QwenVLVisionConfig,
         vb: VarBuilder,
         use_postshuffle_norm: bool,
     ) -> Result<Self> {
@@ -143,15 +143,15 @@ impl Qwen3VLVisionPatchMerger {
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLVisionAttention {
+pub struct QwenVLVisionAttention {
     num_heads: usize,
     qkv: Linear,
     proj: Linear,
     scaling: f64,
 }
 
-impl Qwen3VLVisionAttention {
-    pub fn new(config: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
+impl QwenVLVisionAttention {
+    pub fn new(config: QwenVLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let hidden_size = config.hidden_size;
         let num_heads = config.num_heads;
         let head_dim = hidden_size / num_heads;
@@ -215,18 +215,18 @@ impl Qwen3VLVisionAttention {
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLVisionBlock {
+pub struct QwenVLVisionBlock {
     norm1: LayerNorm,
     norm2: LayerNorm,
-    attn: Qwen3VLVisionAttention,
+    attn: QwenVLVisionAttention,
     mlp: TwoLinearMLP,
 }
 
-impl Qwen3VLVisionBlock {
-    pub fn new(config: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
+impl QwenVLVisionBlock {
+    pub fn new(config: QwenVLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let norm1 = get_layer_norm(vb.pp("norm1"), 1e-6, config.hidden_size)?;
         let norm2 = get_layer_norm(vb.pp("norm2"), 1e-6, config.hidden_size)?;
-        let attn = Qwen3VLVisionAttention::new(config.clone(), vb.pp("attn"))?;
+        let attn = QwenVLVisionAttention::new(config.clone(), vb.pp("attn"))?;
         let mlp = TwoLinearMLP::new(
             vb.pp("mlp"),
             config.hidden_size,
@@ -276,23 +276,23 @@ impl Qwen3VLVisionBlock {
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLVisionModel {
+pub struct QwenVLVisionModel {
     pub spatial_merge_size: usize,
-    pub patch_embed: Qwen3VLVisionPatchEmbed,
+    pub patch_embed: QwenVLVisionPatchEmbed,
     pub pos_embed: Embedding,
     pub num_grid_per_side: u32,
     pub rotary_pos_emb: Qwen2_5VisionRotaryEmbedding,
-    pub blocks: Vec<Qwen3VLVisionBlock>,
-    pub merger: Qwen3VLVisionPatchMerger,
+    pub blocks: Vec<QwenVLVisionBlock>,
+    pub merger: QwenVLVisionPatchMerger,
     pub deepstack_visual_indexes: Vec<usize>,
-    pub deepstack_merger_list: Vec<Qwen3VLVisionPatchMerger>,
+    pub deepstack_merger_list: Vec<QwenVLVisionPatchMerger>,
     pub dtype: DType,
 }
 
-impl Qwen3VLVisionModel {
-    pub fn new(config: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
+impl QwenVLVisionModel {
+    pub fn new(config: QwenVLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let spatial_merge_size = config.spatial_merge_size;
-        let patch_embed = Qwen3VLVisionPatchEmbed::new(&config, vb.pp("patch_embed"))?;
+        let patch_embed = QwenVLVisionPatchEmbed::new(&config, vb.pp("patch_embed"))?;
         let pos_embed = embedding(
             config.num_position_embeddings,
             config.hidden_size,
@@ -304,15 +304,15 @@ impl Qwen3VLVisionModel {
         let mut blocks = Vec::new();
         let vb_blocks = vb.pp("blocks");
         for i in 0..config.depth {
-            let block = Qwen3VLVisionBlock::new(config.clone(), vb_blocks.pp(i))?;
+            let block = QwenVLVisionBlock::new(config.clone(), vb_blocks.pp(i))?;
             blocks.push(block);
         }
-        let merger = Qwen3VLVisionPatchMerger::new(&config, vb.pp("merger"), false)?;
+        let merger = QwenVLVisionPatchMerger::new(&config, vb.pp("merger"), false)?;
         let deepstack_visual_indexes = config.deepstack_visual_indexes.clone();
         let mut deepstack_merger_list = Vec::new();
         let vb_deepstack = vb.pp("deepstack_merger_list");
         for i in 0..deepstack_visual_indexes.len() {
-            let merger_i = Qwen3VLVisionPatchMerger::new(&config, vb_deepstack.pp(i), true)?;
+            let merger_i = QwenVLVisionPatchMerger::new(&config, vb_deepstack.pp(i), true)?;
             deepstack_merger_list.push(merger_i);
         }
         Ok(Self {
@@ -572,7 +572,7 @@ impl Qwen3VLVisionModel {
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLTextAttention {
+pub struct QwenVLTextAttention {
     pub q_proj: Linear,
     pub k_proj: Linear,
     pub v_proj: Linear,
@@ -587,8 +587,8 @@ pub struct Qwen3VLTextAttention {
     pub kv_cache: Option<(Tensor, Tensor)>,
 }
 
-impl Qwen3VLTextAttention {
-    pub fn new(config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
+impl QwenVLTextAttention {
+    pub fn new(config: QwenVLTextConfig, vb: VarBuilder) -> Result<Self> {
         let hidden_size = config.hidden_size;
         let num_attention_heads = config.num_attention_heads;
         let head_dim = config.head_dim;
@@ -687,16 +687,16 @@ impl Qwen3VLTextAttention {
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLTextDecoderLayer {
-    pub self_attn: Qwen3VLTextAttention,
+pub struct QwenVLTextDecoderLayer {
+    pub self_attn: QwenVLTextAttention,
     pub mlp: GateUpDownMLP,
     pub input_layernorm: RmsNorm,
     pub post_attention_layernorm: RmsNorm,
 }
 
-impl Qwen3VLTextDecoderLayer {
-    pub fn new(config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Qwen3VLTextAttention::new(config.clone(), vb.pp("self_attn"))?;
+impl QwenVLTextDecoderLayer {
+    pub fn new(config: QwenVLTextConfig, vb: VarBuilder) -> Result<Self> {
+        let self_attn = QwenVLTextAttention::new(config.clone(), vb.pp("self_attn"))?;
         let mlp = GateUpDownMLP::new(
             vb.pp("mlp"),
             config.hidden_size,
@@ -746,29 +746,29 @@ impl Qwen3VLTextDecoderLayer {
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLTextModel {
+pub struct QwenVLTextModel {
     pub embed_tokens: Embedding,
-    pub layers: Vec<Qwen3VLTextDecoderLayer>,
+    pub layers: Vec<QwenVLTextDecoderLayer>,
     pub norm: RmsNorm,
-    pub rotary_emb: Qwen3VLTextRotaryEmbedding,
+    pub rotary_emb: QwenVLTextRotaryEmbedding,
     pub mrope_section: Vec<usize>,
 }
 
-impl Qwen3VLTextModel {
-    pub fn new(config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
+impl QwenVLTextModel {
+    pub fn new(config: QwenVLTextConfig, vb: VarBuilder) -> Result<Self> {
         let vocab_size = config.vocab_size;
         let embed_tokens = embedding(vocab_size, config.hidden_size, vb.pp("embed_tokens"))?;
         let mut layers = vec![];
         let vb_l = vb.pp("layers");
         for layer_idx in 0..config.num_hidden_layers {
-            let layer = Qwen3VLTextDecoderLayer::new(config.clone(), vb_l.pp(layer_idx))?;
+            let layer = QwenVLTextDecoderLayer::new(config.clone(), vb_l.pp(layer_idx))?;
             layers.push(layer)
         }
         let norm = rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
         let head_dim = config.head_dim;
-        let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
+        let rotary_emb = QwenVLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         // [FIX] rope_scaling is now optional. Assuming it exists if we are here, or panic/default.
-        // Given Qwen3 config flow, if it was missing it should have failed earlier or defaults populated.
+        // Given Qwen config flow, if it was missing it should have failed earlier or defaults populated.
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         Ok(Self {
             embed_tokens,
@@ -843,26 +843,26 @@ impl Qwen3VLTextModel {
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLModel {
-    config: Qwen3VLConfig,
-    visual: Qwen3VLVisionModel,
-    language_model: Qwen3VLTextModel,
+pub struct QwenVLModel {
+    config: QwenVLConfig,
+    visual: QwenVLVisionModel,
+    language_model: QwenVLTextModel,
     lm_head: Linear,
     rope_deltas: Option<Tensor>,
 }
 
-impl Qwen3VLModel {
-    pub fn new(config: Qwen3VLConfig, vb: VarBuilder) -> Result<Self> {
+impl QwenVLModel {
+    pub fn new(config: QwenVLConfig, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model");
         let config = config.clone();
-        let v_config = config.vision_config.clone().ok_or(anyhow!("Missing vision_config for Qwen3VLModel"))?;
-        let visual = Qwen3VLVisionModel::new(v_config, vb_m.pp("visual"))?;
+        let v_config = config.vision_config.clone().ok_or(anyhow!("Missing vision_config for QwenVLModel"))?;
+        let visual = QwenVLVisionModel::new(v_config, vb_m.pp("visual"))?;
         
-        // [FIX] text_config is optional, but required for Qwen3VLModel
-        let text_config = config.text_config.clone().ok_or(anyhow!("Missing text_config for Qwen3VLModel"))?;
+        // [FIX] text_config is optional, but required for QwenVLModel
+        let text_config = config.text_config.clone().ok_or(anyhow!("Missing text_config for QwenVLModel"))?;
         
         let language_model =
-            Qwen3VLTextModel::new(text_config.clone(), vb_m.pp("language_model"))?;
+            QwenVLTextModel::new(text_config.clone(), vb_m.pp("language_model"))?;
         let lm_head = if config.tie_word_embeddings {
             Linear::new(language_model.embed_tokens.embeddings().clone(), None)
         } else {
