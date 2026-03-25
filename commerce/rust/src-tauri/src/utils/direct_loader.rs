@@ -42,38 +42,45 @@ mod windows_impl {
     });
 
     pub fn load_block(path: &Path) -> Result<Vec<u8>> {
-        let ctx = CONTEXT.as_ref().map_err(|e| anyhow!("DirectStorage init error: {}", e))?;
-        unsafe {
-            let metadata = fs::metadata(path)?;
-            let size = metadata.len() as usize;
-            let path_str = path.to_string_lossy().to_string();
-            let file: IDStorageFile = ctx.factory.OpenFile(&HSTRING::from(path_str))?;
-            let mut buffer = vec![0u8; size];
-            let mut request = DSTORAGE_REQUEST::default();
-            request.Options.set_SourceType(DSTORAGE_REQUEST_SOURCE_FILE);
-            request.Options.set_DestinationType(DSTORAGE_REQUEST_DESTINATION_MEMORY);
-            request.Source.File = ManuallyDrop::new(DSTORAGE_SOURCE_FILE {
-                Source: ManuallyDrop::new(Some(file.clone())),
-                Offset: 0,
-                Size: size as u32,
-            });
-            request.Destination.Memory = DSTORAGE_DESTINATION_MEMORY {
-                Buffer: buffer.as_mut_ptr() as *mut _,
-                Size: size as u32,
-            };
-            ctx.queue.EnqueueRequest(&request);
-            ctx.queue.EnqueueStatus(&ctx.status_array, 0);
-            ctx.queue.Submit();
-            while !ctx.status_array.IsComplete(0) { std::thread::yield_now(); }
-            ctx.status_array.GetHResult(0).map_err(|e| anyhow!(e))?;
-            Ok(buffer)
+        // [CRITICAL FIX] DirectStorage 지원 안 되는 PC를 위한 Fallback 추가
+        if let Ok(ctx) = CONTEXT.as_ref() {
+            unsafe {
+                if let Ok(metadata) = fs::metadata(path) {
+                    let size = metadata.len() as usize;
+                    let path_str = path.to_string_lossy().to_string();
+                    if let Ok(file) = ctx.factory.OpenFile(&HSTRING::from(path_str)) {
+                        let mut buffer = vec![0u8; size];
+                        let mut request = DSTORAGE_REQUEST::default();
+                        request.Options.set_SourceType(DSTORAGE_REQUEST_SOURCE_FILE);
+                        request.Options.set_DestinationType(DSTORAGE_REQUEST_DESTINATION_MEMORY);
+                        request.Source.File = ManuallyDrop::new(DSTORAGE_SOURCE_FILE {
+                            Source: ManuallyDrop::new(Some(file)),
+                            Offset: 0,
+                            Size: size as u32,
+                        });
+                        request.Destination.Memory = DSTORAGE_DESTINATION_MEMORY {
+                            Buffer: buffer.as_mut_ptr() as *mut _,
+                            Size: size as u32,
+                        };
+                        ctx.queue.EnqueueRequest(&request);
+                        ctx.queue.EnqueueStatus(&ctx.status_array, 0);
+                        ctx.queue.Submit();
+                        while !ctx.status_array.IsComplete(0) { std::thread::yield_now(); }
+                        if ctx.status_array.GetHResult(0).is_ok() {
+                            return Ok(buffer);
+                        }
+                    }
+                }
+            }
         }
+        // DirectStorage 초기화 실패(0x80004001) 또는 큐 실패 시, 표준 파일 I/O로 안전하게 우회합니다.
+        fs::read(path).map_err(|e| anyhow::anyhow!("Fallback read failed: {}", e))
     }
 
     pub fn save_block(path: &Path, data: &[u8]) -> Result<()> {
         unsafe {
             let path_wide = HSTRING::from(path.to_string_lossy().as_ref());
-            let handle: HANDLE = CreateFileW(
+            let handle_res = CreateFileW(
                 &path_wide,
                 GENERIC_WRITE.0,
                 FILE_SHARE_WRITE,
@@ -81,17 +88,25 @@ mod windows_impl {
                 CREATE_ALWAYS,
                 FILE_FLAG_OVERLAPPED | FILE_ATTRIBUTE_NORMAL,
                 Some(HANDLE::default()),
-            ).map_err(|e| anyhow!("Failed to create file: {}", e))?;
+            );
 
-            let mut overlapped = OVERLAPPED::default();
-            let mut bytes_written = 0u32;
-            let _ = WriteFile(handle, Some(data), Some(&mut bytes_written), Some(&mut overlapped));
+            if let Ok(handle) = handle_res {
+                if !handle.is_invalid() {
+                    let mut overlapped = OVERLAPPED::default();
+                    let mut bytes_written = 0u32;
+                    let _ = WriteFile(handle, Some(data), Some(&mut bytes_written), Some(&mut overlapped));
 
-            let mut transferred = 0u32;
-            GetOverlappedResult(handle, &overlapped, &mut transferred, true).map_err(|e| anyhow!(e))?;
-            let _ = CloseHandle(handle);
-            Ok(())
+                    let mut transferred = 0u32;
+                    let result = GetOverlappedResult(handle, &overlapped, &mut transferred, true);
+                    let _ = CloseHandle(handle);
+                    if result.is_ok() {
+                        return Ok(());
+                    }
+                }
+            }
         }
+        // Overlapped IO가 실패하거나 핸들을 얻지 못한 경우 표준 파일 I/O로 우회합니다.
+        fs::write(path, data).map_err(|e| anyhow::anyhow!("Fallback write failed: {}", e))
     }
 }
 

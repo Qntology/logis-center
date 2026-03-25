@@ -197,30 +197,17 @@ pub fn init_bake_worker() {
 }
 
 async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
+    // [CRITICAL FIX] 대기표(Queue) 시스템 도입: 슬롯이 부족하다고 매니저가 멈춰서(Block) 기다리는 데드락 원천 차단!
+    let mut waiting_acquires = std::collections::VecDeque::new();
+    
     while let Some(req) = rx.recv().await {
         match req {
             SlotRequest::Acquire { total_tokens: _total_tokens, tx } => {
-                let max_writes = 64; let mut found = None;
-                while found.is_none() {
-                    if SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
-                        for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
-                            if slot.state.load(Ordering::SeqCst) == 0 {
-                                if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { SLOT_MANAGER.update_counters(0, 1); SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); found = Some(i); break; }
-                            }
-                        }
-                        if found.is_none() {
-                            for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
-                                if slot.state.load(Ordering::SeqCst) == 2 {
-                                    if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { SLOT_MANAGER.update_counters(2, 1); SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); found = Some(i); break; }
-                                }
-                            }
-                        }
-                    }
-                    if found.is_none() { tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
-                }
-                let _ = tx.send(found.unwrap());
+                // 슬롯을 당장 안 주고 대기열에 줄부터 세웁니다.
+                waiting_acquires.push_back(tx);
             },
             SlotRequest::Release { idx, is_bake } => {
+                // 반납 신호가 오면 즉각적으로 슬롯을 비워줍니다.
                 let s = &SLOT_MANAGER.slots[idx]; let old = s.state.load(Ordering::SeqCst);
                 let new = if is_bake { 2 } else { 0 };
                 if s.state.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
@@ -228,6 +215,45 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
                     if old == 1 { SLOT_MANAGER.active_write_count.fetch_sub(1, Ordering::SeqCst); }
                     SLOT_MANAGER.handoff_notifier.notify_waiters();
                 }
+            }
+        }
+
+        // [핵심 로직] 여유 슬롯이 있고 대기표를 뽑은 사람이 있다면, 하나씩 슬롯을 나눠줍니다.
+        let max_writes = 64;
+        while !waiting_acquires.is_empty() && SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
+            let mut found = None;
+            
+            // 1. 완전히 비어있는 슬롯(0) 탐색
+            for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
+                if slot.state.load(Ordering::SeqCst) == 0 {
+                    if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { 
+                        SLOT_MANAGER.update_counters(0, 1); 
+                        SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); 
+                        found = Some(i); break; 
+                    }
+                }
+            }
+            
+            // 2. 캐시된 슬롯(2) 덮어쓰기 탐색
+            if found.is_none() {
+                for (i, slot) in SLOT_MANAGER.slots.iter().enumerate() {
+                    if slot.state.load(Ordering::SeqCst) == 2 {
+                        if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() { 
+                            SLOT_MANAGER.update_counters(2, 1); 
+                            SLOT_MANAGER.active_write_count.fetch_add(1, Ordering::SeqCst); 
+                            found = Some(i); break; 
+                        }
+                    }
+                }
+            }
+
+            if let Some(idx) = found {
+                // 슬롯을 찾았으면 대기표 1번에게 전달
+                let tx = waiting_acquires.pop_front().unwrap();
+                let _ = tx.send(idx);
+            } else {
+                // 슬롯이 없으면 미련 없이 루프를 탈출하여 다음 'Release' 신호를 받을 준비를 합니다. (데드락 회피)
+                break; 
             }
         }
     }
@@ -302,6 +328,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 SlotTask::Bake(bake) => {
                     let loop_count = bake.layers.len();
 
+                    // [CRITICAL FIX] 메인 큐에서 소비된 1을 빼고, 새로 파생될 하위 작업 수(loop_count)만큼만 정확히 더합니다.
+                    // 이렇게 해야 하위 파일 저장(SaveTask)이 끝날 때까지 카운터가 0으로 떨어지지 않고 안전하게 대기합니다!
                     GLOBAL_IO_COUNTER.fetch_add(loop_count, std::sync::atomic::Ordering::SeqCst);
                     GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 
@@ -350,7 +378,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     }
                                 }
 
-                                // [CRITICAL FIX] 메모리 정렬(contiguous)을 먼저 수행하여 Safetensors 저장 실패(Silent Fail) 원천 차단!
+                                // [CRITICAL FIX] 메모리 정렬(contiguous)을 수행하되, 실패 시 원본으로 스왑
                                 let k_contig = k_aligned.contiguous().unwrap_or(k_aligned);
                                 let v_contig = v_aligned.contiguous().unwrap_or(v_aligned);
 
@@ -368,6 +396,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             if io_tx_nested.send(SaveTask { 
                                 slot_id: sid, path: file_path.clone(), tensors: map, is_last: false, block_idx, registry: Some(registry_inner), kv_name: kv_name_inner 
                             }).await.is_err() {
+                                // [CRITICAL FIX] 내부 Send 실패 시에만 카운터를 복구시킴
                                 GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                             }
                         });
@@ -384,12 +413,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     tokio::spawn(async move {
                         let _guard = ReadSlotGuard { sid, active: true };
                         let (b_idx_off, b_idx) = { match shared_block.inner.read() { Ok(inner) => (inner.offset, inner.index), _ => (0, 999) } };
-                        let mut root = provided_path.clone();
-                        while !root.to_string_lossy().ends_with("kv") && root.parent().is_some() { root = root.parent().unwrap().to_path_buf(); }
-                        let block_root = root.join(kv_name.as_deref().unwrap_or("inference")).join(format!("b{}", b_idx_off));
                         
-                        // [CRITICAL FIX] 0..28 루프를 제거하고, 타겟 레이어 1개만 Direct Load!
-                        let file_path = block_root.join(format!("l{}.st", target_layer));
+                        // [CRITICAL FIX] 엉뚱한 상위 디렉토리로 올라가던 루프를 삭제하고, 장부(registry)에서 받아온 
+                        // 정확한 SSD 경로(provided_path)에 파일명만 즉시 붙여서 블록 유실(Block missing)을 원천 차단합니다!
+                        let file_path = provided_path.join(format!("l{}.st", target_layer));
                         if file_path.is_file() {
                             if let Ok(content) = load_kv_block(&file_path) {
                                 if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
