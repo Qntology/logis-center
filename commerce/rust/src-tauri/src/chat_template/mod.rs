@@ -21,14 +21,10 @@ pub fn get_template(path: String) -> Result<String> {
         .ok_or(anyhow!(format!("chat_template to str error")))?;
     
     let fixed_template = chat_template
-        .replace(
-            "message.content.startswith('<tool_response>')",
-            "message.content is startingwith('<tool_response>')", 
-        )
-        .replace(
-            "message.content.endswith('</tool_response>')",
-            "message.content is endingwith('</tool_response>')", 
-        )
+        // 변수명이나 따옴표 종류에 상관없이 모두 잡아내도록 변경
+        .replace(".startswith(", " is startingwith(")
+        .replace(".endswith(", " is endingwith(")
+        // 아래는 기존 코드 유지
         .replace(
             "content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n')",
             "((content | split('</think>'))[0] | rstrip('\n') | split('<think>'))[-1] | lstrip('\n')", 
@@ -45,6 +41,7 @@ pub fn get_template(path: String) -> Result<String> {
             "content.lstrip('\n')",
             "content | lstrip('\n')", 
         );
+        
     Ok(fixed_template)
 }
 
@@ -107,11 +104,16 @@ impl ChatTemplate {
             if let crate::openai_types::ChatCompletionRequestMessage::User(user_msg) = msg {
                 if let crate::openai_types::ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
                     let mut text_content = String::new();
+                    
                     for part in parts {
                         if let crate::openai_types::ChatCompletionRequestMessageContentPart::Text(text_part) = part {
                             text_content.push_str(&text_part.text);
+                        } else if let crate::openai_types::ChatCompletionRequestMessageContentPart::ImageURL(_) = part {
+                            // Qwen-VL 모델이 이미지를 인식할 수 있도록 플레이스홀더를 주입합니다.
+                            text_content.push_str("<|vision_start|><|image_pad|><|vision_end|>\n");
                         }
                     }
+                    
                     user_msg.content = crate::openai_types::ChatCompletionRequestUserMessageContent::Text(text_content);
                 }
             }

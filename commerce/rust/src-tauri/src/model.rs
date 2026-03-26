@@ -639,18 +639,21 @@ impl LogisModel {
     }
 
     pub async fn ensure_qwen3_5(&self) -> anyhow::Result<()> {
-        let mut q35_gen_guard = self.qwen3_5_generator.lock().await;
-        if q35_gen_guard.is_none() {
+        // Lock을 짧게 잡아서 로드 필요한지(상태)만 먼저 확인합니다.
+        let needs_load = {
+            self.qwen3_5_generator.lock().await.is_none()
+        };
+
+        if needs_load {
             println!("[MODEL] Loading Qwen 3.5 Generator (0.8B)...");
             
-            // Unload others to save VRAM
+            // 이제 쥐고 있는 Lock이 없으므로 데드락 없이 안전하게 호출됩니다.
             self.unload_generator().await; 
             
             let path = self.qwen3_5_model_path.clone();
             let dev = self.device_config.device.clone();
             
             let gen = tokio::task::spawn_blocking(move || {
-                // Find GGUF and MMPROJ in the directory
                 let gguf_files = utils::find_type_files(&path, "gguf").unwrap_or_default();
                 let model_gguf = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned().ok_or_else(|| anyhow!("No model GGUF found"))?;
                 let mmproj_gguf = gguf_files.iter().find(|f| f.contains("mmproj")).cloned();
@@ -658,6 +661,8 @@ impl LogisModel {
                 Qwen3_5GenerateModel::init_from_gguf(&model_gguf, mmproj_gguf.as_deref(), Some(&dev))
             }).await??;
             
+            // 로드가 다 끝난 후 다시 Lock을 잡고 값을 할당합니다.
+            let mut q35_gen_guard = self.qwen3_5_generator.lock().await;
             *q35_gen_guard = Some(gen);
         }
         Ok(())
@@ -824,7 +829,15 @@ impl LogisModel {
                 // ref = hashId(team + cc + no)
                 let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, hashed_cc, clean_no));
 
-                let mut final_data = extracted_data.clone();
+                // 👇 데이터가 Object가 아닐 경우를 대비해 안전하게 감싸줍니다.
+                let mut final_data = if extracted_data.is_object() {
+                    extracted_data.clone()
+                } else {
+                    // JSON 객체가 아니면, AI의 원본 응답을 "raw_output"이라는 키에 담아 객체로 만듭니다.
+                    json!({ "raw_output": extracted_data })
+                };
+
+                // 이제 final_data는 무조건 Object임이 보장되므로 unwrap()이 안전합니다.
                 final_data.as_object_mut().unwrap().insert("index".to_string(), json!(index_val));
                 final_data.as_object_mut().unwrap().insert("id".to_string(), json!(hashed_id));
 
