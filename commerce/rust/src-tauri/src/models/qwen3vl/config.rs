@@ -22,8 +22,8 @@ impl PreprocessorConfig {
     pub fn qwen3_5_img_default() -> Self {
         Self {
             size: Size {
-                longest_edge: 4096, // [CRITICAL FIX] 16777216 -> 4096으로 정상화 (메모리 폭발 방지)
-                shortest_edge: 224, // [CRITICAL FIX] 65536 -> 224로 정상화 (무한 리사이징 방지)
+                longest_edge: 16777216,
+                shortest_edge: 65536,
             },
             patch_size: 16,
             temporal_patch_size: 2,
@@ -36,8 +36,8 @@ impl PreprocessorConfig {
     pub fn qwen3_5_video_default() -> Self {
         Self {
             size: Size {
-                longest_edge: 4096, // [CRITICAL FIX] 동일하게 수정
-                shortest_edge: 224, // [CRITICAL FIX] 동일하게 수정
+                longest_edge: 25165824,
+                shortest_edge: 4096,
             },
             patch_size: 16,
             temporal_patch_size: 2,

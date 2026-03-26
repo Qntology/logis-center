@@ -804,7 +804,7 @@ impl LogisModel {
                 cancel_token.clone(), 
                 Some(task_id.clone())
             ).await?;
-
+            
             println!("\n=======================================");
             println!("[DEBUG-VISION] 🤖 AI Raw Response:\n{}", result_str);
             println!("=======================================\n");
@@ -888,20 +888,15 @@ impl LogisModel {
     ) -> anyhow::Result<String> {
         self.ensure_qwen3_5().await?;
 
-        if let Some(ref sid) = session_id {
-            let cache_dir = std::path::Path::new("tmp").join("qwen3_5_cache").join(sid);
-            if cache_dir.exists() {
-                let _ = std::fs::remove_dir_all(&cache_dir);
-                println!("[CACHE] Cleared previous SSD cache for session: {}", sid);
-            }
-        }
-
         if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
             crate::scheduler::log_task_progress(_app_handle, task_id, &base_payload);
         } else if let Some(sid) = &session_id {
              crate::scheduler::log_task_progress(_app_handle, sid, &base_payload);
         }
 
+        let mut q35_gen_guard = self.qwen3_5_generator.lock().await;
+        let gen = q35_gen_guard.as_mut().ok_or_else(|| anyhow!("Qwen 3.5 Generator is unloaded"))?;
+        
         let mut content_parts = Vec::new();
         
         if let Some(img) = image {
@@ -929,55 +924,13 @@ impl LogisModel {
         let params = ChatCompletionParameters {
             messages: vec![ChatCompletionRequestMessage::User(message)],
             model: "qwen3.5".to_string(),
-            max_tokens: Some(max_tokens as u32), // 한 파트당 최대 토큰 수
+            max_tokens: Some(max_tokens as u32),
             temperature: Some(0.1),
             top_p: Some(0.9),
             ..Default::default()
         };
         
-        let mut q35_gen_guard = self.qwen3_5_generator.lock().await;
-        let gen = q35_gen_guard.as_mut().ok_or_else(|| anyhow!("Qwen 3.5 Generator is unloaded"))?;
-
-        let mut full_result = String::new();
-        let mut is_continuation = false;
-        let mut last_offset = 0;
-        let mut last_token = None;
-        let mut part_num = 1;
-
-        loop {
-            // (선택 사항) 프론트엔드 UI에 현재 Part N이 생성 중임을 알림
-            let task_id_val = base_payload.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            let _ = _app_handle.emit(_event_name, json!({
-                "task_id": task_id_val,
-                "category": format!("Generating Part {}", part_num),
-                "summary": "AI is generating long response...",
-                "spinner": "⏳"
-            }));
-
-            let res = gen.generate_part(&params, is_continuation, last_offset, last_token).await.map_err(|e| anyhow!("Qwen 3.5 Inference failed: {}", e))?;
-            
-            full_result.push_str(&res.text);
-
-            // 모델이 정상적으로 스스로 생성을 종료했다면 루프 탈출
-            if res.is_finished {
-                break;
-            }
-
-            // 안 끝났다면 캐시를 유지한 채 다음 파트 생성을 위한 세팅
-            is_continuation = true;
-            last_offset = res.next_offset;
-            last_token = Some(res.last_token);
-            part_num += 1;
-            
-            // 무한 생성 루프 방지용 (안전장치)
-            if part_num > 15 {
-                println!("[WARNING] Model exceeded maximum continuation parts. Stopping.");
-                gen.clear_kv_cache();
-                break;
-            }
-        }
-
-        Ok(full_result)
+        gen.generate(params).map_err(|e| anyhow!("Qwen 3.5 Inference failed: {}", e))
     }
 
     pub fn is_cpu(&self) -> bool {

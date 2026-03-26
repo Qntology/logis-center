@@ -355,7 +355,7 @@ async fn process_task(
     app_handle: &tauri::AppHandle,
     device_preference: Option<String>,
 ) -> Result<()> {
-    // [NEW] Ensure log directory exists at runtime using dynamic path
+    // [NEW] Ensure log directory exists at runtime using dynamic path 
     let pug_logs_dir = utils::paths::get_pug_logs_dir(Some(app_handle), &task.id);
     println!("[DEBUG] Pug logs directory: {:?}", pug_logs_dir);
 
@@ -369,11 +369,8 @@ async fn process_task(
 
     // [SSD-BRIDGE] Start warming up weights in background RAM immediately
     let qwen35_model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3.5-0.8B-Instruct-gguf").or_else(|_| std::fs::canonicalize("models/Qwen3.5-0.8B-Instruct-gguf")).ok();
-    
-    // 👇 [RAM-FIX] RAM을 90% 이상 잡아먹던 강제 캐싱 로직을 꺼버립니다!
     if let Some(p) = qwen35_model_path_hint {
-        // let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
-        println!("[PRE-FETCH] Disabled to save System RAM.");
+        let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
     }
 
     // [SPINNER-ACTIVATE] Ensure UI spinner is ON immediately upon task recovery/start

@@ -172,12 +172,13 @@ impl Qwen3VLProcessor {
     }
 
     pub fn process_vision_tensor(&self, img_tensor: &Tensor) -> Result<(Tensor, Tensor)> {
+        // Check that data have `num_frames` divisible by `temporal_patch_size`
+        // img_tensor: (t, c, h, w)
         let t = img_tensor.dim(0)?;
         let img_tensor = if t % self.img_process_cfg.temporal_patch_size != 0 {
             let repeat_num = self.img_process_cfg.temporal_patch_size
                 - t % self.img_process_cfg.temporal_patch_size;
-            // [CRITICAL FIX] .i() 대신 narrow를 사용하여 4D 차원을 안전하게 보존!
-            let repeats = img_tensor.narrow(0, t - 1, 1)?.repeat((repeat_num, 1, 1, 1))?;
+            let repeats = img_tensor.i(t - 1)?.repeat((repeat_num, 1, 1, 1))?;
             Tensor::cat(&[img_tensor, &repeats], 0)?
         } else {
             img_tensor.clone()
@@ -198,10 +199,16 @@ impl Qwen3VLProcessor {
             self.img_process_cfg.patch_size,
         ]);
         let img_tensor = img_tensor.reshape(shape)?;
-        
-        // [CRITICAL FIX] permute 이후 메모리 정렬을 위해 contiguous() 추가!
-        let img_tensor = img_tensor.permute(vec![0, 3, 6, 4, 7, 2, 1, 5, 8])?.contiguous()?;
-        
+        // shape to // grid_t,
+        // grid_h / merge_size,
+        // grid_w / merge_size,
+        // merge_size,
+        // merge_size,
+        // channel,
+        // temporal_patch_size,
+        // patch_size,
+        // patch_size,
+        let img_tensor = img_tensor.permute(vec![0, 3, 6, 4, 7, 2, 1, 5, 8])?;
         let img_tensor = img_tensor
             .reshape((
                 grid_t * grid_h * grid_w,
@@ -209,8 +216,8 @@ impl Qwen3VLProcessor {
                     * self.img_process_cfg.temporal_patch_size
                     * self.img_process_cfg.patch_size
                     * self.img_process_cfg.patch_size,
-            ))?; // 여기서 contiguous() 제거
-            
+            ))?
+            .contiguous()?;
         let grid_thw = Tensor::from_vec(
             vec![grid_t as u32, grid_h as u32, grid_w as u32],
             (1, 3),
@@ -380,19 +387,10 @@ impl Qwen3VLProcessor {
         let mut text = text.to_string();
         if let Some(ref image_grid_thw) = image_grid_thw {
             let mut index = 0;
-            // [LOOP-FIX] 안전한 카운터
-            let max_iters = 100;
-            while text.contains(&self.image_token) && index < max_iters {
-                // grid_i를 안전하게 가져옴 (실패 시 기본값)
-                let grid_i = match image_grid_thw.i(index) {
-                    Ok(t) => t,
-                    Err(_) => {
-                        println!("[PROCESSOR-WARN] grid_thw index {} out of bounds!", index);
-                        break;
-                    }
-                };
-                let grid_vec = grid_i.to_vec1::<u32>().unwrap_or(vec![1, 14, 14]);
-                let repeat_num = grid_vec.iter().product::<u32>() as usize / merge_length;
+            while text.contains(&self.image_token) {
+                let grid_i = image_grid_thw.i(index)?;
+                let repeat_num =
+                    grid_i.to_vec1::<u32>()?.iter().product::<u32>() as usize / merge_length;
                 let replace = "<|placeholder|>".repeat(repeat_num);
                 text = text.replacen(&self.image_token, &replace, 1);
                 index += 1;
