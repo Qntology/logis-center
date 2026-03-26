@@ -51,6 +51,14 @@ impl Qwen3_5RMSNorm {
         let norm = norm.broadcast_mul(&self.weight)?.to_dtype(xs.dtype())?;
         Ok(norm)
     }
+
+    pub fn clear(&mut self) {
+        self.weight = Tensor::zeros((1,), self.weight.dtype(), &Device::Cpu).unwrap();
+    }
+
+    pub fn is_cleared(&self) -> bool {
+        self.weight.elem_count() <= 1
+    }
 }
 
 pub struct Qwen3_5RMSNormGated {
@@ -80,6 +88,8 @@ impl Qwen3_5RMSNormGated {
         xs = xs.to_dtype(orig_dtype)?;
         Ok(xs)
     }
+
+    pub fn clear(&mut self) {}
 }
 
 #[macro_export]
@@ -112,7 +122,6 @@ macro_rules! reshape_chunk_tensor {
 }
 
 pub struct Qwen3_5GatedDeltaNet {
-    // hidden_size: usize,
     num_v_heads: usize,
     num_k_heads: usize,
     head_k_dim: usize,
@@ -120,18 +129,11 @@ pub struct Qwen3_5GatedDeltaNet {
     key_dim: usize,
     value_dim: usize,
     conv_kernel_size: usize,
-    // layer_idx: usize,
-    // activation: Activation,
-    // layer_norm_epsilon: f64,
-    // QKV 投影
-    // conv_dim: usize,
     conv1d: Conv1d,
     dt_bias: Tensor,
     a_log: Tensor,
     norm: Qwen3_5RMSNormGated,
     out_proj: ProjKind,
-
-    // Z, B, A 投影
     in_proj_qkv: ProjKind,
     in_proj_z: ProjKind,
     in_proj_b: ProjKind,
@@ -142,17 +144,16 @@ pub struct Qwen3_5GatedDeltaNet {
 
 impl Qwen3_5GatedDeltaNet {
     pub fn new_from_vb(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
-        let hidden_size = config.hidden_size; // 1024
-        let num_v_heads = config.linear_num_value_heads; // 16
-        let num_k_heads = config.linear_num_key_heads; // 16
-        let head_k_dim = config.linear_key_head_dim; // 128
-        let head_v_dim = config.linear_value_head_dim; // 128
-        let key_dim = head_k_dim * num_k_heads; // 2048
-        let value_dim = head_v_dim * num_v_heads; // 2048
-        let conv_kernel_size = config.linear_conv_kernel_dim; // 4
-        // let activation = config.hidden_act;
+        let hidden_size = config.hidden_size; 
+        let num_v_heads = config.linear_num_value_heads; 
+        let num_k_heads = config.linear_num_key_heads; 
+        let head_k_dim = config.linear_key_head_dim; 
+        let head_v_dim = config.linear_value_head_dim; 
+        let key_dim = head_k_dim * num_k_heads; 
+        let value_dim = head_v_dim * num_v_heads; 
+        let conv_kernel_size = config.linear_conv_kernel_dim; 
         let layer_norm_epsilon = config.rms_norm_eps;
-        let conv_dim = key_dim * 2 + value_dim; // 6144
+        let conv_dim = key_dim * 2 + value_dim; 
         let conv1d = get_conv1d(
             vb.pp("conv1d"),
             conv_dim,
@@ -168,19 +169,13 @@ impl Qwen3_5GatedDeltaNet {
         let a_log = vb.get(num_v_heads, "A_log")?;
         let norm = Qwen3_5RMSNormGated::new(vb.pp("norm"), head_v_dim, layer_norm_epsilon)?;
 
-        // 2048, 1024
         let out_proj = linear_no_bias(value_dim, hidden_size, vb.pp("out_proj"))?;
-        // 1024, 6144
         let in_proj_qkv = linear_no_bias(hidden_size, conv_dim, vb.pp("in_proj_qkv"))?;
-        // 1024, 2048
         let in_proj_z = linear_no_bias(hidden_size, value_dim, vb.pp("in_proj_z"))?;
-        // 1024, 16
         let in_proj_b = linear_no_bias(hidden_size, num_v_heads, vb.pp("in_proj_b"))?;
-        // 1024, 16
         let in_proj_a = linear_no_bias(hidden_size, num_v_heads, vb.pp("in_proj_a"))?;
 
         Ok(Self {
-            // hidden_size,
             num_v_heads,
             num_k_heads,
             head_k_dim,
@@ -188,9 +183,6 @@ impl Qwen3_5GatedDeltaNet {
             key_dim,
             value_dim,
             conv_kernel_size,
-            // activation,
-            // layer_norm_epsilon,
-            // conv_dim,
             conv1d,
             dt_bias,
             a_log,
@@ -230,11 +222,6 @@ impl Qwen3_5GatedDeltaNet {
         let a_log = gguf.get_dequantized(&format!("{prefix}.ssm_a"))?;
         let norm_weight = gguf.get_dequantized(&format!("{prefix}.ssm_norm.weight"))?;
         let norm = Qwen3_5RMSNormGated::from_weight(norm_weight, rms_norm_eps)?;
-        // let out_proj = gguf.qmatmul(&format!("{prefix}.ssm_out.weight"))?;
-        // let in_proj_qkv = gguf.qmatmul(&format!("{prefix}.attn_qkv.weight"))?;
-        // let in_proj_z = gguf.qmatmul(&format!("{prefix}.attn_gate.weight"))?;
-        // let in_proj_b = gguf.qmatmul(&format!("{prefix}.ssm_beta.weight"))?;
-        // let in_proj_a = gguf.qmatmul(&format!("{prefix}.ssm_alpha.weight"))?;
         let out_proj = gguf.quantize_linear(&format!("{prefix}.ssm_out"), false)?;
         let in_proj_qkv = gguf.quantize_linear(&format!("{prefix}.attn_qkv"), false)?;
         let in_proj_z = gguf.quantize_linear(&format!("{prefix}.attn_gate"), false)?;
@@ -270,8 +257,6 @@ impl Qwen3_5GatedDeltaNet {
         let conv_state_new = Tensor::cat(&[conv_state, xs], D::Minus1)?;
         let conv_update = conv_state_new.narrow(D::Minus1, seq_len, state_len)?;
         self.conv_state_cache = Some(conv_update);
-        // too slow
-        // let out = conv_state_new.conv1d(self.conv1d.weight(), 0, 1, 1, dim)?;
         let out = conv1d_depthwise(&conv_state_new, self.conv1d.weight(), self.conv1d.bias())?;
         let start = out.dim(D::Minus1)? - seq_len;
         let out = out.narrow(D::Minus1, start, seq_len)?.silu()?;
@@ -318,7 +303,7 @@ impl Qwen3_5GatedDeltaNet {
             .broadcast_as(decay_mask.shape())?;
         let on_false = decay_mask.zeros_like()?;
         let decay_mask = tril_mask.where_cond(&decay_mask, &on_false)?.contiguous()?;
-        // when rank = 5, matmul error, bs=1,squeeze(0)
+        
         let mut attn = k_beta
             .squeeze(0)?
             .contiguous()?
@@ -330,10 +315,8 @@ impl Qwen3_5GatedDeltaNet {
             .unsqueeze(0)?
             .mul(&decay_mask)?
             .affine(-1.0, 0.0)?;
-        // 包含对角线的上三角矩阵
         let mask = Tensor::triu2(chunk_size, candle_core::DType::U32, query.device())?
             .broadcast_as(decay_mask.shape())?;
-        // attn的对角线为0,为1的取0, 为0的取attn
         attn = mask.where_cond(&on_false, &attn)?;
         let (d0, d1, d2, _, _) = attn.dims5()?;
         for i in 1..chunk_size {
@@ -350,7 +333,6 @@ impl Qwen3_5GatedDeltaNet {
         let attn = attn
             .broadcast_add(&Tensor::eye(chunk_size, attn.dtype(), attn.device())?)?
             .contiguous()?;
-        // when rank = 5, matmul error, bs=1,squeeze(0)
         let value = attn.squeeze(0)?.matmul(&v_beta.squeeze(0)?)?.unsqueeze(0)?;
         let k_cumdecay = attn
             .squeeze(0)?
@@ -538,12 +520,6 @@ impl Qwen3_5GatedDeltaNet {
             )?;
             mixed_qkv = conv1d_depthwise(&mixed_qkv, self.conv1d.weight(), self.conv1d.bias())?;
             mixed_qkv = mixed_qkv.narrow(D::Minus1, 0, seq_len)?.silu()?;
-            // too slowly
-            // mixed_qkv = self
-            //     .conv1d
-            //     .forward(&mixed_qkv)?
-            //     .narrow(D::Minus1, 0, seq_len)?
-            //     .silu()?;
         }
         let mixed_qkv = mixed_qkv.transpose(1, 2)?;
         let qkv_split = split_tensor(
@@ -577,6 +553,15 @@ impl Qwen3_5GatedDeltaNet {
         let output = self.out_proj.forward(&core_attn_out)?;
 
         Ok(output)
+    }
+
+    pub fn get_states(&self) -> (Option<Tensor>, Option<Tensor>) {
+        (self.conv_state_cache.clone(), self.recurrent_state_cache.clone())
+    }
+
+    pub fn set_states(&mut self, conv: Option<Tensor>, recurrent: Option<Tensor>) {
+        self.conv_state_cache = conv;
+        self.recurrent_state_cache = recurrent;
     }
 
     pub fn clear_cache(&mut self) {
@@ -664,10 +649,6 @@ impl Qwen3_5Attention {
         let num_kv_groups = num_attention_heads / num_key_value_heads;
         let head_dim = gguf.get_matedata("qwen35.attention.key_length")?.to_u32()? as usize;
         let scaling = 1f64 / f64::sqrt(head_dim as f64);
-        // let q_proj = gguf.qmatmul(&format!("{prefix}.attn_q.weight"))?;
-        // let k_proj = gguf.qmatmul(&format!("{prefix}.attn_k.weight"))?;
-        // let v_proj = gguf.qmatmul(&format!("{prefix}.attn_v.weight"))?;
-        // let o_proj = gguf.qmatmul(&format!("{prefix}.attn_output.weight"))?;
         let q_proj = gguf.quantize_linear(&format!("{prefix}.attn_q"), false)?;
         let k_proj = gguf.quantize_linear(&format!("{prefix}.attn_k"), false)?;
         let v_proj = gguf.quantize_linear(&format!("{prefix}.attn_v"), false)?;
@@ -750,6 +731,14 @@ impl Qwen3_5Attention {
         Ok(attn_output)
     }
 
+    pub fn get_kv(&self) -> Option<(Tensor, Tensor)> {
+        self.kv_cache.clone()
+    }
+
+    pub fn set_kv(&mut self, kv: Option<(Tensor, Tensor)>) {
+        self.kv_cache = kv;
+    }
+
     pub fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
     }
@@ -783,10 +772,16 @@ impl AttnKind {
             }
         }
     }
+
+    pub fn clear_cache(&mut self) {
+        match self {
+            AttnKind::LinearAttn(attn) => attn.clear_cache(),
+            AttnKind::SelfAttn(attn) => attn.clear_kv_cache(),
+        }
+    }
 }
 
 pub struct Qwen3_5DecoderLayer {
-    // hidden_size: usize,
     layer_type: String,
     attn: AttnKind,
     mlp: GateUpDownMLPGguf,
@@ -795,47 +790,6 @@ pub struct Qwen3_5DecoderLayer {
 }
 
 impl Qwen3_5DecoderLayer {
-    pub fn new_from_vb(
-        vb: VarBuilder,
-        config: &Qwen3_5TextConfig,
-        layer_idx: usize,
-    ) -> Result<Self> {
-        let hidden_size = config.hidden_size;
-        let layer_type = config.layer_types[layer_idx].clone();
-        let attn = if layer_type.eq("linear_attention") {
-            let attn = Qwen3_5GatedDeltaNet::new_from_vb(vb.pp("linear_attn"), config)?;
-            AttnKind::LinearAttn(attn)
-        } else {
-            let attn = Qwen3_5Attention::new_from_vb(vb.pp("self_attn"), config)?;
-            AttnKind::SelfAttn(attn)
-        };
-        let mlp = GateUpDownMLPGguf::new_from_vb(
-            vb.pp("mlp"),
-            hidden_size,
-            config.intermediate_size,
-            false,
-            None,
-            None,
-            None,
-            Some(config.hidden_act),
-        )?;
-        let input_layernorm =
-            Qwen3_5RMSNorm::new(vb.pp("input_layernorm"), hidden_size, config.rms_norm_eps)?;
-        let post_attention_layernorm = Qwen3_5RMSNorm::new(
-            vb.pp("post_attention_layernorm"),
-            hidden_size,
-            config.rms_norm_eps,
-        )?;
-        Ok(Self {
-            // hidden_size,
-            layer_type,
-            attn,
-            mlp,
-            input_layernorm,
-            post_attention_layernorm,
-        })
-    }
-
     pub fn new_from_gguf<R: Read + Seek>(
         gguf: &mut Gguf<R>,
         prefix: &str,
@@ -864,7 +818,6 @@ impl Qwen3_5DecoderLayer {
             gguf.get_dequantized(&format!("{prefix}.post_attention_norm.weight"))?;
         let post_attention_layernorm = Qwen3_5RMSNorm::from_weight(post_norm_weight, rms_norm_eps)?;
         Ok(Self {
-            // hidden_size,
             layer_type: layer_type.to_string(),
             attn,
             mlp,
@@ -890,221 +843,245 @@ impl Qwen3_5DecoderLayer {
         Ok(xs)
     }
 
-    pub fn clear_cache(&mut self) {
-        match &mut self.attn {
+    pub fn save_state_to_disk(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let mut tensors = std::collections::HashMap::new();
+        
+        match &self.attn {
             AttnKind::LinearAttn(attn) => {
-                attn.clear_cache();
-            }
+                let (conv, rec) = attn.get_states();
+                if let Some(c) = conv { tensors.insert("conv_state".to_string(), c); }
+                if let Some(r) = rec { tensors.insert("recurrent_state".to_string(), r); }
+            },
             AttnKind::SelfAttn(attn) => {
-                attn.clear_kv_cache();
+                if let Some((k, v)) = attn.get_kv() {
+                    tensors.insert("k_cache".to_string(), k);
+                    tensors.insert("v_cache".to_string(), v);
+                }
             }
         }
+
+        if !tensors.is_empty() {
+            if let Some(parent) = path.parent() {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            candle_core::safetensors::save(&tensors, path)?;
+        }
+        Ok(())
+    }
+
+    pub fn load_state_from_disk(&mut self, path: &std::path::Path, device: &candle_core::Device) -> anyhow::Result<()> {
+        if !path.exists() { 
+            return Ok(()); 
+        }
+
+        let tensors = candle_core::safetensors::load(path, device)?;
+        
+        match &mut self.attn {
+            AttnKind::LinearAttn(attn) => {
+                let conv = tensors.get("conv_state").cloned();
+                let rec = tensors.get("recurrent_state").cloned();
+                attn.set_states(conv, rec);
+            },
+            AttnKind::SelfAttn(attn) => {
+                let k = tensors.get("k_cache").cloned();
+                let v = tensors.get("v_cache").cloned();
+                if k.is_some() && v.is_some() {
+                    attn.set_kv(Some((k.unwrap(), v.unwrap())));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
+// [CRITICAL FIX] Qwen3_5TextModel이 더 이상 Gguf 인스턴스나 Vec<Layer>를 보유하지 않고,
+// 매 Forward마다 즉석에서 레이어를 조립하고 폐기하는 PURE LAYER-BY-LAYER 모드로 작동합니다!
 pub struct Qwen3_5TextModel {
     embed_tokens: Embedding,
-    layers: Vec<Qwen3_5DecoderLayer>,
+    num_layers: usize,
     norm: Qwen3_5RMSNorm,
     rotary_emb: Qwen3VLTextRotaryEmbedding,
     mrope_section: Vec<usize>,
     dtype: DType,
+    mmap: Option<std::sync::Arc<memmap2::Mmap>>,
+    rms_norm_eps: f64,
+    layer_types: Vec<String>,
 }
 
 impl Qwen3_5TextModel {
-    pub fn new_from_vb(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
-        let embed_tokens = embedding(config.vocab_size, config.hidden_size, vb.pp("embed_tokens"))?;
-        let mut layers = vec![];
-        let vb_layers = vb.pp("layers");
-        for i in 0..config.num_hidden_layers {
-            // for i in 0..4 {
-            let layer = Qwen3_5DecoderLayer::new_from_vb(vb_layers.pp(i), config, i)?;
-            layers.push(layer);
-        }
-        let norm = Qwen3_5RMSNorm::new(vb.pp("norm"), config.hidden_size, config.rms_norm_eps)?;
-        let rope_dim =
-            (config.head_dim as f32 * config.rope_parameters.partial_rotary_factor) as usize;
-        let rotary_emb =
-            Qwen3VLTextRotaryEmbedding::new(rope_dim, config.rope_parameters.rope_theta);
-        Ok(Self {
-            embed_tokens,
-            layers,
-            norm,
-            rotary_emb,
-            mrope_section: config.rope_parameters.mrope_section.clone(),
-            dtype: vb.dtype(),
-        })
-    }
-    pub fn new_from_gguf<R: Read + Seek>(gguf: &mut Gguf<R>, device: &Device) -> Result<Self> {
+    pub fn new_from_gguf(
+        mmap: std::sync::Arc<memmap2::Mmap>, 
+        device: &Device
+    ) -> Result<Self> {
+        // [FIX] 초기 로딩을 위해 1회용 Gguf Reader 생성
+        let mut reader = std::io::Cursor::new(&mmap[..]);
+        let ct = candle_core::quantized::gguf_file::Content::read(&mut reader)?;
+        let mut reader2 = std::io::Cursor::new(&mmap[..]);
+        let mut gguf = Gguf::new(ct, &mut reader2, device.clone());
+        
         let dtype = match gguf.get_matedata("general.dtype") {
-            Ok(v) => match v.to_u32() as Result<u32, candle_core::Error> {
-                Ok(0) => DType::F32,
-                Ok(1) => DType::F16,
-                _ => DType::F16,
-            },
+            Ok(v) => match v.to_u32() as Result<u32, candle_core::Error> { Ok(0) => DType::F32, Ok(1) => DType::F16, _ => DType::F16 },
             Err(_) => DType::F16,
         };
         let num_layers = gguf.get_matedata("qwen35.block_count")?.to_u32()? as usize;
-        let full_attention_interval = gguf
-            .get_matedata("qwen35.full_attention_interval")?
-            .to_u32()? as usize;
+        
+        let layer_types: Vec<String> = if let Ok(val) = gguf.get_matedata("qwen35.layer_types") {
+            let mut types = Vec::new();
+            if let Ok(arr) = val.to_vec() {
+                for v in arr {
+                    if let Ok(s) = v.to_string() {
+                        types.push(s.to_string());
+                    }
+                }
+            }
+            types
+        } else {
+            (0..num_layers).map(|i| {
+                if (i + 1) % 4 == 0 { "full_attention".to_string() } else { "linear_attention".to_string() }
+            }).collect()
+        };
+        
         let rope_freq_base = gguf.get_matedata("qwen35.rope.freq_base")?.to_f32()?;
-        let rope_dimension_count =
-            gguf.get_matedata("qwen35.rope.dimension_count")?.to_u32()? as usize;
-        let mut mrope_section = gguf
-            .get_matedata("qwen35.rope.dimension_sections")?
-            .to_vec()?
-            .iter()
-            .map(|v: &candle_core::quantized::gguf_file::Value| v.to_i32().map(|x| x as usize))
-            .collect::<Result<Vec<usize>, candle_core::Error>>()?;
+        let rope_dimension_count = gguf.get_matedata("qwen35.rope.dimension_count")?.to_u32()? as usize;
+        let mut mrope_section = gguf.get_matedata("qwen35.rope.dimension_sections")?.to_vec()?.iter().map(|v| v.to_i32().unwrap() as usize).collect::<Vec<_>>();
         let _ = mrope_section.pop();
-        let rms_norm_eps = gguf
-            .get_matedata("qwen35.attention.layer_norm_rms_epsilon")?
-            .to_f32()? as f64;
-        let hidden_size = gguf.get_matedata("qwen35.embedding_length")?.to_u32()? as usize; // 1024
+        let rms_norm_eps = gguf.get_matedata("qwen35.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
+        let hidden_size = gguf.get_matedata("qwen35.embedding_length")?.to_u32()? as usize; 
+        
         let embed_tensor = gguf.tensor("token_embd.weight")?;
-        // let embed_tokens = match dtype {
-        //     DType::F32 => Embedding::new(embed_tensor.dequantize(device)?, hidden_size),
-        //     _ => Embedding::new(embed_tensor.dequantize_f16(device)?, hidden_size),
-        // };
-        let embed_tokens = Embedding::new(embed_tensor.dequantize(device)?, hidden_size);
-        let mut layers = vec![];
-        for i in 0..num_layers {
-            // for i in 0..4 {
-            let prefix = format!("blk.{i}");
-            let layer_type = if (i + 1) % full_attention_interval == 0 {
-                "full_attention".to_string()
-            } else {
-                "linear_attention".to_string()
-            };
-            let layer =
-                Qwen3_5DecoderLayer::new_from_gguf(gguf, &prefix, &layer_type, rms_norm_eps)?;
-            layers.push(layer);
-        }
+        
+        // [VRAM-FIX 1] 임베딩 테이블을 무조건 Device::Cpu에 올려두어 VRAM 절약
+        let embed_tokens = Embedding::new(embed_tensor.dequantize(&Device::Cpu)?, hidden_size);
+        
         let norm_weight = gguf.get_dequantized("output_norm.weight")?;
-        let norm = Qwen3_5RMSNorm::from_weight(norm_weight, rms_norm_eps)?;
+        // [VRAM-FIX 2] 아웃풋 노름도 CPU로
+        let norm = Qwen3_5RMSNorm::from_weight(norm_weight.to_device(&Device::Cpu)?, rms_norm_eps)?;
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(rope_dimension_count, rope_freq_base);
 
         Ok(Self {
-            embed_tokens,
-            layers,
-            norm,
-            rotary_emb,
-            mrope_section,
-            dtype,
+            embed_tokens, 
+            num_layers, // [CRITICAL FIX] layers 배열을 아예 들고 있지 않습니다!
+            norm, rotary_emb, mrope_section, dtype,
+            mmap: Some(mmap), rms_norm_eps,
+            layer_types,
         })
     }
 
-    pub fn forward(&mut self, inputs_embeds: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
+    pub async fn forward(
+        &mut self, 
+        inputs_embeds: &Tensor, 
+        position_ids: &Tensor,
+        session_id: &str 
+    ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
-
-        let (cos, sin) =
-            self.rotary_emb
-                .forward(position_ids, self.dtype, self.mrope_section.clone())?;
-        let mut xs = inputs_embeds.clone();
-        let attention_mask: Option<Tensor> = {
-            if seq_len <= 1 {
-                None
-            } else {
-                Some(prepare_causal_attention_mask(
-                    b_size,
-                    seq_len,
-                    0,
-                    inputs_embeds.device(),
-                )?)
-            }
+        let (cos, sin) = self.rotary_emb.forward(position_ids, self.dtype, self.mrope_section.clone())?;
+        
+        // [VRAM-FIX] 연산 시점에만 GPU로 올림
+        let mut xs = if !inputs_embeds.device().same_device(&cos.device()) {
+            inputs_embeds.to_device(&cos.device())?
+        } else {
+            inputs_embeds.clone()
         };
-        // let mut i = 0;
-        for layer in self.layers.iter_mut() {
-            let layer_mask =
-                if layer.layer_type.ne("linear_attention") || (seq_len != 1 && b_size != 1) {
-                    attention_mask.clone()
-                } else {
-                    None
-                };
+        
+        let attention_mask: Option<Tensor> = {
+            if seq_len <= 1 { None } else { Some(prepare_causal_attention_mask(b_size, seq_len, 0, xs.device())?) }
+        };
+
+        let kv_dir = std::path::Path::new("tmp").join("qwen3_5_cache").join(session_id);
+        
+        let mmap = self.mmap.clone().unwrap();
+        let rms_eps = self.rms_norm_eps;
+
+        let mut reader1 = std::io::Cursor::new(&mmap[..]);
+        let ct = candle_core::quantized::gguf_file::Content::read(&mut reader1)?;
+        let mut reader2 = std::io::Cursor::new(&mmap[..]);
+        let mut gguf = Gguf::new(ct, &mut reader2, xs.device().clone());
+
+        let default_layer = "linear_attention".to_string();
+
+        for i in 0..self.num_layers {
+            let prefix = format!("blk.{}", i);
+            let layer_type = self.layer_types.get(i).unwrap_or(&default_layer);
+            
+            // [PURE LAYER-BY-LAYER] 매번 새롭게 레이어를 만들어냅니다.
+            let mut layer = Qwen3_5DecoderLayer::new_from_gguf(&mut gguf, &prefix, layer_type, rms_eps)?;
+
+            let layer_state_path = kv_dir.join(format!("layer_{}.safetensors", i));
+            layer.load_state_from_disk(&layer_state_path, xs.device())?;
+
+            let layer_mask = if layer_type.ne("linear_attention") || (seq_len != 1 && b_size != 1) { attention_mask.clone() } else { None };
+            
+            // 실제 GPU 코어 연산
             xs = layer.forward(&xs, Some(&cos), Some(&sin), layer_mask.as_ref())?;
-            // println!("layer {i} : {}", xs);
-            // i += 1;
+
+            // 상태 저장
+            layer.save_state_to_disk(&layer_state_path)?;
+
+            // [메모리 폭파] 연산이 끝났으므로 해당 레이어를 즉각 RAM/VRAM에서 소멸시킵니다.
+            drop(layer);
         }
+        
+        self.norm.weight = self.norm.weight.to_device(xs.device())?;
         xs = self.norm.forward(&xs)?;
+        self.norm.weight = self.norm.weight.to_device(&Device::Cpu)?; 
         Ok(xs)
     }
 
     pub fn clear_cache(&mut self) {
-        for layer in self.layers.iter_mut() {
-            layer.clear_cache();
-        }
+        // No-op. The SSD cache is cleared directly from extract_from_image.
     }
 }
 
 pub struct Qwen3_5Model {
-    // config: Qwen3_5Config,
     spatial_merge_size: usize,
     image_token_id: u32,
     video_token_id: u32,
     vision_start_token_id: u32,
-    visual: Option<Qwen3VLVisionModel>,
+    pub visual: Option<Qwen3VLVisionModel>, // [FIX] public으로 변경하여 외부에서 drop 가능하게 함
     language_model: Qwen3_5TextModel,
     lm_head: ProjKind,
     rope_deltas: Option<Tensor>,
 }
 
 impl Qwen3_5Model {
-    pub fn new_from_vb(vb: VarBuilder, config: Qwen3_5Config) -> Result<Self> {
-        let vb_m = vb.pp("model");
-        let visual = Qwen3VLVisionModel::new(config.vision_config.clone(), vb_m.pp("visual"))?;
-        let language_model =
-            Qwen3_5TextModel::new_from_vb(vb_m.pp("language_model"), &config.text_config)?;
-        let lm_head = if config.tie_word_embeddings {
-            Linear::new(language_model.embed_tokens.embeddings().clone(), None)
-        } else {
-            linear_no_bias(
-                config.text_config.hidden_size,
-                config.text_config.vocab_size,
-                vb.pp("lm_head"),
-            )?
-        };
-        Ok(Self {
-            spatial_merge_size: config.vision_config.spatial_merge_size,
-            image_token_id: config.image_token_id,
-            video_token_id: config.video_token_id,
-            vision_start_token_id: config.vision_start_token_id,
-            visual: Some(visual),
-            language_model,
-            lm_head: ProjKind::LinearProj(lm_head),
-            rope_deltas: None,
-        })
-    }
-
-    pub fn new_from_gguf<R: Read + Seek>(
-        gguf: &mut Gguf<R>,
-        mmproj_gguf: Option<&mut Gguf<R>>,
+    pub fn new_from_gguf(
+        mmap: std::sync::Arc<memmap2::Mmap>,
+        mmproj_gguf: Option<&mut Gguf<std::fs::File>>,
         device: &Device,
     ) -> Result<Self> {
         let spatial_merge_size = 2usize;
         let image_token_id = 248056u32;
         let video_token_id = 248057u32;
         let vision_start_token_id = 248053u32;
+        
         let visual = if let Some(mmproj) = mmproj_gguf {
-            let visual = Qwen3VLVisionModel::new_from_gguf(mmproj)?;
-            Some(visual)
-        } else {
-            None
-        };
-        let language_model = Qwen3_5TextModel::new_from_gguf(gguf, device)?;
+            let v_model = Qwen3VLVisionModel::new_from_gguf(mmproj)?;
+            Some(v_model)
+        } else { None };
+        
+        // 텍스트 모델은 Gguf 객체 없이 오직 Mmap만 전달받아 내부적으로 생성합니다.
+        let language_model = Qwen3_5TextModel::new_from_gguf(mmap.clone(), device)?;
+        
+        // lm_head 생성을 위해 1회용 Gguf Reader 생성
+        let mut reader1 = std::io::Cursor::new(&mmap[..]);
+        let ct = candle_core::quantized::gguf_file::Content::read(&mut reader1)?;
+        let mut reader2 = std::io::Cursor::new(&mmap[..]);
+        let mut gguf = Gguf::new(ct, &mut reader2, device.clone());
+        
         let lm_head_tensor = match gguf.tensor("output.weight") {
             Ok(tensor) => tensor,
             Err(_) => gguf.tensor("token_embd.weight")?,
         };
-        let lm_head = QMatMul::from_qtensor(lm_head_tensor)?;
+        
+        // [VRAM-FIX 4] 헤드 매트릭스도 CPU에 보관
+        let lm_head_t = lm_head_tensor.dequantize(&Device::Cpu)?;
+        
         Ok(Self {
-            spatial_merge_size,
-            image_token_id,
-            video_token_id,
-            vision_start_token_id,
-            visual,
-            language_model,
-            lm_head: ProjKind::QuantizedProj(QuantizedLinear::new(lm_head, None)),
+            spatial_merge_size, image_token_id, video_token_id, vision_start_token_id,
+            visual, language_model, 
+            lm_head: ProjKind::LinearProj(candle_nn::Linear::new(lm_head_t, None)),
             rope_deltas: None,
         })
     }
@@ -1122,8 +1099,6 @@ impl Qwen3_5Model {
                 let mut v_thw_vec = Vec::new();
                 for (index, t) in grid_t.iter().enumerate() {
                     let mut thw_i = thw.i(index)?.to_vec1::<u32>()?;
-                    // [12, 30, 50]
-                    // [1, 30, 50]*t
                     thw_i[0] = 1;
                     v_thw_vec.push(
                         Tensor::new(thw_i, thw.device())?
@@ -1158,7 +1133,6 @@ impl Qwen3_5Model {
             for i in 0..total_input_ids.dim(0)? {
                 let mut input_ids_i = total_input_ids.i(i)?;
                 let mask_i = mask_.i(i)?;
-                // 推理时, attention_mask如果是全1向量,取非0索引的操作没必要
                 if mask_i.sum_all()?.to_scalar::<u32>()? != mask_i.dim(0)? as u32 {
                     let nonzero_idx = nonzero_index(&mask_i)?;
                     input_ids_i = input_ids_i.gather(&nonzero_idx, 0)?;
@@ -1167,7 +1141,6 @@ impl Qwen3_5Model {
                 let mut text_end = 0;
                 let mut thw = vec![];
                 let mut llm_pos_ids_list: Vec<Tensor> = Vec::new();
-                // vision start的下一个索引
                 let vision_indices = get_vision_next_indices(&input_ids_i, vision_start_token_id);
 
                 match vision_indices {
@@ -1294,8 +1267,6 @@ impl Qwen3_5Model {
             for i in 0..position_ids.dim(0)? {
                 let mut position_ids_i = position_ids.i(i)?;
                 let mask_i = mask.i(i)?;
-                // 如果有pad, 将填充位置置为1
-                // 当bs>1, 可能存在不同序列长度，需要添加pad使seq_len长度一致
                 if mask_i.sum_all()?.to_scalar::<u32>()? != mask_i.dim(0)? as u32 {
                     let zero_indices = zero_index(&mask_i)?;
                     let replace_1 = Tensor::ones(
@@ -1381,22 +1352,26 @@ impl Qwen3_5Model {
         Ok(position_ids)
     }
 
-    pub fn forward(
+    pub async fn forward(
         &mut self,
         input_ids: &Tensor,
         pixel_values: Option<&Tensor>,
         image_grid_thw: Option<&Tensor>,
         pixel_values_video: Option<&Tensor>,
         video_grid_thw: Option<&Tensor>,
-        // cache_position: Option<&Tensor>,
         seqlen_offset: usize,
+        session_id: &str, 
     ) -> Result<Tensor> {
-        let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
+        let mut inputs_embeds = self.language_model.embed_tokens.forward(&input_ids.to_device(&Device::Cpu)?)?;
+        inputs_embeds = inputs_embeds.to_device(input_ids.device())?;
+        
         if let Some(pixel_values) = pixel_values {
             if let Some(image_grid_thw) = image_grid_thw {
-                if let Some(visual) = self.visual.as_ref() {
-                    let (image_embeds, _): (Tensor, _) = visual.forward(pixel_values, image_grid_thw)?;
-                    // println!("image_embeds: {}", image_embeds);
+                // [RAM-FIX] 연산이 끝나는 즉시 무거운 비전 모델(1.2GB)을 RAM에서 영구 소각(Drop)시킵니다.
+                if let Some(visual) = self.visual.take() {
+                    let pv_dev = pixel_values.to_device(input_ids.device())?;
+                    let grid_dev = image_grid_thw.to_device(input_ids.device())?;
+                    let (image_embeds, _): (Tensor, _) = visual.forward(&pv_dev, &grid_dev)?;
                     let vision_mask = get_equal_mask(input_ids, self.image_token_id)?;
                     let n_image_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
                     if n_image_tokens as usize != image_embeds.dim(0)? {
@@ -1411,10 +1386,13 @@ impl Qwen3_5Model {
                 }
             }
         }
+
         if let Some(pixel_values_video) = pixel_values_video {
             if let Some(video_grid_thw) = video_grid_thw {
-                if let Some(visual) = self.visual.as_ref() {
-                    let (video_embeds, _): (Tensor, _) = visual.forward(pixel_values_video, video_grid_thw)?;
+                if let Some(visual) = self.visual.take() {
+                    let pv_dev = pixel_values_video.to_device(input_ids.device())?;
+                    let grid_dev = video_grid_thw.to_device(input_ids.device())?;
+                    let (video_embeds, _): (Tensor, _) = visual.forward(&pv_dev, &grid_dev)?;
                     let vision_mask = get_equal_mask(input_ids, self.video_token_id)?;
                     let n_video_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
                     if n_video_tokens as usize != video_embeds.dim(0)? {
@@ -1429,7 +1407,7 @@ impl Qwen3_5Model {
                 }
             }
         }
-        // println!("visual : {}", inputs_embeds);
+        
         let position_ids = self.compute_3d_position_ids(
             input_ids,
             &inputs_embeds,
@@ -1437,11 +1415,16 @@ impl Qwen3_5Model {
             video_grid_thw,
             seqlen_offset,
         )?;
-        let outputs = self.language_model.forward(&inputs_embeds, &position_ids)?;
+        
+        let outputs = self.language_model.forward(&inputs_embeds, &position_ids, session_id).await?;
+        
         let seq_len = outputs.dim(1)?;
         let hidden_state = outputs.narrow(1, seq_len - 1, 1)?;
-        let logits = self.lm_head.forward(&hidden_state)?;
-        Ok(logits)
+        
+        let hidden_cpu = hidden_state.to_device(&Device::Cpu)?;
+        let logits = self.lm_head.forward(&hidden_cpu)?;
+        
+        Ok(logits.to_device(input_ids.device())?)
     }
 
     pub fn clear_cache(&mut self) {

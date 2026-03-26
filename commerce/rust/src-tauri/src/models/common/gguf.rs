@@ -217,6 +217,11 @@ impl QuantizedLinear {
     pub fn inner_dequantize(&self) -> Result<Tensor> {
         Ok(self.inner.dequantize_f16()?)
     }
+
+    pub fn clear(&mut self) {
+        self.inner = QMatMul::Tensor(Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap());
+        self.bias = None;
+    }
 }
 
 impl Module for QuantizedLinear {
@@ -238,6 +243,19 @@ impl Module for QuantizedLinear {
 pub enum ProjKind {
     QuantizedProj(QuantizedLinear),
     LinearProj(Linear),
+}
+
+impl ProjKind {
+    // 👇 [NEW] ProjKind 종류에 상관없이 가중치 파괴
+    pub fn clear(&mut self) {
+        match self {
+            ProjKind::QuantizedProj(q) => q.clear(),
+            ProjKind::LinearProj(l) => {
+                let dummy = Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap();
+                *l = candle_nn::Linear::new(dummy, None);
+            }
+        }
+    }
 }
 
 impl Module for ProjKind {
@@ -322,6 +340,12 @@ impl GateUpDownMLPGguf {
             down_proj: ProjKind::LinearProj(down_proj),
             act,
         })
+    }
+
+    pub fn clear(&mut self) {
+        self.gate_proj.clear();
+        self.up_proj.clear();
+        self.down_proj.clear();
     }
 }
 
