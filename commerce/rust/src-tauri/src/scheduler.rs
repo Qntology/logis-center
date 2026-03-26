@@ -367,9 +367,9 @@ async fn process_task(
         println!("[PROCESS] Found existing KV cache for task {}. Ready to reuse.", task.id);
     }
 
-    // [SSD-BRIDGE] Start warming up 2B weights in background RAM immediately
-    let large_model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3.5-Instruct-gguf").or_else(|_| std::fs::canonicalize("models/Qwen3.5-Instruct-gguf")).ok();
-    if let Some(p) = large_model_path_hint {
+    // [SSD-BRIDGE] Start warming up weights in background RAM immediately
+    let qwen35_model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3.5-0.8B-Instruct-gguf").or_else(|_| std::fs::canonicalize("models/Qwen3.5-0.8B-Instruct-gguf")).ok();
+    if let Some(p) = qwen35_model_path_hint {
         let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
     }
 
@@ -435,20 +435,16 @@ async fn process_task(
         model_lock.as_ref().unwrap().clone()
     };
 
-    // --- Image Extraction Logic (Vision Baker Pipeline) ---
+    // --- Image Extraction Logic (Qwen 3.5 Pipeline) ---
     if task.r#type == "image_extraction" {
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
         if !image_path.is_empty() {
             println!("[Scheduler] Starting Image Extraction for {}", task.id);
             
-            let snapshot_id = format!("{}_img", task.id);
+            // [QWEN3.5] Log progress
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Analyzing visual context with Qwen 3.5...", "spinner": "⠋" }));
             
-            // [Full Vision] Load full 2B model and analyze
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Analyzing visual context with 2B-VL...", "spinner": "⠋" }));
-            
-            // Transition to full Large model. secure_vram_relay will load existing KV if snapshot_id exists.
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
-
+            // ensure_qwen3_5 is called internally by extract_from_image
             model.extract_from_image(
                 task.id.clone(),
                 image_path,

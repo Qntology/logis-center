@@ -814,7 +814,6 @@ impl QwenVLTextModel {
                     seq_len,
                     0,
                     inputs_embeds.device(),
-                    inputs_embeds.dtype(), // [FIX] 5번째 인자로 현재 텐서의 dtype 전달
                 )?)
             }
         };

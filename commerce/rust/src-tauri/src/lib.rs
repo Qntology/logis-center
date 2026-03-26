@@ -7,6 +7,7 @@ mod scheduler;
 
 pub mod models;
 pub mod utils;
+pub mod position_embed;
 pub mod openai_types;
 pub mod chat_template;
 pub mod tokenizer;

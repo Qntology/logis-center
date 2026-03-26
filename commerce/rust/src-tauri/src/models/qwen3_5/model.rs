@@ -724,7 +724,7 @@ impl Qwen3_5Attention {
             .transpose(1, 2)?;
         let (query_states, key_states) =
             glm_asr_apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
-        let (key_states, value_states) = match &self.kv_cache {
+        let (key_states, value_states) = match &self.kv_cache as &Option<(Tensor, Tensor)> {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
                 let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
@@ -733,6 +733,7 @@ impl Qwen3_5Attention {
             }
         };
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
+        let _: Option<(Tensor, Tensor)> = self.kv_cache.clone();
         let attn_output = eager_attention_forward(
             &query_states,
             &key_states,
@@ -770,10 +771,12 @@ impl AttnKind {
         match self {
             AttnKind::LinearAttn(attn) => attn.forward(xs, attention_mask),
             AttnKind::SelfAttn(attn) => {
-                if let Some(cos) = cos
-                    && let Some(sin) = sin
-                {
-                    attn.forward(xs, cos, sin, attention_mask)
+                if let Some(cos) = cos {
+                    if let Some(sin) = sin {
+                        attn.forward(xs, cos, sin, attention_mask)
+                    } else {
+                        Err(anyhow!("Qwen3_5 self attn cos and sin is all need"))
+                    }
                 } else {
                     Err(anyhow!("Qwen3_5 self attn cos and sin is all need"))
                 }
@@ -934,7 +937,7 @@ impl Qwen3_5TextModel {
     }
     pub fn new_from_gguf<R: Read + Seek>(gguf: &mut Gguf<R>, device: &Device) -> Result<Self> {
         let dtype = match gguf.get_matedata("general.dtype") {
-            Ok(v) => match v.to_u32() {
+            Ok(v) => match v.to_u32() as Result<u32, candle_core::Error> {
                 Ok(0) => DType::F32,
                 Ok(1) => DType::F16,
                 _ => DType::F16,
@@ -952,7 +955,7 @@ impl Qwen3_5TextModel {
             .get_matedata("qwen35.rope.dimension_sections")?
             .to_vec()?
             .iter()
-            .map(|v| v.to_i32().map(|x| x as usize))
+            .map(|v: &crate::models::common::gguf::MetadataValue| v.to_i32().map(|x| x as usize))
             .collect::<Result<Vec<usize>, candle_core::Error>>()?;
         let _ = mrope_section.pop();
         let rms_norm_eps = gguf
@@ -1347,23 +1350,28 @@ impl Qwen3_5Model {
         video_grid_thw: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        let position_ids = if let Some(rope_deltas) = &self.rope_deltas
-            && seqlen_offset != 0
-        {
-            let (bs, seq_len, _) = inputs_embeds.dims3()?;
-            Tensor::arange(
-                seqlen_offset as i64,
-                (seqlen_offset + seq_len) as i64,
-                input_ids.device(),
-            )?
-            .to_dtype(rope_deltas.dtype())?
-            .unsqueeze(0)?
-            .broadcast_as((bs, seq_len))?
-            .broadcast_add(rope_deltas)?
-            .unsqueeze(0)?
-            .broadcast_as((3, bs, seq_len))?
-            .contiguous()?
-            .to_dtype(candle_core::DType::U32)?
+        let position_ids = if let Some(rope_deltas) = &self.rope_deltas {
+            if seqlen_offset != 0 {
+                let (bs, seq_len, _) = inputs_embeds.dims3()?;
+                Tensor::arange(
+                    seqlen_offset as i64,
+                    (seqlen_offset + seq_len) as i64,
+                    input_ids.device(),
+                )?
+                .to_dtype(rope_deltas.dtype())?
+                .unsqueeze(0)?
+                .broadcast_as((bs, seq_len))?
+                .broadcast_add(rope_deltas)?
+                .unsqueeze(0)?
+                .broadcast_as((3, bs, seq_len))?
+                .contiguous()?
+                .to_dtype(candle_core::DType::U32)?
+            } else {
+                let (position_ids, rope_deltas) =
+                    self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
+                self.rope_deltas = Some(rope_deltas);
+                position_ids
+            }
         } else {
             let (position_ids, rope_deltas) =
                 self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
@@ -1384,40 +1392,42 @@ impl Qwen3_5Model {
         seqlen_offset: usize,
     ) -> Result<Tensor> {
         let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
-        if let Some(pixel_values) = pixel_values
-            && let Some(image_grid_thw) = image_grid_thw
-            && let Some(visual) = self.visual.as_ref()
-        {
-            let (image_embeds, _) = visual.forward(pixel_values, image_grid_thw)?;
-            // println!("image_embeds: {}", image_embeds);
-            let vision_mask = get_equal_mask(input_ids, self.image_token_id)?;
-            let n_image_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
-            if n_image_tokens as usize != image_embeds.dim(0)? {
-                return Err(anyhow!(format!(
-                    "n_image_token num: {} not equal to image_embed len: {}",
-                    n_image_tokens,
-                    image_embeds.dim(0)?
-                )));
+        if let Some(pixel_values) = pixel_values {
+            if let Some(image_grid_thw) = image_grid_thw {
+                if let Some(visual) = self.visual.as_ref() {
+                    let (image_embeds, _): (Tensor, _) = visual.forward(pixel_values, image_grid_thw)?;
+                    // println!("image_embeds: {}", image_embeds);
+                    let vision_mask = get_equal_mask(input_ids, self.image_token_id)?;
+                    let n_image_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
+                    if n_image_tokens as usize != image_embeds.dim(0)? {
+                        return Err(anyhow!(format!(
+                            "n_image_token num: {} not equal to image_embed len: {}",
+                            n_image_tokens,
+                            image_embeds.dim(0)?
+                        )));
+                    }
+                    let image_embeds = image_embeds.to_dtype(inputs_embeds.dtype())?;
+                    inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;
+                }
             }
-            let image_embeds = image_embeds.to_dtype(inputs_embeds.dtype())?;
-            inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;
         }
-        if let Some(pixel_values_video) = pixel_values_video
-            && let Some(video_grid_thw) = video_grid_thw
-            && let Some(visual) = self.visual.as_ref()
-        {
-            let (video_embeds, _) = visual.forward(pixel_values_video, video_grid_thw)?;
-            let vision_mask = get_equal_mask(input_ids, self.video_token_id)?;
-            let n_video_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
-            if n_video_tokens as usize != video_embeds.dim(0)? {
-                return Err(anyhow!(format!(
-                    "n_video_tokens num: {} not equal to video_embeds len: {}",
-                    n_video_tokens,
-                    video_embeds.dim(0)?
-                )));
+        if let Some(pixel_values_video) = pixel_values_video {
+            if let Some(video_grid_thw) = video_grid_thw {
+                if let Some(visual) = self.visual.as_ref() {
+                    let (video_embeds, _): (Tensor, _) = visual.forward(pixel_values_video, video_grid_thw)?;
+                    let vision_mask = get_equal_mask(input_ids, self.video_token_id)?;
+                    let n_video_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
+                    if n_video_tokens as usize != video_embeds.dim(0)? {
+                        return Err(anyhow!(format!(
+                            "n_video_tokens num: {} not equal to video_embeds len: {}",
+                            n_video_tokens,
+                            video_embeds.dim(0)?
+                        )));
+                    }
+                    let video_embeds = video_embeds.to_dtype(inputs_embeds.dtype())?;
+                    inputs_embeds = masked_scatter_dim0(&inputs_embeds, &video_embeds, &vision_mask)?;
+                }
             }
-            let video_embeds = video_embeds.to_dtype(inputs_embeds.dtype())?;
-            inputs_embeds = masked_scatter_dim0(&inputs_embeds, &video_embeds, &vision_mask)?;
         }
         // println!("visual : {}", inputs_embeds);
         let position_ids = self.compute_3d_position_ids(

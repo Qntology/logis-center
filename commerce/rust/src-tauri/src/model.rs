@@ -1,6 +1,7 @@
 use crate::utils;
 use anyhow::anyhow;
 use crate::models::qwen::generate::QwenVLGenerateModel;
+use crate::models::qwen3_5::generate::Qwen3_5GenerateModel;
 use crate::models::embedding::EmbeddingModel;
 use crate::openai_types::{
     ChatCompletionParameters,
@@ -138,6 +139,7 @@ pub enum ModelSize {
 pub struct LogisModel {
     pub app_handle: tauri::AppHandle,
     pub generator: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, // Primary Active Slot (GPU)
+    pub qwen3_5_generator: Arc<TokioMutex<Option<Qwen3_5GenerateModel>>>, // Qwen 3.5 Slot
     pub small_hibernation: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, // 0.6B RAM Slot
     pub large_hibernation: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, // 2B RAM Slot
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
@@ -149,6 +151,7 @@ pub struct LogisModel {
     // Config for Lazy Reloading
     small_model_path: String,
     large_model_path: String,
+    qwen3_5_model_path: String,
     embedding_path: std::path::PathBuf,
     device_config: utils::DeviceConfig,
     max_tokens_limit: u32,
@@ -161,6 +164,8 @@ impl LogisModel {
         // Clear everything
         let mut gen = self.generator.lock().await;
         *gen = None;
+        let mut q35_gen = self.qwen3_5_generator.lock().await;
+        *q35_gen = None;
         let mut s_hib = self.small_hibernation.lock().await;
         *s_hib = None;
         let mut l_hib = self.large_hibernation.lock().await;
@@ -221,6 +226,14 @@ impl LogisModel {
                 let _ = g.clear_kv_cache();
                 let _ = g.qwen.drop_kv_storage(); 
                 drop(g); 
+            }
+        }
+        {
+            let mut q35_gen = self.qwen3_5_generator.lock().await;
+            if let Some(mut g) = q35_gen.take() {
+                println!("[DIAG-PURGE] Dropping Qwen 3.5 Generator...");
+                g.clear_kv_cache();
+                drop(g);
             }
         }
         {
@@ -625,6 +638,31 @@ impl LogisModel {
         Ok(())
     }
 
+    pub async fn ensure_qwen3_5(&self) -> anyhow::Result<()> {
+        let mut q35_gen_guard = self.qwen3_5_generator.lock().await;
+        if q35_gen_guard.is_none() {
+            println!("[MODEL] Loading Qwen 3.5 Generator (0.8B)...");
+            
+            // Unload others to save VRAM
+            self.unload_generator().await; 
+            
+            let path = self.qwen3_5_model_path.clone();
+            let dev = self.device_config.device.clone();
+            
+            let gen = tokio::task::spawn_blocking(move || {
+                // Find GGUF and MMPROJ in the directory
+                let gguf_files = utils::find_type_files(&path, "gguf").unwrap_or_default();
+                let model_gguf = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned().ok_or_else(|| anyhow!("No model GGUF found"))?;
+                let mmproj_gguf = gguf_files.iter().find(|f| f.contains("mmproj")).cloned();
+                
+                Qwen3_5GenerateModel::init_from_gguf(&model_gguf, mmproj_gguf.as_deref(), Some(&dev))
+            }).await??;
+            
+            *q35_gen_guard = Some(gen);
+        }
+        Ok(())
+    }
+
     pub async fn ensure_embedding(&self) -> anyhow::Result<()> {
         let current_size = { *self.current_size.lock().await };
         
@@ -709,6 +747,7 @@ impl LogisModel {
 
         let small_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf"));
         let large_model_path = normalize_path(base_path.join("Qwen3-VL-2B-Instruct-gguf"));
+        let qwen3_5_model_path = normalize_path(base_path.join("Qwen3.5-0.8B-Instruct-gguf"));
         let embedding_path = base_path.join("embeddinggemma-300m");
 
         let max_tokens_limit = 65536; 
@@ -716,6 +755,7 @@ impl LogisModel {
         Ok(Self {
             app_handle,
             generator: Arc::new(TokioMutex::new(None)),
+            qwen3_5_generator: Arc::new(TokioMutex::new(None)),
             small_hibernation: Arc::new(TokioMutex::new(None)),
             large_hibernation: Arc::new(TokioMutex::new(None)),
             embedding_model: Arc::new(TokioMutex::new(None)),
@@ -724,6 +764,7 @@ impl LogisModel {
             dual_mode_enabled: true, 
             small_model_path,
             large_model_path,
+            qwen3_5_model_path,
             embedding_path,
             device_config: config.clone(),
             max_tokens_limit: max_tokens_limit as u32,
@@ -741,30 +782,22 @@ impl LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
-        // [VISION-FIX] 이미지 추출은 반드시 2B (Large) 모델을 사용해야 합니다.
-        {
-            let gen_guard = self.generator.lock().await;
-            if gen_guard.is_none() {
-                drop(gen_guard);
-                self.ensure_generator(ModelSize::Large).await?;
-            }
-        }
+        // [QWEN3.5-INTEGRATION] Use Qwen 3.5 for image extraction
+        self.ensure_qwen3_5().await?;
 
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
             let prompt = get_image_extraction_prompt("kr", &language, "tracking", "");
             
-            // 이미지 분석은 Large 모델로 진행
-            let result_str = self.chat_with_image_spinner(
+            let result_str = self.chat_with_qwen3_5_image_spinner(
                 prompt, 
                 Some(dynamic_image), 
                 app_handle, 
                 "extraction-progress", 
-                json!({ "category": "Vision Analysis", "summary": "Analyzing image with 2B model..." }), 
+                json!({ "category": "Vision Analysis", "summary": "Analyzing image with Qwen 3.5..." }), 
                 1024, 
                 cancel_token.clone(), 
-                Some(task_id.clone()),
-                None
+                Some(task_id.clone())
             ).await?;
 
             let extracted_data = crate::parsing::parse_json_from_llm(&result_str);
@@ -823,6 +856,64 @@ impl LogisModel {
             }));
             Ok(())
         }
+    }
+
+    pub async fn chat_with_qwen3_5_image_spinner(
+        &self, 
+        prompt: String, 
+        image: Option<DynamicImage>,
+        _app_handle: &tauri::AppHandle,
+        _event_name: &str,
+        base_payload: Value,
+        max_tokens: usize,
+        _cancel_token: Option<Arc<AtomicBool>>,
+        session_id: Option<String>
+    ) -> anyhow::Result<String> {
+        self.ensure_qwen3_5().await?;
+
+        if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
+            crate::scheduler::log_task_progress(_app_handle, task_id, &base_payload);
+        } else if let Some(sid) = &session_id {
+             crate::scheduler::log_task_progress(_app_handle, sid, &base_payload);
+        }
+
+        let mut q35_gen_guard = self.qwen3_5_generator.lock().await;
+        let gen = q35_gen_guard.as_mut().ok_or_else(|| anyhow!("Qwen 3.5 Generator is unloaded"))?;
+        
+        let mut content_parts = Vec::new();
+        
+        if let Some(img) = image {
+            let mut buf = Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Png)?;
+            let b64 = BASE64_STANDARD.encode(buf.into_inner());
+            let url = format!("data:image/png;base64,{}", b64);
+            
+            content_parts.push(ChatCompletionRequestMessageContentPart::ImageURL(
+                ChatCompletionRequestMessageContentPartImage {
+                    image_url: ImageURL { url, detail: None }
+                }
+            ));
+        }
+
+        content_parts.push(ChatCompletionRequestMessageContentPart::Text(
+            ChatCompletionRequestMessageContentPartText { text: prompt }
+        ));
+
+        let message = ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Array(content_parts),
+            name: None,
+        };
+
+        let params = ChatCompletionParameters {
+            messages: vec![ChatCompletionRequestMessage::User(message)],
+            model: "qwen3.5".to_string(),
+            max_tokens: Some(max_tokens as u32),
+            temperature: Some(0.1),
+            top_p: Some(0.9),
+            ..Default::default()
+        };
+        
+        gen.generate(params).map_err(|e| anyhow!("Qwen 3.5 Inference failed: {}", e))
     }
 
     pub fn is_cpu(&self) -> bool {
