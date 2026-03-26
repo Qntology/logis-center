@@ -955,7 +955,7 @@ impl Qwen3_5TextModel {
             .get_matedata("qwen35.rope.dimension_sections")?
             .to_vec()?
             .iter()
-            .map(|v: &crate::models::common::gguf::MetadataValue| v.to_i32().map(|x| x as usize))
+            .map(|v: &candle_core::quantized::gguf_file::Value| v.to_i32().map(|x| x as usize))
             .collect::<Result<Vec<usize>, candle_core::Error>>()?;
         let _ = mrope_section.pop();
         let rms_norm_eps = gguf

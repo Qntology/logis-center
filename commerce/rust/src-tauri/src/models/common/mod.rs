@@ -189,10 +189,12 @@ impl NaiveAttention {
         let value_states = value_states
             .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let (query_states, key_states) = if let Some(cos) = cos
-            && let Some(sin) = sin
-        {
-            apply_rotary_pos_emb(&query_states, &key_states, cos, sin, tof32)?
+        let (query_states, key_states) = if let Some(cos) = cos {
+            if let Some(sin) = sin {
+                apply_rotary_pos_emb(&query_states, &key_states, cos, sin, tof32)?
+            } else {
+                (query_states, key_states)
+            }
         } else {
             (query_states, key_states)
         };
@@ -332,13 +334,15 @@ impl QKVCatAttention {
         let query_states = qkv.i(0)?.contiguous()?;
         let key_states = qkv.i(1)?.contiguous()?;
         let value_states = qkv.i(2)?.contiguous()?;
-        let (query_states, key_states) = if let Some(cos) = cos
-            && let Some(sin) = sin
-        {
-            if use_roformer {
-                apply_rotary_pos_emb_roformer(&query_states, &key_states, cos, sin, tof32)?
+        let (query_states, key_states) = if let Some(cos) = cos {
+            if let Some(sin) = sin {
+                if use_roformer {
+                    apply_rotary_pos_emb_roformer(&query_states, &key_states, cos, sin, tof32)?
+                } else {
+                    apply_rotary_pos_emb(&query_states, &key_states, cos, sin, tof32)?
+                }
             } else {
-                apply_rotary_pos_emb(&query_states, &key_states, cos, sin, tof32)?
+                (query_states, key_states)
             }
         } else {
             (query_states, key_states)

@@ -182,16 +182,16 @@ impl<R: Read + Seek> Gguf<R> {
 
                 let mut add_tokens = vec![];
                 for (id, type_) in token_types.into_iter().enumerate() {
-                    if type_ == 3
-                        && let Some(token_str) = vocab.get(id)
-                    {
-                        let add_token = AddedToken::from(token_str.clone(), true);
-                        add_tokens.push(add_token);
-                    } else if type_ == 4
-                        && let Some(token_str) = vocab.get(id)
-                    {
-                        let add_token = AddedToken::from(token_str.clone(), false);
-                        add_tokens.push(add_token);
+                    if type_ == 3 {
+                        if let Some(token_str) = vocab.get(id) {
+                            let add_token = AddedToken::from(token_str.clone(), true);
+                            add_tokens.push(add_token);
+                        }
+                    } else if type_ == 4 {
+                        if let Some(token_str) = vocab.get(id) {
+                            let add_token = AddedToken::from(token_str.clone(), false);
+                            add_tokens.push(add_token);
+                        }
                     }
                 }
                 let _ = tokenizer.add_special_tokens(&add_tokens);

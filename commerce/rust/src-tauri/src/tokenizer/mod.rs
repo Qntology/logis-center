@@ -7,6 +7,10 @@ pub struct TokenizerModel {
 }
 
 impl TokenizerModel {
+    pub fn new(tokenizer: Tokenizer) -> Self {
+        Self { tokenizer }
+    }
+
     pub fn init(path: &str) -> Result<Self> {
         let path = path.to_string();
         assert!(

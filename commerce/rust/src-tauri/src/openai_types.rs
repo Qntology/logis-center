@@ -62,6 +62,8 @@ pub enum ChatCompletionRequestUserMessageContent {
 pub enum ChatCompletionRequestMessageContentPart {
     Text(ChatCompletionRequestMessageContentPartText),
     ImageURL(ChatCompletionRequestMessageContentPartImage),
+    #[serde(rename = "video_url")]
+    VideoURL(ChatCompletionRequestMessageContentPartVideo),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -75,10 +77,20 @@ pub struct ChatCompletionRequestMessageContentPartImage {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ChatCompletionRequestMessageContentPartVideo {
+    pub video_url: VideoURL,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ImageURL {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VideoURL {
+    pub url: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]

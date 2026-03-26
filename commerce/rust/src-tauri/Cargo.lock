@@ -8940,6 +8940,7 @@ dependencies = [
 name = "rust"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "arrow-array",
  "arrow-schema",

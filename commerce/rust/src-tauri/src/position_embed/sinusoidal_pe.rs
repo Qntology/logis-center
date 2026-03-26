@@ -9,10 +9,14 @@ pub struct SinusoidalPositionEncoderCat {
 
 impl SinusoidalPositionEncoderCat {
     pub fn new(dim: Option<usize>, save_freq: bool, device: &Device) -> Result<Self> {
-        let inv_freq = if save_freq && let Some(dim) = dim {
-            let inv_freq = compute_default_rope_parameters(dim, 10000.0);
-            let inv_freq = Tensor::from_slice(&inv_freq, (1, inv_freq.len()), device)?;
-            Some(inv_freq)
+        let inv_freq = if save_freq {
+            if let Some(dim) = dim {
+                let inv_freq = compute_default_rope_parameters(dim, 10000.0);
+                let inv_freq = Tensor::from_slice(&inv_freq, (1, inv_freq.len()), device)?;
+                Some(inv_freq)
+            } else {
+                None
+            }
         } else {
             None
         };

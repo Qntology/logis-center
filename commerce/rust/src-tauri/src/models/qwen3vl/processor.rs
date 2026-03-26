@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use aha_openai_dive::v1::resources::chat::{
-    ChatCompletionParameters, ChatMessage, ChatMessageContent, ChatMessageContentPart,
+use crate::openai_types::{
+    ChatCompletionParameters, ChatCompletionRequestMessage as ChatMessage, ChatCompletionRequestUserMessageContent as ChatMessageContent, ChatCompletionRequestMessageContentPart as ChatMessageContentPart,
 };
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Shape, Tensor};
@@ -131,16 +131,16 @@ impl Qwen3VLProcessor {
         vision_map.insert("image".to_string(), Vec::new());
         vision_map.insert("video".to_string(), Vec::new());
         for chat_mes in mes.messages.clone() {
-            if let ChatMessage::User { content, .. } = chat_mes
-                && let ChatMessageContent::ContentPart(part_vec) = content
-            {
-                for part in part_vec {
-                    if let ChatMessageContentPart::Image(img_part) = part {
-                        let img_url = img_part.image_url;
-                        vision_map.get_mut("image").unwrap().push(img_url.url);
-                    } else if let ChatMessageContentPart::Video(video_part) = part {
-                        let video_url = video_part.video_url;
-                        vision_map.get_mut("video").unwrap().push(video_url.url);
+            if let ChatMessage::User(user_mes) = chat_mes {
+                if let ChatMessageContent::Array(part_vec) = user_mes.content {
+                    for part in part_vec {
+                        if let ChatMessageContentPart::ImageURL(img_part) = part {
+                            let img_url = img_part.image_url;
+                            vision_map.get_mut("image").unwrap().push(img_url.url);
+                        } else if let ChatMessageContentPart::VideoURL(video_part) = part {
+                            let video_url = video_part.video_url;
+                            vision_map.get_mut("video").unwrap().push(video_url.url);
+                        }
                     }
                 }
             }
@@ -286,7 +286,7 @@ impl Qwen3VLProcessor {
         fps: f32,
         t_merge_size: usize,
     ) -> Result<Vec<f32>> {
-        let indices = if !frames_indices.len().is_multiple_of(t_merge_size) {
+        let mut indices = if frames_indices.len() % t_merge_size != 0 {
             let mut frames_indices = frames_indices.clone();
             let last = frames_indices[frames_indices.len() - 1];
             let pad_len = t_merge_size - frames_indices.len() % t_merge_size;
@@ -409,9 +409,8 @@ impl Qwen3VLProcessor {
                     self.img_process_cfg.merge_size,
                 )?;
                 let mut video_placeholder = "".to_string();
-                let [t, h, w] = grid_i.to_vec1::<u32>()?[..] else {
-                    return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
-                };
+                let grid_vec = grid_i.to_vec1::<u32>()?;
+                let (t, h, w) = (grid_vec[0], grid_vec[1], grid_vec[2]);
                 let frame_seqlen = h * w / merge_length as u32;
                 for frame_idx in 0..t {
                     let curr_time = curr_timestamp[frame_idx as usize];
@@ -491,7 +490,7 @@ pub fn get_video_data(
     let mut frame_id = 0_u32;
 
     // 图片帧使用scaler reshape的时候需要保证宽高是16的倍数,不然reshape出来的是损坏的图片
-    // 所以计算resize的目标宽高时,需要用16和image_factor的最小公倍数
+    // 所以计算resize的目标宽高时,需要用16和image_factor의 최소공배수
     let (resize_h, resize_w) = video_smart_resize(
         nframes,
         video_h,
@@ -519,7 +518,7 @@ pub fn get_video_data(
         |decoder: &mut ffmpeg::decoder::Video| -> Result<()> {
             let mut decoded = ffmpeg::frame::Video::empty();
             while decoder.receive_frame(&mut decoded).is_ok() {
-                if frame_id.is_multiple_of(sample_interval) {
+                if frame_id % sample_interval == 0 {
                     frame_indices.push(frame_id);
                     let mut rgb_frame = ffmpeg::frame::Video::empty();
                     scaler
