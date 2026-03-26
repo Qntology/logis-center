@@ -804,6 +804,10 @@ impl LogisModel {
                 cancel_token.clone(), 
                 Some(task_id.clone())
             ).await?;
+            
+            println!("\n=======================================");
+            println!("[DEBUG-VISION] 🤖 AI Raw Response:\n{}", result_str);
+            println!("=======================================\n");
 
             let extracted_data = crate::parsing::parse_json_from_llm(&result_str);
             
