@@ -995,25 +995,17 @@ impl Qwen3_5TextModel {
         })
     }
 
-    pub fn forward(&mut self, inputs_embeds: &Tensor, position_ids: &Tensor) -> Result<Tensor> {
+    pub async fn forward(&mut self, inputs_embeds: &Tensor, position_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
-
-        let (cos, sin) =
-            self.rotary_emb
-                .forward(position_ids, self.dtype, self.mrope_section.clone())?;
-        let mut xs = inputs_embeds.clone();
-        let attention_mask: Option<Tensor> = {
-            if seq_len <= 1 {
-                None
-            } else {
-                Some(prepare_causal_attention_mask(
-                    b_size,
-                    seq_len,
-                    0,
-                    inputs_embeds.device(),
-                )?)
-            }
+        let (cos, sin) = self.rotary_emb.forward(position_ids, self.dtype, self.mrope_section.clone())?;
+        let mut xs = if !inputs_embeds.device().same_device(&cos.device()) { inputs_embeds.to_device(&cos.device())? } else { inputs_embeds.clone() };
+        
+        let attention_mask: Option<Tensor> = { 
+            if seq_len <= 1 { None } 
+            // [CRITICAL FIX] 0 대신 seqlen_offset을 넘겨 과거 토큰을 기억하게 만듭니다.
+            else { Some(prepare_causal_attention_mask(b_size, seq_len, seqlen_offset, xs.device())?) } 
         };
+
         // let mut i = 0;
         for layer in self.layers.iter_mut() {
             let layer_mask =
@@ -1381,14 +1373,13 @@ impl Qwen3_5Model {
         Ok(position_ids)
     }
 
-    pub fn forward(
+    pub async fn forward(
         &mut self,
         input_ids: &Tensor,
         pixel_values: Option<&Tensor>,
         image_grid_thw: Option<&Tensor>,
         pixel_values_video: Option<&Tensor>,
         video_grid_thw: Option<&Tensor>,
-        // cache_position: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
         let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
@@ -1396,16 +1387,7 @@ impl Qwen3_5Model {
             if let Some(image_grid_thw) = image_grid_thw {
                 if let Some(visual) = self.visual.as_ref() {
                     let (image_embeds, _): (Tensor, _) = visual.forward(pixel_values, image_grid_thw)?;
-                    // println!("image_embeds: {}", image_embeds);
                     let vision_mask = get_equal_mask(input_ids, self.image_token_id)?;
-                    let n_image_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
-                    if n_image_tokens as usize != image_embeds.dim(0)? {
-                        return Err(anyhow!(format!(
-                            "n_image_token num: {} not equal to image_embed len: {}",
-                            n_image_tokens,
-                            image_embeds.dim(0)?
-                        )));
-                    }
                     let image_embeds = image_embeds.to_dtype(inputs_embeds.dtype())?;
                     inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;
                 }
@@ -1416,30 +1398,49 @@ impl Qwen3_5Model {
                 if let Some(visual) = self.visual.as_ref() {
                     let (video_embeds, _): (Tensor, _) = visual.forward(pixel_values_video, video_grid_thw)?;
                     let vision_mask = get_equal_mask(input_ids, self.video_token_id)?;
-                    let n_video_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
-                    if n_video_tokens as usize != video_embeds.dim(0)? {
-                        return Err(anyhow!(format!(
-                            "n_video_tokens num: {} not equal to video_embeds len: {}",
-                            n_video_tokens,
-                            video_embeds.dim(0)?
-                        )));
-                    }
                     let video_embeds = video_embeds.to_dtype(inputs_embeds.dtype())?;
                     inputs_embeds = masked_scatter_dim0(&inputs_embeds, &video_embeds, &vision_mask)?;
                 }
             }
         }
-        // println!("visual : {}", inputs_embeds);
-        let position_ids = self.compute_3d_position_ids(
-            input_ids,
-            &inputs_embeds,
-            image_grid_thw,
-            video_grid_thw,
-            seqlen_offset,
-        )?;
-        let outputs = self.language_model.forward(&inputs_embeds, &position_ids)?;
-        let seq_len = outputs.dim(1)?;
-        let hidden_state = outputs.narrow(1, seq_len - 1, 1)?;
+
+        let position_ids = self.compute_3d_position_ids(input_ids, &inputs_embeds, image_grid_thw, video_grid_thw, seqlen_offset)?;
+        
+        // =======================================================
+        // [ULTIMATE FIX] 비전 데이터까지 모두 임베딩에 섞인 후 OOM 방지 청크 실행
+        // =======================================================
+        let total_len = inputs_embeds.dim(1)?;
+        let chunk_size = 1024;
+        let mut final_hidden_state = None;
+
+        if total_len > 1 {
+            let mut processed = 0;
+            let mut current_offset = seqlen_offset;
+            
+            while processed < total_len {
+                let take = (total_len - processed).min(chunk_size);
+                let chunk_embeds = inputs_embeds.narrow(1, processed, take)?;
+                let chunk_pos_ids = position_ids.narrow(2, processed, take)?;
+
+                // 여기서 await가 정상적으로 동작합니다!
+                let outputs = self.language_model.forward(&chunk_embeds, &chunk_pos_ids, current_offset).await?;
+
+                if processed + take == total_len {
+                    let seq_len = outputs.dim(1)?;
+                    final_hidden_state = Some(outputs.narrow(1, seq_len - 1, 1)?);
+                }
+
+                processed += take;
+                current_offset += take;
+            }
+        } else {
+            let outputs = self.language_model.forward(&inputs_embeds, &position_ids, seqlen_offset).await?;
+            let seq_len = outputs.dim(1)?;
+            final_hidden_state = Some(outputs.narrow(1, seq_len - 1, 1)?);
+        }
+        // =======================================================
+
+        let hidden_state = final_hidden_state.unwrap();
         let logits = self.lm_head.forward(&hidden_state)?;
         Ok(logits)
     }

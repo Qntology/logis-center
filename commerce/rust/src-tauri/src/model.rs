@@ -638,25 +638,39 @@ impl LogisModel {
         Ok(())
     }
 
-    pub async fn ensure_qwen3_5(&self) -> anyhow::Result<()> {
+    pub async fn ensure_qwen3_5(&self, size: ModelSize) -> anyhow::Result<()> {
         // Lock을 짧게 잡아서 로드 필요한지(상태)만 먼저 확인합니다.
         let needs_load = {
-            self.qwen3_5_generator.lock().await.is_none()
+            let guard = self.qwen3_5_generator.lock().await;
+            if let Some(gen) = guard.as_ref() {
+                // pre_processor가 있으면 Large(비전+텍스트), 없으면 Small(텍스트)
+                let is_large = gen.pre_processor.is_some();
+                let wants_large = size == ModelSize::Large;
+                is_large != wants_large // 내가 원하는 크기와 다르면 로드 필요
+            } else {
+                true
+            }
         };
 
         if needs_load {
-            println!("[MODEL] Loading Qwen 3.5 Generator (0.8B)...");
+            println!("[MODEL] Loading Qwen 3.5 Generator (0.8B) for size {:?}...", size);
             
-            // 이제 쥐고 있는 Lock이 없으므로 데드락 없이 안전하게 호출됩니다.
+            // 메모리 확보를 위해 기존 모델 해제
             self.unload_generator().await; 
             
             let path = self.qwen3_5_model_path.clone();
             let dev = self.device_config.device.clone();
             
             let gen = tokio::task::spawn_blocking(move || {
-                let gguf_files = utils::find_type_files(&path, "gguf").unwrap_or_default();
-                let model_gguf = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned().ok_or_else(|| anyhow!("No model GGUF found"))?;
-                let mmproj_gguf = gguf_files.iter().find(|f| f.contains("mmproj")).cloned();
+                let gguf_files = crate::utils::find_type_files(&path, "gguf").unwrap_or_default();
+                let model_gguf = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned().ok_or_else(|| anyhow::anyhow!("No model GGUF found"))?;
+                
+                // [CRITICAL FIX] Small이면 텍스트 가중치만! Large면 비전 가중치(mmproj)까지 로드!
+                let mmproj_gguf = if size == ModelSize::Large {
+                    gguf_files.iter().find(|f| f.contains("mmproj")).cloned()
+                } else {
+                    None
+                };
                 
                 Qwen3_5GenerateModel::init_from_gguf(&model_gguf, mmproj_gguf.as_deref(), Some(&dev))
             }).await??;
@@ -787,8 +801,8 @@ impl LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
-        // [QWEN3.5-INTEGRATION] Use Qwen 3.5 for image extraction
-        self.ensure_qwen3_5().await?;
+        // [QWEN3.5-INTEGRATION] 이미지 추출이므로 Large(비전+텍스트) 모드로 호출합니다.
+        self.ensure_qwen3_5(ModelSize::Large).await?;
 
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
@@ -886,7 +900,9 @@ impl LogisModel {
         _cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
-        self.ensure_qwen3_5().await?;
+        // [VISION-DYNAMIC] 이미지가 전달되었으면 Large, 없으면 Small만 가볍게 올립니다!
+        let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
+        self.ensure_qwen3_5(target_size).await?;
 
         if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
             crate::scheduler::log_task_progress(_app_handle, task_id, &base_payload);
@@ -930,7 +946,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params).map_err(|e| anyhow!("Qwen 3.5 Inference failed: {}", e))
+        gen.generate(params).await.map_err(|e| anyhow!("Qwen 3.5 Inference failed: {}", e))
     }
 
     pub fn is_cpu(&self) -> bool {

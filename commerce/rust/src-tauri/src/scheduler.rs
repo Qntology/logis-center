@@ -592,6 +592,43 @@ async fn process_task(
                 println!("[Scheduler] Classified as: {}", page_type);
             }
         }
+
+        // {
+        //     model.ensure_qwen3_5(crate::model::ModelSize::Small).await?;
+
+        //     let params = ChatCompletionParameters {
+        //         messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+        //             content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+        //             name: None,
+        //         })],
+        //         model: "qwen".to_string(), 
+        //         max_tokens: Some(16),
+        //         temperature: Some(0.1),
+        //         ..Default::default()
+        //     };
+
+        //     // 2. 구형 generator 대신 qwen3_5_generator 사용!
+        //     if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+        //         println!("[Scheduler] 0.8B Step A: Asking classification question...");
+                
+        //         // 3. 최적화된 generate_part 함수 호출
+        //         let generation_result = gen.generate_part(&params, false, 0, None).await?;
+        //         let res = generation_result.text; // 결과 텍스트 추출
+                
+        //         println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
+                
+        //         let _ = data_manager.offload(&res, "step_a_res");
+        //         let type_info = parsing::parse_json_from_llm(&res); 
+        //         page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
+        //         if page_type.is_empty() {
+        //             page_type = match task.r#type.as_str() {
+        //                 "image_extraction" => "tracking".to_string(),
+        //                 _ => "unknown".to_string(),
+        //             };
+        //         }
+        //         println!("[Scheduler] Classified as: {}", page_type);
+        //     }
+        // }
         
         if page_type.is_empty() || page_type == "unknown" { 
             model.deep_purge_resources().await;
