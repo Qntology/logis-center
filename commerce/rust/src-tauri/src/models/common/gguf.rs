@@ -49,6 +49,30 @@ impl<R: Read + Seek> Gguf<R> {
         Ok(QuantizedLinear::new(weight, bias))
     }
 
+    pub fn load_proj_auto(&mut self, prefix: &str, bias: bool) -> Result<ProjKind> {
+        let base_name = format!("{prefix}.weight.base");
+        
+        let bias_tensor = if bias {
+            self.get_dequantized(&format!("{prefix}.bias")).ok()
+        } else {
+            None
+        };
+
+        if self.ct.tensor_infos.contains_key(&base_name) {
+            // [TurboQuant 모드]
+            let base_quant = self.qmatmul(&base_name)?;
+            let residual_8bit = self.qmatmul(&format!("{prefix}.weight.residual"))?;
+            
+            Ok(ProjKind::TurboQuantProj(crate::models::qwen3_5::model::TurboQuantLinear::new(
+                base_quant, residual_8bit, bias_tensor
+            )))
+        } else {
+            // [하위 호환성 (일반 Q2_K, Q4_K 등)]
+            let q_linear = self.quantize_linear(prefix, bias)?;
+            Ok(ProjKind::QuantizedProj(q_linear))
+        }
+    }
+
     pub fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
         let weight = ws.dequantize(&self.device)?;
@@ -234,17 +258,24 @@ impl Module for QuantizedLinear {
     }
 }
 
+// [FIX] Added Debug and Clone derivation
 #[derive(Debug, Clone)]
 pub enum ProjKind {
-    QuantizedProj(QuantizedLinear),
     LinearProj(Linear),
+    QuantizedProj(QuantizedLinear),
+    // TurboQuant 추가
+    TurboQuantProj(crate::models::qwen3_5::model::TurboQuantLinear), 
 }
 
+// [CRITICAL FIX] Implement candle_core::Module instead of a loose forward function
+// so that it can be used with tensor.apply()
 impl Module for ProjKind {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
         match self {
-            ProjKind::QuantizedProj(q) => q.forward(xs),
             ProjKind::LinearProj(l) => l.forward(xs),
+            ProjKind::QuantizedProj(q) => q.forward(xs),
+            // Map anyhow::Error to candle_core::Error using string conversion
+            ProjKind::TurboQuantProj(t) => t.forward(xs).map_err(|e| candle_core::Error::Msg(e.to_string())), 
         }
     }
 }
@@ -327,6 +358,8 @@ impl GateUpDownMLPGguf {
 
 impl Module for GateUpDownMLPGguf {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
+        // [FIX] Map anyhow::Error to candle_core::Error where necessary if ProjKind was returning anyhow
+        // But since we just made ProjKind return candle_core::Result, this will now compile cleanly!
         let w1 = self.gate_proj.forward(xs)?.apply(&self.act)?;
         let w3 = self.up_proj.forward(xs)?;
         self.down_proj.forward(&(w1 * w3)?)
@@ -387,5 +420,36 @@ impl TwoLinearMLPGguf {
             .apply(&self.act)?
             .apply(&self.linear2)?;
         Ok(xs)
+    }
+}
+
+
+#[derive(Debug, Clone)]
+pub struct TurboQuantLinear {
+    inner_base_4bit: QMatMul,
+    inner_residual_8bit: QMatMul,
+    bias: Option<Tensor>,
+}
+
+impl Module for TurboQuantLinear {
+    fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
+        // 기존 QuantizedLinear와 동일하게 F16/F32를 안전하게 분기 처리
+        let out_base = if xs.dtype() == DType::F16 {
+            self.inner_base_4bit.forward_via_f16(xs)?
+        } else {
+            self.inner_base_4bit.forward(xs)?
+        };
+
+        let out_res = if xs.dtype() == DType::F16 {
+            self.inner_residual_8bit.forward_via_f16(xs)?
+        } else {
+            self.inner_residual_8bit.forward(xs)?
+        };
+
+        let mut out = out_base.add(&out_res)?;
+        if let Some(bias) = &self.bias {
+            out = out.broadcast_add(&bias.to_dtype(out.dtype())?)?;
+        }
+        Ok(out)
     }
 }

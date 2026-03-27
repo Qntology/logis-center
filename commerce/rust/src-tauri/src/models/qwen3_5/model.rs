@@ -24,6 +24,58 @@ use crate::{
     },
 };
 
+// [FIX] Add Debug derive
+#[derive(Clone, Debug)]
+pub struct TurboQuantLinear {
+    base_quant: QMatMul,
+    residual_8bit: QMatMul,
+    bias: Option<Tensor>,
+}
+
+impl TurboQuantLinear {
+    pub fn new(base_quant: QMatMul, residual_8bit: QMatMul, bias: Option<Tensor>) -> Self {
+        Self { base_quant, residual_8bit, bias }
+    }
+
+    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let (b, s, h) = xs.dims3()?;
+        let xs_flat = xs.reshape((b * s, h))?;
+        
+        let out_base = match &self.base_quant {
+            QMatMul::QTensor(_) => self.base_quant.forward(&xs_flat.to_dtype(DType::F32)?)?,
+            _ => self.base_quant.forward(&xs_flat)?,
+        };
+
+        let has_residual = match &self.residual_8bit {
+            QMatMul::Tensor(t) => t.elem_count() > 1,
+            _ => true,
+        };
+
+        let out = if has_residual {
+            let out_res = match &self.residual_8bit {
+                QMatMul::QTensor(_) => self.residual_8bit.forward(&xs_flat.to_dtype(DType::F32)?)?,
+                _ => self.residual_8bit.forward(&xs_flat)?,
+            };
+            
+            let out_res_aligned = if out_res.dtype() != out_base.dtype() {
+                out_res.to_dtype(out_base.dtype())?
+            } else {
+                out_res
+            };
+            
+            out_base.add(&out_res_aligned)?
+        } else {
+            out_base
+        };
+
+        let mut out = out.reshape((b, s, ()))?;
+        if let Some(bias) = &self.bias {
+            out = out.broadcast_add(bias)?;
+        }
+        Ok(out)
+    }
+}
+
 pub struct Qwen3_5RMSNorm {
     eps: f64,
     weight: Tensor,
@@ -664,24 +716,24 @@ impl Qwen3_5Attention {
         let num_kv_groups = num_attention_heads / num_key_value_heads;
         let head_dim = gguf.get_matedata("qwen35.attention.key_length")?.to_u32()? as usize;
         let scaling = 1f64 / f64::sqrt(head_dim as f64);
-        // let q_proj = gguf.qmatmul(&format!("{prefix}.attn_q.weight"))?;
-        // let k_proj = gguf.qmatmul(&format!("{prefix}.attn_k.weight"))?;
-        // let v_proj = gguf.qmatmul(&format!("{prefix}.attn_v.weight"))?;
-        // let o_proj = gguf.qmatmul(&format!("{prefix}.attn_output.weight"))?;
-        let q_proj = gguf.quantize_linear(&format!("{prefix}.attn_q"), false)?;
-        let k_proj = gguf.quantize_linear(&format!("{prefix}.attn_k"), false)?;
-        let v_proj = gguf.quantize_linear(&format!("{prefix}.attn_v"), false)?;
-        let o_proj = gguf.quantize_linear(&format!("{prefix}.attn_output"), false)?;
+        
+        // [CRITICAL FIX] gguf.load_proj_auto directly returns a ProjKind. 
+        // Do NOT wrap it in ProjKind::QuantizedProj().
+        let q_proj = gguf.load_proj_auto(&format!("{prefix}.attn_q"), false)?;
+        let k_proj = gguf.load_proj_auto(&format!("{prefix}.attn_k"), false)?;
+        let v_proj = gguf.load_proj_auto(&format!("{prefix}.attn_v"), false)?;
+        let o_proj = gguf.load_proj_auto(&format!("{prefix}.attn_output"), false)?;
+        
         let q_norm_weight = gguf.get_dequantized(&format!("{prefix}.attn_q_norm.weight"))?;
         let q_norm = Qwen3_5RMSNorm::from_weight(q_norm_weight, rms_norm_eps)?;
         let k_norm_weight = gguf.get_dequantized(&format!("{prefix}.attn_k_norm.weight"))?;
         let k_norm = Qwen3_5RMSNorm::from_weight(k_norm_weight, rms_norm_eps)?;
 
         Ok(Self {
-            q_proj: ProjKind::QuantizedProj(q_proj),
-            k_proj: ProjKind::QuantizedProj(k_proj),
-            v_proj: ProjKind::QuantizedProj(v_proj),
-            o_proj: ProjKind::QuantizedProj(o_proj),
+            q_proj, // [FIX] Just pass it directly
+            k_proj,
+            v_proj,
+            o_proj,
             q_norm,
             k_norm,
             num_attention_heads,

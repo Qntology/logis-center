@@ -26,6 +26,124 @@ use crate::{
 };
 use crate::models::qwen::generate::SLOT_MANAGER;
 
+#[derive(Clone)]
+pub struct TurboQuantLinear {
+    // Q2_K, Q3_K, Q4_K 등 어떤 포맷이든 베이스로 들어갈 수 있는 텐서
+    base_quant: QMatMul, 
+    // 8-bit 이상치/잔차 가중치 (예: Q8_0)
+    residual_8bit: QMatMul,
+    bias: Option<Tensor>,
+    device: Device,
+}
+
+impl TurboQuantLinear {
+    pub fn new(base_quant: QMatMul, residual_8bit: QMatMul, bias: Option<Tensor>, device: Device) -> Self {
+        Self { base_quant, residual_8bit, bias, device }
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    pub fn clear(&mut self) {
+        let dummy = Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap();
+        self.base_quant = QMatMul::Tensor(dummy.clone());
+        self.residual_8bit = QMatMul::Tensor(dummy);
+        self.bias = None;
+        self.device = Device::Cpu;
+    }
+
+    pub fn is_cleared(&self) -> bool {
+        match &self.base_quant {
+            QMatMul::Tensor(t) => t.elem_count() <= 1,
+            _ => false,
+        }
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        if self.is_cleared() {
+            return Err(anyhow::anyhow!("TurboQuantLinear weight is cleared. Reload required."));
+        }
+        
+        if !self.device.same_device(device) {
+            let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+
+            // Move Base Quant (Q2_K 등)
+            self.base_quant = match &self.base_quant {
+                QMatMul::QTensor(q) => {
+                    match q.dequantize(device) {
+                        Ok(t) => QMatMul::Tensor(t.to_dtype(target_dtype).unwrap_or(t)),
+                        Err(_) => QMatMul::QTensor(q.clone()) // Q2_K 변환 실패 시 안전 장치
+                    }
+                },
+                QMatMul::Tensor(t) => QMatMul::Tensor(t.to_device(device)?.to_dtype(target_dtype)?),
+                QMatMul::TensorF16(t) => QMatMul::TensorF16(t.to_device(device)?.to_dtype(target_dtype)?),
+            };
+
+            // Move 8-bit residual
+            self.residual_8bit = match &self.residual_8bit {
+                QMatMul::QTensor(q) => {
+                    match q.dequantize(device) {
+                        Ok(t) => QMatMul::Tensor(t.to_dtype(target_dtype).unwrap_or(t)),
+                        Err(_) => QMatMul::QTensor(q.clone())
+                    }
+                },
+                QMatMul::Tensor(t) => QMatMul::Tensor(t.to_device(device)?.to_dtype(target_dtype)?),
+                QMatMul::TensorF16(t) => QMatMul::TensorF16(t.to_device(device)?.to_dtype(target_dtype)?),
+            };
+
+            if let Some(b) = &self.bias {
+                self.bias = Some(b.to_device(device)?.to_dtype(target_dtype)?);
+            }
+            self.device = device.clone();
+        }
+        Ok(())
+    }
+
+    /// [핵심] Q2_K + 8-bit 잔차 하이브리드 연산 로직
+    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let (b, s, h) = xs.dims3()?;
+        let xs_flat = xs.reshape((b * s, h))?;
+        
+        // 1. Base 연산 (여기서 Q2_K 행렬 곱셈이 맹렬하게 돌아갑니다)
+        let out_base = match &self.base_quant {
+            QMatMul::QTensor(_) => self.base_quant.forward(&xs_flat.to_dtype(DType::F32)?)?,
+            _ => self.base_quant.forward(&xs_flat)?,
+        };
+
+        let has_residual = match &self.residual_8bit {
+            QMatMul::Tensor(t) => t.elem_count() > 1,
+            _ => true,
+        };
+
+        // 2. Q2_K로 깎여나간 지능을 8-bit 잔차 연산으로 복구하여 합침
+        let out = if has_residual {
+            let out_res = match &self.residual_8bit {
+                QMatMul::QTensor(_) => self.residual_8bit.forward(&xs_flat.to_dtype(DType::F32)?)?,
+                _ => self.residual_8bit.forward(&xs_flat)?,
+            };
+            
+            let out_res_aligned = if out_res.dtype() != out_base.dtype() {
+                out_res.to_dtype(out_base.dtype())?
+            } else {
+                out_res
+            };
+            
+            out_base.add(&out_res_aligned)?
+        } else {
+            out_base
+        };
+
+        let out = out.reshape((b, s, ()))?;
+
+        if let Some(bias) = &self.bias {
+            Ok(out.broadcast_add(bias)?)
+        } else {
+            Ok(out)
+        }
+    }
+}
+
 // Local RmsNorm implementation exposing weight and device
 #[derive(Clone, Debug)]
 pub struct RmsNorm {
@@ -69,9 +187,28 @@ impl Module for RmsNorm {
             return Err(candle_core::Error::Msg("RMSNorm weight is cleared. Reload required.".to_string()));
         }
         
-        // [CRITICAL FIX] VRAM을 2배로 먹고 속도를 떨어뜨리던 수동 분산 계산을 모두 지우고, 
-        // Candle 프레임워크의 초고속 네이티브 C++/CUDA 커널에 연산을 위임합니다!
-        candle_nn::ops::rms_norm(x, &self.weight, self.eps as f32)
+        // 1. 디바이스 맞추기
+        let x_aligned = if !x.device().same_device(self.weight.device()) {
+            x.to_device(self.weight.device())?
+        } else {
+            x.clone()
+        };
+
+        // 2. 가중치와 타입 맞추기 (이 부분 추가!)
+        let x_aligned = if x_aligned.dtype() != self.weight.dtype() {
+            x_aligned.to_dtype(self.weight.dtype())?
+        } else {
+            x_aligned
+        };
+
+        // 3. 연산 수행 후, 원본 x의 타입으로 안전하게 복귀
+        let out = candle_nn::ops::rms_norm(&x_aligned, &self.weight, self.eps as f32)?;
+        
+        if out.dtype() != x.dtype() {
+            out.to_dtype(x.dtype())
+        } else {
+            Ok(out)
+        }
     }
 }
 
@@ -377,10 +514,10 @@ pub struct BitKVMetadata {
 
 #[derive(Clone)]
 pub struct QuantizedQwenVLTextAttention {
-    pub q_proj: QLinear,
-    pub k_proj: QLinear,
-    pub v_proj: QLinear,
-    pub o_proj: QLinear,
+    pub q_proj: TurboQuantLinear,
+    pub k_proj: TurboQuantLinear,
+    pub v_proj: TurboQuantLinear,
+    pub o_proj: TurboQuantLinear,
     pub q_norm: RmsNorm,
     pub k_norm: RmsNorm,
     pub num_attention_heads: usize,
@@ -505,15 +642,10 @@ impl QuantizedQwenVLTextAttention {
             }
         }
 
-        let q_proj = get_qlinear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
-        
-        if layer_idx == 0 {
-            println!("[DIAG-MODEL] Layer 0 Q-Proj Weight Shape: {:?}", q_proj.shape());
-        }
-
-        let k_proj = get_qlinear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?;
-        let v_proj = get_qlinear(ct, reader, &format!("{base_name}.{v}"), device, dtype)?;
-        let o_proj = get_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
+        let q_proj = get_turboquant_linear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
+        let k_proj = get_turboquant_linear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?;
+        let v_proj = get_turboquant_linear(ct, reader, &format!("{base_name}.{v}"), device, dtype)?;
+        let o_proj = get_turboquant_linear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
 
         let q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype)?;
         let k_norm = get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype)?;
@@ -556,10 +688,10 @@ impl QuantizedQwenVLTextAttention {
             ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
         };
 
-        self.q_proj = get_qlinear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
-        self.k_proj = get_qlinear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?;
-        self.v_proj = get_qlinear(ct, reader, &format!("{base_name}.{v}"), device, dtype)?;
-        self.o_proj = get_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
+        self.q_proj = get_turboquant_linear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
+        self.k_proj = get_turboquant_linear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?;
+        self.v_proj = get_turboquant_linear(ct, reader, &format!("{base_name}.{v}"), device, dtype)?;
+        self.o_proj = get_turboquant_linear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
         self.q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), self.q_norm.eps(), device, dtype)?;
         self.k_norm = get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), self.k_norm.eps(), device, dtype)?;
 
@@ -1441,10 +1573,10 @@ impl QuantizedQwenVLTextDecoderLayer {
 
         // 빈 텐서들로 초기화
         let zero_t = Tensor::zeros((1,), dtype, device)?;
-        let q_proj = QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone());
-        let k_proj = QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone());
-        let v_proj = QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone());
-        let o_proj = QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone());
+        let q_proj = TurboQuantLinear::new(QMatMul::Tensor(zero_t.clone()), QMatMul::Tensor(zero_t.clone()), None, device.clone());
+        let k_proj = TurboQuantLinear::new(QMatMul::Tensor(zero_t.clone()), QMatMul::Tensor(zero_t.clone()), None, device.clone());
+        let v_proj = TurboQuantLinear::new(QMatMul::Tensor(zero_t.clone()), QMatMul::Tensor(zero_t.clone()), None, device.clone());
+        let o_proj = TurboQuantLinear::new(QMatMul::Tensor(zero_t.clone()), QMatMul::Tensor(zero_t.clone()), None, device.clone());
         let q_norm = RmsNorm::new(zero_t.clone(), config.rms_norm_eps);
         let k_norm = RmsNorm::new(zero_t.clone(), config.rms_norm_eps);
 
@@ -1603,15 +1735,12 @@ impl QuantizedQwenVLTextDecoderLayer {
         
         let residual = xs.clone();
         let xs = self.input_layernorm.forward(&xs)?;
-        
-        // 주의: 아래 forward 호출 시 cos_ref, sin_ref를 넘겨주도록 변경
         let xs = self.self_attn.forward(&xs, cos_ref, sin_ref, attention_mask.as_ref(), seqlen_offset, session_id, kv_name, baking_only)?;
         
-        // [HARDENING] Residual Addition DType Guard
-        
+        // [CRITICAL FIX] 1번째 잔차 덧셈 (Attention 후) 타입 동기화
+        let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
         let xs = residual.add(&xs)?;
         
-        // [OPTIMIZATION] Skip MLP block if not available (MLP 0% Mode)
         if let (Some(gate_proj), Some(up_proj), Some(down_proj), Some(post_norm)) = (&self.mlp_gate, &self.mlp_up, &self.mlp_down, &self.post_attention_layernorm) {
             let residual = xs.clone();
             let xs = post_norm.forward(&xs)?;
@@ -1619,14 +1748,16 @@ impl QuantizedQwenVLTextDecoderLayer {
                 let gate = gate_proj.forward(&xs)?;
                 let up = up_proj.forward(&xs)?;
                 let gate = candle_nn::ops::silu(&gate)?;
+                // [CRITICAL FIX] gate와 up 곱셈 전 타입 일치
+                let up = if up.dtype() != gate.dtype() { up.to_dtype(gate.dtype())? } else { up };
                 let hidden = gate.mul(&up)?;
                 down_proj.forward(&hidden)?
             };
-            // [HARDENING] Second Residual Addition DType Guard
-            // let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
+            
+            // [CRITICAL FIX] 2번째 잔차 덧셈 (MLP 후) 타입 동기화
+            let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
             Ok(residual.add(&xs)?)
         } else {
-            // MLP was skipped (Attention-Only), just return result after attention
             Ok(xs)
         }
     }
@@ -3227,8 +3358,15 @@ impl QuantizedQwenTextModel {
         let cache_position = if let Some(cp) = cache_position_in { if !cp.device().same_device(&self.text_device) { Some(cp.to_device(&self.text_device)?) } else { Some(cp.clone()) } } else { None };
         let (b_sz, seq_len) = input_ids.dims2()?;
         let flat_input = input_ids.flatten_all()?;
+        
+        // 1. 임베딩 계산
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
-        let inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
+        let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
+        
+        // [CRITICAL FIX] 임베딩 결과물이 텍스트 디바이스(GPU)에 제대로 올라가 있는지 확실히 못박습니다!
+        if !inputs_embeds.device().same_device(&self.text_device) {
+            inputs_embeds = inputs_embeds.to_device(&self.text_device)?;
+        }
         
         let start = seqlen_offset as u32;
         let position_ids = Tensor::arange(start, start + seq_len as u32, input_ids.device())?
@@ -3266,6 +3404,44 @@ fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader
     let weight = QMatMul::from_qtensor(weight)?;
     let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { Some(t.dequantize(device)?.to_dtype(dtype)?) } else { None };
     Ok(QLinear::new(weight, bias, device.clone()))
+}
+
+fn get_turboquant_linear<R: std::io::Seek + std::io::Read>(
+    ct: &gguf_file::Content, 
+    reader: &mut R, 
+    name: &str, 
+    device: &Device, 
+    dtype: DType
+) -> Result<TurboQuantLinear> {
+    let base_name = format!("{name}.weight.base");
+    
+    let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { 
+        Some(t.dequantize(device)?.to_dtype(dtype)?) 
+    } else { 
+        None 
+    };
+
+    if ct.tensor_infos.contains_key(&base_name) {
+        // [Q2_K TurboQuant 모드 활성화]
+        // .weight.base 에 Q2_K 텐서가 들어있다고 가정하고 로드합니다.
+        let base_weight = ct.tensor(reader, &base_name, device)?;
+        let base_quant = QMatMul::from_qtensor(base_weight)?;
+
+        let res_weight = ct.tensor(reader, &format!("{name}.weight.residual"), device)?;
+        let residual_8bit = QMatMul::from_qtensor(res_weight)?;
+
+        Ok(TurboQuantLinear::new(base_quant, residual_8bit, bias, device.clone()))
+    } else {
+        // [일반 모델 하위 호환 모드]
+        let weight = ct.tensor(reader, &format!("{name}.weight"), device)
+            .map_err(|e| anyhow::anyhow!("Failed to load standard {name}.weight: {e}"))?;
+        let base_quant = QMatMul::from_qtensor(weight)?;
+        
+        let dummy = Tensor::zeros((1,), DType::F32, device)?;
+        let residual_8bit = QMatMul::Tensor(dummy);
+
+        Ok(TurboQuantLinear::new(base_quant, residual_8bit, bias, device.clone()))
+    }
 }
 
 fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, eps: f64, device: &Device, dtype: DType) -> Result<RmsNorm> {
