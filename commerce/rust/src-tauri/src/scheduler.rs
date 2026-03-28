@@ -410,7 +410,10 @@ async fn process_task(
 
     // [LOCK] Acquire Model Access
     let model = {
+        println!("[Scheduler] 🛡️ Attempting to acquire Model Lock...");
         let mut model_lock = model_mutex.lock().await;
+        println!("[Scheduler] ✅ Model Lock acquired.");
+        
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
         // [FIX] If current model doesn't match preference, unload it to force switch (CPU <-> GPU)
@@ -424,12 +427,19 @@ async fn process_task(
         }
 
         if model_lock.is_none() {
+            println!("[Scheduler] Model not initialized. Starting LogisModel::new...");
             // [LOG-ONLY] No emit here to keep UI clean
             log_task_progress(app_handle, &task.id, &json!({ "category": "Loading Model", "summary": "Initializing AI Core..." }));
             
             match LogisModel::new(app_handle.clone(), effective_device_pref).await {
-                Ok(m) => *model_lock = Some(m),
-                Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
+                Ok(m) => {
+                    println!("[Scheduler] LogisModel::new successful.");
+                    *model_lock = Some(m);
+                },
+                Err(e) => {
+                    println!("[Scheduler] ❌ LogisModel::new failed: {}", e);
+                    return Err(anyhow::anyhow!("Model Load Failed: {}", e));
+                }
             }
         }
         model_lock.as_ref().unwrap().clone()

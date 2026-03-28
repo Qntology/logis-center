@@ -19,17 +19,21 @@ use std::sync::Mutex;
 static DEVICE_CACHE: Lazy<Mutex<Vec<Option<Device>>>> = Lazy::new(|| Mutex::new(vec![None; 8]));
 
 pub fn get_gpu_device(id: usize) -> Device {
-    let mut cache = DEVICE_CACHE.lock().unwrap();
-    if id < cache.len() {
-        if let Some(dev) = &cache[id] {
-            return dev.clone();
+    {
+        let mut cache = DEVICE_CACHE.lock().unwrap();
+        if id < cache.len() {
+            if let Some(dev) = &cache[id] {
+                return dev.clone();
+            }
         }
     }
 
     #[cfg(feature = "cuda")]
     let dev = {
-        println!("[CUDA/ROCm] 🚀 Initializing Primary Context on GPU {}...", id);
-        Device::new_cuda(id).unwrap_or(Device::Cpu)
+        println!("[CUDA/ROCm] 🚀 Attempting to Create Primary Context on GPU {}...", id);
+        let d = Device::new_cuda(id).unwrap_or(Device::Cpu);
+        println!("[CUDA/ROCm] ✅ Primary Context Created on GPU {}.", id);
+        d
     };
 
     #[cfg(all(not(feature = "cuda"), feature = "metal"))]
@@ -41,9 +45,11 @@ pub fn get_gpu_device(id: usize) -> Device {
     #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
     let dev = Device::Cpu;
 
-    let mut cache = DEVICE_CACHE.lock().unwrap();
-    if id < cache.len() {
-        cache[id] = Some(dev.clone());
+    {
+        let mut cache = DEVICE_CACHE.lock().unwrap();
+        if id < cache.len() {
+            cache[id] = Some(dev.clone());
+        }
     }
     dev
 }
@@ -52,7 +58,7 @@ pub fn get_cuda_device(id: usize) -> Device {
     get_gpu_device(id)
 }
 
-pub fn get_best_device() -> Device {
+pub fn get_best_device_info() -> (Device, usize) {
     // 1. 네이티브 백엔드 시도 (CUDA/ROCm)
     #[cfg(feature = "cuda")]
     {
@@ -60,9 +66,14 @@ pub fn get_best_device() -> Device {
             if let Ok(count) = nvml.device_count() {
                 let mut best_id = 0;
                 let mut max_free = 0;
+                
+                println!("[GPU-CHECK] Found {} CUDA-capable device(s).", count);
+                
                 for i in 0..count {
                     if let Ok(device) = nvml.device_by_index(i) {
                         if let Ok(mem) = device.memory_info() {
+                            let free_gb = mem.free as f64 / 1e9;
+                            println!("[GPU-CHECK] GPU {}: {:.2} GB Free VRAM", i, free_gb);
                             if mem.free > max_free {
                                 max_free = mem.free;
                                 best_id = i;
@@ -70,25 +81,32 @@ pub fn get_best_device() -> Device {
                         }
                     }
                 }
+                
                 if max_free > 0 {
-                    return get_gpu_device(best_id as usize);
+                    println!("[GPU-CHECK] Selecting GPU {} as the best device.", best_id);
+                    return (get_gpu_device(best_id as usize), best_id as usize);
                 }
             }
         }
-        return get_gpu_device(0);
+        println!("[GPU-CHECK] NVML failed or no free VRAM. Defaulting to GPU 0.");
+        return (get_gpu_device(0), 0);
     }
 
     // 2. Mac 가속 시도 (Metal)
     #[cfg(all(not(feature = "cuda"), feature = "metal"))]
     {
-        return get_gpu_device(0);
+        return (get_gpu_device(0), 0);
     }
 
     // 3. CPU 기본
     #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
     {
-        Device::Cpu
+        (Device::Cpu, 0)
     }
+}
+
+pub fn get_best_device() -> Device {
+    get_best_device_info().0
 }
 
 pub fn get_device(device: Option<&Device>) -> Device {
@@ -146,11 +164,11 @@ pub struct DeviceConfig {
 }
 
 pub fn get_optimal_device_config() -> DeviceConfig {
-    let device = get_best_device();
+    let (device, gpu_id) = get_best_device_info();
     let is_cpu = device.is_cpu();
     
     let name = if cfg!(feature = "cuda") && !is_cpu {
-        "CUDA/ROCm".to_string()
+        format!("CUDA/ROCm (GPU {})", gpu_id)
     } else if cfg!(feature = "metal") && !is_cpu {
         "Metal".to_string()
     } else {
@@ -163,7 +181,7 @@ pub fn get_optimal_device_config() -> DeviceConfig {
         classify_chunk_size: 12_000, 
         extract_chunk_size: 12_000,
         name,
-        gpu_id: 0,
+        gpu_id,
     }
 }
 
