@@ -3,7 +3,7 @@ chcp 65001 > nul
 call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 set "PYTHONIOENCODING=utf-8"
 
-:: [AMD ROCm/HIP 설정]
+:: [AMD ROCm/HIP]
 set "CANDLE_HIP=1"
 set "HIP_PATH=C:\Program Files\AMD\ROCm\7.1"
 set "PATH=%HIP_PATH%\bin;%PATH%"
