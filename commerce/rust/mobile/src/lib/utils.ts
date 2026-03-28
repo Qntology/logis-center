@@ -107,7 +107,7 @@ export function parseStatus(status: number | string): string {
         case 10: step = 'draft'; break;
         case 11: step = 'show'; break;
         case 12: step = 'hide'; break;
-        default: step = 'unknown'; // fallback
+        default: step = ''; // fallback
     }
     return step;
 }
