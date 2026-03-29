@@ -710,8 +710,19 @@ async fn process_task(
         };
         
         let team_id = if task.to.is_empty() { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") } else { task.to.clone() };
-        let origin_str = task_data.get("origin").and_then(|s| s.as_str()).unwrap_or("http://localhost");
-        let base_url = url::Url::parse(origin_str).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
+        
+        // [FIX] Use the actual task URL to determine the origin, not hardcoded localhost
+        let origin_str = task_data.get("origin").and_then(|s| s.as_str()).map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                // If origin not in task_data, extract from the task.data_json URL
+                if let Ok(task_url) = url::Url::parse(&url) {
+                    format!("{}://{}", task_url.scheme(), task_url.host_str().unwrap_or("localhost"))
+                } else {
+                    "http://localhost".to_string()
+                }
+            });
+            
+        let base_url = url::Url::parse(&origin_str).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
         let url_obj = base_url.join(&url).unwrap_or(base_url);
         let raw_path = url_obj.path();
         let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 

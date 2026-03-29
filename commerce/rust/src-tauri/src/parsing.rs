@@ -341,7 +341,7 @@ Based on the provided Pug template, identify the primary category of this webpag
 
 [OUTPUT FORMAT]
 {
-    "type": "..."
+    "type": String
 }"###.to_string() }
 
 pub fn page_selectors_prompt(page_type: &str) -> String {
@@ -1052,6 +1052,43 @@ pub fn json_to_natural_language(value: &serde_json::Value) -> String {
     output.trim().to_string()
 }
 
+pub fn normalize_to_json_string(input: &str) -> String {
+    let mut s = input.replace(&['\u{00A0}', '\u{200B}', '\u{202F}', '\u{FEFF}'][..], " ").trim().to_string();
+
+    // 1. Backticks to quotes
+    let re_backtick = Regex::new(r"`([\s\S]*?)`").unwrap();
+    s = re_backtick.replace_all(&s, |caps: &regex::Captures| {
+        format!("\"{}\"", caps[1].replace("\"", "\\\""))
+    }).to_string();
+
+    // 2. Key quotes correction (key: -> "key":)
+    let re_keys = Regex::new(r"([{,])\s*([a-zA-Z0-9_]+)\s*:").unwrap();
+    s = re_keys.replace_all(&s, "$1\"$2\":").to_string();
+
+    // 3. Single quotes to double quotes for values
+    let re_single_vals = Regex::new(r":\s*'([^']*)'").unwrap();
+    s = re_single_vals.replace_all(&s, |caps: &regex::Captures| {
+        format!(": \"{}\"", caps[1].replace("\"", "\\\""))
+    }).to_string();
+
+    // 4. CSS selector/nested quotes protection (Simplified for Rust regex)
+    let re_nested = Regex::new(r#"="([^"]*)""#).unwrap();
+    s = re_nested.replace_all(&s, "=\\\"$1\\\"").to_string();
+
+    // 5. Trailing Comma removal
+    let re_trailing = Regex::new(r",\s*([\]}])").unwrap();
+    s = re_trailing.replace_all(&s, "$1").to_string();
+
+    // 6. Force close braces
+    let open_braces = s.matches('{').count();
+    let close_braces = s.matches('}').count();
+    if open_braces > close_braces {
+        s.push_str(&"}".repeat(open_braces - close_braces));
+    }
+
+    s
+}
+
 pub fn parse_json_from_llm(text: &str) -> serde_json::Value {
     // [CLEANUP] Remove <think>...</think> tags if they exist
     let mut clean_text = text.to_string();
@@ -1061,26 +1098,47 @@ pub fn parse_json_from_llm(text: &str) -> serde_json::Value {
                 clean_text.replace_range(start_think..end_think + 8, "");
             }
         } else {
-            // Unclosed think tag - just remove from start
             clean_text.replace_range(start_think.., "");
         }
     }
     let clean_text = clean_text.trim();
 
+    // 1. First attempt: Direct parse
     if let Ok(v) = serde_json::from_str(clean_text) { return v; }
+
+    // 2. Extract JSON part and attempt direct parse
+    let mut extracted = String::new();
     if let Some(start) = clean_text.find("{") {
         if let Some(end) = clean_text.rfind("}") {
             if start < end {
-                if let Ok(v) = serde_json::from_str(&clean_text[start..=end]) { return v; }
+                extracted = clean_text[start..=end].to_string();
+                if let Ok(v) = serde_json::from_str(&extracted) { return v; }
             }
         }
-    }
-    if let Some(start) = clean_text.find("[") {
+    } else if let Some(start) = clean_text.find("[") {
         if let Some(end) = clean_text.rfind("]") {
             if start < end {
-                if let Ok(v) = serde_json::from_str(&clean_text[start..=end]) { return v; }
+                extracted = clean_text[start..=end].to_string();
+                if let Ok(v) = serde_json::from_str(&extracted) { return v; }
             }
         }
     }
+
+    // 3. Last attempt: Normalize/Repair then parse
+    let to_repair = if extracted.is_empty() { clean_text } else { &extracted };
+    let repaired = normalize_to_json_string(to_repair);
+    
+    if let Ok(v) = serde_json::from_str(&repaired) {
+        return v;
+    } else {
+        // Final fallback: try extracting from repaired string again
+        if let Some(start) = repaired.find("{") {
+            if let Some(end) = repaired.rfind("}") {
+                if let Ok(v) = serde_json::from_str(&repaired[start..=end]) { return v; }
+            }
+        }
+    }
+
+    println!("[Parsing] Warning: Failed to repair dirty JSON: {}", clean_text);
     serde_json::json!({})
 }

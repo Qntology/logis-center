@@ -327,10 +327,15 @@ function renderDetail(title: string, content: string) {
 function renderChat(data: any) {
     if (!chatTalks) return;
     // Handle both old and new data structures
-    let content = data.content;
+    let content = data.content || data.text || "";
     if (typeof content === 'string' && content.startsWith('{')) {
-        try { content = JSON.parse(content).summary || JSON.parse(content).text; } catch(e){}
+        try { 
+            const obj = JSON.parse(content);
+            content = obj.summary || obj.text || obj.title || content; 
+        } catch(e){}
     }
+    if (!content || content === "undefined") content = "";
+    
     const div = document.createElement("div");
     div.className = `chat-talk ${data.role === 'user' ? 'user' : 'system'}`;
     div.innerHTML = `<div class="chat-message"><div class="content">${content}</div></div>`;

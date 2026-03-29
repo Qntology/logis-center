@@ -819,10 +819,12 @@ async fn get_task_logs(app_handle: tauri::AppHandle, task_id: String) -> Result<
 
 #[tauri::command]
 async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<String, String> {
+    println!("[DEBUG] upsert_items called with {} items.", items.len());
     let store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
         let mut count = 0;
         for item in items {
+            println!("[DEBUG] Syncing item: {}", item);
             // Basic parsing to determine ID and Table
             // In content.js structure: id, type are top level or in data
             let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();

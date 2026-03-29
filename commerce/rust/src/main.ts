@@ -450,13 +450,15 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                 type = 'page';
                 const data = node.data || {};
                 const nodeType = node.type || data.type || 'unknown';
+                console.log("[DEBUG] renderAccordion Page Node:", { id: nodeId, type: nodeType, domain: node.domain, origin: data.origin, link: data.link });
                 name = `<span>${nodeType}</span> <span>${(data.item ? " Draft" : " ")}</span>`;
 
                 if (data.origin) {
                     var _url = new URL(data.origin);
-                    if (!navTmp[_url.host] && data.item) {
-                        host = `<strong>${_url.host}</strong>`;
-                        navTmp[_url.host] = true;
+                    const domain = node.domain || _url.hostname;
+                    if (!navTmp[domain] && data.item) {
+                        host = `<strong>${domain}</strong>`;
+                        navTmp[domain] = true;
                     }
                     if (nodeId === activeContext.ref || (currentDetectedUrl && currentDetectedUrl.includes(data.link))) {
                         active = "active";
@@ -497,7 +499,7 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                            data-cc="${node.cc || (node.data && node.data.cc) || ''}" 
                            data-bcc="${node.bcc || (node.data && node.data.bcc) || ''}" 
                            data-ref="${node.ref || node.ref_val || (node.data && node.data.ref) || ''}"
-                           data-domain="${node.domain || ''}" 
+                           data-domain="${node.domain || (_url ? _url.hostname : '')}" 
                            data-type="${node.type || (node.data && node.data.type) || ''}">
                         ${content}
                     </label>
@@ -758,6 +760,7 @@ document.addEventListener('show-doc', (e: any) => showDetail(e.detail));
 document.addEventListener('view-task-log', () => { openWidget("list"); listView.style.display = "none"; detailView.style.display = "flex"; });
 
 btnExtract?.addEventListener("click", async () => {
+    console.log("[DEBUG] btnExtract clicked. currentDetectedUrl:", currentDetectedUrl, "currentImage:", currentImage);
     if (currentDetectedUrl || currentImage) {
         // [CHECK] If already extracting, do nothing
         if (isExtracting) return;
@@ -2335,11 +2338,17 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
     const processBatch = mode === 'prepend' ? [...sortedBatch].reverse() : sortedBatch;
 
     processBatch.forEach(msg => {
-        let textContent = "";
-        try {
-            const contentObj = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content;
-            textContent = contentObj.text || contentObj.title || contentObj.summary || JSON.stringify(contentObj);
-        } catch (e) { textContent = String(msg.content); }
+        let textContent = msg.text || "";
+        const rawContent = msg.content || (msg as any).data;
+
+        if (rawContent && rawContent !== "undefined") {
+            try {
+                const contentObj = typeof rawContent === 'string' ? JSON.parse(rawContent) : rawContent;
+                textContent = contentObj.text || contentObj.title || contentObj.summary || textContent || (typeof contentObj === 'string' ? contentObj : JSON.stringify(contentObj));
+            } catch (e) {
+                if (!textContent) textContent = String(rawContent);
+            }
+        }
 
         const displayMsg: ChatMessage = { ...msg, text: textContent };
         
@@ -2406,15 +2415,16 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
 }
 
 function createMessageHTML(msg: ChatMessage) {
-    const statusMap: Record<number, { icon: string, text: string, color: string }> = { 
-        1: { icon: "⏳", text: "processing", color: "var(--primary)" }, 
-        2: { icon: "🛑", text: "stopped", color: "#ef4444" }, 
-        3: { icon: "🚫", text: "cancelled", color: "#666" }, 
-        6: { icon: "❌", text: "error", color: "#ef4444" }, 
-        9: { icon: "✅", text: "done", color: "#22c55e" }, 
-        10: { icon: "📥", text: "pending", color: "#999" } 
+    const statusMap: Record<number, { icon: string, text: string, color: string }> = {
+        0: { icon: "✅", text: "done", color: "#22c55e" },
+        1: { icon: "⏳", text: "processing", color: "var(--primary)" },
+        2: { icon: "🛑", text: "stopped", color: "#ef4444" },
+        3: { icon: "🚫", text: "cancelled", color: "#666" },
+        6: { icon: "❌", text: "error", color: "#ef4444" },
+        9: { icon: "✅", text: "done", color: "#22c55e" },
+        10: { icon: "📥", text: "pending", color: "#999" }
     };
-    const currentStatus = statusMap[msg.status] || statusMap[1];
+    const currentStatus = statusMap[msg.status] || statusMap[0];
     const timeStr = new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const isSystemTask = msg.role === "system_task";
     const roleClass = msg.role === "user" ? "user" : "system";
