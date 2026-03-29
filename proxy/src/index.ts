@@ -2534,7 +2534,7 @@ export default {
 								var item
 
 								if(models['deepinfra']){
-									item = await Deepinfra(deepinfra, 'google/gemma-3-27b-it', system, '', null, inlineData)
+									item = await Deepinfra(deepinfra, 'Qwen/Qwen3.5-0.8B', system, '', null, inlineData)
 
 									models['deepinfra'] -= 1
 

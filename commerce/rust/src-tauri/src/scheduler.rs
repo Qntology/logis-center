@@ -355,6 +355,8 @@ async fn process_task(
     app_handle: &tauri::AppHandle,
     device_preference: Option<String>,
 ) -> Result<()> {
+    let team_id = if !task.to.is_empty() { task.to.clone() } else { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") };
+
     // [NEW] Ensure log directory exists at runtime using dynamic path 
     let pug_logs_dir = utils::paths::get_pug_logs_dir(Some(app_handle), &task.id);
     println!("[DEBUG] Pug logs directory: {:?}", pug_logs_dir);
@@ -569,6 +571,18 @@ async fn process_task(
         let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] Identify the page type.\n\n[INSTRUCTION]\n{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, type_prompt);
         let snapshot_id = format!("{}_step_a", task.id);
         
+        // [FIX] Update shared JSON with current step and session info
+        if let Ok(content) = std::fs::read_to_string("tmp/index.json") {
+            if let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(obj) = json_val.as_object_mut() {
+                    obj.insert("step".to_string(), json!("Step A (Classification)"));
+                    obj.insert("session_id".to_string(), json!(snapshot_id));
+                    obj.insert("kv_path".to_string(), json!(kv_name.clone().unwrap_or_else(|| "tmp/kv/".to_string())));
+                    let _ = std::fs::write("tmp/index.json", json_val.to_string());
+                }
+            }
+        }
+
         // 1. [0.6B] Load & Generate (Direct 28-Layer Generation)
         {
             model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
@@ -665,6 +679,18 @@ async fn process_task(
         let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, selector_prompt);
         let snapshot_id = format!("{}_step_b", task.id);
 
+        // [FIX] Update shared JSON with current step B, session info and the identified type
+        if let Ok(content) = std::fs::read_to_string("tmp/index.json") {
+            if let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(obj) = json_val.as_object_mut() {
+                    obj.insert("step".to_string(), json!("Step B (Selectors)"));
+                    obj.insert("session_id".to_string(), json!(snapshot_id));
+                    obj.insert("type".to_string(), json!(page_type));
+                    let _ = std::fs::write("tmp/index.json", json_val.to_string());
+                }
+            }
+        }
+
         // 1. [Large] Load & Generate (Direct 28-Layer Generation)
         {
             model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
@@ -709,18 +735,39 @@ async fn process_task(
             store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
         };
         
-        let team_id = if task.to.is_empty() { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") } else { task.to.clone() };
-        
-        // [FIX] Use the actual task URL to determine the origin, not hardcoded localhost
+        // [FIX] Try to load the active origin and type from the shared JSON file (tmp/index.json)
+        // This is the most reliable way to bridge the gap between automation and scheduler.
+        let mut shared_origin = None;
+        let mut shared_type = None;
+        if let Ok(content) = std::fs::read_to_string("tmp/index.json") {
+            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(o) = json_val.get("origin").and_then(|v| v.as_str()) {
+                    if let Ok(u) = url::Url::parse(o) {
+                        shared_origin = Some(format!("{}://{}", u.scheme(), u.host_str().unwrap_or("localhost")));
+                    }
+                }
+                if let Some(t) = json_val.get("type").and_then(|v| v.as_str()) {
+                    if !t.is_empty() { shared_type = Some(t.to_string()); }
+                }
+            }
+        }
+
         let origin_str = task_data.get("origin").and_then(|s| s.as_str()).map(|s| s.to_string())
+            .filter(|s| s != "http://localhost") // If it's already localhost, treat it as missing
+            .or(shared_origin) // Fallback to the shared file
             .unwrap_or_else(|| {
-                // If origin not in task_data, extract from the task.data_json URL
+                // If all else fails, extract from the task.data_json URL
                 if let Ok(task_url) = url::Url::parse(&url) {
                     format!("{}://{}", task_url.scheme(), task_url.host_str().unwrap_or("localhost"))
                 } else {
                     "http://localhost".to_string()
                 }
             });
+
+        // Use shared type if available and task type is missing or unknown
+        if page_type.is_empty() || page_type == "unknown" {
+            if let Some(st) = shared_type { page_type = st; }
+        }
             
         let base_url = url::Url::parse(&origin_str).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
         let url_obj = base_url.join(&url).unwrap_or(base_url);
@@ -849,7 +896,6 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     // [PARITY] ID Generation
-    let team_id = if !task.to.is_empty() { task.to.clone() } else { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") };
     let id_val_raw = extracted_data.get("id").or_else(|| extracted_data.get("index")).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(&id_val_raw).replace("-", "").replace("_", "");
     let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));

@@ -228,6 +228,18 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                 
                 if current_is_shop {
                     println!("[AUTO] Active Shop Context Sync: {}", last_detected_url);
+                    // [FIX] Save to a shared JSON file to bridge the gap between automation and scheduler
+                    let _ = std::fs::create_dir_all("tmp");
+                    let shared_data = json!({
+                        "origin": last_detected_url,
+                        "type": "",
+                        "step": "idle",
+                        "session_id": "",
+                        "kv_path": "tmp/kv/"
+                    });
+                    if let Ok(json_str) = serde_json::to_string(&shared_data) {
+                        let _ = std::fs::write("tmp/index.json", json_str);
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(800)).await; 
