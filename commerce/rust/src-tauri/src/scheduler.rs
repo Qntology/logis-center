@@ -626,7 +626,7 @@ async fn process_task(
                 ],
                 model: "qwen".to_string(), 
                 max_tokens: Some(16),
-                temperature: Some(0.1),
+                temperature: Some(0.0), top_p: Some(0.01),
                 ..Default::default()
             };
 
@@ -683,7 +683,7 @@ async fn process_task(
 
         {
             // [핵심] 여기서도 '미리 구워둔 Base' 스냅샷을 불러옵니다!
-            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![
@@ -696,7 +696,7 @@ async fn process_task(
                         name: None,
                     })
                 ],
-                model: "qwen".to_string(), max_tokens: Some(128), temperature: Some(0.1),
+                model: "qwen".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
                 ..Default::default()
             };
 
@@ -842,7 +842,7 @@ async fn process_task(
                         content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                         name: None,
                     })],
-                    model: "qwen".to_string(), max_tokens: Some(512), temperature: Some(0.1),
+                    model: "qwen".to_string(), max_tokens: Some(1024), temperature: Some(0.0), top_p: Some(0.01),
                     ..Default::default()
                 };
 

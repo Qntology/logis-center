@@ -347,15 +347,17 @@ Based on the provided Pug template, identify the primary category of this webpag
 pub fn page_selectors_prompt(page_type: &str) -> String {
     let template = r###"[TASK]
 The page has been classified as '{TYPE}'.
-Based on the provided Pug template, identify the structural CSS selectors required for data extraction.
+Based on the provided Pug template, identify the structural CSS selectors for the MAIN data list.
 
 [INSTRUCTION]
-Analyze the page structure you have already learned and find the repeating CSS Selector patterns.
+1. Exclude nav/header patterns navigation menus entirely (e.g., id/class containing gnb, lnb, tnb, header, footer, sidebar).
+2. IDENTIFY the repeating sibling items that represent the actual {TYPE} records.
+3. LOCATE the main content container.
 
 [SCHEMA DEFINITIONS]
-- node: '{TYPE}' based CSS selector for the main container wrapping all list items(e.g., `div[id="..."]`, `ul[id="..."]`, `ol[id="..."]`, `div[class="..."]`, `ul[class="..."]`, `ol[class="..."]`). Focus on the direct parent of recurring rows/items, excluding header, footer, ads, and pagination.
-- item: '{TYPE}' based CSS selector for sibling items(e.g., `div[class="..."]`, `tr[class="..."]`, `li[class="..."]`). Match recurring patterns and exclude header, footer, ads, and pagination.
-- detail: is a detail page or a detail form. Exclude header, footer, ads, pagination.
+- item: The repeating child element. Match recurring item patterns. Exclude nav/header
+- node: The direct parent wrapper of the recurring items. Exclude nav/header.
+- detail: is a detail page or a detail form. Exclude nav/header
 
 [OUTPUT FORMAT]
 {
