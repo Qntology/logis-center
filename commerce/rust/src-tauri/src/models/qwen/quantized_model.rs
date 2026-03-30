@@ -1074,7 +1074,7 @@ impl QuantizedQwenVLTextAttention {
         };
         let index: LayerIndex = serde_json::from_str(&index_json)?;
         
-        for block_info in index.blocks {
+        for (b_idx, block_info) in index.blocks.into_iter().enumerate() {
             let block_parent = kv_dir.join(kv_name).join(format!("b{}", block_info.offset));
             let l_file = block_parent.join(format!("l{}.st", self.layer_idx));
             let file_path = if l_file.exists() { l_file } else { block_parent.join("l0.st") };
@@ -1240,7 +1240,6 @@ impl QuantizedQwenVLTextAttention {
     }
 
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> {
-        // [SSD-ALIGNMENT] 표준화된 경로 구조 생성 (Session/Mode/Type/Block)
         let kv_type = kv_name.unwrap_or("text");
         let b_str = format!("b{}", offset);
         let block_dir = path.join(kv_type).join(&b_str);
@@ -1281,17 +1280,19 @@ impl QuantizedQwenVLTextAttention {
             }
             
             if let Ok(mut reg) = self.registry.entries.write() {
-                // 이 레이어의 세부 정보를 장부에 기록
                 let entry_idx = offset / 256;
                 if entry_idx < reg.len() {
                     let entry = &mut reg[entry_idx];
-                    entry.ssd_path = Some(path.to_path_buf());
+                    // ❌ 기존 코드: entry.ssd_path = Some(path.to_path_buf());
+                    // ✅ 수정 코드: b0 블록 폴더 경로를 지정
+                    entry.ssd_path = Some(block_dir.clone()); 
                     entry.location[self.layer_idx] = KVLocation::SSD;
                     if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = false; }
                 } else {
-                    // 장부가 비어있거나 부족하면 확장
                     let mut entry = crate::models::qwen::quantized_model::RegistryEntry::new(offset, k.dim(2)?, 28);
-                    entry.ssd_path = Some(path.to_path_buf());
+                    // ❌ 기존 코드: entry.ssd_path = Some(path.to_path_buf());
+                    // ✅ 수정 코드: 
+                    entry.ssd_path = Some(block_dir.clone()); 
                     entry.location[self.layer_idx] = KVLocation::SSD;
                     if self.layer_idx < entry.is_dirty.len() { entry.is_dirty[self.layer_idx] = false; }
                     reg.push(entry);
@@ -1348,7 +1349,6 @@ impl QuantizedQwenVLTextAttention {
         let mut total_restored_len = 0;
 
         for (i, (offset, frag_path)) in fragments.iter().enumerate() {
-            // [FIX] Calculate block length based on current total context
             let b_len = if *offset < current_kv_len {
                 (current_kv_len - *offset).min(256)
             } else { 256 };
@@ -1369,7 +1369,9 @@ impl QuantizedQwenVLTextAttention {
                     slot_ids: vec![None; 28],
                     token_start: *offset,
                     token_len: b_len,
-                    ssd_path: Some(frag_path.parent().unwrap().to_path_buf()),
+                    // ❌ 기존 코드: ssd_path: Some(frag_path.parent().unwrap().to_path_buf()),
+                    // ✅ 수정 코드: b0, b256 등 실제 블록 경로를 그대로 유지합니다!
+                    ssd_path: Some(frag_path.clone()), 
                     hidden_states_path: vec![None; 28],
                     is_dirty: vec![false; 28], 
                     last_accessed: std::time::Instant::now(),
@@ -1379,7 +1381,9 @@ impl QuantizedQwenVLTextAttention {
             
             if i < reg.len() {
                 reg[i].location[self.layer_idx] = KVLocation::SSD;
-                reg[i].ssd_path = Some(frag_path.parent().unwrap().to_path_buf());
+                // ❌ 기존 코드: reg[i].ssd_path = Some(frag_path.parent().unwrap().to_path_buf());
+                // ✅ 수정 코드: 
+                reg[i].ssd_path = Some(frag_path.clone()); 
             }
         }
 
@@ -1389,11 +1393,11 @@ impl QuantizedQwenVLTextAttention {
         Ok(())
     }
 
-                        pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
+    pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
 
-                            self.save_kv_cache(path, true, block_size, None)
+        self.save_kv_cache(path, true, block_size, None)
 
-                        }
+    }
 
                     
 }
@@ -2344,7 +2348,7 @@ impl QuantizedQwenVLTextModel {
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> {
         use crate::models::qwen::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
         
-        let mut block_groups: std::collections::HashMap<usize, Vec<LayerKVDump>> = std::collections::HashMap::new();
+        let mut block_groups: std::collections::HashMap<(usize, usize), Vec<LayerKVDump>> = std::collections::HashMap::new();
         
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
             for block in &mut layer.self_attn.kv_blocks {
@@ -2360,7 +2364,7 @@ impl QuantizedQwenVLTextModel {
                     let k = inner.k_cache.as_ref().unwrap();
                     let k_shape_u32: Vec<u32> = k.shape().dims().iter().map(|&x| x as u32).collect();
                     
-                    block_groups.entry(inner.offset).or_default().push(LayerKVDump {
+                    block_groups.entry((inner.offset, inner.index)).or_default().push(LayerKVDump {
                         layer_idx: l_idx,
                         k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
                         v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
@@ -2389,7 +2393,7 @@ impl QuantizedQwenVLTextModel {
             
             let sub_path = if mode { format!("{}/reference/{}", session_id, kv_type) } else { format!("{}/inference/{}", session_id, kv_type) };
 
-            for (off, layers) in block_groups {
+            for ((off, idx), layers) in block_groups {
                 let sid = SLOT_MANAGER.acquire_write_slot(256).await;
                 let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
                 if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
@@ -2398,7 +2402,7 @@ impl QuantizedQwenVLTextModel {
 
                 if tx.send(SlotTask::Bake(BakeTask {
                     slot_id: sid, task_dir: block_dir, kv_name: Some(sub_path.clone()), offset: off, layers,
-                    is_relay_baking: mode, block_idx: Some(off / 256), registry: self.registry.clone(),
+                    is_relay_baking: mode, block_idx: Some(idx), registry: self.registry.clone(),
                 })).await.is_err() {
                     crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     SLOT_MANAGER.release_slot(sid).await;
@@ -2449,7 +2453,8 @@ impl QuantizedQwenVLTextModel {
                                 raw_v: Some(v.to_device(&Device::Cpu).unwrap()), 
                             },
                             inner.offset,
-                            inner.len
+                            inner.len,
+                            idx // <--- 추가!
                         ));
                         
                         if idx < reg.len() { reg[idx].is_dirty[layer_idx] = false; }
@@ -2487,18 +2492,17 @@ impl QuantizedQwenVLTextModel {
                     format!("{}/inference/{}", session_id, kv_type)
                 };
 
-                for (dump, off, b_len) in dumps_to_send {
+                for (dump, off, b_len, block_idx) in dumps_to_send { // <--- block_idx 추가
                     let sid = SLOT_MANAGER.acquire_write_slot(b_len).await;
                     let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
                     if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
                     
                     {
                         let mut reg_w = self.registry.entries.write().unwrap();
-                        let b_idx = off / 256;
-                        if b_idx < reg_w.len() { reg_w[b_idx].ssd_path = Some(block_dir.clone()); }
+                        // 엉뚱한 덮어쓰기 방지!
+                        if block_idx < reg_w.len() { reg_w[block_idx].ssd_path = Some(block_dir.clone()); } 
                     }
 
-                    // [CRITICAL FIX] 큐에 넣기 직전 작업 카운터를 명시적으로 +1 올려서 Underflow 데드락 원천 차단!
                     crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                     if tx.send(SlotTask::Bake(BakeTask {
@@ -2508,7 +2512,7 @@ impl QuantizedQwenVLTextModel {
                         offset: off,
                         layers: vec![dump],
                         is_relay_baking: mode,
-                        block_idx: Some(off / 256),
+                        block_idx: Some(block_idx), // <--- 수정!
                         registry: self.registry.clone(),
                     })).await.is_err() {
                         // 전송 실패 시 카운터를 다시 원상복구하고 슬롯을 반납하여 시스템 멈춤 방지

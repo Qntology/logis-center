@@ -413,25 +413,39 @@ impl LogisModel {
     pub async fn load_kv_snapshot(&self, task_id: &str, kv_name: Option<String>) -> anyhow::Result<()> {
         let generator_arc = self.generator.clone();
         let task_id_str = task_id.to_string();
+        let kv_name_str = kv_name.unwrap_or_else(|| "text".to_string());
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let kv_dir = crate::utils::paths::get_kv_dir(None).join(&task_id_str);
-                let kv_file = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
+                let kv_root = crate::utils::paths::get_kv_dir(None).join(&task_id_str);
                 
-                if kv_dir.exists() && kv_dir.is_dir() {
-                    println!("[SSD-BRIDGE] Loading Directory-based KV snapshot from {:?}", kv_dir);
-                    gen.load_kv_from_disk(&kv_dir, kv_name.as_deref())?;
-                    Ok(())
-                } else if kv_file.exists() {
-                    println!("[SSD-BRIDGE] Loading File-based KV snapshot from {:?}", kv_file);
-                    gen.load_kv_from_disk(&kv_file, kv_name.as_deref())?;
-                    Ok(())
-                } else {
-                    println!("[SSD-BRIDGE] No snapshot found for {} (Checked dir and file)", task_id_str);
-                    Ok(())
+                // [CRITICAL FIX] generate.rs가 캐시를 저장하는 실제 깊은 경로(inference/text 등)를 정확히 타겟팅합니다!
+                let kv_type = kv_name_str.split('/').last().unwrap_or("text");
+                let kv_type = if kv_type == "inference" || kv_type == "reference" || kv_type.is_empty() { "text" } else { kv_type };
+
+                let paths_to_try = vec![
+                    kv_root.join("inference").join(kv_type),
+                    kv_root.join("reference").join(kv_type),
+                    kv_root.clone(),
+                ];
+
+                let mut loaded = false;
+                for p in paths_to_try {
+                    // 폴더가 존재하고 비어있지 않은지 검사합니다.
+                    if p.exists() && std::fs::read_dir(&p).map(|mut d| d.next().is_some()).unwrap_or(false) {
+                        println!("[SSD-BRIDGE] Loading Directory-based KV snapshot from {:?}", p);
+                        // p 경로가 이미 세부 경로(inference/text)를 모두 포함하므로 kv_name은 None으로 전달합니다.
+                        gen.load_kv_from_disk(&p, None)?;
+                        loaded = true;
+                        break;
+                    }
                 }
+
+                if !loaded {
+                    println!("[SSD-BRIDGE] No snapshot found for {} (Checked deep paths)", task_id_str);
+                }
+                Ok(())
             } else {
                 Err(anyhow::anyhow!("No active generator to load snapshot into"))
             }

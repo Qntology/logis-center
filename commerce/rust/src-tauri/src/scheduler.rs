@@ -370,10 +370,10 @@ async fn process_task(
     }
 
     // [SSD-BRIDGE] Start warming up weights in background RAM immediately
-    let qwen35_model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3.5-0.8B-Instruct-gguf").or_else(|_| std::fs::canonicalize("models/Qwen3.5-0.8B-Instruct-gguf")).ok();
-    if let Some(p) = qwen35_model_path_hint {
-        let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
-    }
+    // let qwen35_model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3.5-0.8B-Instruct-gguf").or_else(|_| std::fs::canonicalize("models/Qwen3.5-0.8B-Instruct-gguf")).ok();
+    // if let Some(p) = qwen35_model_path_hint {
+    //     let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
+    // }
 
     // [SPINNER-ACTIVATE] Ensure UI spinner is ON immediately upon task recovery/start
     let payload = json!({ 
@@ -540,6 +540,7 @@ async fn process_task(
 
 
     use crate::openai_types::{
+        ChatCompletionRequestSystemMessage,
         ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
         ChatCompletionRequestUserMessageContent
     };
@@ -549,49 +550,80 @@ async fn process_task(
 
     // ==================================================================================
     // [ULTRA-OPTIMIZED PIPELINE]
-    // Step 1: 0.6B Bakes [PUG + Classification Task] -> Save SNAPSHOT_A
-    // Step 2: 0.6B Loads SNAPSHOT_A -> Instant Generation
-    // Step 3: 0.6B Bakes [PUG + Selector Task] -> Save SNAPSHOT_B
-    // Step 4: 0.6B Loads SNAPSHOT_B -> Instant Generation
-    // ... 
+    // Step 0: 0.6B Base Baking [System: PUG] -> Save task_id_base
+    // Step 1: 0.6B Loads base -> Ask Classification [User: Task] -> Save task_id_step_a
+    // Step 2: 0.6B Loads base -> Ask Selectors [User: Task] -> Save task_id_step_b
     // ==================================================================================
 
-    // --- STEP A: CLASSIFICATION (Disk Bridge Relay) ---
+    let base_session_id = format!("{}_base", task.id);
+    let system_content = format!("[PUG CONTENT]\n{}", light_pug);
+
+    // --- STEP 0: BASE BAKING (공통 컨텍스트 딱 1번만 굽기) ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] Starting DISK BRIDGE RELAY (0.6B -> Disk -> 0.6B)");
         
-        // [NEW] Log step A start for UI recovery
+        let base_kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&base_session_id);
+        if !base_kv_path.exists() {
+            println!("[Scheduler] Baking Base PUG Context to SSD...");
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Reading document structure...", "spinner": "⠋" }));
+            
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            
+            let params = ChatCompletionParameters {
+                messages: vec![ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                    content: system_content.clone(),
+                    name: None,
+                })],
+                model: "qwen".to_string(),
+                ..Default::default()
+            };
+
+            if let Some(gen) = model.generator.lock().await.as_mut() {
+                // System 메시지(PUG)만 1만 토큰을 읽어서 base_session_id 로 저장합니다.
+                gen.prefill_only(params, Some(cancellation_token.clone()), Some(base_session_id.clone()), None, kv_name.clone()).await?;
+            }
+        }
+    }
+
+    // --- STEP A: CLASSIFICATION (분류) ---
+    {
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Classify)");
+        
         log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
 
         let type_prompt = parsing::page_type_prompt();
-        let pug_content = light_pug.clone();
-        
-        // [REFINED-PROMPT] Place specific instructions at the end for better compliance.
-        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] Identify the page type.\n\n[INSTRUCTION]\n{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, type_prompt);
+        let task_question = format!("[TASK] Identify the page type.\n\n[INSTRUCTION]\n{}\n\n[ACTION] RETURN JSON ONLY.", type_prompt);
         let snapshot_id = format!("{}_step_a", task.id);
         
-        // [FIX] Update shared JSON with current step and session info
         if let Ok(content) = std::fs::read_to_string("tmp/index.json") {
             if let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(obj) = json_val.as_object_mut() {
                     obj.insert("step".to_string(), json!("Step A (Classification)"));
-                    obj.insert("session_id".to_string(), json!(snapshot_id));
+                    obj.insert("session_id".to_string(), json!(snapshot_id.clone()));
                     obj.insert("kv_path".to_string(), json!(kv_name.clone().unwrap_or_else(|| "tmp/kv/".to_string())));
                     let _ = std::fs::write("tmp/index.json", json_val.to_string());
                 }
             }
         }
 
-        // 1. [0.6B] Load & Generate (Direct 28-Layer Generation)
         {
-            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            // [핵심] Step A가 아니라 '미리 구워둔 Base' 스냅샷을 불러옵니다!
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
-                    name: None,
-                })],
+                messages: vec![
+                    // Base 캐시와 토큰을 100% 일치시키기 위해 System 메시지를 그대로 넣습니다.
+                    ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                        content: system_content.clone(),
+                        name: None,
+                    }),
+                    // 질문은 User 메시지로 분리합니다. (이 부분 50토큰만 연산됨!)
+                    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                        content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                        name: None,
+                    })
+                ],
                 model: "qwen".to_string(), 
                 max_tokens: Some(16),
                 temperature: Some(0.1),
@@ -607,7 +639,6 @@ async fn process_task(
                 let type_info = parsing::parse_json_from_llm(&res); 
                 page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
                 if page_type.is_empty() {
-                    println!("[Scheduler] Warning: LLM returned empty type. Using task type fallback.");
                     page_type = match task.r#type.as_str() {
                         "image_extraction" => "tracking".to_string(),
                         _ => "unknown".to_string(),
@@ -616,43 +647,6 @@ async fn process_task(
                 println!("[Scheduler] Classified as: {}", page_type);
             }
         }
-
-        // {
-        //     model.ensure_qwen3_5(crate::model::ModelSize::Small).await?;
-
-        //     let params = ChatCompletionParameters {
-        //         messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-        //             content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
-        //             name: None,
-        //         })],
-        //         model: "qwen".to_string(), 
-        //         max_tokens: Some(16),
-        //         temperature: Some(0.1),
-        //         ..Default::default()
-        //     };
-
-        //     // 2. 구형 generator 대신 qwen3_5_generator 사용!
-        //     if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-        //         println!("[Scheduler] 0.8B Step A: Asking classification question...");
-                
-        //         // 3. 최적화된 generate_part 함수 호출
-        //         let generation_result = gen.generate_part(&params, false, 0, None).await?;
-        //         let res = generation_result.text; // 결과 텍스트 추출
-                
-        //         println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
-                
-        //         let _ = data_manager.offload(&res, "step_a_res");
-        //         let type_info = parsing::parse_json_from_llm(&res); 
-        //         page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
-        //         if page_type.is_empty() {
-        //             page_type = match task.r#type.as_str() {
-        //                 "image_extraction" => "tracking".to_string(),
-        //                 _ => "unknown".to_string(),
-        //             };
-        //         }
-        //         println!("[Scheduler] Classified as: {}", page_type);
-        //     }
-        // }
         
         if page_type.is_empty() || page_type == "unknown" { 
             model.deep_purge_resources().await;
@@ -662,45 +656,47 @@ async fn process_task(
                         
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // [CRITICAL-CLEANUP] Clear the cache from Step A before Step B (git e8260c5 parity)
     model.deep_purge_resources().await;
     wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
 
-    // --- STEP B: SELECTORS (Disk Bridge Relay) ---
+    // --- STEP B: SELECTORS (선택자 추출) ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] Starting DISK BRIDGE RELAY for Selectors");
+        println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Selectors)");
         
-        // [NEW] Log step B start
         log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Identifying data elements...", "spinner": "⠋" }));
 
         let selector_prompt = parsing::page_selectors_prompt(&page_type); 
-        let pug_content = light_pug.clone();
-        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, selector_prompt);
+        let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY.", selector_prompt);
         let snapshot_id = format!("{}_step_b", task.id);
 
-        // [FIX] Update shared JSON with current step B, session info and the identified type
         if let Ok(content) = std::fs::read_to_string("tmp/index.json") {
             if let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(obj) = json_val.as_object_mut() {
                     obj.insert("step".to_string(), json!("Step B (Selectors)"));
-                    obj.insert("session_id".to_string(), json!(snapshot_id));
+                    obj.insert("session_id".to_string(), json!(snapshot_id.clone()));
                     obj.insert("type".to_string(), json!(page_type));
                     let _ = std::fs::write("tmp/index.json", json_val.to_string());
                 }
             }
         }
 
-        // 1. [Large] Load & Generate (Direct 28-Layer Generation)
         {
-            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+            // [핵심] 여기서도 '미리 구워둔 Base' 스냅샷을 불러옵니다!
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
-                    name: None,
-                })],
-                model: "qwen".to_string(), max_tokens: Some(64), temperature: Some(0.1),
+                messages: vec![
+                    ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                        content: system_content.clone(),
+                        name: None,
+                    }),
+                    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                        content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                        name: None,
+                    })
+                ],
+                model: "qwen".to_string(), max_tokens: Some(128), temperature: Some(0.1),
                 ..Default::default()
             };
 
@@ -709,9 +705,7 @@ async fn process_task(
                 let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
                 println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
 
-                // [DEBUG] AI 응답 저장
                 let _ = data_manager.offload(&res, "step_b_res");
-
                 selector_info = parsing::parse_json_from_llm(&res);
                 println!("[Scheduler] Selectors Identified.");
             }

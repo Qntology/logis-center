@@ -87,7 +87,7 @@ impl SlotManager {
 
 pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub static SLOT_MANAGER_DATA: Lazy<(SlotManager, Mutex<Option<mpsc::Receiver<SlotRequest>>>)> = Lazy::new(|| {
-    let (sm, rx) = SlotManager::new(32); 
+    let (sm, rx) = SlotManager::new(128); // 32 -> 128로 증가
     (sm, Mutex::new(Some(rx)))
 });
 pub static SLOT_MANAGER: Lazy<&SlotManager> = Lazy::new(|| &SLOT_MANAGER_DATA.0);
@@ -625,9 +625,9 @@ impl QwenVLGenerateModel {
                 }
             }
     
-            let temperature = mes.temperature.unwrap_or(1.0) as f32;
+            let temperature = mes.temperature.unwrap_or(0.1) as f32;
             let seed = mes.seed.unwrap_or(34562) as u64;
-            let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(1.0) as f32), Some(9), seed);
+            let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(0.1) as f32), Some(9), seed);
             let mes_render = self.chat_template.apply_chat_template(&mes)?;
             let input = self.pre_processor.process_info(&mes, &mes_render)?;
             let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
@@ -672,8 +672,12 @@ impl QwenVLGenerateModel {
 
         // [DENSE-MODE] Find token IDs for '<', 'think', and '{' to apply biases
         let think_token_id = self.tokenizer.text_encode_vec("<think>".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
-        let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(123); // '{' 의 ID
         let lt_id = self.tokenizer.text_encode_vec("<".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+
+        // [STRICT-JSON] 프롬프트에 /no_think 지시어가 있으면 첫 토큰을 무조건 '{'로 강제합니다.
+        let is_strict_json = input.replace_text.contains("/no_think") || input.replace_text.contains("RETURN JSON ONLY");
 
         for i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
@@ -696,27 +700,32 @@ impl QwenVLGenerateModel {
             }
 
             // 2. [DENSE-BIAS] Token Biases (In-place 연산)
-            if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 100.0; }
+            if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; } // <think> 억제
             if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 10.0; }
             
-            if i == 0 && (open_bracket_id as usize) < len {
-                logits_vec[open_bracket_id as usize] += 20.0;
-                if (self.eos_token_id1 as usize) < len { logits_vec[self.eos_token_id1 as usize] = -1000.0; }
-                if (self.eos_token_id2 as usize) < len { logits_vec[self.eos_token_id2 as usize] = -1000.0; }
+            if i == 0 {
+                if (self.eos_token_id1 as usize) < len { logits_vec[self.eos_token_id1 as usize] = -10000.0; }
+                if (self.eos_token_id2 as usize) < len { logits_vec[self.eos_token_id2 as usize] = -10000.0; }
+                if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; } // 첫 토큰 줄바꿈 억제
+                
+                if (open_bracket_id as usize) < len {
+                    let boost = if is_strict_json { 10000.0 } else { 20.0 };
+                    logits_vec[open_bracket_id as usize] += boost;
+                }
             }
 
             // 모든 수정이 끝난 뒤 딱 한 번만 GPU로 업로드!
             let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
             let mut next_id = lp.sample(&logits_tensor)?;
             
-            // [FORCE-START] If model still tries to output EOS at step 0, override it with '{'
-            if i == 0 && (next_id == self.eos_token_id1 || next_id == self.eos_token_id2) {
-                println!("[DEBUG-GEN] EOS detected on first token. Overriding with '{{' to force JSON.");
-                next_id = 123; // ASCII for '{' is usually safe, or use open_bracket_id
-                if open_bracket_id != 999999 { next_id = open_bracket_id; }
-            }
-            
+            // [FORCE-START] Strict JSON 모드이거나, AI가 첫 턴에 변덕을 부려 EOS를 내뱉으려 할 때 무조건 '{' 강제 삽입
             if i == 0 {
+                if is_strict_json {
+                    next_id = open_bracket_id; // 완벽한 강제 주입
+                } else if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 {
+                    println!("[DEBUG-GEN] EOS detected on first token. Overriding with '{{' to force JSON.");
+                    next_id = open_bracket_id;
+                }
                 println!("[DEBUG-GEN] First Token Final: {} ('{}')", next_id, self.tokenizer.token_decode(vec![next_id]).unwrap_or_else(|_| "???".to_string()));
             }
 
