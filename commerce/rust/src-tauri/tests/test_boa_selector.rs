@@ -6,17 +6,32 @@ use std::collections::HashMap;
 
 #[test]
 fn test_boa_selector_detection() {
-    let pug_content = fs::read_to_string("tests/temp_pug_content.txt").expect("Failed to read PUG content");
-    let document = Html::parse_document(&pug_content);
+    let html_content = fs::read_to_string("tests/temp_clean_html.txt").expect("Failed to read HTML content");
+    let document = Html::parse_document(&html_content);
     let mut nodes_json = Vec::new();
     let mut node_to_idx = HashMap::new();
 
+    // 1단계: 모든 노드의 ID를 인덱스에 매핑 (부모 참조를 위해)
     for (idx, node) in document.tree.root().descendants().enumerate() {
         node_to_idx.insert(node.id(), idx);
+    }
+
+    // 2단계: 노드 정보 수집
+    for (idx, node) in document.tree.root().descendants().enumerate() {
         if let Some(el) = node.value().as_element() {
             let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
             let text: String = node.children().filter_map(|child| child.value().as_text().map(|t| t.to_string())).collect::<Vec<_>>().join(" ").trim().to_string();
-            nodes_json.push(json!({ "index": idx, "parentIndex": parent_idx, "tagName": el.name().to_string(), "id": el.id().unwrap_or("").to_string(), "classes": el.attr("class").unwrap_or("").split_whitespace().collect::<Vec<_>>(), "text": text }));
+            nodes_json.push(json!({ 
+                "index": idx, 
+                "parentIndex": parent_idx, 
+                "tagName": el.name().to_string(), 
+                "id": el.id().unwrap_or("").to_string(), 
+                "classes": el.attr("class").unwrap_or("").split_whitespace().collect::<Vec<_>>(), 
+                "text": text 
+            }));
+        } else {
+            // 태그가 아닌 노드(Text 등)도 인덱스 유지를 위해 null로 채움
+            nodes_json.push(json!(null));
         }
     }
 
@@ -30,65 +45,84 @@ fn test_boa_selector_detection() {
         const titles = TITLES_PLACEHOLDER;
         
         function cleanClassList(classes) {
-            // rows, list0, list1 같은 반복되는 클래스는 유지해야 패턴 매칭이 됨
-            const ignore = ['active', 'selected', 'on', 'current', 'focus', 'hover'];
-            return classes.filter(c => !ignore.includes(c.toLowerCase()) && c.indexOf('__') === -1).sort();
+            if (!classes) return [];
+            return classes
+                .map(c => c.toLowerCase().replace(/\d+$/, ''))
+                .filter(c => !['active', 'rows'].includes(c))
+                .sort();
         }
 
         function getSignature(node, includeId = true) {
-            if (!node) return "";
+            if (!node || !node.tagName) return "";
             let s = node.tagName;
             if (includeId && node.id) s += "#" + node.id;
             const cls = cleanClassList(node.classes);
-            if (cls.length > 0) s += "." + cls.join(".");
+            if (cls.length > 0) s += "." + [...new Set(cls)].join(".");
             return s;
         }
 
-        function findElements(textToFind) {
-            const lower = textToFind.toLowerCase();
-            return nodes.filter(n => n.text && n.text.toLowerCase().includes(lower));
+        function getChildren(pIdx) { 
+            return nodes.filter(n => n && n.parentIndex === pIdx); 
         }
-
-        function getChildren(pIdx) { return nodes.filter(n => n && n.parentIndex === pIdx); }
 
         function detect(tIdx) {
             let cur = tIdx;
-            // 부모 탐색을 더 높게 (10단계까지)
-            for (let i = 0; i < 10 && cur !== -1; i++) {
+            let history = [];
+            for (let i = 0; i < 15; i++) {
                 const node = nodes[cur];
-                if (!node) break;
+                if (!node) { 
+                    // 부모가 null인 경우(Text 노드 등) 한 단계 더 위로
+                    cur = (nodes[cur] && nodes[cur].parentIndex) || -1;
+                    if (cur === -1) break;
+                    continue;
+                }
+                
                 const pIdx = node.parentIndex;
-                if (pIdx === -1) break;
+                if (pIdx === undefined || pIdx === -1) break;
                 
                 const sibs = getChildren(pIdx);
-                // 형제가 2개 이상이고 시그니처가 어느 정도 반복되면 리스트로 인정
+                const parentNode = nodes[pIdx];
+                
                 if (sibs.length >= 2) {
                     const sigs = sibs.map(s => getSignature(s, false)).filter(s => s !== "");
                     const counts = {}; sigs.forEach(s => counts[s] = (counts[s] || 0) + 1);
                     const entries = Object.entries(counts).sort((a,b) => b[1]-a[1]);
                     
-                    // 가장 많은 패턴이 전체의 30% 이상이면 리스트 후보 (복합 구조 고려하여 낮춤)
-                    if (entries.length && (entries[0][1] / sibs.length) >= 0.3) {
-                        const parentNode = nodes[pIdx];
-                        // 부모가 table이나 tbody면 더 올라가야 할 수도 있음
-                        if (["tbody", "thead"].includes(parentNode.tagName)) {
-                            cur = pIdx;
-                            continue;
+                    if (entries.length > 0) {
+                        const topPattern = entries[0][0];
+                        const confidence = entries[0][1] / sibs.length;
+                        history.push({ i, tagName: parentNode.tagName, sig: getSignature(parentNode), confidence, topPattern });
+
+                        if (confidence >= 0.2 && (topPattern.startsWith("tr") || topPattern.startsWith("li") || topPattern.startsWith("div"))) {
+                            // 테이블/리스트 구조 발견
+                            let finalParent = parentNode;
+                            // table이나 div#id 가 나올 때까지 2단계 더 상향 탐색
+                            let walkIdx = pIdx;
+                            for(let j=0; j<3; j++) {
+                                let gIdx = nodes[walkIdx] ? nodes[walkIdx].parentIndex : -1;
+                                if (gIdx !== -1 && nodes[gIdx]) {
+                                    const grand = nodes[gIdx];
+                                    if (grand.id || ["table", "ul", "ol"].includes(grand.tagName)) {
+                                        finalParent = grand;
+                                        if (grand.tagName === "table") break;
+                                    }
+                                    walkIdx = gIdx;
+                                }
+                            }
+                            return { parent: getSignature(finalParent, true), item: topPattern, confidence, history };
                         }
-                        return { "parent": getSignature(parentNode, true), "item": entries[0][0], "confidence": (entries[0][1] / sibs.length) };
                     }
                 }
                 cur = pIdx;
             }
-            return null;
+            return { error: "Structure Not Recognized", history };
         }
 
-        const matches = findElements(titles[0]);
-        let res = { "parent": "body", "item": "div", "matchCount": matches.length, "matches": [] };
+        const matches = nodes.filter(n => n && n.text && titles.some(t => n.text.includes(t)));
+        let res = { matchCount: matches.length };
         if (matches.length > 0) {
-            res.matches = matches.slice(0, 3).map(m => ({ signature: getSignature(m), text: m.text.substring(0, 20) }));
             const d = detect(matches[0].index);
-            if (d) { res.parent = d.parent; res.item = d.item; res.confidence = d.confidence; }
+            res = { ...res, ...d };
         }
         JSON.stringify(res);
     "##;
