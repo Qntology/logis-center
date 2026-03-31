@@ -1,0 +1,997 @@
+﻿html
+    head
+        title
+            | 愿由ъ옄 ?섏씠吏
+    body
+        header[id="hd"]
+            div[id="hd_wrap"]
+                h1
+                    | ?됰났??二쇰뒗 ?쇳븨紐?
+                div[id="logo"]
+                    a[href="http://demofran.com/admin/"]
+                        img[src="http://demofran.com/admin/img/logo.gif"]
+                div[id="tnb"]
+                    ul
+                        li
+                            | 遺꾩뼇紐?v2.4.2
+                        li
+                            | ?ㅻ뒛:29, ?댁젣:280, 理쒕?:1622, ?꾩껜:153539
+                        li
+                            a[href="http://demofran.com/admin/config.php?code=super"]
+                                | 愿由ъ옄?뺣낫
+                        li
+                            a[href="http://demofran.com/admin/"]
+                                | 愿由ъ옄??                        li
+                            a[href="http://demofran.com"]
+                                | ?쇳븨紐?                        li[id="tnb_logout"]
+                            a[href="http://demofran.com/bbs/logout.php"]
+                                | 濡쒓렇?꾩썐
+                nav[id="gnb"]
+                    h2
+                        | 愿由ъ옄 二쇰찓??                    ul[id="gnb_1dul"]
+                        li[class="gnb_1dli"]
+                            a[class="gnb_1da" href="http://demofran.com/admin/member.php?code=list"]
+                                | ?뚯썝愿由?                        li[class="gnb_1dli"]
+                            a[class="gnb_1da" href="http://demofran.com/admin/partner.php?code=plist"]
+                                | 媛留뱀젏愿由?                        li[class="gnb_1dli"]
+                            a[class="gnb_1da" href="http://demofran.com/admin/seller.php?code=list"]
+                                | 怨듦툒?ш?由?                        li[class="gnb_1dli"]
+                            a[class="gnb_1da" href="http://demofran.com/admin/category.php?code=list"]
+                                | 移댄뀒怨좊━ 愿由?                        li[class="gnb_1dli active"]
+                            a[class="gnb_1da" href="http://demofran.com/admin/goods.php?code=list"]
+                                | ?곹뭹愿由?                        li[class="gnb_1dli"]
+                            a[class="gnb_1da" href="http://demofran.com/admin/order.php?code=list"]
+                                | 二쇰Ц愿由?                        li[class="gnb_1dli"]
+                            a[class="gnb_1da" href="http://demofran.com/admin/visit.php?code=hour"]
+                                | ?듦퀎遺꾩꽍
+                        li[class="gnb_1dli"]
+                            a[class="gnb_1da" href="http://demofran.com/admin/help.php?code=qa"]
+                                | 怨좉컼吏??                        li[class="gnb_1dli"]
+                            a[class="gnb_1da" href="http://demofran.com/admin/design.php?code=banner_list"]
+                                | ?붿옄?멸?由?                        li[class="gnb_1dli"]
+                            a[class="gnb_1da" href="http://demofran.com/admin/config.php?code=default"]
+                                | ?섍꼍?ㅼ젙
+        div[id="wrapper"]
+            div[id="snb"]
+                div[class="snb_header ico_config"]
+                    h2
+                        i[class="ionicons ion-bag"]
+                        | ?곹뭹愿由?                dl
+                    dt[class="g10 menu_toggle"]
+                        | ?곹뭹愿由?                    dd[class="g10 active"]
+                        a[href="http://demofran.com/admin/goods.php?code=list"]
+                            | ?꾩껜 ?곹뭹愿由?                    dd[class="g10"]
+                        a[href="http://demofran.com/admin/goods.php?code=supply"]
+                            | 怨듦툒???湲곗긽??                            em
+                                | 0
+                    dd[class="g10"]
+                        a[href="http://demofran.com/admin/goods.php?code=supply2"]
+                            | 怨듦툒??蹂대쪟?곹뭹
+                            em
+                                | 0
+                    dd[class="g10"]
+                        a[href="http://demofran.com/admin/goods.php?code=userlist"]
+                            | 媛留뱀젏 ?곹뭹愿由?                    dd[class="g10"]
+                        a[href="http://demofran.com/admin/goods.php?code=type"]
+                            | ?곹뭹 吏꾩뿴愿由?                    dd[class="g10"]
+                        a[href="http://demofran.com/admin/goods.php?code=brand_list"]
+                            | 釉뚮옖??愿由?                    dd[class="g10"]
+                        a[href="http://demofran.com/admin/goods.php?code=plan"]
+                            | 湲고쉷??愿由?                    dt[class="g20 menu_toggle"]
+                        | ?ш퀬愿由?                    dd[class="g20"]
+                        a[href="http://demofran.com/admin/goods.php?code=stock"]
+                            | ?곹뭹 ?ш퀬愿由?                            em
+                                | 0
+                    dd[class="g20"]
+                        a[href="http://demofran.com/admin/goods.php?code=optstock"]
+                            | ?곹뭹 ?듭뀡?ш퀬愿由?                            em
+                                | 0
+                    dt[class="g30 menu_toggle"]
+                        | ?쇨큵泥섎━
+                    dd[class="g30"]
+                        a[href="http://demofran.com/admin/goods.php?code=xls_reg"]
+                            | ?곹뭹 ?묒??쇨큵?깅줉
+                    dd[class="g30"]
+                        a[href="http://demofran.com/admin/goods.php?code=xls_option_reg"]
+                            | ?듭뀡 ?묒??쇨큵?깅줉
+                    dd[class="g30"]
+                        a[href="http://demofran.com/admin/goods.php?code=xls_mod"]
+                            | ?곹뭹 ?묒??쇨큵?섏젙
+                    dd[class="g30"]
+                        a[href="http://demofran.com/admin/goods.php?code=getprice"]
+                            | 鍮좊Ⅸ ?먮ℓ媛寃??섏젙
+                    dd[class="g30"]
+                        a[href="http://demofran.com/admin/goods.php?code=getpoint"]
+                            | 鍮좊Ⅸ ?곷┰?ъ씤???섏젙
+                    dd[class="g30"]
+                        a[href="http://demofran.com/admin/goods.php?code=getuse"]
+                            | 鍮좊Ⅸ ?먮ℓ?щ? ?섏젙
+                    dd[class="g30"]
+                        a[href="http://demofran.com/admin/goods.php?code=getmove"]
+                            | 鍮좊Ⅸ ?곹뭹?대룞 ?섏젙
+                    dd[class="g30"]
+                        a[href="http://demofran.com/admin/goods.php?code=getbrand"]
+                            | 鍮좊Ⅸ 釉뚮옖???섏젙
+                    dd[class="g30"]
+                        a[href="http://demofran.com/admin/goods.php?code=getdelivery"]
+                            | 鍮좊Ⅸ 諛곗넚鍮??섏젙
+                    dd[class="g30"]
+                        a[href="http://demofran.com/admin/goods.php?code=getbuylevel"]
+                            | 鍮좊Ⅸ 援щℓ媛?λ젅踰??섏젙
+                    dd[class="g30"]
+                        a[href="http://demofran.com/admin/goods.php?code=getpartner"]
+                            | 鍮좊Ⅸ 媛留뱀젏?몄텧 ?섏젙
+                    dt[class="g40 menu_toggle"]
+                        | 臾몄쓽 / ?꾧린
+                    dd[class="g40"]
+                        a[href="http://demofran.com/admin/goods.php?code=qa"]
+                            | ?곹뭹 臾몄쓽愿由?                            em
+                                | 0
+                    dd[class="g40"]
+                        a[href="http://demofran.com/admin/goods.php?code=review"]
+                            | ?곹뭹 ?꾧린愿由?                    dt[class="g50 menu_toggle"]
+                        | 荑좏룿愿由?                    dd[class="g50"]
+                        a[href="http://demofran.com/admin/goods.php?code=gift"]
+                            | 荑좏룿愿由?(?몄뇙??
+                    dd[class="g50"]
+                        a[href="http://demofran.com/admin/goods.php?code=coupon"]
+                            | 荑좏룿愿由?(?⑤씪??
+                    dt[class="g60 menu_toggle"]
+                        | 湲고?愿由?                    dd[class="g60"]
+                        a[href="http://demofran.com/admin/goods.php?code=price"]
+                            | 媛寃⑸퉬援먯궗?댄듃 ?곕룞
+                    dd[class="g60"]
+                        a[href="http://demofran.com/admin/goods.php?code=popular_list"]
+                            | ?곹뭹 寃?됱뼱愿由?                    dd[class="g60"]
+                        a[href="http://demofran.com/admin/goods.php?code=popular_rank"]
+                            | ?곹뭹 寃?됱뼱?쒖쐞
+            div[id="content"]
+                div[class="breadcrumb"]
+                    span
+                        | HOME
+                    i[class="ionicons ion-ios-arrow-right"]
+                    | ?곹뭹愿由?                    i[class="ionicons ion-ios-arrow-right"]
+                    | ?꾩껜 ?곹뭹愿由?                div[class="s_wrap"]
+                    h1
+                        | ?꾩껜 ?곹뭹愿由?                    h2
+                        | 湲곕낯寃??                    form[id="fsearch" name="fsearch"]
+                        input[name="code" type="hidden" value="list"]
+                        div[class="tbl_frm01"]
+                            table[class="tablef"]
+                                colgroup
+                                    col[class="w100"]
+                                    col
+                                    col[class="w100"]
+                                    col
+                                tbody
+                                    tr
+                                        th
+                                            | 寃?됱뼱
+                                        td
+                                            select[name="sfl"]
+                                                option[value="gname"]
+                                                    | ?곹뭹紐?                                                option[value="gcode"]
+                                                    | ?곹뭹肄붾뱶
+                                                option[value="mb_id"]
+                                                    | ?낆껜肄붾뱶
+                                                option[value="maker"]
+                                                    | ?쒖“??                                                option[value="origin"]
+                                                    | ?먯궛吏
+                                                option[value="model"]
+                                                    | 紐⑤뜽紐?                                                option[value="explan"]
+                                                    | 吏㏃??ㅻ챸
+                                            input[class="frm_input" name="stx" type="text"]
+                                    tr
+                                        th
+                                            | 移댄뀒怨좊━
+                                        td
+                                            select[id="sel_ca1" name="sel_ca1"]
+                                                option
+                                                    | =移댄뀒怨좊━?좏깮=
+                                                option[value="002"]
+                                                    | ?앺뭹/?앺븘??                                                option[value="001"]
+                                                    | ?⑥뀡?섎쪟/?≫솕/酉고떚
+                                                option[value="003"]
+                                                    | 異쒖궛/?좎븘??                                                option[value="004"]
+                                                    | ?앺솢/嫄닿컯
+                                                option[value="005"]
+                                                    | 媛援??명뀒由ъ뼱
+                                                option[value="007"]
+                                                    | ?ㅽ룷痢??덉?/?먮룞李?怨듦뎄
+                                                option[value="006"]
+                                                    | 媛???붿???而댄벂??                                                option[value="008"]
+                                                    | ?꾩꽌/?ы뻾/e荑좏룿/痍⑤?
+                                            select[id="sel_ca2" name="sel_ca2"]
+                                                option
+                                                    | =移댄뀒怨좊━?좏깮=
+                                            select[id="sel_ca3" name="sel_ca3"]
+                                                option
+                                                    | =移댄뀒怨좊━?좏깮=
+                                            select[id="sel_ca4" name="sel_ca4"]
+                                                option
+                                                    | =移댄뀒怨좊━?좏깮=
+                                            select[id="sel_ca5" name="sel_ca5"]
+                                                option
+                                                    | =移댄뀒怨좊━?좏깮=
+                                    tr
+                                        th
+                                            | 湲곌컙寃??                                        td
+                                            select[id="q_date_field" name="q_date_field"]
+                                                option[value="update_time"]
+                                                    | 理쒓렐?섏젙??                                                option[value="reg_time"]
+                                                    | 理쒖큹?깅줉??                                            label[class="sound_only"]
+                                                | ?쒖옉??                                            input[id="fr_date" class="frm_input w80 hasDatepicker" name="fr_date" type="text"]
+                                            | ~
+                                            label[class="sound_only"]
+                                                | 醫낅즺??                                            input[id="to_date" class="frm_input w80 hasDatepicker" name="to_date" type="text"]
+                                            span[class="btn_group"]
+                                                input[class="btn_small white" type="button" value="?ㅻ뒛"]
+                                                input[class="btn_small white" type="button" value="?댁젣"]
+                                                input[class="btn_small white" type="button" value="?쇱＜??]
+                                                input[class="btn_small white" type="button" value="吏?쒕떖"]
+                                                input[class="btn_small white" type="button" value="1媛쒖썡"]
+                                                input[class="btn_small white" type="button" value="3媛쒖썡"]
+                                                input[class="btn_small white" type="button" value="?꾩껜"]
+                                    tr
+                                        th
+                                            | 釉뚮옖??                                        td
+                                            select[name="q_brand"]
+                                                option[selected]
+                                                    | ?꾩껜
+                                                option[value="1"]
+                                                    | ?뚯뒪??湲곗뾽
+                                                option[value="2"]
+                                                    | ?뚯뒪??湲곗뾽
+                                                option[value="3"]
+                                                    | ?뚯뒪??湲곗뾽
+                                                option[value="4"]
+                                                    | ?뚯뒪??湲곗뾽
+                                                option[value="5"]
+                                                    | ?뚯뒪??湲곗뾽
+                                                option[value="6"]
+                                                    | ?뚯뒪??湲곗뾽
+                                                option[value="7"]
+                                                    | ?뚯뒪??湲곗뾽
+                                                option[value="8"]
+                                                    | ?뚯뒪??湲곗뾽
+                                        th
+                                            | 諛곗넚媛??吏??                                        td
+                                            select[name="q_zone"]
+                                                option[selected]
+                                                    | ?꾩껜
+                                                option[value="?꾧뎅"]
+                                                    | ?꾧뎅
+                                                option[value="媛뺤썝??]
+                                                    | 媛뺤썝??                                                option[value="寃쎄린??]
+                                                    | 寃쎄린??                                                option[value="寃쎌긽??]
+                                                    | 寃쎌긽??                                                option[value="?쒖슱/寃쎄린??]
+                                                    | ?쒖슱/寃쎄린??                                                option[value="?쒖슱?밸퀎??]
+                                                    | ?쒖슱?밸퀎??                                                option[value="?꾨씪??]
+                                                    | ?꾨씪??                                                option[value="?쒖＜??]
+                                                    | ?쒖＜??                                                option[value="異⑹껌??]
+                                                    | 異⑹껌??                                    tr
+                                        th
+                                            | ?곹뭹?ш퀬
+                                        td
+                                            select[id="q_stock_field" name="q_stock_field"]
+                                                option[value="stock_qty"]
+                                                    | ?ш퀬?섎웾
+                                                option[value="noti_qty"]
+                                                    | ?듬낫?섎웾
+                                            label[class="sound_only"]
+                                                | ?ш퀬?섎웾 ?쒖옉
+                                            input[id="fr_stock" class="frm_input" name="fr_stock" type="text"]
+                                            | 媛??댁긽 ~
+                                            label[class="sound_only"]
+                                                | ?ш퀬?섎웾 ??                                            input[id="to_stock" class="frm_input" name="to_stock" type="text"]
+                                            | 媛??댄븯
+                                        th
+                                            | ?곹뭹媛寃?                                        td
+                                            select[id="q_price_field" name="q_price_field"]
+                                                option[value="goods_price"]
+                                                    | ?먮ℓ媛寃?                                                option[value="supply_price"]
+                                                    | 怨듦툒媛寃?                                                option[value="normal_price"]
+                                                    | ?쒖쨷媛寃?                                                option[value="gpoint"]
+                                                    | ?ъ씤??                                            label[class="sound_only"]
+                                                | ?곹뭹媛寃??쒖옉
+                                            input[id="fr_price" class="frm_input" name="fr_price" type="text"]
+                                            | ???댁긽 ~
+                                            label[class="sound_only"]
+                                                | ?곹뭹媛寃???                                            input[id="to_price" class="frm_input" name="to_price" type="text"]
+                                            | ???댄븯
+                                    tr
+                                        th
+                                            | ?먮ℓ?щ?
+                                        td
+                                            label
+                                                input[checked name="q_isopen" type="radio"]
+                                                | ?꾩껜
+                                            label
+                                                input[name="q_isopen" type="radio" value="1"]
+                                                | 吏꾩뿴
+                                            label
+                                                input[name="q_isopen" type="radio" value="2"]
+                                                | ?덉젅
+                                            label
+                                                input[name="q_isopen" type="radio" value="3"]
+                                                | ?⑥쥌
+                                            label
+                                                input[name="q_isopen" type="radio" value="4"]
+                                                | 以묒?
+                                        th
+                                            | ?꾩닔?듭뀡
+                                        td
+                                            label
+                                                input[checked name="q_option" type="radio"]
+                                                | ?꾩껜
+                                            label
+                                                input[name="q_option" type="radio" value="1"]
+                                                | ?ъ슜
+                                            label
+                                                input[name="q_option" type="radio" value="0"]
+                                                | 誘몄궗??                                    tr
+                                        th
+                                            | 怨쇱꽭?좏삎
+                                        td
+                                            label
+                                                input[checked name="q_notax" type="radio"]
+                                                | ?꾩껜
+                                            label
+                                                input[name="q_notax" type="radio" value="1"]
+                                                | 怨쇱꽭
+                                            label
+                                                input[name="q_notax" type="radio" value="0"]
+                                                | 鍮꾧낵??                                        th
+                                            | 異붽??듭뀡
+                                        td
+                                            label
+                                                input[checked name="q_supply" type="radio"]
+                                                | ?꾩껜
+                                            label
+                                                input[name="q_supply" type="radio" value="1"]
+                                                | ?ъ슜
+                                            label
+                                                input[name="q_supply" type="radio" value="0"]
+                                                | 誘몄궗??                        div[class="btn_confirm"]
+                            input[class="btn_medium" type="submit" value="寃??]
+                            input[id="frmRest" class="btn_medium grey" type="button" value="珥덇린??]
+                    form[id="fgoodslist" name="fgoodslist"]
+                        input[name="q1" type="hidden" value="code=list"]
+                        input[name="page" type="hidden" value="1"]
+                        div[class="local_ov mart30"]
+                            | ?꾩껜 :
+                            b[class="fc_red"]
+                                | 13
+                            | 嫄?議고쉶
+                            span[class="ov_a"]
+                                select[id="page_rows"]
+                                    option[selected value="30"]
+                                        | 30以??뺣젹
+                                    option[value="50"]
+                                        | 50以??뺣젹
+                                    option[value="100"]
+                                        | 100以??뺣젹
+                                    option[value="150"]
+                                        | 150以??뺣젹
+                        div[class="local_frm01"]
+                            input[class="btn_lsmall bx-white" name="act_button" type="submit" value="?좏깮??젣"]
+                            input[class="btn_lsmall bx-white" name="act_button" type="submit" value="?좏깮?쒖쐞?섏젙"]
+                            input[class="btn_lsmall bx-white" name="act_button" type="submit" value="?좏깮?곹뭹蹂듭궗"]
+                            a[class="btn_lsmall bx-white" href="./goods/goods_list_excel.php?code=list"]
+                                i[class="fa fa-file-excel-o"]
+                                | ?묒????                            a[class="fr btn_lsmall red" href="./goods.php?code=form"]
+                                i[class="ionicons ion-android-add"]
+                                | ?곹뭹?깅줉
+                        div[class="tbl_head02"]
+                            table[id="sodr_list" class="tablef"]
+                                colgroup
+                                    col[class="w50"]
+                                    col[class="w50"]
+                                    col[class="w60"]
+                                    col[class="w120"]
+                                    col
+                                    col
+                                    col[class="w80"]
+                                    col[class="w80"]
+                                    col[class="w90"]
+                                    col[class="w90"]
+                                    col[class="w90"]
+                                    col[class="w90"]
+                                    col[class="w60"]
+                                    col[class="w60"]
+                                thead
+                                    tr
+                                        th
+                                            input[name="chkall" type="checkbox" value="1"]
+                                        th
+                                            | 踰덊샇
+                                        th
+                                            | ?대?吏
+                                        th
+                                            a[href="/admin/goods.php?code=list&page=&filed=gcode&orderby=asc"]
+                                                | ?곹뭹肄붾뱶
+                                        th
+                                            a[href="/admin/goods.php?code=list&page=&filed=gname&orderby=asc"]
+                                                | ?곹뭹紐?                                        th
+                                            a[href="/admin/goods.php?code=list&page=&filed=reg_time&orderby=asc"]
+                                                | 理쒖큹?깅줉??                                        th
+                                            a[href="/admin/goods.php?code=list&page=&filed=isopen&orderby=asc"]
+                                                | 吏꾩뿴
+                                        th[class="th_bg"]
+                                            | 媛寃⑹젙蹂?                                        th
+                                            a[href="/admin/goods.php?code=list&page=&filed=rank&orderby=asc"]
+                                                | ?쒖쐞
+                                        th
+                                            | 愿由?                                    tr[class="rows"]
+                                        th
+                                            a[href="/admin/goods.php?code=list&page=&filed=mb_id&orderby=asc"]
+                                                | ?낆껜肄붾뱶
+                                        th
+                                            | 怨듦툒?щ챸
+                                        th
+                                            | 移댄뀒怨좊━
+                                        th
+                                            a[href="/admin/goods.php?code=list&page=&filed=update_time&orderby=asc"]
+                                                | 理쒓렐?섏젙??                                        th
+                                            a[href="/admin/goods.php?code=list&page=&filed=stock_qty&orderby=asc"]
+                                                | ?ш퀬
+                                        th[class="th_bg"]
+                                            a[href="/admin/goods.php?code=list&page=&filed=normal_price&orderby=asc"]
+                                                | ?쒖쨷媛
+                                        th[class="th_bg"]
+                                            a[href="/admin/goods.php?code=list&page=&filed=supply_price&orderby=asc"]
+                                                | 怨듦툒媛
+                                        th[class="th_bg"]
+                                            a[href="/admin/goods.php?code=list&page=&filed=goods_price&orderby=asc"]
+                                                | ?먮ℓ媛
+                                        th[class="th_bg"]
+                                            a[href="/admin/goods.php?code=list&page=&filed=gpoint&orderby=asc"]
+                                                | ?ъ씤??                                tbody
+                                    tr[class="list0"]
+                                        td
+                                            input[name="gs_id[0]" type="hidden" value="13"]
+                                            input[name="chk[]" type="checkbox" value="0"]
+                                        td
+                                            | 13
+                                        td
+                                            a[href="http://demofran.com/shop/view.php?index_no=13"]
+                                                img[src="http://demofran.com/data/goods/1735175576/thumb-L1HcL19cWvrb9W1DvdDN46aaTm9BTh_40x40.jpg"]
+                                        td
+                                            | 1735175576
+                                        td[class="tal"]
+                                            | ?뚯뒪???곹뭹3
+                                        td
+                                            | 24-12-26
+                                        td
+                                            | 吏꾩뿴
+                                        td[class="tar"]
+                                            | 0
+                                        td[class="tar"]
+                                            | 0
+                                        td[class="tar"]
+                                            | 0
+                                        td[class="tar"]
+                                            | 0
+                                        td
+                                            input[class="frm_input" name="rank[0]" type="text" value="0"]
+                                        td
+                                            a[class="btn_small" href="./goods.php?code=form&w=u&gs_id=13&page=1&bak=list"]
+                                                | ?섏젙
+                                    tr[class="list0 rows"]
+                                        td[class="fc_00f"]
+                                            | admin
+                                        td[class="tal txt_succeed"]
+                                            | ?섑뵆??                                        td[class="tal txt_succeed"]
+                                            span[class="fsitem"]
+                                                | 媛???붿???而댄벂??> ?명듃遺?PC
+                                        td[class="fc_00f"]
+                                            | 24-12-26
+                                        td
+                                            span[class="txt_false"]
+                                                | 臾댁젣??                                    tr[class="list1"]
+                                        td
+                                            input[name="gs_id[1]" type="hidden" value="12"]
+                                            input[name="chk[]" type="checkbox" value="1"]
+                                        td
+                                            | 12
+                                        td
+                                            a[href="http://demofran.com/shop/view.php?index_no=12"]
+                                                img[src="http://demofran.com/data/goods/1726045860/thumb-12_Mldks366mBjnWJd2fh4qlnX491lr3K_40x40.jpg"]
+                                        td
+                                            | 1726045860
+                                        td[class="tal"]
+                                            | ?뚯뒪???곹뭹 - ?뚮씪???꾨┛???뚮씪?댁뒪 ?먰뵾??F7093  287
+                                        td
+                                            | 24-09-11
+                                        td
+                                            | 吏꾩뿴
+                                        td[class="tar"]
+                                            | 684,000
+                                        td[class="tar"]
+                                            | 492,480
+                                        td[class="tar"]
+                                            | 615,600
+                                        td[class="tar"]
+                                            | 0
+                                        td
+                                            input[class="frm_input" name="rank[1]" type="text" value="0"]
+                                        td
+                                            a[class="btn_small" href="./goods.php?code=form&w=u&gs_id=12&page=1&bak=list"]
+                                                | ?섏젙
+                                    tr[class="list1 rows"]
+                                        td[class="fc_00f"]
+                                            | admin
+                                        td[class="tal txt_succeed"]
+                                            | ?섑뵆??                                        td[class="tal txt_succeed"]
+                                            span[class="fsitem"]
+                                                | ?⑥뀡?섎쪟/?≫솕/酉고떚
+                                            | ??1嫄?                                        td[class="fc_00f"]
+                                            | 24-10-08
+                                        td
+                                            span[class="txt_false"]
+                                                | 臾댁젣??                                    tr[class="list0"]
+                                        td
+                                            input[name="gs_id[2]" type="hidden" value="11"]
+                                            input[name="chk[]" type="checkbox" value="2"]
+                                        td
+                                            | 11
+                                        td
+                                            a[href="http://demofran.com/shop/view.php?index_no=11"]
+                                                img[src="http://demofran.com/data/goods/1726045859/thumb-11_SRBXGgqj9P8AftNpfQyHedUUk4KzAf_40x40.jpg"]
+                                        td
+                                            | 1726045859
+                                        td[class="tal"]
+                                            | ?뚯뒪???곹뭹 ?ㅻぐ 泥대━ 濡??щ━釉??곗뀛痢?                                        td
+                                            | 24-09-11
+                                        td
+                                            | 吏꾩뿴
+                                        td[class="tar"]
+                                            | 140,000
+                                        td[class="tar"]
+                                            | 71,200
+                                        td[class="tar"]
+                                            | 89,000
+                                        td[class="tar"]
+                                            | 4,450
+                                        td
+                                            input[class="frm_input" name="rank[2]" type="text" value="0"]
+                                        td
+                                            a[class="btn_small" href="./goods.php?code=form&w=u&gs_id=11&page=1&bak=list"]
+                                                | ?섏젙
+                                    tr[class="list0 rows"]
+                                        td[class="fc_00f"]
+                                            | admin
+                                        td[class="tal txt_succeed"]
+                                            | ?섑뵆??                                        td[class="tal txt_succeed"]
+                                            span[class="fsitem"]
+                                                | ?⑥뀡?섎쪟/?≫솕/酉고떚
+                                        td[class="fc_00f"]
+                                            | 24-12-04
+                                        td
+                                            span[class="txt_false"]
+                                                | 臾댁젣??                                    tr[class="list1"]
+                                        td
+                                            input[name="gs_id[3]" type="hidden" value="10"]
+                                            input[name="chk[]" type="checkbox" value="3"]
+                                        td
+                                            | 10
+                                        td
+                                            a[href="http://demofran.com/shop/view.php?index_no=10"]
+                                                img[src="http://demofran.com/data/goods/1726045858/thumb-10_37tXzNudBWjLx9cZWEFbE3R5PSbZUm_40x40.jpg"]
+                                        td
+                                            | 1726045858
+                                        td[class="tal"]
+                                            | ?뚯뒪???뚮옯 移대씪 怨⑥? ?덊듃 (GBSKN045P)
+                                        td
+                                            | 24-09-11
+                                        td
+                                            | 吏꾩뿴
+                                        td[class="tar"]
+                                            | 70,000
+                                        td[class="tar"]
+                                            | 28,000
+                                        td[class="tar"]
+                                            | 35,000
+                                        td[class="tar"]
+                                            | 0
+                                        td
+                                            input[class="frm_input" name="rank[3]" type="text" value="0"]
+                                        td
+                                            a[class="btn_small" href="./goods.php?code=form&w=u&gs_id=10&page=1&bak=list"]
+                                                | ?섏젙
+                                    tr[class="list1 rows"]
+                                        td[class="fc_00f"]
+                                            | admin
+                                        td[class="tal txt_succeed"]
+                                            | ?섑뵆??                                        td[class="tal txt_succeed"]
+                                            span[class="fsitem"]
+                                                | ?⑥뀡?섎쪟/?≫솕/酉고떚
+                                        td[class="fc_00f"]
+                                            | 24-12-04
+                                        td
+                                            span[class="txt_false"]
+                                                | 臾댁젣??                                    tr[class="list0"]
+                                        td
+                                            input[name="gs_id[4]" type="hidden" value="9"]
+                                            input[name="chk[]" type="checkbox" value="4"]
+                                        td
+                                            | 9
+                                        td
+                                            a[href="http://demofran.com/shop/view.php?index_no=9"]
+                                                img[src="http://demofran.com/data/goods/1726045857/thumb-9_4_37tXzNudBWjLx9cZWEFbE3R5PSbZUm_40x40.jpg"]
+                                        td
+                                            | 1726045857
+                                        td[class="tal"]
+                                            | ?뚯뒪???뚮옯 移대씪 怨⑥? ?덊듃 (GBSKN045P)
+                                        td
+                                            | 24-09-11
+                                        td
+                                            | 吏꾩뿴
+                                        td[class="tar"]
+                                            | 70,000
+                                        td[class="tar"]
+                                            | 28,000
+                                        td[class="tar"]
+                                            | 35,000
+                                        td[class="tar"]
+                                            | 0
+                                        td
+                                            input[class="frm_input" name="rank[4]" type="text" value="0"]
+                                        td
+                                            a[class="btn_small" href="./goods.php?code=form&w=u&gs_id=9&page=1&bak=list"]
+                                                | ?섏젙
+                                    tr[class="list0 rows"]
+                                        td[class="fc_00f"]
+                                            | admin
+                                        td[class="tal txt_succeed"]
+                                            | ?섑뵆??                                        td[class="tal txt_succeed"]
+                                            span[class="fsitem"]
+                                                | ?⑥뀡?섎쪟/?≫솕/酉고떚
+                                        td[class="fc_00f"]
+                                            | 24-09-11
+                                        td
+                                            span[class="txt_false"]
+                                                | 臾댁젣??                                    tr[class="list1"]
+                                        td
+                                            input[name="gs_id[5]" type="hidden" value="8"]
+                                            input[name="chk[]" type="checkbox" value="5"]
+                                        td
+                                            | 8
+                                        td
+                                            a[href="http://demofran.com/shop/view.php?index_no=8"]
+                                                img[src="http://demofran.com/data/goods/1726045856/thumb-8_5_SRBXGgqj9P8AftNpfQyHedUUk4KzAf_40x40.jpg"]
+                                        td
+                                            | 1726045856
+                                        td[class="tal"]
+                                            | ?뚯뒪???곹뭹 ?ㅻぐ 泥대━ 濡??щ━釉??곗뀛痢?                                        td
+                                            | 24-09-11
+                                        td
+                                            | 吏꾩뿴
+                                        td[class="tar"]
+                                            | 140,000
+                                        td[class="tar"]
+                                            | 71,200
+                                        td[class="tar"]
+                                            | 89,000
+                                        td[class="tar"]
+                                            | 0
+                                        td
+                                            input[class="frm_input" name="rank[5]" type="text" value="0"]
+                                        td
+                                            a[class="btn_small" href="./goods.php?code=form&w=u&gs_id=8&page=1&bak=list"]
+                                                | ?섏젙
+                                    tr[class="list1 rows"]
+                                        td[class="fc_00f"]
+                                            | admin
+                                        td[class="tal txt_succeed"]
+                                            | ?섑뵆??                                        td[class="tal txt_succeed"]
+                                            span[class="fsitem"]
+                                                | ?⑥뀡?섎쪟/?≫솕/酉고떚
+                                        td[class="fc_00f"]
+                                            | 24-09-11
+                                        td
+                                            span[class="txt_false"]
+                                                | 臾댁젣??                                    tr[class="list0"]
+                                        td
+                                            input[name="gs_id[6]" type="hidden" value="7"]
+                                            input[name="chk[]" type="checkbox" value="6"]
+                                        td
+                                            | 7
+                                        td
+                                            a[href="http://demofran.com/shop/view.php?index_no=7"]
+                                                img[src="http://demofran.com/data/goods/1726045855/thumb-7_6_Mldks366mBjnWJd2fh4qlnX491lr3K_40x40.jpg"]
+                                        td
+                                            | 1726045855
+                                        td[class="tal"]
+                                            | ?뚯뒪???곹뭹 - ?뚮씪???꾨┛???뚮씪?댁뒪 ?먰뵾??F7093  287
+                                        td
+                                            | 24-09-11
+                                        td
+                                            | 吏꾩뿴
+                                        td[class="tar"]
+                                            | 684,000
+                                        td[class="tar"]
+                                            | 492,480
+                                        td[class="tar"]
+                                            | 615,600
+                                        td[class="tar"]
+                                            | 0
+                                        td
+                                            input[class="frm_input" name="rank[6]" type="text" value="0"]
+                                        td
+                                            a[class="btn_small" href="./goods.php?code=form&w=u&gs_id=7&page=1&bak=list"]
+                                                | ?섏젙
+                                    tr[class="list0 rows"]
+                                        td[class="fc_00f"]
+                                            | admin
+                                        td[class="tal txt_succeed"]
+                                            | ?섑뵆??                                        td[class="tal txt_succeed"]
+                                            span[class="fsitem"]
+                                                | ?⑥뀡?섎쪟/?≫솕/酉고떚
+                                            | ??1嫄?                                        td[class="fc_00f"]
+                                            | 24-09-11
+                                        td
+                                            span[class="txt_false"]
+                                                | 臾댁젣??                                    tr[class="list1"]
+                                        td
+                                            input[name="gs_id[7]" type="hidden" value="6"]
+                                            input[name="chk[]" type="checkbox" value="7"]
+                                        td
+                                            | 6
+                                        td
+                                            a[href="http://demofran.com/shop/view.php?index_no=6"]
+                                                img[src="http://demofran.com/data/goods/1726045851/thumb-6_Mldks366mBjnWJd2fh4qlnX491lr3K_40x40.jpg"]
+                                        td
+                                            | 1726045851
+                                        td[class="tal"]
+                                            | ?뚯뒪???곹뭹 - ?뚮씪???꾨┛???뚮씪?댁뒪 ?먰뵾??F7093  287
+                                        td
+                                            | 24-09-11
+                                        td
+                                            | 吏꾩뿴
+                                        td[class="tar"]
+                                            | 684,000
+                                        td[class="tar"]
+                                            | 492,480
+                                        td[class="tar"]
+                                            | 615,600
+                                        td[class="tar"]
+                                            | 0
+                                        td
+                                            input[class="frm_input" name="rank[7]" type="text" value="0"]
+                                        td
+                                            a[class="btn_small" href="./goods.php?code=form&w=u&gs_id=6&page=1&bak=list"]
+                                                | ?섏젙
+                                    tr[class="list1 rows"]
+                                        td[class="fc_00f"]
+                                            | admin
+                                        td[class="tal txt_succeed"]
+                                            | ?섑뵆??                                        td[class="tal txt_succeed"]
+                                            span[class="fsitem"]
+                                                | ?⑥뀡?섎쪟/?≫솕/酉고떚
+                                            | ??1嫄?                                        td[class="fc_00f"]
+                                            | 24-09-11
+                                        td
+                                            span[class="txt_false"]
+                                                | 臾댁젣??                                    tr[class="list0"]
+                                        td
+                                            input[name="gs_id[8]" type="hidden" value="5"]
+                                            input[name="chk[]" type="checkbox" value="8"]
+                                        td
+                                            | 5
+                                        td
+                                            a[href="http://demofran.com/shop/view.php?index_no=5"]
+                                                img[src="http://demofran.com/data/goods/1726045850/thumb-5_SRBXGgqj9P8AftNpfQyHedUUk4KzAf_40x40.jpg"]
+                                        td
+                                            | 1726045850
+                                        td[class="tal"]
+                                            | ?뚯뒪???곹뭹 ?ㅻぐ 泥대━ 濡??щ━釉??곗뀛痢?                                        td
+                                            | 24-09-11
+                                        td
+                                            | 吏꾩뿴
+                                        td[class="tar"]
+                                            | 140,000
+                                        td[class="tar"]
+                                            | 71,200
+                                        td[class="tar"]
+                                            | 89,000
+                                        td[class="tar"]
+                                            | 0
+                                        td
+                                            input[class="frm_input" name="rank[8]" type="text" value="0"]
+                                        td
+                                            a[class="btn_small" href="./goods.php?code=form&w=u&gs_id=5&page=1&bak=list"]
+                                                | ?섏젙
+                                    tr[class="list0 rows"]
+                                        td[class="fc_00f"]
+                                            | admin
+                                        td[class="tal txt_succeed"]
+                                            | ?섑뵆??                                        td[class="tal txt_succeed"]
+                                            span[class="fsitem"]
+                                                | ?⑥뀡?섎쪟/?≫솕/酉고떚
+                                        td[class="fc_00f"]
+                                            | 24-09-11
+                                        td
+                                            span[class="txt_false"]
+                                                | 臾댁젣??                                    tr[class="list1"]
+                                        td
+                                            input[name="gs_id[9]" type="hidden" value="4"]
+                                            input[name="chk[]" type="checkbox" value="9"]
+                                        td
+                                            | 4
+                                        td
+                                            a[href="http://demofran.com/shop/view.php?index_no=4"]
+                                                img[src="http://demofran.com/data/goods/1726045849/thumb-4_37tXzNudBWjLx9cZWEFbE3R5PSbZUm_40x40.jpg"]
+                                        td
+                                            | 1726045849
+                                        td[class="tal"]
+                                            | ?뚯뒪???뚮옯 移대씪 怨⑥? ?덊듃 (GBSKN045P)
+                                        td
+                                            | 24-09-11
+                                        td
+                                            | 吏꾩뿴
+                                        td[class="tar"]
+                                            | 70,000
+                                        td[class="tar"]
+                                            | 28,000
+                                        td[class="tar"]
+                                            | 35,000
+                                        td[class="tar"]
+                                            | 0
+                                        td
+                                            input[class="frm_input" name="rank[9]" type="text" value="0"]
+                                        td
+                                            a[class="btn_small" href="./goods.php?code=form&w=u&gs_id=4&page=1&bak=list"]
+                                                | ?섏젙
+                                    tr[class="list1 rows"]
+                                        td[class="fc_00f"]
+                                            | admin
+                                        td[class="tal txt_succeed"]
+                                            | ?섑뵆??                                        td[class="tal txt_succeed"]
+                                            span[class="fsitem"]
+                                                | ?⑥뀡?섎쪟/?≫솕/酉고떚
+                                        td[class="fc_00f"]
+                                            | 24-09-11
+                                        td
+                                            span[class="txt_false"]
+                                                | 臾댁젣??                                    tr[class="list0"]
+                                        td
+                                            input[name="gs_id[10]" type="hidden" value="3"]
+                                            input[name="chk[]" type="checkbox" value="10"]
+                                        td
+                                            | 3
+                                        td
+                                            a[href="http://demofran.com/shop/view.php?index_no=3"]
+                                                img[src="http://demofran.com/data/goods/1726045737/thumb-37tXzNudBWjLx9cZWEFbE3R5PSbZUm_40x40.jpg"]
+                                        td
+                                            | 1726045737
+                                        td[class="tal"]
+                                            | ?뚯뒪???뚮옯 移대씪 怨⑥? ?덊듃 (GBSKN045P)
+                                        td
+                                            | 24-09-11
+                                        td
+                                            | 吏꾩뿴
+                                        td[class="tar"]
+                                            | 70,000
+                                        td[class="tar"]
+                                            | 28,000
+                                        td[class="tar"]
+                                            | 35,000
+                                        td[class="tar"]
+                                            | 0
+                                        td
+                                            input[class="frm_input" name="rank[10]" type="text" value="0"]
+                                        td
+                                            a[class="btn_small" href="./goods.php?code=form&w=u&gs_id=3&page=1&bak=list"]
+                                                | ?섏젙
+                                    tr[class="list0 rows"]
+                                        td[class="fc_00f"]
+                                            | admin
+                                        td[class="tal txt_succeed"]
+                                            | ?섑뵆??                                        td[class="tal txt_succeed"]
+                                            span[class="fsitem"]
+                                                | ?⑥뀡?섎쪟/?≫솕/酉고떚
+                                        td[class="fc_00f"]
+                                            | 24-09-11
+                                        td
+                                            span[class="txt_false"]
+                                                | 臾댁젣??                                    tr[class="list1"]
+                                        td
+                                            input[name="gs_id[11]" type="hidden" value="2"]
+                                            input[name="chk[]" type="checkbox" value="11"]
+                                        td
+                                            | 2
+                                        td
+                                            a[href="http://demofran.com/shop/view.php?index_no=2"]
+                                                img[src="http://demofran.com/data/goods/1726045193/thumb-SRBXGgqj9P8AftNpfQyHedUUk4KzAf_40x40.jpg"]
+                                        td
+                                            | 1726045193
+                                        td[class="tal"]
+                                            | ?뚯뒪???곹뭹 ?ㅻぐ 泥대━ 濡??щ━釉??곗뀛痢?                                        td
+                                            | 24-09-11
+                                        td
+                                            | 吏꾩뿴
+                                        td[class="tar"]
+                                            | 140,000
+                                        td[class="tar"]
+                                            | 71,200
+                                        td[class="tar"]
+                                            | 89,000
+                                        td[class="tar"]
+                                            | 0
+                                        td
+                                            input[class="frm_input" name="rank[11]" type="text" value="0"]
+                                        td
+                                            a[class="btn_small" href="./goods.php?code=form&w=u&gs_id=2&page=1&bak=list"]
+                                                | ?섏젙
+                                    tr[class="list1 rows"]
+                                        td[class="fc_00f"]
+                                            | admin
+                                        td[class="tal txt_succeed"]
+                                            | ?섑뵆??                                        td[class="tal txt_succeed"]
+                                            span[class="fsitem"]
+                                                | ?⑥뀡?섎쪟/?≫솕/酉고떚
+                                        td[class="fc_00f"]
+                                            | 24-12-04
+                                        td
+                                            span[class="txt_false"]
+                                                | 臾댁젣??                                    tr[class="list0"]
+                                        td
+                                            input[name="gs_id[12]" type="hidden" value="1"]
+                                            input[name="chk[]" type="checkbox" value="12"]
+                                        td
+                                            | 1
+                                        td
+                                            a[href="http://demofran.com/shop/view.php?index_no=1"]
+                                                img[src="http://demofran.com/data/goods/1726043335/thumb-Mldks366mBjnWJd2fh4qlnX491lr3K_40x40.jpg"]
+                                        td
+                                            | 1726043335
+                                        td[class="tal"]
+                                            | ?뚯뒪???곹뭹 - ?뚮씪???꾨┛???뚮씪?댁뒪 ?먰뵾??F7093  287
+                                        td
+                                            | 24-09-11
+                                        td
+                                            | 吏꾩뿴
+                                        td[class="tar"]
+                                            | 684,000
+                                        td[class="tar"]
+                                            | 492,480
+                                        td[class="tar"]
+                                            | 615,600
+                                        td[class="tar"]
+                                            | 0
+                                        td
+                                            input[class="frm_input" name="rank[12]" type="text" value="0"]
+                                        td
+                                            a[class="btn_small" href="./goods.php?code=form&w=u&gs_id=1&page=1&bak=list"]
+                                                | ?섏젙
+                                    tr[class="list0 rows"]
+                                        td[class="fc_00f"]
+                                            | admin
+                                        td[class="tal txt_succeed"]
+                                            | ?섑뵆??                                        td[class="tal txt_succeed"]
+                                            span[class="fsitem"]
+                                                | ?⑥뀡?섎쪟/?≫솕/酉고떚
+                                            | ??1嫄?                                        td[class="fc_00f"]
+                                            | 24-09-11
+                                        td
+                                            span[class="txt_false"]
+                                                | 臾댁젣??                        div[class="local_frm02"]
+                            input[class="btn_lsmall bx-white" name="act_button" type="submit" value="?좏깮??젣"]
+                            input[class="btn_lsmall bx-white" name="act_button" type="submit" value="?좏깮?쒖쐞?섏젙"]
+                            input[class="btn_lsmall bx-white" name="act_button" type="submit" value="?좏깮?곹뭹蹂듭궗"]
+                            a[class="btn_lsmall bx-white" href="./goods/goods_list_excel.php?code=list"]
+                                i[class="fa fa-file-excel-o"]
+                                | ?묒????                            a[class="fr btn_lsmall red" href="./goods.php?code=form"]
+                                i[class="ionicons ion-android-add"]
+                                | ?곹뭹?깅줉
+        div[id="ft"]
+            p
+                | Copyright  ?됰났??二쇰뒗 ?쇳븨紐?. All rights reserved.
+        div[id="ajax-loading"]
+            img[src="http://demofran.com/img/ajax-loader.gif"]
+        div[id="anc_header"]
+            a[href="#anc_hd"]
+                span
+                | TOP
+        div[id="ui-datepicker-div" class="ui-datepicker ui-widget ui-widget-content ui-helper-clearfix ui-corner-all"]

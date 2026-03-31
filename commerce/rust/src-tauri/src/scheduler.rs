@@ -659,31 +659,22 @@ async fn process_task(
     model.deep_purge_resources().await;
     wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
 
-    // --- STEP B: SELECTORS (선택자 추출) ---
+    // --- STEP B: SELECTORS (선택자 추출 - JS 기반 신규 로직) ---
     {
+        use boa_engine::{Context, Source};
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Selectors)");
+        println!("[Scheduler] Starting JS-BASED SELECTOR ANALYSIS (LLM Titles -> Boa Engine)");
         
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Identifying data elements...", "spinner": "⠋" }));
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Analyzing DOM with JS engine...", "spinner": "⠋" }));
 
-        let selector_prompt = parsing::page_selectors_prompt(&page_type); 
-        let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY.", selector_prompt);
-        let snapshot_id = format!("{}_step_b", task.id);
+        // 1. LLM에게 상품명(titles) 추출 요청
+        let title_prompt = parsing::extract_titles_prompt(&page_type);
+        let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY.", title_prompt);
+        let snapshot_id = format!("{}_step_b_titles", task.id);
 
-        if let Ok(content) = std::fs::read_to_string("tmp/index.json") {
-            if let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(obj) = json_val.as_object_mut() {
-                    obj.insert("step".to_string(), json!("Step B (Selectors)"));
-                    obj.insert("session_id".to_string(), json!(snapshot_id.clone()));
-                    obj.insert("type".to_string(), json!(page_type));
-                    let _ = std::fs::write("tmp/index.json", json_val.to_string());
-                }
-            }
-        }
-
+        let mut titles = Vec::new();
         {
-            // [핵심] 여기서도 '미리 구워둔 Base' 스냅샷을 불러옵니다!
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![
@@ -696,18 +687,96 @@ async fn process_task(
                         name: None,
                     })
                 ],
-                model: "qwen".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
+                model: "qwen".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.01),
                 ..Default::default()
             };
 
             if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] Small Step B: Asking selector question...");
+                println!("[JS-BRIDGE] 1. Requesting titles from LLM...");
                 let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
-                println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
+                println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
 
-                let _ = data_manager.offload(&res, "step_b_res");
-                selector_info = parsing::parse_json_from_llm(&res);
-                println!("[Scheduler] Selectors Identified.");
+                let title_info = parsing::parse_json_from_llm(&res);
+                let items_opt = title_info.get("order")
+                    .or(title_info.get("items"))
+                    .or(title_info.get("titles"))
+                    .and_then(|v| v.as_array());
+
+                if let Some(items) = items_opt {
+                    for item in items {
+                        if let Some(t) = item.as_str() {
+                            titles.push(t.to_string());
+                        } else if let Some(t) = item.get("title").and_then(|v| v.as_str()) {
+                            titles.push(t.to_string());
+                        }
+                    }
+                }
+                println!("[JS-BRIDGE] Titles extracted (Robust): {:?}", titles);
+            }
+        }
+
+        if titles.is_empty() {
+             println!("[JS-BRIDGE] Warning: No titles extracted from LLM. Falling back to default.");
+        }
+
+        // 2. Boa Engine으로 DOM 분석
+        {
+            println!("[JS-BRIDGE] 2. Starting boa-engine for DOM analysis...");
+            let mut context = Context::default();
+            
+            let clean_html = data_manager.load(&data_manager.get_path("clean_html"))?;
+            let document = scraper::Html::parse_document(&clean_html);
+            
+            let mut nodes_json = Vec::new();
+            let mut node_to_idx = std::collections::HashMap::new();
+
+            for (idx, node) in document.tree.root().descendants().enumerate() {
+                node_to_idx.insert(node.id(), idx);
+                
+                if let Some(el) = node.value().as_element() {
+                    let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
+                    
+                    let text: String = node.children()
+                        .filter_map(|child| child.value().as_text().map(|t| t.to_string()))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .trim()
+                        .to_string();
+                        
+                    nodes_json.push(json!({
+                        "index": idx,
+                        "parentIndex": parent_idx,
+                        "tagName": el.name().to_string(),
+                        "id": el.id().unwrap_or("").to_string(),
+                        "classes": el.attr("class").unwrap_or("").split_whitespace().collect::<Vec<_>>(),
+                        "text": text
+                    }));
+                }
+            }
+            
+            let nodes_str = serde_json::to_string(&nodes_json)?;
+            let titles_str = serde_json::to_string(&titles)?;
+
+            let js_template = r#"
+                const nodes = NODES_PLACEHOLDER;
+                const titles = TITLES_PLACEHOLDER;
+                let res = { "parent": "body", "item": "div", "matchCount": 0 };
+                JSON.stringify(res);
+            "#;
+
+            let js_code = js_template
+                .replace("NODES_PLACEHOLDER", &nodes_str)
+                .replace("TITLES_PLACEHOLDER", &titles_str);
+
+            match context.eval(Source::from_bytes(js_code.as_bytes())) {
+                Ok(val) => {
+                    let res_str = val.as_string().unwrap().to_std_string_escaped();
+                    println!("[JS-BRIDGE] Boa Final Result: {}", res_str);
+                    selector_info = serde_json::from_str(&res_str).unwrap_or(json!({}));
+                },
+                Err(e) => {
+                    println!("[JS-BRIDGE] Error executing JS: {:?}", e);
+                }
             }
         }
     }

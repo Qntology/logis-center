@@ -344,6 +344,21 @@ Based on the provided Pug template, identify the primary category of this webpag
     type: String
 }"###.to_string() }
 
+pub fn extract_titles_prompt(page_type: &str) -> String {
+    let template = r###"[TASK]
+Find all the {TYPE} titles from the following PUG/HTML content.
+
+[SCHEMA DEFINITIONS]
+- title: {TYPE} title {String}
+
+[OUTPUT FORMAT]
+{ "order" : [ {"title" : String} ] }
+
+[ACTION] RETURN JSON ONLY.
+NO EXPLANATION. NO THINKING. /no_think"###;
+    template.replace("{TYPE}", page_type)
+}
+
 pub fn page_selectors_prompt(page_type: &str) -> String {
     let template = r###"[TASK]
 The page has been classified as '{TYPE}'.
