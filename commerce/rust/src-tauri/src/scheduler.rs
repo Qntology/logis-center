@@ -730,9 +730,13 @@ async fn process_task(
             let mut nodes_json = Vec::new();
             let mut node_to_idx = std::collections::HashMap::new();
 
+            // 1단계: 모든 노드 ID 매핑
             for (idx, node) in document.tree.root().descendants().enumerate() {
                 node_to_idx.insert(node.id(), idx);
-                
+            }
+
+            // 2단계: 노드 정보 수집 (Element 노드 중심)
+            for (idx, node) in document.tree.root().descendants().enumerate() {
                 if let Some(el) = node.value().as_element() {
                     let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
                     
@@ -751,18 +755,103 @@ async fn process_task(
                         "classes": el.attr("class").unwrap_or("").split_whitespace().collect::<Vec<_>>(),
                         "text": text
                     }));
+                } else {
+                    nodes_json.push(json!(null));
                 }
             }
             
             let nodes_str = serde_json::to_string(&nodes_json)?;
             let titles_str = serde_json::to_string(&titles)?;
 
-            let js_template = r#"
+            let js_template = r##"
                 const nodes = NODES_PLACEHOLDER;
                 const titles = TITLES_PLACEHOLDER;
-                let res = { "parent": "body", "item": "div", "matchCount": 0 };
+                
+                function cleanClassList(classes) {
+                    if (!classes) return [];
+                    return classes
+                        .map(c => c.toLowerCase().replace(/\d+$/, '')) // list0 -> list 정규화
+                        .filter(c => !['active', 'rows', 'selected', 'on', 'current', 'focus', 'hover'].includes(c) && c.indexOf('__') === -1)
+                        .sort();
+                }
+
+                function getSignature(node, includeId = true) {
+                    if (!node || !node.tagName) return "";
+                    let s = node.tagName;
+                    if (includeId && node.id && node.id.trim() !== "") {
+                        s += "#" + node.id;
+                    }
+                    const cls = cleanClassList(node.classes);
+                    if (cls.length > 0) {
+                        s += "." + [...new Set(cls)].join(".");
+                    }
+                    return s;
+                }
+
+                function findElements(textToFind) {
+                    const lower = textToFind.toLowerCase().trim().replace(/\s+/g, ' ');
+                    return nodes.filter(n => {
+                        if (!n || !n.text) return false;
+                        return n.text.toLowerCase().replace(/\s+/g, ' ').includes(lower);
+                    });
+                }
+
+                function getChildren(pIdx) { 
+                    return nodes.filter(n => n && n.parentIndex === pIdx); 
+                }
+
+                function detect(tIdx) {
+                    let cur = tIdx;
+                    for (let i = 0; i < 15; i++) {
+                        const node = nodes[cur];
+                        if (!node) {
+                            cur = (nodes[cur] && nodes[cur].parentIndex) || -1;
+                            if (cur === -1) break;
+                            continue;
+                        }
+                        const pIdx = node.parentIndex;
+                        if (pIdx === undefined || pIdx === -1) break;
+                        const sibs = getChildren(pIdx);
+                        const parentNode = nodes[pIdx];
+                        if (sibs.length >= 2) {
+                            const sigs = sibs.map(s => getSignature(s, false)).filter(s => s !== "");
+                            const counts = {}; sigs.forEach(s => counts[s] = (counts[s] || 0) + 1);
+                            const entries = Object.entries(counts).sort((a,b) => b[1]-a[1]);
+                            if (entries.length > 0) {
+                                const topPattern = entries[0][0];
+                                const confidence = entries[0][1] / sibs.length;
+                                if (confidence >= 0.2 && (topPattern.startsWith("tr") || topPattern.startsWith("li") || topPattern.startsWith("div"))) {
+                                    let finalParent = parentNode;
+                                    let walkIdx = pIdx;
+                                    for(let j=0; j<3; j++) {
+                                        let gIdx = nodes[walkIdx] ? nodes[walkIdx].parentIndex : -1;
+                                        if (gIdx !== -1 && nodes[gIdx]) {
+                                            const grand = nodes[gIdx];
+                                            if (grand.id || ["table", "ul", "ol"].includes(grand.tagName)) {
+                                                finalParent = grand;
+                                                if (grand.tagName === "table") break;
+                                            }
+                                            walkIdx = gIdx;
+                                        }
+                                    }
+                                    return { parent: getSignature(finalParent, true), item: topPattern };
+                                }
+                            }
+                        }
+                        cur = pIdx;
+                    }
+                    return null;
+                }
+
+                const matches = titles.flatMap(t => findElements(t));
+                let res = { "parent": "body", "item": "div", "matchCount": matches.length };
+                if (matches.length > 0) {
+                    const bestMatch = matches.sort((a, b) => b.index - a.index)[0];
+                    const d = detect(bestMatch.index);
+                    if (d) { res.parent = d.parent; res.item = d.item; }
+                }
                 JSON.stringify(res);
-            "#;
+            "##;
 
             let js_code = js_template
                 .replace("NODES_PLACEHOLDER", &nodes_str)
