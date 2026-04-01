@@ -918,7 +918,7 @@ sale_price:sale price | number,
 supply_price:supply price | number,
 currency:ISO 4217 Currency Code | string,
 quantity:item stock quantity | number,
-tracking_number:Tracking Number or 운송장 번호 or 运单号 or 運單號 or 伝票번호 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Номер накладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ | string,
+tracking_number:Tracking Number or 운송장 번호 or 运单호 or 運單號 or 伝표번호 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Ноमर 나кладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ | string,
 registration_date:yyyy-MM-ddThh:mm:ss | string,"###.to_string(),
         "tracking" | "review" => r###"status:'start' or 'progress' or 'stop' or 'cancel' or 'return',
 id:Refer to the ID value from the link or an attribute | string,
@@ -935,28 +935,19 @@ registration_date:yyyy-MM-ddThh:mm:ss | string,"###.to_string(),
     };
 
     let template = r###"[TASK]
-Extract data from the PUG snippet into a JSON object.
+Extract detailed information from the provided Pug template into a single structured JSON object.
 
-[SCHEMA]
+[SCHEMA DEFINITIONS]
 {SCHEMA}
 
-[RULES]
-1. Output ONLY a single JSON object.
-2. No explanation, no thinking tags, no conversational text.
-3. If a value is missing, use null.
-4. Prices and quantities must be numbers only.
+[OUTPUT FORMAT]
+Return ONLY a single valid JSON object. 
+If a field is missing, use null. 
+Normalize all dates to 'yyyy-MM-ddThh:mm:ss'. 
+Extract only numeric values for price, quantity, amount.
 
-[EXAMPLE]
-Input: 
-tr
-  td.id | 123
-  td.name | Test Item
-  td.price | 1,000
-Output:
-{ "id": "123", "title": "Test Item", "sale_price": 1000 }
-
-[INPUT PUG]
-"###;
+[ACTION] RETURN JSON ONLY. 
+NO EXPLANATION. NO THINKING. /no_think"###;
 
     template.replace("{SCHEMA}", &schema)
 }

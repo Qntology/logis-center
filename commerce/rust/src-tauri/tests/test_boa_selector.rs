@@ -180,7 +180,7 @@ fn test_automated_extraction_pipeline() {
         if let Some(first_item) = pug_list.first() {
             println!("\n--- [PROMPT ENGINEERING VERIFICATION] ---");
             let extraction_instruction = parsing::list2json("goods", "english");
-            let task_question = format!("[ITEM PUG]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", first_item, extraction_instruction);
+            let task_question = format!("[PUG CONTENT]\n{}\n\n{}", first_item, extraction_instruction);
             println!("Generated Prompt Sample:\n{}", task_question);
         }
         

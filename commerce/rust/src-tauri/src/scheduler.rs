@@ -987,7 +987,7 @@ async fn process_task(
                 if cancellation_token.load(Ordering::Relaxed) { break; }
                 
                 let extraction_instruction = parsing::list2json(&page_type, language);
-                let task_question = format!("[ITEM PUG]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", item_pug, extraction_instruction);
+                let task_question = format!("[PUG CONTENT]\n{}\n\n{}", item_pug, extraction_instruction);
                 
                 let res = if let Some(gen) = model.generator.lock().await.as_mut() {
                     println!("[Scheduler] Extracting Item {}/{}...", idx + 1, pug_list.len());
