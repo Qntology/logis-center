@@ -918,7 +918,7 @@ sale_price:sale price | number,
 supply_price:supply price | number,
 currency:ISO 4217 Currency Code | string,
 quantity:item stock quantity | number,
-tracking_number:Tracking Number or 운송장 번호 or 运단호 or 運單號 or 伝표번호 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Но머 나кладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ | string,
+tracking_number:Tracking Number or 운송장 번호 or 运单号 or 運單號 or 伝票번호 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Номер накладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ | string,
 registration_date:yyyy-MM-ddThh:mm:ss | string,"###.to_string(),
         "tracking" | "review" => r###"status:'start' or 'progress' or 'stop' or 'cancel' or 'return',
 id:Refer to the ID value from the link or an attribute | string,
@@ -936,7 +936,7 @@ registration_date:yyyy-MM-ddThh:mm:ss | string,"###.to_string(),
 
     let template = r###" 
 [TASK]
-Extract a list of items from the provided Pug snippets into a JSON object matching the schema.
+Extract detailed information from the provided Pug template into a single structured JSON object.
 
 [CONTEXT]
 Category: {TYPE}
@@ -946,18 +946,15 @@ Language: {LANGUAGE}
 {SCHEMA}
 
 [EXTRACTION RULES]
-1. Return a JSON object containing the fields defined in [SCHEMA DEFINITIONS].
-2. The "items" field must be an array of objects.
-3. If data for a field is missing, use null.
-4. Extract only numeric values for prices and quantities.
-5. Return ONLY valid JSON. No explanation.
+1. Return ONLY valid JSON. No preamble, no postscript.
+2. If a field is missing in the data, use null.
+3. Normalize all dates to 'yyyy-MM-ddThh:mm:ss'.
+4. Extract only numeric values for price, quantity, amount.
+5. Do NOT make up data. Only extract what is present in the Pug structure.
 
 [OUTPUT FORMAT]
 {
-    "type": "...",
-    "items": [
-        { "id": "...", "title": "...", "status": "..." }
-    ]
+    "field_name": "extracted_value"
 }"###;
 
     template.replace("{TYPE}", page_type)

@@ -968,21 +968,51 @@ async fn process_task(
 
     // --- PHASE 2 Continue: Detail Extraction (If needed) --- 
     if !is_detail {
-        // [LIST MODE] Direct DOM Extraction
-        let list_log = json!({ "category": "List Processing", "summary": "Extracting list data...", "spinner": "⠋" });
+        // [LIST MODE] 지능형 리스트 추출 (LLM 기반)
+        let list_log = json!({ "category": "List Processing", "summary": "Extracting list data with LLM...", "spinner": "⠋" });
         log_task_progress(app_handle, &task.id, &list_log);
 
         let mut all_extracted_items = Vec::new();
-        {
+        let pug_list = {
             let clean_html_path = data_manager.get_path("clean_html");
             let clean_content = data_manager.load(&clean_html_path)?;
-            let document = scraper::Html::parse_document(&clean_content);
-            if let Ok(sel) = scraper::Selector::parse(&target_selector) {
-                for item in document.select(&sel) {
-                    let text = item.text().collect::<Vec<_>>().join(" ").trim().to_string();
-                    if !text.is_empty() {
-                        all_extracted_items.push(json!({ "text": text }));
-                    }
+            parsing::split_html_to_pug_list(&clean_content, &target_selector, PugMode::FullContent)
+        };
+
+        if !pug_list.is_empty() {
+            // Small 모델 확보
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+
+            for (idx, item_pug) in pug_list.iter().enumerate() {
+                if cancellation_token.load(Ordering::Relaxed) { break; }
+                
+                let extraction_instruction = parsing::list2json(&page_type, language);
+                let task_question = format!("[ITEM PUG]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", item_pug, extraction_instruction);
+                
+                let res = if let Some(gen) = model.generator.lock().await.as_mut() {
+                    println!("[Scheduler] Extracting Item {}/{}...", idx + 1, pug_list.len());
+                    let params = ChatCompletionParameters {
+                        messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                            content: ChatCompletionRequestUserMessageContent::Text(task_question),
+                            name: None,
+                        })],
+                        model: "qwen".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.01),
+                        ..Default::default()
+                    };
+                    gen.generate(params, Some(cancellation_token.clone()), None, Some("inference".to_string())).await
+                } else {
+                    Err(anyhow::anyhow!("Generator not available"))
+                };
+
+                match res {
+                    Ok(res_text) => {
+                        let item_json = parsing::parse_json_from_llm(&res_text);
+                        // 의미 있는 데이터인지 확인 (null이 아니거나 비어있지 않은 객체)
+                        if !item_json.is_null() && (item_json.is_object() || item_json.is_array()) {
+                            all_extracted_items.push(item_json);
+                        }
+                    },
+                    Err(e) => println!("[Scheduler] Error extracting item {}: {:?}", idx, e),
                 }
             }
         }
