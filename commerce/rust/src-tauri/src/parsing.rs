@@ -352,7 +352,7 @@ Find all the {TYPE} titles from the following PUG/HTML content.
 - title: {TYPE} title {String}
 
 [OUTPUT FORMAT]
-{ "order" : [ {"title" : String} ] }
+{ "{TYPE}" : [ {"title" : String} ] }
 
 [ACTION] RETURN JSON ONLY.
 NO EXPLANATION. NO THINKING. /no_think"###;
@@ -934,32 +934,31 @@ registration_date:yyyy-MM-ddThh:mm:ss | string,"###.to_string(),
         _ => "id: ID\ntitle: Title\nstatus: Status".to_string()
     };
 
-    let template = r###" 
-[TASK]
-Extract detailed information from the provided Pug template into a single structured JSON object.
+    let template = r###"[TASK]
+Extract data from the PUG snippet into a JSON object.
 
-[CONTEXT]
-Category: {TYPE}
-Language: {LANGUAGE}
-
-[SCHEMA DEFINITIONS]
+[SCHEMA]
 {SCHEMA}
 
-[EXTRACTION RULES]
-1. Return ONLY valid JSON. No preamble, no postscript.
-2. If a field is missing in the data, use null.
-3. Normalize all dates to 'yyyy-MM-ddThh:mm:ss'.
-4. Extract only numeric values for price, quantity, amount.
-5. Do NOT make up data. Only extract what is present in the Pug structure.
+[RULES]
+1. Output ONLY a single JSON object.
+2. No explanation, no thinking tags, no conversational text.
+3. If a value is missing, use null.
+4. Prices and quantities must be numbers only.
 
-[OUTPUT FORMAT]
-{
-    "field_name": "extracted_value"
-}"###;
+[EXAMPLE]
+Input: 
+tr
+  td.id | 123
+  td.name | Test Item
+  td.price | 1,000
+Output:
+{ "id": "123", "title": "Test Item", "sale_price": 1000 }
 
-    template.replace("{TYPE}", page_type)
-            .replace("{LANGUAGE}", language)
-            .replace("{SCHEMA}", &schema)
+[INPUT PUG]
+"###;
+
+    template.replace("{SCHEMA}", &schema)
 }
 
 /// Converts a JSON Value into a human-readable natural language narrative.
