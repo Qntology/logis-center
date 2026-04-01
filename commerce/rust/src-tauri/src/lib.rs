@@ -1,7 +1,7 @@
 mod model;
 mod store;
 mod automation;
-mod parsing;
+pub mod parsing;
 mod logic;
 mod scheduler;
 

@@ -3,20 +3,19 @@ use scraper::Html;
 use serde_json::json;
 use std::fs;
 use std::collections::HashMap;
+use tauri_app_lib::parsing::{self, PugMode};
 
 #[test]
-fn test_boa_selector_detection() {
+fn test_automated_extraction_pipeline() {
     let html_content = fs::read_to_string("tests/temp_clean_html.txt").expect("Failed to read HTML content");
     let document = Html::parse_document(&html_content);
     let mut nodes_json = Vec::new();
     let mut node_to_idx = HashMap::new();
 
-    // 1단계: 모든 노드의 ID를 인덱스에 매핑 (부모 참조를 위해)
     for (idx, node) in document.tree.root().descendants().enumerate() {
         node_to_idx.insert(node.id(), idx);
     }
 
-    // 2단계: 노드 정보 수집
     for (idx, node) in document.tree.root().descendants().enumerate() {
         if let Some(el) = node.value().as_element() {
             let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
@@ -30,12 +29,12 @@ fn test_boa_selector_detection() {
                 "text": text 
             }));
         } else {
-            // 태그가 아닌 노드(Text 등)도 인덱스 유지를 위해 null로 채움
             nodes_json.push(json!(null));
         }
     }
 
-    let titles = vec!["F7093".to_string()];
+    // [INPUT] 오직 타겟 텍스트만 주어짐
+    let titles = vec!["테스트 상품3".to_string()];
     let nodes_str = serde_json::to_string(&nodes_json).unwrap();
     let titles_str = serde_json::to_string(&titles).unwrap();
 
@@ -44,11 +43,15 @@ fn test_boa_selector_detection() {
         const nodes = NODES_PLACEHOLDER;
         const titles = TITLES_PLACEHOLDER;
         
-        function cleanClassList(classes) {
+        function cleanClassList(classes, stripNumbers = false) {
             if (!classes) return [];
+            const skip = ['active', 'selected', 'on', 'current', 'focus', 'hover', 'enabled', 'disabled'];
             return classes
-                .map(c => c.toLowerCase().replace(/\d+$/, ''))
-                .filter(c => !['active', 'rows'].includes(c))
+                .filter(c => {
+                    const lowerC = c.toLowerCase();
+                    return !skip.includes(lowerC) && c.indexOf('__') === -1 && !/^[a-z0-9]{8,}$/.test(c);
+                })
+                .map(c => stripNumbers ? c.replace(/\d+$/, '') : c)
                 .sort();
         }
 
@@ -57,7 +60,7 @@ fn test_boa_selector_detection() {
             let s = node.tagName;
             if (includeId && node.id) s += "#" + node.id;
             const cls = cleanClassList(node.classes);
-            if (cls.length > 0) s += "." + [...new Set(cls)].join(".");
+            if (cls.length > 0) s += "." + cls.join(".");
             return s;
         }
 
@@ -65,71 +68,120 @@ fn test_boa_selector_detection() {
             return nodes.filter(n => n && n.parentIndex === pIdx); 
         }
 
-        function detect(tIdx) {
-            let cur = tIdx;
-            let history = [];
+        // tracker.js 핵심: 유사도 점수 계산 (태그 일치 + 클래스 일부 일치)
+        // [FIX] 숫자를 제거한 클래스명으로 비교하여 zebra stripes(list0, list1) 대응
+        function calculateSimilarity(nodeA, nodeB) {
+            if (nodeA.tagName !== nodeB.tagName) return 0;
+            const clsA = cleanClassList(nodeA.classes, true);
+            const clsB = cleanClassList(nodeB.classes, true);
+            if (clsA.length === 0 && clsB.length === 0) return 100;
+            
+            let matchCount = 0;
+            clsA.forEach(c => { if (clsB.includes(c)) matchCount++; });
+            return clsA.length ? (matchCount / clsA.length) * 100 : 0;
+        }
+
+        function detectList(tIdx) {
+            let curIdx = tIdx;
+            let debugLogs = [];
             for (let i = 0; i < 15; i++) {
-                const node = nodes[cur];
-                if (!node) { 
-                    // 부모가 null인 경우(Text 노드 등) 한 단계 더 위로
-                    cur = (nodes[cur] && nodes[cur].parentIndex) || -1;
-                    if (cur === -1) break;
-                    continue;
-                }
+                const node = nodes[curIdx];
+                if (!node) break;
                 
                 const pIdx = node.parentIndex;
                 if (pIdx === undefined || pIdx === -1) break;
                 
-                const sibs = getChildren(pIdx);
                 const parentNode = nodes[pIdx];
+                const siblings = getChildren(pIdx);
                 
-                if (sibs.length >= 2) {
-                    const sigs = sibs.map(s => getSignature(s, false)).filter(s => s !== "");
-                    const counts = {}; sigs.forEach(s => counts[s] = (counts[s] || 0) + 1);
-                    const entries = Object.entries(counts).sort((a,b) => b[1]-a[1]);
-                    
-                    if (entries.length > 0) {
-                        const topPattern = entries[0][0];
-                        const confidence = entries[0][1] / sibs.length;
-                        history.push({ i, tagName: parentNode.tagName, sig: getSignature(parentNode), confidence, topPattern });
+                debugLogs.push(`Level ${i}: Parent <${parentNode.tagName}> Class: [${parentNode.classes.join(", ")}]`);
+                
+                const similarSiblings = siblings.filter(s => {
+                    const score = calculateSimilarity(node, s);
+                    if (score >= 20) {
+                        debugLogs.push(`  - Sibling <${s.tagName}> Original Class: [${s.classes.join(", ")}] Score (stripped): ${score.toFixed(1)}`);
+                    }
+                    return score >= 60;
+                });
 
-                        if (confidence >= 0.2 && (topPattern.startsWith("tr") || topPattern.startsWith("li") || topPattern.startsWith("div"))) {
-                            // 테이블/리스트 구조 발견
-                            let finalParent = parentNode;
-                            // table이나 div#id 가 나올 때까지 2단계 더 상향 탐색
-                            let walkIdx = pIdx;
-                            for(let j=0; j<3; j++) {
-                                let gIdx = nodes[walkIdx] ? nodes[walkIdx].parentIndex : -1;
-                                if (gIdx !== -1 && nodes[gIdx]) {
-                                    const grand = nodes[gIdx];
-                                    if (grand.id || ["table", "ul", "ol"].includes(grand.tagName)) {
-                                        finalParent = grand;
-                                        if (grand.tagName === "table") break;
-                                    }
-                                    walkIdx = gIdx;
-                                }
+                if (similarSiblings.length >= 2) {
+                    // 리스트 부모 찾기 (ID나 Table 선호)
+                    let finalParent = parentNode;
+                    let walkIdx = pIdx;
+                    for(let j=0; j<5; j++) {
+                        let gIdx = nodes[walkIdx] ? nodes[walkIdx].parentIndex : -1;
+                        if (gIdx !== -1 && nodes[gIdx]) {
+                            const grand = nodes[gIdx];
+                            if (grand.id || ["table", "ul", "ol", "nav"].includes(grand.tagName)) {
+                                finalParent = grand;
+                                if (grand.id || grand.tagName === "table") break;
                             }
-                            return { parent: getSignature(finalParent, true), item: topPattern, confidence, history };
+                            walkIdx = gIdx;
                         }
                     }
+
+                    const parentSig = getSignature(finalParent, true);
+                    
+                    // 아이템 셀렉터 유추: 수집된 모든 유사 형제의 클래스를 분석
+                    const uniqueSigs = [];
+                    similarSiblings.forEach(s => {
+                        const sig = getSignature(s, false);
+                        if (!uniqueSigs.includes(sig)) uniqueSigs.push(sig);
+                    });
+
+                    // 콤마로 연결된 최종 셀렉터 생성
+                    const fullSelector = uniqueSigs.map(sig => parentSig + " " + sig).join(", ");
+
+                    return { 
+                        parent: parentSig, 
+                        itemSelector: fullSelector,
+                        matchCount: similarSiblings.length,
+                        debug: debugLogs
+                    };
                 }
-                cur = pIdx;
+                curIdx = pIdx;
             }
-            return { error: "Structure Not Recognized", history };
+            return { error: "No list detected", debug: debugLogs };
         }
 
-        const matches = nodes.filter(n => n && n.text && titles.some(t => n.text.includes(t)));
-        let res = { matchCount: matches.length };
+        const findText = titles[0].toLowerCase().replace(/\s+/g, ' ');
+        const matches = nodes.filter(n => n && n.text && n.text.toLowerCase().replace(/\s+/g, ' ').includes(findText));
+        
         if (matches.length > 0) {
-            const d = detect(matches[0].index);
-            res = { ...res, ...d };
+            const res = detectList(matches[0].index);
+            JSON.stringify(res);
+        } else {
+            JSON.stringify({ error: "Text not found" });
         }
-        JSON.stringify(res);
     "##;
 
     let js_code = js_template.replace("NODES_PLACEHOLDER", &nodes_str).replace("TITLES_PLACEHOLDER", &titles_str);
-    match context.eval(Source::from_bytes(js_code.as_bytes())) {
-        Ok(val) => { println!("RESULT: {}", val.as_string().unwrap().to_std_string_escaped()); },
-        Err(e) => { panic!("JS Error: {:?}", e); }
+    let detection_res = match context.eval(Source::from_bytes(js_code.as_bytes())) {
+        Ok(val) => val.as_string().unwrap().to_std_string_escaped(),
+        Err(e) => panic!("JS Error: {:?}", e),
+    };
+
+    let res_json: serde_json::Value = serde_json::from_str(&detection_res).unwrap();
+    
+    if let Some(debug) = res_json.get("debug").and_then(|v| v.as_array()) {
+        println!("\n--- [DETECTION LOGS] ---");
+        for log in debug {
+            println!("{}", log.as_str().unwrap_or(""));
+        }
+    }
+
+    if let Some(selector) = res_json.get("itemSelector").and_then(|v| v.as_str()) {
+        println!("\n[PHASE 1] Final Result: {}", detection_res);
+        println!("[PHASE 2] Using Detected Selector: {}", selector);
+        
+        let pug_list = parsing::split_html_to_pug_list(&html_content, selector, PugMode::FullContent);
+        println!("[PHASE 3] Found {} items via Pug conversion.", pug_list.len());
+        
+        // 검증: list1이 포함되어 있는지 확인
+        assert!(selector.contains("list1"), "Selector should contain list1");
+        assert!(pug_list.len() >= 13, "Should find all items (at least 13 based on HTML)");
+    } else {
+        println!("Error: {}", res_json.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown"));
+        panic!("Detection failed");
     }
 }

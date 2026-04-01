@@ -730,7 +730,7 @@ async fn process_task(
             let mut nodes_json = Vec::new();
             let mut node_to_idx = std::collections::HashMap::new();
 
-            // 1단계: 모든 노드 ID 매핑
+            // 1단계: 모든 노드 ID 매핑 (부모 참조 안정성 확보)
             for (idx, node) in document.tree.root().descendants().enumerate() {
                 node_to_idx.insert(node.id(), idx);
             }
@@ -769,31 +769,21 @@ async fn process_task(
                 
                 function cleanClassList(classes) {
                     if (!classes) return [];
+                    const skip = ['active', 'selected', 'on', 'current', 'focus', 'hover', 'enabled', 'disabled'];
                     return classes
-                        .map(c => c.toLowerCase().replace(/\d+$/, '')) // list0 -> list 정규화
-                        .filter(c => !['active', 'rows', 'selected', 'on', 'current', 'focus', 'hover'].includes(c) && c.indexOf('__') === -1)
+                        .filter(c => !skip.includes(c.toLowerCase()) && !/^[a-z0-9]{8,}$/.test(c)) 
                         .sort();
                 }
 
                 function getSignature(node, includeId = true) {
                     if (!node || !node.tagName) return "";
                     let s = node.tagName;
-                    if (includeId && node.id && node.id.trim() !== "") {
-                        s += "#" + node.id;
-                    }
+                    if (includeId && node.id) s += "#" + node.id;
                     const cls = cleanClassList(node.classes);
                     if (cls.length > 0) {
                         s += "." + [...new Set(cls)].join(".");
                     }
                     return s;
-                }
-
-                function findElements(textToFind) {
-                    const lower = textToFind.toLowerCase().trim().replace(/\s+/g, ' ');
-                    return nodes.filter(n => {
-                        if (!n || !n.text) return false;
-                        return n.text.toLowerCase().replace(/\s+/g, ' ').includes(lower);
-                    });
                 }
 
                 function getChildren(pIdx) { 
@@ -811,31 +801,49 @@ async fn process_task(
                         }
                         const pIdx = node.parentIndex;
                         if (pIdx === undefined || pIdx === -1) break;
-                        const sibs = getChildren(pIdx);
+                        
+                        const siblings = getChildren(pIdx);
                         const parentNode = nodes[pIdx];
-                        if (sibs.length >= 2) {
-                            const sigs = sibs.map(s => getSignature(s, false)).filter(s => s !== "");
-                            const counts = {}; sigs.forEach(s => counts[s] = (counts[s] || 0) + 1);
-                            const entries = Object.entries(counts).sort((a,b) => b[1]-a[1]);
-                            if (entries.length > 0) {
-                                const topPattern = entries[0][0];
-                                const confidence = entries[0][1] / sibs.length;
-                                if (confidence >= 0.2 && (topPattern.startsWith("tr") || topPattern.startsWith("li") || topPattern.startsWith("div"))) {
-                                    let finalParent = parentNode;
-                                    let walkIdx = pIdx;
-                                    for(let j=0; j<3; j++) {
-                                        let gIdx = nodes[walkIdx] ? nodes[walkIdx].parentIndex : -1;
-                                        if (gIdx !== -1 && nodes[gIdx]) {
-                                            const grand = nodes[gIdx];
-                                            if (grand.id || ["table", "ul", "ol"].includes(grand.tagName)) {
-                                                finalParent = grand;
-                                                if (grand.tagName === "table") break;
-                                            }
-                                            walkIdx = gIdx;
+                        
+                        if (siblings.length >= 2) {
+                            const targetSig = getSignature(node, false);
+                            const similarSiblings = siblings.filter(s => {
+                                if (s.tagName !== node.tagName) return false;
+                                const sCls = cleanClassList(s.classes);
+                                const nCls = cleanClassList(node.classes);
+                                return nCls.some(c => sCls.includes(c)) || getSignature(s, false) === targetSig;
+                            });
+
+                            if (similarSiblings.length >= 2) {
+                                let finalParent = parentNode;
+                                let walkIdx = pIdx;
+                                for(let j=0; j<5; j++) {
+                                    let gIdx = nodes[walkIdx] ? nodes[walkIdx].parentIndex : -1;
+                                    if (gIdx !== -1 && nodes[gIdx]) {
+                                        const grand = nodes[gIdx];
+                                        if (grand.id || ["table", "ul", "ol", "nav"].includes(grand.tagName)) {
+                                            finalParent = grand;
+                                            if (grand.id || grand.tagName === "table") break;
                                         }
+                                        walkIdx = gIdx;
                                     }
-                                    return { parent: getSignature(finalParent, true), item: topPattern };
                                 }
+
+                                const commonClasses = cleanClassList(node.classes).filter(c => 
+                                    similarSiblings.every(s => cleanClassList(s.classes).includes(c))
+                                );
+                                let itemSelector = node.tagName;
+                                if (commonClasses.length > 0) {
+                                    itemSelector += "." + commonClasses.join(".");
+                                } else {
+                                    const bestCls = cleanClassList(node.classes)[0];
+                                    if (bestCls) itemSelector += "." + bestCls;
+                                }
+
+                                return { 
+                                    parent: getSignature(finalParent, true), 
+                                    item: itemSelector
+                                };
                             }
                         }
                         cur = pIdx;
@@ -843,11 +851,12 @@ async fn process_task(
                     return null;
                 }
 
-                const matches = titles.flatMap(t => findElements(t));
+                const findText = titles.length > 0 ? titles[0].toLowerCase().replace(/\s+/g, ' ') : "";
+                const matches = nodes.filter(n => n && n.text && n.text.toLowerCase().replace(/\s+/g, ' ').includes(findText));
+                
                 let res = { "parent": "body", "item": "div", "matchCount": matches.length };
                 if (matches.length > 0) {
-                    const bestMatch = matches.sort((a, b) => b.index - a.index)[0];
-                    const d = detect(bestMatch.index);
+                    const d = detect(matches[0].index);
                     if (d) { res.parent = d.parent; res.item = d.item; }
                 }
                 JSON.stringify(res);
@@ -993,7 +1002,7 @@ async fn process_task(
 
             // 1. [Large] Load & Generate (Direct 28-Layer Generation)
             {
-                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
