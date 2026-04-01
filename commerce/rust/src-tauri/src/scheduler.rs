@@ -989,7 +989,12 @@ async fn process_task(
         let pug_list = {
             let clean_html_path = data_manager.get_path("clean_html");
             let clean_content = data_manager.load(&clean_html_path)?;
-            parsing::split_html_to_pug_list(&clean_content, &target_selector, PugMode::FullContent)
+            let headers = parsing::extract_table_headers(&clean_content, &target_selector);
+            if !headers.is_empty() {
+                println!("[Scheduler] Extracted {} header rows for 'alt' mapping.", headers.len());
+            }
+            let document = scraper::Html::parse_document(&clean_content);
+            parsing::split_doc_to_pug_list_advanced(&document, &target_selector, PugMode::FullContent, if headers.is_empty() { None } else { Some(headers) })
         };
 
         if !pug_list.is_empty() {
@@ -1042,7 +1047,7 @@ async fn process_task(
             let mut pug_output = String::new();
             if let Ok(selector) = scraper::Selector::parse(&target_selector) {
                 if let Some(node) = document.select(&selector).next() {
-                    parsing::generate_pug_lines(*node, 0, &mut pug_output, &PugMode::FullContent);
+                    parsing::generate_pug_lines(*node, 0, &mut pug_output, &PugMode::FullContent, &mut None);
                 }
             }
             parsing::sanitize_llm_input(&pug_output)

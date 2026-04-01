@@ -7,7 +7,24 @@ use tauri_app_lib::parsing::{self, PugMode};
 
 #[test]
 fn test_automated_extraction_pipeline() {
-    let html_content = fs::read_to_string("tests/temp_clean_html.txt").expect("Failed to read HTML content");
+    let bytes = fs::read("tests/temp_clean_html.txt").expect("Should read test file");
+    
+    let (decoded_utf8, _, malformed_utf8) = encoding_rs::UTF_8.decode(&bytes);
+    let (decoded_euc, _, malformed_euc) = encoding_rs::EUC_KR.decode(&bytes);
+    
+    let utf8_str = decoded_utf8.as_ref();
+    let euc_str = decoded_euc.as_ref();
+
+    // Heuristic: If UTF-8 is malformed OR contains very few Korean chars compared to EUC-KR, use EUC-KR
+    let has_euc_marker = utf8_str.to_lowercase().contains("charset=euc-kr") || utf8_str.to_lowercase().contains("charset=cp949");
+    
+    let html_content = if has_euc_marker || (malformed_utf8 && !malformed_euc) || (euc_str.contains("상품") && !utf8_str.contains("상품")) {
+        println!("[Test] Detected Korean encoding (EUC-KR/CP949)");
+        decoded_euc.into_owned()
+    } else {
+        println!("[Test] Using UTF-8 encoding");
+        utf8_str.to_string()
+    };
     let document = Html::parse_document(&html_content);
     let mut nodes_json = Vec::new();
     let mut node_to_idx = HashMap::new();
@@ -174,14 +191,33 @@ fn test_automated_extraction_pipeline() {
         println!("\n[PHASE 1] Final Result: {}", detection_res);
         println!("[PHASE 2] Using Detected Selector: {}", selector);
         
-        let pug_list = parsing::split_html_to_pug_list(&html_content, selector, PugMode::FullContent);
+        // [NEW] Header mapping verification
+        let headers = parsing::extract_table_headers(&html_content, selector);
+        if !headers.is_empty() {
+            println!("[PHASE 2.5] Extracted {} header rows.", headers.len());
+            for (i, row) in headers.iter().enumerate() {
+                println!("  Row {}: {:?}", i, row);
+            }
+        }
+
+        let document = Html::parse_document(&html_content);
+        let pug_list = parsing::split_doc_to_pug_list_advanced(&document, selector, PugMode::FullContent, if headers.is_empty() { None } else { Some(headers) });
         println!("[PHASE 3] Found {} items via Pug conversion.", pug_list.len());
         
         if let Some(first_item) = pug_list.first() {
+            println!("\n--- [PUG OUTPUT VERIFICATION (ALT ATTRIBUTES)] ---");
+            // Check if any line in first_item contains 'alt="'
+            let has_alt = first_item.lines().any(|line| line.contains("alt=\""));
+            println!("Contains alt attributes: {}", has_alt);
+            if has_alt {
+                let alt_lines: Vec<_> = first_item.lines().filter(|l| l.contains("alt=\"")).collect();
+                println!("Sample alt lines:\n{}", alt_lines.join("\n"));
+            }
+            
             println!("\n--- [PROMPT ENGINEERING VERIFICATION] ---");
             let extraction_instruction = parsing::list2json("goods", "english");
             let task_question = format!("[PUG CONTENT]\n{}\n\n{}", first_item, extraction_instruction);
-            println!("Generated Prompt Sample:\n{}", task_question);
+            println!("Generated Prompt Sample (Snippet):\n{}", if task_question.len() > 500 { &task_question[..500] } else { &task_question });
         }
         
         // 검증: list1이 포함되어 있는지 확인

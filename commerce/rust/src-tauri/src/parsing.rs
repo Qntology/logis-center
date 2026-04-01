@@ -91,7 +91,7 @@ pub fn convert_doc_to_clean_pug(document: &Html, mode: PugMode) -> String {
 
             if element.name() == "body" {
 
-                generate_pug_lines(child, 0, &mut pug_output, &mode);
+                generate_pug_lines(child, 0, &mut pug_output, &mode, &mut None);
 
                 found_body = true;
 
@@ -107,7 +107,7 @@ pub fn convert_doc_to_clean_pug(document: &Html, mode: PugMode) -> String {
 
             for child in document.tree.root().children() {
 
-                generate_pug_lines(child, 0, &mut pug_output, &mode);
+                generate_pug_lines(child, 0, &mut pug_output, &mode, &mut None);
 
             }
 
@@ -132,37 +132,22 @@ pub fn convert_to_clean_pug(html: &str, mode: PugMode) -> String {
 
 
 pub fn convert_doc_to_clean_pug_selector(document: &Html, selector_str: &str, mode: PugMode) -> String {
-
     let selector = match Selector::parse(selector_str) {
-
         Ok(s) => s,
-
         Err(_) => return String::new(),
-
     };
-
     let mut pug_output = String::new();
-
     pug_output.reserve(1024 * 5);
-
+    let mut ctx = None;
     for node in document.tree.root().descendants() {
-
         if let Some(element_ref) = scraper::ElementRef::wrap(node) {
-
             if selector.matches(&element_ref) {
-
-                 generate_pug_lines(node, 0, &mut pug_output, &mode);
-
+                 generate_pug_lines(node, 0, &mut pug_output, &mode, &mut ctx);
                  break;
-
             }
-
         }
-
     }
-
     pug_output
-
 }
 
 
@@ -177,7 +162,15 @@ pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMo
 
 
 
-pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output: &mut String, mode: &PugMode) {
+#[derive(Default, Clone)]
+pub struct TableContext {
+    pub headers: Vec<Vec<String>>, // Row -> Col -> Title
+    pub current_row_idx: usize,
+    pub current_col_idx: usize,
+    pub is_in_tbody: bool,
+}
+
+pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output: &mut String, mode: &PugMode, ctx: &mut Option<TableContext>) {
     if indent_level > 50 { return; }
     let indent = "    ".repeat(indent_level);
     
@@ -199,8 +192,11 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 return;
             }
 
+            // [NEW] Context Management
+            if tag_name == "tbody" { if let Some(c) = ctx.as_mut() { c.is_in_tbody = true; c.current_row_idx = 0; } }
+            if tag_name == "tr" { if let Some(c) = ctx.as_mut() { c.current_col_idx = 0; } }
+
             // --- 허용된 속성만 Pug 문법으로 변환 ---
-            let mut attributes_string = String::new();
             let mut other_attributes = Vec::new();
 
             // ID 속성 처리
@@ -208,10 +204,24 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 other_attributes.push(format!("id=\"{}\"", id));
             }
 
-            // Class 속성 처리 [class="class1 class2"]
+            // Class 속성 처리
             if let Some(classes) = element.attr("class") {
                 if !classes.is_empty() {
                     other_attributes.push(format!("class=\"{}\"", classes));
+                }
+            }
+
+            // [NEW] Inject alt from headers for tbody cells
+            if tag_name == "td" || tag_name == "th" {
+                if let Some(c) = ctx.as_mut() {
+                    if c.is_in_tbody && !c.headers.is_empty() {
+                        let h_row = &c.headers[c.current_row_idx % c.headers.len()];
+                        if let Some(title) = h_row.get(c.current_col_idx) {
+                            if !title.is_empty() {
+                                other_attributes.push(format!("alt=\"{}\"", title.replace("\"", "'")));
+                            }
+                        }
+                    }
                 }
             }
 
@@ -222,10 +232,9 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             ];
 
             for (name, value) in element.attrs() {
-                if name == "id" || name == "class" { continue; }
+                if name == "id" || name == "class" || name == "alt" { continue; }
 
                 if name.starts_with("data-") || always_include.contains(&name) {
-                    // Boolean 속성 처리
                     if ["checked", "selected", "disabled", "readonly"].contains(&name) && (value.is_empty() || value == name) {
                         other_attributes.push(name.to_string());
                     } else if !value.is_empty() {
@@ -235,7 +244,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 }
             }
 
-            // 브래킷으로 묶는 속성들 추가
+            let mut attributes_string = String::new();
             if !other_attributes.is_empty() {
                 attributes_string.push_str(&format!("[{}]", other_attributes.join(" ")));
             }
@@ -264,10 +273,8 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 break;
             }
 
-            // 태그 이름과 변환된 속성 문자열을 함께 추가 (원래 노드 기준)
             output.push_str(&format!("{}{}{}\n", indent, tag_name, attributes_string));
 
-            // textarea의 값 처리
             if tag_name == "textarea" {
                 let mut text_content = String::new();
                 for child in current_node.children() {
@@ -282,11 +289,15 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                     }
                 }
             } else {
-                // 자식 노드 처리 (축약된 노드의 자식들 탐색)
                 for child in current_node.children() {
-                    generate_pug_lines(child, indent_level + 1, output, mode);
+                    generate_pug_lines(child, indent_level + 1, output, mode, ctx);
                 }
             }
+
+            // [NEW] End of Tag Updates
+            if tag_name == "tr" { if let Some(c) = ctx.as_mut() { if c.is_in_tbody { c.current_row_idx += 1; } } }
+            if tag_name == "td" || tag_name == "th" { if let Some(c) = ctx.as_mut() { if c.is_in_tbody { c.current_col_idx += 1; } } }
+            if tag_name == "tbody" { if let Some(c) = ctx.as_mut() { c.is_in_tbody = false; } }
         }
         Node::Text(text) => {
             if *mode == PugMode::FullContent {
@@ -301,24 +312,72 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
 }
 
 pub fn split_doc_to_pug_list(document: &Html, selector_str: &str, mode: PugMode) -> Vec<String> {
+    split_doc_to_pug_list_advanced(document, selector_str, mode, None)
+}
+
+pub fn split_doc_to_pug_list_advanced(document: &Html, selector_str: &str, mode: PugMode, headers: Option<Vec<Vec<String>>>) -> Vec<String> {
     let selector = match Selector::parse(selector_str) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
     let mut pug_list = Vec::new();
+    
     for node in document.tree.root().descendants() {
         if let Some(element_ref) = scraper::ElementRef::wrap(node) {
             if selector.matches(&element_ref) {
-                 let mut pug_output = String::new();
-                 pug_output.reserve(2048);
-                 generate_pug_lines(node, 0, &mut pug_output, &mode);
-                 if !pug_output.trim().is_empty() {
-                     pug_list.push(pug_output);
-                 }
+                  let mut pug_output = String::new();
+                  pug_output.reserve(2048);
+                  // Create a fresh context for each top-level item if headers are provided
+                  let mut ctx = headers.as_ref().map(|h| TableContext {
+                      headers: h.clone(),
+                      is_in_tbody: true, // Treat the matched item as if it's in tbody
+                      ..Default::default()
+                  });
+                  generate_pug_lines(node, 0, &mut pug_output, &mode, &mut ctx);
+                  if !pug_output.trim().is_empty() {
+                      pug_list.push(pug_output);
+                  }
             }
         }
     }
     pug_list
+}
+
+pub fn extract_table_headers(html: &str, table_selector: &str) -> Vec<Vec<String>> {
+    let document = Html::parse_document(html);
+    let mut all_headers = Vec::new();
+    
+    if let Ok(sel) = Selector::parse(table_selector) {
+        if let Some(first_match) = document.select(&sel).next() {
+            let mut current = first_match.parent();
+            while let Some(parent) = current {
+                if let Some(el) = parent.value().as_element() {
+                    if el.name() == "table" {
+                        if let Some(table_ref) = scraper::ElementRef::wrap(parent) {
+                            if let Ok(thead_sel) = Selector::parse("thead") {
+                                if let Some(thead) = table_ref.select(&thead_sel).next() {
+                                    if let Ok(tr_sel) = Selector::parse("tr") {
+                                        for tr in thead.select(&tr_sel) {
+                                            let mut row_headers = Vec::new();
+                                            if let Ok(cell_sel) = Selector::parse("th, td") {
+                                                for cell in tr.select(&cell_sel) {
+                                                    row_headers.push(cell.text().collect::<Vec<_>>().join(" ").trim().to_string());
+                                                }
+                                            }
+                                            if !row_headers.is_empty() { all_headers.push(row_headers); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+                current = parent.parent();
+            }
+        }
+    }
+    all_headers
 }
 
 pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> Vec<String> {
