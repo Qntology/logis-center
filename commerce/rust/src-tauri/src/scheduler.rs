@@ -767,11 +767,15 @@ async fn process_task(
                 const nodes = NODES_PLACEHOLDER;
                 const titles = TITLES_PLACEHOLDER;
                 
-                function cleanClassList(classes) {
+                function cleanClassList(classes, stripNumbers = false) {
                     if (!classes) return [];
                     const skip = ['active', 'selected', 'on', 'current', 'focus', 'hover', 'enabled', 'disabled'];
                     return classes
-                        .filter(c => !skip.includes(c.toLowerCase()) && !/^[a-z0-9]{8,}$/.test(c)) 
+                        .filter(c => {
+                            const lowerC = c.toLowerCase();
+                            return !skip.includes(lowerC) && c.indexOf('__') === -1 && !/^[a-z0-9]{8,}$/.test(c);
+                        })
+                        .map(c => stripNumbers ? c.replace(/\d+$/, '') : c)
                         .sort();
                 }
 
@@ -790,61 +794,60 @@ async fn process_task(
                     return nodes.filter(n => n && n.parentIndex === pIdx); 
                 }
 
+                function calculateSimilarity(nodeA, nodeB) {
+                    if (nodeA.tagName !== nodeB.tagName) return 0;
+                    const clsA = cleanClassList(nodeA.classes, true);
+                    const clsB = cleanClassList(nodeB.classes, true);
+                    if (clsA.length === 0 && clsB.length === 0) return 100;
+                    
+                    let matchCount = 0;
+                    clsA.forEach(c => { if (clsB.includes(c)) matchCount++; });
+                    return clsA.length ? (matchCount / clsA.length) * 100 : 0;
+                }
+
                 function detect(tIdx) {
                     let cur = tIdx;
                     for (let i = 0; i < 15; i++) {
                         const node = nodes[cur];
-                        if (!node) {
-                            cur = (nodes[cur] && nodes[cur].parentIndex) || -1;
-                            if (cur === -1) break;
-                            continue;
-                        }
+                        if (!node) break;
+                        
                         const pIdx = node.parentIndex;
                         if (pIdx === undefined || pIdx === -1) break;
                         
-                        const siblings = getChildren(pIdx);
                         const parentNode = nodes[pIdx];
+                        const siblings = getChildren(pIdx);
                         
-                        if (siblings.length >= 2) {
-                            const targetSig = getSignature(node, false);
-                            const similarSiblings = siblings.filter(s => {
-                                if (s.tagName !== node.tagName) return false;
-                                const sCls = cleanClassList(s.classes);
-                                const nCls = cleanClassList(node.classes);
-                                return nCls.some(c => sCls.includes(c)) || getSignature(s, false) === targetSig;
+                        const similarSiblings = siblings.filter(s => calculateSimilarity(node, s) >= 60);
+
+                        if (similarSiblings.length >= 2) {
+                            let finalParent = parentNode;
+                            let walkIdx = pIdx;
+                            for(let j=0; j<5; j++) {
+                                let gIdx = nodes[walkIdx] ? nodes[walkIdx].parentIndex : -1;
+                                if (gIdx !== -1 && nodes[gIdx]) {
+                                    const grand = nodes[gIdx];
+                                    if (grand.id || ["table", "ul", "ol", "nav"].includes(grand.tagName)) {
+                                        finalParent = grand;
+                                        if (grand.id || grand.tagName === "table") break;
+                                    }
+                                    walkIdx = gIdx;
+                                }
+                            }
+
+                            const parentSig = getSignature(finalParent, true);
+                            const uniqueSigs = [];
+                            similarSiblings.forEach(s => {
+                                const sig = getSignature(s, false);
+                                if (!uniqueSigs.includes(sig)) uniqueSigs.push(sig);
                             });
 
-                            if (similarSiblings.length >= 2) {
-                                let finalParent = parentNode;
-                                let walkIdx = pIdx;
-                                for(let j=0; j<5; j++) {
-                                    let gIdx = nodes[walkIdx] ? nodes[walkIdx].parentIndex : -1;
-                                    if (gIdx !== -1 && nodes[gIdx]) {
-                                        const grand = nodes[gIdx];
-                                        if (grand.id || ["table", "ul", "ol", "nav"].includes(grand.tagName)) {
-                                            finalParent = grand;
-                                            if (grand.id || grand.tagName === "table") break;
-                                        }
-                                        walkIdx = gIdx;
-                                    }
-                                }
+                            const fullSelector = uniqueSigs.map(sig => parentSig + " " + sig).join(", ");
 
-                                const commonClasses = cleanClassList(node.classes).filter(c => 
-                                    similarSiblings.every(s => cleanClassList(s.classes).includes(c))
-                                );
-                                let itemSelector = node.tagName;
-                                if (commonClasses.length > 0) {
-                                    itemSelector += "." + commonClasses.join(".");
-                                } else {
-                                    const bestCls = cleanClassList(node.classes)[0];
-                                    if (bestCls) itemSelector += "." + bestCls;
-                                }
-
-                                return { 
-                                    parent: getSignature(finalParent, true), 
-                                    item: itemSelector
-                                };
-                            }
+                            return { 
+                                parent: parentSig, 
+                                itemSelector: fullSelector,
+                                matchCount: similarSiblings.length
+                            };
                         }
                         cur = pIdx;
                     }
@@ -854,10 +857,10 @@ async fn process_task(
                 const findText = titles.length > 0 ? titles[0].toLowerCase().replace(/\s+/g, ' ') : "";
                 const matches = nodes.filter(n => n && n.text && n.text.toLowerCase().replace(/\s+/g, ' ').includes(findText));
                 
-                let res = { "parent": "body", "item": "div", "matchCount": matches.length };
+                let res = { "parent": "body", "itemSelector": "div", "matchCount": matches.length };
                 if (matches.length > 0) {
                     const d = detect(matches[0].index);
-                    if (d) { res.parent = d.parent; res.item = d.item; }
+                    if (d) { res.parent = d.parent; res.itemSelector = d.itemSelector; }
                 }
                 JSON.stringify(res);
             "##;
@@ -947,11 +950,19 @@ async fn process_task(
         let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(raw_path), None).await;
     }
 
-    let item_selector = final_page_info.get("item").and_then(|s| s.as_str()).unwrap_or("");
+    let item_selector = final_page_info.get("itemSelector")
+        .or_else(|| final_page_info.get("item"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
     let node_selector = final_page_info.get("node").and_then(|s| s.as_str()).unwrap_or("");
-    let target_selector = if !node_selector.is_empty() && !item_selector.is_empty() {
-        format!("{} {}", node_selector, item_selector) // Simplified for brevity
-    } else if !item_selector.is_empty() { item_selector.to_string() } else { node_selector.to_string() };
+    
+    let target_selector = if !node_selector.is_empty() && !item_selector.is_empty() && !item_selector.contains(",") {
+        format!("{} {}", node_selector, item_selector) 
+    } else if !item_selector.is_empty() { 
+        item_selector.to_string() 
+    } else { 
+        node_selector.to_string() 
+    };
     
     let mut extracted_data = json!({});
 
