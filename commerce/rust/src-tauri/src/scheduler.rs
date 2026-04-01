@@ -489,13 +489,23 @@ async fn process_task(
             let response = reqwest::get(&url).await?;
             let bytes = response.bytes().await?;
             
-            // [ENCODING-FIX] Detect and decode Korean encodings (EUC-KR/UTF-8)
-            let (decoded, _, _) = encoding_rs::EUC_KR.decode(&bytes);
-            let decoded_str = decoded.as_ref();
-            let content = if decoded_str.to_lowercase().contains("charset=euc-kr") || decoded_str.to_lowercase().contains("charset=\"euc-kr\"") {
-                decoded.into_owned()
+            // [ENCODING-FIX] UTF-8 First Strategy
+            let (decoded_utf8, _, malformed_utf8) = encoding_rs::UTF_8.decode(&bytes);
+            let utf8_str = decoded_utf8.as_ref();
+            
+            // Check for explicit EUC-KR/CP949 markers in the UTF-8 decoded string
+            let needs_euc = utf8_str.to_lowercase().contains("charset=euc-kr") || 
+                            utf8_str.to_lowercase().contains("charset=\"euc-kr\"") ||
+                            utf8_str.to_lowercase().contains("charset=cp949") ||
+                            utf8_str.to_lowercase().contains("charset=ks_c_5601");
+
+            let content = if needs_euc && malformed_utf8 {
+                // Only use EUC-KR if it's explicitly requested AND UTF-8 decoding had issues
+                let (decoded_euc, _, _) = encoding_rs::EUC_KR.decode(&bytes);
+                decoded_euc.into_owned()
             } else {
-                String::from_utf8_lossy(&bytes).into_owned()
+                // Default to UTF-8 (Lossy fallback if needed)
+                utf8_str.to_string()
             };
             
             data_manager.offload(&content, "raw_html")?
@@ -697,9 +707,12 @@ async fn process_task(
                 println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
 
                 let title_info = parsing::parse_json_from_llm(&res);
+                // Robust key checking: Try all common list keys
                 let items_opt = title_info.get("order")
+                    .or(title_info.get("goods"))
                     .or(title_info.get("items"))
                     .or(title_info.get("titles"))
+                    .or(title_info.get("products"))
                     .and_then(|v| v.as_array());
 
                 if let Some(items) = items_opt {
