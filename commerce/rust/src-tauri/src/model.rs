@@ -131,8 +131,9 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelSize {
-    Small, // 0.6B for Ingestion
-    Large, // 2B-VL for Inference
+    Small,   // 0.6B for Ingestion
+    Large,   // 2B-VL for Inference
+    Qwen3_5, // 0.8B Qwen 3.5 (Text Optimized)
 }
 
 #[derive(Clone)]
@@ -565,6 +566,11 @@ impl LogisModel {
     }
 
     pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool, baking_only: bool) -> anyhow::Result<()> {
+        if size == ModelSize::Qwen3_5 {
+            // [QWEN3.5] Dedicated loader for GGUF-based Qwen 3.5
+            return self.ensure_qwen3_5(if force_text_only { ModelSize::Small } else { ModelSize::Large }).await;
+        }
+
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
         let mut small_slot = self.small_hibernation.lock().await;
@@ -600,7 +606,8 @@ impl LogisModel {
                     *current_size_guard = Some(ModelSize::Large);
                     true
                 } else { false }
-            }
+            },
+            ModelSize::Qwen3_5 => false, // Qwen3_5 has its own slot, handled by ensure_qwen3_5
         };
 
         if found_in_slot {
@@ -642,6 +649,7 @@ impl LogisModel {
                 match old_size {
                     ModelSize::Small => *small_slot = Some(old_m),
                     ModelSize::Large => *large_slot = Some(old_m),
+                    ModelSize::Qwen3_5 => {}, // Qwen3_5 uses its own slot, handled separately
                 }
             }
         }
@@ -705,9 +713,9 @@ impl LogisModel {
                 // If Large is active, Embedding must stay on CPU to avoid OOM
                 println!("[MODEL] Large model active. Forcing Embedding to CPU to prevent swapping.");
             },
-            Some(ModelSize::Small) => {
-                // Small and Embedding can coexist. 
-                println!("[MODEL] Small model active. Embedding and 0.6B will coexist.");
+            Some(ModelSize::Small) | Some(ModelSize::Qwen3_5) => {
+                // Small/Qwen3.5 and Embedding can coexist. 
+                println!("[MODEL] Small/Qwen3.5 model active. Embedding will coexist.");
             },
             None => {
                 // No generator active, safe to clean up any leftovers

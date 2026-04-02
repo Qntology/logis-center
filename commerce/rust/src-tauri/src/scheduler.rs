@@ -998,8 +998,8 @@ async fn process_task(
         };
 
         if !pug_list.is_empty() {
-            // Small 모델 확보
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+            // [QWEN3.5] Text-Only 확보
+            model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
             for (idx, item_pug) in pug_list.iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -1007,19 +1007,19 @@ async fn process_task(
                 let extraction_instruction = parsing::list2json(&page_type, language);
                 let task_question = format!("[PUG CONTENT]\n{}\n\n{}", item_pug, extraction_instruction);
                 
-                let res = if let Some(gen) = model.generator.lock().await.as_mut() {
-                    println!("[Scheduler] Extracting Item {}/{}...", idx + 1, pug_list.len());
+                let res = if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+                    println!("[Scheduler] Qwen3.5 Extracting Item {}/{}...", idx + 1, pug_list.len());
                     let params = ChatCompletionParameters {
                         messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
                             content: ChatCompletionRequestUserMessageContent::Text(task_question),
                             name: None,
                         })],
-                        model: "qwen".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.01),
+                        model: "qwen3.5".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.01),
                         ..Default::default()
                     };
-                    gen.generate(params, Some(cancellation_token.clone()), None, Some("inference".to_string())).await
+                    gen.generate(params).await.map_err(|e| anyhow::anyhow!("Qwen 3.5 Inference failed: {}", e))
                 } else {
-                    Err(anyhow::anyhow!("Generator not available"))
+                    Err(anyhow::anyhow!("Qwen 3.5 Generator not available"))
                 };
 
                 match res {
