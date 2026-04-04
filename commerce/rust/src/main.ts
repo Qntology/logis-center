@@ -320,12 +320,9 @@ listen("browser-match-found", async (event: any) => {
     currentDetectedUrl = payload.url;
     isCurrentShop = payload.is_client || payload.is_admin;
 
-    if (isCurrentShop) {
-        // If a match is found, the browser must be running, so hide launch button
-        if (btnAutoLaunch) btnAutoLaunch.style.display = "none";
-    } else {
-        // Even if not a shop, if we have a URL, the browser is running
-        if (currentDetectedUrl && btnAutoLaunch) btnAutoLaunch.style.display = "none";
+    // [FIX] 해당 이벤트가 발송되고 있다면 브라우저가 실행 중인 상태이므로 무조건 버튼을 숨김
+    if (btnAutoLaunch) {
+        btnAutoLaunch.style.display = "none";
     }
     
     await updateExtractButtonVisibility();

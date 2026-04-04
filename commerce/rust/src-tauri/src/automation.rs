@@ -149,18 +149,28 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
     tokio::spawn(async move {
         let mut last_detected_url = String::new();
         let mut last_is_shop = false;
+        let mut fail_count = 0; // [NEW] 연속 실패 횟수 추적
 
         loop {
-            // [CRITICAL] Stop monitoring if global stop signal is active
             if crate::utils::is_extraction_stopped() {
                 println!("[AUTO] Global stop signal detected. Exiting browser monitor.");
                 break;
             }
 
             let pages = match browser.pages().await {
-                Ok(p) => p,
+                Ok(p) => {
+                    fail_count = 0; // 성공 시 카운트 초기화
+                    p
+                },
                 Err(e) => {
-                    println!("[AUTO] Failed to fetch pages: {}. Retrying...", e);
+                    let err_msg = e.to_string();
+                    // [FIX] 브라우저가 종료되었을 때 (연결 끊김) 루프 탈출
+                    if err_msg.contains("receiver is gone") || err_msg.contains("closed") || fail_count > 5 {
+                        println!("[AUTO] Browser disconnected. Exiting monitor.");
+                        break;
+                    }
+                    println!("[AUTO] Failed to fetch pages: {}. Retrying...", err_msg);
+                    fail_count += 1;
                     tokio::time::sleep(Duration::from_millis(2000)).await;
                     continue; 
                 }, 
@@ -170,7 +180,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
             let mut is_client = false;
             let mut is_admin = false;
 
-            // 1. [STRICT] Try to find the truly visible/focused tab
+            // 1. [STRICT] 보이는 탭 찾기
             for page in pages.iter() {
                 if let Ok(res) = page.evaluate("document.visibilityState").await {
                     if res.into_value::<String>().unwrap_or_default() == "visible" {
@@ -182,12 +192,13 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                 }
             }
 
-            // 2. [FALLBACK] If browser is minimized or no tab is 'visible', use the first page
-            if (active_url.is_empty() || active_url == "about:blank") && !pages.is_empty() {
+            // 2. [FALLBACK] 최소화 되어있거나 visible 탭이 없으면 첫번째 페이지 사용
+            // [FIX] about:blank 도 정상적인 URL로 취급하도록 변경
+            if active_url.is_empty() && !pages.is_empty() {
                 for page in pages.iter() {
                     if let Ok(val) = page.evaluate("window.location.href").await {
                         let url = val.into_value::<String>().unwrap_or_default();
-                        if !url.is_empty() && url != "about:blank" {
+                        if !url.is_empty() {
                             active_url = url;
                             break;
                         }
@@ -195,7 +206,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                 }
             }
 
-            // 3. [JUDGE] Evaluate if the detected URL is a shop admin
+            // 3. [JUDGE] 쇼핑몰 관리자/클라이언트 여부 판단
             if !active_url.is_empty() && active_url != "about:blank" {
                 is_client = is_shop(&active_url, CLIENT_PATTERNS);
                 is_admin = is_shop(&active_url, ADMIN_PATTERNS);
@@ -203,7 +214,6 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
 
             let current_is_shop = is_client || is_admin;
 
-            // Update global state for InitialSyncData
             {
                 let mut state = LAST_DETECTED_STATE.lock().await;
                 state.url = active_url.clone();
@@ -211,16 +221,14 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                 state.is_admin = is_admin;
             }
 
-            // Notify UI only if URL changed OR if it's a shop page
-            // [FIX] Always emit when URL changes so frontend can sync btn-extract and btn-auto-launch
-            if (active_url != last_detected_url || current_is_shop != last_is_shop) && !active_url.is_empty() {
+            // [FIX] URL이 비어있어도 상태가 변했다면 이벤트를 쏴서 프론트엔드가 알 수 있게 함
+            if active_url != last_detected_url || current_is_shop != last_is_shop {
                 let payload = json!({
                     "url": active_url.clone(),
                     "is_client": is_client,
                     "is_admin": is_admin
                 });
                 
-                // Emit every time to keep frontend state consistent with the actual browser
                 let _ = app_handle.emit("browser-match-found", &payload);
                 
                 last_detected_url = active_url;
@@ -228,7 +236,6 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                 
                 if current_is_shop {
                     println!("[AUTO] Active Shop Context Sync: {}", last_detected_url);
-                    // [FIX] Save to a shared JSON file to bridge the gap between automation and scheduler
                     let _ = std::fs::create_dir_all("tmp");
                     let shared_data = json!({
                         "origin": last_detected_url,
@@ -244,8 +251,13 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
             }
             tokio::time::sleep(Duration::from_millis(800)).await; 
         }
+        
+        // [FIX] 모니터 종료 시 글로벌 상태 초기화 및 프론트엔드에 stopped 이벤트 발송
+        let mut global = GLOBAL_BROWSER.lock().await;
+        *global = None;
+        let _ = app_handle.emit("browser-status", "stopped");
         let _ = app_handle.emit("browser-match-found", json!({ "url": "", "is_client": false, "is_admin": false }));
-        println!("[AUTO] Browser monitor exited.");
+        println!("[AUTO] Browser monitor exited cleanly.");
     });
 }
 
