@@ -986,6 +986,11 @@ async fn process_task(
         log_task_progress(app_handle, &task.id, &list_log);
 
         let mut all_extracted_items = Vec::new();
+        
+        // 👇 [추가된 변수] 병합 대기열을 위한 변수들
+        let mut pending_merge: Option<serde_json::Value> = None;
+        let mut merge_countdown = 0;
+
         let pug_list = {
             let clean_html_path = data_manager.get_path("clean_html");
             let clean_content = data_manager.load(&clean_html_path)?;
@@ -998,7 +1003,6 @@ async fn process_task(
         };
 
         if !pug_list.is_empty() {
-            // [QWEN3.5] Text-Only 확보
             model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
             for (idx, item_pug) in pug_list.iter().enumerate() {
@@ -1025,13 +1029,43 @@ async fn process_task(
                 match res {
                     Ok(res_text) => {
                         let item_json = parsing::parse_json_from_llm(&res_text);
-                        // 의미 있는 데이터인지 확인 (null이 아니거나 비어있지 않은 객체)
                         if !item_json.is_null() && (item_json.is_object() || item_json.is_array()) {
-                            all_extracted_items.push(item_json);
+                            
+                            // 👇 [수정된 로직 시작] 단순 push 대신 후처리 병합 수행
+                            let is_continuation = item_json.get("is_continuation").and_then(|v| v.as_bool()).unwrap_or(false);
+                            
+                            if is_continuation && pending_merge.is_some() {
+                                let mut parent = pending_merge.take().unwrap();
+                                crate::scheduler::merge_json_results(&mut parent, &item_json);
+                                merge_countdown -= 1;
+                                
+                                if merge_countdown > 0 {
+                                    pending_merge = Some(parent);
+                                } else {
+                                    all_extracted_items.push(parent);
+                                }
+                            } else {
+                                let rowspan = item_json.get("rowspan_count").and_then(|v| v.as_u64()).unwrap_or(1);
+                                if rowspan > 1 {
+                                    pending_merge = Some(item_json);
+                                    merge_countdown = rowspan - 1;
+                                } else {
+                                    // 기존에 대기 중이던 게 꼬였다면 일단 push하고 비움
+                                    if let Some(stray) = pending_merge.take() {
+                                        all_extracted_items.push(stray);
+                                    }
+                                    all_extracted_items.push(item_json);
+                                }
+                            }
+                            // 👆 [수정된 로직 끝]
                         }
                     },
                     Err(e) => println!("[Scheduler] Error extracting item {}: {:?}", idx, e),
                 }
+            }
+
+            if let Some(last_item) = pending_merge.take() {
+                all_extracted_items.push(last_item);
             }
         }
         extracted_data = json!({ "items": all_extracted_items, "type": page_type, "detail": false });

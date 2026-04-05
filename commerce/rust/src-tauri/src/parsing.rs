@@ -322,24 +322,71 @@ pub fn split_doc_to_pug_list_advanced(document: &Html, selector_str: &str, mode:
     };
     let mut pug_list = Vec::new();
     
+    // 👇 [추가된 변수] rowspan으로 묶인 다음 행들을 병합하기 위한 버퍼와 카운터
+    let mut skip_next_n_rows = 0;
+    let mut combined_pug_buffer = String::new();
+
     for node in document.tree.root().descendants() {
         if let Some(element_ref) = scraper::ElementRef::wrap(node) {
             if selector.matches(&element_ref) {
-                  let mut pug_output = String::new();
-                  pug_output.reserve(2048);
-                  // Create a fresh context for each top-level item if headers are provided
-                  let mut ctx = headers.as_ref().map(|h| TableContext {
-                      headers: h.clone(),
-                      is_in_tbody: true, // Treat the matched item as if it's in tbody
-                      ..Default::default()
-                  });
-                  generate_pug_lines(node, 0, &mut pug_output, &mode, &mut ctx);
-                  if !pug_output.trim().is_empty() {
-                      pug_list.push(pug_output);
-                  }
+                
+                let mut pug_output = String::new();
+                pug_output.reserve(2048);
+                
+                let mut ctx = headers.as_ref().map(|h| TableContext {
+                    headers: h.clone(),
+                    is_in_tbody: true,
+                    ..Default::default()
+                });
+                
+                // 현재 노드의 PUG 라인 생성
+                generate_pug_lines(node, 0, &mut pug_output, &mode, &mut ctx);
+
+                // 👇 [수정된 로직 시작] 개별로 바로 push 하지 않고 rowspan 검사
+                if !pug_output.trim().is_empty() {
+                    // 현재 노드 내부에 rowspan 속성이 있는지 확인
+                    let mut current_rowspan = 1;
+                    if let Ok(td_selector) = scraper::Selector::parse("td, th") {
+                        for cell in element_ref.select(&td_selector) {
+                            if let Some(span_str) = cell.value().attr("rowspan") {
+                                if let Ok(span) = span_str.parse::<usize>() {
+                                    if span > current_rowspan {
+                                        current_rowspan = span;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if skip_next_n_rows > 0 {
+                        // 이전 행에 rowspan이 있어서 현재 행을 합쳐야 하는 경우
+                        combined_pug_buffer.push_str(&pug_output);
+                        skip_next_n_rows -= 1;
+                        
+                        // 대기 중인 행을 다 합쳤다면 최종 리스트에 추가
+                        if skip_next_n_rows == 0 {
+                            pug_list.push(combined_pug_buffer.clone());
+                            combined_pug_buffer.clear();
+                        }
+                    } else if current_rowspan > 1 {
+                        // 새로운 rowspan 시작 지점
+                        combined_pug_buffer.push_str(&pug_output);
+                        skip_next_n_rows = current_rowspan - 1;
+                    } else {
+                        // 평범한 단일 행
+                        pug_list.push(pug_output);
+                    }
+                }
+                // 👆 [수정된 로직 끝]
             }
         }
     }
+    
+    // 혹시 버퍼에 남은 게 있다면 털어줌
+    if !combined_pug_buffer.is_empty() {
+        pug_list.push(combined_pug_buffer);
+    }
+    
     pug_list
 }
 
