@@ -558,6 +558,8 @@ async fn process_task(
     let mut page_type = String::new();
     let mut selector_info: serde_json::Value = json!({});
 
+    let mut is_detail = false;
+
     // ==================================================================================
     // [ULTRA-OPTIMIZED PIPELINE]
     // Step 0: 0.6B Base Baking [System: PUG] -> Save task_id_base
@@ -663,6 +665,50 @@ async fn process_task(
             return Ok(()); 
         }
     }
+
+    // 👇 [여기에 새로운 STEP A-2 추가!] 👇
+    // --- STEP A-2: DETAIL CLASSIFICATION (디테일 페이지 여부 독립 판별) ---
+    {
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Is Detail)");
+        
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining if detail page...", "spinner": "⠋" }));
+
+        let detail_prompt = parsing::is_detail_prompt(&page_type);
+        // LLM이 지시사항을 잘 따르도록 래핑
+        let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think", detail_prompt);
+        let snapshot_id = format!("{}_step_a2", task.id);
+
+        model.secure_vram_relay(crate::model::ModelSize::Small, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+
+        let params = ChatCompletionParameters {
+            messages: vec![
+                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                    content: system_content.clone(),
+                    name: None,
+                }),
+                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                    content: ChatCompletionRequestUserMessageContent::Text(task_question),
+                    name: None,
+                })
+            ],
+            model: "qwen".to_string(), 
+            max_tokens: Some(16), // true/false만 대답하므로 짧게 설정
+            temperature: Some(0.0), top_p: Some(0.01),
+            ..Default::default()
+        };
+
+        if let Some(gen) = model.generator.lock().await.as_mut() {
+            println!("[Scheduler] 0.6B Step A-2: Asking detail classification...");
+            let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
+            println!("[DEBUG-SCHED] Step A-2 Raw Response: '{}'", res);
+            
+            let detail_info = parsing::parse_json_from_llm(&res); 
+            is_detail = detail_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+            println!("[Scheduler] Classified is_detail as: {}", is_detail);
+        }
+    }
+    // 👆 [새로운 STEP A-2 끝] 👆
                         
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -902,7 +948,6 @@ async fn process_task(
             final_page_info.as_object_mut().unwrap().insert(k.clone(), v.clone()); 
         }
     }
-    let is_detail = selector_info.get("detail").and_then(|v: &serde_json::Value| v.as_bool()).unwrap_or(false);
     
     // [PARITY] Store 'Page' Entity
     {

@@ -465,27 +465,17 @@ NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{TYPE}", page_type)
 }
 
-pub fn page_selectors_prompt(page_type: &str) -> String {
-    let template = r###"[TASK]
-The page has been classified as '{TYPE}'.
-Based on the provided Pug template, identify the structural CSS selectors for the MAIN data list.
+pub fn is_detail_prompt(page_type: &str) -> String {
+    let template = r###"[TASK] Analyze the provided Pug HTML content from top to bottom. Determine if the main content represents a "Detail/Edit Form" (true) or a "List/Index Page" (false). 
+[FORCED DOCUMENT SCANNING LOGIC] 
+You MUST scan the ENTIRE document down to the footer before making a decision. Admin List pages often have search forms at the top that look like Detail forms. Do not be fooled. Scan the middle and bottom sections of the document for the following structural signatures: 1. "data_grid": A large repeating table body (`tbody`) where multiple sibling rows (`tr`) represent distinct, independent database records. 2. "bulk_or_pagination": Structural controls for bulk actions (array checkboxes across rows) or dataset navigation (pagination, row-count selectors). If either of these exists anywhere in the document, the page is a List/Index page (`false`), regardless of the forms at the top. If the main layout is entirely dedicated to a single entity's inputs without these list signatures, it is a Detail Form (`true`). 
 
-[INSTRUCTION]
-1. Exclude nav/header patterns navigation menus entirely (e.g., id/class containing gnb, lnb, tnb, header, footer, sidebar).
-2. IDENTIFY the repeating sibling items that represent the actual {TYPE} records.
-3. LOCATE the main content container.
+[SCHEMA DEFINITIONS] 
+- found_data_grid: Boolean. True if you found a repeating horizontal data table in the middle/bottom. 
+- found_bulk_or_pagination: Boolean. True if you found bulk action checkboxes or pagination structures. 
+- detail: Boolean. Output `false` if either of the above is true. Output `true` ONLY if both are false and the primary structure is a single-entity mutation form. 
 
-[SCHEMA DEFINITIONS]
-- item: The repeating child element. Match recurring item patterns. Exclude nav/header
-- node: The direct parent wrapper of the recurring items. Exclude nav/header.
-- detail: is a detail page or a detail form. Exclude nav/header
-
-[OUTPUT FORMAT]
-{
-    item: String,
-    node: String,
-    detail: Boolean
-}"###;
+[OUTPUT FORMAT] { "found_data_grid": Boolean, "found_bulk_or_pagination": Boolean, "detail": Boolean }"###;
     template.replace("{TYPE}", page_type)
 }
 
