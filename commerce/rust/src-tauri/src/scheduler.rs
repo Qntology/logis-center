@@ -693,7 +693,7 @@ async fn process_task(
                 })
             ],
             model: "qwen".to_string(), 
-            max_tokens: Some(16), // true/false만 대답하므로 짧게 설정
+            max_tokens: Some(64), // true/false만 대답하므로 짧게 설정
             temperature: Some(0.0), top_p: Some(0.01),
             ..Default::default()
         };
@@ -715,317 +715,319 @@ async fn process_task(
     model.deep_purge_resources().await;
     wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
 
-    // --- STEP B: SELECTORS (선택자 추출 - JS 기반 신규 로직) ---
-    {
-        use boa_engine::{Context, Source};
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] Starting JS-BASED SELECTOR ANALYSIS (LLM Titles -> Boa Engine)");
         
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Analyzing DOM with JS engine...", "spinner": "⠋" }));
-
-        // 1. LLM에게 상품명(titles) 추출 요청
-        let title_prompt = parsing::extract_titles_prompt(&page_type);
-        let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY.", title_prompt);
-        let snapshot_id = format!("{}_step_b_titles", task.id);
-
-        let mut titles = Vec::new();
-        {
-            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
-
-            let params = ChatCompletionParameters {
-                messages: vec![
-                    ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                        content: system_content.clone(),
-                        name: None,
-                    }),
-                    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                        content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
-                        name: None,
-                    })
-                ],
-                model: "qwen".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.01),
-                ..Default::default()
-            };
-
-            if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[JS-BRIDGE] 1. Requesting titles from LLM...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
-                println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
-
-                let title_info = parsing::parse_json_from_llm(&res);
-                // Robust key checking: Try all common list keys
-                let items_opt = title_info.get("order")
-                    .or(title_info.get("goods"))
-                    .or(title_info.get("items"))
-                    .or(title_info.get("titles"))
-                    .or(title_info.get("products"))
-                    .and_then(|v| v.as_array());
-
-                if let Some(items) = items_opt {
-                    for item in items {
-                        if let Some(t) = item.as_str() {
-                            titles.push(t.to_string());
-                        } else if let Some(t) = item.get("title").and_then(|v| v.as_str()) {
-                            titles.push(t.to_string());
-                        }
-                    }
-                }
-                println!("[JS-BRIDGE] Titles extracted (Robust): {:?}", titles);
-            }
-        }
-
-        if titles.is_empty() {
-             println!("[JS-BRIDGE] Warning: No titles extracted from LLM. Falling back to default.");
-        }
-
-        // 2. Boa Engine으로 DOM 분석
-        {
-            println!("[JS-BRIDGE] 2. Starting boa-engine for DOM analysis...");
-            let mut context = Context::default();
-            
-            let clean_html = data_manager.load(&data_manager.get_path("clean_html"))?;
-            let document = scraper::Html::parse_document(&clean_html);
-            
-            let mut nodes_json = Vec::new();
-            let mut node_to_idx = std::collections::HashMap::new();
-
-            // 1단계: 모든 노드 ID 매핑 (부모 참조 안정성 확보)
-            for (idx, node) in document.tree.root().descendants().enumerate() {
-                node_to_idx.insert(node.id(), idx);
-            }
-
-            // 2단계: 노드 정보 수집 (Element 노드 중심)
-            for (idx, node) in document.tree.root().descendants().enumerate() {
-                if let Some(el) = node.value().as_element() {
-                    let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
-                    
-                    let text: String = node.children()
-                        .filter_map(|child| child.value().as_text().map(|t| t.to_string()))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .trim()
-                        .to_string();
-                        
-                    nodes_json.push(json!({
-                        "index": idx,
-                        "parentIndex": parent_idx,
-                        "tagName": el.name().to_string(),
-                        "id": el.id().unwrap_or("").to_string(),
-                        "classes": el.attr("class").unwrap_or("").split_whitespace().collect::<Vec<_>>(),
-                        "text": text
-                    }));
-                } else {
-                    nodes_json.push(json!(null));
-                }
-            }
-            
-            let nodes_str = serde_json::to_string(&nodes_json)?;
-            let titles_str = serde_json::to_string(&titles)?;
-
-            let js_template = r##"
-                const nodes = NODES_PLACEHOLDER;
-                const titles = TITLES_PLACEHOLDER;
-                
-                function cleanClassList(classes, stripNumbers = false) {
-                    if (!classes) return [];
-                    const skip = ['active', 'selected', 'on', 'current', 'focus', 'hover', 'enabled', 'disabled'];
-                    return classes
-                        .filter(c => {
-                            const lowerC = c.toLowerCase();
-                            return !skip.includes(lowerC) && c.indexOf('__') === -1 && !/^[a-z0-9]{8,}$/.test(c);
-                        })
-                        .map(c => stripNumbers ? c.replace(/\d+$/, '') : c)
-                        .sort();
-                }
-
-                function getSignature(node, includeId = true) {
-                    if (!node || !node.tagName) return "";
-                    let s = node.tagName;
-                    if (includeId && node.id) s += "#" + node.id;
-                    const cls = cleanClassList(node.classes);
-                    if (cls.length > 0) {
-                        s += "." + [...new Set(cls)].join(".");
-                    }
-                    return s;
-                }
-
-                function getChildren(pIdx) { 
-                    return nodes.filter(n => n && n.parentIndex === pIdx); 
-                }
-
-                function calculateSimilarity(nodeA, nodeB) {
-                    if (nodeA.tagName !== nodeB.tagName) return 0;
-                    const clsA = cleanClassList(nodeA.classes, true);
-                    const clsB = cleanClassList(nodeB.classes, true);
-                    if (clsA.length === 0 && clsB.length === 0) return 100;
-                    
-                    let matchCount = 0;
-                    clsA.forEach(c => { if (clsB.includes(c)) matchCount++; });
-                    return clsA.length ? (matchCount / clsA.length) * 100 : 0;
-                }
-
-                function detect(tIdx) {
-                    let cur = tIdx;
-                    for (let i = 0; i < 15; i++) {
-                        const node = nodes[cur];
-                        if (!node) break;
-                        
-                        const pIdx = node.parentIndex;
-                        if (pIdx === undefined || pIdx === -1) break;
-                        
-                        const parentNode = nodes[pIdx];
-                        const siblings = getChildren(pIdx);
-                        
-                        const similarSiblings = siblings.filter(s => calculateSimilarity(node, s) >= 60);
-
-                        if (similarSiblings.length >= 2) {
-                            let finalParent = parentNode;
-                            let walkIdx = pIdx;
-                            for(let j=0; j<5; j++) {
-                                let gIdx = nodes[walkIdx] ? nodes[walkIdx].parentIndex : -1;
-                                if (gIdx !== -1 && nodes[gIdx]) {
-                                    const grand = nodes[gIdx];
-                                    if (grand.id || ["table", "ul", "ol", "nav"].includes(grand.tagName)) {
-                                        finalParent = grand;
-                                        if (grand.id || grand.tagName === "table") break;
-                                    }
-                                    walkIdx = gIdx;
-                                }
-                            }
-
-                            const parentSig = getSignature(finalParent, true);
-                            const uniqueSigs = [];
-                            similarSiblings.forEach(s => {
-                                const sig = getSignature(s, false);
-                                if (!uniqueSigs.includes(sig)) uniqueSigs.push(sig);
-                            });
-
-                            const fullSelector = uniqueSigs.map(sig => parentSig + " " + sig).join(", ");
-
-                            return { 
-                                parent: parentSig, 
-                                itemSelector: fullSelector,
-                                matchCount: similarSiblings.length
-                            };
-                        }
-                        cur = pIdx;
-                    }
-                    return null;
-                }
-
-                const findText = titles.length > 0 ? titles[0].toLowerCase().replace(/\s+/g, ' ') : "";
-                const matches = nodes.filter(n => n && n.text && n.text.toLowerCase().replace(/\s+/g, ' ').includes(findText));
-                
-                let res = { "parent": "body", "itemSelector": "div", "matchCount": matches.length };
-                if (matches.length > 0) {
-                    const d = detect(matches[0].index);
-                    if (d) { res.parent = d.parent; res.itemSelector = d.itemSelector; }
-                }
-                JSON.stringify(res);
-            "##;
-
-            let js_code = js_template
-                .replace("NODES_PLACEHOLDER", &nodes_str)
-                .replace("TITLES_PLACEHOLDER", &titles_str);
-
-            match context.eval(Source::from_bytes(js_code.as_bytes())) {
-                Ok(val) => {
-                    let res_str = val.as_string().unwrap().to_std_string_escaped();
-                    println!("[JS-BRIDGE] Boa Final Result: {}", res_str);
-                    selector_info = serde_json::from_str(&res_str).unwrap_or(json!({}));
-                },
-                Err(e) => {
-                    println!("[JS-BRIDGE] Error executing JS: {:?}", e);
-                }
-            }
-        }
-    }
-
-    // [INTERMEDIATE PARITY LOGIC] Save Page Info
-    let mut final_page_info = json!({ "type": page_type });
-    if let Some(obj) = selector_info.as_object() {
-        for (k, v) in obj { 
-            final_page_info.as_object_mut().unwrap().insert(k.clone(), v.clone()); 
-        }
-    }
-    
-    // [PARITY] Store 'Page' Entity
-    {
-        // Acquire Store lock briefly
-        let store = {
-            let store_guard = store_mutex.lock().await;
-            store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
-        };
-        
-        // [FIX] Try to load the active origin and type from the shared JSON file (tmp/index.json)
-        // This is the most reliable way to bridge the gap between automation and scheduler.
-        let mut shared_origin = None;
-        let mut shared_type = None;
-        if let Ok(content) = std::fs::read_to_string("tmp/index.json") {
-            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(o) = json_val.get("origin").and_then(|v| v.as_str()) {
-                    if let Ok(u) = url::Url::parse(o) {
-                        shared_origin = Some(format!("{}://{}", u.scheme(), u.host_str().unwrap_or("localhost")));
-                    }
-                }
-                if let Some(t) = json_val.get("type").and_then(|v| v.as_str()) {
-                    if !t.is_empty() { shared_type = Some(t.to_string()); }
-                }
-            }
-        }
-
-        let origin_str = task_data.get("origin").and_then(|s| s.as_str()).map(|s| s.to_string())
-            .filter(|s| s != "http://localhost") // If it's already localhost, treat it as missing
-            .or(shared_origin) // Fallback to the shared file
-            .unwrap_or_else(|| {
-                // If all else fails, extract from the task.data_json URL
-                if let Ok(task_url) = url::Url::parse(&url) {
-                    format!("{}://{}", task_url.scheme(), task_url.host_str().unwrap_or("localhost"))
-                } else {
-                    "http://localhost".to_string()
-                }
-            });
-
-        // Use shared type if available and task type is missing or unknown
-        if page_type.is_empty() || page_type == "unknown" {
-            if let Some(st) = shared_type { page_type = st; }
-        }
-            
-        let base_url = url::Url::parse(&origin_str).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
-        let url_obj = base_url.join(&url).unwrap_or(base_url);
-        let raw_path = url_obj.path();
-        let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
-        let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-        let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
-
-        let mut page_data: serde_json::Value = selector_info.clone();
-        if let Some(obj) = page_data.as_object_mut() {
-            obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
-            obj.insert("link".to_string(), json!(url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()));
-            obj.insert("type".to_string(), json!(page_type));
-        }
-
-        let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(raw_path), None).await;
-    }
-
-    let item_selector = final_page_info.get("itemSelector")
-        .or_else(|| final_page_info.get("item"))
-        .and_then(|s| s.as_str())
-        .unwrap_or("");
-    let node_selector = final_page_info.get("node").and_then(|s| s.as_str()).unwrap_or("");
-    
-    let target_selector = if !node_selector.is_empty() && !item_selector.is_empty() && !item_selector.contains(",") {
-        format!("{} {}", node_selector, item_selector) 
-    } else if !item_selector.is_empty() { 
-        item_selector.to_string() 
-    } else { 
-        node_selector.to_string() 
-    };
-    
-    let mut extracted_data = json!({});
 
     // --- PHASE 2 Continue: Detail Extraction (If needed) --- 
     if !is_detail {
+        // --- STEP B: SELECTORS (선택자 추출 - JS 기반 신규 로직) ---
+        {
+            use boa_engine::{Context, Source};
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            println!("[Scheduler] Starting JS-BASED SELECTOR ANALYSIS (LLM Titles -> Boa Engine)");
+            
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Analyzing DOM with JS engine...", "spinner": "⠋" }));
+
+            // 1. LLM에게 상품명(titles) 추출 요청
+            let title_prompt = parsing::extract_titles_prompt(&page_type);
+            let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY.", title_prompt);
+            let snapshot_id = format!("{}_step_b_titles", task.id);
+
+            let mut titles = Vec::new();
+            {
+                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+
+                let params = ChatCompletionParameters {
+                    messages: vec![
+                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                            content: system_content.clone(),
+                            name: None,
+                        }),
+                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                            content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                            name: None,
+                        })
+                    ],
+                    model: "qwen".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.01),
+                    ..Default::default()
+                };
+
+                if let Some(gen) = model.generator.lock().await.as_mut() {
+                    println!("[JS-BRIDGE] 1. Requesting titles from LLM...");
+                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
+                    println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
+
+                    let title_info = parsing::parse_json_from_llm(&res);
+                    // Robust key checking: Try all common list keys
+                    let items_opt = title_info.get("order")
+                        .or(title_info.get("goods"))
+                        .or(title_info.get("items"))
+                        .or(title_info.get("titles"))
+                        .or(title_info.get("products"))
+                        .and_then(|v| v.as_array());
+
+                    if let Some(items) = items_opt {
+                        for item in items {
+                            if let Some(t) = item.as_str() {
+                                titles.push(t.to_string());
+                            } else if let Some(t) = item.get("title").and_then(|v| v.as_str()) {
+                                titles.push(t.to_string());
+                            }
+                        }
+                    }
+                    println!("[JS-BRIDGE] Titles extracted (Robust): {:?}", titles);
+                }
+            }
+
+            if titles.is_empty() {
+                 println!("[JS-BRIDGE] Warning: No titles extracted from LLM. Falling back to default.");
+            }
+
+            // 2. Boa Engine으로 DOM 분석
+            {
+                println!("[JS-BRIDGE] 2. Starting boa-engine for DOM analysis...");
+                let mut context = Context::default();
+                
+                let clean_html = data_manager.load(&data_manager.get_path("clean_html"))?;
+                let document = scraper::Html::parse_document(&clean_html);
+                
+                let mut nodes_json = Vec::new();
+                let mut node_to_idx = std::collections::HashMap::new();
+
+                // 1단계: 모든 노드 ID 매핑 (부모 참조 안정성 확보)
+                for (idx, node) in document.tree.root().descendants().enumerate() {
+                    node_to_idx.insert(node.id(), idx);
+                }
+
+                // 2단계: 노드 정보 수집 (Element 노드 중심)
+                for (idx, node) in document.tree.root().descendants().enumerate() {
+                    if let Some(el) = node.value().as_element() {
+                        let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
+                        
+                        let text: String = node.children()
+                            .filter_map(|child| child.value().as_text().map(|t| t.to_string()))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .trim()
+                            .to_string();
+                            
+                        nodes_json.push(json!({
+                            "index": idx,
+                            "parentIndex": parent_idx,
+                            "tagName": el.name().to_string(),
+                            "id": el.id().unwrap_or("").to_string(),
+                            "classes": el.attr("class").unwrap_or("").split_whitespace().collect::<Vec<_>>(),
+                            "text": text
+                        }));
+                    } else {
+                        nodes_json.push(json!(null));
+                    }
+                }
+                
+                let nodes_str = serde_json::to_string(&nodes_json)?;
+                let titles_str = serde_json::to_string(&titles)?;
+
+                let js_template = r##"
+                    const nodes = NODES_PLACEHOLDER;
+                    const titles = TITLES_PLACEHOLDER;
+                    
+                    function cleanClassList(classes, stripNumbers = false) {
+                        if (!classes) return [];
+                        const skip = ['active', 'selected', 'on', 'current', 'focus', 'hover', 'enabled', 'disabled'];
+                        return classes
+                            .filter(c => {
+                                const lowerC = c.toLowerCase();
+                                return !skip.includes(lowerC) && c.indexOf('__') === -1 && !/^[a-z0-9]{8,}$/.test(c);
+                            })
+                            .map(c => stripNumbers ? c.replace(/\d+$/, '') : c)
+                            .sort();
+                    }
+
+                    function getSignature(node, includeId = true) {
+                        if (!node || !node.tagName) return "";
+                        let s = node.tagName;
+                        if (includeId && node.id) s += "#" + node.id;
+                        const cls = cleanClassList(node.classes);
+                        if (cls.length > 0) {
+                            s += "." + [...new Set(cls)].join(".");
+                        }
+                        return s;
+                    }
+
+                    function getChildren(pIdx) { 
+                        return nodes.filter(n => n && n.parentIndex === pIdx); 
+                    }
+
+                    function calculateSimilarity(nodeA, nodeB) {
+                        if (nodeA.tagName !== nodeB.tagName) return 0;
+                        const clsA = cleanClassList(nodeA.classes, true);
+                        const clsB = cleanClassList(nodeB.classes, true);
+                        if (clsA.length === 0 && clsB.length === 0) return 100;
+                        
+                        let matchCount = 0;
+                        clsA.forEach(c => { if (clsB.includes(c)) matchCount++; });
+                        return clsA.length ? (matchCount / clsA.length) * 100 : 0;
+                    }
+
+                    function detect(tIdx) {
+                        let cur = tIdx;
+                        for (let i = 0; i < 15; i++) {
+                            const node = nodes[cur];
+                            if (!node) break;
+                            
+                            const pIdx = node.parentIndex;
+                            if (pIdx === undefined || pIdx === -1) break;
+                            
+                            const parentNode = nodes[pIdx];
+                            const siblings = getChildren(pIdx);
+                            
+                            const similarSiblings = siblings.filter(s => calculateSimilarity(node, s) >= 60);
+
+                            if (similarSiblings.length >= 2) {
+                                let finalParent = parentNode;
+                                let walkIdx = pIdx;
+                                for(let j=0; j<5; j++) {
+                                    let gIdx = nodes[walkIdx] ? nodes[walkIdx].parentIndex : -1;
+                                    if (gIdx !== -1 && nodes[gIdx]) {
+                                        const grand = nodes[gIdx];
+                                        if (grand.id || ["table", "ul", "ol", "nav"].includes(grand.tagName)) {
+                                            finalParent = grand;
+                                            if (grand.id || grand.tagName === "table") break;
+                                        }
+                                        walkIdx = gIdx;
+                                    }
+                                }
+
+                                const parentSig = getSignature(finalParent, true);
+                                const uniqueSigs = [];
+                                similarSiblings.forEach(s => {
+                                    const sig = getSignature(s, false);
+                                    if (!uniqueSigs.includes(sig)) uniqueSigs.push(sig);
+                                });
+
+                                const fullSelector = uniqueSigs.map(sig => parentSig + " " + sig).join(", ");
+
+                                return { 
+                                    parent: parentSig, 
+                                    itemSelector: fullSelector,
+                                    matchCount: similarSiblings.length
+                                };
+                            }
+                            cur = pIdx;
+                        }
+                        return null;
+                    }
+
+                    const findText = titles.length > 0 ? titles[0].toLowerCase().replace(/\s+/g, ' ') : "";
+                    const matches = nodes.filter(n => n && n.text && n.text.toLowerCase().replace(/\s+/g, ' ').includes(findText));
+                    
+                    let res = { "parent": "body", "itemSelector": "div", "matchCount": matches.length };
+                    if (matches.length > 0) {
+                        const d = detect(matches[0].index);
+                        if (d) { res.parent = d.parent; res.itemSelector = d.itemSelector; }
+                    }
+                    JSON.stringify(res);
+                "##;
+
+                let js_code = js_template
+                    .replace("NODES_PLACEHOLDER", &nodes_str)
+                    .replace("TITLES_PLACEHOLDER", &titles_str);
+
+                match context.eval(Source::from_bytes(js_code.as_bytes())) {
+                    Ok(val) => {
+                        let res_str = val.as_string().unwrap().to_std_string_escaped();
+                        println!("[JS-BRIDGE] Boa Final Result: {}", res_str);
+                        selector_info = serde_json::from_str(&res_str).unwrap_or(json!({}));
+                    },
+                    Err(e) => {
+                        println!("[JS-BRIDGE] Error executing JS: {:?}", e);
+                    }
+                }
+            }
+        }
+
+        // [INTERMEDIATE PARITY LOGIC] Save Page Info
+        let mut final_page_info = json!({ "type": page_type });
+        if let Some(obj) = selector_info.as_object() {
+            for (k, v) in obj { 
+                final_page_info.as_object_mut().unwrap().insert(k.clone(), v.clone()); 
+            }
+        }
+        
+        // [PARITY] Store 'Page' Entity
+        {
+            // Acquire Store lock briefly
+            let store = {
+                let store_guard = store_mutex.lock().await;
+                store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
+            };
+            
+            // [FIX] Try to load the active origin and type from the shared JSON file (tmp/index.json)
+            // This is the most reliable way to bridge the gap between automation and scheduler.
+            let mut shared_origin = None;
+            let mut shared_type = None;
+            if let Ok(content) = std::fs::read_to_string("tmp/index.json") {
+                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(o) = json_val.get("origin").and_then(|v| v.as_str()) {
+                        if let Ok(u) = url::Url::parse(o) {
+                            shared_origin = Some(format!("{}://{}", u.scheme(), u.host_str().unwrap_or("localhost")));
+                        }
+                    }
+                    if let Some(t) = json_val.get("type").and_then(|v| v.as_str()) {
+                        if !t.is_empty() { shared_type = Some(t.to_string()); }
+                    }
+                }
+            }
+
+            let origin_str = task_data.get("origin").and_then(|s| s.as_str()).map(|s| s.to_string())
+                .filter(|s| s != "http://localhost") // If it's already localhost, treat it as missing
+                .or(shared_origin) // Fallback to the shared file
+                .unwrap_or_else(|| {
+                    // If all else fails, extract from the task.data_json URL
+                    if let Ok(task_url) = url::Url::parse(&url) {
+                        format!("{}://{}", task_url.scheme(), task_url.host_str().unwrap_or("localhost"))
+                    } else {
+                        "http://localhost".to_string()
+                    }
+                });
+
+            // Use shared type if available and task type is missing or unknown
+            if page_type.is_empty() || page_type == "unknown" {
+                if let Some(st) = shared_type { page_type = st; }
+            }
+                
+            let base_url = url::Url::parse(&origin_str).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
+            let url_obj = base_url.join(&url).unwrap_or(base_url);
+            let raw_path = url_obj.path();
+            let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
+            let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
+            let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
+
+            let mut page_data: serde_json::Value = selector_info.clone();
+            if let Some(obj) = page_data.as_object_mut() {
+                obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
+                obj.insert("link".to_string(), json!(url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()));
+                obj.insert("type".to_string(), json!(page_type));
+            }
+
+            let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(raw_path), None).await;
+        }
+
+        let item_selector = final_page_info.get("itemSelector")
+            .or_else(|| final_page_info.get("item"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        let node_selector = final_page_info.get("node").and_then(|s| s.as_str()).unwrap_or("");
+        
+        let target_selector = if !node_selector.is_empty() && !item_selector.is_empty() && !item_selector.contains(",") {
+            format!("{} {}", node_selector, item_selector) 
+        } else if !item_selector.is_empty() { 
+            item_selector.to_string() 
+        } else { 
+            node_selector.to_string() 
+        };
+        
+        let mut extracted_data = json!({});
+        
         // [LIST MODE] 지능형 리스트 추출 (LLM 기반)
         let list_log = json!({ "category": "List Processing", "summary": "Extracting list data with LLM...", "spinner": "⠋" });
         log_task_progress(app_handle, &task.id, &list_log);
