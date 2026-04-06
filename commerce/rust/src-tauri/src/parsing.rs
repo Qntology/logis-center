@@ -466,16 +466,38 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 }
 
 pub fn is_detail_prompt(page_type: &str) -> String {
-    let template = r###"[TASK] Analyze the provided Pug HTML content from top to bottom. Determine if the main content represents a "Detail/Edit Form" (true) or a "List/Index Page" (false). 
-[FORCED DOCUMENT SCANNING LOGIC] 
-You MUST scan the ENTIRE document down to the footer before making a decision. Admin List pages often have search forms at the top that look like Detail forms. Do not be fooled. Scan the middle and bottom sections of the document for the following structural signatures: 1. "data_grid": A large repeating table body (`tbody`) where multiple sibling rows (`tr`) represent distinct, independent database records. 2. "bulk_or_pagination": Structural controls for bulk actions (array checkboxes across rows) or dataset navigation (pagination, row-count selectors). If either of these exists anywhere in the document, the page is a List/Index page (`false`), regardless of the forms at the top. If the main layout is entirely dedicated to a single entity's inputs without these list signatures, it is a Detail Form (`true`). 
+    let template = r###"[TASK]
+Analyze the provided Pug HTML content from top to bottom. Determine if the main content represents a "Detail/Edit Form" (true) or a "List/Index Page" (false).
 
-[SCHEMA DEFINITIONS] 
-- found_data_grid: Boolean. True if you found a repeating horizontal data table in the middle/bottom. 
-- found_bulk_or_pagination: Boolean. True if you found bulk action checkboxes or pagination structures. 
-- detail: Boolean. Output `false` if either of the above is true. Output `true` ONLY if both are false and the primary structure is a single-entity mutation form. 
+[ENTITY CONTEXT: {TYPE}]
+You are evaluating a page managing this specific domain entity. Use this context to conceptually understand the abstract structures:
+- Single Entity (Detail): A property configuration interface. It features a large overarching form dedicated to inputting or updating the specific attributes of ONE primary entity. (Minor sub-lists for options/variants do not make it a global list).
+- Collection (List): A catalog or inventory interface dedicated to displaying, filtering, or batch-processing multiple DIFFERENT primary entities.
 
-[OUTPUT FORMAT] { "found_data_grid": Boolean, "found_bulk_or_pagination": Boolean, "detail": Boolean }"###;
+[FORCED DOCUMENT SCANNING LOGIC]
+Read the entire document. Look past global navigation menus and overarching search/filter forms at the top. Focus purely on the main data payload area and evaluate the following structural signatures:
+
+1. "is_multi_entity_grid": Does the main data area consist of a structural grid/table displaying multiple independent records? (Look for a header section followed by multiple repeating body blocks/rows representing different entities).
+2. "has_batch_processing_controls": Do the repeating blocks/rows contain identical selection mechanisms (like repeating checkboxes) specifically meant for selecting multiple distinct items for a bulk action?
+3. "has_dataset_navigation": Does the page contain dataset navigation controls (e.g., pagination links, "next/prev" buttons, or a dataset size selector like "X items per page") to navigate a large collection?
+
+If the main data payload is a multi-entity grid OR has dataset navigation, it is a List/Index page (`false`). If the main data payload is a massive property-value entry form for a single entity, it is a Detail Form (`true`).
+
+[SCHEMA DEFINITIONS]
+- is_multi_entity_grid: Boolean. True if the main data payload is a grid/list displaying multiple DIFFERENT primary entities.
+- has_batch_processing_controls: Boolean. True if the main grid rows have repeating selection inputs for bulk actions.
+- has_dataset_navigation: Boolean. True if there are pagination controls or overarching page-size selectors.
+- detail: Boolean. Output `false` if ANY of the three properties above are true. Output `true` ONLY if all three are false and the structure is a single-entity configuration form.
+
+[OUTPUT FORMAT]
+{
+  "is_multi_entity_grid": Boolean,
+  "has_batch_processing_controls": Boolean,
+  "has_dataset_navigation": Boolean,
+  "detail": Boolean
+}
+
+NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{TYPE}", page_type)
 }
 
