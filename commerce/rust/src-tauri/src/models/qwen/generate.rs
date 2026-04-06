@@ -278,7 +278,18 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 // Candle의 내장 save 함수를 사용하여 안전하게 다이렉트로 디스크에 씁니다.
                 let tp_clone = tp.clone();
                 let serialize_result = tokio::task::spawn_blocking(move || {
-                    candle_core::safetensors::save(&ts, &tp_clone)?;
+                    // 1. 임시 파일로 평문 텐서 저장
+                    let tmp_path = tp_clone.with_extension("tmp");
+                    candle_core::safetensors::save(&ts, &tmp_path)?;
+                    
+                    // 2. 임시 파일 읽기 및 암호화
+                    let plain_data = std::fs::read(&tmp_path)?;
+                    let encrypted_data = crate::utils::crypto::encrypt_data(&plain_data)?;
+                    
+                    // 3. 최종 경로에 암호화된 데이터 저장 및 임시 파일 삭제
+                    std::fs::write(&tp_clone, encrypted_data)?;
+                    let _ = std::fs::remove_file(tmp_path);
+                    
                     Ok::<_, anyhow::Error>(())
                 }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Thread error: {}", e)));
 
@@ -418,33 +429,35 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         // 정확한 SSD 경로(provided_path)에 파일명만 즉시 붙여서 블록 유실(Block missing)을 원천 차단합니다!
                         let file_path = provided_path.join(format!("l{}.st", target_layer));
                         if file_path.is_file() {
-                            if let Ok(content) = load_kv_block(&file_path) {
-                                if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                    let prefix = format!("b{}_l{}_", b_idx_off, target_layer);
-                                    let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).ok();
+                            if let Ok(encrypted_content) = load_kv_block(&file_path) {
+                                if let Ok(content) = crate::utils::crypto::decrypt_data(&encrypted_content) {
+                                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                                        let prefix = format!("b{}_l{}_", b_idx_off, target_layer);
+                                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).ok();
                                     
-                                    if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
-                                        let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                                        let file_shape: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                                        if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                            let file_shape: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
 
-                                        let dev = &Device::Cpu;
-                                        let mut kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
-                                        let mut vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
-                                        
-                                        // [CRITICAL FIX] CPU 모드라면 백그라운드 스레드에서 미리 F32로 변환하여 메인 런타임의 병목을 원천 차단!
-                                        if load.is_cpu {
-                                            kd_t = kd_t.to_dtype(DType::F32).unwrap_or(kd_t);
-                                            vd_t = vd_t.to_dtype(DType::F32).unwrap_or(vd_t);
-                                        }
-                                        let meta = BitKVMetadata { k_data: kd_t, v_data: vd_t, original_shape: file_shape };
-                                        
-                                        if let Ok(mut r) = reg.entries.write() {
-                                            if b_idx < r.len() {
-                                                {
-                                                    let mut cache = r[b_idx].bitkv_cache.write().unwrap();
-                                                    cache[target_layer] = Some(meta); // 타겟 레이어에 적재
+                                            let dev = &Device::Cpu;
+                                            let mut kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
+                                            let mut vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
+                                            
+                                            // [CRITICAL FIX] CPU 모드라면 백그라운드 스레드에서 미리 F32로 변환하여 메인 런타임의 병목을 원천 차단!
+                                            if load.is_cpu {
+                                                kd_t = kd_t.to_dtype(DType::F32).unwrap_or(kd_t);
+                                                vd_t = vd_t.to_dtype(DType::F32).unwrap_or(vd_t);
+                                            }
+                                            let meta = BitKVMetadata { k_data: kd_t, v_data: vd_t, original_shape: file_shape };
+                                            
+                                            if let Ok(mut r) = reg.entries.write() {
+                                                if b_idx < r.len() {
+                                                    {
+                                                        let mut cache = r[b_idx].bitkv_cache.write().unwrap();
+                                                        cache[target_layer] = Some(meta); // 타겟 레이어에 적재
+                                                    }
+                                                    r[b_idx].location[target_layer] = KVLocation::RAM;
                                                 }
-                                                r[b_idx].location[target_layer] = KVLocation::RAM;
                                             }
                                         }
                                     }

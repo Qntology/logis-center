@@ -715,7 +715,7 @@ async fn process_task(
     model.deep_purge_resources().await;
     wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
 
-        
+    let mut extracted_data = json!({});
 
     // --- PHASE 2 Continue: Detail Extraction (If needed) --- 
     if !is_detail {
@@ -1026,8 +1026,6 @@ async fn process_task(
             node_selector.to_string() 
         };
         
-        let mut extracted_data = json!({});
-        
         // [LIST MODE] 지능형 리스트 추출 (LLM 기반)
         let list_log = json!({ "category": "List Processing", "summary": "Extracting list data with LLM...", "spinner": "⠋" });
         log_task_progress(app_handle, &task.id, &list_log);
@@ -1124,14 +1122,7 @@ async fn process_task(
         let content_pug = {
             let clean_html_path = data_manager.get_path("clean_html");
             let clean_content = data_manager.load(&clean_html_path)?;
-            let document = scraper::Html::parse_document(&clean_content);
-            let mut pug_output = String::new();
-            if let Ok(selector) = scraper::Selector::parse(&target_selector) {
-                if let Some(node) = document.select(&selector).next() {
-                    parsing::generate_pug_lines(*node, 0, &mut pug_output, &PugMode::FullContent, &mut None);
-                }
-            }
-            parsing::sanitize_llm_input(&pug_output)
+            parsing::convert_to_clean_pug(&clean_content, PugMode::FullContent)
         };
 
         if !content_pug.trim().is_empty() {
@@ -1142,7 +1133,7 @@ async fn process_task(
 
             // 1. [Large] Load & Generate (Direct 28-Layer Generation)
             {
-                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 

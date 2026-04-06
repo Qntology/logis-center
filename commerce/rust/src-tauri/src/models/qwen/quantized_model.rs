@@ -740,46 +740,51 @@ impl QuantizedQwenVLTextAttention {
                             for retry in 0..3 {
                                 if block_file.exists() {
                                     match crate::utils::direct_loader::load_kv_block(&block_file) {
-                                        Ok(data) => {
-                                            match safetensors::SafeTensors::deserialize(&data) {
-                                                Ok(st) => {
-                                                    let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
-                                                    let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
-                                                    
-                                                    if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
-                                                        let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                                                        let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
-                                                        
-                                                        let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap_or_else(|_| Tensor::zeros(meta_os.clone(), DType::BF16, &Device::Cpu).unwrap());
-                                                        let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap_or_else(|_| Tensor::zeros(meta_os.clone(), DType::BF16, &Device::Cpu).unwrap());
-                                                        
-                                                        let cpu_dev = &Device::Cpu;
-                                                        let k_unpacked = self.decompress_from_bf16(&kd_t, &meta_os, cpu_dev).unwrap_or_else(|_| kd_t.clone());
-                                                        let v_unpacked = self.decompress_from_bf16(&vd_t, &meta_os, cpu_dev).unwrap_or_else(|_| vd_t.clone());
+                                        Ok(encrypted_data) => {
+                                            match crate::utils::crypto::decrypt_data(&encrypted_data) {
+                                                Ok(data) => {
+                                                    match safetensors::SafeTensors::deserialize(&data) {
+                                                        Ok(st) => {
+                                                            let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
+                                                            let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                                                            
+                                                            if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                                                let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                                                let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                                                                
+                                                                let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap_or_else(|_| Tensor::zeros(meta_os.clone(), DType::BF16, &Device::Cpu).unwrap());
+                                                                let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap_or_else(|_| Tensor::zeros(meta_os.clone(), DType::BF16, &Device::Cpu).unwrap());
+                                                                
+                                                                let cpu_dev = &Device::Cpu;
+                                                                let k_unpacked = self.decompress_from_bf16(&kd_t, &meta_os, cpu_dev).unwrap_or_else(|_| kd_t.clone());
+                                                                let v_unpacked = self.decompress_from_bf16(&vd_t, &meta_os, cpu_dev).unwrap_or_else(|_| vd_t.clone());
 
-                                                        k_cpu = Some(k_unpacked.clone());
-                                                        v_cpu = Some(v_unpacked.clone());
-                                                        
-                                                        let mut reg = self.registry.entries.write().unwrap();
-                                                        if index < reg.len() { 
-                                                            reg[index].ssd_path = Some(full_path.clone());
-                                                            reg[index].location[self.layer_idx] = KVLocation::RAM; 
-                                                            
-                                                            let mut cache = reg[index].bitkv_cache.write().unwrap();
-                                                            let cache_k = if self.q_proj.device().is_cpu() { k_unpacked.clone() } else { kd_t };
-                                                            let cache_v = if self.q_proj.device().is_cpu() { v_unpacked.clone() } else { vd_t };
-                                                            
-                                                            cache[self.layer_idx] = Some(BitKVMetadata {
-                                                                k_data: cache_k, v_data: cache_v, original_shape: meta_os,
-                                                            });
-                                                        }
-                                                        break; // 로딩 성공 시 재시도 루프 탈출
-                                                    } else {
-                                                        // [DIAGNOSTIC] 텐서 키 불일치 시 침묵하지 않고 정확한 이유를 출력합니다.
-                                                        println!("[DIAG-LOAD] Keys missing! Expected prefix: {}. Found keys: {:?}", prefix, st.names());
+                                                                k_cpu = Some(k_unpacked.clone());
+                                                                v_cpu = Some(v_unpacked.clone());
+                                                                
+                                                                let mut reg = self.registry.entries.write().unwrap();
+                                                                if index < reg.len() { 
+                                                                    reg[index].ssd_path = Some(full_path.clone());
+                                                                    reg[index].location[self.layer_idx] = KVLocation::RAM; 
+                                                                    
+                                                                    let mut cache = reg[index].bitkv_cache.write().unwrap();
+                                                                    let cache_k = if self.q_proj.device().is_cpu() { k_unpacked.clone() } else { kd_t };
+                                                                    let cache_v = if self.q_proj.device().is_cpu() { v_unpacked.clone() } else { vd_t };
+                                                                    
+                                                                    cache[self.layer_idx] = Some(BitKVMetadata {
+                                                                        k_data: cache_k, v_data: cache_v, original_shape: meta_os,
+                                                                    });
+                                                                }
+                                                                break; // 로딩 성공 시 재시도 루프 탈출
+                                                            } else {
+                                                                // [DIAGNOSTIC] 텐서 키 불일치 시 침묵하지 않고 정확한 이유를 출력합니다.
+                                                                println!("[DIAG-LOAD] Keys missing! Expected prefix: {}. Found keys: {:?}", prefix, st.names());
+                                                            }
+                                                        },
+                                                        Err(e) => { println!("[DIAG-LOAD] Safetensors parse failed for {:?}: {:?}", block_file, e); }
                                                     }
                                                 },
-                                                Err(e) => { println!("[DIAG-LOAD] Safetensors parse failed for {:?}: {:?}", block_file, e); }
+                                                Err(e) => { println!("[DIAG-LOAD] Decryption failed for {:?}: {:?}", block_file, e); }
                                             }
                                         },
                                         Err(e) => { println!("[DIAG-LOAD] Read failed for {:?}: {:?}", block_file, e); }
@@ -994,6 +999,11 @@ impl QuantizedQwenVLTextAttention {
             };
 
             if let (Some(k), Some(v)) = (k_opt, v_opt) {
+                // 🌟 [핵심 최적화] 백그라운드 큐에 넣기 "전"에 즉시 VRAM -> CPU RAM으로 이동!
+                // 이렇게 하면 VRAM은 즉각 해제되고, 백그라운드 스레드는 시스템 RAM만 사용합니다.
+                let k_cpu = k.to_device(&Device::Cpu).unwrap_or_else(|_| k.clone());
+                let v_cpu = v.to_device(&Device::Cpu).unwrap_or_else(|_| v.clone());
+                
                 let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
                 let last_part = kv_name_raw.split('/').last().unwrap_or("text");
                 let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text".to_string() } else { last_part.to_string() };
@@ -1006,11 +1016,10 @@ impl QuantizedQwenVLTextAttention {
                 crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                 tauri::async_runtime::spawn(async move {
-                    // [CRITICAL FIX] 무거운 GPU->CPU 다운로드(블로킹 연산)가 비동기 런타임을 마비시키지 않도록
-                    // spawn_blocking으로 완벽하게 격리시켜 디코딩 버벅임(Stuttering)을 차단합니다!
                     let (k_vram, v_vram) = tokio::task::spawn_blocking(move || {
-                        let k_res = k.to_device(&Device::Cpu).unwrap_or_else(|_| k.clone()).contiguous().unwrap_or_else(|_| k.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| k.clone());
-                        let v_res = v.to_device(&Device::Cpu).unwrap_or_else(|_| v.clone()).contiguous().unwrap_or_else(|_| v.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| v.clone());
+                        // 이제 여기서는 이미 CPU로 넘어온 텐서(k_cpu)만 다루므로 VRAM 누수가 절대 없습니다.
+                        let k_res = k_cpu.contiguous().unwrap_or_else(|_| k_cpu.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| k_cpu.clone());
+                        let v_res = v_cpu.contiguous().unwrap_or_else(|_| v_cpu.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| v_cpu.clone());
                         (k_res, v_res)
                     }).await.unwrap_or_else(|_| (Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(), Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap()));
                     
@@ -1083,55 +1092,57 @@ impl QuantizedQwenVLTextAttention {
             
             let b_idx = block_info.offset / 256;
             
-            if let Ok(content) = crate::utils::direct_loader::load_kv_block(&file_path) {
-                if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+            if let Ok(encrypted_content) = crate::utils::direct_loader::load_kv_block(&file_path) {
+                if let Ok(content) = crate::utils::crypto::decrypt_data(&encrypted_content) {
+                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
                     // [RESTORATION] 프리픽스 매칭 로직 복구
-                    let is_l0 = file_path.to_string_lossy().contains("l0.st");
-                    let prefix = if is_l0 { format!("b{}_l0_", block_info.offset) } else { format!("b{}_l{}_", block_info.offset, self.layer_idx) };
-                    let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                        let is_l0 = file_path.to_string_lossy().contains("l0.st");
+                        let prefix = if is_l0 { format!("b{}_l0_", block_info.offset) } else { format!("b{}_l{}_", block_info.offset, self.layer_idx) };
+                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
 
-                    if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
-                        let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                        let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
-                        
-                        let dev = &Device::Cpu;
-                        let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, dev)?;
-                        let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, dev)?;
+                        if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                            let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                            
+                            let dev = &Device::Cpu;
+                            let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, dev)?;
+                            let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, dev)?;
 
-                        let mut k_raw = self.decompress_from_bf16(&kd_t, &meta_os, dev)?;
-                        let mut v_raw = self.decompress_from_bf16(&vd_t, &meta_os, dev)?;
+                            let mut k_raw = self.decompress_from_bf16(&kd_t, &meta_os, dev)?;
+                            let mut v_raw = self.decompress_from_bf16(&vd_t, &meta_os, dev)?;
 
-                        // [KV-BRIDGE] 0.6B -> 0.6B 상황에서도 규격이 다르면 정렬 (커밋 261fe0ef 매커니즘)
-                        let target_heads = self.num_key_value_heads;
-                        let target_dim = self.head_dim;
-                        let (_b, h, _s, d) = k_raw.dims4()?;
+                            // [KV-BRIDGE] 0.6B -> 0.6B 상황에서도 규격이 다르면 정렬 (커밋 261fe0ef 매커니즘)
+                            let target_heads = self.num_key_value_heads;
+                            let target_dim = self.head_dim;
+                            let (_b, h, _s, d) = k_raw.dims4()?;
 
-                        if d < target_dim {
-                            k_raw = Tensor::cat(&[&k_raw, &k_raw], D::Minus1)?;
-                            v_raw = Tensor::cat(&[&v_raw, &v_raw], D::Minus1)?;
-                        }
-                        if h != target_heads {
-                            let mut k_list = Vec::with_capacity(target_heads);
-                            let mut v_list = Vec::with_capacity(target_heads);
-                            for i in 0..target_heads {
-                                let src_idx = i % h;
-                                k_list.push(k_raw.narrow(1, src_idx, 1)?);
-                                v_list.push(v_raw.narrow(1, src_idx, 1)?);
+                            if d < target_dim {
+                                k_raw = Tensor::cat(&[&k_raw, &k_raw], D::Minus1)?;
+                                v_raw = Tensor::cat(&[&v_raw, &v_raw], D::Minus1)?;
                             }
-                            k_raw = Tensor::cat(&k_list, 1)?;
-                            v_raw = Tensor::cat(&v_list, 1)?;
-                        }
+                            if h != target_heads {
+                                let mut k_list = Vec::with_capacity(target_heads);
+                                let mut v_list = Vec::with_capacity(target_heads);
+                                for i in 0..target_heads {
+                                    let src_idx = i % h;
+                                    k_list.push(k_raw.narrow(1, src_idx, 1)?);
+                                    v_list.push(v_raw.narrow(1, src_idx, 1)?);
+                                }
+                                k_raw = Tensor::cat(&k_list, 1)?;
+                                v_raw = Tensor::cat(&v_list, 1)?;
+                            }
 
-                        let mut reg = self.registry.entries.write().unwrap();
-                        if b_idx < reg.len() {
-                            if let Some(block) = self.kv_blocks.get(b_idx) {
-                                let mut inner = block.inner.write().unwrap();
-                                // [CRITICAL FIX] RAM 캐싱 단계이므로 절대 VRAM에 올리지 않고 Device::Cpu로 고정!
-                                inner.k_cache = Some(k_raw.to_device(&Device::Cpu)?);
-                                inner.v_cache = Some(v_raw.to_device(&Device::Cpu)?);
-                                inner.location = KVLocation::RAM;
-                                reg[b_idx].location[self.layer_idx] = KVLocation::RAM;
-                                reg[b_idx].ssd_path = Some(file_path.parent().unwrap().to_path_buf());
+                            let mut reg = self.registry.entries.write().unwrap();
+                            if b_idx < reg.len() {
+                                if let Some(block) = self.kv_blocks.get(b_idx) {
+                                    let mut inner = block.inner.write().unwrap();
+                                    // [CRITICAL FIX] RAM 캐싱 단계이므로 절대 VRAM에 올리지 않고 Device::Cpu로 고정!
+                                    inner.k_cache = Some(k_raw.to_device(&Device::Cpu)?);
+                                    inner.v_cache = Some(v_raw.to_device(&Device::Cpu)?);
+                                    inner.location = KVLocation::RAM;
+                                    reg[b_idx].location[self.layer_idx] = KVLocation::RAM;
+                                    reg[b_idx].ssd_path = Some(file_path.parent().unwrap().to_path_buf());
+                                }
                             }
                         }
                     }
@@ -2770,13 +2781,15 @@ impl QuantizedQwenVLTextModel {
         // [ROBUST-LENGTH-DETECTION] Get actual length of the last block
         let mut last_chunk_len = 256;
         let (_, last_st_path) = fragments.last().unwrap();
-        if let Ok(content) = crate::utils::direct_loader::load_kv_block(&last_st_path.join("l0.st")) {
-            if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                if let Some(name) = st.names().iter().find(|n| n.contains("k_shape")) {
-                    if let Ok(view) = st.tensor(name) {
-                        let data = view.data();
-                        if data.len() >= 12 {
-                            last_chunk_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        if let Ok(encrypted_content) = crate::utils::direct_loader::load_kv_block(&last_st_path.join("l0.st")) {
+            if let Ok(content) = crate::utils::crypto::decrypt_data(&encrypted_content) {
+                if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                    if let Some(name) = st.names().iter().find(|n| n.contains("k_shape")) {
+                        if let Ok(view) = st.tensor(name) {
+                            let data = view.data();
+                            if data.len() >= 12 {
+                                last_chunk_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+                            }
                         }
                     }
                 }
