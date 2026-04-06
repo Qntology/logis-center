@@ -257,7 +257,32 @@ pub struct GateUpDownMLPGguf {
     act: Activation,
 }
 
+pub fn dummy_proj(device: &Device) -> ProjKind {
+    ProjKind::LinearProj(Linear::new(Tensor::zeros((1, 1), DType::F32, device).unwrap(), None))
+}
+
+
 impl GateUpDownMLPGguf {
+    pub fn clear_weights(&mut self) {
+        let dummy = dummy_proj(&Device::Cpu);
+        self.gate_proj = dummy.clone();
+        self.up_proj = dummy.clone();
+        self.down_proj = dummy;
+    }
+
+    pub fn load_weights_inplace<R: Read + Seek>(&mut self, ct: &gguf_file::Content, reader: &mut R, prefix: &str, device: &Device) -> Result<()> {
+        let gate_w = ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?;
+        self.gate_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(gate_w)?, None));
+        
+        let up_w = ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?;
+        self.up_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(up_w)?, None));
+        
+        let down_w = ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
+        self.down_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(down_w)?, None));
+        
+        Ok(())
+    }
+    
     pub fn new_from_gguf<R: Read + Seek>(
         gguf: &mut Gguf<R>,
         prefix: &str,

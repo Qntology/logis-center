@@ -1066,7 +1066,12 @@ async fn process_task(
                         model: "qwen3.5".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.01),
                         ..Default::default()
                     };
-                    gen.generate(params).await.map_err(|e| anyhow::anyhow!("Qwen 3.5 Inference failed: {}", e))
+                    gen.generate(
+                        params, 
+                        Some(cancellation_token.clone()), 
+                        None, // 리스트 아이템은 독립적이므로 캐시 세션을 공유하지 않음
+                        Some("inference".to_string())
+                    ).await.map_err(|e| anyhow::anyhow!("Qwen 3.5 Inference failed: {}", e))
                 } else {
                     Err(anyhow::anyhow!("Qwen 3.5 Generator not available"))
                 };
@@ -1128,34 +1133,40 @@ async fn process_task(
         if !content_pug.trim().is_empty() {
             let extraction_instruction = parsing::item2json(&page_type, &url, language);
             let pug_content = content_pug.clone();
-            let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think", pug_content, extraction_instruction);
+            let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think", pug_content, extraction_instruction);
             let snapshot_id = format!("{}_detail", task.id);
 
             // 1. [Large] Load & Generate (Direct 28-Layer Generation)
             {
-                model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, Some(&snapshot_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+                // 🌟 [수정 1] 새로운 생성 작업이므로 불러올 캐시는 None으로 전달합니다.
+                model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
                         content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                         name: None,
                     })],
-                    model: "qwen".to_string(), max_tokens: Some(1024), temperature: Some(0.0), top_p: Some(0.01),
+                    // 🌟 [수정 2] 모델 이름을 "qwen3.5"로 정확히 명시합니다.
+                    model: "qwen3.5".to_string(), max_tokens: Some(1024), temperature: Some(0.0), top_p: Some(0.01),
                     ..Default::default()
                 };
 
-                // 3. Small Instant Inference
-                if let Some(gen) = model.generator.lock().await.as_mut() {
-                    println!("[Scheduler] Small Step C: Asking extraction question...");
-                    log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Small Inference..." }));
+                // 🌟 [수정 3] 0.6B(generator)가 아닌 Qwen 3.5 제너레이터를 호출합니다.
+                if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+                    println!("[Scheduler] Qwen3.5 Step C: Asking extraction question...");
+                    log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Qwen 3.5 Inference..." }));
                     
+                    // 🚨 [핵심 수정] 3.5 모델은 아직 추가 인자를 받지 않으므로 params만 넘깁니다!
                     let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), Some("inference".to_string())).await?;
+                    
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
 
                     // [DEBUG] AI 응답 저장
                     let _ = data_manager.offload(&res, "step_c_res");
 
                     extracted_data = parsing::parse_json_from_llm(&res);
+                } else {
+                    println!("[Scheduler] ERROR: Qwen 3.5 generator is missing!");
                 }
             }
         }

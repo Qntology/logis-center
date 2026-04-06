@@ -919,7 +919,7 @@ impl LogisModel {
         _event_name: &str,
         base_payload: Value,
         max_tokens: usize,
-        _cancel_token: Option<Arc<AtomicBool>>,
+        cancellation_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
         // [VISION-DYNAMIC] 이미지가 전달되었으면 Large, 없으면 Small만 가볍게 올립니다!
@@ -968,7 +968,12 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params).await.map_err(|e| anyhow!("Qwen 3.5 Inference failed: {}", e))
+        gen.generate(
+            params, 
+            cancellation_token.clone(),
+            None, 
+            Some("inference".to_string())
+        ).await.map_err(|e| anyhow!("Qwen 3.5 Inference failed: {}", e))
     }
 
     pub fn is_cpu(&self) -> bool {

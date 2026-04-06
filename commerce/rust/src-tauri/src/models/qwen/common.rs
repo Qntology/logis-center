@@ -6,7 +6,10 @@ use candle_nn::{
     linear_no_bias, rms_norm,
 };
 
-use crate::{models::qwen::rope::apply_rotary_pos_emb, utils::tensor_utils::repeat_kv};
+use crate::{
+    position_embed::rope::{RoPE, apply_rotary_pos_emb, apply_rotary_pos_emb_roformer},
+    utils::tensor_utils::prepare_causal_attention_mask, // 🌟 Warning의 원인이었던 repeat_kv만 쏙 뺐습니다!
+};
 
 #[derive(Debug, Clone)]
 pub struct GateUpDownMLP {

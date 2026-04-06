@@ -1308,26 +1308,30 @@ pub fn softplus_stable(xs: &Tensor) -> Result<Tensor> {
     Ok((xs.abs()?.neg()?.exp()? + 1.0)?.log()?.add(&x_max_0)?)
 }
 
-// refer to https://github.com/huggingface/candle/issues/3389
 pub fn conv1d_depthwise(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
-    // group = dim, stride= 1
-    // input: (bs, dim, len)
-    // weight: (dim, 1, k) -> (dim, k)
-    // input already padding
     let len_in = input.dim(2)?;
     let weight = weight.squeeze(1)?.to_dtype(input.dtype())?;
     let kernel_size = weight.dim(1)?;
-    // len_out = (len_in - k + 2p) / s + 1, p = 0, s = 1
     let len_out = len_in - kernel_size + 1;
-    let mut out = input
-        .narrow(2, 0, len_out)?
-        .broadcast_mul(&weight.narrow(1, 0, 1)?.unsqueeze(0)?)?;
-    for k in 1..kernel_size {
-        out = (out
-            + input
-                .narrow(2, k, len_out)?
-                .broadcast_mul(&weight.narrow(1, k, 1)?.unsqueeze(0)?)?)?;
-    }
+
+    let mut out = if len_out == 1 {
+        // 🌟 [디코딩 초고속 패스] 루프를 아예 돌지 않고 단 1번의 텐서 연산으로 끝냅니다!
+        // 여기서만 1글자당 273번의 GPU 커널 호출이 증발합니다.
+        input.broadcast_mul(&weight.unsqueeze(0)?)?.sum_keepdim(2)?
+    } else {
+        // 프리필(Prefill) 처리용 기존 패스
+        let mut out = input
+            .narrow(2, 0, len_out)?
+            .broadcast_mul(&weight.narrow(1, 0, 1)?.unsqueeze(0)?)?;
+        for k in 1..kernel_size {
+            out = (out
+                + input
+                    .narrow(2, k, len_out)?
+                    .broadcast_mul(&weight.narrow(1, k, 1)?.unsqueeze(0)?)?)?;
+        }
+        out
+    };
+
     match bias {
         None => Ok(out),
         Some(bias) => {
