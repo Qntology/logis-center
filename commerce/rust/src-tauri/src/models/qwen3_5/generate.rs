@@ -312,7 +312,19 @@ impl Qwen3_5GenerateModel {
             self.clear_kv_cache();
 
             let mes_render = self.chat_template.apply_chat_template(mes)?;
-            let (text, px_vals, img_thw, vid_px_vals, vid_thw) = if let Some(processor) = &self.pre_processor {
+            
+            // 👇 [핵심 수정] 메세지 내부에 이미지나 비디오 URL이 존재하는지 직접 안전하게 판별합니다.
+            let has_vision = mes.messages.iter().any(|msg| {
+                if let ChatCompletionRequestMessage::User(user_msg) = msg {
+                    if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
+                        parts.iter().any(|p| matches!(p, ChatCompletionRequestMessageContentPart::ImageURL(_) | ChatCompletionRequestMessageContentPart::VideoURL(_)))
+                    } else { false }
+                } else { false }
+            });
+
+            // 👇 비전 콘텐츠가 있을 때만 processor를 태우고, 순수 텍스트면 원본 ChatML을 그대로 보존합니다!
+            let (text, px_vals, img_thw, vid_px_vals, vid_thw) = if has_vision && self.pre_processor.is_some() {
+                let processor = self.pre_processor.as_ref().unwrap();
                 let input = processor.process_info(mes, &mes_render)?;
                 (input.replace_text, input.pixel_values, input.image_grid_thw, input.pixel_values_video, input.video_grid_thw)
             } else {
