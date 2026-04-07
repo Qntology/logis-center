@@ -43,8 +43,9 @@ impl Qwen3_5RMSNorm {
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        // 🌟 [수정] Result 반환 타입을 맞추기 위해 Ok( ... ?) 로 감싸줍니다.
-        Ok(candle_nn::ops::rms_norm(xs, &self.weight, self.eps as f32)?)
+        // 🌟 [수정] F32로 저장된 가중치를 xs(BF16) 타입에 맞춰준 뒤 네이티브 커널 실행!
+        let w = self.weight.to_dtype(xs.dtype())?;
+        Ok(candle_nn::ops::rms_norm(xs, &w, self.eps as f32)?)
     }
 
     pub fn clear(&mut self) {
@@ -57,38 +58,36 @@ impl Qwen3_5RMSNorm {
 }
 
 pub struct Qwen3_5RMSNormGated {
-    norm: RmsNorm,
+    weight: Tensor,
+    eps: f64,
     dtype: DType,
 }
 
 impl Qwen3_5RMSNormGated {
     pub fn new(vb: VarBuilder, hidden_size: usize, eps: f64) -> Result<Self> {
         let dtype = vb.dtype();
-        let norm = rms_norm(hidden_size, eps, vb)?;
-        Ok(Self { norm, dtype })
+        let weight = vb.get(hidden_size, "weight")?;
+        Ok(Self { weight, eps, dtype })
     }
 
     pub fn from_weight(weight: Tensor, eps: f64) -> Result<Self> {
         let dtype = weight.dtype();
-        let norm = RmsNorm::new(weight, eps);
-        Ok(Self { norm, dtype })
+        Ok(Self { weight, eps, dtype })
     }
 
     pub fn forward(&self, xs: &Tensor, gate: Option<&Tensor>) -> Result<Tensor> {
-        // 🌟 [최적화 1] 3번에 걸친 무의미한 F32/BF16 수동 캐스팅을 모조리 삭제합니다!
-        // VRAM 메모리 복사 오버헤드가 사라지고, 프레임워크의 네이티브 최적화 속도를 100% 활용합니다.
-        let mut out = self.norm.forward(xs)?;
+        let w = self.weight.to_dtype(xs.dtype())?;
+        let mut out = candle_nn::ops::rms_norm(xs, &w, self.eps as f32)?;
         if let Some(gate) = gate {
-            // SILU 연산 역시 원본 타입(BF16)에서 바로 수행 후 병합!
             out = out.broadcast_mul(&gate.silu()?)?;
         }
         Ok(out)
     }
 
     pub fn clear(&mut self) {
-        self.norm = candle_nn::rms_norm(1, 1e-6, candle_nn::VarBuilder::zeros(candle_core::DType::F32, &candle_core::Device::Cpu)).unwrap();
+        self.weight = Tensor::zeros((1,), candle_core::DType::F32, &candle_core::Device::Cpu).unwrap();
     }
-    pub fn eps(&self) -> f64 { 1e-6 }
+    pub fn eps(&self) -> f64 { self.eps }
 }
 
 #[macro_export]
@@ -571,11 +570,9 @@ impl Qwen3_5GatedDeltaNet {
         let value = qkv_split[2].reshape((bs, seq_len, (), self.head_v_dim))?;
         let beta = sigmoid(&b)?;
         let a_plus_bias = softplus(
-            &a.to_dtype(candle_core::DType::F32)?
-                .broadcast_add(&self.dt_bias.to_dtype(candle_core::DType::F32)?)?,
+            &a.to_dtype(candle_core::DType::F32)?.broadcast_add(&self.dt_bias)?,
         )?;
-        let g = (-1.0 * self.a_log.to_dtype(candle_core::DType::F32)?.exp()?)?
-            .broadcast_mul(&a_plus_bias)?;
+        let g = self.a_log.broadcast_mul(&a_plus_bias)?;
         if self.num_v_heads / self.num_k_heads > 1 {
             query = repeat_interleave(&query, self.num_v_heads / self.num_k_heads, 2)?;
             key = repeat_interleave(&key, self.num_v_heads / self.num_k_heads, 2)?;
@@ -812,7 +809,7 @@ impl Qwen3_5Attention {
         let mut l_n: Option<Tensor> = None;
         
         // 🌟 [최적화 2] 1,680번 반복되던 스케일링 곱셈을 루프 바깥으로 빼서 딱 1번만 계산합니다!
-        let q_aligned = (query_states.to_dtype(target_dtype)? * self.scaling)?.contiguous()?;
+        let q_aligned = (query_states * self.scaling)?;
 
         for block in &self.kv_blocks {
             let (index, b_off, b_len) = {
@@ -935,7 +932,6 @@ impl Qwen3_5Attention {
                 }
             }
 
-            let s_chunk_f32 = s_chunk.to_dtype(DType::F32)?;
             let m_j = s_chunk.max_keepdim(candle_core::D::Minus1)?;
             let p_j = s_chunk.broadcast_sub(&m_j)?.exp()?;
             let l_j = p_j.sum_keepdim(candle_core::D::Minus1)?;
@@ -1654,6 +1650,7 @@ pub struct Qwen3_5Model {
     pub language_model: Qwen3_5TextModel,
     lm_head: ProjKind,
     rope_deltas: Option<Tensor>,
+    rope_deltas_cpu: Option<Vec<i64>>,
 }
 
 impl Qwen3_5Model {
@@ -1680,6 +1677,7 @@ impl Qwen3_5Model {
             language_model,
             lm_head: ProjKind::LinearProj(lm_head),
             rope_deltas: None,
+            rope_deltas_cpu: None,
         })
     }
 
@@ -1720,6 +1718,7 @@ impl Qwen3_5Model {
             language_model,
             lm_head: ProjKind::LinearProj(lm_head),
             rope_deltas: None,
+            rope_deltas_cpu: None,
         })
     }
 
@@ -1729,7 +1728,7 @@ impl Qwen3_5Model {
         image_grid_thw: Option<&Tensor>,
         video_grid_thw: Option<&Tensor>,
         mask: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor)> {
+    ) -> Result<(Tensor, Tensor, Vec<i64>)> {
         let video_grid_thw = match video_grid_thw {
             Some(thw) => {
                 let grid_t = thw.i((.., 0))?.to_vec1::<u32>()?;
@@ -1838,9 +1837,11 @@ impl Qwen3_5Model {
                 let position_deltas = llm_position.max_all()?.to_scalar::<u32>()? as i64 + 1 - input_ids_i.dim(0)? as i64;
                 mrope_position_deltas.push(position_deltas);
             }
+            let mrope_position_deltas_vec = mrope_position_deltas.clone(); // 🌟 복사본 떠두기
             let mut mrope_position_deltas = Tensor::new(mrope_position_deltas, input_ids.device())?;
             if mrope_position_deltas.rank() == 1 { mrope_position_deltas = mrope_position_deltas.unsqueeze(0)?; }
-            Ok((position_ids.contiguous()?, mrope_position_deltas))
+            
+            Ok((position_ids.contiguous()?, mrope_position_deltas, mrope_position_deltas_vec)) // 🌟 vec 반환 추가
         } else if let Some(mask) = mask {
             let mut position_ids = mask.to_dtype(candle_core::DType::F64)?.cumsum(D::Minus1)?.to_dtype(candle_core::DType::U32)?.broadcast_sub(&Tensor::new(vec![1_u32], input_ids.device())?)?;
             for i in 0..position_ids.dim(0)? {
@@ -1856,11 +1857,17 @@ impl Qwen3_5Model {
             position_ids = position_ids.unsqueeze(0)?.broadcast_as((3, input_ids.dim(0)?, input_ids.dim(1)?))?.contiguous()?;
             let mut mrope_position_deltas = position_ids.max(0)?.max(D::Minus1)?.broadcast_sub(&Tensor::new(vec![mask.dim(D::Minus1)? as u32 - 1], input_ids.device())?)?.contiguous()?;
             if mrope_position_deltas.rank() == 1 { mrope_position_deltas = mrope_position_deltas.unsqueeze(0)?; }
-            Ok((position_ids, mrope_position_deltas))
+            
+            // 🌟 [추가 & 수정] Vec<i64> 형변환 후 리턴
+            let mrope_position_deltas_vec = mrope_position_deltas.flatten_all()?.to_vec1::<u32>()?.iter().map(|&x| x as i64).collect();
+            Ok((position_ids, mrope_position_deltas, mrope_position_deltas_vec))
         } else {
             let position_ids = Tensor::arange(0_u32, input_ids.dim(D::Minus1)? as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, input_ids.dim(0)?, input_ids.dim(D::Minus1)?))?.contiguous()?;
             let mrope_position_deltas = Tensor::zeros((input_ids.dim(0)?, 1), input_ids.dtype(), input_ids.device())?;
-            Ok((position_ids, mrope_position_deltas))
+            
+            // 🌟 [추가 & 수정] 비어있는 Vec 생성 후 리턴
+            let mrope_position_deltas_vec = vec![0i64; input_ids.dim(0)?];
+            Ok((position_ids, mrope_position_deltas, mrope_position_deltas_vec))
         }
     }
 
@@ -1872,22 +1879,32 @@ impl Qwen3_5Model {
         video_grid_thw: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        let position_ids = if let Some(rope_deltas) = &self.rope_deltas {
+        let position_ids = if let Some(rope_deltas_cpu) = &self.rope_deltas_cpu {
             if seqlen_offset != 0 {
                 let (bs, seq_len, _) = inputs_embeds.dims3()?;
-                Tensor::arange(seqlen_offset as i64, (seqlen_offset + seq_len) as i64, input_ids.device())?
-                .to_dtype(rope_deltas.dtype())?.unsqueeze(0)?.broadcast_as((bs, seq_len))?.broadcast_add(rope_deltas)?.unsqueeze(0)?.broadcast_as((3, bs, seq_len))?.contiguous()?.to_dtype(candle_core::DType::U32)?
+                let mut p_ids_vec = Vec::with_capacity(bs);
+                for b in 0..bs {
+                    let delta = rope_deltas_cpu[b];
+                    let real_start = (seqlen_offset as i64 + delta) as u32;
+                    // 🌟 [핵심 변경 1] input_ids 대신 실제 연산이 일어날 inputs_embeds.device() 참조!
+                    let p_id = Tensor::arange(real_start, real_start + seq_len as u32, inputs_embeds.device())?
+                        .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, seq_len))?;
+                    p_ids_vec.push(p_id);
+                }
+                Tensor::cat(&p_ids_vec, 1)?
             } else {
-                let (position_ids, rope_deltas) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
+                let (position_ids, rope_deltas, deltas_cpu) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
                 self.rope_deltas = Some(rope_deltas);
+                self.rope_deltas_cpu = Some(deltas_cpu);
                 position_ids
             }
         } else {
-            let (position_ids, rope_deltas) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
+            let (position_ids, rope_deltas, deltas_cpu) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
             self.rope_deltas = Some(rope_deltas);
+            self.rope_deltas_cpu = Some(deltas_cpu);
             position_ids
         };
-        Ok(position_ids)
+        Ok(position_ids.to_device(inputs_embeds.device())?)
     }
 
     // [수정] session_id와 kv_name 인자 추가
@@ -1973,9 +1990,10 @@ impl Qwen3_5Model {
         // 이 우회 공사 덕분에 GPU VRAM 300MB가 영구적으로 텅 비게 됩니다.
         let hidden_state_cpu = hidden_state.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
         let logits_cpu = self.lm_head.forward(&hidden_state_cpu)?;
-        let logits = logits_cpu.to_device(input_ids.device())?;
         
-        Ok(logits)
+        // 🌟 [최적화 2] 어차피 샘플러(Logit Processor)는 CPU에서 돌아갑니다. 
+        // GPU로 되돌려보내는 치명적인 이중 PCIe 병목(Round-Trip)을 원천 차단하고 CPU 텐서 그대로 반환합니다!
+        Ok(logits_cpu)
     }
 
     pub fn clear_cache(&mut self) {

@@ -169,7 +169,7 @@ impl Qwen3_5GenerateModel {
             } else {
                 (mes_render, None, None, None, None)
             };
-        let mut input_ids = self.tokenizer.text_encode(mes_text, &self.device)?;
+        let mut input_ids = self.tokenizer.text_encode(mes_text.clone(), &self.device)?;
         let mut seq_len = input_ids.dim(1)?;
         let mut seqlen_offset = 0;
         let pixel_values: Option<&Tensor> = pixel_values.as_ref();
@@ -182,7 +182,12 @@ impl Qwen3_5GenerateModel {
         let mut cur_pixel_values = pixel_values;
         let mut cur_pixel_values_video = pixel_values_video;
 
-        for _ in 0..sample_len {
+        let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(123);
+        let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
+        let is_strict_json = mes_text.contains("/no_think") || mes_text.contains("RETURN JSON ONLY");
+        let mut gen_text_buffer = String::new(); // 깊이 추적용
+
+        for i in 0..sample_len {
             // [취소 감지] 사용자가 멈춤 버튼을 눌렀을 때 즉시 중단
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
 
@@ -193,10 +198,30 @@ impl Qwen3_5GenerateModel {
                 cur_pixel_values_video,
                 video_grid_thw,
                 seqlen_offset,
-                session_id.clone(), // [추가] 세션 식별자 전달
-                kv_name.clone()     // [추가] 서브 경로 전달
+                session_id.clone(), 
+                kv_name.clone()     
             ).await?;
-            let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+            
+            let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+
+            // 👇 [추가] DENSE-BIAS: 첫 토큰 강제 주입 로직
+            if i == 0 {
+                // Tensor를 Vec로 빼서 확률 직접 조작
+                let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
+                let len = logits_vec.len();
+                
+                if (self.eos_token_id as usize) < len { logits_vec[self.eos_token_id as usize] = -10000.0; }
+                if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
+                
+                if (open_bracket_id as usize) < len {
+                    let boost = if is_strict_json { 10000.0 } else { 20.0 };
+                    logits_vec[open_bracket_id as usize] += boost;
+                }
+                
+                // 조작된 확률을 다시 Tensor로 복구 (Device 주의)
+                logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
+            }
+
             let logits = if self.repeat_penalty == 1. {
                 logits
             } else {
@@ -207,13 +232,34 @@ impl Qwen3_5GenerateModel {
                     &generate[start_at..],
                 )?
             };
-            let next_token = logit_processor.sample(&logits)?;
+            
+            let mut next_token = logit_processor.sample(&logits)?;
+
+            // 👇 [추가] FORCE-START: AI가 헛소리를 하려 해도 멱살 잡고 '{' 로 강제 시작
+            if i == 0 && (is_strict_json || next_token == self.eos_token_id) {
+                next_token = open_bracket_id;
+            }
+
             generate.push(next_token);
             
-            // 🌟 [추가] AI가 뱉어내는 텍스트를 터미널에 한 글자씩 실시간으로 찍어줍니다!
             if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
                 print!("{}", piece);
                 let _ = std::io::stdout().flush();
+                gen_text_buffer.push_str(&piece);
+                
+                // 👇 [수정] 단순 contains 대신 qwen의 정밀한 중첩 깊이 추적 로직 이식
+                if gen_text_buffer.contains('{') {
+                    let mut depth = 0;
+                    let mut has_started = false;
+                    for c in gen_text_buffer.chars() {
+                        if c == '{' { depth += 1; has_started = true; }
+                        else if c == '}' { depth -= 1; }
+                    }
+                    if has_started && depth == 0 && gen_text_buffer.trim_end().ends_with('}') {
+                        println!("\n[DEBUG-GEN] Balanced JSON detected (Depth 0). Stopping at token {}.", i + 1);
+                        break;
+                    }
+                }
             }
 
             if next_token == self.eos_token_id {
@@ -221,6 +267,7 @@ impl Qwen3_5GenerateModel {
             }
             seqlen_offset += seq_len;
             seq_len = 1;
+            // 🌟 [최적화 복구] 기준점(input_ids)은 반드시 GPU에 있어야 이후의 1,000GB/s 매트릭스 연산이 GPU에서 돕니다!
             input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
             cur_pixel_values = None;
             cur_pixel_values_video = None;
@@ -284,7 +331,7 @@ impl Qwen3_5GenerateModel {
         println!("\n[AI Thinking...]");
 
         let total_prompt_len = input_ids.dim(1)?;
-        let chunk_size = 256; // 🌟 [핵심] 여기서도 256으로 동기화!
+        let chunk_size = 256; 
 
         if total_prompt_len > 1 {
             println!("[PREFILL] Prompt is {} tokens long. Processing in chunks to prevent VRAM OOM...", total_prompt_len);
@@ -318,7 +365,15 @@ impl Qwen3_5GenerateModel {
             cur_video_thw = None;
         }
 
-        for _ in 0..sample_len {
+        // 👇 [추가] 상태 추적 및 Logit 조작용 (DENSE-BIAS 및 JSON 추적)
+        let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(123);
+        let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
+        
+        // 💡 3.5 버전은 스트리밍 시작 시 강제 JSON 여부 판별이 애매하므로,
+        // 단순하게 첫 토큰 EOS 방지 및 괄호 강제 시작으로 무한 루프를 원천 차단합니다.
+        let mut gen_text_buffer = String::new();
+
+        for i in 0..sample_len {
             let logits = self.qwen3_5.forward(
                 &input_ids,
                 cur_pixel_values.as_ref(),
@@ -330,8 +385,18 @@ impl Qwen3_5GenerateModel {
                 kv_name.clone()
             ).await?;
             
-            let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+            let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             
+            // 👇 [추가] DENSE-BIAS: 첫 턴 방어 로직 (EOS 출력 방지 및 강제 괄호 시작 확률업)
+            if i == 0 {
+                let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
+                let len = logits_vec.len();
+                if (self.eos_token_id as usize) < len { logits_vec[self.eos_token_id as usize] = -10000.0; }
+                if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
+                if (open_bracket_id as usize) < len { logits_vec[open_bracket_id as usize] += 10000.0; }
+                logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
+            }
+
             let logits = if self.repeat_penalty == 1. {
                 logits
             } else {
@@ -339,13 +404,35 @@ impl Qwen3_5GenerateModel {
                 candle_transformers::utils::apply_repeat_penalty(&logits, self.repeat_penalty, &generate[start_at..])?
             };
             
-            let next_token = logit_processor.sample(&logits)?;
+            let mut next_token = logit_processor.sample(&logits)?;
+            
+            // 👇 [추가] FORCE-START: 확률을 올렸음에도 불구하고 헛소리를 하려 한다면 멱살 잡고 '{' 강제 삽입
+            if i == 0 && next_token == self.eos_token_id {
+                next_token = open_bracket_id;
+            }
+
             generate.push(next_token);
             final_token = next_token;
 
             if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
                 print!("{}", piece);
                 let _ = std::io::stdout().flush();
+                gen_text_buffer.push_str(&piece);
+
+                // 👇 [추가] 중첩 깊이 추적 기반 조기 종료 (무한 루프 탈출기)
+                if gen_text_buffer.contains('{') {
+                    let mut depth = 0;
+                    let mut has_started = false;
+                    for c in gen_text_buffer.chars() {
+                        if c == '{' { depth += 1; has_started = true; }
+                        else if c == '}' { depth -= 1; }
+                    }
+                    if has_started && depth == 0 && gen_text_buffer.trim_end().ends_with('}') {
+                        println!("\n[DEBUG-GEN] Balanced JSON detected. Stopping.");
+                        is_finished = true;
+                        break;
+                    }
+                }
             }
 
             if next_token == self.eos_token_id {

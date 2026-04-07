@@ -2128,19 +2128,22 @@ impl QuantizedQwenVLTextModel {
         let is_small_model = self.layers.len() <= 36;
         if is_small_model && current_kv_len < 1024 { return Ok(()); }
 
-        if is_small_model {
-            // println!("[ENGINE-TRACE] Small Model context large ({}). Enabling VRAM evacuation for safety.", current_kv_len);
-        }
+        // if is_small_model {
+        //     // println!("[ENGINE-TRACE] Small Model context large ({}). Enabling VRAM evacuation for safety.", current_kv_len);
+        // }
 
-        // [DYNAMIC-LIMITS] 시스템 자원 상황에 따라 임계값 유동적 조절 (OOM 방지)
-        let vram_limit = {
-            let mut sys = sysinfo::System::new();
-            sys.refresh_memory();
-            let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+        // [기존 코드] 🚨 초당 수백 번씩 OS 시스템 콜을 발생시키던 치명적 병목
+        // let vram_limit = {
+        //     let mut sys = sysinfo::System::new();
+        //     sys.refresh_memory();
+        //     let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+        //     if free_ram_gb > 4.0 { 8 } else if free_ram_gb > 2.0 { 4 } else { 2 }
+        // };
 
-            // VRAM 제한은 기존과 동일하게 타이트하게 유지 (8블록 = 2048토큰)
-            if free_ram_gb > 4.0 { 8 } else if free_ram_gb > 2.0 { 4 } else { 2 }
-        };
+        // 🌟 [최적화 2] 무거운 시스템 콜(System::new)을 완전히 삭제하고 안전 컷오프(8블록 = 2048토큰) 하드코딩!
+        // OS 락(Lock)이 풀리면서 GPU가 기다림 없이 즉각적으로 다음 연산을 수행합니다.
+        let vram_limit = 8; 
+        
         let mut vram_evicted = false;
 
         // 1. VRAM -> RAM 계층 관리

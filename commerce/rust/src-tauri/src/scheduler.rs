@@ -1147,7 +1147,7 @@ async fn process_task(
                         name: None,
                     })],
                     // 🌟 [수정 2] 모델 이름을 "qwen3.5"로 정확히 명시합니다.
-                    model: "qwen3.5".to_string(), max_tokens: Some(1024), temperature: Some(0.0), top_p: Some(0.01),
+                    model: "qwen3.5".to_string(), max_tokens: Some(1024), temperature: Some(1.0), top_p: Some(0.9),
                     ..Default::default()
                 };
 
