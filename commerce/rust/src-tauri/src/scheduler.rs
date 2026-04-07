@@ -1135,28 +1135,30 @@ async fn process_task(
             let pug_content = content_pug.clone();
             let snapshot_id = format!("{}_detail", task.id);
 
-            // 👇 [수정됨] System과 User를 분리하지 않고, LM Studio와 동일하게 하나의 텍스트로 완벽하게 합칩니다.
-            let combined_prompt = format!(
-                "[SYSTEM]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think",
-                pug_content, extraction_instruction
-            );
-
             // 1. [Large] Load & Generate (Direct 28-Layer Generation)
             {
                 model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
+                // 👇 [핵심 수정] System(데이터)과 User(명령)를 완벽히 분리하여 0.8B 모델의 ChatML 어텐션 붕괴를 방지합니다.
                 let params = ChatCompletionParameters {
-                    // 👇 [수정됨] 오직 User 메시지 하나만 배열에 넣어서 전달합니다.
                     messages: vec![
+                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                            content: format!("[PUG CONTENT]\n{}", pug_content),
+                            name: None,
+                        }),
                         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                            content: ChatCompletionRequestUserMessageContent::Text(combined_prompt),
+                            content: ChatCompletionRequestUserMessageContent::Text(format!(
+                                "[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think",
+                                extraction_instruction
+                            )),
                             name: None,
                         })
                     ],
                     model: "qwen3.5".to_string(), 
                     max_tokens: Some(2048), 
-                    temperature: Some(0.1), 
-                    top_p: Some(0.9),
+                    // 👇 [핵심 수정] 반복 루프를 막고 완벽한 결정론적(Deterministic) JSON을 뽑기 위해 파라미터를 극단적으로 조입니다.
+                    temperature: Some(0.0), 
+                    top_p: Some(0.01),
                     ..Default::default()
                 };
 

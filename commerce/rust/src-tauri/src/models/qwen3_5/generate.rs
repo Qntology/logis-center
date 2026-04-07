@@ -136,7 +136,7 @@ impl Qwen3_5GenerateModel {
             device,
             eos_token_id,
             model_name: stem.to_string(),
-            repeat_penalty: 1.0, 
+            repeat_penalty: 1.05, 
             repeat_last_n: 1024,
         })
     }
