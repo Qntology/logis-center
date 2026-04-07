@@ -2337,7 +2337,7 @@ impl QuantizedQwenVLTextModel {
         // 🌟 [중요] 가중치 소각 로직은 주석 처리 유지!
         // 0.6B 모델 가중치(약 1.2GB)는 3.9GB VRAM에 충분히 들어갑니다.
         // 이것마저 지우면 모델 엔진이 매 글자마다 가중치를 로딩하느라 엄청난 병목이 발생합니다.
-        if is_decoding { self.layers[layer_idx].clear(); }
+        // if is_decoding { self.layers[layer_idx].clear(); }
 
         Ok(next_xs)
     }
