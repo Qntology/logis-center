@@ -142,6 +142,7 @@ impl Qwen3_5GenerateModel {
     }
 
     // 🌟 [핵심 변경점] 0.6B 모델과 완벽하게 동일한 파라미터 구조를 가지도록 시그니처 수정
+    // 🌟 1. generate 함수 전체 교체
     pub async fn generate(
         &mut self, 
         mes: ChatCompletionParameters, 
@@ -156,8 +157,20 @@ impl Qwen3_5GenerateModel {
             get_logit_processor(Some(temperature as f32), Some(top_p as f32), Some(20), seed);
         
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
+        
+        // 👇 [핵심 추가 1] 메세지 내부에 이미지나 비디오 URL이 존재하는지 직접 안전하게 판별합니다.
+        let has_vision = mes.messages.iter().any(|msg| {
+            if let ChatCompletionRequestMessage::User(user_msg) = msg {
+                if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
+                    parts.iter().any(|p| matches!(p, ChatCompletionRequestMessageContentPart::ImageURL(_) | ChatCompletionRequestMessageContentPart::VideoURL(_)))
+                } else { false }
+            } else { false }
+        });
+
+        // 👇 [핵심 추가 2] 비전 콘텐츠가 있을 때만 processor를 태우고, 순수 텍스트면 원본 ChatML을 그대로 보존합니다!
         let (mes_text, pixel_values, image_grid_thw, pixel_values_video, video_grid_thw): (String, Option<Tensor>, Option<Tensor>, Option<Tensor>, Option<Tensor>) =
-            if let Some(processor) = &self.pre_processor {
+            if has_vision && self.pre_processor.is_some() {
+                let processor = self.pre_processor.as_ref().unwrap();
                 let input = processor.process_info(&mes, &mes_render)?;
                 (
                     input.replace_text,
@@ -169,6 +182,7 @@ impl Qwen3_5GenerateModel {
             } else {
                 (mes_render, None, None, None, None)
             };
+
         let mut input_ids = self.tokenizer.text_encode(mes_text.clone(), &self.device)?;
         let mut seq_len = input_ids.dim(1)?;
         let mut seqlen_offset = 0;
@@ -185,10 +199,9 @@ impl Qwen3_5GenerateModel {
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(123);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
         let is_strict_json = mes_text.contains("/no_think") || mes_text.contains("RETURN JSON ONLY");
-        let mut gen_text_buffer = String::new(); // 깊이 추적용
+        let mut gen_text_buffer = String::new(); 
 
         for i in 0..sample_len {
-            // [취소 감지] 사용자가 멈춤 버튼을 눌렀을 때 즉시 중단
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
 
             let logits = self.qwen3_5.forward(
@@ -204,11 +217,10 @@ impl Qwen3_5GenerateModel {
             
             let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
 
-            // 👇 [수정 시작] 약했던 기존 페널티 삭제 및 강력한 수동 억제(1.2) 적용
+            // 👇 루프 반복 억제 페널티 강화 (1.2)
             let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
             let len = logits_vec.len();
             
-            // 1. Repetition Penalty (매 턴마다 강력하게 적용)
             if !generate.is_empty() {
                 let penalty = 1.2; 
                 let mut set = std::collections::HashSet::new();
@@ -222,7 +234,6 @@ impl Qwen3_5GenerateModel {
                 }
             }
 
-            // 2. 첫 턴 방어 로직
             if i == 0 {
                 if (self.eos_token_id as usize) < len { logits_vec[self.eos_token_id as usize] = -10000.0; }
                 if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
@@ -235,9 +246,8 @@ impl Qwen3_5GenerateModel {
             
             let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
             let mut next_token = logit_processor.sample(&logits)?;
-            // 👆 [수정 끝]
             
-            // 👇 [추가] FORCE-START: AI가 헛소리를 하려 해도 멱살 잡고 '{' 로 강제 시작
+            // 강제 JSON 시작 방어
             if i == 0 && (is_strict_json || next_token == self.eos_token_id) {
                 next_token = open_bracket_id;
             }
@@ -249,7 +259,6 @@ impl Qwen3_5GenerateModel {
                 let _ = std::io::stdout().flush();
                 gen_text_buffer.push_str(&piece);
                 
-                // 👇 [수정] 단순 contains 대신 qwen의 정밀한 중첩 깊이 추적 로직 이식
                 if gen_text_buffer.contains('{') {
                     let mut depth = 0;
                     let mut has_started = false;
@@ -269,16 +278,14 @@ impl Qwen3_5GenerateModel {
             }
             seqlen_offset += seq_len;
             seq_len = 1;
-            // 🌟 [최적화 복구] 기준점(input_ids)은 반드시 GPU에 있어야 이후의 1,000GB/s 매트릭스 연산이 GPU에서 돕니다!
             input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
             cur_pixel_values = None;
             cur_pixel_values_video = None;
         }
-        println!(); // 🌟 [추가] 출력이 끝나면 줄바꿈
+        println!(); 
 
         let res = self.tokenizer.token_decode(generate)?;
         
-        // 🌟 [핵심] 생성 종료 후, RAM에 남아있는 KV 캐시 텐서들을 백그라운드 IO 큐를 통해 SSD로 암호화 백업!
         if let Some(s_id) = &session_id {
             let _ = self.qwen3_5.language_model.force_flush_all_active_blocks(s_id, kv_name.as_deref()).await;
             println!("[GEN-SAVE] Qwen 3.5 active KV blocks flushed to disk.");
@@ -288,7 +295,7 @@ impl Qwen3_5GenerateModel {
         Ok(res)
     }
 
-    // `generate_part` 도 동일하게 캐싱 파이프라인 적용
+    // 🌟 2. generate_part 함수 전체 교체
     pub async fn generate_part(
         &mut self,
         mes: &ChatCompletionParameters,
@@ -313,7 +320,7 @@ impl Qwen3_5GenerateModel {
 
             let mes_render = self.chat_template.apply_chat_template(mes)?;
             
-            // 👇 [핵심 수정] 메세지 내부에 이미지나 비디오 URL이 존재하는지 직접 안전하게 판별합니다.
+            // 👇 [핵심 추가 1] 메세지 내부에 이미지나 비디오 URL이 존재하는지 직접 안전하게 판별합니다.
             let has_vision = mes.messages.iter().any(|msg| {
                 if let ChatCompletionRequestMessage::User(user_msg) = msg {
                     if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
@@ -322,7 +329,7 @@ impl Qwen3_5GenerateModel {
                 } else { false }
             });
 
-            // 👇 비전 콘텐츠가 있을 때만 processor를 태우고, 순수 텍스트면 원본 ChatML을 그대로 보존합니다!
+            // 👇 [핵심 추가 2] 비전 콘텐츠가 있을 때만 processor를 태우고, 순수 텍스트면 원본 ChatML을 그대로 보존합니다!
             let (text, px_vals, img_thw, vid_px_vals, vid_thw) = if has_vision && self.pre_processor.is_some() {
                 let processor = self.pre_processor.as_ref().unwrap();
                 let input = processor.process_info(mes, &mes_render)?;
@@ -344,15 +351,11 @@ impl Qwen3_5GenerateModel {
         
         println!("\n[AI Thinking...]");
 
-        // 🚨 [여기에 있던 중복된 Prefill Chunking while 루프를 완전히 삭제했습니다!] 🚨
-
-        // 상태 추적 및 Logit 조작용 (DENSE-BIAS 및 JSON 추적)
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(123);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
         let mut gen_text_buffer = String::new();
 
         for i in 0..sample_len {
-            // 🌟 14,928개의 전체 input_ids가 한 번에 넘어가고, model.rs 내부에서 안전하게 256개씩 청킹됩니다!
             let logits = self.qwen3_5.forward(
                 &input_ids,
                 cur_pixel_values.as_ref(),
@@ -366,7 +369,7 @@ impl Qwen3_5GenerateModel {
             
             let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             
-            // 👇 [수정 시작] generate_part 에도 동일한 강력 페널티 이식
+            // 👇 루프 반복 억제 페널티 강화 (1.2)
             let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
             let len = logits_vec.len();
 
@@ -391,9 +394,8 @@ impl Qwen3_5GenerateModel {
 
             let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
             let mut next_token = logit_processor.sample(&logits)?;
-            // 👆 [수정 끝]
             
-            // 강제 방어
+            // 강제 JSON 시작 방어
             if i == 0 && next_token == self.eos_token_id {
                 next_token = open_bracket_id;
             }
@@ -406,7 +408,6 @@ impl Qwen3_5GenerateModel {
                 let _ = std::io::stdout().flush();
                 gen_text_buffer.push_str(&piece);
 
-                // 중첩 깊이 추적 기반 조기 종료
                 if gen_text_buffer.contains('{') {
                     let mut depth = 0;
                     let mut has_started = false;
@@ -431,7 +432,6 @@ impl Qwen3_5GenerateModel {
             seq_len = 1;
             input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
             
-            // 첫 번째 순회 이후에는 비전 텐서들을 초기화하여 오버헤드 방지
             cur_pixel_values = None;
             cur_image_thw = None;
             cur_pixel_values_video = None;

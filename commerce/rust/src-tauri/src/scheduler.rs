@@ -1135,7 +1135,7 @@ async fn process_task(
             let pug_content = content_pug.clone();
             let snapshot_id = format!("{}_detail", task.id);
 
-            // 1. [Large] Load & Generate (Direct 28-Layer Generation)
+            // 1. [Large] Load & Generate (Direct Qwen3.5 0.8B-Layer Generation)
             {
                 model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 

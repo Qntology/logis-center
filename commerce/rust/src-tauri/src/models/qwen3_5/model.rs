@@ -692,7 +692,7 @@ impl Qwen3_5GatedDeltaNet {
         self.dt_bias = dt_bias_raw.to_dtype(DType::F32)?; 
         
         let a_log_raw = ct.tensor(reader, &format!("{prefix}.ssm_a"), device)?.dequantize(device)?;
-        self.a_log = (a_log_raw.to_dtype(DType::F32)?.exp()? * -1.0f64)?;
+        self.a_log = a_log_raw.to_dtype(DType::F32)?;  // <--- 원본 그대로 받아오도록 수정!
         
         let norm_weight = ct.tensor(reader, &format!("{prefix}.ssm_norm.weight"), device)?.dequantize(device)?;
         self.norm = Qwen3_5RMSNormGated::from_weight(norm_weight, 1e-6)?;
