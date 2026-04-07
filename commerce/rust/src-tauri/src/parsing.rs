@@ -895,7 +895,6 @@ Extract detailed information from the provided Pug template into a single struct
 
 [CONTEXT]
 Page Type: {TYPE}
-Source URL: {HREF}
 
 [SCHEMA DEFINITIONS]
 {SCHEMA}

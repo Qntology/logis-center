@@ -568,6 +568,7 @@ async fn process_task(
     // ==================================================================================
 
     let base_session_id = format!("{}_base", task.id);
+    let base_session_id_35 = format!("{}_base_q35", task.id); // 🌟 0.8B 전용 세션 ID
     let system_content = format!("[PUG CONTENT]\n{}", light_pug);
 
     // --- STEP 0: BASE BAKING (공통 컨텍스트 딱 1번만 굽기) ---
@@ -593,6 +594,32 @@ async fn process_task(
             if let Some(gen) = model.generator.lock().await.as_mut() {
                 // System 메시지(PUG)만 1만 토큰을 읽어서 base_session_id 로 저장합니다.
                 gen.prefill_only(params, Some(cancellation_token.clone()), Some(base_session_id.clone()), None, kv_name.clone()).await?;
+            }
+        }
+    }
+
+    {
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        
+        let base_kv_path_35 = utils::paths::get_kv_dir(Some(app_handle)).join(&base_session_id_35);
+        if !base_kv_path_35.exists() {
+            println!("[Scheduler] Baking Base PUG Context to SSD for Qwen 3.5...");
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Reading document structure (High Precision)...", "spinner": "⠋" }));
+            
+            // Qwen3.5 모델로 VRAM 릴레이 확보
+            model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            
+            let params = ChatCompletionParameters {
+                messages: vec![ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                    content: system_content.clone(),
+                    name: None,
+                })],
+                model: "qwen3.5".to_string(),
+                ..Default::default()
+            };
+
+            if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+                gen.prefill_only(params, Some(base_session_id_35.clone()), kv_name.clone()).await?;
             }
         }
     }
@@ -734,9 +761,11 @@ async fn process_task(
 
             let mut titles = Vec::new();
             {
-                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                // 🌟 [수정] None 넘기기
+                model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                 let params = ChatCompletionParameters {
+                    // (messages 등 기존 코드 유지) ...
                     messages: vec![
                         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                             content: system_content.clone(),
@@ -747,17 +776,18 @@ async fn process_task(
                             name: None,
                         })
                     ],
-                    model: "qwen".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.01),
+                    model: "qwen3.5".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.01),
                     ..Default::default()
                 };
 
-                if let Some(gen) = model.generator.lock().await.as_mut() {
+                if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
                     println!("[JS-BRIDGE] 1. Requesting titles from LLM...");
-                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
-                    println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
+                    // 🌟 [수정] generate_part 로 교체 및 base_session_id_35 넘기기
+                    let res = gen.generate_part(&params, false, 0, None, Some(base_session_id_35.clone()), kv_name.clone()).await?;
+                    println!("[JS-BRIDGE] LLM Raw Response: '{}'", res.text);
 
-                    let title_info = parsing::parse_json_from_llm(&res);
-                    // Robust key checking: Try all common list keys
+                    let title_info = parsing::parse_json_from_llm(&res.text);
+                    // Robust key checking ... (이하 기존 코드 유지)
                     let items_opt = title_info.get("order")
                         .or(title_info.get("goods"))
                         .or(title_info.get("items"))
@@ -1137,13 +1167,14 @@ async fn process_task(
 
             // 1. [Large] Load & Generate (Direct Qwen3.5 0.8B-Layer Generation)
             {
-                model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+                // 🌟 [수정] None 넘기기
+                model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
-                // 👇 [핵심 수정] System(데이터)과 User(명령)를 완벽히 분리하여 0.8B 모델의 ChatML 어텐션 붕괴를 방지합니다.
                 let params = ChatCompletionParameters {
+                    // (messages 등 기존 코드 유지) ...
                     messages: vec![
                         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                            content: format!("[PUG CONTENT]\n{}", pug_content),
+                            content: system_content.clone(),
                             name: None,
                         }),
                         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -1156,7 +1187,6 @@ async fn process_task(
                     ],
                     model: "qwen3.5".to_string(), 
                     max_tokens: Some(2048), 
-                    // 👇 [핵심 수정] 반복 루프를 막고 완벽한 결정론적(Deterministic) JSON을 뽑기 위해 파라미터를 극단적으로 조입니다.
                     temperature: Some(0.0), 
                     top_p: Some(0.01),
                     ..Default::default()
@@ -1166,7 +1196,8 @@ async fn process_task(
                     println!("[Scheduler] Qwen3.5 Step C: Asking extraction question...");
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Qwen 3.5 Inference..." }));
                     
-                    let res = gen.generate_part(&params, false, 0, None, Some(snapshot_id.clone()), Some("inference".to_string())).await?;
+                    // 🌟 [수정] base_session_id_35 넘기기
+                    let res = gen.generate_part(&params, false, 0, None, Some(base_session_id_35.clone()), kv_name.clone()).await?;
                     
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res.text);
 

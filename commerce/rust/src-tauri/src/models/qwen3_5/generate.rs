@@ -183,9 +183,29 @@ impl Qwen3_5GenerateModel {
                 (mes_render, None, None, None, None)
             };
 
-        let mut input_ids = self.tokenizer.text_encode(mes_text.clone(), &self.device)?;
+        let ids_vec = self.tokenizer.text_encode_vec(mes_text.clone(), false)?;
+        let total_toks = ids_vec.len();
+
+        let mut baked_len = 0;
+        if let Some(s_id) = &session_id {
+            let path = crate::utils::paths::get_kv_dir(None).join(s_id).join("tokens.json");
+            if path.exists() {
+                if let Ok(data) = std::fs::read_to_string(path) {
+                    if let Ok(baked_ids) = serde_json::from_str::<Vec<u32>>(&data) {
+                        baked_len = baked_ids.len();
+                    }
+                }
+            }
+        }
+
+        let (mut input_ids, mut seqlen_offset) = if baked_len > 0 && baked_len < total_toks {
+            println!("[SKIP-PREFILL] Qwen 3.5 Reusing baked context: {} tokens.", baked_len);
+            let missing_ids = ids_vec[baked_len..].to_vec();
+            (Tensor::from_vec(missing_ids, (1, total_toks - baked_len), &self.device)?, baked_len)
+        } else {
+            (Tensor::from_vec(ids_vec, (1, total_toks), &self.device)?, 0)
+        };
         let mut seq_len = input_ids.dim(1)?;
-        let mut seqlen_offset = 0;
         let pixel_values: Option<&Tensor> = pixel_values.as_ref();
         let image_grid_thw: Option<&Tensor> = image_grid_thw.as_ref();
         let pixel_values_video: Option<&Tensor> = pixel_values_video.as_ref();
@@ -296,6 +316,7 @@ impl Qwen3_5GenerateModel {
     }
 
     // 🌟 2. generate_part 함수 전체 교체
+    // 🌟 2. generate_part 함수 전체 교체
     pub async fn generate_part(
         &mut self,
         mes: &ChatCompletionParameters,
@@ -316,11 +337,10 @@ impl Qwen3_5GenerateModel {
         let sample_len = mes.max_tokens.unwrap_or(1024);
 
         let (mut input_ids, mut seqlen_offset, mut cur_pixel_values, mut cur_image_thw, mut cur_pixel_values_video, mut cur_video_thw) = if !is_continuation {
-            self.clear_kv_cache();
 
             let mes_render = self.chat_template.apply_chat_template(mes)?;
             
-            // 👇 [핵심 추가 1] 메세지 내부에 이미지나 비디오 URL이 존재하는지 직접 안전하게 판별합니다.
+            // 👇 메세지 내부에 이미지나 비디오 URL이 존재하는지 직접 안전하게 판별합니다.
             let has_vision = mes.messages.iter().any(|msg| {
                 if let ChatCompletionRequestMessage::User(user_msg) = msg {
                     if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
@@ -329,7 +349,7 @@ impl Qwen3_5GenerateModel {
                 } else { false }
             });
 
-            // 👇 [핵심 추가 2] 비전 콘텐츠가 있을 때만 processor를 태우고, 순수 텍스트면 원본 ChatML을 그대로 보존합니다!
+            // 👇 비전 콘텐츠가 있을 때만 processor를 태우고, 순수 텍스트면 원본 ChatML을 그대로 보존합니다!
             let (text, px_vals, img_thw, vid_px_vals, vid_thw) = if has_vision && self.pre_processor.is_some() {
                 let processor = self.pre_processor.as_ref().unwrap();
                 let input = processor.process_info(mes, &mes_render)?;
@@ -338,8 +358,45 @@ impl Qwen3_5GenerateModel {
                 (mes_render, None, None, None, None)
             };
             
-            let ids = self.tokenizer.text_encode(text, &self.device)?;
-            (ids, 0, px_vals, img_thw, vid_px_vals, vid_thw)
+            // 🌟 [추가된 부분] 캐시가 존재하는지 검사하여 스킵 여부를 결정합니다.
+            let ids_vec = self.tokenizer.text_encode_vec(text, false)?;
+            let total_toks = ids_vec.len();
+
+            let mut baked_len = 0;
+            if let Some(s_id) = &session_id {
+                let path = crate::utils::paths::get_kv_dir(None).join(s_id).join("tokens.json");
+                if path.exists() {
+                    if let Ok(data) = std::fs::read_to_string(path) {
+                        if let Ok(baked_ids) = serde_json::from_str::<Vec<u32>>(&data) {
+                            baked_len = baked_ids.len();
+                        }
+                    }
+                }
+            }
+
+            // 🌟 [핵심 수정] 구워진 캐시가 있다면 캐시를 비우지 않고, 누락된 토큰부터 시작합니다!
+            if baked_len > 0 && baked_len < total_toks {
+                println!("[SKIP-PREFILL] Qwen 3.5 Reusing baked context in generate_part: {} tokens.", baked_len);
+                
+                // 🌟 [CRITICAL FIX] Attention 레이어를 위한 KV 레지스트리 복원!
+                // 이것이 없으면 Hybrid 모델 내의 Full Attention 레이어들이 과거 토큰을 완전히 무시해버립니다.
+                if let Some(s_id) = &session_id {
+                    let kv_name_raw = kv_name.as_deref().unwrap_or("text");
+                    let kv_type = kv_name_raw.split('/').last().unwrap_or("text");
+                    let sub_path = format!("{}/inference/{}", s_id, kv_type);
+                    let _ = self.qwen3_5.language_model.restore_kv_registry(&sub_path);
+                }
+
+                let missing_ids = ids_vec[baked_len..].to_vec();
+                let missing_len = missing_ids.len();
+                let ids = Tensor::from_vec(missing_ids, (1, missing_len), &self.device)?;
+                (ids, baked_len, px_vals, img_thw, vid_px_vals, vid_thw)
+            } else {
+                // 캐시가 없을 때만 초기화!
+                self.clear_kv_cache();
+                let ids = Tensor::from_vec(ids_vec, (1, total_toks), &self.device)?;
+                (ids, 0, px_vals, img_thw, vid_px_vals, vid_thw)
+            }
         } else {
             let ids = Tensor::from_vec(vec![last_token.unwrap()], (1, 1), &self.device)?;
             (ids, last_offset, None, None, None, None)
@@ -351,11 +408,17 @@ impl Qwen3_5GenerateModel {
         
         println!("\n[AI Thinking...]");
 
+        // 🌟 [CRITICAL FIX] 추론을 시작하기 전에 혹시라도 밀려있는 SSD I/O 작업이 모두 끝날 때까지 대기합니다!
+        crate::models::qwen::generate::wait_for_global_io().await;
+
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(123);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
         let mut gen_text_buffer = String::new();
 
         for i in 0..sample_len {
+            // 🌟 [CRITICAL FIX] 각 토큰을 생성할 때도 디스크 병목이 풀렸는지 확인합니다.
+            crate::models::qwen::generate::wait_for_global_io().await;
+
             let logits = self.qwen3_5.forward(
                 &input_ids,
                 cur_pixel_values.as_ref(),
@@ -451,6 +514,58 @@ impl Qwen3_5GenerateModel {
             next_offset: seqlen_offset,
             last_token: final_token,
         })
+    }
+
+    // 🌟 [수정된 prefill_only: SSD 쓰기 동기화 대기 로직 완벽 적용]
+    pub async fn prefill_only(
+        &mut self, 
+        mes: ChatCompletionParameters, 
+        session_id: Option<String>, 
+        kv_name: Option<String>
+    ) -> Result<usize> {
+        self.clear_kv_cache();
+
+        let mut mes_render = String::new();
+        for msg in &mes.messages {
+            match msg {
+                ChatCompletionRequestMessage::System(sys) => {
+                    mes_render.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", sys.content));
+                }
+                ChatCompletionRequestMessage::User(user) => {
+                    if let ChatCompletionRequestUserMessageContent::Text(text) = &user.content {
+                        mes_render.push_str(&format!("<|im_start|>user\n{}<|im_end|>\n", text));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let input_ids = self.tokenizer.text_encode_vec(mes_render.clone(), false)?;
+        let total_toks = input_ids.len();
+
+        let ids_tensor = Tensor::from_vec(input_ids.clone(), (1, total_toks), &self.device)?;
+
+        self.qwen3_5.forward(
+            &ids_tensor, None, None, None, None, 0,
+            session_id.clone(), kv_name.clone()
+        ).await?;
+
+        if let Some(s_id) = &session_id {
+            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+            if !path.exists() { std::fs::create_dir_all(&path)?; }
+            std::fs::write(path.join("tokens.json"), serde_json::to_string(&input_ids)?)?;
+
+            let _ = self.qwen3_5.language_model.force_flush_all_active_blocks(s_id, kv_name.as_deref()).await;
+            
+            // 👇 [CRITICAL FIX] Background SSD I/O가 모두 끝날 때까지 완벽하게 대기합니다!!!
+            // 이 코드가 없으면 모델이 빈 허공(Zeros)을 읽고 환각을 일으킵니다.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            println!("[PREFILL-WAIT] Waiting for SSD write to complete...");
+            crate::models::qwen::generate::wait_for_global_io().await;
+            println!("[PREFILL-SAVE] Confirm: Qwen 3.5 Base Context prefilled and safely flushed to disk. ({} tokens)", total_toks);
+        }
+
+        Ok(total_toks)
     }
 
     pub fn clear_kv_cache(&mut self) {

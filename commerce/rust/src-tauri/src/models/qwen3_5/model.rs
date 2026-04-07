@@ -1572,6 +1572,60 @@ impl Qwen3_5TextModel {
         self.current_kv_len = 0;
     }
 
+    // 🌟 [추가] Qwen3_5TextModel 내부에 위치해야 합니다.
+    pub fn restore_kv_registry(&mut self, kv_name: &str) -> Result<()> {
+        use crate::models::qwen::generate::LayerIndex;
+        let kv_dir = crate::utils::paths::get_kv_dir(None);
+        let index_path = kv_dir.join(kv_name).join("layer0.json");
+        
+        if !index_path.exists() { return Ok(()); }
+        
+        let index_json = String::from_utf8(crate::utils::direct_loader::load_kv_block(&index_path).unwrap_or_default()).unwrap_or_default();
+        let index: LayerIndex = serde_json::from_str(&index_json).unwrap_or_else(|_| LayerIndex { layer_idx: 0, total_tokens: 0, blocks: vec![] });
+        let total_tokens = index.total_tokens;
+
+        {
+            let mut reg = self.registry.entries.write().unwrap();
+            let needed_blocks = (total_tokens + 255) / 256;
+            while reg.len() < needed_blocks {
+                let off = reg.len() * 256;
+                reg.push(crate::models::qwen::quantized_model::RegistryEntry::new(off, 0, 28));
+            }
+        }
+
+        for layer in self.layers.iter_mut() {
+            if let AttnKind::SelfAttn(attn) = &mut layer.attn {
+                let reg_len = self.registry.entries.read().unwrap().len();
+                while attn.kv_blocks.len() < reg_len {
+                    let idx = attn.kv_blocks.len();
+                    let off = idx * 256;
+                    attn.kv_blocks.push(crate::models::qwen::quantized_model::KVBlock::new(
+                        crate::models::qwen::quantized_model::KVLocation::SSD, idx, 0, off
+                    ));
+                }
+            }
+        }
+
+        {
+            let mut reg = self.registry.entries.write().unwrap();
+            for (idx, entry) in reg.iter_mut().enumerate() {
+                let off = idx * 256;
+                let b_len = if off + 256 <= total_tokens { 256 } else { total_tokens.saturating_sub(off) };
+                entry.token_len = b_len;
+                for layer in self.layers.iter_mut() {
+                    if let AttnKind::SelfAttn(attn) = &mut layer.attn {
+                        if let Some(block) = attn.kv_blocks.get(idx) {
+                            let mut inner = block.inner.write().unwrap();
+                            inner.len = b_len;
+                        }
+                    }
+                }
+            }
+        }
+        self.current_kv_len = total_tokens;
+        Ok(())
+    }
+
     // 🌟 [핵심] 기존 0.6B의 BAKE_TX 워커를 활용함과 동시에, SSM 전용 다이렉트 백업 트랙을 추가합니다!
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> {
         use crate::models::qwen::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
@@ -1929,31 +1983,32 @@ impl Qwen3_5Model {
         video_grid_thw: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        let position_ids = if let Some(rope_deltas_cpu) = &self.rope_deltas_cpu {
-            if seqlen_offset != 0 {
-                let (bs, seq_len, _) = inputs_embeds.dims3()?;
-                let mut p_ids_vec = Vec::with_capacity(bs);
-                for b in 0..bs {
-                    let delta = rope_deltas_cpu[b];
-                    let real_start = (seqlen_offset as i64 + delta) as u32;
-                    // 🌟 [핵심 변경 1] input_ids 대신 실제 연산이 일어날 inputs_embeds.device() 참조!
-                    let p_id = Tensor::arange(real_start, real_start + seq_len as u32, inputs_embeds.device())?
-                        .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, seq_len))?;
-                    p_ids_vec.push(p_id);
-                }
-                Tensor::cat(&p_ids_vec, 1)?
+        let (bs, seq_len, _) = inputs_embeds.dims3()?;
+
+        // 🌟 [CRITICAL FIX] 위치 정보(RoPE) 리셋 버그 픽스!
+        if self.rope_deltas_cpu.is_none() {
+            if seqlen_offset > 0 {
+                // 모델이 디스크에서 리로드 된 직후 (캐시 재사용)
+                // 이미지가 포함되지 않은 텍스트 청크이므로 delta는 0으로 처리하여
+                // 다음 토큰들이 0이 아닌 13765부터 정확히 매겨지도록 강제합니다!
+                self.rope_deltas_cpu = Some(vec![0i64; bs]);
             } else {
-                let (position_ids, rope_deltas, deltas_cpu) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
+                let (_, rope_deltas, deltas_cpu) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
                 self.rope_deltas = Some(rope_deltas);
                 self.rope_deltas_cpu = Some(deltas_cpu);
-                position_ids
             }
-        } else {
-            let (position_ids, rope_deltas, deltas_cpu) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
-            self.rope_deltas = Some(rope_deltas);
-            self.rope_deltas_cpu = Some(deltas_cpu);
-            position_ids
-        };
+        }
+
+        let deltas_cpu = self.rope_deltas_cpu.as_ref().unwrap();
+        let mut p_ids_vec = Vec::with_capacity(bs);
+        for b in 0..bs {
+            let delta = deltas_cpu[b];
+            let real_start = (seqlen_offset as i64 + delta) as u32;
+            let p_id = Tensor::arange(real_start, real_start + seq_len as u32, inputs_embeds.device())?
+                .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, seq_len))?;
+            p_ids_vec.push(p_id);
+        }
+        let position_ids = Tensor::cat(&p_ids_vec, 1)?;
         Ok(position_ids.to_device(inputs_embeds.device())?)
     }
 
