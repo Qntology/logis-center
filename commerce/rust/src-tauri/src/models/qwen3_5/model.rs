@@ -538,26 +538,44 @@ impl Qwen3_5GatedDeltaNet {
         if use_precomputed_states {
             mixed_qkv = self.torch_causal_conv1d_update(&mixed_qkv)?;
         } else {
+            // 1. 다음 청크를 위해 현재 청크의 끝부분을 상태로 저장해 둡니다.
             let pad = self.conv_kernel_size as isize - mixed_qkv.dim(D::Minus1)? as isize;
-            let conv_state = if pad >= 0 {
+            let next_conv_state = if pad >= 0 {
                 mixed_qkv.pad_with_zeros(D::Minus1, pad as usize, 0)?
             } else {
                 mixed_qkv.narrow(D::Minus1, pad.unsigned_abs(), self.conv_kernel_size)?
             };
-            self.conv_state_cache = Some(conv_state);
-            mixed_qkv = mixed_qkv.pad_with_zeros(
-                D::Minus1,
-                self.conv_kernel_size - 1,
-                self.conv_kernel_size - 1,
-            )?;
+            
+            // 2. 🌟 [핵심 버그 수정] 이전 청크의 꼬리(conv_state)를 현재 청크의 머리에 이어 붙입니다!
+            if let Some(prev_state) = &self.conv_state_cache {
+                let prev_len = prev_state.dim(D::Minus1)?;
+                let take_len = self.conv_kernel_size - 1;
+                
+                // 필요한 만큼만 꼬리를 잘라냅니다.
+                let prev_causal = if prev_len >= take_len {
+                    prev_state.narrow(D::Minus1, prev_len - take_len, take_len)?
+                } else {
+                    prev_state.pad_with_zeros(D::Minus1, take_len - prev_len, 0)?
+                };
+                
+                let (bs, dim, _) = mixed_qkv.dims3()?;
+                let right_pad = Tensor::zeros((bs, dim, take_len), mixed_qkv.dtype(), mixed_qkv.device())?;
+                
+                // [이전 상태(과거 문맥)] + [현재 청크] + [오른쪽 0 패딩]
+                mixed_qkv = Tensor::cat(&[&prev_causal, &mixed_qkv, &right_pad], D::Minus1)?;
+            } else {
+                // 이전 상태가 없는 진짜 첫 번째 청크일 때만 양쪽에 0을 채웁니다.
+                mixed_qkv = mixed_qkv.pad_with_zeros(
+                    D::Minus1,
+                    self.conv_kernel_size - 1,
+                    self.conv_kernel_size - 1,
+                )?;
+            }
+            
+            // 3. 상태 업데이트 및 컨볼루션 연산
+            self.conv_state_cache = Some(next_conv_state);
             mixed_qkv = conv1d_depthwise(&mixed_qkv, self.conv1d.weight(), self.conv1d.bias())?;
             mixed_qkv = mixed_qkv.narrow(D::Minus1, 0, seq_len)?.silu()?;
-            // too slowly
-            // mixed_qkv = self
-            //     .conv1d
-            //     .forward(&mixed_qkv)?
-            //     .narrow(D::Minus1, 0, seq_len)?
-            //     .silu()?;
         }
         let mixed_qkv = mixed_qkv.transpose(1, 2)?;
         let qkv_split = split_tensor(

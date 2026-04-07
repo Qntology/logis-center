@@ -1133,38 +1133,45 @@ async fn process_task(
         if !content_pug.trim().is_empty() {
             let extraction_instruction = parsing::item2json(&page_type, &url, language);
             let pug_content = content_pug.clone();
-            let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think", pug_content, extraction_instruction);
             let snapshot_id = format!("{}_detail", task.id);
+
+            // 👇 [수정됨] System과 User를 분리하지 않고, LM Studio와 동일하게 하나의 텍스트로 완벽하게 합칩니다.
+            let combined_prompt = format!(
+                "[SYSTEM]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think",
+                pug_content, extraction_instruction
+            );
 
             // 1. [Large] Load & Generate (Direct 28-Layer Generation)
             {
-                // 🌟 [수정 1] 새로운 생성 작업이므로 불러올 캐시는 None으로 전달합니다.
                 model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
                 let params = ChatCompletionParameters {
-                    messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                        content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
-                        name: None,
-                    })],
-                    // 🌟 [수정 2] 모델 이름을 "qwen3.5"로 정확히 명시합니다.
-                    model: "qwen3.5".to_string(), max_tokens: Some(1024), temperature: Some(0.0), top_p: Some(0.01),
+                    // 👇 [수정됨] 오직 User 메시지 하나만 배열에 넣어서 전달합니다.
+                    messages: vec![
+                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                            content: ChatCompletionRequestUserMessageContent::Text(combined_prompt),
+                            name: None,
+                        })
+                    ],
+                    model: "qwen3.5".to_string(), 
+                    max_tokens: Some(2048), 
+                    temperature: Some(0.1), 
+                    top_p: Some(0.9),
                     ..Default::default()
                 };
 
-                // 🌟 [수정 3] 0.6B(generator)가 아닌 Qwen 3.5 제너레이터를 호출합니다.
                 if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
                     println!("[Scheduler] Qwen3.5 Step C: Asking extraction question...");
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Qwen 3.5 Inference..." }));
                     
-                    // 🚨 [핵심 수정] 3.5 모델은 아직 추가 인자를 받지 않으므로 params만 넘깁니다!
-                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), Some("inference".to_string())).await?;
+                    let res = gen.generate_part(&params, false, 0, None, Some(snapshot_id.clone()), Some("inference".to_string())).await?;
                     
-                    println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
+                    println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res.text);
 
                     // [DEBUG] AI 응답 저장
-                    let _ = data_manager.offload(&res, "step_c_res");
+                    let _ = data_manager.offload(&res.text, "step_c_res");
 
-                    extracted_data = parsing::parse_json_from_llm(&res);
+                    extracted_data = parsing::parse_json_from_llm(&res.text);
                 } else {
                     println!("[Scheduler] ERROR: Qwen 3.5 generator is missing!");
                 }

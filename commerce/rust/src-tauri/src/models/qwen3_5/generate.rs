@@ -136,8 +136,8 @@ impl Qwen3_5GenerateModel {
             device,
             eos_token_id,
             model_name: stem.to_string(),
-            repeat_penalty: 1.1,
-            repeat_last_n: 64,
+            repeat_penalty: 1.0, 
+            repeat_last_n: 1024,
         })
     }
 
@@ -293,8 +293,8 @@ impl Qwen3_5GenerateModel {
         is_continuation: bool,
         last_offset: usize,
         last_token: Option<u32>,
-        session_id: Option<String>, // [추가]
-        kv_name: Option<String>     // [추가]
+        session_id: Option<String>,
+        kv_name: Option<String>
     ) -> Result<GenerationResult> {
         let mut logit_processor = get_logit_processor(
             Some(mes.temperature.unwrap_or(0.1) as f32), 
@@ -330,50 +330,15 @@ impl Qwen3_5GenerateModel {
         
         println!("\n[AI Thinking...]");
 
-        let total_prompt_len = input_ids.dim(1)?;
-        let chunk_size = 256; 
+        // 🚨 [여기에 있던 중복된 Prefill Chunking while 루프를 완전히 삭제했습니다!] 🚨
 
-        if total_prompt_len > 1 {
-            println!("[PREFILL] Prompt is {} tokens long. Processing in chunks to prevent VRAM OOM...", total_prompt_len);
-            let mut processed = 0;
-            while processed < total_prompt_len - 1 {
-                let take = (total_prompt_len - 1 - processed).min(chunk_size);
-                let chunk_ids = input_ids.narrow(1, processed, take)?;
-                
-                let _ = self.qwen3_5.forward(
-                    &chunk_ids,
-                    if processed == 0 { cur_pixel_values.as_ref() } else { None },
-                    if processed == 0 { cur_image_thw.as_ref() } else { None },
-                    if processed == 0 { cur_pixel_values_video.as_ref() } else { None },
-                    if processed == 0 { cur_video_thw.as_ref() } else { None },
-                    seqlen_offset,
-                    session_id.clone(),
-                    kv_name.clone()
-                ).await?;
-                
-                processed += take;
-                seqlen_offset += take;
-                print!("\r[PREFILL] {} / {} tokens processed", processed, total_prompt_len);
-                let _ = std::io::stdout().flush();
-            }
-            println!("\n[PREFILL] Complete.");
-            
-            input_ids = input_ids.narrow(1, total_prompt_len - 1, 1)?;
-            cur_pixel_values = None;
-            cur_image_thw = None;
-            cur_pixel_values_video = None;
-            cur_video_thw = None;
-        }
-
-        // 👇 [추가] 상태 추적 및 Logit 조작용 (DENSE-BIAS 및 JSON 추적)
+        // 상태 추적 및 Logit 조작용 (DENSE-BIAS 및 JSON 추적)
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(123);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
-        
-        // 💡 3.5 버전은 스트리밍 시작 시 강제 JSON 여부 판별이 애매하므로,
-        // 단순하게 첫 토큰 EOS 방지 및 괄호 강제 시작으로 무한 루프를 원천 차단합니다.
         let mut gen_text_buffer = String::new();
 
         for i in 0..sample_len {
+            // 🌟 14,928개의 전체 input_ids가 한 번에 넘어가고, model.rs 내부에서 안전하게 256개씩 청킹됩니다!
             let logits = self.qwen3_5.forward(
                 &input_ids,
                 cur_pixel_values.as_ref(),
@@ -387,7 +352,7 @@ impl Qwen3_5GenerateModel {
             
             let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             
-            // 👇 [추가] DENSE-BIAS: 첫 턴 방어 로직 (EOS 출력 방지 및 강제 괄호 시작 확률업)
+            // 첫 턴 방어 로직 (EOS 출력 방지 및 강제 괄호 시작 확률업)
             if i == 0 {
                 let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
                 let len = logits_vec.len();
@@ -406,7 +371,7 @@ impl Qwen3_5GenerateModel {
             
             let mut next_token = logit_processor.sample(&logits)?;
             
-            // 👇 [추가] FORCE-START: 확률을 올렸음에도 불구하고 헛소리를 하려 한다면 멱살 잡고 '{' 강제 삽입
+            // 강제 방어
             if i == 0 && next_token == self.eos_token_id {
                 next_token = open_bracket_id;
             }
@@ -419,7 +384,7 @@ impl Qwen3_5GenerateModel {
                 let _ = std::io::stdout().flush();
                 gen_text_buffer.push_str(&piece);
 
-                // 👇 [추가] 중첩 깊이 추적 기반 조기 종료 (무한 루프 탈출기)
+                // 중첩 깊이 추적 기반 조기 종료
                 if gen_text_buffer.contains('{') {
                     let mut depth = 0;
                     let mut has_started = false;
@@ -443,6 +408,8 @@ impl Qwen3_5GenerateModel {
             seqlen_offset += seq_len;
             seq_len = 1;
             input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
+            
+            // 첫 번째 순회 이후에는 비전 텐서들을 초기화하여 오버헤드 방지
             cur_pixel_values = None;
             cur_image_thw = None;
             cur_pixel_values_video = None;
