@@ -280,7 +280,7 @@ impl Qwen3_5GatedDeltaNet {
         let state_len = conv_state.dim(D::Minus1)?;
         let take_len = self.conv_kernel_size - 1; 
         
-        // 안전장치: state가 필요 이상으로 길면 마지막 요소들만 추출
+        // 1. 저장된 상태(과거 문맥)에서 필요한 만큼(K-1)만 가져옵니다.
         let state_to_use = if state_len > take_len {
             conv_state.narrow(D::Minus1, state_len - take_len, take_len)?
         } else if state_len < take_len {
@@ -289,15 +289,26 @@ impl Qwen3_5GatedDeltaNet {
             conv_state.clone()
         };
         
+        // 2. [왼쪽 과거 K-1 개] + [오른쪽 현재 토큰 1개] = 총 K 개 생성
         let conv_state_new = Tensor::cat(&[&state_to_use, xs], D::Minus1)?;
-        let conv_update = conv_state_new.narrow(D::Minus1, seq_len, take_len)?;
+        
+        // 3. 다음 상태 업데이트를 위해 가장 최신 토큰들을 저장
+        let next_cache_len = conv_state_new.dim(D::Minus1)?;
+        let conv_update = conv_state_new.narrow(D::Minus1, next_cache_len - take_len, take_len)?;
         self.conv_state_cache = Some(conv_update);
         
+        // 4. 컨볼루션 연산
         let out = conv1d_depthwise(&conv_state_new, self.conv1d.weight(), self.conv1d.bias())?;
         
-        // 🌟 버그 수정: 뒤쪽 쓰레기값이 아닌, 정확히 계산된 앞쪽 인덱스 추출
-        let out = out.narrow(D::Minus1, take_len, seq_len)?.silu()?;
-        Ok(out)
+        // 5. 프레임워크 안전장치 (정확히 필요한 만큼만 추출)
+        let out_len = out.dim(D::Minus1)?;
+        let final_out = if out_len > seq_len {
+            out.narrow(D::Minus1, out_len - seq_len, seq_len)?
+        } else {
+            out
+        };
+        
+        Ok(final_out.silu()?)
     }
 
     fn torch_chunk_gated_delta_rule(
@@ -550,36 +561,44 @@ impl Qwen3_5GatedDeltaNet {
             mixed_qkv = self.torch_causal_conv1d_update(&mixed_qkv)?;
         } else {
             let take_len = self.conv_kernel_size - 1;
+            let (bs, dim, seq_len) = mixed_qkv.dims3()?;
             
             // 1. 다음 청크를 위해 현재 청크의 끝부분을 상태로 저장해 둡니다.
-            let next_conv_state = if mixed_qkv.dim(D::Minus1)? >= take_len {
-                mixed_qkv.narrow(D::Minus1, mixed_qkv.dim(D::Minus1)? - take_len, take_len)?
+            let next_conv_state = if seq_len >= take_len {
+                mixed_qkv.narrow(D::Minus1, seq_len - take_len, take_len)?
             } else {
-                mixed_qkv.pad_with_zeros(D::Minus1, take_len - mixed_qkv.dim(D::Minus1)?, 0)?
+                mixed_qkv.pad_with_zeros(D::Minus1, take_len - seq_len, 0)?
             };
             
-            let has_prev = self.conv_state_cache.is_some();
-            
-            // 2. 이전 청크의 꼬리가 있다면 현재 청크 머리에만 이어 붙입니다. (우측 쓰레기 패딩 삭제)
-            if let Some(prev_state) = &self.conv_state_cache {
+            // 2. 🌟 핵심 보정: Causal Conv를 위해 "왼쪽에만" 과거 상태(또는 0)를 K-1 만큼 붙입니다!
+            let prev_causal = if let Some(prev_state) = &self.conv_state_cache {
                 let prev_len = prev_state.dim(D::Minus1)?;
-                let prev_causal = if prev_len >= take_len {
+                if prev_len >= take_len {
                     prev_state.narrow(D::Minus1, prev_len - take_len, take_len)?
                 } else {
                     prev_state.pad_with_zeros(D::Minus1, take_len - prev_len, 0)?
-                };
-                mixed_qkv = Tensor::cat(&[&prev_causal, &mixed_qkv], D::Minus1)?;
-            }
+                }
+            } else {
+                // 첫 청크일 경우 순수 0으로 채워진 Zero Padding을 "왼쪽"에 생성
+                Tensor::zeros((bs, dim, take_len), mixed_qkv.dtype(), mixed_qkv.device())?
+            };
+            
+            // [왼쪽 패딩 3개] + [현재 청크 256개] = 총 259개 (어떤 경우에도 259개가 보장됨)
+            mixed_qkv = Tensor::cat(&[&prev_causal, &mixed_qkv], D::Minus1)?;
             
             // 3. 상태 업데이트 및 컨볼루션 연산
             self.conv_state_cache = Some(next_conv_state);
             mixed_qkv = conv1d_depthwise(&mixed_qkv, self.conv1d.weight(), self.conv1d.bias())?;
             
-            // 4. 🌟 버그 수정: Conv1d 내부 패딩으로 인해 밀려난 인덱스를 정확히 보정!
-            // - 이전 상태를 붙였다면 (has_prev), 인덱스 3부터 시작해야 맞음
-            // - 첫 청크라서 아무것도 안 붙였다면, 내부 패딩 규칙에 의해 인덱스 0부터 시작해야 맞음
-            let start_idx = if has_prev { take_len } else { 0 };
-            mixed_qkv = mixed_qkv.narrow(D::Minus1, start_idx, seq_len)?.silu()?;
+            // 4. conv1d_depthwise 내부 패딩이 0이므로, 259개가 입력되면 256개로 정확히 깎여서 출력됨!
+            let out_len = mixed_qkv.dim(D::Minus1)?;
+            mixed_qkv = if out_len > seq_len {
+                mixed_qkv.narrow(D::Minus1, out_len - seq_len, seq_len)?
+            } else {
+                mixed_qkv
+            };
+            
+            mixed_qkv = mixed_qkv.silu()?;
         }
         let mixed_qkv = mixed_qkv.transpose(1, 2)?;
         let qkv_split = split_tensor(
