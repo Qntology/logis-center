@@ -167,7 +167,7 @@ impl Qwen3_5GatedDeltaNet {
             conv_dim,
             conv_dim,
             conv_kernel_size,
-            conv_kernel_size - 1,
+            0, // <--- 여기를 0으로 바꿉니다!
             1,
             1,
             conv_dim,
@@ -230,7 +230,7 @@ impl Qwen3_5GatedDeltaNet {
         let conv_dim = key_dim * 2 + value_dim;
         let conv1d = gguf.conv1d(
             &format!("{prefix}.ssm_conv1d"),
-            conv_kernel_size - 1,
+            0, // <--- 여기를 0으로 바꿉니다!
             1,
             1,
             conv_dim,
@@ -677,7 +677,16 @@ impl Qwen3_5GatedDeltaNet {
     pub fn load_weights_inplace<R: std::io::Read + std::io::Seek>(&mut self, ct: &candle_core::quantized::gguf_file::Content, reader: &mut R, prefix: &str, device: &Device) -> Result<()> {
         let conv_dim = self.key_dim * 2 + self.value_dim;
         let conv1d_weight = ct.tensor(reader, &format!("{prefix}.ssm_conv1d.weight"), device)?.dequantize(device)?;
-        self.conv1d = candle_nn::Conv1d::new(conv1d_weight, None, candle_nn::Conv1dConfig { padding: self.conv_kernel_size - 1, stride: 1, dilation: 1, groups: conv_dim, cudnn_fwd_algo: None });
+        
+        // 🚨 수정 전: padding: self.conv_kernel_size - 1
+        // ✅ 수정 후: padding: 0
+        self.conv1d = candle_nn::Conv1d::new(conv1d_weight, None, candle_nn::Conv1dConfig { 
+            padding: 0, // <--- 여기를 0으로 바꿉니다!
+            stride: 1, 
+            dilation: 1, 
+            groups: conv_dim, 
+            cudnn_fwd_algo: None 
+        });
         
         let dt_bias_raw = ct.tensor(reader, &format!("{prefix}.ssm_dt.bias"), device)?.dequantize(device)?;
         self.dt_bias = dt_bias_raw.to_dtype(DType::F32)?; 

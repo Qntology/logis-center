@@ -204,12 +204,26 @@ impl Qwen3_5GenerateModel {
             
             let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
 
-            // 👇 [추가] DENSE-BIAS: 첫 토큰 강제 주입 로직
+            // 👇 [수정 시작] 약했던 기존 페널티 삭제 및 강력한 수동 억제(1.2) 적용
+            let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
+            let len = logits_vec.len();
+            
+            // 1. Repetition Penalty (매 턴마다 강력하게 적용)
+            if !generate.is_empty() {
+                let penalty = 1.2; 
+                let mut set = std::collections::HashSet::new();
+                let start_at = generate.len().saturating_sub(self.repeat_last_n);
+                for &t in &generate[start_at..] {
+                    if !set.contains(&t) && (t as usize) < len {
+                        let logit = logits_vec[t as usize];
+                        logits_vec[t as usize] = if logit < 0.0 { logit * penalty } else { logit / penalty };
+                        set.insert(t);
+                    }
+                }
+            }
+
+            // 2. 첫 턴 방어 로직
             if i == 0 {
-                // Tensor를 Vec로 빼서 확률 직접 조작
-                let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
-                let len = logits_vec.len();
-                
                 if (self.eos_token_id as usize) < len { logits_vec[self.eos_token_id as usize] = -10000.0; }
                 if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
                 
@@ -217,24 +231,12 @@ impl Qwen3_5GenerateModel {
                     let boost = if is_strict_json { 10000.0 } else { 20.0 };
                     logits_vec[open_bracket_id as usize] += boost;
                 }
-                
-                // 조작된 확률을 다시 Tensor로 복구 (Device 주의)
-                logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
             }
-
-            let logits = if self.repeat_penalty == 1. {
-                logits
-            } else {
-                let start_at = generate.len().saturating_sub(self.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
-                    &logits,
-                    self.repeat_penalty,
-                    &generate[start_at..],
-                )?
-            };
             
+            let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
             let mut next_token = logit_processor.sample(&logits)?;
-
+            // 👆 [수정 끝]
+            
             // 👇 [추가] FORCE-START: AI가 헛소리를 하려 해도 멱살 잡고 '{' 로 강제 시작
             if i == 0 && (is_strict_json || next_token == self.eos_token_id) {
                 next_token = open_bracket_id;
@@ -352,24 +354,32 @@ impl Qwen3_5GenerateModel {
             
             let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             
-            // 첫 턴 방어 로직 (EOS 출력 방지 및 강제 괄호 시작 확률업)
+            // 👇 [수정 시작] generate_part 에도 동일한 강력 페널티 이식
+            let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
+            let len = logits_vec.len();
+
+            if !generate.is_empty() {
+                let penalty = 1.2; 
+                let mut set = std::collections::HashSet::new();
+                let start_at = generate.len().saturating_sub(self.repeat_last_n);
+                for &t in &generate[start_at..] {
+                    if !set.contains(&t) && (t as usize) < len {
+                        let logit = logits_vec[t as usize];
+                        logits_vec[t as usize] = if logit < 0.0 { logit * penalty } else { logit / penalty };
+                        set.insert(t);
+                    }
+                }
+            }
+
             if i == 0 {
-                let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
-                let len = logits_vec.len();
                 if (self.eos_token_id as usize) < len { logits_vec[self.eos_token_id as usize] = -10000.0; }
                 if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
                 if (open_bracket_id as usize) < len { logits_vec[open_bracket_id as usize] += 10000.0; }
-                logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
             }
 
-            let logits = if self.repeat_penalty == 1. {
-                logits
-            } else {
-                let start_at = generate.len().saturating_sub(self.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(&logits, self.repeat_penalty, &generate[start_at..])?
-            };
-            
+            let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
             let mut next_token = logit_processor.sample(&logits)?;
+            // 👆 [수정 끝]
             
             // 강제 방어
             if i == 0 && next_token == self.eos_token_id {
