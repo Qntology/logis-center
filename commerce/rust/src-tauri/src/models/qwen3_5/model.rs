@@ -1859,14 +1859,18 @@ impl Qwen3_5Model {
     ) -> Result<Tensor> {
         let (bs, seq_len, _) = inputs_embeds.dims3()?;
 
+        // 🌟 핵심 픽스: 이미지를 처음 읽는 단계(offset==0)에서는 
+        // 3D 공간 인덱스를 절대 버리지 않고 그대로 GPU에 전달하여 "시각적 구조"를 보존합니다!
+        if seqlen_offset == 0 {
+            let (pos_ids, rope_deltas, deltas_cpu) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
+            self.rope_deltas = Some(rope_deltas);
+            self.rope_deltas_cpu = Some(deltas_cpu);
+            return Ok(pos_ids.to_device(inputs_embeds.device())?);
+        }
+
+        // 이후 텍스트를 1글자씩 뱉는 디코딩 단계에서는 선형(1D)으로 숫자를 올립니다.
         if self.rope_deltas_cpu.is_none() {
-            if seqlen_offset > 0 {
-                self.rope_deltas_cpu = Some(vec![0i64; bs]);
-            } else {
-                let (_, rope_deltas, deltas_cpu) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
-                self.rope_deltas = Some(rope_deltas);
-                self.rope_deltas_cpu = Some(deltas_cpu);
-            }
+            self.rope_deltas_cpu = Some(vec![0i64; bs]);
         }
 
         let deltas_cpu = self.rope_deltas_cpu.as_ref().unwrap();

@@ -200,6 +200,7 @@ impl Qwen3_5GenerateModel {
             let missing_ids = ids_vec[baked_len..].to_vec();
             (Tensor::from_vec(missing_ids, (1, total_toks - baked_len), &self.device)?, baked_len)
         } else {
+            self.clear_kv_cache(); // 🌟 핵심 픽스: 새로운 사진/문서를 볼 때 이전 잔상(KV)을 완벽히 소각합니다.
             (Tensor::from_vec(ids_vec, (1, total_toks), &self.device)?, 0)
         };
         let mut seq_len = input_ids.dim(1)?;

@@ -1462,16 +1462,9 @@ Current Language: {LANGUAGE}
 1. Extract the tracking_number. It should be selected from numbers matching barcodes or QR codes, filtered by region, excluding telephone formats or order numbers.
 2. Set recipient_match to true if the label address matches the context address (ignoring floor levels).
 3. Extract all visible barcodes into an array.
-4. Provide a text summary in {LANGUAGE}, masking the address to District-level and up. Do not mention masking.
 
 [OUTPUT FORMAT]
-Return valid JSON only. No explanation.
-{
-    "tracking_number": "string",
-    "recipient_match": boolean,
-    "barcodes": ["string"],
-    "text": "string"
-}"###;
+{ "tracking_number": "string", "recipient_match": boolean, "barcodes": ["string"] }"###;
         template.replace("{REGION}", region).replace("{ADDRESS}", address).replace("{LANGUAGE}", language)
     } else {
         String::new()
