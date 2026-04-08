@@ -545,10 +545,23 @@ impl Qwen3_5GatedDeltaNet {
     }
 
     pub fn forward(&mut self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+        let dev = xs.device();
+        let dtype = xs.dtype();
+        
+        if let Some(conv) = self.conv_state_cache.take() {
+            // conv_state는 모델의 원래 타입(BF16/F16)을 따름
+            self.conv_state_cache = Some(conv.to_device(dev)?.to_dtype(dtype)?);
+        }
+        if let Some(rec) = self.recurrent_state_cache.take() {
+            // 🌟 [CRITICAL FIX] recurrent_state는 내부 누산 정밀도를 위해 반드시 F32로 유지되어야 합니다!
+            self.recurrent_state_cache = Some(rec.to_device(dev)?.to_dtype(candle_core::DType::F32)?);
+        }
+
         let (bs, seq_len, _) = xs.dims3()?;
         
         // 원본 xs(BF16)를 그대로 사용하여 바로 고속 투영(Projection)으로 직행합니다.
         let mut mixed_qkv = self.in_proj_qkv.forward(xs)?.transpose(1, 2)?;
+        
         let z = self
             .in_proj_z
             .forward(xs)?
@@ -1418,6 +1431,7 @@ impl Qwen3_5TextModel {
                         for ssm_dir in path_candidates {
                             let st_path = ssm_dir.join(format!("l{}.st", l_idx));
                             if st_path.exists() {
+                                let mut loaded = false;
                                 if let Ok(encrypted_data) = std::fs::read(&st_path) {
                                     if let Ok(plain_data) = crate::utils::crypto::decrypt_data(&encrypted_data) {
                                         if let Ok(tensors) = candle_core::safetensors::load_buffer(&plain_data, xs.device()) {
@@ -1425,10 +1439,14 @@ impl Qwen3_5TextModel {
                                             let loaded_rec = tensors.get("recurrent_state").cloned();
                                             if loaded_conv.is_some() && loaded_rec.is_some() {
                                                 layer.set_ssm_states(loaded_conv, loaded_rec);
+                                                loaded = true;
                                                 break;
                                             }
                                         }
                                     }
+                                }
+                                if !loaded {
+                                    println!("[WARNING] SSM State corrupted or failed to parse for Layer {} (Session: {}). Model may hallucinate!", l_idx, sid);
                                 }
                             }
                         }
@@ -1440,8 +1458,17 @@ impl Qwen3_5TextModel {
             
             xs = layer.forward(&xs, Some(&cos), Some(&sin), layer_mask.as_ref(), seqlen_offset)?;
 
-            // 🌟 [핵심 최적화 2] 디코딩(1토큰) 중에는 VRAM 방어(소각) 생략!
             if !is_decoding {
+                // 🌟 [CRITICAL FIX] 가중치 소각(clear_weights) 전, 
+                // SSM State(Linear Attention)를 안전한 CPU 메모리로 대피시킵니다!
+                if layer.layer_type == "linear_attention" {
+                    let (conv_opt, rec_opt) = layer.get_ssm_states();
+                    if let (Some(conv), Some(rec)) = (conv_opt, rec_opt) {
+                        let safe_conv = conv.to_device(&candle_core::Device::Cpu).unwrap_or(conv);
+                        let safe_rec = rec.to_device(&candle_core::Device::Cpu).unwrap_or(rec);
+                        layer.set_ssm_states(Some(safe_conv), Some(safe_rec));
+                    }
+                }
                 layer.clear_weights();
             }
 
@@ -1525,35 +1552,35 @@ impl Qwen3_5TextModel {
                     },
                     AttnKind::LinearAttn(attn) => {
                         // 🌟 [핵심 최적화 3] 디코딩(1토큰) 중에는 무자비한 21-Thread SSM 디스크 I/O 스팸을 막습니다!
-                        if !is_decoding && attn.is_state_dirty {
-                            let (conv_opt, rec_opt) = attn.get_states();
-                            if let (Some(conv), Some(rec)) = (conv_opt, rec_opt) {
-                                let conv_cpu = conv.to_device(&candle_core::Device::Cpu).unwrap_or(conv);
-                                let rec_cpu = rec.to_device(&candle_core::Device::Cpu).unwrap_or(rec);
-                                attn.is_state_dirty = false;
+                        // if !is_decoding && attn.is_state_dirty {
+                        //     let (conv_opt, rec_opt) = attn.get_states();
+                        //     if let (Some(conv), Some(rec)) = (conv_opt, rec_opt) {
+                        //         let conv_cpu = conv.to_device(&candle_core::Device::Cpu).unwrap_or(conv);
+                        //         let rec_cpu = rec.to_device(&candle_core::Device::Cpu).unwrap_or(rec);
+                        //         attn.is_state_dirty = false;
 
-                                let ssm_dir = base_dir.join("ssm");
-                                if !ssm_dir.exists() { let _ = std::fs::create_dir_all(&ssm_dir); }
+                        //         let ssm_dir = base_dir.join("ssm");
+                        //         if !ssm_dir.exists() { let _ = std::fs::create_dir_all(&ssm_dir); }
                                 
-                                let l_idx_clone = l_idx;
-                                tokio::task::spawn_blocking(move || {
-                                    let mut map = std::collections::HashMap::new();
-                                    map.insert("conv_state".to_string(), conv_cpu);
-                                    map.insert("recurrent_state".to_string(), rec_cpu);
+                        //         let l_idx_clone = l_idx;
+                        //         tokio::task::spawn_blocking(move || {
+                        //             let mut map = std::collections::HashMap::new();
+                        //             map.insert("conv_state".to_string(), conv_cpu);
+                        //             map.insert("recurrent_state".to_string(), rec_cpu);
 
-                                    let st_path = ssm_dir.join(format!("l{}.st", l_idx_clone));
-                                    let tmp_path = st_path.with_extension("tmp");
-                                    if candle_core::safetensors::save(&map, &tmp_path).is_ok() {
-                                        if let Ok(plain_data) = std::fs::read(&tmp_path) {
-                                            if let Ok(encrypted_data) = crate::utils::crypto::encrypt_data(&plain_data) {
-                                                let _ = std::fs::write(&st_path, encrypted_data);
-                                            }
-                                        }
-                                        let _ = std::fs::remove_file(tmp_path);
-                                    }
-                                });
-                            }
-                        }
+                        //             let st_path = ssm_dir.join(format!("l{}.st", l_idx_clone));
+                        //             let tmp_path = st_path.with_extension("tmp");
+                        //             if candle_core::safetensors::save(&map, &tmp_path).is_ok() {
+                        //                 if let Ok(plain_data) = std::fs::read(&tmp_path) {
+                        //                     if let Ok(encrypted_data) = crate::utils::crypto::encrypt_data(&plain_data) {
+                        //                         let _ = std::fs::write(&st_path, encrypted_data);
+                        //                     }
+                        //                 }
+                        //                 let _ = std::fs::remove_file(tmp_path);
+                        //             }
+                        //         });
+                        //     }
+                        // }
                     }
                 }
             }
@@ -1693,6 +1720,10 @@ impl Qwen3_5TextModel {
             let ssm_dir = base_dir.join("ssm");
             if !ssm_dir.exists() { let _ = std::fs::create_dir_all(&ssm_dir); }
 
+            // [CRITICAL FIX] 백그라운드 스레드가 디스크 쓰기를 마칠 때까지 메인 런타임이 대기할 수 있도록 IO 카운터 증가!
+            let dump_count = ssm_dumps.len();
+            crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_add(dump_count, std::sync::atomic::Ordering::SeqCst);
+
             tokio::task::spawn_blocking(move || {
                 for (l_idx, conv, rec) in ssm_dumps {
                     let mut map = std::collections::HashMap::new();
@@ -1702,18 +1733,16 @@ impl Qwen3_5TextModel {
                     let st_path = ssm_dir.join(format!("l{}.st", l_idx));
                     let tmp_path = st_path.with_extension("tmp");
                     
-                    // 1) Safetensors 포맷으로 임시 직렬화
                     if candle_core::safetensors::save(&map, &tmp_path).is_ok() {
-                        // 2) XOR 암호화 적용
                         if let Ok(plain_data) = std::fs::read(&tmp_path) {
                             if let Ok(encrypted_data) = crate::utils::crypto::encrypt_data(&plain_data) {
-                                // 3) 암호화된 최종 파일 쓰기
                                 let _ = std::fs::write(&st_path, encrypted_data);
                             }
                         }
-                        // 임시 파일 청소
                         let _ = std::fs::remove_file(tmp_path);
                     }
+                    // [CRITICAL FIX] 1개 레이어의 디스크 쓰기가 끝날 때마다 카운터 차감
+                    crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             });
         }
@@ -2020,6 +2049,7 @@ impl Qwen3_5Model {
         image_grid_thw: Option<&Tensor>,
         pixel_values_video: Option<&Tensor>,
         video_grid_thw: Option<&Tensor>,
+        cache_position: Option<&Tensor>, // <--- [CRITICAL FIX] 복구됨!
         seqlen_offset: usize,
         session_id: Option<String>,
         kv_name: Option<String>,
@@ -2052,7 +2082,22 @@ impl Qwen3_5Model {
             }
         }
 
-        let position_ids = self.compute_3d_position_ids(input_ids, &inputs_embeds, image_grid_thw, video_grid_thw, seqlen_offset)?;
+        let position_ids;
+        if cache_position.is_some() && seqlen_offset > 0 {
+            let (bs, seq_len, _) = inputs_embeds.dims3()?;
+            let delta = cache_position.unwrap().i(0)?
+                .to_dtype(candle_core::DType::U32)?
+                .broadcast_add(&Tensor::new(seqlen_offset as u32, inputs_embeds.device())?)?;
+            position_ids = Tensor::arange(0u32, seq_len as u32, input_ids.device())?
+                .unsqueeze(0)?
+                .broadcast_as((bs, seq_len))?
+                .broadcast_add(&delta)?
+                .unsqueeze(0)?
+                .broadcast_as((3, bs, seq_len))?
+                .contiguous()?;
+        } else {
+            position_ids = self.compute_3d_position_ids(input_ids, &inputs_embeds, image_grid_thw, video_grid_thw, seqlen_offset)?;
+        }
         
         let total_len = inputs_embeds.dim(1)?;
         let chunk_size = 256; // 🌟 [핵심] 1024 -> 256으로 축소하여 VRAM 스파이크 원천 차단!

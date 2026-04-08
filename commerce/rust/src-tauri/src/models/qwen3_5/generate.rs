@@ -230,6 +230,7 @@ impl Qwen3_5GenerateModel {
                 image_grid_thw,
                 cur_pixel_values_video,
                 video_grid_thw,
+                None, // <--- [수정] cache_position 추가
                 seqlen_offset,
                 session_id.clone(), 
                 kv_name.clone()     
@@ -425,6 +426,7 @@ impl Qwen3_5GenerateModel {
                 cur_image_thw.as_ref(),
                 cur_pixel_values_video.as_ref(),
                 cur_video_thw.as_ref(),
+                None, // <--- [수정] cache_position 추가
                 seqlen_offset,
                 session_id.clone(),
                 kv_name.clone()
@@ -546,7 +548,9 @@ impl Qwen3_5GenerateModel {
         let ids_tensor = Tensor::from_vec(input_ids.clone(), (1, total_toks), &self.device)?;
 
         self.qwen3_5.forward(
-            &ids_tensor, None, None, None, None, 0,
+            &ids_tensor, None, None, None, None, 
+            None, // <--- [수정] cache_position 추가
+            0,
             session_id.clone(), kv_name.clone()
         ).await?;
 
