@@ -319,24 +319,20 @@ impl Qwen3_5GatedDeltaNet {
             .broadcast_sub(&g.unsqueeze(D::Minus2)?)?
             .exp()?
             .to_dtype(candle_core::DType::F32)?;
-        let tril_mask = Tensor::tril2(chunk_size, candle_core::DType::U32, query.device())?
+            
+        // 🌟 Fix 1: F32 커널로 생성 후 U8 변환하여 GPU 크래시 방지
+        let tril_mask = Tensor::tril2(chunk_size, candle_core::DType::F32, query.device())?
+            .to_dtype(candle_core::DType::U8)?
             .broadcast_as(decay_mask.shape())?;
+        
         let on_false = decay_mask.zeros_like()?;
         let decay_mask = tril_mask.where_cond(&decay_mask, &on_false)?.contiguous()?;
         
-        let mut attn = k_beta
-            .squeeze(0)?
-            .contiguous()?
-            .matmul(
-                &key.squeeze(0)?
-                    .transpose(D::Minus1, D::Minus2)?
-                    .contiguous()?,
-            )?
-            .unsqueeze(0)?
-            .mul(&decay_mask)?
-            .affine(-1.0, 0.0)?;
+        let mut attn = k_beta.squeeze(0)?.contiguous()?.matmul(&key.squeeze(0)?.transpose(D::Minus1, D::Minus2)?.contiguous()?)?.unsqueeze(0)?.mul(&decay_mask)?.affine(-1.0, 0.0)?;
         
-        let mask = Tensor::triu2(chunk_size, candle_core::DType::U32, query.device())?
+        // 🌟 Fix 2: F32 커널로 생성 후 U8 변환
+        let mask = Tensor::triu2(chunk_size, candle_core::DType::F32, query.device())?
+            .to_dtype(candle_core::DType::U8)?
             .broadcast_as(decay_mask.shape())?;
         
         attn = mask.where_cond(&on_false, &attn)?;
@@ -377,7 +373,9 @@ impl Qwen3_5GatedDeltaNet {
         };
 
         let mut core_attn_out = value.zeros_like()?;
-        let tril_mask = Tensor::tril2(chunk_size, candle_core::DType::U32, query.device())?
+        // 🌟 Fix 3: F32 커널로 생성 후 U8 변환
+        let tril_mask = Tensor::tril2(chunk_size, candle_core::DType::F32, query.device())?
+            .to_dtype(candle_core::DType::U8)?
             .broadcast_as((batch_size, num_heads, chunk_size, chunk_size))?;
         let on_false = tril_mask.zeros_like()?.to_dtype(candle_core::DType::F32)?;
         let last_dim = core_attn_out.dim(D::Minus1)?;
@@ -1765,147 +1763,90 @@ impl Qwen3_5Model {
         &self,
         input_ids: &Tensor,
         image_grid_thw: Option<&Tensor>,
-        video_grid_thw: Option<&Tensor>,
-        mask: Option<&Tensor>,
+        _video_grid_thw: Option<&Tensor>,
+        _mask: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor, Vec<i64>)> {
-        let video_grid_thw = match video_grid_thw {
-            Some(thw) => {
-                let grid_t = thw.i((.., 0))?.to_vec1::<u32>()?;
-                let mut v_thw_vec = Vec::new();
-                for (index, t) in grid_t.iter().enumerate() {
-                    let mut thw_i = thw.i(index)?.to_vec1::<u32>()?;
-                    thw_i[0] = 1;
-                    v_thw_vec.push(
-                        Tensor::new(thw_i, thw.device())?
-                            .repeat(*t as usize)?
-                            .reshape((*t as usize, ()))?,
-                    );
-                }
-                Some(Tensor::cat(&v_thw_vec, 0)?)
-            }
-            None => None,
-        };
-
         let spatial_merge_size = self.spatial_merge_size;
         let image_token_id = self.image_token_id;
-        let video_token_id = self.video_token_id;
         let vision_start_token_id = self.vision_start_token_id;
-        let mut mrope_position_deltas = vec![];
-        if image_grid_thw.is_some() || video_grid_thw.is_some() {
-            let total_input_ids = input_ids.clone();
-            let mask_ = mask
-                .cloned()
-                .unwrap_or(Tensor::ones_like(&total_input_ids)?)
-                .to_device(input_ids.device())?;
-            let mut position_ids = Tensor::ones(
-                (3, input_ids.dim(0)?, input_ids.dim(1)?),
-                input_ids.dtype(),
-                input_ids.device(),
-            )?;
-            let mut image_index = 0;
-            let mut video_index = 0;
+        
+        let (b_sz, seq_len) = input_ids.dims2()?;
+        let mut mrope_position_deltas = Vec::new();
 
-            for i in 0..total_input_ids.dim(0)? {
-                let mut input_ids_i = total_input_ids.i(i)?;
-                let mask_i = mask_.i(i)?;
-                if mask_i.sum_all()?.to_scalar::<u32>()? != mask_i.dim(0)? as u32 {
-                    let nonzero_idx = nonzero_index(&mask_i)?;
-                    input_ids_i = input_ids_i.gather(&nonzero_idx, 0)?;
-                }
-                let mut text_start = 0;
-                let mut text_end = 0;
-                let mut thw = vec![];
-                let mut llm_pos_ids_list: Vec<Tensor> = Vec::new();
-                let vision_indices = get_vision_next_indices(&input_ids_i, vision_start_token_id);
+        let input_ids_vec = input_ids.to_vec2::<u32>()?;
+        let mut image_idx = 0;
 
-                match vision_indices {
-                    Ok(indeices) => {
-                        let vision_tokens = input_ids_i.gather(&indeices, 0)?.to_vec1::<u32>()?;
-                        let vision_indices_vec = indeices.to_vec1::<u32>()?;
-                        for (j, &token) in vision_tokens.iter().enumerate() {
-                            if token == image_token_id {
-                                thw = image_grid_thw.unwrap().i(image_index)?.to_vec1::<u32>()?;
-                                image_index += 1;
-                                text_end = vision_indices_vec[j];
+        let image_thw_cpu = if let Some(thw) = image_grid_thw {
+            Some(thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?)
+        } else { None };
+
+        let mut flat_pos_ids: Vec<u32> = Vec::with_capacity(3 * b_sz * seq_len);
+
+        for b in 0..b_sz {
+            let ids = &input_ids_vec[b];
+            let mut curr_pos = 0u32;
+            let mut llm_pos_ids = vec![vec![0u32; seq_len]; 3];
+            let mut i = 0;
+            
+            while i < seq_len {
+                if ids[i] == vision_start_token_id && i + 1 < seq_len && ids[i+1] == image_token_id {
+                    if let Some(thw_cpu_array) = &image_thw_cpu {
+                        if image_idx < thw_cpu_array.len() {
+                            let thw = &thw_cpu_array[image_idx];
+                            image_idx += 1;
+                            let (t, h, w) = (thw[0], thw[1] / spatial_merge_size as u32, thw[2] / spatial_merge_size as u32);
+                            
+                            for d in 0..3 { llm_pos_ids[d][i] = curr_pos; }
+                            i += 1;
+                            curr_pos += 1;
+
+                            let img_len = (t * h * w) as usize;
+                            for tt in 0..t {
+                                for hh in 0..h {
+                                    for ww in 0..w {
+                                        let idx = i + (tt * h * w + hh * w + ww) as usize;
+                                        if idx < seq_len {
+                                            llm_pos_ids[0][idx] = curr_pos + tt;
+                                            llm_pos_ids[1][idx] = curr_pos + hh;
+                                            llm_pos_ids[2][idx] = curr_pos + ww;
+                                        }
+                                    }
+                                }
                             }
-                            if token == video_token_id {
-                                thw = video_grid_thw
-                                    .as_ref()
-                                    .unwrap()
-                                    .i(video_index)?
-                                    .to_vec1::<u32>()?;
-                                text_end = vision_indices_vec[j];
-                                video_index += 1;
-                            }
-                            let llm_grid_t = thw[0];
-                            let llm_grid_h = thw[1] / spatial_merge_size as u32;
-                            let llm_grid_w = thw[2] / spatial_merge_size as u32;
-                            let text_len = text_end - text_start;
-                            let start_idx = if !llm_pos_ids_list.is_empty() {
-                                llm_pos_ids_list[llm_pos_ids_list.len() - 1].max_all()?.to_scalar::<u32>()? + 1
-                            } else { 0 };
-                            let pos_ids = Tensor::arange(start_idx, start_idx + text_len, input_ids_i.device())?
-                            .unsqueeze(0)?.broadcast_as((3usize, text_len as usize))?;
-                            llm_pos_ids_list.push(pos_ids);
-
-                            let t_index = Tensor::arange(start_idx + text_len, start_idx + text_len + llm_grid_t, input_ids_i.device())?
-                            .unsqueeze(D::Minus1)?.broadcast_as((llm_grid_t as usize, llm_grid_h as usize * llm_grid_w as usize))?.flatten_all()?;
-                            let h_index = Tensor::arange(start_idx + text_len, start_idx + text_len + llm_grid_h, input_ids_i.device())?
-                            .unsqueeze(0)?.unsqueeze(D::Minus1)?.broadcast_as((llm_grid_t as usize, llm_grid_h as usize, llm_grid_w as usize))?.flatten_all()?;
-                            let w_index = Tensor::arange(start_idx + text_len, start_idx + text_len + llm_grid_w, input_ids_i.device())?
-                            .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((llm_grid_t as usize, llm_grid_h as usize, llm_grid_w as usize))?.flatten_all()?;
-
-                            let thw_index = Tensor::stack(&[t_index, h_index, w_index], 0)?;
-                            llm_pos_ids_list.push(thw_index);
-                            text_start = text_end + llm_grid_t * llm_grid_h * llm_grid_w;
+                            i += img_len;
+                            curr_pos += t.max(h).max(w); 
+                        } else {
+                            for d in 0..3 { llm_pos_ids[d][i] = curr_pos; }
+                            i += 1; curr_pos += 1;
                         }
+                    } else {
+                        for d in 0..3 { llm_pos_ids[d][i] = curr_pos; }
+                        i += 1; curr_pos += 1;
                     }
-                    Err(e) => { println!("get vision_indices err: {e}"); }
-                };
-                if text_start < input_ids_i.dim(0)? as u32 {
-                    let start_idx = if !llm_pos_ids_list.is_empty() {
-                        llm_pos_ids_list[llm_pos_ids_list.len() - 1].max_all()?.to_scalar::<u32>()? + 1
-                    } else { 0 };
-                    let text_len = input_ids_i.dim(0)? as u32 - text_start;
-                    let pos_ids = Tensor::arange(start_idx, start_idx + text_len, input_ids_i.device())?
-                            .unsqueeze(0)?.broadcast_as((3usize, text_len as usize))?;
-                    llm_pos_ids_list.push(pos_ids);
-                }
-                let llm_position = Tensor::cat(&llm_pos_ids_list, 1)?.reshape((3, 1, ()))?;
-                position_ids = position_ids.slice_assign(&[(0..3), (i..i + 1), (0..input_ids.dim(1)?)], &llm_position)?;
-                let position_deltas = llm_position.max_all()?.to_scalar::<u32>()? as i64 + 1 - input_ids_i.dim(0)? as i64;
-                mrope_position_deltas.push(position_deltas);
-            }
-            let mrope_position_deltas_vec = mrope_position_deltas.clone(); 
-            let mut mrope_position_deltas = Tensor::new(mrope_position_deltas, input_ids.device())?;
-            if mrope_position_deltas.rank() == 1 { mrope_position_deltas = mrope_position_deltas.unsqueeze(0)?; }
-            
-            Ok((position_ids.contiguous()?, mrope_position_deltas, mrope_position_deltas_vec))
-        } else if let Some(mask) = mask {
-            let mut position_ids = mask.to_dtype(candle_core::DType::F64)?.cumsum(D::Minus1)?.to_dtype(candle_core::DType::U32)?.broadcast_sub(&Tensor::new(vec![1_u32], input_ids.device())?)?;
-            for i in 0..position_ids.dim(0)? {
-                let mut position_ids_i = position_ids.i(i)?;
-                let mask_i = mask.i(i)?;
-                if mask_i.sum_all()?.to_scalar::<u32>()? != mask_i.dim(0)? as u32 {
-                    let zero_indices = zero_index(&mask_i)?;
-                    let replace_1 = Tensor::ones(zero_indices.dim(0)?, candle_core::DType::U32, input_ids.device())?;
-                    position_ids_i = position_ids_i.scatter(&zero_indices, &replace_1, 0)?.unsqueeze(0)?;
-                    position_ids = position_ids.slice_assign(&[(i..i + 1), (0..position_ids.dim(1)?)], &position_ids_i)?;
+                } else {
+                    for d in 0..3 { llm_pos_ids[d][i] = curr_pos; }
+                    i += 1;
+                    curr_pos += 1;
                 }
             }
-            position_ids = position_ids.unsqueeze(0)?.broadcast_as((3, input_ids.dim(0)?, input_ids.dim(1)?))?.contiguous()?;
-            let mut mrope_position_deltas = position_ids.max(0)?.max(D::Minus1)?.broadcast_sub(&Tensor::new(vec![mask.dim(D::Minus1)? as u32 - 1], input_ids.device())?)?.contiguous()?;
-            if mrope_position_deltas.rank() == 1 { mrope_position_deltas = mrope_position_deltas.unsqueeze(0)?; }
             
-            let mrope_position_deltas_vec = mrope_position_deltas.flatten_all()?.to_vec1::<u32>()?.iter().map(|&x| x as i64).collect();
-            Ok((position_ids, mrope_position_deltas, mrope_position_deltas_vec))
-        } else {
-            let position_ids = Tensor::arange(0_u32, input_ids.dim(D::Minus1)? as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, input_ids.dim(0)?, input_ids.dim(D::Minus1)?))?.contiguous()?;
-            let mrope_position_deltas = Tensor::zeros((input_ids.dim(0)?, 1), input_ids.dtype(), input_ids.device())?;
+            for d in 0..3 {
+                flat_pos_ids.extend_from_slice(&llm_pos_ids[d]);
+            }
+            mrope_position_deltas.push(curr_pos as i64 - seq_len as i64);
+        } 
+
+        // 🌟 CPU에서 F32로 완전히 세팅한 후 최종 결과만 GPU로 전송
+        let position_ids = Tensor::from_vec(flat_pos_ids, (3, b_sz, seq_len), &Device::Cpu)?
+            .to_dtype(DType::F32)?
+            .to_device(input_ids.device())?;
             
-            let mrope_position_deltas_vec = vec![0i64; input_ids.dim(0)?];
-            Ok((position_ids, mrope_position_deltas, mrope_position_deltas_vec))
-        }
+        let target_dtype = if input_ids.device().is_cuda() { DType::BF16 } else { DType::F32 };
+        let deltas = Tensor::from_vec(mrope_position_deltas.clone(), (b_sz, 1), &Device::Cpu)?
+            .to_dtype(target_dtype)?
+            .to_device(input_ids.device())?; 
+        
+        Ok((position_ids.contiguous()?, deltas, mrope_position_deltas))
     }
 
     fn compute_3d_position_ids(
@@ -1932,13 +1873,13 @@ impl Qwen3_5Model {
         let mut p_ids_vec = Vec::with_capacity(bs);
         for b in 0..bs {
             let delta = deltas_cpu[b];
-            let real_start = (seqlen_offset as i64 + delta) as u32;
-            let p_id = Tensor::arange(real_start, real_start + seq_len as u32, inputs_embeds.device())?
+            let real_start = (seqlen_offset as i64 + delta) as f32;
+            let p_id = Tensor::arange(real_start, real_start + seq_len as f32, &Device::Cpu)?
                 .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, seq_len))?;
             p_ids_vec.push(p_id);
         }
-        let position_ids = Tensor::cat(&p_ids_vec, 1)?;
-        Ok(position_ids.to_device(inputs_embeds.device())?)
+        let position_ids = Tensor::cat(&p_ids_vec, 1)?.to_device(inputs_embeds.device())?;
+        Ok(position_ids)
     }
 
     pub async fn forward(
@@ -1962,7 +1903,12 @@ impl Qwen3_5Model {
             if let Some(image_grid_thw) = image_grid_thw {
                 if let Some(visual) = self.visual.as_ref() {
                     let (image_embeds, _): (Tensor, _) = visual.forward(pixel_values, image_grid_thw)?;
-                    let vision_mask = get_equal_mask(input_ids, self.image_token_id)?;
+                    
+                    // 🌟 외부 유틸리티 대신 CPU에서 직접 마스크를 만들어 CUDA U32/U8 충돌 원천 차단
+                    let img_token_t = Tensor::new(vec![self.image_token_id as f32], &Device::Cpu)?;
+                    let mask_cpu = input_ids_cpu.to_dtype(DType::F32)?.broadcast_eq(&img_token_t)?.to_dtype(DType::U8)?;
+                    let vision_mask = mask_cpu.to_device(input_ids.device())?;
+                    
                     let image_embeds = image_embeds.to_dtype(inputs_embeds.dtype())?;
                     inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;
                 }
@@ -1972,7 +1918,11 @@ impl Qwen3_5Model {
             if let Some(video_grid_thw) = video_grid_thw {
                 if let Some(visual) = self.visual.as_ref() {
                     let (video_embeds, _): (Tensor, _) = visual.forward(pixel_values_video, video_grid_thw)?;
-                    let vision_mask = get_equal_mask(input_ids, self.video_token_id)?;
+                    
+                    let vid_token_t = Tensor::new(vec![self.video_token_id as f32], &Device::Cpu)?;
+                    let mask_cpu = input_ids_cpu.to_dtype(DType::F32)?.broadcast_eq(&vid_token_t)?.to_dtype(DType::U8)?;
+                    let vision_mask = mask_cpu.to_device(input_ids.device())?;
+                    
                     let video_embeds = video_embeds.to_dtype(inputs_embeds.dtype())?;
                     inputs_embeds = masked_scatter_dim0(&inputs_embeds, &video_embeds, &vision_mask)?;
                 }
@@ -1982,16 +1932,21 @@ impl Qwen3_5Model {
         let position_ids;
         if cache_position.is_some() && seqlen_offset > 0 {
             let (bs, seq_len, _) = inputs_embeds.dims3()?;
+            
+            // 🌟 CPU에서 안전하게 F32 덧셈 수행 후 GPU로 전송
             let delta = cache_position.unwrap().i(0)?
-                .to_dtype(candle_core::DType::U32)?
-                .broadcast_add(&Tensor::new(seqlen_offset as u32, inputs_embeds.device())?)?;
-            position_ids = Tensor::arange(0u32, seq_len as u32, input_ids.device())?
+                .to_device(&Device::Cpu)?
+                .to_dtype(candle_core::DType::F32)?
+                .broadcast_add(&Tensor::new(seqlen_offset as f32, &Device::Cpu)?)?;
+            
+            position_ids = Tensor::arange(0f32, seq_len as f32, &Device::Cpu)?
                 .unsqueeze(0)?
                 .broadcast_as((bs, seq_len))?
                 .broadcast_add(&delta)?
                 .unsqueeze(0)?
                 .broadcast_as((3, bs, seq_len))?
-                .contiguous()?;
+                .contiguous()?
+                .to_device(input_ids.device())?;
         } else {
             position_ids = self.compute_3d_position_ids(input_ids, &inputs_embeds, image_grid_thw, video_grid_thw, seqlen_offset)?;
         }
@@ -2032,7 +1987,6 @@ impl Qwen3_5Model {
 
         let hidden_state = final_hidden_state.unwrap();
         
-        // VRAM 누수를 막기 위해 상태값을 즉시 CPU로 보내어 Logit 연산을 처리합니다.
         let hidden_state_cpu = hidden_state.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
         let logits_cpu = self.lm_head.forward(&hidden_state_cpu)?;
         

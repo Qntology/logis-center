@@ -1,7 +1,7 @@
 use std::io::{Read, Seek};
 
 use anyhow::{Result, anyhow};
-use candle_core::{D, DType, IndexOp, Shape, Tensor};
+use candle_core::{D, DType, Device, IndexOp, Shape, Tensor};
 use candle_nn::{
     Activation, Embedding, Init, LayerNorm, Linear, Module, RmsNorm, VarBuilder, embedding, linear,
     linear_no_bias, rms_norm,
@@ -100,6 +100,12 @@ impl Qwen3VLVisionPatchEmbed {
         let hidden_states = hidden_states.broadcast_add(&self.conv3d_bias.to_dtype(dtype)?)?;
         Ok(hidden_states)
     }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.conv3d_weight = self.conv3d_weight.to_device(device)?;
+        self.conv3d_bias = self.conv3d_bias.to_device(device)?;
+        Ok(())
+    }
 }
 
 pub struct Qwen3VLVisionPatchMerger {
@@ -162,6 +168,14 @@ impl Qwen3VLVisionPatchMerger {
             act_fn,
             linear_fc2: ProjKind::QuantizedProj(linear_2),
         })
+    }
+
+    // 👇 GPU VRAM으로 텐서를 넘겨주기 위해 필수적인 누락되었던 함수입니다. 👇
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let n_w = self.norm.weight().to_device(device)?;
+        let n_b = self.norm.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
+        self.norm = LayerNorm::new(n_w, n_b, 1e-6);
+        Ok(())
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
@@ -233,47 +247,37 @@ impl Qwen3VLVisionAttention {
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        cu_seqlens: &Tensor,
+        chunks: &[usize], 
     ) -> Result<Tensor> {
-        // xs: (seq_len, hidden_size)
         let seq_length = xs.dim(0)?;
-        // (seq_len, hidden_size) -> (seq_len, hidden_size*3)
-        // -> (seq_len, 3, num_heads, head_dim)
-        // -> (3, seq_len, num_heads, head_dim)
-        let qkv_states = xs
-            .apply(&self.qkv)?
-            .reshape((seq_length, 3, self.num_heads, ()))?
-            .permute((1, 0, 2, 3))?;
-        // (seq_len, num_heads, head_dim)
-        let query_states = qkv_states.i(0)?.contiguous()?;
-        let key_states = qkv_states.i(1)?.contiguous()?;
-        let value_states = qkv_states.i(2)?.contiguous()?;
-        let (query_states, key_states) =
-            apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?;
-        // (seq_len, num_heads, head_dim) -> (num_heads, seq_len, head_dim) -> (1, num_heads, seq_len, head_dim)
-        let query_states = query_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
-        let key_states = key_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
-        let value_states = value_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
-        let cu_last_id = cu_seqlens.dim(0)? - 1;
-        let lengths = cu_seqlens.i(1..)?.sub(&cu_seqlens.i(..cu_last_id)?)?;
-        let chunks: Vec<usize> = lengths
-            .to_vec1::<u32>()?
-            .iter()
-            .map(|&x| x as usize)
-            .collect();
-        let q_splits = split_tensor(&query_states, &chunks, 2)?;
-        let k_splits = split_tensor(&key_states, &chunks, 2)?;
-        let v_splits = split_tensor(&value_states, &chunks, 2)?;
-
+        let qkv_states = self.qkv.forward(xs)?.reshape((seq_length, 3, self.num_heads, ()))?.permute((1, 0, 2, 3))?; 
+        
+        let query_states = qkv_states.i(0)?; 
+        let key_states = qkv_states.i(1)?; 
+        let value_states = qkv_states.i(2)?; 
+        
+        let (query_states, key_states) = apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?; 
+        let query_states = query_states.transpose(0, 1)?.unsqueeze(0)?;
+        let key_states = key_states.transpose(0, 1)?.unsqueeze(0)?;
+        let value_states = value_states.transpose(0, 1)?.unsqueeze(0)?;
+        
+        let q_splits = split_tensor(&query_states, chunks, 2)?;
+        let k_splits = split_tensor(&key_states, chunks, 2)?;
+        let v_splits = split_tensor(&value_states, chunks, 2)?;
+        
         let mut attn_outputs = Vec::new();
         for (q, (k, v)) in q_splits.iter().zip(k_splits.iter().zip(v_splits.iter())) {
             let output = eager_attention_forward(q, k, v, None, None, self.scaling)?;
             attn_outputs.push(output);
         }
-        let attn_output = Tensor::cat(&attn_outputs, 1)?;
-        let attn_output = attn_output.reshape((seq_length, ()))?.contiguous()?;
-        let attn_ouput = attn_output.apply(&self.proj)?;
-        Ok(attn_ouput)
+        
+        let attn_output = Tensor::cat(&attn_outputs, 1)?.reshape((seq_length, ()))?;
+        Ok(self.proj.forward(&attn_output)?)
+    }
+
+    pub fn to_device(&mut self, _device: &Device) -> Result<()> {
+        // GGUF 양자화된 텐서(ProjKind)는 자체 장치를 사용하므로 이동 생략
+        Ok(())
     }
 }
 
@@ -345,27 +349,32 @@ impl Qwen3VLVisionBlock {
     pub fn forward(
         &self,
         xs: &Tensor,
-        cu_seqlens: &Tensor,
+        chunks: &[usize],
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
         let orig_dtype = xs.dtype();
         let residual = xs.clone();
-        let xs = self
-            .norm1
-            .forward(&xs.to_dtype(self.norm1.weight().dtype())?)?;
+        let xs = self.norm1.forward(&xs.to_dtype(self.norm1.weight().dtype())?)?;
         let xs = xs.to_dtype(orig_dtype)?;
-        let xs = self.attn.forward(&xs, cos, sin, cu_seqlens)?;
+        let xs = self.attn.forward(&xs, cos, sin, chunks)?;
         let xs = (residual + xs)?;
         let residual = xs.clone();
-        let xs = self.mlp.forward(
-            &self
-                .norm2
-                .forward(&xs.to_dtype(self.norm2.weight().dtype())?)?
-                .to_dtype(orig_dtype)?,
-        )?;
-        let xs = (residual + xs)?;
-        Ok(xs)
+        let xs = self.mlp.forward(&self.norm2.forward(&xs.to_dtype(self.norm2.weight().dtype())?)?.to_dtype(orig_dtype)?)?;
+        Ok((residual + xs)?)
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let n1_w = self.norm1.weight().to_device(device)?;
+        let n1_b = self.norm1.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
+        self.norm1 = LayerNorm::new(n1_w, n1_b, 1e-6);
+
+        let n2_w = self.norm2.weight().to_device(device)?;
+        let n2_b = self.norm2.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
+        self.norm2 = LayerNorm::new(n2_w, n2_b, 1e-6);
+
+        self.attn.to_device(device)?;
+        Ok(())
     }
 }
 
@@ -423,7 +432,6 @@ impl Qwen3VLVisionModel {
     }
 
     pub fn new_from_gguf<R: Read + Seek>(mmproj_gguf: &mut Gguf<R>) -> Result<Self> {
-        // let num_layers = gguf.get_matedata("qwen35.block_count")?.to_u32()? as usize;
         let spatial_merge_size = mmproj_gguf
             .get_matedata("clip.vision.spatial_merge_size")?
             .to_u32()? as usize;
@@ -454,7 +462,6 @@ impl Qwen3VLVisionModel {
             .to_u32()? as usize;
         for i in 0..num_block {
             let prefix = format!("v.blk.{i}");
-            // let block = Qwen3VLVisionBlock::new(config.clone(), vb_blocks.pp(i))?;
             let block = Qwen3VLVisionBlock::new_from_gguf(mmproj_gguf, &prefix, rms_norm_eps)?;
             blocks.push(block);
         }
@@ -508,184 +515,139 @@ impl Qwen3VLVisionModel {
         })
     }
 
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.patch_embed.to_device(device)?;
+        let p_w = self.pos_embed.embeddings().to_device(device)?;
+        self.pos_embed = Embedding::new(p_w, self.pos_embed.hidden_size());
+        for block in self.blocks.iter_mut() { block.to_device(device)?; }
+        self.merger.to_device(device)?;
+        for merger in self.deepstack_merger_list.iter_mut() { merger.to_device(device)?; }
+        Ok(())
+    }
+
     pub fn fast_pos_embed_interpolate(&self, grid_thw: &Tensor) -> Result<Tensor> {
-        let mut idx_list = vec![vec![]; 4];
-        let mut weight_list = vec![vec![]; 4];
+        let dev = grid_thw.device(); // 최종 목적지 (GPU)
+        let cpu_dev = &Device::Cpu;  // 모든 연산은 CPU에서 수행하여 CUDA 에러 차단
+        let grid_thw_cpu = grid_thw.to_device(cpu_dev)?.to_vec2::<u32>()?;
+        
+        // U32 커널 에러 차단을 위해 처음부터 F32로 연산
+        let side_tensor = Tensor::new(self.num_grid_per_side as f32, cpu_dev)?;
+        let one_t_f32 = Tensor::new(1f32, cpu_dev)?;
+        
+        let mut idx_tensors: [Vec<Tensor>; 4] = Default::default();
+        let mut weight_tensors: [Vec<Tensor>; 4] = Default::default();
         let mut split_idx = vec![];
+
         for i in 0..grid_thw.dim(0)? {
-            let [_, h, w] = grid_thw.i(i)?.to_vec1::<u32>()?[..] else {
-                return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
-            };
+            let [_, h, w] = grid_thw_cpu[i][..] else { return Err(anyhow!("...")); };
             split_idx.push((h * w) as usize);
             let num_grid_per_side_sub_one = (self.num_grid_per_side - 1) as f32;
-            let h_idxs = linspace(
-                0.0,
-                num_grid_per_side_sub_one,
-                h as usize,
-                grid_thw.device(),
-            )?;
-            let w_idxs = linspace(
-                0.0,
-                num_grid_per_side_sub_one,
-                w as usize,
-                grid_thw.device(),
-            )?;
-            let h_idxs_floor = h_idxs.to_dtype(candle_core::DType::U32)?;
-            let w_idxs_floor = w_idxs.to_dtype(candle_core::DType::U32)?;
-            let h_idxs_ceil = h_idxs_floor
-                .affine(1.0, 1.0)?
-                .clamp(0u32, num_grid_per_side_sub_one as u32)?;
-            let w_idxs_ceil = w_idxs_floor
-                .affine(1.0, 1.0)?
-                .clamp(0u32, num_grid_per_side_sub_one as u32)?;
-            let dh = h_idxs
-                .sub(&h_idxs_floor.to_dtype(h_idxs.dtype())?)?
-                .unsqueeze(D::Minus1)?;
-            let dw = w_idxs
-                .sub(&w_idxs_floor.to_dtype(h_idxs.dtype())?)?
-                .unsqueeze(0)?;
-            let base_h = h_idxs_floor
-                .affine(self.num_grid_per_side as f64, 0.0)?
-                .unsqueeze(D::Minus1)?;
-            let base_h_ceil = h_idxs_ceil
-                .affine(self.num_grid_per_side as f64, 0.0)?
-                .unsqueeze(D::Minus1)?;
-            idx_list[0].extend_from_slice(
-                &base_h
-                    .broadcast_add(&w_idxs_floor.unsqueeze(0)?)?
-                    .flatten_all()?
-                    .to_vec1::<u32>()?,
-            );
-            idx_list[1].extend_from_slice(
-                &base_h
-                    .broadcast_add(&w_idxs_ceil.unsqueeze(0)?)?
-                    .flatten_all()?
-                    .to_vec1::<u32>()?,
-            );
-            idx_list[2].extend_from_slice(
-                &base_h_ceil
-                    .broadcast_add(&w_idxs_floor.unsqueeze(0)?)?
-                    .flatten_all()?
-                    .to_vec1::<u32>()?,
-            );
-            idx_list[3].extend_from_slice(
-                &base_h_ceil
-                    .broadcast_add(&w_idxs_ceil.unsqueeze(0)?)?
-                    .flatten_all()?
-                    .to_vec1::<u32>()?,
-            );
+            let h_idxs = linspace(0.0, num_grid_per_side_sub_one, h as usize, cpu_dev)?;
+            let w_idxs = linspace(0.0, num_grid_per_side_sub_one, w as usize, cpu_dev)?;
+            
+            let h_idxs_floor = h_idxs.floor()?;
+            let w_idxs_floor = w_idxs.floor()?;
+            
+            let h_idxs_ceil = h_idxs_floor.broadcast_add(&one_t_f32)?.clamp(0f32, num_grid_per_side_sub_one)?;
+            let w_idxs_ceil = w_idxs_floor.broadcast_add(&one_t_f32)?.clamp(0f32, num_grid_per_side_sub_one)?;
+            
+            let dh = h_idxs.sub(&h_idxs_floor)?.unsqueeze(D::Minus1)?;
+            let dw = w_idxs.sub(&w_idxs_floor)?.unsqueeze(0)?;
+            
+            let base_h = h_idxs_floor.broadcast_mul(&side_tensor)?.unsqueeze(D::Minus1)?;
+            let base_h_ceil = h_idxs_ceil.broadcast_mul(&side_tensor)?.unsqueeze(D::Minus1)?;
 
-            let one_sub_dh = Tensor::ones_like(&dh)?.sub(&dh)?;
-            let one_sub_dw = Tensor::ones_like(&dw)?.sub(&dw)?;
+            // 안전한 CPU에서 U32 캐스팅
+            idx_tensors[0].push(base_h.broadcast_add(&w_idxs_floor.unsqueeze(0)?)?.to_dtype(DType::U32)?.flatten_all()?);
+            idx_tensors[1].push(base_h.broadcast_add(&w_idxs_ceil.unsqueeze(0)?)?.to_dtype(DType::U32)?.flatten_all()?);
+            idx_tensors[2].push(base_h_ceil.broadcast_add(&w_idxs_floor.unsqueeze(0)?)?.to_dtype(DType::U32)?.flatten_all()?);
+            idx_tensors[3].push(base_h_ceil.broadcast_add(&w_idxs_ceil.unsqueeze(0)?)?.to_dtype(DType::U32)?.flatten_all()?);
 
-            weight_list[0].extend_from_slice(
-                &one_sub_dh
-                    .broadcast_mul(&one_sub_dw)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?,
-            );
-            weight_list[1].extend_from_slice(
-                &one_sub_dh
-                    .broadcast_mul(&dw)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?,
-            );
-            weight_list[2].extend_from_slice(
-                &dh.broadcast_mul(&one_sub_dw)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?,
-            );
-            weight_list[3]
-                .extend_from_slice(&dh.broadcast_mul(&dw)?.flatten_all()?.to_vec1::<f32>()?);
+            let one_sub_dh = dh.affine(-1.0, 1.0)?;
+            let one_sub_dw = dw.affine(-1.0, 1.0)?;
+
+            weight_tensors[0].push(one_sub_dh.broadcast_mul(&one_sub_dw)?.flatten_all()?);
+            weight_tensors[1].push(one_sub_dh.broadcast_mul(&dw)?.flatten_all()?);
+            weight_tensors[2].push(dh.broadcast_mul(&one_sub_dw)?.flatten_all()?);
+            weight_tensors[3].push(dh.broadcast_mul(&dw)?.flatten_all()?);
         }
-        let idx_tensor = Tensor::new(idx_list, grid_thw.device())?;
-        let weight_tensor = Tensor::new(weight_list, grid_thw.device())?.to_dtype(self.dtype)?;
-        let pos_embeds = self
-            .pos_embed
-            .forward(&idx_tensor)?
-            .broadcast_mul(&weight_tensor.unsqueeze(D::Minus1)?)?;
-        let patch_pos_embeds = pos_embeds
-            .i(0)?
-            .add(&pos_embeds.i(1)?)?
-            .add(&pos_embeds.i(2)?)?
-            .add(&pos_embeds.i(3)?)?;
+
+        // 연산이 끝난 후 최종 결과만 GPU로 전송
+        let idx_tensor = Tensor::stack(&[
+            Tensor::cat(&idx_tensors[0], 0)?, Tensor::cat(&idx_tensors[1], 0)?,
+            Tensor::cat(&idx_tensors[2], 0)?, Tensor::cat(&idx_tensors[3], 0)?,
+        ], 0)?.to_device(dev)?; 
+
+        let weight_tensor = Tensor::stack(&[
+            Tensor::cat(&weight_tensors[0], 0)?, Tensor::cat(&weight_tensors[1], 0)?,
+            Tensor::cat(&weight_tensors[2], 0)?, Tensor::cat(&weight_tensors[3], 0)?,
+        ], 0)?.to_device(dev)?.to_dtype(self.dtype)?; 
+        
+        let pos_embeds = self.pos_embed.forward(&idx_tensor)?.broadcast_mul(&weight_tensor.unsqueeze(D::Minus1)?)?;
+        let patch_pos_embeds = pos_embeds.i(0)?.add(&pos_embeds.i(1)?)?.add(&pos_embeds.i(2)?)?.add(&pos_embeds.i(3)?)?;
+        
         let mut patch_pos_embeds_permute = vec![];
         let patch_pos_embeds = split_tensor(&patch_pos_embeds, &split_idx, 0)?;
         let merge_size = self.spatial_merge_size;
         for (i, pos_embed) in patch_pos_embeds.iter().enumerate() {
-            let [t, h, w] = grid_thw.i(i)?.to_vec1::<u32>()?[..] else {
-                return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
-            };
-            // let pos_embed = &patch_pos_embeds[i];
-            let pos_emebd_last_dim = pos_embed.dim(D::Minus1)?;
+            let [t, h, w] = grid_thw_cpu[i][..] else { return Err(anyhow!("...")); };
+            let pos_emebd_last_dim: usize = pos_embed.dim(D::Minus1)?;
             let pos_embed = pos_embed.repeat((t as usize, 1))?;
-            let shape = Shape::from(vec![
-                t as usize,
-                h as usize / merge_size,
-                merge_size,
-                w as usize / merge_size,
-                merge_size,
-                pos_emebd_last_dim,
-            ]);
-            let pos_embed = pos_embed
-                .reshape(shape)?
-                .permute((0, 1, 3, 2, 4, 5))?
-                .flatten(0, 4)?;
+            let shape = Shape::from(vec![t as usize, h as usize / merge_size, merge_size, w as usize / merge_size, merge_size, pos_emebd_last_dim]);
+            let pos_embed = pos_embed.reshape(shape)?.permute((0, 1, 3, 2, 4, 5))?.flatten(0, 4)?;
             patch_pos_embeds_permute.push(pos_embed);
         }
-        let patch_pos_embeds = Tensor::cat(&patch_pos_embeds_permute, 0)?;
-        Ok(patch_pos_embeds)
+        Ok(Tensor::cat(&patch_pos_embeds_permute, 0)?)
     }
 
     pub fn rot_pos_emb(&self, grid_thw: &Tensor) -> Result<Tensor> {
+        let dev = grid_thw.device();
+        let cpu_dev = &Device::Cpu;
         let merge_size = self.spatial_merge_size;
-        let max_hw = grid_thw.i((.., 1..))?.max_all()?.to_scalar::<u32>()?;
-        let freq_table = self
-            .rotary_pos_emb
-            .forward(max_hw as usize, grid_thw.device())?;
+        let grid_thw_cpu = grid_thw.to_device(cpu_dev)?.to_vec2::<u32>()?;
+        let max_hw = grid_thw_cpu.iter().flat_map(|thw| [thw[1], thw[2]]).max().unwrap_or(0);
+
+        let freq_table = self.rotary_pos_emb.forward(max_hw as usize, dev)?; 
         let mut pos_ids_vec = vec![];
+        
         for i in 0..grid_thw.dim(0)? {
-            let [t, h, w] = grid_thw.i(i)?.to_vec1::<u32>()?[..] else {
-                return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
-            };
+            let [t, h, w] = grid_thw_cpu[i][..] else { return Err(anyhow!("...")); };
             let merged_h = h / merge_size as u32;
             let merged_w = w / merge_size as u32;
-            let blocks_rows = Tensor::arange(0, merged_h, grid_thw.device())?;
-            let blocks_cols = Tensor::arange(0, merged_w, grid_thw.device())?;
-            let intra_row = Tensor::arange(0, merge_size as u32, grid_thw.device())?;
-            let intra_col = Tensor::arange(0, merge_size as u32, grid_thw.device())?;
+            
+            // 모든 행렬 연산을 CPU에서 F32로 처리하여 CUDA 에러 방지
+            let blocks_rows = Tensor::arange(0f32, merged_h as f32, cpu_dev)?;
+            let blocks_cols = Tensor::arange(0f32, merged_w as f32, cpu_dev)?;
+            let intra_row = Tensor::arange(0f32, merge_size as f32, cpu_dev)?;
+            let intra_col = Tensor::arange(0f32, merge_size as f32, cpu_dev)?;
 
             let row_idx = blocks_rows
-                .reshape(((), 1, 1, 1))?
-                .contiguous()?
-                .affine(merge_size as f64, 0.0)?
-                .broadcast_add(&intra_row.reshape((1, 1, (), 1))?.contiguous()?)?;
+                .unsqueeze(1)?.unsqueeze(2)?.unsqueeze(3)?
+                .broadcast_mul(&Tensor::new(merge_size as f32, cpu_dev)?)?
+                .broadcast_add(&intra_row.unsqueeze(0)?.unsqueeze(1)?.unsqueeze(3)?)?;
+
             let col_idx = blocks_cols
-                .reshape((1, (), 1, 1))?
-                .contiguous()?
-                .affine(merge_size as f64, 0.0)?
-                .broadcast_add(&intra_col.reshape((1, 1, 1, ()))?.contiguous()?)?;
-            let row_idx = row_idx
-                .expand((merged_h as usize, merged_w as usize, merge_size, merge_size))?
-                .flatten_all()?;
-            let col_idx = col_idx
-                .expand((merged_h as usize, merged_w as usize, merge_size, merge_size))?
-                .flatten_all()?;
+                .unsqueeze(0)?.unsqueeze(2)?.unsqueeze(3)?
+                .broadcast_mul(&Tensor::new(merge_size as f32, cpu_dev)?)?
+                .broadcast_add(&intra_col.unsqueeze(0)?.unsqueeze(1)?.unsqueeze(2)?)?;
+
+            let row_idx = row_idx.expand((merged_h as usize, merged_w as usize, merge_size, merge_size))?.contiguous()?.flatten_all()?;
+            let col_idx = col_idx.expand((merged_h as usize, merged_w as usize, merge_size, merge_size))?.contiguous()?.flatten_all()?;
+                
             let mut coords = Tensor::stack(&[row_idx, col_idx], D::Minus1)?.contiguous()?;
-            if t > 1 {
-                coords = coords.repeat((t as usize, 1))?;
-            }
-            pos_ids_vec.push(coords);
+            if t > 1 { coords = coords.repeat((t as usize, 1))?; }
+            
+            // 연산 완료 후 최종적으로 GPU 이동 및 U32 변환
+            pos_ids_vec.push(coords.to_device(dev)?.to_dtype(DType::U32)?);
         }
         let pos_ids = Tensor::cat(&pos_ids_vec, 0)?;
-        let pos_ids_h = pos_ids.i((.., 0))?.contiguous()?;
-        // 第二列是w维度的索引
-        let pos_ids_w = pos_ids.i((.., 1))?.contiguous()?;
+        let pos_ids_h = pos_ids.i((.., 0))?.contiguous()?; 
+        let pos_ids_w = pos_ids.i((.., 1))?.contiguous()?; 
+        
         let rotary_pos_emb_h = freq_table.index_select(&pos_ids_h, 0)?;
         let rotary_pos_emb_w = freq_table.index_select(&pos_ids_w, 0)?;
-        // 每个patch融合h索引和w索引两个的位置编码信息
-        let rotary_pos_emb = Tensor::cat(&[rotary_pos_emb_h, rotary_pos_emb_w], 1)?.contiguous()?;
-        Ok(rotary_pos_emb)
+        
+        Ok(Tensor::cat(&[rotary_pos_emb_h, rotary_pos_emb_w], 1)?.contiguous()?)
     }
 
     pub fn forward(
@@ -694,43 +656,31 @@ impl Qwen3VLVisionModel {
         grid_thw: &Tensor,
     ) -> Result<(Tensor, Vec<Tensor>)> {
         let hidden_states = self.patch_embed.forward(hidden_states)?;
-        let pos_embeds = self
-            .fast_pos_embed_interpolate(grid_thw)?
-            .to_dtype(hidden_states.dtype())?;
+        let pos_embeds = self.fast_pos_embed_interpolate(grid_thw)?.to_dtype(hidden_states.dtype())?;
         let hidden_states = hidden_states.broadcast_add(&pos_embeds)?;
         let rotary_pos_emb = self.rot_pos_emb(grid_thw)?;
         let seq_len = hidden_states.dim(0)?;
         let mut hidden_states = hidden_states.reshape((seq_len, ()))?;
         let rotary_pos_emb = rotary_pos_emb.reshape((seq_len, ()))?;
         let emb = Tensor::cat(&[&rotary_pos_emb, &rotary_pos_emb], D::Minus1)?;
-        let cos = emb.cos()?;
-        let sin = emb.sin()?;
-        let cu_seqlens = grid_thw.i((.., 1))?.mul(&grid_thw.i((.., 2))?)?;
-        let grid_t = grid_thw.i((.., 0))?.to_vec1::<u32>()?;
-        let mut cu_seqlens_repeat = Vec::new();
-        for (index, t) in grid_t.iter().enumerate() {
-            cu_seqlens_repeat.push(cu_seqlens.i(index)?.repeat(*t as usize)?);
+        let cos = emb.cos()?.to_dtype(self.dtype)?;
+        let sin = emb.sin()?.to_dtype(self.dtype)?;
+        
+        let grid_thw_cpu = grid_thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
+        let mut chunks = Vec::new();
+        for thw in grid_thw_cpu {
+            let (t, h, w) = (thw[0] as usize, thw[1] as usize, thw[2] as usize);
+            let hw = h * w;
+            for _ in 0..t { chunks.push(hw); }
         }
-        let cu_seqlens_full = Tensor::cat(&cu_seqlens_repeat, 0)?.flatten_all()?;
-        let cu_seqlens = cu_seqlens_full
-            .to_dtype(DType::F64)?
-            .cumsum(0)?
-            .to_dtype(DType::U32)?
-            .pad_with_zeros(D::Minus1, 1, 0)?;
+
         let mut deepstack_feature_lists = vec![];
         for (layer_num, block) in self.blocks.iter().enumerate() {
-            hidden_states = block.forward(&hidden_states, &cu_seqlens, &cos, &sin)?;
+            hidden_states = block.forward(&hidden_states, &chunks, &cos, &sin)?;
             if self.deepstack_visual_indexes.contains(&layer_num) {
-                if let Some(index) = self
-                    .deepstack_visual_indexes
-                    .iter()
-                    .position(|&x| x == layer_num)
-                {
-                    let deepstack_feature =
-                        self.deepstack_merger_list[index].forward(&hidden_states)?;
+                if let Some(index) = self.deepstack_visual_indexes.iter().position(|&x| x == layer_num) {
+                    let deepstack_feature = self.deepstack_merger_list[index].forward(&hidden_states)?;
                     deepstack_feature_lists.push(deepstack_feature);
-                } else {
-                    println!("Value not found");
                 }
             }
         }
