@@ -151,7 +151,7 @@ impl Qwen3_5GenerateModel {
         let temperature = mes.temperature.unwrap_or(0.4);
         let top_p = mes.top_p.unwrap_or(0.95);
         let mut logit_processor =
-            get_logit_processor(Some(temperature as f32), Some(top_p as f32), Some(20), seed);
+            get_logit_processor(Some(temperature as f32), Some(top_p as f32), Some(40), seed);
         
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         
@@ -340,7 +340,7 @@ impl Qwen3_5GenerateModel {
         let mut logit_processor = get_logit_processor(
             Some(mes.temperature.unwrap_or(0.1) as f32), 
             Some(mes.top_p.unwrap_or(0.9) as f32), 
-            Some(20), 
+            Some(40), 
             mes.seed.unwrap_or(32768) as u64
         );
         
