@@ -1404,12 +1404,16 @@ impl Qwen3_5TextModel {
             if !is_decoding {
                 // 가중치 소각(clear_weights) 전, SSM State를 안전한 CPU 메모리로 대피시킵니다!
                 if layer.layer_type == "linear_attention" {
+                    let is_dirty_backup = layer.is_ssm_dirty(); // 🌟 핵심 픽스 2: 기억 상실 방지 플래그 백업
+                    
                     let (conv_opt, rec_opt) = layer.get_ssm_states();
                     if let (Some(conv), Some(rec)) = (conv_opt, rec_opt) {
                         let safe_conv = conv.to_device(&candle_core::Device::Cpu).unwrap_or(conv);
                         let safe_rec = rec.to_device(&candle_core::Device::Cpu).unwrap_or(rec);
                         layer.set_ssm_states(Some(safe_conv), Some(safe_rec));
                     }
+
+                    layer.set_ssm_dirty(is_dirty_backup); // 🌟 핵심 픽스 2: 메모리 대피 후 플래그 원상 복구하여 SSD에 강제 저장!
                 }
                 layer.clear_weights();
             }
@@ -1859,16 +1863,25 @@ impl Qwen3_5Model {
     ) -> Result<Tensor> {
         let (bs, seq_len, _) = inputs_embeds.dims3()?;
 
-        // 🌟 핵심 픽스: 이미지를 처음 읽는 단계(offset==0)에서는 
-        // 3D 공간 인덱스를 절대 버리지 않고 그대로 GPU에 전달하여 "시각적 구조"를 보존합니다!
-        if seqlen_offset == 0 {
-            let (pos_ids, rope_deltas, deltas_cpu) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
+        let has_vision = image_grid_thw.is_some() || video_grid_thw.is_some();
+
+        // 🌟 핵심 픽스 1: 이미지가 포함된 경우 (SSD 캐시에 이어붙이는 경우 포함)
+        // 무조건 3D 공간 인덱스를 계산하여 시각적 구조를 완벽히 보존합니다!
+        if seqlen_offset == 0 || has_vision {
+            let (mut pos_ids, rope_deltas, deltas_cpu) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
+            
+            if seqlen_offset > 0 {
+                // 이전 문맥(13,000토큰 등)에 이어붙이는 경우, 3D 구조를 유지한 채로 오프셋만 밀어줍니다.
+                let offset_t = Tensor::new(seqlen_offset as f32, &Device::Cpu)?;
+                pos_ids = pos_ids.broadcast_add(&offset_t)?;
+            }
+
             self.rope_deltas = Some(rope_deltas);
             self.rope_deltas_cpu = Some(deltas_cpu);
             return Ok(pos_ids.to_device(inputs_embeds.device())?);
         }
 
-        // 이후 텍스트를 1글자씩 뱉는 디코딩 단계에서는 선형(1D)으로 숫자를 올립니다.
+        // 텍스트를 1글자씩 뱉는 디코딩 단계에서는 선형(1D)으로 숫자를 올립니다.
         if self.rope_deltas_cpu.is_none() {
             self.rope_deltas_cpu = Some(vec![0i64; bs]);
         }
