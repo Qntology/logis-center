@@ -156,18 +156,57 @@ impl Qwen3VLProcessor {
     ) -> Result<Tensor> {
         let img_h = img.height();
         let img_w = img.width();
-        //  h,w resize成 32的倍数
+        
+        // 🌟 픽스 1: 픽셀 면적(Max/Min Pixels)으로 입력된 값을 실제 엣지 길이로 안전하게 변환
+        let mut longest_edge = (self.img_process_cfg.size.longest_edge as f64).sqrt() as u32;
+        let mut shortest_edge = (self.img_process_cfg.size.shortest_edge as f64).sqrt() as u32;
+        
+        // 상식적인 엣지 길이 범위를 벗어나지 않도록 폴백(Fallback) 방어선 구축
+        if longest_edge > 4096 || longest_edge < 100 { longest_edge = 4096; }
+        if shortest_edge > 1024 || shortest_edge < 100 { shortest_edge = 256; }
+
+        // 🌟 픽스 2: VRAM 동적 캡핑 (3.9GB GPU가 터지는 것을 막기 위해 해상도 제한)
+        use sysinfo::System;
+        let mut sys = System::new_all();
+        sys.refresh_memory();
+        let free_ram = sys.available_memory();
+        
+        if free_ram < 2_000_000_000 && longest_edge > 1024 {
+            println!("[PROCESSOR] Low System RAM. Capping Image to 1024px.");
+            longest_edge = 1024;
+        }
+
+        if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+            if let Ok(dev) = nvml.device_by_index(0) {
+                if let Ok(mem) = dev.memory_info() {
+                    if mem.free < 2_000_000_000 {
+                        let cap = if mem.free < 800_000_000 { 768 } else { 896 };
+                        if longest_edge > cap {
+                            longest_edge = cap;
+                        }
+                    } else if mem.free < 4_500_000_000 {
+                        // 3.9GB VRAM 환경에 최적화: 최대 1344px (약 1500~2000 이미지 토큰 생성)
+                        if longest_edge > 1344 {
+                            longest_edge = 1344;
+                        }
+                    }
+                }
+            }
+        }
+
+        // h,w resize를 패치 크기의 배수로 최적화
         let (resize_h, resize_w) = img_smart_resize(
             img_h,
             img_w,
             (self.img_process_cfg.patch_size * self.img_process_cfg.merge_size) as u32,
-            self.img_process_cfg.size.shortest_edge as u32,
-            self.img_process_cfg.size.longest_edge as u32,
+            shortest_edge,
+            longest_edge,
         )?;
+        
         let img = img.resize_exact(resize_w, resize_h, image::imageops::FilterType::CatmullRom);
         let img_tensor = img_transform(&img, img_mean, img_std, &self.device, self.dtype)?;
-        // (c, h, w) => (1, c, h, w)
         let img_tensor = img_tensor.unsqueeze(0)?;
+        
         Ok(img_tensor)
     }
 
