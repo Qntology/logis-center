@@ -3,7 +3,6 @@ use anyhow::{Result, anyhow};
 use candle_core::{DType, Device, Tensor, quantized::gguf_file};
 use candle_nn::VarBuilder;
 use std::io::Write;
-// [추가] 취소 토큰 및 비동기 상태 처리를 위한 패키지
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use crate::{
@@ -76,7 +75,7 @@ impl Qwen3_5GenerateModel {
         mmproj_file: Option<&str>,
         device: Option<&Device>,
     ) -> Result<Self> {
-        // 🌟 [핵심 변경] 단순 File 오픈이 아닌 Mmap으로 메모리에 매핑합니다.
+        // Mmap으로 메모리에 매핑
         let file = std::fs::File::open(model_file)?;
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
         let mmap_arc = std::sync::Arc::new(mmap);
@@ -84,7 +83,7 @@ impl Qwen3_5GenerateModel {
         let mut reader = std::io::Cursor::new(&mmap_arc[..]);
         let content = gguf_file::Content::read(&mut reader)?;
         
-        // 🌟 [수정] Content는 Clone이 불가능하므로, 메타데이터만 가볍게 한 번 더 읽어서 Arc에 담아줍니다.
+        // Content Clone 우회를 위한 메타데이터 Arc 래핑
         let mut reader_clone = std::io::Cursor::new(&mmap_arc[..]);
         let content_clone = gguf_file::Content::read(&mut reader_clone)?;
         let ct_arc = std::sync::Arc::new(content_clone);
@@ -114,12 +113,12 @@ impl Qwen3_5GenerateModel {
             .get_matedata("tokenizer.ggml.eos_token_id")?
             .to_u32()?;
             
-        // 🌟 [수정] 밥줄(Mmap, Ct)을 쥐여준 채로 모델을 생성합니다.
+        // 밥줄(Mmap, Ct)을 쥐여준 채로 모델 생성
         let qwen3_5 = Qwen3_5Model::new_from_gguf(
             &mut model_gguf, 
             mmproj_gguf.as_mut(), 
             &device,
-            Some(mmap_arc.clone()), // 🌟 [핵심 수정] .clone()을 붙여서 포인터만 우아하게 넘겨줍니다!
+            Some(mmap_arc.clone()), 
             Some(ct_arc)
         )?;
         
@@ -141,8 +140,6 @@ impl Qwen3_5GenerateModel {
         })
     }
 
-    // 🌟 [핵심 변경점] 0.6B 모델과 완벽하게 동일한 파라미터 구조를 가지도록 시그니처 수정
-    // 🌟 1. generate 함수 전체 교체
     pub async fn generate(
         &mut self, 
         mes: ChatCompletionParameters, 
@@ -158,7 +155,7 @@ impl Qwen3_5GenerateModel {
         
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         
-        // 👇 [핵심 추가 1] 메세지 내부에 이미지나 비디오 URL이 존재하는지 직접 안전하게 판별합니다.
+        // 메세지 내 비전 URL 유무 판별
         let has_vision = mes.messages.iter().any(|msg| {
             if let ChatCompletionRequestMessage::User(user_msg) = msg {
                 if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
@@ -167,7 +164,7 @@ impl Qwen3_5GenerateModel {
             } else { false }
         });
 
-        // 👇 [핵심 추가 2] 비전 콘텐츠가 있을 때만 processor를 태우고, 순수 텍스트면 원본 ChatML을 그대로 보존합니다!
+        // 비전 유무에 따른 전처리 분기
         let (mes_text, pixel_values, image_grid_thw, pixel_values_video, video_grid_thw): (String, Option<Tensor>, Option<Tensor>, Option<Tensor>, Option<Tensor>) =
             if has_vision && self.pre_processor.is_some() {
                 let processor = self.pre_processor.as_ref().unwrap();
@@ -230,7 +227,7 @@ impl Qwen3_5GenerateModel {
                 image_grid_thw,
                 cur_pixel_values_video,
                 video_grid_thw,
-                None, // <--- [수정] cache_position 추가
+                None, 
                 seqlen_offset,
                 session_id.clone(), 
                 kv_name.clone()     
@@ -238,7 +235,6 @@ impl Qwen3_5GenerateModel {
             
             let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
 
-            // 👇 루프 반복 억제 페널티 강화 (1.2)
             let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
             let len = logits_vec.len();
             
@@ -268,7 +264,6 @@ impl Qwen3_5GenerateModel {
             let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
             let mut next_token = logit_processor.sample(&logits)?;
             
-            // 강제 JSON 시작 방어
             if i == 0 && (is_strict_json || next_token == self.eos_token_id) {
                 next_token = open_bracket_id;
             }
@@ -316,8 +311,6 @@ impl Qwen3_5GenerateModel {
         Ok(res)
     }
 
-    // 🌟 2. generate_part 함수 전체 교체
-    // 🌟 2. generate_part 함수 전체 교체
     pub async fn generate_part(
         &mut self,
         mes: &ChatCompletionParameters,
@@ -341,7 +334,6 @@ impl Qwen3_5GenerateModel {
 
             let mes_render = self.chat_template.apply_chat_template(mes)?;
             
-            // 👇 메세지 내부에 이미지나 비디오 URL이 존재하는지 직접 안전하게 판별합니다.
             let has_vision = mes.messages.iter().any(|msg| {
                 if let ChatCompletionRequestMessage::User(user_msg) = msg {
                     if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
@@ -350,7 +342,6 @@ impl Qwen3_5GenerateModel {
                 } else { false }
             });
 
-            // 👇 비전 콘텐츠가 있을 때만 processor를 태우고, 순수 텍스트면 원본 ChatML을 그대로 보존합니다!
             let (text, px_vals, img_thw, vid_px_vals, vid_thw) = if has_vision && self.pre_processor.is_some() {
                 let processor = self.pre_processor.as_ref().unwrap();
                 let input = processor.process_info(mes, &mes_render)?;
@@ -359,7 +350,6 @@ impl Qwen3_5GenerateModel {
                 (mes_render, None, None, None, None)
             };
             
-            // 🌟 [추가된 부분] 캐시가 존재하는지 검사하여 스킵 여부를 결정합니다.
             let ids_vec = self.tokenizer.text_encode_vec(text, false)?;
             let total_toks = ids_vec.len();
 
@@ -375,12 +365,10 @@ impl Qwen3_5GenerateModel {
                 }
             }
 
-            // 🌟 [핵심 수정] 구워진 캐시가 있다면 캐시를 비우지 않고, 누락된 토큰부터 시작합니다!
             if baked_len > 0 && baked_len < total_toks {
                 println!("[SKIP-PREFILL] Qwen 3.5 Reusing baked context in generate_part: {} tokens.", baked_len);
                 
-                // 🌟 [CRITICAL FIX] Attention 레이어를 위한 KV 레지스트리 복원!
-                // 이것이 없으면 Hybrid 모델 내의 Full Attention 레이어들이 과거 토큰을 완전히 무시해버립니다.
+                // Attention 레이어를 위한 KV 레지스트리 복원
                 if let Some(s_id) = &session_id {
                     let kv_name_raw = kv_name.as_deref().unwrap_or("text");
                     let kv_type = kv_name_raw.split('/').last().unwrap_or("text");
@@ -393,7 +381,6 @@ impl Qwen3_5GenerateModel {
                 let ids = Tensor::from_vec(missing_ids, (1, missing_len), &self.device)?;
                 (ids, baked_len, px_vals, img_thw, vid_px_vals, vid_thw)
             } else {
-                // 캐시가 없을 때만 초기화!
                 self.clear_kv_cache();
                 let ids = Tensor::from_vec(ids_vec, (1, total_toks), &self.device)?;
                 (ids, 0, px_vals, img_thw, vid_px_vals, vid_thw)
@@ -409,7 +396,6 @@ impl Qwen3_5GenerateModel {
         
         println!("\n[AI Thinking...]");
 
-        // 🌟 [CRITICAL FIX] 추론을 시작하기 전에 혹시라도 밀려있는 SSD I/O 작업이 모두 끝날 때까지 대기합니다!
         crate::models::qwen::generate::wait_for_global_io().await;
 
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(123);
@@ -417,7 +403,6 @@ impl Qwen3_5GenerateModel {
         let mut gen_text_buffer = String::new();
 
         for i in 0..sample_len {
-            // 🌟 [CRITICAL FIX] 각 토큰을 생성할 때도 디스크 병목이 풀렸는지 확인합니다.
             crate::models::qwen::generate::wait_for_global_io().await;
 
             let logits = self.qwen3_5.forward(
@@ -426,15 +411,13 @@ impl Qwen3_5GenerateModel {
                 cur_image_thw.as_ref(),
                 cur_pixel_values_video.as_ref(),
                 cur_video_thw.as_ref(),
-                None, // <--- [수정] cache_position 추가
+                None, 
                 seqlen_offset,
                 session_id.clone(),
                 kv_name.clone()
             ).await?;
             
             let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-            
-            // 👇 루프 반복 억제 페널티 강화 (1.2)
             let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
             let len = logits_vec.len();
 
@@ -460,7 +443,6 @@ impl Qwen3_5GenerateModel {
             let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
             let mut next_token = logit_processor.sample(&logits)?;
             
-            // 강제 JSON 시작 방어
             if i == 0 && next_token == self.eos_token_id {
                 next_token = open_bracket_id;
             }
@@ -518,7 +500,6 @@ impl Qwen3_5GenerateModel {
         })
     }
 
-    // 🌟 [수정된 prefill_only: SSD 쓰기 동기화 대기 로직 완벽 적용]
     pub async fn prefill_only(
         &mut self, 
         mes: ChatCompletionParameters, 
@@ -549,7 +530,7 @@ impl Qwen3_5GenerateModel {
 
         self.qwen3_5.forward(
             &ids_tensor, None, None, None, None, 
-            None, // <--- [수정] cache_position 추가
+            None, 
             0,
             session_id.clone(), kv_name.clone()
         ).await?;
@@ -561,8 +542,7 @@ impl Qwen3_5GenerateModel {
 
             let _ = self.qwen3_5.language_model.force_flush_all_active_blocks(s_id, kv_name.as_deref()).await;
             
-            // 👇 [CRITICAL FIX] Background SSD I/O가 모두 끝날 때까지 완벽하게 대기합니다!!!
-            // 이 코드가 없으면 모델이 빈 허공(Zeros)을 읽고 환각을 일으킵니다.
+            // Background SSD I/O가 끝날 때까지 완벽하게 대기
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             println!("[PREFILL-WAIT] Waiting for SSD write to complete...");
             crate::models::qwen::generate::wait_for_global_io().await;

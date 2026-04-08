@@ -259,7 +259,6 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
     }
 }
 
-// generate.rs 내 spawn_slot_worker 함수의 SaveTask 처리 루프 수정
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(100); 
     tokio::spawn(async move {
@@ -523,9 +522,7 @@ impl QwenVLGenerateModel {
         let t_dev = get_device(text_device); let v_dev = get_device(vision_device); 
         let parsed_dtype = get_dtype(dtype, cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16"));
         
-        // [CRITICAL FIX] CPU 모드일 경우 이미지 전처리기(Processor), 비전 모델, 텍스트 모델 등
-        // 모든 시스템 파이프라인의 데이터 타입을 설정 파일(Config) 무시하고 F32로 완전히 통일시킵니다!
-        // 이를 통해 잠재적인 Vision DType Mismatch 크래시를 막고 오버헤드를 0%로 만듭니다.
+        // [CRITICAL FIX] CPU 모드일 경우 데이터 타입을 설정 파일 무시하고 F32로 완전히 통일
         let effective_dtype = if t_dev.is_cpu() { DType::F32 } else { parsed_dtype };
 
         let gguf_f = find_type_files(path, "gguf")?; let mmproj_p = gguf_f.iter().find(|f| f.contains("mmproj")).cloned();
@@ -552,12 +549,11 @@ impl QwenVLGenerateModel {
         let (e1, e2) = match &g_cfg.eos_token_id { serde_json::Value::Number(n) => { let id = n.as_u64().unwrap_or(151645) as u32; (id, id) }, serde_json::Value::Array(arr) => { (arr.get(0).and_then(|v| v.as_u64()).unwrap_or(151643) as u32, arr.get(1).and_then(|v| v.as_u64()).unwrap_or(151643) as u32) }, _ => (151643, 151643) };
         let loaded_model_name = if m_p.as_ref().map(|p| p.contains("0.6B")).unwrap_or(false) { "0.6B".to_string() } else { "2B".to_string() };
         
-        // [CRITICAL FIX] pre_processor 에도 effective_dtype를 전달하여 생성 단계부터 F32를 보장합니다!
+        // pre_processor 에도 effective_dtype를 전달하여 생성 단계부터 F32 보장
         Ok(Self { chat_template, tokenizer, pre_processor: QwenVLProcessor::new(tok_path, &v_dev, effective_dtype)?, qwen, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: loaded_model_name, hard_token_limit, kv_root })
     }
 
     pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut QwenVLGenerateModel>, _kv_name: Option<String>) -> Result<usize> {
-        // [FIX] Always start prefill from zero to avoid double offset on restart
         self.clear_kv_cache();
         if let ModelVariant::QuantizedVL(m) = &mut self.qwen { m.language_model.truncate_kv_cache(0)?; }
         if let ModelVariant::QuantizedText(m) = &mut self.qwen { m.language_model.truncate_kv_cache(0)?; }
@@ -573,7 +569,6 @@ impl QwenVLGenerateModel {
             fs::write(path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
         
-            // [FIX] IO 카운터가 실제로 올라갈 때까지 미세 대기 후 루프 진입
             tokio::time::sleep(std::time::Duration::from_millis(50)).await; 
             
             println!("[PREFILL-WAIT] Waiting for SSD write to complete...");
@@ -583,123 +578,113 @@ impl QwenVLGenerateModel {
         Ok(total_toks)
     }
 
-        pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
-            // [CONTEXT-RESTORATION] If a session_id is provided, load the previous KV context from SSD
-            let mut is_reference_snapshot = false;
-            if let Some(s_id) = &session_id {
-                let snapshot_root = crate::utils::paths::get_kv_dir(None).join(s_id);
-                
-                // [FIX] Try both 'inference/text' and 'reference/text' paths
-                let paths_to_try = vec![
-                    snapshot_root.join("inference").join("text"),
-                    snapshot_root.join("reference").join("text"),
-                    snapshot_root.clone(),
-                ];
+    pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
+        let mut is_reference_snapshot = false;
+        if let Some(s_id) = &session_id {
+            let snapshot_root = crate::utils::paths::get_kv_dir(None).join(s_id);
+            
+            let paths_to_try = vec![
+                snapshot_root.join("inference").join("text"),
+                snapshot_root.join("reference").join("text"),
+                snapshot_root.clone(),
+            ];
 
-                for snapshot_path in paths_to_try {
-                    if snapshot_path.exists() && fs::read_dir(&snapshot_path).map(|mut d| d.next().is_some()).unwrap_or(false) {
-                        println!("[GEN-LOAD] Loading existing snapshot from {:?}...", snapshot_path);
-                        
-                        // [FIX] If loading from 'reference', we must force prefill for the other 27 layers.
-                        if snapshot_path.to_string_lossy().contains("reference") {
-                            is_reference_snapshot = true;
-                        }
-
-                        let _ = self.load_kv_from_disk(&snapshot_path, None); // [FIX] Already pointed to full path
-                        
-                        if is_reference_snapshot {
-                            println!("[GEN-LOAD] Reference snapshot detected. Resetting Registry Entry states for Full 28-Layer Prefill...");
-                            
-                            // [FIX] Registry 상태를 RAM/Empty로 초기화하고 token_start를 0번부터 다시 설정
-                            let reset_reg = |reg: &KVRegistry| {
-                                let mut entries = reg.entries.write().unwrap();
-                                for (i, entry) in entries.iter_mut().enumerate() {
-                                    for loc in entry.location.iter_mut() { *loc = KVLocation::RAM; }
-                                    for slot in entry.slot_ids.iter_mut() { *slot = None; }
-                                    entry.token_start = i * 256; // [FIX] Re-initialize start position
-                                    entry.token_len = 0;
-                                    entry.is_dirty.fill(true);
-                                    let mut cache = entry.bitkv_cache.write().unwrap();
-                                    cache.fill(None);
-                                }
-                            };
-
-                            if let ModelVariant::QuantizedVL(m) = &mut self.qwen {
-                                reset_reg(&m.language_model.registry);
-                                let _ = m.language_model.truncate_kv_cache(0);
-                            } else if let ModelVariant::QuantizedText(m) = &mut self.qwen {
-                                reset_reg(&m.language_model.registry);
-                                let _ = m.language_model.truncate_kv_cache(0);
-                            }
-                            self.clear_kv_cache();
-                        }
-                        break;
+            for snapshot_path in paths_to_try {
+                if snapshot_path.exists() && fs::read_dir(&snapshot_path).map(|mut d| d.next().is_some()).unwrap_or(false) {
+                    println!("[GEN-LOAD] Loading existing snapshot from {:?}...", snapshot_path);
+                    
+                    if snapshot_path.to_string_lossy().contains("reference") {
+                        is_reference_snapshot = true;
                     }
+
+                    let _ = self.load_kv_from_disk(&snapshot_path, None); 
+                    
+                    if is_reference_snapshot {
+                        println!("[GEN-LOAD] Reference snapshot detected. Resetting Registry Entry states for Full 28-Layer Prefill...");
+                        
+                        let reset_reg = |reg: &KVRegistry| {
+                            let mut entries = reg.entries.write().unwrap();
+                            for (i, entry) in entries.iter_mut().enumerate() {
+                                for loc in entry.location.iter_mut() { *loc = KVLocation::RAM; }
+                                for slot in entry.slot_ids.iter_mut() { *slot = None; }
+                                entry.token_start = i * 256; 
+                                entry.token_len = 0;
+                                entry.is_dirty.fill(true);
+                                let mut cache = entry.bitkv_cache.write().unwrap();
+                                cache.fill(None);
+                            }
+                        };
+
+                        if let ModelVariant::QuantizedVL(m) = &mut self.qwen {
+                            reset_reg(&m.language_model.registry);
+                            let _ = m.language_model.truncate_kv_cache(0);
+                        } else if let ModelVariant::QuantizedText(m) = &mut self.qwen {
+                            reset_reg(&m.language_model.registry);
+                            let _ = m.language_model.truncate_kv_cache(0);
+                        }
+                        self.clear_kv_cache();
+                    }
+                    break;
                 }
             }
-    
-            let temperature = mes.temperature.unwrap_or(0.0) as f32;
-            let seed = mes.seed.unwrap_or(34562) as u64;
-            let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(0.01) as f32), Some(9), seed);
-            let mes_render = self.chat_template.apply_chat_template(&mes)?;
-            let input = self.pre_processor.process_info(&mes, &mes_render)?;
-            let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
-            
-            let total_toks = f_ids.len();
-            println!("[DIAG-GEN] Encoded Prompt Length: {} tokens.", total_toks); // [DEBUG] 24k 원인 파악용
-            
-            let kv_len = self.get_kv_len();
-            
-            // [REFINED-RELAY-LOGIC] Trust restored kv_len and skip prefill if it matches or covers the prompt.
-            let mut gen_text = String::new();
-            let (input_ids, offset) = if kv_len > 0 && !is_reference_snapshot {
-                if kv_len >= total_toks {
-                    println!("[SKIP-PREFILL] Snapshot covers entire prompt (Detected: {}, Needed: {}). Capping offset.", kv_len, total_toks);
-                    // [FIX] Strictly cap offset at total_toks - 1 to prevent double offset
-                    let last_id = *f_ids.last().unwrap_or(&0);
-                    (Tensor::from_vec(vec![last_id], (1, 1), &self.text_device)?, total_toks - 1)
-                } else {
-                    let missing_ids = f_ids[kv_len..].to_vec();
-                    let missing_len = missing_ids.len();
-                    println!("[PARTIAL-PREFILL] Context partially restored ({}). Prefilling remaining {} tokens.", kv_len, missing_len);
-                    (Tensor::from_vec(missing_ids, (1, missing_len), &self.text_device)?, kv_len)
-                }
-            } else {
-                if is_reference_snapshot {
-                    println!("[FULL-PREFILL] Reference context found. Computing entire prompt to fill all 28 layers (Len: {}).", total_toks);
-                } else {
-                    println!("[FULL-PREFILL] No context found. Computing entire prompt (Len: {}).", total_toks);
-                }
-                (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
-            };
-            
-            let total_tokens_after_prefill = offset + input_ids.dim(1)?;
+        }
+
+        let temperature = mes.temperature.unwrap_or(0.0) as f32;
+        let seed = mes.seed.unwrap_or(34562) as u64;
+        let mut lp = get_logit_processor(Some(temperature), Some(mes.top_p.unwrap_or(0.01) as f32), Some(9), seed);
+        let mes_render = self.chat_template.apply_chat_template(&mes)?;
+        let input = self.pre_processor.process_info(&mes, &mes_render)?;
+        let f_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         
-        wait_for_global_io().await; // [SYNC] Ensure disk is ready before inference
+        let total_toks = f_ids.len();
+        println!("[DIAG-GEN] Encoded Prompt Length: {} tokens.", total_toks); 
+        
+        let kv_len = self.get_kv_len();
+        
+        let mut gen_text = String::new();
+        let (input_ids, offset) = if kv_len > 0 && !is_reference_snapshot {
+            if kv_len >= total_toks {
+                println!("[SKIP-PREFILL] Snapshot covers entire prompt (Detected: {}, Needed: {}). Capping offset.", kv_len, total_toks);
+                let last_id = *f_ids.last().unwrap_or(&0);
+                (Tensor::from_vec(vec![last_id], (1, 1), &self.text_device)?, total_toks - 1)
+            } else {
+                let missing_ids = f_ids[kv_len..].to_vec();
+                let missing_len = missing_ids.len();
+                println!("[PARTIAL-PREFILL] Context partially restored ({}). Prefilling remaining {} tokens.", kv_len, missing_len);
+                (Tensor::from_vec(missing_ids, (1, missing_len), &self.text_device)?, kv_len)
+            }
+        } else {
+            if is_reference_snapshot {
+                println!("[FULL-PREFILL] Reference context found. Computing entire prompt to fill all 28 layers (Len: {}).", total_toks);
+            } else {
+                println!("[FULL-PREFILL] No context found. Computing entire prompt (Len: {}).", total_toks);
+            }
+            (Tensor::from_vec(f_ids.clone(), (1, total_toks), &self.text_device)?, 0)
+        };
+        
+        let total_tokens_after_prefill = offset + input_ids.dim(1)?;
+    
+        wait_for_global_io().await; 
         let mut logits = self.qwen.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         
-        // [DEBUG-SAMPLING] 첫 번째 토큰 샘플링 전 로그
-        println!("[DEBUG-GEN] Prefill Complete. EOS IDs: {}, {}. Sampling first token...", self.eos_token_id1, self.eos_token_id2);
+        println!("[DEBUG-GEN] Prefill Complete. Sampling first token...");
 
         let mut gen_ids = vec![];
 
-        // [DENSE-MODE] Find token IDs for '<', 'think', and '{' to apply biases
         let think_token_id = self.tokenizer.text_encode_vec("<think>".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
-        let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(123); // '{' 의 ID
+        let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(123);
         let lt_id = self.tokenizer.text_encode_vec("<".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
 
-        // [STRICT-JSON] 프롬프트에 /no_think 지시어가 있으면 첫 토큰을 무조건 '{'로 강제합니다.
         let is_strict_json = input.replace_text.contains("/no_think") || input.replace_text.contains("RETURN JSON ONLY");
 
         for i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
             
-            // [CRITICAL FIX] PCIe Thrashing 방지: 단 한 번의 CPU 다운로드로 모든 패널티/바이아스 일괄 처리!
+            // PCIe Thrashing 방지: 단 한 번의 CPU 다운로드로 모든 패널티/바이아스 일괄 처리
             let mut logits_vec = logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             let len = logits_vec.len();
 
-            // 1. Repetition Penalty (In-place 연산)
             if !gen_ids.is_empty() {
                 let penalty = 1.2;
                 let mut set = std::collections::HashSet::new();
@@ -712,14 +697,13 @@ impl QwenVLGenerateModel {
                 }
             }
 
-            // 2. [DENSE-BIAS] Token Biases (In-place 연산)
-            if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; } // <think> 억제
+            if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
             if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 10.0; }
             
             if i == 0 {
                 if (self.eos_token_id1 as usize) < len { logits_vec[self.eos_token_id1 as usize] = -10000.0; }
                 if (self.eos_token_id2 as usize) < len { logits_vec[self.eos_token_id2 as usize] = -10000.0; }
-                if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; } // 첫 토큰 줄바꿈 억제
+                if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
                 
                 if (open_bracket_id as usize) < len {
                     let boost = if is_strict_json { 10000.0 } else { 20.0 };
@@ -727,30 +711,25 @@ impl QwenVLGenerateModel {
                 }
             }
 
-            // 모든 수정이 끝난 뒤 딱 한 번만 GPU로 업로드!
             let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
             let mut next_id = lp.sample(&logits_tensor)?;
             
-            // [FORCE-START] Strict JSON 모드이거나, AI가 첫 턴에 변덕을 부려 EOS를 내뱉으려 할 때 무조건 '{' 강제 삽입
             if i == 0 {
                 if is_strict_json {
-                    next_id = open_bracket_id; // 완벽한 강제 주입
+                    next_id = open_bracket_id;
                 } else if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 {
                     println!("[DEBUG-GEN] EOS detected on first token. Overriding with '{{' to force JSON.");
                     next_id = open_bracket_id;
                 }
-                println!("[DEBUG-GEN] First Token Final: {} ('{}')", next_id, self.tokenizer.token_decode(vec![next_id]).unwrap_or_else(|_| "???".to_string()));
             }
 
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
-                if i == 0 { println!("[DEBUG-GEN] Warning: Model emitted EOS on first token."); }
                 break; 
             }
             gen_ids.push(next_id);
             let piece = self.tokenizer.token_decode(vec![next_id])?;
             gen_text.push_str(&piece);
 
-            // [EARLY-STOP] JSON 중첩 깊이(Nesting Depth)를 추적하여 완벽히 닫혔을 때만 종료
             if gen_text.contains('{') {
                 let mut depth = 0;
                 let mut has_started = false;
@@ -758,7 +737,6 @@ impl QwenVLGenerateModel {
                     if c == '{' { depth += 1; has_started = true; }
                     else if c == '}' { depth -= 1; }
                 }
-                // 모든 괄호의 쌍이 맞고(depth 0), 마지막 토큰이 '}' 계열일 때 종료
                 if has_started && depth == 0 && gen_text.trim_end().ends_with('}') {
                     println!("[DEBUG-GEN] Balanced JSON detected (Depth 0). Stopping at token {}.", i + 1);
                     break;
@@ -767,12 +745,11 @@ impl QwenVLGenerateModel {
             
             let current_pos = total_tokens_after_prefill + i as usize;
             
-            wait_for_global_io().await; // [SYNC] Wait for any incremental baking
+            wait_for_global_io().await; 
             logits = self.qwen.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;
         }
         if let Some(s_id) = &session_id {
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
-            println!("[GEN-SAVE] All active KV blocks flushed to disk.");
         }
         Ok(gen_text)
     }

@@ -103,6 +103,7 @@ fn chunk_text(text: &str, target_size: usize) -> Vec<String> {
     }
     chunks
 }
+
 // Deep merge for JSON objects
 fn merge_json_results(target: &mut Value, source: &Value) {
     if let (Some(target_obj), Some(source_obj)) = (target.as_object_mut(), source.as_object()) {
@@ -189,157 +190,153 @@ pub async fn start_background_worker(
             UI_READY_SIGNAL.notified().await;
         }
         
-                let mut delay_secs = 1;
-                let mut current_device_pref: Option<String> = None;
-                
-                loop {
-                    // [CRITICAL] Global Stop Signal Check
-                    if crate::utils::is_extraction_stopped() {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        continue;
-                    }
+        let mut delay_secs = 1;
+        let mut current_device_pref: Option<String> = None;
+        
+        loop {
+            // [CRITICAL] Global Stop Signal Check
+            if crate::utils::is_extraction_stopped() {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
 
-                    let mut pending_tasks = Vec::new();
-                    {
-                        let store_opt = store.lock().await;
-                        if let Some(db) = store_opt.as_ref() {
-                            match db.get_pending_tasks(5).await {
-                                Ok(tasks) => pending_tasks = tasks,
-                                Err(e) => println!("[Scheduler] Failed to fetch tasks: {:?}", e),
-                            }
-                        }
+            let mut pending_tasks = Vec::new();
+            {
+                let store_opt = store.lock().await;
+                if let Some(db) = store_opt.as_ref() {
+                    match db.get_pending_tasks(5).await {
+                        Ok(tasks) => pending_tasks = tasks,
+                        Err(e) => println!("[Scheduler] Failed to fetch tasks: {:?}", e),
                     }
-        
-                    if pending_tasks.is_empty() {
-                        // [EVENT-DRIVEN] Wait for timeout OR new task signal
-                        tokio::select! {
-                            _ = sleep(Duration::from_secs(delay_secs)) => {
-                                delay_secs = (delay_secs + 1).min(10); 
-                            }
-                            _ = TASK_QUEUED_SIGNAL.notified() => {
-                                delay_secs = 1;
-                                println!("[Scheduler] New task signal received. Waking up immediately.");
-                            }
-                        }
-                        continue;
-                    } else {
+                }
+            }
+
+            if pending_tasks.is_empty() {
+                // [EVENT-DRIVEN] Wait for timeout OR new task signal
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(delay_secs)) => {
+                        delay_secs = (delay_secs + 1).min(10); 
+                    }
+                    _ = TASK_QUEUED_SIGNAL.notified() => {
                         delay_secs = 1;
+                        println!("[Scheduler] New task signal received. Waking up immediately.");
                     }
-        
-                    for task in pending_tasks {
-                        // [FIX] Do NOT reset the cancellation token here. 
-                        // It should only be reset at the start of the entire loop iteration if needed,
-                        // or managed by the command that starts the extraction.
-                        
-                        if cancellation_token.load(Ordering::Relaxed) {
-                            println!("[Scheduler] Cancellation detected before starting task {}, skipping batch.", task.id);
-                            break;
-                        }
-        
-                        println!("[Scheduler] Processing task: {}", task.id);
-                        
+                }
+                continue;
+            } else {
+                delay_secs = 1;
+            }
+
+            for task in pending_tasks {
+                if cancellation_token.load(Ordering::Relaxed) {
+                    println!("[Scheduler] Cancellation detected before starting task {}, skipping batch.", task.id);
+                    break;
+                }
+
+                println!("[Scheduler] Processing task: {}", task.id);
+                
+                {
+                    let store_guard = store.lock().await;
+                    if let Some(db) = store_guard.as_ref() {
+                        let _ = db.update_task_status(&task.id, crate::logic::parse_status("progress")).await;
+                    }
+                }
+
+                match process_task(task.clone(), &store, &model, &cancellation_token, &app_handle, current_device_pref.clone()).await {
+                    Ok(_) => {
+                        println!("[Scheduler] Task completed: {}", task.id);
                         {
-                            let store_guard = store.lock().await;
-                            if let Some(db) = store_guard.as_ref() {
-                                let _ = db.update_task_status(&task.id, crate::logic::parse_status("progress")).await;
+                            let mut model_lock = model.lock().await;
+                            if let Some(m) = model_lock.as_ref() {
+                                m.deep_purge_resources().await;
                             }
+                            // 모델 인스턴스 자체를 None으로 만들어 완전히 초기화 (다음 작업 시 필요하면 다시 로드)
+                            *model_lock = None;
                         }
-        
-                        match process_task(task.clone(), &store, &model, &cancellation_token, &app_handle, current_device_pref.clone()).await {
-                            Ok(_) => {
-                                println!("[Scheduler] Task completed: {}", task.id);
-                                {
-                                    let mut model_lock = model.lock().await;
-                                    if let Some(m) = model_lock.as_ref() {
-                                        m.deep_purge_resources().await;
-                                    }
-                                    // 모델 인스턴스 자체를 None으로 만들어 완전히 초기화 (다음 작업 시 필요하면 다시 로드)
-                                    *model_lock = None;
-                                }
-                                
-                                let store_guard = store.lock().await;
-                                if let Some(db) = store_guard.as_ref() {
-                                    let _ = db.update_task_status(&task.id, crate::logic::parse_status("complete")).await;
-                                }
-                                // [NEW] 성공 시에만 리소스 정리 및 모드 리셋
-                                cleanup_task_resources(&task.id, Some(&app_handle));
-                                current_device_pref = None; 
-                            },
-                            Err(e) => {
-                                let err_msg = e.to_string();
-                                println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, err_msg);
-                                
-                                // [PERSISTENT-ERROR-LOG] 작업 디렉토리에 에러 사유 기록
-                                let task_dir = utils::paths::get_task_specific_dir(Some(&app_handle), &task.id);
-                                if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
-                                let error_file = task_dir.join("error_reason.txt");
-                                let _ = std::fs::write(&error_file, format!("Timestamp: {}\nError: {}\n", chrono::Utc::now(), err_msg));
-        
-                                // [CRITICAL-CLEANUP] 작업 실패 시 즉시 모델을 메모리에서 해제하여 다음 작업 대비
+                        
+                        let store_guard = store.lock().await;
+                        if let Some(db) = store_guard.as_ref() {
+                            let _ = db.update_task_status(&task.id, crate::logic::parse_status("complete")).await;
+                        }
+                        // [NEW] 성공 시에만 리소스 정리 및 모드 리셋
+                        cleanup_task_resources(&task.id, Some(&app_handle));
+                        current_device_pref = None; 
+                    },
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, err_msg);
+                        
+                        // [PERSISTENT-ERROR-LOG] 작업 디렉토리에 에러 사유 기록
+                        let task_dir = utils::paths::get_task_specific_dir(Some(&app_handle), &task.id);
+                        if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
+                        let error_file = task_dir.join("error_reason.txt");
+                        let _ = std::fs::write(&error_file, format!("Timestamp: {}\nError: {}\n", chrono::Utc::now(), err_msg));
+
+                        // [CRITICAL-CLEANUP] 작업 실패 시 즉시 모델을 메모리에서 해제하여 다음 작업 대비
+                        {
+                            let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
+                            if let Some(m) = model_lock.as_ref() {
+                                println!("[Scheduler] Error detected. Performing emergency memory release...");
+                                m.deep_purge_resources().await;
+                            }
+                            *model_lock = None;
+                        }
+
+                        if err_msg.contains("Task cancelled") {
+                             println!("[Scheduler] Task cancelled: {}", task.id);
+                             let store_guard = store.lock().await;
+                             if let Some(db) = store_guard.as_ref() {
+                                 let _ = db.update_task_status(&task.id, crate::logic::parse_status("cancel")).await;
+                                 let _ = db.update_message_status(&task.id, crate::logic::parse_status("cancel"), Some("Cancelled by user")).await;
+                             }
+                             let _ = app_handle.emit("extraction-progress", json!({
+                                "task_id": task.id,
+                                "category": "Done", "summary": "Cancelled by user", "spinner": "🛑", "data": null 
+                             }));
+                             // [NEW] 취소 시 리소스 정리 및 모드 리셋
+                             cleanup_task_resources(&task.id, Some(&app_handle));
+                             current_device_pref = None;
+                             break; 
+                        } else {
+                            println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, err_msg);
+                            
+                            // [NEW] Automatic OOM Recovery Logic (Forcing SSD-Swap Mode)
+                            if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
+                                println!("[Scheduler] OOM Detected! Activating SSD-Swap Mode for retry.");
                                 {
                                     let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
                                     if let Some(m) = model_lock.as_ref() {
-                                        println!("[Scheduler] Error detected. Performing emergency memory release...");
-                                        m.deep_purge_resources().await;
+                                        let _ = m.deep_purge_resources().await;
                                     }
-                                    *model_lock = None;
+                                    *model_lock = None; 
                                 }
-        
-                                if err_msg.contains("Task cancelled") {
-                                     println!("[Scheduler] Task cancelled: {}", task.id);
-                                     let store_guard = store.lock().await;
-                                     if let Some(db) = store_guard.as_ref() {
-                                         let _ = db.update_task_status(&task.id, crate::logic::parse_status("cancel")).await;
-                                         let _ = db.update_message_status(&task.id, crate::logic::parse_status("cancel"), Some("Cancelled by user")).await;
-                                     }
-                                     let _ = app_handle.emit("extraction-progress", json!({
-                                        "task_id": task.id,
-                                        "category": "Done", "summary": "Cancelled by user", "spinner": "🛑", "data": null 
-                                     }));
-                                     // [NEW] 취소 시 리소스 정리 및 모드 리셋
-                                     cleanup_task_resources(&task.id, Some(&app_handle));
-                                     current_device_pref = None;
-                                     break; 
-                                } else {
-                                    println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, err_msg);
-                                    
-                                    // [NEW] Automatic OOM Recovery Logic (Forcing SSD-Swap Mode)
-                                    if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
-                                        println!("[Scheduler] OOM Detected! Activating SSD-Swap Mode for retry.");
-                                        {
-                                            let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
-                                            if let Some(m) = model_lock.as_ref() {
-                                                let _ = m.deep_purge_resources().await;
-                                            }
-                                            *model_lock = None; 
-                                        }
-                                        
-                                        // Use gpu_disk_swap instead of cpu for better performance during retry
-                                        current_device_pref = Some("gpu_disk_swap".to_string());
-        
-                                        log_task_progress(&app_handle, &task.id, &json!({
-                                            "category": "Warning", "summary": "Memory pressure detected. Retrying with SSD-Swap Mode...", "spinner": "💾"
-                                        }));
-                                        
-                                        tokio::time::sleep(Duration::from_secs(2)).await;
-                                        continue; 
-                                    }
-        
-                                    let store_guard = store.lock().await;                            
-                                    if let Some(db) = store_guard.as_ref() {
-                                        let _ = db.update_task_status(&task.id, crate::logic::parse_status("error")).await;
-                                        let _ = db.update_message_status(&task.id, crate::logic::parse_status("error"), Some(&format!("Error: {}", err_msg))).await;
-                                    }
-                                    
-                                    // [NEW] Explicitly notify UI of failure to stop spinner
-                                    let _ = app_handle.emit("extraction-progress", json!({
-                                        "task_id": task.id,
-                                        "category": "Error", "summary": format!("Failed: {}", err_msg), "spinner": "❌"
-                                    }));
-                                }
+                                
+                                // Use gpu_disk_swap instead of cpu for better performance during retry
+                                current_device_pref = Some("gpu_disk_swap".to_string());
+
+                                log_task_progress(&app_handle, &task.id, &json!({
+                                    "category": "Warning", "summary": "Memory pressure detected. Retrying with SSD-Swap Mode...", "spinner": "💾"
+                                }));
+                                
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                continue; 
                             }
+
+                            let store_guard = store.lock().await;                            
+                            if let Some(db) = store_guard.as_ref() {
+                                let _ = db.update_task_status(&task.id, crate::logic::parse_status("error")).await;
+                                let _ = db.update_message_status(&task.id, crate::logic::parse_status("error"), Some(&format!("Error: {}", err_msg))).await;
+                            }
+                            
+                            // [NEW] Explicitly notify UI of failure to stop spinner
+                            let _ = app_handle.emit("extraction-progress", json!({
+                                "task_id": task.id,
+                                "category": "Error", "summary": format!("Failed: {}", err_msg), "spinner": "❌"
+                            }));
                         }
                     }
+                }
+            }
             
             // Reset token after batch is done or broken, for the next poll
             cancellation_token.store(false, Ordering::SeqCst);
@@ -368,12 +365,6 @@ async fn process_task(
     if kv_path.exists() {
         println!("[PROCESS] Found existing KV cache for task {}. Ready to reuse.", task.id);
     }
-
-    // [SSD-BRIDGE] Start warming up weights in background RAM immediately
-    // let qwen35_model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3.5-0.8B-Instruct-gguf").or_else(|_| std::fs::canonicalize("models/Qwen3.5-0.8B-Instruct-gguf")).ok();
-    // if let Some(p) = qwen35_model_path_hint {
-    //     let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
-    // }
 
     // [SPINNER-ACTIVATE] Ensure UI spinner is ON immediately upon task recovery/start
     let payload = json!({ 
@@ -546,8 +537,6 @@ async fn process_task(
         pug
     };
 
-    // [LOCK] Removed (Moved up)
-
 
     use crate::openai_types::{
         ChatCompletionRequestSystemMessage,
@@ -693,7 +682,6 @@ async fn process_task(
         }
     }
 
-    // 👇 [여기에 새로운 STEP A-2 추가!] 👇
     // --- STEP A-2: DETAIL CLASSIFICATION (디테일 페이지 여부 독립 판별) ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -735,7 +723,6 @@ async fn process_task(
             println!("[Scheduler] Classified is_detail as: {}", is_detail);
         }
     }
-    // 👆 [새로운 STEP A-2 끝] 👆
                         
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -761,11 +748,10 @@ async fn process_task(
 
             let mut titles = Vec::new();
             {
-                // 🌟 [수정] None 넘기기
+                // 🌟 None 넘기기
                 model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                 let params = ChatCompletionParameters {
-                    // (messages 등 기존 코드 유지) ...
                     messages: vec![
                         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                             content: system_content.clone(),
@@ -782,12 +768,11 @@ async fn process_task(
 
                 if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
                     println!("[JS-BRIDGE] 1. Requesting titles from LLM...");
-                    // 🌟 [수정] generate_part 로 교체 및 base_session_id_35 넘기기
+                    // 🌟 generate_part 로 교체 및 base_session_id_35 넘기기
                     let res = gen.generate_part(&params, false, 0, None, Some(base_session_id_35.clone()), kv_name.clone()).await?;
                     println!("[JS-BRIDGE] LLM Raw Response: '{}'", res.text);
 
                     let title_info = parsing::parse_json_from_llm(&res.text);
-                    // Robust key checking ... (이하 기존 코드 유지)
                     let items_opt = title_info.get("order")
                         .or(title_info.get("goods"))
                         .or(title_info.get("items"))
@@ -1062,7 +1047,7 @@ async fn process_task(
 
         let mut all_extracted_items = Vec::new();
         
-        // 👇 [추가된 변수] 병합 대기열을 위한 변수들
+        // 병합 대기열을 위한 변수들
         let mut pending_merge: Option<serde_json::Value> = None;
         let mut merge_countdown = 0;
 
@@ -1111,7 +1096,7 @@ async fn process_task(
                         let item_json = parsing::parse_json_from_llm(&res_text);
                         if !item_json.is_null() && (item_json.is_object() || item_json.is_array()) {
                             
-                            // 👇 [수정된 로직 시작] 단순 push 대신 후처리 병합 수행
+                            // 단순 push 대신 후처리 병합 수행 (rowspan 처리)
                             let is_continuation = item_json.get("is_continuation").and_then(|v| v.as_bool()).unwrap_or(false);
                             
                             if is_continuation && pending_merge.is_some() {
@@ -1137,7 +1122,6 @@ async fn process_task(
                                     all_extracted_items.push(item_json);
                                 }
                             }
-                            // 👆 [수정된 로직 끝]
                         }
                     },
                     Err(e) => println!("[Scheduler] Error extracting item {}: {:?}", idx, e),
@@ -1162,16 +1146,14 @@ async fn process_task(
 
         if !content_pug.trim().is_empty() {
             let extraction_instruction = parsing::item2json(&page_type, &url, language);
-            let pug_content = content_pug.clone();
             let snapshot_id = format!("{}_detail", task.id);
 
             // 1. [Large] Load & Generate (Direct Qwen3.5 0.8B-Layer Generation)
             {
-                // 🌟 [수정] None 넘기기
+                // 🌟 None 넘기기
                 model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                 let params = ChatCompletionParameters {
-                    // (messages 등 기존 코드 유지) ...
                     messages: vec![
                         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                             content: system_content.clone(),
@@ -1196,7 +1178,7 @@ async fn process_task(
                     println!("[Scheduler] Qwen3.5 Step C: Asking extraction question...");
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Qwen 3.5 Inference..." }));
                     
-                    // 🌟 [수정] base_session_id_35 넘기기
+                    // 🌟 base_session_id_35 넘기기
                     let res = gen.generate_part(&params, false, 0, None, Some(base_session_id_35.clone()), kv_name.clone()).await?;
                     
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res.text);
@@ -1227,10 +1209,6 @@ async fn process_task(
     }
 
     // --- DB OPS & SIDE EFFECTS ---
-    // [NOTE] Now we can safely load Embedding Model (via get_embedding inside logic)
-    // The Store/Logic calls below will internally call model.get_embedding(), which calls ensure_embedding().
-    // Since is unloaded, this is safe.
-
     // Normalize Data
     if let Some(obj) = extracted_data.as_object_mut() {
         if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type)); }
@@ -1252,14 +1230,12 @@ async fn process_task(
 
     log_task_progress(app_handle, &task.id, &json!({ "category": "Saving", "summary": "Syncing to database..." }));
 
-    // [SIDE EFFECTS & UPSERT]
     // Re-acquire Store for final ops
     let store = {
         let store_guard = store_mutex.lock().await;
         store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
     };
 
-    // (Logic ported from previous implementation - condensed)
     if page_type == "order" {
         if let Some(goods_arr) = extracted_data.get("goods").and_then(|v| v.as_array()) {
             let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
@@ -1283,20 +1259,11 @@ async fn process_task(
         }
     }
 
-    // Embedding & Final Upsert
-    // Note: logic::relay and upsert_item will need embedding.
-    // Since is unloaded, model.get_embedding() will load EmbeddingModel automatically.
-    
-    // ... (Standard Upsert Logic as per original file, referencing 'extracted_data')
-    // For brevity in this replace block, I am simplifying the tail end to just the core upsert action 
-    // but in a real file you keep the full logic. I will paste the 'Direct Upsert' part here.
-    
     let target_table = page_type.to_string();
     let text_to_embed = parsing::json_to_natural_language(&extracted_data);
     let item_digest = crate::utils::hash::digest(&text_to_embed); 
     let target_id = if !task.r#ref.is_empty() { task.r#ref.clone() } else { generated_id }; 
     
-    // Check digest match to skip embedding
     let mut existing_vector = None;
     if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
         if existing_item.digest == item_digest {
@@ -1307,7 +1274,6 @@ async fn process_task(
     let vector = if let Some(v) = existing_vector {
         Some(v)
     } else {
-        // This call implicitly loads EmbeddingModel (Phase 3)
         Some(model.get_embedding(text_to_embed).await?)
     };
 

@@ -516,7 +516,6 @@ pub fn decoding_attention_parallel(
         let k_chunk = key_states.narrow(2, start, end - start)?;
         let v_chunk = value_states.narrow(2, start, end - start)?;
 
-        // [삭제] 기존에 있던 let q_aligned = query_states.to_dtype(...) 코드는 삭제합니다.
         let attn_weights = (q_aligned.matmul(&k_chunk.transpose(2, 3)?)? * scaling)?;
         let max_logits = attn_weights.max_keepdim(D::Minus1)?;
         let exp_weights = attn_weights.broadcast_sub(&max_logits)?.exp()?;
@@ -704,7 +703,6 @@ pub fn eager_attention_forward(
         let k_block = key_states.narrow(2, start, end - start)?;
         let v_block = value_states.narrow(2, start, end - start)?; 
 
-        // [삭제] 기존 루프 내부에 있던 let q_aligned = ... 제거 완료
         let attn_weights = (q_aligned.matmul(&k_block.transpose(2, 3)?)? * scaling)?; 
         
         // 마스크 처리
@@ -729,7 +727,6 @@ pub fn eager_attention_forward(
         let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
         
         let out_block = exp_weights.to_dtype(v_block.dtype())?.matmul(&v_block)?;
-        // let lse = (sum_exp.log()? + max_logits)?;
 
         block_outputs.push(out_block);
         block_lse.push((sum_exp, max_logits)); // [CRITICAL FIX] 튜플로 묶어서 보관

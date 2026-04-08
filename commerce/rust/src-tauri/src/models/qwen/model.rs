@@ -378,7 +378,6 @@ impl QwenVLVisionModel {
             let h_idxs_ceil = h_idxs_floor.broadcast_add(&one_t_u32)? 
                 .clamp(0u32, num_grid_per_side_sub_one as u32)?;
             
-            
             let w_idxs_ceil = w_idxs_floor
                 .affine(1.0, 1.0)?
                 .clamp(0u32, num_grid_per_side_sub_one as u32)?;
@@ -434,10 +433,9 @@ impl QwenVLVisionModel {
         let patch_pos_embeds = split_tensor(&patch_pos_embeds, &split_idx, 0)?;
         let merge_size = self.spatial_merge_size;
         for (i, pos_embed) in patch_pos_embeds.iter().enumerate() {
-            let [t, h, w] = grid_thw_cpu[i][..] else { // [FIX] 두 번째 루프에서도 CPU 캐시 배열 사용
+            let [t, h, w] = grid_thw_cpu[i][..] else {
                 return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
             };
-            // let pos_embed = &patch_pos_embeds[i];
             let pos_emebd_last_dim: usize = pos_embed.dim(D::Minus1)?;
             let pos_embed = pos_embed.repeat((t as usize, 1))?;
             let shape = Shape::from(vec![
@@ -469,7 +467,7 @@ impl QwenVLVisionModel {
         let mut pos_ids_vec = vec![];
         
         for i in 0..grid_thw.dim(0)? {
-            let [t, h, w] = grid_thw_cpu[i][..] else { // [FIX] CPU 캐시 사용
+            let [t, h, w] = grid_thw_cpu[i][..] else {
                 return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
             };
             let merged_h = h / merge_size as u32;
@@ -479,7 +477,7 @@ impl QwenVLVisionModel {
             let intra_row = Tensor::arange(0, merge_size as u32, grid_thw.device())?;
             let intra_col = Tensor::arange(0, merge_size as u32, grid_thw.device())?;
 
-            // [CRITICAL FIX] 증발했던 row_idx와 col_idx의 3D Grid 인덱스 계산 공식을 복구합니다!
+            // [CRITICAL FIX] 3D Grid 인덱스 계산 공식 복구 완료
             let row_idx = blocks_rows
                 .unsqueeze(1)?.unsqueeze(2)?.unsqueeze(3)?
                 .broadcast_mul(&Tensor::new(merge_size as u32, grid_thw.device())?)?
@@ -508,8 +506,7 @@ impl QwenVLVisionModel {
         }
         let pos_ids = Tensor::cat(&pos_ids_vec, 0)?;
 
-        // [CRITICAL FIX] 텐서를 잘라낸 직후에는 비연속 메모리가 되므로, 
-        // index_select에 넣기 직전에 반드시 .contiguous()로 묶어줘야 에러가 안 납니다!
+        // [CRITICAL FIX] 텐서를 잘라낸 직후 비연속 메모리를 피하기 위해 .contiguous()로 묶어줌
         let pos_ids_h = pos_ids.i((.., 0))?.contiguous()?; 
         let pos_ids_w = pos_ids.i((.., 1))?.contiguous()?; 
         
@@ -550,7 +547,7 @@ impl QwenVLVisionModel {
 
         let mut deepstack_feature_lists = vec![];
         for (layer_num, block) in self.blocks.iter().enumerate() {
-            // [FIX] 미리 계산된 chunks 슬라이스를 전달합니다.
+            // 미리 계산된 chunks 슬라이스 전달
             hidden_states = block.forward(&hidden_states, &chunks, &cos, &sin)?;
             if self.deepstack_visual_indexes.contains(&layer_num) {
                 if let Some(index) = self
@@ -561,8 +558,6 @@ impl QwenVLVisionModel {
                     let deepstack_feature =
                         self.deepstack_merger_list[index].forward(&hidden_states)?;
                     deepstack_feature_lists.push(deepstack_feature);
-                } else {
-                    println!("Value not found");
                 }
             }
         }
@@ -767,8 +762,7 @@ impl QwenVLTextModel {
         let norm = rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
         let head_dim = config.head_dim;
         let rotary_emb = QwenVLTextRotaryEmbedding::new(head_dim, config.rope_theta);
-        // [FIX] rope_scaling is now optional. Assuming it exists if we are here, or panic/default.
-        // Given Qwen config flow, if it was missing it should have failed earlier or defaults populated.
+        // [FIX] rope_scaling optional 처리
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         Ok(Self {
             embed_tokens,
@@ -857,7 +851,6 @@ impl QwenVLModel {
         let v_config = config.vision_config.clone().ok_or(anyhow!("Missing vision_config for QwenVLModel"))?;
         let visual = QwenVLVisionModel::new(v_config, vb_m.pp("visual"))?;
         
-        // [FIX] text_config is optional, but required for QwenVLModel
         let text_config = config.text_config.clone().ok_or(anyhow!("Missing text_config for QwenVLModel"))?;
         
         let language_model =
@@ -884,18 +877,11 @@ impl QwenVLModel {
         &self,
         pixel_values: &Tensor,
         image_grid_thw: &Tensor,
-    ) -> Result<(Tensor, Vec<Tensor>)> { // [FIX] 반환형을 단일 Tensor로 변경!
+    ) -> Result<(Tensor, Vec<Tensor>)> { 
         let (image_embeds, deepstack_image_embeds) =
             self.visual.forward(pixel_values, image_grid_thw)?;
-        let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
-        let thw_vec = image_grid_thw.to_vec2::<u32>()?;
-        let split_sizes: Vec<usize> = thw_vec
-            .iter()
-            .map(|thw| (thw[0] * thw[1] * thw[2]) as usize / spatial_merge_size.pow(2))
-            .collect();
             
         // [CRITICAL FIX] 쪼개는 로직 삭제하고 원본 텐서를 그대로 반환!
-        // let image_embeds = split_tensor(&image_embeds, &split_sizes, 0)?; 
         Ok((image_embeds, deepstack_image_embeds))
     }
 
@@ -925,14 +911,12 @@ impl QwenVLModel {
         let vision_start_token_id = self.config.vision_start_token_id.unwrap_or(0);
         
         let (b_sz, seq_len) = input_ids.dims2()?;
-        let mut position_ids = Tensor::zeros((3, b_sz, seq_len), DType::U32, input_ids.device())?;
         let mut mrope_position_deltas = Vec::new();
 
         let input_ids_vec = input_ids.to_vec2::<u32>()?;
         let mut image_idx = 0;
 
         let image_thw_cpu = if let Some(thw) = image_grid_thw { Some(thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?) } else { None };
-        let video_thw_cpu = if let Some(thw) = _video_grid_thw { Some(thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?) } else { None };
         
         // [CRITICAL FIX] 루프 밖에서 전체 데이터를 담을 그릇을 미리 할당합니다.
         let mut flat_pos_ids = Vec::with_capacity(3 * b_sz * seq_len);
@@ -1001,7 +985,6 @@ impl QwenVLModel {
         Ok((position_ids, deltas))
     }
 
-
     pub fn forward(
         &mut self,
         input_ids: &Tensor,
@@ -1021,10 +1004,7 @@ impl QwenVLModel {
             if let Some(image_grid_thw) = image_grid_thw {
                 let (image_embeds, deepstack_img_embed) =
                     self.get_vision_features(pixel_values, image_grid_thw)?;
-                // let image_embeds = Tensor::cat(&image_embeds, 0)?;
                 let vision_mask = self.get_placeholder_mask(input_ids, true)?;
-                
-                // [CRITICAL FIX] GPU Sync Stall을 유발하는 sum_all() 검증 로직 삭제 완료
                 
                 inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;
                 image_mask = Some(vision_mask);
@@ -1035,11 +1015,7 @@ impl QwenVLModel {
             if let Some(video_grid_thw) = video_grid_thw {
                 let (video_embeds, deepstack_video_embed) =
                     self.get_vision_features(pixel_values_video, video_grid_thw)?;
-                // [CRITICAL FIX] 쪼개는 로직이 사라졌으므로, 다시 cat으로 합치는 코드도 과감히 삭제!
-                
                 let vision_mask = self.get_placeholder_mask(input_ids, false)?;
-                
-                // [CRITICAL FIX] 비디오 쪽의 sum_all() 검증 로직도 삭제 완료
                 
                 inputs_embeds = masked_scatter_dim0(&inputs_embeds, &video_embeds, &vision_mask)?;
                 video_mask = Some(vision_mask);
@@ -1053,6 +1029,7 @@ impl QwenVLModel {
                 let image_mask_ = image_mask_.squeeze(0)?;
                 let video_mask_ = video_mask_.squeeze(0)?;
                 let visual_mask = bitor_tensor(&image_mask_, &video_mask_)?;
+                
                 // [CRITICAL FIX] 3연속 GPU Sync Stall을 1번의 CPU 스캔으로 통합 압축
                 let img_mask_vec = image_mask_.to_vec1::<u32>()?;
                 let vid_mask_vec = video_mask_.to_vec1::<u32>()?;
@@ -1107,8 +1084,9 @@ impl QwenVLModel {
 
         let position_ids;
         let rope_deltas;
-        if seqlen_offset == 0 || self.rope_deltas.is_none() { // cache_position 텐서 검사 완전 제거
+        if seqlen_offset == 0 || self.rope_deltas.is_none() { 
             (position_ids, rope_deltas) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
+            self.rope_deltas = Some(rope_deltas);
         } else {
             let (bs, seq_len, _) = inputs_embeds.dims3()?;
             let delta = if let Some(cache_position) = cache_position {

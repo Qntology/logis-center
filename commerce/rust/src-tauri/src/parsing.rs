@@ -28,108 +28,53 @@ pub fn sanitize_llm_input(text: &str) -> String {
 }
 
 pub fn pre_clean_html(html: &str) -> String {
-
     // 1. 주석 제거
-
-    let re_comm = Regex::new(r"(?s)<!--.*?-->").unwrap();
-
+    let re_comm = Regex::new(r"(?s)").unwrap();
     let html = re_comm.replace_all(html, "");
 
-
-
     // 2. 불필요한 태그 및 내부 콘텐츠 통째로 제거
-
     // JS filter list: script, style, link, noscript, iframe
-
     let re_tags = Regex::new(r"(?is)<(script|style|link|noscript|iframe)\b[^>]*>.*?</(script|style|link|noscript|iframe)>").unwrap();
-
     let html = re_tags.replace_all(&html, "");
 
-
-
-        // 3. 단일 태그 및 불필요한 메타 태그 정리 (input은 제외하고 보존)
-
-
-
-        let re_single = Regex::new(r"(?is)<(meta|link|br|hr|source)\b[^>]*>").unwrap();
-
-
-
-        let clean = re_single.replace_all(&html, "");
-
-
+    // 3. 단일 태그 및 불필요한 메타 태그 정리 (input은 제외하고 보존)
+    let re_single = Regex::new(r"(?is)<(meta|link|br|hr|source)\b[^>]*>").unwrap();
+    let clean = re_single.replace_all(&html, "");
 
     // 4. 연속된 줄바꿈 및 불필요한 공백 제거
-
     let re_whitespace = Regex::new(r"(?m)^\s*\n").unwrap();
-
     let clean = re_whitespace.replace_all(&clean, "");
-
     
-
     clean.trim().to_string()
-
 }
-
-
 
 pub fn convert_doc_to_clean_pug(document: &Html, mode: PugMode) -> String {
-
     let mut pug_output = String::new();
-
     pug_output.reserve(1024 * 50);
-
     
-
     // Discovery 모드(StructureOnly)일 때는 body 내부만 집중
-
     let mut found_body = false;
-
     for child in document.tree.root().children() {
-
         if let Some(element) = child.value().as_element() {
-
             if element.name() == "body" {
-
                 generate_pug_lines(child, 0, &mut pug_output, &mode, &mut None);
-
                 found_body = true;
-
                 break;
-
             }
-
         }
-
     }
-
-        if !found_body {
-
-            for child in document.tree.root().children() {
-
-                generate_pug_lines(child, 0, &mut pug_output, &mode, &mut None);
-
-            }
-
+    if !found_body {
+        for child in document.tree.root().children() {
+            generate_pug_lines(child, 0, &mut pug_output, &mode, &mut None);
         }
-
-        sanitize_llm_input(&pug_output)
-
     }
-
-    
-
-
-
-pub fn convert_to_clean_pug(html: &str, mode: PugMode) -> String {
-
-    let document = Html::parse_document(html);
-
-    convert_doc_to_clean_pug(&document, mode)
-
+    sanitize_llm_input(&pug_output)
 }
-
-
+    
+pub fn convert_to_clean_pug(html: &str, mode: PugMode) -> String {
+    let document = Html::parse_document(html);
+    convert_doc_to_clean_pug(&document, mode)
+}
 
 pub fn convert_doc_to_clean_pug_selector(document: &Html, selector_str: &str, mode: PugMode) -> String {
     let selector = match Selector::parse(selector_str) {
@@ -150,17 +95,10 @@ pub fn convert_doc_to_clean_pug_selector(document: &Html, selector_str: &str, mo
     pug_output
 }
 
-
-
 pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMode) -> String {
-
     let document = Html::parse_document(html);
-
     convert_doc_to_clean_pug_selector(&document, selector_str, mode)
-
 }
-
-
 
 #[derive(Default, Clone)]
 pub struct TableContext {
@@ -192,7 +130,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 return;
             }
 
-            // [NEW] Context Management
+            // Context Management
             if tag_name == "tbody" { if let Some(c) = ctx.as_mut() { c.is_in_tbody = true; c.current_row_idx = 0; } }
             if tag_name == "tr" { if let Some(c) = ctx.as_mut() { c.current_col_idx = 0; } }
 
@@ -211,7 +149,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 }
             }
 
-            // [NEW] Inject alt from headers for tbody cells
+            // Inject alt from headers for tbody cells
             if tag_name == "td" || tag_name == "th" {
                 if let Some(c) = ctx.as_mut() {
                     if c.is_in_tbody && !c.headers.is_empty() {
@@ -294,7 +232,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 }
             }
 
-            // [NEW] End of Tag Updates
+            // End of Tag Updates
             if tag_name == "tr" { if let Some(c) = ctx.as_mut() { if c.is_in_tbody { c.current_row_idx += 1; } } }
             if tag_name == "td" || tag_name == "th" { if let Some(c) = ctx.as_mut() { if c.is_in_tbody { c.current_col_idx += 1; } } }
             if tag_name == "tbody" { if let Some(c) = ctx.as_mut() { c.is_in_tbody = false; } }
@@ -322,7 +260,7 @@ pub fn split_doc_to_pug_list_advanced(document: &Html, selector_str: &str, mode:
     };
     let mut pug_list = Vec::new();
     
-    // 👇 [추가된 변수] rowspan으로 묶인 다음 행들을 병합하기 위한 버퍼와 카운터
+    // rowspan으로 묶인 다음 행들을 병합하기 위한 버퍼와 카운터
     let mut skip_next_n_rows = 0;
     let mut combined_pug_buffer = String::new();
 
@@ -342,7 +280,7 @@ pub fn split_doc_to_pug_list_advanced(document: &Html, selector_str: &str, mode:
                 // 현재 노드의 PUG 라인 생성
                 generate_pug_lines(node, 0, &mut pug_output, &mode, &mut ctx);
 
-                // 👇 [수정된 로직 시작] 개별로 바로 push 하지 않고 rowspan 검사
+                // 개별로 바로 push 하지 않고 rowspan 검사
                 if !pug_output.trim().is_empty() {
                     // 현재 노드 내부에 rowspan 속성이 있는지 확인
                     let mut current_rowspan = 1;
@@ -377,7 +315,6 @@ pub fn split_doc_to_pug_list_advanced(document: &Html, selector_str: &str, mode:
                         pug_list.push(pug_output);
                     }
                 }
-                // 👆 [수정된 로직 끝]
             }
         }
     }
@@ -503,24 +440,24 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 
 pub fn para2graph(language: &str) -> String {
     let template = r###"convert the natural language content to fit the dataset JSON structure. no explanation.
-	{
-		"context" : [
-			{
-				"language" : "{LANG}",
-				"type": "sales" | "order" | "goods" | "tracking" | "view" | "review" | "coupon" | "event" | "",
-				"text": "Segment the natural language content into single-type contexts"
-			}
-		]
-	}"###;
+    {
+        "context" : [
+            {
+                "language" : "{LANG}",
+                "type": "sales" | "order" | "goods" | "tracking" | "view" | "review" | "coupon" | "event" | "",
+                "text": "Segment the natural language content into single-type contexts"
+            }
+        ]
+    }"###;
     template.replace("{LANG}", language)
 }
 
 pub fn graph2contexts(current: &str) -> String {
     let template = r###"convert the natural language content to fit the dataset JSON structure. no explanation.
-	# #date : The date value is set by referencing both the natural language's implied time period and the region value against the current time ({CURRENT}); it will be marked as null if a value is absent
-	# #status : 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
-	# #substantial : 'size' | 'weight' | 'shipping_fee' | 'shipping_duration' | 'sale_price' | 'supply_price' | 'low_stock_threshold' | 'discount' | 'min_order_amount' | 'max_discount_amount' | 'usage_limit' | 'usage_per' | ''
-	# #find : 'many' | 'few' | 'much' | 'little' | 'heavy' | 'light' | ''
+    # #date : The date value is set by referencing both the natural language's implied time period and the region value against the current time ({CURRENT}); it will be marked as null if a value is absent
+    # #status : 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
+    # #substantial : 'size' | 'weight' | 'shipping_fee' | 'shipping_duration' | 'sale_price' | 'supply_price' | 'low_stock_threshold' | 'discount' | 'min_order_amount' | 'max_discount_amount' | 'usage_limit' | 'usage_per' | ''
+    # #find : 'many' | 'few' | 'much' | 'little' | 'heavy' | 'light' | ''
     
     [TASK]
     Analyze EACH provided text segment and extract structured conditions. 
@@ -544,8 +481,6 @@ pub fn graph2contexts(current: &str) -> String {
         ]
     }"###;
     template.replace("{CURRENT}", current)
-
-    
 }
 
 pub fn item2json(page_type: &str, href: &str, language: &str) -> String {

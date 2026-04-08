@@ -43,9 +43,9 @@ impl Qwen3_5RMSNorm {
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        // F32로 저장된 가중치를 xs(BF16) 타입에 맞춰준 뒤 네이티브 커널 실행!
         let w = self.weight.to_dtype(xs.dtype())?;
-        // 🌟 [CRITICAL FIX] CUDA 커널 충돌 방지: 입력 텐서와 가중치를 강제로 일렬 정렬합니다!
-        Ok(candle_nn::ops::rms_norm(&xs.contiguous()?, &w.contiguous()?, self.eps as f32)?)
+        Ok(candle_nn::ops::rms_norm(xs, &w, self.eps as f32)?)
     }
 
     pub fn clear(&mut self) {
@@ -53,7 +53,7 @@ impl Qwen3_5RMSNorm {
     }
     pub fn eps(&self) -> f64 { self.eps }
     
-    // 🌟 [추가] 현재 가중치가 1바이트 껍데기인지(비워져 있는지) 확인
+    // 현재 가중치가 1바이트 껍데기인지(비워져 있는지) 확인
     pub fn is_cleared(&self) -> bool { self.weight.elem_count() <= 1 }
 }
 
@@ -77,8 +77,7 @@ impl Qwen3_5RMSNormGated {
 
     pub fn forward(&self, xs: &Tensor, gate: Option<&Tensor>) -> Result<Tensor> {
         let w = self.weight.to_dtype(xs.dtype())?;
-        // 🌟 [CRITICAL FIX] 여기서도 강제 정렬 바리케이드를 칩니다!
-        let mut out = candle_nn::ops::rms_norm(&xs.contiguous()?, &w.contiguous()?, self.eps as f32)?;
+        let mut out = candle_nn::ops::rms_norm(xs, &w, self.eps as f32)?;
         if let Some(gate) = gate {
             out = out.broadcast_mul(&gate.silu()?)?;
         }
@@ -121,7 +120,6 @@ macro_rules! reshape_chunk_tensor {
 }
 
 pub struct Qwen3_5GatedDeltaNet {
-    // hidden_size: usize,
     num_v_heads: usize,
     num_k_heads: usize,
     head_k_dim: usize,
@@ -129,18 +127,11 @@ pub struct Qwen3_5GatedDeltaNet {
     key_dim: usize,
     value_dim: usize,
     conv_kernel_size: usize,
-    // layer_idx: usize,
-    // activation: Activation,
-    // layer_norm_epsilon: f64,
-    // QKV 投影
-    // conv_dim: usize,
     conv1d: Conv1d,
     dt_bias: Tensor,
     a_log: Tensor,
     norm: Qwen3_5RMSNormGated,
     out_proj: ProjKind,
-
-    // Z, B, A 投影
     in_proj_qkv: ProjKind,
     in_proj_z: ProjKind,
     in_proj_b: ProjKind,
@@ -152,23 +143,22 @@ pub struct Qwen3_5GatedDeltaNet {
 
 impl Qwen3_5GatedDeltaNet {
     pub fn new_from_vb(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
-        let hidden_size = config.hidden_size; // 1024
-        let num_v_heads = config.linear_num_value_heads; // 16
-        let num_k_heads = config.linear_num_key_heads; // 16
-        let head_k_dim = config.linear_key_head_dim; // 128
-        let head_v_dim = config.linear_value_head_dim; // 128
-        let key_dim = head_k_dim * num_k_heads; // 2048
-        let value_dim = head_v_dim * num_v_heads; // 2048
-        let conv_kernel_size = config.linear_conv_kernel_dim; // 4
-        // let activation = config.hidden_act;
+        let hidden_size = config.hidden_size; 
+        let num_v_heads = config.linear_num_value_heads; 
+        let num_k_heads = config.linear_num_key_heads; 
+        let head_k_dim = config.linear_key_head_dim; 
+        let head_v_dim = config.linear_value_head_dim; 
+        let key_dim = head_k_dim * num_k_heads; 
+        let value_dim = head_v_dim * num_v_heads; 
+        let conv_kernel_size = config.linear_conv_kernel_dim; 
         let layer_norm_epsilon = config.rms_norm_eps;
-        let conv_dim = key_dim * 2 + value_dim; // 6144
+        let conv_dim = key_dim * 2 + value_dim; 
         let conv1d = get_conv1d(
             vb.pp("conv1d"),
             conv_dim,
             conv_dim,
             conv_kernel_size,
-            0, // <--- 여기를 0으로 바꿉니다!
+            0, 
             1,
             1,
             conv_dim,
@@ -178,19 +168,13 @@ impl Qwen3_5GatedDeltaNet {
         let a_log = vb.get(num_v_heads, "A_log")?;
         let norm = Qwen3_5RMSNormGated::new(vb.pp("norm"), head_v_dim, layer_norm_epsilon)?;
 
-        // 2048, 1024
         let out_proj = linear_no_bias(value_dim, hidden_size, vb.pp("out_proj"))?;
-        // 1024, 6144
         let in_proj_qkv = linear_no_bias(hidden_size, conv_dim, vb.pp("in_proj_qkv"))?;
-        // 1024, 2048
         let in_proj_z = linear_no_bias(hidden_size, value_dim, vb.pp("in_proj_z"))?;
-        // 1024, 16
         let in_proj_b = linear_no_bias(hidden_size, num_v_heads, vb.pp("in_proj_b"))?;
-        // 1024, 16
         let in_proj_a = linear_no_bias(hidden_size, num_v_heads, vb.pp("in_proj_a"))?;
 
         Ok(Self {
-            // hidden_size,
             num_v_heads,
             num_k_heads,
             head_k_dim,
@@ -198,9 +182,6 @@ impl Qwen3_5GatedDeltaNet {
             key_dim,
             value_dim,
             conv_kernel_size,
-            // activation,
-            // layer_norm_epsilon,
-            // conv_dim,
             conv1d,
             dt_bias,
             a_log,
@@ -231,7 +212,7 @@ impl Qwen3_5GatedDeltaNet {
         let conv_dim = key_dim * 2 + value_dim;
         let conv1d = gguf.conv1d(
             &format!("{prefix}.ssm_conv1d"),
-            0, // <--- 여기를 0으로 바꿉니다!
+            0, 
             1,
             1,
             conv_dim,
@@ -241,11 +222,6 @@ impl Qwen3_5GatedDeltaNet {
         let a_log = gguf.get_dequantized(&format!("{prefix}.ssm_a"))?;
         let norm_weight = gguf.get_dequantized(&format!("{prefix}.ssm_norm.weight"))?;
         let norm = Qwen3_5RMSNormGated::from_weight(norm_weight, rms_norm_eps)?;
-        // let out_proj = gguf.qmatmul(&format!("{prefix}.ssm_out.weight"))?;
-        // let in_proj_qkv = gguf.qmatmul(&format!("{prefix}.attn_qkv.weight"))?;
-        // let in_proj_z = gguf.qmatmul(&format!("{prefix}.attn_gate.weight"))?;
-        // let in_proj_b = gguf.qmatmul(&format!("{prefix}.ssm_beta.weight"))?;
-        // let in_proj_a = gguf.qmatmul(&format!("{prefix}.ssm_alpha.weight"))?;
         let out_proj = gguf.quantize_linear(&format!("{prefix}.ssm_out"), false)?;
         let in_proj_qkv = gguf.quantize_linear(&format!("{prefix}.attn_qkv"), false)?;
         let in_proj_z = gguf.quantize_linear(&format!("{prefix}.attn_gate"), false)?;
@@ -281,35 +257,27 @@ impl Qwen3_5GatedDeltaNet {
         let state_len = conv_state.dim(D::Minus1)?;
         let take_len = self.conv_kernel_size - 1; 
         
-        // 1. 저장된 상태(과거 문맥)에서 필요한 만큼(K-1)만 가져옵니다.
         let state_to_use = if state_len > take_len {
-            // 🌟 [CRITICAL FIX] 가상 뷰(narrow)를 생성한 즉시 연속된 메모리로 확정합니다!
-            conv_state.narrow(D::Minus1, state_len - take_len, take_len)?.contiguous()?
+            conv_state.narrow(D::Minus1, state_len - take_len, take_len)?
         } else if state_len < take_len {
-            // 🌟 [CRITICAL FIX] 패딩(padding)을 추가한 직후에도 연속된 메모리로 확정합니다!
-            conv_state.pad_with_zeros(D::Minus1, take_len - state_len, 0)?.contiguous()?
+            conv_state.pad_with_zeros(D::Minus1, take_len - state_len, 0)?
         } else {
-            // 🌟 [CRITICAL FIX] 원본 텐서(clone) 역시 연속된 메모리인지 확실하게 보장합니다!
-            conv_state.contiguous()?
+            conv_state.clone()
         };
         
-        // 🌟 [CRITICAL FIX] xs 역시 연속된 메모리인지 확인 후 붙입니다.
-        let conv_state_new = Tensor::cat(&[&state_to_use, &xs.contiguous()?], D::Minus1)?.contiguous()?;
+        let conv_state_new = Tensor::cat(&[&state_to_use, xs], D::Minus1)?;
         
-        // 3. 다음 상태 업데이트를 위해 가장 최신 토큰들을 저장
         let next_cache_len = conv_state_new.dim(D::Minus1)?;
-        let conv_update = conv_state_new.narrow(D::Minus1, next_cache_len - take_len, take_len)?.contiguous()?;
+        let conv_update = conv_state_new.narrow(D::Minus1, next_cache_len - take_len, take_len)?;
         self.conv_state_cache = Some(conv_update);
         
-        // 4. 컨볼루션 연산
         let out = conv1d_depthwise(&conv_state_new, self.conv1d.weight(), self.conv1d.bias())?;
         
-        // 5. 프레임워크 안전장치 (정확히 필요한 만큼만 추출)
         let out_len = out.dim(D::Minus1)?;
         let final_out = if out_len > seq_len {
-            out.narrow(D::Minus1, out_len - seq_len, seq_len)?.contiguous()? // 🌟 [CRITICAL FIX] 결과 추출 시에도 보장
+            out.narrow(D::Minus1, out_len - seq_len, seq_len)?
         } else {
-            out.contiguous()? // 🌟 [CRITICAL FIX] 결과 추출 시에도 보장
+            out
         };
         
         Ok(final_out.silu()?)
@@ -344,7 +312,7 @@ impl Qwen3_5GatedDeltaNet {
         let k_beta = key.broadcast_mul(&beta.unsqueeze(D::Minus1)?.contiguous()?)?;
         let (query, key, k_beta, v_beta) =
             reshape_chunk_tensor!(chunk_size, query, key, k_beta, v_beta);
-        let g = g.reshape((g.dim(0)?, g.dim(1)?, (), chunk_size))?.contiguous()?;
+        let g = g.reshape((g.dim(0)?, g.dim(1)?, (), chunk_size))?;
         let g = g.cumsum(D::Minus1)?;
         let decay_mask = g
             .unsqueeze(D::Minus1)?
@@ -352,10 +320,10 @@ impl Qwen3_5GatedDeltaNet {
             .exp()?
             .to_dtype(candle_core::DType::F32)?;
         let tril_mask = Tensor::tril2(chunk_size, candle_core::DType::U32, query.device())?
-            .broadcast_as(decay_mask.shape())?.contiguous()?;
+            .broadcast_as(decay_mask.shape())?;
         let on_false = decay_mask.zeros_like()?;
         let decay_mask = tril_mask.where_cond(&decay_mask, &on_false)?.contiguous()?;
-        // when rank = 5, matmul error, bs=1,squeeze(0)
+        
         let mut attn = k_beta
             .squeeze(0)?
             .contiguous()?
@@ -369,8 +337,8 @@ impl Qwen3_5GatedDeltaNet {
             .affine(-1.0, 0.0)?;
         
         let mask = Tensor::triu2(chunk_size, candle_core::DType::U32, query.device())?
-            .broadcast_as(decay_mask.shape())?.contiguous()?;
-        // attn的对角线为0,为1的取0, 为0的取attn
+            .broadcast_as(decay_mask.shape())?;
+        
         attn = mask.where_cond(&on_false, &attn)?;
         let (d0, d1, d2, _, _) = attn.dims5()?;
         for i in 1..chunk_size {
@@ -387,7 +355,7 @@ impl Qwen3_5GatedDeltaNet {
         let attn = attn
             .broadcast_add(&Tensor::eye(chunk_size, attn.dtype(), attn.device())?)?
             .contiguous()?;
-        // when rank = 5, matmul error, bs=1,squeeze(0)
+        
         let value = attn.squeeze(0)?.matmul(&v_beta.squeeze(0)?)?.unsqueeze(0)?;
         let k_cumdecay = attn
             .squeeze(0)?
@@ -410,7 +378,7 @@ impl Qwen3_5GatedDeltaNet {
 
         let mut core_attn_out = value.zeros_like()?;
         let tril_mask = Tensor::tril2(chunk_size, candle_core::DType::U32, query.device())?
-            .broadcast_as((batch_size, num_heads, chunk_size, chunk_size))?.contiguous()?;
+            .broadcast_as((batch_size, num_heads, chunk_size, chunk_size))?;
         let on_false = tril_mask.zeros_like()?.to_dtype(candle_core::DType::F32)?;
         let last_dim = core_attn_out.dim(D::Minus1)?;
         for i in 0..total_sequence_length / chunk_size {
@@ -422,12 +390,12 @@ impl Qwen3_5GatedDeltaNet {
                 .matmul(&k_i.transpose(D::Minus1, D::Minus2)?.contiguous()?)?
                 .mul(&decay_mask.i((.., .., i))?)?;
             let attn = tril_mask.where_cond(&attn, &on_false)?.contiguous()?;
-            let v_prime = k_cumdecay.i((.., .., i))?.contiguous()?.matmul(&last_recurrent_state.contiguous()?)?;
+            let v_prime = k_cumdecay.i((.., .., i))?.matmul(&last_recurrent_state)?;
             let v_new = v_i.sub(&v_prime)?;
             let attn_inter = q_i
-                .broadcast_mul(&g_i.unsqueeze(D::Minus1)?.exp()?)?.contiguous()?
-                .matmul(&last_recurrent_state.contiguous()?)?;
-            let out_i = attn_inter.add(&attn.contiguous()?.matmul(&v_new.contiguous()?)?)?.unsqueeze(2)?;
+                .broadcast_mul(&g_i.unsqueeze(D::Minus1)?.exp()?)?
+                .matmul(&last_recurrent_state)?;
+            let out_i = attn_inter.add(&attn.matmul(&v_new)?)?.unsqueeze(2)?;
             core_attn_out = core_attn_out.slice_assign(
                 &[
                     (0..batch_size),
@@ -452,9 +420,9 @@ impl Qwen3_5GatedDeltaNet {
                             .exp()?
                             .unsqueeze(D::Minus1)?,
                     )?
-                    .transpose(D::Minus1, D::Minus2)?.contiguous()? // 🌟 여기서 반드시 굳혀야 합니다!
+                    .transpose(D::Minus1, D::Minus2)?
                     .squeeze(0)?
-                    .matmul(&v_new.squeeze(0)?.contiguous()?)?      // 🌟 v_new도 굳힙니다!
+                    .matmul(&v_new.squeeze(0)?)?
                     .unsqueeze(0)?,
                 )?;
         }
@@ -486,7 +454,6 @@ impl Qwen3_5GatedDeltaNet {
         };
         let initial_dtype = query.dtype();
         
-        // 🌟 [핵심] transmute 하기 전에 원본 차원을 미리 계산합니다.
         let (batch_size, sequence_length, num_heads, k_head_dim) = query.dims4()?;
         let v_head_dim = value.dim(D::Minus1)?;
         let scale = 1.0 / (k_head_dim as f64).sqrt();
@@ -499,8 +466,6 @@ impl Qwen3_5GatedDeltaNet {
         };
 
         if sequence_length == 1 {
-            // 🌟 [궁극의 최적화] 5연속 전체 메모리 복사(.contiguous)를 유발하던 transmute 매크로 완벽 우회!
-            // seq_len이 1이므로 메모리 이동 없이 squeeze만으로 동일한 뷰를 얻어 F32 연산을 수행합니다.
             // 1글자를 뱉을 때마다 낭비되던 105번의 GPU 메모리 할당이 증발합니다!
             let q_i = query.squeeze(1)?.to_dtype(candle_core::DType::F32)?;
             let k_i = key.squeeze(1)?.to_dtype(candle_core::DType::F32)?;
@@ -516,12 +481,10 @@ impl Qwen3_5GatedDeltaNet {
             )?;
             let out_i = last_recurrent_state.broadcast_mul(&q_i.unsqueeze(D::Minus1)?)?.sum_keepdim(D::Minus2)?;
             
-            // 🌟 [적용] 캐시 저장 시 무조건 일렬 정렬!
-            self.recurrent_state_cache = Some(last_recurrent_state.contiguous()?);
-            return Ok(out_i.transpose(1, 2)?.contiguous()?.to_dtype(initial_dtype)?);
+            self.recurrent_state_cache = Some(last_recurrent_state);
+            return Ok(out_i.transpose(1, 2)?.to_dtype(initial_dtype)?); 
         }
 
-        // [프리필(Prefill) 전용 패스] sequence_length > 1 일 때만 기존 매크로 사용
         let (query, key, value, beta, g) = transmute_tensors!(query, key, value, beta, g);
         let mut core_attn_out = Tensor::zeros(
             (batch_size, num_heads, sequence_length, v_head_dim),
@@ -543,7 +506,7 @@ impl Qwen3_5GatedDeltaNet {
             
             core_attn_out = core_attn_out.slice_assign(&[(0..batch_size), (0..num_heads), (i..i + 1), (0..v_head_dim)], &out_i)?;
         }
-        self.recurrent_state_cache = Some(last_recurrent_state.contiguous()?);
+        self.recurrent_state_cache = Some(last_recurrent_state);
         core_attn_out = core_attn_out.transpose(1, 2)?.contiguous()?.to_dtype(initial_dtype)?;
 
         Ok(core_attn_out)
@@ -554,18 +517,15 @@ impl Qwen3_5GatedDeltaNet {
         let dtype = xs.dtype();
         
         if let Some(conv) = self.conv_state_cache.take() {
-            // 🌟 [CRITICAL FIX] 캐시 복구 시 무조건 연속 메모리로 확정 (.contiguous() 추가)
-            self.conv_state_cache = Some(conv.to_device(dev)?.to_dtype(dtype)?.contiguous()?);
+            self.conv_state_cache = Some(conv.to_device(dev)?.to_dtype(dtype)?);
         }
         if let Some(rec) = self.recurrent_state_cache.take() {
-            // 🌟 [CRITICAL FIX] 캐시 복구 시 무조건 연속 메모리로 확정 (.contiguous() 추가)
-            self.recurrent_state_cache = Some(rec.to_device(dev)?.to_dtype(candle_core::DType::F32)?.contiguous()?);
+            self.recurrent_state_cache = Some(rec.to_device(dev)?.to_dtype(candle_core::DType::F32)?);
         }
 
         let (bs, seq_len, _) = xs.dims3()?;
         
-        // 🌟 [CRITICAL FIX] Transpose 직후 텐서를 일렬로 펴서 cuDNN 에러를 예방합니다.
-        let mut mixed_qkv = self.in_proj_qkv.forward(xs)?.transpose(1, 2)?.contiguous()?;
+        let mut mixed_qkv = self.in_proj_qkv.forward(xs)?.transpose(1, 2)?;
         
         let z = self
             .in_proj_z
@@ -581,58 +541,45 @@ impl Qwen3_5GatedDeltaNet {
             let take_len = self.conv_kernel_size - 1;
             let (bs, dim, seq_len) = mixed_qkv.dims3()?;
             
-            // 1. 다음 청크를 위해 현재 청크의 끝부분을 상태로 저장해 둡니다.
             let next_conv_state = if seq_len >= take_len {
-                // 🌟 [CRITICAL FIX] 상태 저장 시에도 무조건 연속 메모리로 만들어 디스크/캐시 오염을 막습니다.
-                mixed_qkv.narrow(D::Minus1, seq_len - take_len, take_len)?.contiguous()?
+                mixed_qkv.narrow(D::Minus1, seq_len - take_len, take_len)?
             } else {
-                mixed_qkv.pad_with_zeros(D::Minus1, take_len - seq_len, 0)?.contiguous()?
+                mixed_qkv.pad_with_zeros(D::Minus1, take_len - seq_len, 0)?
             };
             
-            // 2. 🌟 핵심 보정: Causal Conv를 위해 "왼쪽에만" 과거 상태(또는 0)를 K-1 만큼 붙입니다!
             let prev_causal = if let Some(prev_state) = &self.conv_state_cache {
                 let prev_len = prev_state.dim(D::Minus1)?;
                 if prev_len >= take_len {
-                    // 🌟 [CRITICAL FIX] 잘라낸(narrow) 즉시 일렬 정렬!
-                    prev_state.narrow(D::Minus1, prev_len - take_len, take_len)?.contiguous()?
+                    prev_state.narrow(D::Minus1, prev_len - take_len, take_len)?
                 } else {
-                    // 🌟 [CRITICAL FIX] 패딩(pad) 즉시 일렬 정렬!
-                    prev_state.pad_with_zeros(D::Minus1, take_len - prev_len, 0)?.contiguous()?
+                    prev_state.pad_with_zeros(D::Minus1, take_len - prev_len, 0)?
                 }
             } else {
-                // 첫 청크일 경우 순수 0으로 채워진 Zero Padding을 "왼쪽"에 생성
                 Tensor::zeros((bs, dim, take_len), mixed_qkv.dtype(), mixed_qkv.device())?
             };
             
-            // [왼쪽 패딩 3개] + [현재 청크 256개] = 총 259개 (어떤 경우에도 259개가 보장됨)
-            mixed_qkv = Tensor::cat(&[&prev_causal, &mixed_qkv], D::Minus1)?.contiguous()?;
-            
-            // 3. 상태 업데이트 및 컨볼루션 연산
+            mixed_qkv = Tensor::cat(&[&prev_causal, &mixed_qkv], D::Minus1)?;
             self.conv_state_cache = Some(next_conv_state);
             mixed_qkv = conv1d_depthwise(&mixed_qkv, self.conv1d.weight(), self.conv1d.bias())?;
             
-            // 4. conv1d_depthwise 내부 패딩이 0이므로, 259개가 입력되면 256개로 정확히 깎여서 출력됨!
             let out_len = mixed_qkv.dim(D::Minus1)?;
             mixed_qkv = if out_len > seq_len {
-                // 🌟 [추가 바리케이드] 잘라낸(narrow) 즉시 굳혀줍니다!
-                mixed_qkv.narrow(D::Minus1, out_len - seq_len, seq_len)?.contiguous()?
+                mixed_qkv.narrow(D::Minus1, out_len - seq_len, seq_len)?
             } else {
-                mixed_qkv.contiguous()? // 🌟 그대로 쓸 때도 혹시 모르니 굳혀줍니다!
+                mixed_qkv
             };
             
             mixed_qkv = mixed_qkv.silu()?;
         }
-        // 🌟 [적용] 뒤집은(transpose) 직후 일단 정렬
-        let mixed_qkv = mixed_qkv.transpose(1, 2)?.contiguous()?; 
+        let mixed_qkv = mixed_qkv.transpose(1, 2)?;
         let qkv_split = split_tensor(
             &mixed_qkv,
             &[self.key_dim, self.key_dim, self.value_dim],
             D::Minus1,
         )?;
-        // 🌟 [적용] 잘라낸 조각들을 reshape 하기 전에 반드시 개별적으로 정렬!
-        let mut query = qkv_split[0].contiguous()?.reshape((bs, seq_len, (), self.head_k_dim))?;
-        let mut key = qkv_split[1].contiguous()?.reshape((bs, seq_len, (), self.head_k_dim))?;
-        let value = qkv_split[2].contiguous()?.reshape((bs, seq_len, (), self.head_v_dim))?;
+        let mut query = qkv_split[0].reshape((bs, seq_len, (), self.head_k_dim))?;
+        let mut key = qkv_split[1].reshape((bs, seq_len, (), self.head_k_dim))?;
+        let value = qkv_split[2].reshape((bs, seq_len, (), self.head_v_dim))?;
         let beta = sigmoid(&b)?;
         let a_plus_bias = softplus(
             &a.to_dtype(candle_core::DType::F32)?.broadcast_add(&self.dt_bias)?,
@@ -652,11 +599,7 @@ impl Qwen3_5GatedDeltaNet {
         let core_attn_out = self.norm.forward(&core_attn_out, Some(&z))?;
         let core_attn_out = core_attn_out.reshape((bs, seq_len, ()))?;
         
-        // [기존 코드] 🚨 여기서 F32 상태로 그대로 들어가면서 텐서 코어가 꺼지고 병목이 발생했습니다!
-        // let output = self.out_proj.forward(&core_attn_out)?; 
-
-        // 🌟 [최적화 2] Linear 연산 직전에 모델의 원래 타입(BF16)으로 다시 내려줍니다!
-        // 이 한 줄 덕분에 GPU의 텐서 코어가 다시 켜지며 아웃풋 연산 속도가 폭발적으로 상승합니다.
+        // Linear 연산 직전에 모델의 원래 타입(BF16)으로 다시 내려 GPU의 텐서 코어를 다시 켭니다.
         let core_attn_out_native = core_attn_out.to_dtype(xs.dtype())?;
         let output = self.out_proj.forward(&core_attn_out_native)?;
 
@@ -665,14 +608,12 @@ impl Qwen3_5GatedDeltaNet {
         Ok(output)
     }
 
-    // 4. clear_cache 갱신 및 새로운 Getter / Setter 메서드 추가
     pub fn clear_cache(&mut self) {
         self.conv_state_cache = None;
         self.recurrent_state_cache = None;
-        self.is_state_dirty = false; // 🌟 [추가]
+        self.is_state_dirty = false;
     }
 
-    // 🌟 [신규 추가] SSD I/O를 위해 상태를 통째로 빼오거나 집어넣는 파이프라인
     pub fn get_states(&self) -> (Option<Tensor>, Option<Tensor>) {
         (self.conv_state_cache.clone(), self.recurrent_state_cache.clone())
     }
@@ -680,7 +621,7 @@ impl Qwen3_5GatedDeltaNet {
     pub fn set_states(&mut self, conv: Option<Tensor>, recurrent: Option<Tensor>) {
         self.conv_state_cache = conv;
         self.recurrent_state_cache = recurrent;
-        self.is_state_dirty = false; // 디스크에서 막 불러온 상태이므로 아직 안 더러워짐
+        self.is_state_dirty = false; 
     }
 
     pub fn clear_weights(&mut self) {
@@ -700,13 +641,12 @@ impl Qwen3_5GatedDeltaNet {
 
     pub fn load_weights_inplace<R: std::io::Read + std::io::Seek>(&mut self, ct: &candle_core::quantized::gguf_file::Content, reader: &mut R, prefix: &str, device: &Device) -> Result<()> {
         let conv_dim = self.key_dim * 2 + self.value_dim;
-        // 🌟 [CRITICAL FIX] 가중치 로드 직후 무조건 연속 메모리로 확정 (.contiguous() 추가)
-        let conv1d_weight = ct.tensor(reader, &format!("{prefix}.ssm_conv1d.weight"), device)?.dequantize(device)?.contiguous()?;
+        let conv1d_weight_raw = ct.tensor(reader, &format!("{prefix}.ssm_conv1d.weight"), device)?.dequantize(device)?.contiguous()?;
         
-        // 🚨 수정 전: padding: self.conv_kernel_size - 1
-        // ✅ 수정 후: padding: 0
+        let conv1d_weight = conv1d_weight_raw.reshape((conv_dim, 1, self.conv_kernel_size))?;
+        
         self.conv1d = candle_nn::Conv1d::new(conv1d_weight, None, candle_nn::Conv1dConfig { 
-            padding: 0, // <--- 여기를 0으로 바꿉니다!
+            padding: 0, 
             stride: 1, 
             dilation: 1, 
             groups: conv_dim, 
@@ -717,7 +657,7 @@ impl Qwen3_5GatedDeltaNet {
         self.dt_bias = dt_bias_raw.to_dtype(DType::F32)?; 
         
         let a_log_raw = ct.tensor(reader, &format!("{prefix}.ssm_a"), device)?.dequantize(device)?;
-        self.a_log = a_log_raw.to_dtype(DType::F32)?;  // <--- 원본 그대로 받아오도록 수정!
+        self.a_log = a_log_raw.to_dtype(DType::F32)?;  
         
         let norm_weight = ct.tensor(reader, &format!("{prefix}.ssm_norm.weight"), device)?.dequantize(device)?;
         self.norm = Qwen3_5RMSNormGated::from_weight(norm_weight, 1e-6)?;
@@ -743,7 +683,6 @@ pub struct Qwen3_5Attention {
     num_kv_groups: usize,
     head_dim: usize,
     scaling: f64,
-    // [하이브리드 캐시 시스템 도입]
     kv_blocks: Vec<KVBlock>,
     registry: KVRegistry,
     layer_idx: usize,
@@ -812,25 +751,19 @@ impl Qwen3_5Attention {
     pub fn forward(&mut self, xs: &Tensor, cos: &Tensor, sin: &Tensor, attention_mask: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
         let query_chunk = self.q_proj.forward(xs)?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim * 2))?.chunk(2, D::Minus1)?;
-        
-        // Chunk 분할 뷰를 즉시 물리 메모리로 확정
-        let query_states = query_chunk[0].contiguous()?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
-        let gate = query_chunk[1].contiguous()?.reshape((b_sz, q_len, ()))?;
+        let query_states = query_chunk[0].reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
+        let gate = query_chunk[1].reshape((b_sz, q_len, ()))?;
 
-        // RMSNorm 통과 및 Transpose 직후 정렬
-        let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?.contiguous()?;
+        let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?;
         let key_states = self.k_proj.forward(xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
-        let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?.contiguous()?;
-        
-        // 🌟 [CRITICAL FIX] value_states 뒤집은 직후에도 반드시 메모리를 굳혀줍니다!
-        let value_states = self.v_proj.forward(xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?;
+        let value_states = self.v_proj.forward(xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?;
         
         let (query_states, key_states) = glm_asr_apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
         
         let dev = xs.device();
         let target_dtype = xs.dtype();
 
-        // 1. [블록 할당 및 추가] 새로 계산된 KV를 256 사이즈 블록으로 쪼개서 넣기
         let mut tokens_to_process = q_len;
         let mut chunk_offset = 0;
         while tokens_to_process > 0 {
@@ -840,8 +773,8 @@ impl Qwen3_5Attention {
                 let free_space = 256usize.saturating_sub(inner.len);
                 if inner.location == KVLocation::VRAM && free_space > 0 {
                     let take = tokens_to_process.min(free_space);
-                    let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
-                    let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
+                    let k_piece = key_states.narrow(2, chunk_offset, take)?;
+                    let v_piece = value_states.narrow(2, chunk_offset, take)?;
 
                     if let (Some(pk), Some(pv)) = (inner.k_cache.take(), inner.v_cache.take()) {
                         inner.k_cache = Some(Tensor::cat(&[&pk, &k_piece], 2)?);
@@ -859,8 +792,8 @@ impl Qwen3_5Attention {
             }
             if !appended {
                 let take = tokens_to_process.min(256);
-                let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
-                let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
+                let k_piece = key_states.narrow(2, chunk_offset, take)?;
+                let v_piece = value_states.narrow(2, chunk_offset, take)?;
                 let index = self.kv_blocks.len();
                 let current_total = seqlen_offset + chunk_offset;
                 
@@ -882,13 +815,11 @@ impl Qwen3_5Attention {
             }
         }
 
-        // 🌟 2. [VRAM 폭발 원천 차단] Eager Eaten 대신 Chunk-based Online Softmax 적용
         let total_tokens_now = seqlen_offset + q_len;
         let mut out_res: Option<Tensor> = None;
         let mut m_n: Option<Tensor> = None;
         let mut l_n: Option<Tensor> = None;
         
-        // 🌟 [최적화 2] 1,680번 반복되던 스케일링 곱셈을 루프 바깥으로 빼서 딱 1번만 계산합니다!
         let q_aligned = (query_states * self.scaling)?;
 
         for block in &self.kv_blocks {
@@ -971,7 +902,7 @@ impl Qwen3_5Attention {
                         }
                     }
                     
-                    let fallback_shape = vec![1, self.num_key_value_heads, b_len, self.head_dim]; // 안전 폴백
+                    let fallback_shape = vec![1, self.num_key_value_heads, b_len, self.head_dim]; 
                     let k_safe = k_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::F32, &Device::Cpu).unwrap());
                     let v_safe = v_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::F32, &Device::Cpu).unwrap());
                     
@@ -982,20 +913,19 @@ impl Qwen3_5Attention {
             let mut k = k_block;
             let mut v = v_block;
 
-            // 1) GQA Expansion
             if self.num_kv_groups > 1 {
                 let (b, h, s, d) = k.dims4()?;
-                // 🌟 [적용] expand(가상 확장) 직후 무조건 contiguous()로 물리 메모리를 채운 뒤 reshape!
-                k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.contiguous()?.reshape((b, h * self.num_kv_groups, s, d))?;
-                v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.contiguous()?.reshape((b, h * self.num_kv_groups, s, d))?;
+                k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
             }
 
-            let actual_kv_len = k.dim(2)?;
-            // 🌟 [적용] transpose 전 K를 단단하게 고정!
-            let k_t = k.contiguous()?.transpose(2, 3)?.contiguous()?;
+            k = k.contiguous()?;
+            v = v.contiguous()?;
 
-            // 2) Q * K^T * scaling
-            let mut s_chunk = (q_aligned.matmul(&k_t)? * self.scaling)?;
+            let actual_kv_len = k.dim(2)?;
+            let k_t = k.transpose(2, 3)?.contiguous()?;
+            
+            let mut s_chunk = q_aligned.matmul(&k_t)?;
 
             if let Some(mask) = &attention_mask {
                 let mask_len = mask.dim(candle_core::D::Minus1)?;
@@ -1005,8 +935,7 @@ impl Qwen3_5Attention {
                     if take < actual_kv_len {
                         let left_masked = s_chunk.narrow(candle_core::D::Minus1, 0, take)?.broadcast_add(&chunk_mask)?;
                         let right_unmasked = s_chunk.narrow(candle_core::D::Minus1, take, actual_kv_len - take)?;
-                        // 🌟 [추가 바리케이드] Cat으로 이어붙인 직후 무조건 굳혀줍니다!
-                        s_chunk = Tensor::cat(&[&left_masked, &right_unmasked], candle_core::D::Minus1)?.contiguous()?;
+                        s_chunk = Tensor::cat(&[&left_masked, &right_unmasked], candle_core::D::Minus1)?;
                     } else {
                         s_chunk = s_chunk.broadcast_add(&chunk_mask)?; 
                     }
@@ -1017,7 +946,6 @@ impl Qwen3_5Attention {
             let p_j = s_chunk.broadcast_sub(&m_j)?.exp()?;
             let l_j = p_j.sum_keepdim(candle_core::D::Minus1)?;
             
-            // 네이티브 BF16 상태로 즉시 행렬곱(MatMul) 강행!
             let out_j = p_j.matmul(&v)?;
 
             match out_res.as_ref() {
@@ -1047,15 +975,13 @@ impl Qwen3_5Attention {
             drop(v);
         }
 
-        // 🌟 [최종 반환부] 여기서도 F32 찌꺼기를 지우고 네이티브로 즉각 반환합니다.
         let attn_output = if let (Some(out_res_val), Some(l_val)) = (out_res, l_n) {
             out_res_val.broadcast_div(&l_val)?
         } else {
             return Err(anyhow!("No KV data processed"));
         };
 
-        // 🌟 [추가 바리케이드] reshape 하기 "전"에 contiguous()로 먼저 펴줘야 에러가 안 납니다!
-        let attn_output = attn_output.transpose(1, 2)?.contiguous()?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
+        let attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?.contiguous()?;
         let attn_output = attn_output.mul(&sigmoid(&gate)?)?;
         Ok(attn_output.apply(&self.o_proj)?)
     }
@@ -1108,7 +1034,6 @@ impl AttnKind {
         }
     }
 
-    // 🌟 [추가] SSM 캐시 접근 브릿지
     pub fn get_ssm_states(&self) -> (Option<Tensor>, Option<Tensor>) {
         if let AttnKind::LinearAttn(attn) = self {
             attn.get_states()
@@ -1138,9 +1063,6 @@ impl AttnKind {
     }
 }
 
-// ---------------------------------------------------------
-// [DecoderLayer 업데이트] seqlen_offset 전달용
-// ---------------------------------------------------------
 pub struct Qwen3_5DecoderLayer {
     pub layer_type: String,
     attn: AttnKind,
@@ -1149,15 +1071,12 @@ pub struct Qwen3_5DecoderLayer {
     post_attention_layernorm: Qwen3_5RMSNorm,
 }
 
-// ----------------------------------------------------------------------------------
-// [Qwen3_5DecoderLayer] Layer 생성자에 registry 주입
-// ----------------------------------------------------------------------------------
 impl Qwen3_5DecoderLayer {
     pub fn new_from_vb(
         vb: VarBuilder,
         config: &Qwen3_5TextConfig,
         layer_idx: usize,
-        registry: KVRegistry, // [추가] 장부 주입
+        registry: KVRegistry, 
     ) -> Result<Self> {
         let hidden_size = config.hidden_size;
         let layer_type = config.layer_types[layer_idx].clone();
@@ -1165,7 +1084,6 @@ impl Qwen3_5DecoderLayer {
             let attn = Qwen3_5GatedDeltaNet::new_from_vb(vb.pp("linear_attn"), config)?;
             AttnKind::LinearAttn(attn)
         } else {
-            // [수정] layer_idx 와 registry 를 어텐션 코어에 전달
             let attn = Qwen3_5Attention::new_from_vb(vb.pp("self_attn"), config, layer_idx, registry)?;
             AttnKind::SelfAttn(attn)
         };
@@ -1200,14 +1118,13 @@ impl Qwen3_5DecoderLayer {
         prefix: &str,
         layer_type: &str,
         rms_norm_eps: f64,
-        layer_idx: usize, // [추가]
-        registry: KVRegistry, // [추가]
+        layer_idx: usize, 
+        registry: KVRegistry, 
     ) -> Result<Self> {
         let attn = if layer_type.eq("linear_attention") {
             let attn = Qwen3_5GatedDeltaNet::new_from_gguf(gguf, prefix, rms_norm_eps)?;
             AttnKind::LinearAttn(attn)
         } else {
-            // [수정] layer_idx 와 registry 를 어텐션 코어에 전달
             let attn = Qwen3_5Attention::new_from_gguf(gguf, prefix, rms_norm_eps, layer_idx, registry)?;
             AttnKind::SelfAttn(attn)
         };
@@ -1278,7 +1195,6 @@ impl Qwen3_5DecoderLayer {
         self.post_attention_layernorm.clear();
     }
 
-    // 🌟 [추가] 레이어가 비워져 있는지 확인
     pub fn is_cleared(&self) -> bool { self.input_layernorm.is_cleared() }
 
     pub fn load_weights_inplace<R: std::io::Read + std::io::Seek>(&mut self, ct: &candle_core::quantized::gguf_file::Content, reader: &mut R, prefix: &str, device: &Device) -> Result<()> {
@@ -1312,7 +1228,7 @@ pub struct Qwen3_5TextModel {
     pub active_session_id: Option<String>,
     pub active_kv_name: Option<String>,
     
-    // 🌟 [PART 2 추가] Mmap 핑퐁을 위한 메타데이터 필드
+    // Mmap 핑퐁을 위한 메타데이터 필드
     pub mmap: Option<std::sync::Arc<memmap2::Mmap>>,
     pub ct: Option<std::sync::Arc<candle_core::quantized::gguf_file::Content>>,
     pub base_name: String,
@@ -1326,7 +1242,7 @@ impl Qwen3_5TextModel {
         let vb_layers = vb.pp("layers");
         for i in 0..config.num_hidden_layers {
             let mut layer = Qwen3_5DecoderLayer::new_from_vb(vb_layers.pp(i), config, i, registry.clone())?;
-            layer.clear_weights(); // 🌟 [추가] 초기화 즉시 1바이트 껍데기로 만들어버림
+            layer.clear_weights(); // 초기화 즉시 1바이트 껍데기로 만들어버림
             layers.push(layer);
         }
         let norm = Qwen3_5RMSNorm::new(vb.pp("norm"), config.hidden_size, config.rms_norm_eps)?;
@@ -1335,7 +1251,7 @@ impl Qwen3_5TextModel {
         Ok(Self {
             embed_tokens, layers, norm, rotary_emb, mrope_section: config.rope_parameters.mrope_section.clone(), dtype: vb.dtype(),
             registry, current_kv_len: 0, active_session_id: None, active_kv_name: None,
-            mmap: None, ct: None, base_name: "model".to_string(), // 🌟 [추가]
+            mmap: None, ct: None, base_name: "model".to_string(), 
         })
     }
 
@@ -1359,7 +1275,7 @@ impl Qwen3_5TextModel {
         let hidden_size = gguf.get_matedata("qwen35.embedding_length")?.to_u32()? as usize;
         let embed_tensor = gguf.tensor("token_embd.weight")?;
         
-        // 🌟 [최적화 1] 15만 개 단어사전(수백 MB)을 VRAM에 풀지 않고 CPU RAM에 압축 해제하여 영구 고정!
+        // 15만 개 단어사전(수백 MB)을 VRAM에 풀지 않고 CPU RAM에 압축 해제하여 영구 고정!
         let embed_tokens = Embedding::new(embed_tensor.dequantize(&Device::Cpu)?, hidden_size);
         
         let registry = KVRegistry::new(); // 장부 초기화
@@ -1368,7 +1284,7 @@ impl Qwen3_5TextModel {
             let prefix = format!("blk.{i}");
             let layer_type = if (i + 1) % full_attention_interval == 0 { "full_attention".to_string() } else { "linear_attention".to_string() };
             let mut layer = Qwen3_5DecoderLayer::new_from_gguf(gguf, &prefix, &layer_type, rms_norm_eps, i, registry.clone())?;
-            layer.clear_weights(); // 🌟 [추가] 초기화 즉시 1바이트 껍데기로 만들어버림
+            layer.clear_weights(); // 초기화 즉시 1바이트 껍데기로 만들어버림
             layers.push(layer);
         }
         let norm_weight = gguf.get_dequantized("output_norm.weight")?;
@@ -1378,12 +1294,11 @@ impl Qwen3_5TextModel {
         Ok(Self {
             embed_tokens, layers, norm, rotary_emb, mrope_section, dtype,
             registry, current_kv_len: 0, active_session_id: None, active_kv_name: None,
-            // 🌟 [수정] 넘겨받은 Mmap 핸들을 저장합니다.
             mmap: mmap_handle, ct: ct_handle, base_name: "model".to_string(),
         })
     }
 
-    // 🌟 [추가] 찰나의 순간에 디스크에서 가중치를 퍼 올리는 JIT 로더
+    // 찰나의 순간에 디스크에서 가중치를 퍼 올리는 JIT 로더
     pub fn reload_layer(&mut self, layer_idx: usize, device: &Device) -> Result<()> {
         if let (Some(mmap), Some(ct)) = (self.mmap.as_ref(), self.ct.as_ref()) {
             let mut reader = std::io::Cursor::new(&mmap[..]);
@@ -1394,13 +1309,13 @@ impl Qwen3_5TextModel {
         Ok(())
     }
 
-    // 🌟 [수정] 메모리는 유지하되 PCIe & SSD 병목은 완벽 차단한 궁극의 파이프라인
+    // 메모리는 유지하되 PCIe & SSD 병목은 완벽 차단한 궁극의 파이프라인
     pub async fn forward(&mut self, inputs_embeds: &Tensor, position_ids: &Tensor, seqlen_offset: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
         self.active_session_id = session_id.clone();
         self.active_kv_name = kv_name.clone();
 
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
-        let is_decoding = seq_len <= 1; // 🌟 [추가] 현재 AI가 대답 중인지 판별
+        let is_decoding = seq_len <= 1; // 현재 AI가 대답 중인지 판별
 
         let (cos, sin) = self.rotary_emb.forward(position_ids, self.dtype, self.mrope_section.clone())?;
         
@@ -1420,8 +1335,7 @@ impl Qwen3_5TextModel {
         let total_layers = self.layers.len();
 
         for l_idx in 0..total_layers {
-            // 🌟 [핵심 최적화 1] 가중치가 비워져 있을 때만 Mmap 로드! 
-            // 디코딩 시에는 한 번 VRAM에 올린 가중치를 계속 쥐고 있어 매 토큰 1.6GB 복사 오버헤드를 없앱니다.
+            // 가중치가 비워져 있을 때만 Mmap 로드! 
             if self.layers[l_idx].is_cleared() {
                 self.reload_layer(l_idx, xs.device())?;
             }
@@ -1438,13 +1352,17 @@ impl Qwen3_5TextModel {
                 if conv_opt.is_none() || rec_opt.is_none() {
                     if let Some(sid) = &session_id {
                         let kv_dir = crate::utils::paths::get_kv_dir(None);
+                        
                         let kv_name_raw = kv_name.as_deref().unwrap_or("text");
-                        let last_part = kv_name_raw.split('/').last().unwrap_or("text");
-                        let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text" } else { last_part };
+                        let mut safe_kv_type = kv_name_raw.split('/').last().unwrap_or("text");
+                        if safe_kv_type == "inference" || safe_kv_type == "reference" || safe_kv_type.is_empty() {
+                            safe_kv_type = "text";
+                        }
                         
                         let path_candidates = vec![
-                            kv_dir.join(format!("{}/inference/{}/ssm", sid, kv_type)),
-                            kv_dir.join(format!("{}/reference/{}/ssm", sid, kv_type))
+                            kv_dir.join(format!("{}/inference/{}/ssm", sid, safe_kv_type)),
+                            kv_dir.join(format!("{}/reference/{}/ssm", sid, safe_kv_type)),
+                            kv_dir.join(format!("{}/inference/text/ssm", sid)), // 최후의 폴백
                         ];
 
                         let mut found_file = false;
@@ -1454,25 +1372,26 @@ impl Qwen3_5TextModel {
                             if st_path.exists() {
                                 found_file = true;
                                 let mut loaded = false;
-                                if let Ok(encrypted_data) = std::fs::read(&st_path) {
-                                    if let Ok(plain_data) = crate::utils::crypto::decrypt_data(&encrypted_data) {
-                                        if let Ok(tensors) = candle_core::safetensors::load_buffer(&plain_data, xs.device()) {
-                                            let loaded_conv = tensors.get("conv_state").cloned();
-                                            let loaded_rec = tensors.get("recurrent_state").cloned();
-                                            if loaded_conv.is_some() && loaded_rec.is_some() {
-                                                layer.set_ssm_states(loaded_conv, loaded_rec);
-                                                loaded = true;
-                                                break;
+                                for _retry in 0..3 {
+                                    if let Ok(encrypted_data) = std::fs::read(&st_path) {
+                                        if let Ok(plain_data) = crate::utils::crypto::decrypt_data(&encrypted_data) {
+                                            // Device 강제 할당 제거: CPU에서 풀어서 안전하게 GPU로 넘깁니다.
+                                            if let Ok(tensors) = candle_core::safetensors::load_buffer(&plain_data, &candle_core::Device::Cpu) {
+                                                let loaded_conv = tensors.get("conv_state").map(|t| t.to_device(xs.device()).unwrap_or(t.clone()));
+                                                let loaded_rec = tensors.get("recurrent_state").map(|t| t.to_device(xs.device()).unwrap_or(t.clone()));
+                                                if loaded_conv.is_some() && loaded_rec.is_some() {
+                                                    layer.set_ssm_states(loaded_conv, loaded_rec);
+                                                    loaded = true;
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
+                                    std::thread::sleep(std::time::Duration::from_millis(5));
                                 }
-                                if !loaded {
-                                    println!("[WARNING] SSM State corrupted or failed to parse for Layer {} (Session: {}). Model may hallucinate!", l_idx, sid);
-                                }
+                                if loaded { break; }
                             }
                         }
-                        // 🌟 [CRITICAL FIX] 디스크에 파일이 아예 없을 경우 강력한 경고 발생
                         if !found_file {
                             println!("[WARNING] SSM state file completely missing for Layer {} (Session: {})! Model context destroyed.", l_idx, sid);
                         }
@@ -1485,16 +1404,13 @@ impl Qwen3_5TextModel {
             xs = layer.forward(&xs, Some(&cos), Some(&sin), layer_mask.as_ref(), seqlen_offset)?;
 
             if !is_decoding {
+                // 가중치 소각(clear_weights) 전, SSM State를 안전한 CPU 메모리로 대피시킵니다!
                 if layer.layer_type == "linear_attention" {
-                    let is_dirty = layer.is_ssm_dirty(); // 🌟 [CRITICAL FIX] 상태 플래그 백업
                     let (conv_opt, rec_opt) = layer.get_ssm_states();
                     if let (Some(conv), Some(rec)) = (conv_opt, rec_opt) {
                         let safe_conv = conv.to_device(&candle_core::Device::Cpu).unwrap_or(conv);
                         let safe_rec = rec.to_device(&candle_core::Device::Cpu).unwrap_or(rec);
                         layer.set_ssm_states(Some(safe_conv), Some(safe_rec));
-                    }
-                    if is_dirty {
-                        layer.set_ssm_dirty(true); // 🌟 [CRITICAL FIX] 상태 플래그 원상복구
                     }
                 }
                 layer.clear_weights();
@@ -1525,7 +1441,7 @@ impl Qwen3_5TextModel {
                                 let v = inner.v_cache.as_ref().unwrap();
                                 
                                 if is_dirty {
-                                    // 🌟 [최적화 1] 원본은 VRAM에 내버려 두고, 백그라운드 저장을 위해 CPU로 '복제'만 뜹니다.
+                                    // 원본은 VRAM에 내버려 두고, 백그라운드 저장을 위해 CPU로 '복제'만 뜹니다.
                                     let k_cpu = k.to_device(&candle_core::Device::Cpu).unwrap_or(k.clone());
                                     let v_cpu = v.to_device(&candle_core::Device::Cpu).unwrap_or(v.clone());
                                     let k_shape_u32: Vec<u32> = k_cpu.shape().dims().iter().map(|&x| x as u32).collect();
@@ -1546,12 +1462,8 @@ impl Qwen3_5TextModel {
                                     let mut reg = attn.registry.entries.write().unwrap();
                                     if inner.index < reg.len() {
                                         reg[inner.index].is_dirty[l_idx] = false;
-                                        // 🚨 주의: reg.location은 변경하지 않고 VRAM 상태로 유지!
                                     }
                                 }
-
-                                // 🌟 [최적화 2] 기존의 텐서 RAM 강등 로직(inner.k_cache = Some(k_cpu))을 완전히 삭제!!
-                                // 이제 JIT Jumper 없이 VRAM에서 1,000GB/s의 대역폭으로 직접 어텐션을 계산합니다.
                             }
                         }
 
@@ -1578,37 +1490,8 @@ impl Qwen3_5TextModel {
                             }
                         }
                     },
-                    AttnKind::LinearAttn(attn) => {
-                        // 🌟 [핵심 최적화 3] 디코딩(1토큰) 중에는 무자비한 21-Thread SSM 디스크 I/O 스팸을 막습니다!
-                        // if !is_decoding && attn.is_state_dirty {
-                        //     let (conv_opt, rec_opt) = attn.get_states();
-                        //     if let (Some(conv), Some(rec)) = (conv_opt, rec_opt) {
-                        //         let conv_cpu = conv.to_device(&candle_core::Device::Cpu).unwrap_or(conv);
-                        //         let rec_cpu = rec.to_device(&candle_core::Device::Cpu).unwrap_or(rec);
-                        //         attn.is_state_dirty = false;
-
-                        //         let ssm_dir = base_dir.join("ssm");
-                        //         if !ssm_dir.exists() { let _ = std::fs::create_dir_all(&ssm_dir); }
-                                
-                        //         let l_idx_clone = l_idx;
-                        //         tokio::task::spawn_blocking(move || {
-                        //             let mut map = std::collections::HashMap::new();
-                        //             map.insert("conv_state".to_string(), conv_cpu);
-                        //             map.insert("recurrent_state".to_string(), rec_cpu);
-
-                        //             let st_path = ssm_dir.join(format!("l{}.st", l_idx_clone));
-                        //             let tmp_path = st_path.with_extension("tmp");
-                        //             if candle_core::safetensors::save(&map, &tmp_path).is_ok() {
-                        //                 if let Ok(plain_data) = std::fs::read(&tmp_path) {
-                        //                     if let Ok(encrypted_data) = crate::utils::crypto::encrypt_data(&plain_data) {
-                        //                         let _ = std::fs::write(&st_path, encrypted_data);
-                        //                     }
-                        //                 }
-                        //                 let _ = std::fs::remove_file(tmp_path);
-                        //             }
-                        //         });
-                        //     }
-                        // }
+                    AttnKind::LinearAttn(_attn) => {
+                        // 디코딩 중 무자비한 SSM 디스크 I/O 스팸 방지 로직 유지
                     }
                 }
             }
@@ -1630,22 +1513,11 @@ impl Qwen3_5TextModel {
     pub fn restore_kv_registry(&mut self, kv_name: &str) -> Result<()> {
         use crate::models::qwen::generate::LayerIndex;
         let kv_dir = crate::utils::paths::get_kv_dir(None);
+        let index_path = kv_dir.join(kv_name).join("layer0.json");
         
-        // 🌟 [CRITICAL FIX] Layer 0은 SSM이므로 index 파일이 없습니다! 
-        // Full Attention 레이어(예: layer3.json)가 나올 때까지 순회하며 진짜 인덱스를 찾습니다.
-        let mut index_json = String::new();
-        for l_idx in 0..28 {
-            let index_path = kv_dir.join(kv_name).join(format!("layer{}.json", l_idx));
-            if index_path.exists() {
-                if let Ok(data) = crate::utils::direct_loader::load_kv_block(&index_path) {
-                    index_json = String::from_utf8(data).unwrap_or_default();
-                    if !index_json.is_empty() { break; }
-                }
-            }
-        }
+        if !index_path.exists() { return Ok(()); }
         
-        if index_json.is_empty() { return Ok(()); }
-        
+        let index_json = String::from_utf8(crate::utils::direct_loader::load_kv_block(&index_path).unwrap_or_default()).unwrap_or_default();
         let index: LayerIndex = serde_json::from_str(&index_json).unwrap_or_else(|_| LayerIndex { layer_idx: 0, total_tokens: 0, blocks: vec![] });
         let total_tokens = index.total_tokens;
 
@@ -1691,12 +1563,11 @@ impl Qwen3_5TextModel {
         Ok(())
     }
 
-    // 🌟 [핵심] 기존 0.6B의 BAKE_TX 워커를 활용함과 동시에, SSM 전용 다이렉트 백업 트랙을 추가합니다!
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> {
         use crate::models::qwen::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
         
         let mut block_groups: std::collections::HashMap<(usize, usize), Vec<LayerKVDump>> = std::collections::HashMap::new();
-        let mut ssm_dumps = Vec::new(); // 🌟 [신규] SSM 상태를 담을 전용 그릇
+        let mut ssm_dumps = Vec::new(); // SSM 상태를 담을 전용 그릇
 
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
             // 1. 기존 Self Attention (KV 블록) 수집
@@ -1732,33 +1603,31 @@ impl Qwen3_5TextModel {
                 }
             }
 
-            // 🌟 2. [신규] SSM (Linear Attention) 상태 수집
+            // 2. SSM (Linear Attention) 상태 수집
             if layer.is_ssm_dirty() {
                 let (conv_opt, rec_opt) = layer.get_ssm_states();
                 if let (Some(conv), Some(rec)) = (conv_opt, rec_opt) {
-                    // GPU 병목을 막기 위해 CPU로 즉시 옮깁니다.
                     let conv_cpu = conv.to_device(&Device::Cpu).unwrap_or(conv);
                     let rec_cpu = rec.to_device(&Device::Cpu).unwrap_or(rec);
                     ssm_dumps.push((l_idx, conv_cpu, rec_cpu));
-                    layer.set_ssm_dirty(false); // 백업 큐에 넣었으므로 더러움(dirty) 마크 해제
+                    layer.set_ssm_dirty(false);
                 }
             }
         }
 
         let kv_dir = crate::utils::paths::get_kv_dir(None);
-        let mode = false; // 3.5는 inference로 고정
+        let mode = false; 
         let kv_name_raw = kv_name.unwrap_or("text");
         let last_part = kv_name_raw.split('/').last().unwrap_or("text");
         let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text" } else { last_part };
         let sub_path = format!("{}/inference/{}", session_id, kv_type);
         let base_dir = kv_dir.join(&sub_path);
 
-        // 🌟 3. [신규] SSM 비동기 다이렉트 암호화 & 저장 (가장 빠름)
+        // 3. SSM 비동기 다이렉트 암호화 & 저장
         if !ssm_dumps.is_empty() {
             let ssm_dir = base_dir.join("ssm");
             if !ssm_dir.exists() { let _ = std::fs::create_dir_all(&ssm_dir); }
 
-            // [CRITICAL FIX] 백그라운드 스레드가 디스크 쓰기를 마칠 때까지 메인 런타임이 대기할 수 있도록 IO 카운터 증가!
             let dump_count = ssm_dumps.len();
             crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_add(dump_count, std::sync::atomic::Ordering::SeqCst);
 
@@ -1779,13 +1648,12 @@ impl Qwen3_5TextModel {
                         }
                         let _ = std::fs::remove_file(tmp_path);
                     }
-                    // [CRITICAL FIX] 1개 레이어의 디스크 쓰기가 끝날 때마다 카운터 차감
                     crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             });
         }
 
-        // 4. 기존 KV 블록 큐 전송 (SLOT_MANAGER 경유)
+        // 4. 기존 KV 블록 큐 전송
         if block_groups.is_empty() { return Ok(()); }
 
         if let Some(tx) = BAKE_TX.get() {
@@ -1852,7 +1720,6 @@ impl Qwen3_5Model {
         })
     }
 
-    // 🌟 [수정] 제네릭 R1, R2 분리 및 Mmap 인자 추가
     pub fn new_from_gguf<R1: Read + Seek, R2: Read + Seek>(
         gguf: &mut Gguf<R1>,
         mmproj_gguf: Option<&mut Gguf<R2>>,
@@ -1870,13 +1737,14 @@ impl Qwen3_5Model {
         } else {
             None
         };
-        // 🌟 [수정] 파라미터 전달
+
         let language_model = Qwen3_5TextModel::new_from_gguf(gguf, device, mmap_handle, ct_handle)?;
         let lm_head_tensor = match gguf.tensor("output.weight") {
             Ok(tensor) => tensor,
             Err(_) => gguf.tensor("token_embd.weight")?,
         };
-        // 🌟 [최적화 1] VRAM을 300MB 넘게 차지하는 거대한 단어사전 매트릭스를 CPU RAM에 풀어서(F32) 영구 고정!
+        
+        // 거대한 단어사전 매트릭스를 CPU RAM에 풀어서 영구 고정!
         let lm_head_cpu = lm_head_tensor.dequantize(&Device::Cpu)?.to_dtype(DType::F32)?;
         let lm_head = candle_nn::Linear::new(lm_head_cpu, None);
         
@@ -2008,11 +1876,11 @@ impl Qwen3_5Model {
                 let position_deltas = llm_position.max_all()?.to_scalar::<u32>()? as i64 + 1 - input_ids_i.dim(0)? as i64;
                 mrope_position_deltas.push(position_deltas);
             }
-            let mrope_position_deltas_vec = mrope_position_deltas.clone(); // 🌟 복사본 떠두기
+            let mrope_position_deltas_vec = mrope_position_deltas.clone(); 
             let mut mrope_position_deltas = Tensor::new(mrope_position_deltas, input_ids.device())?;
             if mrope_position_deltas.rank() == 1 { mrope_position_deltas = mrope_position_deltas.unsqueeze(0)?; }
             
-            Ok((position_ids.contiguous()?, mrope_position_deltas, mrope_position_deltas_vec)) // 🌟 vec 반환 추가
+            Ok((position_ids.contiguous()?, mrope_position_deltas, mrope_position_deltas_vec))
         } else if let Some(mask) = mask {
             let mut position_ids = mask.to_dtype(candle_core::DType::F64)?.cumsum(D::Minus1)?.to_dtype(candle_core::DType::U32)?.broadcast_sub(&Tensor::new(vec![1_u32], input_ids.device())?)?;
             for i in 0..position_ids.dim(0)? {
@@ -2029,14 +1897,12 @@ impl Qwen3_5Model {
             let mut mrope_position_deltas = position_ids.max(0)?.max(D::Minus1)?.broadcast_sub(&Tensor::new(vec![mask.dim(D::Minus1)? as u32 - 1], input_ids.device())?)?.contiguous()?;
             if mrope_position_deltas.rank() == 1 { mrope_position_deltas = mrope_position_deltas.unsqueeze(0)?; }
             
-            // 🌟 [추가 & 수정] Vec<i64> 형변환 후 리턴
             let mrope_position_deltas_vec = mrope_position_deltas.flatten_all()?.to_vec1::<u32>()?.iter().map(|&x| x as i64).collect();
             Ok((position_ids, mrope_position_deltas, mrope_position_deltas_vec))
         } else {
             let position_ids = Tensor::arange(0_u32, input_ids.dim(D::Minus1)? as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, input_ids.dim(0)?, input_ids.dim(D::Minus1)?))?.contiguous()?;
             let mrope_position_deltas = Tensor::zeros((input_ids.dim(0)?, 1), input_ids.dtype(), input_ids.device())?;
             
-            // 🌟 [추가 & 수정] 비어있는 Vec 생성 후 리턴
             let mrope_position_deltas_vec = vec![0i64; input_ids.dim(0)?];
             Ok((position_ids, mrope_position_deltas, mrope_position_deltas_vec))
         }
@@ -2052,12 +1918,8 @@ impl Qwen3_5Model {
     ) -> Result<Tensor> {
         let (bs, seq_len, _) = inputs_embeds.dims3()?;
 
-        // 🌟 [CRITICAL FIX] 위치 정보(RoPE) 리셋 버그 픽스!
         if self.rope_deltas_cpu.is_none() {
             if seqlen_offset > 0 {
-                // 모델이 디스크에서 리로드 된 직후 (캐시 재사용)
-                // 이미지가 포함되지 않은 텍스트 청크이므로 delta는 0으로 처리하여
-                // 다음 토큰들이 0이 아닌 13765부터 정확히 매겨지도록 강제합니다!
                 self.rope_deltas_cpu = Some(vec![0i64; bs]);
             } else {
                 let (_, rope_deltas, deltas_cpu) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
@@ -2075,12 +1937,10 @@ impl Qwen3_5Model {
                 .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, seq_len))?;
             p_ids_vec.push(p_id);
         }
-        // 🌟 [CRITICAL FIX] Broadcast 된 뷰들을 이어붙인 직후 무조건 메모리를 물리적으로 정렬합니다!
-        let position_ids = Tensor::cat(&p_ids_vec, 1)?.contiguous()?;
+        let position_ids = Tensor::cat(&p_ids_vec, 1)?;
         Ok(position_ids.to_device(inputs_embeds.device())?)
     }
 
-    // [수정] session_id와 kv_name 인자 추가
     pub async fn forward(
         &mut self,
         input_ids: &Tensor,
@@ -2088,16 +1948,14 @@ impl Qwen3_5Model {
         image_grid_thw: Option<&Tensor>,
         pixel_values_video: Option<&Tensor>,
         video_grid_thw: Option<&Tensor>,
-        cache_position: Option<&Tensor>, // <--- [CRITICAL FIX] 복구됨!
+        cache_position: Option<&Tensor>, 
         seqlen_offset: usize,
         session_id: Option<String>,
         kv_name: Option<String>,
     ) -> Result<Tensor> {
-        // 🌟 [최적화 2] CPU에 상주 중인 임베딩 사전을 조회하기 위해 토큰 ID를 잠깐 CPU로 복사
         let input_ids_cpu = input_ids.to_device(&Device::Cpu)?;
         let inputs_embeds_cpu = self.language_model.embed_tokens.forward(&input_ids_cpu)?;
         
-        // 🌟 조회된 가벼운 결과물(1토큰당 2KB)만 고속 PCIe 버스를 태워 GPU VRAM으로 전송!
         let mut inputs_embeds = inputs_embeds_cpu.to_device(input_ids.device())?;
         
         if let Some(pixel_values) = pixel_values {
@@ -2139,7 +1997,7 @@ impl Qwen3_5Model {
         }
         
         let total_len = inputs_embeds.dim(1)?;
-        let chunk_size = 256; // 🌟 [핵심] 1024 -> 256으로 축소하여 VRAM 스파이크 원천 차단!
+        let chunk_size = 256; 
         let mut final_hidden_state = None;
 
         if total_len > 1 {
@@ -2148,16 +2006,14 @@ impl Qwen3_5Model {
             
             while processed < total_len {
                 let take = (total_len - processed).min(chunk_size);
-                // 🌟 [CRITICAL FIX] 텐서를 자른 직후 연속된 메모리로 확정하여 CUDA 에러 원천 차단!
-                let chunk_embeds = inputs_embeds.narrow(1, processed, take)?.contiguous()?;
-                let chunk_pos_ids = position_ids.narrow(2, processed, take)?.contiguous()?;
+                let chunk_embeds = inputs_embeds.narrow(1, processed, take)?;
+                let chunk_pos_ids = position_ids.narrow(2, processed, take)?;
 
                 let outputs = self.language_model.forward(&chunk_embeds, &chunk_pos_ids, current_offset, session_id.clone(), kv_name.clone()).await?;
 
                 if processed + take == total_len {
                     let seq_len = outputs.dim(1)?;
-                    // 🌟 [CRITICAL FIX] 마지막 토큰만 잘라낼 때도 무조건 연속된 메모리로 확정하여 F32 변환 시 크래시 차단!
-                    final_hidden_state = Some(outputs.narrow(1, seq_len - 1, 1)?.contiguous()?);
+                    final_hidden_state = Some(outputs.narrow(1, seq_len - 1, 1)?);
                 }
 
                 processed += take;
@@ -2169,7 +2025,6 @@ impl Qwen3_5Model {
             }
             println!("\n[Qwen3.5-PREFILL] Complete. Starting Generation...");
         } else {
-            // 🌟 [핵심 수정] 치명적인 중복 호출 오타를 삭제하고 딱 한 번만 실행되게 만듭니다!
             let outputs = self.language_model.forward(&inputs_embeds, &position_ids, seqlen_offset, session_id.clone(), kv_name.clone()).await?;
             let seq_len = outputs.dim(1)?;
             final_hidden_state = Some(outputs.narrow(1, seq_len - 1, 1)?);
@@ -2177,13 +2032,10 @@ impl Qwen3_5Model {
 
         let hidden_state = final_hidden_state.unwrap();
         
-        // 🌟 [최적화 2] 단 1글자짜리 가벼운 상태값(2KB)을 CPU로 보내서 계산하고, 결과만 VRAM으로 쏙 받아옵니다!
-        // 이 우회 공사 덕분에 GPU VRAM 300MB가 영구적으로 텅 비게 됩니다.
+        // VRAM 누수를 막기 위해 상태값을 즉시 CPU로 보내어 Logit 연산을 처리합니다.
         let hidden_state_cpu = hidden_state.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
         let logits_cpu = self.lm_head.forward(&hidden_state_cpu)?;
         
-        // 🌟 [최적화 2] 어차피 샘플러(Logit Processor)는 CPU에서 돌아갑니다. 
-        // GPU로 되돌려보내는 치명적인 이중 PCIe 병목(Round-Trip)을 원천 차단하고 CPU 텐서 그대로 반환합니다!
         Ok(logits_cpu)
     }
 
