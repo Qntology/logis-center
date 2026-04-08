@@ -180,7 +180,23 @@ impl Qwen3_5GenerateModel {
                 (mes_render, None, None, None, None)
             };
 
-        let ids_vec = self.tokenizer.text_encode_vec(mes_text.clone(), false)?;
+        let mut ids_vec = Vec::new();
+        for (i, p_start) in mes_text.split("<|vision_start|>").enumerate() {
+            if i > 0 { ids_vec.push(248053); } // vision_start_token_id
+            for (j, p_end) in p_start.split("<|vision_end|>").enumerate() {
+                if j > 0 { ids_vec.push(248054); } // vision_end_token_id
+                for (k, p_img) in p_end.split("<|image_pad|>").enumerate() {
+                    if k > 0 { ids_vec.push(248056); } // image_token_id
+                    for (l, p_vid) in p_img.split("<|video_pad|>").enumerate() {
+                        if l > 0 { ids_vec.push(248057); } // video_token_id
+                        if !p_vid.is_empty() {
+                            let mut t_ids = self.tokenizer.text_encode_vec(p_vid.to_string(), false)?;
+                            ids_vec.append(&mut t_ids);
+                        }
+                    }
+                }
+            }
+        }
         let total_toks = ids_vec.len();
 
         let mut baked_len = 0;
@@ -351,7 +367,23 @@ impl Qwen3_5GenerateModel {
                 (mes_render, None, None, None, None)
             };
             
-            let ids_vec = self.tokenizer.text_encode_vec(text, false)?;
+            let mut ids_vec = Vec::new();
+            for (i, p_start) in text.split("<|vision_start|>").enumerate() {
+                if i > 0 { ids_vec.push(248053); } 
+                for (j, p_end) in p_start.split("<|vision_end|>").enumerate() {
+                    if j > 0 { ids_vec.push(248054); } 
+                    for (k, p_img) in p_end.split("<|image_pad|>").enumerate() {
+                        if k > 0 { ids_vec.push(248056); } 
+                        for (l, p_vid) in p_img.split("<|video_pad|>").enumerate() {
+                            if l > 0 { ids_vec.push(248057); } 
+                            if !p_vid.is_empty() {
+                                let mut t_ids = self.tokenizer.text_encode_vec(p_vid.to_string(), false)?;
+                                ids_vec.append(&mut t_ids);
+                            }
+                        }
+                    }
+                }
+            }
             let total_toks = ids_vec.len();
 
             let mut baked_len = 0;

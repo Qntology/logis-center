@@ -148,6 +148,29 @@ impl Qwen3VLProcessor {
         Ok(vision_map)
     }
 
+    // pub fn process_img(
+    //     &self,
+    //     img: &DynamicImage,
+    //     img_mean: &Tensor,
+    //     img_std: &Tensor,
+    // ) -> Result<Tensor> {
+    //     let img_h = img.height();
+    //     let img_w = img.width();
+    //     //  h,w resize成 32的倍数
+    //     let (resize_h, resize_w) = img_smart_resize(
+    //         img_h,
+    //         img_w,
+    //         (self.img_process_cfg.patch_size * self.img_process_cfg.merge_size) as u32,
+    //         self.img_process_cfg.size.shortest_edge as u32,
+    //         self.img_process_cfg.size.longest_edge as u32,
+    //     )?;
+    //     let img = img.resize_exact(resize_w, resize_h, image::imageops::FilterType::CatmullRom);
+    //     let img_tensor = img_transform(&img, img_mean, img_std, &self.device, self.dtype)?;
+    //     // (c, h, w) => (1, c, h, w)
+    //     let img_tensor = img_tensor.unsqueeze(0)?;
+    //     Ok(img_tensor)
+    // }
+
     pub fn process_img(
         &self,
         img: &DynamicImage,
@@ -157,50 +180,46 @@ impl Qwen3VLProcessor {
         let img_h = img.height();
         let img_w = img.width();
         
-        // 🌟 픽스 1: 픽셀 면적(Max/Min Pixels)으로 입력된 값을 실제 엣지 길이로 안전하게 변환
-        let mut longest_edge = (self.img_process_cfg.size.longest_edge as f64).sqrt() as u32;
-        let mut shortest_edge = (self.img_process_cfg.size.shortest_edge as f64).sqrt() as u32;
-        
-        // 상식적인 엣지 길이 범위를 벗어나지 않도록 폴백(Fallback) 방어선 구축
-        if longest_edge > 4096 || longest_edge < 100 { longest_edge = 4096; }
-        if shortest_edge > 1024 || shortest_edge < 100 { shortest_edge = 256; }
+        // json에 정의된 값은 길이(Edge)가 아니라 면적(Pixels)입니다!
+        let mut max_pixels = self.img_process_cfg.size.longest_edge as u32; 
+        let mut min_pixels = self.img_process_cfg.size.shortest_edge as u32; 
 
-        // 🌟 픽스 2: VRAM 동적 캡핑 (3.9GB GPU가 터지는 것을 막기 위해 해상도 제한)
+        // 상식적인 면적 범위 방어 (최대 4096x4096, 최소 56x56)
+        if max_pixels > 16_777_216 { max_pixels = 16_777_216; }
+        if min_pixels < 3136 { min_pixels = 3136; }
+
         use sysinfo::System;
         let mut sys = System::new_all();
         sys.refresh_memory();
         let free_ram = sys.available_memory();
         
-        if free_ram < 2_000_000_000 && longest_edge > 1024 {
-            println!("[PROCESSOR] Low System RAM. Capping Image to 1024px.");
-            longest_edge = 1024;
+        // 1024 x 1024 해상도 = 약 1,048,576 픽셀
+        if free_ram < 2_000_000_000 && max_pixels > 1_048_576 {
+            println!("[PROCESSOR] Low System RAM. Capping Image Area to 1024x1024.");
+            max_pixels = 1_048_576;
         }
 
         if let Ok(nvml) = nvml_wrapper::Nvml::init() {
             if let Ok(dev) = nvml.device_by_index(0) {
                 if let Ok(mem) = dev.memory_info() {
+                    // VRAM 3.9GB 환경에 맞게 해상도 동적 조절 (면적 기준)
                     if mem.free < 2_000_000_000 {
-                        let cap = if mem.free < 800_000_000 { 768 } else { 896 };
-                        if longest_edge > cap {
-                            longest_edge = cap;
-                        }
+                        let cap = if mem.free < 800_000_000 { 589_824 } else { 802_816 }; // 768x768 or 896x896
+                        if max_pixels > cap { max_pixels = cap; }
                     } else if mem.free < 4_500_000_000 {
-                        // 3.9GB VRAM 환경에 최적화: 최대 1344px (약 1500~2000 이미지 토큰 생성)
-                        if longest_edge > 1344 {
-                            longest_edge = 1344;
-                        }
+                        if max_pixels > 1_806_336 { max_pixels = 1_806_336; } // 1344x1344
                     }
                 }
             }
         }
 
-        // h,w resize를 패치 크기의 배수로 최적화
+        // 이제 올바른 픽셀 면적이 들어가서 이미지가 선명하게 유지됩니다!
         let (resize_h, resize_w) = img_smart_resize(
             img_h,
             img_w,
             (self.img_process_cfg.patch_size * self.img_process_cfg.merge_size) as u32,
-            shortest_edge,
-            longest_edge,
+            min_pixels,
+            max_pixels,
         )?;
         
         let img = img.resize_exact(resize_w, resize_h, image::imageops::FilterType::CatmullRom);
