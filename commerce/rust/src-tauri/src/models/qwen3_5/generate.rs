@@ -256,7 +256,7 @@ impl Qwen3_5GenerateModel {
             let len = logits_vec.len();
             
             if !generate.is_empty() {
-                let penalty = 1.2; 
+                let penalty = 1.1; 
                 let mut set = std::collections::HashSet::new();
                 let start_at = generate.len().saturating_sub(self.repeat_last_n);
                 for &t in &generate[start_at..] {
@@ -431,6 +431,9 @@ impl Qwen3_5GenerateModel {
 
         crate::models::qwen::generate::wait_for_global_io().await;
 
+        let mes_check = self.chat_template.apply_chat_template(mes).unwrap_or_default();
+        let is_strict_json = mes_check.contains("/no_think") || mes_check.contains("RETURN JSON ONLY");
+        
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(123);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
         let mut gen_text_buffer = String::new();
@@ -455,7 +458,8 @@ impl Qwen3_5GenerateModel {
             let len = logits_vec.len();
 
             if !generate.is_empty() {
-                let penalty = 1.2; 
+                // 🌟 JSON 모드일 경우 반복 페널티를 사실상 해제(1.01)하여 중간에 끊기는 것을 방지
+                let penalty = if is_strict_json { 1.01 } else { 1.1 }; 
                 let mut set = std::collections::HashSet::new();
                 let start_at = generate.len().saturating_sub(self.repeat_last_n);
                 for &t in &generate[start_at..] {
@@ -470,13 +474,18 @@ impl Qwen3_5GenerateModel {
             if i == 0 {
                 if (self.eos_token_id as usize) < len { logits_vec[self.eos_token_id as usize] = -10000.0; }
                 if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
-                if (open_bracket_id as usize) < len { logits_vec[open_bracket_id as usize] += 10000.0; }
+                if (open_bracket_id as usize) < len { 
+                    // 🌟 JSON 모드일 때만 `{`를 10000점 부스팅
+                    let boost = if is_strict_json { 10000.0 } else { 20.0 };
+                    logits_vec[open_bracket_id as usize] += boost; 
+                }
             }
 
             let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
             let mut next_token = logit_processor.sample(&logits)?;
             
-            if i == 0 && next_token == self.eos_token_id {
+            // 🌟 방어 로직 추가
+            if i == 0 && (is_strict_json || next_token == self.eos_token_id) {
                 next_token = open_bracket_id;
             }
 
@@ -549,7 +558,7 @@ impl Qwen3_5GenerateModel {
                 }
                 ChatCompletionRequestMessage::User(user) => {
                     if let ChatCompletionRequestUserMessageContent::Text(text) = &user.content {
-                        mes_render.push_str(&format!("<|im_start|>user\n{}<|im_end|>\n", text));
+                        mes_render.push_str(&format!("<|im_start|>user\n{}", text));
                     }
                 }
                 _ => {}
