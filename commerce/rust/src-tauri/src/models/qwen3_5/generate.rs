@@ -232,7 +232,9 @@ impl Qwen3_5GenerateModel {
 
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(123);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
-        let is_strict_json = mes_text.contains("/no_think") || mes_text.contains("RETURN JSON ONLY");
+        
+        // 🌟 Fix: 텍스트 추출용 부스터 조건("Return ONLY") 추가
+        let is_strict_json = mes_text.contains("/no_think") || mes_text.contains("RETURN JSON ONLY") || mes_text.contains("Return ONLY");
         let mut gen_text_buffer = String::new(); 
 
         for i in 0..sample_len {
@@ -256,7 +258,8 @@ impl Qwen3_5GenerateModel {
             let len = logits_vec.len();
             
             if !generate.is_empty() {
-                let penalty = 1.1; 
+                // 🌟 Fix: JSON 추출 모드일 때 반복 페널티 완전 해제 (1.1 -> 1.01)
+                let penalty = if is_strict_json { 1.01 } else { 1.1 }; 
                 let mut set = std::collections::HashSet::new();
                 let start_at = generate.len().saturating_sub(self.repeat_last_n);
                 for &t in &generate[start_at..] {
@@ -431,8 +434,9 @@ impl Qwen3_5GenerateModel {
 
         crate::models::qwen::generate::wait_for_global_io().await;
 
+        // 🌟 Fix: text 변수 스코프 에러 우회 및 텍스트 추출기용 부스터 조건("Return ONLY") 추가
         let mes_check = self.chat_template.apply_chat_template(mes).unwrap_or_default();
-        let is_strict_json = mes_check.contains("/no_think") || mes_check.contains("RETURN JSON ONLY");
+        let is_strict_json = mes_check.contains("/no_think") || mes_check.contains("RETURN JSON ONLY") || mes_check.contains("Return ONLY");
         
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(123);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
@@ -557,8 +561,19 @@ impl Qwen3_5GenerateModel {
                     mes_render.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", sys.content));
                 }
                 ChatCompletionRequestMessage::User(user) => {
-                    if let ChatCompletionRequestUserMessageContent::Text(text) = &user.content {
-                        mes_render.push_str(&format!("<|im_start|>user\n{}", text));
+                    match &user.content {
+                        ChatCompletionRequestUserMessageContent::Text(text) => {
+                            mes_render.push_str(&format!("<|im_start|>user\n{}", text)); // 👈 삭제됨
+                        }
+                        ChatCompletionRequestUserMessageContent::Array(parts) => {
+                            let mut combined = String::new();
+                            for part in parts {
+                                if let ChatCompletionRequestMessageContentPart::Text(t) = part {
+                                    combined.push_str(&t.text);
+                                }
+                            }
+                            mes_render.push_str(&format!("<|im_start|>user\n{}", combined)); // 👈 삭제됨
+                        }
                     }
                 }
                 _ => {}

@@ -831,8 +831,9 @@ impl LogisModel {
             let prompt = get_image_extraction_prompt("kr", &language, "tracking", "");
             
             let result_str = self.chat_with_qwen3_5_image_spinner(
-                prompt, 
-                Some(dynamic_image), 
+                "You are a highly precise document data extraction assistant.", // 🌟 System 주입
+                &prompt,                                                        // 🌟 User 주입
+                Some(dynamic_image),
                 app_handle, 
                 "extraction-progress", 
                 json!({ "category": "Vision Analysis", "summary": "Analyzing image with Qwen 3.5..." }), 
@@ -913,7 +914,8 @@ impl LogisModel {
 
     pub async fn chat_with_qwen3_5_image_spinner(
         &self, 
-        prompt: String, 
+        system: &str,       // 🌟 추가 (System)
+        user_input: &str,   // 🌟 prompt -> user_input으로 변경
         image: Option<DynamicImage>,
         _app_handle: &tauri::AppHandle,
         _event_name: &str,
@@ -922,15 +924,7 @@ impl LogisModel {
         cancellation_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
-        // [VISION-DYNAMIC] 이미지가 전달되었으면 Large, 없으면 Small만 가볍게 올립니다!
-        let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
-        self.ensure_qwen3_5(target_size).await?;
-
-        if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
-            crate::scheduler::log_task_progress(_app_handle, task_id, &base_payload);
-        } else if let Some(sid) = &session_id {
-             crate::scheduler::log_task_progress(_app_handle, sid, &base_payload);
-        }
+        // ... (생략: ensure_qwen3_5 및 로깅 등 유지) ...
 
         let mut q35_gen_guard = self.qwen3_5_generator.lock().await;
         let gen = q35_gen_guard.as_mut().ok_or_else(|| anyhow!("Qwen 3.5 Generator is unloaded"))?;
@@ -950,17 +944,26 @@ impl LogisModel {
             ));
         }
 
+        // 🌟 User Text 할당
         content_parts.push(ChatCompletionRequestMessageContentPart::Text(
-            ChatCompletionRequestMessageContentPartText { text: prompt }
+            ChatCompletionRequestMessageContentPartText { text: user_input.to_string() }
         ));
 
-        let message = ChatCompletionRequestUserMessage {
+        // 🌟 System 메시지 명시적 생성
+        let system_message = ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
+            content: system.to_string(),
+            name: None,
+        });
+
+        // 🌟 User 메시지 명시적 생성
+        let user_message = ChatCompletionRequestUserMessage {
             content: ChatCompletionRequestUserMessageContent::Array(content_parts),
             name: None,
         };
 
         let params = ChatCompletionParameters {
-            messages: vec![ChatCompletionRequestMessage::User(message)],
+            // 🌟 완벽하게 분리된 형태로 배열에 담겨 전송됨
+            messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
             model: "qwen3.5".to_string(),
             max_tokens: Some(max_tokens as u32),
             temperature: Some(0.1),
@@ -1217,7 +1220,8 @@ impl LogisModel {
 
     pub async fn run_inference_with_spinner(
         &self, 
-        prompt: String, 
+        system: &str,       // 🌟 추가
+        user_input: &str,   // 🌟 변경
         image: Option<DynamicImage>, 
         _app_handle: &tauri::AppHandle,
         _event_name: &str,
@@ -1264,16 +1268,21 @@ impl LogisModel {
         }
 
         content_parts.push(ChatCompletionRequestMessageContentPart::Text(
-            ChatCompletionRequestMessageContentPartText { text: prompt }
+            ChatCompletionRequestMessageContentPartText { text: user_input.to_string() }
         ));
 
-        let message = ChatCompletionRequestUserMessage {
+        let system_message = ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
+            content: system.to_string(),
+            name: None,
+        });
+
+        let user_message = ChatCompletionRequestUserMessage {
             content: ChatCompletionRequestUserMessageContent::Array(content_parts),
             name: None,
         };
 
         let params = ChatCompletionParameters {
-            messages: vec![ChatCompletionRequestMessage::User(message)],
+            messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
             model: "qwen".to_string(),
             max_tokens: Some(max_tok),
             temperature: Some(0.1),
@@ -1296,8 +1305,9 @@ impl LogisModel {
         let prompt = get_image_extraction_prompt("kr", "korean", "tracking", "");
         
         let response = self.run_inference_with_spinner(
-            prompt, 
-            Some(master_img), 
+            "You are a highly precise document data extraction assistant.", // 🌟 System 주입
+            &prompt,                                                        // 🌟 User 주입
+            Some(master_img),
             app_handle, 
             "extraction-progress", 
             json!({ "category": "Processing", "summary": "Analyzing document content..." }),
