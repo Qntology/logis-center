@@ -834,14 +834,22 @@ impl Qwen3VLModel {
     }
 
     fn get_placeholder_mask(&self, input_ids: &Tensor, is_image: bool) -> Result<Tensor> {
-        let special_token = if is_image {
-            Tensor::new(vec![self.config.image_token_id as u32], input_ids.device())?
+        let special_token_id = if is_image {
+            self.config.image_token_id as f32
         } else {
-            Tensor::new(vec![self.config.video_token_id as u32], input_ids.device())?
+            self.config.video_token_id as f32
         };
-        let special_mask = input_ids
+        
+        let cpu_dev = &Device::Cpu;
+        let special_token = Tensor::new(vec![special_token_id], cpu_dev)?;
+        let input_ids_cpu = input_ids.to_device(cpu_dev)?.to_dtype(DType::F32)?;
+        
+        // 🌟 비교 연산을 전부 CPU 위에서 F32로 진행하여 GPU 커널 부재 에러 원천 차단
+        let special_mask = input_ids_cpu
             .broadcast_eq(&special_token)?
-            .to_dtype(candle_core::DType::U32)?;
+            .to_dtype(candle_core::DType::U8)?
+            .to_device(input_ids.device())?;
+            
         Ok(special_mask)
     }
 

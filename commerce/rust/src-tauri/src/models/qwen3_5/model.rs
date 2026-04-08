@@ -19,7 +19,7 @@ use crate::{
         qwen3_5::config::{Qwen3_5Config, Qwen3_5TextConfig},
         qwen3vl::model::Qwen3VLVisionModel,
     },
-    position_embed::rope::{Qwen3VLTextRotaryEmbedding, glm_asr_apply_rotary_pos_emb},
+    position_embed::rope::{Qwen3VLTextRotaryEmbedding, apply_rotary_pos_emb},
     utils::tensor_utils::{
         get_equal_mask, get_vision_next_indices, l2_normalize, masked_scatter_dim0, nonzero_index,
         prepare_causal_attention_mask, repeat_interleave, split_tensor, zero_index,
@@ -757,7 +757,21 @@ impl Qwen3_5Attention {
         let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?;
         let value_states = self.v_proj.forward(xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?;
         
-        let (query_states, key_states) = glm_asr_apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
+        // 🌟 핵심 픽스: Partial RoPE 지원
+        // 전체 차원(256) 중 RoPE 차원(64)만 잘라내서 회전시킨 뒤, 나머지 차원과 다시 결합합니다!
+        let rot_dim = cos.dim(D::Minus1)?;
+        let (query_states, key_states) = if rot_dim < self.head_dim {
+            let q_rot = query_states.narrow(D::Minus1, 0, rot_dim)?;
+            let q_pass = query_states.narrow(D::Minus1, rot_dim, self.head_dim - rot_dim)?;
+            let k_rot = key_states.narrow(D::Minus1, 0, rot_dim)?;
+            let k_pass = key_states.narrow(D::Minus1, rot_dim, self.head_dim - rot_dim)?;
+            
+            let (q_rot, k_rot) = apply_rotary_pos_emb(&q_rot, &k_rot, cos, sin, false)?;
+            
+            (Tensor::cat(&[&q_rot, &q_pass], D::Minus1)?, Tensor::cat(&[&k_rot, &k_pass], D::Minus1)?)
+        } else {
+            apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?
+        };
         
         let dev = xs.device();
         let target_dtype = xs.dtype();
@@ -980,7 +994,7 @@ impl Qwen3_5Attention {
         };
 
         let attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?.contiguous()?;
-        let attn_output = attn_output.mul(&sigmoid(&gate)?)?;
+        let attn_output = attn_output.mul(&candle_nn::ops::sigmoid(&gate)?)?;
         Ok(attn_output.apply(&self.o_proj)?)
     }
 
@@ -1404,7 +1418,7 @@ impl Qwen3_5TextModel {
             if !is_decoding {
                 // 가중치 소각(clear_weights) 전, SSM State를 안전한 CPU 메모리로 대피시킵니다!
                 if layer.layer_type == "linear_attention" {
-                    let is_dirty_backup = layer.is_ssm_dirty(); // 🌟 핵심 픽스 2: 기억 상실 방지 플래그 백업
+                    let is_dirty_backup = layer.is_ssm_dirty(); // 🌟 핵심: 기억 상실 방지 플래그 백업
                     
                     let (conv_opt, rec_opt) = layer.get_ssm_states();
                     if let (Some(conv), Some(rec)) = (conv_opt, rec_opt) {
@@ -1413,7 +1427,7 @@ impl Qwen3_5TextModel {
                         layer.set_ssm_states(Some(safe_conv), Some(safe_rec));
                     }
 
-                    layer.set_ssm_dirty(is_dirty_backup); // 🌟 핵심 픽스 2: 메모리 대피 후 플래그 원상 복구하여 SSD에 강제 저장!
+                    layer.set_ssm_dirty(is_dirty_backup); // 🌟 핵심: 대피 후 플래그 원상 복구하여 SSD 저장 강제
                 }
                 layer.clear_weights();
             }
@@ -1793,17 +1807,14 @@ impl Qwen3_5Model {
             let mut i = 0;
             
             while i < seq_len {
-                if ids[i] == vision_start_token_id && i + 1 < seq_len && ids[i+1] == image_token_id {
+                // 💡 vision_start를 믿지 않고, 확실한 image_token_id만으로 3D 격자를 발동시킵니다.
+                if ids[i] == image_token_id {
                     if let Some(thw_cpu_array) = &image_thw_cpu {
                         if image_idx < thw_cpu_array.len() {
                             let thw = &thw_cpu_array[image_idx];
                             image_idx += 1;
                             let (t, h, w) = (thw[0], thw[1] / spatial_merge_size as u32, thw[2] / spatial_merge_size as u32);
                             
-                            for d in 0..3 { llm_pos_ids[d][i] = curr_pos; }
-                            i += 1;
-                            curr_pos += 1;
-
                             let img_len = (t * h * w) as usize;
                             for tt in 0..t {
                                 for hh in 0..h {
@@ -1819,19 +1830,15 @@ impl Qwen3_5Model {
                             }
                             i += img_len;
                             curr_pos += t.max(h).max(w); 
-                        } else {
-                            for d in 0..3 { llm_pos_ids[d][i] = curr_pos; }
-                            i += 1; curr_pos += 1;
+                            continue; // 이미지 블록 처리가 끝났으므로 다음 루프로 직행
                         }
-                    } else {
-                        for d in 0..3 { llm_pos_ids[d][i] = curr_pos; }
-                        i += 1; curr_pos += 1;
                     }
-                } else {
-                    for d in 0..3 { llm_pos_ids[d][i] = curr_pos; }
-                    i += 1;
-                    curr_pos += 1;
                 }
+                
+                // 일반 텍스트 토큰 및 쪼개진 특수 토큰 처리
+                for d in 0..3 { llm_pos_ids[d][i] = curr_pos; }
+                i += 1;
+                curr_pos += 1;
             }
             
             for d in 0..3 {
@@ -1863,25 +1870,16 @@ impl Qwen3_5Model {
     ) -> Result<Tensor> {
         let (bs, seq_len, _) = inputs_embeds.dims3()?;
 
-        let has_vision = image_grid_thw.is_some() || video_grid_thw.is_some();
-
-        // 🌟 핵심 픽스 1: 이미지가 포함된 경우 (SSD 캐시에 이어붙이는 경우 포함)
-        // 무조건 3D 공간 인덱스를 계산하여 시각적 구조를 완벽히 보존합니다!
-        if seqlen_offset == 0 || has_vision {
-            let (mut pos_ids, rope_deltas, deltas_cpu) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
-            
-            if seqlen_offset > 0 {
-                // 이전 문맥(13,000토큰 등)에 이어붙이는 경우, 3D 구조를 유지한 채로 오프셋만 밀어줍니다.
-                let offset_t = Tensor::new(seqlen_offset as f32, &Device::Cpu)?;
-                pos_ids = pos_ids.broadcast_add(&offset_t)?;
-            }
-
+        // 🌟 핵심 퀄리티 픽스: 최초 1회(seqlen_offset == 0)에만 3D 좌표를 계산합니다!
+        // 디코딩 중에는 절대 재계산하지 않고, 저장해둔 오프셋(delta)을 유지하여 위치 연속성을 100% 보장합니다.
+        if seqlen_offset == 0 {
+            let (pos_ids, rope_deltas, deltas_cpu) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
             self.rope_deltas = Some(rope_deltas);
             self.rope_deltas_cpu = Some(deltas_cpu);
             return Ok(pos_ids.to_device(inputs_embeds.device())?);
         }
 
-        // 텍스트를 1글자씩 뱉는 디코딩 단계에서는 선형(1D)으로 숫자를 올립니다.
+        // 이후 1글자씩 뱉어낼 때는 과거로 돌아가지 않고 정상적으로 +1씩 전진합니다.
         if self.rope_deltas_cpu.is_none() {
             self.rope_deltas_cpu = Some(vec![0i64; bs]);
         }
@@ -1890,6 +1888,7 @@ impl Qwen3_5Model {
         let mut p_ids_vec = Vec::with_capacity(bs);
         for b in 0..bs {
             let delta = deltas_cpu[b];
+            // 🌟 이전 3D 이미지 공간만큼 점프했던 delta 값을 온전히 더해줍니다.
             let real_start = (seqlen_offset as i64 + delta) as f32;
             let p_id = Tensor::arange(real_start, real_start + seq_len as f32, &Device::Cpu)?
                 .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, seq_len))?;
@@ -1913,7 +1912,6 @@ impl Qwen3_5Model {
     ) -> Result<Tensor> {
         let input_ids_cpu = input_ids.to_device(&Device::Cpu)?;
         let inputs_embeds_cpu = self.language_model.embed_tokens.forward(&input_ids_cpu)?;
-        
         let mut inputs_embeds = inputs_embeds_cpu.to_device(input_ids.device())?;
         
         if let Some(pixel_values) = pixel_values {
@@ -1921,7 +1919,7 @@ impl Qwen3_5Model {
                 if let Some(visual) = self.visual.as_ref() {
                     let (image_embeds, _): (Tensor, _) = visual.forward(pixel_values, image_grid_thw)?;
                     
-                    // 🌟 외부 유틸리티 대신 CPU에서 직접 마스크를 만들어 CUDA U32/U8 충돌 원천 차단
+                    // 외부 유틸리티 대신 CPU에서 직접 마스크를 만들어 CUDA U32/U8 충돌 원천 차단
                     let img_token_t = Tensor::new(vec![self.image_token_id as f32], &Device::Cpu)?;
                     let mask_cpu = input_ids_cpu.to_dtype(DType::F32)?.broadcast_eq(&img_token_t)?.to_dtype(DType::U8)?;
                     let vision_mask = mask_cpu.to_device(input_ids.device())?;

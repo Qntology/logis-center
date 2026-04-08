@@ -385,22 +385,60 @@ impl Qwen3VLProcessor {
         }
         let merge_length = self.img_process_cfg.merge_size.pow(2);
         let mut text = text.to_string();
+        
+        // 🌟 방탄 로직 1: 템플릿 파서가 이미지를 날려버렸을 경우를 대비해 자동 복구
+        if image_grid_thw.is_some() && !text.contains(&self.image_token) {
+            if let Some(idx) = text.find("<|im_start|>user\n") {
+                text.insert_str(idx + 17, &format!("{}\n", self.image_token));
+            } else {
+                text = format!("{}\n{}", self.image_token, text);
+            }
+        }
+        
+        // 🌟 방탄 로직 2: 태그 중복 방지 및 초과 토큰 삭제
         if let Some(ref image_grid_thw) = image_grid_thw {
             let mut index = 0;
+            let num_images = image_grid_thw.dim(0)?;
+            
             while text.contains(&self.image_token) {
+                // 프롬프트 내의 이미지 토큰 개수가 실제 전달된 이미지 수보다 많을 경우 (수동 주입 중복 등)
+                // 범위를 벗어나는 텐서 참조(narrow crash)를 막고 잉여 토큰을 삭제합니다.
+                if index >= num_images {
+                    text = text.replacen(&self.image_token, "", 1);
+                    continue;
+                }
+                
                 let grid_i = image_grid_thw.i(index)?;
                 let repeat_num =
                     grid_i.to_vec1::<u32>()?.iter().product::<u32>() as usize / merge_length;
+                    
                 let replace = "<|placeholder|>".repeat(repeat_num);
-                text = text.replacen(&self.image_token, &replace, 1);
+                
+                // 템플릿이 이미 <|vision_start|>를 붙였는지 확인하여 중복 방지
+                let three_token = format!("{}{}{}", self.vision_start_token, self.image_token, self.vision_end_token);
+                let replace_wrapped = format!("{}{}{}", self.vision_start_token, replace, self.vision_end_token);
+                
+                if text.contains(&three_token) {
+                    text = text.replacen(&three_token, &replace_wrapped, 1);
+                } else {
+                    text = text.replacen(&self.image_token, &replace_wrapped, 1);
+                }
+                
                 index += 1;
             }
             text = text.replace("<|placeholder|>", &self.image_token);
         }
+
+        // (선택 사항) 비디오도 동일하게 OutOfBounds 에러 방지 처리
         #[cfg(feature = "ffmpeg")]
         if let Some(ref video_grid_thw) = video_grid_thw {
             let mut index = 0;
+            let num_videos = video_grid_thw.dim(0)?;
             while text.contains(&self.video_token) {
+                if index >= num_videos {
+                    text = text.replacen(&self.video_token, "", 1);
+                    continue;
+                }
                 let grid_i = video_grid_thw.i(index)?;
                 let video_info = &video_metadata.as_ref().unwrap()[index];
                 let curr_timestamp = self.calculate_timestamps(
