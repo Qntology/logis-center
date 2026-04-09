@@ -909,8 +909,9 @@ impl Qwen3_5Attention {
             };
             if b_off >= total_tokens_now { continue; }
 
+            // 🌟 [교체 구간 1] Qwen3_5Attention::forward 내부
             let (k_block, v_block) = {
-                let inner = block.inner.read().unwrap();
+                let mut inner = block.inner.write().unwrap(); // mut write로 변경
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                     (k.to_device(dev)?.to_dtype(target_dtype)?, v.to_device(dev)?.to_dtype(target_dtype)?)
                 } else {
@@ -986,7 +987,20 @@ impl Qwen3_5Attention {
                     let k_safe = k_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::F32, &Device::Cpu).unwrap());
                     let v_safe = v_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::F32, &Device::Cpu).unwrap());
                     
-                    (k_safe.to_device(dev)?.to_dtype(target_dtype)?, v_safe.to_device(dev)?.to_dtype(target_dtype)?)
+                    let k_gpu = k_safe.to_device(dev)?.to_dtype(target_dtype)?;
+                    let v_gpu = v_safe.to_device(dev)?.to_dtype(target_dtype)?;
+
+                    // 🌟 VRAM 승격 (Tiering 3 -> 1단계 복귀)
+                    inner.k_cache = Some(k_gpu.clone());
+                    inner.v_cache = Some(v_gpu.clone());
+                    inner.location = KVLocation::VRAM;
+                    
+                    let mut reg = self.registry.entries.write().unwrap();
+                    if index < reg.len() {
+                        reg[index].location[self.layer_idx] = KVLocation::VRAM;
+                    }
+                    
+                    (k_gpu, v_gpu)
                 }
             };
 
@@ -1555,6 +1569,7 @@ impl Qwen3_5TextModel {
                 layer.clear_weights();
             }
 
+            // 🌟 [교체 구간] Qwen3_5TextModel::forward 내부의 세션 ID 저장 블록 전체
             if let Some(sid) = &session_id {
                 let kv_dir = crate::utils::paths::get_kv_dir(None);
                 let kv_name_raw = kv_name.as_deref().unwrap_or("text");
@@ -1567,20 +1582,22 @@ impl Qwen3_5TextModel {
                     AttnKind::SelfAttn(attn) => {
                         let mut dumps = Vec::new();
                         for block in attn.kv_blocks.iter_mut() {
-                            let inner = block.inner.read().unwrap(); // 🌟 mut 삭제 및 read() 로 변경
+                            let mut inner = block.inner.write().unwrap(); 
                             let is_full = inner.len == 256;
                             
-                            if is_full && inner.k_cache.is_some() && inner.location == crate::models::qwen::quantized_model::KVLocation::VRAM {
+                            // 🌟 [CRITICAL FIX] Prefill 도중 VRAM 텐서를 삭제(None)하면 다음 청크가 참조하지 못해 정확도가 박살납니다.
+                            // 오직 꽉 찬 블록만 '복사본'을 디스크로 보낼 뿐, VRAM에서 절대 삭제하지 않습니다!
+                            let should_evacuate = is_full; 
+                            
+                            if should_evacuate && inner.k_cache.is_some() && inner.location == crate::models::qwen::quantized_model::KVLocation::VRAM {
                                 let is_dirty = {
                                     let reg = attn.registry.entries.read().unwrap();
                                     if inner.index < reg.len() && l_idx < reg[inner.index].is_dirty.len() { reg[inner.index].is_dirty[l_idx] } else { true }
                                 };
 
-                                let k = inner.k_cache.as_ref().unwrap();
-                                let v = inner.v_cache.as_ref().unwrap();
-                                
                                 if is_dirty {
-                                    // 원본은 VRAM에 내버려 두고, 백그라운드 저장을 위해 CPU로 '복제'만 뜹니다.
+                                    let k = inner.k_cache.as_ref().unwrap();
+                                    let v = inner.v_cache.as_ref().unwrap();
                                     let k_cpu = k.to_device(&candle_core::Device::Cpu).unwrap_or(k.clone());
                                     let v_cpu = v.to_device(&candle_core::Device::Cpu).unwrap_or(v.clone());
                                     let k_shape_u32: Vec<u32> = k_cpu.shape().dims().iter().map(|&x| x as u32).collect();
@@ -1603,6 +1620,9 @@ impl Qwen3_5TextModel {
                                         reg[inner.index].is_dirty[l_idx] = false;
                                     }
                                 }
+
+                                // 🌟 [핵심 수정] 이전에는 여기서 inner.k_cache = None; 을 해버렸으나 완벽히 제거함.
+                                // VRAM 클리어 및 메모리 청소는 모든 문맥 파악이 끝난 뒤 `force_flush_all_active_blocks` 함수가 알아서 담당합니다.
                             }
                         }
 
@@ -1630,7 +1650,7 @@ impl Qwen3_5TextModel {
                         }
                     },
                     AttnKind::LinearAttn(_attn) => {
-                        // 디코딩 중 무자비한 SSM 디스크 I/O 스팸 방지 로직 유지
+                        // 디코딩 중 SSM 디스크 I/O 스팸 방지
                     }
                 }
             }
@@ -1711,6 +1731,7 @@ impl Qwen3_5TextModel {
         Ok(())
     }
 
+    // 🌟 [교체 구간 3] Qwen3_5TextModel::force_flush_all_active_blocks 함수 전체 통째로 교체
     pub async fn force_flush_all_active_blocks(&mut self, session_id: &str, kv_name: Option<&str>) -> Result<()> {
         use crate::models::qwen::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
         
@@ -1721,7 +1742,7 @@ impl Qwen3_5TextModel {
             // 1. 기존 Self Attention (KV 블록) 수집
             if let AttnKind::SelfAttn(attn) = &mut layer.attn {
                 for block in &mut attn.kv_blocks {
-                    let inner = block.inner.read().unwrap();
+                    let mut inner = block.inner.write().unwrap();
                     let is_dirty = {
                         let reg = self.registry.entries.read().unwrap();
                         if inner.index < reg.len() && l_idx < reg[inner.index].is_dirty.len() { 
@@ -1743,9 +1764,17 @@ impl Qwen3_5TextModel {
                             raw_v: Some(v.to_device(&Device::Cpu).unwrap_or(v.clone()).contiguous().unwrap_or_else(|_| v.clone())),
                         });
                         
+                        // 🌟 VRAM 확실하게 제거
+                        inner.k_cache = None;
+                        inner.v_cache = None;
+                        inner.location = crate::models::qwen::quantized_model::KVLocation::SSD;
+
                         let mut reg = self.registry.entries.write().unwrap();
                         if inner.index < reg.len() && l_idx < reg[inner.index].is_dirty.len() {
                             reg[inner.index].is_dirty[l_idx] = false; 
+                            reg[inner.index].location[l_idx] = crate::models::qwen::quantized_model::KVLocation::SSD;
+                            let mut cache = reg[inner.index].bitkv_cache.write().unwrap();
+                            cache[l_idx] = None;
                         }
                     }
                 }

@@ -914,17 +914,33 @@ impl LogisModel {
 
     pub async fn chat_with_qwen3_5_image_spinner(
         &self, 
-        system: &str,       // 🌟 추가 (System)
-        user_input: &str,   // 🌟 prompt -> user_input으로 변경
+        system: &str,       
+        user_input: &str,   
         image: Option<DynamicImage>,
         _app_handle: &tauri::AppHandle,
         _event_name: &str,
-        base_payload: Value,
+        mut base_payload: Value,
         max_tokens: usize,
         cancellation_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
-        // ... (생략: ensure_qwen3_5 및 로깅 등 유지) ...
+        // [VISION-DYNAMIC] 이미지가 있으면 Large(비전+텍스트), 없으면 Small(텍스트 전용)
+        let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
+        self.ensure_qwen3_5(target_size).await?;
+
+        // [FIX] Inject task_id from session_id if it's a task reference
+        if let Some(ref sid) = session_id {
+            if sid.starts_with("task_") || sid.starts_with("img_") {
+                if let Some(obj) = base_payload.as_object_mut() {
+                    obj.insert("task_id".to_string(), json!(sid));
+                }
+            }
+        }
+
+        // [LOG] Save to task history if task_id exists
+        if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
+            crate::scheduler::log_task_progress(_app_handle, task_id, &base_payload);
+        }
 
         let mut q35_gen_guard = self.qwen3_5_generator.lock().await;
         let gen = q35_gen_guard.as_mut().ok_or_else(|| anyhow!("Qwen 3.5 Generator is unloaded"))?;
@@ -944,25 +960,25 @@ impl LogisModel {
             ));
         }
 
-        // 🌟 User Text 할당
+        // User Text 할당
         content_parts.push(ChatCompletionRequestMessageContentPart::Text(
             ChatCompletionRequestMessageContentPartText { text: user_input.to_string() }
         ));
 
-        // 🌟 System 메시지 명시적 생성
+        // System 메시지 명시적 생성
         let system_message = ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
             content: system.to_string(),
             name: None,
         });
 
-        // 🌟 User 메시지 명시적 생성
+        // User 메시지 명시적 생성
         let user_message = ChatCompletionRequestUserMessage {
             content: ChatCompletionRequestUserMessageContent::Array(content_parts),
             name: None,
         };
 
+        // 파라미터 세팅
         let params = ChatCompletionParameters {
-            // 🌟 완벽하게 분리된 형태로 배열에 담겨 전송됨
             messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
             model: "qwen3.5".to_string(),
             max_tokens: Some(max_tokens as u32),
@@ -974,7 +990,7 @@ impl LogisModel {
         gen.generate(
             params, 
             cancellation_token.clone(),
-            None, 
+            session_id, // 🌟 SSD 저장 및 병합 캐시 활성화!
             Some("inference".to_string())
         ).await.map_err(|e| anyhow!("Qwen 3.5 Inference failed: {}", e))
     }

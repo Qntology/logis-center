@@ -723,7 +723,7 @@ async fn process_task(
             let mut titles = Vec::new();
             {
                 // 🌟 None 넘기기
-                model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![
@@ -743,7 +743,7 @@ async fn process_task(
                 if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
                     println!("[JS-BRIDGE] 1. Requesting titles from LLM...");
                     // 🌟 generate_part 로 교체 및 base_session_id_35 넘기기
-                    let res = gen.generate_part(&params, false, 0, None, None, kv_name.clone()).await?;
+                    let res = gen.generate_part(&params, false, 0, None, Some(snapshot_id.clone()), kv_name.clone()).await?;
                     println!("[JS-BRIDGE] LLM Raw Response: '{}'", res.text);
 
                     let title_info = parsing::parse_json_from_llm(&res.text);
@@ -1037,7 +1037,7 @@ async fn process_task(
         };
 
         if !pug_list.is_empty() {
-            model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, Some(&base_session_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
             for (idx, item_pug) in pug_list.iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -1045,8 +1045,13 @@ async fn process_task(
                 let extraction_instruction = parsing::list2json(&page_type, language);
                 let task_question = format!("[PUG CONTENT]\n{}\n\n{}", item_pug, extraction_instruction);
                 
+                // 🌟 [교체 구간 2-B] src/scheduler.rs 의 리스트 추출 루프 내부
                 let res = if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
                     println!("[Scheduler] Qwen3.5 Extracting Item {}/{}...", idx + 1, pug_list.len());
+                    
+                    // 🌟 리스트 아이템별로 덮어쓰지 않도록 고유 세션 ID 생성
+                    let item_session_id = format!("{}_list_item_{}", task.id, idx); 
+                    
                     let params = ChatCompletionParameters {
                         messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
                             content: ChatCompletionRequestUserMessageContent::Text(task_question),
@@ -1058,7 +1063,7 @@ async fn process_task(
                     gen.generate(
                         params, 
                         Some(cancellation_token.clone()), 
-                        None, // 리스트 아이템은 독립적이므로 캐시 세션을 공유하지 않음
+                        Some(item_session_id), // 🌟 None 에서 생성한 고유 세션 ID로 변경
                         Some("inference".to_string())
                     ).await.map_err(|e| anyhow::anyhow!("Qwen 3.5 Inference failed: {}", e))
                 } else {
@@ -1125,7 +1130,7 @@ async fn process_task(
             // 1. [Large] Load & Generate (Direct Qwen3.5 0.8B-Layer Generation)
             {
                 // 🌟 None 넘기기
-                model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![
@@ -1148,12 +1153,13 @@ async fn process_task(
                     ..Default::default()
                 };
 
+                // 🌟 [교체 구간 2-C] src/scheduler.rs 의 Detail Extraction 내부 (하단부)
                 if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
                     println!("[Scheduler] Qwen3.5 Step C: Asking extraction question...");
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Qwen 3.5 Inference..." }));
                     
-                    // 🌟 base_session_id_35 넘기기
-                    let res = gen.generate_part(&params, false, 0, None, None, kv_name.clone()).await?;
+                    // 🌟 generate_part 에 None 대신 Some(snapshot_id.clone()) 전달
+                    let res = gen.generate_part(&params, false, 0, None, Some(snapshot_id.clone()), kv_name.clone()).await?;
                     
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res.text);
 
