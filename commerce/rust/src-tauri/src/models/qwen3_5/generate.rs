@@ -396,6 +396,10 @@ impl Qwen3_5GenerateModel {
             let ids = Tensor::from_vec(ids_vec, (1, total_toks), &self.device)?;
             (ids, 0, px_vals, img_thw, vid_px_vals, vid_thw)
         } else {
+            // 🌟 [수정 1] Continuation 시, 백그라운드 SSD 백업본을 VRAM으로 100% 강제 적재
+            if let Some(sid) = &session_id {
+                let _ = self.qwen3_5.language_model.preload_all_cache_to_vram(sid, kv_name.as_deref(), &self.device).await;
+            }
             let ids = Tensor::from_vec(vec![last_token.unwrap()], (1, 1), &self.device)?;
             (ids, last_offset, None, None, None, None)
         };
@@ -406,21 +410,19 @@ impl Qwen3_5GenerateModel {
         
         println!("\n[AI Thinking...]");
 
+        // 🌟 [수정 2] I/O 동기화를 루프 진입 전에 딱 1번만 수행하여 디코딩 멈춤 현상 제거
         crate::models::qwen::generate::wait_for_global_io().await;
 
-        // 🌟 Fix: text 변수 스코프 에러 우회 및 텍스트 추출기용 부스터 조건("Return ONLY") 추가
         let mes_check = self.chat_template.apply_chat_template(mes).unwrap_or_default();
         let is_strict_json = mes_check.contains("/no_think") || mes_check.contains("RETURN JSON ONLY") || mes_check.contains("Return ONLY");
         
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(123);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
         let mut gen_text_buffer = String::new();
-        
-        // 🌟 [추가] 출력을 모아서 하기 위한 전용 버퍼 생성
         let mut print_buffer = String::new();
 
         for i in 0..sample_len {
-            crate::models::qwen::generate::wait_for_global_io().await;
+            // crate::models::qwen::generate::wait_for_global_io().await; // 🌟 기존 로직 삭제 (주석 처리 또는 제거)
 
             let logits = self.qwen3_5.forward(
                 &input_ids,
@@ -439,7 +441,6 @@ impl Qwen3_5GenerateModel {
             let len = logits_vec.len();
 
             if !generate.is_empty() {
-                // 🌟 JSON 모드일 경우 반복 페널티를 사실상 해제(1.01)하여 중간에 끊기는 것을 방지
                 let penalty = if is_strict_json { 1.01 } else { 1.1 }; 
                 let mut set = std::collections::HashSet::new();
                 let start_at = generate.len().saturating_sub(self.repeat_last_n);
@@ -456,7 +457,9 @@ impl Qwen3_5GenerateModel {
                 if (self.eos_token_id as usize) < len { logits_vec[self.eos_token_id as usize] = -10000.0; }
             }
 
-            let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
+            // 🌟 [수정 3] CPU 메모리에서 가공된 Logits 배열을 GPU로 재업로드(PCIe 낭비)하지 않고, 
+            // CPU 상에서 즉시 샘플링하도록 `&self.device`를 `&candle_core::Device::Cpu`로 교체!
+            let logits = Tensor::from_vec(logits_vec, (len,), &candle_core::Device::Cpu)?;
             let mut next_token = logit_processor.sample(&logits)?;
             
             if i == 0 && next_token == self.eos_token_id {

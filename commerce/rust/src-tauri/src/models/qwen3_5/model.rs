@@ -1433,6 +1433,73 @@ impl Qwen3_5TextModel {
         })
     }
 
+    /// [성능 최적화] 디코딩 전 모든 SSM 상태와 KV Cache를 VRAM으로 강제 적재합니다.
+    pub async fn preload_all_cache_to_vram(&mut self, session_id: &str, kv_name: Option<&str>, target_device: &Device) -> anyhow::Result<()> {
+        let kv_dir = crate::utils::paths::get_kv_dir(None);
+        let kv_name_raw = kv_name.unwrap_or("text");
+        let kv_type = kv_name_raw.split('/').last().unwrap_or("text");
+        let sub_path = format!("{}/inference/{}", session_id, kv_type);
+        let base_dir = kv_dir.join(&sub_path);
+
+        // 1. SSM(Linear Attention) State VRAM 적재
+        let ssm_dir = base_dir.join("ssm");
+        for (l_idx, layer) in self.layers.iter_mut().enumerate() {
+            if layer.layer_type == "linear_attention" {
+                let st_path = ssm_dir.join(format!("l{}.st", l_idx));
+                if st_path.exists() {
+                    if let Ok(enc_data) = std::fs::read(&st_path) {
+                        if let Ok(plain_data) = crate::utils::crypto::decrypt_data(&enc_data) {
+                            if let Ok(tensors) = candle_core::safetensors::load_buffer(&plain_data, target_device) {
+                                let conv = tensors.get("conv_state").cloned();
+                                let rec = tensors.get("recurrent_state").cloned();
+                                layer.set_ssm_states(conv, rec);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Self Attention KV Block VRAM 적재
+        for (l_idx, layer) in self.layers.iter_mut().enumerate() {
+            if let crate::models::qwen3_5::model::AttnKind::SelfAttn(attn) = &mut layer.attn {
+                for block in &mut attn.kv_blocks {
+                    let mut inner = block.inner.write().unwrap();
+                    if inner.k_cache.is_some() && inner.location == crate::models::qwen::quantized_model::KVLocation::VRAM {
+                        continue; 
+                    }
+                    let b_off = inner.offset;
+                    let block_file = base_dir.join(format!("b{}", b_off)).join(format!("l{}.st", l_idx));
+                    if block_file.exists() {
+                        if let Ok(enc_data) = crate::utils::direct_loader::load_kv_block(&block_file) {
+                            if let Ok(dec_data) = crate::utils::crypto::decrypt_data(&enc_data) {
+                                if let Ok(st) = safetensors::SafeTensors::deserialize(&dec_data) {
+                                    let prefix = format!("b{}_l{}_", b_off, l_idx);
+                                    let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                                    
+                                    if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                        let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                        let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                                        let target_dtype = if target_device.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+                                        
+                                        if let Ok(kd_t) = candle_core::Tensor::from_raw_buffer(kd.data(), candle_core::DType::BF16, &meta_os, target_device) {
+                                            inner.k_cache = kd_t.to_dtype(target_dtype).ok();
+                                        }
+                                        if let Ok(vd_t) = candle_core::Tensor::from_raw_buffer(vd.data(), candle_core::DType::BF16, &meta_os, target_device) {
+                                            inner.v_cache = vd_t.to_dtype(target_dtype).ok();
+                                        }
+                                        inner.location = crate::models::qwen::quantized_model::KVLocation::VRAM;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     // 찰나의 순간에 디스크에서 가중치를 퍼 올리는 JIT 로더
     pub fn reload_layer(&mut self, layer_idx: usize, device: &Device) -> Result<()> {
         if let (Some(mmap), Some(ct)) = (self.mmap.as_ref(), self.ct.as_ref()) {

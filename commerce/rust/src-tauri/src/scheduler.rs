@@ -743,7 +743,7 @@ async fn process_task(
                 if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
                     println!("[JS-BRIDGE] 1. Requesting titles from LLM...");
                     // 🌟 generate_part 로 교체 및 base_session_id_35 넘기기
-                    let res = gen.generate_part(&params, false, 0, None, None, kv_name.clone()).await?;
+                    let res = gen.generate_part(&params, false, 0, None, Some(base_session_id_35.clone()), kv_name.clone()).await?;
                     println!("[JS-BRIDGE] LLM Raw Response: '{}'", res.text);
 
                     let title_info = parsing::parse_json_from_llm(&res.text);
@@ -1153,7 +1153,7 @@ async fn process_task(
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Qwen 3.5 Inference..." }));
                     
                     // 🌟 base_session_id_35 넘기기
-                    let res = gen.generate_part(&params, false, 0, None, None, kv_name.clone()).await?;
+                    let res = gen.generate_part(&params, false, 0, None, Some(base_session_id_35.clone()), kv_name.clone()).await?;
                     
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res.text);
 
