@@ -199,26 +199,14 @@ impl Qwen3_5GenerateModel {
         }
         let total_toks = ids_vec.len();
 
-        let mut baked_len = 0;
-        if let Some(s_id) = &session_id {
-            let path = crate::utils::paths::get_kv_dir(None).join(s_id).join("tokens.json");
-            if path.exists() {
-                if let Ok(data) = std::fs::read_to_string(path) {
-                    if let Ok(baked_ids) = serde_json::from_str::<Vec<u32>>(&data) {
-                        baked_len = baked_ids.len();
-                    }
-                }
-            }
-        }
+        self.clear_kv_cache(); 
+        
+        let full_ids_tensor = Tensor::from_vec(ids_vec.clone(), (1, total_toks), &self.device)?;
+        let _ = self.qwen3_5.compute_and_set_rope_deltas(&full_ids_tensor, image_grid_thw.as_ref(), video_grid_thw.as_ref());
 
-        let (mut input_ids, mut seqlen_offset) = if baked_len > 0 && baked_len < total_toks {
-            println!("[SKIP-PREFILL] Qwen 3.5 Reusing baked context: {} tokens.", baked_len);
-            let missing_ids = ids_vec[baked_len..].to_vec();
-            (Tensor::from_vec(missing_ids, (1, total_toks - baked_len), &self.device)?, baked_len)
-        } else {
-            self.clear_kv_cache(); // 🌟 핵심 픽스: 새로운 사진/문서를 볼 때 이전 잔상(KV)을 완벽히 소각합니다.
-            (Tensor::from_vec(ids_vec, (1, total_toks), &self.device)?, 0)
-        };
+        let mut input_ids = Tensor::from_vec(ids_vec, (1, total_toks), &self.device)?;
+        let mut seqlen_offset = 0;
+        
         let mut seq_len = input_ids.dim(1)?;
         let pixel_values: Option<&Tensor> = pixel_values.as_ref();
         let image_grid_thw: Option<&Tensor> = image_grid_thw.as_ref();
@@ -273,19 +261,16 @@ impl Qwen3_5GenerateModel {
 
             if i == 0 {
                 if (self.eos_token_id as usize) < len { logits_vec[self.eos_token_id as usize] = -10000.0; }
-                if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
-                
-                if (open_bracket_id as usize) < len {
-                    let boost = if is_strict_json { 10000.0 } else { 20.0 };
-                    logits_vec[open_bracket_id as usize] += boost;
-                }
+                // 자연스러운 토큰 흐름을 위해 enter_id 억제와 '{' 강제 부스팅을 모두 삭제합니다.
             }
             
             let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
             let mut next_token = logit_processor.sample(&logits)?;
             
-            if i == 0 && (is_strict_json || next_token == self.eos_token_id) {
-                next_token = open_bracket_id;
+            // 토큰 경계를 부수던 '{' 강제 덮어쓰기 완전 삭제
+            if i == 0 && next_token == self.eos_token_id {
+                // 만약 첫 토큰이 실수로 EOS라면 최소한의 방어로 줄바꿈 대체
+                next_token = enter_id;
             }
 
             generate.push(next_token);
@@ -389,38 +374,13 @@ impl Qwen3_5GenerateModel {
             }
             let total_toks = ids_vec.len();
 
-            let mut baked_len = 0;
-            if let Some(s_id) = &session_id {
-                let path = crate::utils::paths::get_kv_dir(None).join(s_id).join("tokens.json");
-                if path.exists() {
-                    if let Ok(data) = std::fs::read_to_string(path) {
-                        if let Ok(baked_ids) = serde_json::from_str::<Vec<u32>>(&data) {
-                            baked_len = baked_ids.len();
-                        }
-                    }
-                }
-            }
+            self.clear_kv_cache();
 
-            if baked_len > 0 && baked_len < total_toks {
-                println!("[SKIP-PREFILL] Qwen 3.5 Reusing baked context in generate_part: {} tokens.", baked_len);
-                
-                // Attention 레이어를 위한 KV 레지스트리 복원
-                if let Some(s_id) = &session_id {
-                    let kv_name_raw = kv_name.as_deref().unwrap_or("text");
-                    let kv_type = kv_name_raw.split('/').last().unwrap_or("text");
-                    let sub_path = format!("{}/inference/{}", s_id, kv_type);
-                    let _ = self.qwen3_5.language_model.restore_kv_registry(&sub_path);
-                }
+            let full_ids_tensor = Tensor::from_vec(ids_vec.clone(), (1, total_toks), &self.device)?;
+            let _ = self.qwen3_5.compute_and_set_rope_deltas(&full_ids_tensor, img_thw.as_ref(), vid_thw.as_ref());
 
-                let missing_ids = ids_vec[baked_len..].to_vec();
-                let missing_len = missing_ids.len();
-                let ids = Tensor::from_vec(missing_ids, (1, missing_len), &self.device)?;
-                (ids, baked_len, px_vals, img_thw, vid_px_vals, vid_thw)
-            } else {
-                self.clear_kv_cache();
-                let ids = Tensor::from_vec(ids_vec, (1, total_toks), &self.device)?;
-                (ids, 0, px_vals, img_thw, vid_px_vals, vid_thw)
-            }
+            let ids = Tensor::from_vec(ids_vec, (1, total_toks), &self.device)?;
+            (ids, 0, px_vals, img_thw, vid_px_vals, vid_thw)
         } else {
             let ids = Tensor::from_vec(vec![last_token.unwrap()], (1, 1), &self.device)?;
             (ids, last_offset, None, None, None, None)
@@ -477,20 +437,13 @@ impl Qwen3_5GenerateModel {
 
             if i == 0 {
                 if (self.eos_token_id as usize) < len { logits_vec[self.eos_token_id as usize] = -10000.0; }
-                if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
-                if (open_bracket_id as usize) < len { 
-                    // 🌟 JSON 모드일 때만 `{`를 10000점 부스팅
-                    let boost = if is_strict_json { 10000.0 } else { 20.0 };
-                    logits_vec[open_bracket_id as usize] += boost; 
-                }
             }
 
             let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
             let mut next_token = logit_processor.sample(&logits)?;
             
-            // 🌟 방어 로직 추가
-            if i == 0 && (is_strict_json || next_token == self.eos_token_id) {
-                next_token = open_bracket_id;
+            if i == 0 && next_token == self.eos_token_id {
+                next_token = enter_id;
             }
 
             generate.push(next_token);
@@ -580,10 +533,18 @@ impl Qwen3_5GenerateModel {
             }
         }
 
+        // ✅ 수정 후 (안전 마진 10토큰 남기기 적용)
         let input_ids = self.tokenizer.text_encode_vec(mes_render.clone(), false)?;
         let total_toks = input_ids.len();
 
-        let ids_tensor = Tensor::from_vec(input_ids.clone(), (1, total_toks), &self.device)?;
+        // 🌟 [CRITICAL FIX] Token Boundary Merge로 인한 SSM 상태 오염 원천 차단!
+        // Qwen 3.5의 Mamba(SSM) 레이어는 과거로 롤백(Truncate)이 불가능합니다.
+        // 뒤에 이어붙을 질문([TASK]) 때문에 마지막 토큰 경계가 변형되어 뇌가 깨지는 것을 막기 위해,
+        // 안전하게 마지막 10개 토큰은 굽지 않고 남겨둡니다. (generate_part에서 자연스럽게 이어서 연산됨)
+        let safe_toks = if total_toks > 20 { total_toks - 10 } else { total_toks };
+        let safe_input_ids = input_ids[..safe_toks].to_vec();
+
+        let ids_tensor = Tensor::from_vec(safe_input_ids.clone(), (1, safe_toks), &self.device)?;
 
         self.qwen3_5.forward(
             &ids_tensor, None, None, None, None, 
@@ -595,18 +556,18 @@ impl Qwen3_5GenerateModel {
         if let Some(s_id) = &session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(s_id);
             if !path.exists() { std::fs::create_dir_all(&path)?; }
-            std::fs::write(path.join("tokens.json"), serde_json::to_string(&input_ids)?)?;
+            // 🌟 저장도 안전하게 자른 텐서 기준(safe_input_ids)으로 저장합니다.
+            std::fs::write(path.join("tokens.json"), serde_json::to_string(&safe_input_ids)?)?;
 
             let _ = self.qwen3_5.language_model.force_flush_all_active_blocks(s_id, kv_name.as_deref()).await;
             
-            // Background SSD I/O가 끝날 때까지 완벽하게 대기
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             println!("[PREFILL-WAIT] Waiting for SSD write to complete...");
             crate::models::qwen::generate::wait_for_global_io().await;
-            println!("[PREFILL-SAVE] Confirm: Qwen 3.5 Base Context prefilled and safely flushed to disk. ({} tokens)", total_toks);
+            println!("[PREFILL-SAVE] Confirm: Qwen 3.5 Base Context prefilled and safely flushed to disk. ({} tokens)", safe_toks);
         }
 
-        Ok(total_toks)
+        Ok(safe_toks)
     }
 
     pub fn clear_kv_cache(&mut self) {

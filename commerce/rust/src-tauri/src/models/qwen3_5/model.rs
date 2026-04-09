@@ -1002,6 +1002,43 @@ impl Qwen3_5Attention {
         self.kv_blocks.clear();
     }
 
+    // 🌟 [새로 추가할 함수 1]
+    pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
+        let mut _current_total = 0;
+        let mut to_remove = Vec::new();
+        let total_blocks = self.kv_blocks.len();
+        
+        for i in 0..total_blocks {
+            let block = &mut self.kv_blocks[i];
+            let mut inner = block.inner.write().unwrap();
+            
+            if _current_total + inner.len <= len {
+                _current_total += inner.len;
+            } else {
+                let keep_in_this_block = len - _current_total;
+                if keep_in_this_block > 0 {
+                    if inner.location == KVLocation::VRAM {
+                        let (new_k, new_v) = if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                            (Some(k.narrow(2, 0, keep_in_this_block)?), Some(v.narrow(2, 0, keep_in_this_block)?))
+                        } else { (None, None) };
+                        inner.k_cache = new_k;
+                        inner.v_cache = new_v;
+                    }
+                    inner.len = keep_in_this_block;
+                    _current_total += keep_in_this_block;
+                    for j in (i + 1)..total_blocks { to_remove.push(j); }
+                } else {
+                    for j in i..total_blocks { to_remove.push(j); }
+                }
+                break;
+            }
+        }
+        
+        to_remove.sort_by(|a, b| b.cmp(a));
+        for idx in to_remove { self.kv_blocks.remove(idx); }
+        Ok(())
+    }
+
     pub fn clear_weights(&mut self) {
         let dummy = crate::models::common::gguf::dummy_proj(&Device::Cpu);
         self.q_proj = dummy.clone();
@@ -1195,6 +1232,15 @@ impl Qwen3_5DecoderLayer {
             AttnKind::LinearAttn(attn) => { attn.clear_cache(); }
             AttnKind::SelfAttn(attn) => { attn.clear_kv_cache(); }
         }
+    }
+
+    // 🌟 [새로 추가할 함수 2]
+    pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
+        if let AttnKind::SelfAttn(attn) = &mut self.attn {
+            attn.truncate_kv_cache(len)?;
+        }
+        // SSM (LinearAttn)은 토큰 단위 롤백이 불가하므로 무시합니다.
+        Ok(())
     }
 
     pub fn clear_weights(&mut self) {
@@ -1444,7 +1490,7 @@ impl Qwen3_5TextModel {
                     AttnKind::SelfAttn(attn) => {
                         let mut dumps = Vec::new();
                         for block in attn.kv_blocks.iter_mut() {
-                            let mut inner = block.inner.write().unwrap();
+                            let inner = block.inner.read().unwrap(); // 🌟 mut 삭제 및 read() 로 변경
                             let is_full = inner.len == 256;
                             
                             if is_full && inner.k_cache.is_some() && inner.location == crate::models::qwen::quantized_model::KVLocation::VRAM {
@@ -1524,6 +1570,15 @@ impl Qwen3_5TextModel {
             layer.clear_cache();
         }
         self.current_kv_len = 0;
+    }
+
+    // 🌟 [새로 추가할 함수 3]
+    pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
+        for layer in self.layers.iter_mut() {
+            layer.truncate_kv_cache(len)?;
+        }
+        self.current_kv_len = len;
+        Ok(())
     }
 
     pub fn restore_kv_registry(&mut self, kv_name: &str) -> Result<()> {
@@ -1775,6 +1830,19 @@ impl Qwen3_5Model {
             rope_deltas: None,
             rope_deltas_cpu: None,
         })
+    }
+
+    // 🌟 [추가할 함수] 전체 프롬프트를 기반으로 위치 오프셋(mRoPE)을 사전 계산하여 모델 뇌에 각인시킵니다.
+    pub fn compute_and_set_rope_deltas(
+        &mut self,
+        full_input_ids: &Tensor,
+        image_grid_thw: Option<&Tensor>,
+        video_grid_thw: Option<&Tensor>,
+    ) -> Result<()> {
+        let (_, deltas, deltas_cpu) = self.get_rope_index(full_input_ids, image_grid_thw, video_grid_thw, None)?;
+        self.rope_deltas = Some(deltas);
+        self.rope_deltas_cpu = Some(deltas_cpu);
+        Ok(())
     }
 
     fn get_rope_index(

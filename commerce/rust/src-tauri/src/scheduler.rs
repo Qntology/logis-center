@@ -587,32 +587,6 @@ async fn process_task(
         }
     }
 
-    {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        
-        let base_kv_path_35 = utils::paths::get_kv_dir(Some(app_handle)).join(&base_session_id_35);
-        if !base_kv_path_35.exists() {
-            println!("[Scheduler] Baking Base PUG Context to SSD for Qwen 3.5...");
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Reading document structure (High Precision)...", "spinner": "⠋" }));
-            
-            // Qwen3.5 모델로 VRAM 릴레이 확보
-            model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
-            
-            let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                    content: system_content.clone(),
-                    name: None,
-                })],
-                model: "qwen3.5".to_string(),
-                ..Default::default()
-            };
-
-            if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-                gen.prefill_only(params, Some(base_session_id_35.clone()), kv_name.clone()).await?;
-            }
-        }
-    }
-
     // --- STEP A: CLASSIFICATION (분류) ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -769,7 +743,7 @@ async fn process_task(
                 if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
                     println!("[JS-BRIDGE] 1. Requesting titles from LLM...");
                     // 🌟 generate_part 로 교체 및 base_session_id_35 넘기기
-                    let res = gen.generate_part(&params, false, 0, None, Some(base_session_id_35.clone()), kv_name.clone()).await?;
+                    let res = gen.generate_part(&params, false, 0, None, None, kv_name.clone()).await?;
                     println!("[JS-BRIDGE] LLM Raw Response: '{}'", res.text);
 
                     let title_info = parsing::parse_json_from_llm(&res.text);
@@ -1168,7 +1142,7 @@ async fn process_task(
                         })
                     ],
                     model: "qwen3.5".to_string(), 
-                    max_tokens: Some(2048), 
+                    max_tokens: Some(1048), 
                     temperature: Some(0.0), 
                     top_p: Some(0.01),
                     ..Default::default()
@@ -1179,7 +1153,7 @@ async fn process_task(
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Qwen 3.5 Inference..." }));
                     
                     // 🌟 base_session_id_35 넘기기
-                    let res = gen.generate_part(&params, false, 0, None, Some(base_session_id_35.clone()), kv_name.clone()).await?;
+                    let res = gen.generate_part(&params, false, 0, None, None, kv_name.clone()).await?;
                     
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res.text);
 

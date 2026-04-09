@@ -687,7 +687,7 @@ additional_goods:[
     }
 ],
 title:{
-    value:product based title | string,
+    value:goods name | string,
 },
 registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
@@ -843,7 +843,7 @@ Page Type: {TYPE}
 
 [OUTPUT FORMAT]
 {
-    "field_name": "extracted_value"
+    field name: extracted value
 }"###;
 
     template.replace("{TYPE}", page_type)
