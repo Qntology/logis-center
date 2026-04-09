@@ -686,6 +686,11 @@ pub struct Qwen3_5Attention {
     layer_idx: usize,
     pub active_session_id: Option<String>,
     pub active_kv_name: Option<String>,
+    
+    // 🌟 [추가] Fast-Path 병합 캐시 (매번 텐서를 합치는 병목 제거)
+    pub vram_merged_k: Option<Tensor>,
+    pub vram_merged_v: Option<Tensor>,
+    pub merged_vram_block_count: usize,
 }
 
 impl Qwen3_5Attention {
@@ -714,6 +719,9 @@ impl Qwen3_5Attention {
             layer_idx,
             active_session_id: None,
             active_kv_name: None,
+            vram_merged_k: None,
+            vram_merged_v: None,
+            merged_vram_block_count: 0,
         })
     }
 
@@ -743,6 +751,9 @@ impl Qwen3_5Attention {
             layer_idx,
             active_session_id: None,
             active_kv_name: None,
+            vram_merged_k: None,
+            vram_merged_v: None,
+            merged_vram_block_count: 0,
         })
     }
 
@@ -828,6 +839,63 @@ impl Qwen3_5Attention {
         }
 
         let total_tokens_now = seqlen_offset + q_len;
+
+        // =========================================================================
+        // 🚀 [최적화 2] Qwen 3.5 디코딩 초고속 가속 (No-Cat Fast-Path)
+        // 15,000 토큰을 매번 합치는(cat) 바보 같은 짓을 멈추고,
+        // VRAM에 상주된 블록들을 순회하며 수학적으로(Softmax) 결과값만 더해버립니다!
+        // =========================================================================
+        let is_decoding = q_len == 1;
+        if is_decoding {
+            let valid_blocks: Vec<_> = self.kv_blocks.iter().filter(|b| b.inner.read().unwrap().offset < total_tokens_now).collect();
+            let all_in_vram = valid_blocks.iter().all(|b| b.inner.read().unwrap().location == KVLocation::VRAM);
+            
+            if all_in_vram {
+                let mut out_res: Option<Tensor> = None;
+                let mut m_n: Option<Tensor> = None;
+                let mut l_n: Option<Tensor> = None;
+                let q_aligned = (query_states * self.scaling)?;
+
+                for block in valid_blocks {
+                    let inner = block.inner.read().unwrap();
+                    let (k, v) = (inner.k_cache.as_ref().unwrap(), inner.v_cache.as_ref().unwrap());
+                    
+                    let (mut k_exp, mut v_exp) = (k.clone(), v.clone());
+                    if self.num_kv_groups > 1 {
+                        let (b, h, s, d) = k.dims4()?;
+                        k_exp = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                        v_exp = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                    }
+                    
+                    let s_chunk = q_aligned.matmul(&k_exp.transpose(2, 3)?)?;
+                    let s_chunk_f32 = s_chunk.to_dtype(DType::F32)?;
+                    let m_j = s_chunk_f32.max_keepdim(D::Minus1)?;
+                    let p_j = s_chunk_f32.broadcast_sub(&m_j)?.exp()?;
+                    let l_j = p_j.sum_keepdim(D::Minus1)?;
+                    let out_j_f32 = p_j.to_dtype(v_exp.dtype())?.matmul(&v_exp)?.to_dtype(DType::F32)?;
+
+                    match out_res {
+                        None => { out_res = Some(out_j_f32); m_n = Some(m_j); l_n = Some(l_j); }
+                        Some(prev_out) => {
+                            let prev_m = m_n.as_ref().unwrap(); let prev_l = l_n.as_ref().unwrap();
+                            let m_new = prev_m.maximum(&m_j)?;
+                            let diff_old = prev_m.broadcast_sub(&m_new)?.exp()?;
+                            let diff_new = m_j.broadcast_sub(&m_new)?.exp()?;
+                            l_n = Some(prev_l.broadcast_mul(&diff_old)?.add(&l_j.broadcast_mul(&diff_new)?)?);
+                            out_res = Some(prev_out.broadcast_mul(&diff_old)?.add(&out_j_f32.broadcast_mul(&diff_new)?)?);
+                            m_n = Some(m_new);
+                        }
+                    }
+                }
+                
+                let attn_output = out_res.unwrap().broadcast_div(&l_n.unwrap())?.to_dtype(target_dtype)?;
+                let attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
+                let attn_output = attn_output.mul(&candle_nn::ops::sigmoid(&gate)?)?;
+                return Ok(attn_output.apply(&self.o_proj)?); 
+            }
+        }
+        // =========================================================================
+
         let mut out_res: Option<Tensor> = None;
         let mut m_n: Option<Tensor> = None;
         let mut l_n: Option<Tensor> = None;
@@ -1000,6 +1068,10 @@ impl Qwen3_5Attention {
 
     pub fn clear_kv_cache(&mut self) {
         self.kv_blocks.clear();
+
+        self.vram_merged_k = None;
+        self.vram_merged_v = None;
+        self.merged_vram_block_count = 0;
     }
 
     // 🌟 [새로 추가할 함수 1]
@@ -1036,6 +1108,11 @@ impl Qwen3_5Attention {
         
         to_remove.sort_by(|a, b| b.cmp(a));
         for idx in to_remove { self.kv_blocks.remove(idx); }
+
+        self.vram_merged_k = None;
+        self.vram_merged_v = None;
+        self.merged_vram_block_count = 0;
+        
         Ok(())
     }
 
@@ -1956,10 +2033,12 @@ impl Qwen3_5Model {
         let mut p_ids_vec = Vec::with_capacity(bs);
         for b in 0..bs {
             let delta = deltas_cpu[b];
-            // 🌟 이전 3D 이미지 공간만큼 점프했던 delta 값을 온전히 더해줍니다.
             let real_start = (seqlen_offset as i64 + delta) as f32;
-            let p_id = Tensor::arange(real_start, real_start + seq_len as f32, &Device::Cpu)?
-                .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, seq_len))?;
+            
+            // arange 대신 단일 스칼라 텐서를 즉시 생성
+            let p_id = Tensor::new(&[real_start], &Device::Cpu)?
+                .reshape((1, 1, 1))?
+                .broadcast_as((3, 1, 1))?; // seq_len은 항상 1이므로 하드코딩
             p_ids_vec.push(p_id);
         }
         let position_ids = Tensor::cat(&p_ids_vec, 1)?.to_device(inputs_embeds.device())?;

@@ -681,6 +681,59 @@ impl QuantizedQwenVLTextAttention {
         // 3. [CHUNK-BASED ONLINE SOFTMAX] Zero-VRAM Spikes Attention
         let total_tokens_now = seqlen_offset + q_len;
         
+        // =========================================================================
+        // 🚀 [최적화 2] 0.6B 디코딩 초고속 가속 (No-Cat Fast-Path)
+        // =========================================================================
+        let is_decoding = q_len == 1;
+        if is_decoding {
+            let valid_blocks: Vec<_> = self.kv_blocks.iter().filter(|b| b.inner.read().unwrap().offset < total_tokens_now).collect();
+            let all_in_vram = valid_blocks.iter().all(|b| b.inner.read().unwrap().location == KVLocation::VRAM);
+            
+            if all_in_vram {
+                let mut out_res: Option<Tensor> = None;
+                let mut m_n: Option<Tensor> = None;
+                let mut l_n: Option<Tensor> = None;
+                let q_aligned = query_states.to_dtype(target_dtype)?;
+
+                for block in valid_blocks {
+                    let inner = block.inner.read().unwrap();
+                    let (k, v) = (inner.k_cache.as_ref().unwrap(), inner.v_cache.as_ref().unwrap());
+                    
+                    let (mut k_exp, mut v_exp) = (k.clone(), v.clone());
+                    if self.num_kv_groups > 1 {
+                        let (b, h, s, d) = k.dims4()?;
+                        k_exp = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                        v_exp = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                    }
+                    
+                    let s_chunk = q_aligned.matmul(&k_exp.transpose(2, 3)?)?;
+                    let s_chunk_f32 = s_chunk.to_dtype(DType::F32)?;
+                    let m_j = s_chunk_f32.max_keepdim(D::Minus1)?;
+                    let p_j = s_chunk_f32.broadcast_sub(&m_j)?.exp()?;
+                    let l_j = p_j.sum_keepdim(D::Minus1)?;
+                    let out_j_f32 = p_j.to_dtype(v_exp.dtype())?.matmul(&v_exp)?.to_dtype(DType::F32)?;
+
+                    match out_res {
+                        None => { out_res = Some(out_j_f32); m_n = Some(m_j); l_n = Some(l_j); }
+                        Some(prev_out) => {
+                            let prev_m = m_n.as_ref().unwrap(); let prev_l = l_n.as_ref().unwrap();
+                            let m_new = prev_m.maximum(&m_j)?;
+                            let diff_old = prev_m.broadcast_sub(&m_new)?.exp()?;
+                            let diff_new = m_j.broadcast_sub(&m_new)?.exp()?;
+                            l_n = Some(prev_l.broadcast_mul(&diff_old)?.add(&l_j.broadcast_mul(&diff_new)?)?);
+                            out_res = Some(prev_out.broadcast_mul(&diff_old)?.add(&out_j_f32.broadcast_mul(&diff_new)?)?);
+                            m_n = Some(m_new);
+                        }
+                    }
+                }
+                
+                let attn_output = out_res.unwrap().broadcast_div(&l_n.unwrap())?.to_dtype(target_dtype)?;
+                let attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
+                return Ok(self.o_proj.forward(&attn_output)?); 
+            }
+        }
+        // =========================================================================
+
         let mut out_res: Option<Tensor> = None;
         let mut m_n: Option<Tensor> = None;
         let mut l_n: Option<Tensor> = None;
@@ -1106,10 +1159,16 @@ impl QuantizedQwenVLTextAttention {
                             if b_idx < reg.len() {
                                 if let Some(block) = self.kv_blocks.get(b_idx) {
                                     let mut inner = block.inner.write().unwrap();
-                                    inner.k_cache = Some(k_raw.to_device(&Device::Cpu)?);
-                                    inner.v_cache = Some(v_raw.to_device(&Device::Cpu)?);
-                                    inner.location = KVLocation::RAM;
-                                    reg[b_idx].location[self.layer_idx] = KVLocation::RAM;
+                                    
+                                    // 🌟 [초고속 VRAM 파이프라인] 읽어온 텐서를 바로 GPU(self.device())로 밀어 넣습니다.
+                                    let target_device = self.q_proj.device();
+                                    let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
+                                    
+                                    inner.k_cache = Some(k_raw.to_device(target_device)?.to_dtype(target_dtype)?);
+                                    inner.v_cache = Some(v_raw.to_device(target_device)?.to_dtype(target_dtype)?);
+                                    
+                                    inner.location = KVLocation::VRAM; // RAM을 건너뛰고 VRAM 상주 확정!
+                                    reg[b_idx].location[self.layer_idx] = KVLocation::VRAM;
                                     reg[b_idx].ssd_path = Some(file_path.parent().unwrap().to_path_buf());
                                 }
                             }
@@ -2023,7 +2082,9 @@ impl QuantizedQwenVLTextModel {
         let is_small_model = self.layers.len() <= 36;
         if is_small_model && current_kv_len < 1024 { return Ok(()); }
 
-        let vram_limit = 8; 
+        // 🌟 [최적화 1] VRAM을 100~300MB 더 쓰는 대신 15,000 토큰(60블록)을 
+        // 전부 GPU에 상주시켜 디코딩 시 발생하는 RAM -> VRAM 복사 병목을 원천 차단합니다!
+        let vram_limit = 64; 
         let mut vram_evicted = false;
 
         {
@@ -2901,8 +2962,10 @@ impl QuantizedQwenVLModel {
                 let delta = deltas_cpu[b]; 
                 let real_start = (seqlen_offset as i64 + delta) as u32; 
                 
-                let p_id = Tensor::arange(real_start, real_start + seq_len as u32, input_ids.device())? 
-                    .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, 1, seq_len))?; 
+                // arange 대신 단일 텐서 생성
+                let p_id = Tensor::new(&[real_start], input_ids.device())? 
+                    .reshape((1, 1, 1))?
+                    .broadcast_as((3, 1, 1))?; 
                 p_ids_vec.push(p_id); 
             }
             Tensor::cat(&p_ids_vec, 1)?

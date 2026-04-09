@@ -65,7 +65,7 @@ impl Qwen3_5GenerateModel {
             device,
             eos_token_id,
             model_name: model_name.to_string(),
-            repeat_penalty: 1.01,
+            repeat_penalty: 1.1,
             repeat_last_n: 64,
         })
     }
@@ -135,8 +135,8 @@ impl Qwen3_5GenerateModel {
             device,
             eos_token_id,
             model_name: stem.to_string(),
-            repeat_penalty: 1.05, 
-            repeat_last_n: 1024,
+            repeat_penalty: 1.1, 
+            repeat_last_n: 64,
         })
     }
 
@@ -206,7 +206,7 @@ impl Qwen3_5GenerateModel {
 
         let mut input_ids = Tensor::from_vec(ids_vec, (1, total_toks), &self.device)?;
         let mut seqlen_offset = 0;
-        
+
         let mut seq_len = input_ids.dim(1)?;
         let pixel_values: Option<&Tensor> = pixel_values.as_ref();
         let image_grid_thw: Option<&Tensor> = image_grid_thw.as_ref();
@@ -221,9 +221,11 @@ impl Qwen3_5GenerateModel {
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(123);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
         
-        // 🌟 Fix: 텍스트 추출용 부스터 조건("Return ONLY") 추가
         let is_strict_json = mes_text.contains("/no_think") || mes_text.contains("RETURN JSON ONLY") || mes_text.contains("Return ONLY");
         let mut gen_text_buffer = String::new(); 
+        
+        // 🌟 [추가] generate 함수용 출력 버퍼
+        let mut print_buffer = String::new();
 
         for i in 0..sample_len {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
@@ -275,11 +277,18 @@ impl Qwen3_5GenerateModel {
 
             generate.push(next_token);
             
+            // 🌟 [수정] 1글자씩 뱉던 로직을 버퍼링 로직으로 교체
             if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
-                print!("{}", piece);
-                let _ = std::io::stdout().flush();
+                print_buffer.push_str(&piece);
                 gen_text_buffer.push_str(&piece);
-                
+
+                // 10글자 이상이거나, 줄바꿈이거나, 끝났을 때만 모아서 출력
+                if print_buffer.len() >= 10 || piece.contains('\n') || next_token == self.eos_token_id {
+                    print!("{}", print_buffer);
+                    let _ = std::io::stdout().flush();
+                    print_buffer.clear(); 
+                }
+
                 if gen_text_buffer.contains('{') {
                     let mut depth = 0;
                     let mut has_started = false;
@@ -288,8 +297,13 @@ impl Qwen3_5GenerateModel {
                         else if c == '}' { depth -= 1; }
                     }
                     if has_started && depth == 0 && gen_text_buffer.trim_end().ends_with('}') {
-                        println!("\n[DEBUG-GEN] Balanced JSON detected (Depth 0). Stopping at token {}.", i + 1);
-                        break;
+                        // 🌟 종료 전 남은 버퍼 강제 출력
+                        if !print_buffer.is_empty() {
+                            print!("{}", print_buffer);
+                            let _ = std::io::stdout().flush();
+                        }
+                        println!("\n[DEBUG-GEN] Balanced JSON detected. Stopping.");
+                        break; // generate 함수는 is_finished 변수가 없으므로 그냥 break만 하시면 됩니다.
                     }
                 }
             }
@@ -401,6 +415,9 @@ impl Qwen3_5GenerateModel {
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(123);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
         let mut gen_text_buffer = String::new();
+        
+        // 🌟 [추가] 출력을 모아서 하기 위한 전용 버퍼 생성
+        let mut print_buffer = String::new();
 
         for i in 0..sample_len {
             crate::models::qwen::generate::wait_for_global_io().await;
@@ -450,10 +467,17 @@ impl Qwen3_5GenerateModel {
             final_token = next_token;
 
             if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
-                print!("{}", piece);
-                let _ = std::io::stdout().flush();
+                print_buffer.push_str(&piece);
                 gen_text_buffer.push_str(&piece);
 
+                // 🌟 [핵심] 버퍼에 10글자 이상 모였거나, 줄바꿈이 있거나, 마지막 토큰일 때만 한 번에 화면에 출력(Flush)합니다.
+                if print_buffer.len() >= 10 || piece.contains('\n') || next_token == self.eos_token_id {
+                    print!("{}", print_buffer);
+                    let _ = std::io::stdout().flush();
+                    print_buffer.clear(); // 출력 후 버퍼 비우기
+                }
+
+                // 중첩 깊이 추적 기반 조기 종료
                 if gen_text_buffer.contains('{') {
                     let mut depth = 0;
                     let mut has_started = false;
@@ -462,6 +486,11 @@ impl Qwen3_5GenerateModel {
                         else if c == '}' { depth -= 1; }
                     }
                     if has_started && depth == 0 && gen_text_buffer.trim_end().ends_with('}') {
+                        // 남은 버퍼 강제 출력
+                        if !print_buffer.is_empty() {
+                            print!("{}", print_buffer);
+                            let _ = std::io::stdout().flush();
+                        }
                         println!("\n[DEBUG-GEN] Balanced JSON detected. Stopping.");
                         is_finished = true;
                         break;
