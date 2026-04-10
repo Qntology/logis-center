@@ -109,9 +109,14 @@ pub struct BakeTask {
 }
 
 pub struct SaveTask {
-    pub slot_id: usize, pub path: PathBuf, pub tensors: std::collections::HashMap<String, Tensor>,
-    pub is_last: bool, pub block_idx: Option<usize>, pub registry: Option<KVRegistry>,
+    pub slot_id: usize, 
+    pub path: PathBuf, 
+    pub tensors: std::collections::HashMap<String, Tensor>,
+    pub is_last: bool, 
+    pub block_idx: Option<usize>, 
+    pub registry: Option<KVRegistry>,
     pub kv_name: Option<String>,
+    pub block_len: usize, // 🌟 동적 크기 전달용 필드 추가
 }
 
 pub enum SlotTask { 
@@ -266,6 +271,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         while let Some(task) = io_rx.recv().await {
             let sem = semaphore.clone();
             let (tp, ts, reg, b_idx, sid, is_last, kv_n) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone());
+            let block_len_for_index = task.block_len; // 🌟 텐서 크기 동적 반영
+
             tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
                 struct IoGuard; impl Drop for IoGuard { fn drop(&mut self) { GLOBAL_IO_COUNTER.fetch_sub(1, Ordering::SeqCst); } }
@@ -273,19 +280,14 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 
                 if let Some(p) = tp.parent() { if !p.exists() { let _ = fs::create_dir_all(p); } }
                 
-                // [COMPILATION FIX] candle_core::Tensor는 safetensors::View를 직접 지원하지 않으므로
-                // Candle의 내장 save 함수를 사용하여 안전하게 다이렉트로 디스크에 씁니다.
                 let tp_clone = tp.clone();
                 let serialize_result = tokio::task::spawn_blocking(move || {
-                    // 1. 임시 파일로 평문 텐서 저장
                     let tmp_path = tp_clone.with_extension("tmp");
                     candle_core::safetensors::save(&ts, &tmp_path)?;
                     
-                    // 2. 임시 파일 읽기 및 암호화
                     let plain_data = std::fs::read(&tmp_path)?;
                     let encrypted_data = crate::utils::crypto::encrypt_data(&plain_data)?;
                     
-                    // 3. 최종 경로에 암호화된 데이터 저장 및 임시 파일 삭제
                     std::fs::write(&tp_clone, encrypted_data)?;
                     let _ = std::fs::remove_file(tmp_path);
                     
@@ -306,9 +308,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     let e = &mut entries[idx]; 
                                     e.location[layer_num] = KVLocation::SSD; 
                                     e.ssd_path = Some(tp.parent().unwrap().to_path_buf());
-                                    
-                                    // [CRITICAL FIX] 여기서 RAM 캐시(bitkv_cache)를 삭제하던 로직을 제거했습니다.
-                                    // RAM에 캐시를 남겨두어 디코딩 속도를 극대화하고 SSD 병목을 없앱니다.
                                 }
                             }
                         }
@@ -317,7 +316,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
                             let offset = offset_str.parse::<usize>().unwrap_or(0);
                             let _ = INDEX_TX.send(SlotTask::IndexUpdate {
-                                kv_name, layer_idx: l_num, offset, len: 1024, file_name: format!("b{}/l{}.st", offset, l_num),
+                                kv_name, layer_idx: l_num, offset, len: block_len_for_index, file_name: format!("b{}/l{}.st", offset, l_num),
                             }).await;
                         }
                     },
@@ -338,8 +337,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                 SlotTask::Bake(bake) => {
                     let loop_count = bake.layers.len();
 
-                    // [CRITICAL FIX] 메인 큐에서 소비된 1을 빼고, 새로 파생될 하위 작업 수(loop_count)만큼만 정확히 더합니다.
-                    // 이렇게 해야 하위 파일 저장(SaveTask)이 끝날 때까지 카운터가 0으로 떨어지지 않고 안전하게 대기합니다!
                     GLOBAL_IO_COUNTER.fetch_add(loop_count, std::sync::atomic::Ordering::SeqCst);
                     GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 
@@ -358,7 +355,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 
                         tokio::spawn(async move {
                             if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
-                                // [SAFE-CONVERSION] CPU에서 완벽하게 BF16 + Contiguous 보장
                                 let k_cpu = rk.to_device(&Device::Cpu).unwrap_or(rk);
                                 let v_cpu = rv.to_device(&Device::Cpu).unwrap_or(rv);
 
@@ -388,7 +384,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     }
                                 }
 
-                                // [CRITICAL FIX] 메모리 정렬(contiguous)을 수행하되, 실패 시 원본으로 스왑
                                 let k_contig = k_aligned.contiguous().unwrap_or(k_aligned);
                                 let v_contig = v_aligned.contiguous().unwrap_or(v_aligned);
 
@@ -403,10 +398,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             
                             let file_path = task_dir.join(format!("l{}.st", act_l));
                             
+                            // 🌟 [추가] 텐서 형태로부터 실제 블록 길이를 추출하여 전달
+                            let b_len = src.k_shape.to_vec1::<u32>().unwrap_or_default().get(2).cloned().unwrap_or(256) as usize;
+                            
                             if io_tx_nested.send(SaveTask { 
-                                slot_id: sid, path: file_path.clone(), tensors: map, is_last: false, block_idx, registry: Some(registry_inner), kv_name: kv_name_inner 
+                                slot_id: sid, path: file_path.clone(), tensors: map, is_last: false, block_idx, registry: Some(registry_inner), kv_name: kv_name_inner,
+                                block_len: b_len // 🌟 필드 추가
                             }).await.is_err() {
-                                // [CRITICAL FIX] 내부 Send 실패 시에만 카운터를 복구시킴
                                 GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                             }
                         });
@@ -417,15 +415,12 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let reg = load.registry.clone(); 
                     let shared_block = load.shared_block.clone();
                     let provided_path = load.path.clone(); 
-                    let kv_name = load.kv_name.clone();
-                    let target_layer = load.layer_idx; // [FIX] 요청받은 타겟 레이어!
+                    let target_layer = load.layer_idx; 
 
                     tokio::spawn(async move {
                         let _guard = ReadSlotGuard { sid, active: true };
                         let (b_idx_off, b_idx) = { match shared_block.inner.read() { Ok(inner) => (inner.offset, inner.index), _ => (0, 999) } };
                         
-                        // [CRITICAL FIX] 엉뚱한 상위 디렉토리로 올라가던 루프를 삭제하고, 장부(registry)에서 받아온 
-                        // 정확한 SSD 경로(provided_path)에 파일명만 즉시 붙여서 블록 유실(Block missing)을 원천 차단합니다!
                         let file_path = provided_path.join(format!("l{}.st", target_layer));
                         if file_path.is_file() {
                             if let Ok(encrypted_content) = load_kv_block(&file_path) {
@@ -442,7 +437,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                             let mut kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
                                             let mut vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
                                             
-                                            // [CRITICAL FIX] CPU 모드라면 백그라운드 스레드에서 미리 F32로 변환하여 메인 런타임의 병목을 원천 차단!
                                             if load.is_cpu {
                                                 kd_t = kd_t.to_dtype(DType::F32).unwrap_or(kd_t);
                                                 vd_t = vd_t.to_dtype(DType::F32).unwrap_or(vd_t);
@@ -453,7 +447,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                                 if b_idx < r.len() {
                                                     {
                                                         let mut cache = r[b_idx].bitkv_cache.write().unwrap();
-                                                        cache[target_layer] = Some(meta); // 타겟 레이어에 적재
+                                                        cache[target_layer] = Some(meta);
                                                     }
                                                     r[b_idx].location[target_layer] = KVLocation::RAM;
                                                 }
@@ -747,7 +741,21 @@ impl QwenVLGenerateModel {
             
             wait_for_global_io().await; 
             logits = self.qwen.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;
+
+            if i > 0 && i % 50 == 0 {
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+                #[cfg(target_os = "linux")]
+                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+                #[cfg(target_os = "macos")]
+                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+            }
         }
+
         if let Some(s_id) = &session_id {
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
         }

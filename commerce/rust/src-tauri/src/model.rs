@@ -387,72 +387,112 @@ impl LogisModel {
 
     // --- [NEW] SSD Bridge Operations ---
     pub async fn save_kv_snapshot(&self, task_id: &str, kv_name: Option<String>, offset: usize) -> anyhow::Result<String> {
+        let current_size = *self.current_size.lock().await;
+        let is_q35 = current_size == Some(ModelSize::Qwen3_5);
         let generator_arc = self.generator.clone();
         let task_id_str = task_id.to_string();
         
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-            let mut gen_guard = generator_arc.blocking_lock();
-            if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
-                println!("[SSD-BRIDGE] Saving KV snapshot to {:?}", path);
-                gen.save_kv_to_disk(&path, kv_name.as_deref(), offset)?;
+            let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
+            if is_q35 {
+                // Qwen3.5는 자체 flush 매커니즘을 사용하므로 패스만 반환
                 Ok(path.to_string_lossy().to_string())
             } else {
-                Err(anyhow::anyhow!("No active generator to save snapshot from"))
+                let mut gen_guard = generator_arc.blocking_lock();
+                if let Some(gen) = gen_guard.as_mut() {
+                    println!("[SSD-BRIDGE] Saving KV snapshot to {:?}", path);
+                    gen.save_kv_to_disk(&path, kv_name.as_deref(), offset)?;
+                    Ok(path.to_string_lossy().to_string())
+                } else {
+                    Err(anyhow::anyhow!("No active generator to save snapshot from"))
+                }
             }
         }).await?
     }
 
     pub async fn truncate_kv_cache(&self, len: usize) -> anyhow::Result<()> {
+        let current_size = *self.current_size.lock().await;
+        let is_q35 = current_size == Some(ModelSize::Qwen3_5);
         let generator_arc = self.generator.clone();
+        let q35_arc = self.qwen3_5_generator.clone();
+
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let mut gen_guard = generator_arc.blocking_lock();
-            if let Some(gen) = gen_guard.as_mut() {
-                gen.truncate_kv_cache(len).map_err(|e| anyhow::anyhow!("Truncate failed: {}", e))
+            if is_q35 {
+                let mut gen_guard = q35_arc.blocking_lock();
+                if let Some(gen) = gen_guard.as_mut() {
+                    gen.qwen3_5.language_model.truncate_kv_cache(len).map_err(|e| anyhow::anyhow!("Truncate failed: {}", e))
+                } else {
+                    Ok(())
+                }
             } else {
-                Ok(())
+                let mut gen_guard = generator_arc.blocking_lock();
+                if let Some(gen) = gen_guard.as_mut() {
+                    gen.truncate_kv_cache(len).map_err(|e| anyhow::anyhow!("Truncate failed: {}", e))
+                } else {
+                    Ok(())
+                }
             }
         }).await?
     }
 
     pub async fn load_kv_snapshot(&self, task_id: &str, kv_name: Option<String>) -> anyhow::Result<()> {
+        let current_size = *self.current_size.lock().await;
+        let is_q35 = current_size == Some(ModelSize::Qwen3_5);
+        
         let generator_arc = self.generator.clone();
+        let q35_arc = self.qwen3_5_generator.clone();
         let task_id_str = task_id.to_string();
         let kv_name_str = kv_name.unwrap_or_else(|| "text".to_string());
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let mut gen_guard = generator_arc.blocking_lock();
-            if let Some(gen) = gen_guard.as_mut() {
-                let kv_root = crate::utils::paths::get_kv_dir(None).join(&task_id_str);
-                
-                // [CRITICAL FIX] generate.rs가 캐시를 저장하는 실제 깊은 경로(inference/text 등)를 정확히 타겟팅합니다!
-                let kv_type = kv_name_str.split('/').last().unwrap_or("text");
-                let kv_type = if kv_type == "inference" || kv_type == "reference" || kv_type.is_empty() { "text" } else { kv_type };
+            let kv_root = crate::utils::paths::get_kv_dir(None).join(&task_id_str);
+            let kv_type = kv_name_str.split('/').last().unwrap_or("text");
+            let kv_type = if kv_type == "inference" || kv_type == "reference" || kv_type.is_empty() { "text" } else { kv_type };
 
+            // 🌟 [핵심 픽스] 현재 모델이 Qwen 3.5(0.8B)라면 0.8B 방(q35_arc)에 스냅샷을 로드합니다!
+            if is_q35 {
+                let mut q35_guard = q35_arc.blocking_lock();
+                if let Some(gen) = q35_guard.as_mut() {
+                    let target_kv_name = format!("{}/inference/{}", task_id_str, kv_type);
+                    let target_kv_name = if !crate::utils::paths::get_kv_dir(None).join(&target_kv_name).exists() {
+                        format!("{}/reference/{}", task_id_str, kv_type)
+                    } else { target_kv_name };
+                    
+                    println!("[SSD-BRIDGE] Restoring Qwen 3.5 Registry from {}", target_kv_name);
+                    gen.qwen3_5.language_model.restore_kv_registry(&target_kv_name)?;
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("No active Qwen 3.5 generator to load snapshot into"))
+                }
+            } else {
+                // 0.6B / 2B 로직은 그대로 유지
                 let paths_to_try = vec![
                     kv_root.join("inference").join(kv_type),
                     kv_root.join("reference").join(kv_type),
                     kv_root.clone(),
                 ];
 
-                let mut loaded = false;
+                let mut target_path = None;
                 for p in paths_to_try {
-                    // 폴더가 존재하고 비어있지 않은지 검사합니다.
                     if p.exists() && std::fs::read_dir(&p).map(|mut d| d.next().is_some()).unwrap_or(false) {
-                        println!("[SSD-BRIDGE] Loading Directory-based KV snapshot from {:?}", p);
-                        // p 경로가 이미 세부 경로(inference/text)를 모두 포함하므로 kv_name은 None으로 전달합니다.
-                        gen.load_kv_from_disk(&p, None)?;
-                        loaded = true;
+                        target_path = Some(p);
                         break;
                     }
                 }
 
-                if !loaded {
+                if let Some(p) = target_path {
+                    let mut gen_guard = generator_arc.blocking_lock();
+                    if let Some(gen) = gen_guard.as_mut() {
+                        println!("[SSD-BRIDGE] Loading Directory-based KV snapshot from {:?}", p);
+                        gen.load_kv_from_disk(&p, None)?;
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("No active generator to load snapshot into"))
+                    }
+                } else {
                     println!("[SSD-BRIDGE] No snapshot found for {} (Checked deep paths)", task_id_str);
+                    Ok(())
                 }
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("No active generator to load snapshot into"))
             }
         }).await?
     }
@@ -669,10 +709,9 @@ impl LogisModel {
         let needs_load = {
             let guard = self.qwen3_5_generator.lock().await;
             if let Some(gen) = guard.as_ref() {
-                // pre_processor가 있으면 Large(비전+텍스트), 없으면 Small(텍스트)
                 let is_large = gen.pre_processor.is_some();
                 let wants_large = size == ModelSize::Large;
-                is_large != wants_large // 내가 원하는 크기와 다르면 로드 필요
+                is_large != wants_large 
             } else {
                 true
             }
@@ -691,7 +730,6 @@ impl LogisModel {
                 let gguf_files = crate::utils::find_type_files(&path, "gguf").unwrap_or_default();
                 let model_gguf = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned().ok_or_else(|| anyhow::anyhow!("No model GGUF found"))?;
                 
-                // [CRITICAL FIX] Small이면 텍스트 가중치만! Large면 비전 가중치(mmproj)까지 로드!
                 let mmproj_gguf = if size == ModelSize::Large {
                     gguf_files.iter().find(|f| f.contains("mmproj")).cloned()
                 } else {
@@ -701,9 +739,12 @@ impl LogisModel {
                 Qwen3_5GenerateModel::init_from_gguf(&model_gguf, mmproj_gguf.as_deref(), Some(&dev))
             }).await??;
             
-            // 로드가 다 끝난 후 다시 Lock을 잡고 값을 할당합니다.
             let mut q35_gen_guard = self.qwen3_5_generator.lock().await;
             *q35_gen_guard = Some(gen);
+            
+            // 🌟 [CRITICAL FIX] 시스템 장부에 Qwen3.5가 켜졌음을 명시하여 스냅샷 미아 발생 방지!
+            let mut current_size_guard = self.current_size.lock().await;
+            *current_size_guard = Some(ModelSize::Qwen3_5);
         }
         Ok(())
     }

@@ -30,7 +30,7 @@ pub struct Qwen3_5GenerateModel {
     chat_template: ChatTemplate,
     tokenizer: TokenizerModel,
     pub pre_processor: Option<Qwen3VLProcessor>,
-    qwen3_5: Qwen3_5Model,
+    pub qwen3_5: Qwen3_5Model, // 🌟 [CRITICAL FIX] pub 추가!
     device: Device,
     pub eos_token_id: u32,
     model_name: String,

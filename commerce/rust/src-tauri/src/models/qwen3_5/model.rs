@@ -470,7 +470,7 @@ impl Qwen3_5GatedDeltaNet {
             let g_i = g.squeeze(1)?.contiguous()?.to_dtype(candle_core::DType::F32)?.exp()?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?.contiguous()?;
             let beta_i = beta.squeeze(1)?.contiguous()?.to_dtype(candle_core::DType::F32)?.unsqueeze(D::Minus1)?.contiguous()?;
             
-            println!("[DEBUG-CONTIG] SSM Fast-Path Q: {}, K: {}, V: {}", q_i.is_contiguous(), k_i.is_contiguous(), v_i.is_contiguous());
+            // println!("[DEBUG-CONTIG] SSM Fast-Path Q: {}, K: {}, V: {}", q_i.is_contiguous(), k_i.is_contiguous(), v_i.is_contiguous());
 
             last_recurrent_state = last_recurrent_state.broadcast_mul(&g_i)?;
             let kv_mem = last_recurrent_state.broadcast_mul(&k_i.unsqueeze(D::Minus1)?.contiguous()?)?.sum(D::Minus2)?;
@@ -607,7 +607,7 @@ impl Qwen3_5GatedDeltaNet {
         };
         
         // 🌟 [크래시 방어 및 로그] reshape 직전에 비연속 메모리를 강제로 이어붙입니다.
-        println!("[DEBUG-CONTIG] SSM Output: {}, Z: {}", core_attn_out.is_contiguous(), z.is_contiguous());
+        // println!("[DEBUG-CONTIG] SSM Output: {}, Z: {}", core_attn_out.is_contiguous(), z.is_contiguous());
         let core_attn_out = core_attn_out.contiguous()?.reshape(((), self.head_v_dim))?;
         let z = z.contiguous()?.reshape(((), self.head_v_dim))?;
         
@@ -914,7 +914,7 @@ impl Qwen3_5Attention {
                 let k_t = k_merged.transpose(2, 3)?.contiguous()?;
                 
                 // 디버그 로그 추가
-                println!("[DEBUG-CONTIG] Attn Q: {}, K_t: {}", q_aligned.is_contiguous(), k_t.is_contiguous());
+                // println!("[DEBUG-CONTIG] Attn Q: {}, K_t: {}", q_aligned.is_contiguous(), k_t.is_contiguous());
                 
                 let attn_weights = q_aligned.matmul(&k_t)?;
                 
@@ -922,7 +922,7 @@ impl Qwen3_5Attention {
                 let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights.contiguous()?)?.to_dtype(target_dtype)?.contiguous()?;
                 
                 let v_m = v_merged.contiguous()?;
-                println!("[DEBUG-CONTIG] Attn W: {}, V_m: {}", attn_weights.is_contiguous(), v_m.is_contiguous());
+                // println!("[DEBUG-CONTIG] Attn W: {}, V_m: {}", attn_weights.is_contiguous(), v_m.is_contiguous());
                 
                 let out_merged = attn_weights.matmul(&v_m)?;
 
@@ -1873,62 +1873,59 @@ impl Qwen3_5TextModel {
         use crate::models::qwen::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
         
         let mut block_groups: std::collections::HashMap<(usize, usize), Vec<LayerKVDump>> = std::collections::HashMap::new();
-        let mut ssm_dumps = Vec::new(); // SSM 상태를 담을 전용 그릇
+        let mut ssm_dumps = Vec::new();
 
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
-            // 1. 기존 Self Attention (KV 블록) 수집
             if let AttnKind::SelfAttn(attn) = &mut layer.attn {
                 
-                // 🌟 [강력한 메모리 해제] 디코딩 가속용으로 팽창했던 거대 캐시를 완전히 찢어버림!
                 attn.vram_merged_k = None;
                 attn.vram_merged_v = None;
                 attn.merged_vram_block_count = 0;
 
                 for block in &mut attn.kv_blocks {
-                    let mut inner = block.inner.write().unwrap();
+                    // 🌟 mut 제거 (E0308 방지)
+                    let inner = block.inner.read().unwrap();
                     let is_dirty = {
-                        let reg = self.registry.entries.read().unwrap();
+                        let reg = attn.registry.entries.read().unwrap();
                         if inner.index < reg.len() && l_idx < reg[inner.index].is_dirty.len() { 
                             reg[inner.index].is_dirty[l_idx] 
                         } else { true }
                     };
 
-                    if inner.k_cache.is_some() && is_dirty {
-                        let k = inner.k_cache.as_ref().unwrap();
-                        let v = inner.v_cache.as_ref().unwrap();
-                        let k_shape_u32: Vec<u32> = k.shape().dims().iter().map(|&x| x as u32).collect();
-                        
-                        block_groups.entry((inner.offset, inner.index)).or_default().push(LayerKVDump {
-                            layer_idx: l_idx,
-                            k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
-                            v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
-                            k_shape: Tensor::from_vec(k_shape_u32, (k.shape().dims().len(),), &Device::Cpu)?,
-                            raw_k: Some(k.to_device(&Device::Cpu).unwrap_or(k.clone()).contiguous().unwrap_or_else(|_| k.clone())), 
-                            raw_v: Some(v.to_device(&Device::Cpu).unwrap_or(v.clone()).contiguous().unwrap_or_else(|_| v.clone())),
-                        });
-                        
-                        // 🌟 VRAM 확실하게 제거
-                        inner.k_cache = None;
-                        inner.v_cache = None;
-                        inner.location = crate::models::qwen::quantized_model::KVLocation::SSD;
-
-                        let mut reg = self.registry.entries.write().unwrap();
-                        if inner.index < reg.len() && l_idx < reg[inner.index].is_dirty.len() {
-                            reg[inner.index].is_dirty[l_idx] = false; 
-                            reg[inner.index].location[l_idx] = crate::models::qwen::quantized_model::KVLocation::SSD;
-                            let mut cache = reg[inner.index].bitkv_cache.write().unwrap();
-                            cache[l_idx] = None;
+                    let is_full = inner.len == 1024;
+                    let should_evacuate = is_full; 
+                    
+                    if should_evacuate && inner.k_cache.is_some() && inner.location == crate::models::qwen::quantized_model::KVLocation::VRAM {
+                        if is_dirty {
+                            let k = inner.k_cache.as_ref().unwrap();
+                            let v = inner.v_cache.as_ref().unwrap();
+                            let k_cpu = k.to_device(&candle_core::Device::Cpu).unwrap_or(k.clone());
+                            let v_cpu = v.to_device(&candle_core::Device::Cpu).unwrap_or(v.clone());
+                            let k_shape_u32: Vec<u32> = k_cpu.shape().dims().iter().map(|&x| x as u32).collect();
+                            
+                            block_groups.entry((inner.offset, inner.index)).or_default().push(LayerKVDump {
+                                layer_idx: l_idx,
+                                k_data: candle_core::Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(),
+                                v_data: candle_core::Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(),
+                                k_shape: candle_core::Tensor::from_vec(k_shape_u32, (k_cpu.shape().dims().len(),), &candle_core::Device::Cpu).unwrap(),
+                                raw_k: Some(k_cpu.contiguous().unwrap_or(k_cpu.clone())),
+                                raw_v: Some(v_cpu.contiguous().unwrap_or(v_cpu.clone())),
+                            });
+                            
+                            let mut reg = attn.registry.entries.write().unwrap();
+                            if inner.index < reg.len() {
+                                reg[inner.index].is_dirty[l_idx] = false;
+                            }
                         }
                     }
                 }
             }
 
-            // 2. SSM (Linear Attention) 상태 수집
             if layer.is_ssm_dirty() {
                 let (conv_opt, rec_opt) = layer.get_ssm_states();
                 if let (Some(conv), Some(rec)) = (conv_opt, rec_opt) {
-                    let conv_cpu = conv.to_device(&Device::Cpu).unwrap_or(conv);
-                    let rec_cpu = rec.to_device(&Device::Cpu).unwrap_or(rec);
+                    let conv_cpu = conv.to_device(&candle_core::Device::Cpu).unwrap_or(conv);
+                    let rec_cpu = rec.to_device(&candle_core::Device::Cpu).unwrap_or(rec);
                     ssm_dumps.push((l_idx, conv_cpu, rec_cpu));
                     layer.set_ssm_dirty(false);
                 }
@@ -1937,13 +1934,14 @@ impl Qwen3_5TextModel {
 
         let kv_dir = crate::utils::paths::get_kv_dir(None);
         let mode = false; 
+        
+        // 🌟 [CRITICAL FIX: E0308] "text".to_string()가 아닌 "text" 리터럴로 받습니다!
         let kv_name_raw = kv_name.unwrap_or("text");
         let last_part = kv_name_raw.split('/').last().unwrap_or("text");
         let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text" } else { last_part };
         let sub_path = format!("{}/inference/{}", session_id, kv_type);
         let base_dir = kv_dir.join(&sub_path);
 
-        // 3. SSM 비동기 다이렉트 암호화 & 저장
         if !ssm_dumps.is_empty() {
             let ssm_dir = base_dir.join("ssm");
             if !ssm_dir.exists() { let _ = std::fs::create_dir_all(&ssm_dir); }
@@ -1973,7 +1971,6 @@ impl Qwen3_5TextModel {
             });
         }
 
-        // 4. 기존 KV 블록 큐 전송
         if block_groups.is_empty() { return Ok(()); }
 
         if let Some(tx) = BAKE_TX.get() {
