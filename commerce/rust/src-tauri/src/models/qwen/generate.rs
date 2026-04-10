@@ -742,7 +742,7 @@ impl QwenVLGenerateModel {
             wait_for_global_io().await; 
             logits = self.qwen.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;
 
-            if i > 0 && i % 50 == 0 {
+            if i > 0 && i % 30 == 0 {
                 #[cfg(target_os = "windows")]
                 unsafe {
                     use windows_sys::Win32::System::Threading::GetCurrentProcess;

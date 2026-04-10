@@ -67,10 +67,10 @@ impl Qwen3VLVisionPatchEmbed {
 
     pub fn new_from_gguf<R: Read + Seek>(gguf: &mut Gguf<R>) -> Result<Self> {
         // 🌟 [RAM 피크 방어 2] F32 변환 스파이크 제거
-        let conv3d_weight_0 = gguf.get_dequantized_f16("v.patch_embd.weight")?.to_dtype(candle_core::DType::BF16)?.unsqueeze(2)?;
-        let conv3d_weight_1 = gguf.get_dequantized_f16("v.patch_embd.weight.1")?.to_dtype(candle_core::DType::BF16)?.unsqueeze(2)?;
+        let conv3d_weight_0 = gguf.get_dequantized_f16("v.patch_embd.weight")?.to_dtype(candle_core::DType::F16)?.unsqueeze(2)?;
+        let conv3d_weight_1 = gguf.get_dequantized_f16("v.patch_embd.weight.1")?.to_dtype(candle_core::DType::F16)?.unsqueeze(2)?;
         let conv3d_weight = Tensor::cat(&[conv3d_weight_0, conv3d_weight_1], 2)?.flatten(1, 4)?.t()?;
-        let conv3d_bias = gguf.get_dequantized_f16("v.patch_embd.bias")?.to_dtype(candle_core::DType::BF16)?;
+        let conv3d_bias = gguf.get_dequantized_f16("v.patch_embd.bias")?.to_dtype(candle_core::DType::F16)?;
         Ok(Self {
             conv3d_weight,
             conv3d_bias,
@@ -423,7 +423,7 @@ impl Qwen3VLVisionModel {
         let patch_embed = Qwen3VLVisionPatchEmbed::new_from_gguf(mmproj_gguf)?;
         
         // 🌟 [RAM 피크 방어 3] 640MB짜리 거대 위치 텐서의 F32 스파이크 방지
-        let pos_emb_weight = mmproj_gguf.get_dequantized_f16("v.position_embd.weight")?.to_dtype(candle_core::DType::BF16)?;
+        let pos_emb_weight = mmproj_gguf.get_dequantized_f16("v.position_embd.weight")?.to_dtype(candle_core::DType::F16)?;
         
         let hidden_size = mmproj_gguf
             .get_matedata("clip.vision.embedding_length")?

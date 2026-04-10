@@ -883,55 +883,112 @@ impl Qwen3_5Attention {
             let all_in_vram = valid_blocks.iter().all(|b| b.inner.read().unwrap().location == KVLocation::VRAM);
             
             if all_in_vram && !valid_blocks.is_empty() {
-                if self.vram_merged_k.is_none() || self.merged_vram_block_count != valid_blocks.len() {
-                    let mut k_list = Vec::with_capacity(valid_blocks.len());
-                    let mut v_list = Vec::with_capacity(valid_blocks.len());
-                    for block in &valid_blocks {
-                        let inner = block.inner.read().unwrap();
-                        // 🌟 [크래시 해결 1] 합치기 전 개별 조각들도 무조건 연속성 보장
-                        k_list.push(inner.k_cache.as_ref().unwrap().contiguous()?);
-                        v_list.push(inner.v_cache.as_ref().unwrap().contiguous()?);
+                let num_valid = valid_blocks.len();
+                let num_full_blocks = num_valid.saturating_sub(1);
+                
+                // 🌟 [최적화 1] 스플릿 캐시: 꽉 찬 과거 블록(N-1개)은 단 한 번만 병합하여 영구 캐싱!
+                if num_full_blocks > 0 {
+                    if self.vram_merged_k.is_none() || self.merged_vram_block_count != num_full_blocks {
+                        let mut k_list = Vec::with_capacity(num_full_blocks);
+                        let mut v_list = Vec::with_capacity(num_full_blocks);
+                        for block in valid_blocks.iter().take(num_full_blocks) {
+                            let inner = block.inner.read().unwrap();
+                            k_list.push(inner.k_cache.as_ref().unwrap().clone());
+                            v_list.push(inner.v_cache.as_ref().unwrap().clone());
+                        }
+                        let mut k_cat = Tensor::cat(&k_list, 2)?;
+                        let mut v_cat = Tensor::cat(&v_list, 2)?;
+                        
+                        if self.num_kv_groups > 1 {
+                            let (b, h, s, d) = k_cat.dims4()?;
+                            k_cat = k_cat.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                            v_cat = v_cat.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                        }
+                        
+                        // 🌟 [CRITICAL FIX] 디코딩 시 O(1)의 속도를 보장하려면 병합 캐시가 무조건 연속 메모리여야 합니다. contiguous() 추가!
+                        self.vram_merged_k = Some(k_cat.contiguous()?);
+                        self.vram_merged_v = Some(v_cat.contiguous()?);
+                        self.merged_vram_block_count = num_full_blocks;
                     }
-                    let mut k_cat = Tensor::cat(&k_list, 2)?;
-                    let mut v_cat = Tensor::cat(&v_list, 2)?;
-                    
-                    if self.num_kv_groups > 1 {
-                        let (b, h, s, d) = k_cat.dims4()?;
-                        k_cat = k_cat.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?.contiguous()?;
-                        v_cat = v_cat.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?.contiguous()?;
-                    }
-                    
-                    self.vram_merged_k = Some(k_cat.contiguous()?);
-                    self.vram_merged_v = Some(v_cat.contiguous()?);
-                    self.merged_vram_block_count = valid_blocks.len();
+                } else {
+                    self.vram_merged_k = None;
+                    self.vram_merged_v = None;
+                    self.merged_vram_block_count = 0;
                 }
 
-                let k_merged = self.vram_merged_k.as_ref().unwrap();
-                let v_merged = self.vram_merged_v.as_ref().unwrap();
-                
-                // 🌟 [크래시 차단 & 로그] 
+                // 🌟 q_aligned에만 1번 contiguous를 주고, 이후로는 절대 쓰지 않습니다.
                 let q_aligned = (query_states * self.scaling)?.contiguous()?;
-                let k_t = k_merged.transpose(2, 3)?.contiguous()?;
                 
-                // 디버그 로그 추가
-                // println!("[DEBUG-CONTIG] Attn Q: {}, K_t: {}", q_aligned.is_contiguous(), k_t.is_contiguous());
+                let mut out_res: Option<Tensor> = None;
+                let mut m_n: Option<Tensor> = None;
+                let mut l_n: Option<Tensor> = None;
+
+                // 1. 캐싱된 과거 블록 연산 (O(1) 초고속 패스)
+                if let (Some(k_merged), Some(v_merged)) = (&self.vram_merged_k, &self.vram_merged_v) {
+                    let k_t = k_merged.transpose(2, 3)?; // contiguous 제거로 메모리 복사 원천 차단
+                    let attn_weights = q_aligned.matmul(&k_t)?;
+                    
+                    let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
+                    let m_j = attn_weights_f32.max_keepdim(D::Minus1)?;
+                    let p_j = attn_weights_f32.broadcast_sub(&m_j)?.exp()?;
+                    let l_j = p_j.sum_keepdim(D::Minus1)?;
+                    
+                    let v_m = v_merged;
+                    let out_j = p_j.to_dtype(v_m.dtype())?.matmul(v_m)?;
+                    
+                    out_res = Some(out_j.to_dtype(DType::F32)?);
+                    m_n = Some(m_j);
+                    l_n = Some(l_j);
+                }
+
+                // 2. 현재 자라나고 있는 마지막 1개 블록 연산
+                let last_block = valid_blocks.last().unwrap();
+                let inner = last_block.inner.read().unwrap();
+                let mut k_last = inner.k_cache.as_ref().unwrap().clone();
+                let mut v_last = inner.v_cache.as_ref().unwrap().clone();
                 
+                if self.num_kv_groups > 1 {
+                    let (b, h, s, d) = k_last.dims4()?;
+                    k_last = k_last.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                    v_last = v_last.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                }
+                
+                let k_t = k_last.transpose(2, 3)?;
                 let attn_weights = q_aligned.matmul(&k_t)?;
                 
-                // 🌟 [수정] softmax 적용 전후로 무조건 contiguous 강제!
-                let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights.contiguous()?)?.to_dtype(target_dtype)?.contiguous()?;
-                
-                let v_m = v_merged.contiguous()?;
-                // println!("[DEBUG-CONTIG] Attn W: {}, V_m: {}", attn_weights.is_contiguous(), v_m.is_contiguous());
-                
-                let out_merged = attn_weights.matmul(&v_m)?;
+                let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
+                let m_j = attn_weights_f32.max_keepdim(D::Minus1)?;
+                let p_j = attn_weights_f32.broadcast_sub(&m_j)?.exp()?;
+                let l_j = p_j.sum_keepdim(D::Minus1)?;
+                let v_m = &v_last;
+                let out_j_f32 = p_j.to_dtype(v_m.dtype())?.matmul(v_m)?.to_dtype(DType::F32)?;
 
-                // 🌟 [수정] transpose 직후 reshape을 하기 전에 무조건 본드(contiguous)를 바릅니다!
-                let attn_output = out_merged.transpose(1, 2)?.contiguous()?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?.contiguous()?;
+                // 3. 과거 블록과 현재 블록 결과 병합 (Online Softmax)
+                match out_res {
+                    None => {
+                        out_res = Some(out_j_f32);
+                        l_n = Some(l_j);
+                    }
+                    Some(prev_out_f32) => {
+                        let prev_m = m_n.unwrap();
+                        let prev_l = l_n.unwrap();
+                        
+                        let m_new = prev_m.maximum(&m_j)?;
+                        let diff_old = prev_m.broadcast_sub(&m_new)?.exp()?;
+                        let diff_new = m_j.broadcast_sub(&m_new)?.exp()?;
+                        
+                        let l_new = prev_l.broadcast_mul(&diff_old)?.add(&l_j.broadcast_mul(&diff_new)?)?;
+                        let out_new_f32 = prev_out_f32.broadcast_mul(&diff_old)?.add(&out_j_f32.broadcast_mul(&diff_new)?)?;
+                        
+                        out_res = Some(out_new_f32);
+                        l_n = Some(l_new);
+                    }
+                }
+
+                let attn_output = out_res.unwrap().broadcast_div(&l_n.unwrap())?.to_dtype(target_dtype)?;
+                let attn_output = attn_output.transpose(1, 2)?.contiguous()?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?.contiguous()?;
                 
-                let gate_val = candle_nn::ops::sigmoid(&gate)?.to_dtype(target_dtype)?; 
-                let attn_output = attn_output.mul(&gate_val)?;
-                return Ok(attn_output.apply(&self.o_proj)?.to_dtype(target_dtype)?);
+                return Ok(self.o_proj.forward(&attn_output)?.to_dtype(target_dtype)?);
             }
         }
 
@@ -949,10 +1006,15 @@ impl Qwen3_5Attention {
             if b_off >= total_tokens_now { continue; }
 
             // 🌟 [교체 구간 1] Qwen3_5Attention::forward 내부
-            let (k_block, v_block) = {
-                let mut inner = block.inner.write().unwrap(); // mut write로 변경
+            let (k_block, v_block, _is_temporary) = {
+                let mut inner = block.inner.write().unwrap(); 
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    (k.to_device(dev)?.to_dtype(target_dtype)?, v.to_device(dev)?.to_dtype(target_dtype)?)
+                    if inner.location == KVLocation::VRAM {
+                        (k.clone(), v.clone(), false) // VRAM에 있다면 그대로 씀
+                    } else {
+                        // RAM에 있다면 GPU로 잠깐 복사해서 씀
+                        (k.to_device(dev)?.to_dtype(target_dtype)?, v.to_device(dev)?.to_dtype(target_dtype)?, true)
+                    }
                 } else {
                     let mut k_cpu = None;
                     let mut v_cpu = None;
@@ -967,6 +1029,7 @@ impl Qwen3_5Attention {
                         }
                     }
 
+                    // ... SSD 읽어오는 로직 생략 (기존과 동일하게 작동함) ...
                     if k_cpu.is_none() {
                         let kv_dir = crate::utils::paths::get_kv_dir(None);
                         let sid = self.active_session_id.as_deref().unwrap_or("default_session");
@@ -1008,7 +1071,7 @@ impl Qwen3_5Attention {
                                                         reg[index].ssd_path = Some(full_path.clone());
                                                         reg[index].location[self.layer_idx] = KVLocation::RAM; 
                                                         let mut cache = reg[index].bitkv_cache.write().unwrap();
-                                                        cache[self.layer_idx] = Some(BitKVMetadata { k_data: kd_t, v_data: vd_t, original_shape: meta_os });
+                                                        cache[self.layer_idx] = Some(crate::models::qwen::quantized_model::BitKVMetadata { k_data: kd_t, v_data: vd_t, original_shape: meta_os });
                                                     }
                                                     break;
                                                 }
@@ -1023,24 +1086,14 @@ impl Qwen3_5Attention {
                     }
                     
                     let fallback_shape = vec![1, self.num_key_value_heads, b_len, self.head_dim]; 
-                    // 🌟 캐시 기본 타입을 BF16으로 강제 고정하여 RAM/VRAM 점유율을 절반으로 깎고 I/O 속도를 2배로 올립니다.
                     let k_safe = k_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::BF16, &Device::Cpu).unwrap());
                     let v_safe = v_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::BF16, &Device::Cpu).unwrap());
                     
                     let k_gpu = k_safe.to_device(dev)?.to_dtype(target_dtype)?;
                     let v_gpu = v_safe.to_device(dev)?.to_dtype(target_dtype)?;
 
-                    // 🌟 VRAM 승격 (Tiering 3 -> 1단계 복귀)
-                    inner.k_cache = Some(k_gpu.clone());
-                    inner.v_cache = Some(v_gpu.clone());
-                    inner.location = KVLocation::VRAM;
-                    
-                    let mut reg = self.registry.entries.write().unwrap();
-                    if index < reg.len() {
-                        reg[index].location[self.layer_idx] = KVLocation::VRAM;
-                    }
-                    
-                    (k_gpu, v_gpu)
+                    // 🌟 [CRITICAL OOM FIX] VRAM에 영구 캐싱하지 않고, 바로 리턴하여 1회용으로 쓰고 파괴되게 합니다!
+                    (k_gpu, v_gpu, true)
                 }
             };
 
@@ -1543,7 +1596,11 @@ impl Qwen3_5TextModel {
         let embed_tensor = gguf.tensor("token_embd.weight")?;
         
         // 🌟 [스마트 폴백] 
-        let embed_tokens = Embedding::new(embed_tensor.dequantize_f16(&Device::Cpu).or_else(|_| embed_tensor.dequantize(&Device::Cpu))?.to_dtype(DType::BF16)?, hidden_size);
+        let embed_dtype = if device.is_cpu() { DType::F32 } else { DType::F16 };
+        let embed_tokens = Embedding::new(
+            embed_tensor.dequantize_f16(device).or_else(|_| embed_tensor.dequantize(device))?.to_dtype(embed_dtype)?, 
+            hidden_size
+        );
         
         // 🌟 [악순환 파괴] 단어 사전 로드 직후, OS 할당자에 남은 2.5GB의 찌꺼기 램을 강제로 반환! (Windows/Mac/Linux 완벽 대응)
         #[cfg(target_os = "windows")]
@@ -1883,8 +1940,8 @@ impl Qwen3_5TextModel {
                 attn.merged_vram_block_count = 0;
 
                 for block in &mut attn.kv_blocks {
-                    // 🌟 mut 제거 (E0308 방지)
-                    let inner = block.inner.read().unwrap();
+                    // 🌟 [CRITICAL FIX] 값을 수정해야 하므로 다시 write() 권한을 가져옵니다!
+                    let mut inner = block.inner.write().unwrap();
                     let is_dirty = {
                         let reg = attn.registry.entries.read().unwrap();
                         if inner.index < reg.len() && l_idx < reg[inner.index].is_dirty.len() { 
@@ -1916,6 +1973,17 @@ impl Qwen3_5TextModel {
                             if inner.index < reg.len() {
                                 reg[inner.index].is_dirty[l_idx] = false;
                             }
+                        }
+
+                        inner.k_cache = None;
+                        inner.v_cache = None;
+                        inner.location = crate::models::qwen::quantized_model::KVLocation::SSD;
+                        
+                        let mut reg = attn.registry.entries.write().unwrap();
+                        if inner.index < reg.len() {
+                            reg[inner.index].location[l_idx] = crate::models::qwen::quantized_model::KVLocation::SSD;
+                            let mut cache = reg[inner.index].bitkv_cache.write().unwrap();
+                            cache[l_idx] = None;
                         }
                     }
                 }
@@ -2234,8 +2302,10 @@ impl Qwen3_5Model {
         kv_name: Option<String>,
     ) -> Result<Tensor> {
         let input_ids_cpu = input_ids.to_device(&Device::Cpu)?;
-        let inputs_embeds_cpu = self.language_model.embed_tokens.forward(&input_ids_cpu)?;
-        let mut inputs_embeds = inputs_embeds_cpu.to_device(input_ids.device())?;
+        // 🌟 [TYPE 최적화] 이미 GPU에 올라가 있는 F16 임베딩에서 초고속으로 값을 뽑은 뒤, 얇은 결과물만 BF16으로 캐스팅합니다!
+        let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
+        let target_dtype = if input_ids.device().is_cuda() { DType::BF16 } else { DType::F32 };
+        inputs_embeds = inputs_embeds.to_dtype(target_dtype)?;
         
         if let Some(pixel_values) = pixel_values {
             if let Some(image_grid_thw) = image_grid_thw {
