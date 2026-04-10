@@ -211,15 +211,29 @@ impl Qwen3_5GenerateModel {
                 }
             }
         }
-        let total_toks = ids_vec.len();
-
-        self.clear_kv_cache(); 
         
-        let full_ids_tensor = Tensor::from_vec(ids_vec.clone(), (1, total_toks), &self.device)?;
-        let _ = self.qwen3_5.compute_and_set_rope_deltas(&full_ids_tensor, image_grid_thw.as_ref(), video_grid_thw.as_ref());
+        let total_toks = ids_vec.len();
+        
+        // 🌟 [CRITICAL FIX] Qwen 3.5 모델이 0.6B처럼 Base 캐시를 유지하고, 부족한 부분(질문)만 
+        // Partial Prefill 하도록 로직을 완전히 뜯어고쳤습니다! 이제 환각(빈 답변)이 사라집니다.
+        let kv_len = self.qwen3_5.language_model.current_kv_len;
 
-        let mut input_ids = Tensor::from_vec(ids_vec, (1, total_toks), &self.device)?;
-        let mut seqlen_offset = 0;
+        let (mut input_ids, mut seqlen_offset) = if kv_len > 0 {
+            println!("[PARTIAL-PREFILL] Context partially restored ({}). Prefilling remaining tokens.", kv_len);
+            let (ids, offset) = if kv_len >= total_toks {
+                let last_id = *ids_vec.last().unwrap_or(&0);
+                (Tensor::from_vec(vec![last_id], (1, 1), &self.device)?, total_toks.saturating_sub(1))
+            } else {
+                let missing_ids = ids_vec[kv_len..].to_vec();
+                (Tensor::from_vec(missing_ids.clone(), (1, missing_ids.len()), &self.device)?, kv_len)
+            };
+            (ids, offset)
+        } else {
+            self.clear_kv_cache(); 
+            let full_ids_tensor = Tensor::from_vec(ids_vec.clone(), (1, total_toks), &self.device)?;
+            let _ = self.qwen3_5.compute_and_set_rope_deltas(&full_ids_tensor, image_grid_thw.as_ref(), video_grid_thw.as_ref());
+            (Tensor::from_vec(ids_vec, (1, total_toks), &self.device)?, 0)
+        };
 
         let mut seq_len = input_ids.dim(1)?;
         let pixel_values: Option<&Tensor> = pixel_values.as_ref();
@@ -406,14 +420,27 @@ impl Qwen3_5GenerateModel {
                 }
             }
             let total_toks = ids_vec.len();
+            let kv_len = self.qwen3_5.language_model.current_kv_len;
 
-            self.clear_kv_cache();
-
-            let full_ids_tensor = Tensor::from_vec(ids_vec.clone(), (1, total_toks), &self.device)?;
-            let _ = self.qwen3_5.compute_and_set_rope_deltas(&full_ids_tensor, img_thw.as_ref(), vid_thw.as_ref());
-
-            let ids = Tensor::from_vec(ids_vec, (1, total_toks), &self.device)?;
-            (ids, 0, px_vals, img_thw, vid_px_vals, vid_thw)
+            // 🌟 [CRITICAL FIX] generate_part 에서도 Partial Prefill 로직 적용!
+            if kv_len > 0 {
+                println!("[PARTIAL-PREFILL] Context partially restored ({}). Prefilling remaining tokens.", kv_len);
+                let (ids, offset) = if kv_len >= total_toks {
+                    let last_id = *ids_vec.last().unwrap_or(&0);
+                    (Tensor::from_vec(vec![last_id], (1, 1), &self.device)?, total_toks.saturating_sub(1))
+                } else {
+                    let missing_ids = ids_vec[kv_len..].to_vec();
+                    (Tensor::from_vec(missing_ids.clone(), (1, missing_ids.len()), &self.device)?, kv_len)
+                };
+                (ids, offset, px_vals, img_thw, vid_px_vals, vid_thw)
+            } else {
+                self.clear_kv_cache();
+                let full_ids_tensor = Tensor::from_vec(ids_vec.clone(), (1, total_toks), &self.device)?;
+                let _ = self.qwen3_5.compute_and_set_rope_deltas(&full_ids_tensor, img_thw.as_ref(), vid_thw.as_ref());
+                
+                let ids = Tensor::from_vec(ids_vec, (1, total_toks), &self.device)?;
+                (ids, 0, px_vals, img_thw, vid_px_vals, vid_thw)
+            }
         } else {
             let ids = Tensor::from_vec(vec![last_token.unwrap()], (1, 1), &self.device)?;
             (ids, last_offset, None, None, None, None)

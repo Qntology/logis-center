@@ -927,10 +927,19 @@ impl Qwen3_5Attention {
                         let kv_name_raw = self.active_kv_name.as_deref().unwrap_or("text");
                         let kv_type = kv_name_raw.split('/').last().unwrap_or("text");
                         
-                        let path_candidates = vec![
-                            kv_dir.join(format!("{}/inference/{}/b{}", sid, kv_type, b_off)),
-                            kv_dir.join(format!("{}/reference/{}/b{}", sid, kv_type, b_off))
-                        ];
+                        let mut path_candidates = Vec::new();
+                        
+                        // 🌟 [CRITICAL FIX 3] 중앙 장부(Registry)에 저장된 원본 스냅샷의 경로를 최우선으로 탐색합니다!
+                        // 이 경로가 누락되어 Base 스냅샷을 놔두고 빈 껍데기(0.0)를 읽어오는 환각이 발생했습니다.
+                        if let Some(p) = {
+                            let reg = self.registry.entries.read().unwrap();
+                            if index < reg.len() { reg[index].ssd_path.clone() } else { None }
+                        } {
+                            path_candidates.push(p);
+                        }
+
+                        path_candidates.push(kv_dir.join(format!("{}/inference/{}/b{}", sid, kv_type, b_off)));
+                        path_candidates.push(kv_dir.join(format!("{}/reference/{}/b{}", sid, kv_type, b_off)));
 
                         for full_path in path_candidates {
                             let block_file = full_path.join(format!("l{}.st", self.layer_idx));
@@ -1810,11 +1819,18 @@ impl Qwen3_5TextModel {
                 let off = idx * 1024;
                 let b_len = if off + 1024 <= total_tokens { 1024 } else { total_tokens.saturating_sub(off) };
                 entry.token_len = b_len;
+                
+                // 🌟 [CRITICAL FIX 1] 중복 저장 방지 및 참조 경로 명시적 지정
+                // 이 처리가 없으면 스냅샷을 로드하자마자 전체 문맥을 다시 디스크에 덮어쓰는 I/O 스팸이 발생합니다.
+                entry.is_dirty.fill(false);
+                entry.ssd_path = Some(kv_dir.join(kv_name).join(format!("b{}", off)));
+                
                 for layer in self.layers.iter_mut() {
                     if let AttnKind::SelfAttn(attn) = &mut layer.attn {
                         if let Some(block) = attn.kv_blocks.get(idx) {
                             let mut inner = block.inner.write().unwrap();
                             inner.len = b_len;
+                            inner.ssd_path = entry.ssd_path.clone();
                         }
                     }
                 }
@@ -1852,11 +1868,17 @@ impl Qwen3_5TextModel {
                     let should_evacuate = is_full; 
                     
                     if should_evacuate && inner.k_cache.is_some() && inner.location == crate::models::qwen::quantized_model::KVLocation::VRAM {
-                        if is_dirty {
+                        // 🌟 [CRITICAL FIX] k_cpu, v_cpu를 if 블록 바깥으로 빼내어 컴파일 에러를 완벽히 해결합니다.
+                        let (k_cpu, v_cpu) = {
                             let k = inner.k_cache.as_ref().unwrap();
                             let v = inner.v_cache.as_ref().unwrap();
-                            let k_cpu = k.to_device(&candle_core::Device::Cpu).unwrap_or(k.clone());
-                            let v_cpu = v.to_device(&candle_core::Device::Cpu).unwrap_or(v.clone());
+                            (
+                                k.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k.clone()),
+                                v.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v.clone())
+                            )
+                        };
+
+                        if is_dirty {
                             let k_shape_u32: Vec<u32> = k_cpu.shape().dims().iter().map(|&x| x as u32).collect();
                             
                             block_groups.entry((inner.offset, inner.index)).or_default().push(LayerKVDump {
@@ -1864,8 +1886,8 @@ impl Qwen3_5TextModel {
                                 k_data: candle_core::Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(),
                                 v_data: candle_core::Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(),
                                 k_shape: candle_core::Tensor::from_vec(k_shape_u32, (k_cpu.shape().dims().len(),), &candle_core::Device::Cpu).unwrap(),
-                                raw_k: Some(k_cpu.contiguous().unwrap_or(k_cpu.clone())),
-                                raw_v: Some(v_cpu.contiguous().unwrap_or(v_cpu.clone())),
+                                raw_k: Some(k_cpu.contiguous().unwrap_or_else(|_| k_cpu.clone())),
+                                raw_v: Some(v_cpu.contiguous().unwrap_or_else(|_| v_cpu.clone())),
                             });
                             
                             let mut reg = attn.registry.entries.write().unwrap();
@@ -1874,18 +1896,13 @@ impl Qwen3_5TextModel {
                             }
                         }
 
-                        // 🌟 [CRITICAL FIX 2] 과거의 치명적 오판을 바로잡습니다!
-                        // 여기서 VRAM을 파괴하지 않으면 15,000 토큰에서 VRAM이 무조건 터집니다.
-                        // 1024개로 꽉 차서 복사본을 보낸 블록은 즉시 VRAM에서 파괴(None)하여 수압을 0으로 리셋합니다!
-                        inner.k_cache = None;
-                        inner.v_cache = None;
-                        inner.location = crate::models::qwen::quantized_model::KVLocation::SSD;
+                        inner.k_cache = Some(k_cpu);
+                        inner.v_cache = Some(v_cpu);
+                        inner.location = crate::models::qwen::quantized_model::KVLocation::RAM;
                         
                         let mut reg = attn.registry.entries.write().unwrap();
                         if inner.index < reg.len() {
-                            reg[inner.index].location[l_idx] = crate::models::qwen::quantized_model::KVLocation::SSD;
-                            let mut cache = reg[inner.index].bitkv_cache.write().unwrap();
-                            cache[l_idx] = None;
+                            reg[inner.index].location[l_idx] = crate::models::qwen::quantized_model::KVLocation::RAM;
                         }
                     }
                 }
