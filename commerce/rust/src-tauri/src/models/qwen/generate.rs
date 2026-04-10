@@ -317,7 +317,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
                             let offset = offset_str.parse::<usize>().unwrap_or(0);
                             let _ = INDEX_TX.send(SlotTask::IndexUpdate {
-                                kv_name, layer_idx: l_num, offset, len: 256, file_name: format!("b{}/l{}.st", offset, l_num),
+                                kv_name, layer_idx: l_num, offset, len: 1024, file_name: format!("b{}/l{}.st", offset, l_num),
                             }).await;
                         }
                     },
@@ -607,7 +607,7 @@ impl QwenVLGenerateModel {
                             for (i, entry) in entries.iter_mut().enumerate() {
                                 for loc in entry.location.iter_mut() { *loc = KVLocation::RAM; }
                                 for slot in entry.slot_ids.iter_mut() { *slot = None; }
-                                entry.token_start = i * 256; 
+                                entry.token_start = i * 1024; 
                                 entry.token_len = 0;
                                 entry.is_dirty.fill(true);
                                 let mut cache = entry.bitkv_cache.write().unwrap();

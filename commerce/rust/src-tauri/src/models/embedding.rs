@@ -341,8 +341,13 @@ impl QuantizedDecoderLayer {
         let mlp = QuantizedMlp::new(ct, reader, layer_idx, device)?;
         
         let prefix = format!("blk.{}.", layer_idx);
-        let input_ln_w = ct.tensor(reader, &format!("{}attn_norm.weight", prefix), device)?.dequantize(device)?;
-        let post_ln_w = ct.tensor(reader, &format!("{}ffn_norm.weight", prefix), device)?.dequantize(device)?;
+        
+        // 🌟 [스마트 폴백] 
+        let t_in = ct.tensor(reader, &format!("{}attn_norm.weight", prefix), device)?;
+        let input_ln_w = t_in.dequantize_f16(device).or_else(|_| t_in.dequantize(device))?.to_dtype(candle_core::DType::F32)?;
+        
+        let t_post = ct.tensor(reader, &format!("{}ffn_norm.weight", prefix), device)?;
+        let post_ln_w = t_post.dequantize_f16(device).or_else(|_| t_post.dequantize(device))?.to_dtype(candle_core::DType::F32)?;
         
         Ok(Self { 
             self_attn, 
@@ -361,7 +366,9 @@ pub struct QuantizedModel {
 
 impl QuantizedModel {
     pub fn new<R: std::io::Seek + std::io::Read>(cfg: &Config, ct: &gguf_file::Content, reader: &mut R, device: &Device) -> Result<Self> {
-        let tok_emb = ct.tensor(reader, "token_embd.weight", device)?.dequantize(device)?;
+        // 🌟 [스마트 폴백]
+        let t_emb = ct.tensor(reader, "token_embd.weight", device)?;
+        let tok_emb = t_emb.dequantize_f16(device).or_else(|_| t_emb.dequantize(device))?.to_dtype(candle_core::DType::F32)?;
         let embed_tokens = candle_nn::Embedding::new(tok_emb, cfg.hidden_size);
         
         let rotary = Arc::new(RotaryEmbedding::new(cfg.head_dim, cfg.max_position_embeddings, cfg.rope_theta, device)?);
@@ -371,7 +378,9 @@ impl QuantizedModel {
             layers.push(QuantizedDecoderLayer::new(cfg, ct, reader, i, device, rotary.clone())?);
         }
         
-        let norm_w = ct.tensor(reader, "output_norm.weight", device)?.dequantize(device)?;
+        // 🌟 [스마트 폴백]
+        let t_norm = ct.tensor(reader, "output_norm.weight", device)?;
+        let norm_w = t_norm.dequantize_f16(device).or_else(|_| t_norm.dequantize(device))?.to_dtype(candle_core::DType::F32)?;
         let norm = RmsNorm::from_tensor(norm_w, cfg.rms_norm_eps);
         
         Ok(Self { embed_tokens, layers, norm })

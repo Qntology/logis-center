@@ -127,6 +127,20 @@ impl Qwen3_5GenerateModel {
             .and_then(|s| s.to_str())
             .unwrap_or("qwen3.5");
             
+        // 🌟 [최종 RAM 피크 박살] 비전 모델과 텍스트 모델 로딩이 완전히 끝난 직후!
+        // OS 할당자가 붙잡고 있는 수 기가바이트의 찌꺼기 램을 OS 커널 레벨에서 강제로 토해내게 만듭니다.
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+        }
+        #[cfg(target_os = "linux")]
+        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+        #[cfg(target_os = "macos")]
+        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+
+        // 구조체 반환 부분은 그대로 유지
         Ok(Self {
             chat_template,
             tokenizer,
@@ -242,8 +256,7 @@ impl Qwen3_5GenerateModel {
                 kv_name.clone()     
             ).await?;
             
-            let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-
+            let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?.contiguous()?;
             let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
             let len = logits_vec.len();
             
@@ -434,7 +447,7 @@ impl Qwen3_5GenerateModel {
                 kv_name.clone()
             ).await?;
             
-            let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+            let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?.contiguous()?;
             let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
             let len = logits_vec.len();
 

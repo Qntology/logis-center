@@ -66,26 +66,11 @@ impl Qwen3VLVisionPatchEmbed {
     }
 
     pub fn new_from_gguf<R: Read + Seek>(gguf: &mut Gguf<R>) -> Result<Self> {
-        // convert_hf_to_gguf.py
-        // temporal_patch_size = 2
-        //  spilt (embed_dim, in_channels, temporal_patch_size, patch_size, patch_size)
-        //  into two (embed_dim, in_channels, patch_size, patch_size)
-        // elif 'patch_embed.proj.weight' in name:
-        //         # split Conv3D into Conv2Ds
-        //         c1, c2, kt, kh, kw = data_torch.shape
-        //         del c1, c2, kh, kw  # unused
-        //         assert kt == 2, "Current implementation only support temporal_patch_size of 2"
-        //         yield (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH] + ".weight"  , data_torch[:, :, 0, ...])
-        //         yield (gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH] + ".weight.1", data_torch[:, :, 1, ...])
-        // (embed_dim, in_channels, patch_size, patch_size)  -> (embed_dim, in_channels, 1, patch_size, patch_size)
-        let conv3d_weight_0 = gguf.get_dequantized("v.patch_embd.weight")?.unsqueeze(2)?;
-        let conv3d_weight_1 = gguf
-            .get_dequantized("v.patch_embd.weight.1")?
-            .unsqueeze(2)?;
-        let conv3d_weight = Tensor::cat(&[conv3d_weight_0, conv3d_weight_1], 2)?
-            .flatten(1, 4)?
-            .t()?;
-        let conv3d_bias = gguf.get_dequantized("v.patch_embd.bias")?;
+        // 🌟 [RAM 피크 방어 2] F32 변환 스파이크 제거
+        let conv3d_weight_0 = gguf.get_dequantized_f16("v.patch_embd.weight")?.to_dtype(candle_core::DType::BF16)?.unsqueeze(2)?;
+        let conv3d_weight_1 = gguf.get_dequantized_f16("v.patch_embd.weight.1")?.to_dtype(candle_core::DType::BF16)?.unsqueeze(2)?;
+        let conv3d_weight = Tensor::cat(&[conv3d_weight_0, conv3d_weight_1], 2)?.flatten(1, 4)?.t()?;
+        let conv3d_bias = gguf.get_dequantized_f16("v.patch_embd.bias")?.to_dtype(candle_core::DType::BF16)?;
         Ok(Self {
             conv3d_weight,
             conv3d_bias,
@@ -436,7 +421,10 @@ impl Qwen3VLVisionModel {
             .get_matedata("clip.vision.spatial_merge_size")?
             .to_u32()? as usize;
         let patch_embed = Qwen3VLVisionPatchEmbed::new_from_gguf(mmproj_gguf)?;
-        let pos_emb_weight = mmproj_gguf.get_dequantized("v.position_embd.weight")?;
+        
+        // 🌟 [RAM 피크 방어 3] 640MB짜리 거대 위치 텐서의 F32 스파이크 방지
+        let pos_emb_weight = mmproj_gguf.get_dequantized_f16("v.position_embd.weight")?.to_dtype(candle_core::DType::BF16)?;
+        
         let hidden_size = mmproj_gguf
             .get_matedata("clip.vision.embedding_length")?
             .to_u32()? as usize;
@@ -583,7 +571,9 @@ impl Qwen3VLVisionModel {
             Tensor::cat(&weight_tensors[2], 0)?, Tensor::cat(&weight_tensors[3], 0)?,
         ], 0)?.to_device(dev)?.to_dtype(self.dtype)?; 
         
-        let pos_embeds = self.pos_embed.forward(&idx_tensor)?.broadcast_mul(&weight_tensor.unsqueeze(D::Minus1)?)?;
+        // 🌟 [타입 충돌 픽스] RAM 최적화를 위해 BF16으로 압축해둔 위치 텐서를, 곱셈 직전에만 안전하게 F32(self.dtype)로 풀어줍니다!
+        let pos_embeds = self.pos_embed.forward(&idx_tensor)?.to_dtype(self.dtype)?.broadcast_mul(&weight_tensor.unsqueeze(D::Minus1)?)?;
+        
         let patch_pos_embeds = pos_embeds.i(0)?.add(&pos_embeds.i(1)?)?.add(&pos_embeds.i(2)?)?.add(&pos_embeds.i(3)?)?;
         
         let mut patch_pos_embeds_permute = vec![];

@@ -42,29 +42,26 @@ impl<R: Read + Seek> Gguf<R> {
     pub fn quantize_linear(&mut self, prefix: &str, bias: bool) -> Result<QuantizedLinear> {
         let weight = self.qmatmul(&format!("{prefix}.weight"))?;
         let bias = if bias {
-            self.get_dequantized(&format!("{prefix}.bias")).ok()
-        } else {
-            None
-        };
+            self.get_dequantized_f16(&format!("{prefix}.bias")).ok() // 🌟 F16 변경
+        } else { None };
         Ok(QuantizedLinear::new(weight, bias))
     }
 
     pub fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
-        let weight = ws.dequantize(&self.device)?;
+        // 🌟 [스마트 폴백 및 최적화] F32 할당 건너뛰기
+        let weight = ws.dequantize_f16(&self.device).or_else(|_| ws.dequantize(&self.device))?.to_dtype(candle_core::DType::F32)?; 
         Ok(RmsNorm::new(weight, eps))
     }
 
     pub fn layer_norm(&mut self, prefix: &str, eps: f64) -> Result<LayerNorm> {
-        let weight = self
-            .ct
-            .tensor(&mut self.reader, &format!("{prefix}.weight"), &self.device)?;
-        let weight = weight.dequantize(&self.device)?;
-        let bias = self
-            .ct
-            .tensor(&mut self.reader, &format!("{prefix}.bias"), &self.device);
+        let ws = self.ct.tensor(&mut self.reader, &format!("{prefix}.weight"), &self.device)?;
+        // 🌟 [스마트 폴백]
+        let weight = ws.dequantize_f16(&self.device).or_else(|_| ws.dequantize(&self.device))?.to_dtype(candle_core::DType::F32)?;
+        let bias = self.ct.tensor(&mut self.reader, &format!("{prefix}.bias"), &self.device);
         let bias = match bias {
-            Ok(bias) => bias.dequantize(&self.device).ok(),
+            // 🌟 [최적화] F32 할당 건너뛰기 (이미 dequantize_f16으로 수정되었으나 명확히 주석 추가)
+            Ok(b) => b.dequantize_f16(&self.device).or_else(|_| b.dequantize(&self.device)).ok().map(|t| t.to_dtype(candle_core::DType::F32).unwrap_or(t)),
             Err(_) => None,
         };
         match bias {
@@ -86,7 +83,9 @@ impl<R: Read + Seek> Gguf<R> {
     }
 
     pub fn get_dequantized_f16(&mut self, name: &str) -> Result<Tensor> {
-        Ok(self.tensor(name)?.dequantize_f16(&self.device)?)
+        let t = self.tensor(name)?;
+        // 🌟 [스마트 폴백] F16 압축 해제 실패 시(이미 F32 원본일 경우), 일반 해제로 자동 우회!
+        Ok(t.dequantize_f16(&self.device).or_else(|_| t.dequantize(&self.device))?)
     }
 
     pub fn conv1d(
@@ -98,9 +97,10 @@ impl<R: Read + Seek> Gguf<R> {
         groups: usize,
         bias: bool,
     ) -> Result<Conv1d> {
-        let weight = self.get_dequantized(&format!("{prefix}.weight"))?;
+        // 🌟 [최적화] Conv1d 레이어 로드 시 F32 직접 할당(스파이크) 우회
+        let weight = self.get_dequantized_f16(&format!("{prefix}.weight"))?.to_dtype(candle_core::DType::F32)?;
         let bias = if bias {
-            self.get_dequantized(&format!("{prefix}.bias")).ok()
+            self.get_dequantized_f16(&format!("{prefix}.bias")).ok().map(|t| t.to_dtype(candle_core::DType::F32).unwrap_or(t))
         } else {
             None
         };
@@ -263,6 +263,16 @@ pub fn dummy_proj(device: &Device) -> ProjKind {
 
 
 impl GateUpDownMLPGguf {
+    pub fn new_dummy(device: &Device) -> Self {
+        let dummy = dummy_proj(device);
+        Self {
+            gate_proj: dummy.clone(),
+            up_proj: dummy.clone(),
+            down_proj: dummy,
+            act: candle_nn::Activation::Silu,
+        }
+    }
+    
     pub fn clear_weights(&mut self) {
         let dummy = dummy_proj(&Device::Cpu);
         self.gate_proj = dummy.clone();

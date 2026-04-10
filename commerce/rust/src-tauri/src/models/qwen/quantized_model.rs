@@ -145,6 +145,25 @@ impl QLinear {
         Ok(())
     }
 
+    // 🌟 [추가] 압축 해제를 방어하는 특수 이동 함수
+    pub fn to_device_keep_quantized(&mut self, device: &Device) -> Result<()> {
+        if self.is_cleared() {
+            return Err(anyhow!("Linear weight is cleared. Reload required."));
+        }
+        if device.is_cuda() {
+            // GPU로 갈 때는 프레임워크 한계상 압축을 풀어야 함
+            self.to_device(device)?;
+        } else {
+            // CPU일 때는 압축 상태(QTensor)를 유지하여 RAM 피크(OOM) 완벽 방지!
+            if let Some(b) = &self.bias {
+                let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+                self.bias = Some(b.to_device(device)?.to_dtype(target_dtype)?);
+            }
+            self.device = device.clone();
+        }
+        Ok(())
+    }
+
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         // [CRITICAL FIX] 224번 반복되던 device/dtype 중복 검사 및 할당 완전 제거!
         let (b, s, h) = xs.dims3()?;
@@ -276,7 +295,7 @@ impl KVRegistry {
         // 이를 통해 RoPE 오프셋이 32512로 점프하는 대참사를 막습니다.
         let mut entries = Vec::with_capacity(128);
         for i in 0..128 {
-            let entry = RegistryEntry::new(i * 256, 0, 28);
+            let entry = RegistryEntry::new(i * 1024, 0, 28);
             entries.push(entry);
         }
         Self {
@@ -320,7 +339,7 @@ impl KVRegistry {
                         if let Ok(loaded) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
                             for item in loaded {
                                 let start = item["token_start"].as_u64().unwrap_or(0) as usize;
-                                let idx = start / 256;
+                                let idx = start / 1024;
                                 if idx < entries.len() {
                                     entries[idx].location[l_idx] = KVLocation::SSD;
                                     if let Some(p) = item["ssd_path"].as_str() {
@@ -623,7 +642,7 @@ impl QuantizedQwenVLTextAttention {
             let mut appended = false;
             if let Some(last_block) = self.kv_blocks.last_mut() {
                 let mut inner = last_block.inner.write().unwrap();
-                let free_space = 256usize.saturating_sub(inner.len);
+                let free_space = 1024usize.saturating_sub(inner.len);
                 if inner.location == KVLocation::VRAM && free_space > 0 {
                     let take = tokens_to_process.min(free_space);
                     // [CRITICAL FIX] 메모리 복사를 유발하는 contiguous() 제거
@@ -651,7 +670,7 @@ impl QuantizedQwenVLTextAttention {
                 }
             }
             if !appended {
-                let take = tokens_to_process.min(256);
+                let take = tokens_to_process.min(1024);
                 
                 // [CRITICAL FIX] 신규 블록을 만들 때도 VRAM 전체 복사(.contiguous())를 제거하여 속도 향상!
                 let k_piece = key_states.narrow(2, chunk_offset, take)?;
@@ -998,7 +1017,7 @@ impl QuantizedQwenVLTextAttention {
         
         let target_indices: Vec<usize> = self.kv_blocks.iter().enumerate().filter_map(|(i, b)| {
             let inner = b.inner.read().unwrap();
-            let is_full = inner.len == 256;
+            let is_full = inner.len == 1024;
             
             let is_dirty = {
                 let reg = self.registry.entries.read().unwrap();
@@ -1115,7 +1134,7 @@ impl QuantizedQwenVLTextAttention {
             
             if !file_path.exists() { continue; }
             
-            let b_idx = block_info.offset / 256;
+            let b_idx = block_info.offset / 1024;
             
             if let Ok(encrypted_content) = crate::utils::direct_loader::load_kv_block(&file_path) {
                 if let Ok(content) = crate::utils::crypto::decrypt_data(&encrypted_content) {
@@ -1311,7 +1330,7 @@ impl QuantizedQwenVLTextAttention {
             }
             
             if let Ok(mut reg) = self.registry.entries.write() {
-                let entry_idx = offset / 256;
+                let entry_idx = offset / 1024;
                 if entry_idx < reg.len() {
                     let entry = &mut reg[entry_idx];
                     entry.ssd_path = Some(block_dir.clone()); 
@@ -1375,8 +1394,8 @@ impl QuantizedQwenVLTextAttention {
 
         for (i, (offset, frag_path)) in fragments.iter().enumerate() {
             let b_len = if *offset < current_kv_len {
-                (current_kv_len - *offset).min(256)
-            } else { 256 };
+                (current_kv_len - *offset).min(1024)
+            } else { 1024 };
             total_restored_len += b_len;
             
             let new_block = KVBlock::new(KVLocation::SSD, i, b_len, *offset);
@@ -1752,12 +1771,13 @@ impl QuantizedQwenVLTextModel {
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
         
+        // 🌟 [수정] ct.tensor 호출 시 &mut 를 제거하고 reader 만 넘깁니다.
         let (embed_tokens, actual_hidden_size) = if let Ok(tensor) = ct.tensor(&mut reader, &token_emb_name, device) {
-             let tensor = tensor.dequantize(device)?.to_dtype(effective_dtype)?; 
+             let tensor = tensor.dequantize_f16(device).or_else(|_| tensor.dequantize(device))?.to_dtype(effective_dtype)?; 
              let h = tensor.dim(1)?;
              (Embedding::new(tensor, h), h)
         } else if let Ok(tensor) = ct.tensor(&mut reader, alt_token_emb, device) {
-             let tensor = tensor.dequantize(device)?.to_dtype(effective_dtype)?; 
+             let tensor = tensor.dequantize_f16(device).or_else(|_| tensor.dequantize(device))?.to_dtype(effective_dtype)?; 
              let h = tensor.dim(1)?;
              (Embedding::new(tensor, h), h)
         } else {
@@ -1835,12 +1855,13 @@ impl QuantizedQwenVLTextModel {
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
         
+        // 🌟 [수정] ct.tensor 호출 시 &mut 를 제거하고 reader 만 넘깁니다.
         let (embed_tokens, actual_hidden_size) = if let Ok(tensor) = ct.tensor(reader, &token_emb_name, device) {
-             let tensor = tensor.dequantize(device)?.to_dtype(effective_dtype)?; 
+             let tensor = tensor.dequantize_f16(device).or_else(|_| tensor.dequantize(device))?.to_dtype(effective_dtype)?; 
              let h = tensor.dim(1)?;
              (Embedding::new(tensor, h), h)
         } else if let Ok(tensor) = ct.tensor(reader, alt_token_emb, device) {
-             let tensor = tensor.dequantize(device)?.to_dtype(effective_dtype)?; 
+             let tensor = tensor.dequantize_f16(device).or_else(|_| tensor.dequantize(device))?.to_dtype(effective_dtype)?; 
              let h = tensor.dim(1)?;
              (Embedding::new(tensor, h), h)
         } else {
@@ -1906,9 +1927,9 @@ impl QuantizedQwenVLTextModel {
         
         {
             let mut reg = self.registry.entries.write().unwrap();
-            let needed_blocks = (total_tokens + 255) / 256;
+            let needed_blocks = (total_tokens + 255) / 1024;
             while reg.len() < needed_blocks {
-                let off = reg.len() * 256;
+                let off = reg.len() * 1024;
                 reg.push(RegistryEntry::new(off, 0, 28));
             }
             self.current_kv_len = total_tokens;
@@ -1918,7 +1939,7 @@ impl QuantizedQwenVLTextModel {
             let reg_len = self.registry.entries.read().unwrap().len();
             while layer.self_attn.kv_blocks.len() < reg_len {
                 let idx = layer.self_attn.kv_blocks.len();
-                let off = idx * 256;
+                let off = idx * 1024;
                 layer.self_attn.kv_blocks.push(KVBlock {
                     inner: Arc::new(std::sync::RwLock::new(KVBlockInner {
                         k_cache: None, v_cache: None,
@@ -1949,8 +1970,8 @@ impl QuantizedQwenVLTextModel {
             let mut reg = self.registry.entries.write().unwrap();
             let total_t = self.current_kv_len;
             for (idx, entry) in reg.iter_mut().enumerate() {
-                let off = idx * 256;
-                let b_len = if off + 256 <= total_t { 256 } else { total_t.saturating_sub(off) };
+                let off = idx * 1024;
+                let b_len = if off + 1024 <= total_t { 1024 } else { total_t.saturating_sub(off) };
                 entry.token_len = b_len;
                 
                 for layer in self.layers.iter_mut() {
@@ -1979,7 +2000,7 @@ impl QuantizedQwenVLTextModel {
         kv_name: Option<String>,
         baking_only: bool,
     ) -> Result<Tensor> {
-        let chunk_size = 256;
+        let chunk_size = 1024;
         let current_seq_len = xs.dim(1)?;
         let is_decoding = current_seq_len <= 1;
         let total_kv_blocks = self.layers[layer_idx].self_attn.kv_blocks.len();
@@ -2186,7 +2207,7 @@ impl QuantizedQwenVLTextModel {
         }
 
         let current_seq_len = xs.dim(1)?;
-        let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(256).collect();
+        let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(1024).collect();
         let mut next_xs = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
 
         if let (Some(embed), Some(mask)) = (deepstack_embed, visual_mask) {
@@ -2307,7 +2328,7 @@ impl QuantizedQwenVLTextModel {
             let sub_path = if mode { format!("{}/reference/{}", session_id, kv_type) } else { format!("{}/inference/{}", session_id, kv_type) };
 
             for ((off, idx), layers) in block_groups {
-                let sid = SLOT_MANAGER.acquire_write_slot(256).await;
+                let sid = SLOT_MANAGER.acquire_write_slot(1024).await;
                 let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
                 if !block_dir.exists() { let _ = fs::create_dir_all(&block_dir); }
 
@@ -2636,7 +2657,7 @@ impl QuantizedQwenVLTextModel {
         if fragments.is_empty() { return Ok(()); }
         fragments.sort_by_key(|f| f.0);
 
-        let mut last_chunk_len = 256;
+        let mut last_chunk_len = 1024;
         let (_, last_st_path) = fragments.last().unwrap();
         if let Ok(encrypted_content) = crate::utils::direct_loader::load_kv_block(&last_st_path.join("l0.st")) {
             if let Ok(content) = crate::utils::crypto::decrypt_data(&encrypted_content) {
@@ -2996,7 +3017,12 @@ impl QuantizedQwenVLModel {
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
-    pub fn to_device(&mut self, device: &Device) -> Result<()> { self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; self.text_device = device.clone(); self.vision_device = device.clone(); Ok(()) }
+    pub fn to_device(&mut self, device: &Device) -> Result<()> { 
+        self.visual.to_device(device)?; 
+        self.language_model.to_device(device)?; 
+        self.lm_head.to_device_keep_quantized(device)?;
+        self.text_device = device.clone(); 
+        self.vision_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, total_len) }
 }
 
@@ -3105,20 +3131,30 @@ impl QuantizedQwenTextModel {
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
-    pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
+    pub fn to_device(&mut self, device: &Device) -> Result<()> { 
+        self.language_model.to_device(device)?; 
+        if let Some(head) = &mut self.lm_head { 
+            head.to_device_keep_quantized(device)?;
+        } 
+        self.text_device = device.clone(); 
+        Ok(()) 
+    }
+
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, _total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, _total_len) }
 }
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
     let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
     let weight = QMatMul::from_qtensor(weight)?;
-    let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { Some(t.dequantize(device)?.to_dtype(dtype)?) } else { None };
+    // 🌟 [스마트 폴백]
+    let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { Some(t.dequantize_f16(device).or_else(|_| t.dequantize(device))?.to_dtype(dtype)?) } else { None };
     Ok(QLinear::new(weight, bias, device.clone()))
 }
 
 fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, eps: f64, device: &Device, dtype: DType) -> Result<RmsNorm> {
     let weight = ct.tensor(reader, &format!("{name}.weight"), device)?;
-    let weight = weight.dequantize(device)?.to_dtype(dtype)?;
+    // 🌟 [스마트 폴백]
+    let weight = weight.dequantize_f16(device).or_else(|_| weight.dequantize(device))?.to_dtype(dtype)?;
     Ok(RmsNorm::new(weight, eps))
 }
 
@@ -3157,7 +3193,8 @@ fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &QwenVLConfig, ct
         let mut base_split_name = new_name.clone();
         if let Some(last_dot) = new_name.rfind('.') { if let Ok(idx) = new_name[last_dot+1..].parse::<usize>() { if name.ends_with(&format!(".{}", idx)) { base_split_name = new_name[..last_dot].to_string(); split_idx = idx; is_split = true; } } }
         let t = ct.tensor(reader, name, device)?;
-        let t = t.dequantize(device)?.to_dtype(dtype)?;
+        // 🌟 [스마트 폴백]
+        let t = t.dequantize_f16(device).or_else(|_| t.dequantize(device))?.to_dtype(dtype)?;
         if is_split { split_tensors.entry(base_split_name).or_default().push((split_idx, t)); } else { data.insert(new_name, t); }
     }
     for (name, mut parts) in split_tensors { parts.sort_by_key(|(i, _)| *i); let tensors: Vec<Tensor> = parts.into_iter().map(|(_, t)| t).collect(); if let Ok(merged) = Tensor::cat(&tensors, 0) { data.insert(name, merged); } }
