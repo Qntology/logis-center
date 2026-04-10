@@ -899,24 +899,16 @@ impl Qwen3_5Attention {
                         let mut v_list = Vec::with_capacity(num_full_blocks);
                         for block in valid_blocks.iter().take(num_full_blocks) {
                             let inner = block.inner.read().unwrap();
-                            // 🌟 [CRITICAL FIX] GPU로 전송 후 병합
                             let k = inner.k_cache.as_ref().unwrap().to_device(dev)?.to_dtype(target_dtype)?;
                             let v = inner.v_cache.as_ref().unwrap().to_device(dev)?.to_dtype(target_dtype)?;
                             k_list.push(k);
                             v_list.push(v);
                         }
-                        let mut k_cat = Tensor::cat(&k_list, 2)?;
-                        let mut v_cat = Tensor::cat(&v_list, 2)?;
+                        let k_cat = Tensor::cat(&k_list, 2)?.contiguous()?;
+                        let v_cat = Tensor::cat(&v_list, 2)?.contiguous()?;
                         
-                        if self.num_kv_groups > 1 {
-                            let (b, h, s, d) = k_cat.dims4()?;
-                            k_cat = k_cat.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                            v_cat = v_cat.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                        }
-                        
-                        // 🌟 [CRITICAL FIX] 디코딩 시 O(1)의 속도를 보장하려면 병합 캐시가 무조건 연속 메모리여야 합니다. contiguous() 추가!
-                        self.vram_merged_k = Some(k_cat.contiguous()?);
-                        self.vram_merged_v = Some(v_cat.contiguous()?);
+                        self.vram_merged_k = Some(k_cat);
+                        self.vram_merged_v = Some(v_cat);
                         self.merged_vram_block_count = num_full_blocks;
                     }
                 } else {
@@ -925,16 +917,24 @@ impl Qwen3_5Attention {
                     self.merged_vram_block_count = 0;
                 }
 
-                // 🌟 q_aligned에만 1번 contiguous를 주고, 이후로는 절대 쓰지 않습니다.
                 let q_aligned = (query_states * self.scaling)?.contiguous()?;
                 
                 let mut out_res: Option<Tensor> = None;
                 let mut m_n: Option<Tensor> = None;
                 let mut l_n: Option<Tensor> = None;
 
-                // 1. 캐싱된 과거 블록 연산 (O(1) 초고속 패스)
                 if let (Some(k_merged), Some(v_merged)) = (&self.vram_merged_k, &self.vram_merged_v) {
-                    let k_t = k_merged.transpose(2, 3)?; // contiguous 제거로 메모리 복사 원천 차단
+                    let mut k_m = k_merged.clone();
+                    let mut v_m = v_merged.clone();
+                    
+                    // 🌟 [VRAM 수압 조절 2] 연산 시에만 확장
+                    if self.num_kv_groups > 1 {
+                        let (b, h, s, d) = k_m.dims4()?;
+                        k_m = k_m.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                        v_m = v_m.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                    }
+                    
+                    let k_t = k_m.transpose(2, 3)?; 
                     let attn_weights = q_aligned.matmul(&k_t)?;
                     
                     let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
@@ -942,15 +942,13 @@ impl Qwen3_5Attention {
                     let p_j = attn_weights_f32.broadcast_sub(&m_j)?.exp()?;
                     let l_j = p_j.sum_keepdim(D::Minus1)?;
                     
-                    let v_m = v_merged;
-                    let out_j = p_j.to_dtype(v_m.dtype())?.matmul(v_m)?;
+                    let out_j = p_j.to_dtype(v_m.dtype())?.matmul(&v_m)?;
                     
                     out_res = Some(out_j.to_dtype(DType::F32)?);
                     m_n = Some(m_j);
                     l_n = Some(l_j);
                 }
 
-                // 2. 현재 자라나고 있는 마지막 1개 블록 연산
                 let last_block = valid_blocks.last().unwrap();
                 let inner = last_block.inner.read().unwrap();
                 let mut k_last = inner.k_cache.as_ref().unwrap().clone();
@@ -972,7 +970,6 @@ impl Qwen3_5Attention {
                 let v_m = &v_last;
                 let out_j_f32 = p_j.to_dtype(v_m.dtype())?.matmul(v_m)?.to_dtype(DType::F32)?;
 
-                // 3. 과거 블록과 현재 블록 결과 병합 (Online Softmax)
                 match out_res {
                     None => {
                         out_res = Some(out_j_f32);
@@ -997,9 +994,7 @@ impl Qwen3_5Attention {
                 let attn_output = out_res.unwrap().broadcast_div(&l_n.unwrap())?.to_dtype(target_dtype)?;
                 let attn_output = attn_output.transpose(1, 2)?.contiguous()?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?.contiguous()?;
                 
-                // 🌟 [CRITICAL FIX 2: 환각 증세의 완벽한 원인!] 
-                // Fast-Path (디코딩)에서 실수로 빼먹었던 Gate(Sigmoid) 연산을 부활시킵니다!!
-                // 이 연산이 없으면 Attention 값이 폭주하여 AI가 멍청해지고 공백만 무한 반복합니다.
+                // 🌟 환각 방지용 Gate 필터 
                 let gate_final = candle_nn::ops::sigmoid(&gate.to_dtype(target_dtype)?)?.to_dtype(target_dtype)?; 
                 let attn_output = attn_output.mul(&gate_final)?;
                 
@@ -1766,22 +1761,20 @@ impl Qwen3_5TextModel {
             
             xs = layer.forward(&xs, Some(&cos), Some(&sin), layer_mask.as_ref(), seqlen_offset)?;
 
-            if !is_decoding {
-                // 가중치 소각(clear_weights) 전, SSM State를 안전한 CPU 메모리로 대피시킵니다!
-                if layer.layer_type == "linear_attention" {
-                    let is_dirty_backup = layer.is_ssm_dirty(); // 🌟 핵심: 기억 상실 방지 플래그 백업
-                    
-                    let (conv_opt, rec_opt) = layer.get_ssm_states();
-                    if let (Some(conv), Some(rec)) = (conv_opt, rec_opt) {
-                        let safe_conv = conv.to_device(&candle_core::Device::Cpu).unwrap_or(conv);
-                        let safe_rec = rec.to_device(&candle_core::Device::Cpu).unwrap_or(rec);
-                        layer.set_ssm_states(Some(safe_conv), Some(safe_rec));
-                    }
-
-                    layer.set_ssm_dirty(is_dirty_backup); // 🌟 핵심: 대피 후 플래그 원상 복구하여 SSD 저장 강제
+            // 🌟 [수압 조절 완결] if !is_decoding 제한을 없애고, 디코딩 시에도 무조건 가중치를 비워서 VRAM 피크를 차단합니다!
+            if layer.layer_type == "linear_attention" {
+                let is_dirty_backup = layer.is_ssm_dirty(); 
+                
+                let (conv_opt, rec_opt) = layer.get_ssm_states();
+                if let (Some(conv), Some(rec)) = (conv_opt, rec_opt) {
+                    let safe_conv = conv.to_device(&candle_core::Device::Cpu).unwrap_or(conv);
+                    let safe_rec = rec.to_device(&candle_core::Device::Cpu).unwrap_or(rec);
+                    layer.set_ssm_states(Some(safe_conv), Some(safe_rec));
                 }
-                layer.clear_weights();
+
+                layer.set_ssm_dirty(is_dirty_backup); 
             }
+            layer.clear_weights();
 
             // 🌟 [교체 구간] Qwen3_5TextModel::forward 내부의 세션 ID 저장 블록 전체
             if let Some(sid) = &session_id {

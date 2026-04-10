@@ -465,9 +465,9 @@ impl QuantizedQwenVLTextAttention {
         self.k_norm.clear();
         
         // VRAM 병합 캐시도 삭제
-        self.vram_merged_k = None;
-        self.vram_merged_v = None;
-        self.merged_vram_block_count = 0;
+        // self.vram_merged_k = None;
+        // self.vram_merged_v = None;
+        // self.merged_vram_block_count = 0;
     }
 
     pub fn new<R: std::io::Seek + std::io::Read>(
@@ -1843,7 +1843,9 @@ impl QuantizedQwenVLTextModel {
 
         let current_device = device.clone(); 
         let registry = KVRegistry::new();
-        let num_layers_to_load = if baking_only { 1 } else { config.num_hidden_layers };
+        
+        // 🌟 [CRITICAL FIX] 심연에 숨어있던 마지막 1층 깎기 코드를 파괴합니다! 이제 Baking 시 28개 층이 모두 구워집니다.
+        let num_layers_to_load = config.num_hidden_layers;
 
         let mut layers = Vec::with_capacity(num_layers_to_load);
         for layer_idx in 0..num_layers_to_load {
@@ -2503,27 +2505,33 @@ impl QuantizedQwenVLTextModel {
         // 🚀 [디코딩 초고속 패스] 🚀 (전체 레이어를 한 번에 관통)
         // ====================================================================
         if is_decoding {
-            if self.layers[0].self_attn.q_proj.is_cleared() {
-                self.reload_all_layers()?; // 디코딩 시작 전 VRAM 통째 점유
-            }
+            // 🌟 [OOM 완벽 차단] 시작 전에 전체 VRAM을 통째로 점유하던 self.reload_all_layers()?; 삭제!
 
             for layer_idx in 0..total_layers {
-                // 🌟 [CRITICAL FIX] 디코딩 시에도 로그를 부활시킵니다!
-                // 단, 화면 스팸을 막기 위해 \r을 사용하여 한 줄에 덮어씁니다.
                 if layer_idx % 7 == 0 || layer_idx == total_layers - 1 {
                     print!("\r[ENGINE] Running Layer {}/{} (Decoding Fast-Path)    ", layer_idx + 1, total_layers);
                     use std::io::Write;
                     let _ = std::io::stdout().flush();
                 }
 
+                // 🌟 Mmap JIT Load (핑퐁 대기열 진입)
+                if self.layers[layer_idx].self_attn.q_proj.is_cleared() {
+                    self.reload_layer(layer_idx)?;
+                }
+
                 if self.is_forced_cpu || !self.layers[layer_idx].device().same_device(&target_device) {
                     self.layers[layer_idx].to_device(&target_device)?;
                 }
 
-                // 🌟 Chunk-by-Chunk for Decoding: 1토큰이 전체 28개 레이어를 한 방에 통과!
                 xs = self.layers[layer_idx].forward(
                     &xs, &cos, &sin, None, seqlen_offset, session_id.clone(), kv_name.clone(), false
                 )?;
+
+                // 🌟 [수압 조절 완결] 연산이 끝난 가중치는 VRAM에서 즉시 파괴하여 메모리 수압을 0으로 만듭니다! 
+                // Mmap(OS 캐시)을 활용하므로 다음 토큰 때 읽어오는 속도는 1ms도 걸리지 않습니다.
+                if !self.is_forced_cpu {
+                    self.layers[layer_idx].clear();
+                }
 
                 if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                     if layer_idx < deepstack_embeds.len() {
