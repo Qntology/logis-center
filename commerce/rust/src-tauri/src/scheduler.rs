@@ -569,7 +569,8 @@ async fn process_task(
             println!("[Scheduler] Baking Base PUG Context to SSD...");
             log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Reading document structure...", "spinner": "⠋" }));
             
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            // 🌟 [CRITICAL FIX] is_baking을 true로 전달하여 안 써도 되는 2GB짜리 비전(이미지) 모델 로딩을 강제 차단합니다! (로딩 속도 13초 -> 3초)
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, kv_name.clone()).await?;
             
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {

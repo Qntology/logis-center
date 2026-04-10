@@ -2,6 +2,7 @@ use crate::models::qwen::quantized_model::{KVLocation, KVBlock, KVRegistry, BitK
 use anyhow::{Result, anyhow};
 use candle_core::{quantized::gguf_file, DType, Device, Tensor};
 use candle_nn::VarBuilder;
+use std::io::Write;
 
 use crate::{
     chat_template::ChatTemplate,
@@ -739,7 +740,13 @@ impl QwenVLGenerateModel {
             
             let current_pos = total_tokens_after_prefill + i as usize;
             
-            wait_for_global_io().await; 
+            // 🌟 [디코딩 진행률 로깅]
+            if i % 10 == 0 || next_id == self.eos_token_id1 || next_id == self.eos_token_id2 {
+                print!("\r[DECODING] {} tokens generated (Context: {})    ", i + 1, current_pos + 1);
+                let _ = std::io::stdout().flush();
+            }
+
+            wait_for_global_io().await;
             logits = self.qwen.forward(&Tensor::from_vec(vec![next_id], (1, 1), &self.text_device)?, None, None, None, None, None, current_pos, current_pos + 1, session_id.clone(), _kv_name.clone()).await?;
 
             if i > 0 && i % 30 == 0 {

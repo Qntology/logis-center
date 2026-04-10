@@ -237,11 +237,12 @@ impl Qwen3VLVisionAttention {
         let seq_length = xs.dim(0)?;
         let qkv_states = self.qkv.forward(xs)?.reshape((seq_length, 3, self.num_heads, ()))?.permute((1, 0, 2, 3))?; 
         
-        let query_states = qkv_states.i(0)?; 
-        let key_states = qkv_states.i(1)?; 
-        let value_states = qkv_states.i(2)?; 
+        // 🌟 [CRITICAL FIX] 메모리 꼬임으로 인한 CUDA NaN(쓰레기값) 생성을 막기 위해 contiguous()를 부활시킵니다!
+        let query_states = qkv_states.i(0)?.contiguous()?; 
+        let key_states = qkv_states.i(1)?.contiguous()?; 
+        let value_states = qkv_states.i(2)?.contiguous()?; 
         
-        let (query_states, key_states) = apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?; 
+        let (query_states, key_states) = apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?;
         let query_states = query_states.transpose(0, 1)?.unsqueeze(0)?;
         let key_states = key_states.transpose(0, 1)?.unsqueeze(0)?;
         let value_states = value_states.transpose(0, 1)?.unsqueeze(0)?;
@@ -580,14 +581,33 @@ impl Qwen3VLVisionModel {
         let patch_pos_embeds = split_tensor(&patch_pos_embeds, &split_idx, 0)?;
         let merge_size = self.spatial_merge_size;
         for (i, pos_embed) in patch_pos_embeds.iter().enumerate() {
-            let [t, h, w] = grid_thw_cpu[i][..] else { return Err(anyhow!("...")); };
+            let [t, h, w] = grid_thw_cpu[i][..] else {
+                return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
+            };
             let pos_emebd_last_dim: usize = pos_embed.dim(D::Minus1)?;
             let pos_embed = pos_embed.repeat((t as usize, 1))?;
-            let shape = Shape::from(vec![t as usize, h as usize / merge_size, merge_size, w as usize / merge_size, merge_size, pos_emebd_last_dim]);
-            let pos_embed = pos_embed.reshape(shape)?.permute((0, 1, 3, 2, 4, 5))?.flatten(0, 4)?;
+            let shape = Shape::from(vec![
+                t as usize,
+                h as usize / merge_size,
+                merge_size,
+                w as usize / merge_size,
+                merge_size,
+                pos_emebd_last_dim,
+            ]);
+            
+            // 🌟 [CRITICAL FIX] permute(차원 뒤섞기) 직후에 무조건 contiguous()로 메모리를 물리적으로 재정렬해야만
+            // 뒤따라오는 flatten(0, 4) 연산이 정상적으로 수행되며, 이미지가 깨지는 환각(공백 출력) 증세가 완벽하게 사라집니다!
+            let pos_embed = pos_embed
+                .reshape(shape)?
+                .permute((0, 1, 3, 2, 4, 5))?
+                .contiguous()? 
+                .flatten(0, 4)?;
+                
             patch_pos_embeds_permute.push(pos_embed);
         }
-        Ok(Tensor::cat(&patch_pos_embeds_permute, 0)?)
+        
+        let patch_pos_embeds = Tensor::cat(&patch_pos_embeds_permute, 0)?;
+        Ok(patch_pos_embeds)
     }
 
     pub fn rot_pos_emb(&self, grid_thw: &Tensor) -> Result<Tensor> {

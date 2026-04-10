@@ -707,22 +707,27 @@ impl QuantizedQwenVLTextAttention {
         let is_decoding = q_len == 1;
         if is_decoding {
             let valid_blocks: Vec<_> = self.kv_blocks.iter().filter(|b| b.inner.read().unwrap().offset < total_tokens_now).collect();
-            let all_in_vram = valid_blocks.iter().all(|b| b.inner.read().unwrap().location == KVLocation::VRAM);
+            // 🌟 [CRITICAL FIX] VRAM 뿐만 아니라 RAM에 캐싱된 블록도 Fast-Path를 타도록 허용!
+            let all_ready = valid_blocks.iter().all(|b| {
+                let loc = b.inner.read().unwrap().location;
+                loc == KVLocation::VRAM || loc == KVLocation::RAM
+            });
             
-            if all_in_vram && !valid_blocks.is_empty() {
+            if all_ready && !valid_blocks.is_empty() {
                 let num_valid = valid_blocks.len();
-                // 🌟 [스플릿 캐시 핵심] 꽉 찬 과거 블록(N-1개)만 병합하고, 마지막 블록은 따로 빼둡니다!
                 let num_full_blocks = num_valid.saturating_sub(1);
                 
-                // 과거 블록 병합 캐싱 (메모리 뻥튀기 원천 차단)
                 if num_full_blocks > 0 {
                     if self.vram_merged_k.is_none() || self.merged_vram_block_count != num_full_blocks {
                         let mut k_list = Vec::with_capacity(num_full_blocks);
                         let mut v_list = Vec::with_capacity(num_full_blocks);
                         for block in valid_blocks.iter().take(num_full_blocks) {
                             let inner = block.inner.read().unwrap();
-                            k_list.push(inner.k_cache.as_ref().unwrap().clone());
-                            v_list.push(inner.v_cache.as_ref().unwrap().clone());
+                            // 🌟 [CRITICAL FIX] RAM에 있는 캐시라면 GPU로 퍼올려서 통짜 캐시(vram_merged)에 병합합니다!
+                            let k = inner.k_cache.as_ref().unwrap().to_device(dev)?.to_dtype(target_dtype)?;
+                            let v = inner.v_cache.as_ref().unwrap().to_device(dev)?.to_dtype(target_dtype)?;
+                            k_list.push(k);
+                            v_list.push(v);
                         }
                         let mut k_cat = Tensor::cat(&k_list, 2)?;
                         let mut v_cat = Tensor::cat(&v_list, 2)?;
@@ -914,8 +919,12 @@ impl QuantizedQwenVLTextAttention {
                     let k_gpu = k_safe.to_device(dev)?.to_dtype(target_dtype)?;
                     let v_gpu = v_safe.to_device(dev)?.to_dtype(target_dtype)?;
 
-                    // 🌟 [OOM 완벽 차단 핵심] RAM이나 SSD에서 읽어온 텐서를 VRAM에 '복귀(저장)'시키지 않고, 
-                    // 이번 루프 연산(is_temporary = true)에만 쓰고 버려서 VRAM이 폭발하는 것을 완벽하게 막습니다!
+                    // 🌟 [CRITICAL FIX] SSD에서 읽어온 블록을 1회용으로 버리지 않고 RAM에 캐싱해 둡니다.
+                    // 이렇게 해야 다음 디코딩 토큰부터 RAM에서 즉시 꺼내어 O(1) Fast-Path를 탈 수 있습니다! (SSD 스팸 차단)
+                    inner.k_cache = Some(k_safe); 
+                    inner.v_cache = Some(v_safe); 
+                    inner.location = KVLocation::RAM;
+                    
                     (k_gpu, v_gpu, true)
                 }
             };
@@ -2840,7 +2849,7 @@ impl QuantizedQwenVLModel {
 
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
-        if baking_only { t_config.num_hidden_layers = 1; }
+        // 🌟 [CRITICAL FIX] Baking 시에도 28개 레이어 전체의 KV 캐시를 구워야 하므로 1로 깎는 코드를 삭제합니다!
 
         let language_model = QuantizedQwenVLTextModel::new_with_mmap(
             &t_config, ct_main.clone(), main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
@@ -2897,7 +2906,7 @@ impl QuantizedQwenVLModel {
         
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
-        if baking_only { t_config.num_hidden_layers = 1; }
+        // 🌟 [CRITICAL FIX] 제한 삭제
 
         let language_model = QuantizedQwenVLTextModel::new(&t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
         
@@ -3146,8 +3155,9 @@ impl QuantizedQwenTextModel {
     ) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
-        if single_layer_mode { t_config.num_hidden_layers = 1; }
         
+        // 🌟 [CRITICAL FIX] 여기서도 1개로 깎아버리는 로직을 완전히 없앱니다!
+
         let language_model = QuantizedQwenVLTextModel::new_with_mmap(
             &t_config, ct_main.clone(), mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
         )?;
@@ -3175,7 +3185,8 @@ impl QuantizedQwenTextModel {
     ) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
-        if single_layer_mode { t_config.num_hidden_layers = 1; }
+
+        // 🌟 [CRITICAL FIX] 삭제 완료!
 
         let language_model = QuantizedQwenVLTextModel::new(
             &t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only

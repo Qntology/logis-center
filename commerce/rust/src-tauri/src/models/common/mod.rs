@@ -1310,11 +1310,9 @@ pub fn softplus_stable(xs: &Tensor) -> Result<Tensor> {
 
 pub fn conv1d_depthwise(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
     let len_in = input.dim(2)?;
-    // 🌟 [수정] 가중치를 입력 타입(BF16)으로 명시적 변환
     let weight = weight.squeeze(1)?.to_dtype(input.dtype())?;
     let kernel_size = weight.dim(1)?;
 
-    println!("[DEBUG-CONV1D] input: {:?}, weight: {:?}", input.dtype(), weight.dtype());
     let len_out = len_in - kernel_size + 1;
 
     let mut out = if len_out == 1 {

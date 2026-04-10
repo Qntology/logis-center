@@ -188,12 +188,12 @@ impl QwenVLVisionAttention {
         let seq_length = xs.dim(0)?;
         let qkv_states = xs.apply(&self.qkv)?.reshape((seq_length, 3, self.num_heads, ()))?.permute((1, 0, 2, 3))?; 
         
-        // [CRITICAL FIX] 메모리 전체 복사를 유발하는 contiguous() 3연타 삭제!
-        let query_states = qkv_states.i(0)?; 
-        let key_states = qkv_states.i(1)?; 
-        let value_states = qkv_states.i(2)?; 
+        // 🌟 [CRITICAL FIX] 이 부분을 지우면 이미지가 완전히 깨져서 AI가 환각 증세를 일으킵니다. 복구 완료!
+        let query_states = qkv_states.i(0)?.contiguous()?; 
+        let key_states = qkv_states.i(1)?.contiguous()?; 
+        let value_states = qkv_states.i(2)?.contiguous()?; 
         
-        let (query_states, key_states) = apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?; 
+        let (query_states, key_states) = apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?;
         let query_states = query_states.transpose(0, 1)?.unsqueeze(0)?;
         let key_states = key_states.transpose(0, 1)?.unsqueeze(0)?;
         let value_states = value_states.transpose(0, 1)?.unsqueeze(0)?;

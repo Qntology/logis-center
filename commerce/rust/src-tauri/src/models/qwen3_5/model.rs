@@ -835,8 +835,11 @@ impl Qwen3_5Attention {
                     let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
 
                     if let (Some(pk), Some(pv)) = (inner.k_cache.take(), inner.v_cache.take()) {
-                        inner.k_cache = Some(Tensor::cat(&[&pk, &k_piece], 2)?);
-                        inner.v_cache = Some(Tensor::cat(&[&pv, &v_piece], 2)?);
+                        let pk = if !pk.device().same_device(dev) { pk.to_device(dev)? } else { pk };
+                        let pv = if !pv.device().same_device(dev) { pv.to_device(dev)? } else { pv };
+
+                        inner.k_cache = Some(Tensor::cat(&[&pk, &k_piece], 2)?.contiguous()?);
+                        inner.v_cache = Some(Tensor::cat(&[&pv, &v_piece], 2)?.contiguous()?);
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
                         
@@ -851,7 +854,7 @@ impl Qwen3_5Attention {
             if !appended {
                 let take = tokens_to_process.min(1024);
                 
-                // 🌟 [크래시 해결 2] 새 블록 생성 시에도 무조건 contiguous() 호출!
+                // 🌟 [CRITICAL FIX 1-B] 새 블록 생성 시에도 무조건 연속 메모리 보장!
                 let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
                 let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
                 let index = self.kv_blocks.len();
@@ -880,21 +883,27 @@ impl Qwen3_5Attention {
         let is_decoding = q_len == 1;
         if is_decoding {
             let valid_blocks: Vec<_> = self.kv_blocks.iter().filter(|b| b.inner.read().unwrap().offset < total_tokens_now).collect();
-            let all_in_vram = valid_blocks.iter().all(|b| b.inner.read().unwrap().location == KVLocation::VRAM);
+            // 🌟 [CRITICAL FIX] RAM 허용
+            let all_ready = valid_blocks.iter().all(|b| {
+                let loc = b.inner.read().unwrap().location;
+                loc == KVLocation::VRAM || loc == KVLocation::RAM
+            });
             
-            if all_in_vram && !valid_blocks.is_empty() {
+            if all_ready && !valid_blocks.is_empty() {
                 let num_valid = valid_blocks.len();
                 let num_full_blocks = num_valid.saturating_sub(1);
                 
-                // 🌟 [최적화 1] 스플릿 캐시: 꽉 찬 과거 블록(N-1개)은 단 한 번만 병합하여 영구 캐싱!
                 if num_full_blocks > 0 {
                     if self.vram_merged_k.is_none() || self.merged_vram_block_count != num_full_blocks {
                         let mut k_list = Vec::with_capacity(num_full_blocks);
                         let mut v_list = Vec::with_capacity(num_full_blocks);
                         for block in valid_blocks.iter().take(num_full_blocks) {
                             let inner = block.inner.read().unwrap();
-                            k_list.push(inner.k_cache.as_ref().unwrap().clone());
-                            v_list.push(inner.v_cache.as_ref().unwrap().clone());
+                            // 🌟 [CRITICAL FIX] GPU로 전송 후 병합
+                            let k = inner.k_cache.as_ref().unwrap().to_device(dev)?.to_dtype(target_dtype)?;
+                            let v = inner.v_cache.as_ref().unwrap().to_device(dev)?.to_dtype(target_dtype)?;
+                            k_list.push(k);
+                            v_list.push(v);
                         }
                         let mut k_cat = Tensor::cat(&k_list, 2)?;
                         let mut v_cat = Tensor::cat(&v_list, 2)?;
@@ -987,6 +996,12 @@ impl Qwen3_5Attention {
 
                 let attn_output = out_res.unwrap().broadcast_div(&l_n.unwrap())?.to_dtype(target_dtype)?;
                 let attn_output = attn_output.transpose(1, 2)?.contiguous()?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?.contiguous()?;
+                
+                // 🌟 [CRITICAL FIX 2: 환각 증세의 완벽한 원인!] 
+                // Fast-Path (디코딩)에서 실수로 빼먹었던 Gate(Sigmoid) 연산을 부활시킵니다!!
+                // 이 연산이 없으면 Attention 값이 폭주하여 AI가 멍청해지고 공백만 무한 반복합니다.
+                let gate_final = candle_nn::ops::sigmoid(&gate.to_dtype(target_dtype)?)?.to_dtype(target_dtype)?; 
+                let attn_output = attn_output.mul(&gate_final)?;
                 
                 return Ok(self.o_proj.forward(&attn_output)?.to_dtype(target_dtype)?);
             }
@@ -1092,7 +1107,11 @@ impl Qwen3_5Attention {
                     let k_gpu = k_safe.to_device(dev)?.to_dtype(target_dtype)?;
                     let v_gpu = v_safe.to_device(dev)?.to_dtype(target_dtype)?;
 
-                    // 🌟 [CRITICAL OOM FIX] VRAM에 영구 캐싱하지 않고, 바로 리턴하여 1회용으로 쓰고 파괴되게 합니다!
+                    // 🌟 RAM 보관
+                    inner.k_cache = Some(k_safe);
+                    inner.v_cache = Some(v_safe);
+                    inner.location = KVLocation::RAM;
+
                     (k_gpu, v_gpu, true)
                 }
             };
@@ -1177,10 +1196,11 @@ impl Qwen3_5Attention {
         
         // 💡 gate(F32/BF16)를 확실히 target_dtype으로 sigmoid 취한 뒤 다시 target_dtype으로 고정
         let gate_final = candle_nn::ops::sigmoid(&gate.to_dtype(target_dtype)?)?.to_dtype(target_dtype)?; 
-        println!("[DEBUG-ATTN-FINAL] output: {:?}, gate: {:?}", attn_output.dtype(), gate_final.dtype());
+        
+        // 🌟 [스팸 삭제] 화면을 도배하던 println!을 지웠습니다.
         let attn_output = attn_output.mul(&gate_final)?;
         
-        Ok(attn_output.apply(&self.o_proj)?.to_dtype(target_dtype)?) // 👈 o_proj 출력도 BF16으로!
+        Ok(attn_output.apply(&self.o_proj)?.to_dtype(target_dtype)?)
     }
 
     pub fn clear_kv_cache(&mut self) {

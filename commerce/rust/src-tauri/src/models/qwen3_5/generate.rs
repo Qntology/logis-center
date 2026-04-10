@@ -310,15 +310,21 @@ impl Qwen3_5GenerateModel {
                         else if c == '}' { depth -= 1; }
                     }
                     if has_started && depth == 0 && gen_text_buffer.trim_end().ends_with('}') {
-                        // 🌟 종료 전 남은 버퍼 강제 출력
                         if !print_buffer.is_empty() {
                             print!("{}", print_buffer);
                             let _ = std::io::stdout().flush();
                         }
                         println!("\n[DEBUG-GEN] Balanced JSON detected. Stopping.");
-                        break; // generate 함수는 is_finished 변수가 없으므로 그냥 break만 하시면 됩니다.
+                        break; 
                     }
                 }
+            }
+
+            // 🌟 [디코딩 진행률 로깅] 여기로 쏙 들어갑니다!
+            let current_pos = seqlen_offset + seq_len; // 현재 전체 문맥 길이
+            if i % 10 == 0 || next_token == self.eos_token_id {
+                print!("\r[Qwen3.5-DECODING] {} tokens generated (Context: {})    ", i + 1, current_pos + 1);
+                let _ = std::io::stdout().flush();
             }
 
             if next_token == self.eos_token_id {
@@ -509,6 +515,13 @@ impl Qwen3_5GenerateModel {
                         break;
                     }
                 }
+            }
+
+            // 🌟 [디코딩 진행률 로깅]
+            let current_pos = seqlen_offset + seq_len;
+            if i % 10 == 0 || next_token == self.eos_token_id {
+                print!("\r[Qwen3.5-DECODING] {} tokens generated (Context: {})    ", i + 1, current_pos + 1);
+                let _ = std::io::stdout().flush();
             }
 
             if next_token == self.eos_token_id {
