@@ -623,19 +623,19 @@ impl QuantizedQwenVLTextAttention {
 
         // [CRITICAL FIX] .contiguous() 삭제로 VRAM 전체 복사 스파이크 원천 차단!
         let mut query_states = self.q_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
-        query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?; // contiguous() 제거
+        query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?.contiguous()?; 
         
         let mut key_states = self.k_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
-        key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?;     // contiguous() 제거
+        key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?.contiguous()?; 
         
-        let value_states = self.v_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?; // contiguous() 제거
+        let value_states = self.v_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?; 
 
         let cos = cos.to_dtype(target_dtype)?;
         let sin = sin.to_dtype(target_dtype)?;
-        // [FIX] cos와 sin 앞에 & 기호 추가
+        
         let (query_states, key_states) = apply_rotary_pos_emb(&query_states, &key_states, &cos, &sin, false)?;
-        let query_states = query_states.to_dtype(target_dtype)?;
-        let key_states = key_states.to_dtype(target_dtype)?;
+        let query_states = query_states.to_dtype(target_dtype)?.contiguous()?;
+        let key_states = key_states.to_dtype(target_dtype)?.contiguous()?;
 
         // 2. [BLOCK-PIPELINE-ALLOCATION] Append or Create New
         let mut tokens_to_process = q_len;
@@ -711,7 +711,8 @@ impl QuantizedQwenVLTextAttention {
         let mut m_n: Option<Tensor> = None;
         let mut l_n: Option<Tensor> = None;
         
-        let q_aligned = query_states.to_dtype(target_dtype)?;
+        // 🌟 [CRITICAL FIX] 여기서도 연속성을 보장하여 행렬 곱셈 시 데이터가 꼬이지 않도록 합니다.
+        let q_aligned = query_states.to_dtype(target_dtype)?.contiguous()?;
 
         for block in &self.kv_blocks {
             let (index, b_off, _b_len) = {
@@ -821,13 +822,12 @@ impl QuantizedQwenVLTextAttention {
                 v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
             }
 
-            // 🌟 [CRITICAL FIX] transpose(2, 3)을 수행하기 "전"에만 contiguous()를 보장하고, 
-            // 축이 뒤집힌 k_t 에는 절대 contiguous()를 씌우지 않습니다! (메모리 쓰레기값 변질 방어)
             k = k.contiguous()?;
             v = v.contiguous()?;
 
             let actual_kv_len = k.dim(2)?;
-            let k_t = k.transpose(2, 3)?; // 👈 여기서 .contiguous()? 를 삭제했습니다!
+            // 🌟 [CRITICAL FIX 3] 이전에 속도를 위해 뺐었지만, ROCm 환경에서 안전성을 위해 다시 부활시킵니다.
+            let k_t = k.transpose(2, 3)?.contiguous()?; 
             
             let mut s_chunk = (q_aligned.matmul(&k_t)? * self.scaling)?;
 
@@ -1126,6 +1126,10 @@ impl QuantizedQwenVLTextAttention {
                                     inner.location = KVLocation::VRAM; // RAM을 건너뛰고 VRAM 상주 확정!
                                     reg[b_idx].location[self.layer_idx] = KVLocation::VRAM;
                                     reg[b_idx].ssd_path = Some(file_path.parent().unwrap().to_path_buf());
+                                    // 🌟 [CRITICAL FIX 2] 여기서도 중복 저장 스팸을 막아 파일 락(Lock) 에러를 방지합니다!
+                                    if self.layer_idx < reg[b_idx].is_dirty.len() {
+                                        reg[b_idx].is_dirty[self.layer_idx] = false;
+                                    }
                                 }
                             }
                         }
@@ -1361,6 +1365,11 @@ impl QuantizedQwenVLTextAttention {
             if i < reg.len() {
                 reg[i].location[self.layer_idx] = KVLocation::SSD;
                 reg[i].ssd_path = Some(frag_path.clone()); 
+                // 🌟 [CRITICAL FIX 1] 로드된 블록은 디스크에 이미 존재하므로, 중복 저장을 막기 위해 dirty 플래그를 꺼줍니다!
+                // 이 3줄이 없으면 10GB의 텐서를 매번 무한대로 다시 구워버리며 시스템을 다운시킵니다.
+                if self.layer_idx < reg[i].is_dirty.len() {
+                    reg[i].is_dirty[self.layer_idx] = false;
+                }
             }
         }
 
@@ -1997,9 +2006,9 @@ impl QuantizedQwenVLTextModel {
                 }
             }
 
-            let xs_chunk = xs.narrow(1, i, take)?;
-            let cos_chunk = cos.narrow(cos.rank().saturating_sub(2), i, take)?;
-            let sin_chunk = sin.narrow(sin.rank().saturating_sub(2), i, take)?;
+            let xs_chunk = xs.narrow(1, i, take)?.contiguous()?;
+            let cos_chunk = cos.narrow(cos.rank().saturating_sub(2), i, take)?.contiguous()?;
+            let sin_chunk = sin.narrow(sin.rank().saturating_sub(2), i, take)?.contiguous()?;
             
             let out = self.layers[layer_idx].forward(&xs_chunk, &cos_chunk, &sin_chunk, None, seqlen_offset + i, session_id.clone(), kv_name.clone(), baking_only)?;
             
@@ -2385,9 +2394,12 @@ impl QuantizedQwenVLTextModel {
         }
 
         // ====================================================================
-        // 🐌 [프리필 안정성 패스] 🐌 (레이어 바이 레이어 핑퐁 로드)
+        // 🛡️ [절대 방어 핑퐁 패스] 🛡️ (프리필 & 디코딩 공통)
         // ====================================================================
-        let attention_mask = Some(prepare_causal_attention_mask(b_size, seq_len, 0, &target_device)?.to_dtype(target_dtype)?);
+        // 🌟 [CRITICAL FIX 1] 환각(외계어)의 가장 큰 원인입니다!
+        // 억지로 만든 마스크가 과거 기억(10,000 토큰)을 블라인드 처리해버렸습니다.
+        // 어텐션 내부에 완벽한 동적 마스크 생성기가 이미 존재하므로, 여기서는 무조건 None을 던져야 합니다!
+        let attention_mask: Option<Tensor> = None;
 
         let mut next_layer_task = None;
         let mut ping_pong_carrier = QuantizedQwenVLTextDecoderLayer::new_skeleton(
@@ -2907,11 +2919,18 @@ impl QuantizedQwenVLModel {
         }
         
         let position_ids = if seqlen_offset == 0 || self.rope_deltas_cpu.is_none() { 
-            // 🌟 [CRITICAL FIX] 함수가 반환하는 3개의 값(Tensor, Tensor, Vec)을 모두 받습니다!
             let (p_ids, deltas_tensor, deltas_cpu) = self.get_rope_index(&input_ids, image_grid_thw, video_grid_thw, None)?; 
             self.rope_deltas = Some(deltas_tensor);
-            self.rope_deltas_cpu = Some(deltas_cpu); // CPU 배열 직접 할당
-            p_ids
+            self.rope_deltas_cpu = Some(deltas_cpu); 
+            
+            // 🌟 [CRITICAL FIX] Partial Prefill 시 157개짜리 텐서의 시작 인덱스를 강제로 0에서 10679로 밀어줍니다!
+            // 이렇게 해야 SSD에서 불러온 과거 기억과 새로 계산하는 기억의 문맥 위치가 어긋나지 않습니다.
+            if seqlen_offset > 0 {
+                let shift = Tensor::new(seqlen_offset as u32, input_ids.device())?.reshape((1, 1, 1))?;
+                p_ids.broadcast_add(&shift)?
+            } else {
+                p_ids
+            }
         } else {
             let deltas_cpu = self.rope_deltas_cpu.as_ref().unwrap();
             let mut p_ids_vec = Vec::with_capacity(b_sz);
