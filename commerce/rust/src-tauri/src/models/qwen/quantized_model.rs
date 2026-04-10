@@ -464,10 +464,11 @@ impl QuantizedQwenVLTextAttention {
         self.q_norm.clear();
         self.k_norm.clear();
         
-        // VRAM 병합 캐시도 삭제
-        // self.vram_merged_k = None;
-        // self.vram_merged_v = None;
-        // self.merged_vram_block_count = 0;
+        // 🌟 [수압 조절 완결] 이제 핑퐁 대기열을 확실하게 타므로, 이전 레이어의 찌꺼기 캐시가 
+        // 다음 레이어 연산 시 VRAM을 차지하지 못하도록 확실하게 파괴(None)해 줍니다!
+        self.vram_merged_k = None;
+        self.vram_merged_v = None;
+        self.merged_vram_block_count = 0;
     }
 
     pub fn new<R: std::io::Seek + std::io::Read>(
@@ -705,127 +706,7 @@ impl QuantizedQwenVLTextAttention {
         // 🚀 [최적화 2] 0.6B 디코딩 초고속 가속 (No-Cat Fast-Path)
         // =========================================================================
         let is_decoding = q_len == 1;
-        if is_decoding {
-            let valid_blocks: Vec<_> = self.kv_blocks.iter().filter(|b| b.inner.read().unwrap().offset < total_tokens_now).collect();
-            // 🌟 [CRITICAL FIX] VRAM 뿐만 아니라 RAM에 캐싱된 블록도 Fast-Path를 타도록 허용!
-            let all_ready = valid_blocks.iter().all(|b| {
-                let loc = b.inner.read().unwrap().location;
-                loc == KVLocation::VRAM || loc == KVLocation::RAM
-            });
-            
-            if all_ready && !valid_blocks.is_empty() {
-                let num_valid = valid_blocks.len();
-                let num_full_blocks = num_valid.saturating_sub(1);
-                
-                if num_full_blocks > 0 {
-                    if self.vram_merged_k.is_none() || self.merged_vram_block_count != num_full_blocks {
-                        let mut k_list = Vec::with_capacity(num_full_blocks);
-                        let mut v_list = Vec::with_capacity(num_full_blocks);
-                        for block in valid_blocks.iter().take(num_full_blocks) {
-                            let inner = block.inner.read().unwrap();
-                            // 🌟 [CRITICAL FIX] RAM에 있는 캐시라면 GPU로 퍼올려서 통짜 캐시(vram_merged)에 병합합니다!
-                            let k = inner.k_cache.as_ref().unwrap().to_device(dev)?.to_dtype(target_dtype)?;
-                            let v = inner.v_cache.as_ref().unwrap().to_device(dev)?.to_dtype(target_dtype)?;
-                            k_list.push(k);
-                            v_list.push(v);
-                        }
-                        let mut k_cat = Tensor::cat(&k_list, 2)?;
-                        let mut v_cat = Tensor::cat(&v_list, 2)?;
-                        
-                        if self.num_kv_groups > 1 {
-                            let (b, h, s, d) = k_cat.dims4()?;
-                            k_cat = k_cat.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                            v_cat = v_cat.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                        }
-                        
-                        self.vram_merged_k = Some(k_cat.contiguous()?);
-                        self.vram_merged_v = Some(v_cat.contiguous()?);
-                        self.merged_vram_block_count = num_full_blocks;
-                    }
-                } else {
-                    self.vram_merged_k = None;
-                    self.vram_merged_v = None;
-                    self.merged_vram_block_count = 0;
-                }
-
-                // [CRITICAL FIX] q_aligned에만 1번 contiguous를 주고, 이후로는 절대 쓰지 않습니다!
-                let q_aligned = (query_states * self.scaling)?.contiguous()?;
-                
-                let mut out_res: Option<Tensor> = None;
-                let mut m_n: Option<Tensor> = None;
-                let mut l_n: Option<Tensor> = None;
-
-                if let (Some(k_merged), Some(v_merged)) = (&self.vram_merged_k, &self.vram_merged_v) {
-                    // 🌟 [최적화 2-B] transpose 후 contiguous() 완전 삭제! 메모리 재할당/누수가 원천 차단됩니다.
-                    let k_t = k_merged.transpose(2, 3)?;
-                    let attn_weights = q_aligned.matmul(&k_t)?;
-                    
-                    let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
-                    let m_j = attn_weights_f32.max_keepdim(D::Minus1)?;
-                    let p_j = attn_weights_f32.broadcast_sub(&m_j)?.exp()?;
-                    let l_j = p_j.sum_keepdim(D::Minus1)?;
-                    
-                    // 🌟 [최적화 2-C] V 캐시도 contiguous 없이 즉시 곱셈 수행
-                    let v_m = v_merged;
-                    let out_j = p_j.to_dtype(v_m.dtype())?.matmul(v_m)?;
-                    
-                    out_res = Some(out_j.to_dtype(DType::F32)?);
-                    m_n = Some(m_j);
-                    l_n = Some(l_j);
-                }
-
-                let last_block = valid_blocks.last().unwrap();
-                let inner = last_block.inner.read().unwrap();
-                let mut k_last = inner.k_cache.as_ref().unwrap().clone();
-                let mut v_last = inner.v_cache.as_ref().unwrap().clone();
-                
-                if self.num_kv_groups > 1 {
-                    let (b, h, s, d) = k_last.dims4()?;
-                    k_last = k_last.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                    v_last = v_last.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                }
-                
-                // 🌟 [최적화 2-D] 마지막 블록도 동일하게 적용
-                let k_t = k_last.transpose(2, 3)?;
-                let attn_weights = q_aligned.matmul(&k_t)?;
-                
-                let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
-                let m_j = attn_weights_f32.max_keepdim(D::Minus1)?;
-                let p_j = attn_weights_f32.broadcast_sub(&m_j)?.exp()?;
-                let l_j = p_j.sum_keepdim(D::Minus1)?;
-                let v_m = &v_last;
-                let out_j_f32 = p_j.to_dtype(v_m.dtype())?.matmul(v_m)?.to_dtype(DType::F32)?;
-
-                match out_res {
-                    None => {
-                        out_res = Some(out_j_f32);
-                        l_n = Some(l_j);
-                    }
-                    Some(prev_out_f32) => {
-                        let prev_m = m_n.unwrap();
-                        let prev_l = l_n.unwrap();
-                        
-                        let m_new = prev_m.maximum(&m_j)?;
-                        let diff_old = prev_m.broadcast_sub(&m_new)?.exp()?;
-                        let diff_new = m_j.broadcast_sub(&m_new)?.exp()?;
-                        
-                        let l_new = prev_l.broadcast_mul(&diff_old)?.add(&l_j.broadcast_mul(&diff_new)?)?;
-                        let out_new_f32 = prev_out_f32.broadcast_mul(&diff_old)?.add(&out_j_f32.broadcast_mul(&diff_new)?)?;
-                        
-                        out_res = Some(out_new_f32);
-                        l_n = Some(l_new);
-                    }
-                }
-
-                let attn_output = out_res.unwrap().broadcast_div(&l_n.unwrap())?.to_dtype(target_dtype)?;
-                // 최종 결과만 깔끔하게 정돈하여 내보냅니다.
-                let attn_output = attn_output.transpose(1, 2)?.contiguous()?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?.contiguous()?;
-                
-                return Ok(self.o_proj.forward(&attn_output)?.to_dtype(target_dtype)?);
-            }
-        }
-        // =========================================================================
-
+        
         let mut out_res: Option<Tensor> = None;
         let mut m_n: Option<Tensor> = None;
         let mut l_n: Option<Tensor> = None;
@@ -940,9 +821,15 @@ impl QuantizedQwenVLTextAttention {
                 v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
             }
 
-            let actual_kv_len = k.dim(2)?;
+            // 🌟 [CRITICAL FIX] transpose(2, 3)을 수행하기 "전"에만 contiguous()를 보장하고, 
+            // 축이 뒤집힌 k_t 에는 절대 contiguous()를 씌우지 않습니다! (메모리 쓰레기값 변질 방어)
+            k = k.contiguous()?;
+            v = v.contiguous()?;
 
-            let mut s_chunk = (q_aligned.matmul(&k.transpose(2, 3)?)? * self.scaling)?;
+            let actual_kv_len = k.dim(2)?;
+            let k_t = k.transpose(2, 3)?; // 👈 여기서 .contiguous()? 를 삭제했습니다!
+            
+            let mut s_chunk = (q_aligned.matmul(&k_t)? * self.scaling)?;
 
             if let Some(mask) = &attention_mask {
                 let mask_len = mask.dim(candle_core::D::Minus1)?;
@@ -1555,14 +1442,12 @@ impl QuantizedQwenVLTextDecoderLayer {
         };
         self_attn.clear(); 
 
-        let (mlp_gate, mlp_up, mlp_down, post_attention_layernorm) = if !baking_only {
-            (
-                Some(QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone())),
-                Some(QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone())),
-                Some(QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone())),
-                Some(RmsNorm::new(zero_t.clone(), config.rms_norm_eps))
-            )
-        } else { (None, None, None, None) };
+        let (mlp_gate, mlp_up, mlp_down, post_attention_layernorm) = (
+            Some(QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone())),
+            Some(QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone())),
+            Some(QLinear::new(QMatMul::Tensor(zero_t.clone()), None, device.clone())),
+            Some(RmsNorm::new(zero_t.clone(), config.rms_norm_eps))
+        );
 
         let input_layernorm = RmsNorm::new(zero_t, config.rms_norm_eps);
 
@@ -1609,15 +1494,11 @@ impl QuantizedQwenVLTextDecoderLayer {
 
         let self_attn = QuantizedQwenVLTextAttention::new(config, ct, reader, &attn_base, is_gguf_naming, device, dtype, layer_idx, registry)?;
         
-        let (mlp_gate, mlp_up, mlp_down, post_attention_layernorm) = if !baking_only {
-            let mg = Some(get_qlinear(ct, reader, &format!("{base_name}.{gate}"), device, dtype)?);
-            let mu = Some(get_qlinear(ct, reader, &format!("{base_name}.{up}"), device, dtype)?);
-            let md = Some(get_qlinear(ct, reader, &format!("{base_name}.{down}"), device, dtype)?);
-            let pln = Some(get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype)?);
-            (mg, mu, md, pln)
-        } else {
-            (None, None, None, None)
-        };
+        let mg = Some(get_qlinear(ct, reader, &format!("{base_name}.{gate}"), device, dtype)?);
+        let mu = Some(get_qlinear(ct, reader, &format!("{base_name}.{up}"), device, dtype)?);
+        let md = Some(get_qlinear(ct, reader, &format!("{base_name}.{down}"), device, dtype)?);
+        let pln = Some(get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype)?);
+        let (mlp_gate, mlp_up, mlp_down, post_attention_layernorm) = (mg, mu, md, pln);
 
         let input_layernorm = get_rms_norm(ct, reader, &format!("{base_name}.{in_ln}"), config.rms_norm_eps, device, dtype)?;
 
@@ -1649,12 +1530,11 @@ impl QuantizedQwenVLTextDecoderLayer {
 
         self.self_attn.load_weights_inplace(ct, reader, &attn_base, is_gguf_naming, device, dtype)?;
 
-        if !baking_only {
-            self.mlp_gate = Some(get_qlinear(ct, reader, &format!("{base_name}.{gate}"), device, dtype)?);
-            self.mlp_up = Some(get_qlinear(ct, reader, &format!("{base_name}.{up}"), device, dtype)?);
-            self.mlp_down = Some(get_qlinear(ct, reader, &format!("{base_name}.{down}"), device, dtype)?);
-            self.post_attention_layernorm = Some(get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), self.input_layernorm.eps(), device, dtype)?);
-        }
+        // 🌟 [CRITICAL FIX] if !baking_only 껍데기 삭제!
+        self.mlp_gate = Some(get_qlinear(ct, reader, &format!("{base_name}.{gate}"), device, dtype)?);
+        self.mlp_up = Some(get_qlinear(ct, reader, &format!("{base_name}.{up}"), device, dtype)?);
+        self.mlp_down = Some(get_qlinear(ct, reader, &format!("{base_name}.{down}"), device, dtype)?);
+        self.post_attention_layernorm = Some(get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), self.input_layernorm.eps(), device, dtype)?);
 
         self.input_layernorm = get_rms_norm(ct, reader, &format!("{base_name}.{in_ln}"), self.input_layernorm.eps(), device, dtype)?;
 
@@ -2268,7 +2148,10 @@ impl QuantizedQwenVLTextModel {
         println!("[MEMORY-OPT] Layer {} Weights and Gradients cleared from RAM/VRAM.", layer_idx);
 
         if let Some(sid) = session_id {
-            if !self.baking_only {
+            // 🌟 [CRITICAL FIX] 프리필(Prefill) 단계(토큰이 2개 이상일 때)에서만 VRAM 전체 캐시를 디스크로 밀어냅니다!
+            // 디코딩(1토큰 생성) 단계에서 이 코드가 실행되면, AI의 이전 기억이 매 토큰마다 강제 삭제되어 
+            // 텅 빈 0.0 텐서만 남게 되고, 이로 인해 외계어를 내뱉는 "기억상실증(환각)"이 발생합니다.
+            if current_seq_len > 1 {
                 let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, current_seq_len).await;
             }
         }
@@ -2502,55 +2385,6 @@ impl QuantizedQwenVLTextModel {
         }
 
         // ====================================================================
-        // 🚀 [디코딩 초고속 패스] 🚀 (전체 레이어를 한 번에 관통)
-        // ====================================================================
-        if is_decoding {
-            // 🌟 [OOM 완벽 차단] 시작 전에 전체 VRAM을 통째로 점유하던 self.reload_all_layers()?; 삭제!
-
-            for layer_idx in 0..total_layers {
-                if layer_idx % 7 == 0 || layer_idx == total_layers - 1 {
-                    print!("\r[ENGINE] Running Layer {}/{} (Decoding Fast-Path)    ", layer_idx + 1, total_layers);
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
-                }
-
-                // 🌟 Mmap JIT Load (핑퐁 대기열 진입)
-                if self.layers[layer_idx].self_attn.q_proj.is_cleared() {
-                    self.reload_layer(layer_idx)?;
-                }
-
-                if self.is_forced_cpu || !self.layers[layer_idx].device().same_device(&target_device) {
-                    self.layers[layer_idx].to_device(&target_device)?;
-                }
-
-                xs = self.layers[layer_idx].forward(
-                    &xs, &cos, &sin, None, seqlen_offset, session_id.clone(), kv_name.clone(), false
-                )?;
-
-                // 🌟 [수압 조절 완결] 연산이 끝난 가중치는 VRAM에서 즉시 파괴하여 메모리 수압을 0으로 만듭니다! 
-                // Mmap(OS 캐시)을 활용하므로 다음 토큰 때 읽어오는 속도는 1ms도 걸리지 않습니다.
-                if !self.is_forced_cpu {
-                    self.layers[layer_idx].clear();
-                }
-
-                if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
-                    if layer_idx < deepstack_embeds.len() {
-                        xs = mask_index_add(
-                            &xs.squeeze(0)?,
-                            &visual_pos_masks.as_ref().unwrap().squeeze(0)?,
-                            &deepstack_embeds[layer_idx],
-                        )?.unsqueeze(0)?;
-                    }
-                }
-            }
-            
-            self.current_kv_len = seqlen_offset + seq_len;
-            let norm_dev = self.norm.weight().device();
-            if !xs.device().same_device(norm_dev) { xs = xs.to_device(norm_dev)?; }
-            return Ok(xs.apply(&self.norm)?);
-        }
-
-        // ====================================================================
         // 🐌 [프리필 안정성 패스] 🐌 (레이어 바이 레이어 핑퐁 로드)
         // ====================================================================
         let attention_mask = Some(prepare_causal_attention_mask(b_size, seq_len, 0, &target_device)?.to_dtype(target_dtype)?);
@@ -2567,7 +2401,9 @@ impl QuantizedQwenVLTextModel {
 
         for layer_idx in 0..total_layers {
             if layer_idx % 7 == 0 || layer_idx == total_layers - 1 {
-                println!("[ENGINE] Running Layer {}/{} (Ping-Pong Prefill Active)", layer_idx + 1, total_layers);
+                // 🌟 프리필인지 디코딩인지 정확히 표시해 줍니다.
+                let phase = if !is_decoding { "Prefill" } else { "Decode" };
+                println!("[ENGINE] Running Layer {}/{} (Ping-Pong {} Active)", layer_idx + 1, total_layers, phase);
             }
 
             if layer_idx + 1 < total_layers {
@@ -2856,9 +2692,7 @@ impl QuantizedQwenVLModel {
         };
 
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
-        
-        // 🌟 [CRITICAL FIX] Baking 시에도 28개 레이어 전체의 KV 캐시를 구워야 하므로 1로 깎는 코드를 삭제합니다!
-
+        // 🌟 [삭제 완료]
         let language_model = QuantizedQwenVLTextModel::new_with_mmap(
             &t_config, ct_main.clone(), main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
         )?;
@@ -3163,9 +2997,7 @@ impl QuantizedQwenTextModel {
     ) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
-        
-        // 🌟 [CRITICAL FIX] 여기서도 1개로 깎아버리는 로직을 완전히 없앱니다!
-
+        // 🌟 [삭제 완료]
         let language_model = QuantizedQwenVLTextModel::new_with_mmap(
             &t_config, ct_main.clone(), mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
         )?;
@@ -3193,9 +3025,7 @@ impl QuantizedQwenTextModel {
     ) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
-
-        // 🌟 [CRITICAL FIX] 삭제 완료!
-
+        // 🌟 [삭제 완료]
         let language_model = QuantizedQwenVLTextModel::new(
             &t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only
         )?;
@@ -3253,6 +3083,10 @@ impl QuantizedQwenTextModel {
                     final_hidden_state = Some(outputs.narrow(1, s_len - 1, 1)?.contiguous()?);
                 }
                 
+                if let Some(sid) = &session_id {
+                    let _ = self.language_model.force_flush_all_active_blocks(sid, kv_name.as_deref()).await;
+                }
+
                 processed += take;
                 current_offset += take;
                 

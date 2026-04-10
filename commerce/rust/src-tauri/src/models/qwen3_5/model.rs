@@ -880,127 +880,8 @@ impl Qwen3_5Attention {
 
         let total_tokens_now = seqlen_offset + q_len;
 
-        let is_decoding = q_len == 1;
-        if is_decoding {
-            let valid_blocks: Vec<_> = self.kv_blocks.iter().filter(|b| b.inner.read().unwrap().offset < total_tokens_now).collect();
-            // 🌟 [CRITICAL FIX] RAM 허용
-            let all_ready = valid_blocks.iter().all(|b| {
-                let loc = b.inner.read().unwrap().location;
-                loc == KVLocation::VRAM || loc == KVLocation::RAM
-            });
-            
-            if all_ready && !valid_blocks.is_empty() {
-                let num_valid = valid_blocks.len();
-                let num_full_blocks = num_valid.saturating_sub(1);
-                
-                if num_full_blocks > 0 {
-                    if self.vram_merged_k.is_none() || self.merged_vram_block_count != num_full_blocks {
-                        let mut k_list = Vec::with_capacity(num_full_blocks);
-                        let mut v_list = Vec::with_capacity(num_full_blocks);
-                        for block in valid_blocks.iter().take(num_full_blocks) {
-                            let inner = block.inner.read().unwrap();
-                            let k = inner.k_cache.as_ref().unwrap().to_device(dev)?.to_dtype(target_dtype)?;
-                            let v = inner.v_cache.as_ref().unwrap().to_device(dev)?.to_dtype(target_dtype)?;
-                            k_list.push(k);
-                            v_list.push(v);
-                        }
-                        let k_cat = Tensor::cat(&k_list, 2)?.contiguous()?;
-                        let v_cat = Tensor::cat(&v_list, 2)?.contiguous()?;
-                        
-                        self.vram_merged_k = Some(k_cat);
-                        self.vram_merged_v = Some(v_cat);
-                        self.merged_vram_block_count = num_full_blocks;
-                    }
-                } else {
-                    self.vram_merged_k = None;
-                    self.vram_merged_v = None;
-                    self.merged_vram_block_count = 0;
-                }
-
-                let q_aligned = (query_states * self.scaling)?.contiguous()?;
-                
-                let mut out_res: Option<Tensor> = None;
-                let mut m_n: Option<Tensor> = None;
-                let mut l_n: Option<Tensor> = None;
-
-                if let (Some(k_merged), Some(v_merged)) = (&self.vram_merged_k, &self.vram_merged_v) {
-                    let mut k_m = k_merged.clone();
-                    let mut v_m = v_merged.clone();
-                    
-                    // 🌟 [VRAM 수압 조절 2] 연산 시에만 확장
-                    if self.num_kv_groups > 1 {
-                        let (b, h, s, d) = k_m.dims4()?;
-                        k_m = k_m.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                        v_m = v_m.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                    }
-                    
-                    let k_t = k_m.transpose(2, 3)?; 
-                    let attn_weights = q_aligned.matmul(&k_t)?;
-                    
-                    let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
-                    let m_j = attn_weights_f32.max_keepdim(D::Minus1)?;
-                    let p_j = attn_weights_f32.broadcast_sub(&m_j)?.exp()?;
-                    let l_j = p_j.sum_keepdim(D::Minus1)?;
-                    
-                    let out_j = p_j.to_dtype(v_m.dtype())?.matmul(&v_m)?;
-                    
-                    out_res = Some(out_j.to_dtype(DType::F32)?);
-                    m_n = Some(m_j);
-                    l_n = Some(l_j);
-                }
-
-                let last_block = valid_blocks.last().unwrap();
-                let inner = last_block.inner.read().unwrap();
-                let mut k_last = inner.k_cache.as_ref().unwrap().clone();
-                let mut v_last = inner.v_cache.as_ref().unwrap().clone();
-                
-                if self.num_kv_groups > 1 {
-                    let (b, h, s, d) = k_last.dims4()?;
-                    k_last = k_last.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                    v_last = v_last.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                }
-                
-                let k_t = k_last.transpose(2, 3)?;
-                let attn_weights = q_aligned.matmul(&k_t)?;
-                
-                let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
-                let m_j = attn_weights_f32.max_keepdim(D::Minus1)?;
-                let p_j = attn_weights_f32.broadcast_sub(&m_j)?.exp()?;
-                let l_j = p_j.sum_keepdim(D::Minus1)?;
-                let v_m = &v_last;
-                let out_j_f32 = p_j.to_dtype(v_m.dtype())?.matmul(v_m)?.to_dtype(DType::F32)?;
-
-                match out_res {
-                    None => {
-                        out_res = Some(out_j_f32);
-                        l_n = Some(l_j);
-                    }
-                    Some(prev_out_f32) => {
-                        let prev_m = m_n.unwrap();
-                        let prev_l = l_n.unwrap();
-                        
-                        let m_new = prev_m.maximum(&m_j)?;
-                        let diff_old = prev_m.broadcast_sub(&m_new)?.exp()?;
-                        let diff_new = m_j.broadcast_sub(&m_new)?.exp()?;
-                        
-                        let l_new = prev_l.broadcast_mul(&diff_old)?.add(&l_j.broadcast_mul(&diff_new)?)?;
-                        let out_new_f32 = prev_out_f32.broadcast_mul(&diff_old)?.add(&out_j_f32.broadcast_mul(&diff_new)?)?;
-                        
-                        out_res = Some(out_new_f32);
-                        l_n = Some(l_new);
-                    }
-                }
-
-                let attn_output = out_res.unwrap().broadcast_div(&l_n.unwrap())?.to_dtype(target_dtype)?;
-                let attn_output = attn_output.transpose(1, 2)?.contiguous()?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?.contiguous()?;
-                
-                // 🌟 환각 방지용 Gate 필터 
-                let gate_final = candle_nn::ops::sigmoid(&gate.to_dtype(target_dtype)?)?.to_dtype(target_dtype)?; 
-                let attn_output = attn_output.mul(&gate_final)?;
-                
-                return Ok(self.o_proj.forward(&attn_output)?.to_dtype(target_dtype)?);
-            }
-        }
+        // 🌟 [수압 조절 완결] 3.5 모델에서도 VRAM을 터뜨리던 통짜 병합(Fast-Path) 블록을 완전히 날려버렸습니다!
+        // 이제 0.6B처럼 무조건 청크 단위 Online Softmax 로직을 타게 되어 수압이 0으로 방어됩니다.
 
         let mut out_res: Option<Tensor> = None;
         let mut m_n: Option<Tensor> = None;
@@ -1256,6 +1137,11 @@ impl Qwen3_5Attention {
         self.o_proj = dummy;
         self.q_norm.clear();
         self.k_norm.clear();
+        
+        // 🌟 [수압 조절 완결] 3.5 모델도 핑퐁 교체 시 1회용 도마를 무조건 파괴하여 VRAM을 0으로 리셋합니다!
+        self.vram_merged_k = None;
+        self.vram_merged_v = None;
+        self.merged_vram_block_count = 0;
     }
 
     pub fn load_weights_inplace<R: std::io::Read + std::io::Seek>(&mut self, ct: &candle_core::quantized::gguf_file::Content, reader: &mut R, prefix: &str, device: &Device) -> Result<()> {
@@ -1988,6 +1874,9 @@ impl Qwen3_5TextModel {
                             }
                         }
 
+                        // 🌟 [CRITICAL FIX 2] 과거의 치명적 오판을 바로잡습니다!
+                        // 여기서 VRAM을 파괴하지 않으면 15,000 토큰에서 VRAM이 무조건 터집니다.
+                        // 1024개로 꽉 차서 복사본을 보낸 블록은 즉시 VRAM에서 파괴(None)하여 수압을 0으로 리셋합니다!
                         inner.k_cache = None;
                         inner.v_cache = None;
                         inner.location = crate::models::qwen::quantized_model::KVLocation::SSD;
@@ -2392,7 +2281,11 @@ impl Qwen3_5Model {
                     // 🌟 [크래시 방어] narrow로 잘라낸 텐서를 즉시 연속된 메모리로 묶습니다!
                     final_hidden_state = Some(outputs.narrow(1, seq_len - 1, 1)?.contiguous()?);
                 }
-                
+
+                if let Some(sid) = &session_id {
+                    let _ = self.language_model.force_flush_all_active_blocks(sid, kv_name.as_deref()).await;
+                }
+
                 processed += take;
                 current_offset += take;
                 
