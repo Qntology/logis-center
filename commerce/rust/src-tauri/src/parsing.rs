@@ -562,7 +562,7 @@ additional_goods:[
         value:URL includes a manage path, an administrative or edit route product Link | string,
     }
 ],
-title:goods name | string,
+title:product name | string,
 registration_date:yyyy-MM-ddThh:mm:ss | string,"###.replace("{HREF}", href),
         "order" => r###"node:order form container CSS selector,
 link : '{HREF}',
