@@ -723,8 +723,7 @@ async fn process_task(
 
             let mut titles = Vec::new();
             {
-                // 🌟 None 넘기기
-                model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![
@@ -737,17 +736,26 @@ async fn process_task(
                             name: None,
                         })
                     ],
-                    model: "qwen3.5".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.01),
+                    model: "qwen".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.01),
                     ..Default::default()
                 };
 
-                if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-                    println!("[JS-BRIDGE] 1. Requesting titles from LLM...");
-                    // 🌟 generate_part 로 교체 및 base_session_id_35 넘기기
-                    let res = gen.generate_part(&params, false, 0, None, Some(snapshot_id.clone()), kv_name.clone()).await?;
-                    println!("[JS-BRIDGE] LLM Raw Response: '{}'", res.text);
+                if let Some(gen) = model.generator.lock().await.as_mut() {
+                    println!("[JS-BRIDGE] 1. Requesting titles from LLM (0.6B)...");
+                    
+                    // 0.6B 모델은 generate_part가 아닌 표준 `generate`를 사용하며, 
+                    // 반환값도 구조체가 아닌 단순 String(res) 입니다.
+                    let res = gen.generate(
+                        params, 
+                        Some(cancellation_token.clone()), 
+                        Some(snapshot_id.clone()), 
+                        kv_name.clone()
+                    ).await?;
+                    
+                    println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
 
-                    let title_info = parsing::parse_json_from_llm(&res.text);
+                    // res.text 가 아닌 res 를 그대로 파싱
+                    let title_info = parsing::parse_json_from_llm(&res);
                     let items_opt = title_info.get("order")
                         .or(title_info.get("goods"))
                         .or(title_info.get("items"))
@@ -1038,7 +1046,9 @@ async fn process_task(
         };
 
         if !pug_list.is_empty() {
-            model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, Some(&base_session_id), Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+            // 🌟 [CRITICAL FIX 2] 리스트 추출은 짧은 item_pug 조각만 독립적으로 읽으므로, 
+            // 무겁고 호환되지 않는 Base 스냅샷 로딩을 원천 차단합니다.
+            model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
             for (idx, item_pug) in pug_list.iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -1130,8 +1140,8 @@ async fn process_task(
 
             // 1. [Large] Load & Generate (Direct Qwen3.5 0.8B-Layer Generation)
             {
-                // 🌟 None 넘기기
-                model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                // 🌟 [CRITICAL FIX 3] 디테일 모드에서도 0.6B Base 스냅샷 로드 시도를 완벽히 끊어버립니다. 
+                model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![
