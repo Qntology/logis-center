@@ -987,6 +987,10 @@ pub fn run() {
                     println!("[Setup] VectorStore initialized.");
                     let _ = s.init_task_table().await;
                     let _ = s.init_all_tables().await;
+                    
+                    // [CRITICAL] Clear zombie tasks synchronously before the store is made available to other commands
+                    let _ = s.cleanup_zombie_tasks().await;
+                    
                     *store_guard = Some(s);
                 }
             });

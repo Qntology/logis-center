@@ -397,40 +397,34 @@ Find all the {TYPE} titles from the following PUG/HTML content.
 [OUTPUT FORMAT]
 { "{TYPE}" : [ {"title" : String} ] }
 
-[ACTION] RETURN JSON ONLY.
 NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{TYPE}", page_type)
 }
 
 pub fn is_detail_prompt(page_type: &str) -> String {
     let template = r###"[TASK]
-Analyze the provided Pug HTML content from top to bottom. Determine if the main content represents a "Detail/Edit Form" (true) or a "List/Index Page" (false).
-
+Analyze the provided Pug HTML content from top to bottom. Determine if the main content represents a "{TYPE} Detail/{TYPE} Edit Form/{TYPE} Manage Form" (true) or a "{TYPE} List/Index Page/Home Page/Dashboard Page" (false).
 [ENTITY CONTEXT: {TYPE}]
 You are evaluating a page managing this specific domain entity. Use this context to conceptually understand the abstract structures:
 - Single Entity (Detail): A property configuration interface. It features a large overarching form dedicated to inputting or updating the specific attributes of ONE primary entity. (Minor sub-lists for options/variants do not make it a global list).
 - Collection (List): A catalog or inventory interface dedicated to displaying, filtering, or batch-processing multiple DIFFERENT primary entities.
 
 [FORCED DOCUMENT SCANNING LOGIC]
-Read the entire document. Look past global navigation menus and overarching search/filter forms at the top. Focus purely on the main data payload area and evaluate the following structural signatures:
-
-1. "is_multi_entity_grid": Does the main data area consist of a structural grid/table displaying multiple independent records? (Look for a header section followed by multiple repeating body blocks/rows representing different entities).
-2. "has_batch_processing_controls": Do the repeating blocks/rows contain identical selection mechanisms (like repeating checkboxes) specifically meant for selecting multiple distinct items for a bulk action?
-3. "has_dataset_navigation": Does the page contain dataset navigation controls (e.g., pagination links, "next/prev" buttons, or a dataset size selector like "X items per page") to navigate a large collection?
-
-If the main data payload is a multi-entity grid OR has dataset navigation, it is a List/Index page (`false`). If the main data payload is a massive property-value entry form for a single entity, it is a Detail Form (`true`).
+Read the entire document from top to bottom. You MUST evaluate the concluding elements at the very bottom of the main content area first.
+Look past global navigation menus and overarching search/filter forms at the top. Focus purely on the main data payload and abstract structural signatures:
+1. Does the page terminate with dataset navigation (pagination, "next/prev") or bulk-action execution elements?
+2. Does the main data area consist of a repeating multi-entity grid?
+3. Does the main data area contain an extensive configuration/input form (inputs, textareas, image uploads, save buttons) for a single entity?
 
 [SCHEMA DEFINITIONS]
-- is_multi_entity_grid: Boolean. True if the main data payload is a grid/list displaying multiple DIFFERENT primary entities.
-- has_batch_processing_controls: Boolean. True if the main grid rows have repeating selection inputs for bulk actions.
-- has_dataset_navigation: Boolean. True if there are pagination controls or overarching page-size selectors.
-- detail: Boolean. Output `false` if ANY of the three properties above are true. Output `true` ONLY if all three are false and the structure is a single-entity configuration form.
+- has_{TYPE}_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
+- has_{TYPE}_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
+- detail: Boolean. True ONLY if has_{TYPE}_list is false AND has_{TYPE}_form is true.
 
 [OUTPUT FORMAT]
 {
-  "is_multi_entity_grid": Boolean,
-  "has_batch_processing_controls": Boolean,
-  "has_dataset_navigation": Boolean,
+  "has_{TYPE}_list": Boolean,
+  "has_{TYPE}_form": Boolean,
   "detail": Boolean
 }
 

@@ -698,6 +698,55 @@ async fn process_task(
             println!("[Scheduler] Classified is_detail as: {}", is_detail);
         }
     }
+    // {
+    //     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+    //     println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Is Detail)");
+        
+    //     log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining if detail page...", "spinner": "⠋" }));
+
+    //     let detail_prompt = parsing::is_detail_prompt(&page_type);
+    //     // LLM이 지시사항을 잘 따르도록 래핑
+    //     let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think", detail_prompt);
+    //     let snapshot_id = format!("{}_step_a2_q35", task.id); // 🌟 ID 충돌 방지를 위해 q35 접미사 추가
+
+    //     // 🌟 [핵심 변경 2] 0.6B용 base_session_id와 호환되지 않으므로 None을 전달하여 프롬프트를 독립적으로 처리
+    //     model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+
+    //     let params = ChatCompletionParameters {
+    //         messages: vec![
+    //             ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+    //                 content: system_content.clone(),
+    //                 name: None,
+    //             }),
+    //             ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+    //                 content: ChatCompletionRequestUserMessageContent::Text(task_question),
+    //                 name: None,
+    //             })
+    //         ],
+    //         model: "qwen3.5".to_string(), // 🌟 [핵심 변경 3] 모델 파라미터명 변경
+    //         max_tokens: Some(64), // true/false만 대답하므로 짧게 설정
+    //         temperature: Some(0.0), top_p: Some(0.01),
+    //         ..Default::default()
+    //     };
+
+    //     // 🌟 [핵심 변경 4] generator 대신 qwen3_5_generator 사용
+    //     if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+    //         println!("[Scheduler] 0.8B (Qwen 3.5) Step A-2: Asking detail classification...");
+    //         let res = gen.generate(
+    //             params, 
+    //             Some(cancellation_token.clone()), 
+    //             Some(snapshot_id.clone()), 
+    //             kv_name.clone()
+    //         ).await?;
+    //         println!("[DEBUG-SCHED] Step A-2 Raw Response: '{}'", res);
+            
+    //         let detail_info = parsing::parse_json_from_llm(&res); 
+    //         is_detail = detail_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+    //         println!("[Scheduler] Classified is_detail as: {}", is_detail);
+    //     } else {
+    //         println!("[Scheduler] ERROR: Qwen 3.5 generator is missing!");
+    //     }
+    // }
                         
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -736,7 +785,7 @@ async fn process_task(
                             name: None,
                         })
                     ],
-                    model: "qwen".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.01),
+                    model: "qwen".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
                     ..Default::default()
                 };
 

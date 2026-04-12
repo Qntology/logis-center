@@ -309,10 +309,32 @@ impl VectorStore {
     }
 
     pub async fn cleanup_zombie_tasks(&self) -> Result<()> {
-        let table = self.conn.open_table("tasks").execute().await?;
-        // 앱 시작 시 '진행 중(1)' 또는 '대기 중(10)' 상태인 모든 작업을 삭제하여 좀비 방지
-        table.delete("status = 1 OR status = 10").await?;
-        println!("[Store] All zombie tasks cleared on startup.");
+        let tasks_table = self.conn.open_table("tasks").execute().await?;
+        let talks_table = self.conn.open_table("talks").execute().await?;
+        
+        // 1. '진행 중(1)' 또는 '대기 중(10)'인 모든 작업의 ID를 가져옵니다.
+        let results = tasks_table.query()
+            .only_if("status = 1 OR status = 10")
+            .execute().await?
+            .try_collect::<Vec<_>>().await?;
+            
+        for batch in results {
+            let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..batch.num_rows() {
+                let task_id = ids.value(i);
+                // 2. 해당 작업과 연결된 채팅 메시지의 상태를 '중단됨(2)'으로 업데이트합니다.
+                let _ = talks_table.update()
+                    .only_if(format!("task_id = '{}'", task_id))
+                    .column("status", "2") // 2: STOPPED
+                    .execute()
+                    .await;
+            }
+        }
+
+        // 3. 이제 tasks 테이블에서 해당 작업들을 삭제합니다.
+        tasks_table.delete("status = 1 OR status = 10").await?;
+        
+        println!("[Store] All zombie tasks cleared and marked as STOPPED on startup.");
         Ok(())
     }
 

@@ -609,12 +609,6 @@ async function renderNavigation() {
             // 3. Render
             pageList.innerHTML = await renderAccordion(tree);
 
-            // [FIX] Navigation rendered, stop spinner if it was the first time
-            if (isFirstNavRender) {
-                isFirstNavRender = false;
-                stopSpinner();
-            }
-
             // 4. Bind Clicks manually to labels
             pageList.querySelectorAll(".logis-label").forEach((label: any) => {
                 label.onclick = (e: Event) => {
@@ -642,7 +636,15 @@ async function renderNavigation() {
             userList.innerHTML = await renderAccordion(teamNodes);
         }
 
-    } catch (e) { console.error("Nav render error:", e); }
+    } catch (e) { 
+        console.error("Nav render error:", e); 
+    } finally {
+        // [FIX] Navigation rendered (or failed), stop spinner if it was the first time
+        if (isFirstNavRender) {
+            isFirstNavRender = false;
+            stopSpinner();
+        }
+    }
 }
 
 // --- Sync Logic ---
@@ -1511,11 +1513,11 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
     }
 
     if (isLoading || (!reset && !isSync && !hasMore)) {
-        if (reset) stopSpinner();
+        if (reset && !isSync) stopSpinner();
         return;
     }
 
-    startSpinner();
+    if (!isSync) startSpinner();
     isLoading = true;
     if (loadingIndicator) loadingIndicator.style.display = "block";
     
@@ -1585,8 +1587,7 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
     finally { 
         isLoading = false; 
         if (loadingIndicator) loadingIndicator.style.display = "none"; 
-        stopSpinner();
-        updateListTransform();
+        if (!isSync) stopSpinner();
     }
 }
 
@@ -1812,7 +1813,7 @@ function startPolling() {
     if (chatPollInterval) clearInterval(chatPollInterval);
     chatPollInterval = window.setInterval(() => {
         if (!currentSession.email) checkAuthStatus();
-        else fetchChatHistory();
+        else fetchChatHistory(false, true); // reset=false, silent=true
     }, 3000);
 }
 
@@ -1864,6 +1865,7 @@ async function initSession() {
                 content: `Resuming: ${lastTask.id}`, 
                 status: 1, created_at: Date.now() 
             });
+            isExtracting = true; // [FIX] Ensure flags are set so progress events are not ignored
             startSpinner();
         }
     } catch (e) { console.error("[WIDGET] Handshake failed:", e); }
@@ -2296,7 +2298,7 @@ const listScroll = document.getElementById("list-scroll");
 if (listScroll) {
     initListPullLogic();
 }
-async function fetchChatHistory(reset: boolean = true, shouldSnap: boolean = true) { 
+async function fetchChatHistory(reset: boolean = true, silent: boolean = false, shouldSnap: boolean = true) { 
     if (reset) { 
         chatPage = 0;
         chatHasMore = true;
@@ -2305,7 +2307,7 @@ async function fetchChatHistory(reset: boolean = true, shouldSnap: boolean = tru
         }
     } 
     // Initial load is NOT history (isHistory = false)
-    await loadMoreChat(false); 
+    await loadMoreChat(false, silent); 
 }
 
 interface ChatMessage {
@@ -2443,13 +2445,13 @@ function createMessageHTML(msg: ChatMessage) {
     </div>`;
 }
 
-async function loadMoreChat(isHistory: boolean = false) {
+async function loadMoreChat(isHistory: boolean = false, silent: boolean = false) {
     if (isChatLoading || (isHistory && !chatHasMore)) {
-        stopSpinner();
+        if (!silent) stopSpinner();
         return;
     }
 
-    startSpinner();
+    if (!silent) startSpinner();
     isChatLoading = true;
 
     try {
@@ -2531,7 +2533,7 @@ async function loadMoreChat(isHistory: boolean = false) {
         console.error(e); 
     } finally { 
         isChatLoading = false; 
-        stopSpinner();
+        if (!silent) stopSpinner();
     }
 }
 
