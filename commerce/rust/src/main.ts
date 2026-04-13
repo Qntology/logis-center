@@ -7,7 +7,7 @@ import { readFile } from '@tauri-apps/plugin-fs';
 // Imports for Rendering & Shim
 import { item2html, selector } from "./lib/render";
 import { Select, Upsert } from "./lib/db";
-import { hashId } from "./lib/utils";
+import { hashId, time2text } from "./lib/utils";
 
 // Access global libs
 const ethers = (window as any).ethers;
@@ -424,6 +424,7 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
         var content = '';
         var name = '';
         var desc: string[] = [];
+        var _url: URL | null = null;
 
         // ONLY generate HTML if this node hasn't been rendered yet
         if (!navTmp[nodeId]) {
@@ -451,7 +452,7 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                 name = `<span>${nodeType}</span> <span>${(data.item ? " Draft" : " ")}</span>`;
 
                 if (data.origin) {
-                    var _url = new URL(data.origin);
+                    _url = new URL(data.origin);
                     const domain = node.domain || _url.hostname;
                     if (!navTmp[domain] && data.item) {
                         host = `<strong>${domain}</strong>`;
@@ -461,7 +462,6 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                         active = "active";
                     }
                 }
-
                 var total = { draft: 0, count: 0 };
                 const pagesStats = (currentSession as any).pages;
                 const cc = node.cc || data.cc;
@@ -544,7 +544,7 @@ async function renderNavigation() {
 
     try {
         navTmp = {}; // Reset for fresh render
-        let _pages = await Select["pages"]();
+        let _pages = await Select["pages"]({});
         
         if (_pages.length === 0) {
             pageList.innerHTML = "<div style='color:#999; padding:10px; font-size:0.75rem;'>No shared pages found.</div>";
@@ -629,7 +629,7 @@ async function renderNavigation() {
         }
 
         // Users rendering (simplified parity)
-        const users = await Select["users"]();
+        const users = await Select["users"]({});
         userList.innerHTML = "";
         if (users.length > 0) {
             const teamNodes = users.filter(u => u.type === "team").map(u => ({...u, children: users.filter(m => m.to === u.id && m.id !== u.id)}));
@@ -697,6 +697,30 @@ async function syncData() {
     }
 }
 
+// --- 기존 State 영역 어딘가에 추가 ---
+let currentSearchMode = "commerce";
+
+// --- DOM 로드 후 이벤트 리스너 추가 ---
+document.querySelectorAll('.mode-tab').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+        // 액티브 상태 스타일 변경
+        document.querySelectorAll('.mode-tab').forEach(b => {
+            (b as HTMLElement).style.color = "#666";
+            (b as HTMLElement).style.fontWeight = "normal";
+            b.classList.remove('active');
+        });
+        
+        const target = e.target as HTMLElement;
+        target.style.color = "var(--primary)";
+        target.style.fontWeight = "bold";
+        target.classList.add('active');
+        
+        // 상태 업데이트
+        currentSearchMode = target.dataset.mode || "commerce";
+    });
+});
+
+
 // [NEW] Global Navigation Link Handler (from item2html)
 document.addEventListener('nav-link', async (e: any) => {
     const targetLink = e.detail;
@@ -715,6 +739,15 @@ searchInput?.addEventListener("input", () => {
     }, 800);
 });
 
+// [신규] 검색창에서 엔터 키를 누르면 AI 검색(돋보기 버튼)을 강제로 실행하도록 연결
+searchInput?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+        e.preventDefault(); // 기본 폼 제출 동작 등 방지
+        btnSubmit?.click(); // 돋보기 버튼 클릭 이벤트 강제 발생
+    }
+});
+
+
 btnSubmit?.addEventListener("click", async () => {
     const query = searchInput.value;
     if (!query) return;
@@ -728,7 +761,8 @@ btnSubmit?.addEventListener("click", async () => {
             const response = await invoke<any>("ai_search_complex", { 
                 query: query, 
                 language: "korean",
-                devicePreference: devicePref
+                devicePreference: devicePref,
+                searchMode: currentSearchMode
             });
             let html = `<div style="margin-bottom:15px; padding:10px; background:#222; border-left:3px solid var(--primary); font-size:0.75rem;"><strong style="display:block; margin-bottom:5px; color:#aaa;">Query Intent:</strong>`;
             if (response.structured && response.structured.context) {
@@ -916,12 +950,11 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
          if (payload.category === "Done") {
              if (btnStopTask) btnStopTask.style.display = "none";
              if (btnDetailDelete) btnDetailDelete.style.display = "flex";
-             if (globalNavSpinner) globalNavSpinner.style.display = "none"; 
              
              // Finalize this specific row
              const row = p.querySelector(".progress-row");
              if (row) {
-                 const s = row.querySelector(".active-spinner");
+                 const s = row.querySelector(".active-spinner") as HTMLElement;
                  if (s) {
                      s.classList.remove("active-spinner");
                      s.innerHTML = "✅";
@@ -931,10 +964,11 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
          } else if (payload.category === "Error") {
              const row = p.querySelector(".progress-row");
              if (row) { 
-                 const s = row.querySelector(".active-spinner");
+                 const s = row.querySelector(".active-spinner") as HTMLElement;
                  if (s) {
                      s.classList.remove("active-spinner");
                      s.innerHTML = "❌";
+                     s.style.color = "#ef4444";
                  }
                  (row as HTMLElement).style.color = "#ef4444"; 
              }
@@ -1197,8 +1231,8 @@ function setupDataChannel(channel: RTCDataChannel) {
                 }
             } else if (msg.type === "get_navigation") {
                 // Fetch pages and users for mobile tree
-                const pages = await Select["pages"]();
-                const users = await Select["users"]();
+                const pages = await Select["pages"]({});
+                const users = await Select["users"]({});
                 if (dataChannel?.readyState === "open") {
                     dataChannel.send(JSON.stringify({ 
                         type: "sync_navigation", 

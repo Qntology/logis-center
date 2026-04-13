@@ -432,49 +432,154 @@ NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{TYPE}", page_type)
 }
 
+// pub fn para2graph(language: &str) -> String {
+//     let template = r###"convert the natural language content to fit the dataset JSON structure. no explanation.
+//     {
+//         "context" : [
+//             {
+//                 "language" : "{LANG}",
+//                 "type": "sales" | "order" | "goods" | "tracking" | "view" | "review" | "coupon" | "event" | "",
+//                 "text": "Segment the natural language content into single-type contexts"
+//             }
+//         ]
+//     }"###;
+//     template.replace("{LANG}", language)
+// }
+
 pub fn para2graph(language: &str) -> String {
-    let template = r###"convert the natural language content to fit the dataset JSON structure. no explanation.
+    let template = r###"Convert the given natural language content into the specified JSON dataset structure by segmenting it into granular semantic chunks.
+
+[DOCUMENT SCANNING & STRICT SEGMENTATION LOGIC]
+1. EXACT COPY: Copy the full input sentence into 'original_text' without changing anything.
+2. PIPE PLANNING: In the 'segmented_plan' field, rewrite the 'original_text' exactly, but insert a pipe symbol ("|") wherever the semantic category (type) changes. You MUST NOT drop, add, or alter any words or spaces. (e.g., Structure it conceptually like: "Event context words | Goods attribute words | Review request words").
+3. STRICT ARRAY MAPPING: For EVERY segment separated by a pipe in 'segmented_plan', create exactly one object in the 'context' array sequentially.
+4. LITERAL EXTRACTION: The 'text' field of each object MUST be the exact substring from the pipe plan, without the pipe symbols. DO NOT translate, summarize, or generate new words.
+
+[SCHEMA DEFINITIONS]
+- original_text: String. The exact, unaltered full natural language input.
+- segmented_plan: String. The original text with "|" inserted strictly at category boundaries.
+- language: String. Default "{LANG}".
+- categories: The main semantic category. Must be exactly one of:
+  - "order": Contexts involving purchasing actions, sales volume, checkout, or order history.
+  - "goods": Contexts describing product specifics, physical attributes, price limits, or catalog details.
+  - "tracking": Contexts regarding shipment status, delivery, or logistics.
+  - "review": Contexts related to customer feedback, ratings, or user messages.
+  - "coupon": Contexts involving discount codes or coupons.
+  - "event": Contexts involving time-bound promotions, seasonal sales, or event announcements.
+  - "": If none of the above logically apply.
+
+[OUTPUT FORMAT]
+{
+  "original_text": "String",
+  "segmented_plan": "String",
+  "context": [
     {
-        "context" : [
-            {
-                "language" : "{LANG}",
-                "type": "sales" | "order" | "goods" | "tracking" | "view" | "review" | "coupon" | "event" | "",
-                "text": "Segment the natural language content into single-type contexts"
-            }
-        ]
-    }"###;
+      "language": "String",
+      "type": "String",
+      "text": "String"
+    } 
+  ]
+}
+
+[ACTION] RETURN STRICTLY VALID JSON ONLY.
+NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{LANG}", language)
 }
 
-pub fn graph2contexts(current: &str) -> String {
-    let template = r###"convert the natural language content to fit the dataset JSON structure. no explanation.
-    # #date : The date value is set by referencing both the natural language's implied time period and the region value against the current time ({CURRENT}); it will be marked as null if a value is absent
-    # #status : 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
-    # #substantial : 'size' | 'weight' | 'shipping_fee' | 'shipping_duration' | 'sale_price' | 'supply_price' | 'low_stock_threshold' | 'discount' | 'min_order_amount' | 'max_discount_amount' | 'usage_limit' | 'usage_per' | ''
-    # #find : 'many' | 'few' | 'much' | 'little' | 'heavy' | 'light' | ''
+// pub fn graph2contexts(current: &str) -> String {
+//     let template = r###"convert the natural language content to fit the dataset JSON structure. no explanation.
+//     # #date : The date value is set by referencing both the natural language's implied time period and the region value against the current time ({CURRENT}); it will be marked as null if a value is absent
+//     # #status : 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
+//     # #substantial : 'size' | 'weight' | 'shipping_fee' | 'shipping_duration' | 'sale_price' | 'supply_price' | 'low_stock_threshold' | 'discount' | 'min_order_amount' | 'max_discount_amount' | 'usage_limit' | 'usage_per' | ''
+//     # #find : 'many' | 'few' | 'much' | 'little' | 'heavy' | 'light' | ''
     
-    [TASK]
-    Analyze EACH provided text segment and extract structured conditions. 
+//     [TASK]
+//     Analyze EACH provided text segment and extract structured conditions. 
     
-    [OUTPUT FORMAT]
-    Return a JSON object containing a "context" array with one object per segment.
+//     [OUTPUT FORMAT]
+//     Return a JSON object containing a "context" array with one object per segment.
+//     {
+//         "context": [
+//             {
+//                 "type": "string",
+//                 "text": "the_original_segment_text",
+//                 "status": "string or null",
+//                 "substantial": "string or null",
+//                 "find": "string or null",
+//                 "condition" : {
+//                     "date": { "eq": "yyyy-MM-ddThh:mm:ss", "lte": "yyyy-MM-ddThh:mm:ss", "gte": "yyyy-MM-ddThh:mm:ss" },
+//                     "quantity": { "eq": number, "lte": number, "gte": number },
+//                     "price": { "currency": "string", "eq": number, "lte": number, "gte": number }
+//                 }
+//             }
+//         ]
+//     }"###;
+//     template.replace("{CURRENT}", current)
+// }
+
+pub fn graph2contexts(current: &str, input_json: &str) -> String {
+    let template = r###"Analyze the natural language content and extract ALL distinct logical conditions into the specified JSON dataset structure.
+
+[ENVIRONMENT CONTEXT]
+Current Time: {CURRENT}
+Default Region: Infer implicitly from the input language.
+
+[DOCUMENT SCANNING & EXTRACTION LOGIC]
+1. ORIGINAL & PLAN: Copy the exact full input into 'original_text'. In 'segmented_plan', conceptually outline the semantic flow of the sentence using conceptual English descriptions separated by pipes.
+2. OVERLAPPING EXTRACTION: Extract EVERY distinct semantic intent into the 'context' array. The extracted 'text' substrings MAY OVERLAP. (e.g., an 'order' chunk can capture a broad phrase, while a 'goods' chunk captures a narrower phrase within it).
+3. EXACT SUBSTRING: The 'text' field MUST be an exact, unaltered substring from the original text.
+
+[REGIONAL SEASONALITY & TIME LOGIC]
+1. Hemisphere Awareness: Calculate seasonal date ranges dynamically based on the inferred region's hemisphere.
+2. Temporal Anchoring: Resolve relative time expressions into absolute ISO-8601 timestamps against the Current Time.
+
+[CHUNK-SPECIFIC CONDITION LOGIC (TEXT-TO-SQL ABSTRACTION)]
+1. ISOLATION: Evaluate conditions ONLY based on the specific 'text' of the current chunk.
+2. SQL OPERATOR MAPPING: Parse the extracted 'text' conceptually as a SQL `WHERE` clause.
+   - SQL `<=` -> map to `lte`.
+   - SQL `>=` -> map to `gte`.
+   - SQL `=` -> map to `eq`.
+3. ISO CURRENCY EXTRACTION: Abstract currency symbols natively into standard ISO 4217 currency codes.
+4. NULLIFICATION: If the extracted 'text' for a specific chunk lacks mathematical constraints, temporal anchors, or price identifiers, the respective condition objects MUST be set to null.
+
+[INPUT JSON]
+{INPUT_JSON}
+
+[SCHEMA DEFINITIONS]
+- categories: Must be one of: 'order', 'goods', 'tracking', 'review', 'coupon', 'event', or ''.
+- status: 'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', or null.
+- substantial: 'size', 'weight', 'shipping_fee', 'shipping_duration', 'sale_price', 'supply_price', 'low_stock_threshold', 'discount', 'min_order_amount', 'max_discount_amount', 'usage_limit', 'usage_per', or null.
+- find: 'many', 'few', 'much', 'little', 'heavy', 'light', or null.
+- condition: Object containing quantitative SQL-like filters.
+  - date: { "eq": ISO-8601 string or null, "lte": ISO-8601 string or null, "gte": ISO-8601 string or null } or null.
+  - quantity: { "eq": Number or null, "lte": Number or null, "gte": Number or null } or null.
+  - price: { "currency": ISO 4217 String or null, "eq": Number or null, "lte": Number or null, "gte": Number or null } or null.
+
+[OUTPUT FORMAT]
+{
+  "original_text": "String",
+  "segmented_plan": "String",
+  "context": [
     {
-        "context": [
-            {
-                "type": "string",
-                "text": "the_original_segment_text",
-                "status": "string or null",
-                "substantial": "string or null",
-                "find": "string or null",
-                "condition" : {
-                    "date": { "eq": "yyyy-MM-ddThh:mm:ss", "lte": "yyyy-MM-ddThh:mm:ss", "gte": "yyyy-MM-ddThh:mm:ss" },
-                    "quantity": { "eq": number, "lte": number, "gte": number },
-                    "price": { "currency": "string", "eq": number, "lte": number, "gte": number }
-                }
-            }
-        ]
-    }"###;
-    template.replace("{CURRENT}", current)
+      "language": "String (ISO 639-1)",
+      "type": "String",
+      "text": "String",
+      "status": "String | null",
+      "substantial": ["String"] | null,
+      "find": ["String"] | null,
+      "condition": {
+        "date": { "eq": null, "lte": null, "gte": null },
+        "quantity": { "eq": null, "lte": null, "gte": null },
+        "price": { "currency": null, "eq": null, "lte": null, "gte": null }
+      }
+    }
+  ]
+}
+
+[ACTION] RETURN STRICTLY VALID JSON ONLY.
+NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template.replace("{CURRENT}", current).replace("{INPUT_JSON}", input_json)
 }
 
 pub fn item2json(page_type: &str, href: &str, language: &str) -> String {

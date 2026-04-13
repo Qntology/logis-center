@@ -1400,48 +1400,107 @@ impl LogisModel {
         }).await?
     }
 
-    pub async fn parse_query_structured(&self, query: String, language: &str) -> anyhow::Result<Value> {
+    // [신규] Commerce 파이프라인: 2-Stage (0.6B para2graph -> 0.8B graph2contexts)
+    pub async fn parse_commerce_query(&self, query: String, language: &str) -> anyhow::Result<Value> {
         let current_time = chrono::Utc::now().to_rfc3339();
-        
-        // Stage 1: Segment query (para2graph) - Using persistent session for schema caching
-        let prompt1 = crate::parsing::para2graph(language);
-        let res1 = self.chat("", &format!("{}\n\nQuery: {}", prompt1, query), None, Some("system_search_p2g".to_string()), None).await?;
-        let segments = crate::parsing::parse_json_from_llm(&res1);
-        
-        // Stage 2: Extract conditions for each segment (graph2contexts) in ONE BATCH
-        let mut final_contexts = Vec::new();
-        if let Some(ctx_arr) = segments.get("context").and_then(|v: &Value| v.as_array()) {
-            // Combine all segments into one batch request
-            let mut combined_segments = String::new();
-            for (idx, seg) in ctx_arr.iter().enumerate() {
-                let seg_text = seg.get("text").and_then(|v: &Value| v.as_str()).unwrap_or("");
-                combined_segments.push_str(&format!("Segment #{}: {}\n", idx + 1, seg_text));
-            }
 
-            if !combined_segments.is_empty() {
-                let prompt2 = crate::parsing::graph2contexts(&current_time);
-                // Using persistent session for schema caching
-                let res2 = self.chat("", &format!("{}\n\nInput Segments:\n{}", prompt2, combined_segments), None, Some("system_search_g2c".to_string()), None).await?;
-                let mut batch_info = crate::parsing::parse_json_from_llm(&res2);
-                
-                // Process results and ensure type parity
-                if let Some(res_arr) = batch_info.get_mut("context").and_then(|v: &mut Value| v.as_array_mut()) {
-                    for (i, item) in res_arr.iter_mut().enumerate() {
-                        // Match with original segment types if LLM lost them in batch
-                        if let Some(original_seg) = ctx_arr.get(i) {
-                            if item.get("type").is_none() || item.get("type").and_then(|v: &Value| v.as_str()) == Some("") {
-                                if let Some(item_obj) = item.as_object_mut() {
-                                    item_obj.insert("type".to_string(), original_seg.get("type").cloned().unwrap_or(json!("")));
-                                }
-                            }
-                        }
-                    }
-                    final_contexts.extend(res_arr.clone());
-                }
+        // ----------------------------------------------------
+        // Stage 1: 세그먼트 분할 (para2graph) - 0.6B (Small) 모델 사용
+        // ----------------------------------------------------
+        let prompt1 = crate::parsing::para2graph(language);
+        let task_question_1 = format!("{}\n\nQuery: {}", prompt1, query);
+        let session_1 = "system_search_p2g".to_string();
+
+        // 1. 0.6B 모델 로드 보장 및 메모리 릴레이
+        self.secure_vram_relay(crate::model::ModelSize::Small, None, None, false, None).await?;
+
+        let res1 = {
+            // 2. 0.6B Generator 명시적 잠금 및 호출
+            if let Some(gen) = self.generator.lock().await.as_mut() {
+                println!("[AI-SEARCH] 0.6B Step 1: Asking para2graph...");
+                let params = crate::openai_types::ChatCompletionParameters {
+                    messages: vec![
+                        crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(task_question_1),
+                            name: None,
+                        })
+                    ],
+                    model: "qwen".to_string(),
+                    max_tokens: Some(512),
+                    temperature: Some(0.1), top_p: Some(0.9),
+                    ..Default::default()
+                };
+                gen.generate(params, None, Some(session_1), None).await?
+            } else {
+                return Err(anyhow::anyhow!("0.6B Generator is missing"));
             }
+        };
+
+        let mut segments = crate::parsing::parse_json_from_llm(&res1);
+
+        // 👇 1단계 파싱 결과 로그 출력
+        println!("\n✅ [STAGE 1: para2graph (0.6B)] 파싱 결과:");
+        println!("{}", serde_json::to_string_pretty(&segments).unwrap_or_default());
+
+        // [필터링 로직] 비어있는 텍스트나 타입이 없는 세그먼트 제거
+        if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
+            ctx_arr.retain(|seg| {
+                let text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").trim();
+                !text.is_empty() && !seg_type.is_empty()
+            });
         }
+
+        // ----------------------------------------------------
+        // Stage 2: 조건 추출 (graph2contexts) - Qwen 3.5 (0.8B) 모델 사용
+        // ----------------------------------------------------
+        let input_for_stage2 = serde_json::to_string_pretty(&segments).unwrap_or_default();
+        let prompt2 = crate::parsing::graph2contexts(&current_time, &input_for_stage2);
+        let session_2 = "system_search_g2c_q35".to_string(); // 🌟 ID 충돌 방지를 위해 q35 접미사 추가
+
+        // 1. Qwen 3.5 모델로 메모리 릴레이 (기존 0.6B 메모리 안전하게 해제)
+        self.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, None, false, None).await?;
+
+        let res2 = {
+            // 2. Qwen 3.5 Generator 명시적 잠금 및 호출
+            if let Some(gen) = self.qwen3_5_generator.lock().await.as_mut() {
+                println!("[AI-SEARCH] 0.8B (Qwen 3.5) Step 2: Asking graph2contexts...");
+                let params = crate::openai_types::ChatCompletionParameters {
+                    messages: vec![
+                        crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt2),
+                            name: None,
+                        })
+                    ],
+                    model: "qwen3.5".to_string(), // 🌟 모델명 변경
+                    max_tokens: Some(1024),
+                    temperature: Some(0.1), top_p: Some(0.9),
+                    ..Default::default()
+                };
+                gen.generate(params, None, Some(session_2), None).await?
+            } else {
+                return Err(anyhow::anyhow!("Qwen 3.5 Generator is missing"));
+            }
+        };
+
+        let final_contexts = crate::parsing::parse_json_from_llm(&res2);
         
-        Ok(json!({ "context": final_contexts }))
+        // 👇 2단계 최종 결과 로그 출력
+        println!("\n🎯 [STAGE 2: graph2contexts (0.8B)] 최종 추출 결과:");
+        println!("{}", serde_json::to_string_pretty(&final_contexts).unwrap_or_default());
+        println!("==================================================\n");
+
+        Ok(final_contexts)
+    }
+
+    // [신규] Shipping 파이프라인 (빠른 단일 처리)
+    pub async fn parse_shipping_query(&self, query: String, _language: &str) -> anyhow::Result<Value> {
+        let ctx = json!([{
+            "type": "tracking",
+            "text": query.clone(),
+            "condition": { "date": null, "quantity": null, "price": null }
+        }]);
+        Ok(json!({ "context": ctx }))
     }
 
     // --- Ported from Python (search_engine.py) ---

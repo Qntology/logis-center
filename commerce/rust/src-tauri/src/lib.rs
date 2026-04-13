@@ -418,10 +418,17 @@ async fn ai_search_complex(
     query: String,
     language: String,
     device_preference: Option<String>,
+    search_mode: String,
 ) -> Result<Value, String> {
+    // 👇 [신규 추가] 프론트엔드에서 요청이 넘어왔는지 확인하는 진입점 로그
+    println!("\n==================================================");
+    println!("🚀 [AI-SEARCH] 프론트엔드 요청 수신 완료!");
+    println!("   - 검색어: {}", query);
+    println!("   - 검색 모드: {}", search_mode);
+    println!("==================================================\n");
+
     let mut model_guard = state.model.lock().await;
-    
-    // [FIX] Check if existing model matches preference
+
     if let Some(m) = model_guard.as_ref() {
         let wants_cpu = device_preference.as_deref() == Some("cpu");
         if m.is_cpu_mode != wants_cpu {
@@ -432,17 +439,26 @@ async fn ai_search_complex(
     }
 
     if model_guard.is_none() {
-        if let Ok(m) = LogisModel::new(app_handle.clone(), device_preference.as_deref()).await { *model_guard = Some(m); }
-        else { return Err("Failed to load model".to_string()); }
+        if let Ok(m) = LogisModel::new(app_handle.clone(), device_preference.as_deref()).await { 
+            *model_guard = Some(m);
+        } else { 
+            return Err("Failed to load model".to_string());
+        }
     }
     let model = model_guard.as_ref().unwrap();
 
-    // 1. Structured Parse (Para2Graph -> Graph2Contexts)
-    let structured_query = model.parse_query_structured(query.clone(), &language).await.map_err(|e| e.to_string())?;
-    
+    // 1. Structured Parse (라우팅 분기 적용)
+    let structured_query = if search_mode == "shipping" {
+        model.parse_shipping_query(query.clone(), &language).await.map_err(|e| e.to_string())?
+    } else {
+        model.parse_commerce_query(query.clone(), &language).await.map_err(|e| e.to_string())?
+    };
+
     // 2. Perform searches for each segment
     let mut all_results = Vec::new();
     let mut store_guard = state.store.lock().await;
+    
+    // ... 이하 LanceDB 검색 로직은 기존 코드와 동일하게 유지 ...
     if store_guard.is_none() {
         let db_path = "data/lancedb";
         if let Ok(s) = VectorStore::new(db_path).await {
@@ -456,11 +472,9 @@ async fn ai_search_complex(
             let text = ctx.get("text").and_then(|v| v.as_str()).unwrap_or("");
             if text.is_empty() { continue; }
             
-            // [FIX] Convert extracted conditions to SQL filter
             let sql_filter = convert_conditions_to_sql(ctx);
-            
             let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 768]);
-            // Now passing the filter to search_items
+            
             if let Ok(results) = store.search_items("items", text, emb, 5, sql_filter).await {
                 for (id, content, score) in results {
                     all_results.push(json!({

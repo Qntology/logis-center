@@ -30,7 +30,7 @@
             <button id="nav-img-clear" title="Remove image">✕</button>
         </div>
 
-        <div id="search-container" class="search-container">
+        <div id="search-container" class="search-container" style="display: flex; flex-direction: column;">            
             <div id="search-tags-container" class="search-tags-container"></div>
             <input type="text" id="global-search" class="search-input" placeholder="Search or Ask Prompt" />
         </div>
@@ -45,7 +45,6 @@
 
       <!-- 2. The Content Panel (Hidden by default) -->
       <section id="content-panel" class="content-panel">
-        
         <!-- Tab: List (Primary View) -->
         <div id="tab-list" class="tab-content active">
            <!-- View 1: List Table -->
@@ -61,7 +60,7 @@
                     <button id="list-refresh-btn" class="nav-btn" title="Refresh">🔄</button>
                  </div>
                </div>
-               
+
                <div id="list-scroll-container" class="list-container" style="height: 450px; overflow: hidden; padding: 0 10px; position: relative;">
                  <div id="list-scroll" class="list-scroll">
                     <div id="list-pull-top" class="chat-pull-loader">
@@ -104,6 +103,11 @@
                                     <button id="nav-signout" class="link-btn hidden">Logout</button>
                                 </div>
                             </div>
+                        </div>
+
+                        <div id="search-mode-tabs" style="display: flex; gap: 10px; margin-bottom: 5px; padding-left: 5px;">
+                            <button class="mode-tab active" data-mode="commerce" style="background: none; color: var(--primary); border: none; font-size: 0.8rem; cursor: pointer; font-weight: bold;">Commerce</button>
+                            <button class="mode-tab" data-mode="shipping" style="background: none; color: #666; border: none; font-size: 0.8rem; cursor: pointer;">Shipping</button>
                         </div>
 
                         <!-- Tree Sections -->
