@@ -1401,23 +1401,24 @@ impl LogisModel {
     }
 
     // [신규] Commerce 파이프라인: 2-Stage (0.6B para2graph -> 0.8B graph2contexts)
+    // [신규] Commerce 파이프라인: 2-Stage (0.8B 단일 모델 연속 처리)
     pub async fn parse_commerce_query(&self, query: String, language: &str) -> anyhow::Result<Value> {
         let current_time = chrono::Utc::now().to_rfc3339();
 
+        // 🌟 1. Qwen 3.5 (0.8B) 모델 단일 로드 (한 번만 호출하여 두 단계 모두 재사용)
+        self.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, None, false, None).await?;
+
         // ----------------------------------------------------
-        // Stage 1: 세그먼트 분할 (para2graph) - 0.6B (Small) 모델 사용
+        // Stage 1: 세그먼트 분할 (para2graph) - 0.8B (Qwen 3.5) 사용
         // ----------------------------------------------------
         let prompt1 = crate::parsing::para2graph(language);
         let task_question_1 = format!("{}\n\nQuery: {}", prompt1, query);
-        let session_1 = "system_search_p2g".to_string();
-
-        // 1. 0.6B 모델 로드 보장 및 메모리 릴레이
-        self.secure_vram_relay(crate::model::ModelSize::Small, None, None, false, None).await?;
+        let session_1 = "system_search_p2g_q35".to_string(); // 세션 캐시 꼬이지 않게 이름 변경
 
         let res1 = {
-            // 2. 0.6B Generator 명시적 잠금 및 호출
-            if let Some(gen) = self.generator.lock().await.as_mut() {
-                println!("[AI-SEARCH] 0.6B Step 1: Asking para2graph...");
+            // 🌟 2. Qwen 3.5 Generator 명시적 잠금 및 호출
+            if let Some(gen) = self.qwen3_5_generator.lock().await.as_mut() {
+                println!("[AI-SEARCH] 0.8B (Qwen 3.5) Step 1: Asking para2graph...");
                 let params = crate::openai_types::ChatCompletionParameters {
                     messages: vec![
                         crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
@@ -1425,21 +1426,21 @@ impl LogisModel {
                             name: None,
                         })
                     ],
-                    model: "qwen".to_string(),
+                    model: "qwen3.5".to_string(), // 🌟 모델명 변경
                     max_tokens: Some(512),
-                    temperature: Some(0.1), top_p: Some(0.9),
+                    temperature: Some(0.0), top_p: Some(0.9),
                     ..Default::default()
                 };
                 gen.generate(params, None, Some(session_1), None).await?
             } else {
-                return Err(anyhow::anyhow!("0.6B Generator is missing"));
+                return Err(anyhow::anyhow!("Qwen 3.5 Generator is missing"));
             }
         };
 
         let mut segments = crate::parsing::parse_json_from_llm(&res1);
 
         // 👇 1단계 파싱 결과 로그 출력
-        println!("\n✅ [STAGE 1: para2graph (0.6B)] 파싱 결과:");
+        println!("\n✅ [STAGE 1: para2graph (0.8B)] 파싱 결과:");
         println!("{}", serde_json::to_string_pretty(&segments).unwrap_or_default());
 
         // [필터링 로직] 비어있는 텍스트나 타입이 없는 세그먼트 제거
@@ -1452,17 +1453,15 @@ impl LogisModel {
         }
 
         // ----------------------------------------------------
-        // Stage 2: 조건 추출 (graph2contexts) - Qwen 3.5 (0.8B) 모델 사용
+        // Stage 2: 조건 추출 (graph2contexts) - Qwen 3.5 (0.8B) 계속 사용
         // ----------------------------------------------------
         let input_for_stage2 = serde_json::to_string_pretty(&segments).unwrap_or_default();
         let prompt2 = crate::parsing::graph2contexts(&current_time, &input_for_stage2);
-        let session_2 = "system_search_g2c_q35".to_string(); // 🌟 ID 충돌 방지를 위해 q35 접미사 추가
+        let session_2 = "system_search_g2c_q35".to_string();
 
-        // 1. Qwen 3.5 모델로 메모리 릴레이 (기존 0.6B 메모리 안전하게 해제)
-        self.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, None, false, None).await?;
+        // 🌟 2단계에서는 secure_vram_relay 호출 생략! (이미 로드되어 있으므로 속도 대폭 향상)
 
         let res2 = {
-            // 2. Qwen 3.5 Generator 명시적 잠금 및 호출
             if let Some(gen) = self.qwen3_5_generator.lock().await.as_mut() {
                 println!("[AI-SEARCH] 0.8B (Qwen 3.5) Step 2: Asking graph2contexts...");
                 let params = crate::openai_types::ChatCompletionParameters {
@@ -1472,9 +1471,9 @@ impl LogisModel {
                             name: None,
                         })
                     ],
-                    model: "qwen3.5".to_string(), // 🌟 모델명 변경
+                    model: "qwen3.5".to_string(),
                     max_tokens: Some(1024),
-                    temperature: Some(0.1), top_p: Some(0.9),
+                    temperature: Some(1.0), top_p: Some(0.9),
                     ..Default::default()
                 };
                 gen.generate(params, None, Some(session_2), None).await?

@@ -156,9 +156,12 @@ function stopSpinner() {
         spinnerInterval = null;
     }
     
-    if (!isExtracting && settingsBtn) {
+    if (settingsBtn) {
         settingsBtn.classList.remove("active-spinner-mode");
-        settingsBtn.innerText = settingsBtn.classList.contains('active') ? "💬" : "🗨️";
+        // Only reset the text icon if we're not still in an extraction process
+        if (!isExtracting) {
+            settingsBtn.innerText = settingsBtn.classList.contains('active') ? "💬" : "🗨️";
+        }
     }
     
     // Clear all spinners to stop them visually
@@ -751,19 +754,49 @@ searchInput?.addEventListener("keydown", (e) => {
 btnSubmit?.addEventListener("click", async () => {
     const query = searchInput.value;
     if (!query) return;
-    openWidget("list"); 
-    if (aiResultsArea && aiResultsContent) {
-        aiResultsArea.style.display = "block";
-        aiResultsTitle.innerText = "🧠 AI Deep Analysis";
-        aiResultsContent.innerHTML = "<div class='spinner'></div> 🤖 Analyzing your query...";
-        try {
-            const devicePref = forceCpuToggle.checked ? "cpu" : null;
-            const response = await invoke<any>("ai_search_complex", { 
-                query: query, 
-                language: "korean",
-                devicePreference: devicePref,
-                searchMode: currentSearchMode
-            });
+
+    // [NEW] Create a Search Task in the chat area
+    const taskId = `search_${Date.now()}`;
+    const startTime = Date.now();
+    
+    // Switch to settings/chat tab to show the task progress
+    openWidget("settings");
+    startSpinner();
+
+    renderMessage({
+        id: taskId,
+        role: "system_task",
+        text: `AI Search: ${query}`,
+        status: 1, // Processing
+        created_at: startTime,
+        updated_at: startTime,
+        task_id: taskId
+    });
+
+    try {
+        const devicePref = forceCpuToggle.checked ? "cpu" : null;
+        const response = await invoke<any>("ai_search_complex", { 
+            query: query, 
+            language: "korean",
+            devicePreference: devicePref,
+            searchMode: currentSearchMode
+        });
+
+        // Update Task to Success
+        renderMessage({
+            id: taskId,
+            role: "system_task",
+            text: `AI Search: ${query}`,
+            status: 9, // Success
+            created_at: startTime,
+            updated_at: Date.now(),
+            task_id: taskId
+        });
+
+        if (aiResultsArea && aiResultsContent) {
+            aiResultsArea.style.display = "block";
+            aiResultsTitle.innerText = "🧠 AI Deep Analysis";
+            
             let html = `<div style="margin-bottom:15px; padding:10px; background:#222; border-left:3px solid var(--primary); font-size:0.75rem;"><strong style="display:block; margin-bottom:5px; color:#aaa;">Query Intent:</strong>`;
             if (response.structured && response.structured.context) {
                 response.structured.context.forEach((ctx: any) => {
@@ -785,7 +818,23 @@ btnSubmit?.addEventListener("click", async () => {
                 ).join("");
             }
             aiResultsContent.innerHTML = html;
-        } catch(e) { aiResultsContent.innerHTML = "<div style='color:#ef4444;'>Error: " + e + "</div>"; }
+        }
+    } catch(e) { 
+        if (aiResultsContent) {
+            aiResultsContent.innerHTML = "<div style='color:#ef4444;'>Error: " + e + "</div>"; 
+        }
+        // Update Task to Error
+        renderMessage({
+            id: taskId,
+            role: "system_task",
+            text: `AI Search Error: ${query}`,
+            status: 6, // Error
+            created_at: startTime,
+            updated_at: Date.now(),
+            task_id: taskId
+        });
+    } finally {
+        stopSpinner();
     }
 });
 
@@ -1342,6 +1391,20 @@ function handleTaskClick(el: HTMLElement) {
     if (!taskId) return;
     
     console.log("[Chat] Task clicked:", taskId);
+
+    if (taskId.startsWith("search_")) {
+        // AI Search Task: Switch to list view and show AI results
+        openWidget("list");
+        listView.style.display = "block";
+        detailView.style.display = "none";
+        if (aiResultsArea) {
+            aiResultsArea.style.display = "block";
+            aiResultsArea.scrollIntoView({ behavior: 'smooth' });
+        }
+        return;
+    }
+
+    // Extraction Task (Default)
     openWidget("list"); 
     listView.style.display = "none"; 
     detailView.style.display = "flex";
