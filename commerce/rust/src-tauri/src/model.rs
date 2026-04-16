@@ -129,29 +129,31 @@ pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
 use tokio::sync::Mutex as TokioMutex;
 use std::time::{Duration, Instant};
 
+use crate::models::qwen3::generate::Qwen3GenerateModel; // 🌟 Qwen3 텍스트 전용 로직 임포트
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelSize {
-    Small,   // 0.6B for Ingestion
-    Large,   // 2B-VL for Inference
+    Qwen,    // 0.6B for Ingestion (기존 Small)
+    Qwen3,   // Qwen3 Text Model (기존 Large, /qwen3/ 로직 전용)
     Qwen3_5, // 0.8B Qwen 3.5 (Text Optimized)
 }
 
 #[derive(Clone)]
 pub struct LogisModel {
     pub app_handle: tauri::AppHandle,
-    pub generator: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, // Primary Active Slot (GPU)
-    pub qwen3_5_generator: Arc<TokioMutex<Option<Qwen3_5GenerateModel>>>, // Qwen 3.5 Slot
-    pub small_hibernation: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, // 0.6B RAM Slot
-    pub large_hibernation: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, // 2B RAM Slot
-    pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
+    pub generator: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, // Qwen 전용 (기존 Small)
+    pub qwen3_generator: Arc<TokioMutex<Option<Qwen3GenerateModel>>>, // 🌟 Qwen3 전용 슬롯 추가!
+    pub qwen3_5_generator: Arc<TokioMutex<Option<Qwen3_5GenerateModel>>>, // Qwen3.5 전용
     
+    pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
+
     pub is_cpu_mode: bool, 
     pub is_disk_swap: bool,
     pub dual_mode_enabled: bool,
     
     // Config for Lazy Reloading
-    small_model_path: String,
-    large_model_path: String,
+    qwen_model_path: String,      // 🌟 (기존 small_model_path 대신 이름 맞춤)
+    qwen3_model_path: String,     // 🌟 Qwen3 모델 경로 추가
     qwen3_5_model_path: String,
     embedding_path: std::path::PathBuf,
     device_config: utils::DeviceConfig,
@@ -162,19 +164,16 @@ pub struct LogisModel {
 
 impl LogisModel {
     pub async fn unload_generator(&self) {
-        // Clear everything
         let mut gen = self.generator.lock().await;
         *gen = None;
+        let mut q3_gen = self.qwen3_generator.lock().await; 
+        *q3_gen = None;
         let mut q35_gen = self.qwen3_5_generator.lock().await;
         *q35_gen = None;
-        let mut s_hib = self.small_hibernation.lock().await;
-        *s_hib = None;
-        let mut l_hib = self.large_hibernation.lock().await;
-        *l_hib = None;
         
         let mut size = self.current_size.lock().await;
         *size = None;
-        println!("[MODEL] All generators (Active & Hibernated) destroyed.");
+        println!("[MODEL] All generators (Active) destroyed."); 
     }
 
     pub async fn unload_embedding(&self) {
@@ -216,43 +215,36 @@ impl LogisModel {
     /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced with Diagnostics)
     pub async fn deep_purge_resources(&self) {
         println!("[DIAG-PURGE] Step 0: Waiting for background IO to finish...");
-        crate::models::qwen::generate::wait_for_global_io().await;
+        crate::models::qwen::generate::wait_for_global_io().await; // [cite: 254]
 
         println!("[DIAG-PURGE] Step 1: Clearing ALL Generation Slots...");
         
         {
             let mut gen = self.generator.lock().await;
             if let Some(mut g) = gen.take() {
-                println!("[DIAG-PURGE] Dropping Active Generator (0.6B/2B)...");
+                println!("[DIAG-PURGE] Dropping Active Generator (0.6B)...");
                 let _ = g.clear_kv_cache();
                 let _ = g.qwen.drop_kv_storage(); 
                 drop(g); 
             }
         }
+        
+        // 🌟 [신규] Qwen3 (텍스트 전용) 슬롯 해제 추가
         {
-            let mut q35_gen = self.qwen3_5_generator.lock().await;
-            if let Some(mut g) = q35_gen.take() {
-                println!("[DIAG-PURGE] Dropping Qwen 3.5 Generator...");
-                g.clear_kv_cache();
+            let mut q3_gen = self.qwen3_generator.lock().await;
+            if let Some(mut g) = q3_gen.take() {
+                println!("[DIAG-PURGE] Dropping Qwen3 Generator...");
+                g.clear_kv_cache(); // Qwen3 구조체에 구현된 캐시 클리어 호출
                 drop(g);
             }
         }
+
         {
-            let mut s_hib = self.small_hibernation.lock().await;
-            if let Some(mut g) = s_hib.take() { 
-                println!("[DIAG-PURGE] Dropping Small Hibernation...");
-                let _ = g.clear_kv_cache();
-                let _ = g.qwen.drop_kv_storage();
-                drop(g); 
-            }
-        }
-        {
-            let mut l_hib = self.large_hibernation.lock().await;
-            if let Some(mut g) = l_hib.take() { 
-                println!("[DIAG-PURGE] Dropping Large Hibernation...");
-                let _ = g.clear_kv_cache();
-                let _ = g.qwen.drop_kv_storage();
-                drop(g); 
+            let mut q35_gen = self.qwen3_5_generator.lock().await;
+            if let Some(mut g) = q35_gen.take() {
+                println!("[DIAG-PURGE] Dropping Qwen 3.5 Generator..."); //
+                g.clear_kv_cache();
+                drop(g);
             }
         }
         
@@ -497,28 +489,37 @@ impl LogisModel {
         }).await?
     }
 
-    /// [NEW] Secure VRAM/RAM Transition Logic (Isolation Protocol)
+    // --- File: src/model.rs ---
+    
     pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool, kv_name: Option<String>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
-        // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
         println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
-        self.deep_purge_resources().await;
+        self.deep_purge_resources().await; //
         
         if !self.is_cpu_mode {
-            // VRAM이 실제로 비워질 때까지 대기
             tokio::time::sleep(Duration::from_millis(500)).await;
             self.wait_for_vram_settle(2000, 5, cancel_token.clone()).await?;
         }
 
-        // 2. [LOAD] 새 모델 로드 (이제 VRAM이 최대치로 확보된 상태)
-        // [OPTIMIZATION] If transitioning to Large for a Relay (task_id present), skip Vision module
-        let text_only = target_size == ModelSize::Large && task_id.is_some() && !is_baking;
-        self.ensure_generator_ext(target_size, text_only, is_baking).await?;
-
-        // 4. [RESTORE] 디스크 스냅샷 로드
-        if let Some(tid) = task_id {
-            self.load_kv_snapshot(tid, kv_name).await?;
+        // 🌟 [핵심 변경] Enum 타입에 따라 완벽하게 독립된 로더를 타도록 분기
+        match target_size {
+            ModelSize::Qwen => {
+                // 기존 0.6B VLM 로직 (Small)
+                self.ensure_generator_ext(ModelSize::Qwen, false, is_baking).await?;
+                if let Some(tid) = task_id {
+                    self.load_kv_snapshot(tid, kv_name).await?;
+                }
+            },
+            ModelSize::Qwen3 => {
+                // 🌟 신규 0.8B 텍스트 전용 로직 (기존 Large 위치 대체)
+                // Part 1에서 만든 ensure_qwen3()를 호출하여 /qwen3/ 로직만 타게 합니다.
+                self.ensure_qwen3().await?;
+            },
+            ModelSize::Qwen3_5 => {
+                // 0.8B Qwen 3.5 로직
+                self.ensure_qwen3_5(false).await?; // 🌟 ModelSize::Qwen3_5 대신 false 로 변경
+            }
         }
 
         println!("[RELAY] Transition to {:?} complete in {:.2}s", target_size, start_time.elapsed().as_secs_f32());
@@ -530,7 +531,7 @@ impl LogisModel {
         let base_session = format!("{}_base", task_id);
         
         // 1. Load Small Model Isolated (Full layers, no baking)
-        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), false, None).await?;
+        self.secure_vram_relay(ModelSize::Qwen, None, cancel_token.clone(), false, None).await?; // 🌟 Small -> Qwen
 
         // 2. Ingest PUG content
         {
@@ -551,27 +552,30 @@ impl LogisModel {
         Ok(())
     }
 
-    // --- [NEW] 2B Continuous Inference Helper ---
-    pub async fn ensure_large_with_base(&self, task_id: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
-        let base_session = format!("{}_base", task_id);
-        
-        // Only load if not already loaded or if current loaded session is different?
-        // secure_vram_relay checks size but not session content.
-        // We force a relay if we are not Large. If we are Large, we assume we might need to reset or just continue.
-        // For safety in this new flow, we can check if we need to load.
-        
-        {
-            let current_size = *self.current_size.lock().await;
-            if current_size == Some(ModelSize::Large) {
-                // Already Large. Assuming context is preserved or we manage it.
-                // But if we just switched from Small, we need to load base.
-                // The safest is to rely on secure_vram_relay's logic:
-                // If we pass the base_session as task_id, it will load that snapshot.
-            }
-        }
+    // --- File: src/model.rs (LogisModel 내부) ---
+    
+    pub async fn ensure_qwen3(&self) -> anyhow::Result<()> {
+        let needs_load = { self.qwen3_generator.lock().await.is_none() };
 
-        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false, None).await
+        if needs_load {
+            println!("[MODEL] Loading Qwen3 Text Model (0.6B) exclusively...");
+            self.unload_generator().await; // 다른 모델들 VRAM 방 빼기
+            
+            let path = self.qwen3_model_path.clone();
+            let dev = self.device_config.device.clone();
+            let dtype = if self.is_cpu_mode { Some(candle_core::DType::F32) } else { Some(candle_core::DType::BF16) };
+            
+            // Qwen3GenerateModel은 동기(sync) 방식이므로 spawn_blocking 사용
+            let gen = tokio::task::spawn_blocking(move || {
+                Qwen3GenerateModel::init(&path, Some(&dev), dtype)
+            }).await??;
+            
+            *self.qwen3_generator.lock().await = Some(gen);
+            *self.current_size.lock().await = Some(ModelSize::Qwen3);
+        }
+        Ok(())
     }
+
 
     async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<QwenVLGenerateModel> {
         println!("[MODEL] Loading Generator from {} (Text-Only: {})...", path, force_text_only);
@@ -611,92 +615,39 @@ impl LogisModel {
 
     pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool, baking_only: bool) -> anyhow::Result<()> {
         if size == ModelSize::Qwen3_5 {
-            // [QWEN3.5] Dedicated loader for GGUF-based Qwen 3.5
-            return self.ensure_qwen3_5(if force_text_only { ModelSize::Small } else { ModelSize::Large }).await;
+            return self.ensure_qwen3_5(false).await; // 🌟 ModelSize::Qwen3_5 대신 false 로 변경
+        }
+        if size == ModelSize::Qwen3 {
+            return self.ensure_qwen3().await; 
         }
 
+        // 오직 ModelSize::Qwen 만 이 아래 로직을 탐
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
-        let mut small_slot = self.small_hibernation.lock().await;
-        let mut large_slot = self.large_hibernation.lock().await;
 
         if *current_size_guard == Some(size) && gen_guard.is_some() && !baking_only {
             return Ok(());
         }
 
-        println!("[MODEL] Activating engine for size: {:?} (Text-Only: {}, Baking: {})...", size, force_text_only, baking_only);
-        // ... (rest of the switching logic remains similar but uses the new loading)
-
-        // 1. [SWITCH] If requested model is already in one of the slots, just move it to main
-        let found_in_slot = match size {
-            ModelSize::Small => {
-                if let Some(m) = small_slot.take() {
-                    if let Some(old_m) = gen_guard.take() {
-                        if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
-                        else if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
-                    }
-                    *gen_guard = Some(m);
-                    *current_size_guard = Some(ModelSize::Small);
-                    true
-                } else { false }
-            },
-            ModelSize::Large => {
-                if let Some(m) = large_slot.take() {
-                    if let Some(old_m) = gen_guard.take() {
-                        if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
-                        else if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
-                    }
-                    *gen_guard = Some(m);
-                    *current_size_guard = Some(ModelSize::Large);
-                    true
-                } else { false }
-            },
-            ModelSize::Qwen3_5 => false, // Qwen3_5 has its own slot, handled by ensure_qwen3_5
-        };
-
-        if found_in_slot {
-            println!("[MODEL] Switched to cached {:?} engine.", size);
-            return Ok(());
-        }
-
-        // 2. [LOAD] Load from disk if not found in any slot
-        println!("[LOAD] Fresh loading {:?} from disk...", size);
-        let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
-        let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
+        println!("[LOAD] Fresh loading {:?} from disk...", size); // [cite: 297]
+        let path = &self.qwen_model_path; // 기존 small_model_path
         
         let target_device = self.device_config.device.clone();
         let is_disk_swap = self.is_disk_swap;
         let dev_id = self.device_config.gpu_id;
-        let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
+        let dtype = if target_device.is_cpu() { Some(candle_core::DType::F32) } else { Some(candle_core::DType::BF16) };
         let limit = self.max_tokens_limit;
         let path_clone = path.to_string();
-        let shared_path_clone = shared_path.map(|s| s.to_string());
         let handle_clone = self.app_handle.clone();
 
         let gen = tokio::task::spawn_blocking(move || {
             let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
             QwenVLGenerateModel::init_with_config(
-                &path_clone, 
-                shared_path_clone.as_deref(), 
-                shared_path_clone.as_deref(), 
+                &path_clone, None, None, // 공유 설정(shared_path) 제거
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
-                force_text_only,
-                baking_only,
-                is_disk_swap,
-                kv_root
+                force_text_only, baking_only, is_disk_swap, kv_root // [cite: 298, 299, 300]
             )
         }).await??;
-
-        // Move current main to slot
-        if let Some(old_m) = gen_guard.take() {
-            if let Some(old_size) = *current_size_guard {
-                match old_size {
-                    ModelSize::Small => *small_slot = Some(old_m),
-                    ModelSize::Large => *large_slot = Some(old_m),
-                    ModelSize::Qwen3_5 => {}, // Qwen3_5 uses its own slot, handled separately
-                }
-            }
-        }
 
         *gen_guard = Some(gen);
         *current_size_guard = Some(size);
@@ -704,23 +655,20 @@ impl LogisModel {
         Ok(())
     }
 
-    pub async fn ensure_qwen3_5(&self, size: ModelSize) -> anyhow::Result<()> {
-        // Lock을 짧게 잡아서 로드 필요한지(상태)만 먼저 확인합니다.
+    pub async fn ensure_qwen3_5(&self, needs_vision: bool) -> anyhow::Result<()> {
         let needs_load = {
             let guard = self.qwen3_5_generator.lock().await;
             if let Some(gen) = guard.as_ref() {
                 let is_large = gen.pre_processor.is_some();
-                let wants_large = size == ModelSize::Large;
-                is_large != wants_large 
+                is_large != needs_vision // 🌟 wants_large 대신 needs_vision 직접 사용
             } else {
                 true
             }
         };
 
         if needs_load {
-            println!("[MODEL] Loading Qwen 3.5 Generator (0.8B) for size {:?}...", size);
+            println!("[MODEL] Loading Qwen 3.5 Generator (0.8B) (Vision: {})...", needs_vision);
             
-            // 메모리 확보를 위해 기존 모델 해제
             self.unload_generator().await; 
             
             let path = self.qwen3_5_model_path.clone();
@@ -730,7 +678,8 @@ impl LogisModel {
                 let gguf_files = crate::utils::find_type_files(&path, "gguf").unwrap_or_default();
                 let model_gguf = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned().ok_or_else(|| anyhow::anyhow!("No model GGUF found"))?;
                 
-                let mmproj_gguf = if size == ModelSize::Large {
+                // 🌟 [수정]
+                let mmproj_gguf = if needs_vision {
                     gguf_files.iter().find(|f| f.contains("mmproj")).cloned()
                 } else {
                     None
@@ -754,13 +703,13 @@ impl LogisModel {
         
         // [STRATEGY] High-priority exclusion logic
         match current_size {
-            Some(ModelSize::Large) => {
-                // If Large is active, Embedding must stay on CPU to avoid OOM
-                println!("[MODEL] Large model active. Forcing Embedding to CPU to prevent swapping.");
+            Some(ModelSize::Qwen3) => { // 🌟 Large -> Qwen3
+                // If Qwen3 is active, Embedding must stay on CPU to avoid OOM
+                println!("[MODEL] Qwen3 model active. Forcing Embedding to CPU to prevent swapping.");
             },
-            Some(ModelSize::Small) | Some(ModelSize::Qwen3_5) => {
-                // Small/Qwen3.5 and Embedding can coexist. 
-                println!("[MODEL] Small/Qwen3.5 model active. Embedding will coexist.");
+            Some(ModelSize::Qwen) | Some(ModelSize::Qwen3_5) => { // 🌟 Small -> Qwen
+                // Qwen/Qwen3.5 and Embedding can coexist. 
+                println!("[MODEL] Qwen/Qwen3.5 model active. Embedding will coexist.");
             },
             None => {
                 // No generator active, safe to clean up any leftovers
@@ -772,8 +721,8 @@ impl LogisModel {
         if emb_guard.is_none() {
             let self_clone = self.embedding_path.clone();
             
-            // Determine target device: CPU if Large is active, else use default GPU
-            let target_device = if current_size == Some(ModelSize::Large) { 
+            // Determine target device: CPU if Qwen3 is active, else use default GPU
+            let target_device = if current_size == Some(ModelSize::Qwen3) { // 🌟 Large -> Qwen3
                 candle_core::Device::Cpu 
             } else { 
                 self.device_config.device.clone() 
@@ -831,8 +780,8 @@ impl LogisModel {
             }
         };
 
-        let small_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf"));
-        let large_model_path = normalize_path(base_path.join("Qwen3-VL-2B-Instruct-gguf"));
+        let qwen_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf")); 
+        let qwen3_model_path = normalize_path(base_path.join("Qwen3-VL-2B-Instruct-gguf")); 
         let qwen3_5_model_path = normalize_path(base_path.join("Qwen3.5-0.8B-Instruct-gguf"));
         let embedding_path = base_path.join("embeddinggemma-300m");
 
@@ -841,15 +790,14 @@ impl LogisModel {
         Ok(Self {
             app_handle,
             generator: Arc::new(TokioMutex::new(None)),
+            qwen3_generator: Arc::new(TokioMutex::new(None)), // 🌟 추가
             qwen3_5_generator: Arc::new(TokioMutex::new(None)),
-            small_hibernation: Arc::new(TokioMutex::new(None)),
-            large_hibernation: Arc::new(TokioMutex::new(None)),
             embedding_model: Arc::new(TokioMutex::new(None)),
             is_cpu_mode: config.is_cpu,
             is_disk_swap,
             dual_mode_enabled: true, 
-            small_model_path,
-            large_model_path,
+            qwen_model_path,    // 🌟 교체
+            qwen3_model_path,   // 🌟 교체
             qwen3_5_model_path,
             embedding_path,
             device_config: config.clone(),
@@ -868,8 +816,8 @@ impl LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
-        // [QWEN3.5-INTEGRATION] 이미지 추출이므로 Large(비전+텍스트) 모드로 호출합니다.
-        self.ensure_qwen3_5(ModelSize::Large).await?;
+        // [QWEN3.5-INTEGRATION] 이미지 추출이므로 비전(true) 모드로 호출합니다.
+        self.ensure_qwen3_5(true).await?; // 🌟 ModelSize::Large 에서 true 로 변경
 
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
@@ -969,9 +917,8 @@ impl LogisModel {
         cancellation_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
-        // [VISION-DYNAMIC] 이미지가 있으면 Large(비전+텍스트), 없으면 Small(텍스트 전용)
-        let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
-        self.ensure_qwen3_5(target_size).await?;
+        // [VISION-DYNAMIC] 🌟 target_size 로직 삭제하고 바로 bool 전달
+        self.ensure_qwen3_5(image.is_some()).await?;
 
         // [FIX] Inject task_id from session_id if it's a task reference
         if let Some(ref sid) = session_id {
@@ -1045,12 +992,12 @@ impl LogisModel {
     }
 
     pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        // [FIX] Default to Small (0.6B) for all chat tasks to align with 0.6B-focused architecture.
+        // [FIX] Default to Qwen (0.6B) for all chat tasks
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
                 drop(gen_guard);
-                self.ensure_generator(ModelSize::Small).await?;
+                self.ensure_generator(ModelSize::Qwen).await?; // 🌟 Small -> Qwen
             }
         }
         
@@ -1146,12 +1093,12 @@ impl LogisModel {
         session_id: Option<String>,
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
-        // [FIX] Ensure we stay on Small (0.6B).
+        // [FIX] Ensure we stay on Qwen (0.6B).
         {
             let gen_guard = self.generator.lock().await;
             if gen_guard.is_none() {
                 drop(gen_guard);
-                self.ensure_generator(ModelSize::Small).await?;
+                self.ensure_generator(ModelSize::Qwen).await?; // 🌟 Small -> Qwen
             }
         }
 
@@ -1191,7 +1138,7 @@ impl LogisModel {
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
         // Ensure generator is loaded
-        self.ensure_generator(ModelSize::Large).await?;
+        self.ensure_generator(ModelSize::Qwen).await?;
 
         // [FIX] Removed redundant emit. Only log the progress if needed.
         // let _ = app_handle.emit(event_name, base_payload);
@@ -1236,9 +1183,8 @@ impl LogisModel {
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
-        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.6B (Small)
-        let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
-        self.ensure_generator(target_size).await?;
+        // [VISION-DYNAMIC]
+        self.ensure_generator(ModelSize::Qwen).await?; // 🌟 무조건 Qwen으로 로드
         
         let mut gen_guard = self.generator.lock().await;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
@@ -1291,9 +1237,8 @@ impl LogisModel {
         session_id: Option<String>,
         kv_name: Option<String>
     ) -> anyhow::Result<String> {
-        // [VISION-DYNAMIC] 이미지가 있으면 2B (Large), 없으면 0.6B (Small)
-        let target_size = if image.is_some() { ModelSize::Large } else { ModelSize::Small };
-        self.ensure_generator(target_size).await?;
+        // [VISION-DYNAMIC]
+        self.ensure_generator(ModelSize::Qwen).await?;
 
         // [FIX] Inject task_id from session_id if it's a task reference
         if let Some(ref sid) = session_id {
@@ -1428,7 +1373,7 @@ impl LogisModel {
                     ],
                     model: "qwen3.5".to_string(), // 🌟 모델명 변경
                     max_tokens: Some(512),
-                    temperature: Some(0.0), top_p: Some(0.9),
+                    temperature: Some(1.0), top_p: Some(0.9),
                     ..Default::default()
                 };
                 gen.generate(params, None, Some(session_1), None).await?
@@ -1439,18 +1384,58 @@ impl LogisModel {
 
         let mut segments = crate::parsing::parse_json_from_llm(&res1);
 
-        // 👇 1단계 파싱 결과 로그 출력
-        println!("\n✅ [STAGE 1: para2graph (0.8B)] 파싱 결과:");
-        println!("{}", serde_json::to_string_pretty(&segments).unwrap_or_default());
+        // ----------------------------------------------------
+        // 🌟 [신규] Stage 1.5: 수치/연산자 추출 - Qwen3 (0.6B Text) 독립 모듈 사용
+        // ----------------------------------------------------
+        // /qwen3/ 로직을 타는 ModelSize::Qwen3 로 스위칭!
+        self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, None, false, None).await?;
 
-        // [필터링 로직] 비어있는 텍스트나 타입이 없는 세그먼트 제거
-        if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
-            ctx_arr.retain(|seg| {
-                let text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
-                let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").trim();
-                !text.is_empty() && !seg_type.is_empty()
-            });
+        let prompt1_5 = crate::parsing::extract_numeric_conditions(&query);
+        
+        let res1_5 = {
+            // 🌟 새롭게 추가한 qwen3_generator 슬롯 사용!
+            if let Some(gen) = self.qwen3_generator.lock().await.as_mut() {
+                println!("[AI-SEARCH] Qwen3 Text (0.6B) Step 1.5: Extracting numeric conditions...");
+                let params = crate::openai_types::ChatCompletionParameters {
+                    messages: vec![
+                        crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt1_5),
+                            name: None,
+                        })
+                    ],
+                    model: "qwen3".to_string(),
+                    max_tokens: Some(256),
+                    temperature: Some(0.0), top_p: Some(0.01),
+                    ..Default::default()
+                };
+                // Qwen3GenerateModel은 동기식(generate) 호출
+                gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))?
+            } else {
+                return Err(anyhow::anyhow!("Qwen3 Generator is missing"));
+            }
+        };
+
+        let conditions_json = crate::parsing::parse_json_from_llm(&res1_5);
+        println!("\n🔍 [STAGE 1.5: Qwen3 파싱 결과]\n{}", serde_json::to_string_pretty(&conditions_json).unwrap_or_default());
+
+        if let Some(obj) = segments.as_object_mut() {
+            obj.insert("numeric_conditions".to_string(), conditions_json);
         }
+
+        // let mut segments = crate::parsing::parse_json_from_llm(&res1);
+
+        // // 👇 1단계 파싱 결과 로그 출력
+        // println!("\n✅ [STAGE 1: para2graph (0.8B)] 파싱 결과:");
+        // println!("{}", serde_json::to_string_pretty(&segments).unwrap_or_default());
+
+        // // [필터링 로직] 비어있는 텍스트나 타입이 없는 세그먼트 제거
+        // if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
+        //     ctx_arr.retain(|seg| {
+        //         let text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+        //         let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").trim();
+        //         !text.is_empty() && !seg_type.is_empty()
+        //     });
+        // }
 
         // ----------------------------------------------------
         // Stage 2: 조건 추출 (graph2contexts) - Qwen 3.5 (0.8B) 계속 사용

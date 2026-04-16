@@ -570,7 +570,7 @@ async fn process_task(
             log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Reading document structure...", "spinner": "⠋" }));
             
             // 🌟 [CRITICAL FIX] is_baking을 true로 전달하여 안 써도 되는 2GB짜리 비전(이미지) 모델 로딩을 강제 차단합니다! (로딩 속도 13초 -> 3초)
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Qwen, None, Some(cancellation_token.clone()), true, kv_name.clone()).await?;
             
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
@@ -612,7 +612,7 @@ async fn process_task(
 
         {
             // [핵심] Step A가 아니라 '미리 구워둔 Base' 스냅샷을 불러옵니다!
-            model.secure_vram_relay(crate::model::ModelSize::Small, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![
@@ -669,7 +669,7 @@ async fn process_task(
         let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think", detail_prompt);
         let snapshot_id = format!("{}_step_a2", task.id);
 
-        model.secure_vram_relay(crate::model::ModelSize::Small, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+        model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
         let params = ChatCompletionParameters {
             messages: vec![
@@ -772,7 +772,7 @@ async fn process_task(
 
             let mut titles = Vec::new();
             {
-                model.secure_vram_relay(crate::model::ModelSize::Small, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![

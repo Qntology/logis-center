@@ -486,36 +486,85 @@ NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{LANG}", language)
 }
 
-// pub fn graph2contexts(current: &str) -> String {
-//     let template = r###"convert the natural language content to fit the dataset JSON structure. no explanation.
-//     # #date : The date value is set by referencing both the natural language's implied time period and the region value against the current time ({CURRENT}); it will be marked as null if a value is absent
-//     # #status : 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
-//     # #substantial : 'size' | 'weight' | 'shipping_fee' | 'shipping_duration' | 'sale_price' | 'supply_price' | 'low_stock_threshold' | 'discount' | 'min_order_amount' | 'max_discount_amount' | 'usage_limit' | 'usage_per' | ''
-//     # #find : 'many' | 'few' | 'much' | 'little' | 'heavy' | 'light' | ''
-    
-//     [TASK]
-//     Analyze EACH provided text segment and extract structured conditions. 
-    
-//     [OUTPUT FORMAT]
-//     Return a JSON object containing a "context" array with one object per segment.
-//     {
-//         "context": [
-//             {
-//                 "type": "string",
-//                 "text": "the_original_segment_text",
-//                 "status": "string or null",
-//                 "substantial": "string or null",
-//                 "find": "string or null",
-//                 "condition" : {
-//                     "date": { "eq": "yyyy-MM-ddThh:mm:ss", "lte": "yyyy-MM-ddThh:mm:ss", "gte": "yyyy-MM-ddThh:mm:ss" },
-//                     "quantity": { "eq": number, "lte": number, "gte": number },
-//                     "price": { "currency": "string", "eq": number, "lte": number, "gte": number }
-//                 }
-//             }
-//         ]
-//     }"###;
-//     template.replace("{CURRENT}", current)
-// }
+// --- File: src/parsing.rs ---
+
+pub fn extract_numeric_conditions(input: &str) -> String {
+    let template = r###"Task: Act as a deterministic semantic parser. You must extract, transform, and normalize data from the natural language input into the strictly defined JSON output format based on the provided schema.
+
+[SCHEMA DEFINITION]
+- property_type: A dynamically generated key representing the extracted attribute context from the text.
+- operator: A string representing the comparison operator. Allowed values:
+  * "gt": Strictly greater than
+  * "gte": Greater than or equal to
+  * "lt": Strictly less than
+  * "lte": Less than or equal to
+  * "eq": Exact match
+
+[TRANSFORMATION LOGIC - MANDATORY EXECUTION]
+1. ATTRIBUTE EXTRACTION:
+   - Identify the context of the numbers in the text to determine the property type.
+2. OPERATOR SELECTION & VALUE MAPPING:
+   - Extract numeric values from the text and map them to the `value` field.
+   - Evaluate the context to select the appropriate operator and map it to the `operator` field according to the schema definition.
+3. ISO STANDARDIZATION:
+   - Identify the currency context and resolve it to its ISO 4217 code. Place this inside the relevant object if applicable.
+
+[INPUT]
+{INPUT}
+
+[OUTPUT FORMAT]
+{
+  "condition": {
+    "quantity": {
+      "is_percent": Boolean,
+      "percent_total": is_percent === true ? 100 : 0,
+      "value": "...",
+      "operator": "..."
+    }
+  }
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template.replace("{INPUT}", input)
+}
+
+pub fn property2operator(current: &str, input: &str) -> String {
+    let template = r###"Task: Act as a deterministic semantic parser. You must extract, transform, and normalize data from the natural language input into the strictly defined JSON output format based on the provided schema.
+
+[SCHEMA DEFINITION]
+- property_type: A dynamically generated key representing the extracted attribute context from the text.
+- operator: A string representing the comparison operator. Allowed values:
+  * "gt": Strictly greater than
+  * "gte": Greater than or equal to
+  * "lt": Strictly less than
+  * "lte": Less than or equal to
+  * "eq": Exact match
+
+[TRANSFORMATION LOGIC - MANDATORY EXECUTION]
+1. ATTRIBUTE EXTRACTION:
+   - Identify the context of the numbers in the text to determine the property type.
+2. OPERATOR SELECTION & VALUE MAPPING:
+   - Extract numeric values from the text and map them to the `value` field.
+   - Evaluate the context to select the appropriate operator and map it to the `operator` field according to the schema definition.
+3. ISO STANDARDIZATION:
+   - Identify the currency context and resolve it to its ISO 4217 code. Place this inside the relevant object if applicable.
+
+[INPUT]
+{INPUT}
+
+[OUTPUT FORMAT]
+{
+  "quantity": {
+    "value": 0,
+    "operator": "..."
+  }
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template.replace("{CURRENT}", current).replace("{INPUT}", input)
+}
 
 pub fn graph2contexts(current: &str, input_json: &str) -> String {
     let template = r###"Analyze the natural language content and extract ALL distinct logical conditions into the specified JSON dataset structure.
