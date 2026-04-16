@@ -50,6 +50,77 @@ impl Qwen3GenerateModel {
         })
     }
 
+    pub fn init_from_gguf(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
+        let chat_template = ChatTemplate::init(path)?;
+        let tokenizer = TokenizerModel::init(path)?;
+        let config_path = std::path::Path::new(path).join("config.json");
+        let cfg: Qwen3Config = serde_json::from_slice(&std::fs::read(config_path)?)?;
+        let device = get_device(device);
+        let cfg_dtype = cfg.torch_dtype.as_str();
+        let dtype = get_dtype(dtype, cfg_dtype);
+        
+        let gguf_files = crate::utils::find_type_files(path, "gguf")?;
+        let model_file = gguf_files.first().ok_or_else(|| anyhow::anyhow!("No GGUF found"))?;
+        
+        let mut file = std::fs::File::open(model_file)?;
+        let ct = candle_core::quantized::gguf_file::Content::read(&mut file)?;
+        
+        println!("[QWEN3-NATIVE] Dequantizing GGUF weights directly into RAM for Qwen3Model...");
+        
+        // GGUF 텐서 이름을 Qwen3Model 구조체 이름에 맞게 자동 번역
+        let mut data = std::collections::HashMap::new();
+        for (name, _) in ct.tensor_infos.iter() {
+            let t = ct.tensor(&mut file, name, &device)?;
+            let t = t.dequantize_f16(&device).or_else(|_| t.dequantize(&device))?.to_dtype(dtype)?;
+            
+            let mut new_name = name.clone();
+            if let Some(rest) = name.strip_prefix("blk.") {
+                let parts: Vec<&str> = rest.splitn(2, '.').collect();
+                if parts.len() == 2 {
+                    let idx = parts[0];
+                    let layer = if parts[1].starts_with("attn_q_norm") { parts[1].replace("attn_q_norm", "self_attn.q_norm") }
+                    else if parts[1].starts_with("attn_k_norm") { parts[1].replace("attn_k_norm", "self_attn.k_norm") }
+                    else if parts[1].starts_with("attn_q") { parts[1].replace("attn_q", "self_attn.q_proj") }
+                    else if parts[1].starts_with("attn_k") { parts[1].replace("attn_k", "self_attn.k_proj") }
+                    else if parts[1].starts_with("attn_v") { parts[1].replace("attn_v", "self_attn.v_proj") }
+                    else if parts[1].starts_with("attn_output") { parts[1].replace("attn_output", "self_attn.o_proj") }
+                    else if parts[1].starts_with("attn_norm") { parts[1].replace("attn_norm", "input_layernorm") }
+                    else if parts[1].starts_with("ffn_norm") { parts[1].replace("ffn_norm", "post_attention_layernorm") }
+                    else if parts[1].starts_with("ffn_gate") { parts[1].replace("ffn_gate", "mlp.gate_proj") }
+                    else if parts[1].starts_with("ffn_up") { parts[1].replace("ffn_up", "mlp.up_proj") }
+                    else if parts[1].starts_with("ffn_down") { parts[1].replace("ffn_down", "mlp.down_proj") }
+                    else { parts[1].to_string() };
+                    new_name = format!("model.layers.{}.{}", idx, layer);
+                }
+            } else if name.starts_with("token_embd") {
+                new_name = name.replace("token_embd", "model.embed_tokens");
+            } else if name.starts_with("output_norm") {
+                new_name = name.replace("output_norm", "model.norm");
+            } else if name.starts_with("output") {
+                new_name = name.replace("output", "lm_head");
+            }
+            data.insert(new_name, t);
+        }
+        
+        let vb = VarBuilder::from_tensors(data, dtype, &device);
+        let qwen3 = Qwen3Model::new(&cfg, vb)?;
+        
+        let generation_config_path = std::path::Path::new(path).join("generation_config.json");
+        let generation_config: Qwen3GenerationConfig =
+            serde_json::from_slice(&std::fs::read(generation_config_path).unwrap_or_default()).unwrap_or_default();
+
+        Ok(Qwen3GenerateModel {
+            chat_template,
+            tokenizer,
+            qwen3,
+            device: device.clone(),
+            eos_token_id1: generation_config.eos_token_id.get(0).cloned().unwrap_or(151643) as u32,
+            eos_token_id2: generation_config.eos_token_id.get(1).cloned().unwrap_or(151645) as u32,
+            generation_config,
+            model_name: "qwen3".to_string(),
+        })
+    }
+
     pub fn generate(&mut self, mes: ChatCompletionParameters) -> Result<String> {
         let temperature = mes
             .temperature

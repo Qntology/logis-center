@@ -141,9 +141,10 @@ pub enum ModelSize {
 #[derive(Clone)]
 pub struct LogisModel {
     pub app_handle: tauri::AppHandle,
-    pub generator: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, // Qwen 전용 (기존 Small)
-    pub qwen3_generator: Arc<TokioMutex<Option<Qwen3GenerateModel>>>, // 🌟 Qwen3 전용 슬롯 추가!
-    pub qwen3_5_generator: Arc<TokioMutex<Option<Qwen3_5GenerateModel>>>, // Qwen3.5 전용
+    pub generator: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, 
+    // 🌟 [복구 완료] 사용자님이 원하시던 오리지널 Qwen3 텍스트 전용 로직을 띄웁니다!
+    pub qwen3_generator: Arc<TokioMutex<Option<Qwen3GenerateModel>>>, 
+    pub qwen3_5_generator: Arc<TokioMutex<Option<Qwen3_5GenerateModel>>>,
     
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
 
@@ -556,22 +557,35 @@ impl LogisModel {
     
     pub async fn ensure_qwen3(&self) -> anyhow::Result<()> {
         let needs_load = { self.qwen3_generator.lock().await.is_none() };
-
         if needs_load {
-            println!("[MODEL] Loading Qwen3 Text Model (0.6B) exclusively...");
-            self.unload_generator().await; // 다른 모델들 VRAM 방 빼기
+            println!("[MODEL] Loading Qwen3 Text Model (0.6B GGUF) exclusively via NATIVE /qwen3/ logic...");
+            self.unload_generator().await;
+            {
+                *self.current_size.lock().await = Some(ModelSize::Qwen3);
+            }
             
             let path = self.qwen3_model_path.clone();
             let dev = self.device_config.device.clone();
             let dtype = if self.is_cpu_mode { Some(candle_core::DType::F32) } else { Some(candle_core::DType::BF16) };
             
-            // Qwen3GenerateModel은 동기(sync) 방식이므로 spawn_blocking 사용
-            let gen = tokio::task::spawn_blocking(move || {
-                Qwen3GenerateModel::init(&path, Some(&dev), dtype)
-            }).await??;
-            
-            *self.qwen3_generator.lock().await = Some(gen);
-            *self.current_size.lock().await = Some(ModelSize::Qwen3);
+            // 🌟 방금 만든 init_from_gguf 를 호출합니다!
+            let gen_result = tokio::task::spawn_blocking(move || -> anyhow::Result<Qwen3GenerateModel> {
+                Qwen3GenerateModel::init_from_gguf(&path, Some(&dev), dtype)
+            }).await?;
+
+            match gen_result {
+                Ok(gen) => {
+                    println!("[MODEL] 🎉 Qwen3 (0.6B GGUF) Native Model loaded successfully!");
+                    *self.qwen3_generator.lock().await = Some(gen);
+                },
+                Err(e) => {
+                    println!("\n==================================================");
+                    println!("🚨 [CRITICAL ERROR] 0.6B GGUF 로딩 실패!");
+                    println!("원인: {:?}", e);
+                    println!("==================================================\n");
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
@@ -629,8 +643,13 @@ impl LogisModel {
             return Ok(());
         }
 
-        println!("[LOAD] Fresh loading {:?} from disk...", size); // [cite: 297]
-        let path = &self.qwen_model_path; // 기존 small_model_path
+        println!("[LOAD] Fresh loading {:?} from disk...", size);
+        let path = &self.qwen_model_path; 
+        
+        // 🌟 [핵심 픽스] Qwen 모델도 로딩 전에 미리 방주인 등록!
+        {
+            *self.current_size.lock().await = Some(size);
+        }
         
         let target_device = self.device_config.device.clone();
         let is_disk_swap = self.is_disk_swap;
@@ -668,8 +687,12 @@ impl LogisModel {
 
         if needs_load {
             println!("[MODEL] Loading Qwen 3.5 Generator (0.8B) (Vision: {})...", needs_vision);
-            
             self.unload_generator().await; 
+            
+            // 🌟 [핵심 픽스] 여기서도 로딩 전에 미리 방주인 등록!
+            {
+                *self.current_size.lock().await = Some(ModelSize::Qwen3_5);
+            }
             
             let path = self.qwen3_5_model_path.clone();
             let dev = self.device_config.device.clone();
@@ -781,7 +804,7 @@ impl LogisModel {
         };
 
         let qwen_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf")); 
-        let qwen3_model_path = normalize_path(base_path.join("Qwen3-VL-2B-Instruct-gguf")); 
+        let qwen3_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf")); 
         let qwen3_5_model_path = normalize_path(base_path.join("Qwen3.5-0.8B-Instruct-gguf"));
         let embedding_path = base_path.join("embeddinggemma-300m");
 
@@ -1384,71 +1407,81 @@ impl LogisModel {
 
         let mut segments = crate::parsing::parse_json_from_llm(&res1);
 
-        // ----------------------------------------------------
-        // 🌟 [신규] Stage 1.5: 수치/연산자 추출 - Qwen3 (0.6B Text) 독립 모듈 사용
-        // ----------------------------------------------------
-        // /qwen3/ 로직을 타는 ModelSize::Qwen3 로 스위칭!
-        self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, None, false, None).await?;
+        // 👇 1단계 파싱 결과 로그 출력
+        println!("\n✅ [STAGE 1: para2graph (0.8B)] 파싱 결과:");
+        println!("{}", serde_json::to_string_pretty(&segments).unwrap_or_default());
 
-        let prompt1_5 = crate::parsing::extract_numeric_conditions(&query);
-        
-        let res1_5 = {
-            // 🌟 새롭게 추가한 qwen3_generator 슬롯 사용!
-            if let Some(gen) = self.qwen3_generator.lock().await.as_mut() {
-                println!("[AI-SEARCH] Qwen3 Text (0.6B) Step 1.5: Extracting numeric conditions...");
-                let params = crate::openai_types::ChatCompletionParameters {
-                    messages: vec![
-                        crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt1_5),
-                            name: None,
-                        })
-                    ],
-                    model: "qwen3".to_string(),
-                    max_tokens: Some(256),
-                    temperature: Some(0.0), top_p: Some(0.01),
-                    ..Default::default()
-                };
-                // Qwen3GenerateModel은 동기식(generate) 호출
-                gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))?
-            } else {
-                return Err(anyhow::anyhow!("Qwen3 Generator is missing"));
-            }
-        };
-
-        let conditions_json = crate::parsing::parse_json_from_llm(&res1_5);
-        println!("\n🔍 [STAGE 1.5: Qwen3 파싱 결과]\n{}", serde_json::to_string_pretty(&conditions_json).unwrap_or_default());
-
-        if let Some(obj) = segments.as_object_mut() {
-            obj.insert("numeric_conditions".to_string(), conditions_json);
+        // [필터링 로직] 비어있는 텍스트나 타입이 없는 세그먼트 제거
+        if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
+             ctx_arr.retain(|seg| {
+                 let text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+                 let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").trim();
+                 !text.is_empty() && !seg_type.is_empty()
+             });
         }
 
-        // let mut segments = crate::parsing::parse_json_from_llm(&res1);
+        // ----------------------------------------------------
+        // 🌟 [신규] Stage 1.5: 수치/연산자 조각별 루프 추출 - Qwen3 (0.6B) 사용
+        // ----------------------------------------------------
+        // /qwen3/ 텍스트 모델로 스위칭!
+        self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, None, false, None).await?;
 
-        // // 👇 1단계 파싱 결과 로그 출력
-        // println!("\n✅ [STAGE 1: para2graph (0.8B)] 파싱 결과:");
-        // println!("{}", serde_json::to_string_pretty(&segments).unwrap_or_default());
+        // Context 배열을 순회하며 개별 추출 수행
+        if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
+            let total_segments = ctx_arr.len(); // 🌟 에러 해결: 루프 시작 전에 길이를 미리 복사해 둡니다!
 
-        // // [필터링 로직] 비어있는 텍스트나 타입이 없는 세그먼트 제거
-        // if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
-        //     ctx_arr.retain(|seg| {
-        //         let text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
-        //         let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").trim();
-        //         !text.is_empty() && !seg_type.is_empty()
-        //     });
-        // }
+            for (idx, seg) in ctx_arr.iter_mut().enumerate() {
+                let current_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                // 🌟 업데이트된 함수 호출: 전체쿼리, 현재텍스트, 타입을 모두 전달
+                let prompt1_5 = crate::parsing::extract_numeric_conditions(&current_text, &query, &seg_type);
+                
+                let res1_5 = {
+                    if let Some(gen) = self.qwen3_generator.lock().await.as_mut() {
+                        println!("[AI-SEARCH] Qwen3 (0.6B) Step 1.5 [{}/{}]: Extracting conditions for '{}'...", idx + 1, total_segments, seg_type);
+                        let params = crate::openai_types::ChatCompletionParameters {
+                            messages: vec![
+                                crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt1_5),
+                                    name: None,
+                                })
+                            ],
+                            model: "qwen3".to_string(),
+                            max_tokens: Some(256),
+                            temperature: Some(0.0), top_p: Some(0.01),
+                            ..Default::default()
+                        };
+                        // 🌟 로더가 바뀌었으므로 비동기(.await) 메서드를 사용합니다!
+                        gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))?
+                    } else {
+                        return Err(anyhow::anyhow!("Qwen3 Generator is missing"));
+                    }
+                };
+
+                let conditions_json = crate::parsing::parse_json_from_llm(&res1_5);
+                println!("🔍 [STAGE 1.5: {} 파싱 결과]\n{}", seg_type, serde_json::to_string_pretty(&conditions_json).unwrap_or_default());
+
+                // 현재 세그먼트 객체 안에 추출된 조건을 삽입
+                if let Some(obj) = seg.as_object_mut() {
+                    obj.insert("numeric_conditions".to_string(), conditions_json);
+                }
+            }
+        }
 
         // ----------------------------------------------------
-        // Stage 2: 조건 추출 (graph2contexts) - Qwen 3.5 (0.8B) 계속 사용
+        // Stage 2: 조건 최종 병합 추출 (graph2contexts) - Qwen 3.5 (0.8B) 
         // ----------------------------------------------------
+        // 🌟 [중요] Stage 1.5에서 0.6B(Qwen3)로 방을 바꿨기 때문에, Stage 2를 위해 다시 0.8B로 돌아와야 합니다!
+        self.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, None, false, None).await?;
+
         let input_for_stage2 = serde_json::to_string_pretty(&segments).unwrap_or_default();
         let prompt2 = crate::parsing::graph2contexts(&current_time, &input_for_stage2);
         let session_2 = "system_search_g2c_q35".to_string();
 
-        // 🌟 2단계에서는 secure_vram_relay 호출 생략! (이미 로드되어 있으므로 속도 대폭 향상)
-
         let res2 = {
             if let Some(gen) = self.qwen3_5_generator.lock().await.as_mut() {
-                println!("[AI-SEARCH] 0.8B (Qwen 3.5) Step 2: Asking graph2contexts...");
+                println!("\n[AI-SEARCH] 0.8B (Qwen 3.5) Step 2: Asking graph2contexts...");
                 let params = crate::openai_types::ChatCompletionParameters {
                     messages: vec![
                         crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 

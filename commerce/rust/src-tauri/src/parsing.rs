@@ -488,11 +488,11 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 
 // --- File: src/parsing.rs ---
 
-pub fn extract_numeric_conditions(input: &str) -> String {
-    let template = r###"Task: Act as a deterministic semantic parser. You must extract, transform, and normalize data from the natural language input into the strictly defined JSON output format based on the provided schema.
+pub fn extract_numeric_conditions(current: &str, input: &str, seg_type: &str) -> String {
+    let template = r###"Task: Act as a deterministic semantic parser.
+You must extract, transform, and normalize data from the natural language input into the strictly defined JSON output format based on the provided schema.
 
 [SCHEMA DEFINITION]
-- property_type: A dynamically generated key representing the extracted attribute context from the text.
 - operator: A string representing the comparison operator. Allowed values:
   * "gt": Strictly greater than
   * "gte": Greater than or equal to
@@ -504,18 +504,21 @@ pub fn extract_numeric_conditions(input: &str) -> String {
 1. ATTRIBUTE EXTRACTION:
    - Identify the context of the numbers in the text to determine the property type.
 2. OPERATOR SELECTION & VALUE MAPPING:
-   - Extract numeric values from the text and map them to the `value` field.
-   - Evaluate the context to select the appropriate operator and map it to the `operator` field according to the schema definition.
+   - Extract numeric values from the current text and map them to the `value` field.
+   - Evaluate the context to select the appropriate operator.
 3. ISO STANDARDIZATION:
-   - Identify the currency context and resolve it to its ISO 4217 code. Place this inside the relevant object if applicable.
+   - Identify the currency context and resolve it to its ISO 4217 code.
 
-[INPUT]
+[FULL QUERY CONTEXT]
 {INPUT}
+
+[CURRENT CHUNK TO ANALYZE]
+{CURRENT}
 
 [OUTPUT FORMAT]
 {
   "condition": {
-    "quantity": {
+    "{TYPE}": {
       "is_percent": Boolean,
       "percent_total": is_percent === true ? 100 : 0,
       "value": "...",
@@ -527,6 +530,8 @@ pub fn extract_numeric_conditions(input: &str) -> String {
 [ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
 
     template.replace("{INPUT}", input)
+            .replace("{CURRENT}", current)
+            .replace("{TYPE}", seg_type)
 }
 
 pub fn property2operator(current: &str, input: &str) -> String {

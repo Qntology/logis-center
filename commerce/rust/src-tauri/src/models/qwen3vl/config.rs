@@ -82,15 +82,15 @@ pub fn qwen3vl_text_config2qwen3_config(cfg: &Qwen3VLTextConfig) -> Qwen3Config 
     Qwen3Config {
         attention_bias: cfg.attention_bias,
         attention_dropout: cfg.attention_dropout as f64,
-        bos_token_id: cfg.bos_token_id as u32,
-        eos_token_id: cfg.eos_token_id as u32,
+        bos_token_id: Some(cfg.bos_token_id as u32), // 🌟 Some() 으로 감싸기
+        eos_token_id: Some(cfg.eos_token_id as u32), // 🌟 Some() 으로 감싸기
         head_dim: cfg.head_dim,
         hidden_act: cfg.hidden_act,
         hidden_size: cfg.hidden_size,
         initializer_range: cfg.initializer_range as f64,
         intermediate_size: cfg.intermediate_size,
         max_position_embeddings: cfg.max_position_embeddings,
-        max_window_layers: 0,
+        max_window_layers: Some(0),
         num_attention_heads: cfg.num_attention_heads,
         num_hidden_layers: cfg.num_hidden_layers,
         num_key_value_heads: cfg.num_key_value_heads,
