@@ -441,17 +441,20 @@ async fn process_task(
     // --- Image Extraction Logic (Qwen 3.5 Pipeline) ---
     if task.r#type == "image_extraction" {
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        
+        // 🌟 [CRITICAL FIX] 프론트엔드가 보낸 탭 모드 읽기 (없으면 기본 commerce)
+        let search_mode = task_data.get("search_mode").and_then(|s| s.as_str()).unwrap_or("commerce").to_string();
+
         if !image_path.is_empty() {
             println!("[Scheduler] Starting Image Extraction for {}", task.id);
             
-            // [QWEN3.5] Log progress
             log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Analyzing visual context with Qwen 3.5...", "spinner": "⠋" }));
             
-            // ensure_qwen3_5 is called internally by extract_from_image
             model.extract_from_image(
                 task.id.clone(),
                 image_path,
                 "korean".to_string(),
+                search_mode, // 🌟 모델의 분석 함수로 탭 상태 전달!
                 app_handle,
                 Some(cancellation_token.clone()),
                 store_mutex,

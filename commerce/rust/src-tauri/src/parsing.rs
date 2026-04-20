@@ -976,3 +976,46 @@ pub fn parse_json_from_llm(text: &str) -> serde_json::Value {
     println!("[Parsing] Warning: Failed to repair dirty JSON: {}", clean_text);
     serde_json::json!({})
 }
+
+
+
+
+
+pub fn extract_shipping_conditions(query: &str, language: &str) -> String {
+    let template = r###"Task: Act as a deterministic shipping and logistics semantic parser.
+Extract the logistics filters from the natural language query into the JSON format.
+
+[SCHEMA DEFINITION]
+Extract the following tracking properties if semantically present in the text:
+- "no": Tracking number, waybill number, or reference identifier.
+- "status": Shipping status (Allowed values: draft, progress, return, complete, error).
+- "carrier": Courier, logistics carrier, vessel, or flight name.
+- "shipping_method": Mode of transport or delivery service level.
+- "sender_address": Origin location, port of loading, departure point, or sender address.
+- "recipient_address": Destination location, port of discharge, arrival point, or recipient address.
+- "shipping_date": Dispatch date, departure date, or shipped on board date.
+- "delivery_date": Arrival date or delivered date.
+- "weight": Cargo, package, or gross weight.
+- "shipping_fee": Logistics cost, freight charge, or shipping fee.
+
+[TRANSFORMATION LOGIC]
+For EVERY extracted field, you MUST wrap it in an operator object:
+{ "operator": "eq" | "gt" | "lt" | "gte" | "lte" | "contains", "value": <extracted_value> }
+
+- Use "contains" for text fields, locations, and names.
+- Use "eq" for exact matches like status or strict identifiers.
+- Use "gt", "gte", "lt", "lte" for numeric values, amounts, weights, and dates.
+- Universality Rule: Do NOT include descriptive text or units (like 'kg', '$', 'days') in the value. Extract and compute only the raw numbers or normalized strings.
+
+[QUERY]
+{QUERY}
+
+[OUTPUT FORMAT]
+{
+  "<property_name>": { "operator": "...", "value": "..." }
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template.replace("{QUERY}", query).replace("{LANGUAGE}", language)
+}

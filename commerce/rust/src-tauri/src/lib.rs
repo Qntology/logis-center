@@ -244,6 +244,9 @@ async fn search_documents(
     _offset: usize,
     filter: Option<String>,
 ) -> Result<Vec<(String, String, f32)>, String> {
+    // 🌟 [추가] 프론트엔드가 텍스트 검색을 요청할 때마다 터미널에 로그를 찍습니다.
+    println!("[DB-SEARCH] 텍스트 검색 요청 수신 (Query: '{}', Filter: {:?})", query, filter);
+
     let store_opt = {
         let mut store_guard = state.store.lock().await;
         if store_guard.is_none() {
@@ -292,10 +295,16 @@ fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
 
     if let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()) {
         for (key, val_obj) in cond {
-            // 🌟 [CRITICAL FIX 3] AI가 "order"나 "goods" 같은 키를 만들어내면, 무조건 DB의 "amount" 컬럼으로 매핑해줍니다!
-            let valid_cols = ["amount", "status", "type", "created_at", "updated_at"];
+            // 🌟 [CRITICAL FIX] Shipping에서 사용하는 컬럼명들을 DB 검색 허용 목록(valid_cols)에 추가합니다!
+            let valid_cols = [
+                "amount", "status", "type", "created_at", "updated_at",
+                "no", "carrier", "shipping_method", "sender_address", "recipient_address", 
+                "shipping_date", "delivery_date", "weight"
+            ];
+            
             let mapped_key = match key.as_str() {
-                "price" | "sale_price" | "discount" | "shipping_fee" | "supply_price" | "order" | "goods" => "amount",
+                // 커머스 가격 관련 키들은 여전히 amount로 묶어줍니다. (shipping_fee는 겹치므로 amount로 매핑하지 않음)
+                "price" | "sale_price" | "discount" | "supply_price" | "order" | "goods" => "amount",
                 k if valid_cols.contains(&k) => k,
                 _ => "" 
             };
@@ -330,6 +339,9 @@ async fn get_all_documents(
     offset: usize,
     filter: Option<String>,
 ) -> Result<Vec<TradeDocument>, String> {
+    // 🌟 [추가] 프론트엔드가 리스트를 요청할 때마다 터미널에 로그를 찍습니다.
+    println!("[DB-FETCH] 리스트 불러오기 요청 수신 (Limit: {}, Filter: {:?})", limit, filter);
+
     let mut store_guard = state.store.lock().await; // 🌟 mut로 변경하여 쓰기 가능하게 만듭니다.
     
     // 🌟 [CRITICAL FIX] DB 초기화 레이스 컨디션 해결
@@ -474,6 +486,7 @@ async fn delete_documents(
 async fn ai_search_complex(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
+    task_id: String, // 🌟 프론트엔드에서 만든 taskId를 그대로 받아옵니다!
     query: String,
     language: String,
     device_preference: Option<String>,
@@ -481,11 +494,48 @@ async fn ai_search_complex(
 ) -> Result<Value, String> {
     println!("\n==================================================");
     println!("🚀 [AI-SEARCH] 프론트엔드 요청 수신 완료!");
+    println!("   - Task ID: {}", task_id);
     println!("   - 검색어: {}", query);
     println!("   - 검색 모드: {}", search_mode);
     println!("==================================================\n");
 
-    IS_SEARCHING.store(true, Ordering::SeqCst); // 🌟 검색 시작 락 활성화
+    IS_SEARCHING.store(true, Ordering::SeqCst); 
+    
+    let cancel_token = state.cancellation_token.clone();
+    
+    let store_opt = {
+        let mut store_guard = state.store.lock().await;
+        if store_guard.is_none() {
+            let db_path = "data/lancedb";
+            if let Ok(s) = VectorStore::new(db_path).await {
+                let _ = s.init_all_tables().await;
+                *store_guard = Some(s);
+            }
+        }
+        store_guard.as_ref().cloned() 
+    };
+
+    // 🌟 DB에 Task 등록
+    if let Some(store) = store_opt.as_ref() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let task = crate::store::Task {
+            id: task_id.clone(), 
+            r#type: "ai_search".to_string(),
+            from: "user".to_string(),
+            to: "system".to_string(),
+            cc: "search".to_string(), bcc: "".to_string(), r#ref: "".to_string(),
+            data_json: json!({"query": query.clone(), "mode": search_mode.clone()}).to_string(),
+            created_at: now, updated_at: now,
+            status: 1, // progress
+        };
+        let _ = store.add_task(task).await;
+        
+        // 🌟 [CRITICAL FIX 5] DB에도 역할을 "user"로 등록하고 쿼리를 원본 그대로 넣습니다.
+        let _ = store.add_message(
+            &task_id, "user", &query, 
+            Some(&task_id), Some(1), None, None, None, None, None, Some("talk"), None
+        ).await;
+    }
 
     let model = {
         let mut model_guard = state.model.lock().await;
@@ -500,7 +550,7 @@ async fn ai_search_complex(
             if let Ok(m) = LogisModel::new(app_handle.clone(), device_preference.as_deref()).await { 
                 *model_guard = Some(m);
             } else { 
-                IS_SEARCHING.store(false, Ordering::SeqCst); // 에러 시 락 해제
+                IS_SEARCHING.store(false, Ordering::SeqCst); 
                 return Err("Failed to load model".to_string());
             }
         }
@@ -510,21 +560,7 @@ async fn ai_search_complex(
     let search_process = async {
         let mut all_results = Vec::new();
         
-        // 🌟 [CRITICAL FIX] AI 분석 전에 DB 인스턴스를 먼저 확보합니다.
-        let store_opt = {
-            let mut store_guard = state.store.lock().await;
-            if store_guard.is_none() {
-                let db_path = "data/lancedb";
-                if let Ok(s) = VectorStore::new(db_path).await {
-                    let _ = s.init_all_tables().await;
-                    *store_guard = Some(s);
-                }
-            }
-            store_guard.as_ref().cloned() 
-        };
-
-        // 🌟 [CRITICAL FIX] Part 3: 팀 프로필에서 Min/Max 통계 데이터(Base Metrics)를 꺼내옵니다.
-        let team_id = crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000"); // 로컬 기본 팀 ID
+        let team_id = crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000"); 
         let mut metrics_json_str = "{}".to_string();
         
         if let Some(store) = store_opt.as_ref() {
@@ -537,15 +573,20 @@ async fn ai_search_complex(
             }
         }
 
+        // 🌟 취소 토큰(cancel_token)을 파싱 함수에 전달!
         let structured_query = if search_mode == "shipping" {
-            model.parse_shipping_query(query.clone(), &language).await.map_err(|e| e.to_string())?
+            model.parse_shipping_query(&task_id, &app_handle, query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
         } else {
-            // 🌟 통계 데이터를 parse_commerce_query 에 주입!
-            model.parse_commerce_query(query.clone(), &language, &metrics_json_str).await.map_err(|e| e.to_string())?
+            model.parse_commerce_query(&task_id, &app_handle, query.clone(), &language, &metrics_json_str, cancel_token.clone()).await.map_err(|e| e.to_string())?
         };
 
-        if let (Some(store), Some(ctx_arr)) = (store_opt, structured_query.get("context").and_then(|v| v.as_array())) {
+        if let (Some(store), Some(ctx_arr)) = (store_opt.clone(), structured_query.get("context").and_then(|v| v.as_array())) {
             for ctx in ctx_arr {
+                // 🌟 매 루프마다 사용자가 Cancel 버튼을 눌렀는지 체크!
+                if cancel_token.load(Ordering::Relaxed) { 
+                    return Err("Search cancelled by user".to_string()); 
+                }
+
                 tokio::task::yield_now().await;
 
                 let text = ctx.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -554,7 +595,7 @@ async fn ai_search_complex(
                 let ctx_type = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
                 let target_table = match ctx_type {
                     "sales" | "goods" | "order" => "sales",
-                    "tracking" | "receiving" | "shipping" => "tracking",
+                    "tracking" | "receiving" | "shipping" | "bl" | "awb" => "tracking",
                     "event" | "coupon" => "event",
                     "member" | "team" | "user" => "users",
                     "talk" => "talks",
@@ -565,18 +606,11 @@ async fn ai_search_complex(
                 let sql_filter = convert_conditions_to_sql(ctx);
                 let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 768]);
                 
-                println!("\n[AI-SEARCH] 🎯 쿼리 라우팅: [{}] 카테고리 -> '{}' 테이블 검색", ctx_type, target_table);
-                if let Some(ref filter) = sql_filter { println!("[AI-SEARCH] 🗄️ SQL 필터: {}", filter); }
-                
                 let search_result = store.search_items(target_table, text, emb.clone(), 5, sql_filter.clone()).await;
                 
                 let final_results = match search_result {
-                    Ok(res) => {
-                        println!("[AI-SEARCH] ✅ 필터 검색 성공! {} 개 결과", res.len());
-                        res
-                    },
-                    Err(e) => {
-                        println!("[AI-SEARCH] ⚠️ SQL 에러 ({}). 순수 의미 검색 폴백...", e);
+                    Ok(res) => res,
+                    Err(_) => {
                         store.search_items(target_table, text, emb, 5, None).await.unwrap_or_default()
                     }
                 };
@@ -589,11 +623,25 @@ async fn ai_search_complex(
         Ok(json!({ "structured": structured_query, "results": all_results }))
     }.await; 
 
-    // 🌟 [CRITICAL FIX] 프로세스 종료 후 검색 상태를 끄고 VRAM을 완벽하게 털어냅니다.
     IS_SEARCHING.store(false, Ordering::SeqCst);
     
-    println!("\n[AI-SEARCH] 🧹 검색 프로세스 종료. VRAM을 시스템에 강제 반환합니다.");
-    // 기존의 단순 해제 로직 대신 아래처럼 딥 퍼지를 호출하면 강제로 비워냅니다.
+    // 🌟 검색 종료 후 결과를 Message(히스토리)로 남기고 Task 상태를 변경
+    if let Some(store) = store_opt.as_ref() {
+        match &search_process {
+            Ok(_) => { // 🌟 result 안 쓰므로 _ 로 변경
+                let _ = store.update_task_status(&task_id, 9).await; 
+                // 🌟 [CRITICAL FIX 6] 사용자의 원래 질문이 지워지지 않도록 텍스트 업데이트(Some(reply))를 None으로 바꿉니다!
+                let _ = store.update_message_status(&task_id, 9, None).await;
+            },
+            Err(e) => {
+                let status_code = if e.contains("cancelled") { 3 } else { 6 };
+                let _ = store.update_task_status(&task_id, status_code).await;
+                // 🌟 여기서도 텍스트 보호를 위해 None으로 처리
+                let _ = store.update_message_status(&task_id, status_code, None).await;
+            }
+        }
+    }
+
     model.deep_purge_resources().await; 
     
     search_process

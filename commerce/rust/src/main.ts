@@ -706,27 +706,41 @@ async function syncData() {
 }
 
 // --- 기존 State 영역 어딘가에 추가 ---
-let currentSearchMode = "commerce";
+let currentSearchMode = localStorage.getItem("search_mode") || "commerce";
 
-// --- DOM 로드 후 이벤트 리스너 추가 ---
+// 🌟 앱 시작 시 탭 UI 초기화 함수
+function applySearchModeUI() {
+    document.querySelectorAll('.mode-tab').forEach(btn => {
+        const el = btn as HTMLElement;
+        if (el.dataset.mode === currentSearchMode) {
+            el.style.color = "var(--primary)";
+            el.style.fontWeight = "bold";
+            el.classList.add('active');
+        } else {
+            el.style.color = "#666";
+            el.style.fontWeight = "normal";
+            el.classList.remove('active');
+        }
+    });
+}
+
+// DOM 로드 후 이벤트 리스너 추가
 document.querySelectorAll('.mode-tab').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-        // 액티브 상태 스타일 변경
-        document.querySelectorAll('.mode-tab').forEach(b => {
-            (b as HTMLElement).style.color = "#666";
-            (b as HTMLElement).style.fontWeight = "normal";
-            b.classList.remove('active');
-        });
-        
+    btn.addEventListener('click', async (e) => {
         const target = e.target as HTMLElement;
-        target.style.color = "var(--primary)";
-        target.style.fontWeight = "bold";
-        target.classList.add('active');
-        
-        // 상태 업데이트
         currentSearchMode = target.dataset.mode || "commerce";
+        
+        // 🌟 탭 클릭 시 상태 저장 및 UI 업데이트
+        localStorage.setItem("search_mode", currentSearchMode);
+        applySearchModeUI();
+
+        console.log(`[UI] Search mode changed to: ${currentSearchMode}. Refreshing list...`);
+        await refreshList(); 
     });
 });
+
+// 파일이 로드될 때 즉시 UI 적용
+applySearchModeUI();
 
 
 // [NEW] Global Navigation Link Handler (from item2html)
@@ -774,10 +788,11 @@ btnSubmit?.addEventListener("click", async () => {
     openWidget("settings");
     startSpinner();
 
+    // 🌟 [CRITICAL FIX 4] 사용자 쿼리를 그대로 렌더링하고, 역할(role)을 "user"로 지정
     renderMessage({
         id: taskId,
-        role: "system_task",
-        text: `AI Search: ${query}`,
+        role: "user", 
+        text: query,
         status: 1, // Processing
         created_at: startTime,
         updated_at: startTime,
@@ -787,17 +802,18 @@ btnSubmit?.addEventListener("click", async () => {
     try {
         const devicePref = forceCpuToggle.checked ? "cpu" : null;
         const response = await invoke<any>("ai_search_complex", { 
+            taskId: taskId, 
             query: query, 
             language: "korean",
             devicePreference: devicePref,
             searchMode: currentSearchMode
         });
 
-        // Update Task to Success
+        // 🌟 성공 시에도 동일하게 "user" 역할과 원래 질문(query)을 유지!
         renderMessage({
             id: taskId,
-            role: "system_task",
-            text: `AI Search: ${query}`,
+            role: "user",
+            text: query, 
             status: 9, // Success
             created_at: startTime,
             updated_at: Date.now(),
@@ -887,7 +903,8 @@ btnExtract?.addEventListener("click", async () => {
                 image_path: currentImage, 
                 ref: currentImage, 
                 link: "Local Image",
-                device_preference: getDevicePref()
+                device_preference: getDevicePref(),
+                search_mode: currentSearchMode // 🌟 [CRITICAL FIX] 현재 사용자가 보고 있는 탭 모드를 백엔드에 찔러줍니다!
             });
         } else {
             console.log("[WIDGET] Queuing HTML task...");
@@ -1056,9 +1073,10 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
 }
 
 btnStopTask?.addEventListener("click", async () => {
-    if (await ask("Stop the current extraction? (The record will be deleted)", { title: "Stop Task", kind: "warning" })) {
+    if (await ask("Stop the current extraction/search? (The record will be deleted)", { title: "Stop Task", kind: "warning" })) {
         // [UI-FIRST] Reset everything immediately to prevent race conditions
         isExtracting = false; 
+        isSearching = false; // 🌟 [CRITICAL FIX 5] 검색 중지 상태 해제!
         stopSpinner();
         
         if (btnExtract) {
@@ -1070,12 +1088,11 @@ btnStopTask?.addEventListener("click", async () => {
 
         try {
             console.log("[WIDGET] Stopping task:", activeTaskId);
-            // [FIX] Pass activeTaskId accurately
             await invoke<string>("stop_current_extraction", { taskId: activeTaskId });
             
-            // Remove the message bubble immediately from UI
+            // 🌟 [CRITICAL FIX] 말풍선 태그의 id 속성은 `search_...` 형식을 그대로 유지하고 있으므로 접두사 없이 지워야 합니다!
             if (activeTaskId) {
-                const msgId = `msg-task-${activeTaskId}`;
+                const msgId = activeTaskId; // "msg-task-" 접두사 제거
                 const el = document.getElementById(msgId);
                 if (el) el.remove();
             }
@@ -1401,12 +1418,13 @@ const syncDataToMobile = () => {
 
 function handleTaskClick(el: HTMLElement) {
     const taskId = el.dataset.taskId;
+    const status = parseInt(el.dataset.status || "0");
     if (!taskId) return;
     
     console.log("[Chat] Task clicked:", taskId);
 
-    if (taskId.startsWith("search_")) {
-        // AI Search Task: Switch to list view and show AI results
+    // 🌟 [CRITICAL FIX 6] 검색 작업이 '완료(9)' 되었거나 '취소(3)/에러(6)' 일 때만 결과 리스트를 보여줍니다.
+    if (taskId.startsWith("search_") && status !== 1) {
         openWidget("list");
         listView.style.display = "block";
         detailView.style.display = "none";
@@ -1417,19 +1435,33 @@ function handleTaskClick(el: HTMLElement) {
         return;
     }
 
-    // Extraction Task (Default)
+    // 🌟 일반 추출 작업이거나, 검색이 '진행 중(1)' 일 때는 [상세 페이지]를 열어서 정지 버튼을 노출시킵니다!
     openWidget("list"); 
     listView.style.display = "none"; 
     detailView.style.display = "flex";
-    if (btnStopTask) btnStopTask.style.display = "flex";
+    
+    if (status === 1) {
+        if (btnStopTask) btnStopTask.style.display = "flex";
+    } else {
+        if (btnStopTask) btnStopTask.style.display = "none";
+    }
     if (btnDetailDelete) btnDetailDelete.style.display = "none";
 
-    detailTitle.innerText = "Task Progress";
+    detailTitle.innerText = taskId.startsWith("search_") ? "Search Progress" : "Task Progress";
+    
     const logArea = document.getElementById("extraction-log");
     if (logArea) {
         logArea.dataset.activeTaskId = taskId;
-        // Optionally fetch logs from backend if needed
+        // 진행 중일 때는 텍스트로 스피너 안내를 띄워줍니다.
+        if (status === 1) {
+            logArea.innerHTML = `<div style="padding: 20px; text-align: center; color: var(--primary);"><span class="spinner active-spinner">⠋</span> AI Processing...</div>`;
+        } else {
+            logArea.innerHTML = "";
+        }
     }
+    
+    // 🌟 이 변수가 세팅되어야 정지 버튼을 누를 때 어떤 Task를 죽일지 알 수 있습니다!
+    activeTaskId = taskId; 
 }
 
 async function sendSignalingMessage(hash: string, payload: any) {
@@ -1632,10 +1664,18 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
     if (loadingIndicator) loadingIndicator.style.display = "block";
     
     try {
+        // 🌟 [CRITICAL FIX] 현재 탭에 맞는 데이터만 필터링!
         let baseFilter = "";
-        if (activeContext.ref) baseFilter = `ref = '${activeContext.ref}'`;
-        else if (activeContext.bcc) baseFilter = `bcc = '${activeContext.bcc}'`;
-        else if (activeContext.cc) baseFilter = `cc = '${activeContext.cc}'`;
+        if (currentSearchMode === "shipping") {
+            baseFilter = "type IN ('tracking', 'receiving', 'shipping', 'bl', 'awb')";
+        } else {
+            baseFilter = "type IN ('sales', 'goods', 'order', 'event', 'coupon', 'review', 'pages')";
+        }
+
+        // 기존 내비게이션 필터가 있다면 안전하게 괄호로 묶어서 AND 조건 추가
+        if (activeContext.ref) baseFilter = `(${baseFilter}) AND ref = '${activeContext.ref}'`;
+        else if (activeContext.bcc) baseFilter = `(${baseFilter}) AND bcc = '${activeContext.bcc}'`;
+        else if (activeContext.cc) baseFilter = `(${baseFilter}) AND cc = '${activeContext.cc}'`;
 
         const textInput = searchInput?.value.toLowerCase() || "";
         let queryParts = activeTags.map(t => {
@@ -1670,12 +1710,34 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
             finalFilter = baseFilter ? `${baseFilter} AND (${historyFilter})` : historyFilter;
         }
 
-        const docs = await Select["items"]({ 
-            value: textQuery, 
-            filter: finalFilter,
-            limit: pageSize, 
-            offset: 0 // We use timestamps for paging now
-        });
+        let docs: any[] = [];
+        
+        if (textQuery) {
+            // 🌟 텍스트 검색 시에도 프론트 래퍼를 버리고 Rust의 search_documents를 직접 타격합니다.
+            const searchResults = await invoke<any[]>("search_documents", {
+                query: textQuery,
+                limit: pageSize,
+                offset: 0,
+                filter: finalFilter || null // 👈 이제 필터가 절대 증발하지 않고 Rust로 꽂힙니다!
+            });
+            
+            // Rust의 search_documents는 [id, text, score] 형태의 배열만 반환하므로, 
+            // 받아온 ID를 이용해 리스트 카드 생성에 필요한 원본 문서(Full Document)를 직접 꺼내옵니다.
+            for (const res of searchResults) {
+                const docId = res[0];
+                const fullDoc = await invoke<any>("get_document", { uuid: docId });
+                if (fullDoc) {
+                    docs.push(fullDoc);
+                }
+            }
+        } else {
+            // 🌟 탭을 클릭하거나 일반 스크롤을 할 때는 Tauri Invoke를 직접 타격하여 완벽한 필터링을 보장합니다.
+            docs = await invoke<any[]>("get_all_documents", {
+                limit: pageSize,
+                offset: 0,
+                filter: finalFilter || null
+            });
+        }
 
         if (!isSync && docs.length < pageSize) hasMore = false;
 
@@ -2477,9 +2539,10 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
                 if (newEl) {
                     newEl.classList.add("updated-flash");
                     setTimeout(() => newEl?.classList.remove("updated-flash"), 1000);
-                    if (displayMsg.role === "system_task") {
-                        newEl.onclick = () => handleTaskClick(newEl);
-                    }
+                    
+                    // 🌟 [CRITICAL FIX 2] 개조된 규칙에 맞춰 클릭 이벤트를 바인딩합니다.
+                    const isClickable = displayMsg.role === "system_task" || (displayMsg.role === "user" && !!displayMsg.task_id && displayMsg.task_id.startsWith("search_"));
+                    if (isClickable) { newEl.onclick = () => handleTaskClick(newEl); }
                 }
             }
         } else {
@@ -2488,19 +2551,21 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
             temp.innerHTML = createMessageHTML(displayMsg);
             const newEl = temp.firstElementChild as HTMLElement;
             
-            if (displayMsg.role === "system_task") {
-                newEl.onclick = () => handleTaskClick(newEl);
-            }
+            const isClickable = displayMsg.role === "system_task" || (displayMsg.role === "user" && !!displayMsg.task_id && displayMsg.task_id.startsWith("search_"));
+            if (isClickable) { newEl.onclick = () => handleTaskClick(newEl); }
 
             if (mode === 'prepend') {
-                // [History] Older messages go to the top of the container
                 chatTalks.prepend(newEl);
             } else {
-                // [Latest] Newer messages go to the bottom of the container
                 chatTalks.appendChild(newEl);
             }
         }
     });
+
+    // 🌟 [CRITICAL FIX 3] Race Condition 방지: 삽입이 끝난 후 무조건 생성시간(created_at) 기준으로 DOM 전체를 정렬!
+    const children = Array.from(chatTalks.children) as HTMLElement[];
+    children.sort((a, b) => parseInt(a.dataset.createdAt || "0") - parseInt(b.dataset.createdAt || "0"));
+    children.forEach(child => chatTalks.appendChild(child));
 
     // [Scroll Maintenance]
     if (mode === 'prepend' && scrollEl) {
@@ -2535,22 +2600,24 @@ function createMessageHTML(msg: ChatMessage) {
     };
     const currentStatus = statusMap[msg.status] || statusMap[0];
     const timeStr = new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    const isSystemTask = msg.role === "system_task";
+    
+    // 🌟 [CRITICAL FIX 1] 사용자의 검색 쿼리(@YOU)이면서 task_id가 있는 경우 컨트롤 가능한 Task Bubble로 만듭니다!
+    const isTaskBubble = msg.role === "system_task" || (msg.role === "user" && !!msg.task_id && msg.task_id.startsWith("search_"));
     const roleClass = msg.role === "user" ? "user" : "system";
 
-    return `<div id="${msg.id}" class="chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}" 
+    return `<div id="${msg.id}" class="chat-talk ${roleClass} ${isTaskBubble ? 'task-bubble' : ''}" 
         data-task-id="${msg.task_id || msg.id}" 
         data-status="${msg.status}" 
         data-updated-at="${msg.updated_at || msg.created_at}"
         data-created-at="${msg.created_at}"
-        style="${isSystemTask ? 'cursor:pointer;' : ''}">
+        style="${isTaskBubble ? 'cursor:pointer;' : ''}">
         <div class="chat-message">
             <div style="font-size:0.6rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;">
                 <span>${msg.role === 'user' ? '@YOU' : '🤖 LOGIS AI'}</span>
                 <span>${timeStr}</span>
             </div>
             <div class="content">${msg.text}</div>
-            ${isSystemTask ? `<div class="status-bar" style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1); font-size:0.65rem; font-weight:bold; color:${currentStatus.color};"><span class="${msg.status === 1 ? 'active-spinner' : ''}">${currentStatus.icon}</span> ${currentStatus.text.toUpperCase()}</div>` : ""}
+            ${isTaskBubble && msg.status !== 0 ? `<div class="status-bar" style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1); font-size:0.65rem; font-weight:bold; color:${currentStatus.color};"><span class="${msg.status === 1 ? 'active-spinner' : ''}">${currentStatus.icon}</span> ${currentStatus.text.toUpperCase()}</div>` : ""}
         </div>
     </div>`;
 }

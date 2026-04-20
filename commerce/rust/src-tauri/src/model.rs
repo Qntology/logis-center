@@ -835,20 +835,23 @@ impl LogisModel {
         task_id: String,
         image_path: String,
         language: String,
+        search_mode: String, // 🌟 [CRITICAL FIX] 프론트에서 넘어온 탭 상태 파라미터 추가
         app_handle: &tauri::AppHandle,
         cancel_token: Option<Arc<AtomicBool>>,
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
-        // [QWEN3.5-INTEGRATION] 이미지 추출이므로 비전(true) 모드로 호출합니다.
-        self.ensure_qwen3_5(true).await?; // 🌟 ModelSize::Large 에서 true 로 변경
+        self.ensure_qwen3_5(true).await?; 
 
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
-            let prompt = get_image_extraction_prompt("kr", &language, "tracking", "");
+            
+            // 🌟 [CRITICAL FIX] 탭 상태가 Shipping이면 송장(tracking)으로, Commerce면 상품(goods)으로 AI 프롬프트를 동적 변경!
+            let prompt_type = if search_mode == "shipping" { "tracking" } else { "goods" };
+            let prompt = get_image_extraction_prompt("kr", &language, prompt_type, "");
             
             let result_str = self.chat_with_qwen3_5_image_spinner(
-                "You are a highly precise document data extraction assistant.", // 🌟 System 주입
-                &prompt,                                                        // 🌟 User 주입
+                "You are a highly precise document data extraction assistant.", 
+                &prompt,                                                        
                 Some(dynamic_image),
                 app_handle, 
                 "extraction-progress", 
@@ -1370,13 +1373,20 @@ impl LogisModel {
 
     // [신규] Commerce 파이프라인: 2-Stage (0.6B para2graph -> 0.8B graph2contexts)
     // [신규] Commerce 파이프라인: 2-Stage (0.8B 단일 모델 연속 처리)
-    pub async fn parse_commerce_query(&self, query: String, language: &str, metrics_json: &str) -> anyhow::Result<Value> {
+    pub async fn parse_commerce_query(&self, task_id: &str, app_handle: &tauri::AppHandle, query: String, language: &str, metrics_json: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {
+        use tauri::Emitter;
         let current_time = chrono::Utc::now().to_rfc3339();
 
         // ----------------------------------------------------
-        // Stage 1: 세그먼트 분할 (para2graph) - Qwen3 (0.6B) 사용 🌟
+        // Stage 1: 세그먼트 분할 (para2graph) - Qwen3 (0.6B) 사용
         // ----------------------------------------------------
-        self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, None, false, None).await?;
+        let payload = json!({ "task_id": task_id, "category": "Stage 1", "summary": "Analyzing semantic intent...", "spinner": "⠋" });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        crate::scheduler::log_task_progress(app_handle, task_id, &payload);
+
+        self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancel_token.clone()), false, None).await?;
+        // 🌟 [CRITICAL FIX 2] 무거운 작업 전후로 취소 토큰을 검사하여 즉시 탈출(Abort)합니다!
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
         let prompt1 = crate::parsing::para2graph(language);
         let task_question_1 = format!("{}\n\nQuery: {}", prompt1, query);
@@ -1385,15 +1395,14 @@ impl LogisModel {
         let max_retries = 2; 
 
         for attempt in 1..=max_retries {
-            // 🌟 [CRITICAL FIX 1] 동기(Sync) 함수인 generate를 spawn_blocking으로 격리!
-            // 이렇게 해야 LLM이 생각하는 10초 동안 프론트엔드의 #btn-settings 클릭(채팅 로드)이 멈추지 않습니다!
+            if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            
             let gen_arc = self.qwen3_generator.clone();
             let task_q = task_question_1.clone();
             
             let res1 = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
                 let mut gen_guard = gen_arc.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
-                    println!("[AI-SEARCH] 0.6B (Qwen3) Step 1 (Attempt {}/{}): Asking para2graph...", attempt, max_retries);
                     let params = crate::openai_types::ChatCompletionParameters {
                         messages: vec![
                             crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
@@ -1414,22 +1423,12 @@ impl LogisModel {
             }).await??;
 
             segments = crate::parsing::parse_json_from_llm(&res1);
-
             let plan_str = segments.get("segmented_plan").and_then(|v| v.as_str()).unwrap_or("");
             let ctx_len = segments.get("context").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-            
             let intended_segments = if plan_str.is_empty() { 0 } else { plan_str.matches('|').count() + 1 };
 
-            if attempt < max_retries && ctx_len == 1 && intended_segments > 1 {
-                println!("⚠️ [STAGE 1] 할루시네이션 감지: Plan은 {}조각이지만 Context는 1개입니다. Temperature를 낮춰 재시도합니다...", intended_segments);
-                continue;
-            } else {
-                break; 
-            }
+            if attempt < max_retries && ctx_len == 1 && intended_segments > 1 { continue; } else { break; }
         }
-
-        println!("\n✅ [STAGE 1: para2graph (0.6B)] 파싱 결과:");
-        println!("{}", serde_json::to_string_pretty(&segments).unwrap_or_default());
 
         if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
              ctx_arr.retain(|seg| {
@@ -1439,6 +1438,8 @@ impl LogisModel {
              });
         }
 
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
         // ----------------------------------------------------
         // Stage 1.5: 수치/연산자 추출 - Qwen3 (0.6B) 연속 사용
         // ----------------------------------------------------
@@ -1446,19 +1447,22 @@ impl LogisModel {
             let total_segments = ctx_arr.len();
 
             for (idx, seg) in ctx_arr.iter_mut().enumerate() {
+                // 🌟 루프 도중에도 취소 버튼을 누르면 즉시 멈춥니다!
+                if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+                let payload = json!({ "task_id": task_id, "category": format!("Stage 1.5 ({}/{})", idx+1, total_segments), "summary": "Extracting filter conditions...", "spinner": "⠋" });
+                let _ = app_handle.emit("extraction-progress", &payload);
+                crate::scheduler::log_task_progress(app_handle, task_id, &payload);
+
                 let current_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-
-                // 🌟 [CRITICAL FIX] 프롬프트 생성 함수에 metrics_json 을 전달!
                 let prompt1_5 = crate::parsing::extract_numeric_conditions(&current_text, &query, &seg_type, metrics_json);
                 
                 let gen_arc = self.qwen3_generator.clone();
-                let seg_type_clone = seg_type.clone();
                 
                 let res1_5 = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
                     let mut gen_guard = gen_arc.blocking_lock();
                     if let Some(gen) = gen_guard.as_mut() {
-                        println!("[AI-SEARCH] Qwen3 (0.6B) Step 1.5 [{}/{}]: Extracting conditions for '{}'...", idx + 1, total_segments, seg_type_clone);
                         let params = crate::openai_types::ChatCompletionParameters {
                             messages: vec![
                                 crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
@@ -1466,9 +1470,7 @@ impl LogisModel {
                                     name: None,
                                 })
                             ],
-                            model: "qwen3".to_string(),
-                            max_tokens: Some(256),
-                            temperature: Some(0.0), top_p: Some(0.01),
+                            model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
                             ..Default::default()
                         };
                         gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
@@ -1478,54 +1480,54 @@ impl LogisModel {
                 }).await??;
 
                 let mut conditions_json = crate::parsing::parse_json_from_llm(&res1_5);
-                
                 if let Some(cond_wrapper) = conditions_json.get_mut("condition").and_then(|v| v.as_object_mut()) {
                     for (_, val_obj) in cond_wrapper.iter_mut() {
                         if let Some(is_pct) = val_obj.get("is_percent").and_then(|v| v.as_bool()) {
                             if is_pct {
                                 if let Some(v_str) = val_obj.get("value").and_then(|v| v.as_str()) {
                                     let numeric_only: String = v_str.chars().filter(|c| c.is_digit(10) || *c == '.').collect();
-                                    if !numeric_only.is_empty() {
-                                        val_obj["value"] = json!(numeric_only);
-                                    }
+                                    if !numeric_only.is_empty() { val_obj["value"] = json!(numeric_only); }
                                 }
                             }
                         }
                     }
                 }
-
-                println!("🔍 [STAGE 1.5: {} 파싱 결과 (필터링 적용)]\n{}", seg_type, serde_json::to_string_pretty(&conditions_json).unwrap_or_default());
-
                 if let Some(obj) = seg.as_object_mut() {
-                    if let Some(cond_val) = conditions_json.get("condition") {
-                        obj.insert("condition".to_string(), cond_val.clone());
-                    } else {
-                        obj.insert("condition".to_string(), conditions_json);
-                    }
+                    if let Some(cond_val) = conditions_json.get("condition") { obj.insert("condition".to_string(), cond_val.clone()); } 
+                    else { obj.insert("condition".to_string(), conditions_json); }
                 }
             }
         }
 
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
         // ----------------------------------------------------
         // Stage 2: 조건 최종 병합 추출 (graph2contexts) - Qwen 3.5 (0.8B) 사용
         // ----------------------------------------------------
-        // 🌟 [CRITICAL FIX] Qwen 3.5 로딩은 Stage 1.5가 무사히 다 끝난 바로 이 시점에 이루어져야 합니다!
-        self.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, None, false, None).await?;
+        let payload = json!({ "task_id": task_id, "category": "Stage 2", "summary": "Switching to 0.8B model...", "spinner": "⠋" });
+        let _ = app_handle.emit("extraction-progress", &payload);
+
+        self.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancel_token.clone()), false, None).await?;
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
         if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
             let total_segments = ctx_arr.len();
 
             for (idx, seg) in ctx_arr.iter_mut().enumerate() {
+                if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+                let payload = json!({ "task_id": task_id, "category": format!("Stage 2 ({}/{})", idx+1, total_segments), "summary": "Extracting final attributes...", "spinner": "⠋" });
+                let _ = app_handle.emit("extraction-progress", &payload);
+                crate::scheduler::log_task_progress(app_handle, task_id, &payload);
+
                 tokio::task::yield_now().await; 
 
                 let current_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-
                 let prompt2 = crate::parsing::graph2contexts(&current_text, &seg_type);
                 
                 let res2 = {
                     if let Some(gen) = self.qwen3_5_generator.lock().await.as_mut() {
-                        println!("\n[AI-SEARCH] 0.8B (Qwen 3.5) Step 2 [{}/{}]: Extracting attributes for '{}'...", idx + 1, total_segments, seg_type);
                         let params = crate::openai_types::ChatCompletionParameters {
                             messages: vec![
                                 crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
@@ -1533,20 +1535,16 @@ impl LogisModel {
                                     name: None,
                                 })
                             ],
-                            model: "qwen3.5".to_string(),
-                            max_tokens: Some(256),
-                            temperature: Some(0.1), top_p: Some(0.1), 
+                            model: "qwen3.5".to_string(), max_tokens: Some(256), temperature: Some(0.1), top_p: Some(0.1), 
                             ..Default::default()
                         };
-                        gen.generate(params, None, None, None).await?
+                        gen.generate(params, Some(cancel_token.clone()), None, None).await?
                     } else {
                         return Err(anyhow::anyhow!("Qwen 3.5 Generator is missing"));
                     }
                 };
 
                 let attributes_json = crate::parsing::parse_json_from_llm(&res2);
-                println!("🔍 [STAGE 2: {} 속성 파싱 결과]\n{}", seg_type, serde_json::to_string_pretty(&attributes_json).unwrap_or_default());
-
                 if let Some(obj) = seg.as_object_mut() {
                     obj.insert("status".to_string(), attributes_json.get("status").cloned().unwrap_or(serde_json::Value::Null));
                     obj.insert("substantial".to_string(), attributes_json.get("substantial").cloned().unwrap_or(serde_json::Value::Null));
@@ -1555,23 +1553,60 @@ impl LogisModel {
             }
         }
 
-        println!("\n🎯 [STAGE 2: graph2contexts (0.8B)] 최종 추출 결과 (모든 속성 및 조건 완벽 병합 완료):");
-        println!("{}", serde_json::to_string_pretty(&segments).unwrap_or_default());
-        println!("==================================================\n");
+        let payload = json!({ "task_id": task_id, "category": "Done", "summary": "Analysis complete.", "spinner": "✅" });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        crate::scheduler::log_task_progress(app_handle, task_id, &payload);
 
         Ok(segments)
     }
 
     // [신규] Shipping 파이프라인 (빠른 단일 처리)
-    pub async fn parse_shipping_query(&self, query: String, _language: &str) -> anyhow::Result<Value> {
+    pub async fn parse_shipping_query(&self, task_id: &str, app_handle: &tauri::AppHandle, query: String, language: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {
+        use tauri::Emitter;
+        let payload = json!({ "task_id": task_id, "category": "Shipping", "summary": "Extracting logistics filters...", "spinner": "⠋" });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        crate::scheduler::log_task_progress(app_handle, task_id, &payload);
+
+        self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancel_token.clone()), false, None).await?;
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+        let prompt = crate::parsing::extract_shipping_conditions(&query, language);
+        let gen_arc = self.qwen3_generator.clone();
+        
+        let res = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let mut gen_guard = gen_arc.blocking_lock();
+            if let Some(gen) = gen_guard.as_mut() {
+                let params = crate::openai_types::ChatCompletionParameters {
+                    messages: vec![
+                        crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt),
+                            name: None,
+                        })
+                    ],
+                    model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
+                    ..Default::default()
+                };
+                gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+            } else {
+                Err(anyhow::anyhow!("Qwen3 Generator is missing"))
+            }
+        }).await??;
+
+        let extracted_conditions = crate::parsing::parse_json_from_llm(&res);
+        
+        let payload = json!({ "task_id": task_id, "category": "Done", "summary": "Filter extraction complete.", "spinner": "✅" });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        crate::scheduler::log_task_progress(app_handle, task_id, &payload);
+
         let ctx = json!([{
             "type": "tracking",
             "text": query.clone(),
-            "condition": { "date": null, "quantity": null, "price": null }
+            "condition": extracted_conditions
         }]);
+
         Ok(json!({ "context": ctx }))
     }
-
+    
     // --- Ported from Python (search_engine.py) ---
     // --- Ported from Python (logic.py) ---
     pub async fn run_deep_research(&self, query: String, context_data: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
