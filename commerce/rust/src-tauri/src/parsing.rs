@@ -539,9 +539,9 @@ pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
     let template = r###"Analyze the specific text segment and extract the logical attributes based on the defined schema.
 
 [SCHEMA DEFINITIONS]
-* status: 'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', or null.
-* substantial: 'size', 'weight', 'shipping_fee', 'shipping_duration', 'sale_price', 'supply_price', 'low_stock_threshold', 'discount', 'min_order_amount', 'max_discount_amount', 'usage_limit', 'usage_per', or null. (Must be an array of matching strings, or null).
-* find: 'many', 'few', 'much', 'little', 'heavy', 'light', or null. (Must be an array of matching strings, or null).
+* status: Extract the exact status mentioned. Choose ONLY from: 'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete'. If no status is explicitly mentioned, return null.
+* substantial: Extract specifically mentioned properties. Choose ONLY from: 'size', 'weight', 'shipping_fee', 'shipping_duration', 'sale_price', 'supply_price', 'low_stock_threshold', 'discount', 'min_order_amount', 'max_discount_amount', 'usage_limit', 'usage_per'. (CRITICAL: Return an array of strings ONLY if these exact words exist in the text. Do NOT blindly copy this list. If none exist, return null).
+* find: Extract search intents. Choose ONLY from: 'many', 'few', 'much', 'little', 'heavy', 'light'. (CRITICAL: Return an array of strings ONLY if these exact words exist in the text. Do NOT blindly copy this list. If none exist, return null).
 
 [CURRENT SEGMENT]
 Category Type: {TYPE}

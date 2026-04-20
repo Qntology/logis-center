@@ -20,6 +20,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{Value, json};
 
+// 🌟 [CRITICAL FIX] 전역 검색 상태 락: 검색 중 스레드 데드락 방지
+static IS_SEARCHING: AtomicBool = AtomicBool::new(false);
+
 pub struct AppState {
     pub model: Arc<TokioMutex<Option<LogisModel>>>,
     pub store: Arc<TokioMutex<Option<VectorStore>>>,
@@ -73,6 +76,12 @@ async fn delete_message(
 
 #[tauri::command]
 async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
+    // 🌟 [CRITICAL FIX] 검색 중일 때는 unload를 즉시 튕겨냅니다. (Mutex 락 꼬임 및 UI 프리징 완벽 차단!)
+    if IS_SEARCHING.load(Ordering::SeqCst) {
+        println!("[UNLOAD] AI Search is active. Skipping unload to prevent deadlock.");
+        return Ok("Search active. Memory kept.".to_string());
+    }
+
     {
         let mut model_guard = state.model.lock().await;
         if let Some(m) = model_guard.as_ref() {
@@ -235,23 +244,30 @@ async fn search_documents(
     _offset: usize,
     filter: Option<String>,
 ) -> Result<Vec<(String, String, f32)>, String> {
-    let mut store_guard = state.store.lock().await;
-    if store_guard.is_none() {
-        let db_path = "data/lancedb";
-        match VectorStore::new(db_path).await {
-            Ok(s) => { *store_guard = Some(s); },
-            Err(e) => return Err(format!("Failed to load DB: {}", e)),
+    let store_opt = {
+        let mut store_guard = state.store.lock().await;
+        if store_guard.is_none() {
+            let db_path = "data/lancedb";
+            if let Ok(s) = VectorStore::new(db_path).await {
+                *store_guard = Some(s);
+            }
         }
-    }
+        store_guard.as_ref().cloned()
+    }; // 🌟 즉시 자물쇠 해제!
     
-    let model_guard = state.model.lock().await;
-    let query_vec = if let Some(model) = model_guard.as_ref() {
-        model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 768])
+    // 🌟 [CRITICAL FIX] 빈 쿼리일 때는 임베딩 모델을 절대 로드하지 않음 (검색 직후 VRAM이 다시 차버리는 현상 해결!)
+    let query_vec = if !query.trim().is_empty() {
+        let model_opt = { state.model.lock().await.as_ref().cloned() }; // 🌟 즉시 자물쇠 해제!
+        if let Some(model) = model_opt {
+            model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 768])
+        } else {
+            vec![0.0; 768]
+        }
     } else {
         vec![0.0; 768]
     };
 
-    if let Some(store) = store_guard.as_ref() {
+    if let Some(store) = store_opt {
         store.search_items("items", &query, query_vec, limit, filter).await.map_err(|e| e.to_string())
     } else {
         Err("DB not initialized".to_string())
@@ -268,7 +284,7 @@ fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
 
     if let Some(status) = ctx.get("status").and_then(|v| v.as_str()) {
         if !status.is_empty() && status != "null" {
-            // 🌟 [CRITICAL FIX 2] LanceDB의 status 컬럼은 Int32 타입입니다! String 필터링 시 에러가 납니다.
+            // 🌟 [CRITICAL FIX 2] 상태값은 문자열이 아니라 Int32로 치환해서 검색해야 합니다.
             let status_int = crate::logic::parse_status(status);
             filters.push(format!("status = {}", status_int));
         }
@@ -276,16 +292,15 @@ fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
 
     if let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()) {
         for (key, val_obj) in cond {
-            // 🌟 [CRITICAL FIX 3] LanceDB에 존재하는 실제 컬럼으로 매핑합니다.
-            // 없는 컬럼을 필터링하면 DB가 터지면서 검색이 취소되므로, 유효한 컬럼만 통과시킵니다.
+            // 🌟 [CRITICAL FIX 3] AI가 "order"나 "goods" 같은 키를 만들어내면, 무조건 DB의 "amount" 컬럼으로 매핑해줍니다!
             let valid_cols = ["amount", "status", "type", "created_at", "updated_at"];
             let mapped_key = match key.as_str() {
-                "price" | "sale_price" | "discount" | "shipping_fee" | "supply_price" => "amount",
+                "price" | "sale_price" | "discount" | "shipping_fee" | "supply_price" | "order" | "goods" => "amount",
                 k if valid_cols.contains(&k) => k,
-                _ => "" // DB에 없는 컬럼이면 빈 문자열 반환 (Semantic 검색으로 폴백 유도)
+                _ => "" 
             };
 
-            if mapped_key.is_empty() { continue; } // 무효한 SQL 컬럼 무시
+            if mapped_key.is_empty() { continue; } // 유효하지 않은 컬럼은 무시하여 DB 크래시 방어
 
             if let Some(op_str) = val_obj.get("operator").and_then(|v| v.as_str()) {
                 if let Some(val_val) = val_obj.get("value") {
@@ -298,16 +313,13 @@ fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
                     } else if let Some(s) = val_val.as_str() {
                         let numeric: String = s.chars().filter(|c| c.is_digit(10) || *c == '.').collect();
                         if numeric.is_empty() { continue; } else { numeric }
-                    } else {
-                        continue;
-                    };
+                    } else { continue; };
 
                     filters.push(format!("{} {} {}", mapped_key, operator, val_str));
                 }
             }
         }
     }
-
     if filters.is_empty() { None } else { Some(filters.join(" AND ")) }
 }
 
@@ -467,113 +479,107 @@ async fn ai_search_complex(
     device_preference: Option<String>,
     search_mode: String,
 ) -> Result<Value, String> {
-    // 👇 [신규 추가] 프론트엔드에서 요청이 넘어왔는지 확인하는 진입점 로그
     println!("\n==================================================");
     println!("🚀 [AI-SEARCH] 프론트엔드 요청 수신 완료!");
     println!("   - 검색어: {}", query);
     println!("   - 검색 모드: {}", search_mode);
     println!("==================================================\n");
 
-    let mut model_guard = state.model.lock().await;
+    IS_SEARCHING.store(true, Ordering::SeqCst); // 🌟 검색 시작 락 활성화
 
-    if let Some(m) = model_guard.as_ref() {
-        let wants_cpu = device_preference.as_deref() == Some("cpu");
-        if m.is_cpu_mode != wants_cpu {
-            println!("[AI-SEARCH] Device preference mismatch. Reloading model...");
-            m.unload_generator().await;
-            *model_guard = None;
-        }
-    }
-
-    if model_guard.is_none() {
-        if let Ok(m) = LogisModel::new(app_handle.clone(), device_preference.as_deref()).await { 
-            *model_guard = Some(m);
-        } else { 
-            return Err("Failed to load model".to_string());
-        }
-    }
-    let model = model_guard.as_ref().unwrap();
-
-    // 1. Structured Parse (라우팅 분기 적용)
-    let structured_query = if search_mode == "shipping" {
-        model.parse_shipping_query(query.clone(), &language).await.map_err(|e| e.to_string())?
-    } else {
-        model.parse_commerce_query(query.clone(), &language).await.map_err(|e| e.to_string())?
-    };
-
-    // 2. Perform searches for each segment
-    let mut all_results = Vec::new();
-    
-    // 🌟 [CRITICAL FIX 1] Mutex Deadlock 방지!
-    // store_guard를 계속 들고 있으면 검색하는 동안 UI(채팅 로드 등)가 완전히 멈춥니다.
-    // VectorStore(DB 연결 객체)만 쏙 빼내고 락을 즉시 해제합니다.
-    let store_opt = {
-        let mut store_guard = state.store.lock().await;
-        if store_guard.is_none() {
-            let db_path = "data/lancedb";
-            if let Ok(s) = VectorStore::new(db_path).await {
-                let _ = s.init_all_tables().await;
-                *store_guard = Some(s);
+    let model = {
+        let mut model_guard = state.model.lock().await;
+        if let Some(m) = model_guard.as_ref() {
+            let wants_cpu = device_preference.as_deref() == Some("cpu");
+            if m.is_cpu_mode != wants_cpu {
+                m.unload_generator().await;
+                *model_guard = None;
             }
         }
-        store_guard.as_ref().cloned() // 🌟 Clone으로 꺼내기
-    }; // 🌟 여기서 store_guard가 버려지면서 자물쇠가 풀림!
-
-    if let (Some(store), Some(ctx_arr)) = (store_opt, structured_query.get("context").and_then(|v| v.as_array())) {
-        for ctx in ctx_arr {
-            let text = ctx.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            if text.is_empty() { continue; }
-            
-            // 🌟 [CRITICAL FIX] AI가 판별한 카테고리(Type)를 기반으로 정확한 DB 테이블을 타겟팅합니다!
-            let ctx_type = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let target_table = match ctx_type {
-                "sales" | "goods" | "order" => "sales",
-                "tracking" | "receiving" | "shipping" => "tracking",
-                "event" | "coupon" => "event",
-                "member" | "team" | "user" => "users",
-                "talk" => "talks",
-                "page" | "pages" => "pages",
-                _ => "items", // 기본 폴백
-            };
-
-            let sql_filter = convert_conditions_to_sql(ctx);
-            let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 768]);
-            
-            println!("\n[AI-SEARCH] 🎯 쿼리 라우팅: [{}] 카테고리를 판단하여 '{}' 테이블을 검색합니다.", ctx_type, target_table);
-            if let Some(ref filter) = sql_filter {
-                println!("[AI-SEARCH] 🗄️ 적용된 SQL 필터: {}", filter);
+        if model_guard.is_none() {
+            if let Ok(m) = LogisModel::new(app_handle.clone(), device_preference.as_deref()).await { 
+                *model_guard = Some(m);
+            } else { 
+                IS_SEARCHING.store(false, Ordering::SeqCst); // 에러 시 락 해제
+                return Err("Failed to load model".to_string());
             }
-            
-            // 🌟 "items" 하드코딩을 지우고 동적 테이블(target_table)로 검색!
-            let search_result = store.search_items(target_table, text, emb.clone(), 5, sql_filter.clone()).await;
-            
-            let final_results = match search_result {
-                Ok(res) => {
-                    println!("[AI-SEARCH] ✅ 필터 검색 성공! {} 개의 결과를 찾았습니다.", res.len());
-                    res
-                },
-                Err(e) => {
-                    println!("[AI-SEARCH] ⚠️ SQL 필터 적용 실패 (원인: {}). '{}' 테이블에서 순수 의미(Vector) 검색으로 폴백합니다...", e, target_table);
-                    // 🌟 에러 발생 시에도 올바른 테이블(target_table)에서 의미 검색 폴백!
-                    store.search_items(target_table, text, emb, 5, None).await.unwrap_or_default()
+        }
+        model_guard.as_ref().unwrap().clone() 
+    }; 
+
+    let search_process = async {
+        let structured_query = if search_mode == "shipping" {
+            model.parse_shipping_query(query.clone(), &language).await.map_err(|e| e.to_string())?
+        } else {
+            model.parse_commerce_query(query.clone(), &language).await.map_err(|e| e.to_string())?
+        };
+
+        let mut all_results = Vec::new();
+        let store_opt = {
+            let mut store_guard = state.store.lock().await;
+            if store_guard.is_none() {
+                let db_path = "data/lancedb";
+                if let Ok(s) = VectorStore::new(db_path).await {
+                    let _ = s.init_all_tables().await;
+                    *store_guard = Some(s);
                 }
-            };
+            }
+            store_guard.as_ref().cloned() 
+        };
 
-            for (id, content, score) in final_results {
-                all_results.push(json!({
-                    "id": id,
-                    "text": content,
-                    "score": score,
-                    "context_type": ctx_type
-                }));
+        if let (Some(store), Some(ctx_arr)) = (store_opt, structured_query.get("context").and_then(|v| v.as_array())) {
+            for ctx in ctx_arr {
+                tokio::task::yield_now().await;
+
+                let text = ctx.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if text.is_empty() { continue; }
+                
+                let ctx_type = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let target_table = match ctx_type {
+                    "sales" | "goods" | "order" => "sales",
+                    "tracking" | "receiving" | "shipping" => "tracking",
+                    "event" | "coupon" => "event",
+                    "member" | "team" | "user" => "users",
+                    "talk" => "talks",
+                    "page" | "pages" => "pages",
+                    _ => "items",
+                };
+
+                let sql_filter = convert_conditions_to_sql(ctx);
+                let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 768]);
+                
+                println!("\n[AI-SEARCH] 🎯 쿼리 라우팅: [{}] 카테고리 -> '{}' 테이블 검색", ctx_type, target_table);
+                if let Some(ref filter) = sql_filter { println!("[AI-SEARCH] 🗄️ SQL 필터: {}", filter); }
+                
+                let search_result = store.search_items(target_table, text, emb.clone(), 5, sql_filter.clone()).await;
+                
+                let final_results = match search_result {
+                    Ok(res) => {
+                        println!("[AI-SEARCH] ✅ 필터 검색 성공! {} 개 결과", res.len());
+                        res
+                    },
+                    Err(e) => {
+                        println!("[AI-SEARCH] ⚠️ SQL 에러 ({}). 순수 의미 검색 폴백...", e);
+                        store.search_items(target_table, text, emb, 5, None).await.unwrap_or_default()
+                    }
+                };
+
+                for (id, content, score) in final_results {
+                    all_results.push(json!({ "id": id, "text": content, "score": score, "context_type": ctx_type }));
+                }
             }
         }
-    }
+        Ok(json!({ "structured": structured_query, "results": all_results }))
+    }.await; 
 
-    Ok(json!({
-        "structured": structured_query,
-        "results": all_results
-    }))
+    // 🌟 [CRITICAL FIX] 프로세스 종료 후 검색 상태를 끄고 VRAM을 완벽하게 털어냅니다.
+    IS_SEARCHING.store(false, Ordering::SeqCst);
+    
+    println!("\n[AI-SEARCH] 🧹 검색 프로세스 종료. VRAM을 시스템에 강제 반환합니다.");
+    // 기존의 단순 해제 로직 대신 아래처럼 딥 퍼지를 호출하면 강제로 비워냅니다.
+    model.deep_purge_resources().await; 
+    
+    search_process
 }
 
 #[tauri::command]

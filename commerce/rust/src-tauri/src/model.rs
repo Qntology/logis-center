@@ -1382,47 +1382,49 @@ impl LogisModel {
         let task_question_1 = format!("{}\n\nQuery: {}", prompt1, query);
         
         let mut segments = serde_json::json!({});
-        let max_retries = 2; // 최대 2회까지 재시도
+        let max_retries = 2; 
 
         for attempt in 1..=max_retries {
-            let res1 = {
-                if let Some(gen) = self.qwen3_generator.lock().await.as_mut() {
+            // 🌟 [CRITICAL FIX 1] 동기(Sync) 함수인 generate를 spawn_blocking으로 격리!
+            // 이렇게 해야 LLM이 생각하는 10초 동안 프론트엔드의 #btn-settings 클릭(채팅 로드)이 멈추지 않습니다!
+            let gen_arc = self.qwen3_generator.clone();
+            let task_q = task_question_1.clone();
+            
+            let res1 = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                let mut gen_guard = gen_arc.blocking_lock();
+                if let Some(gen) = gen_guard.as_mut() {
                     println!("[AI-SEARCH] 0.6B (Qwen3) Step 1 (Attempt {}/{}): Asking para2graph...", attempt, max_retries);
                     let params = crate::openai_types::ChatCompletionParameters {
                         messages: vec![
                             crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                                content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(task_question_1.clone()),
+                                content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(task_q),
                                 name: None,
                             })
                         ],
                         model: "qwen3".to_string(),
                         max_tokens: Some(512),
-                        // 🌟 [CRITICAL FIX] 첫 시도에는 1.0으로 창의성을 주고, 실패 후 재시도시에는 0.1로 낮춰서 포맷 엄수(환각 억제)를 유도합니다.
                         temperature: Some(if attempt == 1 { 1.0 } else { 0.1 }), 
                         top_p: Some(0.9),
                         ..Default::default()
                     };
-                    gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))?
+                    gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
                 } else {
-                    return Err(anyhow::anyhow!("Qwen3 Generator is missing"));
+                    Err(anyhow::anyhow!("Qwen3 Generator is missing"))
                 }
-            };
+            }).await??;
 
             segments = crate::parsing::parse_json_from_llm(&res1);
 
-            // 🌟 [CRITICAL FIX] Plan과 Context 개수 불일치 자가 검증 (Self-Correction)
             let plan_str = segments.get("segmented_plan").and_then(|v| v.as_str()).unwrap_or("");
             let ctx_len = segments.get("context").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
             
-            // 파이프(|) 개수 + 1 로 의도한 세그먼트(조각) 개수 파악
             let intended_segments = if plan_str.is_empty() { 0 } else { plan_str.matches('|').count() + 1 };
 
-            // 의도는 여러 조각인데, 결과가 통짜(1개)로 나왔다면 환각으로 간주하고 재시도!
             if attempt < max_retries && ctx_len == 1 && intended_segments > 1 {
                 println!("⚠️ [STAGE 1] 할루시네이션 감지: Plan은 {}조각이지만 Context는 1개입니다. Temperature를 낮춰 재시도합니다...", intended_segments);
                 continue;
             } else {
-                break; // 정상적이거나 최대 재시도 횟수에 도달하면 루프 탈출
+                break; 
             }
         }
 
@@ -1449,9 +1451,13 @@ impl LogisModel {
 
                 let prompt1_5 = crate::parsing::extract_numeric_conditions(&current_text, &query, &seg_type);
                 
-                let res1_5 = {
-                    if let Some(gen) = self.qwen3_generator.lock().await.as_mut() {
-                        println!("[AI-SEARCH] Qwen3 (0.6B) Step 1.5 [{}/{}]: Extracting conditions for '{}'...", idx + 1, total_segments, seg_type);
+                let gen_arc = self.qwen3_generator.clone();
+                let seg_type_clone = seg_type.clone();
+                
+                let res1_5 = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                    let mut gen_guard = gen_arc.blocking_lock();
+                    if let Some(gen) = gen_guard.as_mut() {
+                        println!("[AI-SEARCH] Qwen3 (0.6B) Step 1.5 [{}/{}]: Extracting conditions for '{}'...", idx + 1, total_segments, seg_type_clone);
                         let params = crate::openai_types::ChatCompletionParameters {
                             messages: vec![
                                 crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
@@ -1464,21 +1470,19 @@ impl LogisModel {
                             temperature: Some(0.0), top_p: Some(0.01),
                             ..Default::default()
                         };
-                        gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))?
+                        gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
                     } else {
-                        return Err(anyhow::anyhow!("Qwen3 Generator is missing"));
+                        Err(anyhow::anyhow!("Qwen3 Generator is missing"))
                     }
-                };
+                }).await??;
 
                 let mut conditions_json = crate::parsing::parse_json_from_llm(&res1_5);
                 
-                // 🌟 [CRITICAL FIX] 숫자 필터링: "상위 20%" -> "20" 으로 변환
                 if let Some(cond_wrapper) = conditions_json.get_mut("condition").and_then(|v| v.as_object_mut()) {
                     for (_, val_obj) in cond_wrapper.iter_mut() {
                         if let Some(is_pct) = val_obj.get("is_percent").and_then(|v| v.as_bool()) {
                             if is_pct {
                                 if let Some(v_str) = val_obj.get("value").and_then(|v| v.as_str()) {
-                                    // 숫자와 소수점만 추출
                                     let numeric_only: String = v_str.chars().filter(|c| c.is_digit(10) || *c == '.').collect();
                                     if !numeric_only.is_empty() {
                                         val_obj["value"] = json!(numeric_only);
@@ -1504,16 +1508,18 @@ impl LogisModel {
         // ----------------------------------------------------
         // Stage 2: 조건 최종 병합 추출 (graph2contexts) - Qwen 3.5 (0.8B) 사용
         // ----------------------------------------------------
+        // 🌟 [CRITICAL FIX] Qwen 3.5 로딩은 Stage 1.5가 무사히 다 끝난 바로 이 시점에 이루어져야 합니다!
         self.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, None, false, None).await?;
 
         if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
             let total_segments = ctx_arr.len();
 
             for (idx, seg) in ctx_arr.iter_mut().enumerate() {
+                tokio::task::yield_now().await; 
+
                 let current_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-                // 🌟 [CRITICAL FIX] 개별 텍스트 조각 하나만 Qwen 3.5에게 전달하여 정확도 극대화
                 let prompt2 = crate::parsing::graph2contexts(&current_text, &seg_type);
                 
                 let res2 = {
@@ -1528,10 +1534,9 @@ impl LogisModel {
                             ],
                             model: "qwen3.5".to_string(),
                             max_tokens: Some(256),
-                            temperature: Some(0.1), top_p: Some(0.1), // 환각 방지를 위해 창의성 억제
+                            temperature: Some(0.1), top_p: Some(0.1), 
                             ..Default::default()
                         };
-                        // 개별 처리이므로 세션 캐시 충돌을 막기 위해 None 전달
                         gen.generate(params, None, None, None).await?
                     } else {
                         return Err(anyhow::anyhow!("Qwen 3.5 Generator is missing"));
@@ -1541,8 +1546,6 @@ impl LogisModel {
                 let attributes_json = crate::parsing::parse_json_from_llm(&res2);
                 println!("🔍 [STAGE 2: {} 속성 파싱 결과]\n{}", seg_type, serde_json::to_string_pretty(&attributes_json).unwrap_or_default());
 
-                // 🌟 [핵심 로직] 추출된 status, substantial, find 값을 해당 조각(seg)에 직접 병합(이어 붙이기)!
-                // 1.5단계에서 추출한 condition은 이미 seg 안에 들어있으므로 자연스럽게 하나의 완전한 객체가 됩니다.
                 if let Some(obj) = seg.as_object_mut() {
                     obj.insert("status".to_string(), attributes_json.get("status").cloned().unwrap_or(serde_json::Value::Null));
                     obj.insert("substantial".to_string(), attributes_json.get("substantial").cloned().unwrap_or(serde_json::Value::Null));
