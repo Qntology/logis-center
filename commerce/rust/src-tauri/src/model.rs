@@ -1373,45 +1373,62 @@ impl LogisModel {
     pub async fn parse_commerce_query(&self, query: String, language: &str) -> anyhow::Result<Value> {
         let current_time = chrono::Utc::now().to_rfc3339();
 
-        // 🌟 1. Qwen 3.5 (0.8B) 모델 단일 로드 (한 번만 호출하여 두 단계 모두 재사용)
-        self.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, None, false, None).await?;
+        // ----------------------------------------------------
+        // Stage 1: 세그먼트 분할 (para2graph) - Qwen3 (0.6B) 사용 🌟
+        // ----------------------------------------------------
+        self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, None, false, None).await?;
 
-        // ----------------------------------------------------
-        // Stage 1: 세그먼트 분할 (para2graph) - 0.8B (Qwen 3.5) 사용
-        // ----------------------------------------------------
         let prompt1 = crate::parsing::para2graph(language);
         let task_question_1 = format!("{}\n\nQuery: {}", prompt1, query);
-        let session_1 = "system_search_p2g_q35".to_string(); // 세션 캐시 꼬이지 않게 이름 변경
+        
+        let mut segments = serde_json::json!({});
+        let max_retries = 2; // 최대 2회까지 재시도
 
-        let res1 = {
-            // 🌟 2. Qwen 3.5 Generator 명시적 잠금 및 호출
-            if let Some(gen) = self.qwen3_5_generator.lock().await.as_mut() {
-                println!("[AI-SEARCH] 0.8B (Qwen 3.5) Step 1: Asking para2graph...");
-                let params = crate::openai_types::ChatCompletionParameters {
-                    messages: vec![
-                        crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(task_question_1),
-                            name: None,
-                        })
-                    ],
-                    model: "qwen3.5".to_string(), // 🌟 모델명 변경
-                    max_tokens: Some(512),
-                    temperature: Some(1.0), top_p: Some(0.9),
-                    ..Default::default()
-                };
-                gen.generate(params, None, Some(session_1), None).await?
+        for attempt in 1..=max_retries {
+            let res1 = {
+                if let Some(gen) = self.qwen3_generator.lock().await.as_mut() {
+                    println!("[AI-SEARCH] 0.6B (Qwen3) Step 1 (Attempt {}/{}): Asking para2graph...", attempt, max_retries);
+                    let params = crate::openai_types::ChatCompletionParameters {
+                        messages: vec![
+                            crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                                content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(task_question_1.clone()),
+                                name: None,
+                            })
+                        ],
+                        model: "qwen3".to_string(),
+                        max_tokens: Some(512),
+                        // 🌟 [CRITICAL FIX] 첫 시도에는 1.0으로 창의성을 주고, 실패 후 재시도시에는 0.1로 낮춰서 포맷 엄수(환각 억제)를 유도합니다.
+                        temperature: Some(if attempt == 1 { 1.0 } else { 0.1 }), 
+                        top_p: Some(0.9),
+                        ..Default::default()
+                    };
+                    gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))?
+                } else {
+                    return Err(anyhow::anyhow!("Qwen3 Generator is missing"));
+                }
+            };
+
+            segments = crate::parsing::parse_json_from_llm(&res1);
+
+            // 🌟 [CRITICAL FIX] Plan과 Context 개수 불일치 자가 검증 (Self-Correction)
+            let plan_str = segments.get("segmented_plan").and_then(|v| v.as_str()).unwrap_or("");
+            let ctx_len = segments.get("context").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            
+            // 파이프(|) 개수 + 1 로 의도한 세그먼트(조각) 개수 파악
+            let intended_segments = if plan_str.is_empty() { 0 } else { plan_str.matches('|').count() + 1 };
+
+            // 의도는 여러 조각인데, 결과가 통짜(1개)로 나왔다면 환각으로 간주하고 재시도!
+            if attempt < max_retries && ctx_len == 1 && intended_segments > 1 {
+                println!("⚠️ [STAGE 1] 할루시네이션 감지: Plan은 {}조각이지만 Context는 1개입니다. Temperature를 낮춰 재시도합니다...", intended_segments);
+                continue;
             } else {
-                return Err(anyhow::anyhow!("Qwen 3.5 Generator is missing"));
+                break; // 정상적이거나 최대 재시도 횟수에 도달하면 루프 탈출
             }
-        };
+        }
 
-        let mut segments = crate::parsing::parse_json_from_llm(&res1);
-
-        // 👇 1단계 파싱 결과 로그 출력
-        println!("\n✅ [STAGE 1: para2graph (0.8B)] 파싱 결과:");
+        println!("\n✅ [STAGE 1: para2graph (0.6B)] 파싱 결과:");
         println!("{}", serde_json::to_string_pretty(&segments).unwrap_or_default());
 
-        // [필터링 로직] 비어있는 텍스트나 타입이 없는 세그먼트 제거
         if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
              ctx_arr.retain(|seg| {
                  let text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
@@ -1421,20 +1438,15 @@ impl LogisModel {
         }
 
         // ----------------------------------------------------
-        // 🌟 [신규] Stage 1.5: 수치/연산자 조각별 루프 추출 - Qwen3 (0.6B) 사용
+        // Stage 1.5: 수치/연산자 추출 - Qwen3 (0.6B) 연속 사용
         // ----------------------------------------------------
-        // /qwen3/ 텍스트 모델로 스위칭!
-        self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, None, false, None).await?;
-
-        // Context 배열을 순회하며 개별 추출 수행
         if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
-            let total_segments = ctx_arr.len(); // 🌟 에러 해결: 루프 시작 전에 길이를 미리 복사해 둡니다!
+            let total_segments = ctx_arr.len();
 
             for (idx, seg) in ctx_arr.iter_mut().enumerate() {
                 let current_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-                // 🌟 업데이트된 함수 호출: 전체쿼리, 현재텍스트, 타입을 모두 전달
                 let prompt1_5 = crate::parsing::extract_numeric_conditions(&current_text, &query, &seg_type);
                 
                 let res1_5 = {
@@ -1452,62 +1464,98 @@ impl LogisModel {
                             temperature: Some(0.0), top_p: Some(0.01),
                             ..Default::default()
                         };
-                        // 🌟 로더가 바뀌었으므로 비동기(.await) 메서드를 사용합니다!
                         gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))?
                     } else {
                         return Err(anyhow::anyhow!("Qwen3 Generator is missing"));
                     }
                 };
 
-                let conditions_json = crate::parsing::parse_json_from_llm(&res1_5);
-                println!("🔍 [STAGE 1.5: {} 파싱 결과]\n{}", seg_type, serde_json::to_string_pretty(&conditions_json).unwrap_or_default());
+                let mut conditions_json = crate::parsing::parse_json_from_llm(&res1_5);
+                
+                // 🌟 [CRITICAL FIX] 숫자 필터링: "상위 20%" -> "20" 으로 변환
+                if let Some(cond_wrapper) = conditions_json.get_mut("condition").and_then(|v| v.as_object_mut()) {
+                    for (_, val_obj) in cond_wrapper.iter_mut() {
+                        if let Some(is_pct) = val_obj.get("is_percent").and_then(|v| v.as_bool()) {
+                            if is_pct {
+                                if let Some(v_str) = val_obj.get("value").and_then(|v| v.as_str()) {
+                                    // 숫자와 소수점만 추출
+                                    let numeric_only: String = v_str.chars().filter(|c| c.is_digit(10) || *c == '.').collect();
+                                    if !numeric_only.is_empty() {
+                                        val_obj["value"] = json!(numeric_only);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
-                // 현재 세그먼트 객체 안에 추출된 조건을 삽입
+                println!("🔍 [STAGE 1.5: {} 파싱 결과 (필터링 적용)]\n{}", seg_type, serde_json::to_string_pretty(&conditions_json).unwrap_or_default());
+
                 if let Some(obj) = seg.as_object_mut() {
-                    obj.insert("numeric_conditions".to_string(), conditions_json);
+                    if let Some(cond_val) = conditions_json.get("condition") {
+                        obj.insert("condition".to_string(), cond_val.clone());
+                    } else {
+                        obj.insert("condition".to_string(), conditions_json);
+                    }
                 }
             }
         }
 
         // ----------------------------------------------------
-        // Stage 2: 조건 최종 병합 추출 (graph2contexts) - Qwen 3.5 (0.8B) 
+        // Stage 2: 조건 최종 병합 추출 (graph2contexts) - Qwen 3.5 (0.8B) 사용
         // ----------------------------------------------------
-        // 🌟 [중요] Stage 1.5에서 0.6B(Qwen3)로 방을 바꿨기 때문에, Stage 2를 위해 다시 0.8B로 돌아와야 합니다!
         self.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, None, false, None).await?;
 
-        let input_for_stage2 = serde_json::to_string_pretty(&segments).unwrap_or_default();
-        let prompt2 = crate::parsing::graph2contexts(&current_time, &input_for_stage2);
-        let session_2 = "system_search_g2c_q35".to_string();
+        if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
+            let total_segments = ctx_arr.len();
 
-        let res2 = {
-            if let Some(gen) = self.qwen3_5_generator.lock().await.as_mut() {
-                println!("\n[AI-SEARCH] 0.8B (Qwen 3.5) Step 2: Asking graph2contexts...");
-                let params = crate::openai_types::ChatCompletionParameters {
-                    messages: vec![
-                        crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt2),
-                            name: None,
-                        })
-                    ],
-                    model: "qwen3.5".to_string(),
-                    max_tokens: Some(1024),
-                    temperature: Some(1.0), top_p: Some(0.9),
-                    ..Default::default()
+            for (idx, seg) in ctx_arr.iter_mut().enumerate() {
+                let current_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                // 🌟 [CRITICAL FIX] 개별 텍스트 조각 하나만 Qwen 3.5에게 전달하여 정확도 극대화
+                let prompt2 = crate::parsing::graph2contexts(&current_text, &seg_type);
+                
+                let res2 = {
+                    if let Some(gen) = self.qwen3_5_generator.lock().await.as_mut() {
+                        println!("\n[AI-SEARCH] 0.8B (Qwen 3.5) Step 2 [{}/{}]: Extracting attributes for '{}'...", idx + 1, total_segments, seg_type);
+                        let params = crate::openai_types::ChatCompletionParameters {
+                            messages: vec![
+                                crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt2),
+                                    name: None,
+                                })
+                            ],
+                            model: "qwen3.5".to_string(),
+                            max_tokens: Some(256),
+                            temperature: Some(0.1), top_p: Some(0.1), // 환각 방지를 위해 창의성 억제
+                            ..Default::default()
+                        };
+                        // 개별 처리이므로 세션 캐시 충돌을 막기 위해 None 전달
+                        gen.generate(params, None, None, None).await?
+                    } else {
+                        return Err(anyhow::anyhow!("Qwen 3.5 Generator is missing"));
+                    }
                 };
-                gen.generate(params, None, Some(session_2), None).await?
-            } else {
-                return Err(anyhow::anyhow!("Qwen 3.5 Generator is missing"));
-            }
-        };
 
-        let final_contexts = crate::parsing::parse_json_from_llm(&res2);
-        
-        // 👇 2단계 최종 결과 로그 출력
-        println!("\n🎯 [STAGE 2: graph2contexts (0.8B)] 최종 추출 결과:");
-        println!("{}", serde_json::to_string_pretty(&final_contexts).unwrap_or_default());
+                let attributes_json = crate::parsing::parse_json_from_llm(&res2);
+                println!("🔍 [STAGE 2: {} 속성 파싱 결과]\n{}", seg_type, serde_json::to_string_pretty(&attributes_json).unwrap_or_default());
+
+                // 🌟 [핵심 로직] 추출된 status, substantial, find 값을 해당 조각(seg)에 직접 병합(이어 붙이기)!
+                // 1.5단계에서 추출한 condition은 이미 seg 안에 들어있으므로 자연스럽게 하나의 완전한 객체가 됩니다.
+                if let Some(obj) = seg.as_object_mut() {
+                    obj.insert("status".to_string(), attributes_json.get("status").cloned().unwrap_or(serde_json::Value::Null));
+                    obj.insert("substantial".to_string(), attributes_json.get("substantial").cloned().unwrap_or(serde_json::Value::Null));
+                    obj.insert("find".to_string(), attributes_json.get("find").cloned().unwrap_or(serde_json::Value::Null));
+                }
+            }
+        }
+
+        println!("\n🎯 [STAGE 2: graph2contexts (0.8B)] 최종 추출 결과 (모든 속성 및 조건 완벽 병합 완료):");
+        println!("{}", serde_json::to_string_pretty(&segments).unwrap_or_default());
         println!("==================================================\n");
 
-        Ok(final_contexts)
+        Ok(segments)
     }
 
     // [신규] Shipping 파이프라인 (빠른 단일 처리)

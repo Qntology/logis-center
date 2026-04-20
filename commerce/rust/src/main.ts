@@ -67,10 +67,11 @@ let isFirstChatLoad = true;
 
 let selectedUuids = new Set<string>();
 let currentDetailUuid: string | null = null;
-let activeTaskId: string | null = null; // [NEW] Track current extraction task
+let activeTaskId: string | null = null; 
 let isExtracting = false; 
+let isSearching = false; // 🌟 [CRITICAL FIX] 검색 중복 방지 및 스피너 보호용 락(Lock)
 let spinnerInterval: number | null = null;
-let qrSpinnerIndex = 0; // [NEW] Track discrete frame for QR spinner
+let qrSpinnerIndex = 0; 
 let systemLogCount = 0;
 
 function stepQrSpinner() {
@@ -135,6 +136,8 @@ function startSpinner() {
     if (settingsBtn) {
         settingsBtn.classList.add("active-spinner-mode");
         if (btnExtract) btnExtract.style.display = "none";
+        // 🌟 검색 중이라면 검색 버튼(#btn-submit)도 즉시 숨겨줍니다.
+        if (isSearching && btnSubmit) btnSubmit.style.display = "none";
     }
     
     let i = 0;
@@ -142,7 +145,6 @@ function startSpinner() {
         const char = spinnerFrames[i % spinnerFrames.length];
         if (settingsBtn) settingsBtn.innerText = char;
         
-        // Update all active spinners, including those in pull loaders
         document.querySelectorAll('.spinner, .active-spinner').forEach(el => {
             (el as HTMLElement).innerText = char;
         });
@@ -151,6 +153,10 @@ function startSpinner() {
 }
 
 function stopSpinner() {
+    // 🌟 [CRITICAL FIX] 추출(Extracting) 중이거나 검색(Searching) 중이면, 
+    // 백그라운드 태스크가 함부로 글로벌 스피너를 끄지 못하도록 절대 방어합니다!
+    if (isExtracting || isSearching) return;
+
     if (spinnerInterval) {
         clearInterval(spinnerInterval);
         spinnerInterval = null;
@@ -158,17 +164,16 @@ function stopSpinner() {
     
     if (settingsBtn) {
         settingsBtn.classList.remove("active-spinner-mode");
-        // Only reset the text icon if we're not still in an extraction process
-        if (!isExtracting) {
-            settingsBtn.innerText = settingsBtn.classList.contains('active') ? "💬" : "🗨️";
-        }
+        settingsBtn.innerText = settingsBtn.classList.contains('active') ? "💬" : "🗨️";
     }
     
-    // Clear all spinners to stop them visually
     document.querySelectorAll('.spinner, .active-spinner').forEach(el => {
         el.classList.remove('active-spinner');
         (el as HTMLElement).innerText = ""; 
     });
+
+    // 🌟 스피너가 최종적으로 꺼질 때, 안전하게 검색 버튼 복구
+    if (btnSubmit) btnSubmit.style.display = "flex";
 }
 
 // --- Layout & Window Logic ---
@@ -745,21 +750,27 @@ searchInput?.addEventListener("input", () => {
 // [신규] 검색창에서 엔터 키를 누르면 AI 검색(돋보기 버튼)을 강제로 실행하도록 연결
 searchInput?.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
-        e.preventDefault(); // 기본 폼 제출 동작 등 방지
-        btnSubmit?.click(); // 돋보기 버튼 클릭 이벤트 강제 발생
+        e.preventDefault(); 
+        // 🌟 진행 중일 때는 엔터키 연타도 무시합니다.
+        if (!isSearching && !isExtracting) { 
+            btnSubmit?.click(); 
+        }
     }
 });
 
-
 btnSubmit?.addEventListener("click", async () => {
+    // 🌟 [CRITICAL FIX] 이미 검색 중이거나 추출 중이면 더블 클릭 무조건 무시!
+    if (isSearching || isExtracting) return; 
+
     const query = searchInput.value;
     if (!query) return;
 
-    // [NEW] Create a Search Task in the chat area
+    isSearching = true; // 🌟 락 온!
+    if (btnSubmit) btnSubmit.style.display = "none"; // 🌟 버튼 즉시 증발
+
     const taskId = `search_${Date.now()}`;
     const startTime = Date.now();
     
-    // Switch to settings/chat tab to show the task progress
     openWidget("settings");
     startSpinner();
 
@@ -834,7 +845,9 @@ btnSubmit?.addEventListener("click", async () => {
             task_id: taskId
         });
     } finally {
-        stopSpinner();
+        isSearching = false; // 🌟 락 오프!
+        if (btnSubmit) btnSubmit.style.display = "flex"; // 🌟 버튼 원상복구
+        stopSpinner(); // 이제서야 안전하게 스피너가 꺼집니다.
     }
 });
 

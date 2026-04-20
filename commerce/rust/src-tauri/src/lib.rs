@@ -262,16 +262,54 @@ async fn search_documents(
 fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
     let mut filters = Vec::new();
     
-    // 1. Type Filter
+    // 1. Type Filter (기본 카테고리 필터)
     if let Some(t) = ctx.get("type").and_then(|v| v.as_str()) {
         if !t.is_empty() { filters.push(format!("type = '{}'", t)); }
     }
 
-    // 2. Condition Filters (Price, Date, etc.)
-    if let Some(cond) = ctx.get("condition") {
-        if let Some(price) = cond.get("price") {
-            if let Some(gte) = price.get("gte").and_then(|v| v.as_f64()) { filters.push(format!("amount >= {}", gte)); }
-            if let Some(lte) = price.get("lte").and_then(|v| v.as_f64()) { filters.push(format!("amount <= {}", lte)); }
+    // 2. Status Filter (Stage 2에서 추출한 상태 필터)
+    if let Some(status) = ctx.get("status").and_then(|v| v.as_str()) {
+        if !status.is_empty() && status != "null" {
+            filters.push(format!("status = '{}'", status));
+        }
+    }
+
+    // 3. Dynamic Conditions (Stage 1.5에서 추출한 수학적 필터)
+    if let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()) {
+        for (key, val_obj) in cond {
+            if let Some(op_str) = val_obj.get("operator").and_then(|v| v.as_str()) {
+                if let Some(val_val) = val_obj.get("value") {
+                    
+                    // 연산자 매핑
+                    let operator = match op_str {
+                        "gt" => ">",
+                        "gte" => ">=",
+                        "lt" => "<",
+                        "lte" => "<=",
+                        "eq" => "=",
+                        _ => "="
+                    };
+                    
+                    // 값 추출 (숫자와 문자열 안전하게 파싱)
+                    let val_str = if val_val.is_number() {
+                        val_val.to_string()
+                    } else if let Some(s) = val_val.as_str() {
+                        // is_percent 등으로 인해 텍스트가 들어왔을 경우 숫자만 다시 한번 강제 추출
+                        let numeric: String = s.chars().filter(|c| c.is_digit(10) || *c == '.').collect();
+                        if numeric.is_empty() { 
+                            format!("'{}'", s.replace("'", "''")) 
+                        } else { 
+                            numeric 
+                        }
+                    } else {
+                        continue;
+                    };
+
+                    // LanceDB 쿼리용 필터 생성 (예: sale_price >= 20)
+                    // DB 컬럼 구조에 맞게 매핑이 필요하다면 여기서 key 값을 변환할 수 있습니다.
+                    filters.push(format!("{} {} {}", key, operator, val_str));
+                }
+            }
         }
     }
 
@@ -285,14 +323,28 @@ async fn get_all_documents(
     offset: usize,
     filter: Option<String>,
 ) -> Result<Vec<TradeDocument>, String> {
-    let store_guard = state.store.lock().await;
+    let mut store_guard = state.store.lock().await; // 🌟 mut로 변경하여 쓰기 가능하게 만듭니다.
+    
+    // 🌟 [CRITICAL FIX] DB 초기화 레이스 컨디션 해결
+    // 프론트엔드가 데이터를 요청했는데 DB가 아직 없으면 즉시 여기서 로드합니다.
+    if store_guard.is_none() {
+        let db_path = "data/lancedb";
+        let _ = std::fs::create_dir_all(db_path);
+        if let Ok(s) = VectorStore::new(db_path).await {
+            let _ = s.init_all_tables().await;
+            *store_guard = Some(s);
+        } else {
+            return Err("Failed to initialize LanceDB".to_string());
+        }
+    }
+
     if let Some(store) = store_guard.as_ref() {
         let mut results = store.get_all_items("items", limit, offset, filter).await.map_err(|e| e.to_string())?;
         
         // [DYNAMIC] Convert JSON to Natural Language for UI display only
         for doc in results.iter_mut() {
             if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&doc.json_data) {
-                doc.text = parsing::json_to_natural_language(&json_val);
+                doc.text = crate::parsing::json_to_natural_language(&json_val);
             }
         }
         
@@ -475,15 +527,25 @@ async fn ai_search_complex(
             let sql_filter = convert_conditions_to_sql(ctx);
             let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 768]);
             
-            if let Ok(results) = store.search_items("items", text, emb, 5, sql_filter).await {
-                for (id, content, score) in results {
-                    all_results.push(json!({
-                        "id": id,
-                        "text": content,
-                        "score": score,
-                        "context_type": ctx.get("type")
-                    }));
+            // 🌟 [CRITICAL FIX] AI가 생성한 SQL 필터로 먼저 검색을 시도합니다.
+            let search_result = store.search_items("items", text, emb.clone(), 5, sql_filter.clone()).await;
+            
+            let final_results = match search_result {
+                Ok(res) => res,
+                Err(e) => {
+                    println!("[AI-SEARCH] SQL Filter Failed ({}). Falling back to pure semantic search...", e);
+                    // 🌟 에러 발생(DB 컬럼명 불일치 등) 시 필터를 빼고 순수 의미(벡터) 검색으로 폴백!
+                    store.search_items("items", text, emb, 5, None).await.unwrap_or_default()
                 }
+            };
+
+            for (id, content, score) in final_results {
+                all_results.push(json!({
+                    "id": id,
+                    "text": content,
+                    "score": score,
+                    "context_type": ctx.get("type")
+                }));
             }
         }
     }

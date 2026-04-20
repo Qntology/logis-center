@@ -451,22 +451,23 @@ pub fn para2graph(language: &str) -> String {
 
 [DOCUMENT SCANNING & STRICT SEGMENTATION LOGIC]
 1. EXACT COPY: Copy the full input sentence into 'original_text' without changing anything.
-2. PIPE PLANNING: In the 'segmented_plan' field, rewrite the 'original_text' exactly, but insert a pipe symbol ("|") wherever the semantic category (type) changes. You MUST NOT drop, add, or alter any words or spaces. (e.g., Structure it conceptually like: "Event context words | Goods attribute words | Review request words").
-3. STRICT ARRAY MAPPING: For EVERY segment separated by a pipe in 'segmented_plan', create exactly one object in the 'context' array sequentially.
-4. LITERAL EXTRACTION: The 'text' field of each object MUST be the exact substring from the pipe plan, without the pipe symbols. DO NOT translate, summarize, or generate new words.
+2. TAGGED PIPE PLANNING: In the 'segmented_plan' field, you MUST prefix every segment with its assigned category tag in brackets, followed by the exact substring, separated by pipes ("|"). Structure it strictly as "[tag1] chunk1 | [tag2] chunk2".
+3. MAXIMAL GROUPING (CRITICAL): Group all contiguous words belonging to the same category into a SINGLE segment. DO NOT split subjects from their numeric conditions. Break the segment ONLY when the category logically shifts.
+4. STRICT ARRAY MAPPING: For EVERY tagged segment in 'segmented_plan', create exactly one object in the 'context' array sequentially.
+5. VERBATIM EXTRACTION: The 'text' field MUST be the exact substring from the plan, excluding the [tag] and | symbols. DO NOT translate, summarize, alter, or hallucinate any characters.
 
 [SCHEMA DEFINITIONS]
 - original_text: String. The exact, unaltered full natural language input.
-- segmented_plan: String. The original text with "|" inserted strictly at category boundaries.
+- segmented_plan: String. The original text with "[type] text | " format inserted strictly at category boundaries.
 - language: String. Default "{LANG}".
-- categories: The main semantic category. Must be exactly one of:
-  - "order": Contexts involving purchasing actions, sales volume, checkout, or order history.
-  - "goods": Contexts describing product specifics, physical attributes, price limits, or catalog details.
-  - "tracking": Contexts regarding shipment status, delivery, or logistics.
-  - "review": Contexts related to customer feedback, ratings, or user messages.
-  - "coupon": Contexts involving discount codes or coupons.
-  - "event": Contexts involving time-bound promotions, seasonal sales, or event announcements.
-  - "": If none of the above logically apply.
+- categories: The main semantic category. Evaluate strictly based on e-commerce business intent. Must be exactly one of:
+  * "order": Intent to measure sales performance or direct transactions. Triggers: conversion rate, sales volume, checkout, payment, cancellation, refund. (RULE: If the context measures buying success or revenue, classify as 'order' even if the word 'product' or 'item' is present).
+  * "goods": Intent to describe product catalog data, exposure, or traffic metrics. Triggers: page views, clicks, physical attributes, stock limits, unit prices. (RULE: Focuses on item specifications and customer traffic before the actual purchase).
+  * "tracking": Intent to manage logistics and fulfillment. Triggers: shipment status, dispatch, delivery duration, courier information.
+  * "review": Intent to analyze the voice of the customer. Triggers: feedback, ratings, reviews, CS messages, complaints.
+  * "coupon": Intent to manage specific discount vouchers. Triggers: coupon codes, issuance limits, discount amounts applied via coupons.
+  * "event": Intent to manage marketing campaigns or analyze broad operational trends. Triggers: promotions, exhibitions, seasonal sales, overarching managerial analysis requests.
+  * "": If none logically apply.
 
 [OUTPUT FORMAT]
 {
@@ -534,106 +535,29 @@ You must extract, transform, and normalize data from the natural language input 
             .replace("{TYPE}", seg_type)
 }
 
-pub fn property2operator(current: &str, input: &str) -> String {
-    let template = r###"Task: Act as a deterministic semantic parser. You must extract, transform, and normalize data from the natural language input into the strictly defined JSON output format based on the provided schema.
-
-[SCHEMA DEFINITION]
-- property_type: A dynamically generated key representing the extracted attribute context from the text.
-- operator: A string representing the comparison operator. Allowed values:
-  * "gt": Strictly greater than
-  * "gte": Greater than or equal to
-  * "lt": Strictly less than
-  * "lte": Less than or equal to
-  * "eq": Exact match
-
-[TRANSFORMATION LOGIC - MANDATORY EXECUTION]
-1. ATTRIBUTE EXTRACTION:
-   - Identify the context of the numbers in the text to determine the property type.
-2. OPERATOR SELECTION & VALUE MAPPING:
-   - Extract numeric values from the text and map them to the `value` field.
-   - Evaluate the context to select the appropriate operator and map it to the `operator` field according to the schema definition.
-3. ISO STANDARDIZATION:
-   - Identify the currency context and resolve it to its ISO 4217 code. Place this inside the relevant object if applicable.
-
-[INPUT]
-{INPUT}
-
-[OUTPUT FORMAT]
-{
-  "quantity": {
-    "value": 0,
-    "operator": "..."
-  }
-}
-
-[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
-
-    template.replace("{CURRENT}", current).replace("{INPUT}", input)
-}
-
-pub fn graph2contexts(current: &str, input_json: &str) -> String {
-    let template = r###"Analyze the natural language content and extract ALL distinct logical conditions into the specified JSON dataset structure.
-
-[ENVIRONMENT CONTEXT]
-Current Time: {CURRENT}
-Default Region: Infer implicitly from the input language.
-
-[DOCUMENT SCANNING & EXTRACTION LOGIC]
-1. ORIGINAL & PLAN: Copy the exact full input into 'original_text'. In 'segmented_plan', conceptually outline the semantic flow of the sentence using conceptual English descriptions separated by pipes.
-2. OVERLAPPING EXTRACTION: Extract EVERY distinct semantic intent into the 'context' array. The extracted 'text' substrings MAY OVERLAP. (e.g., an 'order' chunk can capture a broad phrase, while a 'goods' chunk captures a narrower phrase within it).
-3. EXACT SUBSTRING: The 'text' field MUST be an exact, unaltered substring from the original text.
-
-[REGIONAL SEASONALITY & TIME LOGIC]
-1. Hemisphere Awareness: Calculate seasonal date ranges dynamically based on the inferred region's hemisphere.
-2. Temporal Anchoring: Resolve relative time expressions into absolute ISO-8601 timestamps against the Current Time.
-
-[CHUNK-SPECIFIC CONDITION LOGIC (TEXT-TO-SQL ABSTRACTION)]
-1. ISOLATION: Evaluate conditions ONLY based on the specific 'text' of the current chunk.
-2. SQL OPERATOR MAPPING: Parse the extracted 'text' conceptually as a SQL `WHERE` clause.
-   - SQL `<=` -> map to `lte`.
-   - SQL `>=` -> map to `gte`.
-   - SQL `=` -> map to `eq`.
-3. ISO CURRENCY EXTRACTION: Abstract currency symbols natively into standard ISO 4217 currency codes.
-4. NULLIFICATION: If the extracted 'text' for a specific chunk lacks mathematical constraints, temporal anchors, or price identifiers, the respective condition objects MUST be set to null.
-
-[INPUT JSON]
-{INPUT_JSON}
+pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
+    let template = r###"Analyze the specific text segment and extract the logical attributes based on the defined schema.
 
 [SCHEMA DEFINITIONS]
-- categories: Must be one of: 'order', 'goods', 'tracking', 'review', 'coupon', 'event', or ''.
 - status: 'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', or null.
-- substantial: 'size', 'weight', 'shipping_fee', 'shipping_duration', 'sale_price', 'supply_price', 'low_stock_threshold', 'discount', 'min_order_amount', 'max_discount_amount', 'usage_limit', 'usage_per', or null.
-- find: 'many', 'few', 'much', 'little', 'heavy', 'light', or null.
-- condition: Object containing quantitative SQL-like filters.
-  - date: { "eq": ISO-8601 string or null, "lte": ISO-8601 string or null, "gte": ISO-8601 string or null } or null.
-  - quantity: { "eq": Number or null, "lte": Number or null, "gte": Number or null } or null.
-  - price: { "currency": ISO 4217 String or null, "eq": Number or null, "lte": Number or null, "gte": Number or null } or null.
+- substantial: 'size', 'weight', 'shipping_fee', 'shipping_duration', 'sale_price', 'supply_price', 'low_stock_threshold', 'discount', 'min_order_amount', 'max_discount_amount', 'usage_limit', 'usage_per', or null. (Must be an array of matching strings, or null).
+- find: 'many', 'few', 'much', 'little', 'heavy', 'light', or null. (Must be an array of matching strings, or null).
+
+[CURRENT SEGMENT]
+Category Type: {TYPE}
+Text: {TEXT}
 
 [OUTPUT FORMAT]
 {
-  "original_text": "String",
-  "segmented_plan": "String",
-  "context": [
-    {
-      "language": "String (ISO 639-1)",
-      "type": "String",
-      "text": "String",
-      "status": "String | null",
-      "substantial": ["String"] | null,
-      "find": ["String"] | null,
-      "condition": {
-        "date": { "eq": null, "lte": null, "gte": null },
-        "quantity": { "eq": null, "lte": null, "gte": null },
-        "price": { "currency": null, "eq": null, "lte": null, "gte": null }
-      }
-    }
-  ]
+  "status": "...",
+  "substantial": [...],
+  "find": [...]
 }
 
 [ACTION] RETURN STRICTLY VALID JSON ONLY.
 NO EXPLANATION. NO THINKING. /no_think"###;
 
-    template.replace("{CURRENT}", current).replace("{INPUT_JSON}", input_json)
+    template.replace("{TYPE}", seg_type).replace("{TEXT}", current_text)
 }
 
 pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
