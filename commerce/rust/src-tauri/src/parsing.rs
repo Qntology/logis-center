@@ -539,9 +539,9 @@ pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
     let template = r###"Analyze the specific text segment and extract the logical attributes based on the defined schema.
 
 [SCHEMA DEFINITIONS]
-- status: 'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', or null.
-- substantial: 'size', 'weight', 'shipping_fee', 'shipping_duration', 'sale_price', 'supply_price', 'low_stock_threshold', 'discount', 'min_order_amount', 'max_discount_amount', 'usage_limit', 'usage_per', or null. (Must be an array of matching strings, or null).
-- find: 'many', 'few', 'much', 'little', 'heavy', 'light', or null. (Must be an array of matching strings, or null).
+* status: 'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', or null.
+* substantial: 'size', 'weight', 'shipping_fee', 'shipping_duration', 'sale_price', 'supply_price', 'low_stock_threshold', 'discount', 'min_order_amount', 'max_discount_amount', 'usage_limit', 'usage_per', or null. (Must be an array of matching strings, or null).
+* find: 'many', 'few', 'much', 'little', 'heavy', 'light', or null. (Must be an array of matching strings, or null).
 
 [CURRENT SEGMENT]
 Category Type: {TYPE}
@@ -550,8 +550,8 @@ Text: {TEXT}
 [OUTPUT FORMAT]
 {
   "status": "...",
-  "substantial": [...],
-  "find": [...]
+  "substantial": "...",
+  "find": "..."
 }
 
 [ACTION] RETURN STRICTLY VALID JSON ONLY.

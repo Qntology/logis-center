@@ -262,52 +262,47 @@ async fn search_documents(
 fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
     let mut filters = Vec::new();
     
-    // 1. Type Filter (기본 카테고리 필터)
     if let Some(t) = ctx.get("type").and_then(|v| v.as_str()) {
         if !t.is_empty() { filters.push(format!("type = '{}'", t)); }
     }
 
-    // 2. Status Filter (Stage 2에서 추출한 상태 필터)
     if let Some(status) = ctx.get("status").and_then(|v| v.as_str()) {
         if !status.is_empty() && status != "null" {
-            filters.push(format!("status = '{}'", status));
+            // 🌟 [CRITICAL FIX 2] LanceDB의 status 컬럼은 Int32 타입입니다! String 필터링 시 에러가 납니다.
+            let status_int = crate::logic::parse_status(status);
+            filters.push(format!("status = {}", status_int));
         }
     }
 
-    // 3. Dynamic Conditions (Stage 1.5에서 추출한 수학적 필터)
     if let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()) {
         for (key, val_obj) in cond {
+            // 🌟 [CRITICAL FIX 3] LanceDB에 존재하는 실제 컬럼으로 매핑합니다.
+            // 없는 컬럼을 필터링하면 DB가 터지면서 검색이 취소되므로, 유효한 컬럼만 통과시킵니다.
+            let valid_cols = ["amount", "status", "type", "created_at", "updated_at"];
+            let mapped_key = match key.as_str() {
+                "price" | "sale_price" | "discount" | "shipping_fee" | "supply_price" => "amount",
+                k if valid_cols.contains(&k) => k,
+                _ => "" // DB에 없는 컬럼이면 빈 문자열 반환 (Semantic 검색으로 폴백 유도)
+            };
+
+            if mapped_key.is_empty() { continue; } // 무효한 SQL 컬럼 무시
+
             if let Some(op_str) = val_obj.get("operator").and_then(|v| v.as_str()) {
                 if let Some(val_val) = val_obj.get("value") {
-                    
-                    // 연산자 매핑
                     let operator = match op_str {
-                        "gt" => ">",
-                        "gte" => ">=",
-                        "lt" => "<",
-                        "lte" => "<=",
-                        "eq" => "=",
-                        _ => "="
+                        "gt" => ">", "gte" => ">=", "lt" => "<", "lte" => "<=", "eq" => "=", _ => "="
                     };
                     
-                    // 값 추출 (숫자와 문자열 안전하게 파싱)
                     let val_str = if val_val.is_number() {
                         val_val.to_string()
                     } else if let Some(s) = val_val.as_str() {
-                        // is_percent 등으로 인해 텍스트가 들어왔을 경우 숫자만 다시 한번 강제 추출
                         let numeric: String = s.chars().filter(|c| c.is_digit(10) || *c == '.').collect();
-                        if numeric.is_empty() { 
-                            format!("'{}'", s.replace("'", "''")) 
-                        } else { 
-                            numeric 
-                        }
+                        if numeric.is_empty() { continue; } else { numeric }
                     } else {
                         continue;
                     };
 
-                    // LanceDB 쿼리용 필터 생성 (예: sale_price >= 20)
-                    // DB 컬럼 구조에 맞게 매핑이 필요하다면 여기서 key 값을 변환할 수 있습니다.
-                    filters.push(format!("{} {} {}", key, operator, val_str));
+                    filters.push(format!("{} {} {}", mapped_key, operator, val_str));
                 }
             }
         }
@@ -508,34 +503,59 @@ async fn ai_search_complex(
 
     // 2. Perform searches for each segment
     let mut all_results = Vec::new();
-    let mut store_guard = state.store.lock().await;
     
-    // ... 이하 LanceDB 검색 로직은 기존 코드와 동일하게 유지 ...
-    if store_guard.is_none() {
-        let db_path = "data/lancedb";
-        if let Ok(s) = VectorStore::new(db_path).await {
-            let _ = s.init_all_tables().await;
-            *store_guard = Some(s);
+    // 🌟 [CRITICAL FIX 1] Mutex Deadlock 방지!
+    // store_guard를 계속 들고 있으면 검색하는 동안 UI(채팅 로드 등)가 완전히 멈춥니다.
+    // VectorStore(DB 연결 객체)만 쏙 빼내고 락을 즉시 해제합니다.
+    let store_opt = {
+        let mut store_guard = state.store.lock().await;
+        if store_guard.is_none() {
+            let db_path = "data/lancedb";
+            if let Ok(s) = VectorStore::new(db_path).await {
+                let _ = s.init_all_tables().await;
+                *store_guard = Some(s);
+            }
         }
-    }
+        store_guard.as_ref().cloned() // 🌟 Clone으로 꺼내기
+    }; // 🌟 여기서 store_guard가 버려지면서 자물쇠가 풀림!
 
-    if let (Some(store), Some(ctx_arr)) = (store_guard.as_ref(), structured_query.get("context").and_then(|v| v.as_array())) {
+    if let (Some(store), Some(ctx_arr)) = (store_opt, structured_query.get("context").and_then(|v| v.as_array())) {
         for ctx in ctx_arr {
             let text = ctx.get("text").and_then(|v| v.as_str()).unwrap_or("");
             if text.is_empty() { continue; }
             
+            // 🌟 [CRITICAL FIX] AI가 판별한 카테고리(Type)를 기반으로 정확한 DB 테이블을 타겟팅합니다!
+            let ctx_type = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let target_table = match ctx_type {
+                "sales" | "goods" | "order" => "sales",
+                "tracking" | "receiving" | "shipping" => "tracking",
+                "event" | "coupon" => "event",
+                "member" | "team" | "user" => "users",
+                "talk" => "talks",
+                "page" | "pages" => "pages",
+                _ => "items", // 기본 폴백
+            };
+
             let sql_filter = convert_conditions_to_sql(ctx);
             let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 768]);
             
-            // 🌟 [CRITICAL FIX] AI가 생성한 SQL 필터로 먼저 검색을 시도합니다.
-            let search_result = store.search_items("items", text, emb.clone(), 5, sql_filter.clone()).await;
+            println!("\n[AI-SEARCH] 🎯 쿼리 라우팅: [{}] 카테고리를 판단하여 '{}' 테이블을 검색합니다.", ctx_type, target_table);
+            if let Some(ref filter) = sql_filter {
+                println!("[AI-SEARCH] 🗄️ 적용된 SQL 필터: {}", filter);
+            }
+            
+            // 🌟 "items" 하드코딩을 지우고 동적 테이블(target_table)로 검색!
+            let search_result = store.search_items(target_table, text, emb.clone(), 5, sql_filter.clone()).await;
             
             let final_results = match search_result {
-                Ok(res) => res,
+                Ok(res) => {
+                    println!("[AI-SEARCH] ✅ 필터 검색 성공! {} 개의 결과를 찾았습니다.", res.len());
+                    res
+                },
                 Err(e) => {
-                    println!("[AI-SEARCH] SQL Filter Failed ({}). Falling back to pure semantic search...", e);
-                    // 🌟 에러 발생(DB 컬럼명 불일치 등) 시 필터를 빼고 순수 의미(벡터) 검색으로 폴백!
-                    store.search_items("items", text, emb, 5, None).await.unwrap_or_default()
+                    println!("[AI-SEARCH] ⚠️ SQL 필터 적용 실패 (원인: {}). '{}' 테이블에서 순수 의미(Vector) 검색으로 폴백합니다...", e, target_table);
+                    // 🌟 에러 발생 시에도 올바른 테이블(target_table)에서 의미 검색 폴백!
+                    store.search_items(target_table, text, emb, 5, None).await.unwrap_or_default()
                 }
             };
 
@@ -544,7 +564,7 @@ async fn ai_search_complex(
                     "id": id,
                     "text": content,
                     "score": score,
-                    "context_type": ctx.get("type")
+                    "context_type": ctx_type
                 }));
             }
         }
