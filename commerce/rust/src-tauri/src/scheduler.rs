@@ -352,21 +352,38 @@ async fn process_task(
     app_handle: &tauri::AppHandle,
     device_preference: Option<String>,
 ) -> Result<()> {
+    
+    // 🌟 [CRITICAL FIX] 채널 기반 백그라운드 전담 로거 스레드 생성 (데드락 원천 차단)
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let handle_clone = app_handle.clone();
+    let tid_clone = task.id.clone();
+    
+    // 백그라운드 로거 작업
+    tokio::spawn(async move {
+        use tauri::Emitter;
+        while let Some(msg) = rx.recv().await {
+            let _ = handle_clone.emit("task-console-log", serde_json::json!({"task_id": &tid_clone, "text": msg}));
+        }
+    });
+
+    let emit_term = move |msg: &str| {
+        println!("{}", msg);
+        // 채널을 통해 메시지만 던지고 바로 리턴하므로 절대 블로킹되지 않음
+        let _ = tx.send(format!("{}\n", msg));
+    };
+
     let team_id = if !task.to.is_empty() { task.to.clone() } else { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") };
 
-    // [NEW] Ensure log directory exists at runtime using dynamic path 
     let pug_logs_dir = utils::paths::get_pug_logs_dir(Some(app_handle), &task.id);
-    println!("[DEBUG] Pug logs directory: {:?}", pug_logs_dir);
+    emit_term("\n=======================================");
+    emit_term(&format!("[PROCESS] ⚙️ Task {} started processing.", task.id));
+    emit_term(&format!("[DEBUG] Pug logs directory: {:?}", pug_logs_dir));
 
-    println!("[PROCESS] Task {} started processing.", task.id);
-
-    // [KV-CHECK] Check if task specific KV exists
     let kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id);
     if kv_path.exists() {
-        println!("[PROCESS] Found existing KV cache for task {}. Ready to reuse.", task.id);
+        emit_term(&format!("[PROCESS] Found existing KV cache for task {}. Ready to reuse.", task.id));
     }
 
-    // [SPINNER-ACTIVATE] Ensure UI spinner is ON immediately upon task recovery/start
     let payload = json!({ 
         "task_id": task.id,
         "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋" 
@@ -376,9 +393,7 @@ async fn process_task(
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // [MEMORY] Initialize Data Manager for this task scope with AppHandle for dynamic paths
     let mut data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
-
     let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
     // [FIX] 작업 유형에 따라 파일명을 자동으로 결정합니다.
     let kv_name = if task.r#type == "image_extraction" {

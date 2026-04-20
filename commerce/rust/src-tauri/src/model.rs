@@ -629,14 +629,14 @@ impl LogisModel {
 
     pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool, baking_only: bool) -> anyhow::Result<()> {
         if size == ModelSize::Qwen3_5 {
-            return self.ensure_qwen3_5(false).await; // 🌟 ModelSize::Qwen3_5 대신 false 로 변경
+            return self.ensure_qwen3_5(false).await; 
         }
         if size == ModelSize::Qwen3 {
             return self.ensure_qwen3().await; 
         }
 
         // 오직 ModelSize::Qwen 만 이 아래 로직을 탐
-        let mut current_size_guard = self.current_size.lock().await;
+        let mut current_size_guard = self.current_size.lock().await; // 🌟 첫 번째 자물쇠 획득!
         let mut gen_guard = self.generator.lock().await;
 
         if *current_size_guard == Some(size) && gen_guard.is_some() && !baking_only {
@@ -646,10 +646,9 @@ impl LogisModel {
         println!("[LOAD] Fresh loading {:?} from disk...", size);
         let path = &self.qwen_model_path; 
         
-        // 🌟 [핵심 픽스] Qwen 모델도 로딩 전에 미리 방주인 등록!
-        {
-            *self.current_size.lock().await = Some(size);
-        }
+        // 🌟 [CRITICAL FIX] 이중 자물쇠(Deadlock) 유발 코드 제거! 
+        // 이미 가지고 있는 current_size_guard 에 직접 값을 할당합니다.
+        *current_size_guard = Some(size); 
         
         let target_device = self.device_config.device.clone();
         let is_disk_swap = self.is_disk_swap;
@@ -659,17 +658,34 @@ impl LogisModel {
         let path_clone = path.to_string();
         let handle_clone = self.app_handle.clone();
 
-        let gen = tokio::task::spawn_blocking(move || {
-            let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
-            QwenVLGenerateModel::init_with_config(
-                &path_clone, None, None, // 공유 설정(shared_path) 제거
-                Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
-                force_text_only, baking_only, is_disk_swap, kv_root // [cite: 298, 299, 300]
-            )
-        }).await??;
+        let gen = match tokio::time::timeout(
+            std::time::Duration::from_secs(60), 
+            tokio::task::spawn_blocking(move || {
+                let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
+                QwenVLGenerateModel::init_with_config(
+                    &path_clone, None, None,
+                    Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
+                    force_text_only, baking_only, is_disk_swap, kv_root
+                )
+            })
+        ).await {
+            Ok(Ok(Ok(generator))) => generator,
+            Ok(Ok(Err(e))) => {
+                println!("🚨 [MODEL-ERROR] 모델 초기화 실패 (로직 에러): {:?}", e);
+                return Err(e);
+            },
+            Ok(Err(e)) => {
+                println!("🚨 [MODEL-ERROR] Spawn Blocking 실패 (스레드 에러): {:?}", e);
+                return Err(e.into());
+            },
+            Err(_) => {
+                println!("🚨 [CRITICAL] 60초 타임아웃 발생! 모델 로딩 내부에서 무한 대기에 빠졌습니다!");
+                return Err(anyhow::anyhow!("Model Loading Timeout"));
+            }
+        };
 
         *gen_guard = Some(gen);
-        *current_size_guard = Some(size);
+        // *current_size_guard = Some(size); // 위에서 미리 등록했으므로 생략 가능
         
         Ok(())
     }
@@ -835,20 +851,39 @@ impl LogisModel {
         task_id: String,
         image_path: String,
         language: String,
-        search_mode: String, // 🌟 [CRITICAL FIX] 프론트에서 넘어온 탭 상태 파라미터 추가
+        search_mode: String,
         app_handle: &tauri::AppHandle,
         cancel_token: Option<Arc<AtomicBool>>,
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
+        // 🌟 [CRITICAL FIX] 매크로 제거 후 비동기 우회 함수 장착!
+        let app_handle_clone = app_handle.clone();
+        let task_id_clone = task_id.clone();
+        let emit_term = move |msg: &str| {
+            println!("{}", msg);
+            let m = msg.to_string();
+            let handle = app_handle_clone.clone();
+            let tid = task_id_clone.clone();
+            tokio::spawn(async move {
+                use tauri::Emitter;
+                let _ = handle.emit("task-console-log", serde_json::json!({"task_id": tid, "text": format!("{}\n", m)}));
+            });
+        };
+
+        emit_term("\n=======================================");
+        emit_term(&format!("[ENGINE] 🚀 Starting Image Extraction Pipeline for Task: {}", task_id));
+        emit_term("[STAGE-1] Preparing VRAM and Loading Qwen3.5 (0.8B) Vision Model...");
+
         self.ensure_qwen3_5(true).await?; 
 
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
             
-            // 🌟 [CRITICAL FIX] 탭 상태가 Shipping이면 송장(tracking)으로, Commerce면 상품(goods)으로 AI 프롬프트를 동적 변경!
             let prompt_type = if search_mode == "shipping" { "tracking" } else { "goods" };
             let prompt = get_image_extraction_prompt("kr", &language, prompt_type, "");
             
+            emit_term(&format!("[STAGE-2] Generating vision insights for {} mode...", prompt_type));
+
             let result_str = self.chat_with_qwen3_5_image_spinner(
                 "You are a highly precise document data extraction assistant.", 
                 &prompt,                                                        
@@ -861,43 +896,36 @@ impl LogisModel {
                 Some(task_id.clone())
             ).await?;
             
-            println!("\n=======================================");
-            println!("[DEBUG-VISION] 🤖 AI Raw Response:\n{}", result_str);
-            println!("=======================================\n");
+            emit_term("\n=======================================");
+            emit_term(&format!("[DEBUG-VISION] 🤖 AI Raw Response:\n{}", result_str));
+            emit_term("=======================================\n");
 
             let extracted_data = crate::parsing::parse_json_from_llm(&result_str);
             
             let nl = crate::parsing::json_to_natural_language(&extracted_data);
             let item_digest = crate::utils::hash::digest(&nl);
 
+            emit_term("[STAGE-3] Syncing extracted data to LanceDB...");
+
             let store_guard = store_mutex.lock().await;
             if let Some(db) = store_guard.as_ref() {
-                // Fixed identities for parity
                 let from_addr = "0x0000000000000000000000000000000000000000";
-                let team_id = crate::utils::hash::hash_id(from_addr); // Default team
+                let team_id = crate::utils::hash::hash_id(from_addr); 
                 let hashed_cc = crate::utils::hash::hash_id("local.image");
 
-                // [STRICT PARITY] Use stable hashing for image results
                 let raw_no = extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task_id);
                 let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(raw_no).replace("-", "").replace("_", "");
                 
-                // index = crc32(hashId(type + team + no))
                 let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_no)));
-                // id = hashId(team + index)
                 let hashed_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val));
-                
-                // ref = hashId(team + cc + no)
                 let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, hashed_cc, clean_no));
 
-                // 👇 데이터가 Object가 아닐 경우를 대비해 안전하게 감싸줍니다.
                 let mut final_data = if extracted_data.is_object() {
                     extracted_data.clone()
                 } else {
-                    // JSON 객체가 아니면, AI의 원본 응답을 "raw_output"이라는 키에 담아 객체로 만듭니다.
                     json!({ "raw_output": extracted_data })
                 };
 
-                // 이제 final_data는 무조건 Object임이 보장되므로 unwrap()이 안전합니다.
                 final_data.as_object_mut().unwrap().insert("index".to_string(), json!(index_val));
                 final_data.as_object_mut().unwrap().insert("id".to_string(), json!(hashed_id));
 
@@ -910,11 +938,13 @@ impl LogisModel {
                     Some(from_addr),
                     Some(&team_id),
                     Some(&hashed_cc),
-                    Some(&crate::utils::hash::hash_id(&format!("tracking{}", hashed_cc))), // bcc
+                    Some(&crate::utils::hash::hash_id(&format!("tracking{}", hashed_cc))),
                     Some(&ref_val),
                     Some(&item_digest)
                 ).await;
             }
+            
+            emit_term("[SUCCESS] Task Completed. Data saved.");
             
             let _ = app_handle.emit("extraction-progress", json!({ 
                "task_id": task_id.clone(),
@@ -923,6 +953,7 @@ impl LogisModel {
             
             Ok(())
         } else {
+            emit_term("[ERROR] Failed to load image file.");
             let _ = app_handle.emit("extraction-progress", json!({ 
                "task_id": task_id.clone(),
                "category": "Error", "summary": "Failed to load image file.", "spinner": "❌"
@@ -1377,15 +1408,23 @@ impl LogisModel {
         use tauri::Emitter;
         let current_time = chrono::Utc::now().to_rfc3339();
 
+        // 🌟 [신규] 터미널 로거 헬퍼 주입
+        let emit_term = |msg: &str| {
+            println!("{}", msg);
+            let _ = app_handle.emit("task-console-log", json!({"task_id": task_id, "text": format!("{}\n", msg)}));
+        };
+
+        emit_term("[ENGINE] 🚀 Starting Commerce Search Pipeline...");
+        
         // ----------------------------------------------------
         // Stage 1: 세그먼트 분할 (para2graph) - Qwen3 (0.6B) 사용
         // ----------------------------------------------------
+        emit_term("[STAGE-1] Preparing VRAM and Loading Qwen3 (0.6B) Model...");
         let payload = json!({ "task_id": task_id, "category": "Stage 1", "summary": "Analyzing semantic intent...", "spinner": "⠋" });
         let _ = app_handle.emit("extraction-progress", &payload);
         crate::scheduler::log_task_progress(app_handle, task_id, &payload);
 
         self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancel_token.clone()), false, None).await?;
-        // 🌟 [CRITICAL FIX 2] 무거운 작업 전후로 취소 토큰을 검사하여 즉시 탈출(Abort)합니다!
         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
         let prompt1 = crate::parsing::para2graph(language);
@@ -1396,6 +1435,8 @@ impl LogisModel {
 
         for attempt in 1..=max_retries {
             if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            
+            emit_term(&format!("[STAGE-1] Generating intent segment... (Attempt {}/{})", attempt, max_retries));
             
             let gen_arc = self.qwen3_generator.clone();
             let task_q = task_question_1.clone();
@@ -1422,6 +1463,8 @@ impl LogisModel {
                 }
             }).await??;
 
+            emit_term(&format!("[STAGE-1 RESULT]\n{}", res1)); // 🌟 AI가 뱉어낸 JSON 응답을 UI 터미널에 그대로 꽂아버립니다!
+            
             segments = crate::parsing::parse_json_from_llm(&res1);
             let plan_str = segments.get("segmented_plan").and_then(|v| v.as_str()).unwrap_or("");
             let ctx_len = segments.get("context").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
@@ -1562,14 +1605,32 @@ impl LogisModel {
 
     // [신규] Shipping 파이프라인 (빠른 단일 처리)
     pub async fn parse_shipping_query(&self, task_id: &str, app_handle: &tauri::AppHandle, query: String, language: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {
-        use tauri::Emitter;
+        // 🌟 [CRITICAL FIX] 매크로 제거 후 비동기 우회 함수 장착!
+        let app_handle_clone = app_handle.clone();
+        let task_id_clone = task_id.to_string();
+        let emit_term = move |msg: &str| {
+            println!("{}", msg);
+            let m = msg.to_string();
+            let handle = app_handle_clone.clone();
+            let tid = task_id_clone.clone();
+            tokio::spawn(async move {
+                use tauri::Emitter;
+                let _ = handle.emit("task-console-log", serde_json::json!({"task_id": tid, "text": format!("{}\n", m)}));
+            });
+        };
+
+        emit_term("\n=======================================");
+        emit_term("[ENGINE] 🚀 Starting Shipping Search Pipeline...");
+
         let payload = json!({ "task_id": task_id, "category": "Shipping", "summary": "Extracting logistics filters...", "spinner": "⠋" });
         let _ = app_handle.emit("extraction-progress", &payload);
         crate::scheduler::log_task_progress(app_handle, task_id, &payload);
 
+        emit_term("[STAGE-1] Preparing VRAM and Loading Qwen3 (0.6B) Model...");
         self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancel_token.clone()), false, None).await?;
         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
+        emit_term(&format!("[STAGE-1] Extracting shipping filters from query: '{}'", query));
         let prompt = crate::parsing::extract_shipping_conditions(&query, language);
         let gen_arc = self.qwen3_generator.clone();
         
@@ -1592,6 +1653,9 @@ impl LogisModel {
             }
         }).await??;
 
+        // 🌟 추출된 결과를 터미널 화면에 꽂아줍니다!
+        emit_term(&format!("[STAGE-1 RESULT]\n{}", res));
+
         let extracted_conditions = crate::parsing::parse_json_from_llm(&res);
         
         let payload = json!({ "task_id": task_id, "category": "Done", "summary": "Filter extraction complete.", "spinner": "✅" });
@@ -1604,9 +1668,10 @@ impl LogisModel {
             "condition": extracted_conditions
         }]);
 
+        emit_term("[SUCCESS] Shipping Search Pipeline Completed.");
         Ok(json!({ "context": ctx }))
     }
-    
+
     // --- Ported from Python (search_engine.py) ---
     // --- Ported from Python (logic.py) ---
     pub async fn run_deep_research(&self, query: String, context_data: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {

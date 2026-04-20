@@ -755,8 +755,10 @@ document.addEventListener('nav-link', async (e: any) => {
 
 // --- List Logic (Updated for Cards) ---
 searchInput?.addEventListener("input", () => {
+    if (isSearching || isExtracting) return; // 🌟 [충돌 방어 1] AI 작업 중일 때는 라이브 검색 절대 금지!
     if(searchDebounceTimer) clearTimeout(searchDebounceTimer);
     searchDebounceTimer = window.setTimeout(async () => {
+        if (isSearching || isExtracting) return; // 🌟 [충돌 방어 2] 0.8초 뒤에도 작업 중이면 취소!
         await loadMoreDocs(true);
     }, 800);
 });
@@ -765,7 +767,6 @@ searchInput?.addEventListener("input", () => {
 searchInput?.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
         e.preventDefault(); 
-        // 🌟 진행 중일 때는 엔터키 연타도 무시합니다.
         if (!isSearching && !isExtracting) { 
             btnSubmit?.click(); 
         }
@@ -773,14 +774,20 @@ searchInput?.addEventListener("keydown", (e) => {
 });
 
 btnSubmit?.addEventListener("click", async () => {
-    // 🌟 [CRITICAL FIX] 이미 검색 중이거나 추출 중이면 더블 클릭 무조건 무시!
+    // 🌟 [CRITICAL FIX] 이미 검색 중이거나 추출 중이면 무조건 무시!
     if (isSearching || isExtracting) return; 
+
+    // 🌟 [CRITICAL FIX] 예약되어 있던 라이브 텍스트 검색 타이머를 박살 내어 GPU 충돌을 원천 차단합니다!
+    if (searchDebounceTimer) {
+        clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = null;
+    }
 
     const query = searchInput.value;
     if (!query) return;
 
     isSearching = true; // 🌟 락 온!
-    if (btnSubmit) btnSubmit.style.display = "none"; // 🌟 버튼 즉시 증발
+    if (btnSubmit) btnSubmit.style.display = "none";
 
     const taskId = `search_${Date.now()}`;
     const startTime = Date.now();
@@ -788,12 +795,11 @@ btnSubmit?.addEventListener("click", async () => {
     openWidget("settings");
     startSpinner();
 
-    // 🌟 [CRITICAL FIX 4] 사용자 쿼리를 그대로 렌더링하고, 역할(role)을 "user"로 지정
     renderMessage({
         id: taskId,
         role: "user", 
         text: query,
-        status: 1, // Processing
+        status: 1, 
         created_at: startTime,
         updated_at: startTime,
         task_id: taskId
@@ -806,15 +812,18 @@ btnSubmit?.addEventListener("click", async () => {
             query: query, 
             language: "korean",
             devicePreference: devicePref,
-            searchMode: currentSearchMode
+            searchMode: currentSearchMode,
+            // 🌟 [CRITICAL FIX] 히스토리 증발 방지: 현재 사용자가 보고 있는 위치(Context)를 백엔드에 전달합니다!
+            cc: activeContext.cc || "",
+            bcc: activeContext.bcc || "",
+            refId: activeContext.ref || ""
         });
 
-        // 🌟 성공 시에도 동일하게 "user" 역할과 원래 질문(query)을 유지!
         renderMessage({
             id: taskId,
             role: "user",
             text: query, 
-            status: 9, // Success
+            status: 9, 
             created_at: startTime,
             updated_at: Date.now(),
             task_id: taskId
@@ -850,20 +859,19 @@ btnSubmit?.addEventListener("click", async () => {
         if (aiResultsContent) {
             aiResultsContent.innerHTML = "<div style='color:#ef4444;'>Error: " + e + "</div>"; 
         }
-        // Update Task to Error
         renderMessage({
             id: taskId,
             role: "system_task",
             text: `AI Search Error: ${query}`,
-            status: 6, // Error
+            status: 6, 
             created_at: startTime,
             updated_at: Date.now(),
             task_id: taskId
         });
     } finally {
         isSearching = false; // 🌟 락 오프!
-        if (btnSubmit) btnSubmit.style.display = "flex"; // 🌟 버튼 원상복구
-        stopSpinner(); // 이제서야 안전하게 스피너가 꺼집니다.
+        if (btnSubmit) btnSubmit.style.display = "flex";
+        stopSpinner(); 
     }
 });
 
@@ -942,17 +950,19 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     const summary = (payload.summary || "").toLowerCase();
     const isTerminal = payload.category === "Done" || payload.category === "Error" || summary.includes("cancelled") || summary.includes("stopped");
 
-    // [CRITICAL-FIX] If the user manually stopped extraction, ignore ALL incoming progress events 
-    // unless they are the final terminal signals confirming the stop/error/completion.
-    // [RECOVERY-BYPASS] If we are recovering logs, bypass this guard.
     if (!isRecovery && !isExtracting && !isTerminal) {
         console.log("[WIDGET] Ignoring late progress event after stop:", payload.category);
         return; 
     }
 
-    const catId = payload.category ? payload.category.replace(/[^a-zA-Z0-9]/g, "") : "general";
+    // 🌟 [CRITICAL FIX] "Stage 1.5 (1/4)" 같은 이름에서 괄호 부분을 제거하여, 같은 스텝은 새 줄을 만들지 않고 기존 줄을 업데이트하도록 묶어줍니다!
+    const baseCategory = payload.category ? payload.category.replace(/\s*\(\d+\/\d+\)/, "") : "general";
+    const catId = baseCategory.replace(/[^a-zA-Z0-9]/g, "");
     const elementId = `progress-${catId}`;
+    
     const extractionLog = document.getElementById("extraction-log");
+    // 🌟 아까 만든 상단 스피너 전용 컨테이너를 타겟으로 잡습니다.
+    const targetContainer = document.getElementById("progress-container") || extractionLog;
     
     if (extractionLog && extractionLog.dataset.activeTaskId) {
         if (payload.task_id && payload.task_id !== extractionLog.dataset.activeTaskId) return;
@@ -1014,7 +1024,9 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
              row.innerHTML = `${spinnerIcon}<span class="summary-text">${payload.summary || ""}</span>`;
              p.appendChild(row);
              const results = document.createElement("div"); results.className = "results-container"; p.appendChild(results);
-             extractionLog.appendChild(p);
+             
+             // 🌟 [변경] extractionLog 대신 targetContainer에 붙입니다!
+             if (targetContainer) targetContainer.appendChild(p);
          }
          
          const summaryEl = p.querySelector(".summary-text") as HTMLElement;
@@ -1416,6 +1428,24 @@ const syncDataToMobile = () => {
     dataChannel.send(JSON.stringify({ type: "sync_list", data: docs }));
 };
 
+listen("task-console-log", (event: any) => {
+    const { task_id, text } = event.payload;
+    const key = `term_${task_id}`;
+    
+    let logs = sessionStorage.getItem(key) || "";
+    logs += text;
+    sessionStorage.setItem(key, logs);
+
+    // 상세 페이지가 열려있고 아이디가 일치하면 실시간으로 터미널 UI에 텍스트를 추가합니다.
+    const termArea = document.getElementById("terminal-logs");
+    if (termArea && termArea.dataset.activeTaskId === task_id) {
+        termArea.appendChild(document.createTextNode(text));
+        termArea.scrollTop = termArea.scrollHeight; // 자동 스크롤
+    }
+});
+
+
+// 🌟 handleTaskClick 전체를 덮어씁니다.
 function handleTaskClick(el: HTMLElement) {
     const taskId = el.dataset.taskId;
     const status = parseInt(el.dataset.status || "0");
@@ -1423,7 +1453,6 @@ function handleTaskClick(el: HTMLElement) {
     
     console.log("[Chat] Task clicked:", taskId);
 
-    // 🌟 [CRITICAL FIX 6] 검색 작업이 '완료(9)' 되었거나 '취소(3)/에러(6)' 일 때만 결과 리스트를 보여줍니다.
     if (taskId.startsWith("search_") && status !== 1) {
         openWidget("list");
         listView.style.display = "block";
@@ -1435,7 +1464,6 @@ function handleTaskClick(el: HTMLElement) {
         return;
     }
 
-    // 🌟 일반 추출 작업이거나, 검색이 '진행 중(1)' 일 때는 [상세 페이지]를 열어서 정지 버튼을 노출시킵니다!
     openWidget("list"); 
     listView.style.display = "none"; 
     detailView.style.display = "flex";
@@ -1452,15 +1480,31 @@ function handleTaskClick(el: HTMLElement) {
     const logArea = document.getElementById("extraction-log");
     if (logArea) {
         logArea.dataset.activeTaskId = taskId;
-        // 진행 중일 때는 텍스트로 스피너 안내를 띄워줍니다.
-        if (status === 1) {
-            logArea.innerHTML = `<div style="padding: 20px; text-align: center; color: var(--primary);"><span class="spinner active-spinner">⠋</span> AI Processing...</div>`;
-        } else {
-            logArea.innerHTML = "";
-        }
+        
+        // 🌟 [CRITICAL FIX] sessionStorage에서 누적된 터미널 로그를 꺼내옵니다!
+        const savedLogs = sessionStorage.getItem(`term_${taskId}`) || "Connecting to AI Engine...\n";
+        
+        // 🌟 스피너 컨테이너를 위에, 터미널 창을 아래에 예쁘게 배치합니다!
+        logArea.innerHTML = `
+            <div id="progress-container" style="display:flex; flex-direction:column; gap:5px; margin-bottom:15px;"></div>
+            <div id="terminal-logs" data-active-task-id="${taskId}" style="background: #0a0a0a; color: #4ade80; padding: 12px; font-family: monospace; font-size: 0.75rem; border-radius: 6px; max-height: 250px; overflow-y: auto; white-space: pre-wrap; border: 1px solid #333; box-shadow: inset 0 0 10px rgba(0,0,0,0.8); line-height: 1.4;">${savedLogs}</div>
+        `;
+        
+        const termArea = document.getElementById("terminal-logs");
+        if (termArea) termArea.scrollTop = termArea.scrollHeight;
+        
+        // 기존의 스피너 로그들도 불러옵니다.
+        invoke<any[]>("get_task_logs", { taskId: taskId }).then(logs => {
+            if (logArea.dataset.activeTaskId !== taskId) return;
+            if (logs && logs.length > 0) {
+                logs.forEach(payload => renderProgressToUI(payload, true));
+            } else if (status === 1) {
+                const progContainer = document.getElementById("progress-container");
+                if (progContainer) progContainer.insertAdjacentHTML('beforeend', `<div id="temp-spinner" style="padding: 10px; text-align: center; color: var(--primary);"><span class="spinner active-spinner">⠋</span> Generating Insights...</div>`);
+            }
+        }).catch(err => console.error(err));
     }
     
-    // 🌟 이 변수가 세팅되어야 정지 버튼을 누를 때 어떤 Task를 죽일지 알 수 있습니다!
     activeTaskId = taskId; 
 }
 

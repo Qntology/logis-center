@@ -486,20 +486,30 @@ async fn delete_documents(
 async fn ai_search_complex(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
-    task_id: String, // 🌟 프론트엔드에서 만든 taskId를 그대로 받아옵니다!
+    task_id: String,
     query: String,
     language: String,
     device_preference: Option<String>,
     search_mode: String,
+    cc: String,      // 🌟 [추가] 프론트에서 보낸 현재 위치
+    bcc: String,     // 🌟 [추가] 프론트에서 보낸 현재 위치
+    ref_id: String,  // 🌟 [추가] 프론트에서 보낸 현재 위치
 ) -> Result<Value, String> {
-    println!("\n==================================================");
-    println!("🚀 [AI-SEARCH] 프론트엔드 요청 수신 완료!");
-    println!("   - Task ID: {}", task_id);
-    println!("   - 검색어: {}", query);
-    println!("   - 검색 모드: {}", search_mode);
-    println!("==================================================\n");
+    
+    let emit_term = |msg: &str| {
+        println!("{}", msg);
+        use tauri::Emitter;
+        let _ = app_handle.emit("task-console-log", json!({"task_id": task_id, "text": format!("{}\n", msg)}));
+    };
 
-    IS_SEARCHING.store(true, Ordering::SeqCst); 
+    emit_term("\n==================================================");
+    emit_term("🚀 [AI-SEARCH] 프론트엔드 요청 수신 완료!");
+    emit_term(&format!("   - Task ID: {}", task_id));
+    emit_term(&format!("   - 검색어: {}", query));
+    emit_term(&format!("   - 검색 모드: {}", search_mode));
+    emit_term("==================================================\n");
+
+    IS_SEARCHING.store(true, Ordering::SeqCst);
     
     let cancel_token = state.cancellation_token.clone();
     
@@ -515,7 +525,7 @@ async fn ai_search_complex(
         store_guard.as_ref().cloned() 
     };
 
-    // 🌟 DB에 Task 등록
+    // 🌟 DB에 Task 및 Message 등록
     if let Some(store) = store_opt.as_ref() {
         let now = chrono::Utc::now().timestamp_millis();
         let task = crate::store::Task {
@@ -523,17 +533,19 @@ async fn ai_search_complex(
             r#type: "ai_search".to_string(),
             from: "user".to_string(),
             to: "system".to_string(),
-            cc: "search".to_string(), bcc: "".to_string(), r#ref: "".to_string(),
+            cc: cc.clone(), bcc: bcc.clone(), r#ref: ref_id.clone(), // 🌟 전달받은 위치 그대로 저장
             data_json: json!({"query": query.clone(), "mode": search_mode.clone()}).to_string(),
             created_at: now, updated_at: now,
             status: 1, // progress
         };
         let _ = store.add_task(task).await;
         
-        // 🌟 [CRITICAL FIX 5] DB에도 역할을 "user"로 등록하고 쿼리를 원본 그대로 넣습니다.
+        // 🌟 [CRITICAL FIX] 위치 정보(cc, bcc, ref)를 채팅 메시지에도 박아넣어 히스토리 증발을 영구 차단합니다!
         let _ = store.add_message(
             &task_id, "user", &query, 
-            Some(&task_id), Some(1), None, None, None, None, None, Some("talk"), None
+            Some(&task_id), Some(1), 
+            Some(&cc), Some(&bcc), Some(&ref_id), 
+            None, None, Some("talk"), None
         ).await;
     }
 
