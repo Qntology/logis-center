@@ -1505,7 +1505,6 @@ async fn update_team_base_metrics(
     items: &Vec<serde_json::Value>,
     is_new_draft: bool,
 ) -> anyhow::Result<()> {
-    // 🌟 [CRITICAL FIX] 구조체를 통째로 만들지 않고, 필요한 필드 값만 가볍게 추출합니다. (컴파일 에러 원천 차단)
     let (team_json_str, team_vector, t_from, t_to, t_cc, t_bcc, t_ref, t_digest) = match store.get_item_by_id("users", team_id).await {
         Ok(Some(doc)) => (doc.json_data, doc.vector, doc.from, doc.to, doc.cc, doc.bcc, doc.r#ref, doc.digest),
         _ => (
@@ -1517,62 +1516,67 @@ async fn update_team_base_metrics(
 
     let mut team_data: serde_json::Value = serde_json::from_str(&team_json_str).unwrap_or(json!({ "base": { "pages": {} } }));
 
-    // 2. Initialize JSON structure if missing
-    let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
-    let pages = base.entry("pages").or_insert(json!({})).as_object_mut().unwrap();
-    let cc_node = pages.entry(task_cc).or_insert(json!({})).as_object_mut().unwrap();
+    // 🌟 [CRITICAL FIX] 블록({ })을 사용하여 가변 참조(Mutable Borrow)의 생명주기를 분리합니다!
     
-    // Init page metrics
-    let page_type_node = cc_node.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
-    let global_type_node = base.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
+    // --- [블록 1: 페이지별 통계 업데이트] ---
+    {
+        let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
+        let pages = base.entry("pages").or_insert(json!({})).as_object_mut().unwrap();
+        let cc_node = pages.entry(task_cc).or_insert(json!({})).as_object_mut().unwrap();
+        let page_type_node = cc_node.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
 
-    // 3. Update Draft/Count based on task logic
-    if is_new_draft {
-        let draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
-        page_type_node.insert("draft".to_string(), json!(draft + 1));
-    } else {
-        let draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
-        let count = page_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-        if draft > 0 { page_type_node.insert("draft".to_string(), json!(draft - 1)); }
-        page_type_node.insert("count".to_string(), json!(count + 1));
-        
-        let global_count = global_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-        global_type_node.insert("count".to_string(), json!(global_count + 1));
-    }
+        if is_new_draft {
+            let draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
+            page_type_node.insert("draft".to_string(), json!(draft + 1));
+        } else {
+            let draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
+            let count = page_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+            if draft > 0 { page_type_node.insert("draft".to_string(), json!(draft - 1)); }
+            page_type_node.insert("count".to_string(), json!(count + 1));
+        }
+    } // 👈 여기서 첫 번째 참조(pages)가 안전하게 종료됩니다.
 
-    // 4. Min/Max Calculation Logic for fields
-    let properties = [
-        "price", "quantity", "width", "height", "length", "weight", "shipping_fee", 
-        "shipping_duration", "sale_price", "supply_price", "low_stock_threshold", 
-        "discount", "min_order_amount", "max_discount_amount", "usage_limit", 
-        "usage_per", "started_at", "expired_at"
-    ];
+    // --- [블록 2: 글로벌 전체 통계 및 Min/Max 업데이트] ---
+    {
+        let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
+        let global_type_node = base.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
 
-    for item in items {
-        for prop in properties.iter() {
-            if let Some(val) = item.get(*prop) {
-                // Parse value to float safely
-                let num_val = if val.is_number() {
-                    val.as_f64().unwrap_or(0.0)
-                } else if let Some(s) = val.as_str() {
-                    s.parse::<f64>().unwrap_or(0.0)
-                } else {
-                    continue;
-                };
+        if !is_new_draft {
+            let global_count = global_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+            global_type_node.insert("count".to_string(), json!(global_count + 1));
+        }
 
-                if num_val == 0.0 && *prop != "started_at" && *prop != "expired_at" { continue; }
+        let properties = [
+            "price", "quantity", "width", "height", "length", "weight", "shipping_fee", 
+            "shipping_duration", "sale_price", "supply_price", "low_stock_threshold", 
+            "discount", "min_order_amount", "max_discount_amount", "usage_limit", 
+            "usage_per", "started_at", "expired_at"
+        ];
 
-                // Ensure prop node exists
-                let prop_node = global_type_node.entry(*prop).or_insert(json!({ "min": 99999999999999.0, "max": -99999999999999.0 })).as_object_mut().unwrap();
-                
-                let current_min = prop_node.get("min").and_then(|v| v.as_f64()).unwrap_or(99999999999999.0);
-                let current_max = prop_node.get("max").and_then(|v| v.as_f64()).unwrap_or(-99999999999999.0);
+        for item in items {
+            for prop in properties.iter() {
+                if let Some(val) = item.get(*prop) {
+                    let num_val = if val.is_number() {
+                        val.as_f64().unwrap_or(0.0)
+                    } else if let Some(s) = val.as_str() {
+                        s.parse::<f64>().unwrap_or(0.0)
+                    } else {
+                        continue;
+                    };
 
-                if num_val < current_min { prop_node.insert("min".to_string(), json!(num_val)); }
-                if num_val > current_max { prop_node.insert("max".to_string(), json!(num_val)); }
+                    if num_val == 0.0 && *prop != "started_at" && *prop != "expired_at" { continue; }
+
+                    let prop_node = global_type_node.entry(*prop).or_insert(json!({ "min": 99999999999999.0, "max": -99999999999999.0 })).as_object_mut().unwrap();
+                    
+                    let current_min = prop_node.get("min").and_then(|v| v.as_f64()).unwrap_or(99999999999999.0);
+                    let current_max = prop_node.get("max").and_then(|v| v.as_f64()).unwrap_or(-99999999999999.0);
+
+                    if num_val < current_min { prop_node.insert("min".to_string(), json!(num_val)); }
+                    if num_val > current_max { prop_node.insert("max".to_string(), json!(num_val)); }
+                }
             }
         }
-    }
+    } // 👈 여기서 두 번째 참조가 종료됩니다.
 
     // 5. Save back to DB
     let _ = store.upsert_item(

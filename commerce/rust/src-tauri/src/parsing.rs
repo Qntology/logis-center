@@ -567,6 +567,7 @@ NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{TYPE}", seg_type).replace("{TEXT}", current_text)
 }
 
+
 pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
     "tracking" => r###"status:'draft' or 'progress' or 'return' or 'complete' or 'error',
@@ -578,10 +579,10 @@ sender_phone:sender_phone | string,
 recipient_name:recipient_name | string,
 recipient_address:recipient_address | string,
 recipient_phone:recipient_phone | string,
-package_width:Package width | number,
-package_height:Package height | number,
-package_length:Package length | number,
-package_weight:Package weight | number,
+width:Package width | number,
+height:Package height | number,
+length:Package length | number,
+weight:Package weight | number,
 carrier:carrier name translated into English | string,
 shipping_fee:Shipping cost | number,
 shipping_method:'standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid',
@@ -629,10 +630,10 @@ shipping_fee:product Shipping cost | number,
 shipping_method:'standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid',
 shipping_duration:product Estimated delivery days | number,
 bundle_shipping:product Allow combined shipping | string,
-product_width:Package width(cm) | number,
-product_height:Package height(cm) | number,
-product_length:Package length(cm) | number,
-product_weight:Package weight(kg) | number,
+width:Package width(cm) | number,
+height:Package height(cm) | number,
+length:Package length(cm) | number,
+weight:Package weight(kg) | number,
 options:[
     {
         value:option name | string,
@@ -691,9 +692,13 @@ quantity:{TYPE} quantity | number,
 usage_limit:Total usage limit for the coupon | number,
 usage_per:Usage limit per customer | number,
 new_customer_only:new customer only | boolean,
+first_purchase_only:first purchase only | boolean,
 min_order_amount:Minimum order amount required to apply coupon | number,
+max_order_amount:Maximum order amount allowed to apply coupon | number,
 max_discount_amount:Maximum discount limit allowed for the coupon | number,
 region_restrictions:region restrictions | boolean,
+number:contact phone number | string,
+address:offline location address | string,
 registration_date:yyyy-MM-ddThh:mm:ss | string,"###.replace("{TYPE}", page_type).replace("{HREF}", href),
     "review" => r###"node:review container CSS selector,
 link : '{HREF}',
@@ -783,7 +788,6 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 pub fn json_to_natural_language(value: &serde_json::Value) -> String {
     let mut output = String::new();
     
-    // Recursive handling for nested structures like { "value": "..." }
     if let Some(obj) = value.as_object() {
         if obj.len() == 1 && obj.contains_key("value") {
             return obj.get("value").unwrap().as_str().unwrap_or(&obj.get("value").unwrap().to_string()).to_string();
@@ -794,18 +798,18 @@ pub fn json_to_natural_language(value: &serde_json::Value) -> String {
         let page_type = map.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let is_detail = map.get("detail").and_then(|v| v.as_bool()).unwrap_or(true);
 
-        // Define EXACT columns from parsing.rs
+        // 🌟 [CRITICAL FIX] 추출 스키마와 완벽하게 일치하도록 이름표 동기화 및 누락 항목 추가 완료!
         let keys: Vec<&str> = match page_type {
             "tracking" => {
                 if is_detail {
-                    vec!["status", "id", "title", "sender_name", "sender_address", "sender_phone", "recipient_name", "recipient_address", "recipient_phone", "package_width", "package_height", "package_length", "package_weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping", "shipping_date", "registration_date"]
+                    vec!["status", "id", "title", "sender_name", "sender_address", "sender_phone", "recipient_name", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping", "shipping_date", "registration_date"]
                 } else {
                     vec!["status", "id", "title", "link", "registration_date"]
                 }
             },
             "goods" => {
                 if is_detail {
-                    vec!["code", "link", "id", "status", "payment_method", "bank", "card", "model_name", "brand_name", "condition", "description", "short_description", "tags", "origin_country", "manufacturer", "release_date", "manufacture_date", "expiration_date", "gtin", "mpn", "barcode", "sale_price", "supply_price", "currency", "compare_at_price", "quantity", "stock_keeping_unit", "low_stock_threshold", "unit", "tax_included", "tax_code", "main_image_url", "additional_image_url", "video_url", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping", "product_width", "product_height", "product_length", "product_weight", "options", "additional_goods", "title", "registration_date"]
+                    vec!["code", "link", "id", "status", "payment_method", "bank", "card", "model_name", "brand_name", "condition", "description", "short_description", "tags", "origin_country", "manufacturer", "release_date", "manufacture_date", "expiration_date", "gtin", "mpn", "barcode", "sale_price", "supply_price", "currency", "compare_at_price", "quantity", "stock_keeping_unit", "low_stock_threshold", "unit", "tax_included", "tax_code", "main_image_url", "additional_image_url", "video_url", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping", "width", "height", "length", "weight", "options", "additional_goods", "title", "registration_date"]
                 } else {
                     vec!["status", "link", "id", "title", "sale_price", "supply_price", "currency", "quantity", "tracking_number", "registration_date"]
                 }
@@ -819,7 +823,7 @@ pub fn json_to_natural_language(value: &serde_json::Value) -> String {
             },
             "coupon" | "event" => {
                 if is_detail {
-                    vec!["link", "id", "type", "status", "title", "started_at", "expired_at", "code", "discount", "quantity", "usage_limit", "usage_per", "new_customer_only", "min_order_amount", "max_discount_amount", "region_restrictions", "registration_date"]
+                    vec!["link", "id", "type", "status", "title", "started_at", "expired_at", "code", "discount", "quantity", "usage_limit", "usage_per", "new_customer_only", "first_purchase_only", "min_order_amount", "max_order_amount", "max_discount_amount", "region_restrictions", "number", "address", "registration_date"]
                 } else {
                     vec!["status", "id", "title", "started_at", "expired_at", "registration_date"]
                 }
