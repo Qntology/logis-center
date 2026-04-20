@@ -508,13 +508,9 @@ async fn ai_search_complex(
     }; 
 
     let search_process = async {
-        let structured_query = if search_mode == "shipping" {
-            model.parse_shipping_query(query.clone(), &language).await.map_err(|e| e.to_string())?
-        } else {
-            model.parse_commerce_query(query.clone(), &language).await.map_err(|e| e.to_string())?
-        };
-
         let mut all_results = Vec::new();
+        
+        // 🌟 [CRITICAL FIX] AI 분석 전에 DB 인스턴스를 먼저 확보합니다.
         let store_opt = {
             let mut store_guard = state.store.lock().await;
             if store_guard.is_none() {
@@ -525,6 +521,27 @@ async fn ai_search_complex(
                 }
             }
             store_guard.as_ref().cloned() 
+        };
+
+        // 🌟 [CRITICAL FIX] Part 3: 팀 프로필에서 Min/Max 통계 데이터(Base Metrics)를 꺼내옵니다.
+        let team_id = crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000"); // 로컬 기본 팀 ID
+        let mut metrics_json_str = "{}".to_string();
+        
+        if let Some(store) = store_opt.as_ref() {
+            if let Ok(Some(doc)) = store.get_item_by_id("users", &team_id).await {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&doc.json_data) {
+                    if let Some(base) = val.get("base") {
+                        metrics_json_str = base.to_string();
+                    }
+                }
+            }
+        }
+
+        let structured_query = if search_mode == "shipping" {
+            model.parse_shipping_query(query.clone(), &language).await.map_err(|e| e.to_string())?
+        } else {
+            // 🌟 통계 데이터를 parse_commerce_query 에 주입!
+            model.parse_commerce_query(query.clone(), &language, &metrics_json_str).await.map_err(|e| e.to_string())?
         };
 
         if let (Some(store), Some(ctx_arr)) = (store_opt, structured_query.get("context").and_then(|v| v.as_array())) {

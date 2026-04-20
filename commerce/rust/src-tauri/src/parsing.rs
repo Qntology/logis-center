@@ -489,9 +489,16 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 
 // --- File: src/parsing.rs ---
 
-pub fn extract_numeric_conditions(current: &str, input: &str, seg_type: &str) -> String {
+// ==============================================
+// [Zone: src/parsing.rs 교체 코드]
+// ==============================================
+pub fn extract_numeric_conditions(current: &str, input: &str, seg_type: &str, metrics_json: &str) -> String {
     let template = r###"Task: Act as a deterministic semantic parser.
 You must extract, transform, and normalize data from the natural language input into the strictly defined JSON output format based on the provided schema.
+
+[DATABASE METRICS CONTEXT]
+Use these current database min/max bounds to resolve any relative, proportional, or comparative queries into absolute numeric values.
+Metrics: {METRICS}
 
 [SCHEMA DEFINITION]
 - operator: A string representing the comparison operator. Allowed values:
@@ -502,13 +509,11 @@ You must extract, transform, and normalize data from the natural language input 
   * "eq": Exact match
 
 [TRANSFORMATION LOGIC - MANDATORY EXECUTION]
-1. ATTRIBUTE EXTRACTION:
-   - Identify the context of the numbers in the text to determine the property type.
-2. OPERATOR SELECTION & VALUE MAPPING:
-   - Extract numeric values from the current text and map them to the `value` field.
-   - Evaluate the context to select the appropriate operator.
-3. ISO STANDARDIZATION:
-   - Identify the currency context and resolve it to its ISO 4217 code.
+1. ATTRIBUTE EXTRACTION: Identify the context of the numbers or comparative words in the text to determine the property type.
+2. RELATIVE VALUE CALCULATION (CRITICAL): 
+   - If the query contains relative conditions, percentages, or comparative adjectives, you MUST use the [DATABASE METRICS CONTEXT] to calculate the EXACT absolute numeric threshold. 
+   - Do NOT output percentages or descriptive text in the `value` field. Always compute and output the final absolute number derived from the min/max metrics.
+3. OPERATOR SELECTION: Map the semantic intent to "gt", "gte", "lt", "lte", or "eq".
 
 [FULL QUERY CONTEXT]
 {INPUT}
@@ -533,7 +538,9 @@ You must extract, transform, and normalize data from the natural language input 
     template.replace("{INPUT}", input)
             .replace("{CURRENT}", current)
             .replace("{TYPE}", seg_type)
+            .replace("{METRICS}", metrics_json)
 }
+// ==============================================
 
 pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
     let template = r###"Analyze the specific text segment and extract the logical attributes based on the defined schema.

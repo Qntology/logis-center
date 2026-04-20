@@ -1370,7 +1370,7 @@ impl LogisModel {
 
     // [신규] Commerce 파이프라인: 2-Stage (0.6B para2graph -> 0.8B graph2contexts)
     // [신규] Commerce 파이프라인: 2-Stage (0.8B 단일 모델 연속 처리)
-    pub async fn parse_commerce_query(&self, query: String, language: &str) -> anyhow::Result<Value> {
+    pub async fn parse_commerce_query(&self, query: String, language: &str, metrics_json: &str) -> anyhow::Result<Value> {
         let current_time = chrono::Utc::now().to_rfc3339();
 
         // ----------------------------------------------------
@@ -1449,7 +1449,8 @@ impl LogisModel {
                 let current_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-                let prompt1_5 = crate::parsing::extract_numeric_conditions(&current_text, &query, &seg_type);
+                // 🌟 [CRITICAL FIX] 프롬프트 생성 함수에 metrics_json 을 전달!
+                let prompt1_5 = crate::parsing::extract_numeric_conditions(&current_text, &query, &seg_type, metrics_json);
                 
                 let gen_arc = self.qwen3_generator.clone();
                 let seg_type_clone = seg_type.clone();

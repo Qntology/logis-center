@@ -1305,7 +1305,9 @@ async fn process_task(
     let target_id = if !task.r#ref.is_empty() { task.r#ref.clone() } else { generated_id }; 
     
     let mut existing_vector = None;
+    let mut is_new_draft = true; // 🌟 [신규] 기존에 없던 새 아이템인지(Draft) 판별하는 플래그
     if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
+        is_new_draft = false; // 🌟 DB에 이미 있으면 업데이트(Count 증가)
         if existing_item.digest == item_digest {
             existing_vector = Some(existing_item.vector);
         }
@@ -1330,6 +1332,22 @@ async fn process_task(
         "items", &target_id, &page_type, extracted_data.clone(), vector,
         Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
     ).await;
+
+    // 🌟 [CRITICAL FIX] Part 2: 추출된 데이터들을 모아서 통계(Base Metrics) 업데이트 엔진 가동!
+    let mut items_to_process = Vec::new();
+    if is_detail {
+        // 상세 페이지면 객체 자체를 통계 대상에 추가
+        items_to_process.push(extracted_data.clone());
+    } else if let Some(items) = extracted_data.get("items").and_then(|v| v.as_array()) {
+        // 리스트 페이지면 배열 안의 모든 아이템들을 통계 대상에 추가
+        items_to_process = items.clone();
+    }
+
+    if !items_to_process.is_empty() {
+        // 🌟 방금 Part 1에서 만들었던 엔진을 호출하여 team.data.base 갱신!
+        let _ = update_team_base_metrics(&store, &team_id, &task.cc, &page_type, &items_to_process, is_new_draft).await;
+        println!("[PROCESS] Metrics Engine updated base statistics for {} items.", items_to_process.len());
+    }
 
     // Final Status Update
     let _ = store.update_message_status(&task.id, logic::parse_status("complete"), Some("Extraction Complete")).await;
@@ -1475,5 +1493,101 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
         last_vram = current_vram;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+    Ok(())
+}
+
+
+async fn update_team_base_metrics(
+    store: &crate::store::VectorStore,
+    team_id: &str,
+    task_cc: &str,
+    item_type: &str,
+    items: &Vec<serde_json::Value>,
+    is_new_draft: bool,
+) -> anyhow::Result<()> {
+    // 🌟 [CRITICAL FIX] 구조체를 통째로 만들지 않고, 필요한 필드 값만 가볍게 추출합니다. (컴파일 에러 원천 차단)
+    let (team_json_str, team_vector, t_from, t_to, t_cc, t_bcc, t_ref, t_digest) = match store.get_item_by_id("users", team_id).await {
+        Ok(Some(doc)) => (doc.json_data, doc.vector, doc.from, doc.to, doc.cc, doc.bcc, doc.r#ref, doc.digest),
+        _ => (
+            json!({ "base": { "pages": {} } }).to_string(),
+            vec![0.0; 768],
+            "".to_string(), "".to_string(), "".to_string(), "".to_string(), "".to_string(), "".to_string()
+        )
+    };
+
+    let mut team_data: serde_json::Value = serde_json::from_str(&team_json_str).unwrap_or(json!({ "base": { "pages": {} } }));
+
+    // 2. Initialize JSON structure if missing
+    let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
+    let pages = base.entry("pages").or_insert(json!({})).as_object_mut().unwrap();
+    let cc_node = pages.entry(task_cc).or_insert(json!({})).as_object_mut().unwrap();
+    
+    // Init page metrics
+    let page_type_node = cc_node.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
+    let global_type_node = base.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
+
+    // 3. Update Draft/Count based on task logic
+    if is_new_draft {
+        let draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
+        page_type_node.insert("draft".to_string(), json!(draft + 1));
+    } else {
+        let draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
+        let count = page_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+        if draft > 0 { page_type_node.insert("draft".to_string(), json!(draft - 1)); }
+        page_type_node.insert("count".to_string(), json!(count + 1));
+        
+        let global_count = global_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+        global_type_node.insert("count".to_string(), json!(global_count + 1));
+    }
+
+    // 4. Min/Max Calculation Logic for fields
+    let properties = [
+        "price", "quantity", "width", "height", "length", "weight", "shipping_fee", 
+        "shipping_duration", "sale_price", "supply_price", "low_stock_threshold", 
+        "discount", "min_order_amount", "max_discount_amount", "usage_limit", 
+        "usage_per", "started_at", "expired_at"
+    ];
+
+    for item in items {
+        for prop in properties.iter() {
+            if let Some(val) = item.get(*prop) {
+                // Parse value to float safely
+                let num_val = if val.is_number() {
+                    val.as_f64().unwrap_or(0.0)
+                } else if let Some(s) = val.as_str() {
+                    s.parse::<f64>().unwrap_or(0.0)
+                } else {
+                    continue;
+                };
+
+                if num_val == 0.0 && *prop != "started_at" && *prop != "expired_at" { continue; }
+
+                // Ensure prop node exists
+                let prop_node = global_type_node.entry(*prop).or_insert(json!({ "min": 99999999999999.0, "max": -99999999999999.0 })).as_object_mut().unwrap();
+                
+                let current_min = prop_node.get("min").and_then(|v| v.as_f64()).unwrap_or(99999999999999.0);
+                let current_max = prop_node.get("max").and_then(|v| v.as_f64()).unwrap_or(-99999999999999.0);
+
+                if num_val < current_min { prop_node.insert("min".to_string(), json!(num_val)); }
+                if num_val > current_max { prop_node.insert("max".to_string(), json!(num_val)); }
+            }
+        }
+    }
+
+    // 5. Save back to DB
+    let _ = store.upsert_item(
+        "users", 
+        team_id, 
+        "team", 
+        team_data, 
+        Some(team_vector),
+        Some(&t_from),
+        Some(&t_to),
+        Some(&t_cc),
+        Some(&t_bcc),
+        Some(&t_ref),
+        Some(&t_digest)
+    ).await;
+
     Ok(())
 }
