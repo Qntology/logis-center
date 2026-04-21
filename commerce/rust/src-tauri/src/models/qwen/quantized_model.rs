@@ -2654,7 +2654,7 @@ impl QuantizedQwenVLTextModel {
                 }
             }
         } else if free_vram > safe_zone {
-            // [STABILITY-FIX] Do NOT auto-upload layers in long context mode to avoid sudden OOM.
+            // [STABILITY-FIX] Do NOT auto-upload layers in long context mode to avoid sudden OOM
         }
         Ok(())
     }
