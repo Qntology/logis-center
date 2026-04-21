@@ -543,17 +543,16 @@ async fn ai_search_complex(
             r#type: "ai_search".to_string(),
             from: "user".to_string(),
             to: "system".to_string(),
-            cc: cc.clone(), bcc: bcc.clone(), r#ref: ref_id.clone(), // 🌟 전달받은 위치 그대로 저장
+            cc: cc.clone(), bcc: bcc.clone(), r#ref: ref_id.clone(), 
             data_json: json!({"query": query.clone(), "mode": search_mode.clone()}).to_string(),
             created_at: now, updated_at: now,
-            status: 1, // progress
+            status: 10, // 🌟 [CRITICAL FIX] 검색도 대기열에 들어가므로 일단 Pending(10)으로 시작!
         };
         let _ = store.add_task(task).await;
         
-        // 🌟 [CRITICAL FIX] 위치 정보(cc, bcc, ref)를 채팅 메시지에도 박아넣어 히스토리 증발을 영구 차단합니다!
         let _ = store.add_message(
             &task_id, "user", &query, 
-            Some(&task_id), Some(1), 
+            Some(&task_id), Some(10), // 🌟 [CRITICAL FIX] 말풍선도 Pending(10) 상태로 표시
             Some(&cc), Some(&bcc), Some(&ref_id), 
             None, None, Some("talk"), None
         ).await;
@@ -1228,11 +1227,11 @@ pub fn run() {
                             };
                             let msg_text = format!("Task Started: {}", payload_val.get("link").and_then(|v| v.as_str()).unwrap_or("Unknown URL"));
                             let _ = db.add_message(
-                                &task.id, // 🌟 [CRITICAL FIX] 랜덤 UUID 대신 task.id를 부여하여 상태 업데이트 로직과 완벽하게 연결되도록 수정!
+                                &task.id, 
                                 "system_task", 
                                 &msg_text, 
                                 Some(&task.id), 
-                                Some(1),
+                                Some(10), // 🌟 [수정] 오타(,,) 수정 및 Pending 상태(10) 명확히 적용
                                 Some(&task.cc),
                                 Some(&task.bcc),
                                 Some(&task.r#ref),

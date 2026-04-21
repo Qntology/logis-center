@@ -1085,10 +1085,14 @@ impl LogisModel {
             
             emit_term("[SUCCESS] Task Completed. Data saved.");
             
+            // 🌟 [CRITICAL FIX] 작업이 완전히 끝났음을 프론트엔드 채팅창 말풍선(Task Bubble)에 알립니다!
             let _ = app_handle.emit("extraction-progress", json!({ 
                "task_id": task_id.clone(),
                "category": "Done", "summary": "Analysis Complete", "spinner": "✅", "data": extracted_data
             }));
+            
+            // 🌟 [추가] 프론트엔드가 3초 폴링을 기다리지 않고 즉시 채팅창을 새로고침하도록 강제 명령을 내립니다!
+            crate::scheduler::notify_new_task();
             
             Ok(())
         } else {

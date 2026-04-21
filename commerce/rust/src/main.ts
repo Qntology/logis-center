@@ -833,10 +833,10 @@ document.addEventListener('nav-link', async (e: any) => {
 
 // --- List Logic (Updated for Cards) ---
 searchInput?.addEventListener("input", () => {
-    if (isSearching || isExtracting) return; // 🌟 [충돌 방어 1] AI 작업 중일 때는 라이브 검색 절대 금지!
+    if (isSearching) return; // 🌟 [CRITICAL FIX] 전처리(isExtracting) 중이어도 자동완성 벡터 검색은 즉각 실행되도록 허용!
     if(searchDebounceTimer) clearTimeout(searchDebounceTimer);
     searchDebounceTimer = window.setTimeout(async () => {
-        if (isSearching || isExtracting) return; // 🌟 [충돌 방어 2] 0.8초 뒤에도 작업 중이면 취소!
+        if (isSearching) return; // 🌟 [CRITICAL FIX] 
         await loadMoreDocs(true);
     }, 800);
 });
@@ -853,7 +853,7 @@ searchInput?.addEventListener("keydown", (e) => {
 
 btnSubmit?.addEventListener("click", async () => {
     // 🌟 [CRITICAL FIX] 이미 검색 중이거나 추출 중이면 무조건 무시!
-    if (isSearching || isExtracting) return; 
+    if (isSearching) return
 
     // 🌟 [CRITICAL FIX] 예약되어 있던 라이브 텍스트 검색 타이머를 박살 내어 GPU 충돌을 원천 차단합니다!
     if (searchDebounceTimer) {
@@ -877,7 +877,7 @@ btnSubmit?.addEventListener("click", async () => {
         id: taskId,
         role: "user", 
         text: query,
-        status: 1, 
+        status: 10, // 🌟 [CRITICAL FIX] UI에 즉시 📥 PENDING 상태로 띄웁니다!
         created_at: startTime,
         updated_at: startTime,
         task_id: taskId
