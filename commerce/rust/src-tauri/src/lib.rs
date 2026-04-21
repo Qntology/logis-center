@@ -1228,7 +1228,7 @@ pub fn run() {
                             };
                             let msg_text = format!("Task Started: {}", payload_val.get("link").and_then(|v| v.as_str()).unwrap_or("Unknown URL"));
                             let _ = db.add_message(
-                                &uuid::Uuid::new_v4().to_string(), 
+                                &task.id, // 🌟 [CRITICAL FIX] 랜덤 UUID 대신 task.id를 부여하여 상태 업데이트 로직과 완벽하게 연결되도록 수정!
                                 "system_task", 
                                 &msg_text, 
                                 Some(&task.id), 

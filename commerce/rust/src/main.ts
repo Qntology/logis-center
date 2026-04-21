@@ -118,7 +118,10 @@ const listRefreshBtn = document.getElementById("list-refresh-btn") as HTMLButton
 const btnDeleteSelected = document.getElementById("btn-delete-selected") as HTMLButtonElement;
 const btnSyncQr = document.getElementById("btn-sync-qr") as HTMLButtonElement;
 const listScrollContainer = document.getElementById("list-scroll-container") as HTMLElement;
-const loadingIndicator = document.getElementById("loading-indicator") as HTMLElement;
+const headerLoading = document.getElementById("header-loading") as HTMLElement;
+
+// 🌟 기존 loadingIndicator 대신 h2 태그를 선택합니다.
+const listTitle = document.querySelector("#list-view .header-row h2") as HTMLElement;
 
 const aiResultsArea = document.getElementById("ai-search-results") as HTMLElement;
 const aiResultsTitle = document.getElementById("ai-results-title") as HTMLElement;
@@ -1115,7 +1118,17 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
             btnExtract.classList.remove("active-spinner");
             btnExtract.innerText = "⚡";
         }
-        await updateExtractButtonVisibility();
+        
+        // 🌟 [CRITICAL FIX] 이미지 전처리가 완료(또는 에러)되면 상단 썸네일을 지우고 검색창 잠금을 해제합니다!
+        if (currentImage) {
+            currentImage = null; // 현재 이미지 상태 초기화
+            if (navPreviewContainer) navPreviewContainer.classList.add("hidden"); // 썸네일 숨기기
+            if (navUploadBtn) navUploadBtn.classList.remove("active-emoji"); // 업로드 버튼 하이라이트 제거
+            if (searchInput) searchInput.disabled = false; // 검색창 잠금 해제
+            if (btnSubmit) btnSubmit.style.display = "flex"; // 돋보기 버튼 복구
+        }
+        
+        await updateExtractButtonVisibility(); // 번개 버튼(btn-extract) 상태 재계산 후 숨김 처리
         
         // [FIX] Continue to mapping but we'll return at the end of terminal mapping
     }
@@ -1135,12 +1148,18 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
             statusCode = 6; // Error
         }
         
+        // 🌟 [CRITICAL FIX] 기존 말풍선의 생성 시간을 기억하여 정렬을 유지하고, updated_at을 명시하여 강제 업데이트를 발생시킵니다!
+        const existingEl = document.getElementById(payload.task_id) as HTMLElement;
+        const originalCreatedAt = existingEl ? parseInt(existingEl.dataset.createdAt || "0") : Date.now();
+
         renderMessage({ 
             id: payload.task_id, 
             role: "system_task", 
             content: payload.summary, 
             status: statusCode, 
-            created_at: Date.now() 
+            created_at: originalCreatedAt, 
+            updated_at: Date.now(),
+            task_id: payload.task_id
         });
 
         // [FIX] If terminal status, don't proceed to draw new spinners in the log
@@ -1684,7 +1703,7 @@ function handleTaskClick(el: HTMLElement) {
         
         // 🌟 스피너 컨테이너를 위에, 터미널 창을 아래에 예쁘게 배치합니다!
         logArea.innerHTML = `
-            <div id="progress-container" style="display:flex; flex-direction:column; gap:5px; margin-bottom:15px;"></div>
+            <div id="progress-container"></div>
             <div id="terminal-logs" data-active-task-id="${taskId}" style="background: #0a0a0a; color: #4ade80; padding: 12px; font-family: monospace; font-size: 0.75rem; border-radius: 6px; max-height: 250px; overflow-y: auto; white-space: pre-wrap; border: 1px solid #333; box-shadow: inset 0 0 10px rgba(0,0,0,0.8); line-height: 1.4;">${savedLogs}</div>
         `;
         
@@ -1903,13 +1922,18 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
 
     if (!isSync) startSpinner();
     isLoading = true;
-    if (loadingIndicator) loadingIndicator.style.display = "block";
+    
+    // 🌟 오직 숨겨둔 span 태그(headerLoading)만 살짝 켭니다. 
+    // h2 태그(listTitle)를 덮어씌우는 코드는 완전히 삭제했습니다.
+    if (headerLoading) {
+        headerLoading.style.display = "inline-block";
+    }
     
     try {
         // 🌟 [CRITICAL FIX] 현재 탭에 맞는 데이터만 필터링!
         let baseFilter = "";
         if (currentSearchMode === "shipping") {
-            baseFilter = "type IN ('tracking', 'receiving', 'shipping', 'bl', 'awb', 'BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'TRACKING')";
+            baseFilter = "type IN ('tracking', 'receiving', 'shipping', 'bl', 'awb', 'BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'TRACKING', 'shipping_doc', 'Unknown')";
         } else if (currentSearchMode === "analytic") {
             baseFilter = "type IN ('sales', 'event', 'users', 'pages')"; 
         } else {
@@ -2002,7 +2026,12 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
     } 
     finally { 
         isLoading = false; 
-        if (loadingIndicator) loadingIndicator.style.display = "none"; 
+        
+        // 🌟 로딩 종료: Loading... 글자를 완전히 숨김 (아무것도 표시 안 됨)
+        if (headerLoading) {
+            headerLoading.style.display = "none";
+        }
+        
         if (!isSync) stopSpinner();
     }
 }

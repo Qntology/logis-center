@@ -1016,8 +1016,12 @@ impl LogisModel {
                 // 🌟 [CRITICAL FIX] 프론트엔드 리스트(#doc-list)와 완벽 동기화하기 위해 "items" 테이블로 저장 위치를 강제 통합합니다!
                 let table_name = "items"; 
                 
+                // 🌟 [수정] 사용자님 의견 반영: "shipping"으로 강제하지 않고, AI가 판별한 고유 문서 타입(BL, CI 등)을 그대로 저장합니다!
                 let doc_type = if is_trade_doc { 
-                    extracted_data.get("doc_type").and_then(|s| s.as_str()).unwrap_or("shipping_doc") 
+                    extracted_data.get("header")
+                        .and_then(|h| h.get("doc_type"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("shipping_doc") 
                 } else { 
                     "tracking" 
                 };
@@ -1072,6 +1076,11 @@ impl LogisModel {
                     Some(&ref_val),
                     Some(&item_digest)
                 ).await;
+                
+                // 🌟 [CRITICAL FIX] 이미지 데이터 저장 직후, DB의 Task와 Message 상태도 9(DONE)로 완전히 굳혀버립니다!
+                // 이 두 줄이 없어서 3초마다 UI가 이전 상태(1)를 DB에서 퍼와 덮어씌우고 있었습니다.
+                let _ = db.update_task_status(&task_id, 9).await;
+                let _ = db.update_message_status(&task_id, 9, None).await;
             }
             
             emit_term("[SUCCESS] Task Completed. Data saved.");

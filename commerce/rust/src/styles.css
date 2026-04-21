@@ -924,3 +924,8 @@ input[type="checkbox"]:checked ~ .logis-child {
 }
 
 /* --- END OF TREE VIEW STYLES --- */
+
+#extraction-log{display:flex; flex-direction:column;}
+
+#detail-content{overflow-y:auto; flex:1; font-size: 0.85rem; padding:0 1em 1em;}
+.progress-container{display:flex; flex-direction:column; gap:5px;}

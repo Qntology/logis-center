@@ -52,7 +52,7 @@
                <div class="header-row">
                  <div style="display:flex; align-items:center; gap:10px;">
                     <button id="btn-list-back" class="nav-btn" title="Collapse">⬅︎</button>
-                    <h2>Results</h2>
+                    <h2><span id="header-loading" style="display:none; font-size:1em; font-weight:normal; margin-left:8px;">Loading...</span></h2>
                  </div>
                  <div style="display:flex; gap:5px;">
                     <button id="btn-delete-selected" class="nav-btn" style="display:none; color: #ef4444;" title="Delete Selected">🗑️ All</button>
@@ -77,7 +77,6 @@
                         </div>
 
                         <div id="settings-panel" style="display: none; padding: 10px; margin-bottom: 15px;">
-                            
                             <div id="search-mode-tabs" style="display: flex; gap: 10px; margin-bottom: 15px; padding-left: 5px;">
                                 <button class="mode-tab" data-mode="shipping" style="background: none; color: #666; border: none; font-size: 0.8rem; cursor: pointer;">Shipping</button>
                                 <button class="mode-tab active" data-mode="commerce" style="background: none; color: var(--primary); border: none; font-size: 0.8rem; cursor: pointer; font-weight: bold;">Commerce</button>
@@ -142,8 +141,6 @@
                         <span class="spinner"></span> loading older...
                     </div>
                  </div>
-                 
-                 <div id="loading-indicator" style="display:none; text-align:center; padding:10px; font-size:0.8rem; color:#666;">Loading...</div>
                </div>
                <!-- AI Results Area -->
                <div id="ai-search-results" style="display:none; margin-top:10px; border-top:1px solid #333; padding-top:10px;">
@@ -164,9 +161,9 @@
                         <button id="btn-detail-delete" class="nav-btn" style="color: #ef4444;" title="Delete Document">🗑️</button>
                    </div>
                </div>
-               <div id="detail-content" class="markdown-body" style="overflow-y:auto; flex:1; font-size: 0.85rem; padding-right:5px;">
+               <div id="detail-content" class="markdown-body">
                    <!-- Extraction Logs or Details injected here -->
-                   <div id="extraction-log" style="display:flex; flex-direction:column; gap:5px;"></div>
+                   <div id="extraction-log"></div>
                </div>
            </div>
         </div>
