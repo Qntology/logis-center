@@ -127,6 +127,42 @@ const aiResultsContent = document.getElementById("ai-results-content") as HTMLEl
 const chatTalks = document.querySelector('.chat-talks') as HTMLElement;
 const chatForm = document.querySelector('form[name="chat-form"]') as HTMLFormElement;
 
+// --- Settings Toggle Logic ---
+const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
+const settingsPanel = document.getElementById("settings-panel") as HTMLElement;
+const docList = document.getElementById("doc-list") as HTMLElement;
+// 🌟 nav-section은 여러 개이므로 querySelectorAll로 잡습니다.
+const navSections = document.querySelectorAll(".nav-section"); 
+
+settingsToggle?.addEventListener("change", (e) => {
+    const isChecked = (e.target as HTMLInputElement).checked;
+    const label = document.querySelector('label[for="settings-toggle"]') as HTMLElement;
+    
+    if (isChecked) {
+        // 설정 켜짐: 설정 패널 표시, 리스트 및 네비게이션 숨김
+        if (settingsPanel) settingsPanel.style.display = "block";
+        if (docList) docList.style.display = "none";
+        navSections.forEach(el => (el as HTMLElement).style.display = "none");
+        
+        // 라벨 UI 강조 효과 (선택사항)
+        if (label) {
+            label.style.color = "#000";
+        }
+    } else {
+        // 설정 꺼짐: 설정 패널 숨김, 리스트 및 네비게이션 원상복구
+        if (settingsPanel) settingsPanel.style.display = "none";
+        // 빈 문자열("")을 주면 CSS에 정의된 원래 display 속성으로 되돌아갑니다.
+        if (docList) docList.style.display = ""; 
+        navSections.forEach(el => (el as HTMLElement).style.display = "");
+        
+        // 라벨 UI 원상복구
+        if (label) {
+            label.style.background = "rgba(255,255,255,0.1)";
+            label.style.color = "#aaa";
+        }
+    }
+});
+
 // --- Spinner Logic ---
 const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -555,7 +591,7 @@ async function renderNavigation() {
         let _pages = await Select["pages"]({});
         
         if (_pages.length === 0) {
-            pageList.innerHTML = "<div style='color:#999; padding:10px; font-size:0.75rem;'>No shared pages found.</div>";
+            pageList.innerHTML = "<div>No shared pages found.</div>";
         } else {
             const branchs: Record<string, any> = {};
 
@@ -881,64 +917,132 @@ document.addEventListener('view-task-log', () => { openWidget("list"); listView.
 btnExtract?.addEventListener("click", async () => {
     console.log("[DEBUG] btnExtract clicked. currentDetectedUrl:", currentDetectedUrl, "currentImage:", currentImage);
     if (currentDetectedUrl || currentImage) {
-        // [CHECK] If already extracting, do nothing
         if (isExtracting) return;
 
         btnExtract.style.opacity = "0.5";
         const logArea = document.getElementById("extraction-log");
-        
-        // [UI-RESET]
         if (logArea) logArea.innerHTML = "";
-        if (detailTitle) detailTitle.innerText = "Task Progress";
-        if (detailContent && logArea) {
-            detailContent.innerHTML = "";
-            detailContent.appendChild(logArea);
-        }
-
+        
         setTimeout(() => { if (btnExtract) btnExtract.style.opacity = "1"; }, 300);
 
         openWidget("settings");
         startSpinner();
-        
         isExtracting = true;
         const taskId = `task_${Date.now()}`;
         
-        if (currentImage) {
-            console.log("[WIDGET] Queuing IMAGE task...");
-            await emit("new-task-from-browser", { 
-                id: taskId, 
-                type: "image_extraction", 
-                image_path: currentImage, 
-                ref: currentImage, 
-                link: "Local Image",
-                device_preference: getDevicePref(),
-                search_mode: currentSearchMode // 🌟 [CRITICAL FIX] 현재 사용자가 보고 있는 탭 모드를 백엔드에 찔러줍니다!
-            });
-        } else {
-            console.log("[WIDGET] Queuing HTML task...");
+        // 🌟 [핵심 분기] Cloud Mode 체크
+        const isCloudMode = (document.getElementById("cloud-mode-toggle") as HTMLInputElement)?.checked;
+
+        if (isCloudMode && currentSession.hash) {
+            // ==========================================
+            // ☁️ [SERVER MODE] before_server로 POST 전송
+            // ==========================================
             try {
-                const html = await invoke<string>("extract_html_from_current_tab");
-                const urlObj = new URL(currentDetectedUrl.toLowerCase());
-                const cc = await hashId(urlObj.hostname);
-                const rawPath = urlObj.pathname + urlObj.search;
-                const hashedRefId = await hashId(cc + rawPath.toLowerCase());
-                
-                await emit("new-task-from-browser", { 
-                    id: taskId, 
-                    type: "html_extraction", 
-                    html: html, 
-                    link: rawPath, 
-                    cc: cc, 
-                    ref: hashedRefId, 
-                    from: currentSession.address, 
+                console.log("[WIDGET] Routing task to Cloud Server...");
+                let payloadBody = "";
+                let format = "";
+
+                if (currentImage) {
+                    // 이미지 모드: Tauri 파일 시스템에서 이미지를 읽어 Base64로 변환
+                    const contents = await readFile(currentImage);
+                    const blob = new Blob([contents]);
+                    const base64Data = await new Promise<string>((resolve) => {
+                        const reader = new FileReader();
+                        reader.onloadend = () => {
+                            // "data:image/png;base64,..." 형태 유지 (서버의 inlineData 포맷에 맞춤)
+                            resolve(reader.result as string);
+                        };
+                        reader.readAsDataURL(blob);
+                    });
+                    
+                    payloadBody = base64Data;
+                    format = "image/png"; // 서버 쿼리 파라미터용
+                } else {
+                    // HTML/PUG 모드: 현재 탭의 HTML을 가져옴
+                    payloadBody = await invoke<string>("extract_html_from_current_tab");
+                    format = "text/html";
+                }
+
+                // 서버 요구사항에 맞게 JSON 생성 및 Gzip 압축 준비
+                const requestData = {
+                    id: taskId,
+                    from: currentSession.address,
                     to: currentSession.team,
-                    device_preference: getDevicePref()
+                    cc: activeContext.cc || "",
+                    bcc: activeContext.bcc || "",
+                    ref: activeContext.ref || "",
+                    body: payloadBody, // 서버가 PUG로 변환하거나 이미지로 처리할 원본 데이터
+                    link: currentDetectedUrl || "local",
+                    type: currentImage ? "image_extraction" : "html_extraction"
+                };
+
+                // 기존 만들어두신 proxy_fetch (Rust 경유) 활용 -> CORS 무시 & GZIP 자동 처리
+                const urlObj = new URL(API_HOST);
+                urlObj.searchParams.append("from", currentSession.address || "");
+                urlObj.searchParams.append("to", currentSession.team || "");
+                if (format.includes("image")) {
+                    urlObj.searchParams.append("format", encodeURIComponent(format));
+                }
+
+                // UI 진행률 가짜 에밋 (서버 응답을 기다리는 동안)
+                renderProgressToUI({ task_id: taskId, category: "Cloud Sync", summary: "Sending data to Logis Center...", spinner: "⠋" });
+
+                // [POST to before_server]
+                const response = await invoke<any>("proxy_fetch", {
+                    url: urlObj.toString(),
+                    method: "POST",
+                    headers: { 
+                        "Content-Type": "application/json",
+                        "Content-Encoding": "gzip" // Rust 백엔드에서 Gzip 압축 후 전송하도록 지시
+                    },
+                    body: requestData,
+                    session_params: { hash: currentSession.hash, token: currentSession.token }
                 });
+
+                console.log("[SERVER MODE] Task accepted by server:", response);
+                
+                // 서버에서 Task ID를 받아오면 여기서 1차 종료하고, 추후 proxy에서 폴링/웹소켓으로 결과 받기
+                renderProgressToUI({ task_id: taskId, category: "Cloud Queue", summary: "Task queued on server. Processing remotely.", spinner: "☁️" });
+                isExtracting = false; // 프론트엔드 입장에서는 큐에 넣었으니 작업 종료
+
             } catch (e) {
+                console.error("[SERVER MODE] Failed to send task:", e);
+                renderProgressToUI({ task_id: taskId, category: "Error", summary: `Cloud upload failed: ${e}`, spinner: "❌" });
                 isExtracting = false;
-                stopSpinner();
+            }
+            
+        } else {
+            // ==========================================
+            // 💻 [LOCAL MODE] 기존 Tauri Rust 백엔드 전송
+            // ==========================================
+            if (currentImage) {
+                console.log("[WIDGET] Queuing LOCAL IMAGE task...");
+                await emit("new-task-from-browser", { 
+                    id: taskId, type: "image_extraction", image_path: currentImage, 
+                    ref: currentImage, link: "Local Image",
+                    device_preference: getDevicePref(), search_mode: currentSearchMode
+                });
+            } else {
+                console.log("[WIDGET] Queuing LOCAL HTML task...");
+                try {
+                    const html = await invoke<string>("extract_html_from_current_tab");
+                    const urlObj = new URL(currentDetectedUrl.toLowerCase());
+                    const cc = await hashId(urlObj.hostname);
+                    const rawPath = urlObj.pathname + urlObj.search;
+                    const hashedRefId = await hashId(cc + rawPath.toLowerCase());
+                    
+                    await emit("new-task-from-browser", { 
+                        id: taskId, type: "html_extraction", html: html, link: rawPath, 
+                        cc: cc, ref: hashedRefId, from: currentSession.address, to: currentSession.team,
+                        device_preference: getDevicePref()
+                    });
+                } catch (e) {
+                    isExtracting = false;
+                }
             }
         }
+        
+        stopSpinner();
         await updateExtractButtonVisibility();
     }
 });
@@ -2002,11 +2106,22 @@ function updateAuthUI() {
         if (chatForm) chatForm.classList.remove("hidden");
         const qrMsg = document.getElementById("msg-qr-auth");
         if (qrMsg) qrMsg.remove();
+        if (cloudToggle) {
+            cloudToggle.disabled = false;
+            cloudToggle.title = "Cloud AI Mode is available";
+            // 로그인 시 자동으로 클라우드 모드로 전환하고 싶다면 아래 주석 해제
+            // cloudToggle.checked = true; 
+        }
     } else {
         if (authStatus) authStatus.innerText = "Waiting for Auth...";
         if (btnLogout) btnLogout.style.display = "none";
         if (btnQrAuth) btnQrAuth.style.display = "block";
         if (chatForm) chatForm.classList.add("hidden");
+        if (cloudToggle) {
+            cloudToggle.disabled = true;
+            cloudToggle.checked = false;
+            cloudToggle.title = "Login required to use Cloud AI";
+        }
     }
 }
 

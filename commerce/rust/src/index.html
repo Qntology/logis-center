@@ -68,7 +68,7 @@
                     </div>
 
                     <!-- Navigation Categories (Users + Pages Tree) -->
-                    <div id="nav-categories" class="nav-categories hidden" style="margin-bottom: 20px; padding-bottom: 10px;">
+                    <div id="nav-categories" class="nav-categories hidden">
                         <!-- Pairing Section -->
                         <div id="nav-qr-container" class="hidden" style="margin-bottom: 15px; padding: 15px; background: #1a1a1a; border-radius: 8px; text-align: center;">
                             <!-- State: Manual Sync (Seed Based) -->
@@ -92,38 +92,41 @@
                         </div>
 
                         <!-- Profile Section -->
-                        <div class="nav-profile" style="margin-bottom: 15px;">
-                            <div class="profile-card" style="display:flex; align-items:center; gap:10px; background:#1a1a1a; padding:10px;">
-                                <div class="profile-favicon" id="nav-profile-favicon" style="width:32px; height:32px; background:#333; border-radius:4px;"></div>
-                                <div class="profile-info">
-                                    <strong id="nav-profile-name" style="font-size:0.9rem;">Sign In</strong>
-                                </div>
-                                <div style="margin-left:auto;">
-                                    <button id="nav-signin" class="link-btn">Login</button>
-                                    <button id="nav-signout" class="link-btn hidden">Logout</button>
-                                </div>
+                        <div class="nav-profile"></div>
+
+                        <div class="settings-toggle">
+                            <input type="checkbox" id="settings-toggle" style="display: none;" />
+                            <label for="settings-toggle" style="cursor: pointer; color: #aaa; font-size: 0.8rem; background: rgba(255,255,255,0.1); padding: 5px 10px; border-radius: 6px; transition: 0.2s;">
+                                ⚙️ Settings
+                            </label>
+                        </div>
+
+                        <div id="settings-panel" style="display: none; padding: 10px; margin-bottom: 15px;">
+                            
+                            <div id="search-mode-tabs" style="display: flex; gap: 10px; margin-bottom: 15px; padding-left: 5px;">
+                                <button class="mode-tab active" data-mode="commerce" style="background: none; color: var(--primary); border: none; font-size: 0.8rem; cursor: pointer; font-weight: bold;">Commerce</button>
+                                <button class="mode-tab" data-mode="shipping" style="background: none; color: #666; border: none; font-size: 0.8rem; cursor: pointer;">Shipping</button>
                             </div>
-                        </div>
 
-                        <div id="search-mode-tabs" style="display: flex; gap: 10px; margin-bottom: 5px; padding-left: 5px;">
-                            <button class="mode-tab active" data-mode="commerce" style="background: none; color: var(--primary); border: none; font-size: 0.8rem; cursor: pointer; font-weight: bold;">Commerce</button>
-                            <button class="mode-tab" data-mode="shipping" style="background: none; color: #666; border: none; font-size: 0.8rem; cursor: pointer;">Shipping</button>
-                        </div>
-
-                        <!-- Tree Sections -->
-                        <div class="nav-tree-container">
-                            <!-- Device Preference Toggle -->
                             <div id="device-preference-container" style="padding: 5px 10px; margin-bottom: 10px; background: rgba(255,255,255,0.05); border-radius: 6px; display: flex; align-items: center; justify-content: space-between;">
                                 <label for="force-cpu-toggle" style="font-size: 0.75rem; color: #aaa; cursor: pointer;">Force CPU Mode</label>
                                 <input type="checkbox" id="force-cpu-toggle" style="cursor: pointer;" />
                             </div>
 
+                            <div id="cloud-mode-container" style="padding: 5px 10px; margin-bottom: 5px; background: rgba(255,255,255,0.05); border-radius: 6px; display: flex; align-items: center; justify-content: space-between;">
+                                <label for="cloud-mode-toggle" style="font-size: 0.75rem; color: var(--primary); cursor: pointer; font-weight: bold;">Use Cloud AI</label>
+                                <input type="checkbox" id="cloud-mode-toggle" style="cursor: pointer;" disabled title="Login required to use Cloud AI" />
+                            </div>
+
+                        </div>
+
+                        <div class="nav-tree-container">
                             <div class="nav-section">
-                                <h3 style="font-size:0.75rem; color:#666; text-transform:uppercase; margin-bottom:8px; padding-left:5px;">Shared Pages</h3>
+                                <h3>Shared Pages</h3>
                                 <div id="nav-list-pages" class="tree-root"></div>
                             </div>
                             <div class="nav-section" style="margin-top:15px;">
-                                <h3 style="font-size:0.75rem; color:#666; text-transform:uppercase; margin-bottom:8px; padding-left:5px;">Team Members</h3>
+                                <h3>Team Members</h3>
                                 <div id="nav-list-users" class="tree-root"></div>
                             </div>
                         </div>

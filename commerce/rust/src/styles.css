@@ -110,7 +110,6 @@ body {
     align-items: center;
     overflow-x: auto;
     padding: 0 5px;
-    gap: 5px;
     scrollbar-width: none; /* Hide scrollbar for cleaner look */
 }
 .search-container::-webkit-scrollbar { display: none; }
@@ -148,6 +147,8 @@ body {
 .search-chip .remove-btn:hover { opacity: 1; }
 
 .search-input {
+    padding: 10px;
+    width: 100%;
     min-width: 100px;
     flex: 1;
     background: transparent;
@@ -310,7 +311,7 @@ h2 { margin: 0; font-size: 1.1rem; }
 .upload-zone:hover { border-color: var(--primary); background: rgba(251, 146, 60, 0.1); }
 
 /* Common Elements */
-input, select, textarea, button.action-btn {
+select, textarea, button.action-btn {
   width: 100%;
   background: rgba(0, 0, 0, 0.3);
   border: 1px solid var(--glass-border);
@@ -576,6 +577,8 @@ tr:hover { background: rgba(0,0,0,0.05); }
     margin: 0 auto;
 }
 
+.settings-toggle{position: absolute; right: 0; top: 0;}
+
 .nav-categories.visible {
     opacity: 1;
     pointer-events: auto;
@@ -590,7 +593,6 @@ tr:hover { background: rgba(0,0,0,0.05); }
     position: relative;
     bottom: auto; /* Override absolute positioning from content.js */
     width: 100%;
-    padding-bottom: 10px;
 }
 
 .profile-card {
@@ -658,13 +660,11 @@ tr:hover { background: rgba(0,0,0,0.05); }
 
 /* Nav Lists */
 .nav-section h3 {
-    margin: 0 0 8px 0;
-    font-size: 0.9rem;
-    color: var(--primary);
+    margin: 0;
+    padding: 1em;
+    font-size: 0.7rem;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    border-bottom: 1px solid #eee;
-    padding-bottom: 4px;
 }
 
 .scroll-list {
@@ -766,6 +766,8 @@ tr:hover { background: rgba(0,0,0,0.05); }
     border-radius: 4px;
 }
 
+.card-list{margin: 0 0.5em;}
+
 .toggle-more:checked ~ .logis-more {
     display: block;
 }
@@ -794,7 +796,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
 /* --- LOGIS TREE VIEW STYLES (Synchronized with content.js) --- */
 
 .tree-root {
-    margin: 1em 1em 0;
+    margin: 0 1em 0;
     font-family: arial, sans-serif;
 }
 
@@ -815,9 +817,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
 }
 
 .logis-branch > li.logis-parent {
-    border-bottom: 1px dashed #434343;
-    margin-bottom: 1.5em;
-    padding-bottom: 0.5em;
+    margin-bottom: 0.3em;
 }
 
 .logis-parent strong {
