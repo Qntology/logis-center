@@ -931,7 +931,16 @@ impl LogisModel {
                     let w = dynamic_image.width();
                     let h = dynamic_image.height();
                     let mut final_data_map = serde_json::Map::new();
+                    
+                    // 🌟 [CRITICAL FIX] Python 패리티: 병합을 위한 7대 기본 뼈대(Skeleton)를 무조건 미리 생성해야 합니다!
                     final_data_map.insert("header".to_string(), json!({"doc_type": detected_type}));
+                    final_data_map.insert("parties".to_string(), json!({}));
+                    final_data_map.insert("logistics".to_string(), json!({}));
+                    final_data_map.insert("conditions".to_string(), json!({}));
+                    final_data_map.insert("financials".to_string(), json!({}));
+                    final_data_map.insert("cargo".to_string(), json!({}));
+                    final_data_map.insert("line_items".to_string(), json!([]));
+                    final_data_map.insert("containers".to_string(), json!([]));
 
                     // Step C: 구역별 분할 크롭 및 LLM 타격
                     for (idx, (cat, top, bot)) in missions.iter().enumerate() {
@@ -950,6 +959,8 @@ impl LogisModel {
                         ).await?;
 
                         let tile_json = crate::parsing::parse_json_from_llm(&tile_res);
+                        
+                        // 🌟 기존 병합 함수 호출 (이제 뼈대가 있으므로 정상적으로 채워집니다)
                         merge_json_manual(&mut final_data_map, cat, tile_json);
                     }
                     

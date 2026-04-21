@@ -1153,6 +1153,16 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     if (extractionLog && detailView.style.display !== "none") {
          let p = document.getElementById(elementId);
          if (!p) {
+             // 🌟 [CRITICAL FIX] 새 스텝이 렌더링되기 전에, 위쪽에서 돌고 있는 모든 스피너를 완료(✅) 처리합니다!
+             if (targetContainer) {
+                 const existingSpinners = targetContainer.querySelectorAll('.active-spinner');
+                 existingSpinners.forEach(s => {
+                     s.classList.remove('active-spinner');
+                     s.innerHTML = "✅";
+                     (s as HTMLElement).style.color = "#4ade80";
+                 });
+             }
+
              p = document.createElement("div"); p.id = elementId;
              p.className = "progress-item";
              p.style.borderBottom = "1px solid #eee"; p.style.padding = "6px 0"; p.style.fontSize = "0.75rem";
@@ -1204,8 +1214,8 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
                  (row as HTMLElement).style.color = "#ef4444"; 
              }
          } else {
-             // Intermediate update: ensure spinner is animating if it's still processing
-             if (spinnerEl) {
+             // 🌟 [CRITICAL FIX] 이미 완료(✅)나 에러(❌)로 끝난 이전 스피너는 절대 다시 살려내지 않습니다!
+             if (spinnerEl && spinnerEl.innerHTML !== "✅" && spinnerEl.innerHTML !== "❌") {
                  const newIcon = payload.spinner || "⠋";
                  if (spinnerEl.innerText !== newIcon) {
                      spinnerEl.innerText = newIcon;
@@ -1899,9 +1909,8 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         // 🌟 [CRITICAL FIX] 현재 탭에 맞는 데이터만 필터링!
         let baseFilter = "";
         if (currentSearchMode === "shipping") {
-            baseFilter = "type IN ('tracking', 'receiving', 'shipping', 'bl', 'awb')";
+            baseFilter = "type IN ('tracking', 'receiving', 'shipping', 'bl', 'awb', 'BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'TRACKING')";
         } else if (currentSearchMode === "analytic") {
-            // 🌟 [신규] Analytic 모드용 필터 (필요에 따라 통계와 관련된 테이블만 노출하도록 변경 가능)
             baseFilter = "type IN ('sales', 'event', 'users', 'pages')"; 
         } else {
             baseFilter = "type IN ('sales', 'goods', 'order', 'event', 'coupon', 'review', 'pages')";
