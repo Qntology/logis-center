@@ -209,15 +209,20 @@ function stopSpinner() {
     }
     
     document.querySelectorAll('.spinner, .active-spinner').forEach(el => {
-        // 🌟 [CRITICAL FIX] 작업 로그창(#extraction-log) 안의 스피너는 ✅로 변해야 하므로 강제로 텍스트를 지우지 않습니다!
         if (!el.closest('#extraction-log')) {
             el.classList.remove('active-spinner');
             (el as HTMLElement).innerText = ""; 
         }
     });
 
-    // 🌟 스피너가 최종적으로 꺼질 때, 안전하게 검색 버튼 복구
-    if (btnSubmit) btnSubmit.style.display = "flex";
+    // 🌟 [CRITICAL FIX] 이미지가 올라와 있을 때는 검색(🔍) 버튼을 숨기고 번개(⚡) 버튼을 복구하도록 예외 처리를 추가합니다!
+    if (currentImage) {
+        if (btnSubmit) btnSubmit.style.display = "none";
+    } else {
+        if (btnSubmit) btnSubmit.style.display = "flex";
+    }
+
+    updateExtractButtonVisibility(); // 숨겨졌던 번개 버튼 상태를 안전하게 다시 계산해서 화면에 띄웁니다.
 }
 
 // --- Layout & Window Logic ---
