@@ -1672,6 +1672,52 @@ impl LogisModel {
         Ok(json!({ "context": ctx }))
     }
 
+    // [신규] Analytic 파이프라인 (임시 Dummy 함수)
+    pub async fn parse_analytic_query(&self, task_id: &str, app_handle: &tauri::AppHandle, query: String, language: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {
+        let app_handle_clone = app_handle.clone();
+        let task_id_clone = task_id.to_string();
+        let emit_term = move |msg: &str| {
+            println!("{}", msg);
+            let m = msg.to_string();
+            let handle = app_handle_clone.clone();
+            let tid = task_id_clone.clone();
+            tokio::spawn(async move {
+                use tauri::Emitter;
+                let _ = handle.emit("task-console-log", serde_json::json!({"task_id": tid, "text": format!("{}\n", m)}));
+            });
+        };
+
+        emit_term("\n=======================================");
+        emit_term("[ENGINE] 🚀 Starting Analytic Search Pipeline (Draft Mode)...");
+
+        // UI에 스피너 표기
+        let payload = json!({ "task_id": task_id, "category": "Analytic", "summary": "Running mock analytics...", "spinner": "⠋" });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        crate::scheduler::log_task_progress(app_handle, task_id, &payload);
+
+        // 🌟 취소 버튼 즉시 반응 대응
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+        // [TODO] 향후 여기에 통계 분석 전용 프롬프트 및 LLM 추론 로직 (Graph2Metrics 등) 추가 예정
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await; // 임시 대기
+
+        emit_term(&format!("[STAGE-1] Dummy parsing analytic intent from query: '{}'", query));
+        
+        // 검색 쿼리에 걸리도록 임시 컨텍스트(sales 등)를 뱉어냅니다.
+        let ctx = json!([{
+            "type": "sales", // 검색을 위한 기본 타겟 테이블 (임시)
+            "text": query.clone(),
+            "condition": {}
+        }]);
+
+        let payload_done = json!({ "task_id": task_id, "category": "Done", "summary": "Analytic processing complete (Dummy).", "spinner": "✅" });
+        let _ = app_handle.emit("extraction-progress", &payload_done);
+        crate::scheduler::log_task_progress(app_handle, task_id, &payload_done);
+
+        emit_term("[SUCCESS] Analytic Search Pipeline Completed.");
+        Ok(json!({ "context": ctx }))
+    }
+
     // --- Ported from Python (search_engine.py) ---
     // --- Ported from Python (logic.py) ---
     pub async fn run_deep_research(&self, query: String, context_data: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {

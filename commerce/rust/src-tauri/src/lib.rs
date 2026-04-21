@@ -586,12 +586,18 @@ async fn ai_search_complex(
         }
 
         // 🌟 취소 토큰(cancel_token)을 파싱 함수에 전달!
-        let structured_query = if search_mode == "shipping" {
-            model.parse_shipping_query(&task_id, &app_handle, query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
-        } else {
-            model.parse_commerce_query(&task_id, &app_handle, query.clone(), &language, &metrics_json_str, cancel_token.clone()).await.map_err(|e| e.to_string())?
+        let structured_query = match search_mode.as_str() {
+            "shipping" => {
+                model.parse_shipping_query(&task_id, &app_handle, query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
+            },
+            "analytic" => {
+                model.parse_analytic_query(&task_id, &app_handle, query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
+            },
+            _ => { // default: commerce
+                model.parse_commerce_query(&task_id, &app_handle, query.clone(), &language, &metrics_json_str, cancel_token.clone()).await.map_err(|e| e.to_string())?
+            }
         };
-
+        
         if let (Some(store), Some(ctx_arr)) = (store_opt.clone(), structured_query.get("context").and_then(|v| v.as_array())) {
             for ctx in ctx_arr {
                 // 🌟 매 루프마다 사용자가 Cancel 버튼을 눌렀는지 체크!

@@ -55,7 +55,6 @@
                     <h2>Results</h2>
                  </div>
                  <div style="display:flex; gap:5px;">
-                    <button id="btn-sync-qr" class="nav-btn" title="Sync with Mobile">📱</button>
                     <button id="btn-delete-selected" class="nav-btn" style="display:none; color: #ef4444;" title="Delete Selected">🗑️ All</button>
                     <button id="list-refresh-btn" class="nav-btn" title="Refresh">🔄</button>
                  </div>
@@ -69,28 +68,6 @@
 
                     <!-- Navigation Categories (Users + Pages Tree) -->
                     <div id="nav-categories" class="nav-categories hidden">
-                        <!-- Pairing Section -->
-                        <div id="nav-qr-container" class="hidden" style="margin-bottom: 15px; padding: 15px; background: #1a1a1a; border-radius: 8px; text-align: center;">
-                            <!-- State: Manual Sync (Seed Based) -->
-                            <div id="manual-sync-view">
-                                <h3 style="font-size: 0.9rem; color: #fff; margin-bottom: 10px;">Quick Sync (Same Wi-Fi)</h3>
-                                <div style="font-size: 0.75rem; color: #aaa; background: #2a2a2a; padding: 10px; border-radius: 4px; margin-bottom: 15px;">
-                                    <p>My IP: <strong id="my-full-ip" style="color: var(--primary);">...</strong></p>
-                                    <p>Sync Seed: <strong id="my-sync-seed" style="color: var(--primary);">...</strong></p>
-                                </div>
-                                
-                                <div style="display: flex; flex-direction: column; gap: 8px;">
-                                    <div style="display: flex; align-items: center; justify-content: center; gap: 5px;">
-                                        <span id="ip-prefix" style="color: #666; font-size: 0.8rem;">...</span>
-                                        <input type="number" id="target-part3" placeholder="0" min="0" max="255" style="width: 45px; padding: 5px; background: #333; border: 1px solid #444; color: white; text-align: center; border-radius: 4px;"> .
-                                        <input type="number" id="target-part4" placeholder="0" min="0" max="255" style="width: 45px; padding: 5px; background: #333; border: 1px solid #444; color: white; text-align: center; border-radius: 4px;">
-                                    </div>
-                                    <input type="number" id="target-seed" placeholder="Enter Target Seed (e.g. 777)" style="width: 100%; padding: 8px; background: #333; border: 1px solid #444; color: white; text-align: center; border-radius: 4px;">
-                                    <button id="btn-manual-connect" class="primary-btn" style="width: 100%; padding: 10px; border-radius: 4px; margin-top: 5px;">CONNECT</button>
-                                </div>
-                            </div>
-                        </div>
-
                         <!-- Profile Section -->
                         <div class="nav-profile"></div>
 
@@ -102,8 +79,9 @@
                         <div id="settings-panel" style="display: none; padding: 10px; margin-bottom: 15px;">
                             
                             <div id="search-mode-tabs" style="display: flex; gap: 10px; margin-bottom: 15px; padding-left: 5px;">
-                                <button class="mode-tab active" data-mode="commerce" style="background: none; color: var(--primary); border: none; font-size: 0.8rem; cursor: pointer; font-weight: bold;">Commerce</button>
                                 <button class="mode-tab" data-mode="shipping" style="background: none; color: #666; border: none; font-size: 0.8rem; cursor: pointer;">Shipping</button>
+                                <button class="mode-tab active" data-mode="commerce" style="background: none; color: var(--primary); border: none; font-size: 0.8rem; cursor: pointer; font-weight: bold;">Commerce</button>
+                                <button class="mode-tab" data-mode="analytic" style="background: none; color: #666; border: none; font-size: 0.8rem; cursor: pointer;">Analytic</button>
                             </div>
 
                             <div id="device-preference-container" style="padding: 5px 10px; margin-bottom: 10px; background: rgba(255,255,255,0.05); border-radius: 6px; display: flex; align-items: center; justify-content: space-between;">
@@ -123,8 +101,35 @@
                                 <h3>Shared Pages</h3>
                                 <div id="nav-list-pages" class="tree-root"></div>
                             </div>
+                            <div class="nav-section" style="margin-bottom: 15px;">
+                                <h3>
+                                    Local Members
+
+                                    <button id="btn-sync-qr" title="Sync with Mobile" style="background: none; border: none; font-size: 1rem; cursor: pointer; padding: 0; filter: grayscale(1); transition: 0.2s;" onmouseover="this.style.filter='none'" onmouseout="this.style.filter='grayscale(1)'">ADD</button>
+                                </h3>
+                                <!-- Pairing Section -->
+                                <div id="nav-qr-container" class="hidden">
+                                    <!-- State: Manual Sync (Seed Based) -->
+                                    <div id="manual-sync-view">
+                                        <h3>Add Member</h3>
+                                        <div>
+                                            <p style="display: none;">My IP: <strong id="my-full-ip" style="color: var(--primary);">...</strong></p>
+                                            <p>Sync Seed: <strong id="my-sync-seed" style="color: var(--primary);">...</strong></p>
+                                        </div>
+                                        
+                                        <div style="display: flex; flex-direction: column; gap: 8px;">
+                                            <input type="number" id="target-seed" placeholder="Enter Target Seed (e.g. 777)" style="width: 100%; padding: 8px; background: #333; border: 1px solid #444; color: white; text-align: center; border-radius: 4px; font-size: 1.1rem; letter-spacing: 2px; font-weight: bold;">
+                                            <button id="btn-manual-connect" class="primary-btn" style="width: 100%; padding: 10px; border-radius: 4px; margin-top: 5px; font-weight: bold;">CONNECT</button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div id="nav-list-local-users" class="tree-root">
+                                    <div style='padding-left:1em; font-size:0.75rem; color:#666;'>No local devices</div>
+                                </div>
+                            </div>
+
                             <div class="nav-section">
-                                <h3>Team Members</h3>
+                                <h3>Cloud Members</h3>
                                 <div id="nav-list-users" class="tree-root"></div>
                             </div>
                         </div>

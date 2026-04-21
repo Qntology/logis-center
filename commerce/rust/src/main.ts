@@ -151,14 +151,17 @@ settingsToggle?.addEventListener("change", (e) => {
     } else {
         // 설정 꺼짐: 설정 패널 숨김, 리스트 및 네비게이션 원상복구
         if (settingsPanel) settingsPanel.style.display = "none";
-        // 빈 문자열("")을 주면 CSS에 정의된 원래 display 속성으로 되돌아갑니다.
         if (docList) docList.style.display = ""; 
         navSections.forEach(el => (el as HTMLElement).style.display = "");
         
         // 라벨 UI 원상복구
         if (label) {
-            label.classList.remove("on")
+            label.classList.remove("on");
         }
+
+        // 🌟 [CRITICAL FIX] 패널을 닫고 UI가 복구될 때, 
+        // 현재 탭이 Shipping 이라면 Shared Pages가 다시 보이지 않도록 즉시 재적용!
+        applySearchModeUI(); 
     }
 });
 
@@ -672,11 +675,32 @@ async function renderNavigation() {
         }
 
         // Users rendering (simplified parity)
+        const localUserList = document.getElementById("nav-list-local-users");
         const users = await Select["users"]({});
-        userList.innerHTML = "";
+        
+        if (userList) userList.innerHTML = "";
+        if (localUserList) localUserList.innerHTML = "<div style='padding-left:1em; font-size:0.75rem; color:#666;'>No local devices</div>";
+
         if (users.length > 0) {
-            const teamNodes = users.filter(u => u.type === "team").map(u => ({...u, children: users.filter(m => m.to === u.id && m.id !== u.id)}));
-            userList.innerHTML = await renderAccordion(teamNodes);
+            // 1. 꼬리표를 기준으로 로컬/클라우드 유저 분할
+            const localUsers = users.filter(u => u.data && u.data.is_device === true);
+            const cloudUsers = users.filter(u => !u.data || u.data.is_device !== true);
+
+            // 2. Cloud Team Members 렌더링 (기존 트리 구조 유지)
+            if (cloudUsers.length > 0 && userList) {
+                const teamNodes = cloudUsers.filter(u => u.type === "team").map(u => ({
+                    ...u, 
+                    children: cloudUsers.filter(m => m.to === u.id && m.id !== u.id)
+                }));
+                userList.innerHTML = await renderAccordion(teamNodes);
+            }
+
+            // 3. Local Devices 렌더링 (단일 리스트 구조)
+            if (localUsers.length > 0 && localUserList) {
+                // 로컬 기기는 자식(children)이 없는 플랫한 노드로 렌더링합니다.
+                const localNodes = localUsers.map(u => ({ ...u, children: [] }));
+                localUserList.innerHTML = await renderAccordion(localNodes);
+            }
         }
 
     } catch (e) { 
@@ -691,10 +715,11 @@ async function renderNavigation() {
 }
 
 // --- Sync Logic ---
+// main.ts 내부
 async function syncData() {
     if (!currentSession.hash || !currentSession.email) return;
     
-    console.log("[SYNC] Starting data synchronization...");
+    console.log("[SYNC] 1. 서버에 최신 데이터 요청 중...");
     try {
         const origin = "https://commerce.logis.center";
         const now = Date.now();
@@ -710,6 +735,7 @@ async function syncData() {
         
         const url = `${API_HOST}/?${params.toString()}`;
         
+        // 1. 서버 요청
         const response = await invoke<any>("proxy_fetch", {
             url: url,
             method: "GET",
@@ -720,21 +746,22 @@ async function syncData() {
         stepQrSpinner();
 
         if (response.results && Array.isArray(response.results)) {
-            await Upsert["items"](response.results);
-            console.log("[SYNC] Data upserted.");
+            console.log(`[SYNC] 2. 로컬 LanceDB 최신화 중... (데이터 ${response.results.length}건)`);
+            // 2. LanceDB 최신화 (Rust의 upsert_items 호출)
+            await invoke("upsert_items", { items: response.results });
             
-            // [REACTIVE] Re-render navigation immediately after sync
+            console.log("[SYNC] 3. 로컬 DB에서 데이터 불러와 메뉴 렌더링...");
+            // 3. LanceDB 불러오기 (내부적으로 Select["pages"], Select["users"]를 통해 로컬 DB를 읽음)
             await renderNavigation();
             
-            // [FIX] Use incremental sync instead of full reset (loadMoreDocs(true))
-            // This will trigger upsertListItems with 'prepend' mode
+            // 리스트 뷰도 최신화
             if (currentTab === "list") {
                 await loadMoreDocs(false, true); 
             }
         }
         
     } catch (e) { 
-        console.error("[SYNC] Failed:", e); 
+        console.error("[SYNC] 동기화 실패:", e); 
     } finally {
         if (!isExtracting) stopSpinner();
     }
@@ -757,6 +784,16 @@ function applySearchModeUI() {
             el.classList.remove('active');
         }
     });
+
+    // 🌟 [추가] Shipping 모드일 때 Shared Pages 섹션 통째로 숨기기
+    const pagesSection = document.getElementById("nav-list-pages")?.closest(".nav-section") as HTMLElement;
+    if (pagesSection) {
+        if (currentSearchMode === "shipping") {
+            pagesSection.style.display = "none"; // Shipping이면 숨김
+        } else {
+            pagesSection.style.display = "";     // 그 외(Commerce, Analytic)면 복구
+        }
+    }
 }
 
 // DOM 로드 후 이벤트 리스너 추가
@@ -1295,28 +1332,43 @@ btnSyncQr?.addEventListener("click", async () => {
 
 // [NEW] Manual Connect Handler
 document.getElementById("btn-manual-connect")?.addEventListener("click", async () => {
-    const p3 = (document.getElementById("target-part3") as HTMLInputElement).value;
-    const p4 = (document.getElementById("target-part4") as HTMLInputElement).value;
     const tSeed = (document.getElementById("target-seed") as HTMLInputElement).value;
+    const btn = document.getElementById("btn-manual-connect") as HTMLButtonElement;
     
-    if (!p3 || !p4 || !tSeed) {
-        alert("Please enter IP parts and target seed!");
+    if (!tSeed) {
+        alert("Please enter target seed!");
         return;
     }
 
-    const prefix = await invoke("get_local_network_prefix") as string;
-    const targetIp = `${prefix}.${p3}.${p4}`;
+    // 1. 현재 PC의 전체 IP를 가져옵니다 (예: 192.168.45.115)
+    const myFullIp = await invoke<string>("get_my_full_ip"); 
+    const ipParts = myFullIp.split('.');
+    
+    if (ipParts.length !== 4) {
+        alert("Could not determine local network subnet.");
+        return;
+    }
+
+    // 2. 앞의 3자리만 잘라서 서브넷 베이스를 만듭니다 (예: 192.168.45)
+    const baseIp = `${ipParts[0]}.${ipParts[1]}.${ipParts[2]}`; 
     const seed = parseInt(tSeed);
 
-    console.log(`[SYNC] Connecting to ${targetIp} with seed ${seed}...`);
+    console.log(`[SYNC] Auto-Scanning subnet ${baseIp}.1~254 with seed ${seed}...`);
+    btn.innerText = "SCANNING...";
+    btn.disabled = true;
+
     try {
-        await startWebRtcOfferer(targetIp, seed);
+        await startWebRtcOfferer(baseIp, seed);
     } catch (e) {
-        alert("Connection failed: " + e);
+        alert("Connection failed. Device not found on this Wi-Fi network.");
+    } finally {
+        btn.innerText = "AUTO CONNECT";
+        btn.disabled = false;
     }
 });
 
-async function startWebRtcOfferer(targetIp: string, seed: number) {
+// 🌟 [수정] 병렬 스캔 WebRTC 연결 함수 (이전 답변과 동일, 혹시 몰라 전체 첨부)
+async function startWebRtcOfferer(baseIp: string, seed: number) {
     peerConn = new RTCPeerConnection({ iceServers: [] });
     dataChannel = peerConn.createDataChannel("logis-sync");
     setupDataChannel(dataChannel);
@@ -1335,9 +1387,25 @@ async function startWebRtcOfferer(targetIp: string, seed: number) {
     });
 
     const sdp = peerConn.localDescription?.sdp || "";
-    const answerSdp = await invoke<string>("send_signal_offer", { targetIp, seed, sdp });
-    await peerConn.setRemoteDescription({ type: 'answer', sdp: answerSdp });
-    console.log("[SYNC] Connected via Seed-based handshake!");
+    
+    // 🌟 병렬 연결 시도 (1.1부터 1.254까지 전부 핑을 날려서 가장 먼저 받는 놈과 연결)
+    const scanPromises = [];
+    for (let i = 1; i <= 254; i++) {
+        const targetIp = `${baseIp}.${i}`;
+        scanPromises.push(
+            invoke<string>("send_signal_offer", { targetIp, seed, sdp })
+                .then(answerSdp => ({ targetIp, answerSdp }))
+        );
+    }
+
+    try {
+        const result = await Promise.any(scanPromises);
+        await peerConn.setRemoteDescription({ type: 'answer', sdp: result.answerSdp });
+        console.log(`[SYNC] Connected to ${result.targetIp} successfully via Auto Scan!`);
+    } catch (e) {
+        peerConn.close();
+        throw new Error("Scan failed");
+    }
 }
 
 listen("webrtc-offer", async (event) => {
@@ -1390,7 +1458,7 @@ let desktopStream: MediaStream | null = null;
 let qrRotationInterval: number | null = null;
 
 function setupDataChannel(channel: RTCDataChannel) {
-    channel.onopen = () => {
+    channel.onopen = async () => {
         console.log("[WebRTC] Channel OPEN!");
         const profileName = document.getElementById("nav-profile-name");
         if (profileName) {
@@ -1399,6 +1467,23 @@ function setupDataChannel(channel: RTCDataChannel) {
         }
         document.getElementById("nav-qr-container")?.classList.add("hidden");
         syncDataToMobile();
+
+        // 🌟 [수정] 모바일 기기 정보를 DB에 넣을 때 로컬 꼬리표(is_device) 부착
+        try {
+            const mobileUser = {
+                id: `mobile_${Date.now()}`,
+                type: "user",
+                name: "📱 Linked Mobile",
+                from: currentSession.address || "0x0000000000000000000000000000000000000000", 
+                to: currentSession.team || "0x0000000000000000000000000000000000000000",    
+                data: { origin: "local", is_device: true } // 👈 여기서 구분합니다!
+            };
+            
+            await invoke("upsert_items", { items: [mobileUser] });
+            await renderNavigation();
+        } catch (e) {
+            console.error("[WebRTC] Failed to add mobile to members:", e);
+        }
     };
 
     channel.onmessage = async (e) => {
@@ -1815,6 +1900,9 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         let baseFilter = "";
         if (currentSearchMode === "shipping") {
             baseFilter = "type IN ('tracking', 'receiving', 'shipping', 'bl', 'awb')";
+        } else if (currentSearchMode === "analytic") {
+            // 🌟 [신규] Analytic 모드용 필터 (필요에 따라 통계와 관련된 테이블만 노출하도록 변경 가능)
+            baseFilter = "type IN ('sales', 'event', 'users', 'pages')"; 
         } else {
             baseFilter = "type IN ('sales', 'goods', 'order', 'event', 'coupon', 'review', 'pages')";
         }
@@ -2098,6 +2186,11 @@ function updateAuthUI() {
     const btnLogout = document.getElementById("btn-logout");
     const btnQrAuth = document.getElementById("btn-qr-auth");
     const chatForm = document.querySelector(".chat-form") as HTMLElement;
+    const cloudToggle = document.getElementById("cloud-mode-toggle") as HTMLInputElement;
+    
+    // 🌟 [추가] Cloud Members 섹션을 통째로 잡습니다.
+    const cloudMembersSection = document.getElementById("nav-list-users")?.closest(".nav-section") as HTMLElement;
+
     if (currentSession.email) {
         if (authStatus) authStatus.innerText = "Authenticated";
         if (btnLogout) btnLogout.style.display = "block";
@@ -2105,22 +2198,29 @@ function updateAuthUI() {
         if (chatForm) chatForm.classList.remove("hidden");
         const qrMsg = document.getElementById("msg-qr-auth");
         if (qrMsg) qrMsg.remove();
+        
         if (cloudToggle) {
             cloudToggle.disabled = false;
             cloudToggle.title = "Cloud AI Mode is available";
-            // 로그인 시 자동으로 클라우드 모드로 전환하고 싶다면 아래 주석 해제
-            // cloudToggle.checked = true; 
         }
+
+        // 🌟 [추가] 로그인 성공 시 Cloud Members 영역 표시
+        if (cloudMembersSection) cloudMembersSection.style.display = ""; 
+        
     } else {
         if (authStatus) authStatus.innerText = "Waiting for Auth...";
         if (btnLogout) btnLogout.style.display = "none";
         if (btnQrAuth) btnQrAuth.style.display = "block";
         if (chatForm) chatForm.classList.add("hidden");
+        
         if (cloudToggle) {
             cloudToggle.disabled = true;
             cloudToggle.checked = false;
             cloudToggle.title = "Login required to use Cloud AI";
         }
+
+        // 🌟 [추가] 비로그인 시 Cloud Members 영역 완전히 숨김
+        if (cloudMembersSection) cloudMembersSection.style.display = "none"; 
     }
 }
 
@@ -2150,44 +2250,57 @@ function startPolling() {
 
 
 function saveSession() { localStorage.setItem("chat_session", JSON.stringify(currentSession)); }
+
 async function initSession() {
     const saved = localStorage.getItem("chat_session");
     if (saved) { try { currentSession = { ...currentSession, ...JSON.parse(saved) }; } catch (e) {} } 
     else { const legacy = localStorage.getItem("device_hash"); if (legacy) currentSession.hash = legacy; }
-    if (!currentSession.hash && ethers) { const w = ethers.Wallet.createRandom(); currentSession.hash = w.address.toLowerCase().replace("0x", ""); saveSession(); }
-    saveSession(); currentSession.address = currentSession.address || ZERO_ADDRESS; currentSession.team = currentSession.team || await hashId(ZERO_ADDRESS); updateAuthUI(); startPolling();
+    
+    if (!currentSession.hash && ethers) { 
+        const w = ethers.Wallet.createRandom(); 
+        currentSession.hash = w.address.toLowerCase().replace("0x", ""); 
+        saveSession(); 
+    }
+    
+    saveSession(); 
+    currentSession.address = currentSession.address || ZERO_ADDRESS; 
+    currentSession.team = currentSession.team || await hashId(ZERO_ADDRESS); 
+    updateAuthUI(); 
+    startPolling();
 
-    // [SUPER-HANDSHAKE] Get all initial data in one go
     try {
         console.log("[WIDGET] UI Ready handshake starting...");
         const data = await invoke<any>("mark_ui_ready");
-        console.log("[WIDGET] Initial data received:", data);
 
-        // 1. Browser & URL Status
+        // 브라우저 런처 상태 동기화
         if (btnAutoLaunch) {
             btnAutoLaunch.style.display = (data.browser_status === "running") ? "none" : "flex";
         }
-        
         if (data.current_url) {
             currentDetectedUrl = data.current_url;
-            isCurrentShop = data.is_client || data.is_admin; // [FIX] Sync shop status on startup
-            // Trigger UI update based on the detected URL
+            isCurrentShop = data.is_client || data.is_admin;
             updateExtractButtonVisibility();
         }
 
-        // 2. Pre-populate items list (if empty)
+        // 아이템 리스트 캐싱
         if (data.items && data.items.length > 0 && cachedDocs.length === 0) {
             cachedDocs = data.items;
             renderDocs(data.items);
             currentPage = 1;
         }
 
-        // 3. Trigger tree renders background
-        // (renderNavigation will now use cached data if we optimize it further, 
-        // but for now, the DB is warm and ready)
-        renderNavigation();
+        // 🌟 [핵심 분기 로직] 로그인 상태 확인 후 렌더링 방식 결정
+        if (currentSession.email) {
+            console.log("[WIDGET] 로그인 확인됨. 서버 데이터를 가져옵니다...");
+            // 서버 -> DB 저장 -> 화면 렌더링 흐름을 순차적으로 실행
+            await syncData(); 
+        } else {
+            console.log("[WIDGET] 비로그인 상태. 로컬 LanceDB에서 메뉴를 불러옵니다...");
+            // 1. LanceDB 불러오기 (오프라인/비로그인 모드)
+            await renderNavigation();
+        }
 
-        // 4. If there are active tasks, start spinner
+        // 활성화된 Task(작업) 스피너 복구
         if (data.tasks && data.tasks.length > 0) {
             const lastTask = data.tasks[data.tasks.length - 1];
             renderMessage({ 
@@ -2195,10 +2308,12 @@ async function initSession() {
                 content: `Resuming: ${lastTask.id}`, 
                 status: 1, created_at: Date.now() 
             });
-            isExtracting = true; // [FIX] Ensure flags are set so progress events are not ignored
+            isExtracting = true;
             startSpinner();
         }
-    } catch (e) { console.error("[WIDGET] Handshake failed:", e); }
+    } catch (e) { 
+        console.error("[WIDGET] Handshake failed:", e); 
+    }
 }
 
 document.getElementById("btn-qr-auth")?.addEventListener("click", performQrAuth);
