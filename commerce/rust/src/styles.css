@@ -577,7 +577,9 @@ tr:hover { background: rgba(0,0,0,0.05); }
     margin: 0 auto;
 }
 
-.settings-toggle{position: absolute; right: 0; top: 0;}
+.settings-toggle{position: absolute; right: 5px; top: 0;}
+.settings-toggle label{cursor: pointer; color: rgb(170, 170, 170); font-size: 12px; background: rgba(255, 255, 255, 0.1); padding: 10px 10px; border-radius: 6px; transition: 0.2s; display: block; opacity: 0.5;}
+.settings-toggle label.on{text-decoration: underline;  opacity: 1; color: #000;}
 
 .nav-categories.visible {
     opacity: 1;

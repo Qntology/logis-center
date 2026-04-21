@@ -146,7 +146,7 @@ settingsToggle?.addEventListener("change", (e) => {
         
         // 라벨 UI 강조 효과 (선택사항)
         if (label) {
-            label.style.color = "#000";
+            label.classList.add("on")
         }
     } else {
         // 설정 꺼짐: 설정 패널 숨김, 리스트 및 네비게이션 원상복구
@@ -157,8 +157,7 @@ settingsToggle?.addEventListener("change", (e) => {
         
         // 라벨 UI 원상복구
         if (label) {
-            label.style.background = "rgba(255,255,255,0.1)";
-            label.style.color = "#aaa";
+            label.classList.remove("on")
         }
     }
 });
