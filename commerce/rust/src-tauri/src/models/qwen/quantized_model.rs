@@ -611,15 +611,13 @@ impl QuantizedQwenVLTextAttention {
 
         // [CRITICAL] Internal Causal Mask Generation for Prefill Integrity
         let total_len = seqlen_offset + q_len;
-        let attention_mask = if q_len > 1 && attention_mask_in.is_none() {
-            let q_indices = Tensor::arange(0u32, q_len as u32, dev)?.unsqueeze(1)?;
-            let k_indices = Tensor::arange(0u32, total_len as u32, dev)?.unsqueeze(0)?;
-            let mask = k_indices.broadcast_gt(&(q_indices.broadcast_add(&Tensor::new(seqlen_offset as u32, dev)?)?))?;
-            let mask = mask.to_dtype(target_dtype)?.affine(-1e4, 0.0)?; // BF16 안전 범위로 조정
-            Some(mask.unsqueeze(0)?.unsqueeze(0)?)
-        } else {
-            attention_mask_in.map(|m| m.clone())
-        };
+        
+        // 🌟 [VRAM 2GB+ 폭발 원천 차단] 
+        // 수만 토큰의 거대 마스크를 한 번에 만들면 VRAM이 누수처럼 증가합니다.
+        // 전체 마스크 생성을 지우고, 동적 생성을 위한 플래그만 남깁니다.
+        let has_dynamic_mask = q_len > 1 && attention_mask_in.is_none();
+        let q_indices = if has_dynamic_mask { Some(Tensor::arange(0u32, q_len as u32, dev)?.unsqueeze(1)?) } else { None };
+        let seq_offset_t = if has_dynamic_mask { Some(Tensor::new(seqlen_offset as u32, dev)?) } else { None };
 
         // [CRITICAL FIX] .contiguous() 삭제로 VRAM 전체 복사 스파이크 원천 차단!
         let mut query_states = self.q_proj.forward(&xs)?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
@@ -831,7 +829,16 @@ impl QuantizedQwenVLTextAttention {
             
             let mut s_chunk = (q_aligned.matmul(&k_t)? * self.scaling)?;
 
-            if let Some(mask) = &attention_mask {
+            // 🌟 [VRAM 누수 해결] 블록이 겹치는 부위만 512KB짜리 소형 마스크를 만들어 즉시 연산!
+            if has_dynamic_mask {
+                if b_off + actual_kv_len > seqlen_offset {
+                    let k_indices = Tensor::arange(b_off as u32, (b_off + actual_kv_len) as u32, dev)?.unsqueeze(0)?;
+                    let mask = k_indices.broadcast_gt(&(q_indices.as_ref().unwrap().broadcast_add(seq_offset_t.as_ref().unwrap())?))?;
+                    let chunk_mask = mask.to_dtype(target_dtype)?.affine(-1e4, 0.0)?.unsqueeze(0)?.unsqueeze(0)?;
+                    s_chunk = s_chunk.broadcast_add(&chunk_mask)?;
+                }
+            } else if let Some(mask) = attention_mask_in {
+                // 커스텀 Vision 마스크 처리 유지
                 let mask_len = mask.dim(candle_core::D::Minus1)?;
                 if b_off < mask_len {
                     let take = std::cmp::min(actual_kv_len, mask_len - b_off);
@@ -2022,6 +2029,13 @@ impl QuantizedQwenVLTextModel {
                 tokio::task::yield_now().await;
             } else {
                 let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
+                
+                // 🌟 [CRITICAL FIX] CPU 큐 폭발로 인한 0.1GB 지속 상승 방지
+                // 매 청크(256 토큰)마다 GPU 연산 완료를 대기하여, 과거 블록의 VRAM을 즉시 회수합니다.
+                let dev = self.layers[layer_idx].device();
+                if dev.is_cuda() {
+                    let _ = dev.synchronize();
+                }
             }
         } 
 
@@ -2050,7 +2064,7 @@ impl QuantizedQwenVLTextModel {
         let is_small_model = self.layers.len() <= 36;
         if is_small_model && current_kv_len < 1024 { return Ok(()); }
 
-        let vram_limit = 16; 
+        let vram_limit = 8; 
         let mut vram_evicted = false;
 
         {
