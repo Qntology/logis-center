@@ -622,20 +622,12 @@ async fn ai_search_complex(
                 
                 let ctx_type = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
                 
-                // 🌟 [추가 보완] Shipping 모드일 때는 무조건 무역 문서/배송 관련 테이블만 뒤지도록 라우팅 강제!
-                let target_table = if search_mode == "shipping" {
-                    // 무역 문서 데이터는 upsert_item에서 "tracking" 테이블로 통합 저장되도록 설정했습니다.
-                    "tracking" 
-                } else {
-                    match ctx_type {
-                        "sales" | "goods" | "order" => "sales",
-                        "tracking" | "receiving" | "shipping" | "bl" | "awb" => "tracking",
-                        "event" | "coupon" => "event",
-                        "member" | "team" | "user" => "users",
-                        "talk" => "talks",
-                        "page" | "pages" => "pages",
-                        _ => "items",
-                    }
+                // 🌟 [CRITICAL FIX] 데이터 파편화를 막고 프론트엔드 검색과 완벽 동기화하기 위해 타겟을 "items"로 통일!
+                let target_table = match ctx_type {
+                    "member" | "team" | "user" => "users",
+                    "page" | "pages" => "pages",
+                    "talk" => "talks",
+                    _ => "items", // Shipping, Commerce, Sales 등 모든 메인 문서는 items 테이블에 있습니다.
                 };
 
                 let sql_filter = convert_conditions_to_sql(ctx);

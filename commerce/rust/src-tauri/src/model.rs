@@ -1013,8 +1013,9 @@ impl LogisModel {
                 
                 let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(raw_no).replace("-", "").replace("_", "");
                 
-                // 테이블 라우팅 분기
-                let table_name = if is_trade_doc { "tracking" } else { "commerce_tracking" };
+                // 🌟 [CRITICAL FIX] 프론트엔드 리스트(#doc-list)와 완벽 동기화하기 위해 "items" 테이블로 저장 위치를 강제 통합합니다!
+                let table_name = "items"; 
+                
                 let doc_type = if is_trade_doc { 
                     extracted_data.get("doc_type").and_then(|s| s.as_str()).unwrap_or("shipping_doc") 
                 } else { 
