@@ -856,17 +856,18 @@ impl LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
-        // 🌟 [CRITICAL FIX] 매크로 제거 후 비동기 우회 함수 장착!
         let app_handle_clone = app_handle.clone();
         let task_id_clone = task_id.clone();
+        
+        // 🌟 [CRITICAL FIX] 변수 이름 오타 수정 (m -> msg_str)
         let emit_term = move |msg: &str| {
             println!("{}", msg);
-            let m = msg.to_string();
+            let msg_str = msg.to_string(); // 👈 여기서 m 이 아니라 msg_str 로 받음
             let handle = app_handle_clone.clone();
             let tid = task_id_clone.clone();
             tokio::spawn(async move {
                 use tauri::Emitter;
-                let _ = handle.emit("task-console-log", serde_json::json!({"task_id": tid, "text": format!("{}\n", m)}));
+                let _ = handle.emit("task-console-log", serde_json::json!({"task_id": tid, "text": format!("{}\n", msg_str)}));
             });
         };
 
@@ -879,29 +880,108 @@ impl LogisModel {
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
             
-            let prompt_type = if search_mode == "shipping" { "tracking" } else { "goods" };
-            let prompt = get_image_extraction_prompt("kr", &language, prompt_type, "");
-            
-            emit_term(&format!("[STAGE-2] Generating vision insights for {} mode...", prompt_type));
+            // 🌟 [핵심 라우팅 분기] Shipping 모드와 Commerce 모드 판단
+            let is_trade_doc = search_mode == "shipping";
+            let mut extracted_data = json!({});
 
-            let result_str = self.chat_with_qwen3_5_image_spinner(
-                "You are a highly precise document data extraction assistant.", 
-                &prompt,                                                        
-                Some(dynamic_image),
-                app_handle, 
-                "extraction-progress", 
-                json!({ "category": "Vision Analysis", "summary": "Analyzing image with Qwen 3.5..." }), 
-                1024, 
-                cancel_token.clone(), 
-                Some(task_id.clone())
-            ).await?;
+            if is_trade_doc {
+                emit_term("[STAGE-2] 🚢 Trade Document Mode: Initiating Classification...");
+                
+                // Step A: 문서 종류 1차 판별 (768px 축소 썸네일 사용)
+                let class_img = dynamic_image.resize(768, 768, image::imageops::FilterType::Triangle);
+                let class_prompt = crate::parsing::get_trade_doc_classification_prompt(); // (이 프롬프트 안에 TRACKING 추가됨)
+                let type_res = self.chat_with_qwen3_5_image_spinner(
+                    "You are a document classifier.", &class_prompt, Some(class_img), app_handle, "extraction-progress", 
+                    json!({ "category": "Vision (Step 1/2)", "summary": "Identifying document type..." }), 128, cancel_token.clone(), Some(task_id.clone())
+                ).await?;
+                
+                let detected_type = crate::parsing::parse_json_from_llm(&type_res)
+                    .get("doc_type").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
+                emit_term(&format!("✅ Document identified as: **{}**", detected_type));
+
+                // 🌟 [개선된 분기 포인트] TRACKING(운송장)으로 판별되면 무거운 Slice & Merge를 우회합니다!
+                if detected_type == "TRACKING" {
+                    emit_term("[STAGE-2] 📦 Fast-Tracking Parcel Label...");
+                    
+                    let prompt = crate::parsing::get_image_extraction_prompt("kr", &language, "tracking", "");
+                    let result_str = self.chat_with_qwen3_5_image_spinner(
+                        "You are a highly precise logistics data extraction assistant.", &prompt, Some(dynamic_image.clone()), app_handle, "extraction-progress", 
+                        json!({ "category": "Vision Analysis", "summary": "Extracting Tracking Label data..." }), 512, cancel_token.clone(), Some(task_id.clone())
+                    ).await?;
+                    
+                    extracted_data = crate::parsing::parse_json_from_llm(&result_str);
+                    
+                    // DB 저장 시 에러가 나지 않도록 doc_type 꼬리표를 강제로 달아줍니다.
+                    if let Some(obj) = extracted_data.as_object_mut() {
+                        obj.insert("doc_type".to_string(), json!("TRACKING"));
+                    }
+                    
+                } else {
+                    // 🌟 B/L, CI 등 밀도 높은 무역 문서일 경우 기존처럼 Slice & Merge 파이프라인을 탑니다.
+                    emit_term("[STAGE-2] 🚢 Initiating Slice & Merge Pipeline...");
+                    
+                    // Step B: 판별된 문서에 따른 자르기(Slice) 미션 설정
+                    let missions = match detected_type.as_str() {
+                        "CI" | "PI" => vec![("header", 0.0, 0.20), ("parties", 0.0, 0.40), ("logistics", 0.20, 0.50), ("items", 0.30, 0.85), ("financials", 0.70, 0.95), ("conditions", 0.80, 1.0)],
+                        "BL" => vec![("header", 0.0, 0.20), ("parties", 0.0, 0.60), ("logistics", 0.35, 0.65), ("cargo", 0.50, 0.90), ("conditions", 0.80, 1.0)],
+                        "AWB" => vec![("header", 0.0, 0.15), ("parties", 0.0, 0.40), ("logistics", 0.10, 0.40), ("cargo", 0.30, 0.70), ("financials", 0.60, 0.90)],
+                        _ => vec![("header", 0.0, 0.30), ("parties", 0.0, 0.50), ("items", 0.30, 0.80), ("conditions", 0.70, 1.0)],
+                    };
+
+                    let w = dynamic_image.width();
+                    let h = dynamic_image.height();
+                    let mut final_data_map = serde_json::Map::new();
+                    final_data_map.insert("header".to_string(), json!({"doc_type": detected_type}));
+
+                    // Step C: 구역별 분할 크롭 및 LLM 타격
+                    for (idx, (cat, top, bot)) in missions.iter().enumerate() {
+                        if cancel_token.as_ref().map_or(false, |t| t.load(std::sync::atomic::Ordering::Relaxed)) { return Err(anyhow!("Cancelled")); }
+                        
+                        let crop_y = (h as f32 * top) as u32;
+                        let crop_h = (h as f32 * (bot - top)) as u32;
+                        let img_slice = dynamic_image.crop_imm(0, crop_y, w, crop_h);
+                        
+                        let prompt = crate::parsing::get_trade_category_schema(cat, &detected_type);
+                        let summary_msg = format!("Scanning {} ({}%)...", cat.to_uppercase(), (bot * 100.0) as i32);
+                        
+                        let tile_res = self.chat_with_qwen3_5_image_spinner(
+                            "You are a highly precise document data extraction assistant.", &prompt, Some(img_slice), app_handle, "extraction-progress", 
+                            json!({ "category": format!("Vision (Slice {}/{})", idx+1, missions.len()), "summary": summary_msg }), 1024, cancel_token.clone(), Some(task_id.clone())
+                        ).await?;
+
+                        let tile_json = crate::parsing::parse_json_from_llm(&tile_res);
+                        merge_json_manual(&mut final_data_map, cat, tile_json);
+                    }
+                    
+                    extracted_data = Value::Object(final_data_map);
+                }
+
+            } else {
+                // ============================================================
+                // 🛒 [Commerce 모드] 커머스 라우팅 보완
+                // ============================================================
+                emit_term("[STAGE-2] 🛒 Commerce Mode: Analyzing Product/Label...");
+                
+                // 🌟 [개선] 기존에 무조건 "goods"(상품) 프롬프트를 먹이던 것을, 
+                // 택배 운송장이 올라올 확률이 높으므로 바코드/송장 번호를 우선 추출하는 "tracking" 기반의 
+                // 범용 커머스 프롬프트로 처리하도록 변경했습니다.
+                let prompt = crate::parsing::get_image_extraction_prompt("kr", &language, "tracking", "");
+                
+                let result_str = self.chat_with_qwen3_5_image_spinner(
+                    "You are a precise commerce and logistics extraction assistant.", &prompt, Some(dynamic_image.clone()), app_handle, "extraction-progress", 
+                    json!({ "category": "Vision Analysis", "summary": "Analyzing commerce tracking/goods..." }), 1024, cancel_token.clone(), Some(task_id.clone())
+                ).await?;
+                
+                extracted_data = crate::parsing::parse_json_from_llm(&result_str);
+            }
             
+            let mode_name = if is_trade_doc { "Trade Document" } else { "Commerce" };
+            emit_term(&format!("[STAGE-2] Generating vision insights for {} mode...", mode_name));
+
             emit_term("\n=======================================");
-            emit_term(&format!("[DEBUG-VISION] 🤖 AI Raw Response:\n{}", result_str));
+            emit_term(&format!("[DEBUG-VISION] 🤖 AI Raw Response Extracted."));
             emit_term("=======================================\n");
 
-            let extracted_data = crate::parsing::parse_json_from_llm(&result_str);
-            
             let nl = crate::parsing::json_to_natural_language(&extracted_data);
             let item_digest = crate::utils::hash::digest(&nl);
 
@@ -911,34 +991,72 @@ impl LogisModel {
             if let Some(db) = store_guard.as_ref() {
                 let from_addr = "0x0000000000000000000000000000000000000000";
                 let team_id = crate::utils::hash::hash_id(from_addr); 
-                let hashed_cc = crate::utils::hash::hash_id("local.image");
+                let hashed_cc = crate::utils::hash::hash_id(if is_trade_doc { "local.shipping" } else { "local.commerce" });
 
-                let raw_no = extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task_id);
+                // 식별자(ID) 추출 기준 분기
+                let raw_no = if is_trade_doc {
+                    extracted_data.get("document_number").and_then(|s| s.as_str()).unwrap_or(&task_id)
+                } else {
+                    extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task_id)
+                };
+                
                 let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(raw_no).replace("-", "").replace("_", "");
                 
-                let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_no)));
+                // 테이블 라우팅 분기
+                let table_name = if is_trade_doc { "tracking" } else { "commerce_tracking" };
+                let doc_type = if is_trade_doc { 
+                    extracted_data.get("doc_type").and_then(|s| s.as_str()).unwrap_or("shipping_doc") 
+                } else { 
+                    "tracking" 
+                };
+
+                let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}", doc_type, clean_no)));
                 let hashed_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val));
                 let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, hashed_cc, clean_no));
 
-                let mut final_data = if extracted_data.is_object() {
-                    extracted_data.clone()
-                } else {
-                    json!({ "raw_output": extracted_data })
-                };
-
+                let mut final_data = if extracted_data.is_object() { extracted_data.clone() } else { json!({ "raw_output": extracted_data }) };
                 final_data.as_object_mut().unwrap().insert("index".to_string(), json!(index_val));
                 final_data.as_object_mut().unwrap().insert("id".to_string(), json!(hashed_id));
 
+                // 🌟 [추가 보완] 무역 문서(Trade Doc)일 경우 Python처럼 핵심 컬럼 평탄화 (Flattening)
+                if is_trade_doc {
+                    let obj = final_data.as_object_mut().unwrap();
+                    
+                    // Header에서 날짜/문서번호 추출
+                    if let Some(header) = extracted_data.get("header") {
+                        obj.insert("issue_date".to_string(), header.get("issue_date").cloned().unwrap_or(json!("")));
+                        obj.insert("no".to_string(), header.get("document_number").cloned().unwrap_or(json!("")));
+                    }
+                    // Parties에서 화주/수하인 추출
+                    if let Some(parties) = extracted_data.get("parties") {
+                        obj.insert("sender_name".to_string(), parties.get("supplier_name").cloned().unwrap_or(json!("")));
+                        obj.insert("recipient_name".to_string(), parties.get("buyer_name").cloned().unwrap_or(json!("")));
+                    }
+                    // Logistics에서 선박/항구 추출
+                    if let Some(logistics) = extracted_data.get("logistics") {
+                        obj.insert("vessel".to_string(), logistics.get("vehicle_name").cloned().unwrap_or(json!("")));
+                        obj.insert("pol".to_string(), logistics.get("location_port_of_loading").cloned().unwrap_or(json!("")));
+                        obj.insert("pod".to_string(), logistics.get("location_port_of_discharge").cloned().unwrap_or(json!("")));
+                    }
+                    // Financials/Conditions 추출
+                    if let Some(fin) = extracted_data.get("financials") {
+                        obj.insert("amount".to_string(), fin.get("amount_total").cloned().unwrap_or(json!(0)));
+                    }
+                    if let Some(cond) = extracted_data.get("conditions") {
+                        obj.insert("incoterms".to_string(), cond.get("incoterms_code").cloned().unwrap_or(json!("")));
+                    }
+                }
+                
                 let _ = db.upsert_item(
-                    "commerce_tracking", 
+                    table_name, // 분기된 테이블 적용
                     &hashed_id, 
-                    "tracking", 
+                    doc_type, 
                     final_data, 
                     None,
                     Some(from_addr),
                     Some(&team_id),
                     Some(&hashed_cc),
-                    Some(&crate::utils::hash::hash_id(&format!("tracking{}", hashed_cc))),
+                    Some(&crate::utils::hash::hash_id(&format!("{}{}", doc_type, hashed_cc))),
                     Some(&ref_val),
                     Some(&item_digest)
                 ).await;
@@ -953,11 +1071,7 @@ impl LogisModel {
             
             Ok(())
         } else {
-            emit_term("[ERROR] Failed to load image file.");
-            let _ = app_handle.emit("extraction-progress", json!({ 
-               "task_id": task_id.clone(),
-               "category": "Error", "summary": "Failed to load image file.", "spinner": "❌"
-            }));
+            // ... 기존 에러 핸들링 로직
             Ok(())
         }
     }

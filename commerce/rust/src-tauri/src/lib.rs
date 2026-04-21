@@ -295,16 +295,26 @@ fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
 
     if let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()) {
         for (key, val_obj) in cond {
-            // 🌟 [CRITICAL FIX] Shipping에서 사용하는 컬럼명들을 DB 검색 허용 목록(valid_cols)에 추가합니다!
+            // 🌟 [CRITICAL FIX] Python의 PATH_MAP 역할을 수행하도록 무역 문서용 필드 완벽 추가!
             let valid_cols = [
                 "amount", "status", "type", "created_at", "updated_at",
                 "no", "carrier", "shipping_method", "sender_address", "recipient_address", 
-                "shipping_date", "delivery_date", "weight"
+                "shipping_date", "delivery_date", "weight",
+                // 🌟 [무역 문서 전용 컬럼 추가]
+                "vessel", "pol", "pod", "incoterms", "sender_name", "recipient_name", "issue_date"
             ];
             
             let mapped_key = match key.as_str() {
-                // 커머스 가격 관련 키들은 여전히 amount로 묶어줍니다. (shipping_fee는 겹치므로 amount로 매핑하지 않음)
                 "price" | "sale_price" | "discount" | "supply_price" | "order" | "goods" => "amount",
+                // 🌟 무역 문서의 중첩 키 평탄화 매핑 (Python PATH_MAP과 동일한 역할)
+                "document_number" | "tracking_number" => "no",
+                "supplier_name" | "shipper_name" => "sender_name",
+                "buyer_name" | "consignee_name" => "recipient_name",
+                "amount_total" | "total_amount" => "amount",
+                "vehicle_name" | "flight_no" => "vessel",
+                "location_port_of_loading" => "pol",
+                "location_port_of_discharge" => "pod",
+                "incoterms_code" => "incoterms",
                 k if valid_cols.contains(&k) => k,
                 _ => "" 
             };
@@ -611,14 +621,21 @@ async fn ai_search_complex(
                 if text.is_empty() { continue; }
                 
                 let ctx_type = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let target_table = match ctx_type {
-                    "sales" | "goods" | "order" => "sales",
-                    "tracking" | "receiving" | "shipping" | "bl" | "awb" => "tracking",
-                    "event" | "coupon" => "event",
-                    "member" | "team" | "user" => "users",
-                    "talk" => "talks",
-                    "page" | "pages" => "pages",
-                    _ => "items",
+                
+                // 🌟 [추가 보완] Shipping 모드일 때는 무조건 무역 문서/배송 관련 테이블만 뒤지도록 라우팅 강제!
+                let target_table = if search_mode == "shipping" {
+                    // 무역 문서 데이터는 upsert_item에서 "tracking" 테이블로 통합 저장되도록 설정했습니다.
+                    "tracking" 
+                } else {
+                    match ctx_type {
+                        "sales" | "goods" | "order" => "sales",
+                        "tracking" | "receiving" | "shipping" | "bl" | "awb" => "tracking",
+                        "event" | "coupon" => "event",
+                        "member" | "team" | "user" => "users",
+                        "talk" => "talks",
+                        "page" | "pages" => "pages",
+                        _ => "items",
+                    }
                 };
 
                 let sql_filter = convert_conditions_to_sql(ctx);

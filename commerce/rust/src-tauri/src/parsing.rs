@@ -981,41 +981,121 @@ pub fn parse_json_from_llm(text: &str) -> serde_json::Value {
 
 
 
+
+
+pub fn get_trade_doc_classification_prompt() -> String {
+    // TRACKING을 선택지에 명시적으로 추가
+    r###"Classify document type. Choose strictly from: PI, CI, BL, AWB, PL, CO, LC, TRACKING, Unknown. 
+Return JSON exactly like: {"doc_type": "BL"}
+NO EXPLANATION."###.to_string()
+}
+
+pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
+    let schema = match category {
+        "header" => r#"{
+  "document_type": "CLASSIFIED TYPE {String}",
+  "document_number": "Primary Identifier (B/L No, Invoice No) {String}",
+  "issue_date": "Date of Creation (YYYY-MM-DD) {String}",
+  "reference_number": "Export Ref, Booking No, PO No {String}"
+}"#,
+        "parties" => r#"{
+  "supplier_name": "Shipper, Seller, Exporter {String}",
+  "supplier_address": "Address of Supplier {String}",
+  "buyer_name": "Consignee, Buyer, Importer {String}",
+  "buyer_address": "Address of Buyer {String}",
+  "notify_party_name": "Notify Party Name {String}"
+}"#,
+        "logistics" => r#"{
+  "vehicle_name": "Vessel Name, Flight No {String}",
+  "voyage_number": "Voyage No {String}",
+  "location_port_of_loading": "POL, Airport of Departure {String}",
+  "location_port_of_discharge": "POD, Airport of Destination {String}"
+}"#,
+        "conditions" => r#"{
+  "incoterms_code": "FOB, CIF, EXW, DDP {String}",
+  "freight_payment_term": "Freight Prepaid, Freight Collect {String}"
+}"#,
+        "financials" => r#"{
+  "currency_code": "Currency Symbol (USD, EUR) {String}",
+  "amount_total": "Grand Total Amount {Number}"
+}"#,
+        "cargo" => r#"{
+  "package_count": "Total Quantity (NOT Money) {Number}",
+  "weight_gross": "Total Gross Weight {Number}",
+  "volume_measurement": "Total Volume (CBM) {Number}",
+  "marks_and_numbers": "Marks & Nos {String}"
+}"#,
+        "items" => r#"[ {
+  "description": "Description of Goods {String}",
+  "quantity": "Line Item Quantity {Number}",
+  "hs_code": "HS Code / Tariff No {String}"
+} ]"#,
+        "containers" => r#"[ {
+  "container_number": "Container No (4 char + 7 digit) {String}",
+  "seal_number": "Seal No {String}",
+  "type_description": "Type (20GP, 40HC) {String}"
+} ]"#,
+        _ => "{}"
+    };
+
+    format!("RULES: Follow comments strictly. Output JSON ONLY. MISSION: Extract data for category '{}'.\nSCHEMA:\n{}", category.to_uppercase(), schema)
+}
+
+// ==========================================
+// [수정] 무역 문서(Trade Doc) 검색을 위한 Shipping Condition 업그레이드
+// ==========================================
 pub fn extract_shipping_conditions(query: &str, language: &str) -> String {
-    let template = r###"Task: Act as a deterministic shipping and logistics semantic parser.
+    let template = r###"Task: Act as a deterministic shipping and trade logistics semantic parser.
 Extract the logistics filters from the natural language query into the JSON format.
 
 [SCHEMA DEFINITION]
-Extract the following tracking properties if semantically present in the text:
-- "no": Tracking number, waybill number, or reference identifier.
-- "status": Shipping status (Allowed values: draft, progress, return, complete, error).
-- "carrier": Courier, logistics carrier, vessel, or flight name.
-- "shipping_method": Mode of transport or delivery service level.
-- "sender_address": Origin location, port of loading, departure point, or sender address.
-- "recipient_address": Destination location, port of discharge, arrival point, or recipient address.
-- "shipping_date": Dispatch date, departure date, or shipped on board date.
-- "delivery_date": Arrival date or delivered date.
-- "weight": Cargo, package, or gross weight.
-- "shipping_fee": Logistics cost, freight charge, or shipping fee.
+Extract the following tracking/trade properties if semantically present in the text:
+- "no": Tracking number, B/L number, Invoice number.
+- "status": Shipping status (draft, progress, return, complete, error).
+- "vessel": Vessel name, Flight No, or Carrier.
+- "pol": Port of Loading, Origin, Departure point.
+- "pod": Port of Discharge, Destination, Arrival point.
+- "sender_name": Shipper, Seller, or Exporter name.
+- "recipient_name": Consignee, Buyer, or Importer name.
+- "incoterms": Incoterms (e.g., FOB, CIF, EXW).
+- "weight": Cargo or gross weight.
+- "amount": Total financial amount or price.
 
 [TRANSFORMATION LOGIC]
-For EVERY extracted field, you MUST wrap it in an operator object:
+For EVERY extracted field, wrap it in an operator object:
 { "operator": "eq" | "gt" | "lt" | "gte" | "lte" | "contains", "value": <extracted_value> }
-
-- Use "contains" for text fields, locations, and names.
-- Use "eq" for exact matches like status or strict identifiers.
-- Use "gt", "gte", "lt", "lte" for numeric values, amounts, weights, and dates.
-- Universality Rule: Do NOT include descriptive text or units (like 'kg', '$', 'days') in the value. Extract and compute only the raw numbers or normalized strings.
+- Use "contains" for text fields, names, ports, vessels.
+- Use "eq" for strict identifiers or status.
 
 [QUERY]
 {QUERY}
 
 [OUTPUT FORMAT]
-{
-  "<property_name>": { "operator": "...", "value": "..." }
-}
-
-[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+{ "<property_name>": { "operator": "...", "value": "..." } }
+JSON ONLY. NO EXPLANATION. /no_think"###;
 
     template.replace("{QUERY}", query).replace("{LANGUAGE}", language)
+}
+
+pub fn get_image_extraction_prompt(region: &str, language: &str, page_type: &str, address: &str) -> String {
+    if page_type == "tracking" || page_type == "goods" {
+        let template = r###"[TASK]
+Convert the image to fit the structured JSON format. 
+
+[CONTEXT]
+Region: {REGION}
+Recipient Address: {ADDRESS}
+Current Language: {LANGUAGE}
+
+[INSTRUCTION]
+1. Extract the tracking_number or document number.
+2. Set recipient_match to true if the label address matches the context address.
+3. Extract all visible barcodes into an array.
+
+[OUTPUT FORMAT]
+{ "tracking_number": "string", "recipient_match": boolean, "barcodes": ["string"] }"###;
+        template.replace("{REGION}", region).replace("{ADDRESS}", address).replace("{LANGUAGE}", language)
+    } else {
+        String::new()
+    }
 }
