@@ -209,8 +209,11 @@ function stopSpinner() {
     }
     
     document.querySelectorAll('.spinner, .active-spinner').forEach(el => {
-        el.classList.remove('active-spinner');
-        (el as HTMLElement).innerText = ""; 
+        // 🌟 [CRITICAL FIX] 작업 로그창(#extraction-log) 안의 스피너는 ✅로 변해야 하므로 강제로 텍스트를 지우지 않습니다!
+        if (!el.closest('#extraction-log')) {
+            el.classList.remove('active-spinner');
+            (el as HTMLElement).innerText = ""; 
+        }
     });
 
     // 🌟 스피너가 최종적으로 꺼질 때, 안전하게 검색 버튼 복구
@@ -1098,21 +1101,30 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
         return; 
     }
 
-    // 🌟 [CRITICAL FIX] "Stage 1.5 (1/4)" 같은 이름에서 괄호 부분을 제거하여, 같은 스텝은 새 줄을 만들지 않고 기존 줄을 업데이트하도록 묶어줍니다!
-    const baseCategory = payload.category ? payload.category.replace(/\s*\(\d+\/\d+\)/, "") : "general";
+    // 🌟 [CRITICAL FIX] 정규식을 수정하여 (Slice 1/5) 같은 글자도 하나의 카테고리로 묶어냅니다!
+    const baseCategory = payload.category ? payload.category.replace(/\s*\(.*?\)/g, "") : "general";
     const catId = baseCategory.replace(/[^a-zA-Z0-9]/g, "");
     const elementId = `progress-${catId}`;
     
     const extractionLog = document.getElementById("extraction-log");
-    // 🌟 아까 만든 상단 스피너 전용 컨테이너를 타겟으로 잡습니다.
     const targetContainer = document.getElementById("progress-container") || extractionLog;
     
     if (extractionLog && extractionLog.dataset.activeTaskId) {
         if (payload.task_id && payload.task_id !== extractionLog.dataset.activeTaskId) return;
     }
 
-    if (payload.category === "Done" || payload.category === "Error") {
-        isExtracting = false; // Ensure flag is synced
+    if (isTerminal) {
+        // 🌟 [CRITICAL FIX] Done/Error 종료 신호가 오면, 스피너를 끄기 전에 살아있는 모든 스피너를 ✅ 나 ❌ 로 즉시 확정짓습니다!
+        if (targetContainer) {
+             const existingSpinners = targetContainer.querySelectorAll('.active-spinner');
+             existingSpinners.forEach(s => {
+                 s.classList.remove('active-spinner');
+                 s.innerHTML = payload.category === "Error" ? "❌" : "✅";
+                 (s as HTMLElement).style.color = payload.category === "Error" ? "#ef4444" : "#4ade80";
+             });
+        }
+        
+        isExtracting = false; 
         stopSpinner();
         if (btnExtract) {
             btnExtract.classList.remove("active-spinner");

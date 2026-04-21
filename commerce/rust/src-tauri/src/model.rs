@@ -1123,9 +1123,12 @@ impl LogisModel {
 
         // [LOG] Save to task history if task_id exists
         if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
-            crate::scheduler::log_task_progress(_app_handle, task_id, &base_payload);
+            crate::scheduler::log_task_progress(_app_handle, task_id, &base_payload); // 기존 변수명이 app_handle이면 app_handle로 사용
         }
-
+        
+        // 🌟 [CRITICAL FIX] 화면에 실시간 진행률(퍼센트)을 쏘아 보내는 코드를 복구합니다!
+        let _ = _app_handle.emit(_event_name, &base_payload); // 기존 변수명이 app_handle이면 app_handle, _event_name이면 _event_name 사용
+        
         let mut q35_gen_guard = self.qwen3_5_generator.lock().await;
         let gen = q35_gen_guard.as_mut().ok_or_else(|| anyhow!("Qwen 3.5 Generator is unloaded"))?;
         
