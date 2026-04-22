@@ -26,6 +26,8 @@ use serde_json::{Value, json};
 static IS_SEARCHING: AtomicBool = AtomicBool::new(false);
 
 pub static ACTIVE_TASK_MEM: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::new(None));
+// 🌟 [추가] 디스크 I/O 없이 0.000001초 만에 카테고리를 읽기 위한 빛의 속도 메모리 장부!
+pub static CURRENT_UI_CATEGORY: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::from("Processing")));
 
 pub struct AppState {
     pub model: Arc<TokioMutex<Option<LogisModel>>>,
@@ -184,11 +186,16 @@ async fn set_ignore_cursor_events(app_handle: tauri::AppHandle, ignore: bool) {
 
 #[tauri::command]
 async fn launch_browser(
+    state: State<'_, AppState>, // 🌟 Tauri State 주입
     app_handle: tauri::AppHandle,
     browser: String,
     url: String,
     script: String,
 ) -> Result<String, String> {
+    // 🌟 [CRITICAL FIX] 브라우저 실행 전, 잔류한 Stop 시그널을 강제 해제합니다!
+    state.cancellation_token.store(false, Ordering::SeqCst);
+    crate::utils::set_extraction_stop_signal(false);
+
     automation::run_browser_automation(browser, url, script, app_handle)
         .await
         .map_err(|e| e.to_string())
@@ -196,9 +203,14 @@ async fn launch_browser(
 
 #[tauri::command]
 async fn launch_best_browser(
+    state: State<'_, AppState>, // 🌟 Tauri State 주입
     app_handle: tauri::AppHandle,
     url: String,
 ) -> Result<String, String> {
+    // 🌟 [CRITICAL FIX] 브라우저 실행 전, 잔류한 Stop 시그널을 강제 해제합니다!
+    state.cancellation_token.store(false, Ordering::SeqCst);
+    crate::utils::set_extraction_stop_signal(false);
+
     let available = automation::get_available_browsers();
     // Priority: Chrome -> Edge -> Firefox
     let target = if available.iter().any(|b| b.name == "chrome") {

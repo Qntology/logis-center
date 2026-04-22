@@ -369,6 +369,8 @@ pub async fn start_background_worker(
             
             // Reset token after batch is done or broken, for the next poll
             cancellation_token.store(false, Ordering::SeqCst);
+            // 🌟 [CRITICAL FIX] 메모리 토큰뿐만 아니라, 파일 기반 글로벌 Stop 시그널도 함께 초기화하여 봇이 튕기는 현상 원천 차단!
+            crate::utils::set_extraction_stop_signal(false); 
         }
     });
 }
@@ -732,10 +734,10 @@ async fn process_task(
         // LLM이 지시사항을 잘 따르도록 래핑
         let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think", detail_prompt);
         
-        let snapshot_id = format!("{}_step_a2_q35", task.id); // 🌟 ID 충돌 방지를 위해 q35 접미사 추가
+        let snapshot_id = format!("{}_step_a2", task.id); // 🌟 q35 접미사 제거
 
-        // 🌟 [핵심 변경] 0.6B용 base_session_id와 호환되지 않으므로 None을 전달하여 Qwen 3.5 (0.8B) 모델을 독립적으로 로드합니다.
-        model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+        // 🌟 [CRITICAL FIX] 다시 0.6B(Qwen)로 복구하고, 0.6B의 특권인 미리 구워둔 base_session_id를 전달하여 엄청난 속도 향상을 누립니다!
+        model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
         let params = ChatCompletionParameters {
             messages: vec![
@@ -748,14 +750,15 @@ async fn process_task(
                     name: None,
                 })
             ],
-            model: "qwen3.5".to_string(), 
-            max_tokens: Some(128), // 🌟 JSON 객체가 깊어졌으므로 토큰을 살짝 여유 있게 할당
+            model: "qwen".to_string(), // 🌟 qwen 으로 복구
+            max_tokens: Some(128),     // JSON 스키마가 길어졌으므로 토큰 길이는 128로 유지
             temperature: Some(0.0), top_p: Some(0.01),
             ..Default::default()
         };
 
-        if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-            println!("[Scheduler] 0.8B (Qwen 3.5) Step A-2: Asking detail classification...");
+        // 🌟 0.6B 제너레이터(generator)로 복구
+        if let Some(gen) = model.generator.lock().await.as_mut() {
+            println!("[Scheduler] 0.6B (Qwen) Step A-2: Asking detail classification...");
             let res = gen.generate(
                 params, 
                 Some(cancellation_token.clone()), 
@@ -766,7 +769,7 @@ async fn process_task(
             
             let detail_info = parsing::parse_json_from_llm(&res); 
             
-            // 🌟 [CRITICAL FIX] 바뀐 프롬프트 스키마 형태 {"goods": {"detail": true}} 에 맞게 파싱 로직 업데이트
+            // 바뀐 프롬프트 스키마 형태 {"goods": {"detail": true}} 에 맞춘 파싱 로직 (그대로 유지)
             is_detail = detail_info
                 .get(&page_type)
                 .and_then(|v| v.get("detail"))
@@ -780,7 +783,7 @@ async fn process_task(
                 
             println!("[Scheduler] Classified is_detail as: {}", is_detail);
         } else {
-            println!("[Scheduler] ERROR: Qwen 3.5 generator is missing!");
+            println!("[Scheduler] ERROR: Qwen generator is missing!");
         }
     }
 
@@ -1091,8 +1094,19 @@ async fn process_task(
                 obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
                 obj.insert("link".to_string(), json!(url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()));
                 obj.insert("type".to_string(), json!(page_type));
+                
+                // 🌟 [CRITICAL FIX] 클라우드(list2json) 스키마와 완벽 호환되도록 Boa Engine의 결과를 매핑해줍니다!
+                if let Some(item_sel) = selector_info.get("itemSelector") {
+                    obj.insert("item".to_string(), item_sel.clone()); // itemSelector -> item
+                }
+                if let Some(parent_sel) = selector_info.get("parent") {
+                    obj.insert("node".to_string(), parent_sel.clone()); // parent -> node
+                }
+                // 상세 페이지가 아님을 명시
+                obj.insert("detail".to_string(), json!(false));
             }
 
+            // 이제 클라우드와 완벽히 동일한 스키마로 LanceDB의 'pages' 테이블에 영구 저장됩니다!
             let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(raw_path), None).await;
         }
 
@@ -1516,6 +1530,13 @@ pub fn log_task_progress(app: &tauri::AppHandle, task_id: &str, payload: &serde_
     {
         let line = format!("{}\n", payload.to_string());
         let _ = file.write_all(line.as_bytes());
+    }
+
+    // 🌟 [성능 최적화] 디스크 I/O를 없애고 초고속 메모리(CURRENT_UI_CATEGORY)에 현재 스텝을 기록합니다!
+    if let Some(cat) = payload.get("category").and_then(|v| v.as_str()) {
+        if let Ok(mut w) = crate::CURRENT_UI_CATEGORY.write() {
+            *w = cat.to_string();
+        }
     }
 }
 

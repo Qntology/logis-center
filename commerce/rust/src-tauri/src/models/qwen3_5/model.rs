@@ -2315,16 +2315,14 @@ impl Qwen3_5Model {
                             if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
                         } else { sid.clone() };
                         
-                        // 🌟 Prefill 진행률 (동일한 카테고리 유지)
-                        let summary_msg = if task_id.starts_with("search_") {
-                            format!("Prefill: Analyzing search context ({}%)...", pct)
-                        } else {
-                            format!("Prefill: Reading document ({}%)...", pct)
-                        };
+                        // 🌟 [성능 최적화] 파일 읽기를 제거하고 초고속 전역 메모리에서 카테고리를 즉시 가져옵니다!
+                        let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
+
+                        let summary_msg = format!("Reading context ({}%)...", pct);
 
                         let _ = tx.send(serde_json::json!({
                             "task_id": task_id,
-                            "category": "AI Inference", // 👈 스케줄러와 통일하여 한 줄에서 업데이트!
+                            "category": format!("{} (Prefill)", current_cat),
                             "summary": summary_msg,
                             "spinner": "⠹"
                         }));

@@ -2168,7 +2168,10 @@ impl QuantizedQwenVLTextModel {
         // 가중치 비우기 (프리필 중 메모리 안정성 확보)
         self.layers[layer_idx].clear(); 
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
-        println!("[MEMORY-OPT] Layer {} Weights and Gradients cleared from RAM/VRAM.", layer_idx);
+        let is_decoding = current_seq_len <= 1;
+        if !is_decoding {
+            println!("[MEMORY-OPT] Layer {} Weights and Gradients cleared from RAM/VRAM.", layer_idx);
+        }
 
         if let Some(sid) = session_id {
             // 🌟 [CRITICAL FIX] 프리필(Prefill) 단계(토큰이 2개 이상일 때)에서만 VRAM 전체 캐시를 디스크로 밀어냅니다!
@@ -2426,8 +2429,7 @@ impl QuantizedQwenVLTextModel {
         }
 
         for layer_idx in 0..total_layers {
-            if layer_idx % 7 == 0 || layer_idx == total_layers - 1 {
-                // 🌟 프리필인지 디코딩인지 정확히 표시해 줍니다.
+            if !is_decoding && (layer_idx % 7 == 0 || layer_idx == total_layers - 1) {
                 let phase = if !is_decoding { "Prefill" } else { "Decode" };
                 println!("[ENGINE] Running Layer {}/{} (Ping-Pong {} Active)", layer_idx + 1, total_layers, phase);
             }
@@ -3132,15 +3134,14 @@ impl QuantizedQwenTextModel {
                             if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
                         } else { sid.clone() };
                         
-                        let summary_msg = if task_id.starts_with("search_") {
-                            format!("Prefill: Analyzing search context ({}%)...", pct)
-                        } else {
-                            format!("Prefill: Reading document structure ({}%)...", pct)
-                        };
+                        // 🌟 [성능 최적화] 파일 읽기를 제거하고 초고속 전역 메모리에서 카테고리를 즉시 가져옵니다!
+                        let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
+
+                        let summary_msg = format!("Reading context ({}%)...", pct);
                         
                         let _ = tx.send(serde_json::json!({
                             "task_id": task_id,
-                            "category": "Preparation", // 👈 스케줄러의 초기 세팅과 통일
+                            "category": format!("{} (Prefill)", current_cat), 
                             "summary": summary_msg,
                             "spinner": "⠹"
                         }));

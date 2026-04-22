@@ -745,6 +745,14 @@ impl QwenVLGenerateModel {
                 let sample_len = mes.max_tokens.unwrap_or(2048) as f32;
                 let pct = ((i as f32 / sample_len) * 100.0) as i32;
                 
+                // 🌟 [CRITICAL FIX] AI가 실시간으로 뱉어내는 텍스트를 정제하여 요약본 생성!
+                let clean_text = gen_text.replace("\n", " ").replace("\"", "'");
+                let display_text = if clean_text.len() > 35 { 
+                    format!("...{}", &clean_text[clean_text.len()-35..]) 
+                } else { 
+                    clean_text.clone() 
+                };
+
                 if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
                     if let Some(sid) = &session_id {
                         let task_id = if sid.starts_with("task_") || sid.starts_with("img_") || sid.starts_with("search_") {
@@ -752,22 +760,24 @@ impl QwenVLGenerateModel {
                             if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
                         } else { sid.clone() };
                         
-                        let summary_msg = if task_id.starts_with("search_") {
-                            format!("Decoding: Generating AI response ({}%)...", pct)
-                        } else {
-                            format!("Decoding: Extracting data ({}%)...", pct)
-                        };
+                        // 🌟 [성능 최적화] 파일 읽기를 제거하고 초고속 전역 메모리에서 카테고리를 즉시 가져옵니다!
+                        let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
+
+                        let summary_msg = format!("{} ({}%)", display_text, pct);
 
                         let _ = tx.send(serde_json::json!({
                             "task_id": task_id,
-                            "category": "Preparation", // 👈 스케줄러의 초기 세팅과 통일
+                            "category": format!("{} (Decoding)", current_cat), 
                             "summary": summary_msg,
                             "spinner": "⠧"
                         }));
                     }
                 }
-                print!("\r[DECODING] {} tokens generated (Context: {})    ", i + 1, current_pos + 1);
-                let _ = std::io::stdout().flush();
+                
+                if !is_strict_json {
+                    print!("\r[DECODING] {} tokens generated (Context: {})    ", i + 1, current_pos + 1);
+                    let _ = std::io::stdout().flush();
+                }
             }
 
             wait_for_global_io().await;

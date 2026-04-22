@@ -334,11 +334,42 @@ impl Qwen3_5GenerateModel {
                 }
             }
 
-            // 🌟 [디코딩 진행률 로깅] 여기로 쏙 들어갑니다!
+            // 🌟 [디코딩 진행률 로깅 및 UI 전송]
             let current_pos = seqlen_offset + seq_len; // 현재 전체 문맥 길이
             if i % 10 == 0 || next_token == self.eos_token_id {
-                print!("\r[Qwen3.5-DECODING] {} tokens generated (Context: {})    ", i + 1, current_pos + 1);
-                let _ = std::io::stdout().flush();
+                let pct = ((i as f32 / sample_len as f32) * 100.0) as i32;
+                
+                // 🌟 [CRITICAL FIX] AI가 실시간으로 뱉어내는 텍스트를 UI에 꽂아줍니다!
+                let clean_text = gen_text_buffer.replace("\n", " ").replace("\"", "'");
+                let display_text = if clean_text.len() > 35 { 
+                    format!("...{}", &clean_text[clean_text.len()-35..]) 
+                } else { 
+                    clean_text.clone() 
+                };
+
+                if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
+                    if let Some(sid) = &session_id {
+                        let task_id = if sid.starts_with("task_") || sid.starts_with("img_") || sid.starts_with("search_") {
+                            let p: Vec<&str> = sid.split('_').collect();
+                            if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
+                        } else { sid.clone() };
+                        
+                        let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
+
+                        let summary_msg = format!("{} ({}%)", display_text, pct);
+
+                        let _ = tx.send(serde_json::json!({
+                            "task_id": task_id,
+                            "category": format!("{} (Decoding)", current_cat), 
+                            "summary": summary_msg,
+                            "spinner": "⠧"
+                        }));
+                    }
+                }
+                if !is_strict_json {
+                    print!("\r[Qwen3.5-DECODING] {} tokens generated (Context: {})    ", i + 1, current_pos + 1);
+                    let _ = std::io::stdout().flush();
+                }
             }
 
             if next_token == self.eos_token_id {
@@ -548,6 +579,15 @@ impl Qwen3_5GenerateModel {
             let current_pos = seqlen_offset + seq_len;
             if i % 10 == 0 || next_token == self.eos_token_id {
                 let pct = ((i as f32 / sample_len as f32) * 100.0) as i32;
+                
+                // 🌟 [CRITICAL FIX] AI가 실시간으로 뱉어내는 텍스트를 UI에 꽂아줍니다!
+                let clean_text = gen_text_buffer.replace("\n", " ").replace("\"", "'");
+                let display_text = if clean_text.len() > 35 { 
+                    format!("...{}", &clean_text[clean_text.len()-35..]) 
+                } else { 
+                    clean_text.clone() 
+                };
+
                 if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
                     if let Some(sid) = &session_id {
                         let task_id = if sid.starts_with("task_") || sid.starts_with("img_") || sid.starts_with("search_") {
@@ -555,23 +595,22 @@ impl Qwen3_5GenerateModel {
                             if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
                         } else { sid.clone() };
                         
-                        // 🌟 Decoding 진행률 (동일한 카테고리 유지)
-                        let summary_msg = if task_id.starts_with("search_") {
-                            format!("Decoding: Generating response ({}%)...", pct)
-                        } else {
-                            format!("Decoding: Extracting details ({}%)...", pct)
-                        };
+                        let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
+
+                        let summary_msg = format!("{} ({}%)", display_text, pct);
 
                         let _ = tx.send(serde_json::json!({
                             "task_id": task_id,
-                            "category": "AI Inference", // 👈 스케줄러와 통일하여 한 줄에서 업데이트!
+                            "category": format!("{} (Decoding)", current_cat), 
                             "summary": summary_msg,
                             "spinner": "⠧"
                         }));
                     }
                 }
-                print!("\r[Qwen3.5-DECODING] {} tokens generated (Context: {})    ", i + 1, current_pos + 1);
-                let _ = std::io::stdout().flush();
+                if !is_strict_json {
+                    print!("\r[Qwen3.5-DECODING] {} tokens generated (Context: {})    ", i + 1, current_pos + 1);
+                    let _ = std::io::stdout().flush();
+                }
             }
 
             if next_token == self.eos_token_id {

@@ -65,6 +65,58 @@ let isChatLoading = false;
 let isFirstNavRender = true;
 let isFirstChatLoad = true;
 
+// [NEW] Window Focus State (백그라운드 리소스 최적화용)
+let isFocus = true;
+
+// ==========================================
+// [PARITY] Cloud front.js Core Utilities
+// ==========================================
+function isDiff(obj1: any, obj2: any): boolean {
+    if (!obj1 && !obj2) return false;
+    if (!obj1 || !obj2) return true;
+    const keys1 = Object.keys(obj1);
+    const keys2 = Object.keys(obj2);
+    if (keys1.length !== keys2.length) return true;
+    
+    for (const key of keys1) {
+        if (typeof obj1[key] === 'object' && typeof obj2[key] === 'object') {
+            if (isDiff(obj1[key], obj2[key])) return true;
+        } else if (obj1[key] !== obj2[key]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function safeClone(obj: any) {
+    const seen = new WeakMap();
+    function clone(value: any) {
+        if (typeof value !== "object" || value === null) return value;
+        if (seen.has(value)) return null; 
+        const copy: any = Array.isArray(value) ? [] : {};
+        seen.set(value, copy);
+        for (const key in value) {
+            copy[key] = clone(value[key]);
+        }
+        return copy;
+    }
+    return clone(obj);
+}
+
+function mergeNode(obj1: any, obj2: any) {
+    const isEmpty = (value: any) => value === null || value === undefined || value === '' || value === 0;
+    const merged = { ...obj1 };
+    for (const key in obj2) {
+        if (obj2.hasOwnProperty(key)) {
+            const value2 = obj2[key];
+            if (!isEmpty(value2)) {
+                merged[key] = value2;
+            }
+        }
+    }
+    return merged;
+}
+
 const taskSteps = new Map<string, Map<string, number>>();
 
 let selectedUuids = new Set<string>();
@@ -2205,14 +2257,103 @@ function upsertListItems(docs: any[], mode: 'prepend' | 'append') {
 }
 
 function bindCardEvents(el: HTMLElement, doc: any) {
+    const toggleCheckbox = el.querySelector('.toggle-more') as HTMLInputElement;
+    const moreContent = el.querySelector('.more-content') as HTMLElement;
+    const moreLabel = el.querySelector('.more-label') as HTMLElement;
+    const relateContainer = el.querySelector('.logis-relate') as HTMLElement;
+
+    // 🌟 [PARITY] 클라우드의 Relay(관계 병합) 아코디언 토글 이벤트
+    if (toggleCheckbox && moreContent && moreLabel) {
+        toggleCheckbox.addEventListener('change', async () => {
+            if (toggleCheckbox.checked) {
+                // 아코디언 열림
+                moreContent.style.display = "block";
+                moreLabel.innerHTML = "fold ▲";
+                
+                // 🌟 열릴 때 연관된 데이터(Foreign/Primary)를 DB에서 긁어와 병합합니다!
+                if (relateContainer) {
+                    await loadRelatedData(doc, relateContainer);
+                }
+            } else {
+                // 아코디언 닫힘
+                moreContent.style.display = "none";
+                moreLabel.innerHTML = "more ▼";
+            }
+        });
+    }
+
     el.addEventListener("click", (e) => {
         const target = e.target as HTMLElement;
-        if (target.closest('.toggle-more') || target.closest('.more-label')) return;
+        
+        // 아코디언 래퍼나 내부 연관 데이터 클릭 시, 메인 상세 페이지로 넘어가지 않도록 차단
+        if (target.closest('.toggle-more') || target.closest('.more-label') || target.closest('.more-content') || target.closest('.logis-relate')) {
+            return;
+        }
+
         const docId = doc.id || doc.uuid || (doc.data && (doc.data.id || doc.data.uuid)) || doc.uuid_val || doc.ref || doc.index;
         if (!target.closest('a') && !target.closest('input') && !target.closest('button')) {
             if (docId) showDetail(String(docId));
         }
     });
+}
+
+// 🌟 [PARITY] 클라우드 Relay 로직의 클라이언트 사이드 이식
+async function loadRelatedData(doc: any, container: HTMLElement) {
+    if (!container || container.dataset.loaded === "true") return;
+    
+    // 스피너 표시
+    container.innerHTML = `<div style="padding:10px; text-align:center; font-size:0.75rem; color:var(--primary);"><span class="active-spinner">⠋</span> Loading related data...</div>`;
+    
+    try {
+        const docId = doc.id || doc.uuid;
+        const docRef = doc.ref;
+        
+        // 1. 나를 부모로 가지는 자식들 (ref = 내 ID)
+        let filterStr = `ref = '${docId}'`; 
+        
+        // 2. 나와 같은 출신(링크)을 가진 형제들 (ref = 내 출처)
+        if (docRef && docRef !== "") {
+            filterStr += ` OR ref = '${docRef}'`; 
+        }
+        
+        // 백엔드(LanceDB)에 쿼리 전송
+        const relatedDocs = await invoke<any[]>("get_all_documents", {
+            limit: 10,
+            offset: 0,
+            filter: filterStr
+        });
+
+        // 본인 제외 및 중복 제거
+        const uniqueDocs = relatedDocs.filter(d => (d.id || d.uuid) !== docId);
+
+        if (uniqueDocs.length > 0) {
+            const relatedHtml = uniqueDocs.map(d => {
+                // 🌟 하위 아이템은 무한 확장을 막기 위해 checked=true (펼쳐짐) 및 부가 정보 축소 형태로 렌더링
+                return item2html(d, true, currentDetectedUrl);
+            }).join("");
+            
+            // 연관 데이터 UI 주입
+            container.innerHTML = `<div style="margin-top:15px; border-top:1px dashed rgba(255,255,255,0.2); padding-top:10px;">
+                <strong style="font-size:0.75rem; color:#aaa; margin-bottom:10px; display:block;">🔗 Related Documents</strong>
+                ${relatedHtml}
+            </div>`;
+            
+            // 내부 연관 카드의 클릭 이벤트(상세 페이지 진입)도 재귀적으로 바인딩
+            const newCards = container.querySelectorAll('.logis-result');
+            newCards.forEach((card, idx) => {
+                bindCardEvents(card as HTMLElement, uniqueDocs[idx]);
+            });
+        } else {
+            // 연관 데이터가 없으면 깔끔하게 비움
+            container.innerHTML = ""; 
+        }
+        
+        container.dataset.loaded = "true"; // 불필요한 중복 쿼리 방지 (캐싱)
+        
+    } catch (e) {
+        console.error("[Relay] Failed to load related data:", e);
+        container.innerHTML = `<div style="color:#ef4444; font-size:0.7rem; padding:5px;">Failed to load related data.</div>`;
+    }
 }
 
 function renderDocs(docs: any[]) {
@@ -2384,9 +2525,33 @@ async function performQrAuth() {
     }
 }
 
+// 🌟 [PARITY] Window Focus/Blur 이벤트 리스너 추가
+window.addEventListener("blur", () => {
+    isFocus = false;
+    if (chatPollInterval) {
+        clearInterval(chatPollInterval);
+        chatPollInterval = null;
+        console.log("[WIDGET] Window blurred. Polling paused to save resources.");
+    }
+});
+
+window.addEventListener("focus", () => {
+    isFocus = true;
+    if (!chatPollInterval && currentSession.email) {
+        console.log("[WIDGET] Window focused. Polling resumed.");
+        // 창을 다시 봤을 때 즉시 1회 최신화
+        fetchChatHistory(false, true); 
+        startPolling();
+    }
+});
+
+// 🌟 [PARITY] startPolling 함수 업그레이드
 function startPolling() {
     if (chatPollInterval) clearInterval(chatPollInterval);
+    if (!isFocus) return; // 화면을 안 보고 있으면 시작조차 하지 않음
+    
     chatPollInterval = window.setInterval(() => {
+        if (!isFocus) return; // 폴링 주기마다 한 번 더 체크
         if (!currentSession.email) checkAuthStatus();
         else fetchChatHistory(false, true); // reset=false, silent=true
     }, 3000);
