@@ -168,14 +168,12 @@ pub async fn start_background_worker(
 ) {
     println!("[Scheduler] Background worker waiting for UI Ready signal...");
     
-    // 🌟 [CRITICAL FIX] 모델 깊은 곳에서 올라오는 퍼센트(%) 신호를 받아 UI로 직행시키는 리스너 
     let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     let _ = PROGRESS_TX.set(ptx);
     let app_handle_prog = app_handle.clone();
     tokio::spawn(async move {
         use tauri::Emitter;
         while let Some(payload) = prx.recv().await {
-            // 🌟 UI로 쏘는 동시에 가장 최신 페이로드를 메모리에 장부 기록!
             if let Ok(mut w) = crate::LATEST_PROGRESS_PAYLOAD.write() {
                 *w = Some(payload.clone());
             }
@@ -185,11 +183,10 @@ pub async fn start_background_worker(
 
     clear_all_temp_data(Some(&app_handle));
 
-    // [NEW] 앱 시작 시 즉시 좀비 작업 정리 (잠금 획득 시도)
     {
         let store_clone = store.clone();
         tauri::async_runtime::spawn(async move {
-            for _ in 0..10 { // 최대 5초간 대기하며 시도
+            for _ in 0..10 { 
                 if let Ok(guard) = store_clone.try_lock() {
                     if let Some(db) = guard.as_ref() {
                         let _ = db.cleanup_zombie_tasks().await;
@@ -202,8 +199,6 @@ pub async fn start_background_worker(
     }
     
     tokio::spawn(async move {
-        // [EVENT-DRIVEN-WAIT] Zero CPU usage, zero delay. 
-        // Wakes up exactly when mark_ui_ready is called.
         if !UI_READY_FLAG.load(Ordering::SeqCst) {
             UI_READY_SIGNAL.notified().await;
         }
@@ -212,7 +207,6 @@ pub async fn start_background_worker(
         let mut current_device_pref: Option<String> = None;
         
         loop {
-            // [CRITICAL] Global Stop Signal Check
             if crate::utils::is_extraction_stopped() {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
@@ -230,7 +224,6 @@ pub async fn start_background_worker(
             }
 
             if pending_tasks.is_empty() {
-                // [EVENT-DRIVEN] Wait for timeout OR new task signal
                 tokio::select! {
                     _ = sleep(Duration::from_secs(delay_secs)) => {
                         delay_secs = (delay_secs + 1).min(10); 
@@ -257,17 +250,14 @@ pub async fn start_background_worker(
                     let store_guard = store.lock().await;
                     if let Some(db) = store_guard.as_ref() {
                         let _ = db.update_task_status(&task.id, crate::logic::parse_status("progress")).await;
-                        // 🌟 [CRITICAL FIX] 말풍선 텍스트를 "Processing..."으로 강제 지정하여 DB 레코드가 튕기거나 증발하는 것을 100% 방지합니다!
                         let _ = db.update_message_status(&task.id, crate::logic::parse_status("progress"), Some("Processing...")).await;
                     }
                 }
 
-                // 👇 Ok(_) 와 Err(e) 바로 밑에 메모리 초기화 코드가 추가되었습니다.
                 match process_task(task.clone(), &store, &model, &cancellation_token, &app_handle, current_device_pref.clone()).await {
                     Ok(_) => {
                         println!("[Scheduler] Task completed: {}", task.id);
                         
-                        // 🌟 [CRITICAL FIX] 작업 완료 시 메모리를 완벽히 비워줍니다. (디스크 초기화 불필요)
                         if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() { *w = None; }
                         if let Ok(mut w) = crate::LATEST_PROGRESS_PAYLOAD.write() { *w = None; }
 
@@ -276,18 +266,15 @@ pub async fn start_background_worker(
                             if let Some(m) = model_lock.as_ref() {
                                 m.deep_purge_resources().await;
                             }
-                            // 모델 인스턴스 자체를 None으로 만들어 완전히 초기화 (다음 작업 시 필요하면 다시 로드)
                             *model_lock = None;
                         }
                         
                         let store_guard = store.lock().await;
                         if let Some(db) = store_guard.as_ref() {
                             let _ = db.update_task_status(&task.id, crate::logic::parse_status("complete")).await;
-                            // 🌟 [CRITICAL FIX] 말풍선 상태도 확실하게 9로 한 번 더 못을 박고 텍스트를 업데이트해 DB의 updated_at을 강제 갱신합니다!
                             let _ = db.update_message_status(&task.id, crate::logic::parse_status("complete"), Some("Task Completed")).await;
                         }
 
-                        // [NEW] 성공 시에만 리소스 정리 및 모드 리셋
                         cleanup_task_resources(&task.id, Some(&app_handle));
                         current_device_pref = None; 
                     },
@@ -295,17 +282,13 @@ pub async fn start_background_worker(
                         let err_msg = e.to_string();
                         println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, err_msg);
                         
-                        // 🌟 [CRITICAL FIX] 작업 실패/에러 시에도 메모리와 JSON을 비워줍니다.
                         if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() { *w = None; }
-                        let _ = std::fs::write("tmp/index.json", "{}");
 
-                        // [PERSISTENT-ERROR-LOG] 작업 디렉토리에 에러 사유 기록
                         let task_dir = utils::paths::get_task_specific_dir(Some(&app_handle), &task.id);
                         if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
                         let error_file = task_dir.join("error_reason.txt");
                         let _ = std::fs::write(&error_file, format!("Timestamp: {}\nError: {}\n", chrono::Utc::now(), err_msg));
 
-                        // [CRITICAL-CLEANUP] 작업 실패 시 즉시 모델을 메모리에서 해제하여 다음 작업 대비
                         {
                             let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
                             if let Some(m) = model_lock.as_ref() {
@@ -326,54 +309,51 @@ pub async fn start_background_worker(
                                 "task_id": task.id,
                                 "category": "Done", "summary": "Cancelled by user", "spinner": "🛑", "data": null 
                              }));
-                             // [NEW] 취소 시 리소스 정리 및 모드 리셋
                              cleanup_task_resources(&task.id, Some(&app_handle));
+                             
+                             // 🌟 [CRITICAL FIX] 취소 시 기본값(GPU)으로 롤백!
                              current_device_pref = None;
                              break; 
-                        } else {
-                            println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, err_msg);
+                        } else if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
+                            // 🌟 오직 VRAM OOM 일 때만 CPU 모드로 우회!
+                            println!("[Scheduler] OOM Detected! Activating CPU Mode for retry.");
+                            current_device_pref = Some("cpu".to_string());
+
+                            log_task_progress(&app_handle, &task.id, &json!({
+                                "category": "Warning", "summary": "Memory pressure detected. Retrying with CPU Mode...", "spinner": "💾"
+                            }));
                             
-                            // [NEW] Automatic OOM Recovery Logic (Forcing SSD-Swap Mode)
-                            if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
-                                println!("[Scheduler] OOM Detected! Activating SSD-Swap Mode for retry.");
-                                {
-                                    let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
-                                    if let Some(m) = model_lock.as_ref() {
-                                        let _ = m.deep_purge_resources().await;
-                                    }
-                                    *model_lock = None; 
+                            {
+                                let store_guard = store.lock().await;
+                                if let Some(db) = store_guard.as_ref() {
+                                    let _ = db.update_task_status(&task.id, 10).await;
+                                    let _ = db.update_message_status(&task.id, 10, Some("Retrying in CPU Mode...")).await;
                                 }
-                                
-                                // Use gpu_disk_swap instead of cpu for better performance during retry
-                                current_device_pref = Some("gpu_disk_swap".to_string());
-
-                                log_task_progress(&app_handle, &task.id, &json!({
-                                    "category": "Warning", "summary": "Memory pressure detected. Retrying with SSD-Swap Mode...", "spinner": "💾"
-                                }));
-                                
-                                tokio::time::sleep(Duration::from_secs(2)).await;
-                                continue; 
                             }
-
+                            
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue; 
+                        } else {
+                            // 🌟 OOM이 아닌 기타 일반 에러 처리
                             let store_guard = store.lock().await;                            
                             if let Some(db) = store_guard.as_ref() {
                                 let _ = db.update_task_status(&task.id, crate::logic::parse_status("error")).await;
                                 let _ = db.update_message_status(&task.id, crate::logic::parse_status("error"), Some(&format!("Error: {}", err_msg))).await;
                             }
                             
-                            // [NEW] Explicitly notify UI of failure to stop spinner
                             let _ = app_handle.emit("extraction-progress", json!({
                                 "task_id": task.id,
                                 "category": "Error", "summary": format!("Failed: {}", err_msg), "spinner": "❌"
                             }));
+
+                            // 🌟 [CRITICAL FIX] 일반 에러이므로 다음 작업이 엉뚱하게 CPU로 돌지 않도록 GPU 모드로 롤백!
+                            current_device_pref = None;
                         }
                     }
                 }
             }
             
-            // Reset token after batch is done or broken, for the next poll
             cancellation_token.store(false, Ordering::SeqCst);
-            // 🌟 [CRITICAL FIX] 메모리 토큰뿐만 아니라, 파일 기반 글로벌 Stop 시그널도 함께 초기화하여 봇이 튕기는 현상 원천 차단!
             crate::utils::set_extraction_stop_signal(false); 
         }
     });
