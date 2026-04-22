@@ -2548,12 +2548,17 @@ window.addEventListener("focus", () => {
 // 🌟 [PARITY] startPolling 함수 업그레이드
 function startPolling() {
     if (chatPollInterval) clearInterval(chatPollInterval);
-    if (!isFocus) return; // 화면을 안 보고 있으면 시작조차 하지 않음
+    if (!isFocus) return; 
     
     chatPollInterval = window.setInterval(() => {
-        if (!isFocus) return; // 폴링 주기마다 한 번 더 체크
+        if (!isFocus) return; 
+        
+        // 🌟 [사용자 요청 반영] 히스토리(Settings) 창이 열려있을 때만 서버에 요청을 보냅니다!
+        // 닫혀있을 때는 백그라운드 서버 통신을 완전히 차단하여 최적화합니다.
+        if (currentTab !== "settings" || !isExpanded) return;
+
         if (!currentSession.email) checkAuthStatus();
-        else fetchChatHistory(false, true); // reset=false, silent=true
+        else fetchChatHistory(false, true); 
     }, 3000);
 }
 

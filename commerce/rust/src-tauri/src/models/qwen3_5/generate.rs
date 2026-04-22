@@ -316,6 +316,7 @@ impl Qwen3_5GenerateModel {
                     print_buffer.clear(); 
                 }
 
+                let mut is_json_finished = false;
                 if gen_text_buffer.contains('{') {
                     let mut depth = 0;
                     let mut has_started = false;
@@ -329,17 +330,27 @@ impl Qwen3_5GenerateModel {
                             let _ = std::io::stdout().flush();
                         }
                         println!("\n[DEBUG-GEN] Balanced JSON detected. Stopping.");
-                        break; 
+                        is_json_finished = true; // 🌟 즉시 break 하지 않고 플래그만 세웁니다!
                     }
                 }
             }
 
-            // 🌟 [디코딩 진행률 로깅 및 UI 전송]
-            let current_pos = seqlen_offset + seq_len; // 현재 전체 문맥 길이
-            if i % 10 == 0 || next_token == self.eos_token_id {
-                let pct = ((i as f32 / sample_len as f32) * 100.0) as i32;
+            let current_pos = seqlen_offset + seq_len;
+            
+            // 🌟 JSON 완성이 감지되었을 때도 마지막 100% 퍼센트를 발송하도록 조건 추가
+            if i % 10 == 0 || next_token == self.eos_token_id || is_json_finished {
                 
-                // 🌟 [CRITICAL FIX] AI가 실시간으로 뱉어내는 텍스트를 UI에 꽂아줍니다!
+                // 🌟 짧은 JSON이거나 AI가 답변을 스스로 끝냈다면(EOS), 100%로 꽉 채워줍니다.
+                let is_eos = next_id == self.eos_token_id1 || next_id == self.eos_token_id2; 
+                // (참고: Qwen3_5 모델 파일에서는 next_token == self.eos_token_id 입니다.)
+                
+                let pct = if is_json_finished || is_eos {
+                    100
+                } else {
+                    // 혹시라도 sample_len 이 i 보다 작게 설정되어 100%가 넘어가는 것을 방지
+                    (((i as f32) / sample_len as f32) * 100.0).min(99.0) as i32
+                };
+                
                 let clean_text = gen_text_buffer.replace("\n", " ").replace("\"", "'");
                 let display_text = if clean_text.len() > 35 { 
                     format!("...{}", &clean_text[clean_text.len()-35..]) 
@@ -356,7 +367,11 @@ impl Qwen3_5GenerateModel {
                         
                         let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
 
-                        let summary_msg = format!("{} ({}%)", display_text, pct);
+                        let summary_msg = if task_id.starts_with("search_") {
+                            format!("Generating insights ({}%)...", pct)
+                        } else {
+                            format!("Extracting data ({}%)...", pct)
+                        };
 
                         let _ = tx.send(serde_json::json!({
                             "task_id": task_id,
@@ -372,7 +387,9 @@ impl Qwen3_5GenerateModel {
                 }
             }
 
-            if next_token == self.eos_token_id {
+            // 🌟 100% UI 전송이 끝난 뒤에 비로소 루프를 탈출합니다.
+            if next_token == self.eos_token_id || is_json_finished {
+                is_finished = true;
                 break;
             }
             seqlen_offset += seq_len;
@@ -555,6 +572,7 @@ impl Qwen3_5GenerateModel {
                 }
 
                 // 중첩 깊이 추적 기반 조기 종료
+                let mut is_json_finished = false;
                 if gen_text_buffer.contains('{') {
                     let mut depth = 0;
                     let mut has_started = false;
@@ -563,24 +581,32 @@ impl Qwen3_5GenerateModel {
                         else if c == '}' { depth -= 1; }
                     }
                     if has_started && depth == 0 && gen_text_buffer.trim_end().ends_with('}') {
-                        // 남은 버퍼 강제 출력
                         if !print_buffer.is_empty() {
                             print!("{}", print_buffer);
                             let _ = std::io::stdout().flush();
                         }
                         println!("\n[DEBUG-GEN] Balanced JSON detected. Stopping.");
-                        is_finished = true;
-                        break;
+                        is_json_finished = true; // 🌟 즉시 break 하지 않고 플래그만 세웁니다!
                     }
                 }
             }
 
-            // 🌟 [디코딩 진행률 로깅 및 UI 전송]
             let current_pos = seqlen_offset + seq_len;
-            if i % 10 == 0 || next_token == self.eos_token_id {
-                let pct = ((i as f32 / sample_len as f32) * 100.0) as i32;
+            
+            // 🌟 JSON 완성이 감지되었을 때도 마지막 100% 퍼센트를 발송하도록 조건 추가
+            if i % 10 == 0 || next_token == self.eos_token_id || is_json_finished {
                 
-                // 🌟 [CRITICAL FIX] AI가 실시간으로 뱉어내는 텍스트를 UI에 꽂아줍니다!
+                // 🌟 짧은 JSON이거나 AI가 답변을 스스로 끝냈다면(EOS), 100%로 꽉 채워줍니다.
+                let is_eos = next_id == self.eos_token_id1 || next_id == self.eos_token_id2; 
+                // (참고: Qwen3_5 모델 파일에서는 next_token == self.eos_token_id 입니다.)
+                
+                let pct = if is_json_finished || is_eos {
+                    100
+                } else {
+                    // 혹시라도 sample_len 이 i 보다 작게 설정되어 100%가 넘어가는 것을 방지
+                    (((i as f32) / sample_len as f32) * 100.0).min(99.0) as i32
+                };
+                
                 let clean_text = gen_text_buffer.replace("\n", " ").replace("\"", "'");
                 let display_text = if clean_text.len() > 35 { 
                     format!("...{}", &clean_text[clean_text.len()-35..]) 
@@ -597,7 +623,11 @@ impl Qwen3_5GenerateModel {
                         
                         let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
 
-                        let summary_msg = format!("{} ({}%)", display_text, pct);
+                        let summary_msg = if task_id.starts_with("search_") {
+                            format!("Generating insights ({}%)...", pct)
+                        } else {
+                            format!("Extracting data ({}%)...", pct)
+                        };
 
                         let _ = tx.send(serde_json::json!({
                             "task_id": task_id,
@@ -613,7 +643,8 @@ impl Qwen3_5GenerateModel {
                 }
             }
 
-            if next_token == self.eos_token_id {
+            // 🌟 100% UI 전송이 끝난 뒤에 비로소 루프를 탈출합니다.
+            if next_token == self.eos_token_id || is_json_finished {
                 is_finished = true;
                 break;
             }

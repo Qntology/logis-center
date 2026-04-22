@@ -725,6 +725,7 @@ impl QwenVLGenerateModel {
             let piece = self.tokenizer.token_decode(vec![next_id])?;
             gen_text.push_str(&piece);
 
+            let mut is_json_finished = false;
             if gen_text.contains('{') {
                 let mut depth = 0;
                 let mut has_started = false;
@@ -734,18 +735,24 @@ impl QwenVLGenerateModel {
                 }
                 if has_started && depth == 0 && gen_text.trim_end().ends_with('}') {
                     println!("[DEBUG-GEN] Balanced JSON detected (Depth 0). Stopping at token {}.", i + 1);
-                    break;
+                    is_json_finished = true; // 🌟 즉시 break 하지 않고 플래그만 세웁니다!
                 }
             }
             
             let current_pos = total_tokens_after_prefill + i as usize;
             
             // 🌟 [디코딩 진행률 로깅 및 UI 전송]
-            if i % 10 == 0 || next_id == self.eos_token_id1 || next_id == self.eos_token_id2 {
+            // JSON 완성이 감지되었을 때도 마지막 100% 퍼센트를 발송하도록 조건 추가
+            if i % 10 == 0 || next_id == self.eos_token_id1 || next_id == self.eos_token_id2 || is_json_finished {
                 let sample_len = mes.max_tokens.unwrap_or(2048) as f32;
-                let pct = ((i as f32 / sample_len) * 100.0) as i32;
                 
-                // 🌟 [CRITICAL FIX] AI가 실시간으로 뱉어내는 텍스트를 정제하여 요약본 생성!
+                // 🌟 짧은 JSON이라 일찍 끝났다면 100%로 꽉 채워줍니다.
+                let pct = if is_json_finished || next_id == self.eos_token_id1 || next_id == self.eos_token_id2 {
+                    100
+                } else {
+                    ((i as f32 / sample_len) * 100.0) as i32
+                };
+                
                 let clean_text = gen_text.replace("\n", " ").replace("\"", "'");
                 let display_text = if clean_text.len() > 35 { 
                     format!("...{}", &clean_text[clean_text.len()-35..]) 
@@ -760,10 +767,14 @@ impl QwenVLGenerateModel {
                             if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
                         } else { sid.clone() };
                         
-                        // 🌟 [성능 최적화] 파일 읽기를 제거하고 초고속 전역 메모리에서 카테고리를 즉시 가져옵니다!
                         let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
 
-                        let summary_msg = format!("{} ({}%)", display_text, pct);
+                        // 🌟 [UI 버그 수정] 지저분한 JSON 파편(display_text)을 빼버리고 깔끔한 고정 텍스트를 띄웁니다!
+                        let summary_msg = if task_id.starts_with("search_") {
+                            format!("Generating insights ({}%)...", pct)
+                        } else {
+                            format!("Extracting data ({}%)...", pct)
+                        };
 
                         let _ = tx.send(serde_json::json!({
                             "task_id": task_id,
@@ -778,6 +789,11 @@ impl QwenVLGenerateModel {
                     print!("\r[DECODING] {} tokens generated (Context: {})    ", i + 1, current_pos + 1);
                     let _ = std::io::stdout().flush();
                 }
+            }
+
+            // 🌟 100% UI 전송이 안전하게 끝난 뒤에 비로소 루프를 탈출합니다.
+            if is_json_finished || next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
+                break; 
             }
 
             wait_for_global_io().await;
