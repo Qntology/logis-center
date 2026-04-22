@@ -26,8 +26,9 @@ use serde_json::{Value, json};
 static IS_SEARCHING: AtomicBool = AtomicBool::new(false);
 
 pub static ACTIVE_TASK_MEM: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::new(None));
-// 🌟 [추가] 디스크 I/O 없이 0.000001초 만에 카테고리를 읽기 위한 빛의 속도 메모리 장부!
 pub static CURRENT_UI_CATEGORY: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::from("Processing")));
+// 🌟 [CRITICAL FIX] SSD에 적히지 않는 실시간 퍼센트 데이터를 붙잡아둘 0.01초 단위 메모리 캐시!
+pub static LATEST_PROGRESS_PAYLOAD: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::new(None));
 
 pub struct AppState {
     pub model: Arc<TokioMutex<Option<LogisModel>>>,
@@ -37,26 +38,27 @@ pub struct AppState {
 
 #[tauri::command]
 async fn get_active_task_context() -> Result<Value, String> {
-    // 1. 메모리 참조 (가장 빠르고 정확함)
-    if let Some(mem_task) = crate::ACTIVE_TASK_MEM.read().unwrap().clone() {
-        if mem_task.get("id").is_some() {
-            return Ok(mem_task);
-        }
-    }
+    let mut result = json!(null);
     
-    // 2. 파일 참조 (앱이 재시작되었거나 메모리가 날아갔을 경우 tmp/index.json)
-    let path = "tmp/index.json";
-    if let Ok(content) = std::fs::read_to_string(path) {
-        if let Ok(val) = serde_json::from_str::<Value>(&content) {
-            if val.get("id").is_some() {
-                // 메모리에 다시 복구시켜 둠
-                if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() {
-                    *w = Some(val.clone());
+    // 🌟 [성능 최적화] 무의미한 파일(tmp/index.json) 폴백을 완전히 제거하고 순수 RAM만 참조합니다!
+    if let Some(mem_task) = crate::ACTIVE_TASK_MEM.read().unwrap().clone() {
+        if mem_task.get("id").is_some() { result = mem_task; }
+    }
+
+    // 🌟 [CRITICAL FIX] 앱이 켜질 때 깜빡거림 방지: 활성화된 작업이 있다면, 메모리에 담긴 최신 퍼센트 요약본도 꽂아줍니다!
+    if !result.is_null() {
+        if let Ok(mem) = crate::LATEST_PROGRESS_PAYLOAD.read() {
+            if let Some(latest) = mem.as_ref() {
+                if result.get("id") == latest.get("task_id") {
+                    if let Some(summary) = latest.get("summary") {
+                        result.as_object_mut().unwrap().insert("summary".to_string(), summary.clone());
+                    }
                 }
-                return Ok(val);
             }
         }
+        return Ok(result);
     }
+    
     Ok(json!(null))
 }
 
@@ -1066,12 +1068,22 @@ async fn get_active_tasks(state: State<'_, AppState>) -> Result<Vec<store::Task>
 #[tauri::command]
 async fn get_task_logs(app_handle: tauri::AppHandle, task_id: String) -> Result<Vec<Value>, String> {
     let log_path = crate::utils::paths::get_task_log_file(Some(&app_handle), &task_id);
-    if !log_path.exists() { return Ok(vec![]); }
+    let mut logs: Vec<Value> = if log_path.exists() {
+        let content = std::fs::read_to_string(log_path).map_err(|e| e.to_string())?;
+        content.lines().filter_map(|line| serde_json::from_str(line).ok()).collect()
+    } else {
+        vec![]
+    };
 
-    let content = std::fs::read_to_string(log_path).map_err(|e| e.to_string())?;
-    let logs = content.lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
+    // 🌟 [CRITICAL FIX] 파일 로그를 다 읽어온 뒤, 메모리에 남아있는 가장 최신 퍼센트 페이로드를 맨 뒤에 슬쩍 끼워 넣습니다!
+    if let Ok(mem) = crate::LATEST_PROGRESS_PAYLOAD.read() {
+        if let Some(latest) = mem.as_ref() {
+            if latest.get("task_id").and_then(|v| v.as_str()) == Some(task_id.as_str()) {
+                logs.push(latest.clone());
+            }
+        }
+    }
+    
     Ok(logs)
 }
 

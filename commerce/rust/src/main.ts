@@ -2620,7 +2620,8 @@ async function initSession() {
                     id: activeTask.id,
                     task_id: activeTask.id,
                     role: "system_task",
-                    text: "Resuming Task: " + (activeTask.link || "Local Source"),
+                    // 🌟 [CRITICAL FIX] 메모리에 최신 퍼센트 요약본이 있다면 그걸 쓰고, 아니면 기본 문구를 씁니다!
+                    text: activeTask.summary || ("Resuming Task: " + (activeTask.link || "Local Source")),
                     status: activeTask.status,
                     created_at: activeTask.created_at || Date.now(),
                     updated_at: activeTask.updated_at || Date.now()

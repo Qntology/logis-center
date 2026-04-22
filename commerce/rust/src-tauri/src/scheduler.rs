@@ -175,6 +175,10 @@ pub async fn start_background_worker(
     tokio::spawn(async move {
         use tauri::Emitter;
         while let Some(payload) = prx.recv().await {
+            // 🌟 UI로 쏘는 동시에 가장 최신 페이로드를 메모리에 장부 기록!
+            if let Ok(mut w) = crate::LATEST_PROGRESS_PAYLOAD.write() {
+                *w = Some(payload.clone());
+            }
             let _ = app_handle_prog.emit("extraction-progress", &payload);
         }
     });
@@ -263,9 +267,9 @@ pub async fn start_background_worker(
                     Ok(_) => {
                         println!("[Scheduler] Task completed: {}", task.id);
                         
-                        // 🌟 [CRITICAL FIX] 작업 완료 시 메모리와 JSON을 비워줍니다.
+                        // 🌟 [CRITICAL FIX] 작업 완료 시 메모리를 완벽히 비워줍니다. (디스크 초기화 불필요)
                         if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() { *w = None; }
-                        let _ = std::fs::write("tmp/index.json", "{}");
+                        if let Ok(mut w) = crate::LATEST_PROGRESS_PAYLOAD.write() { *w = None; }
 
                         {
                             let mut model_lock = model.lock().await;
@@ -522,11 +526,10 @@ async fn process_task(
         "updated_at": chrono::Utc::now().timestamp_millis()
     });
     
+    // 🌟 [성능 최적화] 파일 쓰기를 없애고 오직 RAM(ACTIVE_TASK_MEM)에만 기록합니다.
     if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() {
         *w = Some(active_task_json.clone());
     }
-    let _ = std::fs::create_dir_all("tmp");
-    let _ = std::fs::write("tmp/index.json", active_task_json.to_string());
 
     if url.is_empty() { return Ok(()); }
 
@@ -665,13 +668,13 @@ async fn process_task(
         let task_question = format!("[TASK] Identify the page type.\n\n[INSTRUCTION]\n{}\n\n[ACTION] RETURN JSON ONLY.", type_prompt);
         let snapshot_id = format!("{}_step_a", task.id);
         
-        if let Ok(content) = std::fs::read_to_string("tmp/index.json") {
-            if let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(obj) = json_val.as_object_mut() {
+        // 🌟 [성능 최적화] 파일 읽기/쓰기를 삭제하고 RAM 메모리에 직접 꽂아 넣습니다.
+        if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() {
+            if let Some(task_val) = w.as_mut() {
+                if let Some(obj) = task_val.as_object_mut() {
                     obj.insert("step".to_string(), json!("Step A (Classification)"));
                     obj.insert("session_id".to_string(), json!(snapshot_id.clone()));
                     obj.insert("kv_path".to_string(), json!(kv_name.clone().unwrap_or_else(|| "tmp/kv/".to_string())));
-                    let _ = std::fs::write("tmp/index.json", json_val.to_string());
                 }
             }
         }
@@ -1048,12 +1051,11 @@ async fn process_task(
                 store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
             };
             
-            // [FIX] Try to load the active origin and type from the shared JSON file (tmp/index.json)
-            // This is the most reliable way to bridge the gap between automation and scheduler.
+            // 🌟 [성능 최적화] 파일 의존성을 제거하고 초고속 RAM에서 origin과 type을 가져옵니다.
             let mut shared_origin = None;
             let mut shared_type = None;
-            if let Ok(content) = std::fs::read_to_string("tmp/index.json") {
-                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Ok(mem) = crate::ACTIVE_TASK_MEM.read() {
+                if let Some(json_val) = mem.as_ref() {
                     if let Some(o) = json_val.get("origin").and_then(|v| v.as_str()) {
                         if let Ok(u) = url::Url::parse(o) {
                             shared_origin = Some(format!("{}://{}", u.scheme(), u.host_str().unwrap_or("localhost")));
@@ -1537,6 +1539,10 @@ pub fn log_task_progress(app: &tauri::AppHandle, task_id: &str, payload: &serde_
         if let Ok(mut w) = crate::CURRENT_UI_CATEGORY.write() {
             *w = cat.to_string();
         }
+    }
+    // 🌟 파일 기록 이벤트도 메모리 장부에 일관되게 남겨줍니다.
+    if let Ok(mut w) = crate::LATEST_PROGRESS_PAYLOAD.write() {
+        *w = Some(payload.clone());
     }
 }
 
