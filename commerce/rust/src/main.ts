@@ -176,8 +176,7 @@ function startSpinner() {
     
     if (settingsBtn) {
         settingsBtn.classList.add("active-spinner-mode");
-        if (btnExtract) btnExtract.style.display = "none";
-        // 🌟 검색 중이라면 검색 버튼(#btn-submit)도 즉시 숨겨줍니다.
+        // 🌟 [CRITICAL FIX] 글로벌 스피너가 돌 때 번개 버튼을 무조건 숨기던 코드를 제거합니다! (대기열 큐잉 허용)
         if (isSearching && btnSubmit) btnSubmit.style.display = "none";
     }
     
@@ -311,17 +310,9 @@ if (pillNav) {
     });
 }
 
-// --- Search & Main Nav ---
 async function updateExtractButtonVisibility() {
     if (!btnExtract) return;
     
-    // [UI-FIX] If already extracting or the global spinner is active, keep the button hidden
-    if (isExtracting || spinnerInterval) {
-        btnExtract.style.display = "none";
-        btnExtract.classList.remove("active-spinner");
-        return;
-    }
-
     if (currentImage) {
         btnExtract.style.display = "flex";
         btnExtract.innerHTML = "⚡";
@@ -330,41 +321,20 @@ async function updateExtractButtonVisibility() {
         return;
     }
 
-    // [FIX] Only show extract button if it's a confirmed shop domain
     if (!currentDetectedUrl || !isCurrentShop) {
         btnExtract.style.display = "none";
         return;
     }
 
-    // [UI-FIX] Show the button immediately before performing async checks
+    // 🌟 [CRITICAL FIX] 스피너는 우측 끝 설정 버튼(💬)에만 맡기고, 번개 버튼은 무조건 ⚡ 고정!
     btnExtract.style.display = "flex";
     btnExtract.innerHTML = "⚡";
     btnExtract.classList.remove("active-spinner");
 
     try {
         const urlObj = new URL(currentDetectedUrl.toLowerCase());
-        const hostname = urlObj.hostname; 
-        const link = (urlObj.pathname + urlObj.search).toLowerCase();
-        const ccHash = await hashId(hostname); 
-        const hashedRefId = await hashId(ccHash + link);
-        
-        btnExtract.title = `Extract from ${hostname}`;
-
-        const isActive = await invoke<boolean>("check_active_task", {
-                    payload: { cc: ccHash, ref: hashedRefId }
-                });
-        
-        // [FIX] Priority Guard: Even if server says active, trust the local isExtracting flag
-        // especially during the transition period after clicking Stop button.
-        if (isActive === true && isExtracting) {
-            btnExtract.classList.add("active-spinner");
-            btnExtract.title = "Extraction in progress...";
-            if (!spinnerInterval) startSpinner(); 
-        } else if (!isExtracting) {
-            // Ensure UI is reset if we are definitely not extracting
-            btnExtract.classList.remove("active-spinner");
-            btnExtract.innerText = "⚡";
-        }
+        btnExtract.title = `Extract from ${urlObj.hostname}`;
+        // 🌟 불필요한 백엔드 작업 체크(check_active_task) 및 스피너 변환 로직 완전 삭제 (속도 향상!)
     } catch (e) { 
         console.warn("[WIDGET] visibility check error:", e);
     }
@@ -979,6 +949,17 @@ btnExtract?.addEventListener("click", async () => {
             startSpinner();
         }
         const taskId = `task_${Date.now()}`;
+
+        // 🌟 [CRITICAL FIX 1] 번개(⚡) 버튼도 돋보기(🔍)처럼 누르자마자 즉시 📥 PENDING 상태를 화면에 띄웁니다!
+        renderMessage({
+            id: taskId,
+            role: "system_task",
+            text: currentImage ? "Task Started: Local Image" : "Task Started: " + (currentDetectedUrl || "Unknown URL"),
+            status: 10, // Pending 상태
+            created_at: Date.now(),
+            updated_at: Date.now(),
+            task_id: taskId
+        });
         
         // 🌟 [핵심 분기] Cloud Mode 체크
         const isCloudMode = (document.getElementById("cloud-mode-toggle") as HTMLInputElement)?.checked;
@@ -1069,7 +1050,12 @@ btnExtract?.addEventListener("click", async () => {
                 console.log("[WIDGET] Queuing LOCAL IMAGE task...");
                 await emit("new-task-from-browser", { 
                     id: taskId, type: "image_extraction", image_path: currentImage, 
-                    ref: currentImage, link: "Local Image",
+                    // 🌟 [CRITICAL FIX 2] 이미지를 올릴 때도 현재 보고 있는 폴더/페이지의 필터 꼬리표(cc, bcc)를 달아줍니다! 
+                    // (이게 없어서 DB에 저장되더라도 화면의 3초 폴링 필터링에서 걸러져서 아예 안 보였던 것입니다)
+                    ref: activeContext.ref || currentImage, 
+                    cc: activeContext.cc || "",
+                    bcc: activeContext.bcc || "",
+                    link: "Local Image",
                     device_preference: getDevicePref(), search_mode: currentSearchMode
                 });
             } else {
@@ -1083,7 +1069,11 @@ btnExtract?.addEventListener("click", async () => {
                     
                     await emit("new-task-from-browser", { 
                         id: taskId, type: "html_extraction", html: html, link: rawPath, 
-                        cc: cc, ref: hashedRefId, from: currentSession.address, to: currentSession.team,
+                        // 🌟 [CRITICAL FIX 1] 이미지 전처리와 동일하게, 웹페이지 전처리도 현재 UI 필터(activeContext)를 유지하도록 꼬리표를 부착합니다!
+                        cc: activeContext.cc || cc, 
+                        ref: activeContext.ref || hashedRefId, 
+                        bcc: activeContext.bcc || "", 
+                        from: currentSession.address, to: currentSession.team,
                         device_preference: getDevicePref()
                     });
                 } catch (e) {
@@ -2307,7 +2297,7 @@ async function performQrAuth() {
     if (!chatTalks || !currentSession.hash) return;
     const existing = document.getElementById("msg-qr-auth");
     if (existing) existing.remove();
-    const html = `<div class="chat-talk system" id="msg-qr-auth"><div class="chat-message" style="padding:0; background: #fff; color: #000; border:0;"><div style="font-size:0.75rem; font-weight: bold; margin-bottom: 15px; color: #333;"><span id="qr-auth-spinner" class="active-spinner" style="margin-right:5px; font-family:monospace; color:var(--primary); font-weight:bold;">⠋</span>Scan the QR code</div><div id="qr-code-target" style="display: inline-block; background: #fff; border-radius: 8px;"></div></div></div>`;
+    const html = `<div class="chat-talk system" id="msg-qr-auth" data-created-at="9999999999999"><div class="chat-message" style="padding:0; background: #fff; color: #000; border:0;"><div style="font-size:0.75rem; font-weight: bold; margin-bottom: 15px; color: #333;"><span id="qr-auth-spinner" class="active-spinner" style="margin-right:5px; font-family:monospace; color:var(--primary); font-weight:bold;">⠋</span>Scan the QR code</div><div id="qr-code-target" style="display: inline-block; background: #fff; border-radius: 8px;"></div></div></div>`;
     chatTalks.insertAdjacentHTML('beforeend', html);
     const qrTarget = document.getElementById("qr-code-target");
     if (qrTarget) {
@@ -2379,17 +2369,34 @@ async function initSession() {
             await renderNavigation();
         }
 
-        // 활성화된 Task(작업) 스피너 복구
-        if (data.tasks && data.tasks.length > 0) {
-            const lastTask = data.tasks[data.tasks.length - 1];
-            renderMessage({ 
-                id: lastTask.id, role: "system_task", 
-                content: `Resuming: ${lastTask.id}`, 
-                status: 1, created_at: Date.now() 
-            });
-            isExtracting = true;
-            startSpinner();
+        // 🌟 [CRITICAL FIX] 앱(창) 새로고침 시, DB가 아닌 백엔드 메모리/JSON 백업에서 진행 중인 작업을 확실하게 복구합니다!
+        try {
+            const activeTask = await invoke<any>("get_active_task_context");
+            if (activeTask && activeTask.id && (activeTask.status === 1 || activeTask.status === 10)) {
+                console.log("[WIDGET] Resuming active task from fallback:", activeTask.id);
+                
+                renderMessage({
+                    id: activeTask.id,
+                    task_id: activeTask.id,
+                    role: "system_task",
+                    text: "Resuming Task: " + (activeTask.link || "Local Source"),
+                    status: activeTask.status,
+                    created_at: activeTask.created_at || Date.now(),
+                    updated_at: activeTask.updated_at || Date.now()
+                });
+                
+                // 프론트엔드의 진행 상태 락(Lock)을 다시 걸어주고 스피너를 돌립니다.
+                isExtracting = true;
+                activeTaskId = activeTask.id; // 현재 활성화된 작업 ID 복구
+                startSpinner();
+                
+                // 진행 중 버튼 상태 동기화
+                await updateExtractButtonVisibility();
+            }
+        } catch (err) {
+            console.warn("[WIDGET] No active task to resume or failed to fetch:", err);
         }
+
     } catch (e) { 
         console.error("[WIDGET] Handshake failed:", e); 
     }
@@ -2848,16 +2855,10 @@ interface ChatMessage {
 function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append') {
     if (!chatTalks) return;
 
-    // [Slack/Discord Style] Chronological Order (Oldest -> Newest)
     const sortedBatch = [...messages].sort((a, b) => a.created_at - b.created_at);
-
-    // Capture scroll state for history loading (prepend)
     const scrollEl = document.getElementById("chat-scroll");
     const prevScrollHeight = scrollEl ? scrollEl.scrollHeight : 0;
     const prevScrollTop = scrollEl ? scrollEl.scrollTop : 0;
-
-    // For 'prepend' mode (History), we iterate from Newest to Oldest in the batch 
-    // and prepend each, so the absolute Oldest ends up at the very top.
     const processBatch = mode === 'prepend' ? [...sortedBatch].reverse() : sortedBatch;
 
     processBatch.forEach(msg => {
@@ -2875,56 +2876,57 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
 
         const displayMsg: ChatMessage = { ...msg, text: textContent };
         
-        // [ID-SELECTOR] Use attribute selector to handle hashes/0x safely
-        const existingEl = chatTalks.querySelector(`[id="${msg.id}"]`) as HTMLElement;
+        // 🌟 [CRITICAL FIX 3] DOM 충돌 방지: 업데이트할 요소를 찾을 때 msg.id 대신 생성된 domId를 기준으로 찾습니다!
+        const isTask = displayMsg.role === "system_task" || (displayMsg.role === "user" && !!displayMsg.task_id && displayMsg.task_id.startsWith("search_"));
+        const domId = isTask ? (displayMsg.task_id || displayMsg.id) : displayMsg.id;
+        
+        const existingEl = chatTalks.querySelector(`[id="${domId}"]`) as HTMLElement;
 
         if (existingEl) {
-            // [UPDATE] Diff Check
             const cachedUpdatedAt = parseInt(existingEl.dataset.updatedAt || "0");
             const cachedStatus = parseInt(existingEl.dataset.status || "0");
             
             if (msg.updated_at > cachedUpdatedAt || msg.status !== cachedStatus) {
-                console.log(`[Chat] Updating ${msg.id}`);
+                console.log(`[Chat] Updating ${domId}`);
                 existingEl.outerHTML = createMessageHTML(displayMsg);
                 
-                const newEl = chatTalks.querySelector(`[id="${msg.id}"]`) as HTMLElement;
+                const newEl = chatTalks.querySelector(`[id="${domId}"]`) as HTMLElement;
                 if (newEl) {
                     newEl.classList.add("updated-flash");
                     setTimeout(() => newEl?.classList.remove("updated-flash"), 1000);
-                    
-                    // 🌟 [CRITICAL FIX 2] 개조된 규칙에 맞춰 클릭 이벤트를 바인딩합니다.
-                    const isClickable = displayMsg.role === "system_task" || (displayMsg.role === "user" && !!displayMsg.task_id && displayMsg.task_id.startsWith("search_"));
-                    if (isClickable) { newEl.onclick = () => handleTaskClick(newEl); }
+                    if (isTask) { newEl.onclick = () => handleTaskClick(newEl); }
                 }
             }
         } else {
-            // [INSERT] New Message
             const temp = document.createElement('div');
             temp.innerHTML = createMessageHTML(displayMsg);
             const newEl = temp.firstElementChild as HTMLElement;
-            
-            const isClickable = displayMsg.role === "system_task" || (displayMsg.role === "user" && !!displayMsg.task_id && displayMsg.task_id.startsWith("search_"));
-            if (isClickable) { newEl.onclick = () => handleTaskClick(newEl); }
+            if (isTask) { newEl.onclick = () => handleTaskClick(newEl); }
 
-            if (mode === 'prepend') {
-                chatTalks.prepend(newEl);
-            } else {
+            // 🌟 [CRITICAL FIX 4] QR 널뛰기 방지: 무식한 재정렬(sort)을 버리고, 시간순에 맞는 위치를 찾아 살포시 끼워넣습니다 (insertBefore)!
+            let inserted = false;
+            const currentChildren = Array.from(chatTalks.children) as HTMLElement[];
+            for (let i = 0; i < currentChildren.length; i++) {
+                const childTime = parseInt(currentChildren[i].dataset.createdAt || "0");
+                if (displayMsg.created_at < childTime) {
+                    chatTalks.insertBefore(newEl, currentChildren[i]);
+                    inserted = true;
+                    break;
+                }
+            }
+            if (!inserted) {
                 chatTalks.appendChild(newEl);
             }
         }
     });
 
-    // 🌟 [CRITICAL FIX 3] Race Condition 방지: 삽입이 끝난 후 무조건 생성시간(created_at) 기준으로 DOM 전체를 정렬!
-    const children = Array.from(chatTalks.children) as HTMLElement[];
-    children.sort((a, b) => parseInt(a.dataset.createdAt || "0") - parseInt(b.dataset.createdAt || "0"));
-    children.forEach(child => chatTalks.appendChild(child));
+    // 🌟 (이전에 있던 children.sort와 forEach appendChild는 완전히 삭제되었습니다!)
 
     // [Scroll Maintenance]
     if (mode === 'prepend' && scrollEl) {
         const newScrollHeight = scrollEl.scrollHeight;
         const heightDiff = newScrollHeight - prevScrollHeight;
         if (heightDiff > 0) {
-            // [FIX] Update custom scroll engine's Y position to maintain visual spot
             currentY += heightDiff;
             updateTransform();
         }
@@ -2932,7 +2934,6 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
         const container = document.querySelector(".chat-container") as HTMLElement;
         const maxScroll = Math.max(0, scrollEl.scrollHeight - (container?.clientHeight || 0));
         
-        // Snapping to bottom if close to bottom or initial load
         if (prevScrollHeight === 0 || (currentY >= prevScrollHeight - (container?.clientHeight || 0) - 50)) {
             currentY = maxScroll;
             updateTransform();
@@ -2956,8 +2957,11 @@ function createMessageHTML(msg: ChatMessage) {
     // 🌟 [CRITICAL FIX 1] 사용자의 검색 쿼리(@YOU)이면서 task_id가 있는 경우 컨트롤 가능한 Task Bubble로 만듭니다!
     const isTaskBubble = msg.role === "system_task" || (msg.role === "user" && !!msg.task_id && msg.task_id.startsWith("search_"));
     const roleClass = msg.role === "user" ? "user" : "system";
+    
+    // 🌟 [CRITICAL FIX 2] Task일 경우 DB에서 날아온 고유 id 대신 task_id를 우선시하여 DOM을 생성합니다! (새로고침 시 증발 방지)
+    const domId = isTaskBubble ? (msg.task_id || msg.id) : msg.id;
 
-    return `<div id="${msg.id}" class="chat-talk ${roleClass} ${isTaskBubble ? 'task-bubble' : ''}" 
+    return `<div id="${domId}" class="chat-talk ${roleClass} ${isTaskBubble ? 'task-bubble' : ''}" 
         data-task-id="${msg.task_id || msg.id}" 
         data-status="${msg.status}" 
         data-updated-at="${msg.updated_at || msg.created_at}"
@@ -3022,10 +3026,34 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
             finalFilter = baseFilter ? `${baseFilter} AND ${syncFilter}` : syncFilter;
         }
 
-        const limit = 10;
+        const limit = 10; 
         const offset = 0;
 
+        // 👇 백엔드 쿼리 직후에 메모리(JSON)에서 강제로 데이터를 꺼내와 messages 배열에 끼워 넣는 로직이 추가되었습니다.
         const messages = await invoke<any[]>("get_chat_messages", { limit: limit, offset: offset, filter: finalFilter });
+        
+        // 🌟 [CRITICAL FIX] 사용자님 제안 로직: DB 필터링 버그를 완벽히 무시하고, 메모리/JSON에서 무조건 활성 Task를 구출해 강제 삽입합니다!
+        try {
+            const activeTask = await invoke<any>("get_active_task_context");
+            if (activeTask && activeTask.id) {
+                const exists = messages.find(m => m.id === activeTask.id || m.task_id === activeTask.id);
+                if (!exists) {
+                    console.log("[WIDGET] Injecting Active Task from Memory/JSON fallback:", activeTask.id);
+                    messages.push({
+                        id: activeTask.id,
+                        task_id: activeTask.id,
+                        role: "system_task",
+                        text: "Task Started: " + (activeTask.link || "Local Source"),
+                        status: activeTask.status || 1,
+                        created_at: activeTask.created_at || Date.now(),
+                        updated_at: activeTask.updated_at || Date.now()
+                    });
+                }
+            }
+        } catch (e) {
+            console.warn("[WIDGET] Failed to fetch active task fallback:", e);
+        }
+
         const scrollEl = document.getElementById("chat-scroll") as HTMLElement;
 
         if (chatTalks) {
@@ -3041,13 +3069,13 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                 if (isHistory) chatHasMore = false;
 
                 if (!isHistory && chatTalks.querySelectorAll('.chat-talk').length === 0) {
-                    chatTalks.insertAdjacentHTML('beforeend', "<div class='no-msg' style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>");
+                    chatTalks.insertAdjacentHTML('beforeend', "<div class='no-msg' data-created-at=\"0\" style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>");
                 }
             }
 
             // [UI] Show "End of history" if no more past messages
             if (isHistory && !chatHasMore && !chatTalks.querySelector('.chat-history-end')) {
-                const endHtml = `<div class="chat-talk system chat-history-end" style="text-align:center; opacity:0.4; font-size:0.6rem; padding:15px 10px;">
+                const endHtml = `<div class="chat-talk system chat-history-end" data-created-at="0" style="text-align:center; opacity:0.4; font-size:0.6rem; padding:15px 10px;">
                     <div style="border-top:1px solid rgba(255,255,255,0.05); margin-bottom:10px;"></div>
                     <span>No more older messages</span>
                 </div>`;

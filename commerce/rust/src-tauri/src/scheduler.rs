@@ -253,12 +253,20 @@ pub async fn start_background_worker(
                     let store_guard = store.lock().await;
                     if let Some(db) = store_guard.as_ref() {
                         let _ = db.update_task_status(&task.id, crate::logic::parse_status("progress")).await;
+                        // 🌟 [CRITICAL FIX] 말풍선 텍스트를 "Processing..."으로 강제 지정하여 DB 레코드가 튕기거나 증발하는 것을 100% 방지합니다!
+                        let _ = db.update_message_status(&task.id, crate::logic::parse_status("progress"), Some("Processing...")).await;
                     }
                 }
 
+                // 👇 Ok(_) 와 Err(e) 바로 밑에 메모리 초기화 코드가 추가되었습니다.
                 match process_task(task.clone(), &store, &model, &cancellation_token, &app_handle, current_device_pref.clone()).await {
                     Ok(_) => {
                         println!("[Scheduler] Task completed: {}", task.id);
+                        
+                        // 🌟 [CRITICAL FIX] 작업 완료 시 메모리와 JSON을 비워줍니다.
+                        if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() { *w = None; }
+                        let _ = std::fs::write("tmp/index.json", "{}");
+
                         {
                             let mut model_lock = model.lock().await;
                             if let Some(m) = model_lock.as_ref() {
@@ -271,7 +279,10 @@ pub async fn start_background_worker(
                         let store_guard = store.lock().await;
                         if let Some(db) = store_guard.as_ref() {
                             let _ = db.update_task_status(&task.id, crate::logic::parse_status("complete")).await;
+                            // 🌟 [CRITICAL FIX] 말풍선 상태도 확실하게 9로 한 번 더 못을 박고 텍스트를 업데이트해 DB의 updated_at을 강제 갱신합니다!
+                            let _ = db.update_message_status(&task.id, crate::logic::parse_status("complete"), Some("Task Completed")).await;
                         }
+
                         // [NEW] 성공 시에만 리소스 정리 및 모드 리셋
                         cleanup_task_resources(&task.id, Some(&app_handle));
                         current_device_pref = None; 
@@ -280,6 +291,10 @@ pub async fn start_background_worker(
                         let err_msg = e.to_string();
                         println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, err_msg);
                         
+                        // 🌟 [CRITICAL FIX] 작업 실패/에러 시에도 메모리와 JSON을 비워줍니다.
+                        if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() { *w = None; }
+                        let _ = std::fs::write("tmp/index.json", "{}");
+
                         // [PERSISTENT-ERROR-LOG] 작업 디렉토리에 에러 사유 기록
                         let task_dir = utils::paths::get_task_specific_dir(Some(&app_handle), &task.id);
                         if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
@@ -494,6 +509,23 @@ async fn process_task(
     }
 
     let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    
+    // 🌟 [CRITICAL FIX] 사용자님 제안 로직: 메모리 및 tmp/index.json 에 진행중인 Task 강제 기록!
+    let active_task_json = json!({
+        "id": task.id.clone(),
+        "type": task.r#type.clone(),
+        "link": url.clone(),
+        "status": 1, // Processing
+        "created_at": task.created_at,
+        "updated_at": chrono::Utc::now().timestamp_millis()
+    });
+    
+    if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() {
+        *w = Some(active_task_json.clone());
+    }
+    let _ = std::fs::create_dir_all("tmp");
+    let _ = std::fs::write("tmp/index.json", active_task_json.to_string());
+
     if url.is_empty() { return Ok(()); }
 
     // [RESUME-LOGIC] Check if PUG already exists

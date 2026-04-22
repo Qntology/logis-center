@@ -1080,7 +1080,8 @@ impl LogisModel {
                 // 🌟 [CRITICAL FIX] 이미지 데이터 저장 직후, DB의 Task와 Message 상태도 9(DONE)로 완전히 굳혀버립니다!
                 // 이 두 줄이 없어서 3초마다 UI가 이전 상태(1)를 DB에서 퍼와 덮어씌우고 있었습니다.
                 let _ = db.update_task_status(&task_id, 9).await;
-                let _ = db.update_message_status(&task_id, 9, None).await;
+                // 🌟 [CRITICAL FIX] None 대신 명시적인 텍스트를 넣어 DB의 updated_at 필드가 무조건 갱신되도록 강제합니다!
+                let _ = db.update_message_status(&task_id, 9, Some("Extraction Complete")).await;
             }
             
             emit_term("[SUCCESS] Task Completed. Data saved.");

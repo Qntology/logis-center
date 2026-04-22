@@ -12,8 +12,10 @@ pub mod openai_types;
 pub mod chat_template;
 pub mod tokenizer;
 
-use tauri::{State, Manager, Listener}; // Added Manager
+use tauri::{State, Manager, Listener}; 
 use tokio::sync::Mutex as TokioMutex;
+use std::sync::RwLock; // 🌟 추가
+use once_cell::sync::Lazy; // 🌟 추가
 use model::LogisModel;
 use store::{VectorStore, TradeDocument};
 use std::sync::Arc;
@@ -23,10 +25,37 @@ use serde_json::{Value, json};
 // 🌟 [CRITICAL FIX] 전역 검색 상태 락: 검색 중 스레드 데드락 방지
 static IS_SEARCHING: AtomicBool = AtomicBool::new(false);
 
+pub static ACTIVE_TASK_MEM: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::new(None));
+
 pub struct AppState {
     pub model: Arc<TokioMutex<Option<LogisModel>>>,
     pub store: Arc<TokioMutex<Option<VectorStore>>>,
     pub cancellation_token: Arc<AtomicBool>,
+}
+
+#[tauri::command]
+async fn get_active_task_context() -> Result<Value, String> {
+    // 1. 메모리 참조 (가장 빠르고 정확함)
+    if let Some(mem_task) = crate::ACTIVE_TASK_MEM.read().unwrap().clone() {
+        if mem_task.get("id").is_some() {
+            return Ok(mem_task);
+        }
+    }
+    
+    // 2. 파일 참조 (앱이 재시작되었거나 메모리가 날아갔을 경우 tmp/index.json)
+    let path = "tmp/index.json";
+    if let Ok(content) = std::fs::read_to_string(path) {
+        if let Ok(val) = serde_json::from_str::<Value>(&content) {
+            if val.get("id").is_some() {
+                // 메모리에 다시 복구시켜 둠
+                if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() {
+                    *w = Some(val.clone());
+                }
+                return Ok(val);
+            }
+        }
+    }
+    Ok(json!(null))
 }
 
 #[tauri::command]
@@ -606,7 +635,7 @@ async fn ai_search_complex(
                 model.parse_commerce_query(&task_id, &app_handle, query.clone(), &language, &metrics_json_str, cancel_token.clone()).await.map_err(|e| e.to_string())?
             }
         };
-        
+
         if let (Some(store), Some(ctx_arr)) = (store_opt.clone(), structured_query.get("context").and_then(|v| v.as_array())) {
             for ctx in ctx_arr {
                 // 🌟 매 루프마다 사용자가 Cancel 버튼을 눌렀는지 체크!
@@ -914,8 +943,32 @@ async fn get_chat_messages(
 ) -> Result<Vec<Value>, String> {
     let store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
-        db.get_all_messages(limit, offset, filter).await.map_err(|e| e.to_string())
-    } else { Ok(vec![]) }
+        // 1. 일반 메시지 쿼리 (프론트엔드에서 요청한 limit, offset 적용)
+        let mut messages = db.get_all_messages(limit, offset, filter.clone()).await.unwrap_or_default();
+        
+        // 🌟 [근본 해결책] 2. limit에 밀려 잘려나가는 것을 방지하기 위해, 
+        // 진행 중(1)이거나 대기 중(10)인 활성 Task는 DB에서 한 번 더 쿼리하여 무조건 포함시킵니다!
+        let active_filter = if let Some(ref f) = filter {
+            format!("({}) AND status IN (1, 10)", f)
+        } else {
+            "status IN (1, 10)".to_string()
+        };
+
+        if let Ok(active_msgs) = db.get_all_messages(50, 0, Some(active_filter)).await {
+            for active_msg in active_msgs {
+                let active_id = active_msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                
+                // 중복 방지: 이미 일반 쿼리(1번) 결과에 포함되어 있지 않은 녀석만 배열에 쏙 끼워 넣습니다.
+                if !messages.iter().any(|m| m.get("id").and_then(|v| v.as_str()).unwrap_or("") == active_id) {
+                    messages.push(active_msg);
+                }
+            }
+        }
+        
+        Ok(messages)
+    } else { 
+        Ok(vec![]) 
+    }
 }
 
 
@@ -1254,7 +1307,8 @@ pub fn run() {
             resize_window, start_drag, move_to_top_center, set_login_state, check_active_task, get_chat_messages, proxy_fetch,
             get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
             upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message, check_gpu_availability,
-            save_mobile_temp_file, crate::utils::network::get_local_network_prefix, crate::utils::network::get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer
+            save_mobile_temp_file, crate::utils::network::get_local_network_prefix, crate::utils::network::get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer,
+            get_active_task_context // 🌟 새로 추가됨
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
