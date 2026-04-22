@@ -929,3 +929,4 @@ input[type="checkbox"]:checked ~ .logis-child {
 
 #detail-content{overflow-y:auto; flex:1; font-size: 0.85rem; padding:0 1em 1em;}
 .progress-container{display:flex; flex-direction:column; gap:5px;}
+#progress-container:empty{margin-bottom: 14px;}

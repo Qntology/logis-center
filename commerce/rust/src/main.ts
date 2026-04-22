@@ -312,31 +312,68 @@ if (pillNav) {
 
 async function updateExtractButtonVisibility() {
     if (!btnExtract) return;
-    
+
+    // 🌟 1. 이미지가 올라와 있을 때 중복 대기열 방어 로직 추가
     if (currentImage) {
-        btnExtract.style.display = "flex";
-        btnExtract.innerHTML = "⚡";
-        btnExtract.classList.remove("active-spinner");
-        btnExtract.title = "Extract from Image";
+        try {
+            const ccHash = activeContext.cc || "";
+            const imageRefHash = await hashId(currentImage); // 현재 띄워진 이미지의 고유 지문 생성
+
+            // 백엔드에 이 이미지가 대기 중이거나 진행 중인지 확인 요청
+            const isImageActive = await invoke<boolean>("check_active_task", {
+                payload: { cc: ccHash, ref: imageRefHash }
+            });
+
+            if (isImageActive) {
+                // 🌟 똑같은 이미지가 이미 큐에 있다면 버튼을 띄우지 않습니다! (중복 방지)
+                btnExtract.style.display = "none";
+            } else {
+                btnExtract.style.display = "flex";
+                btnExtract.innerHTML = "⚡";
+                btnExtract.classList.remove("active-spinner");
+                btnExtract.title = "Extract from Image";
+            }
+        } catch (e) {
+            btnExtract.style.display = "flex";
+        }
         return;
     }
 
+    // 🌟 2. 분석 가능한 샵 도메인이나 허용된 페이지가 아니면 숨김
     if (!currentDetectedUrl || !isCurrentShop) {
         btnExtract.style.display = "none";
         return;
     }
 
-    // 🌟 [CRITICAL FIX] 스피너는 우측 끝 설정 버튼(💬)에만 맡기고, 번개 버튼은 무조건 ⚡ 고정!
-    btnExtract.style.display = "flex";
-    btnExtract.innerHTML = "⚡";
-    btnExtract.classList.remove("active-spinner");
-
     try {
         const urlObj = new URL(currentDetectedUrl.toLowerCase());
-        btnExtract.title = `Extract from ${urlObj.hostname}`;
-        // 🌟 불필요한 백엔드 작업 체크(check_active_task) 및 스피너 변환 로직 완전 삭제 (속도 향상!)
-    } catch (e) { 
+        const hostname = urlObj.hostname;
+        const link = (urlObj.pathname + urlObj.search).toLowerCase();
+        const ccHash = await hashId(hostname);
+        const hashedRefId = await hashId(ccHash + link);
+
+        btnExtract.title = `Extract from ${hostname}`;
+
+        // 🌟 3. 백엔드에 '지금 사용자가 보고 있는 이 페이지'가 대기 중(10)이거나 진행 중(1)인지 물어봅니다.
+        const isActive = await invoke<boolean>("check_active_task", {
+            payload: { cc: ccHash, ref: hashedRefId }
+        });
+
+        if (isActive) {
+            // 이미 큐에 들어갔거나 AI가 분석 중인 동일한 페이지라면, 중복 클릭을 막기 위해 버튼을 숨깁니다.
+            btnExtract.style.display = "none";
+        } else {
+            // 다른 페이지에 접속했거나, 이 페이지의 작업이 완전히 완료(✅ Done)되었다면 다시 띄워줍니다.
+            btnExtract.style.display = "flex";
+            btnExtract.innerHTML = "⚡";
+            btnExtract.classList.remove("active-spinner");
+        }
+    } catch (e) {
         console.warn("[WIDGET] visibility check error:", e);
+        // 에러 발생 시 사용을 막지 않도록 기본적으로 표시
+        btnExtract.style.display = "flex";
+        btnExtract.innerHTML = "⚡";
+        btnExtract.classList.remove("active-spinner");
     }
 }
 
@@ -1048,11 +1085,13 @@ btnExtract?.addEventListener("click", async () => {
             // ==========================================
             if (currentImage) {
                 console.log("[WIDGET] Queuing LOCAL IMAGE task...");
+                
+                // 🌟 [CRITICAL FIX] 중복 방지를 위해 이미지 파일의 절대 경로를 해시하여 해당 이미지만의 고유 지문(ref)을 만듭니다!
+                const imageRefHash = await hashId(currentImage);
+
                 await emit("new-task-from-browser", { 
                     id: taskId, type: "image_extraction", image_path: currentImage, 
-                    // 🌟 [CRITICAL FIX 2] 이미지를 올릴 때도 현재 보고 있는 폴더/페이지의 필터 꼬리표(cc, bcc)를 달아줍니다! 
-                    // (이게 없어서 DB에 저장되더라도 화면의 3초 폴링 필터링에서 걸러져서 아예 안 보였던 것입니다)
-                    ref: activeContext.ref || currentImage, 
+                    ref: imageRefHash, // 🌟 이미지 전용 고유 지문 부착
                     cc: activeContext.cc || "",
                     bcc: activeContext.bcc || "",
                     link: "Local Image",
