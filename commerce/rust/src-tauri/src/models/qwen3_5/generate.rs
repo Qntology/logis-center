@@ -304,19 +304,19 @@ impl Qwen3_5GenerateModel {
 
             generate.push(next_token);
             
-            // 🌟 [수정] 1글자씩 뱉던 로직을 버퍼링 로직으로 교체
+            // 🌟 [CRITICAL FIX] 스코프 분리 및 Qwen 3.5 전용 변수명 적용!
+            let mut is_json_finished = false; 
+
             if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
                 print_buffer.push_str(&piece);
                 gen_text_buffer.push_str(&piece);
 
-                // 10글자 이상이거나, 줄바꿈이거나, 끝났을 때만 모아서 출력
                 if print_buffer.len() >= 10 || piece.contains('\n') || next_token == self.eos_token_id {
                     print!("{}", print_buffer);
                     let _ = std::io::stdout().flush();
                     print_buffer.clear(); 
                 }
 
-                let mut is_json_finished = false;
                 if gen_text_buffer.contains('{') {
                     let mut depth = 0;
                     let mut has_started = false;
@@ -330,24 +330,18 @@ impl Qwen3_5GenerateModel {
                             let _ = std::io::stdout().flush();
                         }
                         println!("\n[DEBUG-GEN] Balanced JSON detected. Stopping.");
-                        is_json_finished = true; // 🌟 즉시 break 하지 않고 플래그만 세웁니다!
+                        is_json_finished = true; 
                     }
                 }
             }
 
             let current_pos = seqlen_offset + seq_len;
+            let is_eos = next_token == self.eos_token_id;
             
-            // 🌟 JSON 완성이 감지되었을 때도 마지막 100% 퍼센트를 발송하도록 조건 추가
-            if i % 10 == 0 || next_token == self.eos_token_id || is_json_finished {
-                
-                // 🌟 짧은 JSON이거나 AI가 답변을 스스로 끝냈다면(EOS), 100%로 꽉 채워줍니다.
-                let is_eos = next_id == self.eos_token_id1 || next_id == self.eos_token_id2; 
-                // (참고: Qwen3_5 모델 파일에서는 next_token == self.eos_token_id 입니다.)
-                
+            if i % 10 == 0 || is_eos || is_json_finished {
                 let pct = if is_json_finished || is_eos {
                     100
                 } else {
-                    // 혹시라도 sample_len 이 i 보다 작게 설정되어 100%가 넘어가는 것을 방지
                     (((i as f32) / sample_len as f32) * 100.0).min(99.0) as i32
                 };
                 
@@ -387,11 +381,11 @@ impl Qwen3_5GenerateModel {
                 }
             }
 
-            // 🌟 100% UI 전송이 끝난 뒤에 비로소 루프를 탈출합니다.
-            if next_token == self.eos_token_id || is_json_finished {
-                is_finished = true;
+            // 🌟 generate 함수는 String을 반환하므로 is_finished 플래그 조작 없이 즉시 탈출합니다.
+            if is_eos || is_json_finished {
                 break;
             }
+            
             seqlen_offset += seq_len;
             seq_len = 1;
             input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
@@ -560,19 +554,19 @@ impl Qwen3_5GenerateModel {
             generate.push(next_token);
             final_token = next_token;
 
+            // 🌟 [CRITICAL FIX] 스코프 분리 및 Qwen 3.5 전용 변수명 적용!
+            let mut is_json_finished = false;
+
             if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
                 print_buffer.push_str(&piece);
                 gen_text_buffer.push_str(&piece);
 
-                // 🌟 [핵심] 버퍼에 10글자 이상 모였거나, 줄바꿈이 있거나, 마지막 토큰일 때만 한 번에 화면에 출력(Flush)합니다.
                 if print_buffer.len() >= 10 || piece.contains('\n') || next_token == self.eos_token_id {
                     print!("{}", print_buffer);
                     let _ = std::io::stdout().flush();
-                    print_buffer.clear(); // 출력 후 버퍼 비우기
+                    print_buffer.clear(); 
                 }
 
-                // 중첩 깊이 추적 기반 조기 종료
-                let mut is_json_finished = false;
                 if gen_text_buffer.contains('{') {
                     let mut depth = 0;
                     let mut has_started = false;
@@ -586,24 +580,18 @@ impl Qwen3_5GenerateModel {
                             let _ = std::io::stdout().flush();
                         }
                         println!("\n[DEBUG-GEN] Balanced JSON detected. Stopping.");
-                        is_json_finished = true; // 🌟 즉시 break 하지 않고 플래그만 세웁니다!
+                        is_json_finished = true; 
                     }
                 }
             }
 
             let current_pos = seqlen_offset + seq_len;
+            let is_eos = next_token == self.eos_token_id;
             
-            // 🌟 JSON 완성이 감지되었을 때도 마지막 100% 퍼센트를 발송하도록 조건 추가
-            if i % 10 == 0 || next_token == self.eos_token_id || is_json_finished {
-                
-                // 🌟 짧은 JSON이거나 AI가 답변을 스스로 끝냈다면(EOS), 100%로 꽉 채워줍니다.
-                let is_eos = next_id == self.eos_token_id1 || next_id == self.eos_token_id2; 
-                // (참고: Qwen3_5 모델 파일에서는 next_token == self.eos_token_id 입니다.)
-                
+            if i % 10 == 0 || is_eos || is_json_finished {
                 let pct = if is_json_finished || is_eos {
                     100
                 } else {
-                    // 혹시라도 sample_len 이 i 보다 작게 설정되어 100%가 넘어가는 것을 방지
                     (((i as f32) / sample_len as f32) * 100.0).min(99.0) as i32
                 };
                 
@@ -643,8 +631,8 @@ impl Qwen3_5GenerateModel {
                 }
             }
 
-            // 🌟 100% UI 전송이 끝난 뒤에 비로소 루프를 탈출합니다.
-            if next_token == self.eos_token_id || is_json_finished {
+            // 🌟 generate_part 함수는 is_finished 값을 구조체에 담아 반환해야 하므로 플래그 조작이 필수입니다.
+            if is_eos || is_json_finished {
                 is_finished = true;
                 break;
             }
