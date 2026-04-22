@@ -1523,6 +1523,8 @@ fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
 
 pub fn log_task_progress(app: &tauri::AppHandle, task_id: &str, payload: &serde_json::Value) {
     use std::io::Write;
+    use tauri::Emitter;
+
     let log_path = crate::utils::paths::get_task_log_file(Some(app), task_id);
     
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -1534,16 +1536,18 @@ pub fn log_task_progress(app: &tauri::AppHandle, task_id: &str, payload: &serde_
         let _ = file.write_all(line.as_bytes());
     }
 
-    // 🌟 [성능 최적화] 디스크 I/O를 없애고 초고속 메모리(CURRENT_UI_CATEGORY)에 현재 스텝을 기록합니다!
     if let Some(cat) = payload.get("category").and_then(|v| v.as_str()) {
         if let Ok(mut w) = crate::CURRENT_UI_CATEGORY.write() {
             *w = cat.to_string();
         }
     }
-    // 🌟 파일 기록 이벤트도 메모리 장부에 일관되게 남겨줍니다.
     if let Ok(mut w) = crate::LATEST_PROGRESS_PAYLOAD.write() {
         *w = Some(payload.clone());
     }
+
+    // 🌟 [CRITICAL FIX] 로그 파일에 적히는 모든 내역을 UI로도 즉시 쏘아보냅니다!
+    // 이렇게 하면 새로고침 시 파일에서 읽어오는 내용과 라이브로 찍히는 내용이 100% 일치하여 순서가 절대 꼬이지 않습니다.
+    let _ = app.emit("extraction-progress", payload);
 }
 
 fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {

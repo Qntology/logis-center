@@ -676,7 +676,6 @@ impl QwenVLGenerateModel {
         for i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
             
-            // PCIe Thrashing 방지: 단 한 번의 CPU 다운로드로 모든 패널티/바이아스 일괄 처리
             let mut logits_vec = logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             let len = logits_vec.len();
 
@@ -718,12 +717,12 @@ impl QwenVLGenerateModel {
                 }
             }
 
-            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
-                break; 
-            }
+            let is_eos = next_id == self.eos_token_id1 || next_id == self.eos_token_id2;
+
             gen_ids.push(next_id);
-            let piece = self.tokenizer.token_decode(vec![next_id])?;
-            gen_text.push_str(&piece);
+            if let Ok(piece) = self.tokenizer.token_decode(vec![next_id]) {
+                gen_text.push_str(&piece);
+            }
 
             let mut is_json_finished = false;
             if gen_text.contains('{') {
@@ -735,29 +734,19 @@ impl QwenVLGenerateModel {
                 }
                 if has_started && depth == 0 && gen_text.trim_end().ends_with('}') {
                     println!("[DEBUG-GEN] Balanced JSON detected (Depth 0). Stopping at token {}.", i + 1);
-                    is_json_finished = true; // 🌟 즉시 break 하지 않고 플래그만 세웁니다!
+                    is_json_finished = true; 
                 }
             }
             
             let current_pos = total_tokens_after_prefill + i as usize;
             
-            // 🌟 [디코딩 진행률 로깅 및 UI 전송]
-            // JSON 완성이 감지되었을 때도 마지막 100% 퍼센트를 발송하도록 조건 추가
-            if i % 10 == 0 || next_id == self.eos_token_id1 || next_id == self.eos_token_id2 || is_json_finished {
+            if i % 10 == 0 || is_eos || is_json_finished {
                 let sample_len = mes.max_tokens.unwrap_or(2048) as f32;
                 
-                // 🌟 짧은 JSON이라 일찍 끝났다면 100%로 꽉 채워줍니다.
-                let pct = if is_json_finished || next_id == self.eos_token_id1 || next_id == self.eos_token_id2 {
+                let pct = if is_json_finished || is_eos {
                     100
                 } else {
-                    ((i as f32 / sample_len) * 100.0) as i32
-                };
-                
-                let clean_text = gen_text.replace("\n", " ").replace("\"", "'");
-                let display_text = if clean_text.len() > 35 { 
-                    format!("...{}", &clean_text[clean_text.len()-35..]) 
-                } else { 
-                    clean_text.clone() 
+                    (((i as f32) / sample_len) * 100.0).min(99.0) as i32
                 };
 
                 if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
@@ -769,7 +758,6 @@ impl QwenVLGenerateModel {
                         
                         let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
 
-                        // 🌟 [UI 버그 수정] 지저분한 JSON 파편(display_text)을 빼버리고 깔끔한 고정 텍스트를 띄웁니다!
                         let summary_msg = if task_id.starts_with("search_") {
                             format!("Generating insights ({}%)...", pct)
                         } else {
@@ -791,8 +779,7 @@ impl QwenVLGenerateModel {
                 }
             }
 
-            // 🌟 100% UI 전송이 안전하게 끝난 뒤에 비로소 루프를 탈출합니다.
-            if is_json_finished || next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
+            if is_json_finished || is_eos { 
                 break; 
             }
 

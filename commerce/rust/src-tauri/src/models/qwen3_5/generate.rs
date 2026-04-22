@@ -213,9 +213,6 @@ impl Qwen3_5GenerateModel {
         }
         
         let total_toks = ids_vec.len();
-        
-        // 🌟 [CRITICAL FIX] Qwen 3.5 모델이 0.6B처럼 Base 캐시를 유지하고, 부족한 부분(질문)만 
-        // Partial Prefill 하도록 로직을 완전히 뜯어고쳤습니다! 이제 환각(빈 답변)이 사라집니다.
         let kv_len = self.qwen3_5.language_model.current_kv_len;
 
         let (mut input_ids, mut seqlen_offset) = if kv_len > 0 {
@@ -246,13 +243,10 @@ impl Qwen3_5GenerateModel {
         let mut cur_pixel_values = pixel_values;
         let mut cur_pixel_values_video = pixel_values_video;
 
-        let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(123);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
         
         let is_strict_json = mes_text.contains("/no_think") || mes_text.contains("RETURN JSON ONLY") || mes_text.contains("Return ONLY");
         let mut gen_text_buffer = String::new(); 
-        
-        // 🌟 [추가] generate 함수용 출력 버퍼
         let mut print_buffer = String::new();
 
         for i in 0..sample_len {
@@ -290,7 +284,6 @@ impl Qwen3_5GenerateModel {
 
             if i == 0 {
                 if (self.eos_token_id as usize) < len { logits_vec[self.eos_token_id as usize] = -10000.0; }
-                // 자연스러운 토큰 흐름을 위해 enter_id 억제와 '{' 강제 부스팅을 모두 삭제합니다.
             }
             
             let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
@@ -303,8 +296,7 @@ impl Qwen3_5GenerateModel {
             }
 
             generate.push(next_token);
-            
-            // 🌟 [CRITICAL FIX] 스코프 분리 및 Qwen 3.5 전용 변수명 적용!
+
             let mut is_json_finished = false; 
 
             if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
@@ -344,13 +336,6 @@ impl Qwen3_5GenerateModel {
                 } else {
                     (((i as f32) / sample_len as f32) * 100.0).min(99.0) as i32
                 };
-                
-                let clean_text = gen_text_buffer.replace("\n", " ").replace("\"", "'");
-                let display_text = if clean_text.len() > 35 { 
-                    format!("...{}", &clean_text[clean_text.len()-35..]) 
-                } else { 
-                    clean_text.clone() 
-                };
 
                 if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
                     if let Some(sid) = &session_id {
@@ -381,7 +366,6 @@ impl Qwen3_5GenerateModel {
                 }
             }
 
-            // 🌟 generate 함수는 String을 반환하므로 is_finished 플래그 조작 없이 즉시 탈출합니다.
             if is_eos || is_json_finished {
                 break;
             }
@@ -464,7 +448,6 @@ impl Qwen3_5GenerateModel {
             let total_toks = ids_vec.len();
             let kv_len = self.qwen3_5.language_model.current_kv_len;
 
-            // 🌟 [CRITICAL FIX] generate_part 에서도 Partial Prefill 로직 적용!
             if kv_len > 0 {
                 println!("[PARTIAL-PREFILL] Context partially restored ({}). Prefilling remaining tokens.", kv_len);
                 let (ids, offset) = if kv_len >= total_toks {
@@ -496,15 +479,11 @@ impl Qwen3_5GenerateModel {
 
         crate::models::qwen::generate::wait_for_global_io().await;
 
-        // 🌟 Fix: text 변수 스코프 에러 우회 및 텍스트 추출기용 부스터 조건("Return ONLY") 추가
         let mes_check = self.chat_template.apply_chat_template(mes).unwrap_or_default();
         let is_strict_json = mes_check.contains("/no_think") || mes_check.contains("RETURN JSON ONLY") || mes_check.contains("Return ONLY");
         
-        let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(123);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
         let mut gen_text_buffer = String::new();
-        
-        // 🌟 [추가] 출력을 모아서 하기 위한 전용 버퍼 생성
         let mut print_buffer = String::new();
 
         for i in 0..sample_len {
@@ -527,7 +506,6 @@ impl Qwen3_5GenerateModel {
             let len = logits_vec.len();
 
             if !generate.is_empty() {
-                // 🌟 JSON 모드일 경우 반복 페널티를 사실상 해제(1.01)하여 중간에 끊기는 것을 방지
                 let penalty = if is_strict_json { 1.01 } else { 1.1 }; 
                 let mut set = std::collections::HashSet::new();
                 let start_at = generate.len().saturating_sub(self.repeat_last_n);
@@ -554,7 +532,6 @@ impl Qwen3_5GenerateModel {
             generate.push(next_token);
             final_token = next_token;
 
-            // 🌟 [CRITICAL FIX] 스코프 분리 및 Qwen 3.5 전용 변수명 적용!
             let mut is_json_finished = false;
 
             if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
@@ -595,13 +572,6 @@ impl Qwen3_5GenerateModel {
                     (((i as f32) / sample_len as f32) * 100.0).min(99.0) as i32
                 };
                 
-                let clean_text = gen_text_buffer.replace("\n", " ").replace("\"", "'");
-                let display_text = if clean_text.len() > 35 { 
-                    format!("...{}", &clean_text[clean_text.len()-35..]) 
-                } else { 
-                    clean_text.clone() 
-                };
-
                 if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
                     if let Some(sid) = &session_id {
                         let task_id = if sid.starts_with("task_") || sid.starts_with("img_") || sid.starts_with("search_") {
@@ -631,7 +601,6 @@ impl Qwen3_5GenerateModel {
                 }
             }
 
-            // 🌟 generate_part 함수는 is_finished 값을 구조체에 담아 반환해야 하므로 플래그 조작이 필수입니다.
             if is_eos || is_json_finished {
                 is_finished = true;
                 break;

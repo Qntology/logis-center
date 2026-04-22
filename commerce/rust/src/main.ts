@@ -2553,8 +2553,7 @@ function startPolling() {
     chatPollInterval = window.setInterval(() => {
         if (!isFocus) return; 
         
-        // 🌟 [사용자 요청 반영] 히스토리(Settings) 창이 열려있을 때만 서버에 요청을 보냅니다!
-        // 닫혀있을 때는 백그라운드 서버 통신을 완전히 차단하여 최적화합니다.
+        // 🌟 [사용자 요청 완벽 반영] 히스토리(Settings) 창이 열려있을 때만 서버에 인증/동기화 요청을 보냅니다!
         if (currentTab !== "settings" || !isExpanded) return;
 
         if (!currentSession.email) checkAuthStatus();
