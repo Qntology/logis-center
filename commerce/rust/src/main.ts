@@ -68,6 +68,10 @@ let isFirstChatLoad = true;
 // [NEW] Window Focus State (백그라운드 리소스 최적화용)
 let isFocus = true;
 
+// 🌟 [CRITICAL FIX] 새로고침 시 스텝 순서 꼬임 방지용 대기열
+let isFetchingLogs = false;
+let pendingLiveEvents: any[] = [];
+
 // ==========================================
 // [PARITY] Cloud front.js Core Utilities
 // ==========================================
@@ -1194,7 +1198,14 @@ btnExtract?.addEventListener("click", async () => {
     }
 });
 
-listen("extraction-progress", async (event: any) => { renderProgressToUI(event.payload); });
+listen("extraction-progress", async (event: any) => { 
+    // 🌟 [CRITICAL FIX] 과거 로그를 불러와 장부를 정리 중이라면, 실시간 이벤트를 잠시 대기열에 가둬둡니다!
+    if (isFetchingLogs && event.payload.task_id === activeTaskId) {
+        pendingLiveEvents.push(event.payload);
+        return;
+    }
+    renderProgressToUI(event.payload); 
+});
 document.addEventListener('render-progress', (e: any) => { renderProgressToUI(e.detail); });
 
 async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
@@ -1812,7 +1823,6 @@ listen("task-console-log", (event: any) => {
 });
 
 
-// 🌟 handleTaskClick 전체를 덮어씁니다.
 function handleTaskClick(el: HTMLElement) {
     const taskId = el.dataset.taskId;
     const status = parseInt(el.dataset.status || "0");
@@ -1844,7 +1854,6 @@ function handleTaskClick(el: HTMLElement) {
 
     detailTitle.innerText = taskId.startsWith("search_") ? "Search Progress" : "Task Progress";
     
-    // 🌟 [CRITICAL FIX] 문서 상세보기가 기존 화면을 덮어씌워 도화지(extraction-log)가 증발했다면 다시 깔아줍니다!
     let logArea = document.getElementById("extraction-log");
     if (!logArea) {
         detailContent.innerHTML = `<div id="extraction-log"></div>`;
@@ -1853,11 +1862,8 @@ function handleTaskClick(el: HTMLElement) {
 
     if (logArea) {
         logArea.dataset.activeTaskId = taskId;
-        
-        // 🌟 [CRITICAL FIX] sessionStorage에서 누적된 터미널 로그를 꺼내옵니다!
         const savedLogs = sessionStorage.getItem(`term_${taskId}`) || "Connecting to AI Engine...\n";
         
-        // 🌟 스피너 컨테이너를 위에, 터미널 창을 아래에 예쁘게 배치합니다!
         logArea.innerHTML = `
             <div id="progress-container"></div>
             <div id="terminal-logs" data-active-task-id="${taskId}" style="background: #0a0a0a; color: #4ade80; padding: 12px; font-family: monospace; font-size: 0.75rem; border-radius: 6px; max-height: 250px; overflow-y: auto; white-space: pre-wrap; border: 1px solid #333; box-shadow: inset 0 0 10px rgba(0,0,0,0.8); line-height: 1.4;">${savedLogs}</div>
@@ -1866,19 +1872,36 @@ function handleTaskClick(el: HTMLElement) {
         const termArea = document.getElementById("terminal-logs");
         if (termArea) termArea.scrollTop = termArea.scrollHeight;
         
-        // 기존의 스피너 로그들도 불러옵니다.
+        // 🌟 [CRITICAL FIX] 로그를 가져오는 동안 라이브 이벤트의 난입을 원천 봉쇄합니다!
+        isFetchingLogs = true;
+        pendingLiveEvents = [];
+
         invoke<any[]>("get_task_logs", { taskId: taskId }).then(logs => {
-            if (logArea.dataset.activeTaskId !== taskId) return;
+            if (logArea!.dataset.activeTaskId !== taskId) {
+                isFetchingLogs = false;
+                return;
+            }
+            
+            // 1. 과거 로그부터 순서대로 렌더링 (1, 2, 3... 장부가 예쁘게 정리됨)
             if (logs && logs.length > 0) {
                 logs.forEach(payload => {
-                    payload.task_id = payload.task_id || taskId; // 🌟 [CRITICAL FIX] 렌더링 전 빈칸 채우기!
+                    payload.task_id = payload.task_id || taskId; 
                     renderProgressToUI(payload, true);
                 });
             } else if (status === 1) {
                 const progContainer = document.getElementById("progress-container");
                 if (progContainer) progContainer.insertAdjacentHTML('beforeend', `<div id="temp-spinner" style="padding: 10px; text-align: center; color: var(--primary);"><span class="spinner active-spinner">⠋</span> Generating Insights...</div>`);
             }
-        }).catch(err => console.error(err));
+
+            // 2. 장부 정리가 끝나면, 블로킹을 풀고 갇혀있던 라이브 이벤트를 순서대로 쏟아냅니다.
+            isFetchingLogs = false;
+            pendingLiveEvents.forEach(p => renderProgressToUI(p, false));
+            pendingLiveEvents = [];
+
+        }).catch(err => {
+            console.error(err);
+            isFetchingLogs = false;
+        });
     }
     
     activeTaskId = taskId; 
