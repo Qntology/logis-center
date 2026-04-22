@@ -740,8 +740,32 @@ impl QwenVLGenerateModel {
             
             let current_pos = total_tokens_after_prefill + i as usize;
             
-            // 🌟 [디코딩 진행률 로깅]
+            // 🌟 [디코딩 진행률 로깅 및 UI 전송]
             if i % 10 == 0 || next_id == self.eos_token_id1 || next_id == self.eos_token_id2 {
+                let sample_len = mes.max_tokens.unwrap_or(2048) as f32;
+                let pct = ((i as f32 / sample_len) * 100.0) as i32;
+                
+                if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
+                    if let Some(sid) = &session_id {
+                        let task_id = if sid.starts_with("task_") || sid.starts_with("img_") || sid.starts_with("search_") {
+                            let p: Vec<&str> = sid.split('_').collect();
+                            if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
+                        } else { sid.clone() };
+                        
+                        let summary_msg = if task_id.starts_with("search_") {
+                            format!("Generating AI response ({}%)...", pct)
+                        } else {
+                            format!("Extracting data ({}%)...", pct)
+                        };
+
+                        let _ = tx.send(serde_json::json!({
+                            "task_id": task_id,
+                            "category": "Generation",
+                            "summary": summary_msg,
+                            "spinner": "⠧"
+                        }));
+                    }
+                }
                 print!("\r[DECODING] {} tokens generated (Context: {})    ", i + 1, current_pos + 1);
                 let _ = std::io::stdout().flush();
             }

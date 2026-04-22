@@ -747,7 +747,7 @@ async fn process_task(
                 })
             ],
             model: "qwen".to_string(), 
-            max_tokens: Some(64), // true/false만 대답하므로 짧게 설정
+            max_tokens: Some(128), // true/false만 대답하므로 짧게 설정
             temperature: Some(0.0), top_p: Some(0.01),
             ..Default::default()
         };

@@ -544,9 +544,31 @@ impl Qwen3_5GenerateModel {
                 }
             }
 
-            // 🌟 [디코딩 진행률 로깅]
+            // 🌟 [디코딩 진행률 로깅 및 UI 전송]
             let current_pos = seqlen_offset + seq_len;
             if i % 10 == 0 || next_token == self.eos_token_id {
+                let pct = ((i as f32 / sample_len as f32) * 100.0) as i32;
+                if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
+                    if let Some(sid) = &session_id {
+                        let task_id = if sid.starts_with("task_") || sid.starts_with("img_") || sid.starts_with("search_") {
+                            let p: Vec<&str> = sid.split('_').collect();
+                            if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
+                        } else { sid.clone() };
+                        
+                        let summary_msg = if task_id.starts_with("search_") {
+                            format!("Generating AI response ({}%)...", pct)
+                        } else {
+                            format!("Extracting details ({}%)...", pct)
+                        };
+
+                        let _ = tx.send(serde_json::json!({
+                            "task_id": task_id,
+                            "category": "Generation",
+                            "summary": summary_msg,
+                            "spinner": "⠧"
+                        }));
+                    }
+                }
                 print!("\r[Qwen3.5-DECODING] {} tokens generated (Context: {})    ", i + 1, current_pos + 1);
                 let _ = std::io::stdout().flush();
             }

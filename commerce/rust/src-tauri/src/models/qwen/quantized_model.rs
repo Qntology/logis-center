@@ -3123,19 +3123,25 @@ impl QuantizedQwenTextModel {
                 processed += take;
                 current_offset += take;
                 
-                // 🌟 [CRITICAL FIX] Base 문서 구조를 읽어들이는 실시간 퍼센트를 계산하여 UI로 쏩니다!
+                // 🌟 [CRITICAL FIX] Prefill 진행률(%) 계산 및 AI 검색/문서 전처리 분기 처리
                 let pct = ((processed as f32 / seq_len as f32) * 100.0) as i32;
                 if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
                     if let Some(sid) = &session_id {
-                        let task_id = if sid.starts_with("task_") {
+                        let task_id = if sid.starts_with("task_") || sid.starts_with("search_") || sid.starts_with("img_") {
                             let p: Vec<&str> = sid.split('_').collect();
                             if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
                         } else { sid.clone() };
                         
+                        let summary_msg = if task_id.starts_with("search_") {
+                            format!("Analyzing search context ({}%)...", pct)
+                        } else {
+                            format!("Reading document structure ({}%)...", pct)
+                        };
+                        
                         let _ = tx.send(serde_json::json!({
                             "task_id": task_id,
-                            "category": "Preparation",
-                            "summary": format!("Reading document structure ({}%)...", pct),
+                            "category": "Prefill",
+                            "summary": summary_msg,
                             "spinner": "⠹"
                         }));
                     }
