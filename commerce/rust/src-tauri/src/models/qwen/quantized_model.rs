@@ -3133,14 +3133,14 @@ impl QuantizedQwenTextModel {
                         } else { sid.clone() };
                         
                         let summary_msg = if task_id.starts_with("search_") {
-                            format!("Analyzing search context ({}%)...", pct)
+                            format!("Prefill: Analyzing search context ({}%)...", pct)
                         } else {
-                            format!("Reading document structure ({}%)...", pct)
+                            format!("Prefill: Reading document structure ({}%)...", pct)
                         };
                         
                         let _ = tx.send(serde_json::json!({
                             "task_id": task_id,
-                            "category": "Prefill",
+                            "category": "Preparation", // 👈 스케줄러의 초기 세팅과 통일
                             "summary": summary_msg,
                             "spinner": "⠹"
                         }));

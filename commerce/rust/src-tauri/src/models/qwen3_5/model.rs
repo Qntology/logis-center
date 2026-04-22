@@ -2315,15 +2315,16 @@ impl Qwen3_5Model {
                             if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
                         } else { sid.clone() };
                         
+                        // 🌟 Prefill 진행률 (동일한 카테고리 유지)
                         let summary_msg = if task_id.starts_with("search_") {
-                            format!("Analyzing search context ({}%)...", pct)
+                            format!("Prefill: Analyzing search context ({}%)...", pct)
                         } else {
-                            format!("Analyzing details ({}%)...", pct)
+                            format!("Prefill: Reading document ({}%)...", pct)
                         };
 
                         let _ = tx.send(serde_json::json!({
                             "task_id": task_id,
-                            "category": "Prefill",
+                            "category": "AI Inference", // 👈 스케줄러와 통일하여 한 줄에서 업데이트!
                             "summary": summary_msg,
                             "spinner": "⠹"
                         }));

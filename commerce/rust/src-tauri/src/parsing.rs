@@ -395,15 +395,16 @@ Find all the {TYPE} titles from the following PUG/HTML content.
 - title: {TYPE} title {String}
 
 [OUTPUT FORMAT]
-{ "{TYPE}" : [ {"title" : String} ] }
+{ "{TYPE}" : [...] }
 
-NO EXPLANATION. NO THINKING. /no_think"###;
+RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{TYPE}", page_type)
 }
 
 pub fn is_detail_prompt(page_type: &str) -> String {
     let template = r###"[TASK]
 Analyze the provided Pug HTML content from top to bottom. Determine if the main content represents a "{TYPE} Detail/{TYPE} Edit Form/{TYPE} Manage Form" (true) or a "{TYPE} List/Index Page/Home Page/Dashboard Page" (false).
+
 [ENTITY CONTEXT: {TYPE}]
 You are evaluating a page managing this specific domain entity. Use this context to conceptually understand the abstract structures:
 - Single Entity (Detail): A property configuration interface. It features a large overarching form dedicated to inputting or updating the specific attributes of ONE primary entity. (Minor sub-lists for options/variants do not make it a global list).
@@ -417,15 +418,18 @@ Look past global navigation menus and overarching search/filter forms at the top
 3. Does the main data area contain an extensive configuration/input form (inputs, textareas, image uploads, save buttons) for a single entity?
 
 [SCHEMA DEFINITIONS]
-- has_{TYPE}_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
-- has_{TYPE}_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
-- detail: Boolean. True ONLY if has_{TYPE}_list is false AND has_{TYPE}_form is true.
+- {TYPE}:
+  - has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
+  - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
+  - detail: Boolean. True ONLY if has_list is false AND has_form is true.
 
 [OUTPUT FORMAT]
 {
-  "has_{TYPE}_list": Boolean,
-  "has_{TYPE}_form": Boolean,
-  "detail": Boolean
+  "{TYPE}": {
+    "has_list": Boolean,
+    "has_form": Boolean,
+    "detail": Boolean
+  }
 }
 
 NO EXPLANATION. NO THINKING. /no_think"###;

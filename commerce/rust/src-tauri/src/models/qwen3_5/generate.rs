@@ -555,15 +555,16 @@ impl Qwen3_5GenerateModel {
                             if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
                         } else { sid.clone() };
                         
+                        // 🌟 Decoding 진행률 (동일한 카테고리 유지)
                         let summary_msg = if task_id.starts_with("search_") {
-                            format!("Generating AI response ({}%)...", pct)
+                            format!("Decoding: Generating response ({}%)...", pct)
                         } else {
-                            format!("Extracting details ({}%)...", pct)
+                            format!("Decoding: Extracting details ({}%)...", pct)
                         };
 
                         let _ = tx.send(serde_json::json!({
                             "task_id": task_id,
-                            "category": "Generation",
+                            "category": "AI Inference", // 👈 스케줄러와 통일하여 한 줄에서 업데이트!
                             "summary": summary_msg,
                             "spinner": "⠧"
                         }));
