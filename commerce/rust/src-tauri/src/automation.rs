@@ -133,6 +133,7 @@ pub async fn try_reconnect_existing_browser(app_handle: tauri::AppHandle) -> any
 // Global storage for the last detected browser state
 pub struct DetectedState {
     pub url: String,
+    pub tab_id: String, // 🌟 [NEW] 고유 탭 ID 추적용
     pub is_client: bool,
     pub is_admin: bool,
 }
@@ -140,6 +141,7 @@ pub struct DetectedState {
 pub(crate) static LAST_DETECTED_STATE: Lazy<Arc<tokio::sync::Mutex<DetectedState>>> = Lazy::new(|| {
     Arc::new(tokio::sync::Mutex::new(DetectedState {
         url: String::new(),
+        tab_id: String::new(), // 🌟 [NEW]
         is_client: false,
         is_admin: false,
     }))
@@ -151,8 +153,8 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
         let mut last_is_shop = false;
         let mut fail_count = 0; 
         
-        // 🌟 앱이 포커스를 뺏어가더라도 마지막 탭을 기억하는 장부
-        let mut last_focused_url = String::new();
+        // 🌟 [핵심 장부] 마지막으로 클릭했던 탭의 고유 ID
+        let mut last_focused_tab_id = String::new();
 
         loop {
             if crate::utils::is_extraction_stopped() {
@@ -175,83 +177,109 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
             };
 
             let mut active_url = String::new();
+            let mut active_tab_id = String::new();
             let mut is_client = false;
             let mut is_admin = false;
+
             let mut found_focus = false;
+            let mut remembered_url = String::new();
 
-            // 🌟 1. [PERFECT MATCH] 포커스를 가진 창 (빈 탭이든 뭐든 무조건 최우선!)
+            // 🌟 1. 모든 탭에 고유 ID를 부여하고 상태를 가져옵니다.
             for page in pages.iter().rev() {
-                if let Ok(res) = page.evaluate("document.hasFocus()").await {
-                    if res.into_value::<bool>().unwrap_or(false) {
-                        if let Ok(val) = page.evaluate("window.location.href").await {
-                            let url = val.into_value::<String>().unwrap_or_default();
-                            // [CRITICAL FIX] about:blank 무시 로직 삭제! 빈 탭을 클릭하면 번개 버튼이 꺼져야 정상입니다.
-                            active_url = url.clone();
-                            last_focused_url = url; 
-                            found_focus = true;
-                            break;
-                        }
-                    }
-                }
-            }
+                // 브라우저 탭 내부에 몰래 ID를 심고 가져오는 JS 스크립트
+                let script = r#"
+                    (function() {
+                        window.__logis_tab_id = window.__logis_tab_id || Math.random().toString(36).substring(2);
+                        return JSON.stringify({
+                            id: window.__logis_tab_id,
+                            url: window.location.href,
+                            focus: document.hasFocus(),
+                            visible: document.visibilityState === 'visible'
+                        });
+                    })();
+                "#;
 
-            // 🌟 2. [MEMORY MATCH] 포커스를 잃은 상태라면(앱 클릭), 장부에 적힌 URL이 살아있는지 확인
-            if !found_focus && !last_focused_url.is_empty() {
-                for page in pages.iter().rev() {
-                    if let Ok(val) = page.evaluate("window.location.href").await {
-                        if val.into_value::<String>().unwrap_or_default() == last_focused_url {
-                            active_url = last_focused_url.clone();
-                            break;
-                        }
-                    }
-                }
-                if active_url.is_empty() {
-                    last_focused_url.clear(); 
-                }
-            }
+                if let Ok(res) = page.evaluate(script).await {
+                    if let Some(val_str) = res.into_value::<String>().ok() {
+                        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str) {
+                            let tab_id = json_val.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                            let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                            let has_focus = json_val.get("focus").and_then(|v| v.as_bool()).unwrap_or(false);
 
-            // 🌟 3. [FALLBACK] 처음 켰거나 팝업을 못 찾았다면 화면에 'visible'한 최신 팝업/탭
-            if active_url.is_empty() {
-                for page in pages.iter().rev() {
-                    if let Ok(res) = page.evaluate("document.visibilityState").await {
-                        if res.into_value::<String>().unwrap_or_default() == "visible" {
-                            if let Ok(val) = page.evaluate("window.location.href").await {
-                                let url = val.into_value::<String>().unwrap_or_default();
-                                active_url = url.clone();
-                                last_focused_url = url; // 🌟 [CRITICAL FIX] 앱 재시작 시에도 팝업 주소를 잃어버리지 않게 장부에 적어둡니다!
+                            // [A] 사용자가 특정 탭(빈 탭 포함)을 클릭해서 포커스를 가졌다면 무조건 장부 갱신!
+                            if has_focus {
+                                last_focused_tab_id = tab_id.to_string();
+                                active_tab_id = tab_id.to_string();
+                                active_url = tab_url.to_string();
+                                found_focus = true;
                                 break;
+                            }
+
+                            // [B] 포커스는 없지만, 장부에 적어둔 ID와 일치하는 탭이 아직 닫히지 않고 살아있다면 주소 킵
+                            if !last_focused_tab_id.is_empty() && tab_id == last_focused_tab_id {
+                                remembered_url = tab_url.to_string();
                             }
                         }
                     }
                 }
             }
 
-            // 🌟 4. [LAST RESORT] 최소화 상태 등 아무것도 안 잡히면 강제 마지막 탭
-            if active_url.is_empty() && !pages.is_empty() {
-                for page in pages.iter().rev() {
-                    if let Ok(val) = page.evaluate("window.location.href").await {
-                        let url = val.into_value::<String>().unwrap_or_default();
-                        active_url = url.clone();
-                        last_focused_url = url; // 🌟 여기서도 확실하게 기억!
-                        break;
+            // 🌟 2. 아무 탭도 포커스를 가지지 않은 상태 (Tauri 앱을 클릭한 경우)
+            if !found_focus {
+                if !remembered_url.is_empty() {
+                    // 장부에 적힌 탭이 아직 살아있으므로 그대로 유지 (hidden 이든 visible 이든 상관 안 함!)
+                    active_url = remembered_url;
+                    active_tab_id = last_focused_tab_id.clone();
+                } else {
+                    // 장부에 적힌 탭이 닫혀버렸음 -> 장부 초기화
+                    last_focused_tab_id.clear();
+                    
+                    // Fallback: 처음 켰거나 탭이 다 닫힌 경우, 화면에 보이는(visible) 첫 번째 탭을 강제 픽업하여 장부에 등록
+                    for page in pages.iter().rev() {
+                        let script = r#"
+                            (function() {
+                                window.__logis_tab_id = window.__logis_tab_id || Math.random().toString(36).substring(2);
+                                return JSON.stringify({ id: window.__logis_tab_id, url: window.location.href, visible: document.visibilityState === 'visible' });
+                            })();
+                        "#;
+                        if let Ok(res) = page.evaluate(script).await {
+                            if let Some(val_str) = res.into_value::<String>().ok() {
+                                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str) {
+                                    let is_visible = json_val.get("visible").and_then(|v| v.as_bool()).unwrap_or(false);
+                                    if is_visible {
+                                        let tab_id = json_val.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                        let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                        
+                                        last_focused_tab_id = tab_id.to_string(); // 장부 각인!
+                                        active_tab_id = tab_id.to_string();
+                                        active_url = tab_url.to_string();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
 
-            if !active_url.is_empty() && active_url != "about:blank" {
+            // URL 판별 로직
+            if !active_url.is_empty() && active_url != "about:blank" && !active_url.starts_with("chrome://") && !active_url.starts_with("edge://") {
                 is_client = is_shop(&active_url, CLIENT_PATTERNS);
                 is_admin = is_shop(&active_url, ADMIN_PATTERNS);
             }
 
             let current_is_shop = is_client || is_admin;
 
+            // 전역 상태에 탭 ID와 URL 저장
             {
                 let mut state = LAST_DETECTED_STATE.lock().await;
                 state.url = active_url.clone();
+                state.tab_id = active_tab_id.clone();
                 state.is_client = is_client;
                 state.is_admin = is_admin;
             }
 
+            // UI 통신
             if active_url != last_detected_url || current_is_shop != last_is_shop {
                 let payload = json!({
                     "url": active_url.clone(),
@@ -434,9 +462,9 @@ async fn run_driver_automation(browser: &str, url: &str, script: &str) -> anyhow
 }
 
 pub async fn extract_html_from_current_tab() -> Result<String, String> {
-    let target_url = {
+    let target_tab_id = {
         let state = LAST_DETECTED_STATE.lock().await;
-        state.url.clone()
+        state.tab_id.clone()
     };
 
     let browser_opt = {
@@ -448,11 +476,12 @@ pub async fn extract_html_from_current_tab() -> Result<String, String> {
         let pages = browser.pages().await.map_err(|e| e.to_string())?;
         let mut active_page = None;
 
-        // 🌟 1. UI에 떠 있는 주소와 100% 정확하게 일치하는 팝업/탭 타격
-        if !target_url.is_empty() {
+        // 🌟 1. 전역 상태에 기록된 고유 탭 ID(target_tab_id)와 100% 일치하는 창을 최우선 타격!
+        if !target_tab_id.is_empty() {
             for page in pages.iter().rev() {
-                if let Ok(val) = page.evaluate("window.location.href").await {
-                    if val.into_value::<String>().unwrap_or_default() == target_url {
+                let script = "window.__logis_tab_id || ''";
+                if let Ok(res) = page.evaluate(script).await {
+                    if res.into_value::<String>().unwrap_or_default() == target_tab_id {
                         active_page = Some(page);
                         break;
                     }
@@ -460,7 +489,7 @@ pub async fn extract_html_from_current_tab() -> Result<String, String> {
             }
         }
 
-        // 🌟 2. 일치하는 창이 닫혔다면, 현재 포커스를 가진 창 찾기
+        // 🌟 2. 안전장치: 혹시라도 ID를 못 찾았다면, 현재 포커스된 창 타격
         if active_page.is_none() {
             for page in pages.iter().rev() {
                 if let Ok(res) = page.evaluate("document.hasFocus()").await {
@@ -472,7 +501,7 @@ pub async fn extract_html_from_current_tab() -> Result<String, String> {
             }
         }
 
-        // 🌟 3. 포커스도 없다면 visible한 최신 창 찾기
+        // 🌟 3. 그래도 없으면 visible한 최신 창 찾기
         if active_page.is_none() {
             for page in pages.iter().rev() {
                 let is_visible = match page.evaluate("document.visibilityState").await {
