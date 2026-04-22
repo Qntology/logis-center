@@ -149,7 +149,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
     tokio::spawn(async move {
         let mut last_detected_url = String::new();
         let mut last_is_shop = false;
-        let mut fail_count = 0; // [NEW] 연속 실패 횟수 추적
+        let mut fail_count = 0; 
 
         loop {
             if crate::utils::is_extraction_stopped() {
@@ -159,12 +159,11 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
 
             let pages = match browser.pages().await {
                 Ok(p) => {
-                    fail_count = 0; // 성공 시 카운트 초기화
+                    fail_count = 0; 
                     p
                 },
                 Err(e) => {
                     let err_msg = e.to_string();
-                    // [FIX] 브라우저가 종료되었을 때 (연결 끊김) 루프 탈출
                     if err_msg.contains("receiver is gone") || err_msg.contains("closed") || fail_count > 5 {
                         println!("[AUTO] Browser disconnected. Exiting monitor.");
                         break;
@@ -180,10 +179,10 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
             let mut is_client = false;
             let mut is_admin = false;
 
-            // 1. [STRICT] 보이는 탭 찾기
-            for page in pages.iter() {
-                if let Ok(res) = page.evaluate("document.visibilityState").await {
-                    if res.into_value::<String>().unwrap_or_default() == "visible" {
+            // 🌟 1. [PERFECT MATCH] 포커스를 가진 창(가장 앞의 팝업/탭)을 최우선으로 찾습니다. (역순 탐색)
+            for page in pages.iter().rev() {
+                if let Ok(res) = page.evaluate("document.hasFocus()").await {
+                    if res.into_value::<bool>().unwrap_or(false) {
                         if let Ok(val) = page.evaluate("window.location.href").await {
                             active_url = val.into_value::<String>().unwrap_or_default();
                             break;
@@ -192,13 +191,26 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                 }
             }
 
-            // 2. [FALLBACK] 최소화 되어있거나 visible 탭이 없으면 첫번째 페이지 사용
-            // [FIX] about:blank 도 정상적인 URL로 취급하도록 변경
+            // 🌟 2. [STRICT] 포커스가 없다면 (앱 클릭 중) 화면에 'visible'한 최신 팝업/탭 찾기
+            if active_url.is_empty() {
+                for page in pages.iter().rev() {
+                    if let Ok(res) = page.evaluate("document.visibilityState").await {
+                        if res.into_value::<String>().unwrap_or_default() == "visible" {
+                            if let Ok(val) = page.evaluate("window.location.href").await {
+                                active_url = val.into_value::<String>().unwrap_or_default();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 🌟 3. [FALLBACK] 최소화 상태면 가장 마지막에 띄워진 탭(팝업) 사용
             if active_url.is_empty() && !pages.is_empty() {
-                for page in pages.iter() {
+                for page in pages.iter().rev() {
                     if let Ok(val) = page.evaluate("window.location.href").await {
                         let url = val.into_value::<String>().unwrap_or_default();
-                        if !url.is_empty() {
+                        if !url.is_empty() && url != "about:blank" { 
                             active_url = url;
                             break;
                         }
@@ -206,7 +218,6 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                 }
             }
 
-            // 3. [JUDGE] 쇼핑몰 관리자/클라이언트 여부 판단
             if !active_url.is_empty() && active_url != "about:blank" {
                 is_client = is_shop(&active_url, CLIENT_PATTERNS);
                 is_admin = is_shop(&active_url, ADMIN_PATTERNS);
@@ -221,7 +232,6 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                 state.is_admin = is_admin;
             }
 
-            // [FIX] URL이 비어있어도 상태가 변했다면 이벤트를 쏴서 프론트엔드가 알 수 있게 함
             if active_url != last_detected_url || current_is_shop != last_is_shop {
                 let payload = json!({
                     "url": active_url.clone(),
@@ -252,7 +262,6 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
             tokio::time::sleep(Duration::from_millis(800)).await; 
         }
         
-        // [FIX] 모니터 종료 시 글로벌 상태 초기화 및 프론트엔드에 stopped 이벤트 발송
         let mut global = GLOBAL_BROWSER.lock().await;
         *global = None;
         let _ = app_handle.emit("browser-status", "stopped");
@@ -413,18 +422,32 @@ pub async fn extract_html_from_current_tab() -> Result<String, String> {
         let pages = browser.pages().await.map_err(|e| e.to_string())?;
         
         let mut active_page = None;
-        for page in pages.iter() {
-            let is_visible = match page.evaluate("document.visibilityState").await {
-                Ok(res) => res.into_value::<String>().unwrap_or_default() == "visible",
-                Err(_) => false,
-            };
-            if is_visible {
-                active_page = Some(page);
-                break;
+
+        // 🌟 1. [PERFECT MATCH] 포커스를 가진 창(팝업 최우선) 찾기
+        for page in pages.iter().rev() {
+            if let Ok(res) = page.evaluate("document.hasFocus()").await {
+                if res.into_value::<bool>().unwrap_or(false) {
+                    active_page = Some(page);
+                    break;
+                }
             }
         }
 
-        // Use the active page found, or fallback to the last page if none are strictly 'visible'
+        // 🌟 2. 포커스가 없다면 visible한 최신 창(팝업 우선) 찾기
+        if active_page.is_none() {
+            for page in pages.iter().rev() {
+                let is_visible = match page.evaluate("document.visibilityState").await {
+                    Ok(res) => res.into_value::<String>().unwrap_or_default() == "visible",
+                    Err(_) => false,
+                };
+                if is_visible {
+                    active_page = Some(page);
+                    break;
+                }
+            }
+        }
+
+        // 🌟 3. 그래도 없으면 무조건 가장 마지막에 뜬 창(팝업) 강제 선택
         let target_page = active_page.or(pages.last());
 
         if let Some(page) = target_page {
