@@ -150,6 +150,9 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
         let mut last_detected_url = String::new();
         let mut last_is_shop = false;
         let mut fail_count = 0; 
+        
+        // 🌟 [CRITICAL FIX] 앱(Tauri)이 포커스를 뺏어가더라도 사용자가 마지막으로 보고 있던 크롬 탭을 기억하는 장부
+        let mut last_focused_url = String::new();
 
         loop {
             if crate::utils::is_extraction_stopped() {
@@ -158,17 +161,13 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
             }
 
             let pages = match browser.pages().await {
-                Ok(p) => {
-                    fail_count = 0; 
-                    p
-                },
+                Ok(p) => { fail_count = 0; p },
                 Err(e) => {
                     let err_msg = e.to_string();
                     if err_msg.contains("receiver is gone") || err_msg.contains("closed") || fail_count > 5 {
                         println!("[AUTO] Browser disconnected. Exiting monitor.");
                         break;
                     }
-                    println!("[AUTO] Failed to fetch pages: {}. Retrying...", err_msg);
                     fail_count += 1;
                     tokio::time::sleep(Duration::from_millis(2000)).await;
                     continue; 
@@ -178,26 +177,18 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
             let mut active_url = String::new();
             let mut is_client = false;
             let mut is_admin = false;
+            let mut found_focus = false;
 
-            // 🌟 1. [PERFECT MATCH] 포커스를 가진 창(가장 앞의 팝업/탭)을 최우선으로 찾습니다. (역순 탐색)
+            // 🌟 1. [PERFECT MATCH] 현재 실제로 클릭되어 포커스를 가진 창(팝업/탭)을 최우선으로 찾습니다.
             for page in pages.iter().rev() {
                 if let Ok(res) = page.evaluate("document.hasFocus()").await {
                     if res.into_value::<bool>().unwrap_or(false) {
                         if let Ok(val) = page.evaluate("window.location.href").await {
-                            active_url = val.into_value::<String>().unwrap_or_default();
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // 🌟 2. [STRICT] 포커스가 없다면 (앱 클릭 중) 화면에 'visible'한 최신 팝업/탭 찾기
-            if active_url.is_empty() {
-                for page in pages.iter().rev() {
-                    if let Ok(res) = page.evaluate("document.visibilityState").await {
-                        if res.into_value::<String>().unwrap_or_default() == "visible" {
-                            if let Ok(val) = page.evaluate("window.location.href").await {
-                                active_url = val.into_value::<String>().unwrap_or_default();
+                            let url = val.into_value::<String>().unwrap_or_default();
+                            if !url.is_empty() && url != "about:blank" {
+                                active_url = url.clone();
+                                last_focused_url = url; // 🌟 뺏길 때를 대비해 마지막 탭 주소를 기억해 둡니다!
+                                found_focus = true;
                                 break;
                             }
                         }
@@ -205,7 +196,40 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                 }
             }
 
-            // 🌟 3. [FALLBACK] 최소화 상태면 가장 마지막에 띄워진 탭(팝업) 사용
+            // 🌟 2. [MEMORY MATCH] 포커스를 잃은 상태라면(앱을 클릭한 경우), 아까 기억해둔 팝업/탭이 아직 켜져 있는지 확인합니다!
+            if !found_focus && !last_focused_url.is_empty() {
+                for page in pages.iter().rev() {
+                    if let Ok(val) = page.evaluate("window.location.href").await {
+                        if val.into_value::<String>().unwrap_or_default() == last_focused_url {
+                            active_url = last_focused_url.clone();
+                            break;
+                        }
+                    }
+                }
+                // 만약 사용자가 그 팝업을 꺼버렸다면 장부에서 지웁니다.
+                if active_url.is_empty() {
+                    last_focused_url.clear(); 
+                }
+            }
+
+            // 🌟 3. [FALLBACK] 처음 켰거나 다 못 찾았다면 화면에 'visible'한 최신 팝업/탭 찾기
+            if active_url.is_empty() {
+                for page in pages.iter().rev() {
+                    if let Ok(res) = page.evaluate("document.visibilityState").await {
+                        if res.into_value::<String>().unwrap_or_default() == "visible" {
+                            if let Ok(val) = page.evaluate("window.location.href").await {
+                                let url = val.into_value::<String>().unwrap_or_default();
+                                if !url.is_empty() && url != "about:blank" {
+                                    active_url = url;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 🌟 4. [LAST RESORT] 최소화 상태면 가장 마지막에 띄워진 탭(팝업) 강제 사용
             if active_url.is_empty() && !pages.is_empty() {
                 for page in pages.iter().rev() {
                     if let Ok(val) = page.evaluate("window.location.href").await {
@@ -414,26 +438,46 @@ async fn run_driver_automation(browser: &str, url: &str, script: &str) -> anyhow
 }
 
 pub async fn extract_html_from_current_tab() -> Result<String, String> {
+    // 🌟 [CRITICAL FIX] 추출기가 갈팡질팡하지 않도록, 현재 UI가 가리키고 있는 정확한 URL을 가져옵니다.
+    let target_url = {
+        let state = LAST_DETECTED_STATE.lock().await;
+        state.url.clone()
+    };
+
     let browser_opt = {
         let global = GLOBAL_BROWSER.lock().await;
         global.as_ref().cloned()
     };
+    
     if let Some(browser) = browser_opt {
         let pages = browser.pages().await.map_err(|e| e.to_string())?;
-        
         let mut active_page = None;
 
-        // 🌟 1. [PERFECT MATCH] 포커스를 가진 창(팝업 최우선) 찾기
-        for page in pages.iter().rev() {
-            if let Ok(res) = page.evaluate("document.hasFocus()").await {
-                if res.into_value::<bool>().unwrap_or(false) {
-                    active_page = Some(page);
-                    break;
+        // 🌟 1. UI에 떠 있는 주소와 100% 정확하게 일치하는 팝업/탭을 최우선으로 찾아서 타격합니다!
+        if !target_url.is_empty() {
+            for page in pages.iter().rev() {
+                if let Ok(val) = page.evaluate("window.location.href").await {
+                    if val.into_value::<String>().unwrap_or_default() == target_url {
+                        active_page = Some(page);
+                        break;
+                    }
                 }
             }
         }
 
-        // 🌟 2. 포커스가 없다면 visible한 최신 창(팝업 우선) 찾기
+        // 🌟 2. [안전장치] 만약 주소가 일치하는 창이 닫혔다면, 현재 포커스를 가진 창을 찾습니다.
+        if active_page.is_none() {
+            for page in pages.iter().rev() {
+                if let Ok(res) = page.evaluate("document.hasFocus()").await {
+                    if res.into_value::<bool>().unwrap_or(false) {
+                        active_page = Some(page);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 🌟 3. 포커스도 없다면 visible한 최신 창(팝업 우선) 찾기
         if active_page.is_none() {
             for page in pages.iter().rev() {
                 let is_visible = match page.evaluate("document.visibilityState").await {
@@ -447,7 +491,7 @@ pub async fn extract_html_from_current_tab() -> Result<String, String> {
             }
         }
 
-        // 🌟 3. 그래도 없으면 무조건 가장 마지막에 뜬 창(팝업) 강제 선택
+        // 🌟 4. 그래도 없으면 가장 마지막에 뜬 창 강제 선택
         let target_page = active_page.or(pages.last());
 
         if let Some(page) = target_page {
