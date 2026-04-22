@@ -2287,6 +2287,11 @@ impl Qwen3_5Model {
             let mut current_offset = seqlen_offset;
             
             while processed < total_len {
+                // 🌟 [CRITICAL FIX] Qwen 3.5 모델 프리필 중에도 취소 버튼 즉각 반응!
+                if crate::utils::is_extraction_stopped() {
+                    return Err(anyhow::anyhow!("Task cancelled"));
+                }
+
                 let take = (total_len - processed).min(chunk_size);
                 let chunk_embeds = inputs_embeds.narrow(1, processed, take)?;
                 let chunk_pos_ids = position_ids.narrow(2, processed, take)?;

@@ -1963,6 +1963,11 @@ impl QuantizedQwenVLTextModel {
         let mut chunk_outputs = Vec::with_capacity(total_chunks);
 
         for (chunk_idx, &i) in chunk_offsets.iter().enumerate() {
+            // 🌟 [CRITICAL FIX] 내부 청크 연산 중에도 즉각 취소(Stop)가 가능하도록 차단기 설치!
+            if crate::utils::is_extraction_stopped() {
+                return Err(anyhow::anyhow!("Task cancelled"));
+            }
+            
             let take = (current_seq_len - i).min(chunk_size);
 
             let target_chunks = if is_decoding || chunk_idx == 0 {
@@ -3104,6 +3109,11 @@ impl QuantizedQwenTextModel {
             let mut current_offset = seqlen_offset;
             
             while processed < seq_len {
+                // 🌟 [CRITICAL FIX] 1만 토큰 프리필(Prefill) 중에도 취소 버튼이 즉각 작동하도록!
+                if crate::utils::is_extraction_stopped() {
+                    return Err(anyhow::anyhow!("Task cancelled"));
+                }
+                
                 let take = (seq_len - processed).min(chunk_size);
                 let chunk_embeds = inputs_embeds.narrow(1, processed, take)?;
                 let chunk_pos_ids = position_ids.narrow(2, processed, take)?;

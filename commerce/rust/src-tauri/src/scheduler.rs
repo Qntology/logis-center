@@ -205,6 +205,8 @@ pub async fn start_background_worker(
         
         let mut delay_secs = 1;
         let mut current_device_pref: Option<String> = None;
+        // 🌟 [CRITICAL FIX] 무한 OOM 재시도를 막기 위한 재시도 장부 추가
+        let mut oom_retry_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         
         loop {
             if crate::utils::is_extraction_stopped() {
@@ -277,6 +279,7 @@ pub async fn start_background_worker(
 
                         cleanup_task_resources(&task.id, Some(&app_handle));
                         current_device_pref = None; 
+                        oom_retry_map.remove(&task.id); // 성공 시 장부 삭제
                     },
                     Err(e) => {
                         let err_msg = e.to_string();
@@ -311,30 +314,68 @@ pub async fn start_background_worker(
                              }));
                              cleanup_task_resources(&task.id, Some(&app_handle));
                              
-                             // 🌟 [CRITICAL FIX] 취소 시 기본값(GPU)으로 롤백!
                              current_device_pref = None;
                              break; 
                         } else if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
-                            // 🌟 오직 VRAM OOM 일 때만 CPU 모드로 우회!
-                            println!("[Scheduler] OOM Detected! Activating CPU Mode for retry.");
-                            current_device_pref = Some("cpu".to_string());
-
-                            log_task_progress(&app_handle, &task.id, &json!({
-                                "category": "Warning", "summary": "Memory pressure detected. Retrying with CPU Mode...", "spinner": "💾"
-                            }));
+                            let retries = oom_retry_map.entry(task.id.clone()).or_insert(0);
                             
-                            {
-                                let store_guard = store.lock().await;
-                                if let Some(db) = store_guard.as_ref() {
-                                    let _ = db.update_task_status(&task.id, 10).await;
-                                    let _ = db.update_message_status(&task.id, 10, Some("Retrying in CPU Mode...")).await;
+                            if *retries == 0 {
+                                *retries += 1;
+                                // 🌟 [CRITICAL FIX] OOM 발생 시, 방금 deep_purge로 VRAM을 비웠으므로 
+                                // 느려터진 CPU 모드로 도망가지 않고 다시 한번 GPU 모드로 재시도합니다!
+                                println!("[Scheduler] OOM Detected! VRAM is purged. Retrying on GPU...");
+                                current_device_pref = None;
+
+                                log_task_progress(&app_handle, &task.id, &json!({
+                                    "category": "Warning", "summary": "Memory pressure detected. VRAM cleared. Retrying on GPU...", "spinner": "♻️"
+                                }));
+                                
+                                {
+                                    let store_guard = store.lock().await;
+                                    if let Some(db) = store_guard.as_ref() {
+                                        let _ = db.update_task_status(&task.id, 10).await;
+                                        let _ = db.update_message_status(&task.id, 10, Some("Retrying on GPU...")).await;
+                                    }
+                                }
+                                
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                continue; 
+                            } else {
+                                // 🌟 재시도마저 실패한 경우: 이미지 작업이면 에러 표출, 텍스트면 CPU 우회
+                                if task.r#type == "image_extraction" {
+                                    let final_err = "High-resolution image exceeds VRAM capacity. Please try a smaller image.";
+                                    println!("[Scheduler] GPU retry failed for Vision. Throwing error instead of freezing on CPU.");
+                                    let store_guard = store.lock().await;                            
+                                    if let Some(db) = store_guard.as_ref() {
+                                        let _ = db.update_task_status(&task.id, crate::logic::parse_status("error")).await;
+                                        let _ = db.update_message_status(&task.id, crate::logic::parse_status("error"), Some(&format!("Error: {}", final_err))).await;
+                                    }
+                                    let _ = app_handle.emit("extraction-progress", json!({
+                                        "task_id": task.id,
+                                        "category": "Error", "summary": final_err, "spinner": "❌"
+                                    }));
+                                    current_device_pref = None;
+                                } else {
+                                    println!("[Scheduler] OOM Detected twice! Activating CPU Mode for text task.");
+                                    current_device_pref = Some("cpu".to_string());
+
+                                    log_task_progress(&app_handle, &task.id, &json!({
+                                        "category": "Warning", "summary": "Memory pressure detected. Retrying with CPU Mode...", "spinner": "💾"
+                                    }));
+                                    
+                                    {
+                                        let store_guard = store.lock().await;
+                                        if let Some(db) = store_guard.as_ref() {
+                                            let _ = db.update_task_status(&task.id, 10).await;
+                                            let _ = db.update_message_status(&task.id, 10, Some("Retrying in CPU Mode...")).await;
+                                        }
+                                    }
+                                    
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    continue;
                                 }
                             }
-                            
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                            continue; 
                         } else {
-                            // 🌟 OOM이 아닌 기타 일반 에러 처리
                             let store_guard = store.lock().await;                            
                             if let Some(db) = store_guard.as_ref() {
                                 let _ = db.update_task_status(&task.id, crate::logic::parse_status("error")).await;
@@ -346,7 +387,6 @@ pub async fn start_background_worker(
                                 "category": "Error", "summary": format!("Failed: {}", err_msg), "spinner": "❌"
                             }));
 
-                            // 🌟 [CRITICAL FIX] 일반 에러이므로 다음 작업이 엉뚱하게 CPU로 돌지 않도록 GPU 모드로 롤백!
                             current_device_pref = None;
                         }
                     }
