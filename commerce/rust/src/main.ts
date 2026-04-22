@@ -1792,7 +1792,13 @@ function handleTaskClick(el: HTMLElement) {
 
     detailTitle.innerText = taskId.startsWith("search_") ? "Search Progress" : "Task Progress";
     
-    const logArea = document.getElementById("extraction-log");
+    // 🌟 [CRITICAL FIX] 문서 상세보기가 기존 화면을 덮어씌워 도화지(extraction-log)가 증발했다면 다시 깔아줍니다!
+    let logArea = document.getElementById("extraction-log");
+    if (!logArea) {
+        detailContent.innerHTML = `<div id="extraction-log"></div>`;
+        logArea = document.getElementById("extraction-log");
+    }
+
     if (logArea) {
         logArea.dataset.activeTaskId = taskId;
         
