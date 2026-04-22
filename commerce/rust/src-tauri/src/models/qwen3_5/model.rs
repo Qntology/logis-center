@@ -2306,6 +2306,24 @@ impl Qwen3_5Model {
                 processed += take;
                 current_offset += take;
                 
+                // 🌟 [CRITICAL FIX] 디테일 추출 시 AI가 문맥을 다시 읽는 실시간 퍼센트를 계산하여 UI로 쏩니다!
+                let pct = ((processed as f32 / total_len as f32) * 100.0) as i32;
+                if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
+                    if let Some(sid) = &session_id {
+                        let task_id = if sid.starts_with("task_") {
+                            let p: Vec<&str> = sid.split('_').collect();
+                            if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
+                        } else { sid.clone() };
+                        
+                        let _ = tx.send(serde_json::json!({
+                            "task_id": task_id,
+                            "category": "Detail Extraction",
+                            "summary": format!("Analyzing details ({}%)...", pct),
+                            "spinner": "⠹"
+                        }));
+                    }
+                }
+
                 use std::io::Write;
                 print!("\r[Qwen3.5-PREFILL] {} / {} tokens processed", processed, total_len);
                 let _ = std::io::stdout().flush();

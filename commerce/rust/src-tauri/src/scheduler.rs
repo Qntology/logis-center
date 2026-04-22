@@ -141,6 +141,9 @@ fn merge_json_results(target: &mut Value, source: &Value) {
 
 use tokio::sync::Notify;
 use once_cell::sync::Lazy;
+use once_cell::sync::OnceCell;
+
+pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
 
 // [UI-SYNC] Instant notification system to wake up the worker
 static UI_READY_SIGNAL: Lazy<Notify> = Lazy::new(|| Notify::new());
@@ -165,6 +168,17 @@ pub async fn start_background_worker(
 ) {
     println!("[Scheduler] Background worker waiting for UI Ready signal...");
     
+    // 🌟 [CRITICAL FIX] 모델 깊은 곳에서 올라오는 퍼센트(%) 신호를 받아 UI로 직행시키는 리스너 
+    let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let _ = PROGRESS_TX.set(ptx);
+    let app_handle_prog = app_handle.clone();
+    tokio::spawn(async move {
+        use tauri::Emitter;
+        while let Some(payload) = prx.recv().await {
+            let _ = app_handle_prog.emit("extraction-progress", &payload);
+        }
+    });
+
     clear_all_temp_data(Some(&app_handle));
 
     // [NEW] 앱 시작 시 즉시 좀비 작업 정리 (잠금 획득 시도)
@@ -1120,6 +1134,19 @@ async fn process_task(
             for (idx, item_pug) in pug_list.iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { break; }
                 
+                // 🌟 [CRITICAL FIX] 리스트 아이템 추출 진행률(%) 계산 및 UI/터미널 전송
+                let percent = (((idx + 1) as f32 / pug_list.len() as f32) * 100.0) as i32;
+                let summary_msg = format!("Extracting item data ({}%)...", percent);
+                
+                let payload = json!({ 
+                    "task_id": task.id, 
+                    "category": format!("List Extraction ({}/{})", idx + 1, pug_list.len()), 
+                    "summary": summary_msg, 
+                    "spinner": "⠋" 
+                });
+                let _ = app_handle.emit("extraction-progress", &payload);
+                emit_term(&format!("[STAGE-3] {}", summary_msg));
+
                 let extraction_instruction = parsing::list2json(&page_type, language);
                 let task_question = format!("[PUG CONTENT]\n{}\n\n{}", item_pug, extraction_instruction);
                 
@@ -1234,7 +1261,11 @@ async fn process_task(
                 // 🌟 [교체 구간 2-C] src/scheduler.rs 의 Detail Extraction 내부 (하단부)
                 if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
                     println!("[Scheduler] Qwen3.5 Step C: Asking extraction question...");
-                    log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running Qwen 3.5 Inference..." }));
+                    
+                    // 🌟 [CRITICAL FIX] 디테일 추출 진행 상태를 100%로 명확히 표기하고 UI로 쏩니다.
+                    let payload = json!({ "task_id": task.id, "category": "Detail Extraction", "summary": "Extracting details (100%)...", "spinner": "⠋" });
+                    let _ = app_handle.emit("extraction-progress", &payload);
+                    emit_term("[STAGE-3] Extracting details (100%)...");
                     
                     // 🌟 generate_part 에 None 대신 Some(snapshot_id.clone()) 전달
                     let res = gen.generate_part(&params, false, 0, None, Some(snapshot_id.clone()), kv_name.clone()).await?;
@@ -1318,52 +1349,109 @@ async fn process_task(
     }
 
     let target_table = page_type.to_string();
-    let text_to_embed = parsing::json_to_natural_language(&extracted_data);
-    let item_digest = crate::utils::hash::digest(&text_to_embed); 
-    let target_id = if !task.r#ref.is_empty() { task.r#ref.clone() } else { generated_id }; 
-    
-    let mut existing_vector = None;
-    let mut is_new_draft = true; // 🌟 [신규] 기존에 없던 새 아이템인지(Draft) 판별하는 플래그
-    if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
-        is_new_draft = false; // 🌟 DB에 이미 있으면 업데이트(Count 증가)
-        if existing_item.digest == item_digest {
-            existing_vector = Some(existing_item.vector);
-        }
-    }
-
-    let vector = if let Some(v) = existing_vector {
-        Some(v)
-    } else {
-        Some(model.get_embedding(text_to_embed).await?)
-    };
-
     let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
     let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_val));
     let ref_val = task.r#ref.clone();
 
-    let _ = store.upsert_item(
-        &target_table, &target_id, &page_type, extracted_data.clone(), vector.clone(),
-        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
-    ).await;
-    
-    let _ = store.upsert_item(
-        "items", &target_id, &page_type, extracted_data.clone(), vector,
-        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
-    ).await;
-
-    // 🌟 [CRITICAL FIX] Part 2: 추출된 데이터들을 모아서 통계(Base Metrics) 업데이트 엔진 가동!
     let mut items_to_process = Vec::new();
+    let mut is_new_draft_global = true; 
+
     if is_detail {
-        // 상세 페이지면 객체 자체를 통계 대상에 추가
+        // 🌟 [DETAIL MODE] 단일 문서일 경우 기존처럼 통째로 저장합니다.
+        let text_to_embed = parsing::json_to_natural_language(&extracted_data);
+        let item_digest = crate::utils::hash::digest(&text_to_embed); 
+        let target_id = if !task.r#ref.is_empty() { task.r#ref.clone() } else { generated_id.clone() }; 
+        
+        let mut existing_vector = None;
+        if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
+            is_new_draft_global = false; 
+            if existing_item.digest == item_digest {
+                existing_vector = Some(existing_item.vector);
+            }
+        }
+
+        let vector = if let Some(v) = existing_vector {
+            Some(v)
+        } else {
+            Some(model.get_embedding(text_to_embed).await?)
+        };
+
+        let _ = store.upsert_item(
+            &target_table, &target_id, &page_type, extracted_data.clone(), vector.clone(),
+            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
+        ).await;
+        
+        let _ = store.upsert_item(
+            "items", &target_id, &page_type, extracted_data.clone(), vector,
+            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
+        ).await;
+
         items_to_process.push(extracted_data.clone());
-    } else if let Some(items) = extracted_data.get("items").and_then(|v| v.as_array()) {
-        // 리스트 페이지면 배열 안의 모든 아이템들을 통계 대상에 추가
-        items_to_process = items.clone();
+        
+    } else {
+        // 🌟 [CRITICAL FIX] [LIST MODE] items 배열을 순회하며 낱개로 쪼개어 각각 DB에 독립된 문서로 저장합니다!
+        if let Some(items) = extracted_data.get("items").and_then(|v| v.as_array()) {
+            is_new_draft_global = false; // 리스트 업데이트 통계 기준 처리
+            
+            for item_val in items.iter() {
+                let mut single_item = item_val.clone();
+                
+                // 1. 개별 아이템만의 고유 식별자(ID) 생성 (상품번호나 링크 기반)
+                let original_id = single_item.get("id").or_else(|| single_item.get("no")).and_then(|v| v.as_str())
+                    .unwrap_or_else(|| single_item.get("link").and_then(|v| v.as_str()).unwrap_or(""));
+                
+                let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(original_id).replace("-", "").replace("_", "");
+                let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));
+                let hashed_item_id = if original_id.is_empty() {
+                    crate::utils::hash::hash_id(&format!("{}{}", team_id, uuid::Uuid::new_v4()))
+                } else {
+                    crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val))
+                };
+
+                // 2. 부모 페이지의 메타데이터(type, detail)를 개별 아이템에 주입
+                if let Some(obj) = single_item.as_object_mut() {
+                    obj.insert("type".to_string(), json!(page_type));
+                    obj.insert("detail".to_string(), json!(false));
+                    obj.insert("id".to_string(), json!(hashed_item_id.clone()));
+                    obj.insert("index".to_string(), json!(index_val));
+                }
+
+                let text_to_embed = parsing::json_to_natural_language(&single_item);
+                let item_digest = crate::utils::hash::digest(&text_to_embed);
+                
+                // 3. 중복 검사 및 벡터 임베딩 추출
+                let mut existing_vector = None;
+                if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &hashed_item_id).await {
+                    if existing_item.digest == item_digest {
+                        existing_vector = Some(existing_item.vector);
+                    }
+                }
+                
+                let vector = if let Some(v) = existing_vector {
+                    Some(v)
+                } else {
+                    Some(model.get_embedding(text_to_embed).await?)
+                };
+
+                // 4. DB에 낱개 단위로 저장
+                let _ = store.upsert_item(
+                    &target_table, &hashed_item_id, &page_type, single_item.clone(), vector.clone(),
+                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
+                ).await;
+                
+                let _ = store.upsert_item(
+                    "items", &hashed_item_id, &page_type, single_item.clone(), vector,
+                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
+                ).await;
+
+                items_to_process.push(single_item);
+            }
+        }
     }
 
     if !items_to_process.is_empty() {
-        // 🌟 방금 Part 1에서 만들었던 엔진을 호출하여 team.data.base 갱신!
-        let _ = update_team_base_metrics(&store, &team_id, &task.cc, &page_type, &items_to_process, is_new_draft).await;
+        // 🌟 추출된 낱개 데이터들로 통계(Base Metrics) 엔진 갱신!
+        let _ = update_team_base_metrics(&store, &team_id, &task.cc, &page_type, &items_to_process, is_new_draft_global).await;
         println!("[PROCESS] Metrics Engine updated base statistics for {} items.", items_to_process.len());
     }
 

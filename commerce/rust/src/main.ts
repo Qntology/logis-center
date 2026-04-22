@@ -964,17 +964,20 @@ document.addEventListener('view-task-log', () => { openWidget("list"); listView.
 btnExtract?.addEventListener("click", async () => {
     console.log("[DEBUG] btnExtract clicked. currentDetectedUrl:", currentDetectedUrl, "currentImage:", currentImage);
     if (currentDetectedUrl || currentImage) {
-        if (isExtracting) return;
+        // 🌟 [CRITICAL FIX 1] isExtracting = true 일 때 막던 로직(return)을 지우고 대기열 등록을 허용!
+        const wasExtracting = isExtracting;
+        isExtracting = true;
 
         btnExtract.style.opacity = "0.5";
-        const logArea = document.getElementById("extraction-log");
-        if (logArea) logArea.innerHTML = "";
-        
         setTimeout(() => { if (btnExtract) btnExtract.style.opacity = "1"; }, 300);
 
-        openWidget("settings");
-        startSpinner();
-        isExtracting = true;
+        // 🌟 돌고 있는 작업이 없을 때만 UI를 비우고, 이미 돌고 있으면 기존 로그창 유지
+        if (!wasExtracting) {
+            const logArea = document.getElementById("extraction-log");
+            if (logArea) logArea.innerHTML = "";
+            openWidget("settings");
+            startSpinner();
+        }
         const taskId = `task_${Date.now()}`;
         
         // 🌟 [핵심 분기] Cloud Mode 체크
@@ -1089,7 +1092,21 @@ btnExtract?.addEventListener("click", async () => {
             }
         }
         
-        stopSpinner();
+        if (currentImage) {
+            currentImage = null;
+            if (navPreviewContainer) navPreviewContainer.classList.add("hidden");
+            if (navUploadBtn) navUploadBtn.classList.remove("active-emoji");
+            if (searchInput) searchInput.disabled = false;
+            
+            // 🌟 [CRITICAL FIX] 이미지가 큐에 들어갔으니 숨겨뒀던 돋보기(🔍) 버튼을 즉시 복구시킵니다!
+            if (btnSubmit) btnSubmit.style.display = "flex";
+        }
+
+        // 🌟 [추가 수정] 작업 시작 시 스피너가 깜빡거리며 끊기지 않고 부드럽게 이어지도록 불필요한 stopSpinner() 제거
+        if (wasExtracting) {
+            console.log("[WIDGET] Task safely added to backend queue:", taskId);
+        }
+        
         await updateExtractButtonVisibility();
     }
 });
@@ -1101,9 +1118,16 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     const summary = (payload.summary || "").toLowerCase();
     const isTerminal = payload.category === "Done" || payload.category === "Error" || summary.includes("cancelled") || summary.includes("stopped");
 
+    // 🌟 [CRITICAL FIX 2] 이전 작업이 끝나고 큐에서 새 작업이 뽑혀 시작될 때 프론트엔드를 깨워줍니다!
     if (!isRecovery && !isExtracting && !isTerminal) {
-        console.log("[WIDGET] Ignoring late progress event after stop:", payload.category);
-        return; 
+        if (payload.category === "Processing" || payload.category === "Preparation" || payload.category === "Vision" || payload.category === "Shipping" || payload.category === "Analytic") {
+            console.log("[WIDGET] Queue task started, resuming extraction UI state.");
+            isExtracting = true;
+            startSpinner();
+        } else {
+            console.log("[WIDGET] Ignoring late progress event after stop:", payload.category);
+            return; 
+        }
     }
 
     // 🌟 [CRITICAL FIX] 정규식을 수정하여 (Slice 1/5) 같은 글자도 하나의 카테고리로 묶어냅니다!
