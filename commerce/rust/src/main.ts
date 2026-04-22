@@ -65,6 +65,8 @@ let isChatLoading = false;
 let isFirstNavRender = true;
 let isFirstChatLoad = true;
 
+const taskSteps = new Map<string, Map<string, number>>();
+
 let selectedUuids = new Set<string>();
 let currentDetailUuid: string | null = null;
 let activeTaskId: string | null = null; 
@@ -1144,6 +1146,9 @@ listen("extraction-progress", async (event: any) => { renderProgressToUI(event.p
 document.addEventListener('render-progress', (e: any) => { renderProgressToUI(e.detail); });
 
 async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
+    // 🌟 [CRITICAL FIX] 백엔드에서 task_id를 빼먹고 보낸 멍청한 로그들을 현재 작업 ID로 강제 편입시킵니다!
+    payload.task_id = payload.task_id || activeTaskId || (document.getElementById("extraction-log")?.dataset.activeTaskId);
+
     const summary = (payload.summary || "").toLowerCase();
     const isTerminal = payload.category === "Done" || payload.category === "Error" || summary.includes("cancelled") || summary.includes("stopped");
 
@@ -1164,6 +1169,36 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     const catId = baseCategory.replace(/[^a-zA-Z0-9]/g, "");
     const elementId = `progress-${catId}`;
     
+    let displaySummary = payload.summary || "";
+    
+    if (!isTerminal && payload.category !== "Error") { 
+        const tId = payload.task_id;
+        if (!taskSteps.has(tId)) taskSteps.set(tId, new Map());
+        const stepMap = taskSteps.get(tId)!;
+        
+        // 🌟 [CRITICAL FIX] 해당 카테고리가 처음 등장했을 때만 고유 번호를 발급하고, 이후엔 그 번호를 계속 씁니다.
+        if (!stepMap.has(elementId)) {
+            stepMap.set(elementId, stepMap.size + 1);
+        }
+        let currentStep = stepMap.get(elementId)!;
+        
+        const bubbleEl = document.getElementById(payload.task_id);
+        const isImage = /Vision/i.test(payload.category) || (bubbleEl && bubbleEl.innerText.includes("Local Image"));
+        const totalSteps = isImage ? 5 : 10;
+        
+        currentStep = Math.min(currentStep, totalSteps); 
+        
+        let rawSummary = payload.summary || "";
+        const pctMatch = rawSummary.match(/\(\d+%\)/);
+        const hasDots = rawSummary.endsWith("...");
+        
+        if (hasDots) rawSummary = rawSummary.slice(0, -3).trim();
+        if (pctMatch) rawSummary = rawSummary.replace(pctMatch[0], '').trim();
+        
+        // 띄어쓰기를 살짝 수정하여 보기에 더 깔끔하게 만듭니다: [8/10] (100%)...
+        displaySummary = `${rawSummary} [${currentStep}/${totalSteps}]${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
+    }
+
     const extractionLog = document.getElementById("extraction-log");
     const targetContainer = document.getElementById("progress-container") || extractionLog;
     
@@ -1205,27 +1240,20 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
 
     if (payload.task_id) {
         let statusCode = 1; 
-        const summary = (payload.summary || "").toLowerCase();
+        const summaryMsg = (payload.summary || "").toLowerCase(); // 변수명 충돌 방지
         
-        // [FIX] Correctly map status by checking summary text first
-        if (summary.includes("cancelled") || summary.includes("stopped")) {
-            statusCode = 3; // Cancelled
-            isExtracting = false;
-            stopSpinner();
-        } else if (payload.category === "Done") {
-            statusCode = 9; // Success
-        } else if (payload.category === "Error") {
-            statusCode = 6; // Error
-        }
+        if (summaryMsg.includes("cancelled") || summaryMsg.includes("stopped")) {
+            statusCode = 3; isExtracting = false; stopSpinner();
+        } else if (payload.category === "Done") { statusCode = 9; } 
+        else if (payload.category === "Error") { statusCode = 6; }
         
-        // 🌟 [CRITICAL FIX] 기존 말풍선의 생성 시간을 기억하여 정렬을 유지하고, updated_at을 명시하여 강제 업데이트를 발생시킵니다!
         const existingEl = document.getElementById(payload.task_id) as HTMLElement;
         const originalCreatedAt = existingEl ? parseInt(existingEl.dataset.createdAt || "0") : Date.now();
 
         renderMessage({ 
             id: payload.task_id, 
             role: "system_task", 
-            content: payload.summary, 
+            content: displaySummary, // 🌟 기존 payload.summary 대신 진행도 숫자가 추가된 displaySummary 사용!
             status: statusCode, 
             created_at: originalCreatedAt, 
             updated_at: Date.now(),
@@ -1272,9 +1300,9 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
          const spinnerEl = p.querySelector(".active-spinner") as HTMLElement;
          const resultsContainer = p.querySelector(".results-container");
 
-         // [SMART-UPDATE] Only update DOM if the content actually changed
-         if (summaryEl && summaryEl.textContent !== payload.summary) {
-             summaryEl.textContent = payload.summary || "";
+         // 🌟 [CRITICAL FIX] 디테일 뷰(진행 목록)에도 JS에서 조립한 displaySummary를 똑같이 덮어씌웁니다!
+         if (summaryEl && summaryEl.textContent !== displaySummary) {
+             summaryEl.textContent = displaySummary;
          }
 
          if (payload.category === "Done") {
@@ -1784,7 +1812,10 @@ function handleTaskClick(el: HTMLElement) {
         invoke<any[]>("get_task_logs", { taskId: taskId }).then(logs => {
             if (logArea.dataset.activeTaskId !== taskId) return;
             if (logs && logs.length > 0) {
-                logs.forEach(payload => renderProgressToUI(payload, true));
+                logs.forEach(payload => {
+                    payload.task_id = payload.task_id || taskId; // 🌟 [CRITICAL FIX] 렌더링 전 빈칸 채우기!
+                    renderProgressToUI(payload, true);
+                });
             } else if (status === 1) {
                 const progContainer = document.getElementById("progress-container");
                 if (progContainer) progContainer.insertAdjacentHTML('beforeend', `<div id="temp-spinner" style="padding: 10px; text-align: center; color: var(--primary);"><span class="spinner active-spinner">⠋</span> Generating Insights...</div>`);
@@ -3093,6 +3124,51 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
             console.warn("[WIDGET] Failed to fetch active task fallback:", e);
         }
 
+        // 🌟 [CRITICAL FIX] 새로고침 시 DB가 'Processing...' 이라는 옛날 텍스트를 주더라도, 로그 파일을 뒤져서 [8/10] 최신 텍스트로 강제 업그레이드합니다!
+        for (let m of messages) {
+            if (m.status === 1 && (m.role === "system_task" || m.task_id)) {
+                try {
+                    const tId = m.task_id || m.id;
+                    const logs = await invoke<any[]>("get_task_logs", { taskId: tId });
+                    if (logs && logs.length > 0) {
+                        if (!taskSteps.has(tId)) taskSteps.set(tId, new Map());
+                        const stepMap = taskSteps.get(tId)!;
+                        
+                        let isImage = false;
+                        let lastLog = logs[0];
+                        
+                        // 기존 로그들을 훑으면서 고유 스텝 번호 장부를 복원합니다.
+                        logs.forEach(l => {
+                            l.task_id = l.task_id || tId; // 🌟 [CRITICAL FIX] 여기서도 누락된 task_id를 강제 주입!
+                            
+                            const bCat = l.category ? l.category.replace(/\s*\(.*?\)/g, "") : "general";
+                            const elId = `progress-${bCat.replace(/[^a-zA-Z0-9]/g, "")}`;
+                            
+                            // 🌟 [CRITICAL FIX] Map 구조에 맞춰 순번 부여
+                            if (!stepMap.has(elId)) {
+                                stepMap.set(elId, stepMap.size + 1);
+                            }
+                            if (/Vision/i.test(l.category)) isImage = true;
+                            lastLog = l;
+                        });
+                        
+                        const totalSteps = isImage || (m.text || "").includes("Local Image") ? 5 : 10;
+                        let currentStep = Math.min(stepMap.size, totalSteps);
+                        
+                        let rawSummary = lastLog.summary || "";
+                        const pctMatch = rawSummary.match(/\(\d+%\)/);
+                        const hasDots = rawSummary.endsWith("...");
+                        if (hasDots) rawSummary = rawSummary.slice(0, -3).trim();
+                        if (pctMatch) rawSummary = rawSummary.replace(pctMatch[0], '').trim();
+                        
+                        // DB의 구형 텍스트를 찢고 최신 진행률로 덮어씌웁니다!
+                        m.text = `${rawSummary} [${currentStep}/${totalSteps}]${pctMatch ? pctMatch[0] : ''}${hasDots ? '...' : ''}`;
+                        m.updated_at = Date.now(); // 화면 업데이트를 위해 강제로 최신 시간 부여
+                    }
+                } catch (e) {}
+            }
+        }
+
         const scrollEl = document.getElementById("chat-scroll") as HTMLElement;
 
         if (chatTalks) {
@@ -3120,7 +3196,7 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                 </div>`;
                 chatTalks.insertAdjacentHTML('afterbegin', endHtml);
             }
-            
+
             if (!currentSession.email && currentTab === "settings") {
                 performQrAuth();
             }
