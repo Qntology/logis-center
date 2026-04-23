@@ -648,7 +648,7 @@ options:[
 ],
 additional_goods:[
     {
-        value:URL includes a manage path, an administrative or edit route product Link | string,
+        value:URL includes a manage path, an administrative or edit Link | string,
     }
 ],
 title:product name | string,
@@ -663,7 +663,7 @@ goods:[{
         value:goods title | string,
     },
     link:{
-        value:URL includes a manage path, an administrative or edit route goods Link | string,
+        value:URL includes a manage path, an administrative or edit Link | string,
     },
     id:{
         value:Refer to the product no value from the link or an attribute or input value | string,
@@ -721,6 +721,7 @@ Extract detailed information from the provided Pug template into a single struct
 
 [CONTEXT]
 Page Type: {TYPE}
+current Link: {HREF}
 
 [SCHEMA DEFINITIONS]
 {SCHEMA}
@@ -746,7 +747,7 @@ Page Type: {TYPE}
 pub fn list2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
     "order" | "goods" => r###"status:'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
-link:URL includes a manage path, an administrative or edit route Link | string,
+link:URL includes a manage path, an administrative or edit Link | string,
 id:Refer to the ID value from the link or an attribute | string,
 title:title | string, 
 sale_price:sale price | number,
@@ -758,7 +759,7 @@ registration_date:yyyy-MM-ddThh:mm:ss | string,"###.to_string(),
     "tracking" | "review" => r###"status:'start' or 'progress' or 'stop' or 'cancel' or 'return',
 id:Refer to the ID value from the link or an attribute | string,
 title:author and content | string, 
-link:URL includes a manage path, an administrative or edit route Link | string,
+link:URL includes a manage path, an administrative or edit Link | string,
 registration_date:yyyy-MM-ddThh:mm:ss | string,"###.to_string(),
     "coupon" | "event" => r###"status:'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
 id:Refer to the ID value from the link or an attribute | string,
@@ -771,7 +772,9 @@ registration_date:yyyy-MM-ddThh:mm:ss | string,"###.to_string(),
 
     let template = r###"[TASK]
 Extract detailed information from the provided Pug template into a single structured JSON object.
-current: {HREF}
+
+[CONTEXT]
+current Link: {HREF}
 
 [SCHEMA DEFINITIONS]
 {SCHEMA}

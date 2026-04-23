@@ -634,8 +634,59 @@ async fn process_task(
 
     let mut page_type = String::new();
     let mut selector_info: serde_json::Value = json!({});
-
     let mut is_detail = false;
+    let mut skip_ai_analysis = false; // 🌟 [핵심] AI 분석 스킵 플래그 추가
+
+    let raw_path = {
+        let mut shared_origin = None;
+        if let Ok(mem) = crate::ACTIVE_TASK_MEM.read() {
+            if let Some(json_val) = mem.as_ref() {
+                if let Some(o) = json_val.get("origin").and_then(|v| v.as_str()) {
+                    if let Ok(u) = url::Url::parse(o) { shared_origin = Some(format!("{}://{}", u.scheme(), u.host_str().unwrap_or("localhost"))); }
+                }
+            }
+        }
+        let origin_str = task_data.get("origin").and_then(|s| s.as_str()).map(|s| s.to_string())
+            .filter(|s| s != "http://localhost").or(shared_origin)
+            .unwrap_or_else(|| if let Ok(task_url) = url::Url::parse(&url) { format!("{}://{}", task_url.scheme(), task_url.host_str().unwrap_or("localhost")) } else { "http://localhost".to_string() });
+
+        let base_url = url::Url::parse(&origin_str).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
+        let url_obj = base_url.join(&url).unwrap_or(base_url);
+        url_obj.path().to_string()
+    };
+
+    let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path));
+
+    {
+        let store_guard = store_mutex.lock().await;
+        if let Some(db) = store_guard.as_ref() {
+            if let Ok(Some(page_doc)) = db.get_item_by_id("pages", &page_id).await {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&page_doc.json_data) {
+                    let node_sel = val.get("node").and_then(|v| v.as_str()).unwrap_or("");
+                    
+                    // 🌟 유효성 검증: 캐시된 셀렉터가 현재 웹페이지 HTML에 아직 존재하는가?
+                    let clean_html_path = data_manager.get_path("clean_html");
+                    if let Ok(clean_content) = data_manager.load(&clean_html_path) {
+                        let document = scraper::Html::parse_document(&clean_content);
+                        if let Ok(sel) = scraper::Selector::parse(node_sel) {
+                            if document.select(&sel).next().is_some() || node_sel == "body" || node_sel.is_empty() {
+                                emit_term(&format!("[Scheduler] ⚡ CACHE HIT! Skipping AI Pre-processing for: {}", raw_path));
+                                page_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                                is_detail = val.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+                                selector_info = val.clone();
+                                skip_ai_analysis = true; // 스킵 활성화!
+                                
+                                log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Loaded page config from cache.", "spinner": "⚡" }));
+                            } else {
+                                emit_term("[Scheduler] Cache found but UI changed. Falling back to AI Analysis.");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 
     // ==================================================================================
     // [ULTRA-OPTIMIZED PIPELINE]
@@ -648,166 +699,169 @@ async fn process_task(
     let base_session_id_35 = format!("{}_base_q35", task.id); // 🌟 0.8B 전용 세션 ID
     let system_content = format!("[PUG CONTENT]\n{}", light_pug);
 
-    // --- STEP 0: BASE BAKING (공통 컨텍스트 딱 1번만 굽기) ---
-    {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        
-        let base_kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&base_session_id);
-        if !base_kv_path.exists() {
-            println!("[Scheduler] Baking Base PUG Context to SSD...");
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Reading document structure...", "spinner": "⠋" }));
+    // 🌟 [핵심 변경 1] 캐시 적중 시(skip_ai_analysis = true), 무거운 0.6B 분석을 통째로 건너뜁니다!
+    if !skip_ai_analysis {
+        // --- STEP 0: BASE BAKING (공통 컨텍스트 딱 1번만 굽기) ---
+        {
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
             
-            // 🌟 [CRITICAL FIX] is_baking을 true로 전달하여 안 써도 되는 2GB짜리 비전(이미지) 모델 로딩을 강제 차단합니다! (로딩 속도 13초 -> 3초)
-            model.secure_vram_relay(crate::model::ModelSize::Qwen, None, Some(cancellation_token.clone()), true, kv_name.clone()).await?;
-            
-            let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                    content: system_content.clone(),
-                    name: None,
-                })],
-                model: "qwen".to_string(),
-                ..Default::default()
-            };
+            let base_kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&base_session_id);
+            if !base_kv_path.exists() {
+                println!("[Scheduler] Baking Base PUG Context to SSD...");
+                log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Reading document structure...", "spinner": "⠋" }));
+                
+                // 🌟 [CRITICAL FIX] is_baking을 true로 전달하여 안 써도 되는 2GB짜리 비전(이미지) 모델 로딩을 강제 차단합니다! (로딩 속도 13초 -> 3초)
+                model.secure_vram_relay(crate::model::ModelSize::Qwen, None, Some(cancellation_token.clone()), true, kv_name.clone()).await?;
+                
+                let params = ChatCompletionParameters {
+                    messages: vec![ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                        content: system_content.clone(),
+                        name: None,
+                    })],
+                    model: "qwen".to_string(),
+                    ..Default::default()
+                };
 
-            if let Some(gen) = model.generator.lock().await.as_mut() {
-                // System 메시지(PUG)만 1만 토큰을 읽어서 base_session_id 로 저장합니다.
-                gen.prefill_only(params, Some(cancellation_token.clone()), Some(base_session_id.clone()), None, kv_name.clone()).await?;
-            }
-        }
-    }
-
-    // --- STEP A: CLASSIFICATION (분류) ---
-    {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Classify)");
-        
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
-
-        let type_prompt = parsing::page_type_prompt();
-        let task_question = format!("[TASK] Identify the page type.\n\n[INSTRUCTION]\n{}\n\n[ACTION] RETURN JSON ONLY.", type_prompt);
-        let snapshot_id = format!("{}_step_a", task.id);
-        
-        // 🌟 [성능 최적화] 파일 읽기/쓰기를 삭제하고 RAM 메모리에 직접 꽂아 넣습니다.
-        if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() {
-            if let Some(task_val) = w.as_mut() {
-                if let Some(obj) = task_val.as_object_mut() {
-                    obj.insert("step".to_string(), json!("Step A (Classification)"));
-                    obj.insert("session_id".to_string(), json!(snapshot_id.clone()));
-                    obj.insert("kv_path".to_string(), json!(kv_name.clone().unwrap_or_else(|| "tmp/kv/".to_string())));
+                if let Some(gen) = model.generator.lock().await.as_mut() {
+                    // System 메시지(PUG)만 1만 토큰을 읽어서 base_session_id 로 저장합니다.
+                    gen.prefill_only(params, Some(cancellation_token.clone()), Some(base_session_id.clone()), None, kv_name.clone()).await?;
                 }
             }
         }
 
+        // --- STEP A: CLASSIFICATION (분류) ---
         {
-            // [핵심] Step A가 아니라 '미리 구워둔 Base' 스냅샷을 불러옵니다!
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Classify)");
+            
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
+
+            let type_prompt = parsing::page_type_prompt();
+            let task_question = format!("[TASK] Identify the page type.\n\n[INSTRUCTION]\n{}\n\n[ACTION] RETURN JSON ONLY.", type_prompt);
+            let snapshot_id = format!("{}_step_a", task.id);
+            
+            // 🌟 [성능 최적화] 파일 읽기/쓰기를 삭제하고 RAM 메모리에 직접 꽂아 넣습니다.
+            if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() {
+                if let Some(task_val) = w.as_mut() {
+                    if let Some(obj) = task_val.as_object_mut() {
+                        obj.insert("step".to_string(), json!("Step A (Classification)"));
+                        obj.insert("session_id".to_string(), json!(snapshot_id.clone()));
+                        obj.insert("kv_path".to_string(), json!(kv_name.clone().unwrap_or_else(|| "tmp/kv/".to_string())));
+                    }
+                }
+            }
+
+            {
+                // [핵심] Step A가 아니라 '미리 구워둔 Base' 스냅샷을 불러옵니다!
+                model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+
+                let params = ChatCompletionParameters {
+                    messages: vec![
+                        // Base 캐시와 토큰을 100% 일치시키기 위해 System 메시지를 그대로 넣습니다.
+                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                            content: system_content.clone(),
+                            name: None,
+                        }),
+                        // 질문은 User 메시지로 분리합니다. (이 부분 50토큰만 연산됨!)
+                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                            content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                            name: None,
+                        })
+                    ],
+                    model: "qwen".to_string(), 
+                    max_tokens: Some(16),
+                    temperature: Some(0.0), top_p: Some(0.01),
+                    ..Default::default()
+                };
+
+                if let Some(gen) = model.generator.lock().await.as_mut() {
+                    println!("[Scheduler] 0.6B Step A: Asking classification question...");
+                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
+                    println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
+                    
+                    let _ = data_manager.offload(&res, "step_a_res");
+                    let type_info = parsing::parse_json_from_llm(&res); 
+                    page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
+                    if page_type.is_empty() {
+                        page_type = match task.r#type.as_str() {
+                            "image_extraction" => "tracking".to_string(),
+                            _ => "unknown".to_string(),
+                        };
+                    }
+                    println!("[Scheduler] Classified as: {}", page_type);
+                }
+            }
+            
+            if page_type.is_empty() || page_type == "unknown" { 
+                model.deep_purge_resources().await;
+                return Ok(()); 
+            }
+        }
+
+        // --- STEP A-2: DETAIL CLASSIFICATION (디테일 페이지 여부 독립 판별) ---
+        {
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Is Detail)");
+            
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining if detail page...", "spinner": "⠋" }));
+
+            let detail_prompt = parsing::is_detail_prompt(&page_type);
+            // LLM이 지시사항을 잘 따르도록 래핑
+            let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think", detail_prompt);
+            
+            let snapshot_id = format!("{}_step_a2", task.id); // 🌟 q35 접미사 제거
+
+            // 🌟 [CRITICAL FIX] 다시 0.6B(Qwen)로 복구하고, 0.6B의 특권인 미리 구워둔 base_session_id를 전달하여 엄청난 속도 향상을 누립니다!
             model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![
-                    // Base 캐시와 토큰을 100% 일치시키기 위해 System 메시지를 그대로 넣습니다.
                     ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                         content: system_content.clone(),
                         name: None,
                     }),
-                    // 질문은 User 메시지로 분리합니다. (이 부분 50토큰만 연산됨!)
                     ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                        content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                        content: ChatCompletionRequestUserMessageContent::Text(task_question),
                         name: None,
                     })
                 ],
-                model: "qwen".to_string(), 
-                max_tokens: Some(16),
+                model: "qwen".to_string(), // 🌟 qwen 으로 복구
+                max_tokens: Some(128),     // JSON 스키마가 길어졌으므로 토큰 길이는 128로 유지
                 temperature: Some(0.0), top_p: Some(0.01),
                 ..Default::default()
             };
 
+            // 🌟 0.6B 제너레이터(generator)로 복구
             if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 0.6B Step A: Asking classification question...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
-                println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
+                println!("[Scheduler] 0.6B (Qwen) Step A-2: Asking detail classification...");
+                let res = gen.generate(
+                    params, 
+                    Some(cancellation_token.clone()), 
+                    Some(snapshot_id.clone()), 
+                    kv_name.clone()
+                ).await?;
+                println!("[DEBUG-SCHED] Step A-2 Raw Response: '{}'", res);
                 
-                let _ = data_manager.offload(&res, "step_a_res");
-                let type_info = parsing::parse_json_from_llm(&res); 
-                page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
-                if page_type.is_empty() {
-                    page_type = match task.r#type.as_str() {
-                        "image_extraction" => "tracking".to_string(),
-                        _ => "unknown".to_string(),
-                    };
+                let detail_info = parsing::parse_json_from_llm(&res); 
+                
+                // 바뀐 프롬프트 스키마 형태 {"goods": {"detail": true}} 에 맞춘 파싱 로직 (그대로 유지)
+                is_detail = detail_info
+                    .get(&page_type)
+                    .and_then(|v| v.get("detail"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                
+                // (방어 로직) LLM이 가끔 depth를 무시하고 1차원에 바로 뱉을 경우 대비
+                if !is_detail {
+                    is_detail = detail_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
                 }
-                println!("[Scheduler] Classified as: {}", page_type);
+                    
+                println!("[Scheduler] Classified is_detail as: {}", is_detail);
+            } else {
+                println!("[Scheduler] ERROR: Qwen generator is missing!");
             }
         }
-        
-        if page_type.is_empty() || page_type == "unknown" { 
-            model.deep_purge_resources().await;
-            return Ok(()); 
-        }
-    }
-
-    // --- STEP A-2: DETAIL CLASSIFICATION (디테일 페이지 여부 독립 판별) ---
-    {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Is Detail)");
-        
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining if detail page...", "spinner": "⠋" }));
-
-        let detail_prompt = parsing::is_detail_prompt(&page_type);
-        // LLM이 지시사항을 잘 따르도록 래핑
-        let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think", detail_prompt);
-        
-        let snapshot_id = format!("{}_step_a2", task.id); // 🌟 q35 접미사 제거
-
-        // 🌟 [CRITICAL FIX] 다시 0.6B(Qwen)로 복구하고, 0.6B의 특권인 미리 구워둔 base_session_id를 전달하여 엄청난 속도 향상을 누립니다!
-        model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
-
-        let params = ChatCompletionParameters {
-            messages: vec![
-                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                    content: system_content.clone(),
-                    name: None,
-                }),
-                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(task_question),
-                    name: None,
-                })
-            ],
-            model: "qwen".to_string(), // 🌟 qwen 으로 복구
-            max_tokens: Some(128),     // JSON 스키마가 길어졌으므로 토큰 길이는 128로 유지
-            temperature: Some(0.0), top_p: Some(0.01),
-            ..Default::default()
-        };
-
-        // 🌟 0.6B 제너레이터(generator)로 복구
-        if let Some(gen) = model.generator.lock().await.as_mut() {
-            println!("[Scheduler] 0.6B (Qwen) Step A-2: Asking detail classification...");
-            let res = gen.generate(
-                params, 
-                Some(cancellation_token.clone()), 
-                Some(snapshot_id.clone()), 
-                kv_name.clone()
-            ).await?;
-            println!("[DEBUG-SCHED] Step A-2 Raw Response: '{}'", res);
-            
-            let detail_info = parsing::parse_json_from_llm(&res); 
-            
-            // 바뀐 프롬프트 스키마 형태 {"goods": {"detail": true}} 에 맞춘 파싱 로직 (그대로 유지)
-            is_detail = detail_info
-                .get(&page_type)
-                .and_then(|v| v.get("detail"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            
-            // (방어 로직) LLM이 가끔 depth를 무시하고 1차원에 바로 뱉을 경우 대비
-            if !is_detail {
-                is_detail = detail_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
-            }
-                
-            println!("[Scheduler] Classified is_detail as: {}", is_detail);
-        } else {
-            println!("[Scheduler] ERROR: Qwen generator is missing!");
-        }
-    }
+    } // 👈 🌟 [핵심 변경 1 끝] 0.6B 분석 블록 종료
 
                         
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -819,323 +873,313 @@ async fn process_task(
 
     // --- PHASE 2 Continue: Detail Extraction (If needed) --- 
     if !is_detail {
-        // --- STEP B: SELECTORS (선택자 추출 - JS 기반 신규 로직) ---
-        {
-            use boa_engine::{Context, Source};
-            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-            println!("[Scheduler] Starting JS-BASED SELECTOR ANALYSIS (LLM Titles -> Boa Engine)");
-            
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Analyzing DOM with JS engine...", "spinner": "⠋" }));
-
-            // 1. LLM에게 상품명(titles) 추출 요청
-            let title_prompt = parsing::extract_titles_prompt(&page_type);
-            let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY.", title_prompt);
-            let snapshot_id = format!("{}_step_b_titles", task.id);
-
-            let mut titles = Vec::new();
+        // 🌟 [핵심 변경 2] 캐시가 없을 때만 자바스크립트 엔진(Boa)을 돌리고 DB에 저장합니다.
+        if !skip_ai_analysis {
+            // --- STEP B: SELECTORS (선택자 추출 - JS 기반 신규 로직) ---
             {
-                model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
-
-                let params = ChatCompletionParameters {
-                    messages: vec![
-                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                            content: system_content.clone(),
-                            name: None,
-                        }),
-                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                            content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
-                            name: None,
-                        })
-                    ],
-                    model: "qwen".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
-                    ..Default::default()
-                };
-
-                if let Some(gen) = model.generator.lock().await.as_mut() {
-                    println!("[JS-BRIDGE] 1. Requesting titles from LLM (0.6B)...");
-                    
-                    // 0.6B 모델은 generate_part가 아닌 표준 `generate`를 사용하며, 
-                    // 반환값도 구조체가 아닌 단순 String(res) 입니다.
-                    let res = gen.generate(
-                        params, 
-                        Some(cancellation_token.clone()), 
-                        Some(snapshot_id.clone()), 
-                        kv_name.clone()
-                    ).await?;
-                    
-                    println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
-
-                    // res.text 가 아닌 res 를 그대로 파싱
-                    let title_info = parsing::parse_json_from_llm(&res);
-                    let items_opt = title_info.get("order")
-                        .or(title_info.get("goods"))
-                        .or(title_info.get("items"))
-                        .or(title_info.get("titles"))
-                        .or(title_info.get("products"))
-                        .and_then(|v| v.as_array());
-
-                    if let Some(items) = items_opt {
-                        for item in items {
-                            if let Some(t) = item.as_str() {
-                                titles.push(t.to_string());
-                            } else if let Some(t) = item.get("title").and_then(|v| v.as_str()) {
-                                titles.push(t.to_string());
-                            }
-                        }
-                    }
-                    println!("[JS-BRIDGE] Titles extracted (Robust): {:?}", titles);
-                }
-            }
-
-            if titles.is_empty() {
-                 println!("[JS-BRIDGE] Warning: No titles extracted from LLM. Falling back to default.");
-            }
-
-            // 2. Boa Engine으로 DOM 분석
-            {
-                println!("[JS-BRIDGE] 2. Starting boa-engine for DOM analysis...");
-                let mut context = Context::default();
+                use boa_engine::{Context, Source};
+                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                println!("[Scheduler] Starting JS-BASED SELECTOR ANALYSIS (LLM Titles -> Boa Engine)");
                 
-                let clean_html = data_manager.load(&data_manager.get_path("clean_html"))?;
-                let document = scraper::Html::parse_document(&clean_html);
-                
-                let mut nodes_json = Vec::new();
-                let mut node_to_idx = std::collections::HashMap::new();
+                log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Analyzing DOM with JS engine...", "spinner": "⠋" }));
 
-                // 1단계: 모든 노드 ID 매핑 (부모 참조 안정성 확보)
-                for (idx, node) in document.tree.root().descendants().enumerate() {
-                    node_to_idx.insert(node.id(), idx);
-                }
+                // 1. LLM에게 상품명(titles) 추출 요청
+                let title_prompt = parsing::extract_titles_prompt(&page_type);
+                let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY.", title_prompt);
+                let snapshot_id = format!("{}_step_b_titles", task.id);
 
-                // 2단계: 노드 정보 수집 (Element 노드 중심)
-                for (idx, node) in document.tree.root().descendants().enumerate() {
-                    if let Some(el) = node.value().as_element() {
-                        let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
-                        
-                        let text: String = node.children()
-                            .filter_map(|child| child.value().as_text().map(|t| t.to_string()))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                            .trim()
-                            .to_string();
-                            
-                        nodes_json.push(json!({
-                            "index": idx,
-                            "parentIndex": parent_idx,
-                            "tagName": el.name().to_string(),
-                            "id": el.id().unwrap_or("").to_string(),
-                            "classes": el.attr("class").unwrap_or("").split_whitespace().collect::<Vec<_>>(),
-                            "text": text
-                        }));
-                    } else {
-                        nodes_json.push(json!(null));
-                    }
-                }
-                
-                let nodes_str = serde_json::to_string(&nodes_json)?;
-                let titles_str = serde_json::to_string(&titles)?;
+                let mut titles = Vec::new();
+                {
+                    model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
-                let js_template = r##"
-                    const nodes = NODES_PLACEHOLDER;
-                    const titles = TITLES_PLACEHOLDER;
-                    
-                    function cleanClassList(classes, stripNumbers = false) {
-                        if (!classes) return [];
-                        const skip = ['active', 'selected', 'on', 'current', 'focus', 'hover', 'enabled', 'disabled'];
-                        return classes
-                            .filter(c => {
-                                const lowerC = c.toLowerCase();
-                                return !skip.includes(lowerC) && c.indexOf('__') === -1 && !/^[a-z0-9]{8,}$/.test(c);
+                    let params = ChatCompletionParameters {
+                        messages: vec![
+                            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                                content: system_content.clone(),
+                                name: None,
+                            }),
+                            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                                content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                                name: None,
                             })
-                            .map(c => stripNumbers ? c.replace(/\d+$/, '') : c)
-                            .sort();
-                    }
+                        ],
+                        model: "qwen".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
+                        ..Default::default()
+                    };
 
-                    function getSignature(node, includeId = true) {
-                        if (!node || !node.tagName) return "";
-                        let s = node.tagName;
-                        if (includeId && node.id) s += "#" + node.id;
-                        const cls = cleanClassList(node.classes);
-                        if (cls.length > 0) {
-                            s += "." + [...new Set(cls)].join(".");
-                        }
-                        return s;
-                    }
-
-                    function getChildren(pIdx) { 
-                        return nodes.filter(n => n && n.parentIndex === pIdx); 
-                    }
-
-                    function calculateSimilarity(nodeA, nodeB) {
-                        if (nodeA.tagName !== nodeB.tagName) return 0;
-                        const clsA = cleanClassList(nodeA.classes, true);
-                        const clsB = cleanClassList(nodeB.classes, true);
-                        if (clsA.length === 0 && clsB.length === 0) return 100;
+                    if let Some(gen) = model.generator.lock().await.as_mut() {
+                        println!("[JS-BRIDGE] 1. Requesting titles from LLM (0.6B)...");
                         
-                        let matchCount = 0;
-                        clsA.forEach(c => { if (clsB.includes(c)) matchCount++; });
-                        return clsA.length ? (matchCount / clsA.length) * 100 : 0;
-                    }
+                        // 0.6B 모델은 generate_part가 아닌 표준 `generate`를 사용하며, 
+                        // 반환값도 구조체가 아닌 단순 String(res) 입니다.
+                        let res = gen.generate(
+                            params, 
+                            Some(cancellation_token.clone()), 
+                            Some(snapshot_id.clone()), 
+                            kv_name.clone()
+                        ).await?;
+                        
+                        println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
 
-                    function detect(tIdx) {
-                        let cur = tIdx;
-                        for (let i = 0; i < 15; i++) {
-                            const node = nodes[cur];
-                            if (!node) break;
-                            
-                            const pIdx = node.parentIndex;
-                            if (pIdx === undefined || pIdx === -1) break;
-                            
-                            const parentNode = nodes[pIdx];
-                            const siblings = getChildren(pIdx);
-                            
-                            const similarSiblings = siblings.filter(s => calculateSimilarity(node, s) >= 60);
+                        // res.text 가 아닌 res 를 그대로 파싱
+                        let title_info = parsing::parse_json_from_llm(&res);
+                        let items_opt = title_info.get("order")
+                            .or(title_info.get("goods"))
+                            .or(title_info.get("items"))
+                            .or(title_info.get("titles"))
+                            .or(title_info.get("products"))
+                            .and_then(|v| v.as_array());
 
-                            if (similarSiblings.length >= 2) {
-                                let finalParent = parentNode;
-                                let walkIdx = pIdx;
-                                for(let j=0; j<5; j++) {
-                                    let gIdx = nodes[walkIdx] ? nodes[walkIdx].parentIndex : -1;
-                                    if (gIdx !== -1 && nodes[gIdx]) {
-                                        const grand = nodes[gIdx];
-                                        if (grand.id || ["table", "ul", "ol", "nav"].includes(grand.tagName)) {
-                                            finalParent = grand;
-                                            if (grand.id || grand.tagName === "table") break;
-                                        }
-                                        walkIdx = gIdx;
-                                    }
+                        if let Some(items) = items_opt {
+                            for item in items {
+                                if let Some(t) = item.as_str() {
+                                    titles.push(t.to_string());
+                                } else if let Some(t) = item.get("title").and_then(|v| v.as_str()) {
+                                    titles.push(t.to_string());
                                 }
-
-                                const parentSig = getSignature(finalParent, true);
-                                const uniqueSigs = [];
-                                similarSiblings.forEach(s => {
-                                    const sig = getSignature(s, false);
-                                    if (!uniqueSigs.includes(sig)) uniqueSigs.push(sig);
-                                });
-
-                                const fullSelector = uniqueSigs.map(sig => parentSig + " " + sig).join(", ");
-
-                                return { 
-                                    parent: parentSig, 
-                                    itemSelector: fullSelector,
-                                    matchCount: similarSiblings.length
-                                };
                             }
-                            cur = pIdx;
                         }
-                        return null;
+                        println!("[JS-BRIDGE] Titles extracted (Robust): {:?}", titles);
                     }
+                }
 
-                    const findText = titles.length > 0 ? titles[0].toLowerCase().replace(/\s+/g, ' ') : "";
-                    const matches = nodes.filter(n => n && n.text && n.text.toLowerCase().replace(/\s+/g, ' ').includes(findText));
+                if titles.is_empty() {
+                     println!("[JS-BRIDGE] Warning: No titles extracted from LLM. Falling back to default.");
+                }
+
+                // 2. Boa Engine으로 DOM 분석
+                {
+                    println!("[JS-BRIDGE] 2. Starting boa-engine for DOM analysis...");
+                    let mut context = Context::default();
                     
-                    let res = { "parent": "body", "itemSelector": "div", "matchCount": matches.length };
-                    if (matches.length > 0) {
-                        const d = detect(matches[0].index);
-                        if (d) { res.parent = d.parent; res.itemSelector = d.itemSelector; }
+                    let clean_html = data_manager.load(&data_manager.get_path("clean_html"))?;
+                    let document = scraper::Html::parse_document(&clean_html);
+                    
+                    let mut nodes_json = Vec::new();
+                    let mut node_to_idx = std::collections::HashMap::new();
+
+                    // 1단계: 모든 노드 ID 매핑 (부모 참조 안정성 확보)
+                    for (idx, node) in document.tree.root().descendants().enumerate() {
+                        node_to_idx.insert(node.id(), idx);
                     }
-                    JSON.stringify(res);
-                "##;
 
-                let js_code = js_template
-                    .replace("NODES_PLACEHOLDER", &nodes_str)
-                    .replace("TITLES_PLACEHOLDER", &titles_str);
-
-                match context.eval(Source::from_bytes(js_code.as_bytes())) {
-                    Ok(val) => {
-                        let res_str = val.as_string().unwrap().to_std_string_escaped();
-                        println!("[JS-BRIDGE] Boa Final Result: {}", res_str);
-                        selector_info = serde_json::from_str(&res_str).unwrap_or(json!({}));
-                    },
-                    Err(e) => {
-                        println!("[JS-BRIDGE] Error executing JS: {:?}", e);
-                    }
-                }
-            }
-        }
-
-        // [INTERMEDIATE PARITY LOGIC] Save Page Info
-        let mut final_page_info = json!({ "type": page_type });
-        if let Some(obj) = selector_info.as_object() {
-            for (k, v) in obj { 
-                final_page_info.as_object_mut().unwrap().insert(k.clone(), v.clone()); 
-            }
-        }
-        
-        // [PARITY] Store 'Page' Entity
-        {
-            // Acquire Store lock briefly
-            let store = {
-                let store_guard = store_mutex.lock().await;
-                store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
-            };
-            
-            // 🌟 [성능 최적화] 파일 의존성을 제거하고 초고속 RAM에서 origin과 type을 가져옵니다.
-            let mut shared_origin = None;
-            let mut shared_type = None;
-            if let Ok(mem) = crate::ACTIVE_TASK_MEM.read() {
-                if let Some(json_val) = mem.as_ref() {
-                    if let Some(o) = json_val.get("origin").and_then(|v| v.as_str()) {
-                        if let Ok(u) = url::Url::parse(o) {
-                            shared_origin = Some(format!("{}://{}", u.scheme(), u.host_str().unwrap_or("localhost")));
+                    // 2단계: 노드 정보 수집 (Element 노드 중심)
+                    for (idx, node) in document.tree.root().descendants().enumerate() {
+                        if let Some(el) = node.value().as_element() {
+                            let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
+                            
+                            let text: String = node.children()
+                                .filter_map(|child| child.value().as_text().map(|t| t.to_string()))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                                .trim()
+                                .to_string();
+                                
+                            nodes_json.push(json!({
+                                "index": idx,
+                                "parentIndex": parent_idx,
+                                "tagName": el.name().to_string(),
+                                "id": el.id().unwrap_or("").to_string(),
+                                "classes": el.attr("class").unwrap_or("").split_whitespace().collect::<Vec<_>>(),
+                                "text": text
+                            }));
+                        } else {
+                            nodes_json.push(json!(null));
                         }
                     }
-                    if let Some(t) = json_val.get("type").and_then(|v| v.as_str()) {
-                        if !t.is_empty() { shared_type = Some(t.to_string()); }
+                    
+                    let nodes_str = serde_json::to_string(&nodes_json)?;
+                    let titles_str = serde_json::to_string(&titles)?;
+
+                    let js_template = r##"
+                        const nodes = NODES_PLACEHOLDER;
+                        const titles = TITLES_PLACEHOLDER;
+                        
+                        function cleanClassList(classes, stripNumbers = false) {
+                            if (!classes) return [];
+                            const skip = ['active', 'selected', 'on', 'current', 'focus', 'hover', 'enabled', 'disabled'];
+                            return classes
+                                .filter(c => {
+                                    const lowerC = c.toLowerCase();
+                                    return !skip.includes(lowerC) && c.indexOf('__') === -1 && !/^[a-z0-9]{8,}$/.test(c);
+                                })
+                                .map(c => stripNumbers ? c.replace(/\d+$/, '') : c)
+                                .sort();
+                        }
+
+                        function getSignature(node, includeId = true) {
+                            if (!node || !node.tagName) return "";
+                            let s = node.tagName;
+                            if (includeId && node.id) s += "#" + node.id;
+                            const cls = cleanClassList(node.classes);
+                            if (cls.length > 0) {
+                                s += "." + [...new Set(cls)].join(".");
+                            }
+                            return s;
+                        }
+
+                        function getChildren(pIdx) { 
+                            return nodes.filter(n => n && n.parentIndex === pIdx); 
+                        }
+
+                        function calculateSimilarity(nodeA, nodeB) {
+                            if (nodeA.tagName !== nodeB.tagName) return 0;
+                            const clsA = cleanClassList(nodeA.classes, true);
+                            const clsB = cleanClassList(nodeB.classes, true);
+                            if (clsA.length === 0 && clsB.length === 0) return 100;
+                            
+                            let matchCount = 0;
+                            clsA.forEach(c => { if (clsB.includes(c)) matchCount++; });
+                            return clsA.length ? (matchCount / clsA.length) * 100 : 0;
+                        }
+
+                        function detect(tIdx) {
+                            let cur = tIdx;
+                            for (let i = 0; i < 15; i++) {
+                                const node = nodes[cur];
+                                if (!node) break;
+                                
+                                const pIdx = node.parentIndex;
+                                if (pIdx === undefined || pIdx === -1) break;
+                                
+                                const parentNode = nodes[pIdx];
+                                const siblings = getChildren(pIdx);
+                                
+                                const similarSiblings = siblings.filter(s => calculateSimilarity(node, s) >= 60);
+
+                                if (similarSiblings.length >= 2) {
+                                    let finalParent = parentNode;
+                                    let walkIdx = pIdx;
+                                    for(let j=0; j<5; j++) {
+                                        let gIdx = nodes[walkIdx] ? nodes[walkIdx].parentIndex : -1;
+                                        if (gIdx !== -1 && nodes[gIdx]) {
+                                            const grand = nodes[gIdx];
+                                            if (grand.id || ["table", "ul", "ol", "nav"].includes(grand.tagName)) {
+                                                finalParent = grand;
+                                                if (grand.id || grand.tagName === "table") break;
+                                            }
+                                            walkIdx = gIdx;
+                                        }
+                                    }
+
+                                    const parentSig = getSignature(finalParent, true);
+                                    const uniqueSigs = [];
+                                    similarSiblings.forEach(s => {
+                                        const sig = getSignature(s, false);
+                                        if (!uniqueSigs.includes(sig)) uniqueSigs.push(sig);
+                                    });
+
+                                    const fullSelector = uniqueSigs.map(sig => parentSig + " " + sig).join(", ");
+
+                                    return { 
+                                        parent: parentSig, 
+                                        itemSelector: fullSelector,
+                                        matchCount: similarSiblings.length
+                                    };
+                                }
+                                cur = pIdx;
+                            }
+                            return null;
+                        }
+
+                        const findText = titles.length > 0 ? titles[0].toLowerCase().replace(/\s+/g, ' ') : "";
+                        const matches = nodes.filter(n => n && n.text && n.text.toLowerCase().replace(/\s+/g, ' ').includes(findText));
+                        
+                        let res = { "parent": "body", "itemSelector": "div", "matchCount": matches.length };
+                        if (matches.length > 0) {
+                            const d = detect(matches[0].index);
+                            if (d) { res.parent = d.parent; res.itemSelector = d.itemSelector; }
+                        }
+                        JSON.stringify(res);
+                    "##;
+
+                    let js_code = js_template
+                        .replace("NODES_PLACEHOLDER", &nodes_str)
+                        .replace("TITLES_PLACEHOLDER", &titles_str);
+
+                    match context.eval(Source::from_bytes(js_code.as_bytes())) {
+                        Ok(val) => {
+                            let res_str = val.as_string().unwrap().to_std_string_escaped();
+                            println!("[JS-BRIDGE] Boa Final Result: {}", res_str);
+                            selector_info = serde_json::from_str(&res_str).unwrap_or(json!({}));
+                        },
+                        Err(e) => {
+                            println!("[JS-BRIDGE] Error executing JS: {:?}", e);
+                        }
                     }
                 }
             }
 
-            let origin_str = task_data.get("origin").and_then(|s| s.as_str()).map(|s| s.to_string())
-                .filter(|s| s != "http://localhost") // If it's already localhost, treat it as missing
-                .or(shared_origin) // Fallback to the shared file
-                .unwrap_or_else(|| {
-                    // If all else fails, extract from the task.data_json URL
-                    if let Ok(task_url) = url::Url::parse(&url) {
-                        format!("{}://{}", task_url.scheme(), task_url.host_str().unwrap_or("localhost"))
-                    } else {
-                        "http://localhost".to_string()
+            // [PARITY] Store 'Page' Entity (이 구역도 스킵되지 않으면 DB에 저장)
+            {
+                // Acquire Store lock briefly
+                let store = {
+                    let store_guard = store_mutex.lock().await;
+                    store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
+                };
+                
+                let mut shared_origin = None;
+                let mut shared_type = None;
+                if let Ok(mem) = crate::ACTIVE_TASK_MEM.read() {
+                    if let Some(json_val) = mem.as_ref() {
+                        if let Some(o) = json_val.get("origin").and_then(|v| v.as_str()) {
+                            if let Ok(u) = url::Url::parse(o) {
+                                shared_origin = Some(format!("{}://{}", u.scheme(), u.host_str().unwrap_or("localhost")));
+                            }
+                        }
+                        if let Some(t) = json_val.get("type").and_then(|v| v.as_str()) {
+                            if !t.is_empty() { shared_type = Some(t.to_string()); }
+                        }
                     }
-                });
-
-            // Use shared type if available and task type is missing or unknown
-            if page_type.is_empty() || page_type == "unknown" {
-                if let Some(st) = shared_type { page_type = st; }
-            }
-                
-            let base_url = url::Url::parse(&origin_str).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
-            let url_obj = base_url.join(&url).unwrap_or(base_url);
-            let raw_path = url_obj.path();
-            let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
-            let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-            let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
-
-            let mut page_data: serde_json::Value = selector_info.clone();
-            if let Some(obj) = page_data.as_object_mut() {
-                obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
-                obj.insert("link".to_string(), json!(url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()));
-                obj.insert("type".to_string(), json!(page_type));
-                
-                // 🌟 [CRITICAL FIX] 클라우드(list2json) 스키마와 완벽 호환되도록 Boa Engine의 결과를 매핑해줍니다!
-                if let Some(item_sel) = selector_info.get("itemSelector") {
-                    obj.insert("item".to_string(), item_sel.clone()); // itemSelector -> item
                 }
-                if let Some(parent_sel) = selector_info.get("parent") {
-                    obj.insert("node".to_string(), parent_sel.clone()); // parent -> node
+
+                let origin_str = task_data.get("origin").and_then(|s| s.as_str()).map(|s| s.to_string())
+                    .filter(|s| s != "http://localhost") 
+                    .or(shared_origin) 
+                    .unwrap_or_else(|| {
+                        if let Ok(task_url) = url::Url::parse(&url) {
+                            format!("{}://{}", task_url.scheme(), task_url.host_str().unwrap_or("localhost"))
+                        } else {
+                            "http://localhost".to_string()
+                        }
+                    });
+
+                if page_type.is_empty() || page_type == "unknown" {
+                    if let Some(st) = shared_type { page_type = st; }
                 }
-                // 상세 페이지가 아님을 명시
-                obj.insert("detail".to_string(), json!(false));
+                    
+                let base_url = url::Url::parse(&origin_str).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
+                let url_obj = base_url.join(&url).unwrap_or(base_url);
+                let raw_path = url_obj.path();
+                let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
+                let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
+                let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
+
+                let mut page_data: serde_json::Value = selector_info.clone();
+                if let Some(obj) = page_data.as_object_mut() {
+                    obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
+                    obj.insert("link".to_string(), json!(url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()));
+                    obj.insert("type".to_string(), json!(page_type));
+                    
+                    if let Some(item_sel) = selector_info.get("itemSelector") {
+                        obj.insert("item".to_string(), item_sel.clone()); 
+                    }
+                    if let Some(parent_sel) = selector_info.get("parent") {
+                        obj.insert("node".to_string(), parent_sel.clone()); 
+                    }
+                    obj.insert("detail".to_string(), json!(false));
+                }
+
+                let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(raw_path), None).await;
             }
+        } // 👈 🌟 [핵심 변경 2 끝] JS 선택자 분석 스킵 괄호 닫기!
 
-            // 이제 클라우드와 완벽히 동일한 스키마로 LanceDB의 'pages' 테이블에 영구 저장됩니다!
-            let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(raw_path), None).await;
-        }
-
-        let item_selector = final_page_info.get("itemSelector")
-            .or_else(|| final_page_info.get("item"))
+        // 🌟 [핵심 변경 3] final_page_info 의존성을 제거하고 캐시된 selector_info를 직접 참조합니다.
+        let item_selector = selector_info.get("itemSelector")
+            .or_else(|| selector_info.get("item"))
             .and_then(|s| s.as_str())
             .unwrap_or("");
-        let node_selector = final_page_info.get("node").and_then(|s| s.as_str()).unwrap_or("");
+        let node_selector = selector_info.get("node").or_else(|| selector_info.get("parent")).and_then(|s| s.as_str()).unwrap_or("");
         
         let target_selector = if !node_selector.is_empty() && !item_selector.is_empty() && !item_selector.contains(",") {
             format!("{} {}", node_selector, item_selector) 
