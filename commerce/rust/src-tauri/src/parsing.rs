@@ -763,9 +763,7 @@ id:Refer to the ID value from the link or an attribute | string,
 link:Refer to the ID to find a URL that includes a manage link | string,
 title:title | string, 
 sale_price:sale price | number,
-supply_price:supply price | number,
 currency:ISO 4217 Currency Code | string,
-quantity:item stock quantity | number,
 tracking_number:Tracking Number or 운송장 번호 or 运单호 or 運單號 or 伝표번호 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Ноमर 나кладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ | string,
 registration_date:yyyy-MM-ddThh:mm:ss | string"###.to_string(),
     "tracking" | "review" => r###"status:'start' or 'progress' or 'stop' or 'cancel' or 'return',
@@ -797,7 +795,7 @@ Return ONLY a single valid JSON object strictly matching the schema above.
 Ensure the JSON object is properly closed with '}'. DO NOT repeat keys.
 If a field is missing, use null. 
 Normalize all dates to 'yyyy-MM-ddThh:mm:ss'. 
-Extract only numeric values for price, quantity, amount.
+Extract only numeric values for price.
 Preserve the exact original text for string fields. Do not strip or separate numbers from text to fill numeric fields.
 
 [ACTION] RETURN JSON ONLY. 
