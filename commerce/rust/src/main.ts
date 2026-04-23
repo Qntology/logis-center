@@ -1226,17 +1226,13 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
 
     const summary = (payload.summary || "").toLowerCase();
     const isTerminal = payload.category === "Done" || payload.category === "Error" || summary.includes("cancelled") || summary.includes("stopped");
-    
-    // 🌟 [CRITICAL FIX 1] Warning, Info 등은 단순 알림이므로 진행 스텝(1/4) 장부에 절대 넣지 않습니다!
     const isNotification = payload.category === "Warning" || payload.category === "Info";
 
-    if (!isRecovery && !isExtracting && !isTerminal) {
+    if (!isRecovery && !isExtracting && !isTerminal && !isSearching) {
         if (payload.category === "Processing" || payload.category === "Preparation" || payload.category === "Vision" || payload.category === "Shipping" || payload.category === "Analytic") {
             console.log("[WIDGET] Queue task started, resuming extraction UI state.");
             isExtracting = true;
             startSpinner();
-        } else {
-            return; 
         }
     }
 
@@ -1251,143 +1247,39 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     }
     const stepMap = taskSteps.get(tId)!;
 
-    // 🌟 [CRITICAL FIX 2] 재시도(Processing) 마커가 등장하면, 실시간이든 상세페이지 복구 중이든 무조건 리셋!
-    if (payload.category === "Processing" && stepMap.size > 0) {
-        console.log("[WIDGET] Retry detected! Wiping old steps and UI to ensure clean sequence.");
-        stepMap.clear();
-        
-        const container = document.getElementById("progress-container");
-        if (container) container.innerHTML = "";
-        
-        // 🌟 [CRITICAL FIX 3] 숨어있던 sessionStorage 잔재 박멸 & 터미널 박스 숨김
-        localStorage.removeItem(`term_${tId}`);
-        const termArea = document.getElementById("terminal-logs");
-        if (termArea && termArea.dataset.activeTaskId === tId) {
-            termArea.innerHTML = ""; // 🌟 "Retrying Process..." 텍스트 완전 삭제
-            termArea.style.display = "none"; // 🌟 까만 박스 숨김 처리
-        }
-    }
-
-    if (!taskTotalSteps.has(tId) || taskTotalSteps.get(tId) === undefined) {
-        const bubbleEl = document.getElementById(tId);
-        const isImgTask = payload.task_type === "image_extraction" || 
-                          (payload.category && payload.category.includes("Vision")) || 
-                          (bubbleEl && bubbleEl.innerText.includes("Local Image"));
-        const isSearchTask = tId.startsWith("search_");
-        
-        // 🌟 [CRITICAL FIX] 웹페이지 추출은 시작 시점에 총 스텝을 모릅니다. 
-        // 0으로 세팅하여 측정 가능해질 때까지 [N/M] 표기를 완벽하게 숨깁니다!
-        let initialTotal = 0; 
-        if (isImgTask) initialTotal = 4; 
-        if (isSearchTask) initialTotal = 4; 
-        
-        taskTotalSteps.set(tId, initialTotal); 
-    }
-
-    if (!isTerminal && payload.category !== "Error" && !isNotification) { 
-        if (!stepMap.has(elementId)) {
-            stepMap.set(elementId, stepMap.size + 1);
-        }
-        
-        let currentStep = stepMap.get(elementId)!;
-
-        // 🌟 [회원님 아이디어 적용] AI가 경로를 확정하여 측정이 가능해지는 순간, 총 스텝(분모)을 계산합니다!
-        if (payload.category && payload.category.includes("List Extraction")) {
-            const match = payload.category.match(/\(\d+\/(\d+)\)/);
-            if (match) { 
-                const totalItems = parseInt(match[1]);
-                // 현재 스텝 + 남은 리스트 개수 = 완벽한 전체 스텝 수 도출!
-                taskTotalSteps.set(tId, currentStep + totalItems); 
-            }
-        } else if (payload.category === "AI Inference" || payload.category === "List Processing") {
-            // 상세 페이지 추출의 마지막 단계 진입 시 (다음은 Saving)
-            if (taskTotalSteps.get(tId) === 0) taskTotalSteps.set(tId, currentStep + 1);
-        } else if (payload.category === "Saving") {
-            if (taskTotalSteps.get(tId) === 0) taskTotalSteps.set(tId, currentStep);
-        }
-
-        let totalSteps = taskTotalSteps.get(tId) || 0; 
-        if (totalSteps > 0 && currentStep > totalSteps) {
-            totalSteps = currentStep;
-            taskTotalSteps.set(tId, totalSteps);
-        }
-
+    // 🌟 [UI 심플화] 복잡한 계산식을 모두 삭제하고, 오직 'List Extraction' 단계에서만 [N/M]을 보여줍니다!
+    if (!isTerminal && !isNotification) {
         let rawSummary = payload.summary || "";
         const pctMatch = rawSummary.match(/\(\d+%\)/);
         const hasDots = rawSummary.endsWith("...");
         
         if (hasDots) rawSummary = rawSummary.slice(0, -3).trim();
         if (pctMatch) rawSummary = rawSummary.replace(pctMatch[0], '').trim();
-        
-        // 🌟 측정 가능할 때만 [N/M] 노출, 모를 때는 깔끔하게 퍼센트만 노출!
-        if (totalSteps > 0) {
-            displaySummary = `${rawSummary} [${currentStep}/${totalSteps}]${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
-        } else {
-            displaySummary = `${rawSummary}${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
+
+        let fractionStr = "";
+        if (payload.category && payload.category.includes("List Extraction")) {
+            const match = payload.category.match(/\((\d+)\/(\d+)\)/);
+            if (match) {
+                fractionStr = ` [${match[1]}/${match[2]}]`; // 백엔드가 준 정확한 숫자만 사용
+            }
         }
+        
+        displaySummary = `${rawSummary}${fractionStr}${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
     } else if (isNotification) {
         displaySummary = payload.summary || "";
     }
 
-    const extractionLog = document.getElementById("extraction-log");
-    const targetContainer = document.getElementById("progress-container") || extractionLog;
-    
-    if (extractionLog && extractionLog.dataset.activeTaskId) {
-        if (payload.task_id && payload.task_id !== extractionLog.dataset.activeTaskId) return;
-    }
-
+    // 🌟 [CRITICAL FIX] 조기 종료(return) 방지! 다른 상세 페이지가 열려있더라도 채팅방 버블(말풍선)은 무조건 최신화합니다!
+    let statusCode = 1; 
     if (isTerminal) {
-        if (targetContainer) {
-             const finalTotal = stepMap.size > 0 ? stepMap.size : 1;
-             taskTotalSteps.set(tId, finalTotal);
-
-             const existingSpinners = targetContainer.querySelectorAll('.active-spinner');
-             existingSpinners.forEach(s => {
-                 s.classList.remove('active-spinner');
-                 s.innerHTML = payload.category === "Error" ? "❌" : "✅";
-                 (s as HTMLElement).style.color = payload.category === "Error" ? "#ef4444" : "#4ade80";
-             });
-
-             if (payload.category === "Done") {
-                 targetContainer.querySelectorAll('.summary-text').forEach(el => {
-                     // 🌟 [복구 완료] 과거의 완료 로그들도 최종 확정된 전체 스텝 수(finalTotal)를 분모로 깔끔하게 통일시킵니다.
-                     if (el.textContent) { 
-                         el.textContent = el.textContent.replace(/\[(\d+)\/(undefined|\d+)\]/g, `[$1/${finalTotal}]`); 
-                     }
-                 });
-                 if (!displaySummary.match(/\[(\d+)\/(undefined|\d+)\]/)) {
-                     displaySummary = `${displaySummary} [${finalTotal}/${finalTotal}]`;
-                 } else {
-                     displaySummary = displaySummary.replace(/\[(\d+)\/(undefined|\d+)\]/g, `[$1/${finalTotal}]`);
-                 }
-             }
-        }
-        
-        if (activeTaskId === tId) {
-            isExtracting = false; 
-            stopSpinner();
-            if (btnExtract) { btnExtract.classList.remove("active-spinner"); btnExtract.innerText = "⚡"; }
-            if (currentImage) {
-                currentImage = null; 
-                if (navPreviewContainer) navPreviewContainer.classList.add("hidden"); 
-                if (navUploadBtn) navUploadBtn.classList.remove("active-emoji"); 
-                if (searchInput) searchInput.disabled = false; 
-                if (btnSubmit) btnSubmit.style.display = "flex"; 
-            }
-            updateExtractButtonVisibility(); 
-        }
+        if (payload.category === "Done") statusCode = 9;
+        else if (payload.category === "Error") statusCode = 6;
+        else statusCode = 3;
+    } else if (summary.includes("cancelled") || summary.includes("stopped")) {
+        statusCode = 3;
     }
-
+    
     if (payload.task_id) {
-        let statusCode = 1; 
-        const summaryMsg = (payload.summary || "").toLowerCase(); 
-        
-        if (summaryMsg.includes("cancelled") || summaryMsg.includes("stopped")) {
-            statusCode = 3; 
-            if (activeTaskId === tId) { isExtracting = false; stopSpinner(); }
-        } else if (payload.category === "Done") { statusCode = 9; } 
-        else if (payload.category === "Error") { statusCode = 6; }
-        
         const existingEl = document.getElementById(payload.task_id) as HTMLElement;
         let originalCreatedAt = Date.now();
         if (existingEl) {
@@ -1406,95 +1298,123 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
             updated_at: Date.now(),
             task_id: payload.task_id
         });
-
-        if (statusCode === 3 || statusCode === 9 || statusCode === 6) {
-            if (btnStopTask && activeTaskId === tId) btnStopTask.style.display = "none";
-            return; 
-        }
     }
 
+    // 🌟 1차 스피너 및 전역 상태 종료 처리 (현재 활성화된 작업일 때만 버튼 UI 리셋)
+    if (isTerminal && activeTaskId === tId) {
+        isExtracting = false; 
+        isSearching = false;
+        stopSpinner();
+        if (btnExtract) { btnExtract.classList.remove("active-spinner"); btnExtract.innerText = "⚡"; }
+        if (currentImage) {
+            currentImage = null; 
+            if (navPreviewContainer) navPreviewContainer.classList.add("hidden"); 
+            if (navUploadBtn) navUploadBtn.classList.remove("active-emoji"); 
+            if (searchInput) searchInput.disabled = false; 
+            if (btnSubmit) btnSubmit.style.display = "flex"; 
+        }
+        updateExtractButtonVisibility(); 
+    }
+
+    // 🌟 이제 현재 열려있는 Detail View가 이 Task의 것인지 확인 후 화면(DOM)을 업데이트합니다.
+    const extractionLog = document.getElementById("extraction-log");
+    const targetContainer = document.getElementById("progress-container") || extractionLog;
+
     if (extractionLog && detailView.style.display !== "none") {
-         let p = document.getElementById(elementId);
-         if (!p) {
-             // 🌟 Warning 알림일 때는 다른 진행 중인 스피너들을 초록색(완료)으로 만들지 않습니다!
-             if (targetContainer && !isNotification) {
+        if (extractionLog.dataset.activeTaskId !== tId) {
+            // 현재 보고 있는 화면이 다른 Task면 여기서 DOM 업데이트 중지! (버블은 이미 위에서 업데이트됨)
+            return;
+        }
+
+        if (payload.category === "Processing" && stepMap.size > 0) {
+            stepMap.clear();
+            if (targetContainer) targetContainer.innerHTML = "";
+            localStorage.removeItem(`term_${tId}`);
+            const termArea = document.getElementById("terminal-logs");
+            if (termArea) { termArea.innerHTML = ""; termArea.style.display = "none"; }
+        }
+
+        if (!stepMap.has(elementId)) {
+            stepMap.set(elementId, stepMap.size + 1);
+        }
+
+        if (isTerminal) {
+            if (targetContainer) {
                  const existingSpinners = targetContainer.querySelectorAll('.active-spinner');
                  existingSpinners.forEach(s => {
                      s.classList.remove('active-spinner');
-                     s.innerHTML = "✅";
-                     (s as HTMLElement).style.color = "#4ade80";
+                     s.innerHTML = payload.category === "Error" ? "❌" : "✅";
+                     (s as HTMLElement).style.color = payload.category === "Error" ? "#ef4444" : "#4ade80";
                  });
-             }
+            }
+            if (btnStopTask) btnStopTask.style.display = "none";
+            if (btnDetailDelete) btnDetailDelete.style.display = "flex";
+        }
 
-             p = document.createElement("div"); p.id = elementId;
-             p.className = "progress-item";
-             p.style.borderBottom = "1px solid #eee"; p.style.padding = "6px 0"; p.style.fontSize = "0.75rem";
-             p.style.display = "flex"; p.style.flexDirection = "column"; 
-             const row = document.createElement("div"); row.className = "progress-row"; row.style.display = "flex"; row.style.alignItems = "center";
-             
-             const spinnerIcon = `<span class="active-spinner" style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">⠋</span>`;
-             row.innerHTML = `${spinnerIcon}<span class="summary-text">${displaySummary}</span>`;
-             p.appendChild(row);
-             const results = document.createElement("div"); results.className = "results-container"; p.appendChild(results);
-             
-             if (targetContainer) targetContainer.appendChild(p);
-         }
-         
-         const summaryEl = p.querySelector(".summary-text") as HTMLElement;
-         const spinnerEl = p.querySelector(".active-spinner") as HTMLElement;
+        let p = document.getElementById(elementId);
+        if (!p) {
+            if (targetContainer && !isNotification) {
+                const existingSpinners = targetContainer.querySelectorAll('.active-spinner');
+                existingSpinners.forEach(s => {
+                    s.classList.remove('active-spinner');
+                    s.innerHTML = "✅";
+                    (s as HTMLElement).style.color = "#4ade80";
+                });
+            }
 
-         if (summaryEl && summaryEl.textContent !== displaySummary) {
-             summaryEl.textContent = displaySummary;
-         }
+            p = document.createElement("div"); p.id = elementId;
+            p.className = "progress-item";
+            p.style.borderBottom = "1px solid #eee"; p.style.padding = "6px 0"; p.style.fontSize = "0.75rem";
+            p.style.display = "flex"; p.style.flexDirection = "column"; 
+            const row = document.createElement("div"); row.className = "progress-row"; row.style.display = "flex"; row.style.alignItems = "center";
+            
+            const spinnerIcon = `<span class="active-spinner" style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">⠋</span>`;
+            row.innerHTML = `${spinnerIcon}<span class="summary-text">${displaySummary}</span>`;
+            p.appendChild(row);
+            const results = document.createElement("div"); results.className = "results-container"; p.appendChild(results);
+            
+            if (targetContainer) targetContainer.appendChild(p);
+        }
+        
+        const summaryEl = p.querySelector(".summary-text") as HTMLElement;
+        const spinnerEl = p.querySelector(".active-spinner") as HTMLElement;
 
-         if (payload.category === "Done") {
-             if (btnStopTask && activeTaskId === tId) btnStopTask.style.display = "none";
-             if (btnDetailDelete && activeTaskId === tId) btnDetailDelete.style.display = "flex";
-             
-             const row = p.querySelector(".progress-row");
-             if (row) {
-                 const s = row.querySelector(".active-spinner") as HTMLElement;
-                 if (s) {
-                     s.classList.remove("active-spinner");
-                     s.innerHTML = "✅";
-                     s.style.color = "#4ade80";
-                 }
-             }
-         } else if (payload.category === "Error") {
-             const row = p.querySelector(".progress-row");
-             if (row) { 
-                 const s = row.querySelector(".active-spinner") as HTMLElement;
-                 if (s) {
-                     s.classList.remove("active-spinner");
-                     s.innerHTML = "❌";
-                     s.style.color = "#ef4444";
-                 }
-                 (row as HTMLElement).style.color = "#ef4444"; 
-             }
-         } else if (isNotification) {
-             // 🌟 Warning 알림 전용 노란색 아이콘 처리
-             if (spinnerEl) {
-                 spinnerEl.classList.remove("active-spinner");
-                 spinnerEl.innerHTML = payload.spinner || "⚠️";
-                 spinnerEl.style.color = "#fbbf24"; 
-             }
-         } else {
-             if (spinnerEl && spinnerEl.innerHTML !== "✅" && spinnerEl.innerHTML !== "❌" && spinnerEl.innerHTML !== "⚠️") {
-                 const newIcon = payload.spinner || "⠋";
-                 if (spinnerEl.innerText !== newIcon) {
-                     spinnerEl.innerText = newIcon;
-                 }
-                 if (newIcon === "✅" || newIcon === "✔") {
-                     spinnerEl.classList.remove("active-spinner");
-                     spinnerEl.style.color = "#4ade80";
-                 } else if (newIcon === "❌") {
-                     spinnerEl.classList.remove("active-spinner");
-                     spinnerEl.style.color = "#ef4444";
-                 } else {
-                     spinnerEl.classList.add("active-spinner");
-                 }
-             }
-         }
+        if (summaryEl && summaryEl.textContent !== displaySummary) {
+            summaryEl.textContent = displaySummary;
+        }
+
+        if (payload.category === "Done") {
+            const row = p.querySelector(".progress-row");
+            if (row) {
+                const s = row.querySelector(".active-spinner") as HTMLElement;
+                if (s) { s.classList.remove("active-spinner"); s.innerHTML = "✅"; s.style.color = "#4ade80"; }
+            }
+        } else if (payload.category === "Error") {
+            const row = p.querySelector(".progress-row");
+            if (row) { 
+                const s = row.querySelector(".active-spinner") as HTMLElement;
+                if (s) { s.classList.remove("active-spinner"); s.innerHTML = "❌"; s.style.color = "#ef4444"; }
+                (row as HTMLElement).style.color = "#ef4444"; 
+            }
+        } else if (isNotification) {
+            if (spinnerEl) {
+                spinnerEl.classList.remove("active-spinner");
+                spinnerEl.innerHTML = payload.spinner || "⚠️";
+                spinnerEl.style.color = "#fbbf24"; 
+            }
+        } else {
+            if (spinnerEl && spinnerEl.innerHTML !== "✅" && spinnerEl.innerHTML !== "❌" && spinnerEl.innerHTML !== "⚠️") {
+                const newIcon = payload.spinner || "⠋";
+                if (spinnerEl.innerText !== newIcon) { spinnerEl.innerText = newIcon; }
+                if (newIcon === "✅" || newIcon === "✔") {
+                    spinnerEl.classList.remove("active-spinner"); spinnerEl.style.color = "#4ade80";
+                } else if (newIcon === "❌") {
+                    spinnerEl.classList.remove("active-spinner"); spinnerEl.style.color = "#ef4444";
+                } else {
+                    spinnerEl.classList.add("active-spinner");
+                }
+            }
+        }
     }
 }
 
@@ -3419,43 +3339,14 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
         } catch (e) { }
 
         for (let m of messages) {
-            // (이하 for 루프 내부 로직은 기존과 동일하게 둡니다)
             if (m.status === 1 && (m.role === "system_task" || m.task_id)) {
                 try {
                     const tId = m.task_id || m.id;
                     const logs = await invoke<any[]>("get_task_logs", { taskId: tId });
                     
-                    if (!taskSteps.has(tId)) taskSteps.set(tId, new Map());
-                    const stepMap = taskSteps.get(tId)!;
-                    
-                    let isImage = false;
                     let lastLog = null;
-                    
                     if (logs && logs.length > 0) {
-                        logs.forEach(l => {
-                            l.task_id = l.task_id || tId; 
-                            const bCat = l.category ? l.category.replace(/\s*\(.*?\)/g, "") : "general";
-                            const elId = `progress-${bCat.replace(/[^a-zA-Z0-9]/g, "")}`;
-                            
-                            if (!stepMap.has(elId)) stepMap.set(elId, stepMap.size + 1);
-                            if (/Vision/i.test(l.category)) isImage = true;
-                            lastLog = l;
-                        });
-                    }
-                    
-                    let currentStep = stepMap.size;
-                    let totalSteps = taskTotalSteps.get(tId);
-                    if (totalSteps === undefined) {
-                        const isImgTask = isImage || (m.text && m.text.includes("Local Image"));
-                        const isSearchTask = tId.startsWith("search_");
-                        
-                        // 🌟 여기서도 웹 추출은 0(숨김)으로 처리
-                        totalSteps = isImgTask ? 4 : (isSearchTask ? 4 : 0);
-                        taskTotalSteps.set(tId, totalSteps); 
-                    }
-                    if (totalSteps > 0 && currentStep > totalSteps) {
-                        totalSteps = currentStep;
-                        taskTotalSteps.set(tId, totalSteps);
+                        lastLog = logs[logs.length - 1];
                     }
                     
                     let rawSummary = "Processing...";
@@ -3474,12 +3365,18 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                     if (hasDots) rawSummary = rawSummary.slice(0, -3).trim();
                     if (pctMatch) rawSummary = rawSummary.replace(pctMatch[0], '').trim();
                     
-                    // 🌟 분모가 확정(0 초과)되었을 때만 채팅창에도 [N/M] 노출
-                    if (totalSteps > 0) {
-                        m.text = `${rawSummary} [${currentStep}/${totalSteps}]${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
-                    } else {
-                        m.text = `${rawSummary}${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
+                    let fractionStr = "";
+                    const targetCat = (live && live.category) ? live.category : (lastLog && lastLog.category ? lastLog.category : "");
+
+                    // 🌟 [UI 심플화] 채팅방 히스토리에도 오직 List Extraction 단계에서만 [N/M]을 보여줍니다.
+                    if (targetCat.includes("List Extraction")) {
+                        const match = targetCat.match(/\((\d+)\/(\d+)\)/);
+                        if (match) {
+                            fractionStr = ` [${match[1]}/${match[2]}]`;
+                        }
                     }
+                    
+                    m.text = `${rawSummary}${fractionStr}${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
                     m.updated_at = Date.now();
                     
                 } catch (e) {}

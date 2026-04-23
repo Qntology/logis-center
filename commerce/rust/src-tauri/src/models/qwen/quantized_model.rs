@@ -736,8 +736,9 @@ impl QuantizedQwenVLTextAttention {
                         let reg = self.registry.entries.read().unwrap();
                         let cache = reg[index].bitkv_cache.read().unwrap();
                         if let Some(m) = &cache[self.layer_idx] {
-                            k_cpu = Some(self.decompress_from_bf16(&m.k_data, &m.original_shape, &Device::Cpu)?);
-                            v_cpu = Some(self.decompress_from_bf16(&m.v_data, &m.original_shape, &Device::Cpu)?);
+                            // 🌟 [CRITICAL FIX 1] F32 뻥튀기 방지! BF16 포맷 그대로 RAM에 유지
+                            k_cpu = Some(m.k_data.clone());
+                            v_cpu = Some(m.v_data.clone());
                             ram_count += 1;
                         }
                     }
@@ -775,11 +776,10 @@ impl QuantizedQwenVLTextAttention {
                                                     let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                                                     let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
                                                     
-                                                    let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap();
-                                                    let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap();
-                                                    
-                                                    k_cpu = Some(self.decompress_from_bf16(&kd_t, &meta_os, &Device::Cpu).unwrap_or(kd_t));
-                                                    v_cpu = Some(self.decompress_from_bf16(&vd_t, &meta_os, &Device::Cpu).unwrap_or(vd_t));
+                                                    // 🌟 [CRITICAL FIX 2] 디스크에서 읽은 BF16 데이터를 F32로 해제(decompress)하지 않고 원본 그대로 RAM에 적재!
+                                                    // 이 한 줄의 수정으로 System RAM 점유율이 50% 이상 박살 납니다.
+                                                    k_cpu = Some(Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap());
+                                                    v_cpu = Some(Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap());
                                                 }
                                                 break; 
                                             }
@@ -793,14 +793,14 @@ impl QuantizedQwenVLTextAttention {
                     }
                     
                     let fallback_shape = vec![1, self.num_key_value_heads, _b_len, self.head_dim];
-                    let k_safe = k_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::F32, &Device::Cpu).unwrap());
-                    let v_safe = v_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::F32, &Device::Cpu).unwrap());
+                    // 🌟 만약 비어있다면 F32 대신 BF16 0.0 텐서로 초기화!
+                    let k_safe = k_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::BF16, &Device::Cpu).unwrap());
+                    let v_safe = v_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::BF16, &Device::Cpu).unwrap());
                     
                     let k_gpu = k_safe.to_device(dev)?.to_dtype(target_dtype)?;
                     let v_gpu = v_safe.to_device(dev)?.to_dtype(target_dtype)?;
 
-                    // 🌟 [CRITICAL FIX] SSD에서 읽어온 블록을 1회용으로 버리지 않고 RAM에 캐싱해 둡니다.
-                    // 이렇게 해야 다음 디코딩 토큰부터 RAM에서 즉시 꺼내어 O(1) Fast-Path를 탈 수 있습니다! (SSD 스팸 차단)
+                    // 🌟 RAM 캐시 장부에도 절반으로 다이어트된 BF16 텐서를 그대로 적어둡니다.
                     inner.k_cache = Some(k_safe); 
                     inner.v_cache = Some(v_safe); 
                     inner.location = KVLocation::RAM;

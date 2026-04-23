@@ -743,7 +743,7 @@ Page Type: {TYPE}
             .replace("{SCHEMA}", &schema)
 }
 
-pub fn list2json(page_type: &str, language: &str) -> String {
+pub fn list2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
     "order" | "goods" => r###"status:'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
 link:URL includes a manage path, an administrative or edit route Link | string,
@@ -771,6 +771,7 @@ registration_date:yyyy-MM-ddThh:mm:ss | string,"###.to_string(),
 
     let template = r###"[TASK]
 Extract detailed information from the provided Pug template into a single structured JSON object.
+current: {HREF}
 
 [SCHEMA DEFINITIONS]
 {SCHEMA}
@@ -784,7 +785,7 @@ Extract only numeric values for price, quantity, amount.
 [ACTION] RETURN JSON ONLY. 
 NO EXPLANATION. NO THINKING. /no_think"###;
 
-    template.replace("{SCHEMA}", &schema)
+    template.replace("{SCHEMA}", &schema).replace("{HREF}", href)
 }
 
 /// Converts a JSON Value into a human-readable natural language narrative.

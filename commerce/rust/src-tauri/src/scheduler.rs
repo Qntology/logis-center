@@ -1184,10 +1184,12 @@ async fn process_task(
                     "summary": summary_msg, 
                     "spinner": "⠋" 
                 });
-                let _ = app_handle.emit("extraction-progress", &payload);
+                // 🌟 [CRITICAL FIX] 상태 장부(log_task_progress)에 확실하게 기록해야 
+                // AI가 디코딩 퍼센트를 올바른 "List Extraction" 카테고리로 쏩니다!
+                log_task_progress(app_handle, &task.id, &payload);
                 emit_term(&format!("[STAGE-3] {}", summary_msg));
 
-                let extraction_instruction = parsing::list2json(&page_type, language);
+                let extraction_instruction = parsing::list2json(&page_type, &url, language);
                 let task_question = format!("[PUG CONTENT]\n{}\n\n{}", item_pug, extraction_instruction);
                 
                 // 🌟 [교체 구간 2-B] src/scheduler.rs 의 리스트 추출 루프 내부
@@ -1217,8 +1219,18 @@ async fn process_task(
 
                 match res {
                     Ok(res_text) => {
-                        let item_json = parsing::parse_json_from_llm(&res_text);
+                        let mut item_json = parsing::parse_json_from_llm(&res_text); // 🌟 mut 추가됨
                         if !item_json.is_null() && (item_json.is_object() || item_json.is_array()) {
+                            
+                            if let Some(link_val) = item_json.get_mut("link") {
+                                if let Some(relative_path) = link_val.as_str() {
+                                    if let Ok(base_url) = url::Url::parse(&url) {
+                                        if let Ok(absolute_url) = base_url.join(relative_path) {
+                                            *link_val = json!(absolute_url.to_string());
+                                        }
+                                    }
+                                }
+                            }
                             
                             // 단순 push 대신 후처리 병합 수행 (rowspan 처리)
                             let is_continuation = item_json.get("is_continuation").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1328,7 +1340,8 @@ async fn process_task(
     // --- PHASE 3: HANDOVER (Unload -> Load Embedding) ---
     {
         println!("[Scheduler] PHASE 3: Handover - Unloading, Preparing for Embedding...");
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model..." }));
+        // 🌟 스피너(⠋) 속성 추가
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model...", "spinner": "⠋" }));
         
         // 1. Explicitly Unload to free VRAM for Embedding Model
         model.deep_purge_resources().await;
