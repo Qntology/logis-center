@@ -330,13 +330,13 @@ impl Qwen3_5GenerateModel {
             let current_pos = seqlen_offset + seq_len;
             let is_eos = next_token == self.eos_token_id;
             
-            // 🌟 [UI 자연스러움] 10토큰 -> 3토큰마다 부드러운 애니메이션
-            if i % 3 == 0 || is_eos || is_json_finished {
+            // 🌟 [UI 자연스러움] 매 토큰(1글자)마다 즉각 업데이트!
+            if true {
                 let pct = if is_json_finished || is_eos {
                     100
                 } else {
-                    // 🌟 15% -> 100% 로 갑자기 점프하는 널뛰기 방지용 비선형 로그 곡선 적용
-                    (100.0 * (1.0 - (-0.015 * (i as f32)).exp())).min(99.0) as i32
+                    // 🌟 15% 시작 & 고속 점근 곡선 적용
+                    15 + (84.0 * (1.0 - (-0.05 * (i as f32)).exp())) as i32
                 };
                 
                 if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
@@ -348,7 +348,9 @@ impl Qwen3_5GenerateModel {
                         
                         let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
 
-                        let summary_msg = if task_id.starts_with("search_") {
+                        let summary_msg = if current_cat.contains("Classification") {
+                            format!("Analyzing structure ({}%)...", pct)
+                        } else if task_id.starts_with("search_") {
                             format!("Generating insights ({}%)...", pct)
                         } else {
                             format!("Extracting data ({}%)...", pct)
@@ -567,13 +569,13 @@ impl Qwen3_5GenerateModel {
             let current_pos = seqlen_offset + seq_len;
             let is_eos = next_token == self.eos_token_id;
             
-            // 🌟 [UI 자연스러움] 10토큰 -> 3토큰마다 부드러운 애니메이션
-            if i % 3 == 0 || is_eos || is_json_finished {
+            // 🌟 [UI 자연스러움] 매 토큰(1글자)마다 즉각 업데이트!
+            if true {
                 let pct = if is_json_finished || is_eos {
                     100
                 } else {
-                    // 🌟 15% -> 100% 로 갑자기 점프하는 널뛰기 방지용 비선형 로그 곡선 적용
-                    (100.0 * (1.0 - (-0.015 * (i as f32)).exp())).min(99.0) as i32
+                    // 🌟 15% 시작 & 고속 점근 곡선 적용
+                    15 + (84.0 * (1.0 - (-0.05 * (i as f32)).exp())) as i32
                 };
                 
                 if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
@@ -585,7 +587,9 @@ impl Qwen3_5GenerateModel {
                         
                         let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
 
-                        let summary_msg = if task_id.starts_with("search_") {
+                        let summary_msg = if current_cat.contains("Classification") {
+                            format!("Analyzing structure ({}%)...", pct)
+                        } else if task_id.starts_with("search_") {
                             format!("Generating insights ({}%)...", pct)
                         } else {
                             format!("Extracting data ({}%)...", pct)

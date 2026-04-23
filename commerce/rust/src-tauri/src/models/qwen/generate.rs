@@ -740,14 +740,15 @@ impl QwenVLGenerateModel {
             
             let current_pos = total_tokens_after_prefill + i as usize;
             
-            // 🌟 [UI 자연스러움] 10글자마다 뚝뚝 끊기던 것을 3글자마다 부드럽게 업데이트!
-            if i % 3 == 0 || is_eos || is_json_finished {
+            // 🌟 [UI 자연스러움] 매 토큰(1글자)마다 즉시 UI를 업데이트하여 60FPS 급의 부드러움을 제공합니다!
+            if true {
                 let pct = if is_json_finished || is_eos {
                     100
                 } else {
-                    // 🌟 [CRITICAL FIX] 목표 지점을 모르는 AI 특성상, 점점 느려지며 99%에 수렴하는 비선형 곡선(Asymptotic) 적용!
-                    // 시작 시 즉각적으로 빠르게 차오르며, 0%에 멈춰있는 답답함을 완벽히 해소합니다.
-                    (100.0 * (1.0 - (-0.015 * (i as f32)).exp())).min(99.0) as i32
+                    // 🌟 [비선형 곡선 초고속 튜닝]
+                    // 1. 시작 시 0%가 아닌 15%부터 출발하여 "멈춰있는 느낌"을 완전히 박살냅니다.
+                    // 2. 가속도를 3배 이상(-0.05) 높여서, 짧은 대답(10토큰)일 때도 순식간에 50% 이상 차오르게 합니다.
+                    15 + (84.0 * (1.0 - (-0.05 * (i as f32)).exp())) as i32
                 };
 
                 if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
@@ -759,7 +760,10 @@ impl QwenVLGenerateModel {
                         
                         let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
 
-                        let summary_msg = if task_id.starts_with("search_") {
+                        // 🌟 상태에 따라 더 자연스러운 텍스트로 분기 처리
+                        let summary_msg = if current_cat.contains("Classification") {
+                            format!("Analyzing structure ({}%)...", pct)
+                        } else if task_id.starts_with("search_") {
                             format!("Generating insights ({}%)...", pct)
                         } else {
                             format!("Extracting data ({}%)...", pct)
