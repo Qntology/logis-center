@@ -370,22 +370,23 @@ if (pillNav) {
     });
 }
 
-async function updateExtractButtonVisibility() {
-    if (!btnExtract) return;
+let extractClickLock = false; 
 
-    // 🌟 1. 이미지가 올라와 있을 때 중복 대기열 방어 로직 추가
+async function updateExtractButtonVisibility() {
+    // 🌟 락이 걸려있을 때는 백그라운드 폴링이나 다른 함수가 함부로 버튼을 부활시키지 못하게 방어!
+    if (!btnExtract || extractClickLock) return; 
+
+    // 1. 이미지가 올라와 있을 때 중복 대기열 방어 로직
     if (currentImage) {
         try {
             const ccHash = activeContext.cc || "";
-            const imageRefHash = await hashId(currentImage); // 현재 띄워진 이미지의 고유 지문 생성
+            const imageRefHash = await hashId(currentImage); 
 
-            // 백엔드에 이 이미지가 대기 중이거나 진행 중인지 확인 요청
             const isImageActive = await invoke<boolean>("check_active_task", {
                 payload: { cc: ccHash, ref: imageRefHash }
             });
 
             if (isImageActive) {
-                // 🌟 똑같은 이미지가 이미 큐에 있다면 버튼을 띄우지 않습니다! (중복 방지)
                 btnExtract.style.display = "none";
             } else {
                 btnExtract.style.display = "flex";
@@ -399,7 +400,7 @@ async function updateExtractButtonVisibility() {
         return;
     }
 
-    // 🌟 2. 분석 가능한 샵 도메인이나 허용된 페이지가 아니면 숨김
+    // 2. 분석 가능한 샵 도메인이나 허용된 페이지가 아니면 숨김
     if (!currentDetectedUrl || !isCurrentShop) {
         btnExtract.style.display = "none";
         return;
@@ -414,23 +415,20 @@ async function updateExtractButtonVisibility() {
 
         btnExtract.title = `Extract from ${hostname}`;
 
-        // 🌟 3. 백엔드에 '지금 사용자가 보고 있는 이 페이지'가 대기 중(10)이거나 진행 중(1)인지 물어봅니다.
+        // 3. 백엔드에 현재 페이지 작업 상태 질의
         const isActive = await invoke<boolean>("check_active_task", {
             payload: { cc: ccHash, ref: hashedRefId }
         });
 
         if (isActive) {
-            // 이미 큐에 들어갔거나 AI가 분석 중인 동일한 페이지라면, 중복 클릭을 막기 위해 버튼을 숨깁니다.
             btnExtract.style.display = "none";
         } else {
-            // 다른 페이지에 접속했거나, 이 페이지의 작업이 완전히 완료(✅ Done)되었다면 다시 띄워줍니다.
             btnExtract.style.display = "flex";
             btnExtract.innerHTML = "⚡";
             btnExtract.classList.remove("active-spinner");
         }
     } catch (e) {
         console.warn("[WIDGET] visibility check error:", e);
-        // 에러 발생 시 사용을 막지 않도록 기본적으로 표시
         btnExtract.style.display = "flex";
         btnExtract.innerHTML = "⚡";
         btnExtract.classList.remove("active-spinner");
@@ -1034,175 +1032,168 @@ btnSubmit?.addEventListener("click", async () => {
 document.addEventListener('show-doc', (e: any) => showDetail(e.detail));
 document.addEventListener('view-task-log', () => { openWidget("list"); listView.style.display = "none"; detailView.style.display = "flex"; });
 
+
+// 🌟 [CRITICAL FIX] 추출 버튼 더블클릭 완벽 방어 로직 적용
 btnExtract?.addEventListener("click", async () => {
+    // 🌟 이미 락이 걸려있다면 0.001초만에 들어온 광클도 무조건 튕겨냅니다!
+    if (extractClickLock) return; 
+    extractClickLock = true;
+    
+    // 🌟 클릭 즉시 버튼을 시각적, 물리적으로 증발시킵니다.
+    btnExtract.style.display = "none"; 
+
     console.log("[DEBUG] btnExtract clicked. currentDetectedUrl:", currentDetectedUrl, "currentImage:", currentImage);
-    if (currentDetectedUrl || currentImage) {
-        // 🌟 [CRITICAL FIX 1] isExtracting = true 일 때 막던 로직(return)을 지우고 대기열 등록을 허용!
-        const wasExtracting = isExtracting;
-        isExtracting = true;
+    
+    try {
+        if (currentDetectedUrl || currentImage) {
+            const wasExtracting = isExtracting;
+            isExtracting = true;
 
-        btnExtract.style.opacity = "0.5";
-        setTimeout(() => { if (btnExtract) btnExtract.style.opacity = "1"; }, 300);
-
-        // 🌟 돌고 있는 작업이 없을 때만 UI를 비우고, 이미 돌고 있으면 기존 로그창 유지
-        if (!wasExtracting) {
-            const logArea = document.getElementById("extraction-log");
-            if (logArea) logArea.innerHTML = "";
-            openWidget("settings");
-            startSpinner();
-        }
-        const taskId = `task_${Date.now()}`;
-
-        // 🌟 [CRITICAL FIX 1] 번개(⚡) 버튼도 돋보기(🔍)처럼 누르자마자 즉시 📥 PENDING 상태를 화면에 띄웁니다!
-        renderMessage({
-            id: taskId,
-            role: "system_task",
-            text: currentImage ? "Task Started: Local Image" : "Task Started: " + (currentDetectedUrl || "Unknown URL"),
-            status: 10, // Pending 상태
-            created_at: Date.now(),
-            updated_at: Date.now(),
-            task_id: taskId
-        });
-        
-        // 🌟 [핵심 분기] Cloud Mode 체크
-        const isCloudMode = (document.getElementById("cloud-mode-toggle") as HTMLInputElement)?.checked;
-
-        if (isCloudMode && currentSession.hash) {
-            // ==========================================
-            // ☁️ [SERVER MODE] before_server로 POST 전송
-            // ==========================================
-            try {
-                console.log("[WIDGET] Routing task to Cloud Server...");
-                let payloadBody = "";
-                let format = "";
-
-                if (currentImage) {
-                    // 이미지 모드: Tauri 파일 시스템에서 이미지를 읽어 Base64로 변환
-                    const contents = await readFile(currentImage);
-                    const blob = new Blob([contents]);
-                    const base64Data = await new Promise<string>((resolve) => {
-                        const reader = new FileReader();
-                        reader.onloadend = () => {
-                            // "data:image/png;base64,..." 형태 유지 (서버의 inlineData 포맷에 맞춤)
-                            resolve(reader.result as string);
-                        };
-                        reader.readAsDataURL(blob);
-                    });
-                    
-                    payloadBody = base64Data;
-                    format = "image/png"; // 서버 쿼리 파라미터용
-                } else {
-                    // HTML/PUG 모드: 현재 탭의 HTML을 가져옴
-                    payloadBody = await invoke<string>("extract_html_from_current_tab");
-                    format = "text/html";
-                }
-
-                // 서버 요구사항에 맞게 JSON 생성 및 Gzip 압축 준비
-                const requestData = {
-                    id: taskId,
-                    from: currentSession.address,
-                    to: currentSession.team,
-                    cc: activeContext.cc || "",
-                    bcc: activeContext.bcc || "",
-                    ref: activeContext.ref || "",
-                    body: payloadBody, // 서버가 PUG로 변환하거나 이미지로 처리할 원본 데이터
-                    link: currentDetectedUrl || "local",
-                    type: currentImage ? "image_extraction" : "html_extraction"
-                };
-
-                // 기존 만들어두신 proxy_fetch (Rust 경유) 활용 -> CORS 무시 & GZIP 자동 처리
-                const urlObj = new URL(API_HOST);
-                urlObj.searchParams.append("from", currentSession.address || "");
-                urlObj.searchParams.append("to", currentSession.team || "");
-                if (format.includes("image")) {
-                    urlObj.searchParams.append("format", encodeURIComponent(format));
-                }
-
-                // UI 진행률 가짜 에밋 (서버 응답을 기다리는 동안)
-                renderProgressToUI({ task_id: taskId, category: "Cloud Sync", summary: "Sending data to Logis Center...", spinner: "⠋" });
-
-                // [POST to before_server]
-                const response = await invoke<any>("proxy_fetch", {
-                    url: urlObj.toString(),
-                    method: "POST",
-                    headers: { 
-                        "Content-Type": "application/json",
-                        "Content-Encoding": "gzip" // Rust 백엔드에서 Gzip 압축 후 전송하도록 지시
-                    },
-                    body: requestData,
-                    session_params: { hash: currentSession.hash, token: currentSession.token }
-                });
-
-                console.log("[SERVER MODE] Task accepted by server:", response);
-                
-                // 서버에서 Task ID를 받아오면 여기서 1차 종료하고, 추후 proxy에서 폴링/웹소켓으로 결과 받기
-                renderProgressToUI({ task_id: taskId, category: "Cloud Queue", summary: "Task queued on server. Processing remotely.", spinner: "☁️" });
-                isExtracting = false; // 프론트엔드 입장에서는 큐에 넣었으니 작업 종료
-
-            } catch (e) {
-                console.error("[SERVER MODE] Failed to send task:", e);
-                renderProgressToUI({ task_id: taskId, category: "Error", summary: `Cloud upload failed: ${e}`, spinner: "❌" });
-                isExtracting = false;
+            if (!wasExtracting) {
+                const logArea = document.getElementById("extraction-log");
+                if (logArea) logArea.innerHTML = "";
+                openWidget("settings");
+                startSpinner();
             }
-            
-        } else {
-            // ==========================================
-            // 💻 [LOCAL MODE] 기존 Tauri Rust 백엔드 전송
-            // ==========================================
-            if (currentImage) {
-                console.log("[WIDGET] Queuing LOCAL IMAGE task...");
-                
-                // 🌟 [CRITICAL FIX] 중복 방지를 위해 이미지 파일의 절대 경로를 해시하여 해당 이미지만의 고유 지문(ref)을 만듭니다!
-                const imageRefHash = await hashId(currentImage);
+            const taskId = `task_${Date.now()}`;
 
-                await emit("new-task-from-browser", { 
-                    id: taskId, type: "image_extraction", image_path: currentImage, 
-                    ref: imageRefHash, // 🌟 이미지 전용 고유 지문 부착
-                    cc: activeContext.cc || "",
-                    bcc: activeContext.bcc || "",
-                    link: "Local Image",
-                    device_preference: getDevicePref(), search_mode: currentSearchMode
-                });
-            } else {
-                console.log("[WIDGET] Queuing LOCAL HTML task...");
+            renderMessage({
+                id: taskId,
+                role: "system_task",
+                text: currentImage ? "Task Started: Local Image" : "Task Started: " + (currentDetectedUrl || "Unknown URL"),
+                status: 10, 
+                created_at: Date.now(),
+                updated_at: Date.now(),
+                task_id: taskId
+            });
+            
+            const isCloudMode = (document.getElementById("cloud-mode-toggle") as HTMLInputElement)?.checked;
+
+            if (isCloudMode && currentSession.hash) {
+                // ==========================================
+                // ☁️ [SERVER MODE]
+                // ==========================================
                 try {
-                    const html = await invoke<string>("extract_html_from_current_tab");
-                    const urlObj = new URL(currentDetectedUrl.toLowerCase());
-                    const cc = await hashId(urlObj.hostname);
-                    const rawPath = urlObj.pathname + urlObj.search;
-                    const hashedRefId = await hashId(cc + rawPath.toLowerCase());
-                    
-                    await emit("new-task-from-browser", { 
-                        id: taskId, type: "html_extraction", html: html, link: rawPath, 
-                        // 🌟 [CRITICAL FIX 1] 이미지 전처리와 동일하게, 웹페이지 전처리도 현재 UI 필터(activeContext)를 유지하도록 꼬리표를 부착합니다!
-                        cc: activeContext.cc || cc, 
-                        ref: activeContext.ref || hashedRefId, 
-                        bcc: activeContext.bcc || "", 
-                        from: currentSession.address, to: currentSession.team,
-                        device_preference: getDevicePref()
+                    console.log("[WIDGET] Routing task to Cloud Server...");
+                    let payloadBody = "";
+                    let format = "";
+
+                    if (currentImage) {
+                        const contents = await readFile(currentImage);
+                        const blob = new Blob([contents]);
+                        const base64Data = await new Promise<string>((resolve) => {
+                            const reader = new FileReader();
+                            reader.onloadend = () => { resolve(reader.result as string); };
+                            reader.readAsDataURL(blob);
+                        });
+                        
+                        payloadBody = base64Data;
+                        format = "image/png"; 
+                    } else {
+                        payloadBody = await invoke<string>("extract_html_from_current_tab");
+                        format = "text/html";
+                    }
+
+                    const requestData = {
+                        id: taskId,
+                        from: currentSession.address,
+                        to: currentSession.team,
+                        cc: activeContext.cc || "",
+                        bcc: activeContext.bcc || "",
+                        ref: activeContext.ref || "",
+                        body: payloadBody,
+                        link: currentDetectedUrl || "local",
+                        type: currentImage ? "image_extraction" : "html_extraction"
+                    };
+
+                    const urlObj = new URL(API_HOST);
+                    urlObj.searchParams.append("from", currentSession.address || "");
+                    urlObj.searchParams.append("to", currentSession.team || "");
+                    if (format.includes("image")) {
+                        urlObj.searchParams.append("format", encodeURIComponent(format));
+                    }
+
+                    renderProgressToUI({ task_id: taskId, category: "Cloud Sync", summary: "Sending data to Logis Center...", spinner: "⠋" });
+
+                    const response = await invoke<any>("proxy_fetch", {
+                        url: urlObj.toString(),
+                        method: "POST",
+                        headers: { 
+                            "Content-Type": "application/json",
+                            "Content-Encoding": "gzip" 
+                        },
+                        body: requestData,
+                        session_params: { hash: currentSession.hash, token: currentSession.token }
                     });
+
+                    console.log("[SERVER MODE] Task accepted by server:", response);
+                    renderProgressToUI({ task_id: taskId, category: "Cloud Queue", summary: "Task queued on server. Processing remotely.", spinner: "☁️" });
+                    isExtracting = false;
+
                 } catch (e) {
+                    console.error("[SERVER MODE] Failed to send task:", e);
+                    renderProgressToUI({ task_id: taskId, category: "Error", summary: `Cloud upload failed: ${e}`, spinner: "❌" });
                     isExtracting = false;
                 }
+                
+            } else {
+                // ==========================================
+                // 💻 [LOCAL MODE]
+                // ==========================================
+                if (currentImage) {
+                    console.log("[WIDGET] Queuing LOCAL IMAGE task...");
+                    const imageRefHash = await hashId(currentImage);
+
+                    await emit("new-task-from-browser", { 
+                        id: taskId, type: "image_extraction", image_path: currentImage, 
+                        ref: imageRefHash, 
+                        cc: activeContext.cc || "",
+                        bcc: activeContext.bcc || "",
+                        link: "Local Image",
+                        device_preference: getDevicePref(), search_mode: currentSearchMode
+                    });
+                } else {
+                    console.log("[WIDGET] Queuing LOCAL HTML task...");
+                    try {
+                        const html = await invoke<string>("extract_html_from_current_tab");
+                        const urlObj = new URL(currentDetectedUrl.toLowerCase());
+                        const cc = await hashId(urlObj.hostname);
+                        const rawPath = urlObj.pathname + urlObj.search;
+                        const hashedRefId = await hashId(cc + rawPath.toLowerCase());
+                        
+                        await emit("new-task-from-browser", { 
+                            id: taskId, type: "html_extraction", html: html, link: rawPath, 
+                            cc: activeContext.cc || cc, 
+                            ref: activeContext.ref || hashedRefId, 
+                            bcc: activeContext.bcc || "", 
+                            from: currentSession.address, to: currentSession.team,
+                            device_preference: getDevicePref()
+                        });
+                    } catch (e) {
+                        isExtracting = false;
+                    }
+                }
+            }
+            
+            if (currentImage) {
+                currentImage = null;
+                if (navPreviewContainer) navPreviewContainer.classList.add("hidden");
+                if (navUploadBtn) navUploadBtn.classList.remove("active-emoji");
+                if (searchInput) searchInput.disabled = false;
+                if (btnSubmit) btnSubmit.style.display = "flex";
+            }
+
+            if (wasExtracting) {
+                console.log("[WIDGET] Task safely added to backend queue:", taskId);
             }
         }
-        
-        if (currentImage) {
-            currentImage = null;
-            if (navPreviewContainer) navPreviewContainer.classList.add("hidden");
-            if (navUploadBtn) navUploadBtn.classList.remove("active-emoji");
-            if (searchInput) searchInput.disabled = false;
-            
-            // 🌟 [CRITICAL FIX] 이미지가 큐에 들어갔으니 숨겨뒀던 돋보기(🔍) 버튼을 즉시 복구시킵니다!
-            if (btnSubmit) btnSubmit.style.display = "flex";
-        }
-
-        // 🌟 [추가 수정] 작업 시작 시 스피너가 깜빡거리며 끊기지 않고 부드럽게 이어지도록 불필요한 stopSpinner() 제거
-        if (wasExtracting) {
-            console.log("[WIDGET] Task safely added to backend queue:", taskId);
-        }
-        
-        await updateExtractButtonVisibility();
+    } finally {
+        // 🌟 [CRITICAL FIX] Rust 백엔드(DB)에 작업이 완전히 등재되도록 1.5초간 여유를 줍니다.
+        // 이 시간 동안은 버튼이 절대 부활하지 않으며, 1.5초 뒤 DB를 조회하여 정상적으로 큐에 등록되었다면 버튼은 계속 숨겨집니다.
+        setTimeout(async () => {
+            extractClickLock = false;
+            await updateExtractButtonVisibility();
+        }, 1500);
     }
 });
 
