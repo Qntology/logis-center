@@ -40,12 +40,10 @@ pub struct AppState {
 async fn get_active_task_context() -> Result<Value, String> {
     let mut result = json!(null);
     
-    // 🌟 [성능 최적화] 무의미한 파일(tmp/index.json) 폴백을 완전히 제거하고 순수 RAM만 참조합니다!
     if let Some(mem_task) = crate::ACTIVE_TASK_MEM.read().unwrap().clone() {
         if mem_task.get("id").is_some() { result = mem_task; }
     }
 
-    // 🌟 [CRITICAL FIX] 앱이 켜질 때 깜빡거림 방지: 활성화된 작업이 있다면, 메모리에 담긴 최신 퍼센트 요약본도 꽂아줍니다!
     if !result.is_null() {
         if let Ok(mem) = crate::LATEST_PROGRESS_PAYLOAD.read() {
             if let Some(latest) = mem.as_ref() {
@@ -53,6 +51,8 @@ async fn get_active_task_context() -> Result<Value, String> {
                     if let Some(summary) = latest.get("summary") {
                         result.as_object_mut().unwrap().insert("summary".to_string(), summary.clone());
                     }
+                    // 🌟 [CRITICAL FIX] 프론트엔드가 퍼센트(%)를 즉시 복구할 수 있도록 최신 전체 페이로드도 통째로 꽂아줍니다!
+                    result.as_object_mut().unwrap().insert("latest_payload".to_string(), latest.clone());
                 }
             }
         }
@@ -1068,23 +1068,15 @@ async fn get_active_tasks(state: State<'_, AppState>) -> Result<Vec<store::Task>
 #[tauri::command]
 async fn get_task_logs(app_handle: tauri::AppHandle, task_id: String) -> Result<Vec<Value>, String> {
     let log_path = crate::utils::paths::get_task_log_file(Some(&app_handle), &task_id);
-    let mut logs: Vec<Value> = if log_path.exists() {
-        let content = std::fs::read_to_string(log_path).map_err(|e| e.to_string())?;
-        content.lines().filter_map(|line| serde_json::from_str(line).ok()).collect()
-    } else {
-        vec![]
-    };
-
-    // 🌟 [CRITICAL FIX] 파일 로그를 다 읽어온 뒤, 메모리에 남아있는 가장 최신 퍼센트 페이로드를 맨 뒤에 슬쩍 끼워 넣습니다!
-    if let Ok(mem) = crate::LATEST_PROGRESS_PAYLOAD.read() {
-        if let Some(latest) = mem.as_ref() {
-            if latest.get("task_id").and_then(|v| v.as_str()) == Some(task_id.as_str()) {
-                logs.push(latest.clone());
-            }
-        }
-    }
     
-    Ok(logs)
+    // 🌟 [CRITICAL FIX] 파일에 적힌 100% 확실한 과거 순서만 믿습니다! 
+    // 메모리에 떠도는 최신 퍼센트를 강제로 끝에 끼워 넣으면 스텝 순서(stepMap)가 꼬입니다.
+    if log_path.exists() {
+        let content = std::fs::read_to_string(log_path).map_err(|e| e.to_string())?;
+        Ok(content.lines().filter_map(|line| serde_json::from_str(line).ok()).collect())
+    } else {
+        Ok(vec![])
+    }
 }
 
 #[tauri::command]

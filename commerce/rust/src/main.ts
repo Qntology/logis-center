@@ -71,6 +71,7 @@ let isFocus = true;
 // 🌟 [CRITICAL FIX] 새로고침 시 스텝 순서 꼬임 방지용 대기열
 let isFetchingLogs = false;
 let pendingLiveEvents: any[] = [];
+const livePayloads = new Map<string, any>(); // 🌟 [CRITICAL FIX] 퍼센트(%) 지연 노출을 막기 위한 프론트엔드 초고속 캐시 메모리
 
 // ==========================================
 // [PARITY] Cloud front.js Core Utilities
@@ -1200,20 +1201,28 @@ btnExtract?.addEventListener("click", async () => {
 });
 
 listen("extraction-progress", async (event: any) => { 
-    // 🌟 [CRITICAL FIX] 과거 로그를 불러와 장부를 정리 중이라면, 실시간 이벤트를 잠시 대기열에 가둬둡니다!
-    if (isFetchingLogs && event.payload.task_id === activeTaskId) {
-        pendingLiveEvents.push(event.payload);
+    const payload = event.payload;
+    if (payload.task_id) livePayloads.set(payload.task_id, payload); // 🌟 즉시 캐싱!
+
+    if (isFetchingLogs && payload.task_id === activeTaskId) {
+        pendingLiveEvents.push(payload);
         return;
     }
-    renderProgressToUI(event.payload); 
+    renderProgressToUI(payload); 
 });
+
 document.addEventListener('render-progress', (e: any) => { renderProgressToUI(e.detail); });
 
 async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     payload.task_id = payload.task_id || activeTaskId || (document.getElementById("extraction-log")?.dataset.activeTaskId);
+    const tId = payload.task_id;
+    if (!tId) return;
 
     const summary = (payload.summary || "").toLowerCase();
     const isTerminal = payload.category === "Done" || payload.category === "Error" || summary.includes("cancelled") || summary.includes("stopped");
+    
+    // 🌟 [CRITICAL FIX 1] Warning, Info 등은 단순 알림이므로 진행 스텝(1/4) 장부에 절대 넣지 않습니다!
+    const isNotification = payload.category === "Warning" || payload.category === "Info";
 
     if (!isRecovery && !isExtracting && !isTerminal) {
         if (payload.category === "Processing" || payload.category === "Preparation" || payload.category === "Vision" || payload.category === "Shipping" || payload.category === "Analytic") {
@@ -1221,7 +1230,6 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
             isExtracting = true;
             startSpinner();
         } else {
-            console.log("[WIDGET] Ignoring late progress event after stop:", payload.category);
             return; 
         }
     }
@@ -1231,35 +1239,50 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     const elementId = `progress-${catId}`;
     
     let displaySummary = payload.summary || "";
-    const tId = payload.task_id;
     
     if (!taskSteps.has(tId)) {
         taskSteps.set(tId, new Map());
     }
-    
+    const stepMap = taskSteps.get(tId)!;
+
+    // 🌟 [CRITICAL FIX 2] 재시도(Processing) 마커가 등장하면, 실시간이든 상세페이지 복구 중이든 무조건 리셋!
+    if (payload.category === "Processing" && stepMap.size > 0) {
+        console.log("[WIDGET] Retry detected! Wiping old steps and UI to ensure clean sequence.");
+        stepMap.clear();
+        
+        const container = document.getElementById("progress-container");
+        if (container) container.innerHTML = "";
+        
+        // 🌟 [CRITICAL FIX 3] 숨어있던 sessionStorage 잔재 박멸 & 터미널 박스 숨김
+        localStorage.removeItem(`term_${tId}`);
+        const termArea = document.getElementById("terminal-logs");
+        if (termArea && termArea.dataset.activeTaskId === tId) {
+            termArea.innerHTML = ""; // 🌟 "Retrying Process..." 텍스트 완전 삭제
+            termArea.style.display = "none"; // 🌟 까만 박스 숨김 처리
+        }
+    }
+
     if (!taskTotalSteps.has(tId) || !taskTotalSteps.get(tId)) {
         const bubbleEl = document.getElementById(tId);
-        const isImgTask = (payload.category && payload.category.includes("Vision")) || 
+        // 🌟 [CRITICAL FIX 4] 백엔드가 보내준 task_type을 통해 시작부터 4스텝으로 고정! (1/7 -> 1/4 널뛰기 방지)
+        const isImgTask = payload.task_type === "image_extraction" || 
+                          (payload.category && payload.category.includes("Vision")) || 
                           (bubbleEl && bubbleEl.innerText.includes("Local Image"));
-        const isSearchTask = tId && tId.startsWith("search_");
+        const isSearchTask = tId.startsWith("search_");
         
         let initialTotal = 7; 
-        if (isImgTask) initialTotal = 5; 
+        if (isImgTask) initialTotal = 4; 
         if (isSearchTask) initialTotal = 4; 
         
         taskTotalSteps.set(tId, initialTotal); 
     }
-    
-    const stepMap = taskSteps.get(tId)!;
 
-    if (!isTerminal && payload.category !== "Error") { 
-        if (payload.category && payload.category.includes("Vision")) {
-            taskTotalSteps.set(tId, 5); 
-        } else if (payload.category && payload.category.includes("List Extraction")) {
+    // 🌟 [CRITICAL FIX 3] 알림(Warning)이 아닌 진짜 진행 단계일 때만 스텝을 카운트합니다.
+    if (!isTerminal && payload.category !== "Error" && !isNotification) { 
+        // 기존에 분모를 억지로 5로 만들던 하드코딩 조건문 삭제 완료!
+        if (payload.category && payload.category.includes("List Extraction")) {
             const match = payload.category.match(/\(\d+\/(\d+)\)/);
-            if (match) {
-                taskTotalSteps.set(tId, 6 + parseInt(match[1])); 
-            }
+            if (match) { taskTotalSteps.set(tId, 6 + parseInt(match[1])); }
         } else if (payload.category === "Selector Search") {
             taskTotalSteps.set(tId, 8); 
         }
@@ -1269,7 +1292,6 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
         }
         
         let currentStep = stepMap.get(elementId)!;
-        // 🌟 [CRITICAL FIX] 어떤 상황에서도 undefined가 들어가지 않도록 강제 방어!
         let totalSteps = taskTotalSteps.get(tId) || 7; 
         
         if (currentStep > totalSteps) {
@@ -1285,6 +1307,9 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
         if (pctMatch) rawSummary = rawSummary.replace(pctMatch[0], '').trim();
         
         displaySummary = `${rawSummary} [${currentStep}/${totalSteps}]${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
+    } else if (isNotification) {
+        // Warning이나 Info는 스텝 번호 [x/y]를 붙이지 않고 원본 메세지만 출력합니다.
+        displaySummary = payload.summary || "";
     }
 
     const extractionLog = document.getElementById("extraction-log");
@@ -1308,11 +1333,8 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
 
              if (payload.category === "Done") {
                  targetContainer.querySelectorAll('.summary-text').forEach(el => {
-                     if (el.textContent) {
-                         el.textContent = el.textContent.replace(/\[(\d+)\/(undefined|\d+)\]/g, `[$1/${finalTotal}]`);
-                     }
+                     if (el.textContent) { el.textContent = el.textContent.replace(/\[(\d+)\/(undefined|\d+)\]/g, `[$1/${finalTotal}]`); }
                  });
-                 
                  if (!displaySummary.match(/\[(\d+)\/(undefined|\d+)\]/)) {
                      displaySummary = `${displaySummary} [${finalTotal}/${finalTotal}]`;
                  } else {
@@ -1321,22 +1343,19 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
              }
         }
         
-        isExtracting = false; 
-        stopSpinner();
-        if (btnExtract) {
-            btnExtract.classList.remove("active-spinner");
-            btnExtract.innerText = "⚡";
+        if (activeTaskId === tId) {
+            isExtracting = false; 
+            stopSpinner();
+            if (btnExtract) { btnExtract.classList.remove("active-spinner"); btnExtract.innerText = "⚡"; }
+            if (currentImage) {
+                currentImage = null; 
+                if (navPreviewContainer) navPreviewContainer.classList.add("hidden"); 
+                if (navUploadBtn) navUploadBtn.classList.remove("active-emoji"); 
+                if (searchInput) searchInput.disabled = false; 
+                if (btnSubmit) btnSubmit.style.display = "flex"; 
+            }
+            updateExtractButtonVisibility(); 
         }
-        
-        if (currentImage) {
-            currentImage = null; 
-            if (navPreviewContainer) navPreviewContainer.classList.add("hidden"); 
-            if (navUploadBtn) navUploadBtn.classList.remove("active-emoji"); 
-            if (searchInput) searchInput.disabled = false; 
-            if (btnSubmit) btnSubmit.style.display = "flex"; 
-        }
-        
-        updateExtractButtonVisibility(); 
     }
 
     if (payload.task_id) {
@@ -1344,12 +1363,19 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
         const summaryMsg = (payload.summary || "").toLowerCase(); 
         
         if (summaryMsg.includes("cancelled") || summaryMsg.includes("stopped")) {
-            statusCode = 3; isExtracting = false; stopSpinner();
+            statusCode = 3; 
+            if (activeTaskId === tId) { isExtracting = false; stopSpinner(); }
         } else if (payload.category === "Done") { statusCode = 9; } 
         else if (payload.category === "Error") { statusCode = 6; }
         
         const existingEl = document.getElementById(payload.task_id) as HTMLElement;
-        const originalCreatedAt = existingEl ? parseInt(existingEl.dataset.createdAt || "0") : Date.now();
+        let originalCreatedAt = Date.now();
+        if (existingEl) {
+            originalCreatedAt = parseInt(existingEl.dataset.createdAt || "0");
+        } else {
+            const match = payload.task_id.match(/_(\d+)$/);
+            if (match) originalCreatedAt = parseInt(match[1]);
+        }
 
         renderMessage({ 
             id: payload.task_id, 
@@ -1362,7 +1388,7 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
         });
 
         if (statusCode === 3 || statusCode === 9 || statusCode === 6) {
-            if (btnStopTask) btnStopTask.style.display = "none";
+            if (btnStopTask && activeTaskId === tId) btnStopTask.style.display = "none";
             return; 
         }
     }
@@ -1370,7 +1396,8 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     if (extractionLog && detailView.style.display !== "none") {
          let p = document.getElementById(elementId);
          if (!p) {
-             if (targetContainer) {
+             // 🌟 Warning 알림일 때는 다른 진행 중인 스피너들을 초록색(완료)으로 만들지 않습니다!
+             if (targetContainer && !isNotification) {
                  const existingSpinners = targetContainer.querySelectorAll('.active-spinner');
                  existingSpinners.forEach(s => {
                      s.classList.remove('active-spinner');
@@ -1401,8 +1428,8 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
          }
 
          if (payload.category === "Done") {
-             if (btnStopTask) btnStopTask.style.display = "none";
-             if (btnDetailDelete) btnDetailDelete.style.display = "flex";
+             if (btnStopTask && activeTaskId === tId) btnStopTask.style.display = "none";
+             if (btnDetailDelete && activeTaskId === tId) btnDetailDelete.style.display = "flex";
              
              const row = p.querySelector(".progress-row");
              if (row) {
@@ -1424,8 +1451,15 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
                  }
                  (row as HTMLElement).style.color = "#ef4444"; 
              }
+         } else if (isNotification) {
+             // 🌟 Warning 알림 전용 노란색 아이콘 처리
+             if (spinnerEl) {
+                 spinnerEl.classList.remove("active-spinner");
+                 spinnerEl.innerHTML = payload.spinner || "⚠️";
+                 spinnerEl.style.color = "#fbbf24"; 
+             }
          } else {
-             if (spinnerEl && spinnerEl.innerHTML !== "✅" && spinnerEl.innerHTML !== "❌") {
+             if (spinnerEl && spinnerEl.innerHTML !== "✅" && spinnerEl.innerHTML !== "❌" && spinnerEl.innerHTML !== "⚠️") {
                  const newIcon = payload.spinner || "⠋";
                  if (spinnerEl.innerText !== newIcon) {
                      spinnerEl.innerText = newIcon;
@@ -1446,9 +1480,8 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
 
 btnStopTask?.addEventListener("click", async () => {
     if (await ask("Stop the current extraction/search? (The record will be deleted)", { title: "Stop Task", kind: "warning" })) {
-        // [UI-FIRST] Reset everything immediately to prevent race conditions
         isExtracting = false; 
-        isSearching = false; // 🌟 [CRITICAL FIX 5] 검색 중지 상태 해제!
+        isSearching = false; 
         stopSpinner();
         
         if (btnExtract) {
@@ -1462,10 +1495,10 @@ btnStopTask?.addEventListener("click", async () => {
             console.log("[WIDGET] Stopping task:", activeTaskId);
             await invoke<string>("stop_current_extraction", { taskId: activeTaskId });
             
-            // 🌟 [CRITICAL FIX] 말풍선 태그의 id 속성은 `search_...` 형식을 그대로 유지하고 있으므로 접두사 없이 지워야 합니다!
             if (activeTaskId) {
-                const msgId = activeTaskId; // "msg-task-" 접두사 제거
-                const el = document.getElementById(msgId);
+                // 🌟 취소 시 localStorage 데이터 삭제
+                localStorage.removeItem(`term_${activeTaskId}`);
+                const el = document.getElementById(activeTaskId);
                 if (el) el.remove();
             }
 
@@ -1840,18 +1873,18 @@ listen("task-console-log", (event: any) => {
     const { task_id, text } = event.payload;
     const key = `term_${task_id}`;
     
-    let logs = sessionStorage.getItem(key) || "";
+    // 🌟 sessionStorage -> localStorage 로 영구 보존!
+    let logs = localStorage.getItem(key) || "";
     logs += text;
-    sessionStorage.setItem(key, logs);
+    localStorage.setItem(key, logs);
 
-    // 상세 페이지가 열려있고 아이디가 일치하면 실시간으로 터미널 UI에 텍스트를 추가합니다.
     const termArea = document.getElementById("terminal-logs");
     if (termArea && termArea.dataset.activeTaskId === task_id) {
         termArea.appendChild(document.createTextNode(text));
-        termArea.scrollTop = termArea.scrollHeight; // 자동 스크롤
+        termArea.style.display = "block"; // 🌟 [추가] 텍스트가 도착하면 까만 박스를 보여줍니다!
+        termArea.scrollTop = termArea.scrollHeight; 
     }
 });
-
 
 function handleTaskClick(el: HTMLElement) {
     const taskId = el.dataset.taskId;
@@ -1892,27 +1925,39 @@ function handleTaskClick(el: HTMLElement) {
 
     if (logArea) {
         logArea.dataset.activeTaskId = taskId;
-        const savedLogs = sessionStorage.getItem(`term_${taskId}`) || "Connecting to AI Engine...\n";
+        
+        const savedLogs = localStorage.getItem(`term_${taskId}`);
+        // 🌟 저장된 로그가 있을 때만 박스를 보여주고, 없으면 숨깁니다. (Connecting... 텍스트 제거)
+        const displayStyle = savedLogs && savedLogs.trim() !== "" ? "block" : "none"; 
         
         logArea.innerHTML = `
             <div id="progress-container"></div>
-            <div id="terminal-logs" data-active-task-id="${taskId}" style="background: #0a0a0a; color: #4ade80; padding: 12px; font-family: monospace; font-size: 0.75rem; border-radius: 6px; max-height: 250px; overflow-y: auto; white-space: pre-wrap; border: 1px solid #333; box-shadow: inset 0 0 10px rgba(0,0,0,0.8); line-height: 1.4;">${savedLogs}</div>
+            <div id="terminal-logs" data-active-task-id="${taskId}" style="display: ${displayStyle}; background: #0a0a0a; color: #4ade80; padding: 12px; font-family: monospace; font-size: 0.75rem; border-radius: 6px; max-height: 250px; overflow-y: auto; white-space: pre-wrap; border: 1px solid #333; box-shadow: inset 0 0 10px rgba(0,0,0,0.8); line-height: 1.4;">${savedLogs || ""}</div>
         `;
         
         const termArea = document.getElementById("terminal-logs");
-        if (termArea) termArea.scrollTop = termArea.scrollHeight;
+        if (termArea && displayStyle === "block") termArea.scrollTop = termArea.scrollHeight;
         
-        // 🌟 [CRITICAL FIX] 로그를 가져오는 동안 라이브 이벤트의 난입을 원천 봉쇄합니다!
         isFetchingLogs = true;
         pendingLiveEvents = [];
 
-        invoke<any[]>("get_task_logs", { taskId: taskId }).then(logs => {
+        invoke<any[]>("get_task_logs", { taskId: taskId }).then(async logs => {
             if (logArea!.dataset.activeTaskId !== taskId) {
                 isFetchingLogs = false;
                 return;
             }
+
+            // 🌟 로컬 스토리지엔 없지만 백엔드에 로그가 남아있을 경우 복구하면서 박스를 노출합니다!
+            if (!savedLogs && logs && logs.length > 0 && termArea) {
+                const reconstructed = logs.map(l => `[${l.category ? l.category.toUpperCase() : 'SYSTEM'}] ${l.summary || ''}\n`).join("");
+                if (reconstructed.trim() !== "") {
+                    termArea.innerHTML = reconstructed;
+                    termArea.style.display = "block"; // 숨겨뒀던 박스 노출!
+                    localStorage.setItem(`term_${taskId}`, reconstructed); 
+                    termArea.scrollTop = termArea.scrollHeight;
+                }
+            }
             
-            // 1. 과거 로그부터 순서대로 렌더링 (1, 2, 3... 장부가 예쁘게 정리됨)
             if (logs && logs.length > 0) {
                 logs.forEach(payload => {
                     payload.task_id = payload.task_id || taskId; 
@@ -1923,7 +1968,14 @@ function handleTaskClick(el: HTMLElement) {
                 if (progContainer) progContainer.insertAdjacentHTML('beforeend', `<div id="temp-spinner" style="padding: 10px; text-align: center; color: var(--primary);"><span class="spinner active-spinner">⠋</span> Generating Insights...</div>`);
             }
 
-            // 2. 장부 정리가 끝나면, 블로킹을 풀고 갇혀있던 라이브 이벤트를 순서대로 쏟아냅니다.
+            if (status === 1 || status === 10) {
+                const live = livePayloads.get(taskId);
+                if (live) {
+                    live.task_id = taskId;
+                    renderProgressToUI(live, true);
+                }
+            }
+
             isFetchingLogs = false;
             pendingLiveEvents.forEach(p => renderProgressToUI(p, false));
             pendingLiveEvents = [];
@@ -2619,6 +2671,13 @@ function startPolling() {
 function saveSession() { localStorage.setItem("chat_session", JSON.stringify(currentSession)); }
 
 async function initSession() {
+    // 🌟 [CRITICAL FIX 1] 앱 최초 실행 시, 묵은 localStorage 터미널 찌꺼기를 완벽 청소합니다!
+    Object.keys(localStorage).forEach(key => {
+        if (key.startsWith("term_")) {
+            localStorage.removeItem(key);
+        }
+    });
+
     const saved = localStorage.getItem("chat_session");
     if (saved) { try { currentSession = { ...currentSession, ...JSON.parse(saved) }; } catch (e) {} } 
     else { const legacy = localStorage.getItem("device_hash"); if (legacy) currentSession.hash = legacy; }
@@ -3154,13 +3213,10 @@ interface ChatMessage {
 function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append') {
     if (!chatTalks) return;
 
-    const sortedBatch = [...messages].sort((a, b) => a.created_at - b.created_at);
     const scrollEl = document.getElementById("chat-scroll");
     const prevScrollHeight = scrollEl ? scrollEl.scrollHeight : 0;
-    const prevScrollTop = scrollEl ? scrollEl.scrollTop : 0;
-    const processBatch = mode === 'prepend' ? [...sortedBatch].reverse() : sortedBatch;
 
-    processBatch.forEach(msg => {
+    messages.forEach(msg => {
         let textContent = msg.text || "";
         const rawContent = msg.content || (msg as any).data;
 
@@ -3174,8 +3230,6 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
         }
 
         const displayMsg: ChatMessage = { ...msg, text: textContent };
-        
-        // 🌟 [CRITICAL FIX 3] DOM 충돌 방지: 업데이트할 요소를 찾을 때 msg.id 대신 생성된 domId를 기준으로 찾습니다!
         const isTask = displayMsg.role === "system_task" || (displayMsg.role === "user" && !!displayMsg.task_id && displayMsg.task_id.startsWith("search_"));
         const domId = isTask ? (displayMsg.task_id || displayMsg.id) : displayMsg.id;
         
@@ -3185,7 +3239,7 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
             const cachedUpdatedAt = parseInt(existingEl.dataset.updatedAt || "0");
             const cachedStatus = parseInt(existingEl.dataset.status || "0");
             
-            if (msg.updated_at > cachedUpdatedAt || msg.status !== cachedStatus) {
+            if (msg.updated_at > cachedUpdatedAt || msg.status !== cachedStatus || parseInt(existingEl.dataset.createdAt || "0") > Date.now()) {
                 console.log(`[Chat] Updating ${domId}`);
                 existingEl.outerHTML = createMessageHTML(displayMsg);
                 
@@ -3201,25 +3255,19 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
             temp.innerHTML = createMessageHTML(displayMsg);
             const newEl = temp.firstElementChild as HTMLElement;
             if (isTask) { newEl.onclick = () => handleTaskClick(newEl); }
-
-            // 🌟 [CRITICAL FIX 4] QR 널뛰기 방지: 무식한 재정렬(sort)을 버리고, 시간순에 맞는 위치를 찾아 살포시 끼워넣습니다 (insertBefore)!
-            let inserted = false;
-            const currentChildren = Array.from(chatTalks.children) as HTMLElement[];
-            for (let i = 0; i < currentChildren.length; i++) {
-                const childTime = parseInt(currentChildren[i].dataset.createdAt || "0");
-                if (displayMsg.created_at < childTime) {
-                    chatTalks.insertBefore(newEl, currentChildren[i]);
-                    inserted = true;
-                    break;
-                }
-            }
-            if (!inserted) {
-                chatTalks.appendChild(newEl);
-            }
+            chatTalks.appendChild(newEl);
         }
     });
 
-    // 🌟 (이전에 있던 children.sort와 forEach appendChild는 완전히 삭제되었습니다!)
+    // 🌟 [CRITICAL FIX] 복잡하고 버그가 많았던 insertBefore를 완전히 삭제!
+    // DOM에 렌더링된 모든 자식들을 한 번에 메모리에 올린 후, 시간을 기준으로 100% 완벽하게 재정렬하여 덮어씌웁니다.
+    const children = Array.from(chatTalks.children) as HTMLElement[];
+    children.sort((a, b) => {
+        const timeA = parseInt(a.dataset.createdAt || "0");
+        const timeB = parseInt(b.dataset.createdAt || "0");
+        return timeA - timeB;
+    });
+    children.forEach(c => chatTalks.appendChild(c));
 
     // [Scroll Maintenance]
     if (mode === 'prepend' && scrollEl) {
@@ -3251,20 +3299,24 @@ function createMessageHTML(msg: ChatMessage) {
         10: { icon: "📥", text: "pending", color: "#999" }
     };
     const currentStatus = statusMap[msg.status] || statusMap[0];
-    const timeStr = new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     
-    // 🌟 [CRITICAL FIX 1] 사용자의 검색 쿼리(@YOU)이면서 task_id가 있는 경우 컨트롤 가능한 Task Bubble로 만듭니다!
     const isTaskBubble = msg.role === "system_task" || (msg.role === "user" && !!msg.task_id && msg.task_id.startsWith("search_"));
     const roleClass = msg.role === "user" ? "user" : "system";
-    
-    // 🌟 [CRITICAL FIX 2] Task일 경우 DB에서 날아온 고유 id 대신 task_id를 우선시하여 DOM을 생성합니다! (새로고침 시 증발 방지)
     const domId = isTaskBubble ? (msg.task_id || msg.id) : msg.id;
+
+    // 🌟 [CRITICAL FIX] 화면이 지워졌다 켜져도 절대 흔들리지 않는 불변의 생성 시간(태초의 시간)을 Task ID에서 직접 뽑아냅니다!
+    let trueCreatedAt = msg.created_at;
+    const match = domId.match(/_(\d+)$/);
+    if (match) {
+        trueCreatedAt = parseInt(match[1]);
+    }
+    const timeStr = new Date(trueCreatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
     return `<div id="${domId}" class="chat-talk ${roleClass} ${isTaskBubble ? 'task-bubble' : ''}" 
         data-task-id="${msg.task_id || msg.id}" 
         data-status="${msg.status}" 
-        data-updated-at="${msg.updated_at || msg.created_at}"
-        data-created-at="${msg.created_at}"
+        data-updated-at="${msg.updated_at || trueCreatedAt}"
+        data-created-at="${trueCreatedAt}"
         style="${isTaskBubble ? 'cursor:pointer;' : ''}">
         <div class="chat-message">
             <div style="font-size:0.6rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;">
@@ -3325,8 +3377,11 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
 
         const messages = await invoke<any[]>("get_chat_messages", { limit: limit, offset: offset, filter: finalFilter });
         
+        // 🌟 [CRITICAL FIX 2] 변수 스코프(Scope) 에러 해결! 
+        // try 블록 바깥으로 빼내어 for 루프 안에서 변수를 찾지 못해 Processing이 멈추는 버그를 원천 차단합니다.
+        let activeTask: any = null;
         try {
-            const activeTask = await invoke<any>("get_active_task_context");
+            activeTask = await invoke<any>("get_active_task_context");
             if (activeTask && activeTask.id) {
                 const exists = messages.find(m => m.id === activeTask.id || m.task_id === activeTask.id);
                 if (!exists) {
@@ -3344,69 +3399,63 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
         } catch (e) { }
 
         for (let m of messages) {
+            // (이하 for 루프 내부 로직은 기존과 동일하게 둡니다)
             if (m.status === 1 && (m.role === "system_task" || m.task_id)) {
                 try {
                     const tId = m.task_id || m.id;
                     const logs = await invoke<any[]>("get_task_logs", { taskId: tId });
+                    
+                    if (!taskSteps.has(tId)) taskSteps.set(tId, new Map());
+                    const stepMap = taskSteps.get(tId)!;
+                    
+                    let isImage = false;
+                    let lastLog = null;
+                    
                     if (logs && logs.length > 0) {
-                        if (!taskSteps.has(tId)) taskSteps.set(tId, new Map());
-                        const stepMap = taskSteps.get(tId)!;
-                        
-                        let isImage = false;
-                        let lastLog = logs[0];
-                        
                         logs.forEach(l => {
                             l.task_id = l.task_id || tId; 
                             const bCat = l.category ? l.category.replace(/\s*\(.*?\)/g, "") : "general";
                             const elId = `progress-${bCat.replace(/[^a-zA-Z0-9]/g, "")}`;
                             
-                            if (!stepMap.has(elId)) {
-                                stepMap.set(elId, stepMap.size + 1);
-                            }
+                            if (!stepMap.has(elId)) stepMap.set(elId, stepMap.size + 1);
                             if (/Vision/i.test(l.category)) isImage = true;
                             lastLog = l;
                         });
-                        
-                        let currentStep = stepMap.size;
-                        
-                        // 🌟 [CRITICAL FIX 3] 과거 복구 시에도 텍스트를 파악해 분모를 정확히 세팅하고 "무조건" 장부에 저장합니다.
-                        let totalSteps = taskTotalSteps.get(tId);
-                        if (!totalSteps) {
-                            const isImgTask = isImage || (m.text && m.text.includes("Local Image"));
-                            const isSearchTask = tId.startsWith("search_");
-                            totalSteps = isImgTask ? 5 : (isSearchTask ? 4 : 7);
-                            taskTotalSteps.set(tId, totalSteps); // 👈 핵심: 진행 중인 작업도 일단 무조건 저장해둠!
-                        }
-                        
-                        if (currentStep > totalSteps) {
-                            totalSteps = currentStep;
-                            taskTotalSteps.set(tId, totalSteps);
-                        }
-                        
-                        // 완료된 상태라면 분모를 실제 최종 스텝 수로 강제 일치시킵니다!
-                        if (m.status === 9 || m.status === 0 || m.status === 3 || m.status === 6) {
-                            totalSteps = currentStep;
-                            taskTotalSteps.set(tId, totalSteps);
-                        }
-                        
-                        let rawSummary = lastLog.summary || "";
-                        const pctMatch = rawSummary.match(/\(\d+%\)/);
-                        const hasDots = rawSummary.endsWith("...");
-                        if (hasDots) rawSummary = rawSummary.slice(0, -3).trim();
-                        if (pctMatch) rawSummary = rawSummary.replace(pctMatch[0], '').trim();
-                        
-                        m.text = `${rawSummary} [${currentStep}/${totalSteps}]${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
-                        
-                        if (m.status === 9 || m.status === 0) {
-                            if (!m.text.match(/\[(\d+)\/\d+\]/)) {
-                                m.text = `${m.text} [${totalSteps}/${totalSteps}]`;
-                            } else {
-                                m.text = m.text.replace(/\[(\d+)\/\d+\]/, `[$1/${totalSteps}]`);
-                            }
-                        }
-                        
-                        m.updated_at = Date.now(); 
                     }
+                    
+                    let currentStep = stepMap.size;
+                    let totalSteps = taskTotalSteps.get(tId);
+                    if (!totalSteps) {
+                        const isImgTask = isImage || (m.text && m.text.includes("Local Image"));
+                        const isSearchTask = tId.startsWith("search_");
+                        totalSteps = isImgTask ? 4 : (isSearchTask ? 4 : 7);
+                        taskTotalSteps.set(tId, totalSteps); 
+                    }
+                    if (currentStep > totalSteps) {
+                        totalSteps = currentStep;
+                        taskTotalSteps.set(tId, totalSteps);
+                    }
+                    
+                    // 🌟 [CRITICAL FIX 2] DB에서 퍼온 "Processing..."을 부수고, RAM(livePayloads)에 있는 최신 진행률을 무조건 0순위로 강제 적용합니다!
+                    let rawSummary = "Processing...";
+                    const live = livePayloads.get(tId);
+                    
+                    if (live && live.summary) {
+                        rawSummary = live.summary;
+                    } else if (lastLog && lastLog.summary) {
+                        rawSummary = lastLog.summary;
+                    } else if (activeTask && activeTask.id === tId && activeTask.summary) {
+                        rawSummary = activeTask.summary;
+                    }
+
+                    const pctMatch = rawSummary.match(/\(\d+%\)/);
+                    const hasDots = rawSummary.endsWith("...");
+                    if (hasDots) rawSummary = rawSummary.slice(0, -3).trim();
+                    if (pctMatch) rawSummary = rawSummary.replace(pctMatch[0], '').trim();
+                    
+                    m.text = `${rawSummary} [${currentStep}/${totalSteps}]${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
+                    m.updated_at = Date.now(); 
+                    
                 } catch (e) {}
             }
         }

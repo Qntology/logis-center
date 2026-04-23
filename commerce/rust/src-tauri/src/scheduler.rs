@@ -315,20 +315,25 @@ pub async fn start_background_worker(
                              cleanup_task_resources(&task.id, Some(&app_handle));
                              
                              current_device_pref = None;
-                             break; 
+                             continue;
                         } else if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
                             let retries = oom_retry_map.entry(task.id.clone()).or_insert(0);
                             
                             if *retries == 0 {
                                 *retries += 1;
-                                // 🌟 [CRITICAL FIX] OOM 발생 시, 방금 deep_purge로 VRAM을 비웠으므로 
-                                // 느려터진 CPU 모드로 도망가지 않고 다시 한번 GPU 모드로 재시도합니다!
                                 println!("[Scheduler] OOM Detected! VRAM is purged. Retrying on GPU...");
                                 current_device_pref = None;
 
-                                log_task_progress(&app_handle, &task.id, &json!({
+                                // 🌟 [CRITICAL FIX 2] Warning 로그를 장부(파일)에 적지 않고 화면에만 즉시 쏩니다!
+                                let payload = json!({
+                                    "task_id": task.id,
                                     "category": "Warning", "summary": "Memory pressure detected. VRAM cleared. Retrying on GPU...", "spinner": "♻️"
-                                }));
+                                });
+                                let _ = app_handle.emit("extraction-progress", &payload);
+
+                                // 🌟 그리고 파일을 삭제하여 다음 시작(Processing)이 100% 깨끗한 1번 스텝이 되게 만듭니다.
+                                let log_path = crate::utils::paths::get_task_log_file(Some(&app_handle), &task.id);
+                                let _ = std::fs::remove_file(&log_path);
                                 
                                 {
                                     let store_guard = store.lock().await;
@@ -341,7 +346,6 @@ pub async fn start_background_worker(
                                 tokio::time::sleep(Duration::from_secs(2)).await;
                                 continue; 
                             } else {
-                                // 🌟 재시도마저 실패한 경우: 이미지 작업이면 에러 표출, 텍스트면 CPU 우회
                                 if task.r#type == "image_extraction" {
                                     let final_err = "High-resolution image exceeds VRAM capacity. Please try a smaller image.";
                                     println!("[Scheduler] GPU retry failed for Vision. Throwing error instead of freezing on CPU.");
@@ -358,6 +362,10 @@ pub async fn start_background_worker(
                                 } else {
                                     println!("[Scheduler] OOM Detected twice! Activating CPU Mode for text task.");
                                     current_device_pref = Some("cpu".to_string());
+
+                                    // 여기도 더러워진 로그 청소
+                                    let log_path = crate::utils::paths::get_task_log_file(Some(&app_handle), &task.id);
+                                    let _ = std::fs::remove_file(&log_path);
 
                                     log_task_progress(&app_handle, &task.id, &json!({
                                         "category": "Warning", "summary": "Memory pressure detected. Retrying with CPU Mode...", "spinner": "💾"
@@ -408,23 +416,13 @@ async fn process_task(
     device_preference: Option<String>,
 ) -> Result<()> {
     
-    // 🌟 [CRITICAL FIX] 채널 기반 백그라운드 전담 로거 스레드 생성 (데드락 원천 차단)
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let handle_clone = app_handle.clone();
+    // 🌟 [CRITICAL FIX] 비동기 채널과 스레드 꼬임으로 인한 로그 역전 현상 원천 차단!
+    let app_handle_clone = app_handle.clone();
     let tid_clone = task.id.clone();
-    
-    // 백그라운드 로거 작업
-    tokio::spawn(async move {
-        use tauri::Emitter;
-        while let Some(msg) = rx.recv().await {
-            let _ = handle_clone.emit("task-console-log", serde_json::json!({"task_id": &tid_clone, "text": msg}));
-        }
-    });
-
     let emit_term = move |msg: &str| {
         println!("{}", msg);
-        // 채널을 통해 메시지만 던지고 바로 리턴하므로 절대 블로킹되지 않음
-        let _ = tx.send(format!("{}\n", msg));
+        use tauri::Emitter;
+        let _ = app_handle_clone.emit("task-console-log", serde_json::json!({"task_id": tid_clone, "text": format!("{}\n", msg)}));
     };
 
     let team_id = if !task.to.is_empty() { task.to.clone() } else { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") };
@@ -439,8 +437,10 @@ async fn process_task(
         emit_term(&format!("[PROCESS] Found existing KV cache for task {}. Ready to reuse.", task.id));
     }
 
+    // 🌟 [CRITICAL FIX 1] 프론트엔드가 1단계부터 총 스텝 수(분모)를 헷갈리지 않게 task_type을 강제 주입합니다!
     let payload = json!({ 
         "task_id": task.id,
+        "task_type": task.r#type, 
         "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋" 
     });
     let _ = app_handle.emit("extraction-progress", &payload);
@@ -511,20 +511,19 @@ async fn process_task(
     // --- Image Extraction Logic (Qwen 3.5 Pipeline) ---
     if task.r#type == "image_extraction" {
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        
-        // 🌟 [CRITICAL FIX] 프론트엔드가 보낸 탭 모드 읽기 (없으면 기본 commerce)
         let search_mode = task_data.get("search_mode").and_then(|s| s.as_str()).unwrap_or("commerce").to_string();
 
         if !image_path.is_empty() {
             println!("[Scheduler] Starting Image Extraction for {}", task.id);
             
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Analyzing visual context with Qwen 3.5...", "spinner": "⠋" }));
+            // 🌟 [CRITICAL FIX 1] 이 녀석이 스텝을 5단계로 부풀리는 주범입니다! 과감히 삭제합니다.
+            // log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Analyzing visual context with Qwen 3.5...", "spinner": "⠋" }));
             
             model.extract_from_image(
                 task.id.clone(),
                 image_path,
                 "korean".to_string(),
-                search_mode, // 🌟 모델의 분석 함수로 탭 상태 전달!
+                search_mode, 
                 app_handle,
                 Some(cancellation_token.clone()),
                 store_mutex,
@@ -1545,6 +1544,12 @@ pub fn log_task_progress(app: &tauri::AppHandle, task_id: &str, payload: &serde_
     use std::io::Write;
     use tauri::Emitter;
 
+    // 🌟 [CRITICAL FIX] 백엔드에서 쏘는 모든 익명 로그에 task_id를 강제 주입하여 프론트엔드 오작동 차단!
+    let mut final_payload = payload.clone();
+    if let Some(obj) = final_payload.as_object_mut() {
+        obj.insert("task_id".to_string(), serde_json::json!(task_id));
+    }
+
     let log_path = crate::utils::paths::get_task_log_file(Some(app), task_id);
     
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -1552,22 +1557,20 @@ pub fn log_task_progress(app: &tauri::AppHandle, task_id: &str, payload: &serde_
         .append(true)
         .open(log_path) 
     {
-        let line = format!("{}\n", payload.to_string());
+        let line = format!("{}\n", final_payload.to_string());
         let _ = file.write_all(line.as_bytes());
     }
 
-    if let Some(cat) = payload.get("category").and_then(|v| v.as_str()) {
+    if let Some(cat) = final_payload.get("category").and_then(|v| v.as_str()) {
         if let Ok(mut w) = crate::CURRENT_UI_CATEGORY.write() {
             *w = cat.to_string();
         }
     }
     if let Ok(mut w) = crate::LATEST_PROGRESS_PAYLOAD.write() {
-        *w = Some(payload.clone());
+        *w = Some(final_payload.clone());
     }
 
-    // 🌟 [CRITICAL FIX] 로그 파일에 적히는 모든 내역을 UI로도 즉시 쏘아보냅니다!
-    // 이렇게 하면 새로고침 시 파일에서 읽어오는 내용과 라이브로 찍히는 내용이 100% 일치하여 순서가 절대 꼬이지 않습니다.
-    let _ = app.emit("extraction-progress", payload);
+    let _ = app.emit("extraction-progress", &final_payload);
 }
 
 fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {

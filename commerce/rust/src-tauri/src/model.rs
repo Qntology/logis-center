@@ -859,28 +859,26 @@ impl LogisModel {
         let app_handle_clone = app_handle.clone();
         let task_id_clone = task_id.clone();
         
-        // 🌟 [CRITICAL FIX] 변수 이름 오타 수정 (m -> msg_str)
         let emit_term = move |msg: &str| {
             println!("{}", msg);
-            let msg_str = msg.to_string(); // 👈 여기서 m 이 아니라 msg_str 로 받음
-            let handle = app_handle_clone.clone();
-            let tid = task_id_clone.clone();
-            tokio::spawn(async move {
-                use tauri::Emitter;
-                let _ = handle.emit("task-console-log", serde_json::json!({"task_id": tid, "text": format!("{}\n", msg_str)}));
-            });
+            use tauri::Emitter;
+            let _ = app_handle_clone.emit("task-console-log", serde_json::json!({"task_id": task_id_clone, "text": format!("{}\n", msg)}));
         };
 
         emit_term("\n=======================================");
         emit_term(&format!("[ENGINE] 🚀 Starting Image Extraction Pipeline for Task: {}", task_id));
         emit_term("[STAGE-1] Preparing VRAM and Loading Qwen3.5 (0.8B) Vision Model...");
 
+        // 🌟 [CRITICAL FIX 1] 이미지 추출 5단계를 완벽하게 맞추기 위한 로딩 스텝(2단계) UI 추가!
+        let payload_load = json!({ "task_id": task_id.clone(), "category": "Loading Model", "summary": "Initializing Vision Core...", "spinner": "⠋" });
+        let _ = app_handle.emit("extraction-progress", &payload_load);
+        crate::scheduler::log_task_progress(app_handle, &task_id, &payload_load);
+
         self.ensure_qwen3_5(true).await?; 
 
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
             
-            // 🌟 [핵심 라우팅 분기] Shipping 모드와 Commerce 모드 판단
             let is_trade_doc = search_mode == "shipping";
             let mut extracted_data = json!({});
 
@@ -998,6 +996,11 @@ impl LogisModel {
 
             emit_term("[STAGE-3] Syncing extracted data to LanceDB...");
 
+            // 🌟 [CRITICAL FIX 2] 5단계 마무리를 위한 저장 스텝(4단계) UI 추가!
+            let payload_save = json!({ "task_id": task_id.clone(), "category": "Saving", "summary": "Syncing to database...", "spinner": "⠋" });
+            let _ = app_handle.emit("extraction-progress", &payload_save);
+            crate::scheduler::log_task_progress(app_handle, &task_id, &payload_save);
+
             let store_guard = store_mutex.lock().await;
             if let Some(db) = store_guard.as_ref() {
                 let from_addr = "0x0000000000000000000000000000000000000000";
@@ -1080,28 +1083,27 @@ impl LogisModel {
                 // 🌟 [CRITICAL FIX] 이미지 데이터 저장 직후, DB의 Task와 Message 상태도 9(DONE)로 완전히 굳혀버립니다!
                 // 이 두 줄이 없어서 3초마다 UI가 이전 상태(1)를 DB에서 퍼와 덮어씌우고 있었습니다.
                 let _ = db.update_task_status(&task_id, 9).await;
-                // 🌟 [CRITICAL FIX] None 대신 명시적인 텍스트를 넣어 DB의 updated_at 필드가 무조건 갱신되도록 강제합니다!
                 let _ = db.update_message_status(&task_id, 9, Some("Extraction Complete")).await;
             }
             
             emit_term("[SUCCESS] Task Completed. Data saved.");
             
-            // 🌟 [CRITICAL FIX] 작업이 완전히 끝났음을 프론트엔드 채팅창 말풍선(Task Bubble)에 알립니다!
-            let _ = app_handle.emit("extraction-progress", json!({ 
+            let payload = json!({ 
                "task_id": task_id.clone(),
                "category": "Done", "summary": "Analysis Complete", "spinner": "✅", "data": extracted_data
-            }));
+            });
             
-            // 🌟 [추가] 프론트엔드가 3초 폴링을 기다리지 않고 즉시 채팅창을 새로고침하도록 강제 명령을 내립니다!
+            // 🌟 [CRITICAL FIX] Done 상태를 파일에도 확실히 기록하여 상세페이지 복구 시 100% 출력되게 합니다!
+            crate::scheduler::log_task_progress(app_handle, &task_id, &payload);
+            
             crate::scheduler::notify_new_task();
             
             Ok(())
         } else {
-            // ... 기존 에러 핸들링 로직
             Ok(())
         }
     }
-
+    
     pub async fn chat_with_qwen3_5_image_spinner(
         &self, 
         system: &str,       

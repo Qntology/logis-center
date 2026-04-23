@@ -758,6 +758,12 @@ impl QwenVLGenerateModel {
                         
                         let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
 
+                        let pct = if is_json_finished || is_eos {
+                            100
+                        } else {
+                            (((i as f32) / sample_len as f32) * 100.0).min(99.0) as i32
+                        };
+
                         let summary_msg = if task_id.starts_with("search_") {
                             format!("Generating insights ({}%)...", pct)
                         } else {

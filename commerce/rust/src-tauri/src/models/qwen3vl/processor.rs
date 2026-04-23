@@ -180,40 +180,44 @@ impl Qwen3VLProcessor {
         let img_h = img.height();
         let img_w = img.width();
         
-        // json에 정의된 값은 길이(Edge)가 아니라 면적(Pixels)입니다!
         let mut max_pixels = self.img_process_cfg.size.longest_edge as u32; 
-        let mut min_pixels = self.img_process_cfg.size.shortest_edge as u32; 
+        let min_pixels = self.img_process_cfg.size.shortest_edge as u32; 
 
-        // 상식적인 면적 범위 방어 (최대 4096x4096, 최소 56x56)
+        // 상식적인 면적 범위 방어
         if max_pixels > 16_777_216 { max_pixels = 16_777_216; }
-        if min_pixels < 3136 { min_pixels = 3136; }
-
-        use sysinfo::System;
-        let mut sys = System::new_all();
-        sys.refresh_memory();
-        let free_ram = sys.available_memory();
-        
-        // 1024 x 1024 해상도 = 약 1,048,576 픽셀
-        if free_ram < 2_000_000_000 && max_pixels > 1_048_576 {
-            println!("[PROCESSOR] Low System RAM. Capping Image Area to 1024x1024.");
-            max_pixels = 1_048_576;
-        }
 
         if let Ok(nvml) = nvml_wrapper::Nvml::init() {
             if let Ok(dev) = nvml.device_by_index(0) {
                 if let Ok(mem) = dev.memory_info() {
-                    // VRAM 3.9GB 환경에 맞게 해상도 동적 조절 (면적 기준)
-                    if mem.free < 2_000_000_000 {
-                        let cap = if mem.free < 800_000_000 { 589_824 } else { 802_816 }; // 768x768 or 896x896
+                    // 🌟 [CRITICAL FIX] Qwen 3.5 (Vision)의 Eager Attention OOM 완벽 방어!
+                    // 비전 모델은 이미지 패치(Patch) 개수의 제곱(N^2)에 비례하여 VRAM을 폭식합니다.
+                    // 1344x1344 (1.8M 픽셀) = 7056 토큰 = 3.2GB의 행렬 연산 메모리가 일시적으로 필요하므로 4GB 환경에서는 무조건 터집니다.
+                    // 따라서 VRAM 용량별로 안전한 "최대 픽셀 수"를 철저하게 보수적으로 재조정합니다.
+                    
+                    let free_vram = mem.free;
+                    
+                    if free_vram < 2_000_000_000 {
+                        // 2GB 이하: 768x768 (589,824) -> 2304 토큰 -> Attention ~340MB 스파이크
+                        let cap = 589_824; 
                         if max_pixels > cap { max_pixels = cap; }
-                    } else if mem.free < 4_500_000_000 {
-                        if max_pixels > 1_806_336 { max_pixels = 1_806_336; } // 1344x1344
+                    } else if free_vram < 3_000_000_000 {
+                        // 3GB 이하: 896x896 (802,816) -> 3136 토큰 -> Attention ~620MB 스파이크
+                        let cap = 802_816; 
+                        if max_pixels > cap { max_pixels = cap; }
+                    } else if free_vram < 4_500_000_000 {
+                        // 4.5GB 이하: 1024x1024 (1,048,576) -> 4096 토큰 -> Attention ~1.07GB 스파이크 (안전)
+                        let cap = 1_048_576; 
+                        if max_pixels > cap { max_pixels = cap; }
+                    } else if free_vram < 6_000_000_000 {
+                        // 6GB 이하: 1152x1152 (1,327,104) -> 5184 토큰 -> Attention ~1.7GB 스파이크
+                        let cap = 1_327_104; 
+                        if max_pixels > cap { max_pixels = cap; }
                     }
                 }
             }
         }
 
-        // 이제 올바른 픽셀 면적이 들어가서 이미지가 선명하게 유지됩니다!
+        // 이제 계산된 픽셀 한계에 맞춰 이미지를 지능적으로 축소합니다.
         let (resize_h, resize_w) = img_smart_resize(
             img_h,
             img_w,
