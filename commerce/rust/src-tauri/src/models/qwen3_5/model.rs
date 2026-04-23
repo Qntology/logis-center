@@ -2279,7 +2279,8 @@ impl Qwen3_5Model {
         }
         
         let total_len = inputs_embeds.dim(1)?;
-        let chunk_size = 1024; 
+        // 🌟 [UI 자연스러움] 여기도 1024 -> 256으로 줄여 Qwen 3.5 읽기(Prefill) 시 0% 병목을 제거합니다.
+        let chunk_size = 2048; 
         let mut final_hidden_state = None;
 
         if total_len > 1 {

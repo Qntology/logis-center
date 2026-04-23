@@ -740,13 +740,14 @@ impl QwenVLGenerateModel {
             
             let current_pos = total_tokens_after_prefill + i as usize;
             
-            if i % 10 == 0 || is_eos || is_json_finished {
-                let sample_len = mes.max_tokens.unwrap_or(2048) as f32;
-                
+            // 🌟 [UI 자연스러움] 10글자마다 뚝뚝 끊기던 것을 3글자마다 부드럽게 업데이트!
+            if i % 3 == 0 || is_eos || is_json_finished {
                 let pct = if is_json_finished || is_eos {
                     100
                 } else {
-                    (((i as f32) / sample_len) * 100.0).min(99.0) as i32
+                    // 🌟 [CRITICAL FIX] 목표 지점을 모르는 AI 특성상, 점점 느려지며 99%에 수렴하는 비선형 곡선(Asymptotic) 적용!
+                    // 시작 시 즉각적으로 빠르게 차오르며, 0%에 멈춰있는 답답함을 완벽히 해소합니다.
+                    (100.0 * (1.0 - (-0.015 * (i as f32)).exp())).min(99.0) as i32
                 };
 
                 if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
@@ -757,12 +758,6 @@ impl QwenVLGenerateModel {
                         } else { sid.clone() };
                         
                         let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
-
-                        let pct = if is_json_finished || is_eos {
-                            100
-                        } else {
-                            (((i as f32) / sample_len as f32) * 100.0).min(99.0) as i32
-                        };
 
                         let summary_msg = if task_id.starts_with("search_") {
                             format!("Generating insights ({}%)...", pct)

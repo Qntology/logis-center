@@ -12,7 +12,7 @@ pub mod openai_types;
 pub mod chat_template;
 pub mod tokenizer;
 
-use tauri::{State, Manager, Listener}; 
+use tauri::{State, Manager, Listener, Emitter}; // 🌟 Emitter 추가!
 use tokio::sync::Mutex as TokioMutex;
 use std::sync::RwLock; // 🌟 추가
 use once_cell::sync::Lazy; // 🌟 추가
@@ -620,6 +620,23 @@ async fn ai_search_complex(
         }
         model_guard.as_ref().unwrap().clone() 
     }; 
+
+    // 🌟 [CRITICAL FIX] 대기열(Pending) 통과 후 모델을 잡았을 때! 
+    // DB와 UI의 상태를 10(Pending)에서 1(Processing)로 명확하게 동기화합니다.
+    if let Some(store) = store_opt.as_ref() {
+        let _ = store.update_task_status(&task_id, 1).await;
+        let _ = store.update_message_status(&task_id, 1, Some("Analyzing...")).await;
+    }
+
+    // 화면의 찌꺼기를 날려버리는 트리거(Processing) 발송!
+    let payload_start = json!({ 
+        "task_id": task_id, 
+        "category": "Processing", 
+        "summary": "AI Engine ready. Starting search...", 
+        "spinner": "⠋" 
+    });
+    let _ = app_handle.emit("extraction-progress", &payload_start);
+    crate::scheduler::log_task_progress(&app_handle, &task_id, &payload_start);
 
     let search_process = async {
         let mut all_results = Vec::new();

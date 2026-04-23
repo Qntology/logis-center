@@ -330,13 +330,13 @@ impl Qwen3_5GenerateModel {
             let current_pos = seqlen_offset + seq_len;
             let is_eos = next_token == self.eos_token_id;
             
-            if i % 10 == 0 || is_eos || is_json_finished {
-                // 🌟 [CRITICAL FIX 3] UI 일관성을 위해 토큰 수 노출을 삭제하고 퍼센트(%)로 원복합니다!
-                // 완료 전까지는 아무리 길어져도 99%에서 멈추도록 안전장치를 걸어 점프(널뛰기)를 막습니다.
+            // 🌟 [UI 자연스러움] 10토큰 -> 3토큰마다 부드러운 애니메이션
+            if i % 3 == 0 || is_eos || is_json_finished {
                 let pct = if is_json_finished || is_eos {
                     100
                 } else {
-                    (((i as f32) / sample_len as f32) * 100.0).min(99.0) as i32
+                    // 🌟 15% -> 100% 로 갑자기 점프하는 널뛰기 방지용 비선형 로그 곡선 적용
+                    (100.0 * (1.0 - (-0.015 * (i as f32)).exp())).min(99.0) as i32
                 };
                 
                 if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
@@ -567,11 +567,13 @@ impl Qwen3_5GenerateModel {
             let current_pos = seqlen_offset + seq_len;
             let is_eos = next_token == self.eos_token_id;
             
-            if i % 10 == 0 || is_eos || is_json_finished {
+            // 🌟 [UI 자연스러움] 10토큰 -> 3토큰마다 부드러운 애니메이션
+            if i % 3 == 0 || is_eos || is_json_finished {
                 let pct = if is_json_finished || is_eos {
                     100
                 } else {
-                    (((i as f32) / sample_len as f32) * 100.0).min(99.0) as i32
+                    // 🌟 15% -> 100% 로 갑자기 점프하는 널뛰기 방지용 비선형 로그 곡선 적용
+                    (100.0 * (1.0 - (-0.015 * (i as f32)).exp())).min(99.0) as i32
                 };
                 
                 if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {

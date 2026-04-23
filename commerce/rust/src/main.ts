@@ -863,6 +863,12 @@ function applySearchModeUI() {
         }
     });
 
+    // 🌟 [추가] 선택된 모드의 첫 글자를 대문자로 변환하여 Placeholder에 즉시 반영!
+    if (searchInput) {
+        const capitalizedMode = currentSearchMode.charAt(0).toUpperCase() + currentSearchMode.slice(1);
+        searchInput.placeholder = `${capitalizedMode} Search or Ask`;
+    }
+
     // 🌟 [추가] Shipping 모드일 때 Shared Pages 섹션 통째로 숨기기
     const pagesSection = document.getElementById("nav-list-pages")?.closest(".nav-section") as HTMLElement;
     if (pagesSection) {
@@ -1262,39 +1268,46 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
         }
     }
 
-    if (!taskTotalSteps.has(tId) || !taskTotalSteps.get(tId)) {
+    if (!taskTotalSteps.has(tId) || taskTotalSteps.get(tId) === undefined) {
         const bubbleEl = document.getElementById(tId);
-        // 🌟 [CRITICAL FIX 4] 백엔드가 보내준 task_type을 통해 시작부터 4스텝으로 고정! (1/7 -> 1/4 널뛰기 방지)
         const isImgTask = payload.task_type === "image_extraction" || 
                           (payload.category && payload.category.includes("Vision")) || 
                           (bubbleEl && bubbleEl.innerText.includes("Local Image"));
         const isSearchTask = tId.startsWith("search_");
         
-        let initialTotal = 7; 
+        // 🌟 [CRITICAL FIX] 웹페이지 추출은 시작 시점에 총 스텝을 모릅니다. 
+        // 0으로 세팅하여 측정 가능해질 때까지 [N/M] 표기를 완벽하게 숨깁니다!
+        let initialTotal = 0; 
         if (isImgTask) initialTotal = 4; 
         if (isSearchTask) initialTotal = 4; 
         
         taskTotalSteps.set(tId, initialTotal); 
     }
 
-    // 🌟 [CRITICAL FIX 3] 알림(Warning)이 아닌 진짜 진행 단계일 때만 스텝을 카운트합니다.
     if (!isTerminal && payload.category !== "Error" && !isNotification) { 
-        // 기존에 분모를 억지로 5로 만들던 하드코딩 조건문 삭제 완료!
-        if (payload.category && payload.category.includes("List Extraction")) {
-            const match = payload.category.match(/\(\d+\/(\d+)\)/);
-            if (match) { taskTotalSteps.set(tId, 6 + parseInt(match[1])); }
-        } else if (payload.category === "Selector Search") {
-            taskTotalSteps.set(tId, 8); 
-        }
-
         if (!stepMap.has(elementId)) {
             stepMap.set(elementId, stepMap.size + 1);
         }
         
         let currentStep = stepMap.get(elementId)!;
-        let totalSteps = taskTotalSteps.get(tId) || 7; 
-        
-        if (currentStep > totalSteps) {
+
+        // 🌟 [회원님 아이디어 적용] AI가 경로를 확정하여 측정이 가능해지는 순간, 총 스텝(분모)을 계산합니다!
+        if (payload.category && payload.category.includes("List Extraction")) {
+            const match = payload.category.match(/\(\d+\/(\d+)\)/);
+            if (match) { 
+                const totalItems = parseInt(match[1]);
+                // 현재 스텝 + 남은 리스트 개수 = 완벽한 전체 스텝 수 도출!
+                taskTotalSteps.set(tId, currentStep + totalItems); 
+            }
+        } else if (payload.category === "AI Inference" || payload.category === "List Processing") {
+            // 상세 페이지 추출의 마지막 단계 진입 시 (다음은 Saving)
+            if (taskTotalSteps.get(tId) === 0) taskTotalSteps.set(tId, currentStep + 1);
+        } else if (payload.category === "Saving") {
+            if (taskTotalSteps.get(tId) === 0) taskTotalSteps.set(tId, currentStep);
+        }
+
+        let totalSteps = taskTotalSteps.get(tId) || 0; 
+        if (totalSteps > 0 && currentStep > totalSteps) {
             totalSteps = currentStep;
             taskTotalSteps.set(tId, totalSteps);
         }
@@ -1306,9 +1319,13 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
         if (hasDots) rawSummary = rawSummary.slice(0, -3).trim();
         if (pctMatch) rawSummary = rawSummary.replace(pctMatch[0], '').trim();
         
-        displaySummary = `${rawSummary} [${currentStep}/${totalSteps}]${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
+        // 🌟 측정 가능할 때만 [N/M] 노출, 모를 때는 깔끔하게 퍼센트만 노출!
+        if (totalSteps > 0) {
+            displaySummary = `${rawSummary} [${currentStep}/${totalSteps}]${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
+        } else {
+            displaySummary = `${rawSummary}${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
+        }
     } else if (isNotification) {
-        // Warning이나 Info는 스텝 번호 [x/y]를 붙이지 않고 원본 메세지만 출력합니다.
         displaySummary = payload.summary || "";
     }
 
@@ -1333,7 +1350,10 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
 
              if (payload.category === "Done") {
                  targetContainer.querySelectorAll('.summary-text').forEach(el => {
-                     if (el.textContent) { el.textContent = el.textContent.replace(/\[(\d+)\/(undefined|\d+)\]/g, `[$1/${finalTotal}]`); }
+                     // 🌟 [복구 완료] 과거의 완료 로그들도 최종 확정된 전체 스텝 수(finalTotal)를 분모로 깔끔하게 통일시킵니다.
+                     if (el.textContent) { 
+                         el.textContent = el.textContent.replace(/\[(\d+)\/(undefined|\d+)\]/g, `[$1/${finalTotal}]`); 
+                     }
                  });
                  if (!displaySummary.match(/\[(\d+)\/(undefined|\d+)\]/)) {
                      displaySummary = `${displaySummary} [${finalTotal}/${finalTotal}]`;
@@ -3425,18 +3445,19 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                     
                     let currentStep = stepMap.size;
                     let totalSteps = taskTotalSteps.get(tId);
-                    if (!totalSteps) {
+                    if (totalSteps === undefined) {
                         const isImgTask = isImage || (m.text && m.text.includes("Local Image"));
                         const isSearchTask = tId.startsWith("search_");
-                        totalSteps = isImgTask ? 4 : (isSearchTask ? 4 : 7);
+                        
+                        // 🌟 여기서도 웹 추출은 0(숨김)으로 처리
+                        totalSteps = isImgTask ? 4 : (isSearchTask ? 4 : 0);
                         taskTotalSteps.set(tId, totalSteps); 
                     }
-                    if (currentStep > totalSteps) {
+                    if (totalSteps > 0 && currentStep > totalSteps) {
                         totalSteps = currentStep;
                         taskTotalSteps.set(tId, totalSteps);
                     }
                     
-                    // 🌟 [CRITICAL FIX 2] DB에서 퍼온 "Processing..."을 부수고, RAM(livePayloads)에 있는 최신 진행률을 무조건 0순위로 강제 적용합니다!
                     let rawSummary = "Processing...";
                     const live = livePayloads.get(tId);
                     
@@ -3453,8 +3474,13 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                     if (hasDots) rawSummary = rawSummary.slice(0, -3).trim();
                     if (pctMatch) rawSummary = rawSummary.replace(pctMatch[0], '').trim();
                     
-                    m.text = `${rawSummary} [${currentStep}/${totalSteps}]${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
-                    m.updated_at = Date.now(); 
+                    // 🌟 분모가 확정(0 초과)되었을 때만 채팅창에도 [N/M] 노출
+                    if (totalSteps > 0) {
+                        m.text = `${rawSummary} [${currentStep}/${totalSteps}]${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
+                    } else {
+                        m.text = `${rawSummary}${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
+                    }
+                    m.updated_at = Date.now();
                     
                 } catch (e) {}
             }
