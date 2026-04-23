@@ -2162,9 +2162,10 @@ impl QuantizedQwenVLTextModel {
         }
 
         let current_seq_len = xs.dim(1)?;
-        let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(256).collect(); 
+        // 🌟 [CRITICAL FIX] 썰어내는 크기(2048)에 맞춰 칼질하는 보폭도 2048로 동기화!
+        let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(2048).collect(); 
         
-        // 청크 분할 및 연산 (이제 256 사이즈로 안전하게 진행됨)
+        // 청크 분할 및 연산
         let mut next_xs = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
 
         if let (Some(embed), Some(mask)) = (deepstack_embed, visual_mask) {
