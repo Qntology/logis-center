@@ -767,19 +767,19 @@ supply_price:supply price | number,
 currency:ISO 4217 Currency Code | string,
 quantity:item stock quantity | number,
 tracking_number:Tracking Number or 운송장 번호 or 运单호 or 運單號 or 伝표번호 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Ноमर 나кладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ | string,
-registration_date:yyyy-MM-ddThh:mm:ss | string,"###.to_string(),
+registration_date:yyyy-MM-ddThh:mm:ss | string"###.to_string(),
     "tracking" | "review" => r###"status:'start' or 'progress' or 'stop' or 'cancel' or 'return',
 path:URL includes a manage path, an administrative or edit Link | string,
 id:Refer to the ID value from the link or an attribute | string,
 link:Refer to the ID to find a URL that includes a manage link | string,
 title:author and content | string, 
-registration_date:yyyy-MM-ddThh:mm:ss | string,"###.to_string(),
+registration_date:yyyy-MM-ddThh:mm:ss | string"###.to_string(),
     "coupon" | "event" => r###"status:'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
 id:Refer to the ID value from the link or an attribute | string,
 title:type based item title, 
 started_at:yyyy-MM-ddThh:mm:ss,
 expired_at:yyyy-MM-ddThh:mm:ss,
-registration_date:yyyy-MM-ddThh:mm:ss | string,"###.to_string(),
+registration_date:yyyy-MM-ddThh:mm:ss | string"###.to_string(),
         _ => "id: ID\ntitle: Title\nstatus: Status".to_string()
     };
 
@@ -793,10 +793,12 @@ current Link: {HREF}
 {SCHEMA}
 
 [OUTPUT FORMAT]
-Return ONLY a single valid JSON object. 
+Return ONLY a single valid JSON object strictly matching the schema above.
+Ensure the JSON object is properly closed with '}'. DO NOT repeat keys.
 If a field is missing, use null. 
 Normalize all dates to 'yyyy-MM-ddThh:mm:ss'. 
 Extract only numeric values for price, quantity, amount.
+Preserve the exact original text for string fields. Do not strip or separate numbers from text to fill numeric fields.
 
 [ACTION] RETURN JSON ONLY. 
 NO EXPLANATION. NO THINKING. /no_think"###;

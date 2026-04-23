@@ -1248,7 +1248,7 @@ async fn process_task(
                             content: ChatCompletionRequestUserMessageContent::Text(task_question),
                             name: None,
                         })],
-                        model: "qwen3.5".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
+                        model: "qwen3.5".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.01),
                         ..Default::default()
                     };
                     gen.generate(
