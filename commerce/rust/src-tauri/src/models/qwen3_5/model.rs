@@ -1036,7 +1036,14 @@ impl Qwen3_5Attention {
             // 🌟 [에러 해결] s_chunk를 먼저 F32로 올려서 모든 누적(m_j, p_j, l_j)이 F32에서 안전하게 이뤄지도록 합니다!
             let s_chunk_f32 = s_chunk.to_dtype(DType::F32)?;
             let m_j = s_chunk_f32.max_keepdim(candle_core::D::Minus1)?;
-            let p_j = s_chunk_f32.broadcast_sub(&m_j)?.exp()?;
+            
+            // 🌟 [CRITICAL FIX] 1024 토큰을 넘어갈 때(Block 1 이후), 미래 토큰들이 완전히 마스킹(-inf)되면 
+            // -inf - (-inf) = NaN이 발생하여 모델 뇌가 파괴되는 현상(!!!!!!!! 출력)을 원천 차단합니다.
+            let safe_floor = Tensor::new(-10000.0_f32, m_j.device())?.broadcast_as(m_j.shape())?;
+            let m_j_safe = m_j.maximum(&safe_floor)?;
+
+            // m_j 대신 m_j_safe를 사용하여 빼기 연산 수행
+            let p_j = s_chunk_f32.broadcast_sub(&m_j_safe)?.exp()?;
             let l_j = p_j.sum_keepdim(candle_core::D::Minus1)?;
             
             // v와 곱할 때는 타겟 타입(BF16)으로 맞추고, 다시 누적기(out_res)에 넣기 위해 F32로 올립니다.
@@ -1046,7 +1053,7 @@ impl Qwen3_5Attention {
             match out_res.as_ref() {
                 None => {
                     out_res = Some(out_j_f32); // 🌟 누적기는 완벽한 F32로 유지됨
-                    m_n = Some(m_j);
+                    m_n = Some(m_j); // 🌟 병합 계산을 위해 m_n에는 안전장치가 없는 "원본 m_j"를 유지해야 합니다!
                     l_n = Some(l_j);
                 }
                 Some(prev_out_f32) => {

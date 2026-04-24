@@ -723,13 +723,20 @@ pub fn eager_attention_forward(
 
         // 수치적 안정성을 위한 Max 로짓 추출 및 통합 준비
         let max_logits = attn_weights.max_keepdim(D::Minus1)?;
-        let exp_weights = attn_weights.broadcast_sub(&max_logits)?.exp()?;
+        
+        // 🌟 [CRITICAL FIX] NaN 파괴 현상 원천 차단 패치
+        let safe_floor = Tensor::new(-10000.0_f32, max_logits.device())?
+            .to_dtype(max_logits.dtype())?
+            .broadcast_as(max_logits.shape())?;
+        let max_logits_safe = max_logits.maximum(&safe_floor)?;
+
+        let exp_weights = attn_weights.broadcast_sub(&max_logits_safe)?.exp()?;
         let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
         
         let out_block = exp_weights.to_dtype(v_block.dtype())?.matmul(&v_block)?;
 
         block_outputs.push(out_block);
-        block_lse.push((sum_exp, max_logits)); // [CRITICAL FIX] 튜플로 묶어서 보관
+        block_lse.push((sum_exp, max_logits));
     }
 
     // 블록 결과 통합 (Merging)

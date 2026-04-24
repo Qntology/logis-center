@@ -757,28 +757,34 @@ current Link: {HREF}
 
 pub fn list2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
-    "order" | "goods" => r###"status:'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
-path:URL includes a manage path, an administrative or edit Link | string,
-id:Refer to the ID value from the link or an attribute | string,
-link:Refer to the ID to find a URL that includes a manage link | string,
-title:title | string, 
-sale_price:sale price | number,
-currency:ISO 4217 Currency Code | string,
-tracking_number:Tracking Number or 운송장 번호 or 运单호 or 運單號 or 伝표번호 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Ноमर 나кладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ | string,
-registration_date:yyyy-MM-ddThh:mm:ss | string"###.to_string(),
-    "tracking" | "review" => r###"status:'start' or 'progress' or 'stop' or 'cancel' or 'return',
-path:URL includes a manage path, an administrative or edit Link | string,
-id:Refer to the ID value from the link or an attribute | string,
-link:Refer to the ID to find a URL that includes a manage link | string,
-title:author and content | string, 
-registration_date:yyyy-MM-ddThh:mm:ss | string"###.to_string(),
-    "coupon" | "event" => r###"status:'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
-id:Refer to the ID value from the link or an attribute | string,
-title:type based item title, 
-started_at:yyyy-MM-ddThh:mm:ss,
-expired_at:yyyy-MM-ddThh:mm:ss,
-registration_date:yyyy-MM-ddThh:mm:ss | string"###.to_string(),
-        _ => "id: ID\ntitle: Title\nstatus: Status".to_string()
+    "order" | "goods" => r###"* "path":URL includes a manage path, an administrative or edit Link | string
+* "id":Refer to the ID value from the link or an attribute | string
+* "link":Refer to the ID to find a URL that includes a manage link | string
+* "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error'
+* "title":title | string
+* "sale_price":sale price | number
+* "currency":ISO 4217 Currency Code | string
+* "tracking_number":Tracking Number or 운송장 번호 or 运单호 or 運單號 or 伝표번호 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Ноमर 나кладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ | string
+* "registration_date":yyyy-MM-ddThh:mm:ss | string"###.to_string(),
+    "tracking" | "review" => r###"* "path":URL includes a manage path, an administrative or edit Link | string
+* "id":Refer to the ID value from the link or an attribute | string
+* "link":Refer to the ID to find a URL that includes a manage link | string
+* "status":'start' or 'progress' or 'stop' or 'cancel' or 'return'
+* "title":author and content | string 
+* "registration_date":yyyy-MM-ddThh:mm:ss | string"###.to_string(),
+    "coupon" | "event" => r###"* "path":URL includes a manage path, an administrative or edit Link | string
+* "id":Refer to the ID value from the link or an attribute | string
+* "link":Refer to the ID to find a URL that includes a manage link | string
+* "status":'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
+* "title":type based item title | string, 
+* "started_at":yyyy-MM-ddThh:mm:ss | string,
+* "expired_at":yyyy-MM-ddThh:mm:ss | string,
+* "registration_date":yyyy-MM-ddThh:mm:ss | string"###.to_string(),
+        _ => r###"* "path":URL includes a manage path, an administrative or edit Link | string
+* "id":Refer to the ID value from the link or an attribute | string
+* "link":Refer to the ID to find a URL that includes a manage link | string
+* "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error'
+* "title":title | string"###.to_string()
     };
 
     let template = r###"[TASK]
@@ -791,8 +797,7 @@ current Link: {HREF}
 {SCHEMA}
 
 [OUTPUT FORMAT]
-Return ONLY a single valid JSON object strictly matching the schema above.
-Normalize all dates to 'yyyy-MM-ddThh:mm:ss'.
+{...}
 
 [ACTION] RETURN JSON ONLY. 
 NO EXPLANATION. NO THINKING. /no_think"###;

@@ -509,7 +509,7 @@ impl Qwen3_5GenerateModel {
             let len = logits_vec.len();
 
             if !generate.is_empty() {
-                let penalty = if is_strict_json { 1.01 } else { 1.1 }; 
+                let penalty = 1.1; 
                 let mut set = std::collections::HashSet::new();
                 let start_at = generate.len().saturating_sub(self.repeat_last_n);
                 for &t in &generate[start_at..] {

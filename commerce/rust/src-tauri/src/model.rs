@@ -1685,9 +1685,26 @@ impl LogisModel {
                     else { obj.insert("condition".to_string(), conditions_json); }
                 }
 
-                self.deep_purge_resources().await;
-                // scheduler의 함수를 빌려와 리소스 안정화 대기 (0.8초 이상 권장)
-                crate::scheduler::wait_for_resources_settled(1200, 800, Some(&cancel_token)).await?;
+                crate::models::qwen::generate::wait_for_global_io().await;
+                
+                // 🌟 [신규 추가] GPU 비동기 연산 찌꺼기 강제 동기화
+                if !self.is_cpu_mode {
+                    let dev = self.device_config.device.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if dev.is_cuda() { let _ = dev.synchronize(); }
+                    }).await;
+                }
+
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+                #[cfg(target_os = "linux")]
+                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+                #[cfg(target_os = "macos")]
+                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
             }
         }
 
@@ -1743,9 +1760,26 @@ impl LogisModel {
                     obj.insert("find".to_string(), attributes_json.get("find").cloned().unwrap_or(serde_json::Value::Null));
                 }
 
-                self.deep_purge_resources().await;
-                // scheduler의 함수를 빌려와 리소스 안정화 대기 (0.8초 이상 권장)
-                crate::scheduler::wait_for_resources_settled(1200, 800, Some(&cancel_token)).await?;
+                crate::models::qwen::generate::wait_for_global_io().await;
+                
+                // 🌟 [신규 추가] GPU 비동기 연산 찌꺼기 강제 동기화
+                if !self.is_cpu_mode {
+                    let dev = self.device_config.device.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if dev.is_cuda() { let _ = dev.synchronize(); }
+                    }).await;
+                }
+
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+                #[cfg(target_os = "linux")]
+                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+                #[cfg(target_os = "macos")]
+                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
             }
         }
 
@@ -1900,10 +1934,28 @@ impl LogisModel {
             status_history.push_str(&format!("> {}...\n\n", short_res.replace("\n", " ")));
             crate::scheduler::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
 
-            self.deep_purge_resources().await;
-            if let Some(ref token) = cancel_token {
-                crate::scheduler::wait_for_resources_settled(1200, 800, Some(token)).await?;
+            crate::models::qwen::generate::wait_for_global_io().await;
+            
+            // 🌟 [신규 추가] GPU 비동기 연산 찌꺼기 강제 동기화
+            if !self.is_cpu_mode {
+                let dev = self.device_config.device.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if dev.is_cuda() { let _ = dev.synchronize(); }
+                }).await;
             }
+            
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+            }
+            #[cfg(target_os = "linux")]
+            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+            #[cfg(target_os = "macos")]
+            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+            
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
         // 3. Final Report
