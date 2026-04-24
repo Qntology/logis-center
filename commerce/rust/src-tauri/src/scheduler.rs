@@ -1354,6 +1354,30 @@ async fn process_task(
                     },
                     Err(e) => println!("[Scheduler] Error extracting item {}: {:?}", idx, e),
                 }
+
+
+                // 1. 모델 내부에 쌓인 과거 문맥(KV 캐시) 및 Mamba(SSM) 상태를 명시적으로 파괴합니다.
+                if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+                    gen.clear_kv_cache();
+                }
+
+                // 2. IO 작업이 꼬이지 않도록 대기
+                crate::models::qwen::generate::wait_for_global_io().await;
+
+                // 3. OS 커널 레벨에서 가비지 컬렉터(Garbage Collector)를 강제 호출하여 RAM 피크를 박살 냅니다.
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+                #[cfg(target_os = "linux")]
+                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+                #[cfg(target_os = "macos")]
+                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+
+                // 4. GPU와 OS가 메모리를 반환할 시간을 아주 짧게(0.1초) 줍니다.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
 
             if let Some(last_item) = pending_merge.take() {

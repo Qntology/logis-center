@@ -1684,6 +1684,18 @@ impl LogisModel {
                     if let Some(cond_val) = conditions_json.get("condition") { obj.insert("condition".to_string(), cond_val.clone()); } 
                     else { obj.insert("condition".to_string(), conditions_json); }
                 }
+
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+                #[cfg(target_os = "linux")]
+                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+                #[cfg(target_os = "macos")]
+                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
             }
         }
 
@@ -1738,6 +1750,19 @@ impl LogisModel {
                     obj.insert("substantial".to_string(), attributes_json.get("substantial").cloned().unwrap_or(serde_json::Value::Null));
                     obj.insert("find".to_string(), attributes_json.get("find").cloned().unwrap_or(serde_json::Value::Null));
                 }
+
+                crate::models::qwen::generate::wait_for_global_io().await;
+                
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+                #[cfg(target_os = "linux")]
+                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+                #[cfg(target_os = "macos")]
+                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
             }
         }
 
@@ -1882,18 +1907,30 @@ impl LogisModel {
 
         for step in steps.iter() {
             status_history.push_str(&format!("**⏳ {}**\n", step));
-            // [LOG-ONLY]
             crate::scheduler::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
 
             let prompt = format!("Given this context: {}\n\nTask: {}\nQuery: {}\n\nProvide deep insight for this specific step.", context_data, step, query);
             
-            // In a real implementation, we might want to stream this too, but for now we wait for the step result
             let step_result = self.run_inference_text(prompt, None, cancel_token.clone(), None, None).await?;
             
             let short_res = if step_result.len() > 200 { &step_result[..200] } else { &step_result };
             status_history.push_str(&format!("> {}...\n\n", short_res.replace("\n", " ")));
-            // [LOG-ONLY]
             crate::scheduler::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
+
+            crate::models::qwen::generate::wait_for_global_io().await;
+            
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+            }
+            #[cfg(target_os = "linux")]
+            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+            #[cfg(target_os = "macos")]
+            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+            
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
         // 3. Final Report

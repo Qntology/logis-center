@@ -792,11 +792,7 @@ current Link: {HREF}
 
 [OUTPUT FORMAT]
 Return ONLY a single valid JSON object strictly matching the schema above.
-Ensure the JSON object is properly closed with '}'. DO NOT repeat keys.
-If a field is missing, use null. 
-Normalize all dates to 'yyyy-MM-ddThh:mm:ss'. 
-Extract only numeric values for price.
-Preserve the exact original text for string fields. Do not strip or separate numbers from text to fill numeric fields.
+Normalize all dates to 'yyyy-MM-ddThh:mm:ss'.
 
 [ACTION] RETURN JSON ONLY. 
 NO EXPLANATION. NO THINKING. /no_think"###;

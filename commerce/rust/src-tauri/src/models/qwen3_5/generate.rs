@@ -269,8 +269,7 @@ impl Qwen3_5GenerateModel {
             let len = logits_vec.len();
             
             if !generate.is_empty() {
-                // 🌟 Fix: JSON 추출 모드일 때 반복 페널티 완전 해제 (1.1 -> 1.01)
-                let penalty = if is_strict_json { 1.01 } else { 1.1 }; 
+                let penalty = 1.1; 
                 let mut set = std::collections::HashSet::new();
                 let start_at = generate.len().saturating_sub(self.repeat_last_n);
                 for &t in &generate[start_at..] {
