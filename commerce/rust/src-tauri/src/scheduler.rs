@@ -1320,9 +1320,17 @@ async fn process_task(
 
                 match res {
                     Ok(res_text) => {
-                        let mut item_json = parsing::parse_json_from_llm(&res_text); // 🌟 mut 추가됨
+                        let mut item_json = parsing::parse_json_from_llm(&res_text);
                         if !item_json.is_null() && (item_json.is_object() || item_json.is_array()) {
                             
+                            // 🌟 [Part 2: 롤백 로직 추가] {TYPE}_status 로 추출된 값을 DB 표준 규격인 status 로 매핑 및 기존 키 제거
+                            if let Some(obj) = item_json.as_object_mut() {
+                                let status_key = format!("{}_status", page_type);
+                                if let Some(status_val) = obj.remove(&status_key) {
+                                    obj.insert("status".to_string(), status_val);
+                                }
+                            }
+
                             if let Some(link_val) = item_json.get_mut("link") {
                                 if let Some(relative_path) = link_val.as_str() {
                                     if let Ok(base_url) = url::Url::parse(&url) {
@@ -1461,6 +1469,15 @@ async fn process_task(
                     let _ = data_manager.offload(&res.text, "step_c_res");
 
                     extracted_data = parsing::parse_json_from_llm(&res.text);
+                    
+                    // 🌟 [Part 2: 롤백 로직 추가] {TYPE}_status 를 DB 표준 규격인 status 로 복구
+                    if let Some(obj) = extracted_data.as_object_mut() {
+                        let status_key = format!("{}_status", page_type);
+                        if let Some(status_val) = obj.remove(&status_key) {
+                            obj.insert("status".to_string(), status_val);
+                        }
+                    }
+
                 } else {
                     println!("[Scheduler] ERROR: Qwen 3.5 generator is missing!");
                 }

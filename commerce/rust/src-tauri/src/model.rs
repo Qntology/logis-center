@@ -1755,7 +1755,16 @@ impl LogisModel {
 
                 let attributes_json = crate::parsing::parse_json_from_llm(&res2);
                 if let Some(obj) = seg.as_object_mut() {
-                    obj.insert("status".to_string(), attributes_json.get("status").cloned().unwrap_or(serde_json::Value::Null));
+                    
+                    // 🌟 [Part 2: 롤백 로직 추가] {TYPE}_status 로 추출된 값을 찾아서 status 에 꽂아줍니다.
+                    let status_key = format!("{}_status", seg_type);
+                    let extracted_status = attributes_json.get(&status_key).cloned()
+                        .or_else(|| attributes_json.get("status").cloned()) // (안전장치) LLM이 그냥 status로 뱉었을 경우 호환성 유지
+                        .unwrap_or(serde_json::Value::Null);
+
+                    obj.insert("status".to_string(), extracted_status);
+                    
+                    // 기존 substantial, find 는 그대로 유지
                     obj.insert("substantial".to_string(), attributes_json.get("substantial").cloned().unwrap_or(serde_json::Value::Null));
                     obj.insert("find".to_string(), attributes_json.get("find").cloned().unwrap_or(serde_json::Value::Null));
                 }
