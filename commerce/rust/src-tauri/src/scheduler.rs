@@ -803,7 +803,7 @@ async fn process_task(
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
             println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Is Detail)");
             
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining if detail page...", "spinner": "⠋" }));
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining document...", "spinner": "⠋" }));
 
             let detail_prompt = parsing::is_detail_prompt(&page_type);
             // LLM이 지시사항을 잘 따르도록 래핑
