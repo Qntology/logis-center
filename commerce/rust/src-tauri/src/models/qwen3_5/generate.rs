@@ -264,7 +264,7 @@ impl Qwen3_5GenerateModel {
                 kv_name.clone()     
             ).await?;
             
-            let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?.contiguous()?;
+            let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?.contiguous()?;
             let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
             let len = logits_vec.len();
             
@@ -504,7 +504,7 @@ impl Qwen3_5GenerateModel {
                 kv_name.clone()
             ).await?;
             
-            let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?.contiguous()?;
+            let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?.contiguous()?;
             let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
             let len = logits_vec.len();
 

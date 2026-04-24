@@ -1259,13 +1259,14 @@ async fn process_task(
         };
 
         if !pug_list.is_empty() {
-            // 🌟 [CRITICAL FIX 2] 리스트 추출은 짧은 item_pug 조각만 독립적으로 읽으므로, 
-            // 무겁고 호환되지 않는 Base 스냅샷 로딩을 원천 차단합니다.
-            model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
-
+            // [삭제됨] 기존에 루프 밖에 있던 secure_vram_relay를 루프 안으로 옮깁니다!
+            
             for (idx, item_pug) in pug_list.iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { break; }
                 
+                // 🌟 [핵심 반영 1] 매 아이템 추출을 시작할 때마다 모델을 완전히 새롭게 장전합니다. (단기 기억 100% 상실 보장)
+                model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+
                 // 🌟 [CRITICAL FIX] 리스트 아이템 추출 진행률(%) 계산 및 UI/터미널 전송
                 let percent = (((idx + 1) as f32 / pug_list.len() as f32) * 100.0) as i32;
                 let summary_msg = format!("Extracting item data ({}%)...", percent);
@@ -1356,28 +1357,9 @@ async fn process_task(
                 }
 
 
-                // 1. 모델 내부에 쌓인 과거 문맥(KV 캐시) 및 Mamba(SSM) 상태를 명시적으로 파괴합니다.
-                if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-                    gen.clear_kv_cache();
-                }
-
-                // 2. IO 작업이 꼬이지 않도록 대기
-                crate::models::qwen::generate::wait_for_global_io().await;
-
-                // 3. OS 커널 레벨에서 가비지 컬렉터(Garbage Collector)를 강제 호출하여 RAM 피크를 박살 냅니다.
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                }
-                #[cfg(target_os = "linux")]
-                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-                #[cfg(target_os = "macos")]
-                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
-
-                // 4. GPU와 OS가 메모리를 반환할 시간을 아주 짧게(0.1초) 줍니다.
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                // 1. 모델 내부에 쌓인 과거 문맥(KV 캐시) 명시적 파괴 및 GPU 파이프라인 강제 동기화
+                model.deep_purge_resources().await;
+                wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
             }
 
             if let Some(last_item) = pending_merge.take() {
@@ -1707,7 +1689,7 @@ fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {
     utils::paths::cleanup_temp_dirs(app_handle);
 }
 
-async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, cancellation_token: Option<&Arc<AtomicBool>>) -> Result<()> {
+pub async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, cancellation_token: Option<&Arc<AtomicBool>>) -> Result<()> {
     use nvml_wrapper::Nvml;
     use sysinfo::System;
     
