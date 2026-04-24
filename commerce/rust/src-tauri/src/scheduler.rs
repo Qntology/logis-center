@@ -975,13 +975,16 @@ async fn process_task(
                                 .trim()
                                 .to_string();
                                 
+                            // 🌟 [CRITICAL FIX 1] Rust에서 DOM의 colspan, rowspan 값을 추출하여 JS로 전달합니다!
                             nodes_json.push(json!({
                                 "index": idx,
                                 "parentIndex": parent_idx,
                                 "tagName": el.name().to_string(),
                                 "id": el.id().unwrap_or("").to_string(),
                                 "classes": el.attr("class").unwrap_or("").split_whitespace().collect::<Vec<_>>(),
-                                "text": text
+                                "text": text,
+                                "colspan": el.attr("colspan").unwrap_or("1"),
+                                "rowspan": el.attr("rowspan").unwrap_or("1")
                             }));
                         } else {
                             nodes_json.push(json!(null));
@@ -1024,6 +1027,27 @@ async fn process_task(
 
                         function calculateSimilarity(nodeA, nodeB) {
                             if (nodeA.tagName !== nodeB.tagName) return 0;
+                            
+                            // 🌟 [CRITICAL FIX 2] TR(행) 비교 시, 하위 TD들의 colspan 총합 구조가 다르면 다른 아이템으로 취급합니다!
+                            // (예: 일반 데이터 행 vs colspan=10 인 안내/합계 행)
+                            if (nodeA.tagName === 'tr') {
+                                const aKids = getChildren(nodeA.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
+                                const bKids = getChildren(nodeB.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
+                                
+                                const aColspan = aKids.reduce((sum, k) => sum + parseInt(k.colspan || '1', 10), 0);
+                                const bColspan = bKids.reduce((sum, k) => sum + parseInt(k.colspan || '1', 10), 0);
+                                
+                                // 두 행의 가로 칸 수(colspan 총합)가 2칸 이상 차이난다면 구조가 아예 다른 것입니다.
+                                if (aColspan > 0 && bColspan > 0 && Math.abs(aColspan - bColspan) > 1) {
+                                    return 0;
+                                }
+                            }
+                            
+                            // 🌟 [CRITICAL FIX 3] TD/TH(셀) 자체를 비교할 때 rowspan/colspan 이 다르면 감점
+                            if (nodeA.tagName === 'td' || nodeA.tagName === 'th') {
+                                if (nodeA.colspan !== nodeB.colspan || nodeA.rowspan !== nodeB.rowspan) return 0;
+                            }
+
                             const clsA = cleanClassList(nodeA.classes, true);
                             const clsB = cleanClassList(nodeB.classes, true);
                             if (clsA.length === 0 && clsB.length === 0) return 100;
@@ -1042,6 +1066,30 @@ async fn process_task(
                                 const pIdx = node.parentIndex;
                                 if (pIdx === undefined || pIdx === -1) break;
                                 
+                                if (node.tagName === "td" || node.tagName === "th") {
+                                    // 🌟 [CRITICAL FIX 4] 현재 셀이 rowspan이나 colspan을 가지고 있다면, 
+                                    // 이는 단일 항목이 아니라 복잡한 그리드의 부속품입니다. 묻지도 따지지도 않고 부모(tr)로 올라갑니다.
+                                    if (parseInt(node.colspan || '1', 10) > 1 || parseInt(node.rowspan || '1', 10) > 1) {
+                                        cur = pIdx;
+                                        continue;
+                                    }
+                                    
+                                    const pNode = nodes[pIdx];
+                                    if (pNode && pNode.tagName === "tr") {
+                                        const gpIdx = pNode.parentIndex; 
+                                        if (gpIdx !== undefined && gpIdx !== -1) {
+                                            const trSiblings = getChildren(gpIdx);
+                                            const similarTrs = trSiblings.filter(s => calculateSimilarity(pNode, s) >= 60);
+                                            
+                                            // 부모(tr)가 유사한 구조의 다른 형제(tr)들을 여럿 거느리고 있다면 진짜 세로 리스트입니다.
+                                            if (similarTrs.length >= 2) {
+                                                cur = pIdx;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+
                                 const parentNode = nodes[pIdx];
                                 const siblings = getChildren(pIdx);
                                 
