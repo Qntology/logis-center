@@ -1373,24 +1373,34 @@ async fn process_task(
             let clean_html_path = data_manager.get_path("clean_html");
             let clean_content = data_manager.load(&clean_html_path)?;
             
-            // 🌟 1. JS 엔진이 DOM 분석을 통해 뽑아준 headers 배열을 가져옵니다.
-            let headers: Vec<String> = selector_info.get("headers")
+            // 🌟 1. 캐시나 JS 엔진에서 뽑아준 headers 배열을 가져옵니다.
+            let mut headers: Vec<String> = selector_info.get("headers")
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default();
 
+            // 🌟 [CRITICAL FIX] 과거 캐시(Cache) 때문에 JS 엔진이 스킵되어 headers가 비어있을 경우,
+            // Rust 백엔드의 순수 추출기(extract_table_headers)를 강제 가동하여 헤더를 구출합니다!
+            if headers.is_empty() {
+                let rust_headers = parsing::extract_table_headers(&clean_content, &target_selector);
+                if !rust_headers.is_empty() {
+                    // extract_table_headers는 2차원 배열(Vec<Vec<String>>)을 반환하므로 첫 번째 행을 꺼냅니다.
+                    headers = rust_headers[0].clone();
+                }
+            }
+
             if !headers.is_empty() {
-                println!("[Scheduler] Boa JS Extracted {} header columns for 'alt' mapping.", headers.len());
+                println!("[Scheduler] Extracted {} header columns for 'alt' mapping.", headers.len());
             }
             
             let document = scraper::Html::parse_document(&clean_content);
             
-            // 🌟 2. 가져온 headers를 PUG 변환기에 그대로 주입합니다!
+            // 🌟 2. 구조가 복구된 headers를 PUG 변환기에 주입하여 alt 속성을 찍어냅니다!
             parsing::split_doc_to_pug_list_advanced(
                 &document, 
                 &target_selector, 
                 PugMode::FullContent, 
-                if headers.is_empty() { None } else { Some(vec![headers]) } // 🌟 1차원 배열을 2차원으로 감싸줍니다!
+                if headers.is_empty() { None } else { Some(vec![headers]) }
             )
         };
 
