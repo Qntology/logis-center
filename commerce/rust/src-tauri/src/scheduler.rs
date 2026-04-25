@@ -260,8 +260,16 @@ pub async fn start_background_worker(
                     Ok(_) => {
                         println!("[Scheduler] Task completed: {}", task.id);
                         
-                        if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() { *w = None; }
-                        if let Ok(mut w) = crate::LATEST_PROGRESS_PAYLOAD.write() { *w = None; }
+                        // 🌟 [CRITICAL FIX] Task가 끝났을 때 메모리를 None으로 날려버리면 UI가 'Done' 상태를 읽기도 전에 증발해서 스피너가 무한루프를 돕니다.
+                        // 상태를 9(Complete)로 업데이트하여 UI가 완료되었음을 확실히 인지하게 만듭니다.
+                        if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() { 
+                            if let Some(task_val) = w.as_mut() {
+                                if let Some(obj) = task_val.as_object_mut() {
+                                    obj.insert("status".to_string(), serde_json::json!(9));
+                                }
+                            }
+                        }
+                        // LATEST_PROGRESS_PAYLOAD 는 지우지 않고 유지하여 프론트엔드가 마지막 "✅" 상태를 읽어갈 수 있게 둡니다.
 
                         {
                             let mut model_lock = model.lock().await;
@@ -533,24 +541,54 @@ async fn process_task(
         }
     }
 
-    // 🌟 [CRITICAL FIX] 프론트엔드가 'href'로 보낼 때와 'link'로 보낼 때를 모두 완벽하게 캐치하여 절대경로를 확보합니다!
-    let url = task_data.get("href")
+    let mut url = task_data.get("href")
         .or_else(|| task_data.get("link"))
         .and_then(|s| s.as_str())
         .unwrap_or("")
         .to_string();
+
+    let mut origin_candidate = task_data.get("origin")
+        .or_else(|| task_data.get("domain"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // 🌟 [CRITICAL FIX] 도메인이 누락되었거나 상대경로만 들어왔을 경우, 
+    // 브라우저 자동화 모듈이 감지한 '진짜 현재 URL'을 강제로 끌어와서 복구합니다!
+    if url.starts_with("/") || origin_candidate.is_empty() || origin_candidate.contains("localhost") {
+        let state = crate::automation::LAST_DETECTED_STATE.lock().await;
+        let real_url = state.url.clone();
+        
+        if let Ok(parsed) = url::Url::parse(&real_url) {
+            let real_origin = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or("localhost"));
+            
+            if origin_candidate.is_empty() || origin_candidate.contains("localhost") {
+                origin_candidate = real_origin.clone();
+            }
+            if url.starts_with("/") {
+                url = format!("{}{}", real_origin, url);
+            } else if url.is_empty() {
+                url = real_url;
+            }
+        }
+    }
+
+    if url.starts_with("/") && !origin_candidate.is_empty() && !origin_candidate.contains("localhost") {
+        let scheme = if origin_candidate.starts_with("http") { "" } else { "http://" };
+        url = format!("{}{}{}", scheme, origin_candidate, url);
+    }
     
-    // 🌟 [CRITICAL FIX] 사용자님 제안 로직: 메모리 및 tmp/index.json 에 진행중인 Task 강제 기록!
+    // 🌟 [CRITICAL FIX] 메모리 덮어쓰기 시 origin을 보존하여 뒤쪽 로직이 도메인을 알 수 있게 합니다.
     let active_task_json = json!({
         "id": task.id.clone(),
         "type": task.r#type.clone(),
         "link": url.clone(),
+        "origin": origin_candidate.clone(),
         "status": 1, // Processing
         "created_at": task.created_at,
         "updated_at": chrono::Utc::now().timestamp_millis()
     });
     
-    // 🌟 [성능 최적화] 파일 쓰기를 없애고 오직 RAM(ACTIVE_TASK_MEM)에만 기록합니다.
     if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() {
         *w = Some(active_task_json.clone());
     }
@@ -647,12 +685,22 @@ async fn process_task(
         if let Ok(mem) = crate::ACTIVE_TASK_MEM.read() {
             if let Some(json_val) = mem.as_ref() {
                 if let Some(o) = json_val.get("origin").and_then(|v| v.as_str()) {
-                    if let Ok(u) = url::Url::parse(o) { shared_origin = Some(format!("{}://{}", u.scheme(), u.host_str().unwrap_or("localhost"))); }
+                    if !o.is_empty() && !o.contains("localhost") {
+                        let formatted = if o.starts_with("http") { o.to_string() } else { format!("http://{}", o) };
+                        if let Ok(u) = url::Url::parse(&formatted) { 
+                            shared_origin = Some(format!("{}://{}", u.scheme(), u.host_str().unwrap_or("localhost"))); 
+                        }
+                    }
                 }
             }
         }
-        let origin_str = task_data.get("origin").and_then(|s| s.as_str()).map(|s| s.to_string())
-            .filter(|s| s != "http://localhost").or(shared_origin)
+        
+        let origin_str = task_data.get("origin")
+            .or_else(|| task_data.get("domain"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.contains("localhost"))
+            .or(shared_origin)
             .unwrap_or_else(|| if let Ok(task_url) = url::Url::parse(&url) { format!("{}://{}", task_url.scheme(), task_url.host_str().unwrap_or("localhost")) } else { "http://localhost".to_string() });
 
         let base_url = url::Url::parse(&origin_str).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
@@ -1033,8 +1081,6 @@ async fn process_task(
                         function calculateSimilarity(nodeA, nodeB) {
                             if (nodeA.tagName !== nodeB.tagName) return 0;
                             
-                            // 🌟 [CRITICAL FIX 2] TR(행) 비교 시, 하위 TD들의 colspan 총합 구조가 다르면 다른 아이템으로 취급합니다!
-                            // (예: 일반 데이터 행 vs colspan=10 인 안내/합계 행)
                             if (nodeA.tagName === 'tr') {
                                 const aKids = getChildren(nodeA.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
                                 const bKids = getChildren(nodeB.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
@@ -1042,13 +1088,11 @@ async fn process_task(
                                 const aColspan = aKids.reduce((sum, k) => sum + parseInt(k.colspan || '1', 10), 0);
                                 const bColspan = bKids.reduce((sum, k) => sum + parseInt(k.colspan || '1', 10), 0);
                                 
-                                // 두 행의 가로 칸 수(colspan 총합)가 2칸 이상 차이난다면 구조가 아예 다른 것입니다.
                                 if (aColspan > 0 && bColspan > 0 && Math.abs(aColspan - bColspan) > 1) {
                                     return 0;
                                 }
                             }
                             
-                            // 🌟 [CRITICAL FIX 3] TD/TH(셀) 자체를 비교할 때 rowspan/colspan 이 다르면 감점
                             if (nodeA.tagName === 'td' || nodeA.tagName === 'th') {
                                 if (nodeA.colspan !== nodeB.colspan || nodeA.rowspan !== nodeB.rowspan) return 0;
                             }
@@ -1062,6 +1106,69 @@ async fn process_task(
                             return clsA.length ? (matchCount / clsA.length) * 100 : 0;
                         }
 
+                        // 🌟 [신규 추가] 헤더 컬럼 텍스트 추출 엔진 (Table & Div 모두 지원)
+                        function extractHeaders(finalParent, firstItem) {
+                            let headers = [];
+
+                            function getTexts(rowNode) {
+                                let res = [];
+                                let cells = getChildren(rowNode.index);
+                                // 자식 셀들을 순회하며 텍스트를 뽑고, colspan이 있으면 그만큼 배열에 중복으로 채움
+                                cells.forEach(c => {
+                                    let text = (c.text || "").replace(/\s+/g, ' ').trim();
+                                    let col = parseInt(c.colspan || '1', 10);
+                                    for(let i=0; i<col; i++) res.push(text);
+                                });
+                                return res;
+                            }
+
+                            let tableNode = null;
+                            if (finalParent.tagName === 'table') tableNode = finalParent;
+                            else if (finalParent.tagName === 'tbody') tableNode = nodes[finalParent.parentIndex];
+
+                            // 패턴 1. Table 구조인 경우
+                            if (tableNode && tableNode.tagName === 'table') {
+                                let tKids = getChildren(tableNode.index);
+                                let thead = tKids.find(n => n.tagName === 'thead');
+                                if (thead) {
+                                    let trs = getChildren(thead.index).filter(n => n.tagName === 'tr');
+                                    if (trs.length > 0) return getTexts(trs[0]);
+                                }
+                                // thead가 없으면 테이블의 첫 번째 행(tr)을 확인
+                                let containerIdx = finalParent.tagName === 'tbody' ? finalParent.index : tableNode.index;
+                                let trs = getChildren(containerIdx).filter(n => n.tagName === 'tr');
+                                if (trs.length > 0 && trs[0].index !== firstItem.index) {
+                                    let cells = getChildren(trs[0].index);
+                                    // 첫 행에 th가 있거나, 우리 데이터 시작점보다 위에 있다면 헤더로 간주
+                                    if (cells.some(c => c.tagName === 'th') || trs[0].index < firstItem.index) {
+                                        return getTexts(trs[0]);
+                                    }
+                                }
+                            } 
+                            // 패턴 2. Div / UI List 구조인 경우
+                            else {
+                                let siblings = getChildren(finalParent.index);
+                                let firstIdx = siblings.findIndex(s => s.index === firstItem.index);
+
+                                // 데이터 아이템들 '앞'에 다른 요소가 있다면 (보통 그게 헤더)
+                                if (firstIdx > 0) {
+                                    let candidate = siblings[0]; // 부모 컨테이너의 첫 번째 자식 노드
+                                    
+                                    // 헤더는 보통 본문 데이터 행과 CSS 구조가 다름 (유사도 낮음)
+                                    if (calculateSimilarity(candidate, firstItem) < 50) {
+                                        let candidateCells = getChildren(candidate.index);
+                                        let dataCells = getChildren(firstItem.index);
+                                        
+                                        // 후보 노드의 하위 셀(컬럼) 개수와, 실제 데이터 노드의 하위 셀 개수가 비슷하면(±1) 헤더로 인정!
+                                        if (candidateCells.length > 0 && Math.abs(candidateCells.length - dataCells.length) <= 1) {
+                                            return getTexts(candidate);
+                                        }
+                                    }
+                                }
+                            }
+                            return headers;
+                        }
+
                         function detect(tIdx) {
                             let cur = tIdx;
                             for (let i = 0; i < 15; i++) {
@@ -1072,8 +1179,6 @@ async fn process_task(
                                 if (pIdx === undefined || pIdx === -1) break;
                                 
                                 if (node.tagName === "td" || node.tagName === "th") {
-                                    // 🌟 [CRITICAL FIX 4] 현재 셀이 rowspan이나 colspan을 가지고 있다면, 
-                                    // 이는 단일 항목이 아니라 복잡한 그리드의 부속품입니다. 묻지도 따지지도 않고 부모(tr)로 올라갑니다.
                                     if (parseInt(node.colspan || '1', 10) > 1 || parseInt(node.rowspan || '1', 10) > 1) {
                                         cur = pIdx;
                                         continue;
@@ -1086,7 +1191,6 @@ async fn process_task(
                                             const trSiblings = getChildren(gpIdx);
                                             const similarTrs = trSiblings.filter(s => calculateSimilarity(pNode, s) >= 60);
                                             
-                                            // 부모(tr)가 유사한 구조의 다른 형제(tr)들을 여럿 거느리고 있다면 진짜 세로 리스트입니다.
                                             if (similarTrs.length >= 2) {
                                                 cur = pIdx;
                                                 continue;
@@ -1124,10 +1228,15 @@ async fn process_task(
 
                                     const fullSelector = uniqueSigs.map(sig => parentSig + " " + sig).join(", ");
 
+                                    // 🌟 [적용] 추출된 데이터 행들의 부모(finalParent)와 첫 번째 데이터 행(similarSiblings[0])을 넘겨 헤더를 분석합니다!
+                                    const firstDataItem = similarSiblings[0];
+                                    const headersArray = extractHeaders(finalParent, firstDataItem);
+
                                     return { 
                                         parent: parentSig, 
                                         itemSelector: fullSelector,
-                                        matchCount: similarSiblings.length
+                                        matchCount: similarSiblings.length,
+                                        headers: headersArray  // JSON에 담아서 Rust로 넘깁니다!
                                     };
                                 }
                                 cur = pIdx;
@@ -1138,10 +1247,15 @@ async fn process_task(
                         const findText = titles.length > 0 ? titles[0].toLowerCase().replace(/\s+/g, ' ') : "";
                         const matches = nodes.filter(n => n && n.text && n.text.toLowerCase().replace(/\s+/g, ' ').includes(findText));
                         
-                        let res = { "parent": "body", "itemSelector": "div", "matchCount": matches.length };
+                        // 기본값에 빈 배열 지정
+                        let res = { "parent": "body", "itemSelector": "div", "matchCount": matches.length, "headers": [] };
                         if (matches.length > 0) {
                             const d = detect(matches[0].index);
-                            if (d) { res.parent = d.parent; res.itemSelector = d.itemSelector; }
+                            if (d) { 
+                                res.parent = d.parent; 
+                                res.itemSelector = d.itemSelector; 
+                                res.headers = d.headers || []; 
+                            }
                         }
                         JSON.stringify(res);
                     "##;
@@ -1186,8 +1300,11 @@ async fn process_task(
                     }
                 }
 
-                let origin_str = task_data.get("origin").and_then(|s| s.as_str()).map(|s| s.to_string())
-                    .filter(|s| s != "http://localhost") 
+                let origin_str = task_data.get("origin")
+                    .or_else(|| task_data.get("domain"))
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.contains("localhost")) 
                     .or(shared_origin) 
                     .unwrap_or_else(|| {
                         if let Ok(task_url) = url::Url::parse(&url) {
@@ -1255,12 +1372,26 @@ async fn process_task(
         let pug_list = {
             let clean_html_path = data_manager.get_path("clean_html");
             let clean_content = data_manager.load(&clean_html_path)?;
-            let headers = parsing::extract_table_headers(&clean_content, &target_selector);
+            
+            // 🌟 1. JS 엔진이 DOM 분석을 통해 뽑아준 headers 배열을 가져옵니다.
+            let headers: Vec<String> = selector_info.get("headers")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
+
             if !headers.is_empty() {
-                println!("[Scheduler] Extracted {} header rows for 'alt' mapping.", headers.len());
+                println!("[Scheduler] Boa JS Extracted {} header columns for 'alt' mapping.", headers.len());
             }
+            
             let document = scraper::Html::parse_document(&clean_content);
-            parsing::split_doc_to_pug_list_advanced(&document, &target_selector, PugMode::FullContent, if headers.is_empty() { None } else { Some(headers) })
+            
+            // 🌟 2. 가져온 headers를 PUG 변환기에 그대로 주입합니다!
+            parsing::split_doc_to_pug_list_advanced(
+                &document, 
+                &target_selector, 
+                PugMode::FullContent, 
+                if headers.is_empty() { None } else { Some(vec![headers]) } // 🌟 1차원 배열을 2차원으로 감싸줍니다!
+            )
         };
 
         if !pug_list.is_empty() {
@@ -1325,16 +1456,19 @@ async fn process_task(
 
                 match res {
                     Ok(res_text) => {
-                        let mut item_json = parsing::parse_json_from_llm(&res_text);
+                        let mut parsed_json = parsing::parse_json_from_llm(&res_text);
+                        
+                        // 🌟 [CRITICAL FIX] LLM이 {"order": {...}} 형태로 껍데기를 씌워서 반환하므로,
+                        // page_type(예: "order", "goods") 키를 찾아서 알맹이만 빼냅니다.
+                        let mut item_json = if let Some(inner) = parsed_json.get_mut(&page_type) {
+                            inner.take() // 알맹이 적중 시 꺼냄
+                        } else {
+                            parsed_json // 방어 로직: LLM이 껍데기 없이 바로 뱉었을 경우 그대로 사용
+                        };
+
                         if !item_json.is_null() && (item_json.is_object() || item_json.is_array()) {
                             
-                            // 🌟 [Part 2: 롤백 로직 추가] {TYPE}_status 로 추출된 값을 DB 표준 규격인 status 로 매핑 및 기존 키 제거
-                            if let Some(obj) = item_json.as_object_mut() {
-                                let status_key = format!("{}_status", page_type);
-                                if let Some(status_val) = obj.remove(&status_key) {
-                                    obj.insert("status".to_string(), status_val);
-                                }
-                            }
+                            // (이전에 있던 {TYPE}_status 를 status로 롤백하던 코드는 이제 필요 없으므로 완전 삭제!)
 
                             if let Some(link_val) = item_json.get_mut("link") {
                                 if let Some(relative_path) = link_val.as_str() {
@@ -1473,15 +1607,15 @@ async fn process_task(
                     // [DEBUG] AI 응답 저장
                     let _ = data_manager.offload(&res.text, "step_c_res");
 
-                    extracted_data = parsing::parse_json_from_llm(&res.text);
+                    let mut parsed_json = parsing::parse_json_from_llm(&res.text);
                     
-                    // 🌟 [Part 2: 롤백 로직 추가] {TYPE}_status 를 DB 표준 규격인 status 로 복구
-                    if let Some(obj) = extracted_data.as_object_mut() {
-                        let status_key = format!("{}_status", page_type);
-                        if let Some(status_val) = obj.remove(&status_key) {
-                            obj.insert("status".to_string(), status_val);
-                        }
-                    }
+                    // 🌟 [CRITICAL FIX] LLM이 {"order": {...}} 형태로 껍데기를 씌워서 반환하므로,
+                    // page_type(예: "order", "goods") 키를 찾아서 알맹이만 빼냅니다.
+                    extracted_data = if let Some(inner) = parsed_json.get_mut(&page_type) {
+                        inner.take() // 알맹이 적중 시 꺼냄
+                    } else {
+                        parsed_json // 방어 로직: LLM이 껍데기 없이 바로 뱉었을 경우 그대로 사용
+                    };
 
                 } else {
                     println!("[Scheduler] ERROR: Qwen 3.5 generator is missing!");
@@ -1666,10 +1800,18 @@ async fn process_task(
     // Final Status Update
     let _ = store.update_message_status(&task.id, logic::parse_status("complete"), Some("Extraction Complete")).await;
 
+    // 🌟 [CRITICAL FIX] 불완전한 추출 데이터를 프론트로 직접 쏘지 않습니다.
+    // 대신 프론트엔드가 이 'Done' 신호를 받고 내부적으로 app.fetch()를 트리거하여
+    // DB에서 완벽하게 세팅된(id, ref, bcc 등) 데이터를 가져가도록 유도해야 합니다.
     let payload = json!({
-        "task_id": task.id, "category": "Done", "summary": "Extraction complete.", "spinner": "✅",
-        "data": extracted_data.clone() // 🌟 [CRITICAL FIX] Detail이든 List든 무조건 추출된 전체 데이터를 프론트로 쏴줍니다!
+        "task_id": task.id, 
+        "category": "Done", 
+        "summary": "Extraction complete. Updating list...", 
+        "spinner": "✅",
+        // data를 null로 보내어 프론트엔드가 기존에 그리던 캐시를 초기화하도록 합니다.
+        "data": null 
     });
+    
     let _ = app_handle.emit("extraction-progress", &payload);
     log_task_progress(app_handle, &task.id, &payload);
     
