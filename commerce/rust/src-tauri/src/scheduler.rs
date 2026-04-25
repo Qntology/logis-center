@@ -1106,11 +1106,10 @@ async fn process_task(
                             return clsA.length ? (matchCount / clsA.length) * 100 : 0;
                         }
 
-                        // 🌟 [추가] Table 및 Div 기반 헤더 컬럼명 추출 엔진
+                        // 🌟 [최종 완성형] 회원님 제안 로직: 할아버지 자식 탐색 & Wrapper 매칭 
                         function extractHeaders(finalParent, firstItem) {
                             let headers = [];
 
-                            // 공통: 자식 셀들의 텍스트를 colspan 만큼 중복하여 배열로 만듦
                             function getTexts(rowNode) {
                                 let res = [];
                                 let cells = getChildren(rowNode.index);
@@ -1139,43 +1138,60 @@ async fn process_task(
                                 let trs = getChildren(containerIdx).filter(n => n.tagName === 'tr');
                                 if (trs.length > 0 && trs[0].index !== firstItem.index) {
                                     let cells = getChildren(trs[0].index);
-                                    // 첫 행에 th가 있거나, 데이터 시작점보다 위에 있다면 헤더로 간주
                                     if (cells.some(c => c.tagName === 'th') || trs[0].index < firstItem.index) {
                                         return getTexts(trs[0]);
                                     }
                                 }
+                                return headers;
                             } 
-                            // 2. Div 기반 리스트 구조인 경우 (Type A & B)
-                            else {
-                                let siblings = getChildren(finalParent.index);
-                                let firstIdx = siblings.findIndex(s => s.index === firstItem.index);
-                                let dataColCount = getChildren(firstItem.index).filter(n => n.tagName !== 'div' || n.text !== '').length;
+                            
+                            // 2. Div 기반 구조인 경우 (역순 심층 탐색)
+                            // Helper: 컬럼 개수 세기 (내용이 있는 요소 중심)
+                            const getColCount = (nodeIdx) => {
+                                let kids = getChildren(nodeIdx);
+                                let cols = kids.filter(n => n.tagName !== 'div' || n.text !== '').length;
+                                return cols === 0 ? kids.length : cols;
+                            };
 
-                                // Type B: 같은 부모 아래, 나보다 먼저 등장한 형제 요소가 헤더인 경우
-                                if (firstIdx > 0) {
-                                    let candidate = siblings[0];
-                                    // 헤더는 보통 디자인이 달라 데이터 행과 유사도가 낮음
-                                    if (calculateSimilarity(candidate, firstItem) < 50) {
-                                        let candidateColCount = getChildren(candidate.index).filter(n => n.tagName !== 'div' || n.text !== '').length;
-                                        // 자식 컬럼 개수가 비슷하면(±1) 헤더로 인정
-                                        if (candidateColCount > 0 && Math.abs(candidateColCount - dataColCount) <= 1) {
-                                            return getTexts(candidate);
-                                        }
-                                    }
-                                }
-                                
-                                // Type A: 내 부모 노드 자체가 '.list'이고, 그 형제 노드('.head')가 따로 있는 경우
-                                let grandSiblings = getChildren(finalParent.parentIndex);
-                                let parentIdxInGrand = grandSiblings.findIndex(s => s.index === finalParent.index);
-                                if (parentIdxInGrand > 0) {
-                                    let candidateHead = grandSiblings[parentIdxInGrand - 1];
-                                    let candidateHeadCols = getChildren(candidateHead.index).filter(n => n.tagName !== 'div' || n.text !== '').length;
-                                    
-                                    if (candidateHeadCols > 0 && Math.abs(candidateHeadCols - dataColCount) <= 1) {
-                                        return getTexts(candidateHead);
-                                    }
+                            let dataColCount = getColCount(firstItem.index);
+                            if (dataColCount === 0) return headers;
+
+                            const isHeaderRow = (candIdx) => {
+                                let cCount = getColCount(candIdx);
+                                return cCount > 0 && Math.abs(cCount - dataColCount) <= 1;
+                            };
+
+                            // Type B: 아이템과 같은 부모를 공유하는 형제 노드 역순 탐색
+                            let siblings = getChildren(finalParent.index);
+                            let firstIdx = siblings.findIndex(s => s.index === firstItem.index);
+                            
+                            for (let i = firstIdx - 1; i >= 0; i--) {
+                                let candidate = siblings[i];
+                                // 데이터 행과 디자인이 다르고(유사도<80) 구조가 비슷하면 헤더!
+                                if (calculateSimilarity(candidate, firstItem) < 80 && isHeaderRow(candidate.index)) {
+                                    return getTexts(candidate);
                                 }
                             }
+                            
+                            // Type A: 할아버지의 자식들(부모의 형제 노드) 역순 탐색
+                            let grandSiblings = getChildren(finalParent.parentIndex);
+                            let parentIdxInGrand = grandSiblings.findIndex(s => s.index === finalParent.index);
+                            
+                            for (let i = parentIdxInGrand - 1; i >= 0; i--) {
+                                let candidate = grandSiblings[i];
+                                
+                                // Case A-1: 형제 노드 자체가 헤더 행(Row)인 경우
+                                if (isHeaderRow(candidate.index)) {
+                                    return getTexts(candidate);
+                                }
+                                
+                                // Case A-2: 형제 노드가 헤더를 감싸는 래퍼(Wrapper)인 경우
+                                let candKids = getChildren(candidate.index);
+                                if (candKids.length > 0 && isHeaderRow(candKids[0].index)) {
+                                    return getTexts(candKids[0]);
+                                }
+                            }
+
                             return headers;
                         }
 
@@ -1238,7 +1254,6 @@ async fn process_task(
 
                                     const fullSelector = uniqueSigs.map(sig => parentSig + " " + sig).join(", ");
 
-                                    // 🌟 [적용] 데이터 행들의 부모(finalParent)와 첫 번째 행(similarSiblings[0])을 넘겨 헤더 분석!
                                     const firstDataItem = similarSiblings[0];
                                     const headersArray = extractHeaders(finalParent, firstDataItem);
 
@@ -1246,7 +1261,7 @@ async fn process_task(
                                         parent: parentSig, 
                                         itemSelector: fullSelector,
                                         matchCount: similarSiblings.length,
-                                        headers: headersArray  // 🌟 추출된 헤더를 JSON에 태워 보냅니다.
+                                        headers: headersArray
                                     };
                                 }
                                 cur = pIdx;
