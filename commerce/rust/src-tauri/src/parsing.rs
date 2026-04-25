@@ -741,33 +741,33 @@ current Link: {HREF}
 
 pub fn list2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
-    "order" | "goods" => r###"* "path":URL includes a manage path, an administrative or edit Link | string
+    "order" | "goods" => r###"* "path":URL includes a manage {TYPE} path, an administrative or edit {TYPE} Link | string
 * "id":Refer to the ID value from the link or an attribute | string
-* "link":Refer to the ID to find a URL that includes a manage link | string
-* "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error'
+* "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
+* "{TYPE}_status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error'
 * "title":title | string
 * "sale_price":sale price | number
 * "currency":ISO 4217 Currency Code | string
 * "tracking_number":Tracking Number or 운송장 번호 or 运单호 or 運單號 or 伝표번호 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Ноमर 나кладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ | string
 * "registration_date":yyyy-MM-ddThh:mm:ss | string"###.to_string(),
-    "tracking" | "review" => r###"* "path":URL includes a manage path, an administrative or edit Link | string
+    "tracking" | "review" => r###"* "path":URL includes a manage {TYPE} path, an administrative or edit {TYPE} Link | string
 * "id":Refer to the ID value from the link or an attribute | string
-* "link":Refer to the ID to find a URL that includes a manage link | string
-* "status":'start' or 'progress' or 'stop' or 'cancel' or 'return'
+* "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
+* "{TYPE}_status":'start' or 'progress' or 'stop' or 'cancel' or 'return'
 * "title":author and content | string 
 * "registration_date":yyyy-MM-ddThh:mm:ss | string"###.to_string(),
-    "coupon" | "event" => r###"* "path":URL includes a manage path, an administrative or edit Link | string
+    "coupon" | "event" => r###"* "path":URL includes a manage {TYPE} path, an administrative or edit {TYPE} Link | string
 * "id":Refer to the ID value from the link or an attribute | string
-* "link":Refer to the ID to find a URL that includes a manage link | string
-* "status":'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
-* "title":type based item title | string, 
-* "started_at":yyyy-MM-ddThh:mm:ss | string,
-* "expired_at":yyyy-MM-ddThh:mm:ss | string,
+* "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
+* "{TYPE}_status":'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error'
+* "title":type based item title | string
+* "started_at":yyyy-MM-ddThh:mm:ss | string
+* "expired_at":yyyy-MM-ddThh:mm:ss | string
 * "registration_date":yyyy-MM-ddThh:mm:ss | string"###.to_string(),
-        _ => r###"* "path":URL includes a manage path, an administrative or edit Link | string
+        _ => r###"* "path":URL includes a manage {TYPE} path, an administrative or edit {TYPE} Link | string
 * "id":Refer to the ID value from the link or an attribute | string
-* "link":Refer to the ID to find a URL that includes a manage link | string
-* "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error'
+* "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
+* "{TYPE}_status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error'
 * "title":title | string"###.to_string()
     };
 
@@ -786,7 +786,10 @@ current Link: {HREF}
 [ACTION] RETURN JSON ONLY. 
 NO EXPLANATION. NO THINKING. /no_think"###;
 
-    template.replace("{SCHEMA}", &schema).replace("{HREF}", href)
+    // 🌟 SCHEMA를 먼저 치환해야 스키마 안의 {TYPE} 구문이 정상적으로 'order', 'goods' 등으로 변환됩니다!
+    template.replace("{SCHEMA}", &schema)
+            .replace("{TYPE}", page_type)
+            .replace("{HREF}", href)
 }
 
 /// Converts a JSON Value into a human-readable natural language narrative.
