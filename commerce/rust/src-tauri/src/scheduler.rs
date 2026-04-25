@@ -533,7 +533,12 @@ async fn process_task(
         }
     }
 
-    let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    // 🌟 [CRITICAL FIX] 프론트엔드가 'href'로 보낼 때와 'link'로 보낼 때를 모두 완벽하게 캐치하여 절대경로를 확보합니다!
+    let url = task_data.get("href")
+        .or_else(|| task_data.get("link"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
     
     // 🌟 [CRITICAL FIX] 사용자님 제안 로직: 메모리 및 tmp/index.json 에 진행중인 Task 강제 기록!
     let active_task_json = json!({
@@ -1663,7 +1668,7 @@ async fn process_task(
 
     let payload = json!({
         "task_id": task.id, "category": "Done", "summary": "Extraction complete.", "spinner": "✅",
-        "data": if !is_detail { json!(null) } else { extracted_data }
+        "data": extracted_data.clone() // 🌟 [CRITICAL FIX] Detail이든 List든 무조건 추출된 전체 데이터를 프론트로 쏴줍니다!
     });
     let _ = app_handle.emit("extraction-progress", &payload);
     log_task_progress(app_handle, &task.id, &payload);
