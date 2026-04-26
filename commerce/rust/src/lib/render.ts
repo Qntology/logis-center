@@ -104,7 +104,8 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
 
     if (item.type === "sales" || item.type === "goods" || item.type === "order") {
         itemType = "sales";
-        if(item.type !== "order") item.type = "order"; // front.js 패리티
+        // 🌟 [CRITICAL FIX] 화면 표시용 타입을 무조건 'order'로 덮어씌우던 원흉(하드코딩) 제거!
+        // 이제 DB에 저장된 실제 타입(goods 등)이 UI에 그대로 노출됩니다.
     } else if (item.type === "event" || item.type === "coupon") {
         itemType = "event";
     } else if (tradeDocs.includes(item.type) || tradeDocs.includes(item.type?.toUpperCase())) {

@@ -406,16 +406,32 @@ async function updateExtractButtonVisibility() {
         return;
     }
 
+    // 🌟 [신규] 3. Shared Pages 네비게이션 검증 로직
+    // activeTags(또는 activeContext)에 특정 도메인이 선택되어 있다면,
+    // 현재 접속 중인 브라우저 탭의 URL이 그 도메인과 일치하는지 확인합니다.
     try {
-        const urlObj = new URL(currentDetectedUrl.toLowerCase());
-        const hostname = urlObj.hostname;
-        const link = (urlObj.pathname + urlObj.search).toLowerCase();
-        const ccHash = await hashId(hostname);
+        const currentUrlObj = new URL(currentDetectedUrl.toLowerCase());
+        const currentHostname = currentUrlObj.hostname;
+        
+        // 사용자가 사이드바에서 선택한 도메인 태그를 찾습니다.
+        const domainTag = activeTags.find(t => t.type === 'domain');
+        
+        if (domainTag) {
+            // 태그 값(예: "demofran.com")과 현재 호스트네임 비교
+            if (!currentHostname.includes(domainTag.value)) {
+                // 도메인이 다르면 추출 버튼을 숨기고 로직을 종료합니다.
+                btnExtract.style.display = "none";
+                return;
+            }
+        }
+
+        // 4. 백엔드에 현재 페이지 작업 상태 질의 및 ID 생성
+        const link = (currentUrlObj.pathname + currentUrlObj.search).toLowerCase();
+        const ccHash = await hashId(currentHostname);
         const hashedRefId = await hashId(ccHash + link);
 
-        btnExtract.title = `Extract from ${hostname}`;
+        btnExtract.title = `Extract from ${currentHostname}`;
 
-        // 3. 백엔드에 현재 페이지 작업 상태 질의
         const isActive = await invoke<boolean>("check_active_task", {
             payload: { cc: ccHash, ref: hashedRefId }
         });
@@ -429,9 +445,7 @@ async function updateExtractButtonVisibility() {
         }
     } catch (e) {
         console.warn("[WIDGET] visibility check error:", e);
-        btnExtract.style.display = "flex";
-        btnExtract.innerHTML = "⚡";
-        btnExtract.classList.remove("active-spinner");
+        btnExtract.style.display = "none"; // 에러 시에는 안전하게 숨김 처리
     }
 }
 
@@ -448,6 +462,10 @@ listen("browser-match-found", async (event: any) => {
     }
     
     await updateExtractButtonVisibility();
+    
+    // 🌟 [CRITICAL FIX] 크롬 브라우저에서 주소를 이동할 때마다, 
+    // 해당 도메인에 맞는 Shared Pages를 네비게이션에 즉시 다시 그려줍니다!
+    await renderNavigation();
 });
 
 const handleSearchInteraction = () => {
@@ -595,14 +613,24 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                 try {
                     const bcc = node.bcc || data.bcc;
                     if (bcc) {
-                        const _items = await Select['items']({ key: 'bcc', value: bcc, limit: 1 });
-                        if (_items.length) {
-                            recent = `<strong>${time2text(_items[0].created_at)}</strong>`;
+                        // 🌟 [CRITICAL FIX 1] AI 검색(Select)을 타격하여 무한 스피너가 도는 현상을 원천 차단합니다.
+                        const _items = await invoke<any[]>("get_all_documents", { limit: 1, offset: 0, filter: `bcc = '${bcc}'` });
+                        if (_items.length && _items[0].created_at) {
+                            recent = `<strong>${time2text(Number(_items[0].created_at))}</strong>`;
                         }
                     }
                 } catch (err) {}
 
-                var count = data.item ? `<u>(${total.draft})</u>` : `<u>(${total.count})</u>`;
+                // 🌟 [CRITICAL FIX] front.js 패리티: 리스트 페이지(data.item 존재)일 경우 'Draft' 문구와 draft 카운트를 정확히 표기합니다!
+                name = `<span>${nodeType}</span> <span>${(data.item ? " Draft" : " ")}</span>`;
+                
+                var count = '';
+                if (data.item) {
+                    count = `<u>(${total.draft || 0})</u>`;
+                } else {
+                    count = `<u>(${total.count || 0})</u>`;
+                }
+                
                 content = `<span>${name} ${count}</span> ${recent}`;
             }
 
@@ -668,9 +696,31 @@ async function renderNavigation() {
         navTmp = {}; // Reset for fresh render
         let _pages = await Select["pages"]({});
         
+        // 🌟 [CRITICAL FIX] 크롬 브라우저의 현재 접속 도메인과 일치하는 페이지만 남깁니다.
+        let currentDomain = "";
+        if (currentDetectedUrl) {
+            try {
+                currentDomain = new URL(currentDetectedUrl.toLowerCase()).hostname;
+            } catch(e) {}
+        }
+
+        if (currentDomain) {
+            _pages = _pages.filter(p => {
+                const data = p.data || p;
+                return data.origin && data.origin.toLowerCase().includes(currentDomain);
+            });
+        }
+        
+        const navSection = pageList.closest('.nav-section') as HTMLElement;
+
         if (_pages.length === 0) {
-            pageList.innerHTML = "<div>No shared pages found.</div>";
+            pageList.innerHTML = "<div>No shared pages found for this domain.</div>";
+            // 🌟 현재 도메인과 일치하는 데이터가 없으면 Shared Pages 섹션 전체를 숨깁니다.
+            if (navSection) navSection.style.display = "none";
         } else {
+            // 🌟 일치하는 데이터가 있으면 섹션을 화면에 표시합니다.
+            if (navSection) navSection.style.display = "block";
+            
             const branchs: Record<string, any> = {};
 
             // 1. Build branch Map (origin#type and id)
@@ -728,22 +778,53 @@ async function renderNavigation() {
                 processedIds.add(pageId);
             }
 
+            // 🌟 [CRITICAL FIX] 네비게이션(Accordion)을 렌더링하기 직전에, 
+            // 로컬 DB(users 테이블)에 저장된 AI의 최신 추출 통계(count)를 불러와 메모리에 덮어씌웁니다!
+            try {
+                const _usersForStats = await Select["users"]({});
+                const teamDoc = _usersForStats.find(u => u.type === "team" || (u.data && u.data.type === "team"));
+                if (teamDoc) {
+                    // Rust에서 직렬화된 json_data를 확실하게 객체로 변환
+                    let teamData = teamDoc.data;
+                    if (!teamData && teamDoc.json_data) {
+                        try { teamData = JSON.parse(teamDoc.json_data); } catch(e) {}
+                    }
+                    teamData = teamData || teamDoc;
+
+                    if (teamData.base && teamData.base.pages) {
+                        (currentSession as any).pages = teamData.base.pages;
+                    }
+                }
+            } catch(e) { 
+                console.warn("[Navigation] Failed to load local stats:", e); 
+            }
+
             // 3. Render
             pageList.innerHTML = await renderAccordion(tree);
 
             // 4. Bind Clicks manually to labels
             pageList.querySelectorAll(".logis-label").forEach((label: any) => {
-                label.onclick = (e: Event) => {
+                label.onclick = async (e: Event) => {
                     const ds = label.dataset;
                     if (!ds.id) return;
 
+                    // 1. 컨텍스트 업데이트
                     activeContext.cc = ds.cc || "";
                     activeContext.bcc = ds.bcc || "";
                     activeContext.ref = ds.ref || "";
-
+                    
+                    // 🌟 [CRITICAL FIX 3] 새 항목(goods 등)을 클릭하면 기존에 있던 태그(order 등)를 싹 비워 중첩을 막습니다!
+                    activeTags = activeTags.filter(t => t.type !== 'type' && t.type !== 'domain' && t.type !== 'path');
+                    
+                    // 2. 검색 태그 추가
                     addSearchTag(`@${ds.domain}`, 'domain', ds.domain);
                     addSearchTag(`#${ds.type}`, 'type', ds.type);
+                    updateTagsUI();
                     
+                    // 3. 버튼(#btn-extract) 강제 업데이트 호출
+                    await updateExtractButtonVisibility();
+
+                    // 4. UI 갱신 및 닫기
                     fetchChatHistory(true);
                     hideNavigation();
                 };
@@ -1291,11 +1372,13 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
         });
     }
 
-    // 🌟 1차 스피너 및 전역 상태 종료 처리 (현재 활성화된 작업일 때만 버튼 UI 리셋)
-    if (isTerminal && activeTaskId === tId) {
+    // 🌟 [CRITICAL FIX] 1차 스피너 및 전역 상태 종료 처리 
+    // 사용자가 현재 무슨 화면을 보고 있든, 작업이 끝났다면 무조건 전역 락을 풀고 스피너를 정지시킵니다!
+    if (isTerminal) {
         isExtracting = false; 
         isSearching = false;
         stopSpinner();
+        
         if (btnExtract) { btnExtract.classList.remove("active-spinner"); btnExtract.innerText = "⚡"; }
         if (currentImage) {
             currentImage = null; 
@@ -1305,9 +1388,21 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
             if (btnSubmit) btnSubmit.style.display = "flex"; 
         }
         updateExtractButtonVisibility(); 
+
+        // 🌟 [CRITICAL FIX] 전처리가 완료되면 자동으로 메뉴 카운트와 리스트를 리프레시!
+        if (payload.category === "Done") {
+            if (currentSession.email) {
+                syncData(); // 서버 모드일 경우 서버와 즉시 동기화
+            } else {
+                // 로컬 모드일 경우 즉시 DOM 다시 그리기
+                renderNavigation().then(() => {
+                    if (currentTab === "list") refreshList();
+                });
+            }
+        }
     }
 
-    // 🌟 이제 현재 열려있는 Detail View가 이 Task의 것인지 확인 후 화면(DOM)을 업데이트합니다.
+    // 🌟 이제 현재 열려있는 Detail View가 이 Task의 것인지 확인 후 내부 로그(DOM)를 업데이트합니다.
     const extractionLog = document.getElementById("extraction-log");
     const targetContainer = document.getElementById("progress-container") || extractionLog;
 
@@ -2140,15 +2235,9 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         else if (activeContext.bcc) baseFilter = `(${baseFilter}) AND bcc = '${activeContext.bcc}'`;
         else if (activeContext.cc) baseFilter = `(${baseFilter}) AND cc = '${activeContext.cc}'`;
 
-        const textInput = searchInput?.value.toLowerCase() || "";
-        let queryParts = activeTags.map(t => {
-            if (t.type === 'domain') return `host:${t.value}`;
-            if (t.type === 'type') return `type:${t.value.toLowerCase()}`;
-            if (t.type === 'mode') return `mode:${t.value.toLowerCase()}`;
-            return t.value;
-        });
-        if (textInput) queryParts.push(textInput);
-        const textQuery = queryParts.join(" ");
+        // 🌟 [CRITICAL FIX 4] 사이드바 태그(domain, type)는 위의 activeContext를 통해 SQL 필터로 100% 적용되었습니다.
+        // 이 태그들을 텍스트로 엮어서 억지로 AI 검색에 던지면 검색 결과가 0건이 되고 VRAM이 폭발합니다. 삭제합니다!
+        const textQuery = searchInput?.value.trim() || "";
 
         let finalFilter = baseFilter;
         let latestUpdateTime = 0;
@@ -2234,59 +2323,60 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
 function upsertListItems(docs: any[], mode: 'prepend' | 'append') {
     if (!docListContainer) return;
 
-    // Capture scroll state for prepend maintenance
     const scrollEl = document.getElementById("list-scroll");
     const prevScrollHeight = scrollEl ? scrollEl.scrollHeight : 0;
-    const wasAtTop = listCurrentY <= 10; // Check if user was near the top
+    const wasAtTop = listCurrentY <= 10; 
 
-    // Sort: Newest created_at first (Descending)
     const sortedBatch = [...docs].sort((a, b) => b.created_at - a.created_at);
-    
-    // For 'prepend' (Sync), we iterate from Oldest to Newest in the batch 
-    // and prepend each, so the absolute Newest ends up at the very top.
     const processBatch = mode === 'prepend' ? [...sortedBatch].reverse() : sortedBatch;
 
     processBatch.forEach(doc => {
         const docId = doc.id || doc.uuid || (doc.data && (doc.data.id || doc.data.uuid)) || doc.uuid_val || doc.ref || doc.index;
         const existingEl = docListContainer.querySelector(`[id="${docId}"]`) as HTMLElement;
 
+        // 🌟 [CRITICAL FIX] item2html은 숨겨진 checkbox와 메인 카드(div) 2개의 요소를 생성합니다.
+        const html = item2html(doc, false, currentDetectedUrl);
+        const temp = document.createElement('div');
+        temp.innerHTML = html;
+        
+        // 🌟 클래스 이름(.logis-result)이 누락되거나 충돌하는 상황을 원천 차단하기 위해 
+        // 부여된 ID 값을 이용해 가장 확실하게 두 요소를 뜯어옵니다.
+        const newCheckbox = temp.querySelector(`input#more-${docId}`) as HTMLElement || temp.querySelector('.toggle-more') as HTMLElement;
+        const newCard = temp.querySelector(`div[id="${docId}"]`) as HTMLElement || temp.querySelector('.logis-result') as HTMLElement;
+
         if (existingEl) {
-            // [DIFF] Update if modified
             const cachedUpdatedAt = parseInt(existingEl.dataset.updatedAt || "0");
             if (doc.updated_at > cachedUpdatedAt) {
                 console.log(`[List] Updating item ${docId}`);
-                existingEl.outerHTML = item2html(doc, false, currentDetectedUrl);
-                const newEl = document.getElementById(String(docId));
-                if (newEl) bindCardEvents(newEl, doc);
+                
+                // 체크박스와 카드를 각각 찾아서 안전하게 교체(Replace)합니다.
+                const oldCheckbox = docListContainer.querySelector(`#more-${docId}`);
+                if (oldCheckbox && newCheckbox) docListContainer.replaceChild(newCheckbox, oldCheckbox);
+                
+                if (newCard) {
+                    docListContainer.replaceChild(newCard, existingEl);
+                    bindCardEvents(newCard, doc);
+                }
             }
         } else {
-            // [INSERT]
-            const html = item2html(doc, false, currentDetectedUrl);
-            const temp = document.createElement('div');
-            temp.innerHTML = html;
-            const newEl = temp.firstElementChild as HTMLElement;
-            bindCardEvents(newEl, doc);
-
+            // 새 카드를 삽입할 때도 체크박스와 카드를 순서대로 온전히 다 넣습니다.
             if (mode === 'prepend') {
-                docListContainer.prepend(newEl);
+                if (newCard) docListContainer.prepend(newCard);
+                if (newCheckbox) docListContainer.prepend(newCheckbox);
             } else {
-                docListContainer.appendChild(newEl);
+                if (newCheckbox) docListContainer.appendChild(newCheckbox);
+                if (newCard) docListContainer.appendChild(newCard);
             }
+            if (newCard) bindCardEvents(newCard, doc);
         }
     });
 
-    // [Scroll Maintenance]
     if (mode === 'prepend' && scrollEl) {
         const newScrollHeight = scrollEl.scrollHeight;
         const heightDiff = newScrollHeight - prevScrollHeight;
         if (heightDiff > 0) {
-            if (wasAtTop) {
-                // [FIX] If user was at the top, keep them at the top to see new items
-                listCurrentY = 0;
-            } else {
-                // If they were scrolled down, maintain visual position of old items
-                listCurrentY += heightDiff;
-            }
+            if (wasAtTop) listCurrentY = 0;
+            else listCurrentY += heightDiff;
             updateListTransform();
         }
     }

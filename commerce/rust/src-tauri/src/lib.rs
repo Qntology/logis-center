@@ -1104,27 +1104,26 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
         let mut count = 0;
         for item in items {
             println!("[DEBUG] Syncing item: {}", item);
-            // Basic parsing to determine ID and Table
-            // In content.js structure: id, type are top level or in data
             let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let type_str = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
             
-            // Determine table based on type
+            // 🌟 [CRITICAL FIX] 클라우드(index.ts) 로직 반영: type 문자열 무조건 공백제거 및 소문자 통일
+            let type_str = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();
+            
+            // 🌟 [CRITICAL FIX] 세탁된 type_str을 원본 JSON(clean_item)에도 강제로 덮어씌웁니다.
+            let mut clean_item = item.clone();
+            if let Some(obj) = clean_item.as_object_mut() {
+                obj.insert("type".to_string(), serde_json::json!(type_str));
+            }
+            
+            // Determine table based on cleaned type
             let _table = match type_str.as_str() {
                 "sales" | "goods" | "order" => "sales",
                 "tracking" | "receiving" | "shipping" => "tracking",
                 "event" | "coupon" => "event",
                 "member" | "team" | "user" => "users",
                 "talk" => "talks",
-                // Pages are stored in 'items' table with type='pages' in some contexts, 
-                // or 'pages' table if strictly separated. The store supports "pages".
-                // Based on previous context, page navigation items are usually type='order'/'goods' but acting as navigation nodes.
-                // However, we want to store them where 'get_known_pages' looks. 
-                // 'get_known_pages' looks at "pages" table.
-                // Let's assume the sync sends items intended for the "pages" table if they are nav items.
                 _ => {
-                    // Fallback: If it looks like a page (has origin/link), put in pages
-                    if item.get("origin").is_some() || item.get("link").is_some() {
+                    if clean_item.get("origin").is_some() || clean_item.get("link").is_some() {
                         "pages"
                     } else {
                         "items" 
@@ -1132,17 +1131,15 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                 }
             };
 
-            // Handling the "pages" and "users" specifically for the sync request
-            // If the frontend sends explicit table hint, we could use that, but for now infer from type.
             let final_table = if type_str == "team" || type_str == "user" || type_str == "member" {
                 "users"
-            } else if item.get("data").and_then(|d| d.get("origin")).is_some() {
+            } else if clean_item.get("data").and_then(|d| d.get("origin")).is_some() {
                 "pages"
             } else {
-                "items" // Default bucket
+                "items" 
             };
 
-            // Prepare fields
+            // 🌟 [CRITICAL FIX] Move 에러 방지: clean_item 대신 원본 item을 사용하여 참조를 분리합니다.
             let from = item.get("from").and_then(|v| v.as_str());
             let to = item.get("to").and_then(|v| v.as_str());
             let cc = item.get("cc").and_then(|v| v.as_str());
@@ -1151,7 +1148,8 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
             let digest = item.get("digest").and_then(|v| v.as_str());
 
             if !id.is_empty() {
-                let _ = db.upsert_item(final_table, &id, &type_str, item.clone(), None, from, to, cc, bcc, r#ref, digest).await;
+                // 원본 item 대신 세탁된 clean_item을 DB에 밀어 넣습니다.
+                let _ = db.upsert_item(final_table, &id, &type_str, clean_item, None, from, to, cc, bcc, r#ref, digest).await;
                 count += 1;
             }
         }

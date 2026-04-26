@@ -724,7 +724,8 @@ async fn process_task(
                         if let Ok(sel) = scraper::Selector::parse(node_sel) {
                             if document.select(&sel).next().is_some() || node_sel == "body" || node_sel.is_empty() {
                                 emit_term(&format!("[Scheduler] ⚡ CACHE HIT! Skipping AI Pre-processing for: {}", raw_path));
-                                page_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                                // 🌟 [CRITICAL FIX] trim() 과 to_lowercase() 추가
+                                page_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase(); 
                                 is_detail = val.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
                                 selector_info = val.clone();
                                 skip_ai_analysis = true; // 스킵 활성화!
@@ -834,7 +835,10 @@ async fn process_task(
                     
                     let _ = data_manager.offload(&res, "step_a_res");
                     let type_info = parsing::parse_json_from_llm(&res); 
-                    page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
+                    
+                    // 🌟 [CRITICAL FIX] 공백 찌꺼기 완벽 제거
+                    page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").trim().to_lowercase();                
+                    
                     if page_type.is_empty() {
                         page_type = match task.r#type.as_str() {
                             "image_extraction" => "tracking".to_string(),
@@ -1021,12 +1025,12 @@ async fn process_task(
                         if let Some(el) = node.value().as_element() {
                             let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
                             
-                            let text: String = node.children()
-                                .filter_map(|child| child.value().as_text().map(|t| t.to_string()))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                                .trim()
-                                .to_string();
+                            // 🌟 [CRITICAL FIX] 직계 텍스트만 읽지 않고, <a>, <span> 등 자식 깊숙히 숨어있는 모든 텍스트를 재귀적으로 긁어옵니다!
+                            let text = if let Some(element_ref) = scraper::ElementRef::wrap(node) {
+                                element_ref.text().collect::<Vec<_>>().join(" ").trim().to_string()
+                            } else {
+                                String::new()
+                            };
                                 
                             // 🌟 [CRITICAL FIX 1] Rust에서 DOM의 colspan, rowspan 값을 추출하여 JS로 전달합니다!
                             nodes_json.push(json!({
@@ -1106,7 +1110,7 @@ async fn process_task(
                             return clsA.length ? (matchCount / clsA.length) * 100 : 0;
                         }
 
-                        // 🌟 [최종 완성형] 회원님 제안 로직: 할아버지 자식 탐색 & Wrapper 매칭 
+                        // 🌟 [최종 완성형] 회원님 제안 로직: 할아버지 자식 탐색 & Wrapper 매칭 + 다중 행(colspan/rowspan) 완벽 병합 지원!
                         function extractHeaders(finalParent, firstItem) {
                             let headers = [];
 
@@ -1121,6 +1125,52 @@ async fn process_task(
                                 return res;
                             }
 
+                            // 🌟 [CRITICAL FIX] 다중 행(rowspan/colspan)을 완벽하게 그리드(Grid)로 매핑하여 텍스트를 병합하는 함수 추가!
+                            function getAdvancedTexts(trs) {
+                                let grid = [];
+                                trs.forEach((tr, rIdx) => {
+                                    if(!grid[rIdx]) grid[rIdx] = [];
+                                    // th, td만 필터링
+                                    let cells = getChildren(tr.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
+                                    let cIdx = 0;
+                                    
+                                    cells.forEach(c => {
+                                        // 현재 행에서 비어있는 열(column)을 찾습니다 (이전 rowspan에 의해 채워졌을 수 있음)
+                                        while(grid[rIdx][cIdx] !== undefined) cIdx++;
+                                        
+                                        let text = (c.text || "").replace(/\s+/g, ' ').trim();
+                                        let cSpan = parseInt(c.colspan || '1', 10);
+                                        let rSpan = parseInt(c.rowspan || '1', 10);
+                                        
+                                        // 그리드 공간 채우기
+                                        for (let r = 0; r < rSpan; r++) {
+                                            for (let col = 0; col < cSpan; col++) {
+                                                let trgRow = rIdx + r;
+                                                let trgCol = cIdx + col;
+                                                if (!grid[trgRow]) grid[trgRow] = [];
+                                                grid[trgRow][trgCol] = text;
+                                            }
+                                        }
+                                    });
+                                });
+                                
+                                let finalH = [];
+                                if (grid.length > 0) {
+                                    let maxCols = Math.max(...grid.map(row => row.length));
+                                    for (let c = 0; c < maxCols; c++) {
+                                        let colTexts = [];
+                                        for (let r = 0; r < grid.length; r++) {
+                                            let txt = grid[r][c];
+                                            // 비어있지 않고, 이전에 추가된 텍스트(예: colspan으로 동일 텍스트 반복)가 아니면 합침
+                                            if (txt && !colTexts.includes(txt)) colTexts.push(txt);
+                                        }
+                                        // 세로로 조합 (예: "가격정보 판매가")
+                                        finalH.push(colTexts.join(" ").trim());
+                                    }
+                                }
+                                return finalH;
+                            }
+
                             let tableNode = null;
                             if (finalParent.tagName === 'table') tableNode = finalParent;
                             else if (finalParent.tagName === 'tbody') tableNode = nodes[finalParent.parentIndex];
@@ -1131,7 +1181,8 @@ async fn process_task(
                                 let thead = tKids.find(n => n.tagName === 'thead');
                                 if (thead) {
                                     let trs = getChildren(thead.index).filter(n => n.tagName === 'tr');
-                                    if (trs.length > 0) return getTexts(trs[0]);
+                                    // 🌟 [수정 포인트] 단일 tr[0]가 아니라 전체 trs 묶음을 그리드 변환기로 넘겨줍니다!
+                                    if (trs.length > 0) return getAdvancedTexts(trs);
                                 }
                                 
                                 let containerIdx = finalParent.tagName === 'tbody' ? finalParent.index : tableNode.index;
@@ -1270,11 +1321,15 @@ async fn process_task(
                         }
 
                         const findText = titles.length > 0 ? titles[0].toLowerCase().replace(/\s+/g, ' ') : "";
-                        const matches = nodes.filter(n => n && n.text && n.text.toLowerCase().replace(/\s+/g, ' ').includes(findText));
+                        // 🌟 [CRITICAL FIX] 요소(Element)이면서 텍스트가 있는 노드만 필터링합니다!
+                        let matches = nodes.filter(n => n && n.tagName && n.text && n.text.toLowerCase().replace(/\s+/g, ' ').includes(findText));
+                        
+                        // 🌟 [CRITICAL FIX] 텍스트 길이가 가장 짧은 것(가장 깊숙한 자식 노드)부터 역추적하도록 정렬(Sort)합니다!
+                        matches.sort((a, b) => a.text.length - b.text.length);
                         
                         let res = { "parent": "body", "itemSelector": "div", "matchCount": matches.length, "headers": [] };
                         if (matches.length > 0) {
-                            const d = detect(matches[0].index);
+                            const d = detect(matches[0].index); // 이제 가장 정확한 안쪽 노드부터 역추적 시작!
                             if (d) { 
                                 res.parent = d.parent; 
                                 res.itemSelector = d.itemSelector; 
@@ -1364,7 +1419,9 @@ async fn process_task(
                     obj.insert("detail".to_string(), json!(false));
                 }
 
-                let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(raw_path), None).await;
+                // 🌟 [CRITICAL FIX] 페이지(pages)를 저장할 때 raw_path가 아닌, items와 동일한 해시값(task.ref)을 사용해 클릭 시 필터가 정확히 물리게 합니다!
+                let ref_for_page = if !task.r#ref.is_empty() { &task.r#ref } else { raw_path };
+                let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(ref_for_page), None).await;
             }
         } // 👈 🌟 [핵심 변경 2 끝] JS 선택자 분석 스킵 괄호 닫기!
 
@@ -1492,9 +1549,21 @@ async fn process_task(
                     Ok(res_text) => {
                         let mut parsed_json = parsing::parse_json_from_llm(&res_text);
                         
-                        // 🌟 [CRITICAL FIX] LLM이 {"order": {...}} 형태로 껍데기를 씌워서 반환하므로,
-                        // page_type(예: "order", "goods") 키를 찾아서 알맹이만 빼냅니다.
-                        let mut item_json = if let Some(inner) = parsed_json.get_mut(&page_type) {
+                        // 🌟 [CRITICAL FIX] LLM이 키값에 공백을 넣거나 대소문자를 섞었을 때(예: {"Goods ": ...})를 완벽히 방어합니다.
+                        let mut target_key = page_type.clone();
+                        if parsed_json.get(&target_key).is_none() {
+                            if let Some(obj) = parsed_json.as_object() {
+                                for k in obj.keys() {
+                                    if k.trim().to_lowercase() == page_type {
+                                        target_key = k.clone();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // 찾아낸 가장 정확한 target_key로 껍데기(Outer Shell)를 벗겨냅니다.
+                        let mut item_json = if let Some(inner) = parsed_json.get_mut(&target_key) {
                             inner.take() // 알맹이 적중 시 꺼냄
                         } else {
                             parsed_json // 방어 로직: LLM이 껍데기 없이 바로 뱉었을 경우 그대로 사용
@@ -1643,16 +1712,27 @@ async fn process_task(
 
                     let mut parsed_json = parsing::parse_json_from_llm(&res.text);
                     
-                    // 🌟 [CRITICAL FIX] LLM이 {"order": {...}} 형태로 껍데기를 씌워서 반환하므로,
-                    // page_type(예: "order", "goods") 키를 찾아서 알맹이만 빼냅니다.
-                    extracted_data = if let Some(inner) = parsed_json.get_mut(&page_type) {
+                    // 🌟 [CRITICAL FIX] 디테일 모드에서도 키(Key) 공백/대소문자 오염 방어 로직 동일하게 적용
+                    let mut target_key = page_type.clone();
+                    if parsed_json.get(&target_key).is_none() {
+                        if let Some(obj) = parsed_json.as_object() {
+                            for k in obj.keys() {
+                                if k.trim().to_lowercase() == page_type {
+                                    target_key = k.clone();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    extracted_data = if let Some(inner) = parsed_json.get_mut(&target_key) {
                         inner.take() // 알맹이 적중 시 꺼냄
                     } else {
-                        parsed_json // 방어 로직: LLM이 껍데기 없이 바로 뱉었을 경우 그대로 사용
+                        parsed_json // 방어 로직
                     };
 
                 } else {
-                    println!("[Scheduler] ERROR: Qwen 3.5 generator is missing!");
+                    return Err(anyhow::anyhow!("Qwen 3.5 Generator not available"));
                 }
             }
         }
@@ -1767,7 +1847,8 @@ async fn process_task(
     } else {
         // 🌟 [CRITICAL FIX] [LIST MODE] items 배열을 순회하며 낱개로 쪼개어 각각 DB에 독립된 문서로 저장합니다!
         if let Some(items) = extracted_data.get("items").and_then(|v| v.as_array()) {
-            is_new_draft_global = false; // 리스트 업데이트 통계 기준 처리
+            // 🌟 [CRITICAL FIX] 리스트 전처리 항목은 무조건 Draft(대기) 상태로 집계해야 프론트엔드에서 'Draft (13)' 처럼 정상 표기됩니다!
+            is_new_draft_global = true; 
             
             for item_val in items.iter() {
                 let mut single_item = item_val.clone();
@@ -2034,25 +2115,29 @@ async fn update_team_base_metrics(
         let cc_node = pages.entry(task_cc).or_insert(json!({})).as_object_mut().unwrap();
         let page_type_node = cc_node.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
 
+        let items_count = items.len() as i64; // 🌟 [핵심] 실제 추출된 아이템 개수
+
         if is_new_draft {
             let draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
-            page_type_node.insert("draft".to_string(), json!(draft + 1));
+            page_type_node.insert("draft".to_string(), json!(draft + items_count)); // 1 대신 items_count 추가
         } else {
             let draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
             let count = page_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
             if draft > 0 { page_type_node.insert("draft".to_string(), json!(draft - 1)); }
-            page_type_node.insert("count".to_string(), json!(count + 1));
+            page_type_node.insert("count".to_string(), json!(count + items_count)); // 1 대신 items_count 추가
         }
-    } // 👈 여기서 첫 번째 참조(pages)가 안전하게 종료됩니다.
+    } 
 
     // --- [블록 2: 글로벌 전체 통계 및 Min/Max 업데이트] ---
     {
         let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
         let global_type_node = base.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
+        
+        let items_count = items.len() as i64; // 🌟 [핵심] 실제 추출된 아이템 개수
 
         if !is_new_draft {
             let global_count = global_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-            global_type_node.insert("count".to_string(), json!(global_count + 1));
+            global_type_node.insert("count".to_string(), json!(global_count + items_count)); // 1 대신 items_count 추가
         }
 
         let properties = [

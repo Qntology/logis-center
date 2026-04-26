@@ -746,7 +746,7 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 
 pub fn list2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
-    "order" | "goods" => r###"- "{TYPE}":
+    "order" => r###"- "{TYPE}":
     - "title":title | string
     - "path":URL includes a manage {TYPE} path, an administrative or edit Link | string
     - "id":Refer to the ID value from the link or an attribute | string
@@ -754,7 +754,18 @@ pub fn list2json(page_type: &str, href: &str, language: &str) -> String {
     - "quantity":quantity | string
     - "sale_price":total price | number
     - "currency":ISO 4217 Currency Code | string
-    - "tracking_number":Tracking Number or 운송장 번호 or 运单호 or 運單號 or 伝표번호 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Ноमर 나кладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ | string
+    - "tracking_number":Tracking Number or equivalent term in {LANGUAGE} | string
+    - "registration_date":yyyy-MM-ddThh:mm:ss | string
+    - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error' | string"###.to_string(),
+
+    "goods" => r###"- "{TYPE}":
+    - "title":title | string
+    - "path":URL includes a manage {TYPE} path, an administrative or edit Link | string
+    - "id":Refer to the ID value from the link or an attribute | string
+    - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
+    - "quantity":quantity | string
+    - "sale_price":total price | number
+    - "currency":ISO 4217 Currency Code | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error' | string"###.to_string(),
     
@@ -789,6 +800,7 @@ Extract detailed information from the provided Pug template into a single struct
 
 [CONTEXT]
 current Link: {HREF}
+Language: {LANGUAGE}
 
 [SCHEMA DEFINITIONS]
 {SCHEMA}
@@ -802,6 +814,7 @@ NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{SCHEMA}", &schema)
             .replace("{TYPE}", page_type)
             .replace("{HREF}", href)
+            .replace("{LANGUAGE}", language)
 }
 
 /// Converts a JSON Value into a human-readable natural language narrative.

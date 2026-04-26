@@ -1619,13 +1619,24 @@ impl LogisModel {
         }
 
         if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
-             ctx_arr.retain(|seg| {
-                 let text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
-                 let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").trim();
-                 !text.is_empty() && !seg_type.is_empty()
-             });
+            // 🌟 [CRITICAL FIX] retain은 & 참조자만 전달하므로, 수정을 위한 루프를 별도로 분리합니다. (E0596 해결)
+            for seg in ctx_arr.iter_mut() {
+                let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
+                if let Some(obj) = seg.as_object_mut() {
+                    obj.insert("type".to_string(), serde_json::json!(seg_type));
+                }
+            }
+            
+            // 그 다음 삭제 여부 판별 진행
+            ctx_arr.retain(|seg| {
+                let text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or(""); // 이미 위에서 정리됨
+                
+                !text.is_empty() && !seg_type.is_empty()
+            });
         }
 
+        // 🌟 [CRITICAL FIX] 변수명 오타 수정: cancellation_token -> cancel_token (E0425 해결)
         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
         // ----------------------------------------------------
