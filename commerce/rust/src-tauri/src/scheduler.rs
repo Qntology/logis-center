@@ -1110,10 +1110,18 @@ async fn process_task(
                             return clsA.length ? (matchCount / clsA.length) * 100 : 0;
                         }
 
-                        // 🌟 [최종 완성형] 회원님 제안 로직: 할아버지 자식 탐색 & Wrapper 매칭 + 다중 행(colspan/rowspan) 완벽 병합 지원!
                         function extractHeaders(finalParent, firstItem) {
                             let headers = [];
 
+                            // Helper: 실제 데이터(첫 번째 항목)의 컬럼(td/div) 개수를 셉니다.
+                            const getColCount = (nodeIdx) => {
+                                let kids = getChildren(nodeIdx);
+                                let cols = kids.filter(n => n.tagName !== 'div' || n.text !== '').length;
+                                return cols === 0 ? kids.length : cols;
+                            };
+                            let dataColCount = getColCount(firstItem.index);
+
+                            // 🌟 [CRITICAL FIX] Div 전용 텍스트 추출 및 자가 치유(Self-Healing) 로직
                             function getTexts(rowNode) {
                                 let res = [];
                                 let cells = getChildren(rowNode.index);
@@ -1122,27 +1130,42 @@ async fn process_task(
                                     let col = parseInt(c.colspan || '1', 10);
                                     for(let i=0; i<col; i++) res.push(text);
                                 });
+
+                                // 🌟 [HEALING ALGORITHM for DIVs] 
+                                // CSS flex/grid 스팬으로 인해 헤더 요소 개수가 데이터 개수보다 많을 경우, 
+                                // DOM 속성 없이도 인접한 텍스트를 강제로 묶어 밀림(Shift) 현상을 방어합니다.
+                                let diff = res.length - dataColCount;
+                                if (diff > 0) {
+                                    for (let c = 0; c < res.length - 1 && diff > 0; c++) {
+                                        // 앞 단어와 뒷 단어를 합치고 중복 제거 (예: "가격" + "가격 정보" -> "가격 정보")
+                                        let words1 = res[c].split(/\s+/);
+                                        let words2 = res[c+1].split(/\s+/);
+                                        let uniqueWords = [...new Set([...words1, ...words2])];
+                                        res[c] = uniqueWords.join(" ");
+                                        
+                                        res.splice(c + 1, 1);
+                                        diff--;
+                                        c--; // 합쳐진 요소가 또 다음 요소와 합쳐져야 할지 재검사
+                                    }
+                                }
                                 return res;
                             }
 
-                            // 🌟 [CRITICAL FIX] 다중 행(rowspan/colspan)을 완벽하게 그리드(Grid)로 매핑하여 텍스트를 병합하는 함수 추가!
+                            // 🌟 Table 전용 2D 그리드 매핑 및 자가 치유 로직
                             function getAdvancedTexts(trs) {
                                 let grid = [];
                                 trs.forEach((tr, rIdx) => {
                                     if(!grid[rIdx]) grid[rIdx] = [];
-                                    // th, td만 필터링
                                     let cells = getChildren(tr.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
                                     let cIdx = 0;
                                     
                                     cells.forEach(c => {
-                                        // 현재 행에서 비어있는 열(column)을 찾습니다 (이전 rowspan에 의해 채워졌을 수 있음)
                                         while(grid[rIdx][cIdx] !== undefined) cIdx++;
                                         
                                         let text = (c.text || "").replace(/\s+/g, ' ').trim();
                                         let cSpan = parseInt(c.colspan || '1', 10);
                                         let rSpan = parseInt(c.rowspan || '1', 10);
                                         
-                                        // 그리드 공간 채우기
                                         for (let r = 0; r < rSpan; r++) {
                                             for (let col = 0; col < cSpan; col++) {
                                                 let trgRow = rIdx + r;
@@ -1161,11 +1184,28 @@ async fn process_task(
                                         let colTexts = [];
                                         for (let r = 0; r < grid.length; r++) {
                                             let txt = grid[r][c];
-                                            // 비어있지 않고, 이전에 추가된 텍스트(예: colspan으로 동일 텍스트 반복)가 아니면 합침
                                             if (txt && !colTexts.includes(txt)) colTexts.push(txt);
                                         }
-                                        // 세로로 조합 (예: "가격정보 판매가")
                                         finalH.push(colTexts.join(" ").trim());
+                                    }
+
+                                    let diff = finalH.length - dataColCount;
+                                    if (diff > 0 && grid.length > 0) {
+                                        for (let c = 0; c < finalH.length - 1 && diff > 0; c++) {
+                                            if (grid[0][c] && grid[0][c] === grid[0][c+1]) {
+                                                let words1 = finalH[c].split(/\s+/);
+                                                let words2 = finalH[c+1].split(/\s+/);
+                                                let uniqueWords = [...new Set([...words1, ...words2])];
+                                                finalH[c] = uniqueWords.join(" ");
+                                                
+                                                finalH.splice(c + 1, 1);
+                                                for(let r=0; r<grid.length; r++) {
+                                                    if(grid[r]) grid[r].splice(c+1, 1);
+                                                }
+                                                diff--;
+                                                c--; 
+                                            }
+                                        }
                                     }
                                 }
                                 return finalH;
@@ -1175,13 +1215,12 @@ async fn process_task(
                             if (finalParent.tagName === 'table') tableNode = finalParent;
                             else if (finalParent.tagName === 'tbody') tableNode = nodes[finalParent.parentIndex];
 
-                            // 1. Table 구조인 경우
+                            // 1. 테이블 탐색 분기
                             if (tableNode && tableNode.tagName === 'table') {
                                 let tKids = getChildren(tableNode.index);
                                 let thead = tKids.find(n => n.tagName === 'thead');
                                 if (thead) {
                                     let trs = getChildren(thead.index).filter(n => n.tagName === 'tr');
-                                    // 🌟 [수정 포인트] 단일 tr[0]가 아니라 전체 trs 묶음을 그리드 변환기로 넘겨줍니다!
                                     if (trs.length > 0) return getAdvancedTexts(trs);
                                 }
                                 
@@ -1190,53 +1229,38 @@ async fn process_task(
                                 if (trs.length > 0 && trs[0].index !== firstItem.index) {
                                     let cells = getChildren(trs[0].index);
                                     if (cells.some(c => c.tagName === 'th') || trs[0].index < firstItem.index) {
-                                        return getTexts(trs[0]);
+                                        return getTexts(trs[0]); // Table이지만 thead가 없는 경우
                                     }
                                 }
                                 return headers;
                             } 
                             
-                            // 2. Div 기반 구조인 경우 (역순 심층 탐색)
-                            // Helper: 컬럼 개수 세기 (내용이 있는 요소 중심)
-                            const getColCount = (nodeIdx) => {
-                                let kids = getChildren(nodeIdx);
-                                let cols = kids.filter(n => n.tagName !== 'div' || n.text !== '').length;
-                                return cols === 0 ? kids.length : cols;
-                            };
-
-                            let dataColCount = getColCount(firstItem.index);
-                            if (dataColCount === 0) return headers;
-
+                            // 2. Div 탐색 분기
                             const isHeaderRow = (candIdx) => {
                                 let cCount = getColCount(candIdx);
                                 return cCount > 0 && Math.abs(cCount - dataColCount) <= 1;
                             };
 
-                            // Type B: 아이템과 같은 부모를 공유하는 형제 노드 역순 탐색
                             let siblings = getChildren(finalParent.index);
                             let firstIdx = siblings.findIndex(s => s.index === firstItem.index);
                             
                             for (let i = firstIdx - 1; i >= 0; i--) {
                                 let candidate = siblings[i];
-                                // 데이터 행과 디자인이 다르고(유사도<80) 구조가 비슷하면 헤더!
                                 if (calculateSimilarity(candidate, firstItem) < 80 && isHeaderRow(candidate.index)) {
                                     return getTexts(candidate);
                                 }
                             }
                             
-                            // Type A: 할아버지의 자식들(부모의 형제 노드) 역순 탐색
                             let grandSiblings = getChildren(finalParent.parentIndex);
                             let parentIdxInGrand = grandSiblings.findIndex(s => s.index === finalParent.index);
                             
                             for (let i = parentIdxInGrand - 1; i >= 0; i--) {
                                 let candidate = grandSiblings[i];
                                 
-                                // Case A-1: 형제 노드 자체가 헤더 행(Row)인 경우
                                 if (isHeaderRow(candidate.index)) {
                                     return getTexts(candidate);
                                 }
                                 
-                                // Case A-2: 형제 노드가 헤더를 감싸는 래퍼(Wrapper)인 경우
                                 let candKids = getChildren(candidate.index);
                                 if (candKids.length > 0 && isHeaderRow(candKids[0].index)) {
                                     return getTexts(candKids[0]);
@@ -1321,15 +1345,13 @@ async fn process_task(
                         }
 
                         const findText = titles.length > 0 ? titles[0].toLowerCase().replace(/\s+/g, ' ') : "";
-                        // 🌟 [CRITICAL FIX] 요소(Element)이면서 텍스트가 있는 노드만 필터링합니다!
                         let matches = nodes.filter(n => n && n.tagName && n.text && n.text.toLowerCase().replace(/\s+/g, ' ').includes(findText));
                         
-                        // 🌟 [CRITICAL FIX] 텍스트 길이가 가장 짧은 것(가장 깊숙한 자식 노드)부터 역추적하도록 정렬(Sort)합니다!
                         matches.sort((a, b) => a.text.length - b.text.length);
                         
                         let res = { "parent": "body", "itemSelector": "div", "matchCount": matches.length, "headers": [] };
                         if (matches.length > 0) {
-                            const d = detect(matches[0].index); // 이제 가장 정확한 안쪽 노드부터 역추적 시작!
+                            const d = detect(matches[0].index);
                             if (d) { 
                                 res.parent = d.parent; 
                                 res.itemSelector = d.itemSelector; 
