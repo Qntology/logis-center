@@ -1085,6 +1085,8 @@ async fn process_task(
                         function calculateSimilarity(nodeA, nodeB) {
                             if (nodeA.tagName !== nodeB.tagName) return 0;
                             
+                            // 🌟 [CRITICAL FIX 2] TR(행) 비교 시, 하위 TD들의 colspan 총합 구조가 다르면 다른 아이템으로 취급합니다!
+                            // (예: 일반 데이터 행 vs colspan=10 인 안내/합계 행)
                             if (nodeA.tagName === 'tr') {
                                 const aKids = getChildren(nodeA.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
                                 const bKids = getChildren(nodeB.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
@@ -1092,11 +1094,13 @@ async fn process_task(
                                 const aColspan = aKids.reduce((sum, k) => sum + parseInt(k.colspan || '1', 10), 0);
                                 const bColspan = bKids.reduce((sum, k) => sum + parseInt(k.colspan || '1', 10), 0);
                                 
+                                // 두 행의 가로 칸 수(colspan 총합)가 2칸 이상 차이난다면 구조가 아예 다른 것입니다.
                                 if (aColspan > 0 && bColspan > 0 && Math.abs(aColspan - bColspan) > 1) {
                                     return 0;
                                 }
                             }
                             
+                            // 🌟 [CRITICAL FIX 3] TD/TH(셀) 자체를 비교할 때 rowspan/colspan 이 다르면 감점
                             if (nodeA.tagName === 'td' || nodeA.tagName === 'th') {
                                 if (nodeA.colspan !== nodeB.colspan || nodeA.rowspan !== nodeB.rowspan) return 0;
                             }
@@ -1110,221 +1114,6 @@ async fn process_task(
                             return clsA.length ? (matchCount / clsA.length) * 100 : 0;
                         }
 
-                        // 🌟 [Div 대응 종결판] 클래스 유사도 기반의 스마트 그룹핑 병합 알고리즘
-                        function extractHeaders(finalParent, firstItem, similarSiblings) {
-                            let headers = [];
-
-                            // Helper: 실제 데이터(본문)의 유효한 열(Column) 개수를 셉니다.
-                            const getColCount = (nodeIdx) => {
-                                let kids = getChildren(nodeIdx);
-                                let cols = kids.filter(n => n.tagName !== 'div' || n.text !== '').length;
-                                return cols === 0 ? kids.length : cols;
-                            };
-                            
-                            let maxDataCols = 0;
-                            if (similarSiblings && similarSiblings.length > 0) {
-                                similarSiblings.forEach(s => {
-                                    let c = getColCount(s.index);
-                                    if (c > maxDataCols) maxDataCols = c;
-                                });
-                            } else {
-                                maxDataCols = getColCount(firstItem.index);
-                            }
-
-                            // 🌟 Div 리스트를 위한 스마트 그룹핑 병합 (Smart Grouping)
-                            function getTexts(rowNode) {
-                                let cells = getChildren(rowNode.index);
-                                let rawTexts = [];
-                                let rawClasses = [];
-
-                                // 1. 초기 텍스트 및 클래스 추출
-                                cells.forEach(c => {
-                                    let text = (c.text || "").replace(/\s+/g, ' ').trim();
-                                    if (text) {
-                                        rawTexts.push(text);
-                                        rawClasses.push(cleanClassList(c.classes).join("."));
-                                    }
-                                });
-
-                                // 2. 차이가 발생했을 경우, 클래스 유사도 기반 병합 (Div 전용)
-                                let diff = rawTexts.length - maxDataCols;
-                                if (diff > 0 && rawTexts.length > 1) {
-                                    let mergedTexts = [];
-                                    let currentGroup = [];
-                                    let lastClass = rawClasses[0];
-
-                                    // 동일한 클래스를 가진 요소들을 하나의 덩어리로 묶음
-                                    for (let i = 0; i < rawTexts.length; i++) {
-                                        if (rawClasses[i] === lastClass || !rawClasses[i] || !lastClass) {
-                                            currentGroup.push(rawTexts[i]);
-                                        } else {
-                                            mergedTexts.push(currentGroup.join(" "));
-                                            currentGroup = [rawTexts[i]];
-                                            lastClass = rawClasses[i];
-                                        }
-                                    }
-                                    if (currentGroup.length > 0) {
-                                        mergedTexts.push(currentGroup.join(" "));
-                                    }
-
-                                    // 만약 클래스 묶음으로 처리했는데도 여전히 개수가 많다면 (최후의 수단: 비율 병합)
-                                    if (mergedTexts.length > maxDataCols) {
-                                        let finalMerged = [];
-                                        let ratio = Math.ceil(mergedTexts.length / maxDataCols);
-                                        for (let i = 0; i < mergedTexts.length; i += ratio) {
-                                            let chunk = mergedTexts.slice(i, i + ratio);
-                                            let uniqueWords = [...new Set(chunk.join(" ").split(/\s+/))];
-                                            finalMerged.push(uniqueWords.join(" "));
-                                        }
-                                        return finalMerged.slice(0, maxDataCols); // 정확히 잘라냄
-                                    }
-                                    
-                                    return mergedTexts;
-                                }
-                                
-                                return rawTexts;
-                            }
-
-                            // 🌟 Table 전용 2D 그리드 매핑 및 자가 치유 로직 (기존 로직 유지)
-                            function getAdvancedTexts(trs) {
-                                let grid = [];
-                                trs.forEach((tr, rIdx) => {
-                                    if(!grid[rIdx]) grid[rIdx] = [];
-                                    let cells = getChildren(tr.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
-                                    let cIdx = 0;
-                                    
-                                    cells.forEach(c => {
-                                        while(grid[rIdx][cIdx] !== undefined) cIdx++;
-                                        
-                                        let text = (c.text || "").replace(/\s+/g, ' ').trim();
-                                        let cSpan = parseInt(c.colspan || '1', 10);
-                                        let rSpan = parseInt(c.rowspan || '1', 10);
-                                        
-                                        for (let r = 0; r < rSpan; r++) {
-                                            for (let col = 0; col < cSpan; col++) {
-                                                let trgRow = rIdx + r;
-                                                let trgCol = cIdx + col;
-                                                if (!grid[trgRow]) grid[trgRow] = [];
-                                                grid[trgRow][trgCol] = text;
-                                            }
-                                        }
-                                    });
-                                });
-                                
-                                let finalH = [];
-                                if (grid.length > 0) {
-                                    let maxCols = Math.max(...grid.map(row => row.length));
-                                    for (let c = 0; c < maxCols; c++) {
-                                        let colTexts = [];
-                                        for (let r = 0; r < grid.length; r++) {
-                                            let txt = grid[r][c];
-                                            if (txt && !colTexts.includes(txt)) colTexts.push(txt);
-                                        }
-                                        finalH.push(colTexts.join(" ").trim());
-                                    }
-
-                                    // Table 자가 치유 로직
-                                    let diff = finalH.length - maxDataCols;
-                                    if (diff > 0) {
-                                        let c = 0;
-                                        while (c < finalH.length - 1 && diff > 0) {
-                                            let isDuplicateColspan = false;
-                                            for (let r = 0; r < grid.length; r++) {
-                                                if (grid[r] && grid[r][c] && grid[r][c] === grid[r][c+1]) {
-                                                    isDuplicateColspan = true;
-                                                    break;
-                                                }
-                                            }
-                                            
-                                            if (isDuplicateColspan) {
-                                                let words1 = finalH[c].split(/\s+/);
-                                                let words2 = finalH[c+1].split(/\s+/);
-                                                let uniqueWords = [...new Set([...words1, ...words2])];
-                                                finalH[c] = uniqueWords.join(" ");
-                                                
-                                                finalH.splice(c + 1, 1);
-                                                for(let r=0; r<grid.length; r++) {
-                                                    if(grid[r]) grid[r].splice(c+1, 1);
-                                                }
-                                                diff--;
-                                            } else {
-                                                c++;
-                                            }
-                                        }
-                                        
-                                        // 최후의 수단
-                                        while (finalH.length > maxDataCols && finalH.length > 1) {
-                                            let lastIdx = finalH.length - 1;
-                                            let words1 = finalH[lastIdx - 1].split(/\s+/);
-                                            let words2 = finalH[lastIdx].split(/\s+/);
-                                            let uniqueWords = [...new Set([...words1, ...words2])];
-                                            finalH[lastIdx - 1] = uniqueWords.join(" ");
-                                            finalH.pop();
-                                        }
-                                    }
-                                }
-                                return finalH;
-                            }
-
-                            let tableNode = null;
-                            if (finalParent.tagName === 'table') tableNode = finalParent;
-                            else if (finalParent.tagName === 'tbody') tableNode = nodes[finalParent.parentIndex];
-
-                            // 1. 테이블 탐색 분기
-                            if (tableNode && tableNode.tagName === 'table') {
-                                let tKids = getChildren(tableNode.index);
-                                let thead = tKids.find(n => n.tagName === 'thead');
-                                if (thead) {
-                                    let trs = getChildren(thead.index).filter(n => n.tagName === 'tr');
-                                    if (trs.length > 0) return getAdvancedTexts(trs);
-                                }
-                                
-                                let containerIdx = finalParent.tagName === 'tbody' ? finalParent.index : tableNode.index;
-                                let trs = getChildren(containerIdx).filter(n => n.tagName === 'tr');
-                                if (trs.length > 0 && trs[0].index !== firstItem.index) {
-                                    let cells = getChildren(trs[0].index);
-                                    if (cells.some(c => c.tagName === 'th') || trs[0].index < firstItem.index) {
-                                        return getTexts(trs[0]); 
-                                    }
-                                }
-                                return headers;
-                            } 
-                            
-                            // 2. Div 탐색 분기
-                            const isHeaderRow = (candIdx) => {
-                                let cCount = getColCount(candIdx);
-                                return cCount > 0 && Math.abs(cCount - maxDataCols) <= 1;
-                            };
-
-                            let siblings = getChildren(finalParent.index);
-                            let firstIdx = siblings.findIndex(s => s.index === firstItem.index);
-                            
-                            for (let i = firstIdx - 1; i >= 0; i--) {
-                                let candidate = siblings[i];
-                                if (calculateSimilarity(candidate, firstItem) < 80 && isHeaderRow(candidate.index)) {
-                                    return getTexts(candidate);
-                                }
-                            }
-                            
-                            let grandSiblings = getChildren(finalParent.parentIndex);
-                            let parentIdxInGrand = grandSiblings.findIndex(s => s.index === finalParent.index);
-                            
-                            for (let i = parentIdxInGrand - 1; i >= 0; i--) {
-                                let candidate = grandSiblings[i];
-                                
-                                if (isHeaderRow(candidate.index)) {
-                                    return getTexts(candidate);
-                                }
-                                
-                                let candKids = getChildren(candidate.index);
-                                if (candKids.length > 0 && isHeaderRow(candKids[0].index)) {
-                                    return getTexts(candKids[0]);
-                                }
-                            }
-
-                            return headers;
-                        }
-
                         function detect(tIdx) {
                             let cur = tIdx;
                             for (let i = 0; i < 15; i++) {
@@ -1335,6 +1124,8 @@ async fn process_task(
                                 if (pIdx === undefined || pIdx === -1) break;
                                 
                                 if (node.tagName === "td" || node.tagName === "th") {
+                                    // 🌟 [CRITICAL FIX 4] 현재 셀이 rowspan이나 colspan을 가지고 있다면, 
+                                    // 이는 단일 항목이 아니라 복잡한 그리드의 부속품입니다. 묻지도 따지지도 않고 부모(tr)로 올라갑니다.
                                     if (parseInt(node.colspan || '1', 10) > 1 || parseInt(node.rowspan || '1', 10) > 1) {
                                         cur = pIdx;
                                         continue;
@@ -1347,6 +1138,7 @@ async fn process_task(
                                             const trSiblings = getChildren(gpIdx);
                                             const similarTrs = trSiblings.filter(s => calculateSimilarity(pNode, s) >= 60);
                                             
+                                            // 부모(tr)가 유사한 구조의 다른 형제(tr)들을 여럿 거느리고 있다면 진짜 세로 리스트입니다.
                                             if (similarTrs.length >= 2) {
                                                 cur = pIdx;
                                                 continue;
@@ -1384,14 +1176,10 @@ async fn process_task(
 
                                     const fullSelector = uniqueSigs.map(sig => parentSig + " " + sig).join(", ");
 
-                                    const firstDataItem = similarSiblings[0];
-                                    const headersArray = extractHeaders(finalParent, firstDataItem, similarSiblings);
-
                                     return { 
                                         parent: parentSig, 
                                         itemSelector: fullSelector,
-                                        matchCount: similarSiblings.length,
-                                        headers: headersArray
+                                        matchCount: similarSiblings.length
                                     };
                                 }
                                 cur = pIdx;
@@ -1400,18 +1188,12 @@ async fn process_task(
                         }
 
                         const findText = titles.length > 0 ? titles[0].toLowerCase().replace(/\s+/g, ' ') : "";
-                        let matches = nodes.filter(n => n && n.tagName && n.text && n.text.toLowerCase().replace(/\s+/g, ' ').includes(findText));
+                        const matches = nodes.filter(n => n && n.text && n.text.toLowerCase().replace(/\s+/g, ' ').includes(findText));
                         
-                        matches.sort((a, b) => a.text.length - b.text.length);
-                        
-                        let res = { "parent": "body", "itemSelector": "div", "matchCount": matches.length, "headers": [] };
+                        let res = { "parent": "body", "itemSelector": "div", "matchCount": matches.length };
                         if (matches.length > 0) {
                             const d = detect(matches[0].index);
-                            if (d) { 
-                                res.parent = d.parent; 
-                                res.itemSelector = d.itemSelector; 
-                                res.headers = d.headers || []; 
-                            }
+                            if (d) { res.parent = d.parent; res.itemSelector = d.itemSelector; }
                         }
                         JSON.stringify(res);
                     "##;
@@ -1531,34 +1313,46 @@ async fn process_task(
             let clean_html_path = data_manager.get_path("clean_html");
             let clean_content = data_manager.load(&clean_html_path)?;
             
-            // 🌟 1. 캐시나 JS 엔진에서 뽑아준 headers 배열을 가져옵니다.
-            let mut headers: Vec<String> = selector_info.get("headers")
+            // 🌟 [CRITICAL FIX] JS 엔진에서 넘어온 2차원 배열(Vec<Vec<String>>)을 완벽히 파싱합니다.
+            let mut headers: Vec<Vec<String>> = selector_info.get("headers")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .map(|arr| {
+                    arr.iter().filter_map(|row_val| {
+                        row_val.as_array().map(|r| r.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    }).collect()
+                })
                 .unwrap_or_default();
 
-            // 🌟 [CRITICAL FIX] 과거 캐시(Cache) 때문에 JS 엔진이 스킵되어 headers가 비어있을 경우,
-            // Rust 백엔드의 순수 추출기(extract_table_headers)를 강제 가동하여 헤더를 구출합니다!
+            // 호환성 방어: 캐시에 남아있는 구형 1차원 배열 데이터가 있을 경우 2차원으로 래핑해줍니다.
+            if !headers.is_empty() && headers[0].is_empty() {
+                let flat_headers: Vec<String> = selector_info.get("headers")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                if !flat_headers.is_empty() {
+                    headers = vec![flat_headers];
+                }
+            }
+
+            // Rust 백엔드의 순수 추출기(extract_table_headers)도 원래 2차원 배열을 반환하므로 그대로 수용합니다.
             if headers.is_empty() {
                 let rust_headers = parsing::extract_table_headers(&clean_content, &target_selector);
                 if !rust_headers.is_empty() {
-                    // extract_table_headers는 2차원 배열(Vec<Vec<String>>)을 반환하므로 첫 번째 행을 꺼냅니다.
-                    headers = rust_headers[0].clone();
+                    headers = rust_headers; 
                 }
             }
 
             if !headers.is_empty() {
-                println!("[Scheduler] Extracted {} header columns for 'alt' mapping.", headers.len());
+                println!("[Scheduler] Extracted 2D header map (Rows: {}) for 'alt' mapping.", headers.len());
             }
             
             let document = scraper::Html::parse_document(&clean_content);
             
-            // 🌟 2. 구조가 복구된 headers를 PUG 변환기에 주입하여 alt 속성을 찍어냅니다!
             parsing::split_doc_to_pug_list_advanced(
                 &document, 
                 &target_selector, 
                 PugMode::FullContent, 
-                if headers.is_empty() { None } else { Some(vec![headers]) }
+                if headers.is_empty() { None } else { Some(headers) } // vec![] 래핑 제거!
             )
         };
 
