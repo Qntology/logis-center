@@ -744,25 +744,25 @@ NO EXPLANATION. NO THINKING. /no_think"###;
             .replace("{LANGUAGE}", language)
 }
 
-pub fn list2json(page_type: &str, href: &str, language: &str) -> String {
+pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
     let schema = match page_type {
-    "order" => r###"- "{TYPE}":
+    "order" => r###"- "order":
     - "title":title | string
-    - "path":URL includes a manage {TYPE} path, an administrative or edit Link | string
+    - "path":URL includes a manage order path, an administrative or edit Link | string
     - "id":Refer to the ID value from the link or an attribute | string
-    - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
+    - "link":Refer to the ID to find a URL that includes a manage order link | string
     - "quantity":quantity | string
     - "sale_price":total price | number
     - "currency":ISO 4217 Currency Code | string
-    - "tracking_number":Tracking Number or equivalent term in {LANGUAGE} | string
+    - "tracking_number":Tracking Number or equivalent term in English | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error' | string"###.to_string(),
 
-    "goods" => r###"- "{TYPE}":
+    "goods" => r###"- "goods":
     - "title":title | string
-    - "path":URL includes a manage {TYPE} path, an administrative or edit Link | string
+    - "path":URL includes a manage goods path, an administrative or edit Link | string
     - "id":Refer to the ID value from the link or an attribute | string
-    - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
+    - "link":Refer to the ID to find a URL that includes a manage goods link | string
     - "quantity":quantity | string
     - "sale_price":total price | number
     - "currency":ISO 4217 Currency Code | string
@@ -795,8 +795,25 @@ pub fn list2json(page_type: &str, href: &str, language: &str) -> String {
     - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error' | string"###.to_string()
     };
 
+    // 🌟 [수정] 헤더 유무에 따라 [THEAD CONTENT] 섹션을 구성합니다.
+    let input_section = if !head_pug.is_empty() {
+        format!(
+            "[THEAD CONTENT]\n{}\n\n[TBODY CONTENT]\n{}",
+            head_pug.trim(),
+            item_pug.trim()
+        )
+    } else {
+        format!(
+            "[PUG CONTENT]\n{}",
+            item_pug.trim()
+        )
+    };
+
     let template = r###"[TASK]
 Extract detailed information from the provided Pug template into a single structured JSON object.
+
+[INPUT DATA]
+{INPUT_SECTION}
 
 [CONTEXT]
 current Link: {HREF}
@@ -811,10 +828,12 @@ Language: {LANGUAGE}
 [ACTION] RETURN JSON ONLY. 
 NO EXPLANATION. NO THINKING. /no_think"###;
 
+    // 🌟 {COMBINED_INPUT} 대신 {INPUT_SECTION}으로 정확히 치환합니다.
     template.replace("{SCHEMA}", &schema)
             .replace("{TYPE}", page_type)
             .replace("{HREF}", href)
             .replace("{LANGUAGE}", language)
+            .replace("{INPUT_SECTION}", &input_section)
 }
 
 /// Converts a JSON Value into a human-readable natural language narrative.
@@ -1132,4 +1151,44 @@ Current Language: {LANGUAGE}
     } else {
         String::new()
     }
+}
+
+pub fn extract_table_structure_prompt(page_type: &str, item_selector: &str, pug_content: &str, reference_row: &str) -> String {
+    let template = r###"[PUG CONTENT]
+{PUG_CONTENT}
+
+[Reference: Row Structure]
+{REFERENCE_ROW}
+
+[Instruction]
+Your task is to analyze the [Reference: Row Structure] and locate both its body container and its corresponding header container within the [PUG CONTENT].
+Generate the exact CSS selectors for both containers.
+
+[Rules]
+1. Analyze Reference: Carefully examine the [Reference: Row Structure] to understand the context, structure, and attributes of a single data item/row.
+2. Locate Body Container: Scan the [PUG CONTENT] to find the exact wrapper containing these data rows. Generate a precise CSS selector for this body container.
+3. Locate Header Container: Identify the wrapper or container element that acts as the "Header" for this list (the element containing the column titles or labels). Generate a precise CSS selector for this header container.
+4. Tag Agnostic: Do NOT assume the structure uses traditional <table>, <thead>, or <tbody> tags. It could be built using <div>, <ul>/<li>, or other semantic tags. Analyze the relationship logically.
+5. Strict JSON Output: Output the result strictly in valid JSON format exactly matching the structure below. Do not include any other text, markdown formatting, or explanations.
+
+[Expected Output Format]
+{
+  "{TYPE}" : {
+    "table" : {
+      "tbody" : {
+        "selector" : "{ITEM_SELECTOR}"
+      },
+      "thead" : {
+        "selector" : "..."
+      }
+    }
+  }
+}
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template.replace("{TYPE}", page_type)
+            .replace("{ITEM_SELECTOR}", item_selector)
+            .replace("{PUG_CONTENT}", pug_content)
+            .replace("{REFERENCE_ROW}", reference_row)
 }

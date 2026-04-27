@@ -1309,11 +1309,16 @@ async fn process_task(
         let mut pending_merge: Option<serde_json::Value> = None;
         let mut merge_countdown = 0;
 
-        let pug_list = {
+        // 🌟 [추가] thead PUG를 저장할 변수
+        let mut thead_pug = String::new();
+
+        // 🌟 [수정 완료] p_list 변수명을 할당될 이름인 pug_list와 일치시켜 스코프 에러를 해결합니다.
+        let (pug_list, reference_row_for_thead): (Vec<String>, Option<String>) = {
             let clean_html_path = data_manager.get_path("clean_html");
             let clean_content = data_manager.load(&clean_html_path)?;
             
-            // 🌟 [CRITICAL FIX] JS 엔진에서 넘어온 2차원 배열(Vec<Vec<String>>)을 완벽히 파싱합니다.
+            let document = scraper::Html::parse_document(&clean_content);
+            
             let mut headers: Vec<Vec<String>> = selector_info.get("headers")
                 .and_then(|v| v.as_array())
                 .map(|arr| {
@@ -1323,48 +1328,125 @@ async fn process_task(
                 })
                 .unwrap_or_default();
 
-            // 호환성 방어: 캐시에 남아있는 구형 1차원 배열 데이터가 있을 경우 2차원으로 래핑해줍니다.
-            if !headers.is_empty() && headers[0].is_empty() {
-                let flat_headers: Vec<String> = selector_info.get("headers")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                    .unwrap_or_default();
-                if !flat_headers.is_empty() {
-                    headers = vec![flat_headers];
-                }
-            }
-
-            // Rust 백엔드의 순수 추출기(extract_table_headers)도 원래 2차원 배열을 반환하므로 그대로 수용합니다.
             if headers.is_empty() {
                 let rust_headers = parsing::extract_table_headers(&clean_content, &target_selector);
-                if !rust_headers.is_empty() {
-                    headers = rust_headers; 
-                }
+                if !rust_headers.is_empty() { headers = rust_headers; }
             }
 
-            if !headers.is_empty() {
-                println!("[Scheduler] Extracted 2D header map (Rows: {}) for 'alt' mapping.", headers.len());
-            }
-            
-            let document = scraper::Html::parse_document(&clean_content);
-            
-            parsing::split_doc_to_pug_list_advanced(
+            // Reference Row 추출
+            let ref_row = if !target_selector.is_empty() {
+                scraper::Selector::parse(&target_selector).ok().and_then(|sel| {
+                    document.select(&sel).next().map(|first_match| {
+                        let mut temp_pug = String::new();
+                        let mut ctx = None;
+                        crate::parsing::generate_pug_lines((*first_match).into(), 0, &mut temp_pug, &PugMode::FullContent, &mut ctx);
+                        temp_pug.trim().to_string()
+                    })
+                })
+            } else { None };
+
+            // p_list를 pug_list로 명명하여 하단 return 시의 불일치를 방지합니다.
+            let pug_list = parsing::split_doc_to_pug_list_advanced(
                 &document, 
                 &target_selector, 
                 PugMode::FullContent, 
-                if headers.is_empty() { None } else { Some(headers) } // vec![] 래핑 제거!
-            )
+                if headers.is_empty() { None } else { Some(headers) }
+            );
+
+            (pug_list, ref_row)
         };
 
+        // 🌟 이제 document가 없으므로 안전하게 await를 사용할 수 있습니다.
+        let mut final_thead_selector = String::new();
+
+        // 1. [수정] 사용자 요청대로 'head' 키로 캐시된 선택자가 있는지 확인합니다.
+        if let Some(sel) = selector_info.get("head").and_then(|v| v.as_str()) {
+            if !sel.is_empty() && sel != "..." {
+                final_thead_selector = sel.to_string();
+                println!("[Scheduler] Using cached head selector: {}", final_thead_selector);
+            }
+        } 
+        
+        // 2. [수정 완료] reference_row_for_thead가 Some(String)인 경우 내부 값이 비어있지 않은지 검사합니다.
+        if final_thead_selector.is_empty() {
+            if let Some(ref_row) = reference_row_for_thead {
+                if !ref_row.is_empty() {
+                    log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Analyzing table header structure...", "spinner": "⠋" }));
+                    
+                    let thead_prompt = crate::parsing::extract_table_structure_prompt(&page_type, &target_selector, &light_pug, &ref_row);
+                    let params = ChatCompletionParameters {
+                        messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                            content: ChatCompletionRequestUserMessageContent::Text(thead_prompt),
+                            name: None,
+                        })],
+                        model: "qwen3.5".to_string(), 
+                        max_tokens: Some(256), 
+                        temperature: Some(0.0), 
+                        top_p: Some(0.01),
+                        ..Default::default()
+                    };
+
+                    model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+
+                    if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+                        if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_step_thead", task.id)), kv_name.clone()).await {
+                            let thead_json = crate::parsing::parse_json_from_llm(&res);
+                            
+                            let mut thead_val = thead_json.get(&page_type);
+                            if thead_val.is_none() {
+                                if let Some(obj) = thead_json.as_object() {
+                                    for (k, v) in obj {
+                                        if k.to_lowercase() == page_type.to_lowercase() { thead_val = Some(v); break; }
+                                    }
+                                }
+                            }
+
+                            final_thead_selector = thead_val
+                                .and_then(|v| v.get("table"))
+                                .and_then(|v| v.get("thead"))
+                                .and_then(|v| v.get("selector"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("").to_string();
+                            
+                            // 분석 결과를 'head' 키로 캐시 정보에 저장
+                            if !final_thead_selector.is_empty() && final_thead_selector != "..." {
+                                selector_info.as_object_mut().unwrap().insert("head".to_string(), json!(final_thead_selector));
+                                println!("[Scheduler] AI determined head selector and cached: {}", final_thead_selector);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. 최종 결정된 selector를 사용하여 head PUG를 추출합니다.
+        if !final_thead_selector.is_empty() && final_thead_selector != "..." {
+            if let Ok(clean_content) = data_manager.load(&data_manager.get_path("clean_html")) {
+                let doc = scraper::Html::parse_document(&clean_content);
+                if let Ok(tsel) = scraper::Selector::parse(&final_thead_selector) {
+                    if let Some(thead_match) = doc.select(&tsel).next() {
+                        let mut tpug = String::new();
+                        // 자식 요소들만 순회하여 [THEAD CONTENT] 바로 아래 tr 등이 오도록 구성
+                        for child in thead_match.children() {
+                            crate::parsing::generate_pug_lines(child, 0, &mut tpug, &PugMode::FullContent, &mut None);
+                        }
+                        thead_pug = tpug.trim().to_string();
+                        if !thead_pug.is_empty() {
+                            println!("[Scheduler] 🎉 thead_pug extraction successful ({} bytes)", thead_pug.len());
+                        }
+                    }
+                }
+            }
+        }
+
+        // [수정 완료] 상단 튜플에서 명시적으로 타입을 지정했으므로 컴파일러가 .is_empty()와 .iter()를 정확히 인식합니다.
         if !pug_list.is_empty() {
-            // 🌟 [CRITICAL FIX 2] 리스트 추출은 짧은 item_pug 조각만 독립적으로 읽으므로, 
-            // 무겁고 호환되지 않는 Base 스냅샷 로딩을 원천 차단합니다.
+            // 리스트 추출을 위한 모델 리레이
             model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
             for (idx, item_pug) in pug_list.iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { break; }
                 
-                // 🌟 [CRITICAL FIX] 리스트 아이템 추출 진행률(%) 계산 및 UI/터미널 전송
                 let percent = (((idx + 1) as f32 / pug_list.len() as f32) * 100.0) as i32;
                 let summary_msg = format!("Extracting item data ({}%)...", percent);
                 
@@ -1374,21 +1456,25 @@ async fn process_task(
                     "summary": summary_msg, 
                     "spinner": "⠋" 
                 });
-                // 🌟 [CRITICAL FIX] 상태 장부(log_task_progress)에 확실하게 기록해야 
-                // AI가 디코딩 퍼센트를 올바른 "List Extraction" 카테고리로 쏩니다!
                 log_task_progress(app_handle, &task.id, &payload);
                 emit_term(&format!("[STAGE-3] {}", summary_msg));
 
-                let extraction_instruction = parsing::list2json(&page_type, &url, language);
-                let task_question = format!("[PUG CONTENT]\n{}\n\n{}", item_pug, extraction_instruction);
+                let task_question = parsing::list2json(
+                    &page_type, 
+                    &url, 
+                    language, 
+                    &thead_pug, 
+                    item_pug
+                );
                 
                 // ==================================================================
-                // 🌟 [DEBUG] 회원님 요청: 각 루프마다 LLM에 들어가는 100% 날것의 Context를 텍스트 파일로 박제합니다.
+                // 🌟 [DEBUG] 각 루프마다 LLM에 전달되는 최종 프롬프트 컨텍스트를 저장합니다.
                 // ==================================================================
                 let debug_file_path = pug_logs_dir.join(format!("debug_context_item_{}.txt", idx + 1));
                 let _ = std::fs::write(&debug_file_path, &task_question);
-                println!("\n[DEBUG-CONTEXT] 📝 Item {}/{} 의 Context가 저장되었습니다: {:?}", idx + 1, pug_list.len(), debug_file_path);
-                println!("[DEBUG-CONTEXT] 🔍 텍스트 길이: {} 글자", task_question.len());
+                
+                let head_status = if thead_pug.is_empty() { "Missing" } else { "Attached" };
+                println!("\n[DEBUG-CONTEXT] 📝 Item {}/{} (Header: {}) -> {:?}", idx + 1, pug_list.len(), head_status, debug_file_path);
                 // ==================================================================
                 
                 // 🌟 [교체 구간 2-B] src/scheduler.rs 의 리스트 추출 루프 내부
