@@ -795,25 +795,36 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error' | string"###.to_string()
     };
 
-    // 🌟 [수정] 헤더 유무에 따라 [THEAD CONTENT] 섹션을 구성합니다.
-    let input_section = if !head_pug.is_empty() {
-        format!(
-            "[THEAD CONTENT]\n{}\n\n[TBODY CONTENT]\n{}",
-            head_pug.trim(),
-            item_pug.trim()
-        )
-    } else {
-        format!(
-            "[PUG CONTENT]\n{}",
-            item_pug.trim()
-        )
-    };
+    // 🌟 [최종 반영] .txt 파일 구조와 동일하게 thead/tbody 태그 및 계층형 들여쓰기 적용
+    let mut final_pug = String::new();
+
+    // 1. 헤더 영역 (thead 태그 추가 및 내부 1단계 들여쓰기)
+    if !head_pug.is_empty() {
+        final_pug.push_str("thead\n");
+        for line in head_pug.lines() {
+            final_pug.push_str(&format!("    {}\n", line));
+        }
+    }
+
+    // 2. 바디 영역 (tbody 태그 추가 및 내부 1단계 들여쓰기)
+    if !item_pug.is_empty() {
+        final_pug.push_str("tbody\n");
+        for line in item_pug.lines() {
+            final_pug.push_str(&format!("    {}\n", line));
+        }
+    }
+
+    // 3. 전체 PUG를 프롬프트에 넣기 위해 일괄적으로 4칸 들여쓰기 적용
+    let pug_content = final_pug.trim_end().lines()
+        .map(|line| format!("    {}", line))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let template = r###"[TASK]
-Extract detailed information from the provided Pug template into a single structured JSON object.
+Extract detailed information from the provided Pug tbody into a single structured JSON object.
 
-[INPUT DATA]
-{INPUT_SECTION}
+[PUG CONTENT]
+{PUG_CONTENT}
 
 [CONTEXT]
 current Link: {HREF}
@@ -833,7 +844,7 @@ NO EXPLANATION. NO THINKING. /no_think"###;
             .replace("{TYPE}", page_type)
             .replace("{HREF}", href)
             .replace("{LANGUAGE}", language)
-            .replace("{INPUT_SECTION}", &input_section)
+            .replace("{PUG_CONTENT}", &pug_content)
 }
 
 /// Converts a JSON Value into a human-readable natural language narrative.
