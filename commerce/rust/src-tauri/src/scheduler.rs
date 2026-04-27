@@ -716,24 +716,53 @@ async fn process_task(
             if let Ok(Some(page_doc)) = db.get_item_by_id("pages", &page_id).await {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&page_doc.json_data) {
                     let node_sel = val.get("node").and_then(|v| v.as_str()).unwrap_or("");
+                    let item_sel = val.get("item").or_else(|| val.get("itemSelector")).and_then(|v| v.as_str()).unwrap_or("");
+                    let head_sel = val.get("head").and_then(|v| v.as_str()).unwrap_or("");
                     
-                    // 🌟 유효성 검증: 캐시된 셀렉터가 현재 웹페이지 HTML에 아직 존재하는가?
+                    // 🌟 유효성 검증: 캐시된 부모(node), 아이템(item), 헤더(head) 셀렉터가 현재 웹페이지 구조에 온전히 존재하는가?
                     let clean_html_path = data_manager.get_path("clean_html");
                     if let Ok(clean_content) = data_manager.load(&clean_html_path) {
                         let document = scraper::Html::parse_document(&clean_content);
-                        if let Ok(sel) = scraper::Selector::parse(node_sel) {
-                            if document.select(&sel).next().is_some() || node_sel == "body" || node_sel.is_empty() {
-                                emit_term(&format!("[Scheduler] ⚡ CACHE HIT! Skipping AI Pre-processing for: {}", raw_path));
-                                // 🌟 [CRITICAL FIX] trim() 과 to_lowercase() 추가
-                                page_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase(); 
-                                is_detail = val.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
-                                selector_info = val.clone();
-                                skip_ai_analysis = true; // 스킵 활성화!
-                                
-                                log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Loaded page config from cache.", "spinner": "⚡" }));
+                        let mut is_valid = true;
+
+                        if !node_sel.is_empty() && node_sel != "body" {
+                            if let Ok(sel) = scraper::Selector::parse(node_sel) {
+                                if document.select(&sel).next().is_none() { is_valid = false; }
+                            } else { is_valid = false; }
+                        }
+
+                        if is_valid && !item_sel.is_empty() {
+                            let target_sel_str = if !node_sel.is_empty() && !item_sel.contains(",") {
+                                format!("{} {}", node_sel, item_sel)
                             } else {
-                                emit_term("[Scheduler] Cache found but UI changed. Falling back to AI Analysis.");
-                            }
+                                item_sel.to_string()
+                            };
+                            
+                            // 🌟 [CRITICAL FIX] E0597 해결: 에러 객체가 target_sel_str의 참조를 물고 늘어지지 않도록, 
+                            // 즉시 boolean으로 매핑하여 Result 객체를 그 줄에서 완전 소멸시킵니다.
+                            let is_match_found = scraper::Selector::parse(&target_sel_str)
+                                .map(|sel| document.select(&sel).next().is_some())
+                                .unwrap_or(false);
+                                
+                            if !is_match_found { is_valid = false; }
+                        }
+
+                        if is_valid && !head_sel.is_empty() && head_sel != "..." {
+                            if let Ok(sel) = scraper::Selector::parse(head_sel) {
+                                if document.select(&sel).next().is_none() { is_valid = false; }
+                            } else { is_valid = false; }
+                        }
+
+                        if is_valid {
+                            emit_term(&format!("[Scheduler] ⚡ CACHE HIT! Selectors validated. Skipping AI Pre-processing for: {}", raw_path));
+                            page_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();
+                            is_detail = val.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+                            selector_info = val.clone();
+                            skip_ai_analysis = true; // 스킵 활성화!
+                            
+                            log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Loaded valid config from cache.", "spinner": "⚡" }));
+                        } else {
+                            emit_term("[Scheduler] Cache found but UI changed (Selector mismatch). Falling back to AI Analysis.");
                         }
                     }
                 }
@@ -836,7 +865,7 @@ async fn process_task(
                     let _ = data_manager.offload(&res, "step_a_res");
                     let type_info = parsing::parse_json_from_llm(&res); 
                     
-                    // 🌟 [CRITICAL FIX] 공백 찌꺼기 완벽 제거
+                    // 🌟 [CRITICAL FIX 복구] AI가 뱉어낸 값의 공백 및 대소문자 오염 방어!
                     page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").trim().to_lowercase();                
                     
                     if page_type.is_empty() {
@@ -1020,17 +1049,17 @@ async fn process_task(
                         node_to_idx.insert(node.id(), idx);
                     }
 
-                    // 2단계: 노드 정보 수집 (Element 노드 중심)
+                    // 2단계: 노드 정보 수집 (Element 노드 중심) 
                     for (idx, node) in document.tree.root().descendants().enumerate() {
                         if let Some(el) = node.value().as_element() {
                             let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
                             
-                            // 🌟 [CRITICAL FIX] 직계 텍스트만 읽지 않고, <a>, <span> 등 자식 깊숙히 숨어있는 모든 텍스트를 재귀적으로 긁어옵니다!
-                            let text = if let Some(element_ref) = scraper::ElementRef::wrap(node) {
-                                element_ref.text().collect::<Vec<_>>().join(" ").trim().to_string()
-                            } else {
-                                String::new()
-                            };
+                            let text: String = node.children()
+                                .filter_map(|child| child.value().as_text().map(|t| t.to_string()))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                                .trim()
+                                .to_string();
                                 
                             // 🌟 [CRITICAL FIX 1] Rust에서 DOM의 colspan, rowspan 값을 추출하여 JS로 전달합니다!
                             nodes_json.push(json!({
@@ -1198,6 +1227,7 @@ async fn process_task(
                         JSON.stringify(res);
                     "##;
 
+
                     let js_code = js_template
                         .replace("NODES_PLACEHOLDER", &nodes_str)
                         .replace("TITLES_PLACEHOLDER", &titles_str);
@@ -1214,77 +1244,9 @@ async fn process_task(
                     }
                 }
             }
-
-            // [PARITY] Store 'Page' Entity (이 구역도 스킵되지 않으면 DB에 저장)
-            {
-                // Acquire Store lock briefly
-                let store = {
-                    let store_guard = store_mutex.lock().await;
-                    store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
-                };
-                
-                let mut shared_origin = None;
-                let mut shared_type = None;
-                if let Ok(mem) = crate::ACTIVE_TASK_MEM.read() {
-                    if let Some(json_val) = mem.as_ref() {
-                        if let Some(o) = json_val.get("origin").and_then(|v| v.as_str()) {
-                            if let Ok(u) = url::Url::parse(o) {
-                                shared_origin = Some(format!("{}://{}", u.scheme(), u.host_str().unwrap_or("localhost")));
-                            }
-                        }
-                        if let Some(t) = json_val.get("type").and_then(|v| v.as_str()) {
-                            if !t.is_empty() { shared_type = Some(t.to_string()); }
-                        }
-                    }
-                }
-
-                let origin_str = task_data.get("origin")
-                    .or_else(|| task_data.get("domain"))
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string())
-                    .filter(|s| !s.contains("localhost")) 
-                    .or(shared_origin) 
-                    .unwrap_or_else(|| {
-                        if let Ok(task_url) = url::Url::parse(&url) {
-                            format!("{}://{}", task_url.scheme(), task_url.host_str().unwrap_or("localhost"))
-                        } else {
-                            "http://localhost".to_string()
-                        }
-                    });
-
-                if page_type.is_empty() || page_type == "unknown" {
-                    if let Some(st) = shared_type { page_type = st; }
-                }
-                    
-                let base_url = url::Url::parse(&origin_str).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
-                let url_obj = base_url.join(&url).unwrap_or(base_url);
-                let raw_path = url_obj.path();
-                let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
-                let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-                let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
-
-                let mut page_data: serde_json::Value = selector_info.clone();
-                if let Some(obj) = page_data.as_object_mut() {
-                    obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
-                    obj.insert("link".to_string(), json!(url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()));
-                    obj.insert("type".to_string(), json!(page_type));
-                    
-                    if let Some(item_sel) = selector_info.get("itemSelector") {
-                        obj.insert("item".to_string(), item_sel.clone()); 
-                    }
-                    if let Some(parent_sel) = selector_info.get("parent") {
-                        obj.insert("node".to_string(), parent_sel.clone()); 
-                    }
-                    obj.insert("detail".to_string(), json!(false));
-                }
-
-                // 🌟 [CRITICAL FIX] 페이지(pages)를 저장할 때 raw_path가 아닌, items와 동일한 해시값(task.ref)을 사용해 클릭 시 필터가 정확히 물리게 합니다!
-                let ref_for_page = if !task.r#ref.is_empty() { &task.r#ref } else { raw_path };
-                let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(ref_for_page), None).await;
-            }
         } // 👈 🌟 [핵심 변경 2 끝] JS 선택자 분석 스킵 괄호 닫기!
 
-        // 🌟 [핵심 변경 3] final_page_info 의존성을 제거하고 캐시된 selector_info를 직접 참조합니다.
+        // 🌟 [CRITICAL FIX 1] E0425 해결: 타겟 선택자(target_selector)를 가장 먼저 정의합니다.
         let item_selector = selector_info.get("itemSelector")
             .or_else(|| selector_info.get("item"))
             .and_then(|s| s.as_str())
@@ -1298,68 +1260,12 @@ async fn process_task(
         } else { 
             node_selector.to_string() 
         };
-        
-        // [LIST MODE] 지능형 리스트 추출 (LLM 기반)
-        let list_log = json!({ "category": "List Processing", "summary": "Extracting list data with LLM...", "spinner": "⠋" });
-        log_task_progress(app_handle, &task.id, &list_log);
 
-        let mut all_extracted_items = Vec::new();
-        
-        // 병합 대기열을 위한 변수들
-        let mut pending_merge: Option<serde_json::Value> = None;
-        let mut merge_countdown = 0;
-
-        // 🌟 [추가] thead PUG를 저장할 변수
+        let mut final_thead_selector = String::new();
+        let mut cache_updated = false; // DB 업데이트가 필요한지 추적하는 플래그
         let mut thead_pug = String::new();
 
-        // 🌟 [수정 완료] p_list 변수명을 할당될 이름인 pug_list와 일치시켜 스코프 에러를 해결합니다.
-        let (pug_list, reference_row_for_thead): (Vec<String>, Option<String>) = {
-            let clean_html_path = data_manager.get_path("clean_html");
-            let clean_content = data_manager.load(&clean_html_path)?;
-            
-            let document = scraper::Html::parse_document(&clean_content);
-            
-            let mut headers: Vec<Vec<String>> = selector_info.get("headers")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter().filter_map(|row_val| {
-                        row_val.as_array().map(|r| r.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                    }).collect()
-                })
-                .unwrap_or_default();
-
-            if headers.is_empty() {
-                let rust_headers = parsing::extract_table_headers(&clean_content, &target_selector);
-                if !rust_headers.is_empty() { headers = rust_headers; }
-            }
-
-            // Reference Row 추출
-            let ref_row = if !target_selector.is_empty() {
-                scraper::Selector::parse(&target_selector).ok().and_then(|sel| {
-                    document.select(&sel).next().map(|first_match| {
-                        let mut temp_pug = String::new();
-                        let mut ctx = None;
-                        crate::parsing::generate_pug_lines((*first_match).into(), 0, &mut temp_pug, &PugMode::FullContent, &mut ctx);
-                        temp_pug.trim().to_string()
-                    })
-                })
-            } else { None };
-
-            // p_list를 pug_list로 명명하여 하단 return 시의 불일치를 방지합니다.
-            let pug_list = parsing::split_doc_to_pug_list_advanced(
-                &document, 
-                &target_selector, 
-                PugMode::FullContent, 
-                if headers.is_empty() { None } else { Some(headers) }
-            );
-
-            (pug_list, ref_row)
-        };
-
-        // 🌟 이제 document가 없으므로 안전하게 await를 사용할 수 있습니다.
-        let mut final_thead_selector = String::new();
-
-        // 1. [수정] 사용자 요청대로 'head' 키로 캐시된 선택자가 있는지 확인합니다.
+        // 1. 사용자 요청대로 'head' 키로 캐시된 선택자가 있는지 확인합니다.
         if let Some(sel) = selector_info.get("head").and_then(|v| v.as_str()) {
             if !sel.is_empty() && sel != "..." {
                 final_thead_selector = sel.to_string();
@@ -1367,8 +1273,21 @@ async fn process_task(
             }
         } 
         
-        // 2. [수정 완료] reference_row_for_thead가 Some(String)인 경우 내부 값이 비어있지 않은지 검사합니다.
+        // 2. 캐시가 없거나 비어있는 경우 AI를 통해 테이블 헤더 구조를 분석합니다.
         if final_thead_selector.is_empty() {
+            // Document를 다시 생성하여 안전하게 target_selector 기반으로 샘플 첫 행(ref_row)을 뽑아냅니다.
+            let clean_html_path = data_manager.get_path("clean_html");
+            let reference_row_for_thead = if let Ok(clean_content) = data_manager.load(&clean_html_path) {
+                let document = scraper::Html::parse_document(&clean_content);
+                if let Ok(sel) = scraper::Selector::parse(&target_selector) {
+                    document.select(&sel).next().map(|first_match| {
+                        let mut temp_pug = String::new();
+                        crate::parsing::generate_pug_lines((*first_match).into(), 0, &mut temp_pug, &PugMode::FullContent, &mut None);
+                        temp_pug.trim().to_string()
+                    })
+                } else { None }
+            } else { None };
+
             if let Some(ref_row) = reference_row_for_thead {
                 if !ref_row.is_empty() {
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Analyzing table header structure...", "spinner": "⠋" }));
@@ -1392,6 +1311,7 @@ async fn process_task(
                         if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_step_thead", task.id)), kv_name.clone()).await {
                             let thead_json = crate::parsing::parse_json_from_llm(&res);
                             
+                            // JSON 응답에서 page_type에 맞는 선택자 추출
                             let mut thead_val = thead_json.get(&page_type);
                             if thead_val.is_none() {
                                 if let Some(obj) = thead_json.as_object() {
@@ -1408,10 +1328,10 @@ async fn process_task(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("").to_string();
                             
-                            // 분석 결과를 'head' 키로 캐시 정보에 저장
                             if !final_thead_selector.is_empty() && final_thead_selector != "..." {
-                                selector_info.as_object_mut().unwrap().insert("head".to_string(), json!(final_thead_selector));
+                                selector_info.as_object_mut().unwrap().insert("head".to_string(), json!(final_thead_selector.clone()));
                                 println!("[Scheduler] AI determined head selector and cached: {}", final_thead_selector);
+                                cache_updated = true; // 새로운 head를 찾았으므로 DB 업데이트 예약
                             }
                         }
                     }
@@ -1426,10 +1346,8 @@ async fn process_task(
                 if let Ok(tsel) = scraper::Selector::parse(&final_thead_selector) {
                     if let Some(thead_match) = doc.select(&tsel).next() {
                         let mut tpug = String::new();
-                        // 자식 요소들만 순회하여 [THEAD CONTENT] 바로 아래 tr 등이 오도록 구성
-                        for child in thead_match.children() {
-                            crate::parsing::generate_pug_lines(child, 0, &mut tpug, &PugMode::FullContent, &mut None);
-                        }
+                        // 🌟 thead 노드 자체부터 파싱 시작 (Pug 구조 보존)
+                        crate::parsing::generate_pug_lines((*thead_match).into(), 0, &mut tpug, &PugMode::FullContent, &mut None);
                         thead_pug = tpug.trim().to_string();
                         if !thead_pug.is_empty() {
                             println!("[Scheduler] 🎉 thead_pug extraction successful ({} bytes)", thead_pug.len());
@@ -1439,9 +1357,100 @@ async fn process_task(
             }
         }
 
-        // [수정 완료] 상단 튜플에서 명시적으로 타입을 지정했으므로 컴파일러가 .is_empty()와 .iter()를 정확히 인식합니다.
+        // 4. DB 저장을 head 추출 이후로 실행하여 head 정보를 포함한 selector_info를 영구 저장합니다.
+        if !skip_ai_analysis || cache_updated {
+            let store = {
+                let store_guard = store_mutex.lock().await;
+                store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
+            };
+            
+            let mut shared_origin = None;
+            let mut shared_type = None;
+            if let Ok(mem) = crate::ACTIVE_TASK_MEM.read() {
+                if let Some(json_val) = mem.as_ref() {
+                    if let Some(o) = json_val.get("origin").and_then(|v| v.as_str()) {
+                        if let Ok(u) = url::Url::parse(o) {
+                            shared_origin = Some(format!("{}://{}", u.scheme(), u.host_str().unwrap_or("localhost")));
+                        }
+                    }
+                    if let Some(t) = json_val.get("type").and_then(|v| v.as_str()) {
+                        if !t.is_empty() { shared_type = Some(t.to_string()); }
+                    }
+                }
+            }
+
+            let origin_str = task_data.get("origin")
+                .or_else(|| task_data.get("domain"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+                .filter(|s| !s.contains("localhost")) 
+                .or(shared_origin) 
+                .unwrap_or_else(|| {
+                    if let Ok(task_url) = url::Url::parse(&url) {
+                        format!("{}://{}", task_url.scheme(), task_url.host_str().unwrap_or("localhost"))
+                    } else {
+                        "http://localhost".to_string()
+                    }
+                });
+
+            if page_type.is_empty() || page_type == "unknown" {
+                if let Some(st) = shared_type { page_type = st; }
+            }
+                
+            let base_url = url::Url::parse(&origin_str).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
+            let url_obj = base_url.join(&url).unwrap_or(base_url);
+            let raw_path = url_obj.path();
+            let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
+            let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
+            let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
+
+            let mut page_data: serde_json::Value = selector_info.clone();
+            if let Some(obj) = page_data.as_object_mut() {
+                obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
+                obj.insert("link".to_string(), json!(url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()));
+                obj.insert("type".to_string(), json!(page_type.clone()));
+                
+                if let Some(item_sel) = selector_info.get("itemSelector") {
+                    obj.insert("item".to_string(), item_sel.clone()); 
+                }
+                if let Some(parent_sel) = selector_info.get("parent") {
+                    obj.insert("node".to_string(), parent_sel.clone()); 
+                }
+                obj.insert("detail".to_string(), json!(false));
+            }
+
+            let ref_for_page = if !task.r#ref.is_empty() { &task.r#ref } else { raw_path };
+            let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(ref_for_page), None).await;
+            println!("[Scheduler] Page cache updated in DB (including head selector).");
+        }
+        
+        // [LIST MODE] 지능형 리스트 추출 (LLM 기반)
+        let list_log = json!({ "category": "List Processing", "summary": "Extracting list data with LLM...", "spinner": "⠋" });
+        log_task_progress(app_handle, &task.id, &list_log);
+
+        let mut all_extracted_items = Vec::new();
+        
+        // 병합 대기열을 위한 변수들
+        let mut pending_merge: Option<serde_json::Value> = None;
+        let mut merge_countdown = 0;
+
+        let pug_list = {
+            let clean_html_path = data_manager.get_path("clean_html");
+            let clean_content = data_manager.load(&clean_html_path)?;
+            let document = scraper::Html::parse_document(&clean_content);
+            
+            // 🌟 5. alt 속성 주입을 위한 headers 수집을 완전히 폐기하고 None으로 PUG를 생성합니다.
+            parsing::split_doc_to_pug_list_advanced(
+                &document, 
+                &target_selector, 
+                PugMode::FullContent, 
+                None
+            )
+        };
+
         if !pug_list.is_empty() {
-            // 리스트 추출을 위한 모델 리레이
+            // 🌟 [CRITICAL FIX 2] 리스트 추출은 짧은 item_pug 조각만 독립적으로 읽으므로, 
+            // 무겁고 호환되지 않는 Base 스냅샷 로딩을 원천 차단합니다.
             model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
             for (idx, item_pug) in pug_list.iter().enumerate() {
@@ -1459,6 +1468,7 @@ async fn process_task(
                 log_task_progress(app_handle, &task.id, &payload);
                 emit_term(&format!("[STAGE-3] {}", summary_msg));
 
+                // 🌟 [CRITICAL FIX 3] E0061 해결: 인자 5개를 받도록 변경된 list2json 구조에 완벽하게 맞춥니다.
                 let task_question = parsing::list2json(
                     &page_type, 
                     &url, 
@@ -1468,13 +1478,12 @@ async fn process_task(
                 );
                 
                 // ==================================================================
-                // 🌟 [DEBUG] 각 루프마다 LLM에 전달되는 최종 프롬프트 컨텍스트를 저장합니다.
+                // 🌟 [DEBUG] 회원님 요청: 각 루프마다 LLM에 들어가는 100% 날것의 Context를 텍스트 파일로 박제합니다.
                 // ==================================================================
                 let debug_file_path = pug_logs_dir.join(format!("debug_context_item_{}.txt", idx + 1));
                 let _ = std::fs::write(&debug_file_path, &task_question);
-                
-                let head_status = if thead_pug.is_empty() { "Missing" } else { "Attached" };
-                println!("\n[DEBUG-CONTEXT] 📝 Item {}/{} (Header: {}) -> {:?}", idx + 1, pug_list.len(), head_status, debug_file_path);
+                println!("\n[DEBUG-CONTEXT] 📝 Item {}/{} 의 Context가 저장되었습니다: {:?}", idx + 1, pug_list.len(), debug_file_path);
+                println!("[DEBUG-CONTEXT] 🔍 텍스트 길이: {} 글자", task_question.len());
                 // ==================================================================
                 
                 // 🌟 [교체 구간 2-B] src/scheduler.rs 의 리스트 추출 루프 내부
@@ -1506,21 +1515,9 @@ async fn process_task(
                     Ok(res_text) => {
                         let mut parsed_json = parsing::parse_json_from_llm(&res_text);
                         
-                        // 🌟 [CRITICAL FIX] LLM이 키값에 공백을 넣거나 대소문자를 섞었을 때(예: {"Goods ": ...})를 완벽히 방어합니다.
-                        let mut target_key = page_type.clone();
-                        if parsed_json.get(&target_key).is_none() {
-                            if let Some(obj) = parsed_json.as_object() {
-                                for k in obj.keys() {
-                                    if k.trim().to_lowercase() == page_type {
-                                        target_key = k.clone();
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        // 찾아낸 가장 정확한 target_key로 껍데기(Outer Shell)를 벗겨냅니다.
-                        let mut item_json = if let Some(inner) = parsed_json.get_mut(&target_key) {
+                        // 🌟 [CRITICAL FIX] LLM이 {"order": {...}} 형태로 껍데기를 씌워서 반환하므로,
+                        // page_type(예: "order", "goods") 키를 찾아서 알맹이만 빼냅니다.
+                        let mut item_json = if let Some(inner) = parsed_json.get_mut(&page_type) {
                             inner.take() // 알맹이 적중 시 꺼냄
                         } else {
                             parsed_json // 방어 로직: LLM이 껍데기 없이 바로 뱉었을 경우 그대로 사용
@@ -1669,27 +1666,16 @@ async fn process_task(
 
                     let mut parsed_json = parsing::parse_json_from_llm(&res.text);
                     
-                    // 🌟 [CRITICAL FIX] 디테일 모드에서도 키(Key) 공백/대소문자 오염 방어 로직 동일하게 적용
-                    let mut target_key = page_type.clone();
-                    if parsed_json.get(&target_key).is_none() {
-                        if let Some(obj) = parsed_json.as_object() {
-                            for k in obj.keys() {
-                                if k.trim().to_lowercase() == page_type {
-                                    target_key = k.clone();
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    extracted_data = if let Some(inner) = parsed_json.get_mut(&target_key) {
+                    // 🌟 [CRITICAL FIX] LLM이 {"order": {...}} 형태로 껍데기를 씌워서 반환하므로,
+                    // page_type(예: "order", "goods") 키를 찾아서 알맹이만 빼냅니다.
+                    extracted_data = if let Some(inner) = parsed_json.get_mut(&page_type) {
                         inner.take() // 알맹이 적중 시 꺼냄
                     } else {
-                        parsed_json // 방어 로직
+                        parsed_json // 방어 로직: LLM이 껍데기 없이 바로 뱉었을 경우 그대로 사용
                     };
 
                 } else {
-                    return Err(anyhow::anyhow!("Qwen 3.5 Generator not available"));
+                    println!("[Scheduler] ERROR: Qwen 3.5 generator is missing!");
                 }
             }
         }
@@ -1804,8 +1790,7 @@ async fn process_task(
     } else {
         // 🌟 [CRITICAL FIX] [LIST MODE] items 배열을 순회하며 낱개로 쪼개어 각각 DB에 독립된 문서로 저장합니다!
         if let Some(items) = extracted_data.get("items").and_then(|v| v.as_array()) {
-            // 🌟 [CRITICAL FIX] 리스트 전처리 항목은 무조건 Draft(대기) 상태로 집계해야 프론트엔드에서 'Draft (13)' 처럼 정상 표기됩니다!
-            is_new_draft_global = true; 
+            is_new_draft_global = false; // 리스트 업데이트 통계 기준 처리
             
             for item_val in items.iter() {
                 let mut single_item = item_val.clone();
@@ -2072,29 +2057,29 @@ async fn update_team_base_metrics(
         let cc_node = pages.entry(task_cc).or_insert(json!({})).as_object_mut().unwrap();
         let page_type_node = cc_node.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
 
-        let items_count = items.len() as i64; // 🌟 [핵심] 실제 추출된 아이템 개수
+        let items_count = items.len() as i64; // 🌟 [핵심 복구] 실제 추출된 배열의 아이템 개수 구하기
 
         if is_new_draft {
             let draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
-            page_type_node.insert("draft".to_string(), json!(draft + items_count)); // 1 대신 items_count 추가
+            page_type_node.insert("draft".to_string(), json!(draft + items_count)); // 🌟 1 대신 items_count 누적
         } else {
             let draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
             let count = page_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
             if draft > 0 { page_type_node.insert("draft".to_string(), json!(draft - 1)); }
-            page_type_node.insert("count".to_string(), json!(count + items_count)); // 1 대신 items_count 추가
+            page_type_node.insert("count".to_string(), json!(count + items_count)); // 🌟 1 대신 items_count 누적
         }
-    } 
+    } // 👈 여기서 첫 번째 참조(pages)가 안전하게 종료됩니다.
 
     // --- [블록 2: 글로벌 전체 통계 및 Min/Max 업데이트] ---
     {
         let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
         let global_type_node = base.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
         
-        let items_count = items.len() as i64; // 🌟 [핵심] 실제 추출된 아이템 개수
+        let items_count = items.len() as i64; // 🌟 [핵심 복구] 글로벌 통계용 개수 구하기
 
         if !is_new_draft {
             let global_count = global_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-            global_type_node.insert("count".to_string(), json!(global_count + items_count)); // 1 대신 items_count 추가
+            global_type_node.insert("count".to_string(), json!(global_count + items_count)); // 🌟 1 대신 items_count 누적
         }
 
         let properties = [
