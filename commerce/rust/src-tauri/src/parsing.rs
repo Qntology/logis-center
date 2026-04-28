@@ -611,9 +611,9 @@ pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
 
 [SCHEMA DEFINITIONS]
 {TYPE}:
-  - status: String. Choose one from:
+  - status: String. Choose one:
     {STATUS_OPTIONS}
-  - substantial: Array of Strings. Choose applicable ones from:
+  - substantial: String. Choose one:
     * 'size': Physical dimensions or volume.
     * 'weight': Mass or heaviness.
     * 'shipping_fee': Cost of delivery.
@@ -626,7 +626,7 @@ pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
     * 'max_discount_amount': Maximum cap for a discount.
     * 'usage_limit': Maximum number of times usable globally.
     * 'usage_per': Maximum number of times usable per user.
-  - find: Array of Strings. Choose applicable ones from:
+  - find: String. Choose one:
     * 'many': High quantity, count, or volume.
     * 'few': Low quantity, count, or volume.
     * 'much': High financial value, price, or amount.
@@ -638,8 +638,8 @@ pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
 {
   "{TYPE}" : {
     "status": "...",
-    "substantial": ["..."],
-    "find": ["..."]
+    "substantial": "...",
+    "find": "..."
   }
 }
 
