@@ -635,7 +635,11 @@ Type: {TYPE}
 Text: {TEXT}
 
 [OUTPUT FORMAT]
-{...}
+{
+  "{TYPE}_status": "...",
+  "substantial": "...",
+  "find": "..."
+}
 
 [ACTION] RETURN STRICTLY VALID JSON ONLY.
 NO EXPLANATION. NO THINKING. /no_think"###;

@@ -2789,10 +2789,13 @@ async function initSession() {
                     updated_at: activeTask.updated_at || Date.now()
                 });
                 
-                // 프론트엔드의 진행 상태 락(Lock)을 다시 걸어주고 스피너를 돌립니다.
-                
-                // 프론트엔드의 진행 상태 락(Lock)을 다시 걸어주고 스피너를 돌립니다.
-                isExtracting = true;
+                // 🌟 [CRITICAL FIX] 검색 작업인지 문서 추출 작업인지 명확히 구분하여 알맞은 전역 락(Lock)을 복구합니다!
+                if (activeTask.id.startsWith("search_")) {
+                    isSearching = true; // 검색 중복 실행 방지
+                    if (btnSubmit) btnSubmit.style.display = "none";
+                } else {
+                    isExtracting = true; // 추출 중복 실행 방지
+                }
                 activeTaskId = activeTask.id; // 현재 활성화된 작업 ID 복구
                 startSpinner();
                 

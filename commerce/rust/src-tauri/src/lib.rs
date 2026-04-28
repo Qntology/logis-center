@@ -562,6 +562,14 @@ async fn ai_search_complex(
     emit_term(&format!("   - 검색 모드: {}", search_mode));
     emit_term("==================================================\n");
 
+    // 🌟 [CRITICAL FIX] 백엔드 레벨에서도 중복 실행을 완벽하게 차단하여 
+    // 이전 작업의 모델(Qwen3)이 도중에 강제로 Purge(증발)되는 에러를 원천 봉쇄합니다!
+    if IS_SEARCHING.load(Ordering::SeqCst) {
+        let err_msg = "Another search is currently running. Request rejected.";
+        emit_term(&format!("🚨 [ERROR] {}", err_msg));
+        return Err(err_msg.to_string());
+    }
+
     IS_SEARCHING.store(true, Ordering::SeqCst);
     
     // 🌟 [CRITICAL FIX] DB 동기화 지연 시 프론트엔드 새로고침 증발을 막기 위한 전역 메모리 캐싱!
