@@ -546,100 +546,101 @@ Metrics: {METRICS}
 pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
     // 🌟 도메인(Type)별로 허용되는 상태(Status) 값을 완벽히 분리하여 매핑합니다.
     let status_options = match seg_type {
-        "tracking" => "* 'draft'
-  * 'progress'
-  * 'return'
-  * 'complete'
-  * 'error'",
-        "goods" => "* 'draft'
-  * 'show'
-  * 'hide'
-  * 'progress'
-  * 'stop'
-  * 'cancel'
-  * 'refund'
-  * 'return'
-  * 'exchange'
-  * 'expire'
-  * 'complete'
-  * 'error'",
-        "order" => "* 'draft'
-  * 'progress'
-  * 'stop'
-  * 'cancel'
-  * 'refund'
-  * 'return'
-  * 'exchange'
-  * 'expire'
-  * 'complete'
-  * 'error'",
-        "coupon" | "event" => "* 'show'
-  * 'progress'
-  * 'hide'
-  * 'stop'
-  * 'cancel'
-  * 'expire'
-  * 'complete'
-  * 'error'",
-        "review" => "* 'progress'
-  * 'stop'
-  * 'cancel'
-  * 'refund'
-  * 'return'
-  * 'exchange'
-  * 'expire'
-  * 'complete'
-  * 'error'",
-        _ => "* 'show'
-  * 'progress'
-  * 'remove'
-  * 'hide'
-  * 'stop'
-  * 'cancel'
-  * 'refund'
-  * 'return'
-  * 'exchange'
-  * 'expire'
-  * 'complete'
-  * 'error'"
+        "tracking" => "* 'draft': Shipment preparation or pending pickup.
+  * 'progress': Currently in transit or out for delivery.
+  * 'return': Returning to sender.
+  * 'complete': Successfully delivered to the recipient.
+  * 'error': Delivery exception, lost, or failed.",
+        "goods" => "* 'draft': Product is being created, not yet published.
+  * 'show': Visible and available for sale on storefront.
+  * 'hide': Hidden from the storefront.
+  * 'progress': Currently being restocked or updated.
+  * 'stop': Sales temporarily suspended.
+  * 'cancel': Product discontinued or cancelled.
+  * 'refund': Related to refunded inventory.
+  * 'return': Related to returned inventory.
+  * 'exchange': Related to exchanged inventory.
+  * 'expire': Product expired.
+  * 'complete': Completely sold out or finished lifecycle.
+  * 'error': Data or system error.",
+        "order" => "* 'draft': Pending payment or in cart.
+  * 'progress': Order processing or preparing for shipment.
+  * 'stop': Order on hold.
+  * 'cancel': Order cancelled before fulfillment.
+  * 'refund': Payment refunded.
+  * 'return': Items returned by customer.
+  * 'exchange': Items being exchanged.
+  * 'expire': Payment window expired.
+  * 'complete': Order fully fulfilled and closed.
+  * 'error': Payment or processing error.",
+        "coupon" | "event" => "* 'show': Visible to customers.
+  * 'progress': Currently active and running.
+  * 'hide': Hidden from customers.
+  * 'stop': Temporarily paused.
+  * 'cancel': Terminated early.
+  * 'expire': Passed its expiration date.
+  * 'complete': Successfully finished its run.
+  * 'error': Configuration error.",
+        "review" => "* 'progress': Under moderation or pending approval.
+  * 'stop': Blocked or suspended review.
+  * 'cancel': Deleted or withdrawn by user.
+  * 'refund': Associated with a refunded order.
+  * 'return': Associated with a returned order.
+  * 'exchange': Associated with an exchanged order.
+  * 'expire': Review period expired.
+  * 'complete': Published and visible.
+  * 'error': Rejected or marked as spam.",
+        _ => "* 'show': Visible state.
+  * 'progress': Active/Processing state.
+  * 'remove': Deleted state.
+  * 'hide': Hidden state.
+  * 'stop': Paused/Stopped state.
+  * 'cancel': Cancelled state.
+  * 'refund': Refunded state.
+  * 'return': Returned state.
+  * 'exchange': Exchanged state.
+  * 'expire': Expired state.
+  * 'complete': Finished/Completed state.
+  * 'error': Error state."
     };
 
     let template = r###"Analyze the specific text segment and extract the logical attributes based on the defined schema.
 
 [CURRENT SEGMENT]
-{TEXT}
+Type: {TYPE}
+Text: {TEXT}
 
 [SCHEMA DEFINITIONS]
 {TYPE}:
-  - status:
+  - status: String. Choose one from:
     {STATUS_OPTIONS}
-  - substantial:
-    * 'size'
-    * 'weight'
-    * 'shipping_fee'
-    * 'shipping_duration'
-    * 'sale_price'
-    * 'supply_price'
-    * 'low_stock_threshold'
-    * 'discount'
-    * 'min_order_amount'
-    * 'max_discount_amount'
-    * 'usage_limit'
-    * 'usage_per'
-  - find:
-    * 'many'
-    * 'few'
-    * 'much'
-    * 'little'
-    * 'heavy'
-    * 'light'
+  - substantial: Array of Strings. Choose applicable ones from:
+    * 'size': Physical dimensions or volume.
+    * 'weight': Mass or heaviness.
+    * 'shipping_fee': Cost of delivery.
+    * 'shipping_duration': Time taken for delivery.
+    * 'sale_price': Final selling price to the customer.
+    * 'supply_price': Wholesale or original cost.
+    * 'low_stock_threshold': Minimum inventory alert level.
+    * 'discount': Amount or percentage of price reduction.
+    * 'min_order_amount': Minimum spend required to trigger an action.
+    * 'max_discount_amount': Maximum cap for a discount.
+    * 'usage_limit': Maximum number of times usable globally.
+    * 'usage_per': Maximum number of times usable per user.
+  - find: Array of Strings. Choose applicable ones from:
+    * 'many': High quantity, count, or volume.
+    * 'few': Low quantity, count, or volume.
+    * 'much': High financial value, price, or amount.
+    * 'little': Low financial value, price, or amount.
+    * 'heavy': High physical weight.
+    * 'light': Low physical weight.
 
 [OUTPUT FORMAT]
 {
   "{TYPE}" : {
-      "status": "...",
-      "substantial": "...",
-      "find": "..."
+    "status": "...",
+    "substantial": ["..."],
+    "find": ["..."]
   }
 }
 
