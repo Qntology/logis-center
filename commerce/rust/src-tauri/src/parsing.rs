@@ -607,8 +607,7 @@ pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
     let template = r###"Analyze the specific text segment and extract the logical attributes based on the defined schema.
 
 [CURRENT SEGMENT]
-Type: {TYPE}
-Text: {TEXT}
+{TEXT}
 
 [SCHEMA DEFINITIONS]
 {TYPE}:
