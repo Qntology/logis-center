@@ -544,9 +544,9 @@ async fn ai_search_complex(
     language: String,
     device_preference: Option<String>,
     search_mode: String,
-    cc: String,      // 🌟 [추가] 프론트에서 보낸 현재 위치
-    bcc: String,     // 🌟 [추가] 프론트에서 보낸 현재 위치
-    ref_id: String,  // 🌟 [추가] 프론트에서 보낸 현재 위치
+    cc: String,
+    bcc: String,
+    ref_id: String,
 ) -> Result<Value, String> {
     
     let emit_term = |msg: &str| {
@@ -564,6 +564,19 @@ async fn ai_search_complex(
 
     IS_SEARCHING.store(true, Ordering::SeqCst);
     
+    // 🌟 [CRITICAL FIX] DB 동기화 지연 시 프론트엔드 새로고침 증발을 막기 위한 전역 메모리 캐싱!
+    {
+        let mut mem_guard = crate::ACTIVE_TASK_MEM.write().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        *mem_guard = Some(json!({
+            "id": task_id.clone(),
+            "status": 1,
+            "query": query.clone(),
+            "created_at": now,
+            "updated_at": now
+        }));
+    }
+
     let cancel_token = state.cancellation_token.clone();
     
     let store_opt = {
@@ -578,7 +591,7 @@ async fn ai_search_complex(
         store_guard.as_ref().cloned() 
     };
 
-    // 🌟 DB에 Task 및 Message 등록
+    // 🌟 1. DB에 Task 및 Message 등록
     if let Some(store) = store_opt.as_ref() {
         let now = chrono::Utc::now().timestamp_millis();
         let task = crate::store::Task {
@@ -589,15 +602,28 @@ async fn ai_search_complex(
             cc: cc.clone(), bcc: bcc.clone(), r#ref: ref_id.clone(), 
             data_json: json!({"query": query.clone(), "mode": search_mode.clone()}).to_string(),
             created_at: now, updated_at: now,
-            status: 10, // 🌟 [CRITICAL FIX] 검색도 대기열에 들어가므로 일단 Pending(10)으로 시작!
+            status: 10, 
         };
         let _ = store.add_task(task).await;
         
+        let from_user = "user".to_string();
+        let to_system = "system".to_string();
+
+        // 🌟 [CRITICAL FIX] 1. 사용자 질문 말풍선 (main.ts와 동일하게 _query 식별자 사용 및 완료 상태)
+        let user_msg_id = format!("{}_query", task_id);
         let _ = store.add_message(
-            &task_id, "user", &query, 
-            Some(&task_id), Some(10), // 🌟 [CRITICAL FIX] 말풍선도 Pending(10) 상태로 표시
+            &user_msg_id, "user", &query, 
+            Some(&task_id), Some(9), // 🚨 None 대신 task_id를 연결해 DB의 NOT NULL 제약조건 충돌 방지
             Some(&cc), Some(&bcc), Some(&ref_id), 
-            None, None, Some("talk"), None
+            Some(&from_user), Some(&to_system), Some("talk"), None // 🚨 from, to 누락으로 인한 저장 실패(DB 롤백) 완벽 차단!
+        ).await;
+
+        // 🌟 [CRITICAL FIX] 2. 시스템 진행 상태 말풍선 (main.ts와 동일한 task_id 사용 및 대기 상태)
+        let _ = store.add_message(
+            &task_id, "system_task", "Preparing AI Engine...", 
+            Some(&task_id), Some(10), // 스피너 연동을 위해 10(Pending) 처리
+            Some(&cc), Some(&bcc), Some(&ref_id), 
+            Some(&to_system), Some(&from_user), Some("talk"), None // 🚨 시스템이 응답하는 형태이므로 from/to 스왑
         ).await;
     }
 
@@ -621,11 +647,12 @@ async fn ai_search_complex(
         model_guard.as_ref().unwrap().clone() 
     }; 
 
-    // 🌟 [CRITICAL FIX] 대기열(Pending) 통과 후 모델을 잡았을 때! 
-    // DB와 UI의 상태를 10(Pending)에서 1(Processing)로 명확하게 동기화합니다.
+    // 🌟 2. 대기열(Pending) 통과 후 상태 업데이트
     if let Some(store) = store_opt.as_ref() {
-        let _ = store.update_task_status(&task_id, 1).await;
-        let _ = store.update_message_status(&task_id, 1, Some("Analyzing...")).await;
+        let _ = store.update_task_status(&task_id, 1).await; // 1: Processing
+        
+        // 시스템 말풍선 텍스트만 깔끔하게 변경합니다.
+        let _ = store.update_message_status(&task_id, 1, Some("Analyzing semantic intent...")).await;
     }
 
     // 화면의 찌꺼기를 날려버리는 트리거(Processing) 발송!
@@ -711,25 +738,36 @@ async fn ai_search_complex(
 
     IS_SEARCHING.store(false, Ordering::SeqCst);
     
-    // 🌟 검색 종료 후 결과를 Message(히스토리)로 남기고 Task 상태를 변경
     if let Some(store) = store_opt.as_ref() {
         match &search_process {
-            Ok(_) => { // 🌟 result 안 쓰므로 _ 로 변경
+            Ok(_) => { 
                 let _ = store.update_task_status(&task_id, 9).await; 
-                // 🌟 [CRITICAL FIX 6] 사용자의 원래 질문이 지워지지 않도록 텍스트 업데이트(Some(reply))를 None으로 바꿉니다!
+                
+                // 🚨 [CRITICAL FIX] 텍스트를 query로 덮어쓰지 말고 None을 전달하여 시스템 상태를 그대로 둡니다!
                 let _ = store.update_message_status(&task_id, 9, None).await;
             },
             Err(e) => {
                 let status_code = if e.contains("cancelled") { 3 } else { 6 };
                 let _ = store.update_task_status(&task_id, status_code).await;
-                // 🌟 여기서도 텍스트 보호를 위해 None으로 처리
-                let _ = store.update_message_status(&task_id, status_code, None).await;
+                
+                // 🚨 [CRITICAL FIX] 에러 시에도 사용자의 쿼리를 덧붙이지 않고 깔끔하게 에러 사유만 표시합니다.
+                let error_msg = format!("Task failed or cancelled: {}", e);
+                let _ = store.update_message_status(&task_id, status_code, Some(&error_msg)).await;
+            }
+        }
+    }
+
+    // 🌟 [CRITICAL FIX] 검색 파이프라인 완료 후 메모리 캐시를 깔끔하게 비워줍니다.
+    {
+        let mut mem_guard = crate::ACTIVE_TASK_MEM.write().unwrap();
+        if let Some(mem) = mem_guard.as_ref() {
+            if mem.get("id").and_then(|v| v.as_str()) == Some(task_id.as_str()) {
+                *mem_guard = None;
             }
         }
     }
 
     model.deep_purge_resources().await; 
-    
     search_process
 }
 

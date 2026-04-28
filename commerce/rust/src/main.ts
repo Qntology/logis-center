@@ -296,16 +296,25 @@ function switchTab(tabName: string) {
         else c.classList.remove("active");
     });
     currentTab = tabName;
+    
     if (tabName === "settings") {
         settingsBtn?.classList.add("active-emoji", "active");
-        fetchChatHistory();
+        
+        // 🌟 [CRITICAL FIX] 검색 중(isSearching)이거나 추출 중(isExtracting)일 때는 
+        // 탭을 전환하더라도 억지로 히스토리를 리셋하여 방금 작성한 말풍선을 날려버리지 않도록 방어합니다!
+        if (!isSearching && !isExtracting) {
+            fetchChatHistory();
+        } else if (chatTalks && chatTalks.children.length === 0) {
+            // 채팅창이 완전히 비어있을 때만 리셋 없이 조용히 내역을 불러옵니다.
+            fetchChatHistory(false, true); 
+        }
     } else {
         settingsBtn?.classList.remove("active-emoji", "active");
     }
+    
     if (tabName === "list") refreshList(); 
     if (tabName === "automation") initBrowserDropdown();
 }
-
 function openWidget(tabName: string = "list") {
     if (!isExpanded) {
         isExpanded = true;
@@ -1030,13 +1039,25 @@ btnSubmit?.addEventListener("click", async () => {
     openWidget("settings");
     startSpinner();
 
+    // 🌟 [CRITICAL FIX 1] 사용자 질문 말풍선을 독립적으로 생성하고 완료(9) 상태로 영구 고정합니다.
     renderMessage({
-        id: taskId,
+        id: `${taskId}_query`,
         role: "user", 
         text: query,
-        status: 10, // 🌟 [CRITICAL FIX] UI에 즉시 📥 PENDING 상태로 띄웁니다!
+        status: 9, 
         created_at: startTime,
-        updated_at: startTime,
+        updated_at: startTime
+        // 🚨 [수정] task_id 속성을 완전히 삭제해야 일반 말풍선으로 예쁘게 렌더링됩니다!
+    });
+
+    // 🌟 [CRITICAL FIX 2] 그 바로 아래에 AI의 시스템 상태 말풍선(스피너)을 별도로 띄웁니다.
+    renderMessage({
+        id: taskId,
+        role: "system_task",
+        text: "Preparing AI Engine...",
+        status: 10, 
+        created_at: startTime + 1, // 순서 보장을 위해 1ms 추가
+        updated_at: startTime + 1,
         task_id: taskId
     });
 
@@ -1054,15 +1075,7 @@ btnSubmit?.addEventListener("click", async () => {
             refId: activeContext.ref || ""
         });
 
-        renderMessage({
-            id: taskId,
-            role: "user",
-            text: query, 
-            status: 9, 
-            created_at: startTime,
-            updated_at: Date.now(),
-            task_id: taskId
-        });
+        // 🚨 기존에 있던 renderMessage(..., role: "user", status: 9) 삭제 완료 (위에서 이미 처리함)
 
         if (aiResultsArea && aiResultsContent) {
             aiResultsArea.style.display = "block";
@@ -1094,12 +1107,13 @@ btnSubmit?.addEventListener("click", async () => {
         if (aiResultsContent) {
             aiResultsContent.innerHTML = "<div style='color:#ef4444;'>Error: " + e + "</div>"; 
         }
+        // 에러 발생 시 시스템 말풍선을 에러 상태로 업데이트
         renderMessage({
             id: taskId,
             role: "system_task",
-            text: `AI Search Error: ${query}`,
+            text: `AI Search Error: ${e}`,
             status: 6, 
-            created_at: startTime,
+            created_at: startTime + 1,
             updated_at: Date.now(),
             task_id: taskId
         });
@@ -2753,16 +2767,29 @@ async function initSession() {
             if (activeTask && activeTask.id && (activeTask.status === 1 || activeTask.status === 10)) {
                 console.log("[WIDGET] Resuming active task from fallback:", activeTask.id);
                 
+                // 🌟 [CRITICAL FIX] 새로고침 시 메모리에 살아있는 내 질문(query)도 같이 렌더링 복구합니다!
+                if (activeTask.query) {
+                    renderMessage({
+                        id: `${activeTask.id}_query`,
+                        role: "user",
+                        text: activeTask.query,
+                        status: 9,
+                        created_at: activeTask.created_at || Date.now(),
+                        updated_at: activeTask.updated_at || Date.now()
+                    });
+                }
+
                 renderMessage({
                     id: activeTask.id,
                     task_id: activeTask.id,
                     role: "system_task",
-                    // 🌟 [CRITICAL FIX] 메모리에 최신 퍼센트 요약본이 있다면 그걸 쓰고, 아니면 기본 문구를 씁니다!
                     text: activeTask.summary || ("Resuming Task: " + (activeTask.link || "Local Source")),
                     status: activeTask.status,
-                    created_at: activeTask.created_at || Date.now(),
+                    created_at: (activeTask.created_at || Date.now()) + 1, // 스피너가 내 질문 아래에 오도록 +1ms
                     updated_at: activeTask.updated_at || Date.now()
                 });
+                
+                // 프론트엔드의 진행 상태 락(Lock)을 다시 걸어주고 스피너를 돌립니다.
                 
                 // 프론트엔드의 진행 상태 락(Lock)을 다시 걸어주고 스피너를 돌립니다.
                 isExtracting = true;
@@ -3251,7 +3278,10 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
         }
 
         const displayMsg: ChatMessage = { ...msg, text: textContent };
-        const isTask = displayMsg.role === "system_task" || (displayMsg.role === "user" && !!displayMsg.task_id && displayMsg.task_id.startsWith("search_"));
+        
+        // 🌟 [CRITICAL FIX] 렌더링 함수와 동일하게 _query 식별자가 있는 사용자 메시지는 
+        // 시스템 Task ID로 병합되지 않도록 방어 로직(!displayMsg.id.endsWith("_query"))을 추가합니다!
+        const isTask = displayMsg.role === "system_task" || (displayMsg.role === "user" && !!displayMsg.task_id && displayMsg.task_id.startsWith("search_") && !displayMsg.id.endsWith("_query"));
         const domId = isTask ? (displayMsg.task_id || displayMsg.id) : displayMsg.id;
         
         const existingEl = chatTalks.querySelector(`[id="${domId}"]`) as HTMLElement;
@@ -3321,15 +3351,15 @@ function createMessageHTML(msg: ChatMessage) {
     };
     const currentStatus = statusMap[msg.status] || statusMap[0];
     
-    const isTaskBubble = msg.role === "system_task" || (msg.role === "user" && !!msg.task_id && msg.task_id.startsWith("search_"));
+    // 🚨 [수정] _query 식별자가 붙은 메시지는 절대 Task-Bubble(진행상태 바)로 변신하지 못하게 원천 차단!
+    const isTaskBubble = msg.role === "system_task" || (msg.role === "user" && !!msg.task_id && msg.task_id.startsWith("search_") && !msg.id.endsWith("_query"));
     const roleClass = msg.role === "user" ? "user" : "system";
     const domId = isTaskBubble ? (msg.task_id || msg.id) : msg.id;
 
-    // 🌟 [CRITICAL FIX] 화면이 지워졌다 켜져도 절대 흔들리지 않는 불변의 생성 시간(태초의 시간)을 Task ID에서 직접 뽑아냅니다!
+    // 🚨 [수정] 복잡한 정규식 대신, 시스템 메시지이면 무조건 사용자 메시지(기준 시간)보다 +1ms를 강제로 더해서 순서를 영구 고정합니다.
     let trueCreatedAt = msg.created_at;
-    const match = domId.match(/_(\d+)$/);
-    if (match) {
-        trueCreatedAt = parseInt(match[1]);
+    if (msg.role === "system_task" && domId.startsWith("search_") && !domId.endsWith("_query")) {
+        trueCreatedAt += 1;
     }
     const timeStr = new Date(trueCreatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
@@ -3404,6 +3434,21 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
         try {
             activeTask = await invoke<any>("get_active_task_context");
             if (activeTask && activeTask.id) {
+                // 🌟 [CRITICAL FIX] DB에서 아직 긁어오지 못했다면 메모리 캐시의 query를 강제 주입해 내 질문 증발을 막습니다!
+                if (activeTask.query) {
+                    const userExists = messages.find(m => m.id === `${activeTask.id}_query`);
+                    if (!userExists) {
+                        messages.push({
+                            id: `${activeTask.id}_query`,
+                            role: "user",
+                            text: activeTask.query,
+                            status: 9,
+                            created_at: activeTask.created_at || Date.now(),
+                            updated_at: activeTask.updated_at || Date.now()
+                        });
+                    }
+                }
+
                 const exists = messages.find(m => m.id === activeTask.id || m.task_id === activeTask.id);
                 if (!exists) {
                     messages.push({
@@ -3412,7 +3457,7 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                         role: "system_task",
                         text: "Task Started: " + (activeTask.link || "Local Source"),
                         status: activeTask.status || 1,
-                        created_at: activeTask.created_at || Date.now(),
+                        created_at: (activeTask.created_at || Date.now()) + 1, // 순서 보정
                         updated_at: activeTask.updated_at || Date.now()
                     });
                 }

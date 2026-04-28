@@ -455,35 +455,31 @@ pub fn para2graph(language: &str) -> String {
 
 [DOCUMENT SCANNING & STRICT SEGMENTATION LOGIC]
 1. EXACT COPY: Copy the full input sentence into 'original_text' without changing anything.
-2. TAGGED PIPE PLANNING: In the 'segmented_plan' field, you MUST prefix every segment with its assigned category tag in brackets, followed by the exact substring, separated by pipes ("|"). Structure it strictly as "[tag1] chunk1 | [tag2] chunk2".
-3. MAXIMAL GROUPING (CRITICAL): Group all contiguous words belonging to the same category into a SINGLE segment. DO NOT split subjects from their numeric conditions. Break the segment ONLY when the category logically shifts.
+2. TAGGED PIPE PLANNING: In the 'segmented_plan' field, you MUST prefix every segment with its assigned type tag in brackets, followed by the exact substring, separated by pipes ('|'). Structure it strictly as '[tag1] chunk1 | [tag2] chunk2'.
+3. MAXIMAL GROUPING (CRITICAL): Group all contiguous words belonging to the same type into a SINGLE segment. DO NOT split subjects from their numeric conditions. Break the segment ONLY when the type logically shifts.
 4. STRICT ARRAY MAPPING: For EVERY tagged segment in 'segmented_plan', create exactly one object in the 'context' array sequentially.
 5. VERBATIM EXTRACTION: The 'text' field MUST be the exact substring from the plan, excluding the [tag] and | symbols. DO NOT translate, summarize, alter, or hallucinate any characters.
 
 [SCHEMA DEFINITIONS]
 - original_text: String. The exact, unaltered full natural language input.
-- segmented_plan: String. The original text with "[type] text | " format inserted strictly at category boundaries.
-- language: String. Default "{LANG}".
-- categories: The main semantic category. Evaluate strictly based on e-commerce business intent. Must be exactly one of:
-  * "order": Intent to measure sales performance or direct transactions. Triggers: conversion rate, sales volume, checkout, payment, cancellation, refund. (RULE: If the context measures buying success or revenue, classify as 'order' even if the word 'product' or 'item' is present).
-  * "goods": Intent to describe product catalog data, exposure, or traffic metrics. Triggers: page views, clicks, physical attributes, stock limits, unit prices. (RULE: Focuses on item specifications and customer traffic before the actual purchase).
-  * "tracking": Intent to manage logistics and fulfillment. Triggers: shipment status, dispatch, delivery duration, courier information.
-  * "review": Intent to analyze the voice of the customer. Triggers: feedback, ratings, reviews, CS messages, complaints.
-  * "coupon": Intent to manage specific discount vouchers. Triggers: coupon codes, issuance limits, discount amounts applied via coupons.
-  * "event": Intent to manage marketing campaigns or analyze broad operational trends. Triggers: promotions, exhibitions, seasonal sales, overarching managerial analysis requests.
-  * "": If none logically apply.
+- segmented_plan: String. The original text with '[type] text | ' format inserted strictly at type boundaries.
+- context:
+  - text: String.
+  - language: String. Default '{LANG}'.
+  - type: The main semantic type. Evaluate strictly based on e-commerce business intent. Must be exactly one of:
+    * 'order': Intent to measure sales performance or direct transactions. Triggers: conversion rate, sales volume, checkout, payment, cancellation, refund. (RULE: If the context measures buying success or revenue, classify as 'order' even if the word 'product' or 'item' is present).
+    * 'goods': Intent to describe product catalog data, exposure, or traffic metrics. Triggers: page views, clicks, physical attributes, stock limits, unit prices. (RULE: Focuses on item specifications and customer traffic before the actual purchase).
+    * 'tracking': Intent to manage logistics and fulfillment. Triggers: shipment status, dispatch, delivery duration, courier information.
+    * 'review': Intent to analyze the voice of the customer. Triggers: feedback, ratings, reviews, CS messages, complaints.
+    * 'coupon': Intent to manage specific discount vouchers. Triggers: coupon codes, issuance limits, discount amounts applied via coupons.
+    * 'event': Intent to manage marketing campaigns or analyze broad operational trends. Triggers: promotions, exhibitions, seasonal sales, overarching managerial analysis requests.
+    * '': If none logically apply.
 
 [OUTPUT FORMAT]
 {
   "original_text": "String",
   "segmented_plan": "String",
-  "context": [
-    {
-      "language": "String",
-      "type": "String",
-      "text": "String"
-    } 
-  ]
+  "context": [...]
 }
 
 [ACTION] RETURN STRICTLY VALID JSON ONLY.
@@ -497,7 +493,8 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 // [Zone: src/parsing.rs 교체 코드]
 // ==============================================
 pub fn extract_numeric_conditions(current: &str, input: &str, seg_type: &str, metrics_json: &str) -> String {
-    let template = r###"Task: Act as a deterministic semantic parser.
+    let template = r###"[Task]
+Act as a deterministic semantic parser.
 You must extract, transform, and normalize data from the natural language input into the strictly defined JSON output format based on the provided schema.
 
 [DATABASE METRICS CONTEXT]
@@ -506,18 +503,18 @@ Metrics: {METRICS}
 
 [SCHEMA DEFINITION]
 - operator: A string representing the comparison operator. Allowed values:
-  * "gt": Strictly greater than
-  * "gte": Greater than or equal to
-  * "lt": Strictly less than
-  * "lte": Less than or equal to
-  * "eq": Exact match
+  * 'gt': Strictly greater than
+  * 'gte': Greater than or equal to
+  * 'lt': Strictly less than
+  * 'lte': Less than or equal to
+  * 'eq': Exact match
 
 [TRANSFORMATION LOGIC - MANDATORY EXECUTION]
 1. ATTRIBUTE EXTRACTION: Identify the context of the numbers or comparative words in the text to determine the property type.
 2. RELATIVE VALUE CALCULATION (CRITICAL): 
    - If the query contains relative conditions, percentages, or comparative adjectives, you MUST use the [DATABASE METRICS CONTEXT] to calculate the EXACT absolute numeric threshold. 
    - Do NOT output percentages or descriptive text in the `value` field. Always compute and output the final absolute number derived from the min/max metrics.
-3. OPERATOR SELECTION: Map the semantic intent to "gt", "gte", "lt", "lte", or "eq".
+3. OPERATOR SELECTION: Map the semantic intent to 'gt', 'gte', 'lt', 'lte', or 'eq'.
 
 [FULL QUERY CONTEXT]
 {INPUT}
@@ -549,31 +546,96 @@ Metrics: {METRICS}
 pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
     // 🌟 도메인(Type)별로 허용되는 상태(Status) 값을 완벽히 분리하여 매핑합니다.
     let status_options = match seg_type {
-        "tracking" => "'draft', 'progress', 'return', 'complete', 'error'",
-        "goods" => "'draft', 'show', 'hide', 'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'",
-        "order" => "'draft', 'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'",
-        "coupon" | "event" => "'show', 'progress', 'hide', 'stop', 'cancel', 'expire', 'complete', 'error'",
-        "review" => "'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'",
-        _ => "'show', 'progress', 'remove', 'hide', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'"
+        "tracking" => "* 'draft'
+  * 'progress'
+  * 'return'
+  * 'complete'
+  * 'error'",
+        "goods" => "* 'draft'
+  * 'show'
+  * 'hide'
+  * 'progress'
+  * 'stop'
+  * 'cancel'
+  * 'refund'
+  * 'return'
+  * 'exchange'
+  * 'expire'
+  * 'complete'
+  * 'error'",
+        "order" => "* 'draft'
+  * 'progress'
+  * 'stop'
+  * 'cancel'
+  * 'refund'
+  * 'return'
+  * 'exchange'
+  * 'expire'
+  * 'complete'
+  * 'error'",
+        "coupon" | "event" => "* 'show'
+  * 'progress'
+  * 'hide'
+  * 'stop'
+  * 'cancel'
+  * 'expire'
+  * 'complete'
+  * 'error'",
+        "review" => "* 'progress'
+  * 'stop'
+  * 'cancel'
+  * 'refund'
+  * 'return'
+  * 'exchange'
+  * 'expire'
+  * 'complete'
+  * 'error'",
+        _ => "* 'show'
+  * 'progress'
+  * 'remove'
+  * 'hide'
+  * 'stop'
+  * 'cancel'
+  * 'refund'
+  * 'return'
+  * 'exchange'
+  * 'expire'
+  * 'complete'
+  * 'error'"
     };
 
     let template = r###"Analyze the specific text segment and extract the logical attributes based on the defined schema.
 
 [SCHEMA DEFINITIONS]
-* {TYPE}_status: Extract the exact status mentioned. Choose ONLY from: {STATUS_OPTIONS}. If no status is explicitly mentioned, return null.
-* substantial: Extract specifically mentioned properties. Choose ONLY from: 'size', 'weight', 'shipping_fee', 'shipping_duration', 'sale_price', 'supply_price', 'low_stock_threshold', 'discount', 'min_order_amount', 'max_discount_amount', 'usage_limit', 'usage_per'. (CRITICAL: Return an array of strings ONLY if these exact words exist in the text. Do NOT blindly copy this list. If none exist, return null).
-* find: Extract search intents. Choose ONLY from: 'many', 'few', 'much', 'little', 'heavy', 'light'. (CRITICAL: Return an array of strings ONLY if these exact words exist in the text. Do NOT blindly copy this list. If none exist, return null).
+- {TYPE}_status: String. :
+  {STATUS_OPTIONS}
+- substantial: String. :
+  * 'size'
+  * 'weight'
+  * 'shipping_fee'
+  * 'shipping_duration'
+  * 'sale_price'
+  * 'supply_price'
+  * 'low_stock_threshold'
+  * 'discount'
+  * 'min_order_amount'
+  * 'max_discount_amount'
+  * 'usage_limit'
+  * 'usage_per'
+- find: String. :
+  * 'many'
+  * 'few'
+  * 'much'
+  * 'little'
+  * 'heavy' 
+  * 'light'
 
 [CURRENT SEGMENT]
-Category Type: {TYPE}
+Type: {TYPE}
 Text: {TEXT}
 
 [OUTPUT FORMAT]
-{
-  "{TYPE}_status": "...",
-  "substantial": "...",
-  "find": "..."
-}
+{...}
 
 [ACTION] RETURN STRICTLY VALID JSON ONLY.
 NO EXPLANATION. NO THINKING. /no_think"###;
