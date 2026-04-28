@@ -606,39 +606,41 @@ pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
 
     let template = r###"Analyze the specific text segment and extract the logical attributes based on the defined schema.
 
-[SCHEMA DEFINITIONS]
-- {TYPE}_status: String. :
-  {STATUS_OPTIONS}
-- substantial: String. :
-  * 'size'
-  * 'weight'
-  * 'shipping_fee'
-  * 'shipping_duration'
-  * 'sale_price'
-  * 'supply_price'
-  * 'low_stock_threshold'
-  * 'discount'
-  * 'min_order_amount'
-  * 'max_discount_amount'
-  * 'usage_limit'
-  * 'usage_per'
-- find: String. :
-  * 'many'
-  * 'few'
-  * 'much'
-  * 'little'
-  * 'heavy' 
-  * 'light'
-
 [CURRENT SEGMENT]
-Type: {TYPE}
-Text: {TEXT}
+{TEXT}
+
+[SCHEMA DEFINITIONS]
+{TYPE}:
+  - status:
+    {STATUS_OPTIONS}
+  - substantial:
+    * 'size'
+    * 'weight'
+    * 'shipping_fee'
+    * 'shipping_duration'
+    * 'sale_price'
+    * 'supply_price'
+    * 'low_stock_threshold'
+    * 'discount'
+    * 'min_order_amount'
+    * 'max_discount_amount'
+    * 'usage_limit'
+    * 'usage_per'
+  - find:
+    * 'many'
+    * 'few'
+    * 'much'
+    * 'little'
+    * 'heavy'
+    * 'light'
 
 [OUTPUT FORMAT]
 {
-  "{TYPE}_status": "...",
-  "substantial": "...",
-  "find": "..."
+  "{TYPE}" : {
+      "status": "...",
+      "substantial": "...",
+      "find": "..."
+  }
 }
 
 [ACTION] RETURN STRICTLY VALID JSON ONLY.
