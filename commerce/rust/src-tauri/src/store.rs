@@ -338,6 +338,29 @@ impl VectorStore {
         Ok(())
     }
 
+    pub async fn cleanup_unfinished_tasks_on_startup(&self) -> Result<()> {
+        let tasks_table = self.conn.open_table("tasks").execute().await?;
+        let talks_table = self.conn.open_table("talks").execute().await?;
+
+        // 🌟 [최종 교정] 앱 재시작 시, 큐에 대기 중이던 10번(Pending) 작업은 살려두어 스케줄러가 이어서 처리하게 합니다.
+        // 오직 진행 중이던 1번(Processing) 작업만 메모리 증발로 인한 좀비이므로 2(STOPPED)로 변경합니다.
+        let _ = tasks_table.update()
+            .only_if("status = 1")
+            .column("status", "2") 
+            .execute()
+            .await;
+
+        let _ = talks_table.update()
+            .only_if("status = 1")
+            .column("status", "2")
+            .column("text", "'Task was interrupted due to app restart.'")
+            .execute()
+            .await;
+
+        println!("[Store] CRITICAL: Only Processing tasks (1) forced to STOPPED. Queued tasks (10) preserved.");
+        Ok(())
+    }
+
     pub async fn delete_item(&self, table_name: &str, id: &str) -> Result<()> {
         let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
         let table = self.conn.open_table(target).execute().await?;

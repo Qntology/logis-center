@@ -598,7 +598,7 @@ async fn ai_search_complex(
         let from_user = "user".to_string();
         let to_system = "system".to_string();
 
-        // 사용자 질문 메시지: 기준 시간(now)에 저장 (문자열 변환 추가)
+        // 사용자 질문 메시지: 기준 시간(now)에 저장
         let user_msg_id = format!("{}_query", task_id);
         let now_str = now.to_string();
         let _ = store.add_message(
@@ -609,8 +609,8 @@ async fn ai_search_complex(
             Some(&now_str)
         ).await;
 
-        // 시스템 작업 메시지: 질문보다 확실히 나중에 보이도록 20ms 뒤에 저장 (정렬 안정성 강화)
-        let next_now_str = (now + 20).to_string();
+        // 시스템 작업 메시지: 질문보다 확실히 나중에 보이도록 50ms 뒤에 저장 (프론트엔드 복구 로직과 정렬 대칭)
+        let next_now_str = (now + 50).to_string();
         let _ = store.add_message(
             &task_id, "system_task", "Task Started: AI Search", 
             Some(&task_id), Some(10), 
@@ -767,11 +767,19 @@ async fn ai_search_complex(
     
     if let Some(store) = store_opt.as_ref() {
         match &search_process {
-            Ok(_) => { 
+            Ok(result_data) => { 
                 let _ = store.update_task_status(&task_id, 9).await; 
-                
-                // 🚨 [CRITICAL FIX] 텍스트를 query로 덮어쓰지 말고 None을 전달하여 시스템 상태를 그대로 둡니다!
                 let _ = store.update_message_status(&task_id, 9, None).await;
+
+                // 🌟 [수정] 프론트엔드 UI 렌더링을 위해 추출된 결과(result_data)를 페이로드에 담아 보냅니다.
+                let payload_done = json!({ 
+                    "task_id": task_id, 
+                    "category": "Done", 
+                    "summary": "AI Search Analysis Complete.", 
+                    "spinner": "✅",
+                    "data": result_data 
+                });
+                let _ = app_handle.emit("extraction-progress", &payload_done);
             },
             Err(e) => {
                 let status_code = if e.contains("cancelled") { 3 } else { 6 };
@@ -1259,10 +1267,31 @@ async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, St
     let mut items = Vec::new();
     
     if let Some(db) = store_guard.as_ref() {
-        tasks = db.get_pending_tasks(10).await.unwrap_or_default();
+        let mut raw_tasks = db.get_pending_tasks(10).await.unwrap_or_default();
         if let Ok(mut active) = db.get_pending_tasks(1).await {
-            tasks.append(&mut active);
+            raw_tasks.append(&mut active);
         }
+        
+        // 🌟 [핵심 변경] 현재 Rust 메모리에서 실제로 돌고 있는 유일한 태스크 ID 추출
+        let mem_task_id = if let Ok(mem) = crate::ACTIVE_TASK_MEM.read() {
+            mem.as_ref().and_then(|v| v.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_string()
+        } else { 
+            "".to_string() 
+        };
+
+        for t in raw_tasks {
+            // 🌟 1. DB엔 1(Processing)인데 Rust 메모리에 없다면? -> 진짜 좀비! 즉시 중단(2) 처리
+            if t.status == 1 && t.id != mem_task_id {
+                println!("[DB-SYNC] Zombie task detected in DB: {}. Marking as STOPPED.", t.id);
+                let _ = db.update_task_status(&t.id, 2).await;
+                let _ = db.update_message_status(&t.id, 2, Some("Task was interrupted due to refresh/error.")).await;
+            } 
+            // 🌟 2. 진짜 돌고 있는 작업이거나 정상 대기열(10)인 경우만 프론트엔드로 전달
+            else if t.status == 1 || t.status == 10 {
+                tasks.push(t);
+            }
+        }
+
         pages = db.get_all_items("pages", 50, 0, None).await.unwrap_or_default();
         users = db.get_all_items("users", 20, 0, None).await.unwrap_or_default();
         items = db.get_all_items("items", 10, 0, None).await.unwrap_or_default();
@@ -1341,12 +1370,13 @@ pub fn run() {
                 let db_path = "data/lancedb";
                 let _ = std::fs::create_dir_all(db_path);
                 if let Ok(s) = VectorStore::new(db_path).await {
-                    println!("[Setup] VectorStore initialized.");
+                    println!("[Setup] VectorStore initialized. Recovering zombie records...");
                     let _ = s.init_task_table().await;
                     let _ = s.init_all_tables().await;
                     
-                    // [CRITICAL] Clear zombie tasks synchronously before the store is made available to other commands
-                    let _ = s.cleanup_zombie_tasks().await;
+                    // 🌟 [CRITICAL FIX] 앱 재시작 시, 미완료 태스크를 삭제하지 않고 '중단(2)' 상태로 전환하여
+                    // 사용자가 이전의 실패한 내역을 확인할 수 있도록 복구합니다.
+                    let _ = s.cleanup_unfinished_tasks_on_startup().await;
                     
                     *store_guard = Some(s);
                 }
