@@ -547,61 +547,61 @@ pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
     // 🌟 도메인(Type)별로 허용되는 상태(Status) 값을 완벽히 분리하여 매핑합니다.
     let status_options = match seg_type {
         "tracking" => "* 'draft': Shipment preparation or pending pickup.
-  * 'progress': Currently in transit or out for delivery.
-  * 'return': Returning to sender.
-  * 'complete': Successfully delivered to the recipient.
-  * 'error': Delivery exception, lost, or failed.",
+    * 'progress': Currently in transit or out for delivery.
+    * 'return': Returning to sender.
+    * 'complete': Successfully delivered to the recipient.
+    * 'error': Delivery exception, lost, or failed.",
         "goods" => "* 'draft': Product is being created, not yet published.
-  * 'show': Visible and available for sale on storefront.
-  * 'hide': Hidden from the storefront.
-  * 'progress': Currently being restocked or updated.
-  * 'stop': Sales temporarily suspended.
-  * 'cancel': Product discontinued or cancelled.
-  * 'refund': Related to refunded inventory.
-  * 'return': Related to returned inventory.
-  * 'exchange': Related to exchanged inventory.
-  * 'expire': Product expired.
-  * 'complete': Completely sold out or finished lifecycle.
-  * 'error': Data or system error.",
+    * 'show': Visible and available for sale on storefront.
+    * 'hide': Hidden from the storefront.
+    * 'progress': Currently being restocked or updated.
+    * 'stop': Sales temporarily suspended.
+    * 'cancel': Product discontinued or cancelled.
+    * 'refund': Related to refunded inventory.
+    * 'return': Related to returned inventory.
+    * 'exchange': Related to exchanged inventory.
+    * 'expire': Product expired.
+    * 'complete': Completely sold out or finished lifecycle.
+    * 'error': Data or system error.",
         "order" => "* 'draft': Pending payment or in cart.
-  * 'progress': Order processing or preparing for shipment.
-  * 'stop': Order on hold.
-  * 'cancel': Order cancelled before fulfillment.
-  * 'refund': Payment refunded.
-  * 'return': Items returned by customer.
-  * 'exchange': Items being exchanged.
-  * 'expire': Payment window expired.
-  * 'complete': Order fully fulfilled and closed.
-  * 'error': Payment or processing error.",
+    * 'progress': Order processing or preparing for shipment.
+    * 'stop': Order on hold.
+    * 'cancel': Order cancelled before fulfillment.
+    * 'refund': Payment refunded.
+    * 'return': Items returned by customer.
+    * 'exchange': Items being exchanged.
+    * 'expire': Payment window expired.
+    * 'complete': Order fully fulfilled and closed.
+    * 'error': Payment or processing error.",
         "coupon" | "event" => "* 'show': Visible to customers.
-  * 'progress': Currently active and running.
-  * 'hide': Hidden from customers.
-  * 'stop': Temporarily paused.
-  * 'cancel': Terminated early.
-  * 'expire': Passed its expiration date.
-  * 'complete': Successfully finished its run.
-  * 'error': Configuration error.",
+    * 'progress': Currently active and running.
+    * 'hide': Hidden from customers.
+    * 'stop': Temporarily paused.
+    * 'cancel': Terminated early.
+    * 'expire': Passed its expiration date.
+    * 'complete': Successfully finished its run.
+    * 'error': Configuration error.",
         "review" => "* 'progress': Under moderation or pending approval.
-  * 'stop': Blocked or suspended review.
-  * 'cancel': Deleted or withdrawn by user.
-  * 'refund': Associated with a refunded order.
-  * 'return': Associated with a returned order.
-  * 'exchange': Associated with an exchanged order.
-  * 'expire': Review period expired.
-  * 'complete': Published and visible.
-  * 'error': Rejected or marked as spam.",
+    * 'stop': Blocked or suspended review.
+    * 'cancel': Deleted or withdrawn by user.
+    * 'refund': Associated with a refunded order.
+    * 'return': Associated with a returned order.
+    * 'exchange': Associated with an exchanged order.
+    * 'expire': Review period expired.
+    * 'complete': Published and visible.
+    * 'error': Rejected or marked as spam.",
         _ => "* 'show': Visible state.
-  * 'progress': Active/Processing state.
-  * 'remove': Deleted state.
-  * 'hide': Hidden state.
-  * 'stop': Paused/Stopped state.
-  * 'cancel': Cancelled state.
-  * 'refund': Refunded state.
-  * 'return': Returned state.
-  * 'exchange': Exchanged state.
-  * 'expire': Expired state.
-  * 'complete': Finished/Completed state.
-  * 'error': Error state."
+    * 'progress': Active/Processing state.
+    * 'remove': Deleted state.
+    * 'hide': Hidden state.
+    * 'stop': Paused/Stopped state.
+    * 'cancel': Cancelled state.
+    * 'refund': Refunded state.
+    * 'return': Returned state.
+    * 'exchange': Exchanged state.
+    * 'expire': Expired state.
+    * 'complete': Finished/Completed state.
+    * 'error': Error state."
     };
 
     let template = r###"Analyze the specific text segment and extract the logical attributes based on the defined schema.
