@@ -456,9 +456,8 @@ pub fn para2graph(language: &str) -> String {
 [DOCUMENT SCANNING & STRICT SEGMENTATION LOGIC]
 1. EXACT COPY: Copy the full input sentence into 'original_text' without changing anything.
 2. TAGGED PIPE PLANNING: In the 'segmented_plan' field, you MUST prefix every segment with its assigned type tag in brackets, followed by the exact substring, separated by pipes ('|'). Structure it strictly as '[tag1] chunk1 | [tag2] chunk2'.
-3. MAXIMAL GROUPING (CRITICAL): Group all contiguous words belonging to the same type into a SINGLE segment. DO NOT split subjects from their numeric conditions. Break the segment ONLY when the type logically shifts.
+3. MAXIMAL GROUPING: Group all contiguous words belonging to the same type into a SINGLE segment. DO NOT split subjects from their numeric conditions. Break the segment ONLY when the type logically shifts.
 4. STRICT ARRAY MAPPING: For EVERY tagged segment in 'segmented_plan', create exactly one object in the 'context' array sequentially.
-5. VERBATIM EXTRACTION: The 'text' field MUST be the exact substring from the plan, excluding the [tag] and | symbols. DO NOT translate, summarize, alter, or hallucinate any characters.
 
 [SCHEMA DEFINITIONS]
 - original_text: String. The exact, unaltered full natural language input.
@@ -466,7 +465,7 @@ pub fn para2graph(language: &str) -> String {
 - context:
   - text: String.
   - language: String. Default '{LANG}'.
-  - type: The main semantic type. Evaluate strictly based on e-commerce business intent. Must be exactly one of:
+  - type: String. Choose one:
     * 'order': Intent to measure sales performance or direct transactions. Triggers: conversion rate, sales volume, checkout, payment, cancellation, refund. (RULE: If the context measures buying success or revenue, classify as 'order' even if the word 'product' or 'item' is present).
     * 'goods': Intent to describe product catalog data, exposure, or traffic metrics. Triggers: page views, clicks, physical attributes, stock limits, unit prices. (RULE: Focuses on item specifications and customer traffic before the actual purchase).
     * 'tracking': Intent to manage logistics and fulfillment. Triggers: shipment status, dispatch, delivery duration, courier information.
@@ -613,6 +612,7 @@ pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
 {TYPE}:
   - status: String. Choose one:
     {STATUS_OPTIONS}
+    * '': If none logically apply.
   - substantial: String. Choose one:
     * 'size': Physical dimensions or volume.
     * 'weight': Mass or heaviness.
