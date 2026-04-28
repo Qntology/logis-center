@@ -1011,15 +1011,17 @@ searchInput?.addEventListener("input", () => {
 searchInput?.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
         e.preventDefault(); 
-        if (!isSearching && !isExtracting) { 
+        // 🌟 [CRITICAL FIX] isExtracting 검사를 삭제하여, 전처리 중에도 검색을 대기열에 넣을 수 있게 허용합니다!
+        if (!isSearching) { 
             btnSubmit?.click(); 
         }
     }
 });
 
 btnSubmit?.addEventListener("click", async () => {
-    // 🌟 [CRITICAL FIX] 이미 검색 중이거나 추출 중이면 무조건 무시!
-    if (isSearching) return
+    // 🌟 [CRITICAL FIX] isExtracting 검사를 삭제하여 전처리 중일 때도 큐(Queue)에 들어갈 수 있도록 허용합니다.
+    // 단, 동일한 검색 버튼의 연타를 막기 위해 isSearching 락은 유지합니다.
+    if (isSearching) return;
 
     // 🌟 [CRITICAL FIX] 예약되어 있던 라이브 텍스트 검색 타이머를 박살 내어 GPU 충돌을 원천 차단합니다!
     if (searchDebounceTimer) {
@@ -1030,16 +1032,17 @@ btnSubmit?.addEventListener("click", async () => {
     const query = searchInput.value;
     if (!query) return;
 
-    isSearching = true; // 🌟 락 온!
+    // 🚨 [CRITICAL FIX] 즉시 락(isSearching)을 걸고 스피너를 돌리면 대기열을 무시하고 강제 실행되는 것처럼 보입니다.
+    // 클릭 즉시 버튼만 숨겨두고, 백엔드가 큐를 통과해 실제로 작업을 시작할 때 락이 걸리도록 위임합니다!
     if (btnSubmit) btnSubmit.style.display = "none";
 
     const taskId = `search_${Date.now()}`;
     const startTime = Date.now();
     
     openWidget("settings");
-    startSpinner();
+    // 🚨 startSpinner() 제거 완료 (백엔드가 큐를 통과한 시점에 이벤트 리스너를 통해 켜짐)
 
-    // 🌟 [CRITICAL FIX 1] 사용자 질문 말풍선을 독립적으로 생성하고 완료(9) 상태로 영구 고정합니다.
+    // 1. 사용자 질문: 정확히 startTime에 기록 (DB 저장 시간과 일치시킴)
     renderMessage({
         id: `${taskId}_query`,
         role: "user", 
@@ -1047,16 +1050,15 @@ btnSubmit?.addEventListener("click", async () => {
         status: 9, 
         created_at: startTime,
         updated_at: startTime
-        // 🚨 [수정] task_id 속성을 완전히 삭제해야 일반 말풍선으로 예쁘게 렌더링됩니다!
     });
 
-    // 🌟 [CRITICAL FIX 2] 그 바로 아래에 AI의 시스템 상태 말풍선(스피너)을 별도로 띄웁니다.
+    // 2. 시스템 작업: 1ms 뒤로 기록 (DB 저장 시간과 일치시킴)
     renderMessage({
         id: taskId,
         role: "system_task",
-        text: "Preparing AI Engine...",
+        text: "Task Started: AI Search",
         status: 10, 
-        created_at: startTime + 1, // 순서 보장을 위해 1ms 추가
+        created_at: startTime + 1, 
         updated_at: startTime + 1,
         task_id: taskId
     });
@@ -1317,8 +1319,15 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     if (!isRecovery && !isExtracting && !isTerminal && !isSearching) {
         if (payload.category === "Processing" || payload.category === "Preparation" || payload.category === "Vision" || payload.category === "Shipping" || payload.category === "Analytic") {
             console.log("[WIDGET] Queue task started, resuming extraction UI state.");
-            isExtracting = true;
-            startSpinner();
+            
+            // 🌟 [CRITICAL FIX] 큐에서 튀어나온 작업의 출처(검색 vs 추출)를 정확히 구분하여 알맞은 락(Lock)을 겁니다!
+            if (payload.task_id && payload.task_id.startsWith("search_")) {
+                isSearching = true;
+                if (btnSubmit) btnSubmit.style.display = "none";
+            } else {
+                isExtracting = true;
+            }
+            startSpinner(); // 이제서야 글로벌 스피너가 돌기 시작합니다!
         }
     }
 
@@ -2733,14 +2742,65 @@ async function initSession() {
         console.log("[WIDGET] UI Ready handshake starting...");
         const data = await invoke<any>("mark_ui_ready");
 
+        // 🌟 [CRITICAL FIX] 새로고침 시 DB 대기열(PENDING) 목록을 화면에 강제 복구합니다.
+        // 🌟 [CRITICAL FIX] 새로고침 시 DB에서 진행 중(1)이거나 대기 중(10)인 작업을 완벽히 복구합니다.
+        if (data.tasks && data.tasks.length > 0) {
+            data.tasks.forEach((t: any) => {
+                if (t.status === 10 || t.status === 1) {
+                    let taskQuery = "";
+                    try {
+                        // 🌟 t.data_json에 저장된 원본 query를 추출합니다.
+                        const taskData = typeof t.data_json === 'string' ? JSON.parse(t.data_json) : t.data_json;
+                        taskQuery = taskData.query || "";
+                    } catch(e) {
+                        console.warn("[WIDGET] Failed to parse task data for query recovery:", e);
+                    }
+
+                    // 1. 사용자 질문 말풍선 강제 복구 (100% DB 기반)
+                    if (taskQuery) {
+                        const userMsgId = `${t.id}_query`;
+                        if (!document.getElementById(userMsgId)) {
+                            renderMessage({
+                                id: userMsgId,
+                                role: "user",
+                                text: taskQuery,
+                                status: 9,
+                                created_at: t.created_at,
+                                updated_at: t.updated_at
+                            });
+                        }
+                    }
+
+                    // 2. 시스템 대기열/진행 상태 말풍선 복구
+                    if (!document.getElementById(t.id)) {
+                        renderMessage({
+                            id: t.id,
+                            task_id: t.id,
+                            role: "system_task",
+                            text: t.id.startsWith("search_") ? "Task Started: AI Search" : ("Task Started: " + (t.ref || "Local Source")),
+                            status: t.status,
+                            created_at: t.created_at + 1,
+                            updated_at: t.updated_at + 1
+                        });
+                    }
+                    
+                    // 3. 진행 중(1)이거나 대기 중(10)인 작업에 대한 전역 상태 락 설정
+                    if (t.id.startsWith("search_")) {
+                        isSearching = true;
+                        if (btnSubmit) btnSubmit.style.display = "none";
+                    } else {
+                        isExtracting = true;
+                    }
+                    activeTaskId = t.id;
+                    startSpinner();
+                }
+            });
+            await updateExtractButtonVisibility();
+        }
+
         // 브라우저 런처 상태 동기화
         if (btnAutoLaunch) {
             btnAutoLaunch.style.display = (data.browser_status === "running") ? "none" : "flex";
-        }
-        if (data.current_url) {
-            currentDetectedUrl = data.current_url;
-            isCurrentShop = data.is_client || data.is_admin;
-            updateExtractButtonVisibility();
         }
 
         // 아이템 리스트 캐싱
@@ -2753,57 +2813,10 @@ async function initSession() {
         // 🌟 [핵심 분기 로직] 로그인 상태 확인 후 렌더링 방식 결정
         if (currentSession.email) {
             console.log("[WIDGET] 로그인 확인됨. 서버 데이터를 가져옵니다...");
-            // 서버 -> DB 저장 -> 화면 렌더링 흐름을 순차적으로 실행
             await syncData(); 
         } else {
             console.log("[WIDGET] 비로그인 상태. 로컬 LanceDB에서 메뉴를 불러옵니다...");
-            // 1. LanceDB 불러오기 (오프라인/비로그인 모드)
             await renderNavigation();
-        }
-
-        // 🌟 [CRITICAL FIX] 앱(창) 새로고침 시, DB가 아닌 백엔드 메모리/JSON 백업에서 진행 중인 작업을 확실하게 복구합니다!
-        try {
-            const activeTask = await invoke<any>("get_active_task_context");
-            if (activeTask && activeTask.id && (activeTask.status === 1 || activeTask.status === 10)) {
-                console.log("[WIDGET] Resuming active task from fallback:", activeTask.id);
-                
-                // 🌟 [CRITICAL FIX] 새로고침 시 메모리에 살아있는 내 질문(query)도 같이 렌더링 복구합니다!
-                if (activeTask.query) {
-                    renderMessage({
-                        id: `${activeTask.id}_query`,
-                        role: "user",
-                        text: activeTask.query,
-                        status: 9,
-                        created_at: activeTask.created_at || Date.now(),
-                        updated_at: activeTask.updated_at || Date.now()
-                    });
-                }
-
-                renderMessage({
-                    id: activeTask.id,
-                    task_id: activeTask.id,
-                    role: "system_task",
-                    text: activeTask.summary || ("Resuming Task: " + (activeTask.link || "Local Source")),
-                    status: activeTask.status,
-                    created_at: (activeTask.created_at || Date.now()) + 1, // 스피너가 내 질문 아래에 오도록 +1ms
-                    updated_at: activeTask.updated_at || Date.now()
-                });
-                
-                // 🌟 [CRITICAL FIX] 검색 작업인지 문서 추출 작업인지 명확히 구분하여 알맞은 전역 락(Lock)을 복구합니다!
-                if (activeTask.id.startsWith("search_")) {
-                    isSearching = true; // 검색 중복 실행 방지
-                    if (btnSubmit) btnSubmit.style.display = "none";
-                } else {
-                    isExtracting = true; // 추출 중복 실행 방지
-                }
-                activeTaskId = activeTask.id; // 현재 활성화된 작업 ID 복구
-                startSpinner();
-                
-                // 진행 중 버튼 상태 동기화
-                await updateExtractButtonVisibility();
-            }
-        } catch (err) {
-            console.warn("[WIDGET] No active task to resume or failed to fetch:", err);
         }
 
     } catch (e) { 
@@ -3282,9 +3295,9 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
 
         const displayMsg: ChatMessage = { ...msg, text: textContent };
         
-        // 🌟 [CRITICAL FIX] 렌더링 함수와 동일하게 _query 식별자가 있는 사용자 메시지는 
-        // 시스템 Task ID로 병합되지 않도록 방어 로직(!displayMsg.id.endsWith("_query"))을 추가합니다!
-        const isTask = displayMsg.role === "system_task" || (displayMsg.role === "user" && !!displayMsg.task_id && displayMsg.task_id.startsWith("search_") && !displayMsg.id.endsWith("_query"));
+        // 🌟 [CRITICAL FIX] ID 자체가 _query로 끝나는 사용자 질문 메시지는 절대로 시스템 Task(isTask)로 분류하지 않습니다.
+        // 이를 통해 domId가 원본 ID(search_..._query)를 유지하게 하여 시스템 스피너에 의해 증발되는 것을 막습니다.
+        const isTask = displayMsg.role === "system_task" || (displayMsg.role === "user" && !!displayMsg.task_id && displayMsg.task_id.startsWith("search_") && !displayMsg.id.endsWith("_query") && !displayMsg.task_id.endsWith("_query"));
         const domId = isTask ? (displayMsg.task_id || displayMsg.id) : displayMsg.id;
         
         const existingEl = chatTalks.querySelector(`[id="${domId}"]`) as HTMLElement;
@@ -3317,10 +3330,20 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
     // DOM에 렌더링된 모든 자식들을 한 번에 메모리에 올린 후, 시간을 기준으로 100% 완벽하게 재정렬하여 덮어씌웁니다.
     const children = Array.from(chatTalks.children) as HTMLElement[];
     children.sort((a, b) => {
-        const timeA = parseInt(a.dataset.createdAt || "0");
-        const timeB = parseInt(b.dataset.createdAt || "0");
+        const timeA = Number(a.dataset.createdAt || 0);
+        const timeB = Number(b.dataset.createdAt || 0);
+        
+        if (timeA === timeB) {
+            // 🌟 시간이 1ms 단위까지 완벽히 같다면, 사용자 질문(_query)을 시스템 작업보다 앞으로 보냅니다.
+            const aIsQuery = a.id.includes("_query");
+            const bIsQuery = b.id.includes("_query");
+            if (aIsQuery && !bIsQuery) return -1;
+            if (!aIsQuery && bIsQuery) return 1;
+            return a.id.localeCompare(b.id);
+        }
         return timeA - timeB;
     });
+    // 정렬된 순서대로 DOM 재배치
     children.forEach(c => chatTalks.appendChild(c));
 
     // [Scroll Maintenance]
@@ -3359,8 +3382,12 @@ function createMessageHTML(msg: ChatMessage) {
     const roleClass = msg.role === "user" ? "user" : "system";
     const domId = isTaskBubble ? (msg.task_id || msg.id) : msg.id;
 
-    // 🚨 [수정] 복잡한 정규식 대신, 시스템 메시지이면 무조건 사용자 메시지(기준 시간)보다 +1ms를 강제로 더해서 순서를 영구 고정합니다.
-    let trueCreatedAt = msg.created_at;
+    // 🌟 [CRITICAL FIX] 사용자 질문과 시스템 작업의 생성 시간이 같을 경우 정렬이 꼬입니다.
+    // 시스템 말풍선(Task)일 경우 생성 시간에 +1ms를 강제 주입하여 항상 질문(User) 아래에 배치합니다.
+    let trueCreatedAt = Number(msg.created_at);
+    if (isTaskBubble) {
+        trueCreatedAt += 1;
+    }
     if (msg.role === "system_task" && domId.startsWith("search_") && !domId.endsWith("_query")) {
         trueCreatedAt += 1;
     }
@@ -3433,38 +3460,47 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
         
         // 🌟 [CRITICAL FIX 2] 변수 스코프(Scope) 에러 해결! 
         // try 블록 바깥으로 빼내어 for 루프 안에서 변수를 찾지 못해 Processing이 멈추는 버그를 원천 차단합니다.
-        let activeTask: any = null;
+        let activeMemContext: any = null;
         try {
-            activeTask = await invoke<any>("get_active_task_context");
-            if (activeTask && activeTask.id) {
-                // 🌟 [CRITICAL FIX] DB에서 아직 긁어오지 못했다면 메모리 캐시의 query를 강제 주입해 내 질문 증발을 막습니다!
-                if (activeTask.query) {
-                    const userExists = messages.find(m => m.id === `${activeTask.id}_query`);
+            activeMemContext = await invoke<any>("get_active_task_context");
+        } catch (e) {}
+
+        try {
+            const activeTasks = await invoke<any[]>("get_active_tasks");
+            activeTasks.forEach((t: any) => {
+                let taskQuery = "";
+                try {
+                    const taskData = typeof t.data_json === 'string' ? JSON.parse(t.data_json) : t.data_json;
+                    taskQuery = taskData.query || "";
+                } catch(e) {}
+
+                if (taskQuery) {
+                    const userExists = messages.find(m => m.id === `${t.id}_query`);
                     if (!userExists) {
                         messages.push({
-                            id: `${activeTask.id}_query`,
+                            id: `${t.id}_query`,
                             role: "user",
-                            text: activeTask.query,
+                            text: taskQuery,
                             status: 9,
-                            created_at: activeTask.created_at || Date.now(),
-                            updated_at: activeTask.updated_at || Date.now()
+                            created_at: t.created_at,
+                            updated_at: t.updated_at
                         });
                     }
                 }
 
-                const exists = messages.find(m => m.id === activeTask.id || m.task_id === activeTask.id);
+                const exists = messages.find(m => m.id === t.id || m.task_id === t.id);
                 if (!exists) {
                     messages.push({
-                        id: activeTask.id,
-                        task_id: activeTask.id,
+                        id: t.id,
+                        task_id: t.id,
                         role: "system_task",
-                        text: "Task Started: " + (activeTask.link || "Local Source"),
-                        status: activeTask.status || 1,
-                        created_at: (activeTask.created_at || Date.now()) + 1, // 순서 보정
-                        updated_at: activeTask.updated_at || Date.now()
+                        text: t.id.startsWith("search_") ? "Task Started: AI Search" : ("Task Started: " + (t.ref || "Local Source")),
+                        status: t.status,
+                        created_at: t.created_at + 1,
+                        updated_at: t.updated_at + 1
                     });
                 }
-            }
+            });
         } catch (e) { }
 
         for (let m of messages) {
@@ -3485,8 +3521,8 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                         rawSummary = live.summary;
                     } else if (lastLog && lastLog.summary) {
                         rawSummary = lastLog.summary;
-                    } else if (activeTask && activeTask.id === tId && activeTask.summary) {
-                        rawSummary = activeTask.summary;
+                    } else if (activeMemContext && activeMemContext.id === tId && activeMemContext.summary) {
+                        rawSummary = activeMemContext.summary;
                     }
 
                     const pctMatch = rawSummary.match(/\(\d+%\)/);

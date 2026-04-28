@@ -562,29 +562,6 @@ async fn ai_search_complex(
     emit_term(&format!("   - 검색 모드: {}", search_mode));
     emit_term("==================================================\n");
 
-    // 🌟 [CRITICAL FIX] 백엔드 레벨에서도 중복 실행을 완벽하게 차단하여 
-    // 이전 작업의 모델(Qwen3)이 도중에 강제로 Purge(증발)되는 에러를 원천 봉쇄합니다!
-    if IS_SEARCHING.load(Ordering::SeqCst) {
-        let err_msg = "Another search is currently running. Request rejected.";
-        emit_term(&format!("🚨 [ERROR] {}", err_msg));
-        return Err(err_msg.to_string());
-    }
-
-    IS_SEARCHING.store(true, Ordering::SeqCst);
-    
-    // 🌟 [CRITICAL FIX] DB 동기화 지연 시 프론트엔드 새로고침 증발을 막기 위한 전역 메모리 캐싱!
-    {
-        let mut mem_guard = crate::ACTIVE_TASK_MEM.write().unwrap();
-        let now = chrono::Utc::now().timestamp_millis();
-        *mem_guard = Some(json!({
-            "id": task_id.clone(),
-            "status": 1,
-            "query": query.clone(),
-            "created_at": now,
-            "updated_at": now
-        }));
-    }
-
     let cancel_token = state.cancellation_token.clone();
     
     let store_opt = {
@@ -599,9 +576,11 @@ async fn ai_search_complex(
         store_guard.as_ref().cloned() 
     };
 
-    // 🌟 1. DB에 Task 및 Message 등록
+    // 🌟 1. DB에 Task 및 Message 등록 (시간차를 두어 정렬 순서 물리적 고정)
     if let Some(store) = store_opt.as_ref() {
         let now = chrono::Utc::now().timestamp_millis();
+        
+        // Task 객체는 1ms 뒤로 설정
         let task = crate::store::Task {
             id: task_id.clone(), 
             r#type: "ai_search".to_string(),
@@ -609,7 +588,7 @@ async fn ai_search_complex(
             to: "system".to_string(),
             cc: cc.clone(), bcc: bcc.clone(), r#ref: ref_id.clone(), 
             data_json: json!({"query": query.clone(), "mode": search_mode.clone()}).to_string(),
-            created_at: now, updated_at: now,
+            created_at: now + 1, updated_at: now + 1,
             status: 10, 
         };
         let _ = store.add_task(task).await;
@@ -617,22 +596,94 @@ async fn ai_search_complex(
         let from_user = "user".to_string();
         let to_system = "system".to_string();
 
-        // 🌟 [CRITICAL FIX] 1. 사용자 질문 말풍선 (main.ts와 동일하게 _query 식별자 사용 및 완료 상태)
+        // 사용자 질문 메시지: 기준 시간(now)에 저장 (문자열 변환 추가)
         let user_msg_id = format!("{}_query", task_id);
+        let now_str = now.to_string();
         let _ = store.add_message(
             &user_msg_id, "user", &query, 
-            Some(&task_id), Some(9), // 🚨 None 대신 task_id를 연결해 DB의 NOT NULL 제약조건 충돌 방지
+            Some(&task_id), Some(9), 
             Some(&cc), Some(&bcc), Some(&ref_id), 
-            Some(&from_user), Some(&to_system), Some("talk"), None // 🚨 from, to 누락으로 인한 저장 실패(DB 롤백) 완벽 차단!
+            Some(&from_user), Some(&to_system), Some("talk"), 
+            Some(&now_str) // 🌟 &str 타입을 기대하므로 문자열 참조로 전달
         ).await;
 
-        // 🌟 [CRITICAL FIX] 2. 시스템 진행 상태 말풍선 (main.ts와 동일한 task_id 사용 및 대기 상태)
+        // 시스템 작업 메시지: 1ms 뒤(now + 1)에 저장 (문자열 변환 추가)
+        let next_now_str = (now + 1).to_string();
         let _ = store.add_message(
-            &task_id, "system_task", "Preparing AI Engine...", 
-            Some(&task_id), Some(10), // 스피너 연동을 위해 10(Pending) 처리
+            &task_id, "system_task", "Task Started: AI Search", 
+            Some(&task_id), Some(10), 
             Some(&cc), Some(&bcc), Some(&ref_id), 
-            Some(&to_system), Some(&from_user), Some("talk"), None // 🚨 시스템이 응답하는 형태이므로 from/to 스왑
+            Some(&to_system), Some(&from_user), Some("talk"), 
+            Some(&next_now_str) // 🌟 &str 타입을 기대하므로 문자열 참조로 전달
         ).await;
+    }
+
+    // 🌟 [CRITICAL FIX] 통합 대기열(Queue) 로직: 이전 작업이 끝날 때까지 얌전히 기다리며 순서를 지킵니다!
+    emit_term("[QUEUE] Task queued. Waiting for AI Engine to become available...");
+    loop {
+        if cancel_token.load(Ordering::Relaxed) { 
+            return Err("Task cancelled by user".to_string()); 
+        }
+
+        let can_start = {
+            let mem_busy = crate::ACTIVE_TASK_MEM.read().unwrap().is_some();
+            let search_busy = IS_SEARCHING.load(Ordering::SeqCst);
+
+            // 🌟 [CRITICAL FIX] 백그라운드 스케줄러(웹 전처리 등)가 실행 중인지 정확히 파악하기 위해 
+            // 최신 진행 상황(LATEST_PROGRESS_PAYLOAD)이 끝났는지(Done/Error) 검사합니다.
+            let mut scheduler_busy = false;
+            if let Ok(mem) = crate::LATEST_PROGRESS_PAYLOAD.read() {
+                if let Some(payload) = mem.as_ref() {
+                    let cat = payload.get("category").and_then(|v| v.as_str()).unwrap_or("");
+                    let sum = payload.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                    if cat != "Done" && cat != "Error" && !sum.contains("cancelled") && !sum.contains("stopped") {
+                        scheduler_busy = true; // 스케줄러가 뭔가 열심히 처리 중입니다!
+                    }
+                }
+            }
+
+            // 다른 누군가가 AI 엔진을 1%라도 쓰고 있다면 무조건 대기!
+            if mem_busy || search_busy || scheduler_busy {
+                false
+            } else {
+                let mut is_first = true;
+                if let Some(store) = store_opt.as_ref() {
+                    // 대기열 목록(status=10)을 불러와서 내가 1빠인지 확인 (선입선출)
+                    if let Ok(pending_tasks) = store.get_pending_tasks(10).await {
+                        if let Some(first) = pending_tasks.first() {
+                            if first.id != task_id {
+                                is_first = false;
+                            }
+                        }
+                    }
+                }
+                is_first
+            }
+        };
+
+        if can_start {
+            break;
+        }
+        
+        // 1초마다 내 차례가 왔는지 체크
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    }
+
+    emit_term("[QUEUE] AI Engine acquired. Starting process...");
+
+    // 🌟 대기열 통과! 내 차례가 왔으므로 락을 쥐고 당당하게 실행을 시작합니다.
+    IS_SEARCHING.store(true, Ordering::SeqCst);
+    
+    {
+        let mut mem_guard = crate::ACTIVE_TASK_MEM.write().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        *mem_guard = Some(json!({
+            "id": task_id.clone(),
+            "status": 1,
+            "query": query.clone(),
+            "created_at": now,
+            "updated_at": now
+        }));
     }
 
     let model = {
@@ -1121,8 +1172,11 @@ async fn get_browser_status() -> Result<String, String> {
 async fn get_active_tasks(state: State<'_, AppState>) -> Result<Vec<store::Task>, String> {
     let store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
-        // Fetch tasks with status 10 (pending) or 1 (progress)
-        db.get_pending_tasks(10).await.map_err(|e| e.to_string())
+        let mut tasks = db.get_pending_tasks(10).await.unwrap_or_default();
+        if let Ok(mut active) = db.get_pending_tasks(1).await {
+            tasks.append(&mut active);
+        }
+        Ok(tasks)
     } else {
         Ok(vec![])
     }
@@ -1229,6 +1283,9 @@ async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, St
     
     if let Some(db) = store_guard.as_ref() {
         tasks = db.get_pending_tasks(10).await.unwrap_or_default();
+        if let Ok(mut active) = db.get_pending_tasks(1).await {
+            tasks.append(&mut active);
+        }
         pages = db.get_all_items("pages", 50, 0, None).await.unwrap_or_default();
         users = db.get_all_items("users", 20, 0, None).await.unwrap_or_default();
         items = db.get_all_items("items", 10, 0, None).await.unwrap_or_default();
