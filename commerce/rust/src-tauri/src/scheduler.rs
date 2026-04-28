@@ -246,13 +246,20 @@ pub async fn start_background_worker(
                     break;
                 }
 
+
                 println!("[Scheduler] Processing task: {}", task.id);
                 
                 {
                     let store_guard = store.lock().await;
                     if let Some(db) = store_guard.as_ref() {
-                        let _ = db.update_task_status(&task.id, crate::logic::parse_status("progress")).await;
-                        let _ = db.update_message_status(&task.id, crate::logic::parse_status("progress"), Some("Processing...")).await;
+                        // DB의 상태값만 안전하게 1(Processing)로 동기화합니다.
+                        let _ = db.update_task_status(&task.id, 1).await;
+                        let _ = db.update_message_status(&task.id, 1, Some("Processing...")).await;
+                        
+                        // [SYNC] 프론트엔드 락과 일치시키기 위해 ID와 상태만 메모리에 반영합니다.
+                        if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() {
+                            *w = Some(json!({ "id": task.id, "status": 1 }));
+                        }
                     }
                 }
 
@@ -260,16 +267,17 @@ pub async fn start_background_worker(
                     Ok(_) => {
                         println!("[Scheduler] Task completed: {}", task.id);
                         
-                        // 🌟 [CRITICAL FIX] Task가 끝났을 때 메모리를 None으로 날려버리면 UI가 'Done' 상태를 읽기도 전에 증발해서 스피너가 무한루프를 돕니다.
-                        // 상태를 9(Complete)로 업데이트하여 UI가 완료되었음을 확실히 인지하게 만듭니다.
+                        // 🌟 [CRITICAL FIX] 메모리의 상태를 9(Complete)로 업데이트하여 UI가 완료되었음을 확실히 인지하게 만듭니다.
                         if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() { 
                             if let Some(task_val) = w.as_mut() {
                                 if let Some(obj) = task_val.as_object_mut() {
-                                    obj.insert("status".to_string(), serde_json::json!(9));
+                                    obj.insert("status".to_string(), json!(9));
+                                    obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
                                 }
                             }
                         }
-                        // LATEST_PROGRESS_PAYLOAD 는 지우지 않고 유지하여 프론트엔드가 마지막 "✅" 상태를 읽어갈 수 있게 둡니다.
+
+                        // 일정 시간 뒤에 메모리를 비워주거나, 다음 작업 시작 시 덮어씌워지도록 유지합니다.
 
                         {
                             let mut model_lock = model.lock().await;

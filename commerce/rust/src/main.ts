@@ -40,6 +40,54 @@ let isCurrentShop = false;
 let searchDebounceTimer: number | null = null;
 let chatPollInterval: number | null = null;
 
+// 🌟 [추가] 누락된 전역 상태 변수 선언
+let isSearching = false;
+let isExtracting = false;
+
+// [통합 락 매니저] Frontend-Driven Lock System
+class GlobalTaskManager {
+    static isBusy: boolean = false;
+    static currentTaskId: string | null = null;
+    static activeRefs: Set<string> = new Set(); // 중복 요청 방지용
+
+    static tryAcquire(taskId: string, refOrQuery: string): boolean {
+        // 1. 이미 진행 중이거나 동일한 리소스 요청 시 차단
+        if (this.isBusy || this.activeRefs.has(refOrQuery)) {
+            console.warn(`[LOCK] System busy or duplicate request: ${refOrQuery}`);
+            return false;
+        }
+        // 2. LocalStorage 락 확인 (새로고침 방어용)
+        if (localStorage.getItem("sys_lock")) {
+            console.warn(`[LOCK] LocalStorage locked by another process.`);
+            return false;
+        }
+        // 3. 락 설정
+        this.isBusy = true;
+        this.currentTaskId = taskId;
+        this.activeRefs.add(refOrQuery);
+        localStorage.setItem("sys_lock", taskId);
+        return true;
+    }
+
+    static release(taskId: string, refOrQuery: string) {
+        if (this.currentTaskId === taskId) {
+            this.isBusy = false;
+            this.currentTaskId = null;
+        }
+        this.activeRefs.delete(refOrQuery);
+        if (localStorage.getItem("sys_lock") === taskId) {
+            localStorage.removeItem("sys_lock");
+        }
+    }
+
+    static forceReset() {
+        this.isBusy = false;
+        this.currentTaskId = null;
+        this.activeRefs.clear();
+        localStorage.removeItem("sys_lock");
+    }
+}
+
 // [TAG SYSTEM] Hashtag-style search state
 interface SearchTag {
     id: string;
@@ -128,8 +176,7 @@ const taskTotalSteps = new Map<string, number>(); // 🌟 [CRITICAL FIX] 작업�
 let selectedUuids = new Set<string>();
 let currentDetailUuid: string | null = null;
 let activeTaskId: string | null = null; 
-let isExtracting = false; 
-let isSearching = false; // 🌟 [CRITICAL FIX] 검색 중복 방지 및 스피너 보호용 락(Lock)
+// [DEPRECATED] 흩어져 있던 개별 락 변수들은 GlobalTaskManager로 대체되었습니다.
 let spinnerInterval: number | null = null;
 let qrSpinnerIndex = 0; 
 let systemLogCount = 0;
@@ -237,6 +284,7 @@ function startSpinner() {
     if (settingsBtn) {
         settingsBtn.classList.add("active-spinner-mode");
         // 🌟 [CRITICAL FIX] 글로벌 스피너가 돌 때 번개 버튼을 무조건 숨기던 코드를 제거합니다! (대기열 큐잉 허용)
+        // isSearching 변수가 Part 1에서 선언되었으므로 이제 에러가 발생하지 않습니다.
         if (isSearching && btnSubmit) btnSubmit.style.display = "none";
     }
     
@@ -382,8 +430,30 @@ if (pillNav) {
 let extractClickLock = false; 
 
 async function updateExtractButtonVisibility() {
-    // 🌟 락이 걸려있을 때는 백그라운드 폴링이나 다른 함수가 함부로 버튼을 부활시키지 못하게 방어!
-    if (!btnExtract || extractClickLock) return; 
+    if (!btnExtract) return;
+
+    // 🌟 [CRITICAL FIX] 광클 방지용 내부 락(extractClickLock)만 체크하고, 
+    // sys_lock은 아래에서 화면상 엘리먼트 존재 여부와 대조하여 결정합니다.
+    if (extractClickLock) return; 
+
+    // 🌟 [락 무결성 체크 개선] 새로고침 직후 DOM 생성 지연을 고려하여 5초의 유예 시간을 둡니다.
+    const currentLock = localStorage.getItem("sys_lock");
+    if (currentLock) {
+        const lockEl = document.getElementById(currentLock);
+        if (!lockEl) {
+            const lockTime = parseInt(currentLock.split('_')[1] || "0");
+            const now = Date.now();
+            // 락 생성 후 5초가 지났는데도 UI 말풍선이 없다면 좀비로 간주하고 삭제
+            if (now - lockTime > 5000) {
+                console.warn(`[LOCK] Orphaned lock detected (5s timeout): ${currentLock}. Releasing.`);
+                localStorage.removeItem("sys_lock");
+            } else {
+                // 아직 5초가 안 지났다면 UI가 그려지는 중일 수 있으므로 락을 유지하고 버튼은 숨김 유지
+                if (btnExtract) btnExtract.style.display = "none";
+                return;
+            }
+        }
+    }
 
     // 1. 이미지가 올라와 있을 때 중복 대기열 방어 로직
     if (currentImage) {
@@ -999,10 +1069,11 @@ document.addEventListener('nav-link', async (e: any) => {
 
 // --- List Logic (Updated for Cards) ---
 searchInput?.addEventListener("input", () => {
-    if (isSearching) return; // 🌟 [CRITICAL FIX] 전처리(isExtracting) 중이어도 자동완성 벡터 검색은 즉각 실행되도록 허용!
+    // 선언된 isSearching 변수를 체크하여 중복 검색을 방지합니다.
+    if (isSearching) return; 
     if(searchDebounceTimer) clearTimeout(searchDebounceTimer);
     searchDebounceTimer = window.setTimeout(async () => {
-        if (isSearching) return; // 🌟 [CRITICAL FIX] 
+        if (isSearching) return; 
         await loadMoreDocs(true);
     }, 800);
 });
@@ -1018,31 +1089,38 @@ searchInput?.addEventListener("keydown", (e) => {
     }
 });
 
-btnSubmit?.addEventListener("click", async () => {
-    // 🌟 [CRITICAL FIX] isExtracting 검사를 삭제하여 전처리 중일 때도 큐(Queue)에 들어갈 수 있도록 허용합니다.
-    // 단, 동일한 검색 버튼의 연타를 막기 위해 isSearching 락은 유지합니다.
-    if (isSearching) return;
+// --- main.ts 소스 ---
 
-    // 🌟 [CRITICAL FIX] 예약되어 있던 라이브 텍스트 검색 타이머를 박살 내어 GPU 충돌을 원천 차단합니다!
+btnSubmit?.addEventListener("click", async () => {
+    // 1. 검색 중복 실행 방지
+    if (isSearching) {
+        console.warn("[SEARCH] AI Search is already in progress.");
+        return; 
+    }
+
     if (searchDebounceTimer) {
         clearTimeout(searchDebounceTimer);
         searchDebounceTimer = null;
     }
 
-    const query = searchInput.value;
+    const query = searchInput.value.trim();
     if (!query) return;
 
-    // 🚨 [CRITICAL FIX] 즉시 락(isSearching)을 걸고 스피너를 돌리면 대기열을 무시하고 강제 실행되는 것처럼 보입니다.
-    // 클릭 즉시 버튼만 숨겨두고, 백엔드가 큐를 통과해 실제로 작업을 시작할 때 락이 걸리도록 위임합니다!
+    // 2. 즉시 상태 반영 및 버튼 숨김
+    isSearching = true; 
     if (btnSubmit) btnSubmit.style.display = "none";
+    if (btnExtract) btnExtract.style.display = "none"; 
 
     const taskId = `search_${Date.now()}`;
     const startTime = Date.now();
     
+    // 3. LocalStorage 락 설정 (새로고침 시 복구용)
+    localStorage.setItem("sys_lock", taskId);
+    
+    // 4. UI 탭 전환 및 로딩 준비
     openWidget("settings");
-    // 🚨 startSpinner() 제거 완료 (백엔드가 큐를 통과한 시점에 이벤트 리스너를 통해 켜짐)
 
-    // 1. 사용자 질문: 정확히 startTime에 기록 (DB 저장 시간과 일치시킴)
+    // 5. 사용자 질문 말풍선 렌더링
     renderMessage({
         id: `${taskId}_query`,
         role: "user", 
@@ -1052,33 +1130,35 @@ btnSubmit?.addEventListener("click", async () => {
         updated_at: startTime
     });
 
-    // 2. 시스템 작업: 1ms 뒤로 기록 (DB 저장 시간과 일치시킴)
+    // 6. 시스템 대기열 UI 강제 반영 (status: 10)
     renderMessage({
         id: taskId,
         role: "system_task",
-        text: "Task Started: AI Search",
+        text: `Waiting in Queue: AI Search will start shortly...`, 
         status: 10, 
         created_at: startTime + 1, 
         updated_at: startTime + 1,
         task_id: taskId
     });
 
+    startSpinner(); 
+
     try {
-        const devicePref = forceCpuToggle.checked ? "cpu" : null;
+        const devicePref = getDevicePref();
+        
+        // 🚀 Rust 백엔드 호출
         const response = await invoke<any>("ai_search_complex", { 
             taskId: taskId, 
             query: query, 
             language: "korean",
             devicePreference: devicePref,
             searchMode: currentSearchMode,
-            // 🌟 [CRITICAL FIX] 히스토리 증발 방지: 현재 사용자가 보고 있는 위치(Context)를 백엔드에 전달합니다!
             cc: activeContext.cc || "",
             bcc: activeContext.bcc || "",
             refId: activeContext.ref || ""
         });
 
-        // 🚨 기존에 있던 renderMessage(..., role: "user", status: 9) 삭제 완료 (위에서 이미 처리함)
-
+        // 7. 결과 출력 로직
         if (aiResultsArea && aiResultsContent) {
             aiResultsArea.style.display = "block";
             aiResultsTitle.innerText = "🧠 AI Deep Analysis";
@@ -1106,10 +1186,10 @@ btnSubmit?.addEventListener("click", async () => {
             aiResultsContent.innerHTML = html;
         }
     } catch(e) { 
+        console.error("[SEARCH-ERROR]", e);
         if (aiResultsContent) {
             aiResultsContent.innerHTML = "<div style='color:#ef4444;'>Error: " + e + "</div>"; 
         }
-        // 에러 발생 시 시스템 말풍선을 에러 상태로 업데이트
         renderMessage({
             id: taskId,
             role: "system_task",
@@ -1120,9 +1200,14 @@ btnSubmit?.addEventListener("click", async () => {
             task_id: taskId
         });
     } finally {
-        isSearching = false; // 🌟 락 오프!
+        isSearching = false; 
         if (btnSubmit) btnSubmit.style.display = "flex";
         stopSpinner(); 
+        const currentLock = localStorage.getItem("sys_lock");
+        if (currentLock === taskId) {
+            localStorage.removeItem("sys_lock");
+        }
+        updateExtractButtonVisibility();
     }
 });
 
@@ -1132,27 +1217,33 @@ document.addEventListener('view-task-log', () => { openWidget("list"); listView.
 
 // 🌟 [CRITICAL FIX] 추출 버튼 더블클릭 완벽 방어 로직 적용
 btnExtract?.addEventListener("click", async () => {
-    // 🌟 이미 락이 걸려있다면 0.001초만에 들어온 광클도 무조건 튕겨냅니다!
-    if (extractClickLock) return; 
-    extractClickLock = true;
+    // 1. 중복 클릭 및 전역 락 확인
+    const activeLock = localStorage.getItem("sys_lock");
+    if (activeLock || extractClickLock || isExtracting) {
+        console.warn("[LOCK] System is busy. Ignoring extract request.");
+        if (btnExtract) btnExtract.style.display = "none";
+        return; 
+    }
     
-    // 🌟 클릭 즉시 버튼을 시각적, 물리적으로 증발시킵니다.
-    btnExtract.style.display = "none"; 
+    // 2. 즉시 UI 동기화: 버튼 숨김 및 락 설정
+    extractClickLock = true;
+    isExtracting = true; 
+    if (btnExtract) btnExtract.style.display = "none"; 
+    if (btnSubmit) btnSubmit.style.display = "none"; 
 
     console.log("[DEBUG] btnExtract clicked. currentDetectedUrl:", currentDetectedUrl, "currentImage:", currentImage);
     
     try {
         if (currentDetectedUrl || currentImage) {
-            const wasExtracting = isExtracting;
-            isExtracting = true;
+            const logArea = document.getElementById("extraction-log");
+            if (logArea) logArea.innerHTML = "";
+            openWidget("settings");
+            startSpinner();
 
-            if (!wasExtracting) {
-                const logArea = document.getElementById("extraction-log");
-                if (logArea) logArea.innerHTML = "";
-                openWidget("settings");
-                startSpinner();
-            }
             const taskId = `task_${Date.now()}`;
+            
+            // 🌟 [Lock 획득] 
+            localStorage.setItem("sys_lock", taskId);
 
             renderMessage({
                 id: taskId,
@@ -1298,6 +1389,15 @@ listen("extraction-progress", async (event: any) => {
     const payload = event.payload;
     if (payload.task_id) livePayloads.set(payload.task_id, payload); // 🌟 즉시 캐싱!
 
+    // [락 해제 로직] 작업이 성공, 실패, 혹은 취소되었을 때 통합 락 매니저 초기화
+    const summary = (payload.summary || "").toLowerCase();
+    const isTerminal = payload.category === "Done" || payload.category === "Error" || summary.includes("cancelled") || summary.includes("stopped");
+    
+    if (isTerminal) {
+        console.log(`[LOCK] Terminal state reached for ${payload.task_id}. Releasing global lock.`);
+        GlobalTaskManager.forceReset();
+    }
+
     if (isFetchingLogs && payload.task_id === activeTaskId) {
         pendingLiveEvents.push(payload);
         return;
@@ -1364,14 +1464,24 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
         displaySummary = payload.summary || "";
     }
 
-    // 🌟 [CRITICAL FIX] 조기 종료(return) 방지! 다른 상세 페이지가 열려있더라도 채팅방 버블(말풍선)은 무조건 최신화합니다!
-    let statusCode = 1; 
+    // 🌟 [CRITICAL FIX] 대기열 상태(10)와 진행 상태(1)를 엄격히 구분합니다.
+    let statusCode = 1; // 기본값은 Processing(1)
+    
     if (isTerminal) {
         if (payload.category === "Done") statusCode = 9;
         else if (payload.category === "Error") statusCode = 6;
         else statusCode = 3;
     } else if (summary.includes("cancelled") || summary.includes("stopped")) {
         statusCode = 3;
+    } else {
+        // 🌟 [핵심 로직] 현재 DOM을 확인하여 이미 PENDING(10) 상태라면, 
+        // 실제 작업 시작(Processing/Stage 1 등) 페이로드가 오기 전까지는 10을 유지합니다.
+        const existingMsg = document.getElementById(tId);
+        const currentDomStatus = existingMsg ? parseInt(existingMsg.dataset.status || "0") : 0;
+        
+        if (currentDomStatus === 10 && (payload.category === "Cloud Sync" || payload.category === "Cloud Queue" || summary.includes("queued"))) {
+            statusCode = 10;
+        }
     }
     
     if (payload.task_id) {
@@ -1398,7 +1508,13 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     // 🌟 [CRITICAL FIX] 1차 스피너 및 전역 상태 종료 처리 
     // 사용자가 현재 무슨 화면을 보고 있든, 작업이 끝났다면 무조건 전역 락을 풀고 스피너를 정지시킵니다!
     if (isTerminal) {
-        isExtracting = false; 
+        // 🌟 [Lock 해제 보강] 어떤 경로로든 종료 상태가 되면 락을 확실히 제거합니다.
+        const currentLock = localStorage.getItem("sys_lock");
+        if (currentLock === tId || !currentLock) {
+            localStorage.removeItem("sys_lock");
+        }
+        
+        isExtracting = false;
         isSearching = false;
         stopSpinner();
         
@@ -1529,6 +1645,9 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
 
 btnStopTask?.addEventListener("click", async () => {
     if (await ask("Stop the current extraction/search? (The record will be deleted)", { title: "Stop Task", kind: "warning" })) {
+        // 🌟 [통합 락 매니저] 강제 초기화 호출 (isBusy, currentTaskId, activeRefs, localStorage 일괄 정리)
+        GlobalTaskManager.forceReset();
+        
         isExtracting = false; 
         isSearching = false; 
         stopSpinner();
@@ -1545,7 +1664,7 @@ btnStopTask?.addEventListener("click", async () => {
             await invoke<string>("stop_current_extraction", { taskId: activeTaskId });
             
             if (activeTaskId) {
-                // 🌟 취소 시 localStorage 데이터 삭제
+                // 취소 시 UI 로그 데이터 및 엘리먼트 삭제
                 localStorage.removeItem(`term_${activeTaskId}`);
                 const el = document.getElementById(activeTaskId);
                 if (el) el.remove();
@@ -1554,6 +1673,8 @@ btnStopTask?.addEventListener("click", async () => {
             activeTaskId = null;
             detailTitle.innerText = "Cancelled";
             detailContent.innerHTML = "<div style='color:#ef4444; padding:20px;'>Extraction stopped and deleted by user.</div>";
+            
+            // 버튼 상태 즉시 재계산
             await updateExtractButtonVisibility();
         } catch (e) { 
             console.error("Stop failed:", e); 
@@ -2742,8 +2863,17 @@ async function initSession() {
         console.log("[WIDGET] UI Ready handshake starting...");
         const data = await invoke<any>("mark_ui_ready");
 
+        // 🌟 [CRITICAL FIX] 앱 재실행/새로고침 시 유효하지 않은 좀비 락(sys_lock)을 즉시 사살합니다.
+        const currentLockId = localStorage.getItem("sys_lock");
+        if (currentLockId) {
+            const isLockValid = data.tasks && data.tasks.some((t: any) => t.id === currentLockId && (t.status === 1 || t.status === 10));
+            if (!isLockValid) {
+                console.log(`[LOCK] Cleaning up invalid zombie lock: ${currentLockId}`);
+                localStorage.removeItem("sys_lock");
+            }
+        }
+
         // 🌟 [CRITICAL FIX] 새로고침 시 DB 대기열(PENDING) 목록을 화면에 강제 복구합니다.
-        // 🌟 [CRITICAL FIX] 새로고침 시 DB에서 진행 중(1)이거나 대기 중(10)인 작업을 완벽히 복구합니다.
         if (data.tasks && data.tasks.length > 0) {
             data.tasks.forEach((t: any) => {
                 if (t.status === 10 || t.status === 1) {
@@ -2785,6 +2915,9 @@ async function initSession() {
                     }
                     
                     // 3. 진행 중(1)이거나 대기 중(10)인 작업에 대한 전역 상태 락 설정
+                    // 🌟 새로고침 시 살아있는 작업이 있다면 LocalStorage 락을 복구합니다.
+                    localStorage.setItem("sys_lock", t.id);
+                    
                     if (t.id.startsWith("search_")) {
                         isSearching = true;
                         if (btnSubmit) btnSubmit.style.display = "none";
@@ -2828,7 +2961,24 @@ document.getElementById("btn-qr-auth")?.addEventListener("click", performQrAuth)
 document.getElementById("btn-logout")?.addEventListener("click", async () => { if (await ask("Are you sure?", { title: "Sign Out", kind: "warning" })) { currentSession.email = undefined; updateAuthUI(); } });
 settingsBtn?.addEventListener("click", () => { if (currentTab === "settings" && isExpanded) collapseWidget(); else openWidget("settings"); });
 document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTab("automation"));
-document.getElementById("unload-btn")?.addEventListener("click", async () => { try { await invoke("unload_model"); alert("Memory cleared."); } catch (e) {} });
+document.getElementById("unload-btn")?.addEventListener("click", async () => { 
+    try { 
+        // 🌟 메모리 강제 해제 시 진행 중인 프론트엔드 락도 함께 초기화합니다.
+        GlobalTaskManager.forceReset();
+        isExtracting = false;
+        isSearching = false;
+        stopSpinner();
+
+        await invoke("unload_model"); 
+        alert("Memory cleared."); 
+        
+        // 버튼 상태 복구
+        await updateExtractButtonVisibility();
+        if (btnSubmit) btnSubmit.style.display = "flex";
+    } catch (e) {
+        console.error("[WIDGET] Unload failed:", e);
+    } 
+});
 async function syncBrowserStatus() { try { const s = await invoke<string>("get_browser_status"); if (btnAutoLaunch) btnAutoLaunch.style.display = (s === "running") ? "none" : "flex"; } catch (e) {} }
 // --- Device Preference Logic ---
 const forceCpuToggle = document.getElementById("force-cpu-toggle") as HTMLInputElement;
@@ -3294,9 +3444,6 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
         }
 
         const displayMsg: ChatMessage = { ...msg, text: textContent };
-        
-        // 🌟 [CRITICAL FIX] ID 자체가 _query로 끝나는 사용자 질문 메시지는 절대로 시스템 Task(isTask)로 분류하지 않습니다.
-        // 이를 통해 domId가 원본 ID(search_..._query)를 유지하게 하여 시스템 스피너에 의해 증발되는 것을 막습니다.
         const isTask = displayMsg.role === "system_task" || (displayMsg.role === "user" && !!displayMsg.task_id && displayMsg.task_id.startsWith("search_") && !displayMsg.id.endsWith("_query") && !displayMsg.task_id.endsWith("_query"));
         const domId = isTask ? (displayMsg.task_id || displayMsg.id) : displayMsg.id;
         
@@ -3305,17 +3452,43 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
         if (existingEl) {
             const cachedUpdatedAt = parseInt(existingEl.dataset.updatedAt || "0");
             const cachedStatus = parseInt(existingEl.dataset.status || "0");
-            
-            if (msg.updated_at > cachedUpdatedAt || msg.status !== cachedStatus || parseInt(existingEl.dataset.createdAt || "0") > Date.now()) {
-                console.log(`[Chat] Updating ${domId}`);
-                existingEl.outerHTML = createMessageHTML(displayMsg);
+            const cachedText = existingEl.querySelector('.content')?.textContent || "";
+
+            // 🌟 [핵심 개선] 전체 렌더링을 피하고 변경된 데이터만 핀포인트 업데이트합니다. [cite: 1]
+            if (msg.updated_at > cachedUpdatedAt || msg.status !== cachedStatus || msg.text !== cachedText) {
                 
-                const newEl = chatTalks.querySelector(`[id="${domId}"]`) as HTMLElement;
-                if (newEl) {
-                    newEl.classList.add("updated-flash");
-                    setTimeout(() => newEl?.classList.remove("updated-flash"), 1000);
-                    if (isTask) { newEl.onclick = () => handleTaskClick(newEl); }
+                // 1. 텍스트 내용 업데이트 (퍼센트 및 요약글)
+                const contentEl = existingEl.querySelector('.content');
+                if (contentEl && contentEl.textContent !== msg.text) {
+                    contentEl.textContent = msg.text;
                 }
+
+                // 2. 상태(Status) 및 아이콘 업데이트
+                if (msg.status !== cachedStatus) {
+                    existingEl.dataset.status = msg.status.toString();
+                    
+                    const currentLock = localStorage.getItem("sys_lock");
+                    if (currentLock === domId && [2, 6, 9].includes(msg.status)) {
+                        console.log(`[LOCK] Task ${domId} reached terminal state ${msg.status}. Releasing lock.`);
+                        localStorage.removeItem("sys_lock");
+                    }
+
+                    const statusBar = existingEl.querySelector('.status-bar') as HTMLElement;
+                    if (statusBar) {
+                        const statusMap: any = {
+                            1: { icon: "⠋", text: "PROCESSING", color: "var(--primary)" },
+                            9: { icon: "✅", text: "DONE", color: "#22c55e" },
+                            10: { icon: "📥", text: "QUEUED", color: "#999999" },
+                            2: { icon: "🛑", text: "STOPPED", color: "#ef4444" },
+                            6: { icon: "❌", text: "ERROR", color: "#ef4444" }
+                        };
+                        const s = statusMap[msg.status] || { icon: "⏳", text: "WAITING", color: "#999999" };
+                        statusBar.style.color = s.color;
+                        // 상태가 1(Processing)일 때만 스피너 애니메이션 클래스 부여
+                        statusBar.innerHTML = `<span class="${msg.status === 1 ? 'active-spinner' : ''}">${s.icon}</span> ${s.text}`;
+                    }
+                }
+                existingEl.dataset.updatedAt = msg.updated_at.toString();
             }
         } else {
             const temp = document.createElement('div');
@@ -3326,25 +3499,36 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
         }
     });
 
-    // 🌟 [CRITICAL FIX] 복잡하고 버그가 많았던 insertBefore를 완전히 삭제!
-    // DOM에 렌더링된 모든 자식들을 한 번에 메모리에 올린 후, 시간을 기준으로 100% 완벽하게 재정렬하여 덮어씌웁니다.
-    const children = Array.from(chatTalks.children) as HTMLElement[];
-    children.sort((a, b) => {
+    // 🌟 [CRITICAL FIX] DOM 정렬 로직 강화 (시간 오름차순 및 질문 우선순위 고정)
+    const sortedChildren = Array.from(chatTalks.children) as HTMLElement[];
+    sortedChildren.sort((a, b) => {
         const timeA = Number(a.dataset.createdAt || 0);
         const timeB = Number(b.dataset.createdAt || 0);
         
-        if (timeA === timeB) {
-            // 🌟 시간이 1ms 단위까지 완벽히 같다면, 사용자 질문(_query)을 시스템 작업보다 앞으로 보냅니다.
-            const aIsQuery = a.id.includes("_query");
-            const bIsQuery = b.id.includes("_query");
-            if (aIsQuery && !bIsQuery) return -1;
-            if (!aIsQuery && bIsQuery) return 1;
-            return a.id.localeCompare(b.id);
+        // 1. 시간이 다르면 시간순 정렬
+        if (timeA !== timeB) {
+            return timeA - timeB;
         }
-        return timeA - timeB;
+        
+        // 2. 시간이 동일할 경우, 질문(_query)이 작업 메시지보다 항상 앞에 오도록 배치
+        const aId = a.id || "";
+        const bId = b.id || "";
+        const aIsQuery = aId.endsWith("_query") || aId.includes("_query");
+        const bIsQuery = bId.endsWith("_query") || bId.includes("_query");
+        
+        if (aIsQuery && !bIsQuery) return -1;
+        if (!aIsQuery && bIsQuery) return 1;
+        
+        // 3. 그 외에는 ID 문자열 순서로 고정 정렬
+        return aId.localeCompare(bId);
     });
-    // 정렬된 순서대로 DOM 재배치
-    children.forEach(c => chatTalks.appendChild(c));
+
+    // 🌟 [핵심 수정] 정렬된 리스트와 현재 DOM 순서를 비교하여 필요한 노드만 재배치
+    sortedChildren.forEach((node, idx) => {
+        if (chatTalks.children[idx] !== node) {
+            chatTalks.insertBefore(node, chatTalks.children[idx] || null);
+        }
+    });
 
     // [Scroll Maintenance]
     if (mode === 'prepend' && scrollEl) {
@@ -3366,46 +3550,45 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
 }
 
 function createMessageHTML(msg: ChatMessage) {
+    // 상태별 UI 정의 (10번 상태가 확실히 반영되도록 설정)
     const statusMap: Record<number, { icon: string, text: string, color: string }> = {
-        0: { icon: "✅", text: "done", color: "#22c55e" },
-        1: { icon: "⏳", text: "processing", color: "var(--primary)" },
-        2: { icon: "🛑", text: "stopped", color: "#ef4444" },
-        3: { icon: "🚫", text: "cancelled", color: "#666" },
-        6: { icon: "❌", text: "error", color: "#ef4444" },
-        9: { icon: "✅", text: "done", color: "#22c55e" },
-        10: { icon: "📥", text: "pending", color: "#999" }
+        9: { icon: "✅", text: "DONE", color: "#22c55e" },
+        0: { icon: "✅", text: "DONE", color: "#22c55e" },
+        1: { icon: "⠋", text: "PROCESSING", color: "var(--primary)" },
+        6: { icon: "❌", text: "ERROR", color: "#ef4444" },
+        10: { icon: "📥", text: "PENDING", color: "#999999" }, // 대기 상태 회색조 유지
+        3: { icon: "🛑", text: "STOPPED", color: "#ef4444" }
     };
-    const currentStatus = statusMap[msg.status] || statusMap[0];
     
-    // 🚨 [수정] _query 식별자가 붙은 메시지는 절대 Task-Bubble(진행상태 바)로 변신하지 못하게 원천 차단!
-    const isTaskBubble = msg.role === "system_task" || (msg.role === "user" && !!msg.task_id && msg.task_id.startsWith("search_") && !msg.id.endsWith("_query"));
+    const currentStatus = statusMap[msg.status] || { icon: "⏳", text: "WAITING", color: "#999999" };
+    
+    // Task Bubble 판단 로직 (ID와 Role 기준)
+    const isTaskBubble = msg.role === "system_task" || (!!msg.task_id && msg.task_id.startsWith("search_") && !msg.id.endsWith("_query"));
     const roleClass = msg.role === "user" ? "user" : "system";
     const domId = isTaskBubble ? (msg.task_id || msg.id) : msg.id;
+    
+    const timeStr = new Date(Number(msg.created_at)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const bubbleClass = isTaskBubble ? 'task-bubble' : '';
 
-    // 🌟 [CRITICAL FIX] 사용자 질문과 시스템 작업의 생성 시간이 같을 경우 정렬이 꼬입니다.
-    // 시스템 말풍선(Task)일 경우 생성 시간에 +1ms를 강제 주입하여 항상 질문(User) 아래에 배치합니다.
-    let trueCreatedAt = Number(msg.created_at);
-    if (isTaskBubble) {
-        trueCreatedAt += 1;
-    }
-    if (msg.role === "system_task" && domId.startsWith("search_") && !domId.endsWith("_query")) {
-        trueCreatedAt += 1;
-    }
-    const timeStr = new Date(trueCreatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    // 🌟 핵심: msg.text가 비어있지 않도록 보장하여 새로고침 시에도 내용 표시
+    const displayContent = msg.text && msg.text.trim() !== "" ? msg.text : "대기 중인 작업입니다...";
 
-    return `<div id="${domId}" class="chat-talk ${roleClass} ${isTaskBubble ? 'task-bubble' : ''}" 
+    return `<div id="${domId}" class="chat-talk ${roleClass} ${bubbleClass}" 
         data-task-id="${msg.task_id || msg.id}" 
         data-status="${msg.status}" 
-        data-updated-at="${msg.updated_at || trueCreatedAt}"
-        data-created-at="${trueCreatedAt}"
+        data-updated-at="${msg.updated_at}"
+        data-created-at="${msg.created_at}"
         style="${isTaskBubble ? 'cursor:pointer;' : ''}">
         <div class="chat-message">
             <div style="font-size:0.6rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;">
                 <span>${msg.role === 'user' ? '@YOU' : '🤖 LOGIS AI'}</span>
                 <span>${timeStr}</span>
             </div>
-            <div class="content">${msg.text}</div>
-            ${isTaskBubble && msg.status !== 0 ? `<div class="status-bar" style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1); font-size:0.65rem; font-weight:bold; color:${currentStatus.color};"><span class="${msg.status === 1 ? 'active-spinner' : ''}">${currentStatus.icon}</span> ${currentStatus.text.toUpperCase()}</div>` : ""}
+            <div class="content">${displayContent}</div>
+            ${isTaskBubble && msg.status !== 0 ? `
+                <div class="status-bar" style="margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.1); font-size: 0.65rem; font-weight: bold; color: ${currentStatus.color};">
+                    <span class="${msg.status === 1 ? 'active-spinner' : ''}">${currentStatus.icon}</span> ${currentStatus.text}
+                </div>` : ""}
         </div>
     </div>`;
 }
@@ -3470,20 +3653,26 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
             activeTasks.forEach((t: any) => {
                 let taskQuery = "";
                 try {
+                    // DB의 Task 테이블 data_json에 저장된 원본 query를 추출합니다.
                     const taskData = typeof t.data_json === 'string' ? JSON.parse(t.data_json) : t.data_json;
                     taskQuery = taskData.query || "";
                 } catch(e) {}
 
+                // 🌟 [CRITICAL FIX] 새로고침 시 대기열에 있는 작업의 사용자 질문(@YOU)을 강제 복구합니다.
                 if (taskQuery) {
-                    const userExists = messages.find(m => m.id === `${t.id}_query`);
+                    const userMsgId = `${t.id}_query`;
+                    const userExists = messages.find(m => m.id === userMsgId || (m.task_id === t.id && m.role === "user"));
+                    
                     if (!userExists) {
                         messages.push({
-                            id: `${t.id}_query`,
+                            id: userMsgId,
+                            task_id: t.id,
                             role: "user",
                             text: taskQuery,
-                            status: 9,
-                            created_at: t.created_at,
-                            updated_at: t.updated_at
+                            status: 9, 
+                            // 🌟 시스템 메시지(t.created_at + 1)보다 확실히 먼저 나오도록 10ms의 여유를 두고 배치합니다.
+                            created_at: Number(t.created_at) - 10, 
+                            updated_at: Number(t.created_at) - 10
                         });
                     }
                 }

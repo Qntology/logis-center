@@ -548,6 +548,8 @@ async fn ai_search_complex(
     bcc: String,
     ref_id: String,
 ) -> Result<Value, String> {
+    // 🌟 [대격변] 프론트엔드(LocalStorage)에서 100% 입구를 통제하므로, 
+    // 백엔드의 무거운 LanceDB 조회 및 락 대기열 로직을 전면 철거했습니다! (속도 대폭 향상)
     
     let emit_term = |msg: &str| {
         println!("{}", msg);
@@ -604,90 +606,55 @@ async fn ai_search_complex(
             Some(&task_id), Some(9), 
             Some(&cc), Some(&bcc), Some(&ref_id), 
             Some(&from_user), Some(&to_system), Some("talk"), 
-            Some(&now_str) // 🌟 &str 타입을 기대하므로 문자열 참조로 전달
+            Some(&now_str)
         ).await;
 
-        // 시스템 작업 메시지: 1ms 뒤(now + 1)에 저장 (문자열 변환 추가)
-        let next_now_str = (now + 1).to_string();
+        // 시스템 작업 메시지: 질문보다 확실히 나중에 보이도록 20ms 뒤에 저장 (정렬 안정성 강화)
+        let next_now_str = (now + 20).to_string();
         let _ = store.add_message(
             &task_id, "system_task", "Task Started: AI Search", 
             Some(&task_id), Some(10), 
             Some(&cc), Some(&bcc), Some(&ref_id), 
             Some(&to_system), Some(&from_user), Some("talk"), 
-            Some(&next_now_str) // 🌟 &str 타입을 기대하므로 문자열 참조로 전달
+            Some(&next_now_str)
         ).await;
     }
 
-    // 🌟 [CRITICAL FIX] 통합 대기열(Queue) 로직: 이전 작업이 끝날 때까지 얌전히 기다리며 순서를 지킵니다!
-    emit_term("[QUEUE] Task queued. Waiting for AI Engine to become available...");
-    loop {
-        if cancel_token.load(Ordering::Relaxed) { 
-            return Err("Task cancelled by user".to_string()); 
-        }
-
-        let can_start = {
-            let mem_busy = crate::ACTIVE_TASK_MEM.read().unwrap().is_some();
-            let search_busy = IS_SEARCHING.load(Ordering::SeqCst);
-
-            // 🌟 [CRITICAL FIX] 백그라운드 스케줄러(웹 전처리 등)가 실행 중인지 정확히 파악하기 위해 
-            // 최신 진행 상황(LATEST_PROGRESS_PAYLOAD)이 끝났는지(Done/Error) 검사합니다.
-            let mut scheduler_busy = false;
-            if let Ok(mem) = crate::LATEST_PROGRESS_PAYLOAD.read() {
-                if let Some(payload) = mem.as_ref() {
-                    let cat = payload.get("category").and_then(|v| v.as_str()).unwrap_or("");
-                    let sum = payload.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-                    if cat != "Done" && cat != "Error" && !sum.contains("cancelled") && !sum.contains("stopped") {
-                        scheduler_busy = true; // 스케줄러가 뭔가 열심히 처리 중입니다!
-                    }
-                }
-            }
-
-            // 다른 누군가가 AI 엔진을 1%라도 쓰고 있다면 무조건 대기!
-            if mem_busy || search_busy || scheduler_busy {
-                false
-            } else {
-                let mut is_first = true;
-                if let Some(store) = store_opt.as_ref() {
-                    // 대기열 목록(status=10)을 불러와서 내가 1빠인지 확인 (선입선출)
-                    if let Ok(pending_tasks) = store.get_pending_tasks(10).await {
-                        if let Some(first) = pending_tasks.first() {
-                            if first.id != task_id {
-                                is_first = false;
-                            }
-                        }
-                    }
-                }
-                is_first
-            }
-        };
-
-        if can_start {
-            break;
-        }
-        
-        // 1초마다 내 차례가 왔는지 체크
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    // 🌟 [결단] 대기열 진입 시 프론트엔드에 'PENDING'임을 명시적으로 알립니다.
+    let payload_pending = json!({ 
+        "task_id": task_id, 
+        "category": "Pending", // 🌟 Processing이 아닌 Pending 카테고리 사용
+        "summary": "Waiting for AI Engine access...", 
+        "spinner": "📥" 
+    });
+    let _ = app_handle.emit("extraction-progress", &payload_pending);
+    
+    emit_term("[QUEUE] Task queued. Waiting for Model Access...");
+    
+    let mut model_guard = state.model.lock().await;
+    
+    if cancel_token.load(Ordering::Relaxed) { 
+        return Err("Task cancelled while waiting in queue".to_string()); 
     }
 
     emit_term("[QUEUE] AI Engine acquired. Starting process...");
 
-    // 🌟 대기열 통과! 내 차례가 왔으므로 락을 쥐고 당당하게 실행을 시작합니다.
-    IS_SEARCHING.store(true, Ordering::SeqCst);
-    
+    // [REMOVE] 백엔드 자체 검색 락 변수 조작 제거
+    // 프론트엔드의 GlobalTaskManager가 이미 입구를 막고 있으므로 
+    // 백엔드는 별도의 AtomicBool 락 없이 즉시 실행 로직에 집중합니다.
+
     {
+        // 최소한의 동기화 정보만 업데이트 (UI 복구용)
         let mut mem_guard = crate::ACTIVE_TASK_MEM.write().unwrap();
         let now = chrono::Utc::now().timestamp_millis();
         *mem_guard = Some(json!({
             "id": task_id.clone(),
-            "status": 1,
-            "query": query.clone(),
-            "created_at": now,
-            "updated_at": now
+            "status": 1
         }));
     }
 
+    // 획득한 model_guard를 사용하여 모델 로드 또는 재사용
     let model = {
-        let mut model_guard = state.model.lock().await;
         if let Some(m) = model_guard.as_ref() {
             let wants_cpu = device_preference.as_deref() == Some("cpu");
             if m.is_cpu_mode != wants_cpu {
@@ -724,6 +691,7 @@ async fn ai_search_complex(
     let _ = app_handle.emit("extraction-progress", &payload_start);
     crate::scheduler::log_task_progress(&app_handle, &task_id, &payload_start);
 
+    // 🌟 model_guard가 여기서 소멸되지 않고 이 아래 비동기 블록이 끝날 때까지 유지됩니다.
     let search_process = async {
         let mut all_results = Vec::new();
         
@@ -827,6 +795,11 @@ async fn ai_search_complex(
     }
 
     model.deep_purge_resources().await; 
+    
+    // 🌟 함수 종료 직전 가드와 락을 명시적으로 정리
+    drop(model_guard);
+    IS_SEARCHING.store(false, Ordering::SeqCst);
+    
     search_process
 }
 
@@ -1007,15 +980,19 @@ struct ActiveTaskQuery {
 
 #[tauri::command]
 async fn check_active_task(
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     payload: ActiveTaskQuery,
 ) -> Result<bool, String> {
-    let store_guard = state.store.lock().await;
-    if let Some(store) = store_guard.as_ref() {
-        store.has_active_task(&payload.cc, &payload.r#ref).await.map_err(|e| e.to_string())
-    } else {
-        Ok(false)
+    // 🌟 [CRITICAL FIX] LanceDB 대신 초고속 RAM 캐시인 ACTIVE_TASK_MEM만 확인합니다.
+    if let Ok(mem_guard) = crate::ACTIVE_TASK_MEM.read() {
+        if let Some(active) = mem_guard.as_ref() {
+            let active_ref = active.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+            if active_ref == payload.r#ref {
+                return Ok(true); // 현재 메모리에서 해당 페이지가 돌아가고 있음
+            }
+        }
     }
+    Ok(false)
 }
 
 #[tauri::command]
@@ -1391,7 +1368,6 @@ pub fn run() {
             let event_store = app.state::<AppState>().store.clone();
             let event_cancel = app.state::<AppState>().cancellation_token.clone();
             app.listen("new-task-from-browser", move |event| {
-                // [NEW] Reset stop signals when a new task arrives
                 event_cancel.store(false, Ordering::SeqCst);
                 crate::utils::set_extraction_stop_signal(false);
 
@@ -1400,6 +1376,9 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         let store_guard = store_clone.lock().await;
                         if let Some(db) = store_guard.as_ref() {
+                            // [REMOVE] Rust의 중복 요청 차단 로직 삭제
+                            // 이미 프론트엔드 GlobalTaskManager에서 걸러진 요청만 넘어옵니다.
+
                             let now = chrono::Utc::now().timestamp_millis();
                             let from_addr = payload_val.get("from").and_then(|v| v.as_str()).unwrap_or("0x0000000000000000000000000000000000000000").to_string();
                             let team_id = payload_val.get("to").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| crate::utils::hash::hash_id(&from_addr));
