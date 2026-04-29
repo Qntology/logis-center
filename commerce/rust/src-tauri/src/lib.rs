@@ -1402,18 +1402,19 @@ pub fn run() {
 
             let event_store = app.state::<AppState>().store.clone();
             let event_cancel = app.state::<AppState>().cancellation_token.clone();
+            // 🌟 [수정] 핸들러 내부에서 이벤트를 쏘기 위해 app_handle을 획득합니다.
+            let handle_for_event = app.handle().clone(); 
+
             app.listen("new-task-from-browser", move |event| {
                 event_cancel.store(false, Ordering::SeqCst);
                 crate::utils::set_extraction_stop_signal(false);
+                let app_handle = handle_for_event.clone(); // 🌟 [수정] 클로저 내부에서 사용할 이름 정의
 
                 if let Ok(payload_val) = serde_json::from_str::<serde_json::Value>(event.payload()) {
                     let store_clone = event_store.clone();
                     tauri::async_runtime::spawn(async move {
                         let store_guard = store_clone.lock().await;
                         if let Some(db) = store_guard.as_ref() {
-                            // [REMOVE] Rust의 중복 요청 차단 로직 삭제
-                            // 이미 프론트엔드 GlobalTaskManager에서 걸러진 요청만 넘어옵니다.
-
                             let now = chrono::Utc::now().timestamp_millis();
                             let from_addr = payload_val.get("from").and_then(|v| v.as_str()).unwrap_or("0x0000000000000000000000000000000000000000").to_string();
                             let team_id = payload_val.get("to").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| crate::utils::hash::hash_id(&from_addr));
@@ -1427,22 +1428,16 @@ pub fn run() {
                                 data_json: payload_val.to_string(), created_at: now, updated_at: now, status: 10,
                             };
                             let msg_text = format!("Task Started: {}", payload_val.get("link").and_then(|v| v.as_str()).unwrap_or("Unknown URL"));
+                            
                             let _ = db.add_message(
-                                &task.id, 
-                                "system_task", 
-                                &msg_text, 
-                                Some(&task.id), 
-                                Some(10), // 🌟 [수정] 오타(,,) 수정 및 Pending 상태(10) 명확히 적용
-                                Some(&task.cc),
-                                Some(&task.bcc),
-                                Some(&task.r#ref),
-                                Some(&task.from),
-                                Some(&task.to),
-                                Some("talk"),
-                                None
+                                &task.id, "system_task", &msg_text, Some(&task.id), Some(10),
+                                Some(&task.cc), Some(&task.bcc), Some(&task.r#ref),
+                                Some(&task.from), Some(&task.to), Some("talk"), None
                             ).await;
+                            
                             let _ = db.add_task(task.clone()).await;
-                            // 🌟 [추가] DB 등록 완료 이벤트를 발송하여 프론트엔드가 '가상 큐' 상태를 '실제 DB' 상태로 바꾸게 유도합니다.
+                            
+                            // 🌟 [수정] 유효한 app_handle을 사용하여 이벤트를 발송합니다.
                             let _ = app_handle.emit("task-db-registered", json!({
                                 "task_id": task.id,
                                 "status": task.status,

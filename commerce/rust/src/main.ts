@@ -1482,12 +1482,15 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     const isTerminal = payload.category === "Done" || payload.category === "Error" || summary.includes("cancelled") || summary.includes("stopped");
     const isNotification = payload.category === "Warning" || payload.category === "Info";
 
-    if (!isRecovery && !isExtracting && !isTerminal && !isSearching) {
-        const runningCats = ["Processing", "Preparation", "Vision", "Shipping", "Analytic", "Loading Model", "AI Inference"];
-        if (runningCats.some(c => payload.category && payload.category.includes(c))) {
-            console.log("[WIDGET] Adopting running background task:", payload.task_id);
+    // 🌟 [CRITICAL FIX 1] 상태 입양(Adopt) 범위 확대: 
+    // 백엔드에서 날아오는 'Loading Model', 'Saving', 'Handover' 등 모든 활동을 
+    // '진행 중'으로 인지하여 큐가 풀리지 않도록 락을 단단히 고정합니다!
+    const isPayloadRunning = payload.category && !["Pending", "Cloud Sync", "Cloud Queue"].includes(payload.category);
+
+    if (!isRecovery && !isTerminal && isPayloadRunning) {
+        if (activeTaskId !== payload.task_id || !GlobalTaskManager.isBusy) {
+            console.log("[WIDGET] Adopting/Confirming running background task:", payload.task_id);
             
-            // 🌟 [CRITICAL FIX] 백그라운드 이벤트 수신 시, 전역 락 매니저를 강제로 동기화(Adopt)합니다!
             activeTaskId = payload.task_id;
             localStorage.setItem("sys_lock", activeTaskId!);
             GlobalTaskManager.isBusy = true;
@@ -1555,16 +1558,9 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     } else if (summary.includes("cancelled") || summary.includes("stopped")) {
         statusCode = 3;
     } else {
-        // 🌟 [최종 보강] 백엔드에서 명시적으로 'Processing' 혹은 'Stage' 페이로드가 오기 전까지는 무조건 10번(📥) 상태를 고수합니다.
-        const isActuallyRunning = payload.category === "Processing" || 
-                                 payload.category.startsWith("Stage") || 
-                                 payload.category === "Vision Analysis" ||
-                                 payload.category === "AI Inference" ||
-                                 summary.includes("analyzing") ||
-                                 summary.includes("scanning");
-        
-        // 🌟 Cloud Sync나 Pending 카테고리는 확실히 10번으로 유지
-        if (payload.category === "Pending" || payload.category === "Cloud Sync" || payload.category === "Cloud Queue" || !isActuallyRunning) {
+        // 🌟 [CRITICAL FIX 2] 백엔드에서 날아오는 중간 과정들이 10번(QUEUED)으로 오해받아 
+        // 텍스트가 지워지고 스피너가 멈추는 버그를 원천 차단합니다. 오직 Pending 계열만 10번을 부여합니다!
+        if (payload.category === "Pending" || payload.category === "Cloud Sync" || payload.category === "Cloud Queue") {
             statusCode = 10;
         } else {
             statusCode = 1;
@@ -1584,7 +1580,8 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
         renderMessage({ 
             id: payload.task_id, 
             role: "system_task", 
-            content: displaySummary, 
+            // 🌟 [CRITICAL FIX 1] content 대신 text 속성을 명시적으로 사용하여 텍스트 증발 방지
+            text: displaySummary, 
             status: statusCode, 
             created_at: originalCreatedAt, 
             updated_at: Date.now(),
@@ -3600,26 +3597,31 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
         if (existingEl) {
             const cachedStatus = parseInt(existingEl.dataset.status || "0");
             
-            // 🌟 [방어 로직] 이미 종료 상태(2, 6, 9)인 메시지를 다시 대기(10)나 진행(1)으로 되돌리는 것을 금지합니다.
-            if ([2, 6, 9].includes(cachedStatus) && [1, 10].includes(msg.status)) {
-                return; 
+            // 🌟 [CRITICAL FIX 3] 한 번 진행 중(1)이 된 작업을 늦게 도착한 이벤트가 다시 대기(10)로 강등시키는 것을 원천 차단합니다!
+            if ([1, 2, 6, 9].includes(cachedStatus) && msg.status === 10) {
+                msg.status = cachedStatus; 
+            }
+            // 🌟 이미 종료 상태(2, 6, 9)인 메시지를 다시 진행(1)으로 되돌리는 것도 금지합니다.
+            if ([2, 6, 9].includes(cachedStatus) && msg.status === 1) {
+                msg.status = cachedStatus; 
             }
 
-            const isTransitionFromVirtual = cachedStatus === 10 && msg.status !== 10;
+            const isTransitionFromVirtual = cachedStatus === 10 && displayMsg.status !== 10;
             const cachedUpdatedAt = parseInt(existingEl.dataset.updatedAt || "0");
             const cachedText = existingEl.querySelector('.content')?.textContent || "";
 
-            // 🌟 [수정] cachedText와 msg.text가 다르면 시간값에 상관없이 UI를 즉시 갱신하도록 허용합니다.
-            if (isTransitionFromVirtual || msg.updated_at > cachedUpdatedAt || msg.status !== cachedStatus || (msg.text && cachedText !== msg.text)) {
+            // 🌟 [CRITICAL FIX 2] msg 대신 파싱이 완료된 displayMsg의 속성을 사용하여 안전하게 비교합니다.
+            if (isTransitionFromVirtual || displayMsg.updated_at > cachedUpdatedAt || displayMsg.status !== cachedStatus || (displayMsg.text && cachedText !== displayMsg.text)) {
                 
                 // 1. 텍스트 내용 업데이트 (퍼센트 및 요약글)
                 const contentEl = existingEl.querySelector('.content');
-                if (contentEl && contentEl.textContent !== msg.text) {
-                    contentEl.textContent = msg.text;
+                // 🌟 [CRITICAL FIX 3] msg.text(undefined)가 아닌 displayMsg.text를 꽂아 넣어 빈칸 버그를 해결합니다!
+                if (contentEl && contentEl.textContent !== displayMsg.text) {
+                    contentEl.textContent = displayMsg.text;
                 }
 
                 // 2. 상태(Status) 및 아이콘 업데이트
-                let finalStatus = msg.status;
+                let finalStatus = displayMsg.status;
                 
                 // 🌟 [CRITICAL FIX] 좀비 방어: 현재 활성 작업(activeTaskId)이 아니더라도 큐가 돌리고 있는(currentTaskId) 정상 작업이면 STOPPED 처리를 면제합니다.
                 if (finalStatus === 1 && !isSearching && !isExtracting && activeTaskId !== domId && GlobalTaskManager.currentTaskId !== domId) {
