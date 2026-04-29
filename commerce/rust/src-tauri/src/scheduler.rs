@@ -183,20 +183,8 @@ pub async fn start_background_worker(
 
     clear_all_temp_data(Some(&app_handle));
 
-    {
-        let store_clone = store.clone();
-        tauri::async_runtime::spawn(async move {
-            for _ in 0..10 { 
-                if let Ok(guard) = store_clone.try_lock() {
-                    if let Some(db) = guard.as_ref() {
-                        let _ = db.cleanup_zombie_tasks().await;
-                        break;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        });
-    }
+    // 🌟 [삭제] 이미 lib.rs 의 setup 블록에서 동기적으로 정리가 완료되었으므로, 
+    // 여기서 다시 spawn 하여 불필요한 DB 락 경쟁을 일으킬 필요가 없습니다.
     
     tokio::spawn(async move {
         if !UI_READY_FLAG.load(Ordering::SeqCst) {
@@ -219,7 +207,10 @@ pub async fn start_background_worker(
                 let store_opt = store.lock().await;
                 if let Some(db) = store_opt.as_ref() {
                     match db.get_pending_tasks(5).await {
-                        Ok(tasks) => pending_tasks = tasks,
+                        Ok(tasks) => {
+                            // 🌟 [CRITICAL FIX] 스케줄러는 프론트엔드가 큐로 통제하는 검색 작업(ai_search)을 절대 훔쳐가지 않습니다!
+                            pending_tasks = tasks.into_iter().filter(|t| t.r#type != "ai_search").collect();
+                        },
                         Err(e) => println!("[Scheduler] Failed to fetch tasks: {:?}", e),
                     }
                 }
@@ -592,7 +583,7 @@ async fn process_task(
         "type": task.r#type.clone(),
         "link": url.clone(),
         "origin": origin_candidate.clone(),
-        "status": 1, // Processing
+        "status": 1, 
         "created_at": task.created_at,
         "updated_at": chrono::Utc::now().timestamp_millis()
     });
@@ -601,7 +592,10 @@ async fn process_task(
         *w = Some(active_task_json.clone());
     }
 
-    if url.is_empty() { return Ok(()); }
+    // 🌟 [CRITICAL FIX] URL이 없어서 처리가 불가능한 경우 조용히 성공 처리하지 않고 명시적 에러를 던져 UI의 스피너를 중단시킵니다.
+    if url.is_empty() { 
+        return Err(anyhow::anyhow!("Task missing target URL or unsupported type for background extraction.")); 
+    }
 
     // [RESUME-LOGIC] Check if PUG already exists
     let light_pug_path = data_manager.get_path("light_pug");

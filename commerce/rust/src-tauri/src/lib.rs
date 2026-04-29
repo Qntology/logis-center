@@ -79,7 +79,8 @@ async fn stop_current_extraction(
                 let _ = db.delete_message_by_task_id(id).await;
                 println!("[STOP] Task and message {} cleared from DB.", id);
             } else {
-                let _ = db.cleanup_zombie_tasks().await;
+                // 🌟 [수정] 존재하지 않는 cleanup_zombie_tasks 대신 통합된 cleanup_unfinished_tasks_on_startup 호출
+                let _ = db.cleanup_unfinished_tasks_on_startup().await;
                 println!("[STOP] All pending tasks cleared from DB.");
             }
         }
@@ -1158,7 +1159,8 @@ async fn get_active_tasks(state: State<'_, AppState>) -> Result<Vec<store::Task>
     let store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
         let mut tasks = db.get_pending_tasks(10).await.unwrap_or_default();
-        if let Ok(mut active) = db.get_pending_tasks(1).await {
+        // 🌟 [CRITICAL FIX] get_pending_tasks(1) 오타 수정: 진행 중인 작업(1)은 get_processing_tasks 로 명확히 가져옵니다.
+        if let Ok(mut active) = db.get_processing_tasks(10).await {
             tasks.append(&mut active);
         }
         Ok(tasks)
@@ -1268,7 +1270,8 @@ async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, St
     
     if let Some(db) = store_guard.as_ref() {
         let mut raw_tasks = db.get_pending_tasks(10).await.unwrap_or_default();
-        if let Ok(mut active) = db.get_pending_tasks(1).await {
+        // 🌟 [CRITICAL FIX] limit=1 로 인해 다른 진행 중인 작업들이 증발하던 버그를 해결하고 전용 함수 사용
+        if let Ok(mut active) = db.get_processing_tasks(10).await {
             raw_tasks.append(&mut active);
         }
         
@@ -1365,7 +1368,9 @@ pub fn run() {
             crate::utils::set_extraction_stop_signal(false);
 
             let setup_store = app.state::<AppState>().store.clone();
-            tauri::async_runtime::spawn(async move {
+            // 🌟 [CRITICAL FIX] 좀비 정리는 앱의 다른 기능이 시작되기 전에 '동기적'으로 완료되어야 합니다.
+            // spawn 대신 block_on 계열의 처리를 통해 순서를 보장합니다.
+            tauri::async_runtime::block_on(async move {
                 let mut store_guard = setup_store.lock().await;
                 let db_path = "data/lancedb";
                 let _ = std::fs::create_dir_all(db_path);
@@ -1374,11 +1379,11 @@ pub fn run() {
                     let _ = s.init_task_table().await;
                     let _ = s.init_all_tables().await;
                     
-                    // 🌟 [CRITICAL FIX] 앱 재시작 시, 미완료 태스크를 삭제하지 않고 '중단(2)' 상태로 전환하여
-                    // 사용자가 이전의 실패한 내역을 확인할 수 있도록 복구합니다.
+                    // 🌟 [핵심] 스케줄러 스레드가 생성되기 전에 DB를 먼저 정리합니다.
                     let _ = s.cleanup_unfinished_tasks_on_startup().await;
                     
                     *store_guard = Some(s);
+                    println!("[Setup] Zombie cleanup complete. VectorStore is ready.");
                 }
             });
 
@@ -1436,7 +1441,14 @@ pub fn run() {
                                 Some("talk"),
                                 None
                             ).await;
-                            let _ = db.add_task(task).await;
+                            let _ = db.add_task(task.clone()).await;
+                            // 🌟 [추가] DB 등록 완료 이벤트를 발송하여 프론트엔드가 '가상 큐' 상태를 '실제 DB' 상태로 바꾸게 유도합니다.
+                            let _ = app_handle.emit("task-db-registered", json!({
+                                "task_id": task.id,
+                                "status": task.status,
+                                "created_at": task.created_at,
+                                "text": msg_text
+                            }));
                             crate::scheduler::notify_new_task();
                         }
                     });

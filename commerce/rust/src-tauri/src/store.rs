@@ -250,7 +250,39 @@ impl VectorStore {
 
     pub async fn get_pending_tasks(&self, limit: usize) -> Result<Vec<Task>> {
         let table = self.conn.open_table("tasks").execute().await?;
-        let filter = "status = 10"; // 오직 '대기 중'인 작업만 가져옵니다. (1: 진행 중 제외)
+        // 🌟 [CRITICAL FIX] UI 복구를 위해 ai_search를 포함한 모든 대기열을 반환합니다. (스케줄러 필터링은 scheduler.rs에서 수행)
+        let filter = "status = 10"; 
+        let results = table.query().only_if(filter).limit(limit).execute().await?.try_collect::<Vec<_>>().await?;
+        let mut tasks = Vec::new();
+        for batch in results {
+            let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            let froms = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+            let tos = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+            let ccs = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+            let bccs = batch.column(5).as_any().downcast_ref::<StringArray>().unwrap();
+            let refs = batch.column(6).as_any().downcast_ref::<StringArray>().unwrap();
+            let datas = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
+            let crs = batch.column(8).as_any().downcast_ref::<Int64Array>().unwrap();
+            let ups = batch.column(9).as_any().downcast_ref::<Int64Array>().unwrap();
+            let sts = batch.column(10).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+            for i in 0..batch.num_rows() {
+                tasks.push(Task {
+                    id: ids.value(i).to_string(), r#type: types.value(i).to_string(), from: froms.value(i).to_string(), 
+                    to: tos.value(i).to_string(), cc: ccs.value(i).to_string(), bcc: bccs.value(i).to_string(), 
+                    r#ref: refs.value(i).to_string(), data_json: datas.value(i).to_string(), 
+                    created_at: crs.value(i), updated_at: ups.value(i), status: sts.value(i),
+                });
+            }
+        }
+        tasks.sort_by_key(|t| t.created_at);
+        Ok(tasks)
+    }
+
+    // 🌟 [CRITICAL FIX] 상태가 1인 진행 중인 작업만 정확히 가져오는 전용 함수를 추가합니다.
+    pub async fn get_processing_tasks(&self, limit: usize) -> Result<Vec<Task>> {
+        let table = self.conn.open_table("tasks").execute().await?;
+        let filter = "status = 1"; 
         let results = table.query().only_if(filter).limit(limit).execute().await?.try_collect::<Vec<_>>().await?;
         let mut tasks = Vec::new();
         for batch in results {
@@ -308,56 +340,30 @@ impl VectorStore {
         Ok(())
     }
 
-    pub async fn cleanup_zombie_tasks(&self) -> Result<()> {
-        let tasks_table = self.conn.open_table("tasks").execute().await?;
-        let talks_table = self.conn.open_table("talks").execute().await?;
-        
-        // 1. '진행 중(1)' 또는 '대기 중(10)'인 모든 작업의 ID를 가져옵니다.
-        let results = tasks_table.query()
-            .only_if("status = 1 OR status = 10")
-            .execute().await?
-            .try_collect::<Vec<_>>().await?;
-            
-        for batch in results {
-            let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            for i in 0..batch.num_rows() {
-                let task_id = ids.value(i);
-                // 2. 해당 작업과 연결된 채팅 메시지의 상태를 '중단됨(2)'으로 업데이트합니다.
-                let _ = talks_table.update()
-                    .only_if(format!("task_id = '{}'", task_id))
-                    .column("status", "2") // 2: STOPPED
-                    .execute()
-                    .await;
-            }
-        }
-
-        // 3. 이제 tasks 테이블에서 해당 작업들을 삭제합니다.
-        tasks_table.delete("status = 1 OR status = 10").await?;
-        
-        println!("[Store] All zombie tasks cleared and marked as STOPPED on startup.");
-        Ok(())
-    }
-
+    // 🌟 [정리] 불필요한 구형 로직을 삭제하고 통합합니다.
     pub async fn cleanup_unfinished_tasks_on_startup(&self) -> Result<()> {
         let tasks_table = self.conn.open_table("tasks").execute().await?;
         let talks_table = self.conn.open_table("talks").execute().await?;
 
-        // 🌟 [최종 교정] 앱 재시작 시, 큐에 대기 중이던 10번(Pending) 작업은 살려두어 스케줄러가 이어서 처리하게 합니다.
-        // 오직 진행 중이던 1번(Processing) 작업만 메모리 증발로 인한 좀비이므로 2(STOPPED)로 변경합니다.
+        println!("[Store] Initializing zombie task recovery process...");
+
+        // 🌟 1. [진행 중 사살] 앱이 죽었을 때 연산 중이던(1) 작업은 무조건 중단(2) 처리합니다.
+        // 🌟 2. [검색 큐 사살] ai_search(10)는 프론트엔드 메모리 큐가 증발했으므로 대기 중이라도 사살합니다.
         let _ = tasks_table.update()
-            .only_if("status = 1")
+            .only_if("status = 1 OR (status = 10 AND type = 'ai_search')")
             .column("status", "2") 
             .execute()
             .await;
 
+        // 🌟 3. [채팅 메시지 동기화] UI 말풍선도 동일하게 업데이트합니다.
         let _ = talks_table.update()
-            .only_if("status = 1")
+            .only_if("status = 1 OR (status = 10 AND task_id LIKE 'search_%')")
             .column("status", "2")
             .column("text", "'Task was interrupted due to app restart.'")
             .execute()
             .await;
 
-        println!("[Store] CRITICAL: Only Processing tasks (1) forced to STOPPED. Queued tasks (10) preserved.");
+        println!("[Store] CRITICAL: Zombie recovery complete. (Status 1 and search_tasks set to STOPPED)");
         Ok(())
     }
 

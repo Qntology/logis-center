@@ -1168,9 +1168,10 @@ searchInput?.addEventListener("keydown", (e) => {
 // --- main.ts 소스 ---
 
 btnSubmit?.addEventListener("click", async () => {
-    // 1. 검색 중복 실행 방지
-    if (isSearching) {
-        console.warn("[SEARCH] AI Search is already in progress.");
+    // 1. 검색 및 큐 중복 실행 방지
+    const alreadyQueued = GlobalTaskManager.queue.some(q => q.type === "ai_search");
+    if (isSearching || alreadyQueued) {
+        console.warn("[SEARCH] AI Search is already in progress or queued.");
         return; 
     }
 
@@ -1182,21 +1183,16 @@ btnSubmit?.addEventListener("click", async () => {
     const query = searchInput.value.trim();
     if (!query) return;
 
-    // 2. 즉시 상태 반영 및 버튼 숨김
-    isSearching = true; 
+    // 2. 버튼 숨김 (상태 플래그는 백엔드가 시작될 때까지 건드리지 않음)
     if (btnSubmit) btnSubmit.style.display = "none";
     if (btnExtract) btnExtract.style.display = "none"; 
 
     const taskId = `search_${Date.now()}`;
     const startTime = Date.now();
     
-    // 3. LocalStorage 락 설정 (새로고침 시 복구용)
-    localStorage.setItem("sys_lock", taskId);
-    
-    // 4. UI 탭 전환 및 로딩 준비
-    openWidget("settings");
+    openWidget("list");
 
-    // 5. 사용자 질문 말풍선 렌더링
+    // 3. 사용자 질문 말풍선 즉시 렌더링
     renderMessage({
         id: `${taskId}_query`,
         role: "user", 
@@ -1206,23 +1202,9 @@ btnSubmit?.addEventListener("click", async () => {
         updated_at: startTime
     });
 
-    // 6. 시스템 대기열 UI 강제 반영 (status: 10)
-    renderMessage({
-        id: taskId,
-        role: "system_task",
-        text: `Waiting in Queue: AI Search will start shortly...`, 
-        status: 10, 
-        created_at: startTime + 1, 
-        updated_at: startTime + 1,
-        task_id: taskId
-    });
-
-    startSpinner(); 
-
     try {
         const devicePref = getDevicePref();
-        
-        // 🚀 [수정] 큐 등록 방식으로 전환됨에 따라 동기적인 response 변수가 존재하지 않습니다.
+        // 🌟 큐에 추가 (스피너는 백엔드가 실제 작업을 픽업하면 renderProgressToUI가 켭니다)
         await GlobalTaskManager.addToQueue(taskId, "ai_search", { 
             taskId: taskId, 
             query: query, 
@@ -1233,35 +1215,18 @@ btnSubmit?.addEventListener("click", async () => {
             bcc: activeContext.bcc || "",
             refId: activeContext.ref || ""
         });
-
-        // [참고] 결과 출력 로직(AI Deep Analysis)은 이제 백엔드 처리가 끝난 후 
-        // extraction-progress 이벤트를 통해 'Done' 신호를 받았을 때 그리거나, 
-        // task-bubble을 클릭하여 로그를 확인할 때 렌더링되도록 구조가 변경되었습니다.
-
+        // 🌟 [CRITICAL FIX] 여기서 isSearching = false를 하지 않습니다! 백엔드의 Done/Error 신호가 풀어줄 때까지 잠가둡니다.
     } catch(e) { 
         console.error("[SEARCH-ERROR]", e);
-        if (aiResultsContent) {
-            aiResultsContent.innerHTML = "<div style='color:#ef4444;'>Error: " + e + "</div>"; 
-        }
-        renderMessage({
-            id: taskId,
-            role: "system_task",
-            text: `AI Search Error: ${e}`,
-            status: 6, 
-            created_at: startTime + 1,
-            updated_at: Date.now(),
-            task_id: taskId
-        });
-    } finally {
+        if (aiResultsContent) aiResultsContent.innerHTML = "<div style='color:#ef4444;'>Error: " + e + "</div>"; 
+        
+        // 에러 발생 시에만 강제 해제
         isSearching = false; 
         if (btnSubmit) btnSubmit.style.display = "flex";
         stopSpinner(); 
-        const currentLock = localStorage.getItem("sys_lock");
-        if (currentLock === taskId) {
-            localStorage.removeItem("sys_lock");
-        }
         updateExtractButtonVisibility();
-    }
+    } 
+    // 🌟 [CRITICAL FIX] finally 블록을 통째로 삭제하여 isSearching이 조기 해제되어 큐가 뚫리는 치명적 버그를 차단했습니다.
 });
 
 document.addEventListener('show-doc', (e: any) => showDetail(e.detail));
@@ -1271,19 +1236,20 @@ document.addEventListener('view-task-log', () => { openWidget("list"); listView.
 // 🌟 [CRITICAL FIX] 추출 버튼 더블클릭 완벽 방어 로직 적용
 // 🌟 [CRITICAL FIX] 추출 버튼 더블클릭 완벽 방어 로직 적용
 btnExtract?.addEventListener("click", async () => {
-    // 1. 중복 클릭 및 전역 락 확인
     const activeLock = localStorage.getItem("sys_lock");
-    if (activeLock || extractClickLock || isExtracting) {
+    const alreadyQueued = GlobalTaskManager.queue.some(q => q.type.includes("extraction"));
+    
+    // 1. 중복 클릭 및 큐 확인
+    if (activeLock || extractClickLock || isExtracting || alreadyQueued) {
         console.warn("[LOCK] System is busy. Ignoring extract request.");
         if (btnExtract) btnExtract.style.display = "none";
         return; 
     }
     
-    // 2. 즉시 UI 동기화: 추출 버튼만 숨기고 검색 버튼은 노출 유지
+    // 2. 버튼 숨김 (상태 플래그는 여기서 잠그되, 큐 순서 보장)
     extractClickLock = true;
     isExtracting = true;
     if (btnExtract) btnExtract.style.display = "none";
-    // 🌟 검색 버튼(btnSubmit)을 숨기는 코드를 제거했습니다.
 
     console.log("[DEBUG] btnExtract clicked. currentDetectedUrl:", currentDetectedUrl, "currentImage:", currentImage);
     
@@ -1291,23 +1257,13 @@ btnExtract?.addEventListener("click", async () => {
         if (currentDetectedUrl || currentImage) {
             const logArea = document.getElementById("extraction-log");
             if (logArea) logArea.innerHTML = "";
-            openWidget("settings");
-            startSpinner();
+            
+            // 🌟 [CRITICAL FIX] Settings(디테일 터미널) 탭으로 강제 이동하지 않고 List(채팅창) 탭을 유지합니다!
+            openWidget("list"); 
 
             const taskId = `task_${Date.now()}`;
             
-            // 🌟 [Lock 획득] 
-            localStorage.setItem("sys_lock", taskId);
-
-            renderMessage({
-                id: taskId,
-                role: "system_task",
-                text: currentImage ? "Task Started: Local Image" : "Task Started: " + (currentDetectedUrl || "Unknown URL"),
-                status: 10, 
-                created_at: Date.now(),
-                updated_at: Date.now(),
-                task_id: taskId
-            });
+            // 🌟 수동 renderMessage 및 startSpinner 제거: addToQueue가 대기열 UI(10번)를 예쁘게 그려줍니다.
             
             const isCloudMode = (document.getElementById("cloud-mode-toggle") as HTMLInputElement)?.checked;
 
@@ -1433,6 +1389,22 @@ btnExtract?.addEventListener("click", async () => {
     }
 });
 
+// 🌟 [추가] Rust 백엔드에 성공적으로 등록되었을 때 가상 렌더링 내용을 실제 데이터로 덮어씌웁니다.
+listen("task-db-registered", async (event: any) => {
+    const p = event.payload;
+    console.log(`[WIDGET] Task ${p.task_id} successfully registered in Backend DB.`);
+    
+    renderMessage({
+        id: p.task_id,
+        task_id: p.task_id,
+        role: "system_task",
+        text: p.text,
+        status: p.status,
+        created_at: p.created_at,
+        updated_at: Date.now()
+    });
+});
+
 listen("extraction-progress", async (event: any) => { 
     const payload = event.payload;
     if (payload.task_id) livePayloads.set(payload.task_id, payload);
@@ -1511,17 +1483,23 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     const isNotification = payload.category === "Warning" || payload.category === "Info";
 
     if (!isRecovery && !isExtracting && !isTerminal && !isSearching) {
-        if (payload.category === "Processing" || payload.category === "Preparation" || payload.category === "Vision" || payload.category === "Shipping" || payload.category === "Analytic") {
-            console.log("[WIDGET] Queue task started, resuming extraction UI state.");
+        const runningCats = ["Processing", "Preparation", "Vision", "Shipping", "Analytic", "Loading Model", "AI Inference"];
+        if (runningCats.some(c => payload.category && payload.category.includes(c))) {
+            console.log("[WIDGET] Adopting running background task:", payload.task_id);
             
-            // 🌟 [CRITICAL FIX] 큐에서 튀어나온 작업의 출처(검색 vs 추출)를 정확히 구분하여 알맞은 락(Lock)을 겁니다!
+            // 🌟 [CRITICAL FIX] 백그라운드 이벤트 수신 시, 전역 락 매니저를 강제로 동기화(Adopt)합니다!
+            activeTaskId = payload.task_id;
+            localStorage.setItem("sys_lock", activeTaskId!);
+            GlobalTaskManager.isBusy = true;
+            GlobalTaskManager.currentTaskId = activeTaskId;
+            
             if (payload.task_id && payload.task_id.startsWith("search_")) {
                 isSearching = true;
                 if (btnSubmit) btnSubmit.style.display = "none";
             } else {
                 isExtracting = true;
             }
-            startSpinner(); // 이제서야 글로벌 스피너가 돌기 시작합니다!
+            startSpinner();
         }
     }
 
@@ -1530,6 +1508,15 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     const elementId = `progress-${catId}`;
     
     let displaySummary = payload.summary || "";
+    
+    // 🌟 [CRITICAL FIX] 백엔드에서 텍스트(summary)가 없는 순수 로그 이벤트를 보냈을 때,
+    // 기존에 화면에 떠있던 텍스트를 보존하여 말풍선이 텅 비어버리는 현상을 원천 차단합니다!
+    if (tId) {
+        const existingEl = document.getElementById(tId) as HTMLElement;
+        if (!displaySummary && existingEl) {
+            displaySummary = existingEl.querySelector('.content')?.textContent || "";
+        }
+    }
     
     if (!taskSteps.has(tId)) {
         taskSteps.set(tId, new Map());
@@ -2975,6 +2962,15 @@ async function initSession() {
         
         const data = await invoke<any>("mark_ui_ready");
 
+        // 🌟 [CRITICAL FIX] 백엔드에서 실제로 실행 중인 작업이 있다면 프론트엔드 큐 매니저를 바쁨(Busy) 상태로 잠급니다!
+        // 이렇게 해야 대기열에 있던 검색 작업이 새로고침 즉시 백엔드로 뚫고 들어가는 것을 막을 수 있습니다.
+        const runningTask = data.tasks && data.tasks.find((t: any) => t.status === 1);
+        if (runningTask) {
+            GlobalTaskManager.isBusy = true;
+            GlobalTaskManager.currentTaskId = runningTask.id;
+            console.log(`[QUEUE] Backend is busy with ${runningTask.id}. Pausing frontend queue.`);
+        }
+
         const currentLockId = localStorage.getItem("sys_lock");
         if (currentLockId) {
             const isTaskStillAlive = data.tasks && data.tasks.some((t: any) => t.id === currentLockId && (t.status === 1 || t.status === 10));
@@ -3061,17 +3057,23 @@ async function initSession() {
                     }
                     
                     // 3. 진행 중(1)이거나 대기 중(10)인 작업에 대한 전역 상태 락 설정
-                    // 🌟 새로고침 시 살아있는 작업이 있다면 LocalStorage 락을 복구합니다.
-                    localStorage.setItem("sys_lock", t.id);
-                    
-                    if (t.id.startsWith("search_")) {
-                        isSearching = true;
-                        if (btnSubmit) btnSubmit.style.display = "none";
+                    // 🌟 [CRITICAL FIX] 검색 작업인데 프론트엔드 큐(TS Queue)에 존재하지 않는다면 실행될 가능성이 없는 유령(Ghost)입니다.
+                    const isSearchGhost = t.id.startsWith("search_") && !GlobalTaskManager.queue.some(q => q.taskId === t.id);
+
+                    if (!isSearchGhost) {
+                        localStorage.setItem("sys_lock", t.id);
+                        
+                        if (t.id.startsWith("search_")) {
+                            isSearching = true;
+                            if (btnSubmit) btnSubmit.style.display = "none";
+                        } else {
+                            isExtracting = true;
+                        }
+                        activeTaskId = t.id;
+                        startSpinner();
                     } else {
-                        isExtracting = true;
+                        console.log(`[WIDGET] Ignoring ghost search task: ${t.id}`);
                     }
-                    activeTaskId = t.id;
-                    startSpinner();
                 }
             });
             await updateExtractButtonVisibility();
@@ -3607,7 +3609,8 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
             const cachedUpdatedAt = parseInt(existingEl.dataset.updatedAt || "0");
             const cachedText = existingEl.querySelector('.content')?.textContent || "";
 
-            if (isTransitionFromVirtual || msg.updated_at > cachedUpdatedAt || msg.status !== cachedStatus || msg.text !== cachedText) {
+            // 🌟 [수정] cachedText와 msg.text가 다르면 시간값에 상관없이 UI를 즉시 갱신하도록 허용합니다.
+            if (isTransitionFromVirtual || msg.updated_at > cachedUpdatedAt || msg.status !== cachedStatus || (msg.text && cachedText !== msg.text)) {
                 
                 // 1. 텍스트 내용 업데이트 (퍼센트 및 요약글)
                 const contentEl = existingEl.querySelector('.content');
@@ -3618,8 +3621,8 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
                 // 2. 상태(Status) 및 아이콘 업데이트
                 let finalStatus = msg.status;
                 
-                // 🌟 [추가] 좀비 방어: 진행 중(1) 상태인데 현재 전역 락도 없고 활성 작업도 아니라면 강제로 2(STOPPED) 처리
-                if (finalStatus === 1 && !isSearching && !isExtracting && activeTaskId !== domId) {
+                // 🌟 [CRITICAL FIX] 좀비 방어: 현재 활성 작업(activeTaskId)이 아니더라도 큐가 돌리고 있는(currentTaskId) 정상 작업이면 STOPPED 처리를 면제합니다.
+                if (finalStatus === 1 && !isSearching && !isExtracting && activeTaskId !== domId && GlobalTaskManager.currentTaskId !== domId) {
                     finalStatus = 2;
                 }
 
@@ -3881,7 +3884,8 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                         id: t.id,
                         task_id: t.id,
                         role: "system_task",
-                        text: t.id.startsWith("search_") ? "Task Started: AI Search" : ("Task Started: " + (t.ref || "Local Source")),
+                        // 🌟 [UI 보강] DB에 아직 안 들어간 순수 대기열(status: 10) 상태임을 직관적으로 보여줍니다.
+                        text: t.id.startsWith("search_") ? "Waiting in Queue: AI Search" : ("Waiting in Queue: " + (t.ref || "Local Source")),
                         status: t.status,
                         created_at: t.created_at + 1,
                         updated_at: t.updated_at + 1
