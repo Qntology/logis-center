@@ -304,11 +304,18 @@ async fn search_documents(
     
     // 🌟 [CRITICAL FIX] 빈 쿼리일 때는 임베딩 모델을 절대 로드하지 않음 (검색 직후 VRAM이 다시 차버리는 현상 해결!)
     let query_vec = if !query.trim().is_empty() {
-        let model_opt = { state.model.lock().await.as_ref().cloned() }; // 🌟 즉시 자물쇠 해제!
-        if let Some(model) = model_opt {
-            model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 768])
-        } else {
+        // 🌟 [CRITICAL FIX] 백그라운드 연산이 돌아가고 있을 때는 임베딩 모델 로드(VRAM 차지)를 원천 차단하고 텍스트 검색만 수행합니다.
+        let is_task_active = crate::ACTIVE_TASK_MEM.read().unwrap().is_some();
+        if is_task_active {
+            println!("[DB-SEARCH] Background task is active. Skipping embedding model load to prevent VRAM overflow.");
             vec![0.0; 768]
+        } else {
+            let model_opt = { state.model.lock().await.as_ref().cloned() }; // 🌟 즉시 자물쇠 해제!
+            if let Some(model) = model_opt {
+                model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 768])
+            } else {
+                vec![0.0; 768]
+            }
         }
     } else {
         vec![0.0; 768]

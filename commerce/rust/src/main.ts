@@ -58,6 +58,16 @@ class GlobalTaskManager {
 
     // 🌟 [추가] 앱 시작 시 저장된 큐 복원
     static loadQueue() {
+        // 🌟 [CRITICAL FIX] 앱을 완전히 종료 후 재시작했을 때 대기열 자동 실행 방지
+        // sessionStorage는 F5 새로고침 시에는 유지되지만, 앱 종료 시에는 초기화됩니다.
+        if (!sessionStorage.getItem("app_running_session")) {
+            sessionStorage.setItem("app_running_session", "true");
+            localStorage.removeItem("ts_queue");
+            console.log("[QUEUE] App restarted. Cleared persistent queue to mark as STOPPED.");
+            this.queue = [];
+            return;
+        }
+
         const q = localStorage.getItem("ts_queue");
         if (q) {
             try {
@@ -496,37 +506,22 @@ let extractClickLock = false;
 async function updateExtractButtonVisibility() {
     if (!btnExtract) return;
 
-    // 🌟 [CRITICAL FIX] 전역 변수 isExtracting이 true이면 무조건 버튼을 숨깁니다.
-    if (extractClickLock || isExtracting || isSearching) {
+    // 🌟 [CRITICAL FIX] 대기열 추가를 허용하기 위해 isExtracting/isSearching 등의 전역 잠금을 해제합니다.
+    // 오직 더블클릭 방지용 extractClickLock만 유지합니다.
+    if (extractClickLock) {
         btnExtract.style.display = "none";
         return;
     }
 
+    // 5초 고아 락 해제 로직은 유지하되 버튼 숨김은 제거합니다. (UI 정리를 위함)
     const currentLock = localStorage.getItem("sys_lock");
-    if (currentLock) {
-        // 현재 활성화된 작업(status 1, 10)이 DOM에 존재한다면 버튼을 숨김 유지합니다.
-        const lockEl = document.getElementById(currentLock);
-        if (lockEl) {
-            const status = parseInt(lockEl.dataset.status || "0");
-            if (status === 1 || status === 10) {
-                btnExtract.style.display = "none";
-                return;
-            }
-        }
-    }
     if (currentLock) {
         const lockEl = document.getElementById(currentLock);
         if (!lockEl) {
             const lockTime = parseInt(currentLock.split('_')[1] || "0");
-            const now = Date.now();
-            // 락 생성 후 5초가 지났는데도 UI 말풍선이 없다면 좀비로 간주하고 삭제
-            if (now - lockTime > 5000) {
-                console.warn(`[LOCK] Orphaned lock detected (5s timeout): ${currentLock}. Releasing.`);
+            if (Date.now() - lockTime > 5000) {
+                console.warn(`[LOCK] Orphaned lock detected: ${currentLock}. Releasing.`);
                 localStorage.removeItem("sys_lock");
-            } else {
-                // 아직 5초가 안 지났다면 UI가 그려지는 중일 수 있으므로 락을 유지하고 버튼은 숨김 유지
-                if (btnExtract) btnExtract.style.display = "none";
-                return;
             }
         }
     }
@@ -540,8 +535,11 @@ async function updateExtractButtonVisibility() {
             const isImageActive = await invoke<boolean>("check_active_task", {
                 payload: { cc: ccHash, ref: imageRefHash }
             });
+            
+            // 🌟 프론트엔드 대기열(큐)에 동일한 이미지가 이미 들어있는지 검사
+            const isImageQueued = GlobalTaskManager.queue.some(q => q.payload && q.payload.ref === imageRefHash);
 
-            if (isImageActive) {
+            if (isImageActive || isImageQueued) {
                 btnExtract.style.display = "none";
             } else {
                 btnExtract.style.display = "flex";
@@ -591,7 +589,10 @@ async function updateExtractButtonVisibility() {
             payload: { cc: ccHash, ref: hashedRefId }
         });
 
-        if (isActive) {
+        // 🌟 프론트엔드 대기열(큐)에 동일한 주소가 이미 들어있는지 검사
+        const isQueued = GlobalTaskManager.queue.some(q => q.payload && (q.payload.ref === hashedRefId || q.payload.link === link));
+
+        if (isActive || isQueued) {
             btnExtract.style.display = "none";
         } else {
             btnExtract.style.display = "flex";
@@ -1143,13 +1144,13 @@ document.addEventListener('nav-link', async (e: any) => {
     detailView.style.display = "none";
 });
 
-// --- List Logic (Updated for Cards) ---
 searchInput?.addEventListener("input", () => {
-    // 선언된 isSearching 변수를 체크하여 중복 검색을 방지합니다.
-    if (isSearching) return; 
+    // 🌟 [CRITICAL FIX] 추출 중(isExtracting)이거나 큐가 바쁠 때(GlobalTaskManager.isBusy)
+    // 타이핑만으로 백그라운드 임베딩 로직이 몰래 실행되는 것을 원천 차단합니다!
+    if (isSearching || isExtracting || GlobalTaskManager.isBusy) return; 
     if(searchDebounceTimer) clearTimeout(searchDebounceTimer);
     searchDebounceTimer = window.setTimeout(async () => {
-        if (isSearching) return; 
+        if (isSearching || isExtracting || GlobalTaskManager.isBusy) return; 
         await loadMoreDocs(true);
     }, 800);
 });
@@ -1183,9 +1184,8 @@ btnSubmit?.addEventListener("click", async () => {
     const query = searchInput.value.trim();
     if (!query) return;
 
-    // 2. 버튼 숨김 (상태 플래그는 백엔드가 시작될 때까지 건드리지 않음)
+    // 🌟 [CRITICAL FIX] 검색 버튼 숨김 (번개 버튼은 독립적인 추출 대기열 노출 조건을 따르도록 강제 숨김 코드를 제거합니다)
     if (btnSubmit) btnSubmit.style.display = "none";
-    if (btnExtract) btnExtract.style.display = "none"; 
 
     const taskId = `search_${Date.now()}`;
     const startTime = Date.now();
@@ -1215,6 +1215,10 @@ btnSubmit?.addEventListener("click", async () => {
             bcc: activeContext.bcc || "",
             refId: activeContext.ref || ""
         });
+        
+        // 🌟 [CRITICAL FIX] 검색을 대기열에 추가한 직후, 현재 주소가 전처리 중인지 여부를 재검사하여 번개 버튼을 확실히 숨깁니다.
+        updateExtractButtonVisibility();
+
         // 🌟 [CRITICAL FIX] 여기서 isSearching = false를 하지 않습니다! 백엔드의 Done/Error 신호가 풀어줄 때까지 잠가둡니다.
     } catch(e) { 
         console.error("[SEARCH-ERROR]", e);
@@ -1234,21 +1238,18 @@ document.addEventListener('view-task-log', () => { openWidget("list"); listView.
 
 
 // 🌟 [CRITICAL FIX] 추출 버튼 더블클릭 완벽 방어 로직 적용
-// 🌟 [CRITICAL FIX] 추출 버튼 더블클릭 완벽 방어 로직 적용
+// 🌟 [CRITICAL FIX] 추출 버튼 더블클릭 방어 및 대기열(Queue) 다중 진입 허용
 btnExtract?.addEventListener("click", async () => {
-    const activeLock = localStorage.getItem("sys_lock");
-    const alreadyQueued = GlobalTaskManager.queue.some(q => q.type.includes("extraction"));
-    
-    // 1. 중복 클릭 및 큐 확인
-    if (activeLock || extractClickLock || isExtracting || alreadyQueued) {
-        console.warn("[LOCK] System is busy. Ignoring extract request.");
+    // 1. 순수하게 더블클릭(extractClickLock)만 막고, 
+    // 기존 작업이 돌아가고 있더라도 주소가 다르다면 큐에 넣을 수 있도록 조건 해제
+    if (extractClickLock) {
+        console.warn("[LOCK] Click locked to prevent double submission.");
         if (btnExtract) btnExtract.style.display = "none";
         return; 
     }
     
-    // 2. 버튼 숨김 (상태 플래그는 여기서 잠그되, 큐 순서 보장)
+    // 2. 버튼 숨김 (isExtracting = true 는 백엔드 작업이 실제 픽업될 때 켜지도록 제외)
     extractClickLock = true;
-    isExtracting = true;
     if (btnExtract) btnExtract.style.display = "none";
 
     console.log("[DEBUG] btnExtract clicked. currentDetectedUrl:", currentDetectedUrl, "currentImage:", currentImage);
@@ -1374,10 +1375,8 @@ btnExtract?.addEventListener("click", async () => {
         }
     } catch (e) {
         console.error("[WIDGET] Extraction failed:", e);
-        isExtracting = false;
         extractClickLock = false;
-        localStorage.removeItem("sys_lock");
-        stopSpinner();
+        // 다른 작업이 정상적으로 돌아가고 있을 수 있으므로 sys_lock이나 전역 스피너를 함부로 날리지 않습니다.
         updateExtractButtonVisibility();
     } finally {
         // 🌟 [CRITICAL FIX] Rust 백엔드(DB)에 작업이 완전히 등재되도록 1.5초간 여유를 줍니다.
@@ -2899,6 +2898,11 @@ window.addEventListener("blur", () => {
 
 window.addEventListener("focus", () => {
     isFocus = true;
+    
+    // 🌟 [CRITICAL FIX] 크롬 브라우저를 끄고 앱 화면으로 돌아왔을 때 즉시 브라우저 생존 여부를 검사하여 
+    // 브라우저 런처 버튼 노출 및 번개 버튼 상태를 원상복구합니다.
+    syncBrowserStatus();
+    
     if (!chatPollInterval && currentSession.email) {
         console.log("[WIDGET] Window focused. Polling resumed.");
         // 창을 다시 봤을 때 즉시 1회 최신화
@@ -3124,7 +3128,20 @@ document.getElementById("unload-btn")?.addEventListener("click", async () => {
         console.error("[WIDGET] Unload failed:", e);
     } 
 });
-async function syncBrowserStatus() { try { const s = await invoke<string>("get_browser_status"); if (btnAutoLaunch) btnAutoLaunch.style.display = (s === "running") ? "none" : "flex"; } catch (e) {} }
+
+async function syncBrowserStatus() { 
+    try { 
+        const s = await invoke<string>("get_browser_status"); 
+        if (btnAutoLaunch) btnAutoLaunch.style.display = (s === "running") ? "none" : "flex"; 
+        
+        // 🌟 [CRITICAL FIX] 브라우저가 꺼져있다면 잔류 중인 URL을 초기화하고 번개 버튼(Extract)을 확실히 숨깁니다.
+        if (s === "stopped") { 
+            currentDetectedUrl = ""; 
+            await updateExtractButtonVisibility(); 
+        }
+    } catch (e) {} 
+}
+
 // --- Device Preference Logic ---
 const forceCpuToggle = document.getElementById("force-cpu-toggle") as HTMLInputElement;
 

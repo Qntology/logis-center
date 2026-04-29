@@ -348,16 +348,16 @@ impl VectorStore {
         println!("[Store] Initializing zombie task recovery process...");
 
         // 🌟 1. [진행 중 사살] 앱이 죽었을 때 연산 중이던(1) 작업은 무조건 중단(2) 처리합니다.
-        // 🌟 2. [검색 큐 사살] ai_search(10)는 프론트엔드 메모리 큐가 증발했으므로 대기 중이라도 사살합니다.
+        // 🌟 2. [대기열 사살] 앱 종료 후 재시작 시, 큐에 남아있던 모든 대기 중(10)인 작업도 좀비로 간주하고 사살합니다.
         let _ = tasks_table.update()
-            .only_if("status = 1 OR (status = 10 AND type = 'ai_search')")
+            .only_if("status = 1 OR status = 10")
             .column("status", "2") 
             .execute()
             .await;
 
         // 🌟 3. [채팅 메시지 동기화] UI 말풍선도 동일하게 업데이트합니다.
         let _ = talks_table.update()
-            .only_if("status = 1 OR (status = 10 AND task_id LIKE 'search_%')")
+            .only_if("status = 1 OR status = 10")
             .column("status", "2")
             .column("text", "'Task was interrupted due to app restart.'")
             .execute()

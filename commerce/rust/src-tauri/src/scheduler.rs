@@ -247,9 +247,9 @@ pub async fn start_background_worker(
                         let _ = db.update_task_status(&task.id, 1).await;
                         let _ = db.update_message_status(&task.id, 1, Some("Processing...")).await;
                         
-                        // [SYNC] 프론트엔드 락과 일치시키기 위해 ID와 상태만 메모리에 반영합니다.
+                        // 🌟 [CRITICAL FIX] 프론트엔드의 중복 대기열 방어 로직(check_active_task)이 정상 작동하도록 ref도 함께 저장합니다.
                         if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() {
-                            *w = Some(json!({ "id": task.id, "status": 1 }));
+                            *w = Some(json!({ "id": task.id, "ref": task.r#ref, "status": 1 }));
                         }
                     }
                 }
@@ -577,12 +577,13 @@ async fn process_task(
         url = format!("{}{}{}", scheme, origin_candidate, url);
     }
     
-    // 🌟 [CRITICAL FIX] 메모리 덮어쓰기 시 origin을 보존하여 뒤쪽 로직이 도메인을 알 수 있게 합니다.
+    // 🌟 [CRITICAL FIX] 메모리 덮어쓰기 시 origin과 ref를 보존하여 프론트엔드 중복 노출 방어 로직이 도메인을 알 수 있게 합니다.
     let active_task_json = json!({
         "id": task.id.clone(),
         "type": task.r#type.clone(),
         "link": url.clone(),
         "origin": origin_candidate.clone(),
+        "ref": task.r#ref.clone(),
         "status": 1, 
         "created_at": task.created_at,
         "updated_at": chrono::Utc::now().timestamp_millis()
