@@ -43,6 +43,29 @@ let chatPollInterval: number | null = null;
 // 🌟 [추가] 누락된 전역 상태 변수 선언
 let isSearching = false;
 let isExtracting = false;
+let lastSearchedQuery = "";
+
+// [통합 락 매니저 & 프론트엔드 큐 관리자]
+import "./dexie.min.js";
+const DexieLocal = (window as any).Dexie;
+
+const appDb = new DexieLocal("LogisAppDB");
+appDb.version(1).stores({
+    ts_queue: 'taskId, type',
+    kv_store: 'key' // 추가된 통합 키-값(Key-Value) 저장소
+});
+
+// 기존 localStorage를 대체할 Dexie 헬퍼 함수
+async function kvGet(key: string): Promise<any> {
+    const record = await appDb.table("kv_store").get(key);
+    return record ? record.value : null;
+}
+async function kvSet(key: string, value: any) {
+    await appDb.table("kv_store").put({ key, value });
+}
+async function kvRemove(key: string) {
+    await appDb.table("kv_store").delete(key);
+}
 
 // [통합 락 매니저 & 프론트엔드 큐 관리자]
 class GlobalTaskManager {
@@ -51,32 +74,38 @@ class GlobalTaskManager {
     static activeRefs: Set<string> = new Set();
     static queue: Array<{taskId: string, type: string, payload: any}> = [];
 
-    // 🌟 [추가] 큐를 localStorage에 저장하여 새로고침 시에도 증발 방지
-    static saveQueue() {
-        localStorage.setItem("ts_queue", JSON.stringify(this.queue));
+    // 🌟 [추가] 큐를 Dexie(IndexedDB)에 저장하여 새로고침 시에도 증발 방지
+    static async saveQueue() {
+        await appDb.table("ts_queue").clear();
+        if (this.queue.length > 0) {
+            await appDb.table("ts_queue").bulkAdd(this.queue);
+        }
     }
 
-    // 🌟 [추가] 앱 시작 시 저장된 큐 복원
-    static loadQueue() {
+    // 🌟 [수정] 앱 시작 시 Dexie에서 저장된 큐 복원
+    static async loadQueue() {
         // 🌟 [CRITICAL FIX] 앱을 완전히 종료 후 재시작했을 때 대기열 자동 실행 방지
         // sessionStorage는 F5 새로고침 시에는 유지되지만, 앱 종료 시에는 초기화됩니다.
         if (!sessionStorage.getItem("app_running_session")) {
             sessionStorage.setItem("app_running_session", "true");
-            localStorage.removeItem("ts_queue");
-            console.log("[QUEUE] App restarted. Cleared persistent queue to mark as STOPPED.");
+            await appDb.table("ts_queue").clear();
+            console.log("[QUEUE] App restarted. Cleared persistent Dexie queue to mark as STOPPED.");
             this.queue = [];
             return;
         }
 
-        const q = localStorage.getItem("ts_queue");
-        if (q) {
-            try {
-                this.queue = JSON.parse(q);
-                this.queue.forEach(task => this.activeRefs.add(task.taskId));
-                console.log(`[QUEUE] Restored ${this.queue.length} pending tasks from localStorage.`);
-            } catch(e) {
+        try {
+            const q = await appDb.table("ts_queue").toArray();
+            if (q && q.length > 0) {
+                this.queue = q;
+                this.queue.forEach((task: any) => this.activeRefs.add(task.taskId));
+                console.log(`[QUEUE] Restored ${this.queue.length} pending tasks from Dexie.`);
+            } else {
                 this.queue = [];
             }
+        } catch(e) {
+            console.error("[QUEUE] Failed to load queue from Dexie", e);
+            this.queue = [];
         }
     }
 
@@ -84,14 +113,14 @@ class GlobalTaskManager {
         if (this.activeRefs.has(taskId)) return;
         this.queue.push({ taskId, type, payload });
         this.activeRefs.add(taskId);
-        this.saveQueue(); // 🌟 즉시 저장
+        await this.saveQueue(); // 🌟 즉시 저장 (Dexie)
         
         // 🌟 [추가] 큐에 담기자마자 사용자에게 시각적 피드백 제공 (DB 등록 전 선행 렌더링)
         const startTime = parseInt(taskId.split('_')[1]) || Date.now();
         
         // 1. 사용자 질문 선행 렌더링 (검색인 경우)
         if (payload.query) {
-            renderMessage({
+            await renderMessage({
                 id: `${taskId}_query`,
                 role: "user",
                 text: payload.query,
@@ -102,7 +131,7 @@ class GlobalTaskManager {
         }
 
         // 2. 시스템 대기열 말풍선 선행 렌더링
-        renderMessage({
+        await renderMessage({
             id: taskId,
             task_id: taskId,
             role: "system_task",
@@ -122,10 +151,10 @@ class GlobalTaskManager {
 
         this.isBusy = true;
         const task = this.queue.shift()!;
-        this.saveQueue(); // 🌟 큐에서 항목이 나갔으므로 갱신
+        await this.saveQueue(); // 🌟 큐에서 항목이 나갔으므로 갱신 (Dexie)
         
         this.currentTaskId = task.taskId;
-        localStorage.setItem("sys_lock", task.taskId);
+        await kvSet("sys_lock", task.taskId);
 
         console.log(`[QUEUE] Starting Task: ${task.taskId}`);
         
@@ -137,30 +166,30 @@ class GlobalTaskManager {
             }
         } catch (e) {
             console.error(`[QUEUE] Task execution failed:`, e);
-            this.release(task.taskId, task.taskId);
+            await this.release(task.taskId, task.taskId);
         }
     }
 
-    static release(taskId: string, refOrQuery: string) {
+    static async release(taskId: string, refOrQuery: string) {
         if (this.currentTaskId === taskId) {
             this.isBusy = false;
             this.currentTaskId = null;
         }
         this.activeRefs.delete(taskId);
-        if (localStorage.getItem("sys_lock") === taskId) {
-            localStorage.removeItem("sys_lock");
+        if (await kvGet("sys_lock") === taskId) {
+            await kvRemove("sys_lock");
         }
-        this.saveQueue(); // 🌟 참조 목록(activeRefs)이 변했으므로 갱신
-        this.processNext();
+        await this.saveQueue(); // 🌟 참조 목록(activeRefs)이 변했으므로 갱신 (Dexie)
+        await this.processNext();
     }
 
-    static forceReset() {
+    static async forceReset() {
         this.isBusy = false;
         this.currentTaskId = null;
         this.activeRefs.clear();
         this.queue = [];
-        localStorage.removeItem("sys_lock");
-        localStorage.removeItem("ts_queue"); // 🌟 완전 초기화 시 스토리지도 비움
+        await kvRemove("sys_lock");
+        await appDb.table("ts_queue").clear(); // 🌟 완전 초기화 시 Dexie도 비움
     }
 }
 
@@ -398,9 +427,15 @@ function stopSpinner() {
         }
     });
 
-    // 🌟 [수정] 이미지가 있더라도 검색 버튼(btnSubmit)을 숨기지 않고 항상 노출되도록 변경합니다.
+    // 🌟 [수정] 스피너 정지 시, 이미지가 첨부되어 있거나 진행 중이지 않은 유효한 입력값이 존재하면 검색 버튼 노출
     if (btnSubmit) {
-        btnSubmit.style.display = "flex";
+        const currentVal = searchInput?.value.trim() || "";
+        // 스피너가 멈췄다는 건 작업이 끝났다는 의미이므로, isQueryActive(currentVal)가 false가 되어 버튼이 살아납니다.
+        if (currentImage || (currentVal !== "" && !isQueryActive(currentVal))) {
+            btnSubmit.style.display = "flex";
+        } else {
+            btnSubmit.style.display = "none";
+        }
     }
 
     updateExtractButtonVisibility();
@@ -426,9 +461,15 @@ function switchTab(tabName: string) {
         // 탭을 전환하더라도 억지로 히스토리를 리셋하여 방금 작성한 말풍선을 날려버리지 않도록 방어합니다!
         if (!isSearching && !isExtracting) {
             fetchChatHistory();
-        } else if (chatTalks && chatTalks.children.length === 0) {
-            // 채팅창이 완전히 비어있을 때만 리셋 없이 조용히 내역을 불러옵니다.
-            fetchChatHistory(false, true); 
+        } else {
+            // 🌟 진행 중인 작업 때문에 돔을 리셋(innerHTML="")할 수는 없지만,
+            // 달랑 진행 중인 말풍선 1~2개만 있고 과거 내역이 안 불러와진 상태라면 과거 내역(isHistory=true)을 끌어와서 화면을 채웁니다!
+            if (chatTalks && chatTalks.children.length < 10 && chatHasMore) {
+                loadMoreChat(true, true);
+            } else {
+                // 이미 화면이 채워져 있다면 최신 상태 변경점(status)만 조용히 동기화합니다.
+                loadMoreChat(false, true);
+            }
         }
     } else {
         settingsBtn?.classList.remove("active-emoji", "active");
@@ -514,14 +555,14 @@ async function updateExtractButtonVisibility() {
     }
 
     // 5초 고아 락 해제 로직은 유지하되 버튼 숨김은 제거합니다. (UI 정리를 위함)
-    const currentLock = localStorage.getItem("sys_lock");
+    const currentLock = await kvGet("sys_lock");
     if (currentLock) {
         const lockEl = document.getElementById(currentLock);
         if (!lockEl) {
             const lockTime = parseInt(currentLock.split('_')[1] || "0");
             if (Date.now() - lockTime > 5000) {
                 console.warn(`[LOCK] Orphaned lock detected: ${currentLock}. Releasing.`);
-                localStorage.removeItem("sys_lock");
+                await kvRemove("sys_lock");
             }
         }
     }
@@ -1081,7 +1122,7 @@ async function syncData() {
 }
 
 // --- 기존 State 영역 어딘가에 추가 ---
-let currentSearchMode = localStorage.getItem("search_mode") || "commerce";
+let currentSearchMode = "commerce"; // 값은 initSession에서 Dexie 비동기로 덮어씌워집니다.
 
 // 🌟 앱 시작 시 탭 UI 초기화 함수
 function applySearchModeUI() {
@@ -1122,7 +1163,7 @@ document.querySelectorAll('.mode-tab').forEach(btn => {
         currentSearchMode = target.dataset.mode || "commerce";
         
         // 🌟 탭 클릭 시 상태 저장 및 UI 업데이트
-        localStorage.setItem("search_mode", currentSearchMode);
+        await kvSet("search_mode", currentSearchMode);
         applySearchModeUI();
 
         console.log(`[UI] Search mode changed to: ${currentSearchMode}. Refreshing list...`);
@@ -1144,7 +1185,45 @@ document.addEventListener('nav-link', async (e: any) => {
     detailView.style.display = "none";
 });
 
+// 🌟 [추가] 현재 입력한 검색어가 이미 대기열(10)이나 진행 중(1)인지 확인하는 완벽한 헬퍼 함수
+function isQueryActive(text: string): boolean {
+    const query = text.trim();
+    // 1. 프론트엔드 큐 배열 검사 (아직 UI에 안 그려진 찰나의 순간 방어)
+    if (GlobalTaskManager.queue.some(q => q.type === "ai_search" && q.payload && q.payload.query === query)) return true;
+
+    // 2. DOM 상태 검사 (현재 실행 중인 작업 및 대기열 포함)
+    let active = false;
+    const bubbles = document.querySelectorAll('.task-bubble');
+    for (let i = 0; i < bubbles.length; i++) {
+        const el = bubbles[i] as HTMLElement;
+        const status = parseInt(el.dataset.status || "0");
+        const taskId = el.id;
+        // 🌟 상태가 1(Processing)이거나 10(Queued)일 때만 활성 상태로 간주
+        if ((status === 1 || status === 10) && taskId.startsWith("search_")) {
+            const queryEl = document.getElementById(`${taskId}_query`);
+            if (queryEl) {
+                const qText = queryEl.querySelector('.content')?.textContent || "";
+                if (qText.trim() === query) {
+                    active = true;
+                    break;
+                }
+            }
+        }
+    }
+    return active;
+}
+
 searchInput?.addEventListener("input", () => {
+    // 🌟 [CRITICAL FIX] 입력값이 비어있지 않고, 현재 진행/대기 중인 검색어와 '다를 때만' 버튼을 노출합니다.
+    if (btnSubmit) {
+        const currentVal = searchInput.value.trim();
+        if (currentVal !== "" && !isQueryActive(currentVal)) {
+            btnSubmit.style.display = "flex";
+        } else {
+            btnSubmit.style.display = "none";
+        }
+    }
+
     // 🌟 [CRITICAL FIX] 추출 중(isExtracting)이거나 큐가 바쁠 때(GlobalTaskManager.isBusy)
     // 타이핑만으로 백그라운드 임베딩 로직이 몰래 실행되는 것을 원천 차단합니다!
     if (isSearching || isExtracting || GlobalTaskManager.isBusy) return; 
@@ -1169,10 +1248,13 @@ searchInput?.addEventListener("keydown", (e) => {
 // --- main.ts 소스 ---
 
 btnSubmit?.addEventListener("click", async () => {
-    // 1. 검색 및 큐 중복 실행 방지
-    const alreadyQueued = GlobalTaskManager.queue.some(q => q.type === "ai_search");
-    if (isSearching || alreadyQueued) {
-        console.warn("[SEARCH] AI Search is already in progress or queued.");
+    const query = searchInput.value.trim();
+    if (!query) return;
+
+    // 🌟 [CRITICAL FIX] 다른 검색어가 진행 중이더라도 새로운 검색어를 큐에 추가할 수 있도록 허용하되,
+    // 완전히 동일한 검색어가 이미 진행/대기 중일 때만 중복 실행을 방어합니다!
+    if (isQueryActive(query)) {
+        console.warn("[SEARCH] The exact same query is already in progress or queued.");
         return; 
     }
 
@@ -1181,8 +1263,8 @@ btnSubmit?.addEventListener("click", async () => {
         searchDebounceTimer = null;
     }
 
-    const query = searchInput.value.trim();
-    if (!query) return;
+    // 인풋창 비우기
+    searchInput.value = "";
 
     // 🌟 [CRITICAL FIX] 검색 버튼 숨김 (번개 버튼은 독립적인 추출 대기열 노출 조건을 따르도록 강제 숨김 코드를 제거합니다)
     if (btnSubmit) btnSubmit.style.display = "none";
@@ -1190,10 +1272,11 @@ btnSubmit?.addEventListener("click", async () => {
     const taskId = `search_${Date.now()}`;
     const startTime = Date.now();
     
-    openWidget("list");
+    // 🌟 [수정] 검색 시 설정(채팅) 탭으로 화면을 전환합니다.
+    openWidget("settings");
 
     // 3. 사용자 질문 말풍선 즉시 렌더링
-    renderMessage({
+    await renderMessage({
         id: `${taskId}_query`,
         role: "user", 
         text: query,
@@ -1218,6 +1301,27 @@ btnSubmit?.addEventListener("click", async () => {
         
         // 🌟 [CRITICAL FIX] 검색을 대기열에 추가한 직후, 현재 주소가 전처리 중인지 여부를 재검사하여 번개 버튼을 확실히 숨깁니다.
         updateExtractButtonVisibility();
+
+        // 🌟 [추가] 생성된 검색 테스크(질문) 말풍선 위치로 부드럽게 스크롤 이동
+        setTimeout(() => {
+            const taskEl = document.getElementById(`${taskId}_query`) || document.getElementById(taskId);
+            const scrollEl = document.getElementById("chat-scroll");
+            const container = document.querySelector(".chat-container") as HTMLElement;
+            
+            if (taskEl && scrollEl && container) {
+                const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+                let targetY = taskEl.offsetTop - (container.clientHeight / 2) + (taskEl.clientHeight / 2);
+                
+                if (targetY < 0) targetY = 0;
+                if (targetY > maxScroll) targetY = maxScroll;
+                
+                currentY = targetY;
+                scrollEl.style.transition = "transform 0.3s ease-out";
+                updateTransform();
+                
+                setTimeout(() => { scrollEl.style.transition = ""; }, 300);
+            }
+        }, 100);
 
         // 🌟 [CRITICAL FIX] 여기서 isSearching = false를 하지 않습니다! 백엔드의 Done/Error 신호가 풀어줄 때까지 잠가둡니다.
     } catch(e) { 
@@ -1259,8 +1363,8 @@ btnExtract?.addEventListener("click", async () => {
             const logArea = document.getElementById("extraction-log");
             if (logArea) logArea.innerHTML = "";
             
-            // 🌟 [CRITICAL FIX] Settings(디테일 터미널) 탭으로 강제 이동하지 않고 List(채팅창) 탭을 유지합니다!
-            openWidget("list"); 
+            // 🌟 [CRITICAL FIX] 추출(Extract) 시 채팅창(settings) 탭으로 자동 이동합니다.
+            openWidget("settings"); 
 
             const taskId = `task_${Date.now()}`;
             
@@ -1372,6 +1476,32 @@ btnExtract?.addEventListener("click", async () => {
                 if (btnSubmit) btnSubmit.style.display = "flex";
             }
             console.log("[WIDGET] Task safely added to backend queue:", taskId);
+
+            // 🌟 [CRITICAL FIX] 생성된 테스크 말풍선 위치로 부드럽게 스크롤 이동
+            setTimeout(() => {
+                const taskEl = document.getElementById(taskId);
+                const scrollEl = document.getElementById("chat-scroll");
+                const container = document.querySelector(".chat-container") as HTMLElement;
+                
+                if (taskEl && scrollEl && container) {
+                    const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+                    // 엘리먼트를 화면 중앙쯤에 오도록 Y값 계산
+                    let targetY = taskEl.offsetTop - (container.clientHeight / 2) + (taskEl.clientHeight / 2);
+                    
+                    if (targetY < 0) targetY = 0;
+                    if (targetY > maxScroll) targetY = maxScroll;
+                    
+                    currentY = targetY;
+                    // 부드러운 스크롤 효과를 위해 transition 임시 적용
+                    scrollEl.style.transition = "transform 0.3s ease-out";
+                    updateTransform();
+                    
+                    // 이동 후 transition 제거 (원래 드래그를 위해 없는 상태 유지)
+                    setTimeout(() => {
+                        scrollEl.style.transition = "";
+                    }, 300);
+                }
+            }, 100);
         }
     } catch (e) {
         console.error("[WIDGET] Extraction failed:", e);
@@ -1393,7 +1523,7 @@ listen("task-db-registered", async (event: any) => {
     const p = event.payload;
     console.log(`[WIDGET] Task ${p.task_id} successfully registered in Backend DB.`);
     
-    renderMessage({
+    await renderMessage({
         id: p.task_id,
         task_id: p.task_id,
         role: "system_task",
@@ -1422,8 +1552,8 @@ listen("extraction-progress", async (event: any) => {
             isSearching = false;
         }
 
-        // 🌟 큐 매니저 릴리즈 (내부적으로 processNext를 호출함)
-        GlobalTaskManager.release(payload.task_id, payload.task_id);
+        // 🌟 큐 매니저 릴리즈 (비동기로 Dexie 업데이트 후 processNext 호출됨)
+        await GlobalTaskManager.release(payload.task_id, payload.task_id);
         
         // 🌟 버튼 UI 즉시 갱신 및 스피너 중단
         stopSpinner();
@@ -1491,7 +1621,7 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
             console.log("[WIDGET] Adopting/Confirming running background task:", payload.task_id);
             
             activeTaskId = payload.task_id;
-            localStorage.setItem("sys_lock", activeTaskId!);
+            await kvSet("sys_lock", activeTaskId!);
             GlobalTaskManager.isBusy = true;
             GlobalTaskManager.currentTaskId = activeTaskId;
             
@@ -1576,7 +1706,7 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
             if (match) originalCreatedAt = parseInt(match[1]);
         }
 
-        renderMessage({ 
+        await renderMessage({ 
             id: payload.task_id, 
             role: "system_task", 
             // 🌟 [CRITICAL FIX 1] content 대신 text 속성을 명시적으로 사용하여 텍스트 증발 방지
@@ -1592,9 +1722,9 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     // 사용자가 현재 무슨 화면을 보고 있든, 작업이 끝났다면 무조건 전역 락을 풀고 스피너를 정지시킵니다!
     if (isTerminal) {
         // 🌟 [Lock 해제 보강] 어떤 경로로든 종료 상태가 되면 락을 확실히 제거합니다.
-        const currentLock = localStorage.getItem("sys_lock");
+        const currentLock = await kvGet("sys_lock");
         if (currentLock === tId || !currentLock) {
-            localStorage.removeItem("sys_lock");
+            await kvRemove("sys_lock");
         }
         
         isExtracting = false;
@@ -1637,7 +1767,7 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
         if (payload.category === "Processing" && stepMap.size > 0) {
             stepMap.clear();
             if (targetContainer) targetContainer.innerHTML = "";
-            localStorage.removeItem(`term_${tId}`);
+            await kvRemove(`term_${tId}`);
             const termArea = document.getElementById("terminal-logs");
             if (termArea) { termArea.innerHTML = ""; termArea.style.display = "none"; }
         }
@@ -1728,8 +1858,8 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
 
 btnStopTask?.addEventListener("click", async () => {
     if (await ask("Stop the current extraction/search? (The record will be deleted)", { title: "Stop Task", kind: "warning" })) {
-        // 🌟 [통합 락 매니저] 강제 초기화 호출 (isBusy, currentTaskId, activeRefs, localStorage 일괄 정리)
-        GlobalTaskManager.forceReset();
+        // 🌟 [통합 락 매니저] 강제 초기화 호출 (isBusy, currentTaskId, activeRefs, Dexie 일괄 정리)
+        await GlobalTaskManager.forceReset();
         
         isExtracting = false; 
         isSearching = false; 
@@ -1748,7 +1878,7 @@ btnStopTask?.addEventListener("click", async () => {
             
             if (activeTaskId) {
                 // 취소 시 UI 로그 데이터 및 엘리먼트 삭제
-                localStorage.removeItem(`term_${activeTaskId}`);
+                await kvRemove(`term_${activeTaskId}`);
                 const el = document.getElementById(activeTaskId);
                 if (el) el.remove();
             }
@@ -2122,14 +2252,14 @@ const syncDataToMobile = () => {
     dataChannel.send(JSON.stringify({ type: "sync_list", data: docs }));
 };
 
-listen("task-console-log", (event: any) => {
+listen("task-console-log", async (event: any) => {
     const { task_id, text } = event.payload;
     const key = `term_${task_id}`;
     
-    // 🌟 sessionStorage -> localStorage 로 영구 보존!
-    let logs = localStorage.getItem(key) || "";
+    // 🌟 localStorage -> Dexie(appDb) 로 영구 보존!
+    let logs = (await kvGet(key)) || "";
     logs += text;
-    localStorage.setItem(key, logs);
+    await kvSet(key, logs);
 
     const termArea = document.getElementById("terminal-logs");
     if (termArea && termArea.dataset.activeTaskId === task_id) {
@@ -2139,7 +2269,7 @@ listen("task-console-log", (event: any) => {
     }
 });
 
-function handleTaskClick(el: HTMLElement) {
+async function handleTaskClick(el: HTMLElement) {
     const taskId = el.dataset.taskId;
     const status = parseInt(el.dataset.status || "0");
     if (!taskId) return;
@@ -2179,7 +2309,7 @@ function handleTaskClick(el: HTMLElement) {
     if (logArea) {
         logArea.dataset.activeTaskId = taskId;
         
-        const savedLogs = localStorage.getItem(`term_${taskId}`);
+        const savedLogs = await kvGet(`term_${taskId}`);
         // 🌟 저장된 로그가 있을 때만 박스를 보여주고, 없으면 숨깁니다. (Connecting... 텍스트 제거)
         const displayStyle = savedLogs && savedLogs.trim() !== "" ? "block" : "none"; 
         
@@ -2206,7 +2336,7 @@ function handleTaskClick(el: HTMLElement) {
                 if (reconstructed.trim() !== "") {
                     termArea.innerHTML = reconstructed;
                     termArea.style.display = "block"; // 숨겨뒀던 박스 노출!
-                    localStorage.setItem(`term_${taskId}`, reconstructed); 
+                    await kvSet(`term_${taskId}`, reconstructed); 
                     termArea.scrollTop = termArea.scrollHeight;
                 }
             }
@@ -2773,6 +2903,20 @@ async function handleImageUpload(path: string) {
         }
 
         console.log("[WIDGET] Image selected. Extraction button (⚡) is now visible.");
+        
+        // 🌟 [추가] 이미지 선택 시 설정(채팅) 탭으로 화면을 전환하고 스크롤을 맨 아래로 내립니다.
+        openWidget("settings");
+        setTimeout(() => {
+            const scrollEl = document.getElementById("chat-scroll");
+            const container = document.querySelector(".chat-container") as HTMLElement;
+            if (scrollEl && container) {
+                const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+                currentY = maxScroll;
+                scrollEl.style.transition = "transform 0.3s ease-out";
+                updateTransform();
+                setTimeout(() => { scrollEl.style.transition = ""; }, 300);
+            }
+        }, 100);
     }
 }
 
@@ -2781,9 +2925,16 @@ navImgClear?.addEventListener("click", async () => {
     navPreviewContainer.classList.add("hidden");
     navUploadBtn?.classList.remove("active-emoji");
     
-    // 🌟 [유지] 검색창 활성화 및 검색 버튼 노출을 명시적으로 보장합니다.
+    // 🌟 [유지] 검색창 활성화 및 조건부 검색 버튼 노출을 명시적으로 보장합니다.
     searchInput.disabled = false;
-    if (btnSubmit) btnSubmit.style.display = "flex";
+    if (btnSubmit) {
+        const currentVal = searchInput.value.trim();
+        if (currentVal !== "" && !isQueryActive(currentVal)) {
+            btnSubmit.style.display = "flex";
+        } else {
+            btnSubmit.style.display = "none";
+        }
+    }
     
     await updateExtractButtonVisibility();
 });
@@ -2816,7 +2967,7 @@ async function checkAuthStatus() {
         if (session && session.hash) {
             const hashChanged = session.hash !== currentSession.hash;
             currentSession = { ...currentSession, ...session };
-            saveSession();
+            await saveSession();
             if (hashChanged && !currentSession.email && currentTab === "settings") performQrAuth();
             if (currentSession.email) { 
                 await invoke("initialize_hub", { address: currentSession.address, email: currentSession.email, flag: session.flag || "kr" }); 
@@ -2929,27 +3080,35 @@ function startPolling() {
 
 
 
-function saveSession() { localStorage.setItem("chat_session", JSON.stringify(currentSession)); }
+async function saveSession() { await kvSet("chat_session", JSON.stringify(currentSession)); }
 
 async function initSession() {
-    // 🌟 [CRITICAL FIX 1] 앱 최초 실행 시, 묵은 localStorage 터미널 찌꺼기를 완벽 청소합니다!
-    Object.keys(localStorage).forEach(key => {
-        if (key.startsWith("term_")) {
-            localStorage.removeItem(key);
+    // 🌟 [CRITICAL FIX 1] 앱 최초 실행 시, Dexie에서 묵은 터미널 찌꺼기를 완벽 청소합니다!
+    const allKeys = await appDb.table("kv_store").toCollection().primaryKeys();
+    for (const key of allKeys) {
+        if (typeof key === "string" && key.startsWith("term_")) {
+            await kvRemove(key);
         }
-    });
+    }
 
-    const saved = localStorage.getItem("chat_session");
+    // 🌟 search_mode 도 여기서 비동기로 불러와 초기화합니다.
+    const savedSearchMode = await kvGet("search_mode");
+    if (savedSearchMode) {
+        currentSearchMode = savedSearchMode;
+        applySearchModeUI(); // UI에 즉시 반영
+    }
+
+    const saved = await kvGet("chat_session");
     if (saved) { try { currentSession = { ...currentSession, ...JSON.parse(saved) }; } catch (e) {} } 
-    else { const legacy = localStorage.getItem("device_hash"); if (legacy) currentSession.hash = legacy; }
+    else { const legacy = await kvGet("device_hash"); if (legacy) currentSession.hash = legacy; }
     
     if (!currentSession.hash && ethers) { 
         const w = ethers.Wallet.createRandom(); 
         currentSession.hash = w.address.toLowerCase().replace("0x", ""); 
-        saveSession(); 
+        await saveSession(); 
     }
     
-    saveSession(); 
+    await saveSession(); 
     currentSession.address = currentSession.address || ZERO_ADDRESS; 
     currentSession.team = currentSession.team || await hashId(ZERO_ADDRESS); 
     updateAuthUI(); 
@@ -2958,8 +3117,8 @@ async function initSession() {
     try {
         console.log("[WIDGET] UI Ready handshake starting...");
         
-        // 🌟 1. 새로고침 전 담아두었던 프론트엔드 대기열 먼저 복구
-        GlobalTaskManager.loadQueue();
+        // 🌟 1. 새로고침 전 담아두었던 프론트엔드 대기열 먼저 복구 (Dexie 비동기 처리)
+        await GlobalTaskManager.loadQueue();
         
         const data = await invoke<any>("mark_ui_ready");
 
@@ -2972,7 +3131,7 @@ async function initSession() {
             console.log(`[QUEUE] Backend is busy with ${runningTask.id}. Pausing frontend queue.`);
         }
 
-        const currentLockId = localStorage.getItem("sys_lock");
+        const currentLockId = await kvGet("sys_lock");
         if (currentLockId) {
             const isTaskStillAlive = data.tasks && data.tasks.some((t: any) => t.id === currentLockId && (t.status === 1 || t.status === 10));
             // 🌟 2. DB엔 없어도 TS Queue에 남아있는 녀석은 아직 Rust로 안 넘어간 정당한 대기열입니다.
@@ -2980,8 +3139,8 @@ async function initSession() {
             
             if (!isTaskStillAlive && !isPendingInQueue) {
                 console.log(`[LOCK] Zombie detected: ${currentLockId} is not active in Backend or Queue. Releasing.`);
-                localStorage.removeItem("sys_lock");
-                GlobalTaskManager.forceReset();
+                await kvRemove("sys_lock");
+                await GlobalTaskManager.forceReset();
             } else {
                 console.log(`[LOCK] Valid task detected: ${currentLockId}. Keeping lock.`);
                 if (currentLockId.startsWith("search_")) isSearching = true;
@@ -3016,7 +3175,8 @@ async function initSession() {
 
         // 🌟 새로고침 시 DB에 살아남은 진짜 대기열 목록만 복구
         if (data.tasks && data.tasks.length > 0) {
-            data.tasks.forEach((t: any) => {
+            // 🌟 [CRITICAL FIX] forEach의 콜백은 동기 함수이므로 내부에서 await를 쓸 수 없습니다. 비동기 순차 처리를 위해 for...of 루프로 변경합니다.
+            for (const t of data.tasks) {
                 if (t.status === 10 || t.status === 1) {
                     let taskQuery = "";
                     try {
@@ -3031,7 +3191,7 @@ async function initSession() {
                     if (taskQuery) {
                         const userMsgId = `${t.id}_query`;
                         if (!document.getElementById(userMsgId)) {
-                            renderMessage({
+                            await renderMessage({
                                 id: userMsgId,
                                 role: "user",
                                 text: taskQuery,
@@ -3045,7 +3205,7 @@ async function initSession() {
 
                     // 2. 시스템 대기열/진행 상태 말풍선 복구
                     if (!document.getElementById(t.id)) {
-                        renderMessage({
+                        await renderMessage({
                             id: t.id,
                             task_id: t.id,
                             role: "system_task",
@@ -3062,7 +3222,7 @@ async function initSession() {
                     const isSearchGhost = t.id.startsWith("search_") && !GlobalTaskManager.queue.some(q => q.taskId === t.id);
 
                     if (!isSearchGhost) {
-                        localStorage.setItem("sys_lock", t.id);
+                        await kvSet("sys_lock", t.id);
                         
                         if (t.id.startsWith("search_")) {
                             isSearching = true;
@@ -3076,7 +3236,7 @@ async function initSession() {
                         console.log(`[WIDGET] Ignoring ghost search task: ${t.id}`);
                     }
                 }
-            });
+            }
             await updateExtractButtonVisibility();
         }
 
@@ -3113,7 +3273,7 @@ document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTa
 document.getElementById("unload-btn")?.addEventListener("click", async () => { 
     try { 
         // 🌟 메모리 강제 해제 시 진행 중인 프론트엔드 락도 함께 초기화합니다.
-        GlobalTaskManager.forceReset();
+        await GlobalTaskManager.forceReset();
         isExtracting = false;
         isSearching = false;
         stopSpinner();
@@ -3344,7 +3504,8 @@ async function initDevicePreference() {
             if (label) label.innerText = "CPU Mode (No GPU detected)";
         } else {
             // 2. Load saved preference
-            const savedPref = localStorage.getItem("force_cpu_mode") === "true";
+            const savedPrefStr = await kvGet("force_cpu_mode");
+            const savedPref = savedPrefStr === "true";
             forceCpuToggle.checked = savedPref;
         }
     } catch (e) {
@@ -3352,8 +3513,8 @@ async function initDevicePreference() {
     }
 
     // 3. Save on change
-    forceCpuToggle.addEventListener("change", () => {
-        localStorage.setItem("force_cpu_mode", forceCpuToggle.checked.toString());
+    forceCpuToggle.addEventListener("change", async () => {
+        await kvSet("force_cpu_mode", forceCpuToggle.checked.toString());
         // [NOTE] The preference will be applied on the next model initialization.
         // Users can click "Free Memory" to force a reload if they want immediate effect.
     });
@@ -3586,13 +3747,13 @@ interface ChatMessage {
     content?: string | any;
 }
 
-function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append') {
+async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append') {
     if (!chatTalks) return;
 
     const scrollEl = document.getElementById("chat-scroll");
     const prevScrollHeight = scrollEl ? scrollEl.scrollHeight : 0;
 
-    messages.forEach(msg => {
+    for (const msg of messages) {
         let textContent = msg.text || "";
         const rawContent = msg.content || (msg as any).data;
 
@@ -3648,10 +3809,10 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
                 if (finalStatus !== cachedStatus) {
                     existingEl.dataset.status = finalStatus.toString();
                     
-                    const currentLock = localStorage.getItem("sys_lock");
+                    const currentLock = await kvGet("sys_lock");
                     if (currentLock === domId && [2, 6, 9].includes(finalStatus)) {
                         console.log(`[LOCK] Task ${domId} reached terminal state ${finalStatus}. Releasing lock.`);
-                        localStorage.removeItem("sys_lock");
+                        await kvRemove("sys_lock");
                     }
 
                     const statusBar = existingEl.querySelector('.status-bar') as HTMLElement;
@@ -3678,7 +3839,7 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
             if (isTask) { newEl.onclick = () => handleTaskClick(newEl); }
             chatTalks.appendChild(newEl);
         }
-    });
+    }
 
     // 🌟 [CRITICAL FIX] DOM 정렬 로직 강화 (시간 오름차순 및 질문 우선순위 고정)
     const sortedChildren = Array.from(chatTalks.children) as HTMLElement[];
@@ -3992,10 +4153,10 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
     }
 }
 
-function renderMessage(msg: any, shouldScroll: boolean = true, isPrepend: boolean = false) {
+async function renderMessage(msg: any, shouldScroll: boolean = true, isPrepend: boolean = false) {
     if (!chatTalks) return;
     // Single message upsert (Real-time is always append/newest in Slack style)
-    upsertChatMessages([msg], isPrepend ? 'prepend' : 'append');
+    await upsertChatMessages([msg], isPrepend ? 'prepend' : 'append');
 }
 
 // --- Initialize ---
