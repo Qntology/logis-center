@@ -621,7 +621,14 @@ async function updateExtractButtonVisibility() {
             const pages = await Select["pages"]({});
             isAllowedDomain = pages.some((p: any) => {
                 const data = p.data || p;
-                return data.origin && data.origin.toLowerCase().includes(currentHostname);
+                if (!data.origin) return false;
+                try {
+                    const originHost = new URL(data.origin.toLowerCase()).hostname;
+                    // 정확한 호스트명 일치 또는 서브도메인 여부만 검사하여 오작동 방지
+                    return currentHostname === originHost || currentHostname.endsWith("." + originHost);
+                } catch(e) {
+                    return false;
+                }
             });
         }
 
@@ -841,7 +848,10 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                     _url = new URL(data.origin);
                     const domain = node.domain || _url.hostname;
                     if (!navTmp[domain] && data.item) {
-                        host = `<strong>${domain}</strong>`;
+                        // 🌟 [추가] Host명 옆에 일괄 Show Hidden 버튼을 숨김 상태로 렌더링
+                        host = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                                  <strong style="margin-bottom:0;">${domain}<button class="btn-show-domain-hidden" data-domain="${domain}" style="display:none; margin-left: 10px; background:none; border:none; cursor:pointer; font-size:10px; font-style: italic; text-decoration:underline;">Show</button></strong>
+                                </div>`;
                         navTmp[domain] = true;
                     }
                     if (nodeId === activeContext.ref || (currentDetectedUrl && currentDetectedUrl.includes(data.link))) {
@@ -877,7 +887,18 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                     count = `<u>(${total.count || 0})</u>`;
                 }
                 
-                content = `<span>${name} ${count}</span> ${recent}`;
+                // 🌟 [추가] 숨김 처리 상태 아이콘 및 스타일 적용
+                const isHidden = hiddenPages.includes(nodeId);
+                const visibilityIcon = isHidden ? "show" : "hide";
+                
+                const visibilityBtn = `<button class="btn-toggle-visibility" data-id="${nodeId}">${visibilityIcon}</button>`;
+
+                if(!isHidden){
+                    content = `<div style="display:flex; align-items:center; width:100%; justify-content:space-between;">
+                        ${visibilityBtn}
+                        <div style="display:flex; align-items:center; gap:4px;"><span>${name} ${count}</span> ${recent}</div>
+                    </div>`;
+                }
             }
 
             var hasChildren = node.children && node.children.length > 0;
@@ -893,9 +914,7 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                            data-bcc="${node.bcc || (node.data && node.data.bcc) || ''}" 
                            data-ref="${node.ref || node.ref_val || (node.data && node.data.ref) || ''}"
                            data-domain="${node.domain || (_url ? _url.hostname : '')}" 
-                           data-type="${node.type || (node.data && node.data.type) || ''}">
-                        ${content}
-                    </label>
+                           data-type="${node.type || (node.data && node.data.type) || ''}">${content}</label>
             `;
 
             if (hasChildren) {
@@ -962,7 +981,7 @@ async function renderNavigation() {
         const isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
 
         if (_pages.length === 0) {
-            pageList.innerHTML = "<div>No shared pages found for this domain.</div>";
+            pageList.innerHTML = `<div class="empty">No shared pages found for this domain.</div>`;
             // 🌟 현재 도메인과 일치하는 데이터가 없으면 Shared Pages 섹션 전체를 숨깁니다.
             if (navSection) navSection.style.display = "none";
         } else {
@@ -1050,6 +1069,54 @@ async function renderNavigation() {
             // 3. Render
             pageList.innerHTML = await renderAccordion(tree);
 
+            // 🌟 [추가] Show/Hide 토글 버튼 이벤트 바인딩
+            pageList.querySelectorAll(".btn-toggle-visibility").forEach((btn: any) => {
+                btn.onclick = async (e: Event) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const targetId = btn.dataset.id;
+                    if (!targetId) return;
+
+                    if (hiddenPages.includes(targetId)) {
+                        hiddenPages = hiddenPages.filter(id => id !== targetId);
+                    } else {
+                        hiddenPages.push(targetId);
+                    }
+                    await kvSet("hidden_pages", JSON.stringify(hiddenPages));
+                    await renderNavigation(); // UI 즉시 갱신
+                };
+            });
+
+            // 🌟 [추가] 숨겨진 항목이 있는 Host(도메인)의 Show 버튼 노출 및 일괄 해제 이벤트 바인딩
+            pageList.querySelectorAll(".logis-label").forEach((label: any) => {
+                const id = label.dataset.id;
+                const domain = label.dataset.domain;
+                // 해당 도메인에 속한 아이템 중 하나라도 숨김(hidden) 상태라면 Host의 Show 버튼을 노출합니다.
+                if (hiddenPages.includes(id)) {
+                    const hostShowBtn = pageList.querySelector(`.btn-show-domain-hidden[data-domain="${domain}"]`) as HTMLElement;
+                    if (hostShowBtn) hostShowBtn.style.display = "inline";
+                }
+            });
+
+            pageList.querySelectorAll(".btn-show-domain-hidden").forEach((btn: any) => {
+                btn.onclick = async (e: Event) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const domain = btn.dataset.domain;
+                    
+                    // 🌟 해당 도메인을 가진 모든 라벨을 찾아 hiddenPages 배열에서 전부 제거합니다.
+                    pageList.querySelectorAll(`.logis-label[data-domain="${domain}"]`).forEach((label: any) => {
+                        const id = label.dataset.id;
+                        if (hiddenPages.includes(id)) {
+                            hiddenPages = hiddenPages.filter(hId => hId !== id);
+                        }
+                    });
+                    
+                    await kvSet("hidden_pages", JSON.stringify(hiddenPages));
+                    await renderNavigation(); // UI 즉시 갱신하여 숨겨졌던 모든 항목을 표시
+                };
+            });
+
             // 4. Bind Clicks manually to labels
             pageList.querySelectorAll(".logis-label").forEach((label: any) => {
                 label.onclick = async (e: Event) => {
@@ -1097,7 +1164,7 @@ async function renderNavigation() {
         const users = await Select["users"]({});
         
         if (userList) userList.innerHTML = "";
-        if (localUserList) localUserList.innerHTML = "<div style='padding-left:1em; font-size:0.75rem; color:#666;'>No local devices</div>";
+        if (localUserList) localUserList.innerHTML = `<div class="empty">No local devices</div>`;
 
         if (users.length > 0) {
             // 1. 꼬리표를 기준으로 로컬/클라우드 유저 분할
@@ -1894,7 +1961,7 @@ listen("extraction-progress", async (event: any) => {
                 html += `</div>`;
                 
                 if(!response.results || response.results.length === 0) {
-                    html += "No matching data found.";
+                    html += `<div class="empty">No matching data found</div>`;
                 } else {
                     html += response.results.map((res: any) => 
                         `<div style="border-bottom:1px solid #333; padding:8px 0;">
@@ -3107,7 +3174,8 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
                 renderNavigation();
             }
         } else if (reset) {
-            docListContainer.innerHTML = "<div style='text-align:center; padding:20px; color:#999;'>No documents found.</div>";
+            docListContainer.innerHTML = `<div class="empty">No documents found.</div>`;
+
         }
     } catch (e) { 
         console.error("[WIDGET] loadMoreDocs error:", e);
@@ -3314,7 +3382,7 @@ async function showDetail(uuid: string) {
             try { prettyJson = JSON.stringify(JSON.parse(doc.json_data), null, 2); } catch(e) {}
             detailContent.innerHTML = `<div style="margin-bottom:10px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:#444;"><pre style="white-space: pre-wrap; font-size: 0.75rem; color:#fff; background:#111; padding:10px;">${prettyJson}</pre>`;
         } else {
-            detailContent.innerHTML = "Document not found in database.";
+            detailContent.innerHTML = `<div class="empty">Document not found in database.</div>`;
         }
     } catch (e) { 
         console.error("[WIDGET] get_document failed:", e);
@@ -3492,7 +3560,7 @@ async function performQrAuth() {
     if (!chatTalks || !currentSession.hash) return;
     const existing = document.getElementById("msg-qr-auth");
     if (existing) existing.remove();
-    const html = `<div class="chat-talk system" id="msg-qr-auth" data-created-at="9999999999999"><div class="chat-message" style="padding:0; background: #fff; color: #000; border:0;"><div style="font-size:0.75rem; font-weight: bold; margin-bottom: 15px; color: #333;"><span id="qr-auth-spinner" class="active-spinner" style="margin-right:5px; font-family:monospace; color:var(--primary); font-weight:bold;">⠋</span>Scan the QR code</div><div id="qr-code-target" style="display: inline-block; background: #fff; border-radius: 8px;"></div></div></div>`;
+    const html = `<div class="chat-talk system" id="msg-qr-auth" data-created-at="9999999999999"><div class="chat-message" style="padding:0; background: #fff; color: #000; border:0;"><div style="font-size:0.75rem; font-weight: bold; margin-bottom: 15px; color: #333;"><span id="qr-auth-spinner" class="active-spinner" style="margin-right:5px; font-family:monospace; color:#000; font-weight:bold;">⠋</span>Scan the QR code</div><div id="qr-code-target" style="display: inline-block; background: #fff; border-radius: 8px;"></div></div></div>`;
     chatTalks.insertAdjacentHTML('beforeend', html);
     const qrTarget = document.getElementById("qr-code-target");
     if (qrTarget) {
@@ -3572,7 +3640,16 @@ function startPolling() {
 
 async function saveSession() { await kvSet("chat_session", JSON.stringify(currentSession)); }
 
+// 🌟 [추가] Shared Pages 숨김 처리 상태를 담을 전역 배열
+let hiddenPages: string[] = [];
+
 async function initSession() {
+    // 🌟 [추가] Dexie에서 숨김 페이지 목록을 불러옵니다.
+    const savedHiddenPages = await kvGet("hidden_pages");
+    if (savedHiddenPages) {
+        try { hiddenPages = JSON.parse(savedHiddenPages); } catch(e) {}
+    }
+
     // 🌟 [CRITICAL FIX 1] 앱 최초 실행 시, Dexie에서 묵은 터미널 찌꺼기를 완벽 청소합니다!
     const allKeys = await appDb.table("kv_store").toCollection().primaryKeys();
     for (const key of allKeys) {
@@ -4391,7 +4468,7 @@ async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'ap
                     const statusBar = existingEl.querySelector('.status-bar') as HTMLElement;
                     if (statusBar) {
                         const statusMap: any = {
-                            1: { icon: "⠋", text: "PROCESSING", color: "var(--primary)" },
+                            1: { icon: "⠋", text: "PROCESSING", color: "#000" },
                             9: { icon: "✅", text: "DONE", color: "#22c55e" },
                             10: { icon: "📥", text: "QUEUED", color: "#999999" },
                             2: { icon: "❌", text: "STOPPED", color: "#ef4444" }, // 🌟 아이콘을 ❌로 변경하고 색상을 빨간색으로 고정
@@ -4469,7 +4546,7 @@ function createMessageHTML(msg: ChatMessage) {
     const statusMap: Record<number, { icon: string, text: string, color: string }> = {
         9: { icon: "✅", text: "DONE", color: "#22c55e" },
         0: { icon: "✅", text: "DONE", color: "#22c55e" },
-        1: { icon: "⠋", text: "PROCESSING", color: "var(--primary)" },
+        1: { icon: "⠋", text: "PROCESSING", color: "#000" },
         6: { icon: "❌", text: "ERROR", color: "#ef4444" },
         2: { icon: "❌", text: "STOPPED", color: "#ef4444" }, // 🌟 좀비 테스크(2)를 ERROR 아이콘과 색상으로 지정
         10: { icon: "📥", text: "PENDING", color: "#999999" },
@@ -4497,7 +4574,7 @@ function createMessageHTML(msg: ChatMessage) {
         style="${isTaskBubble ? 'cursor:pointer;' : ''}">
         <div class="chat-message">
             <div style="font-size:0.6rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;">
-                <span>${msg.role === 'user' ? '@YOU' : '🤖 LOGIS AI'}</span>
+                <span>${msg.role === 'user' ? '@YOU' : 'LOGIS AI'}</span>
                 <span>${timeStr}</span>
             </div>
             <div class="content">${displayContent}</div>

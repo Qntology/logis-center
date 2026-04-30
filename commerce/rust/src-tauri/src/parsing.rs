@@ -815,9 +815,9 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
     let schema = match page_type {
     "order" => r###"- "order":
-    - "id":Refer to the ID value from the link or an attribute | string
     - "title":title | string
     - "path":URL includes a manage order path, an administrative or edit Link | string
+    - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage order link | string
     - "quantity":quantity | string
     - "sale_price":total price | number
@@ -827,9 +827,9 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error' | string"###.to_string(),
 
     "goods" => r###"- "goods":
-    - "id":Refer to the ID value from the link or an attribute | string
     - "title":title | string
     - "path":URL includes a manage goods path, an administrative or edit Link | string
+    - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage goods link | string
     - "quantity":quantity | string
     - "sale_price":total price | number
@@ -838,17 +838,17 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error' | string"###.to_string(),
     
     "tracking" | "review" => r###"- "{TYPE}":
-    - "id":Refer to the ID value from the link or an attribute | string
     - "title":author and content | string
+    - "id":Refer to the ID value from the link or an attribute | string
     - "path":URL includes a manage {TYPE} path, an administrative or edit Link | string
     - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'start' or 'progress' or 'stop' or 'cancel' or 'return' | string"###.to_string(),
     
     "coupon" | "event" => r###"- "{TYPE}":
-    - "id":Refer to the ID value from the link or an attribute | string
     - "title":type based item title | string
     - "path":URL includes a manage {TYPE} path, an administrative or edit Link | string
+    - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
     - "started_at":yyyy-MM-ddThh:mm:ss | string
     - "expired_at":yyyy-MM-ddThh:mm:ss | string
@@ -856,9 +856,9 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "status":'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error' | string"###.to_string(),
     
         _ => r###"- "{TYPE}":
-    - "id":Refer to the ID value from the link or an attribute | string
     - "title":title | string
     - "path":URL includes a manage {TYPE} path, an administrative or edit Link | string
+    - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
     - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error' | string"###.to_string()
     };

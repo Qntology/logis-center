@@ -51,6 +51,8 @@ body {
   justify-content: center; /* Center horizontally */
 }
 
+.empty{font-style: italic; font-size:0.8rem; color:#666;}
+
 /* The Main Wrapper */
 .widget-wrapper {
   padding: 10px;
@@ -106,6 +108,8 @@ body {
 
 .pill-nav:active { cursor: grabbing; }
 
+#search-mode-tabs{margin-bottom: 2em; padding: 0.7rem;}
+
 /* Search Container & Chips */
 .search-container {
     flex: 1;
@@ -123,6 +127,8 @@ body {
     gap: 4px;
     flex-shrink: 0;
 }
+
+.search-tags-container:empty{display: none;}
 
 .search-chip {
     display: flex;
@@ -195,7 +201,7 @@ body {
 }
 #nav-img-clear:hover { opacity: 1; }
 
-#search-mode-tabs .mode-tab.active{text-decoration: underline; color:#000;}
+#search-mode-tabs .mode-tab.active{text-transform: uppercase; text-decoration: underline; color:#000;}
 
 .logo-section {
   display: flex;
@@ -434,7 +440,6 @@ tr:hover { background: rgba(0,0,0,0.05); }
     overflow: hidden;
     display: inline-block;
     padding: 10px;
-    border: 1px solid #000;
     border-radius: 1em;
     text-align: left;
     max-width: 85%;
@@ -582,9 +587,11 @@ tr:hover { background: rgba(0,0,0,0.05); }
     margin: 0 auto;
 }
 
+#settings-panel{padding: 0.7rem;}
+
 .settings-toggle{position: absolute; right: 5px; top: 0;}
-.settings-toggle label{cursor: pointer; color: rgb(100, 100, 100); font-size: 12px; background: rgba(255, 255, 255, 0.1); padding: 10px 10px; border-radius: 6px; transition: 0.2s; display: block; opacity: 1;}
-.settings-toggle label.on{text-decoration: underline;  opacity: 1; color: #000;}
+.settings-toggle label{cursor: pointer; color: rgb(100, 100, 100); font-size: 0.8rem; background: rgba(255, 255, 255, 0.1); padding: 10px 10px; border-radius: 6px; transition: 0.2s; display: block; text-decoration: underline;  opacity: 1; color: #000;}
+.settings-toggle label.on{display: none;}
 
 .nav-categories.visible {
     opacity: 1;
@@ -670,7 +677,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
 .nav-section h3 {
     margin: 0;
     padding: 1em;
-    font-size: 0.7rem;
+    font-size: 0.8rem;
     text-transform: uppercase;
     letter-spacing: 0.05em;
 }
@@ -720,6 +727,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
     margin-bottom: 10px;
     box-shadow: 0 2px 5px rgba(0,0,0,0.05);
     transition: transform 0.2s;
+    z-index: 0;
 }
 
 .logis-result:hover {
@@ -728,14 +736,15 @@ tr:hover { background: rgba(0,0,0,0.05); }
 }
 
 .logis-info {
-    display: flex;
+    display: block;
     justify-content: space-between;
     align-items: center;
     font-size: 0.8rem;
     padding: 2px 0;
     color: #333;
-    border-bottom: 1px solid rgba(0,0,0,0.03);
 }
+
+.logis-info strong:empty{display: none;}
 
 .logis-info strong {
     text-transform: uppercase;
@@ -752,6 +761,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
 }
 
 .logis-info .unit {
+    display: none;
     color: #999;
     font-style: normal;
     font-size: 0.7rem;
@@ -760,7 +770,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
 
 .logis-info.status .value {
     font-weight: bold;
-    color: var(--primary);
+    color: #666;
 }
 
 /* More/Details Toggle */
@@ -780,20 +790,29 @@ tr:hover { background: rgba(0,0,0,0.05); }
     display: block;
 }
 
+
+.logis-info.created_at{overflow: hidden;}
+
 .more-label {
-    display: block;
-    text-align: center;
+    float: right;
+    text-decoration: underline;
     font-size: 0.7rem;
-    color: var(--primary);
+    color: #666;
     cursor: pointer;
-    margin-top: 5px;
     padding: 2px;
     opacity: 0.8;
 }
 .more-label:hover { opacity: 1; text-decoration: underline; }
 
-.toggle-more:checked + .logis-result .more-label {
-    display: none; /* Hide label if open, or change text via css content if desired */
+.more-content{display: none;}
+
+
+.toggle-more:checked + .logis-result .more-label{font-size: 0;}
+.toggle-more:checked + .logis-result .more-label:after{content: "Fold"; display: block; float: right; text-decoration: underline; font-size: 0.7rem; color: #666; cursor: pointer; padding: 2px; opacity: 0.8;}
+.toggle-more:checked + .logis-result .more-content:empty+.logis-info.created_at .more-label:after{content: "Empty - Fold";}
+
+.toggle-more:checked + .logis-result .more-content {
+    display: block;
 }
 
 /* Type Specifics */
@@ -818,9 +837,14 @@ tr:hover { background: rgba(0,0,0,0.05); }
 .nav-tree-container{margin-bottom: 2em;}
 
 .tree-root {
-    margin: 0 1em 1em;
+    margin: 0 1.6rem 0.8rem;
     font-family: arial, sans-serif;
 }
+
+
+.btn-toggle-visibility{position: absolute; left: 100%; top: 0; margin-left: 2em; border:0; font-size: 1em; font-style: italic; text-decoration: none; background-color: transparent; cursor: pointer;}
+.btn-toggle-visibility:hover{text-decoration: line-through;}
+.btn-toggle-visibility:hover+div span{text-decoration: line-through;}
 
 .logis-branch {
     list-style: none;
@@ -846,7 +870,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
     display: block;
     margin-bottom: 1em;
     font-weight: 300;
-    font-size: 10px;
+    font-size: 0.8rem;
     font-style: italic;
     color: #888;
     text-transform: lowercase;
@@ -859,10 +883,12 @@ tr:hover { background: rgba(0,0,0,0.05); }
     margin-bottom: 1.5em;
     margin-left: 1em;
     cursor: pointer;
-    font-size: 10px;
+    font-size: 0.8rem;
     font-weight: 300;
     color: #333;
 }
+
+.logis-label:empty{display: none;}
 
 .logis-label.selected span{text-decoration: underline;}
 
@@ -881,7 +907,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
 .logis-label u {
     text-decoration: underline;
     font-style: italic;
-    font-size: 10px;
+    font-size: 0.8rem;
     vertical-align: top;
     margin-left: 4px;
     color: #000;

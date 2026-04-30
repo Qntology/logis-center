@@ -148,7 +148,7 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
             if (_value) _value = time2text(_value);
             if (key === "created_at") {
                 _name = _value; 
-                _value = `<label for="more-${docId}" class="more-label" style="cursor:pointer;">more</label>`;
+                _value = `<label for="more-${docId}" class="more-label" style="cursor:pointer;">More</label>`;
             }
         }
 
@@ -193,9 +193,8 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
             ${Tpl(item, "status")}
             ${Tpl(item, "no")}
             ${Tpl(item, "vessel")}
-            ${Tpl(item, "created_at")}
         `;
-        body += `<div class="${selector.more}" style="display:none;">`;
+        body += `<div class="${selector.more}">`;
         if (more) {
             body += `
                 ${Tpl(item, "pol")}
@@ -205,18 +204,17 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
                 ${Tpl(item, "recipient_name")}
                 ${Tpl(item, "amount", "currency")}
                 ${Tpl(item, "issue_date")}
-            `;
+            `.trim();
         }
-        body += `</div>`;
+        body += `</div>${Tpl(item, "created_at")}`;
 
     } else if (itemType === "sales") {
         body += `
             ${Tpl(item, "status")}
             ${Tpl(item, "title")}
             ${Tpl(item, "sale_price", "currency")}
-            ${Tpl(item, "created_at")}
         `;
-        body += `<div class="${selector.more}" style="display:none;">`;
+        body += `<div class="${selector.more}">`;
         if (more) {
             body += `
                 ${Tpl(item, "price", "currency")}
@@ -235,9 +233,9 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
                 ${Tpl(item, "release_date")}
                 ${Tpl(item, "manufacture_date")}
                 ${Tpl(item, "expiration_date")}
-            `;
+            `.trim();
         }
-        body += `</div>`;
+        body += `</div>${Tpl(item, "created_at")}`;
 
     } else if (itemType === "tracking") {
         if(item.status) item.status = parseStatus(item.status);
@@ -245,9 +243,8 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
             ${Tpl(item, "status")}
             ${Tpl(item, "text")}
             ${Tpl(item, "title")}
-            ${Tpl(item, "created_at")}
         `;
-        body += `<div class="${selector.more}" style="display:none;">`;
+        body += `<div class="${selector.more}">`;
         if (item.data || more) {
             body += `
                 ${Tpl(item, "sender_name")}
@@ -256,9 +253,9 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
                 ${Tpl(item, "recipient_name")}
                 ${Tpl(item, "recipient_address")}
                 ${Tpl(item, "recipient_phone")}
-            `;
+            `.trim();
         }
-        body += `</div>`;
+        body += `</div>${Tpl(item, "created_at")}`;
 
     } else if (itemType === "event") {
         if(item.status) item.status = parseStatus(item.status);
@@ -266,9 +263,8 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
             ${Tpl(item, "status")}
             ${Tpl(item, "title")}
             ${Tpl(item, "discount")}
-            ${Tpl(item, "created_at")}
         `;
-        body += `<div class="${selector.more}" style="display:none;">`;
+        body += `<div class="${selector.more}">`;
         if (more) {
             body += `
                 ${Tpl(item, "code")}
@@ -280,9 +276,9 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
                 ${Tpl(item, "max_discount_amount")}
                 ${Tpl(item, "first_purchase_only")}
                 ${Tpl(item, "region_restrictions")}
-            `;
+            `.trim();
         }
-        body += `</div>`;
+        body += `</div>${Tpl(item, "created_at")}`;
     } else {
         // Fallback for Unknown Types
         body += `

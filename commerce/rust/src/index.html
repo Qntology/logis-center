@@ -75,13 +75,7 @@
                             <label for="settings-toggle">Settings</label>
                         </div>
 
-                        <div id="settings-panel" style="display: none; padding: 10px; margin-bottom: 15px;">
-                            <div id="search-mode-tabs" style="display: flex; gap: 10px; margin-bottom: 15px; padding-left: 5px;">
-                                <button class="mode-tab" data-mode="shipping" style="background: none; color: #666; border: none; font-size: 0.8rem; cursor: pointer;">Shipping</button>
-                                <button class="mode-tab active" data-mode="commerce" style="background: none; color: #000; border: none; font-size: 0.8rem; cursor: pointer; font-weight: bold;">Commerce</button>
-                                <button class="mode-tab" data-mode="analytic" style="background: none; color: #666; border: none; font-size: 0.8rem; cursor: pointer;">Analytic</button>
-                            </div>
-
+                        <div id="settings-panel" style="display: none;">
                             <div id="device-preference-container" style="padding: 5px 10px; margin-bottom: 10px; background: rgba(255,255,255,0.05); border-radius: 6px; display: flex; align-items: center; justify-content: space-between;">
                                 <label for="force-cpu-toggle" style="font-size: 0.75rem; color: #aaa; cursor: pointer;">Force CPU Mode</label>
                                 <input type="checkbox" id="force-cpu-toggle" style="cursor: pointer;" />
@@ -100,6 +94,14 @@
                         </div>
 
                         <div class="nav-tree-container">
+                            <div class="nav-section">
+                                <div id="search-mode-tabs" style="display: flex; gap: 10px;">
+                                    <button class="mode-tab" data-mode="shipping" style="background: none; color: #666; border: none; font-size: 0.8rem; cursor: pointer;">Shipping</button>
+                                    <button class="mode-tab active" data-mode="commerce" style="background: none; color: #000; border: none; font-size: 0.8rem; cursor: pointer; font-weight: bold;">Commerce</button>
+                                    <button class="mode-tab" data-mode="analytic" style="background: none; color: #666; border: none; font-size: 0.8rem; cursor: pointer;">Analytic</button>
+                                </div>
+                            </div>
+
                             <div class="nav-section">
                                 <h3>Shared Pages</h3>
                                 <div id="nav-list-pages" class="tree-root"></div>
