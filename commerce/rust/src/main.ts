@@ -352,14 +352,15 @@ const navSections = document.querySelectorAll(".nav-section");
 settingsToggle?.addEventListener("change", (e) => {
     const isChecked = (e.target as HTMLInputElement).checked;
     const label = document.querySelector('label[for="settings-toggle"]') as HTMLElement;
+    const listRefreshBtn = document.getElementById("list-refresh-btn"); // 🌟 버튼 참조 추가
     
     if (isChecked) {
         // 설정 켜짐: 설정 패널 표시, 리스트 및 네비게이션 숨김
         if (settingsPanel) settingsPanel.style.display = "block";
         if (docList) docList.style.display = "none";
+        if (listRefreshBtn) listRefreshBtn.style.display = "none"; // 🌟 새로고침 버튼 숨김
         navSections.forEach(el => (el as HTMLElement).style.display = "none");
         
-        // 라벨 UI 강조 효과 (선택사항)
         if (label) {
             label.classList.add("on")
         }
@@ -367,15 +368,13 @@ settingsToggle?.addEventListener("change", (e) => {
         // 설정 꺼짐: 설정 패널 숨김, 리스트 및 네비게이션 원상복구
         if (settingsPanel) settingsPanel.style.display = "none";
         if (docList) docList.style.display = ""; 
+        if (listRefreshBtn) listRefreshBtn.style.display = "flex"; // 🌟 새로고침 버튼 다시 표시
         navSections.forEach(el => (el as HTMLElement).style.display = "");
         
-        // 라벨 UI 원상복구
         if (label) {
             label.classList.remove("on");
         }
 
-        // 🌟 [CRITICAL FIX] 패널을 닫고 UI가 복구될 때, 
-        // 현재 탭이 Shipping 이라면 Pages가 다시 보이지 않도록 즉시 재적용!
         applySearchModeUI(); 
     }
 });
@@ -1952,7 +1951,7 @@ listen("extraction-progress", async (event: any) => {
                 aiResultsArea.style.display = "block";
                 aiResultsTitle.innerText = "🧠 AI Deep Analysis";
                 
-                let html = `<div style="margin-bottom:15px; padding:10px; background:#222; border-left:3px solid var(--primary); font-size:0.75rem;"><strong style="display:block; margin-bottom:5px; color:#aaa;">Query Intent:</strong>`;
+                let html = `<div style="margin-bottom:15px; padding:10px; background:#222; border-left:3px solid var(--primary); font-size:0.8rem;"><strong style="display:block; margin-bottom:5px; color:#aaa;">Query Intent:</strong>`;
                 if (response.structured && response.structured.context) {
                     response.structured.context.forEach((ctx: any) => {
                         html += `<div style="margin-bottom:5px;">• ${ctx.text} <span style="color:var(--primary)">[${ctx.type}]</span></div>`;
@@ -2188,7 +2187,7 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
 
             p = document.createElement("div"); p.id = elementId;
             p.className = "progress-item";
-            p.style.borderBottom = "1px solid #eee"; p.style.padding = "6px 0"; p.style.fontSize = "0.75rem";
+            p.style.borderBottom = "1px solid #eee"; p.style.padding = "6px 0"; p.style.fontSize = "0.8rem";
             p.style.display = "flex"; p.style.flexDirection = "column"; 
             const row = document.createElement("div"); row.className = "progress-row"; row.style.display = "flex"; row.style.alignItems = "center";
             
@@ -2648,7 +2647,7 @@ function setupDataChannel(channel: RTCDataChannel) {
                     dataChannel.send(JSON.stringify({
                         type: "sync_detail",
                         title: `${doc.doc_type || 'Detail'} ${doc.doc_number || ''}`,
-                        content: `<div style="margin-bottom:15px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:rgba(255,255,255,0.1);"><pre style="white-space: pre-wrap; font-size: 0.75rem; color:#fff; background:#000; padding:15px; border-radius:8px;">${doc.json_data}</pre>`
+                        content: `<div style="margin-bottom:15px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:rgba(255,255,255,0.1);"><pre style="white-space: pre-wrap; font-size: 0.8rem; color:#fff; background:#000; padding:15px; border-radius:8px;">${doc.json_data}</pre>`
                     }));
                 }
             } else if (msg.type === "get_session") {
@@ -2830,7 +2829,7 @@ async function handleTaskClick(el: HTMLElement) {
         
         logArea.innerHTML = `
             <div id="progress-container"></div>
-            <div id="terminal-logs" data-active-task-id="${taskId}" style="display: ${displayStyle}; background: #0a0a0a; color: #4ade80; padding: 12px; font-family: monospace; font-size: 0.75rem; border-radius: 6px; max-height: 250px; overflow-y: auto; white-space: pre-wrap; border: 1px solid #333; box-shadow: inset 0 0 10px rgba(0,0,0,0.8); line-height: 1.4;">${savedLogs || ""}</div>
+            <div id="terminal-logs" data-active-task-id="${taskId}" style="display: ${displayStyle}; background: #0a0a0a; color: #4ade80; padding: 12px; font-family: monospace; font-size: 0.8rem; border-radius: 6px; max-height: 250px; overflow-y: auto; white-space: pre-wrap; border: 1px solid #333; box-shadow: inset 0 0 10px rgba(0,0,0,0.8); line-height: 1.4;">${savedLogs || ""}</div>
         `;
         
         const termArea = document.getElementById("terminal-logs");
@@ -3301,7 +3300,7 @@ async function loadRelatedData(doc: any, container: HTMLElement) {
     if (!container || container.dataset.loaded === "true") return;
     
     // 스피너 표시
-    container.innerHTML = `<div style="padding:10px; text-align:center; font-size:0.75rem; color:var(--primary);"><span class="active-spinner">⠋</span> Loading related data...</div>`;
+    container.innerHTML = `<div style="padding:10px; text-align:center; font-size:0.8rem; color:var(--primary);"><span class="active-spinner">⠋</span> Loading related data...</div>`;
     
     try {
         const docId = doc.id || doc.uuid;
@@ -3333,7 +3332,7 @@ async function loadRelatedData(doc: any, container: HTMLElement) {
             
             // 연관 데이터 UI 주입
             container.innerHTML = `<div style="margin-top:15px; border-top:1px dashed rgba(255,255,255,0.2); padding-top:10px;">
-                <strong style="font-size:0.75rem; color:#aaa; margin-bottom:10px; display:block;">🔗 Related Documents</strong>
+                <strong style="font-size:0.8rem; color:#aaa; margin-bottom:10px; display:block;">🔗 Related Documents</strong>
                 ${relatedHtml}
             </div>`;
             
@@ -3380,7 +3379,7 @@ async function showDetail(uuid: string) {
             detailTitle.innerText = `${doc.doc_type || 'Detail'} ${doc.doc_number || ''}`;
             let prettyJson = doc.json_data;
             try { prettyJson = JSON.stringify(JSON.parse(doc.json_data), null, 2); } catch(e) {}
-            detailContent.innerHTML = `<div style="margin-bottom:10px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:#444;"><pre style="white-space: pre-wrap; font-size: 0.75rem; color:#fff; background:#111; padding:10px;">${prettyJson}</pre>`;
+            detailContent.innerHTML = `<div style="margin-bottom:10px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:#444;"><pre style="white-space: pre-wrap; font-size: 0.8rem; color:#fff; background:#111; padding:10px;">${prettyJson}</pre>`;
         } else {
             detailContent.innerHTML = `<div class="empty">Document not found in database.</div>`;
         }
@@ -3560,7 +3559,7 @@ async function performQrAuth() {
     if (!chatTalks || !currentSession.hash) return;
     const existing = document.getElementById("msg-qr-auth");
     if (existing) existing.remove();
-    const html = `<div class="chat-talk system" id="msg-qr-auth" data-created-at="9999999999999"><div class="chat-message" style="padding:0; background: #fff; color: #000; border:0;"><div style="font-size:0.75rem; font-weight: bold; margin-bottom: 15px; color: #333;"><span id="qr-auth-spinner" class="active-spinner" style="margin-right:5px; font-family:monospace; color:#000; font-weight:bold;">⠋</span>Scan the QR code</div><div id="qr-code-target" style="display: inline-block; background: #fff; border-radius: 8px;"></div></div></div>`;
+    const html = `<div class="chat-talk system" id="msg-qr-auth" data-created-at="9999999999999"><div class="chat-message" style="padding:0; background: #fff; color: #000; border:0;"><div style="font-size:0.8rem; font-weight: bold; margin-bottom: 15px; color: #333;"><span id="qr-auth-spinner" class="active-spinner" style="margin-right:5px; font-family:monospace; color:#000; font-weight:bold;">⠋</span>Scan the QR code</div><div id="qr-code-target" style="display: inline-block; background: #fff; border-radius: 8px;"></div></div></div>`;
     chatTalks.insertAdjacentHTML('beforeend', html);
     const qrTarget = document.getElementById("qr-code-target");
     if (qrTarget) {
@@ -4573,7 +4572,7 @@ function createMessageHTML(msg: ChatMessage) {
         data-created-at="${msg.created_at}"
         style="${isTaskBubble ? 'cursor:pointer;' : ''}">
         <div class="chat-message">
-            <div style="font-size:0.6rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;">
+            <div style="font-size:0.8rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;">
                 <span>${msg.role === 'user' ? '@YOU' : 'LOGIS AI'}</span>
                 <span>${timeStr}</span>
             </div>
@@ -4781,12 +4780,12 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                 // 🌟 [보강] 이미 no-msg 엘리먼트가 존재한다면 추가하지 않도록 방어합니다.
                 const hasNoMsgEl = chatTalks.querySelector('.no-msg');
                 if (!isHistory && chatTalks.querySelectorAll('.chat-talk').length === 0 && !hasNoMsgEl) {
-                    chatTalks.insertAdjacentHTML('beforeend', "<div class='no-msg' data-created-at=\"0\" style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>");
+                    chatTalks.insertAdjacentHTML('beforeend', "<div class='no-msg' data-created-at=\"0\" style='text-align:center; padding:20px; color:#999; font-size:0.8rem;'>No messages yet.</div>");
                 }
             }
 
             if (isHistory && !chatHasMore && !chatTalks.querySelector('.chat-history-end')) {
-                const endHtml = `<div class="chat-talk system chat-history-end" data-created-at="0" style="text-align:center; opacity:0.4; font-size:0.6rem; padding:15px 10px;">
+                const endHtml = `<div class="chat-talk system chat-history-end" data-created-at="0" style="text-align:center; opacity:0.4; font-size:0.8rem; padding:15px 10px;">
                     <div style="border-top:1px solid rgba(255,255,255,0.05); margin-bottom:10px;"></div>
                     <span>No more older messages</span>
                 </div>`;
