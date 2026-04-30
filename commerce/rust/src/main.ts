@@ -1165,10 +1165,21 @@ async function renderNavigation() {
 async function handleTeamInvite() {
     const emailInput = document.getElementById("invite-email-input") as HTMLInputElement;
     const email = emailInput?.value.trim();
-    if (!email) {
-        alert("Please enter a valid email address.");
+
+    // 🌟 이메일 형식 검증을 위한 정규식 추가
+    const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+
+    if (!email || !emailRegex.test(email)) {
+        alert("Please enter a valid email address (e.g., user@example.com).");
+        if (emailInput) {
+            emailInput.focus();
+            emailInput.style.outline = "2px solid #ef4444";
+        }
         return;
     }
+
+    // 검증 성공 시 스타일 초기화
+    if (emailInput) emailInput.style.outline = "none";
 
     const btn = document.getElementById("btn-send-invite") as HTMLButtonElement;
     const originalText = btn.innerText;
@@ -3737,6 +3748,27 @@ document.getElementById("unload-btn")?.addEventListener("click", async () => {
     } catch (e) {
         console.error("[WIDGET] Unload failed:", e);
     } 
+});
+
+document.getElementById("invite-email-input")?.addEventListener("input", (e) => {
+    const input = e.target as HTMLInputElement;
+    const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+    const btn = document.getElementById("btn-send-invite") as HTMLButtonElement;
+
+    if (input.value.trim() === "") {
+        input.style.outline = "none";
+        if (btn) btn.disabled = false;
+    } else if (!emailRegex.test(input.value.trim())) {
+        input.style.outline = "1px solid #ef4444";
+        // 형식이 맞지 않으면 전송 버튼을 비활성화하여 오전송 방지
+        if (btn) btn.style.opacity = "0.5";
+    } else {
+        input.style.outline = "1px solid #4ade80";
+        if (btn) {
+            btn.disabled = false;
+            btn.style.opacity = "1";
+        }
+    }
 });
 
 async function syncBrowserStatus() { 
