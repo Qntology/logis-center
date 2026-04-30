@@ -430,22 +430,29 @@ impl VectorStore {
         &self, table_name: &str, id: &str, type_: &str, data_val: Value, vector: Option<Vec<f32>>,
         from: Option<&str>, to: Option<&str>, cc: Option<&str>, bcc: Option<&str>, r#ref: Option<&str>, digest: Option<&str>
     ) -> Result<()> {
-         // 🌟 [수정] 터미널을 도배하던 거대한 Data (JSON) 로그 출력을 삭제합니다.
-         println!("[DEBUG] store.upsert_item - Table: {}, ID: {}, Type: {}", table_name, id, type_);
          let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
          let table = self.conn.open_table(target).execute().await?;
-         
-         // [SAFETY-FIX] Ensure ID is never empty
-         let mut final_id = id.to_string();
-         if final_id.is_empty() {
-             final_id = data_val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-         }
-         // Still empty? Use a fallback UUID to prevent database corruption/unreachable rows
-         if final_id.is_empty() {
-             final_id = uuid::Uuid::new_v4().to_string();
-             println!("[Store] Warning: upsert_item called with empty ID. Generated fallback: {}", final_id);
+
+         let final_id = if id.is_empty() { 
+             data_val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string() 
+         } else { id.to_string() };
+
+         if final_id.is_empty() { return Ok(()); }
+
+         // 🌟 [변경] 기존 데이터 조회하여 변경 사항 체크
+         let existing = self.get_item_by_id(target, &final_id).await?;
+         if let Some(doc) = existing {
+             let new_updated_at = data_val.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0);
+             let new_digest = digest.unwrap_or("");
+
+             // 업데이트 시간이 같고 다이제스트가 같으면 불필요한 쓰기 스킵
+             if doc.updated_at_ts >= new_updated_at && !new_digest.is_empty() && doc.digest == new_digest {
+                 return Ok(());
+             }
          }
 
+         println!("[DEBUG] store.upsert_item (Updated) - Table: {}, ID: {}, Type: {}", target, final_id, type_);
+         
          let _ = table.delete(&format!("id = '{}'", final_id)).await;
          let mut final_data = data_val.clone();
          if let Some(blob_base64) = final_data.get("data").and_then(|v| v.as_str()) {
@@ -534,6 +541,9 @@ impl VectorStore {
             let jsons = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
             let digests = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
             let createds = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
+            // 🌟 [추가] 14번 컬럼(updated_at)을 추출하여 updateds 변수에 할당합니다.
+            let updateds = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
+            
             for i in 0..batch.num_rows() {
                 docs.push(TradeDocument { 
                     id: ids.value(i).to_string(), r#type: types.value(i).to_string(), 
@@ -542,7 +552,11 @@ impl VectorStore {
                     r#ref: refs.value(i).to_string(),
                     text: texts.value(i).to_string(), json_data: jsons.value(i).to_string(),
                     digest: digests.value(i).to_string(), total_amount: amounts.value(i),
-                    status: statuses.value(i).to_string(), created_at_ts: createds.value(i), ..Default::default() 
+                    status: statuses.value(i).to_string(), 
+                    created_at_ts: createds.value(i), 
+                    // 🌟 이제 선언된 updateds를 정상적으로 사용할 수 있습니다.
+                    updated_at_ts: updateds.value(i),
+                    ..Default::default() 
                 });
             }
         }
@@ -568,6 +582,9 @@ impl VectorStore {
         let jsons = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
         let digests = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
         let createds = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
+        // 🌟 [추가] updated_at 컬럼 선언
+        let updateds = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
+
         Ok(Some(TradeDocument { 
             id: ids.value(0).to_string(), r#type: types.value(0).to_string(), 
             from: froms.value(0).to_string(), to: tos.value(0).to_string(),
@@ -575,7 +592,11 @@ impl VectorStore {
             r#ref: refs.value(0).to_string(),
             text: texts.value(0).to_string(), json_data: jsons.value(0).to_string(), 
             digest: digests.value(0).to_string(), total_amount: amounts.value(0),
-            status: statuses.value(0).to_string(), created_at_ts: createds.value(0), ..Default::default() 
+            status: statuses.value(0).to_string(), 
+            created_at_ts: createds.value(0), 
+            // 🌟 선언된 변수 매핑
+            updated_at_ts: updateds.value(0),
+            ..Default::default() 
         }))
     }
     
@@ -652,7 +673,8 @@ pub struct TradeDocument {
     pub digest: String,
     pub vector: Vec<f32>,
     pub created_at_ts: i64, 
-    pub item_descriptions: Vec<String>, 
+    pub updated_at_ts: i64,
+    pub item_descriptions: Vec<String>,
     pub item_hs_codes: Vec<String>,
     pub item_sku_numbers: Vec<String>,
     pub container_numbers: Vec<String>,

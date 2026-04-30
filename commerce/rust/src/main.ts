@@ -1038,12 +1038,25 @@ async function renderNavigation() {
                     const ds = label.dataset;
                     if (!ds.id) return;
 
+                    // 🌟 [기획 반영] 초대 패널이 열려있는지 확인
+                    const inviteContainer = document.getElementById("nav-cloud-invite-container");
+                    const isInviteMode = inviteContainer && !inviteContainer.classList.contains("hidden");
+
+                    if (isInviteMode) {
+                        // A. 초대 모드: 클래스 토글 및 이벤트 중단
+                        e.preventDefault();
+                        e.stopPropagation();
+                        label.classList.toggle("selected");
+                        console.log(`[INVITE-MODE] Page ${ds.id} selection toggled:`, label.classList.contains("selected"));
+                        return; // 필터링 로직 실행 방지
+                    }
+
+                    // B. 일반 모드: 기존 필터링 및 내비게이션 로직
                     // 1. 컨텍스트 업데이트
                     activeContext.cc = ds.cc || "";
                     activeContext.bcc = ds.bcc || "";
                     activeContext.ref = ds.ref || "";
                     
-                    // 🌟 [CRITICAL FIX 3] 새 항목(goods 등)을 클릭하면 기존에 있던 태그(order 등)를 싹 비워 중첩을 막습니다!
                     activeTags = activeTags.filter(t => t.type !== 'type' && t.type !== 'domain' && t.type !== 'path');
                     
                     // 2. 검색 태그 추가
@@ -1343,9 +1356,24 @@ async function syncData() {
         stepQrSpinner();
 
         if (response.results && Array.isArray(response.results)) {
-            console.log(`[SYNC] 2. 로컬 LanceDB 최신화 중... (데이터 ${response.results.length}건)`);
-            // 2. LanceDB 최신화 (Rust의 upsert_items 호출)
-            await invoke("upsert_items", { items: response.results });
+            // 🌟 [변경] 서버에서 온 데이터 중 로컬 캐시(이미 리스트에 그려진 데이터)와 
+            // id, updated_at이 완전히 일치하는 것은 제외하고 upsert를 요청합니다.
+            const filteredResults = response.results.filter((newItem: any) => {
+                const existingEl = document.getElementById(newItem.id);
+                if (existingEl) {
+                    const localUpdated = parseInt(existingEl.dataset.updatedAt || "0");
+                    const serverUpdated = newItem.updated_at || 0;
+                    return serverUpdated > localUpdated; // 서버 데이터가 더 최신인 경우만 포함
+                }
+                return true; // 로컬에 없는 데이터는 무조건 포함
+            });
+
+            if (filteredResults.length > 0) {
+                console.log(`[SYNC] 2. 로컬 LanceDB 최신화 중... (${filteredResults.length} / ${response.results.length} 건 변경됨)`);
+                await invoke("upsert_items", { items: filteredResults });
+            } else {
+                console.log(`[SYNC] 2. 변경된 데이터가 없어 DB 쓰기를 건너뜁니다.`);
+            }
 
             // 🌟 [추가] '대기 중' 멤버 정화(Cleanup) 로직
             // 서버에서 받은 결과 중 정식 멤버(member/user)가 있는지 확인합니다.
@@ -2243,6 +2271,7 @@ btnSyncQr?.addEventListener("click", async () => {
 document.getElementById("btn-cloud-invite-toggle")?.addEventListener("click", () => {
     const inviteContainer = document.getElementById("nav-cloud-invite-container");
     const btn = document.getElementById("btn-cloud-invite-toggle");
+    const pageList = document.getElementById("nav-list-pages");
     
     if (!inviteContainer || !btn) return;
 
@@ -2254,6 +2283,10 @@ document.getElementById("btn-cloud-invite-toggle")?.addEventListener("click", ()
     } else {
         inviteContainer.classList.add("hidden");
         btn.innerText = "ADD";
+        // 🌟 [추가] 패널 닫을 때 선택된 클래스 일괄 제거 (기획 의도에 따라 생략 가능)
+        if (pageList) {
+            pageList.querySelectorAll(".logis-label.selected").forEach(el => el.classList.remove("selected"));
+        }
     }
 });
 
@@ -3911,6 +3944,10 @@ function initListPullLogic() {
     const getMaxScroll = () => Math.max(0, scrollEl.scrollHeight - container.clientHeight);
 
     const handleDelta = (delta: number) => {
+        // 🌟 Settings 패널 상태를 확인하여 열려있다면 모든 델타 계산을 중단합니다.
+        const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
+        if (currentTab !== "list" || (settingsToggle && settingsToggle.checked)) return;
+
         const maxScroll = getMaxScroll();
         const isAtTop = listCurrentY <= 0;
         const isAtBottom = listCurrentY >= maxScroll;
@@ -3946,6 +3983,13 @@ function initListPullLogic() {
     };
 
     container.addEventListener('wheel', (e) => {
+        // 🌟 [CRITICAL CHECK] Settings 패널이 활성화되어 있는지 체크합니다.
+        const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
+        const isSettingsOpen = settingsToggle && settingsToggle.checked;
+
+        // 리스트 탭이 아니거나 Settings 패널이 열려 있으면 리스트 전용 스크롤 로직을 완전히 차단합니다.
+        if (currentTab !== "list" || isSettingsOpen) return;
+
         e.preventDefault();
         handleDelta(e.deltaY);
         if (listPullTimer) clearTimeout(listPullTimer);
@@ -3961,6 +4005,13 @@ function initListPullLogic() {
     }, { passive: true });
 
     container.addEventListener('touchmove', (e) => {
+        // 🌟 [CRITICAL CHECK] Settings 패널이 활성화되어 있는지 체크합니다.
+        const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
+        const isSettingsOpen = settingsToggle && settingsToggle.checked;
+
+        // Settings가 열려있다면 리스트의 Pull-to-refresh 로직이 간섭하지 못하게 합니다.
+        if (currentTab !== "list" || isSettingsOpen) return;
+
         const currentTouchY = e.touches[0].pageY;
         handleDelta(lastTouchY - currentTouchY);
         lastTouchY = currentTouchY;
@@ -4184,6 +4235,13 @@ function initChatPullLogic() {
     }, { passive: true });
 
     container.addEventListener('touchmove', (e) => {
+        // 🌟 [CRITICAL CHECK] Settings 패널이 활성화되어 있는지 체크합니다.
+        const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
+        const isSettingsOpen = settingsToggle && settingsToggle.checked;
+
+        // Settings가 열려있다면 리스트의 Pull-to-refresh 로직이 간섭하지 못하게 합니다.
+        if (currentTab !== "list" || isSettingsOpen) return;
+
         const currentTouchY = e.touches[0].pageY;
         handleDelta(lastTouchY - currentTouchY);
         lastTouchY = currentTouchY;

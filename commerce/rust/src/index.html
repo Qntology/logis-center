@@ -113,12 +113,15 @@
                                 <div id="nav-qr-container" class="hidden">
                                     <div id="manual-sync-view">
                                         <div>
-                                            <p>My Sync Seed: <strong id="my-sync-seed">...</strong></p>
+                                            <p>
+                                                <span>Seed:</span>
+                                                <strong id="my-sync-seed">...</strong>
+                                            </p>
                                         </div>
                                         
-                                        <div style="display: flex; flex-direction: column; gap: 8px;">
+                                        <div>
                                             <input type="number" id="target-seed" placeholder="Enter Target Seed (e.g. 777)" style="width: 100%; padding: 8px; background: #333; border: 1px solid #444; color: white; text-align: center; border-radius: 4px; font-size: 1.1rem; letter-spacing: 2px; font-weight: bold;">
-                                            <button id="btn-manual-connect" class="primary-btn" style="width: 100%; padding: 10px; border-radius: 4px; margin-top: 5px; font-weight: bold;">CONNECT</button>
+                                            <button id="btn-manual-connect" class="primary-btn">Connect</button>
                                         </div>
                                     </div>
                                 </div>
@@ -131,13 +134,13 @@
                                 <h3>
                                     Cloud Members
 
-                                    <button id="btn-cloud-invite-toggle" title="Invite Member" style="display: none; background: none; border: none; font-size: 0.7rem; cursor: pointer; padding: 0; filter: grayscale(1); transition: 0.2s;" onmouseover="this.style.filter='none'" onmouseout="this.style.filter='grayscale(1)'">ADD</button>
+                                    <button id="btn-cloud-invite-toggle" title="Invite Member" style="display: none; background: none; border: none; font-size: 0.7rem; cursor: pointer; padding: 0; filter: grayscale(1); transition: 0.2s;" onmouseover="this.style.filter='none'" onmouseout="this.style.filter='grayscale(1)'">Add</button>
                                 </h3>
                                 <div id="nav-cloud-invite-container" class="hidden">
                                     <div>
-                                        <div style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 1em;">
+                                        <div>
                                             <input type="email" id="invite-email-input" placeholder="Member's E-Mail" required style="width: 100%; padding: 8px; background: #333; border: 1px solid #444; color: white; text-align: center; border-radius: 4px; font-size: 1rem; font-weight: bold;">
-                                            <button id="btn-send-invite" class="primary-btn" style="width: 100%; padding: 10px; border-radius: 4px; margin-top: 5px; font-weight: bold;">SEND INVITE</button>
+                                            <button id="btn-send-invite" class="primary-btn">Send Invite</button>
                                         </div>
                                     </div>
                                 </div>

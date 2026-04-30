@@ -1196,7 +1196,10 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
     if let Some(db) = store_guard.as_ref() {
         let mut count = 0;
         for item in items {
-            let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            // 🌟 [보강] id가 데이터 최상위에 없을 경우 data 객체 내부를 한 번 더 탐색하여 정합성을 확보합니다.
+            let id = item.get("id").and_then(|v| v.as_str())
+                        .or_else(|| item.get("data").and_then(|d| d.get("id")).and_then(|v| v.as_str()))
+                        .unwrap_or("").to_string();
             
             // 🌟 [CRITICAL FIX] 클라우드(index.ts) 로직 반영: type 문자열 무조건 공백제거 및 소문자 통일
             let type_str = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();

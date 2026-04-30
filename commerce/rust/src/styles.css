@@ -28,6 +28,9 @@
 
 * { 
   box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  line-height: 1;
   /* Firefox Scrollbar Support */
   scrollbar-width: thin;
   scrollbar-color: rgba(0, 0, 0, 0.2) transparent;
@@ -330,7 +333,7 @@ button.primary-btn {
   color: #000;
   font-weight: bold;
   cursor: pointer;
-  padding: 10px;
+  padding: 0.7rem;
   border-radius: 12px;
 }
 
@@ -572,13 +575,8 @@ tr:hover { background: rgba(0,0,0,0.05); }
     transition: opacity 0.2s ease;
 }
 
-#manual-sync-view p{font-size: 1rem;}
 
-#nav-qr-container {
-    margin-top: -1em; padding: 0 2em 1em; font-size: 0.7rem;
-    transition: all 0.3s ease;
-}
-#nav-qr-container h3{padding: 0;}
+
 
 #sync-qrcode img {
     margin: 0 auto;
@@ -806,9 +804,16 @@ tr:hover { background: rgba(0,0,0,0.05); }
 /* --- LOGIS TREE VIEW STYLES (Synchronized with content.js) --- */
 
 
-.invite-container{padding: 1em; border-radius: 10px; background-color: #eee;}
-.invite-container label{display: block; margin-bottom: 10px; font-size: 12px;}
-.invite-container button {padding: 8px 12px; background-color: #aaa; color: #000; border-radius: 4px; font-weight: bold; font-size: 0.75rem; cursor: pointer; border: none;}
+#nav-cloud-invite-container{margin-bottom: 1em; padding: 0.7rem 0.7rem 0; background-color: #eee;}
+#nav-cloud-invite-container input{display: block; font-size: 12px;}
+#nav-cloud-invite-container button{display: block; background-color: #eee; color: #000; border: 0; border-radius: 4px; width: 100%; font-weight: bold; font-size: 0.75rem; text-decoration: underline; cursor: pointer;}
+
+#nav-qr-container {margin-bottom: 1em; padding: 0.7rem 0.7rem 0; background-color: #eee;}
+#nav-qr-container p{margin-bottom: 0.7rem;}
+#nav-qr-container p span{font-weight: 300; color:#666;}
+#nav-qr-container p strong{font-weight: 900; color:#000;}
+#nav-qr-container h3{padding: 0;}
+#nav-qr-container button{display: block; background-color: #eee; color: #000; border: 0; border-radius: 4px; width: 100%; font-weight: bold; font-size: 0.75rem; text-decoration: underline; cursor: pointer;}
 
 .nav-tree-container{margin-bottom: 2em;}
 
@@ -858,6 +863,8 @@ tr:hover { background: rgba(0,0,0,0.05); }
     font-weight: 300;
     color: #333;
 }
+
+.logis-label.selected span{text-decoration: underline;}
 
 .logis-label:hover span {
     text-decoration: underline;
