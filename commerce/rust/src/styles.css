@@ -790,7 +790,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
 }
 
 #doc-list .empty{margin-left: 0.8rem;}
-.card-list{margin: 0 0.7rem;}
+.card-list{margin: 0 0.7rem; min-height: 150px;}
 
 .toggle-more:checked ~ .logis-more {
     display: block;
@@ -846,12 +846,8 @@ tr:hover { background: rgba(0,0,0,0.05); }
 #nav-qr-container button{display: block; background-color: #eee; color: #000; border: 0; border-radius: 4px; width: 100%; font-weight: bold; font-size: 1rem; text-decoration: underline; cursor: pointer;}
 #nav-qr-container button:hover{font-style: italic;}
 
-.nav-tree-container{margin-bottom: 2em;}
 
-.tree-root {
-    margin: 0 1.6rem 0.8rem;
-    font-family: arial, sans-serif;
-}
+.tree-root {margin: 0 1.6rem 0.8rem;}
 
 
 .btn-toggle-visibility{position: absolute; left: 100%; top: 0; margin-left: 2em; border:0; font-size: 1em; font-style: italic; text-decoration: none; background-color: transparent; cursor: pointer;}

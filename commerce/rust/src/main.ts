@@ -375,7 +375,7 @@ settingsToggle?.addEventListener("change", (e) => {
         }
 
         // 🌟 [CRITICAL FIX] 패널을 닫고 UI가 복구될 때, 
-        // 현재 탭이 Shipping 이라면 Shared Pages가 다시 보이지 않도록 즉시 재적용!
+        // 현재 탭이 Shipping 이라면 Pages가 다시 보이지 않도록 즉시 재적용!
         applySearchModeUI(); 
     }
 });
@@ -614,7 +614,7 @@ async function updateExtractButtonVisibility() {
         const currentHostname = currentUrlObj.hostname;
 
         // 🌟 [CRITICAL FIX] 백엔드에서 인증한 샵(isCurrentShop)이 아니더라도, 
-        // 내가 가진 Shared Pages 도메인 목록에 포함되어 있다면 추출을 허용합니다.
+        // 내가 가진 Pages 도메인 목록에 포함되어 있다면 추출을 허용합니다.
         let isAllowedDomain = isCurrentShop;
         
         if (!isAllowedDomain) {
@@ -638,7 +638,7 @@ async function updateExtractButtonVisibility() {
             return;
         }
 
-        // 🌟 [신규] 3. Shared Pages 네비게이션 검증 로직
+        // 🌟 [신규] 3. Pages 네비게이션 검증 로직
         // 사용자가 사이드바에서 선택한 도메인 태그를 찾습니다.
         const domainTag = activeTags.find(t => t.type === 'domain');
 
@@ -695,7 +695,7 @@ listen("browser-match-found", async (event: any) => {
     await updateExtractButtonVisibility();
     
     // 🌟 [CRITICAL FIX] 크롬 브라우저에서 주소를 이동할 때마다, 
-    // 해당 도메인에 맞는 Shared Pages를 네비게이션에 즉시 다시 그려줍니다!
+    // 해당 도메인에 맞는 Pages를 네비게이션에 즉시 다시 그려줍니다!
     await renderNavigation();
 });
 
@@ -982,11 +982,11 @@ async function renderNavigation() {
 
         if (_pages.length === 0) {
             pageList.innerHTML = `<div class="empty">No shared pages found for this domain.</div>`;
-            // 🌟 현재 도메인과 일치하는 데이터가 없으면 Shared Pages 섹션 전체를 숨깁니다.
-            if (navSection) navSection.style.display = "none";
+            // 🌟 [CRITICAL FIX] 데이터가 없더라도 Commerce/Analytic 모드이면 "비어있음" 문구가 노출되도록 통일
+            if (navSection) navSection.style.display = (isSettingsOpen || currentSearchMode === "shipping") ? "none" : "block";
         } else {
-            // 🌟 일치하는 데이터가 있으면 섹션을 화면에 표시하되, 세팅 화면이 켜져있다면 숨김을 유지합니다.
-            if (navSection) navSection.style.display = isSettingsOpen ? "none" : "block";
+            // 🌟 일치하는 데이터가 있으면 섹션을 화면에 표시하되, 세팅/Shipping 상태에 맞춰 제어합니다.
+            if (navSection) navSection.style.display = (isSettingsOpen || currentSearchMode === "shipping") ? "none" : "block";
             
             const branchs: Record<string, any> = {};
 
@@ -1164,7 +1164,7 @@ async function renderNavigation() {
         const users = await Select["users"]({});
         
         if (userList) userList.innerHTML = "";
-        if (localUserList) localUserList.innerHTML = `<div class="empty">No local devices</div>`;
+        if (localUserList) localUserList.innerHTML = `<div class="empty">No local Members/Devices</div>`;
 
         if (users.length > 0) {
             // 1. 꼬리표를 기준으로 로컬/클라우드 유저 분할
@@ -1289,7 +1289,7 @@ try {
         const now = Date.now();
         const createdAt = now - timezoneOffset;
 
-        // 🌟 [추가] Shared Pages 영역에서 selected 클래스가 붙은 모든 라벨의 data-id 수집
+        // 🌟 [추가] Pages 영역에서 selected 클래스가 붙은 모든 라벨의 data-id 수집
         const selectedPages: string[] = [];
         const pageList = document.getElementById("nav-list-pages");
         if (pageList) {
@@ -1527,7 +1527,7 @@ function applySearchModeUI() {
         searchInput.placeholder = `${capitalizedMode} Search or Ask`;
     }
 
-    // 🌟 [추가] Shipping 모드일 때 Shared Pages 섹션 통째로 숨기기
+    // 🌟 [추가] Shipping 모드일 때 Pages 섹션 통째로 숨기기
     const pagesSection = document.getElementById("nav-list-pages")?.closest(".nav-section") as HTMLElement;
     const isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
     
@@ -1535,7 +1535,7 @@ function applySearchModeUI() {
         if (currentSearchMode === "shipping" || isSettingsOpen) {
             pagesSection.style.display = "none"; // Shipping이거나 세팅 패널이 열려있으면 숨김
         } else {
-            pagesSection.style.display = "";     // 그 외의 경우 복구
+            pagesSection.style.display = "block"; // 🌟 명시적으로 block 처리하여 노출 보장
         }
     }
 }
@@ -3169,7 +3169,7 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
             const mode = isSync ? 'prepend' : 'append';
             upsertListItems(docs, mode);
             
-            // [NEW] If syncing, also refresh the navigation tree (Shared Pages / Users)
+            // [NEW] If syncing, also refresh the navigation tree (Pages / Users)
             if (isSync) {
                 renderNavigation();
             }
@@ -3640,7 +3640,7 @@ function startPolling() {
 
 async function saveSession() { await kvSet("chat_session", JSON.stringify(currentSession)); }
 
-// 🌟 [추가] Shared Pages 숨김 처리 상태를 담을 전역 배열
+// 🌟 [추가] Pages 숨김 처리 상태를 담을 전역 배열
 let hiddenPages: string[] = [];
 
 async function initSession() {
