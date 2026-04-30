@@ -1153,12 +1153,26 @@ async fn extract_html_from_current_tab() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn get_browser_status() -> Result<String, String> {
-    let guard = automation::GLOBAL_BROWSER.lock().await;
-    if guard.is_some() || automation::is_browser_reachable().await { 
-        return Ok("running".to_string()); 
-    }
-    Ok("stopped".to_string())
+async fn get_browser_status() -> Result<Value, String> {
+    let is_running = {
+        let guard = automation::GLOBAL_BROWSER.lock().await;
+        guard.is_some() || automation::is_browser_reachable().await
+    };
+
+    let status = if is_running { "running" } else { "stopped" };
+
+    // 🌟 [추가] 브라우저가 살아있다면, 백엔드가 기억하는 최신 URL 상태도 함께 묶어서 반환합니다.
+    let (url, is_client, is_admin) = {
+        let state = automation::LAST_DETECTED_STATE.lock().await;
+        (state.url.clone(), state.is_client, state.is_admin)
+    };
+
+    Ok(json!({
+        "status": status,
+        "url": url,
+        "is_client": is_client,
+        "is_admin": is_admin
+    }))
 }
 
 #[tauri::command]
@@ -1213,15 +1227,52 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                 obj.insert("type".to_string(), serde_json::json!(type_str));
             }
             
+            // 🌟 [CRITICAL FIX] "talk" 타입의 데이터 구조를 프론트엔드 및 Cloud 백엔드의 표준 구조와 동일하게 강제 정규화합니다.
+            if type_str == "talk" || type_str == "prompt" || type_str == "ai_search" {
+                let text_val = clean_item.get("text")
+                    .or_else(|| clean_item.get("query"))
+                    .or_else(|| clean_item.get("data").and_then(|d| d.get("text")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let link_val = clean_item.get("link")
+                    .or_else(|| clean_item.get("data").and_then(|d| d.get("link")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let origin_val = clean_item.get("origin")
+                    .or_else(|| clean_item.get("data").and_then(|d| d.get("origin")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("https://commerce.logis.center")
+                    .to_string();
+
+                // 기존 최상위 잔재 필드들을 깔끔하게 지웁니다.
+                if let Some(obj) = clean_item.as_object_mut() {
+                    obj.remove("text");
+                    obj.remove("query");
+                    obj.remove("link");
+                    obj.remove("origin");
+                    
+                    // 프록시 서버(index.ts)와 동일하게 data 객체 안에 세 가지 필수 값을 몰아넣습니다.
+                    obj.insert("data".to_string(), json!({
+                        "text": text_val,
+                        "link": link_val,
+                        "origin": origin_val
+                    }));
+                }
+            }
+
             // Determine table based on cleaned type
             let _table = match type_str.as_str() {
                 "sales" | "goods" | "order" => "sales",
                 "tracking" | "receiving" | "shipping" => "tracking",
                 "event" | "coupon" => "event",
                 "member" | "team" | "user" => "users",
-                "talk" => "talks",
+                "talk" | "prompt" | "ai_search" => "talks", // 🌟 talk 관련 타입들을 명확히 talks 테이블로 라우팅
                 _ => {
-                    if clean_item.get("origin").is_some() || clean_item.get("link").is_some() {
+                    if clean_item.get("data").and_then(|d| d.get("origin")).is_some() {
                         "pages"
                     } else {
                         "items" 

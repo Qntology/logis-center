@@ -3915,13 +3915,22 @@ document.getElementById("invite-email-input")?.addEventListener("input", (e) => 
 
 async function syncBrowserStatus() { 
     try { 
-        const s = await invoke<string>("get_browser_status"); 
+        // 🌟 문자열 대신 객체로 응답을 받아옵니다.
+        const res = await invoke<any>("get_browser_status"); 
+        const s = res.status;
+        
         if (btnAutoLaunch) btnAutoLaunch.style.display = (s === "running") ? "none" : "flex"; 
         
-        // 🌟 [CRITICAL FIX] 브라우저가 꺼져있다면 잔류 중인 URL을 초기화하고 번개 버튼(Extract)을 확실히 숨깁니다.
         if (s === "stopped") { 
             currentDetectedUrl = ""; 
             await updateExtractButtonVisibility(); 
+        } else if (s === "running") {
+            // 🌟 [CRITICAL FIX] 휴면 상태에서 깨어났을 때 최신 URL 상태를 즉각 복구하여 추출 버튼을 노출시킵니다.
+            if (res.url) {
+                currentDetectedUrl = res.url;
+                isCurrentShop = res.is_client || res.is_admin;
+                await updateExtractButtonVisibility();
+            }
         }
     } catch (e) {} 
 }

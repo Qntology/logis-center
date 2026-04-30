@@ -1010,6 +1010,9 @@ async fn process_task(
                         
                         println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
 
+                        // 🌟 [추가] LLM 원본 응답(Raw Response)을 파일로 저장합니다.
+                        let _ = data_manager.offload(&res, "js_bridge_llm_raw");
+
                         // res.text 가 아닌 res 를 그대로 파싱
                         let title_info = parsing::parse_json_from_llm(&res);
                         let items_opt = title_info.get("order")
@@ -1239,6 +1242,10 @@ async fn process_task(
                         Ok(val) => {
                             let res_str = val.as_string().unwrap().to_std_string_escaped();
                             println!("[JS-BRIDGE] Boa Final Result: {}", res_str);
+
+                            // 🌟 [추가] Boa 엔진의 최종 분석 결과(Selector JSON)를 파일로 저장합니다.
+                            let _ = data_manager.offload(&res_str, "js_bridge_boa_result");
+
                             selector_info = serde_json::from_str(&res_str).unwrap_or(json!({}));
                         },
                         Err(e) => {
