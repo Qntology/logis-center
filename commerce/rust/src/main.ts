@@ -603,22 +603,38 @@ async function updateExtractButtonVisibility() {
         return;
     }
 
-    // 2. 분석 가능한 샵 도메인이나 허용된 페이지가 아니면 숨김
-    if (!currentDetectedUrl || !isCurrentShop) {
+    // 2. URL이 아예 감지되지 않았다면 숨김
+    if (!currentDetectedUrl) {
         btnExtract.style.display = "none";
         return;
     }
 
-    // 🌟 [신규] 3. Shared Pages 네비게이션 검증 로직
-    // activeTags(또는 activeContext)에 특정 도메인이 선택되어 있다면,
-    // 현재 접속 중인 브라우저 탭의 URL이 그 도메인과 일치하는지 확인합니다.
     try {
         const currentUrlObj = new URL(currentDetectedUrl.toLowerCase());
         const currentHostname = currentUrlObj.hostname;
+
+        // 🌟 [CRITICAL FIX] 백엔드에서 인증한 샵(isCurrentShop)이 아니더라도, 
+        // 내가 가진 Shared Pages 도메인 목록에 포함되어 있다면 추출을 허용합니다.
+        let isAllowedDomain = isCurrentShop;
         
+        if (!isAllowedDomain) {
+            const pages = await Select["pages"]({});
+            isAllowedDomain = pages.some((p: any) => {
+                const data = p.data || p;
+                return data.origin && data.origin.toLowerCase().includes(currentHostname);
+            });
+        }
+
+        // 허용되지 않은 도메인이면 버튼을 숨김
+        if (!isAllowedDomain) {
+            btnExtract.style.display = "none";
+            return;
+        }
+
+        // 🌟 [신규] 3. Shared Pages 네비게이션 검증 로직
         // 사용자가 사이드바에서 선택한 도메인 태그를 찾습니다.
         const domainTag = activeTags.find(t => t.type === 'domain');
-        
+
         if (domainTag) {
             // 태그 값(예: "demofran.com")과 현재 호스트네임 비교
             if (!currentHostname.includes(domainTag.value)) {
@@ -631,7 +647,9 @@ async function updateExtractButtonVisibility() {
         // 4. 백엔드에 현재 페이지 작업 상태 질의 및 ID 생성
         const link = (currentUrlObj.pathname + currentUrlObj.search).toLowerCase();
         const ccHash = await hashId(currentHostname);
-        const hashedRefId = await hashId(ccHash + link);
+        // 🌟 [CRITICAL FIX] 클라우드 로직(index.ts)과 완벽히 동일하게 Team ID를 포함하여 고유 Ref ID를 생성합니다.
+        const teamId = currentSession.team || "";
+        const hashedRefId = await hashId(teamId + ccHash + link);
 
         btnExtract.title = `Extract from ${currentHostname}`;
 
@@ -1753,7 +1771,9 @@ btnExtract?.addEventListener("click", async () => {
                     const urlObj = new URL(currentDetectedUrl.toLowerCase());
                     const cc = await hashId(urlObj.hostname);
                     const rawPath = urlObj.pathname + urlObj.search;
-                    const hashedRefId = await hashId(cc + rawPath.toLowerCase());
+                    // 🌟 [CRITICAL FIX] 버튼 노출 로직과 동일하게 Team ID 병합
+                    const teamId = currentSession.team || "";
+                    const hashedRefId = await hashId(teamId + cc + rawPath.toLowerCase());
                     
                     // 🚀 큐에 등록
                     await GlobalTaskManager.addToQueue(taskId, "html_extraction", { 
@@ -3715,6 +3735,12 @@ async function initSession() {
             btnAutoLaunch.style.display = (data.browser_status === "running") ? "none" : "flex";
         }
 
+        // 🌟 [CRITICAL FIX] 앱 새로고침 시 백엔드에서 감지 중인 브라우저 현재 URL 상태를 완벽 복구합니다.
+        if (data.current_url) {
+            currentDetectedUrl = data.current_url;
+            isCurrentShop = data.is_client || data.is_admin;
+        }
+
         // 아이템 리스트 캐싱
         if (data.items && data.items.length > 0 && cachedDocs.length === 0) {
             cachedDocs = data.items;
@@ -3738,13 +3764,20 @@ async function initSession() {
 
 document.getElementById("btn-qr-auth")?.addEventListener("click", performQrAuth);
 
-// 🌟 [수정] 로그아웃 시 sessionStorage 초기화 및 세션 영구 저장소 갱신
+// 🌟 [수정] 로그아웃 시 Dexie DB의 세션까지 완벽히 제거합니다.
 document.getElementById("btn-logout")?.addEventListener("click", async () => { 
     if (await ask("Are you sure you want to sign out?", { title: "Sign Out", kind: "warning" })) { 
-        currentSession.email = undefined; 
-        sessionStorage.clear(); // sessionStorage 강제 초기화
-        await saveSession(); // 로컬 세션 데이터 업데이트
-        updateAuthUI(); 
+        // 1. 메모리상의 세션 데이터 초기화
+        currentSession = { hash: "", cc: "logis.center" };
+        
+        // 2. Dexie DB 내 저장된 세션 및 터미널 로그 영구 삭제
+        await kvRemove("chat_session");
+        
+        // 3. sessionStorage 및 기타 상태 초기화
+        sessionStorage.clear(); 
+        
+        // 4. 앱 강제 새로고침하여 초기 상태(새 해시 생성 등)로 복귀
+        window.location.reload();
     } 
 });
 
@@ -4668,7 +4701,9 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                 if (isHistory && messages.length < limit) chatHasMore = false;
             } else { 
                 if (isHistory) chatHasMore = false;
-                if (!isHistory && chatTalks.querySelectorAll('.chat-talk').length === 0) {
+                // 🌟 [보강] 이미 no-msg 엘리먼트가 존재한다면 추가하지 않도록 방어합니다.
+                const hasNoMsgEl = chatTalks.querySelector('.no-msg');
+                if (!isHistory && chatTalks.querySelectorAll('.chat-talk').length === 0 && !hasNoMsgEl) {
                     chatTalks.insertAdjacentHTML('beforeend', "<div class='no-msg' data-created-at=\"0\" style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>");
                 }
             }
