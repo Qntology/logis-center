@@ -807,16 +807,9 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
 
                     // 🌟 [수정] 버튼이 우측 끝에 붙도록 Flex 구조 적용
                     content = `<div style="display:flex; align-items:center; width:100%; gap:8px;">
-                        <span class="user-label-text">${name}${desc.length ? `<i>${desc.toString()}</i>` : ''}</span>
+                        <span>${name}${desc.length ? `<i>${desc.toString()}</i>` : ''}</span>
                         ${cancelBtn}
                     </div>`;
-                    
-                    // 🌟 [수정] node.ref가 문자열이 아닌 배열 형태일 경우를 대비해 문자열로 안전하게 변환하여 속성에 주입합니다.
-                    let refVal = node.ref || (node.data && node.data.ref) || "";
-                    if (Array.isArray(refVal)) {
-                        refVal = JSON.stringify(refVal);
-                    }
-                    node.ref_val = refVal; // ref 속성 충돌 방지를 위한 별도 변수 할당
                 }
                 if (nodeId === activeContext.ref) active = "active";
             } else if (node.data || node.type) {
@@ -1078,11 +1071,7 @@ async function renderNavigation() {
         if (users.length > 0) {
             // 1. 꼬리표를 기준으로 로컬/클라우드 유저 분할
             const localUsers = users.filter(u => u.data && u.data.is_device === true);
-            const cloudUsers = users.filter(u => {
-                const data = u.data || {};
-                // 🌟 [체크] 장치(device)가 아니면서, 일반 유저거나 'pending_invite_'로 시작하는 임시 초대 유저 포함
-                return data.is_device !== true || String(u.id).startsWith("pending_invite_");
-            });
+            const cloudUsers = users.filter(u => !u.data || u.data.is_device !== true);
 
             // 2. Cloud Team Members 렌더링 (중복 Row 제거 로직 추가)
             if (cloudUsers.length > 0 && userList) {
@@ -1117,43 +1106,36 @@ async function renderNavigation() {
                     if (btnCloudInvite) btnCloudInvite.style.display = "none";
                 }
 
-                // 🌟 [수정] 멤버 리스트 클릭 시 삭제 버튼 외에 '라벨 클릭(검색 필터)' 처리 추가
+                // 🌟 [추가] 멤버 삭제 및 초대 취소 이벤트 위임 (Event Delegation)
                 userList.onclick = async (e: Event) => {
                     const target = e.target as HTMLElement;
-                    
-                    // 1. 삭제 버튼 처리
                     const cancelBtn = target.closest('.btn-cancel-member') as HTMLElement;
-                    if (cancelBtn) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        const targetId = cancelBtn.dataset.id;
-                        const targetName = cancelBtn.dataset.name;
-                        const confirmed = await ask(`정말 '${targetName}' 멤버를 삭제하거나 초대를 취소하시겠습니까?`, { title: "멤버 삭제 확인", kind: "warning" });
-                        if (confirmed && targetId) {
-                            try {
-                                await invoke("delete_document", { uuid: targetId });
-                                await renderNavigation();
-                            } catch (err) { console.error(err); }
-                        }
-                        return;
-                    }
+                    if (!cancelBtn) return;
 
-                    // 2. [추가] 멤버 라벨(이름 영역) 클릭 시 검색 컨텍스트 업데이트
-                    const label = target.closest('.logis-label') as HTMLElement;
-                    if (label) {
-                        const ds = label.dataset;
-                        // 🌟 활성 컨텍스트에 멤버의 권한(cc, ref) 주입
-                        activeContext.cc = ds.cc || "";
-                        activeContext.ref = ds.ref || ""; 
-                        
-                        // 기존 태그 정리 후 새 멤버 태그 추가
-                        activeTags = activeTags.filter(t => t.type !== 'domain' && t.type !== 'type');
-                        addSearchTag(`@${ds.name || ds.id}`, 'domain', ds.name || ds.id || "");
-                        
-                        // UI 갱신 및 검색 실행
-                        fetchChatHistory(true);
-                        hideNavigation();
-                        console.log(`[SEARCH] Filtering by Member: ${ds.id}, Permissions(ref): ${ds.ref}`);
+                    // 라벨의 기본 클릭 이벤트(검색 컨텍스트 전환) 방지
+                    e.preventDefault();
+                    e.stopPropagation();
+
+                    const targetId = cancelBtn.dataset.id;
+                    const targetName = cancelBtn.dataset.name;
+
+                    // Tauri 네이브 ask 팝업으로 확인
+                    const confirmed = await ask(`정말 '${targetName}' 멤버를 삭제하거나 초대를 취소하시겠습니까?`, { 
+                        title: "멤버 삭제 확인", 
+                        kind: "warning" 
+                    });
+
+                    if (confirmed && targetId) {
+                        try {
+                            // 로컬 및 클라우드(동기화 시)에서 데이터 삭제
+                            await invoke("delete_document", { uuid: targetId });
+                            console.log(`[AUTH] Member/Invite removed: ${targetId}`);
+                            
+                            // UI 즉시 새로고침
+                            await renderNavigation();
+                        } catch (err) {
+                            console.error("Failed to remove member:", err);
+                        }
                     }
                 };
             }
@@ -2994,23 +2976,11 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         else if (activeContext.bcc) baseFilter = `(${baseFilter}) AND bcc = '${activeContext.bcc}'`;
         else if (activeContext.cc) baseFilter = `(${baseFilter}) AND cc = '${activeContext.cc}'`;
 
-        // 🌟 [수정] activeTags 배열을 순회하며 도메인(@) 및 타입(#) 필터를 SQL 조건에 추가합니다.
-        let tagFilter = "";
-        activeTags.forEach(tag => {
-            if (tag.type === 'domain') {
-                const domainCond = `origin MATCH '${tag.value}' OR data MATCH '${tag.value}'`;
-                tagFilter += tagFilter ? ` AND (${domainCond})` : `(${domainCond})`;
-            } else if (tag.type === 'type') {
-                const typeCond = `type = '${tag.value}'`;
-                tagFilter += tagFilter ? ` AND ${typeCond}` : typeCond;
-            }
-        });
-
+        // 🌟 [CRITICAL FIX 4] 사이드바 태그(domain, type)는 위의 activeContext를 통해 SQL 필터로 100% 적용되었습니다.
+        // 이 태그들을 텍스트로 엮어서 억지로 AI 검색에 던지면 검색 결과가 0건이 되고 VRAM이 폭발합니다. 삭제합니다!
         const textQuery = searchInput?.value.trim() || "";
+
         let finalFilter = baseFilter;
-        if (tagFilter) {
-            finalFilter = finalFilter ? `(${finalFilter}) AND (${tagFilter})` : tagFilter;
-        }
         let latestUpdateTime = 0;
         let oldestCreatedAt = 0;
 
@@ -3036,29 +3006,22 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         let docs: any[] = [];
         
         if (textQuery) {
+            // 🌟 텍스트 검색 시에도 프론트 래퍼를 버리고 Rust의 search_documents를 직접 타격합니다.
             const searchResults = await invoke<any[]>("search_documents", {
                 query: textQuery,
                 limit: pageSize,
                 offset: 0,
-                filter: finalFilter || null
+                filter: finalFilter || null // 👈 이제 필터가 절대 증발하지 않고 Rust로 꽂힙니다!
             });
             
-            if (searchResults.length > 0) {
-                const resultIds = searchResults.map(res => `'${res[0]}'`).join(",");
-                // 🌟 [최적화] 각 ID마다 get_document를 호출하는 대신, ID 리스트 필터를 사용하여 한 번에 긁어옵니다.
-                const idFilter = `id IN (${resultIds})`;
-                docs = await invoke<any[]>("get_all_documents", {
-                    limit: pageSize,
-                    offset: 0,
-                    filter: idFilter
-                });
-                
-                // 검색 결과의 유사도(Score) 순서를 유지하기 위해 재정렬
-                docs.sort((a, b) => {
-                    const scoreA = searchResults.find(r => r[0] === a.id)?.[2] || 0;
-                    const scoreB = searchResults.find(r => r[0] === b.id)?.[2] || 0;
-                    return scoreB - scoreA;
-                });
+            // Rust의 search_documents는 [id, text, score] 형태의 배열만 반환하므로, 
+            // 받아온 ID를 이용해 리스트 카드 생성에 필요한 원본 문서(Full Document)를 직접 꺼내옵니다.
+            for (const res of searchResults) {
+                const docId = res[0];
+                const fullDoc = await invoke<any>("get_document", { uuid: docId });
+                if (fullDoc) {
+                    docs.push(fullDoc);
+                }
             }
         } else {
             // 🌟 탭을 클릭하거나 일반 스크롤을 할 때는 Tauri Invoke를 직접 타격하여 완벽한 필터링을 보장합니다.
