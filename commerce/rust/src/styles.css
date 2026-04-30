@@ -109,6 +109,10 @@ body {
 .pill-nav:active { cursor: grabbing; }
 
 #search-mode-tabs{margin-bottom: 2em; padding: 0.7rem;}
+#search-mode-tabs button:hover{font-style: italic;}
+#search-mode-tabs button[data-mode="shipping"]{width: 55px;}
+#search-mode-tabs button[data-mode="commerce"]{width: 77px;}
+#search-mode-tabs button[data-mode="analytic"]{width: 49px;}
 
 /* Search Container & Chips */
 .search-container {
@@ -390,7 +394,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 0.75rem;
+    font-size: 1rem;
     color: var(--primary);
     flex-shrink: 0;
     opacity: 0;
@@ -591,6 +595,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
 
 .settings-toggle{position: absolute; right: 5px; top: 0;}
 .settings-toggle label{cursor: pointer; color: rgb(100, 100, 100); font-size: 0.8rem; background: rgba(255, 255, 255, 0.1); padding: 10px 10px; border-radius: 6px; transition: 0.2s; display: block; text-decoration: underline;  opacity: 1; color: #000;}
+.settings-toggle:hover label{font-style: italic;}
 .settings-toggle label.on{display: none;}
 
 .nav-categories.visible {
@@ -823,16 +828,22 @@ tr:hover { background: rgba(0,0,0,0.05); }
 /* --- LOGIS TREE VIEW STYLES (Synchronized with content.js) --- */
 
 
+#btn-cloud-invite-toggle{margin-left: 10px; text-decoration: underline; vertical-align: top;}
+#btn-cloud-invite-toggle:hover{font-style: italic;}
 #nav-cloud-invite-container{margin-bottom: 1em; padding: 0.7rem 0.7rem 0; background-color: #eee;}
 #nav-cloud-invite-container input{display: block; font-size: 12px;}
-#nav-cloud-invite-container button{display: block; background-color: #eee; color: #000; border: 0; border-radius: 4px; width: 100%; font-weight: bold; font-size: 0.75rem; text-decoration: underline; cursor: pointer;}
+#nav-cloud-invite-container button{display: block; background-color: #eee; color: #000; border: 0; border-radius: 4px; width: 100%; font-weight: bold; font-size: 1rem; text-decoration: underline; cursor: pointer;}
 
+
+#btn-sync-qr{margin-left: 10px; text-decoration: underline; vertical-align: top;}
+#btn-sync-qr:hover{font-style: italic;}
 #nav-qr-container {margin-bottom: 1em; padding: 0.7rem 0.7rem 0; background-color: #eee;}
 #nav-qr-container p{margin-bottom: 0.7rem;}
 #nav-qr-container p span{font-weight: 300; color:#666;}
 #nav-qr-container p strong{font-weight: 900; color:#000;}
 #nav-qr-container h3{padding: 0;}
-#nav-qr-container button{display: block; background-color: #eee; color: #000; border: 0; border-radius: 4px; width: 100%; font-weight: bold; font-size: 0.75rem; text-decoration: underline; cursor: pointer;}
+#nav-qr-container button{display: block; background-color: #eee; color: #000; border: 0; border-radius: 4px; width: 100%; font-weight: bold; font-size: 1rem; text-decoration: underline; cursor: pointer;}
+#nav-qr-container button:hover{font-style: italic;}
 
 .nav-tree-container{margin-bottom: 2em;}
 

@@ -1515,8 +1515,8 @@ function applySearchModeUI() {
             el.style.fontWeight = "bold";
             el.classList.add('active');
         } else {
-            el.style.color = "#666";
-            el.style.fontWeight = "normal";
+            el.style.color = "#999";
+            el.style.fontWeight = "bold";
             el.classList.remove('active');
         }
     });
