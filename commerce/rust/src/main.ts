@@ -457,6 +457,11 @@ function switchTab(tabName: string) {
     if (tabName === "settings") {
         settingsBtn?.classList.add("active-emoji", "active");
         
+        // 🌟 [CRITICAL FIX] Settings 버튼을 누르면 3초를 기다리지 않고 즉시 1회 서버 통신(인증/동기화)을 강제 실행합니다!
+        if (!currentSession.email) {
+            checkAuthStatus();
+        }
+
         // 🌟 [CRITICAL FIX] 검색 중(isSearching)이거나 추출 중(isExtracting)일 때는 
         // 탭을 전환하더라도 억지로 히스토리를 리셋하여 방금 작성한 말풍선을 날려버리지 않도록 방어합니다!
         if (!isSearching && !isExtracting) {
@@ -471,6 +476,9 @@ function switchTab(tabName: string) {
                 loadMoreChat(false, true);
             }
         }
+        
+        // 🌟 탭이 열렸으므로 폴링 타이머를 새롭게 리셋하여 주기를 맞춥니다.
+        startPolling();
     } else {
         settingsBtn?.classList.remove("active-emoji", "active");
     }
@@ -478,6 +486,7 @@ function switchTab(tabName: string) {
     if (tabName === "list") refreshList(); 
     if (tabName === "automation") initBrowserDropdown();
 }
+
 function openWidget(tabName: string = "list") {
     if (!isExpanded) {
         isExpanded = true;
@@ -1047,6 +1056,25 @@ async function renderNavigation() {
                     children: cloudUsers.filter(m => m.to === u.id && m.id !== u.id)
                 }));
                 userList.innerHTML = await renderAccordion(teamNodes);
+
+                // 🌟 [추가] 방장(Owner)인 경우에만 초대 폼 렌더링
+                const myTeam = cloudUsers.find(u => u.type === "team" && u.from === currentSession.address && u.id === u.to);
+                if (myTeam) {
+                    const inviteHtml = `
+                        <div class="invite-container">
+                            <label>+ Invite Member</label>
+                            <div style="display: flex; gap: 5px;">
+                                <input type="email" id="invite-email-input" placeholder="Member's E-Mail" required style="flex: 1; padding: 8px; border-radius: 4px; background: #fff; color: #000; font-size: 0.75rem; border: none; outline: none;" />
+                                <button id="btn-send-invite">Invite</button>
+                            </div>
+                        </div>
+                    `;
+                    userList.insertAdjacentHTML('beforeend', inviteHtml);
+
+                    document.getElementById("btn-send-invite")?.addEventListener("click", async () => {
+                        await handleTeamInvite();
+                    });
+                }
             }
 
             // 3. Local Devices 렌더링 (단일 리스트 구조)
@@ -1068,6 +1096,109 @@ async function renderNavigation() {
     }
 }
 
+// --- Invite Logic ---
+async function handleTeamInvite() {
+    const emailInput = document.getElementById("invite-email-input") as HTMLInputElement;
+    const email = emailInput?.value.trim();
+    if (!email) {
+        alert("Please enter a valid email address.");
+        return;
+    }
+
+    const btn = document.getElementById("btn-send-invite") as HTMLButtonElement;
+    const originalText = btn.innerText;
+    btn.innerText = "Wait...";
+    btn.disabled = true;
+
+    try {
+        const origin = "https://commerce.logis.center";
+        const now = Date.now();
+        const createdAt = now - timezoneOffset;
+        
+        const params = new URLSearchParams({
+            origin: origin,
+            created_at: createdAt.toString(),
+            hash: currentSession.hash,
+            token: currentSession.token || "",
+            href: window.location.href,
+            from: currentSession.team || "",
+            to: currentSession.address || "",
+            email: email 
+        });
+        
+        const url = `${API_HOST}/?${params.toString()}`;
+        
+        const response = await invoke<any>("proxy_fetch", {
+            url: url,
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            session_params: { hash: currentSession.hash, token: currentSession.token }
+        });
+
+        // 서버 응답에서 hook URL을 가져오거나, 기본 mailto 훅을 사용
+        let hookUrl = `${currentSession.hash}.logis.center@oauth.email`;
+        if (response.results && response.results.length > 0) {
+            const invite = response.results[0];
+            if (invite.hook) hookUrl = invite.hook;
+        }
+
+        showInviteQr(hookUrl, email);
+        emailInput.value = "";
+    } catch (e) {
+        console.error("[INVITE] Failed:", e);
+        alert("Error sending invite.");
+    } finally {
+        btn.innerText = originalText;
+        btn.disabled = false;
+    }
+}
+
+function showInviteQr(hook: string, email: string) {
+    if (!chatTalks) return;
+    
+    // 기존 열려있던 네비게이션 숨기고 세팅(채팅) 탭 열기
+    hideNavigation();
+    openWidget("settings");
+
+    const existing = document.getElementById("msg-invite-qr");
+    if (existing) existing.remove();
+    
+    const mailtoLink = `mailto:${encodeURIComponent(hook)}`;
+
+    const html = `
+        <div class="chat-talk system" id="msg-invite-qr" data-created-at="9999999999999">
+            <div class="chat-message" style="padding:15px; background: #fff; color: #000; border:0; border-radius: 8px; text-align: center;">
+                <div style="font-size:0.8rem; font-weight: bold; margin-bottom: 10px; color: #333;">
+                    Invite <span style="color:var(--primary);">${email}</span>
+                </div>
+                <div style="font-size:0.65rem; color: #666; margin-bottom: 15px; line-height: 1.4;">
+                    Scan this QR code with mobile camera<br>to send an invitation email.
+                </div>
+                <div id="invite-qr-target" style="display: inline-block; background: #fff; padding: 10px; border-radius: 8px; border: 1px solid #eee;"></div>
+                <div style="margin-top: 15px;">
+                    <a href="${mailtoLink}" style="display: inline-block; padding: 8px 16px; background: var(--primary); color: #000; text-decoration: none; border-radius: 4px; font-weight: bold; font-size: 0.7rem;">Open Mail App</a>
+                </div>
+            </div>
+        </div>`;
+        
+    chatTalks.insertAdjacentHTML('beforeend', html);
+    
+    const qrTarget = document.getElementById("invite-qr-target");
+    if (qrTarget) {
+        qrTarget.innerHTML = "";
+        new (window as any).QRCode(qrTarget, { 
+            text: mailtoLink, 
+            width: 200, 
+            height: 200, 
+            colorDark: "#000000", 
+            colorLight: "#ffffff", 
+            correctLevel: (window as any).QRCode.CorrectLevel.M 
+        });
+        const scroll = document.getElementById("chat-scroll");
+        if (scroll) scroll.scrollTop = scroll.scrollHeight;
+    }
+}
+
 // --- Sync Logic ---
 // main.ts 내부
 async function syncData() {
@@ -1079,14 +1210,19 @@ async function syncData() {
         const now = Date.now();
         const createdAt = now - timezoneOffset;
         
-        const params = new URLSearchParams({
+        // 🌟 [CRITICAL FIX] front.js 패리티: 서버가 나를 정확히 인지하도록 cc, type, 실제 href 파라미터를 추가합니다.
+        const queryParams: any = {
             origin: origin,
             created_at: createdAt.toString(),
             hash: currentSession.hash,
             token: currentSession.token || "",
-            href: window.location.href
-        });
-        
+            href: currentDetectedUrl || "https://commerce.logis.center/tracking"
+        };
+
+        if (activeContext.cc) queryParams.cc = activeContext.cc;
+        if (currentSearchMode && currentSearchMode !== "commerce") queryParams.type = currentSearchMode;
+
+        const params = new URLSearchParams(queryParams);
         const url = `${API_HOST}/?${params.toString()}`;
         
         // 1. 서버 요청
@@ -1094,7 +1230,8 @@ async function syncData() {
             url: url,
             method: "GET",
             headers: { "Content-Type": "application/json" },
-            session_params: { hash: currentSession.hash, token: currentSession.token }
+            // 🌟 서버가 cc를 헤더나 쿠키처럼 파싱할 수 있게 proxy_fetch 파라미터에도 주입합니다.
+            session_params: { hash: currentSession.hash, token: currentSession.token, cc: activeContext.cc || "" }
         });
 
         stepQrSpinner();
@@ -1105,19 +1242,21 @@ async function syncData() {
             await invoke("upsert_items", { items: response.results });
             
             console.log("[SYNC] 3. 로컬 DB에서 데이터 불러와 메뉴 렌더링...");
-            // 3. LanceDB 불러오기 (내부적으로 Select["pages"], Select["users"]를 통해 로컬 DB를 읽음)
+            // 3. LanceDB 불러오기
             await renderNavigation();
             
-            // 리스트 뷰도 최신화
+            // 🌟 [CRITICAL FIX] 서버 데이터를 로컬 DB에 밀어넣었으니, 현재 보고 있는 탭에 맞춰 UI를 갱신합니다!
             if (currentTab === "list") {
                 await loadMoreDocs(false, true); 
+            } else if (currentTab === "settings") {
+                await fetchChatHistory(false, true);
             }
         }
         
     } catch (e) { 
         console.error("[SYNC] 동기화 실패:", e); 
     } finally {
-        if (!isExtracting) stopSpinner();
+        if (!isExtracting && !isSearching) stopSpinner();
     }
 }
 
@@ -2953,7 +3092,14 @@ async function checkAuthStatus() {
     const now = Date.now();
     const createdAt = now - timezoneOffset; 
     try {
-        const queryParams: Record<string, string> = { origin: origin, created_at: createdAt.toString(), hash: currentSession.hash, href: window.location.href };
+        // 🌟 [CRITICAL FIX] Tauri의 window.location.href는 'localhost'이므로 서버가 도메인(cc)을 파악하지 못합니다.
+        // 브라우저에서 감지된 URL(currentDetectedUrl)이나 기본 클라우드 주소를 전달해야 완벽히 매칭됩니다!
+        const queryParams: Record<string, string> = { 
+            origin: origin, 
+            created_at: createdAt.toString(), 
+            hash: currentSession.hash, 
+            href: currentDetectedUrl || "https://commerce.logis.center/tracking" 
+        };
         if (currentSession.token) queryParams.token = currentSession.token;
         const params = new URLSearchParams(queryParams);
         const finalUrl = `${API_HOST}/?${params.toString()}`.toLowerCase();
@@ -3041,7 +3187,7 @@ async function performQrAuth() {
 window.addEventListener("blur", () => {
     isFocus = false;
     if (chatPollInterval) {
-        clearInterval(chatPollInterval);
+        clearTimeout(chatPollInterval);
         chatPollInterval = null;
         console.log("[WIDGET] Window blurred. Polling paused to save resources.");
     }
@@ -3054,28 +3200,52 @@ window.addEventListener("focus", () => {
     // 브라우저 런처 버튼 노출 및 번개 버튼 상태를 원상복구합니다.
     syncBrowserStatus();
     
-    if (!chatPollInterval && currentSession.email) {
+    // 🌟 [CRITICAL FIX] 이메일(로그인)이 없는 상태에서도 QR 인증 대기를 위해 폴링이 무조건 재개되어야 합니다!
+    if (!chatPollInterval) {
         console.log("[WIDGET] Window focused. Polling resumed.");
-        // 창을 다시 봤을 때 즉시 1회 최신화
-        fetchChatHistory(false, true); 
+        // 창을 다시 봤을 때 즉시 1회 최신화 (로그인 된 상태일 때만)
+        if (currentSession.email) {
+            fetchChatHistory(false, true); 
+        }
         startPolling();
     }
 });
 
-// 🌟 [PARITY] startPolling 함수 업그레이드
+// 🌟 [PARITY] startPolling 함수 업그레이드 (setInterval -> 재귀적 setTimeout)
 function startPolling() {
-    if (chatPollInterval) clearInterval(chatPollInterval);
+    if (chatPollInterval) {
+        clearTimeout(chatPollInterval);
+        chatPollInterval = null;
+    }
     if (!isFocus) return; 
     
-    chatPollInterval = window.setInterval(() => {
+    const poll = async () => {
         if (!isFocus) return; 
         
-        // 🌟 [사용자 요청 완벽 반영] 히스토리(Settings) 창이 열려있을 때만 서버에 인증/동기화 요청을 보냅니다!
-        if (currentTab !== "settings" || !isExpanded) return;
+        // 히스토리(Settings) 창이 열려있을 때만 서버에 인증/동기화 요청을 보냅니다!
+        if (currentTab === "settings" && isExpanded) {
+            try {
+                if (!currentSession.email) {
+                    await checkAuthStatus();
+                } else {
+                    // 🌟 [CRITICAL FIX] 로컬 DB만 조회하던 fetchChatHistory 대신, 
+                    // front.js와 동일하게 실제 서버와 통신하는 syncData를 호출해야 합니다!
+                    await syncData(); 
+                }
+            } catch (e) {
+                console.error("[POLLING] Error during poll:", e);
+            }
+        }
 
-        if (!currentSession.email) checkAuthStatus();
-        else fetchChatHistory(false, true); 
-    }, 3000);
+        // 🌟 [핵심] Rust 백엔드(proxy_fetch)의 응답을 완전히 받은 후, 
+        // 여전히 앱이 포커스 상태라면 다시 3초를 대기하고 다음 폴링을 예약합니다.
+        if (isFocus) {
+            chatPollInterval = window.setTimeout(poll, 3000);
+        }
+    };
+
+    // 첫 시작 시 3초 대기 후 실행
+    chatPollInterval = window.setTimeout(poll, 3000);
 }
 
 

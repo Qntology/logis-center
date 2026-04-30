@@ -1192,16 +1192,17 @@ async fn get_task_logs(app_handle: tauri::AppHandle, task_id: String) -> Result<
 
 #[tauri::command]
 async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<String, String> {
-    println!("[DEBUG] upsert_items called with {} items.", items.len());
     let store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
         let mut count = 0;
         for item in items {
-            println!("[DEBUG] Syncing item: {}", item);
             let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             
             // 🌟 [CRITICAL FIX] 클라우드(index.ts) 로직 반영: type 문자열 무조건 공백제거 및 소문자 통일
             let type_str = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();
+
+            // 🌟 [수정] 터미널을 도배하던 거대한 배열(Data Buffer) 로그 출력을 지우고 ID와 Type만 심플하게 남깁니다.
+            println!("[DEBUG] Syncing item - ID: {}, Type: {}", id, type_str);
             
             // 🌟 [CRITICAL FIX] 세탁된 type_str을 원본 JSON(clean_item)에도 강제로 덮어씌웁니다.
             let mut clean_item = item.clone();

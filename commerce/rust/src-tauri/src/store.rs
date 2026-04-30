@@ -430,7 +430,8 @@ impl VectorStore {
         &self, table_name: &str, id: &str, type_: &str, data_val: Value, vector: Option<Vec<f32>>,
         from: Option<&str>, to: Option<&str>, cc: Option<&str>, bcc: Option<&str>, r#ref: Option<&str>, digest: Option<&str>
     ) -> Result<()> {
-         println!("[DEBUG] store.upsert_item - Table: {}, ID: {}, Type: {}, Data: {}", table_name, id, type_, data_val);
+         // 🌟 [수정] 터미널을 도배하던 거대한 Data (JSON) 로그 출력을 삭제합니다.
+         println!("[DEBUG] store.upsert_item - Table: {}, ID: {}, Type: {}", table_name, id, type_);
          let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
          let table = self.conn.open_table(target).execute().await?;
          
