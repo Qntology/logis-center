@@ -789,6 +789,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
     border-radius: 4px;
 }
 
+#doc-list .empty{margin-left: 0.8rem;}
 .card-list{margin: 0 0.7rem;}
 
 .toggle-more:checked ~ .logis-more {
