@@ -675,6 +675,13 @@ listen("browser-match-found", async (event: any) => {
 });
 
 const handleSearchInteraction = () => {
+    // 🌟 [추가] 검색창 클릭/포커스 시 세팅 패널이 열려있다면 강제로 스위치를 끄고 닫아줍니다.
+    const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
+    if (settingsToggle && settingsToggle.checked) {
+        settingsToggle.checked = false;
+        settingsToggle.dispatchEvent(new Event("change")); // UI 원상복구 이벤트 트리거
+    }
+
     // [UI-FIX] If the panel is already expanded, don't refresh the navigation or clear the list.
     // This prevents annoying UI flickering when the user just wants to type in the search bar.
     if (isExpanded && currentTab === "list") {
@@ -786,8 +793,30 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                     }
                     host = `<strong>${teamName}</strong>`;
                 } else {
-                    if (node.from === currentSession.address) desc.push("owner");
-                    content = `<span>${name}${desc.length ? `<i>${desc.toString()}</i>` : ''}</span>`;
+                    let cancelBtn = "";
+
+                    // 🌟 [수정] 본인 계정만 (owner), 초대된 멤버나 펜딩 상태는 (member)로 표시
+                    if (node.id === currentSession.address) {
+                        desc.push("(owner)");
+                        // 🌟 본인(Owner 또는 Self)일 경우 삭제/취소 버튼을 노출하지 않습니다.
+                    } else {
+                        desc.push("(member)");
+                        // 🌟 타인(Member)일 경우에만 삭제/취소 버튼을 노출합니다.
+                        cancelBtn = `<button class="btn-cancel-member" data-id="${nodeId}" data-name="${name}" style="background:none; border:none; color:#ef4444; font-size:0.85rem; cursor:pointer; padding:0 5px; margin-left:auto; display:flex; align-items:center; justify-content:center;" title="Remove / Cancel Invite">✕</button>`;
+                    }
+
+                    // 🌟 [수정] 버튼이 우측 끝에 붙도록 Flex 구조 적용
+                    content = `<div style="display:flex; align-items:center; width:100%; gap:8px;">
+                        <span class="user-label-text">${name}${desc.length ? `<i>${desc.toString()}</i>` : ''}</span>
+                        ${cancelBtn}
+                    </div>`;
+                    
+                    // 🌟 [수정] node.ref가 문자열이 아닌 배열 형태일 경우를 대비해 문자열로 안전하게 변환하여 속성에 주입합니다.
+                    let refVal = node.ref || (node.data && node.data.ref) || "";
+                    if (Array.isArray(refVal)) {
+                        refVal = JSON.stringify(refVal);
+                    }
+                    node.ref_val = refVal; // ref 속성 충돌 방지를 위한 별도 변수 할당
                 }
                 if (nodeId === activeContext.ref) active = "active";
             } else if (node.data || node.type) {
@@ -919,13 +948,15 @@ async function renderNavigation() {
         
         const navSection = pageList.closest('.nav-section') as HTMLElement;
 
+        const isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
+
         if (_pages.length === 0) {
             pageList.innerHTML = "<div>No shared pages found for this domain.</div>";
             // 🌟 현재 도메인과 일치하는 데이터가 없으면 Shared Pages 섹션 전체를 숨깁니다.
             if (navSection) navSection.style.display = "none";
         } else {
-            // 🌟 일치하는 데이터가 있으면 섹션을 화면에 표시합니다.
-            if (navSection) navSection.style.display = "block";
+            // 🌟 일치하는 데이터가 있으면 섹션을 화면에 표시하되, 세팅 화면이 켜져있다면 숨김을 유지합니다.
+            if (navSection) navSection.style.display = isSettingsOpen ? "none" : "block";
             
             const branchs: Record<string, any> = {};
 
@@ -1047,35 +1078,87 @@ async function renderNavigation() {
         if (users.length > 0) {
             // 1. 꼬리표를 기준으로 로컬/클라우드 유저 분할
             const localUsers = users.filter(u => u.data && u.data.is_device === true);
-            const cloudUsers = users.filter(u => !u.data || u.data.is_device !== true);
+            const cloudUsers = users.filter(u => {
+                const data = u.data || {};
+                // 🌟 [체크] 장치(device)가 아니면서, 일반 유저거나 'pending_invite_'로 시작하는 임시 초대 유저 포함
+                return data.is_device !== true || String(u.id).startsWith("pending_invite_");
+            });
 
-            // 2. Cloud Team Members 렌더링 (기존 트리 구조 유지)
+            // 2. Cloud Team Members 렌더링 (중복 Row 제거 로직 추가)
             if (cloudUsers.length > 0 && userList) {
-                const teamNodes = cloudUsers.filter(u => u.type === "team").map(u => ({
+                const uniqueCloudMembers: any[] = [];
+                const seenMemberMap = new Map();
+
+                cloudUsers.forEach(u => {
+                    if (u.type === "team") {
+                        uniqueCloudMembers.push(u);
+                    } else {
+                        const memberKey = u.to || u.id;
+                        if (!seenMemberMap.has(memberKey)) {
+                            seenMemberMap.set(memberKey, true);
+                            uniqueCloudMembers.push(u);
+                        }
+                    }
+                });
+
+                const teamNodes = uniqueCloudMembers.filter(u => u.type === "team").map(u => ({
                     ...u, 
-                    children: cloudUsers.filter(m => m.to === u.id && m.id !== u.id)
+                    children: uniqueCloudMembers.filter(m => (m.to === u.id || m.cc === u.id) && m.id !== u.id)
                 }));
                 userList.innerHTML = await renderAccordion(teamNodes);
 
-                // 🌟 [추가] 방장(Owner)인 경우에만 초대 폼 렌더링
+                // 🌟 [수정] 방장(Owner)인 경우에만 ADD 버튼 노출 (폼은 HTML에 정적으로 존재)
                 const myTeam = cloudUsers.find(u => u.type === "team" && u.from === currentSession.address && u.id === u.to);
+                const btnCloudInvite = document.getElementById("btn-cloud-invite-toggle");
+                
                 if (myTeam) {
-                    const inviteHtml = `
-                        <div class="invite-container">
-                            <label>+ Invite Member</label>
-                            <div style="display: flex; gap: 5px;">
-                                <input type="email" id="invite-email-input" placeholder="Member's E-Mail" required style="flex: 1; padding: 8px; border-radius: 4px; background: #fff; color: #000; font-size: 0.75rem; border: none; outline: none;" />
-                                <button id="btn-send-invite">Invite</button>
-                            </div>
-                        </div>
-                    `;
-                    userList.insertAdjacentHTML('beforeend', inviteHtml);
-
-                    document.getElementById("btn-send-invite")?.addEventListener("click", async () => {
-                        await handleTeamInvite();
-                    });
+                    if (btnCloudInvite) btnCloudInvite.style.display = "inline-block";
+                } else {
+                    if (btnCloudInvite) btnCloudInvite.style.display = "none";
                 }
+
+                // 🌟 [수정] 멤버 리스트 클릭 시 삭제 버튼 외에 '라벨 클릭(검색 필터)' 처리 추가
+                userList.onclick = async (e: Event) => {
+                    const target = e.target as HTMLElement;
+                    
+                    // 1. 삭제 버튼 처리
+                    const cancelBtn = target.closest('.btn-cancel-member') as HTMLElement;
+                    if (cancelBtn) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        const targetId = cancelBtn.dataset.id;
+                        const targetName = cancelBtn.dataset.name;
+                        const confirmed = await ask(`정말 '${targetName}' 멤버를 삭제하거나 초대를 취소하시겠습니까?`, { title: "멤버 삭제 확인", kind: "warning" });
+                        if (confirmed && targetId) {
+                            try {
+                                await invoke("delete_document", { uuid: targetId });
+                                await renderNavigation();
+                            } catch (err) { console.error(err); }
+                        }
+                        return;
+                    }
+
+                    // 2. [추가] 멤버 라벨(이름 영역) 클릭 시 검색 컨텍스트 업데이트
+                    const label = target.closest('.logis-label') as HTMLElement;
+                    if (label) {
+                        const ds = label.dataset;
+                        // 🌟 활성 컨텍스트에 멤버의 권한(cc, ref) 주입
+                        activeContext.cc = ds.cc || "";
+                        activeContext.ref = ds.ref || ""; 
+                        
+                        // 기존 태그 정리 후 새 멤버 태그 추가
+                        activeTags = activeTags.filter(t => t.type !== 'domain' && t.type !== 'type');
+                        addSearchTag(`@${ds.name || ds.id}`, 'domain', ds.name || ds.id || "");
+                        
+                        // UI 갱신 및 검색 실행
+                        fetchChatHistory(true);
+                        hideNavigation();
+                        console.log(`[SEARCH] Filtering by Member: ${ds.id}, Permissions(ref): ${ds.ref}`);
+                    }
+                };
             }
+
+            // 3. Local Devices 렌더링 (단일 리스트 구조)
 
             // 3. Local Devices 렌더링 (단일 리스트 구조)
             if (localUsers.length > 0 && localUserList) {
@@ -1110,20 +1193,31 @@ async function handleTeamInvite() {
     btn.innerText = "Wait...";
     btn.disabled = true;
 
-    try {
+try {
         const origin = "https://commerce.logis.center";
         const now = Date.now();
         const createdAt = now - timezoneOffset;
+
+        // 🌟 [추가] Shared Pages 영역에서 selected 클래스가 붙은 모든 라벨의 data-id 수집
+        const selectedPages: string[] = [];
+        const pageList = document.getElementById("nav-list-pages");
+        if (pageList) {
+            pageList.querySelectorAll(".logis-label.selected").forEach((label: any) => {
+                if (label.dataset.id) selectedPages.push(label.dataset.id);
+            });
+        }
         
         const params = new URLSearchParams({
             origin: origin,
             created_at: createdAt.toString(),
             hash: currentSession.hash,
             token: currentSession.token || "",
-            href: window.location.href,
+            href: currentDetectedUrl || "https://commerce.logis.center/tracking",
             from: currentSession.team || "",
             to: currentSession.address || "",
-            email: email 
+            email: email,
+            // 🌟 수집된 페이지 ID 배열을 JSON 문자열로 변환하여 전달
+            ref: JSON.stringify(selectedPages)
         });
         
         const url = `${API_HOST}/?${params.toString()}`;
@@ -1144,6 +1238,25 @@ async function handleTeamInvite() {
 
         showInviteQr(hookUrl, email);
         emailInput.value = "";
+
+        // 🌟 [추가] 클라우드 멤버 리스트에 '대기 중(Pending)' 상태로 즉시 렌더링되도록 로컬 DB에 임시 주입합니다.
+        try {
+            const pendingMember = {
+                id: `pending_invite_${Date.now()}`,
+                type: "user", // users 테이블로 분류되어 아코디언 메뉴에 들어갑니다.
+                name: `${email.split('@')[0]} (Pending ⏳)`,
+                from: currentSession.address || "0x0000000000000000000000000000000000000000",
+                to: currentSession.team || "0x0000000000000000000000000000000000000000",
+                cc: currentSession.team || "",
+                data: { origin: "cloud", is_pending: true, email: email }
+            };
+            
+            await invoke("upsert_items", { items: [pendingMember] });
+            await renderNavigation(); // UI 즉시 갱신
+        } catch (err) {
+            console.warn("[INVITE] Failed to add pending member to UI:", err);
+        }
+
     } catch (e) {
         console.error("[INVITE] Failed:", e);
         alert("Error sending invite.");
@@ -1188,8 +1301,8 @@ function showInviteQr(hook: string, email: string) {
         qrTarget.innerHTML = "";
         new (window as any).QRCode(qrTarget, { 
             text: mailtoLink, 
-            width: 200, 
-            height: 200, 
+            width: 300, 
+            height: 300, 
             colorDark: "#000000", 
             colorLight: "#ffffff", 
             correctLevel: (window as any).QRCode.CorrectLevel.M 
@@ -1240,6 +1353,30 @@ async function syncData() {
             console.log(`[SYNC] 2. 로컬 LanceDB 최신화 중... (데이터 ${response.results.length}건)`);
             // 2. LanceDB 최신화 (Rust의 upsert_items 호출)
             await invoke("upsert_items", { items: response.results });
+
+            // 🌟 [추가] '대기 중' 멤버 정화(Cleanup) 로직
+            // 서버에서 받은 결과 중 정식 멤버(member/user)가 있는지 확인합니다.
+            const realMembers = response.results.filter(item => item.type === "member" || item.type === "user");
+            if (realMembers.length > 0) {
+                const localUsers = await Select["users"]({});
+                // 로컬에 저장된 'pending_invite_'로 시작하는 가짜 데이터들을 찾습니다.
+                const pendingInvites = localUsers.filter(u => u.id && u.id.startsWith("pending_invite_"));
+
+                for (const pending of pendingInvites) {
+                    const pendingEmail = pending.data?.email;
+                    // 서버에서 온 정식 멤버 중 이메일(혹은 이름)이 일치하는 사람이 있는지 대조
+                    const isNowMember = realMembers.some(m => {
+                        // 서버 데이터(m) 내부에 이메일 정보가 있거나, 이름이 이메일 아이디와 같은지 확인
+                        return m.to === pending.from || (m.data && m.data.email === pendingEmail);
+                    });
+
+                    if (isNowMember) {
+                        // 정식 멤버가 확인되었으므로 가짜(Pending) 데이터를 로컬 DB에서 삭제합니다.
+                        await invoke("delete_document", { uuid: pending.id });
+                        console.log(`[SYNC] Pending invite for ${pendingEmail} is now a real member. Placeholder removed.`);
+                    }
+                }
+            }
             
             console.log("[SYNC] 3. 로컬 DB에서 데이터 불러와 메뉴 렌더링...");
             // 3. LanceDB 불러오기
@@ -1268,7 +1405,7 @@ function applySearchModeUI() {
     document.querySelectorAll('.mode-tab').forEach(btn => {
         const el = btn as HTMLElement;
         if (el.dataset.mode === currentSearchMode) {
-            el.style.color = "var(--primary)";
+            el.style.color = "#000";
             el.style.fontWeight = "bold";
             el.classList.add('active');
         } else {
@@ -1286,11 +1423,13 @@ function applySearchModeUI() {
 
     // 🌟 [추가] Shipping 모드일 때 Shared Pages 섹션 통째로 숨기기
     const pagesSection = document.getElementById("nav-list-pages")?.closest(".nav-section") as HTMLElement;
+    const isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
+    
     if (pagesSection) {
-        if (currentSearchMode === "shipping") {
-            pagesSection.style.display = "none"; // Shipping이면 숨김
+        if (currentSearchMode === "shipping" || isSettingsOpen) {
+            pagesSection.style.display = "none"; // Shipping이거나 세팅 패널이 열려있으면 숨김
         } else {
-            pagesSection.style.display = "";     // 그 외(Commerce, Analytic)면 복구
+            pagesSection.style.display = "";     // 그 외의 경우 복구
         }
     }
 }
@@ -2097,12 +2236,37 @@ btnSyncQr?.addEventListener("click", async () => {
     const isHidden = qrContainer.classList.contains("hidden");
     if (isHidden) {
         qrContainer.classList.remove("hidden");
+        if (btnSyncQr) btnSyncQr.innerText = "CLOSE"; // 🌟 [추가] 패널이 열리면 CLOSE로 변경
         await initSyncUI(); // [NEW] Initialize IP/Seed view
         listCurrentY = 0;
         updateListTransform(true);
     } else {
         qrContainer.classList.add("hidden");
+        if (btnSyncQr) btnSyncQr.innerText = "ADD"; // 🌟 [추가] 패널이 닫히면 ADD로 원상복구
     }
+});
+
+// 🌟 [추가] Cloud Member 초대 패널 토글 로직 (Local Member와 동일한 구조)
+document.getElementById("btn-cloud-invite-toggle")?.addEventListener("click", () => {
+    const inviteContainer = document.getElementById("nav-cloud-invite-container");
+    const btn = document.getElementById("btn-cloud-invite-toggle");
+    
+    if (!inviteContainer || !btn) return;
+
+    if (inviteContainer.classList.contains("hidden")) {
+        inviteContainer.classList.remove("hidden");
+        btn.innerText = "CLOSE";
+        listCurrentY = 0;
+        updateListTransform(true);
+    } else {
+        inviteContainer.classList.add("hidden");
+        btn.innerText = "ADD";
+    }
+});
+
+// 🌟 [추가] Cloud Member 초대 전송 이벤트 등록
+document.getElementById("btn-send-invite")?.addEventListener("click", async () => {
+    await handleTeamInvite();
 });
 
 // [NEW] Manual Connect Handler
@@ -2203,17 +2367,25 @@ listen("webrtc-offer", async (event) => {
     }
 });
 
-let mySyncSeed = Math.floor(1000 + Math.random() * 9000); 
+let mySyncSeed = 0; 
+let isListenerStarted = false; // 🌟 [추가] 리스너 중복 실행 방지용 플래그
 
 async function initSyncUI() {
-    const myFullIpEl = document.getElementById("my-full-ip");
+    // 🌟 [CRITICAL FIX] 시드 번호를 기기별로 고정(Fix)하기 위해 로컬 DB에서 불러오거나 최초 1회만 생성하여 저장합니다.
+    if (mySyncSeed === 0) {
+        const savedSeed = await kvGet("my_sync_seed");
+        if (savedSeed) {
+            mySyncSeed = parseInt(savedSeed);
+        } else {
+            // 🌟 [수정] 4자리 난수(1000~9999) 대신 2자리 난수(10~99)를 생성합니다.
+            mySyncSeed = Math.floor(10 + Math.random() * 90);
+            await kvSet("my_sync_seed", mySyncSeed.toString());
+        }
+    }
+
     const mySyncSeedEl = document.getElementById("my-sync-seed");
     const ipPrefixEl = document.getElementById("ip-prefix");
 
-    if (myFullIpEl) {
-        const fullIp = await invoke("get_my_full_ip") as string;
-        myFullIpEl.innerText = fullIp;
-    }
     if (mySyncSeedEl) {
         mySyncSeedEl.innerText = mySyncSeed.toString();
     }
@@ -2223,7 +2395,11 @@ async function initSyncUI() {
     }
     
     try {
-        await invoke("start_listener_command", { seed: mySyncSeed });
+        // 🌟 [CRITICAL FIX] 아직 리스너가 열리지 않았을 때만 딱 한 번 실행하도록 차단합니다.
+        if (!isListenerStarted) {
+            await invoke("start_listener_command", { seed: mySyncSeed });
+            isListenerStarted = true;
+        }
     } catch (e) { console.error(e); }
 }
 
@@ -2232,41 +2408,128 @@ let dataChannel: RTCDataChannel | null = null;
 let desktopStream: MediaStream | null = null;
 let qrRotationInterval: number | null = null;
 
+// 🌟 [추가] 양측의 인증(검증)이 완료된 후 실제 데이터 동기화를 시작하는 헬퍼 함수
+function finalizeWebRtcConnection(guestSession: any) {
+    const profileName = document.getElementById("nav-profile-name");
+    if (profileName) {
+        profileName.textContent = "✅ Mobile Linked (P2P)";
+        profileName.style.color = "#4ade80";
+    }
+    document.getElementById("nav-qr-container")?.classList.add("hidden");
+    syncDataToMobile();
+
+    try {
+        const guestName = (guestSession && guestSession.email) ? guestSession.email.split('@')[0] : "📱 Linked Device";
+        const guestAddr = (guestSession && guestSession.address) ? guestSession.address : "0x0000000000000000000000000000000000000000";
+
+        const mobileUser = {
+            id: `mobile_${Date.now()}`,
+            type: "user",
+            name: guestName,
+            from: guestAddr, 
+            to: currentSession.team || "0x0000000000000000000000000000000000000000",    
+            data: { origin: "local", is_device: true } 
+        };
+        
+        invoke("upsert_items", { items: [mobileUser] }).then(() => renderNavigation());
+    } catch (e) {
+        console.error("[WebRTC] Failed to add device to members:", e);
+    }
+}
+
 function setupDataChannel(channel: RTCDataChannel) {
     channel.onopen = async () => {
-        console.log("[WebRTC] Channel OPEN!");
-        const profileName = document.getElementById("nav-profile-name");
-        if (profileName) {
-            profileName.textContent = "✅ Mobile Linked (P2P)";
-            profileName.style.color = "#4ade80";
-        }
-        document.getElementById("nav-qr-container")?.classList.add("hidden");
-        syncDataToMobile();
-
-        // 🌟 [수정] 모바일 기기 정보를 DB에 넣을 때 로컬 꼬리표(is_device) 부착
-        try {
-            const mobileUser = {
-                id: `mobile_${Date.now()}`,
-                type: "user",
-                name: "📱 Linked Mobile",
-                from: currentSession.address || "0x0000000000000000000000000000000000000000", 
-                to: currentSession.team || "0x0000000000000000000000000000000000000000",    
-                data: { origin: "local", is_device: true } // 👈 여기서 구분합니다!
-            };
-            
-            await invoke("upsert_items", { items: [mobileUser] });
-            await renderNavigation();
-        } catch (e) {
-            console.error("[WebRTC] Failed to add mobile to members:", e);
-        }
+        console.log("[WebRTC] Channel OPEN! Starting Zero-Trust Auth Handshake...");
+        // 🌟 [핵심 1] 채널이 열리면 데이터를 즉시 붓지 않고, 내 세션(신분증)을 보내 통성명을 시작합니다.
+        channel.send(JSON.stringify({ 
+            type: "auth_request", 
+            session: currentSession 
+        }));
     };
 
     channel.onmessage = async (e) => {
         try {
             const msg = JSON.parse(e.data);
-            console.log("[WebRTC] Received from Mobile:", msg.type);
+            console.log("[WebRTC] Received from Peer:", msg.type);
             
-            if (msg.type === "get_detail") {
+            // 🌟 [핵심 2] 상대방이 인증을 요청해옴 (내가 Host/수신자 역할일 때)
+            if (msg.type === "auth_request") {
+                const guest = msg.session;
+                
+                // a. 이미 클라우드 팀원인지 내 로컬 DB(LanceDB, 클라우드 동기화됨)에서 조회
+                const users = await Select["users"]({});
+                const isCloudMember = users.some(u => 
+                    (u.id === guest.address || u.from === guest.address) &&
+                    (u.to === currentSession.team || u.cc === currentSession.team)
+                );
+
+                if (isCloudMember) {
+                    // 이미 클라우드에서 인증된 팀원이면 즉시 승인 및 동기화
+                    console.log("[WebRTC] Guest is an authorized Cloud Member. Auto-approving.");
+                    channel.send(JSON.stringify({ type: "auth_success" }));
+                    finalizeWebRtcConnection(guest);
+                } else {
+                    // 🌟 [CRITICAL FIX] 시드 충돌 감지 및 0-멤버 자동 양보(Yield) 로직!
+                    // 상대방(Guest)의 소속 팀과 내(Host) 소속 팀이 명확히 다른데 연결이 들어왔다면, 100% 시드 중복입니다.
+                    if (guest.team && currentSession.team && guest.team !== currentSession.team) {
+                        const myTeamMembers = users.filter(u => u.to === currentSession.team || u.cc === currentSession.team);
+                        
+                        // 내 팀에 나 혼자(1명 이하)밖에 없다면(초대한 멤버가 없다면) 내가 양보하고 시드를 바꿉니다.
+                        if (myTeamMembers.length <= 1) {
+                            console.warn("[WebRTC] Seed collision detected! I have no members. Auto-regenerating my seed...");
+                            channel.send(JSON.stringify({ type: "auth_reject", reason: "Seed collision. Auto-yielding." }));
+                            peerConn?.close();
+                            
+                            // 시드 강제 재생성 및 로컬 DB 영구 저장
+                            // 🌟 [수정] 충돌 시 새로 부여받는 시드도 2자리 난수(10~99)로 통일합니다.
+                            mySyncSeed = Math.floor(10 + Math.random() * 90);
+                            await kvSet("my_sync_seed", mySyncSeed.toString());
+                            
+                            const mySyncSeedEl = document.getElementById("my-sync-seed");
+                            if (mySyncSeedEl) mySyncSeedEl.innerText = mySyncSeed.toString();
+                            
+                            // 🌟 Rust 바인딩된 리스너의 시드만 초고속으로 업데이트 (10048 에러 없음!)
+                            await invoke("start_listener_command", { seed: mySyncSeed });
+                            
+                            alert(`[Network] 동일한 와이파이 내에 시드 번호 충돌이 감지되었습니다.\n멤버가 없는 현재 PC의 시드가 새 번호(${mySyncSeed})로 자동 변경 및 양보되었습니다.`);
+                            return;
+                        } else {
+                            // 내 팀에 멤버가 있다면, 상대방이 양보하도록 거절만 날려줍니다.
+                            console.warn("[WebRTC] Seed collision detected, but I have members. Rejecting guest.");
+                            channel.send(JSON.stringify({ type: "auth_reject", reason: "Wrong team. Please regenerate your seed." }));
+                            peerConn?.close();
+                            return;
+                        }
+                    }
+
+                    // b. 충돌이 아니라 정상적인 외부 기기 연결이라면 화면에 팝업을 띄워 수동 승인 진행
+                    const displayId = guest.email || guest.address || "Unknown Local Device";
+                    const approved = await ask(`Incoming connection from '${displayId}'.\nAre you sure you want to approve this device and share local data?`, { title: "Peer Approval Required", kind: "warning" });
+                    
+                    if (approved) {
+                        console.log("[WebRTC] Connection manually approved by peer.");
+                        channel.send(JSON.stringify({ type: "auth_success" }));
+                        finalizeWebRtcConnection(guest);
+                        // [Option] 필요시 여기서 proxy_fetch를 날려 클라우드 DB에도 guest.address를 강제로 등록(PUT)시킬 수 있습니다.
+                    } else {
+                        console.log("[WebRTC] Connection rejected by peer.");
+                        channel.send(JSON.stringify({ type: "auth_reject", reason: "Rejected by Team Member" }));
+                        peerConn?.close();
+                    }
+                }
+            } 
+            // 🌟 [핵심 3] 상대방이 내 접속을 승인함 (내가 Guest/발신자 역할일 때)
+            else if (msg.type === "auth_success") {
+                console.log("[WebRTC] Auth Approved by Host Peer!");
+                finalizeWebRtcConnection(null);
+            }
+            // 🌟 [핵심 4] 상대방이 내 접속을 거절함
+            else if (msg.type === "auth_reject") {
+                alert(`WebRTC Connection blocked: ${msg.reason}`);
+                peerConn?.close();
+            }
+            // --- 기존 통신 로직 유지 ---
+            else if (msg.type === "get_detail") {
                 const doc = await invoke<any>("get_document", { uuid: msg.uuid });
                 if (doc && dataChannel?.readyState === "open") {
                     dataChannel.send(JSON.stringify({
@@ -2731,11 +2994,23 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         else if (activeContext.bcc) baseFilter = `(${baseFilter}) AND bcc = '${activeContext.bcc}'`;
         else if (activeContext.cc) baseFilter = `(${baseFilter}) AND cc = '${activeContext.cc}'`;
 
-        // 🌟 [CRITICAL FIX 4] 사이드바 태그(domain, type)는 위의 activeContext를 통해 SQL 필터로 100% 적용되었습니다.
-        // 이 태그들을 텍스트로 엮어서 억지로 AI 검색에 던지면 검색 결과가 0건이 되고 VRAM이 폭발합니다. 삭제합니다!
-        const textQuery = searchInput?.value.trim() || "";
+        // 🌟 [수정] activeTags 배열을 순회하며 도메인(@) 및 타입(#) 필터를 SQL 조건에 추가합니다.
+        let tagFilter = "";
+        activeTags.forEach(tag => {
+            if (tag.type === 'domain') {
+                const domainCond = `origin MATCH '${tag.value}' OR data MATCH '${tag.value}'`;
+                tagFilter += tagFilter ? ` AND (${domainCond})` : `(${domainCond})`;
+            } else if (tag.type === 'type') {
+                const typeCond = `type = '${tag.value}'`;
+                tagFilter += tagFilter ? ` AND ${typeCond}` : typeCond;
+            }
+        });
 
+        const textQuery = searchInput?.value.trim() || "";
         let finalFilter = baseFilter;
+        if (tagFilter) {
+            finalFilter = finalFilter ? `(${finalFilter}) AND (${tagFilter})` : tagFilter;
+        }
         let latestUpdateTime = 0;
         let oldestCreatedAt = 0;
 
@@ -2761,22 +3036,29 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         let docs: any[] = [];
         
         if (textQuery) {
-            // 🌟 텍스트 검색 시에도 프론트 래퍼를 버리고 Rust의 search_documents를 직접 타격합니다.
             const searchResults = await invoke<any[]>("search_documents", {
                 query: textQuery,
                 limit: pageSize,
                 offset: 0,
-                filter: finalFilter || null // 👈 이제 필터가 절대 증발하지 않고 Rust로 꽂힙니다!
+                filter: finalFilter || null
             });
             
-            // Rust의 search_documents는 [id, text, score] 형태의 배열만 반환하므로, 
-            // 받아온 ID를 이용해 리스트 카드 생성에 필요한 원본 문서(Full Document)를 직접 꺼내옵니다.
-            for (const res of searchResults) {
-                const docId = res[0];
-                const fullDoc = await invoke<any>("get_document", { uuid: docId });
-                if (fullDoc) {
-                    docs.push(fullDoc);
-                }
+            if (searchResults.length > 0) {
+                const resultIds = searchResults.map(res => `'${res[0]}'`).join(",");
+                // 🌟 [최적화] 각 ID마다 get_document를 호출하는 대신, ID 리스트 필터를 사용하여 한 번에 긁어옵니다.
+                const idFilter = `id IN (${resultIds})`;
+                docs = await invoke<any[]>("get_all_documents", {
+                    limit: pageSize,
+                    offset: 0,
+                    filter: idFilter
+                });
+                
+                // 검색 결과의 유사도(Score) 순서를 유지하기 위해 재정렬
+                docs.sort((a, b) => {
+                    const scoreA = searchResults.find(r => r[0] === a.id)?.[2] || 0;
+                    const scoreB = searchResults.find(r => r[0] === b.id)?.[2] || 0;
+                    return scoreB - scoreA;
+                });
             }
         } else {
             // 🌟 탭을 클릭하거나 일반 스크롤을 할 때는 Tauri Invoke를 직접 타격하여 완벽한 필터링을 보장합니다.
@@ -3015,7 +3297,17 @@ async function showDetail(uuid: string) {
 
 btnDetailBack?.addEventListener("click", () => { detailView.style.display = "none"; listView.style.display = "block"; });
 document.getElementById("btn-settings-back")?.addEventListener("click", collapseWidget);
-btnListBack?.addEventListener("click", collapseWidget);
+
+// 🌟 [수정] 세팅 패널이 열려있을 때는 세팅을 닫고 리스트로 복귀하며, 일반 리스트 상태일 때는 위젯을 닫습니다.
+btnListBack?.addEventListener("click", () => {
+    const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
+    if (settingsToggle && settingsToggle.checked) {
+        settingsToggle.checked = false;
+        settingsToggle.dispatchEvent(new Event("change")); // 세팅 패널 닫기 이벤트 트리거
+    } else {
+        collapseWidget(); // 기존처럼 위젯 닫기
+    }
+});
 
 document.getElementById("nav-signin")?.addEventListener("click", () => openWidget("settings"));
 document.getElementById("nav-signout")?.addEventListener("click", () => { document.getElementById("btn-logout")?.click(); });
@@ -3148,8 +3440,9 @@ function updateAuthUI() {
             cloudToggle.title = "Cloud AI Mode is available";
         }
 
-        // 🌟 [추가] 로그인 성공 시 Cloud Members 영역 표시
-        if (cloudMembersSection) cloudMembersSection.style.display = ""; 
+        // 🌟 [수정] 로그인 성공 시 Cloud Members 영역을 표시하되, 세팅 화면이 켜져있다면 숨김을 유지합니다.
+        const isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
+        if (cloudMembersSection) cloudMembersSection.style.display = isSettingsOpen ? "none" : ""; 
         
     } else {
         if (authStatus) authStatus.innerText = "Waiting for Auth...";
@@ -3437,7 +3730,31 @@ async function initSession() {
 }
 
 document.getElementById("btn-qr-auth")?.addEventListener("click", performQrAuth);
-document.getElementById("btn-logout")?.addEventListener("click", async () => { if (await ask("Are you sure?", { title: "Sign Out", kind: "warning" })) { currentSession.email = undefined; updateAuthUI(); } });
+
+// 🌟 [수정] 로그아웃 시 sessionStorage 초기화 및 세션 영구 저장소 갱신
+document.getElementById("btn-logout")?.addEventListener("click", async () => { 
+    if (await ask("Are you sure you want to sign out?", { title: "Sign Out", kind: "warning" })) { 
+        currentSession.email = undefined; 
+        sessionStorage.clear(); // sessionStorage 강제 초기화
+        await saveSession(); // 로컬 세션 데이터 업데이트
+        updateAuthUI(); 
+    } 
+});
+
+// 🌟 [추가] Dexie DB 초기화 및 앱 리셋 버튼 로직
+document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
+    if (await ask("정말 로컬 데이터베이스를 초기화하시겠습니까?\n모든 로컬 큐 데이터와 캐시가 삭제되며 앱이 재시작됩니다.", { title: "Initialize Local DB", kind: "warning" })) {
+        try {
+            await appDb.delete(); // Dexie DB 완전 삭제
+            sessionStorage.clear(); // 세션 스토리지 초기화
+            window.location.reload(); // 앱 상태를 완전히 비우기 위해 강제 새로고침
+        } catch (e) {
+            console.error("DB Initialization failed:", e);
+            alert("DB 초기화 중 오류가 발생했습니다.");
+        }
+    }
+});
+
 settingsBtn?.addEventListener("click", () => { if (currentTab === "settings" && isExpanded) collapseWidget(); else openWidget("settings"); });
 document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTab("automation"));
 document.getElementById("unload-btn")?.addEventListener("click", async () => { 

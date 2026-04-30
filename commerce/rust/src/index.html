@@ -31,7 +31,6 @@
         </div>
 
         <div id="search-container" class="search-container" style="display: flex; flex-direction: column;">            
-            <div id="search-tags-container" class="search-tags-container"></div>
             <input type="text" id="global-search" class="search-input" placeholder="Search or Ask" />
         </div>
         
@@ -79,7 +78,7 @@
                         <div id="settings-panel" style="display: none; padding: 10px; margin-bottom: 15px;">
                             <div id="search-mode-tabs" style="display: flex; gap: 10px; margin-bottom: 15px; padding-left: 5px;">
                                 <button class="mode-tab" data-mode="shipping" style="background: none; color: #666; border: none; font-size: 0.8rem; cursor: pointer;">Shipping</button>
-                                <button class="mode-tab active" data-mode="commerce" style="background: none; color: var(--primary); border: none; font-size: 0.8rem; cursor: pointer; font-weight: bold;">Commerce</button>
+                                <button class="mode-tab active" data-mode="commerce" style="background: none; color: #000; border: none; font-size: 0.8rem; cursor: pointer; font-weight: bold;">Commerce</button>
                                 <button class="mode-tab" data-mode="analytic" style="background: none; color: #666; border: none; font-size: 0.8rem; cursor: pointer;">Analytic</button>
                             </div>
 
@@ -89,8 +88,13 @@
                             </div>
 
                             <div id="cloud-mode-container" style="padding: 5px 10px; margin-bottom: 5px; background: rgba(255,255,255,0.05); border-radius: 6px; display: flex; align-items: center; justify-content: space-between;">
-                                <label for="cloud-mode-toggle" style="font-size: 0.75rem; color: var(--primary); cursor: pointer; font-weight: bold;">Use Cloud AI</label>
+                                <label for="cloud-mode-toggle" style="font-size: 0.75rem; cursor: pointer;">Use Cloud AI</label>
                                 <input type="checkbox" id="cloud-mode-toggle" style="cursor: pointer;" disabled title="Login required to use Cloud AI" />
+                            </div>
+
+                            <div style="margin-top: 15px; padding-top: 10px; border-top: 1px dashed rgba(255,255,255,0.2); display: flex; flex-direction: column; gap: 8px;">
+                                <button id="btn-logout" class="primary-btn" style="width: 100%;">Sign Out</button>
+                                <button id="btn-reset-db" class="primary-btn" style="width: 100%; background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3);">Initialize Local DB</button>
                             </div>
 
                         </div>
@@ -100,20 +104,16 @@
                                 <h3>Shared Pages</h3>
                                 <div id="nav-list-pages" class="tree-root"></div>
                             </div>
-                            <div class="nav-section users" style="margin-bottom: 15px;">
+                            <div class="nav-section users">
                                 <h3>
                                     Local Members
 
-                                    <button id="btn-sync-qr" title="Sync with Mobile" style="background: none; border: none; font-size: 1rem; cursor: pointer; padding: 0; filter: grayscale(1); transition: 0.2s;" onmouseover="this.style.filter='none'" onmouseout="this.style.filter='grayscale(1)'">ADD</button>
+                                    <button id="btn-sync-qr" title="Sync with Mobile" style="background: none; border: none; font-size: 0.7rem; cursor: pointer; padding: 0; filter: grayscale(1); transition: 0.2s;" onmouseover="this.style.filter='none'" onmouseout="this.style.filter='grayscale(1)'">ADD</button>
                                 </h3>
-                                <!-- Pairing Section -->
                                 <div id="nav-qr-container" class="hidden">
-                                    <!-- State: Manual Sync (Seed Based) -->
                                     <div id="manual-sync-view">
-                                        <h3>Add Member</h3>
                                         <div>
-                                            <p style="display: none;">My IP: <strong id="my-full-ip" style="color: var(--primary);">...</strong></p>
-                                            <p>Sync Seed: <strong id="my-sync-seed" style="color: var(--primary);">...</strong></p>
+                                            <p>My Sync Seed: <strong id="my-sync-seed">...</strong></p>
                                         </div>
                                         
                                         <div style="display: flex; flex-direction: column; gap: 8px;">
@@ -128,13 +128,26 @@
                             </div>
 
                             <div class="nav-section">
-                                <h3>Cloud Members</h3>
+                                <h3>
+                                    Cloud Members
+
+                                    <button id="btn-cloud-invite-toggle" title="Invite Member" style="display: none; background: none; border: none; font-size: 0.7rem; cursor: pointer; padding: 0; filter: grayscale(1); transition: 0.2s;" onmouseover="this.style.filter='none'" onmouseout="this.style.filter='grayscale(1)'">ADD</button>
+                                </h3>
+                                <div id="nav-cloud-invite-container" class="hidden">
+                                    <div>
+                                        <div style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 1em;">
+                                            <input type="email" id="invite-email-input" placeholder="Member's E-Mail" required style="width: 100%; padding: 8px; background: #333; border: 1px solid #444; color: white; text-align: center; border-radius: 4px; font-size: 1rem; font-weight: bold;">
+                                            <button id="btn-send-invite" class="primary-btn" style="width: 100%; padding: 10px; border-radius: 4px; margin-top: 5px; font-weight: bold;">SEND INVITE</button>
+                                        </div>
+                                    </div>
+                                </div>
                                 <div id="nav-list-users" class="tree-root"></div>
                             </div>
                         </div>
                     </div>
 
-                    <!-- REPLACED: Table with Div Container for Cards -->
+                    <div id="search-tags-container" class="search-tags-container"></div>
+
                     <div id="doc-list" class="card-list"></div>
                     
                     <div id="list-pull-bottom" class="chat-pull-loader">

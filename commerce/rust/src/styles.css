@@ -1,5 +1,5 @@
 :root {
-  --primary: #fb923c;
+  --primary: #eee;
   --glass-bg: #fff; /* Lower opacity for better blur visibility */
   --glass-border: rgba(0, 0, 0, 0.15);
   --glass-highlight: rgba(0, 0, 0, 0.05);
@@ -116,6 +116,7 @@ body {
 
 .search-tags-container {
     display: flex;
+    padding: 0.7rem 0.7rem 2rem;
     gap: 4px;
     flex-shrink: 0;
 }
@@ -190,6 +191,8 @@ body {
     opacity: 0.6;
 }
 #nav-img-clear:hover { opacity: 1; }
+
+#search-mode-tabs .mode-tab.active{text-decoration: underline; color:#000;}
 
 .logo-section {
   display: flex;
@@ -569,16 +572,20 @@ tr:hover { background: rgba(0,0,0,0.05); }
     transition: opacity 0.2s ease;
 }
 
+#manual-sync-view p{font-size: 1rem;}
+
 #nav-qr-container {
+    margin-top: -1em; padding: 0 2em 1em; font-size: 0.7rem;
     transition: all 0.3s ease;
 }
+#nav-qr-container h3{padding: 0;}
 
 #sync-qrcode img {
     margin: 0 auto;
 }
 
 .settings-toggle{position: absolute; right: 5px; top: 0;}
-.settings-toggle label{cursor: pointer; color: rgb(170, 170, 170); font-size: 12px; background: rgba(255, 255, 255, 0.1); padding: 10px 10px; border-radius: 6px; transition: 0.2s; display: block; opacity: 0.5;}
+.settings-toggle label{cursor: pointer; color: rgb(100, 100, 100); font-size: 12px; background: rgba(255, 255, 255, 0.1); padding: 10px 10px; border-radius: 6px; transition: 0.2s; display: block; opacity: 1;}
 .settings-toggle label.on{text-decoration: underline;  opacity: 1; color: #000;}
 
 .nav-categories.visible {
@@ -660,6 +667,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
     color: #333;
 }
 
+.nav-section{margin-bottom: 2em;}
 /* Nav Lists */
 .nav-section h3 {
     margin: 0;
@@ -768,7 +776,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
     border-radius: 4px;
 }
 
-.card-list{margin: 0 0.5em;}
+.card-list{margin: 0 0.7rem;}
 
 .toggle-more:checked ~ .logis-more {
     display: block;
@@ -869,7 +877,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
     font-size: 10px;
     vertical-align: top;
     margin-left: 4px;
-    color: var(--primary);
+    color: #000;
 }
 
 .logis-label strong {
