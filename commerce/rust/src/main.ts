@@ -426,11 +426,11 @@ function stopSpinner() {
         }
     });
 
-    // 🌟 [수정] 스피너 정지 시, 이미지가 첨부되어 있거나 진행 중이지 않은 유효한 입력값이 존재하면 검색 버튼 노출
+    // 🌟 [수정] 스피너 정지 시, 진행 중이지 않은 유효한 텍스트 입력값이 존재할 때만 검색 버튼 노출
     if (btnSubmit) {
         const currentVal = searchInput?.value.trim() || "";
         // 스피너가 멈췄다는 건 작업이 끝났다는 의미이므로, isQueryActive(currentVal)가 false가 되어 버튼이 살아납니다.
-        if (currentImage || (currentVal !== "" && !isQueryActive(currentVal))) {
+        if (currentVal !== "" && !isQueryActive(currentVal)) {
             btnSubmit.style.display = "flex";
         } else {
             btnSubmit.style.display = "none";
@@ -1895,8 +1895,17 @@ btnExtract?.addEventListener("click", async () => {
                 currentImage = null;
                 if (navPreviewContainer) navPreviewContainer.classList.add("hidden");
                 if (navUploadBtn) navUploadBtn.classList.remove("active-emoji");
-                if (searchInput) searchInput.disabled = false;
-                if (btnSubmit) btnSubmit.style.display = "flex";
+                if (searchInput) {
+                    searchInput.disabled = false;
+                    if (btnSubmit) {
+                        const currentVal = searchInput.value.trim();
+                        if (currentVal !== "" && !isQueryActive(currentVal)) {
+                            btnSubmit.style.display = "flex";
+                        } else {
+                            btnSubmit.style.display = "none";
+                        }
+                    }
+                }
             }
             console.log("[WIDGET] Task safely added to backend queue:", taskId);
 
@@ -3491,8 +3500,17 @@ async function handleImageUpload(path: string) {
         navUploadBtn?.classList.add("active-emoji");
         
         // 🌟 [수정] 이미지 업로드 시 검색창을 막고 버튼을 숨기던 로직을 제거합니다.
-        searchInput.disabled = false;
-        if (btnSubmit) btnSubmit.style.display = "flex";
+        if (searchInput) {
+            searchInput.disabled = false;
+            if (btnSubmit) {
+                const currentVal = searchInput.value.trim();
+                if (currentVal !== "" && !isQueryActive(currentVal)) {
+                    btnSubmit.style.display = "flex";
+                } else {
+                    btnSubmit.style.display = "none";
+                }
+            }
+        }
         if (btnExtract) btnExtract.style.display = "flex";
         
         try {
@@ -3964,7 +3982,14 @@ document.getElementById("unload-btn")?.addEventListener("click", async () => {
         
         // 버튼 상태 복구
         await updateExtractButtonVisibility();
-        if (btnSubmit) btnSubmit.style.display = "flex";
+        if (btnSubmit && searchInput) {
+            const currentVal = searchInput.value.trim();
+            if (currentVal !== "" && !isQueryActive(currentVal)) {
+                btnSubmit.style.display = "flex";
+            } else {
+                btnSubmit.style.display = "none";
+            }
+        }
     } catch (e) {
         console.error("[WIDGET] Unload failed:", e);
     } 
