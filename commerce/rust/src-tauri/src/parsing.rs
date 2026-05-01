@@ -681,7 +681,7 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "code":product constant code | string
     - "link":'{HREF}' | string
     - "id":Refer to the ID value from the link | string
-    - "status":'draft' or 'show' or 'hide' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error' | string
+    - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string
     - "payment_method":payment method | string
     - "bank":bank company name or '' | string
     - "card":card company name or '' | string
@@ -730,7 +730,7 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "link":'{HREF}' | string
     - "id":Refer to the ID value from the link | string
     - "tracking_number":tracking number | string
-    - "status":'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error' | string
+    - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
     - "goods":[{ title:{ value:goods title | string }, path:{ value:URL includes a manage path, an administrative or edit Link | string }, id:{ value:Refer to the product no value from the link or an attribute or input value | string }, link:{ value:Refer to the ID to find a URL that includes a manage link | string } }]
     - "sender_name":sender_name | string
     - "sender_address":sender_address, Filter the addresses to District-level and up | string
@@ -772,7 +772,7 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "node":review container CSS selector | string
     - "link":'{HREF}' | string
     - "id":Refer to the ID value from the link | string
-    - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error' | string
+    - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
     - "name":reviewer name | string
     - "title":reviewer item title | string
     - "completed":order complete | boolean
@@ -816,51 +816,51 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     let schema = match page_type {
     "order" => r###"- "order":
     - "title":title | string
-    - "path":URL includes a manage order path, an administrative or edit Link | string
+    - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage order link | string
     - "quantity":quantity | string
-    - "sale_price":total price | number
     - "currency":ISO 4217 Currency Code | string
+    - "sale_price":sale price | number
     - "tracking_number":Tracking Number or equivalent term in English | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error' | string"###.to_string(),
+    - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string"###.to_string(),
 
     "goods" => r###"- "goods":
     - "title":title | string
-    - "path":URL includes a manage goods path, an administrative or edit Link | string
+    - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage goods link | string
     - "quantity":quantity | string
-    - "sale_price":total price | number
     - "currency":ISO 4217 Currency Code | string
+    - "sale_price":sale price | number
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error' | string"###.to_string(),
+    - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string"###.to_string(),
     
     "tracking" | "review" => r###"- "{TYPE}":
     - "title":author and content | string
+    - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
-    - "path":URL includes a manage {TYPE} path, an administrative or edit Link | string
     - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'start' or 'progress' or 'stop' or 'cancel' or 'return' | string"###.to_string(),
     
     "coupon" | "event" => r###"- "{TYPE}":
     - "title":type based item title | string
-    - "path":URL includes a manage {TYPE} path, an administrative or edit Link | string
+    - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
     - "started_at":yyyy-MM-ddThh:mm:ss | string
     - "expired_at":yyyy-MM-ddThh:mm:ss | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error' | string"###.to_string(),
+    - "status":'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' | string"###.to_string(),
     
         _ => r###"- "{TYPE}":
     - "title":title | string
-    - "path":URL includes a manage {TYPE} path, an administrative or edit Link | string
+    - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
-    - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error' | string"###.to_string()
+    - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string"###.to_string()
     };
 
     // 🌟 [최종 반영] .txt 파일 구조와 동일하게 thead/tbody 태그 및 계층형 들여쓰기 적용

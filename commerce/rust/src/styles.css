@@ -439,6 +439,9 @@ tr:hover { background: rgba(0,0,0,0.05); }
     text-align: left; /* System default */
 }
 
+
+#msg-qr-auth .chat-message{overflow: visible;}
+
 .chat-message {
     position: relative;
     overflow: hidden;

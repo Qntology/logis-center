@@ -860,8 +860,16 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                 var total = { draft: 0, count: 0 };
                 const pagesStats = (currentSession as any).pages;
                 const cc = node.cc || data.cc;
-                if (pagesStats && cc && pagesStats[cc] && pagesStats[cc][nodeType]) {
-                    total = pagesStats[cc][nodeType];
+                
+                // 🌟 [TRACKING LOG] Accordion 그릴 때 각 노드의 매칭 상태 확인
+                if (nodeType !== 'team' && nodeType !== 'user' && nodeType !== 'member') {
+                    console.log(`[TRACKING-4] 렌더링 노드 타입: ${nodeType}, 대상 CC: ${cc}`);
+                    if (pagesStats && cc && pagesStats[cc] && pagesStats[cc][nodeType]) {
+                        total = pagesStats[cc][nodeType];
+                        console.log(`[TRACKING-5] 매칭 성공! 적용될 카운트:`, total);
+                    } else {
+                        console.log(`[TRACKING-FAIL] 매칭 실패. pagesStats 존재여부: ${!!pagesStats}, CC 존재여부: ${!!cc}`);
+                    }
                 }
 
                 var recent = '';
@@ -1050,12 +1058,22 @@ async function renderNavigation() {
                 const _usersForStats = await Select["users"]({});
                 const teamDoc = _usersForStats.find(u => u.type === "team" || (u.data && u.data.type === "team"));
                 if (teamDoc) {
-                    // Rust에서 직렬화된 json_data를 확실하게 객체로 변환
-                    let teamData = teamDoc.data;
-                    if (!teamData && teamDoc.json_data) {
+                    // 🌟 [CRITICAL FIX] LanceDB(TradeDocument)와 Server(JSON)의 포맷 차이 완벽 호환
+                    // TradeDocument의 경우 최신 데이터가 문자열 형태의 json_data에 들어있으므로 최우선으로 파싱합니다.
+                    let teamData: any = null;
+                    if (teamDoc.json_data && typeof teamDoc.json_data === "string") {
                         try { teamData = JSON.parse(teamDoc.json_data); } catch(e) {}
                     }
+                    if (!teamData && teamDoc.data) {
+                        teamData = typeof teamDoc.data === "string" ? JSON.parse(teamDoc.data) : teamDoc.data;
+                    }
                     teamData = teamData || teamDoc;
+
+                    // 🌟 [로그 추가] 검색창 클릭 및 네비게이션 렌더링 시 Dexie에서 로드된 통계를 출력합니다.
+                    console.log("\n=====================================");
+                    console.log("[DEBUG-UI] Dexie에서 로드된 Team 데이터:", teamDoc);
+                    console.log("[DEBUG-UI] 화면에 렌더링될 Base 통계:", JSON.stringify(teamData.base, null, 2));
+                    console.log("=====================================\n");
 
                     if (teamData.base && teamData.base.pages) {
                         (currentSession as any).pages = teamData.base.pages;
@@ -1440,21 +1458,39 @@ async function syncData() {
         stepQrSpinner();
 
         if (response.results && Array.isArray(response.results)) {
-            // 🌟 [변경] 서버에서 온 데이터 중 로컬 캐시(이미 리스트에 그려진 데이터)와 
-            // id, updated_at이 완전히 일치하는 것은 제외하고 upsert를 요청합니다.
+            // 🌟 [버그 수정] DOM에 렌더링된 요소뿐만 아니라, Dexie DB에 있는 백그라운드 통계(team) 객체의 최신 시간도 대조해야 합니다.
+            // 안 그러면 방금 전처리 완료된 로컬 통계를 과거의 서버 통계로 덮어버리게 됩니다!
+            const localUsers = await Select["users"]({});
+            const localPages = await Select["pages"]({});
+            const localMap = new Map();
+            [...localUsers, ...localPages].forEach((item: any) => {
+                localMap.set(item.id, item.updated_at_ts || item.updated_at || 0);
+            });
+
             const filteredResults = response.results.filter((newItem: any) => {
+                let localUpdated = 0;
+                
                 const existingEl = document.getElementById(newItem.id);
                 if (existingEl) {
-                    const localUpdated = parseInt(existingEl.dataset.updatedAt || "0");
-                    const serverUpdated = newItem.updated_at || 0;
-                    return serverUpdated > localUpdated; // 서버 데이터가 더 최신인 경우만 포함
+                    localUpdated = parseInt(existingEl.dataset.updatedAt || "0");
+                } else if (localMap.has(newItem.id)) {
+                    localUpdated = parseInt(localMap.get(newItem.id) || "0");
                 }
-                return true; // 로컬에 없는 데이터는 무조건 포함
+
+                const serverUpdated = newItem.updated_at || 0;
+                return serverUpdated > localUpdated; // 서버 데이터가 더 최신인 경우만 포함
             });
 
             if (filteredResults.length > 0) {
                 console.log(`[SYNC] 2. 로컬 LanceDB 최신화 중... (${filteredResults.length} / ${response.results.length} 건 변경됨)`);
                 await invoke("upsert_items", { items: filteredResults });
+                
+                // 🌟 [누락 복구] 서버 통계를 LanceDB에 덮어썼다면, 반드시 프론트엔드 Dexie DB 에도 동기화해줘야 화면이 바뀝니다!
+                const newUsers = filteredResults.filter((r: any) => r.type === "team" || r.type === "user" || r.type === "member");
+                const newPages = filteredResults.filter((r: any) => r.type === "pages" || r.type === "page");
+                
+                if (newUsers.length > 0) await Upsert["users"](newUsers);
+                if (newPages.length > 0) await Upsert["pages"](newPages);
             } else {
                 console.log(`[SYNC] 2. 변경된 데이터가 없어 DB 쓰기를 건너뜁니다.`);
             }
@@ -2128,14 +2164,53 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
 
         // 🌟 [CRITICAL FIX] 전처리가 완료되면 자동으로 메뉴 카운트와 리스트를 리프레시!
         if (payload.category === "Done") {
-            if (currentSession.email) {
-                syncData(); // 서버 모드일 경우 서버와 즉시 동기화
-            } else {
-                // 로컬 모드일 경우 즉시 DOM 다시 그리기
-                renderNavigation().then(() => {
-                    if (currentTab === "list") refreshList();
-                });
-            }
+            // 🌟 [버그 수정] 서버 모드이든 로컬 모드이든 무조건 로컬 LanceDB의 최신 전처리 결과를 Dexie에 먼저 덮어써야 합니다!
+            Promise.all([
+                invoke<any[]>("get_known_users"),
+                invoke<any[]>("get_known_pages") 
+            ]).then(async ([users, pages]) => {
+                console.log("\n[TRACKING-1] Rust(LanceDB)에서 가져온 get_known_users 목록 수:", users ? users.length : 0);
+                if (users && users.length > 0) {
+                    const teamDocs = users.filter(u => u.type === "team" || (u.data && u.data.type === "team"));
+                    console.log("[TRACKING-2] 그 중 'team' 타입 문서 파악:", teamDocs);
+                    if (teamDocs.length > 0) {
+                        // 🌟 [CRITICAL FIX] 로그 출력을 위해 json_data 문자열을 객체로 안전하게 파싱합니다.
+                        let tData: any = null;
+                        if (teamDocs[0].json_data && typeof teamDocs[0].json_data === "string") {
+                            try { tData = JSON.parse(teamDocs[0].json_data); } catch(e) {}
+                        }
+                        if (!tData && teamDocs[0].data) {
+                            tData = typeof teamDocs[0].data === "string" ? JSON.parse(teamDocs[0].data) : teamDocs[0].data;
+                        }
+                        tData = tData || teamDocs[0];
+                        
+                        console.log("[TRACKING-3] Dexie에 덮어쓸 최신 Base 통계:", JSON.stringify(tData.base?.pages, null, 2));
+                        await Upsert["users"](teamDocs);
+                    } else {
+                        console.warn("[TRACKING-WARN] get_known_users에 'team' 문서가 포함되지 않았습니다! (Limit 제한 의심)");
+                    }
+                }
+                if (pages && pages.length > 0) await Upsert["pages"](pages);
+                
+                console.log("[SYNC] LanceDB의 최신 데이터(통계, 페이지)를 Dexie로 동기화 완료!");
+                
+                if (currentSession.email) {
+                    syncData(); // 🌟 Dexie 업데이트 완료 후 서버 동기화 시작
+                } else {
+                    renderNavigation().then(() => {
+                        if (currentTab === "list") refreshList();
+                    });
+                }
+            }).catch(e => {
+                console.error("[SYNC] Dexie 동기화 실패:", e);
+                if (currentSession.email) {
+                    syncData();
+                } else {
+                    renderNavigation().then(() => {
+                        if (currentTab === "list") refreshList();
+                    });
+                }
+            });
         }
     }
 

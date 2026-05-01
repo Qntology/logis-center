@@ -1354,11 +1354,29 @@ async fn process_task(
             if let Ok(clean_content) = data_manager.load(&data_manager.get_path("clean_html")) {
                 let doc = scraper::Html::parse_document(&clean_content);
                 if let Ok(tsel) = scraper::Selector::parse(&final_thead_selector) {
-                    if let Some(thead_match) = doc.select(&tsel).next() {
+                    if let Some(first_match) = doc.select(&tsel).next() {
+                        // 🌟 [구조 보존 로직] 매칭된 요소가 th나 td일 경우, 다중 tr 계층 구조를 잃지 않기 위해 DOM 트리를 거슬러 올라가 최상위 thead(또는 tr) 블록 전체를 통째로 가져옵니다.
+                        let mut target_node = first_match;
+                        let mut current = target_node.parent();
+                        
+                        while let Some(parent) = current {
+                            if let Some(el) = parent.value().as_element() {
+                                let tag = el.name().to_lowercase();
+                                if tag == "thead" || tag == "tr" {
+                                    if let Some(wrapped) = scraper::ElementRef::wrap(parent) {
+                                        target_node = wrapped;
+                                        // thead를 찾으면 가장 완벽한 다중 행 헤더 그룹이므로 즉시 탐색 종료
+                                        if tag == "thead" { break; } 
+                                    }
+                                }
+                            }
+                            current = parent.parent();
+                        }
+                        
                         let mut tpug = String::new();
-                        // 🌟 thead 노드 자체부터 파싱 시작 (Pug 구조 보존)
-                        crate::parsing::generate_pug_lines((*thead_match).into(), 0, &mut tpug, &PugMode::FullContent, &mut None);
+                        crate::parsing::generate_pug_lines((*target_node).into(), 0, &mut tpug, &PugMode::FullContent, &mut None);
                         thead_pug = tpug.trim().to_string();
+                        
                         if !thead_pug.is_empty() {
                             println!("[Scheduler] 🎉 thead_pug extraction successful ({} bytes)", thead_pug.len());
                         }
@@ -1708,8 +1726,50 @@ async fn process_task(
 
     // --- DB OPS & SIDE EFFECTS ---
     // Normalize Data
-    if let Some(obj) = extracted_data.as_object_mut() {
-        if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type)); }
+    let normalize_data = |item: &mut serde_json::Value| {
+        if let Some(obj) = item.as_object_mut() {
+            if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type.clone())); }
+            
+            // 통화 대문자 변환
+            if let Some(c) = obj.get("currency").and_then(|v| v.as_str()) {
+                obj.insert("currency".to_string(), json!(c.to_uppercase()));
+            }
+            
+            // 수량 정수형 캐스팅
+            if let Some(q) = obj.get("quantity").cloned() {
+                let q_val = if q.is_number() { q.as_i64().unwrap_or(0) }
+                            else if let Some(s) = q.as_str() { s.parse::<i64>().unwrap_or(0) }
+                            else { 0 };
+                obj.insert("quantity".to_string(), json!(q_val));
+            }
+            
+            // 날짜 기본값(Fallback) 매핑
+            if obj.get("started_at").is_none() || obj.get("started_at").unwrap().is_null() {
+                if let Some(m) = obj.get("manufacture_date").cloned() { obj.insert("started_at".to_string(), m); }
+            }
+            if obj.get("expired_at").is_none() || obj.get("expired_at").unwrap().is_null() {
+                if let Some(e) = obj.get("expiration_date").cloned() { obj.insert("expired_at".to_string(), e); }
+            }
+            
+            // 상태(Condition) 텍스트의 정수형 플래그 매핑
+            if let Some(cond) = obj.get("condition").and_then(|v| v.as_str()) {
+                let cond_lower = cond.to_lowercase();
+                if cond_lower.contains("used") { obj.insert("used".to_string(), json!(1)); }
+                if cond_lower.contains("lease") { obj.insert("lease".to_string(), json!(2)); }
+                if cond_lower.contains("rental") { obj.insert("rental".to_string(), json!(3)); }
+                if cond_lower.contains("refurbish") { obj.insert("refurbish".to_string(), json!(4)); }
+            }
+        }
+    };
+
+    if is_detail {
+        normalize_data(&mut extracted_data);
+    } else {
+        if let Some(items) = extracted_data.get_mut("items").and_then(|v| v.as_array_mut()) {
+            for item in items.iter_mut() {
+                normalize_data(item);
+            }
+        }
     }
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -1741,12 +1801,40 @@ async fn process_task(
                 let g_no = good.get("id").or_else(|| good.get("no")).and_then(|v| v.as_str()).unwrap_or("");
                 if !g_no.is_empty() {
                     let clean_g_no = crate::utils::hash::normalize_numeric_homoglyphs(g_no).replace("-", "").replace("_", "");
-                    let tracking_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, index_val, clean_g_no));
+                    
+                    // 🌟 [버그 수정] 부모(Order)의 송장번호와 자식(Goods)의 고유값을 결합하여 완벽한 Tracking 객체로 조립합니다.
+                    let tracking_number = extracted_data.get("tracking_number").and_then(|v| v.as_str()).unwrap_or("");
+                    let clean_tracking_no = crate::utils::hash::normalize_numeric_homoglyphs(tracking_number).replace("-", "").replace("_", "");
+                    let tracking_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tracking_no)));
+                    let goods_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("goods{}{}", team_id, clean_g_no)));
+                    
+                    let tracking_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, clean_tracking_no, clean_g_no));
                     let mut tracking_data = extracted_data.clone();
-                    tracking_data.as_object_mut().unwrap().insert("type".to_string(), json!("tracking"));
+                    
+                    if let Some(obj) = tracking_data.as_object_mut() {
+                        obj.insert("type".to_string(), json!("tracking"));
+                        obj.insert("no".to_string(), json!(clean_tracking_no));
+                        obj.insert("index".to_string(), json!(tracking_index));
+                        obj.insert("goods".to_string(), json!(goods_index));
+                        obj.insert("order".to_string(), json!(index_val)); // 부모 오더 index 매핑
+                    }
+                    
+                    // 🌟 배송 정보 분리 시 자연어 요약 및 임베딩 추출 로직 추가
+                    let tracking_text = parsing::json_to_natural_language(&tracking_data);
+                    let tracking_vector = model.get_embedding(tracking_text.clone()).await.unwrap_or(vec![0.0; 768]);
+                    tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(tracking_text));
                     
                     let _ = store.upsert_item(
-                        "tracking", &tracking_id, "tracking", tracking_data, None,
+                        "tracking", &tracking_id, "tracking", tracking_data.clone(), Some(tracking_vector.clone()),
+                        Some(&task.from), Some(&team_id), Some(&task.cc),
+                        Some(&crate::utils::hash::hash_id(&format!("tracking{}", cc_val))),
+                        Some(&crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.r#ref))),
+                        None
+                    ).await;
+
+                    // 🌟 공용 items 테이블에도 벡터와 함께 저장하여 통합 검색이 가능하게 합니다.
+                    let _ = store.upsert_item(
+                        "items", &tracking_id, "tracking", tracking_data, Some(tracking_vector),
                         Some(&task.from), Some(&team_id), Some(&task.cc),
                         Some(&crate::utils::hash::hash_id(&format!("tracking{}", cc_val))),
                         Some(&crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.r#ref))),
@@ -1763,20 +1851,38 @@ async fn process_task(
     let ref_val = task.r#ref.clone();
 
     let mut items_to_process = Vec::new();
-    let mut is_new_draft_global = true; 
+    let mut page_draft_diff = 0i64;
+    let mut page_count_diff = 0i64;
+    let mut global_count_diff = 0i64;
 
     if is_detail {
-        // 🌟 [DETAIL MODE] 단일 문서일 경우 기존처럼 통째로 저장합니다.
+        // 🌟 [DETAIL MODE] 단일 문서일 경우
         let text_to_embed = parsing::json_to_natural_language(&extracted_data);
         let item_digest = crate::utils::hash::digest(&text_to_embed); 
         let target_id = if !task.r#ref.is_empty() { task.r#ref.clone() } else { generated_id.clone() }; 
         
         let mut existing_vector = None;
+        let mut is_new = true;
+        let mut was_draft = false;
+
         if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
-            is_new_draft_global = false; 
+            is_new = false;
+            if existing_item.updated_at_ts == 0 {
+                was_draft = true;
+            }
             if existing_item.digest == item_digest {
                 existing_vector = Some(existing_item.vector);
             }
+        }
+
+        // 🌟 [클라우드 패리티 일치] 상세(Detail) 페이지 수집 시: 
+        // 새 항목이면 page_count++, 기존 Draft 항목이었다면 draft--, page_count++ 승급
+        if is_new {
+            page_count_diff += 1;
+            global_count_diff += 1;
+        } else if was_draft {
+            page_draft_diff -= 1;
+            page_count_diff += 1;
         }
 
         let vector = if let Some(v) = existing_vector {
@@ -1784,6 +1890,111 @@ async fn process_task(
         } else {
             Some(model.get_embedding(text_to_embed).await?)
         };
+
+        // 🌟 [누락 복구] 교차 업데이트 (Relay) 로직 실행 (단일 상세 항목)
+        let related_types = crate::logic::related(&page_type);
+        for foreign_type in related_types {
+            if let Some((queries, merge_rule)) = crate::logic::relay(foreign_type, &extracted_data) {
+                for q in queries {
+                    match store.find_item_by_property(&q.table, &q.column, &q.value).await {
+                        Ok(Some((foreign_id, mut foreign_data))) => {
+                            let mut needs_update = false;
+
+                            // 2. Update 속성 병합 (Import/Export)
+                            if let Some(update) = &merge_rule.update {
+                                for field in &update.includes {
+                                    if update.from == page_type {
+                                        if let Some(val) = extracted_data.get(field).cloned() {
+                                            foreign_data.as_object_mut().unwrap().insert(field.clone(), val);
+                                            needs_update = true;
+                                        }
+                                    } else if update.to == page_type {
+                                        if let Some(val) = foreign_data.get(field).cloned() {
+                                            extracted_data.as_object_mut().unwrap().insert(field.clone(), val);
+                                        }
+                                    }
+                                }
+                                if let Some(foreign_info) = &update.foreign {
+                                    if update.from == page_type {
+                                        if let Some(val) = extracted_data.get(&foreign_info.to).cloned() {
+                                            foreign_data.as_object_mut().unwrap().insert(foreign_info.from.clone(), val);
+                                            needs_update = true;
+                                        }
+                                    } else if update.to == page_type {
+                                        if let Some(val) = foreign_data.get(&foreign_info.to).cloned() {
+                                            extracted_data.as_object_mut().unwrap().insert(foreign_info.from.clone(), val);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 3. Upsert 속성 병합
+                            if let Some(upsert) = &merge_rule.upsert {
+                                for field in &upsert.includes {
+                                    if upsert.from == page_type {
+                                        if let Some(val) = extracted_data.get(field).cloned() {
+                                            foreign_data.as_object_mut().unwrap().insert(field.clone(), val);
+                                            needs_update = true;
+                                        }
+                                    } else if upsert.to == page_type {
+                                        if let Some(val) = foreign_data.get(field).cloned() {
+                                            extracted_data.as_object_mut().unwrap().insert(field.clone(), val);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 4. 연관 문서에 변경 사항이 있다면 벡터 재생성 후 DB 재저장
+                            if needs_update {
+                                let merged_text = parsing::json_to_natural_language(&foreign_data);
+                                let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 768]);
+                                foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
+
+                                let _ = store.upsert_item(
+                                    &q.table, &foreign_id, foreign_type, foreign_data.clone(), Some(merged_vector.clone()),
+                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                ).await;
+                                
+                                let _ = store.upsert_item(
+                                    "items", &foreign_id, foreign_type, foreign_data, Some(merged_vector),
+                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                ).await;
+                            }
+                        },
+                        Ok(None) => {
+                            // 🌟 연관 문서가 존재하지 않으면 Draft(가계정) 껍데기를 생성합니다.
+                            let mut draft_data = json!({});
+                            
+                            // 🌟 [버그 수정] q.value가 Number(예: index 값)일 때 해시가 증발하는 현상을 방어합니다.
+                            let val_str = match &q.value {
+                                serde_json::Value::String(s) => s.clone(),
+                                serde_json::Value::Number(n) => n.to_string(),
+                                _ => q.value.to_string(),
+                            };
+                            let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, foreign_type, val_str));
+                            
+                            if let Some(obj) = draft_data.as_object_mut() {
+                                obj.insert("id".to_string(), json!(draft_id.clone()));
+                                obj.insert("type".to_string(), json!(foreign_type));
+                                obj.insert(q.column.clone(), q.value.clone());
+                                obj.insert("updated_at".to_string(), json!(0)); // Draft 플래그
+                            }
+
+                            let _ = store.upsert_item(
+                                &q.table, &draft_id, foreign_type, draft_data.clone(), None,
+                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                            ).await;
+
+                            let _ = store.upsert_item(
+                                "items", &draft_id, foreign_type, draft_data, None,
+                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                            ).await;
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        }
 
         let _ = store.upsert_item(
             &target_table, &target_id, &page_type, extracted_data.clone(), vector.clone(),
@@ -1798,14 +2009,11 @@ async fn process_task(
         items_to_process.push(extracted_data.clone());
         
     } else {
-        // 🌟 [CRITICAL FIX] [LIST MODE] items 배열을 순회하며 낱개로 쪼개어 각각 DB에 독립된 문서로 저장합니다!
+        // 🌟 [LIST MODE] 리스트 배열 순회
         if let Some(items) = extracted_data.get("items").and_then(|v| v.as_array()) {
-            is_new_draft_global = false; // 리스트 업데이트 통계 기준 처리
-            
             for item_val in items.iter() {
                 let mut single_item = item_val.clone();
                 
-                // 1. 개별 아이템만의 고유 식별자(ID) 생성 (상품번호나 링크 기반)
                 let original_id = single_item.get("id").or_else(|| single_item.get("no")).and_then(|v| v.as_str())
                     .unwrap_or_else(|| single_item.get("link").and_then(|v| v.as_str()).unwrap_or(""));
                 
@@ -1817,7 +2025,6 @@ async fn process_task(
                     crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val))
                 };
 
-                // 2. 부모 페이지의 메타데이터(type, detail)를 개별 아이템에 주입
                 if let Some(obj) = single_item.as_object_mut() {
                     obj.insert("type".to_string(), json!(page_type));
                     obj.insert("detail".to_string(), json!(false));
@@ -1828,12 +2035,20 @@ async fn process_task(
                 let text_to_embed = parsing::json_to_natural_language(&single_item);
                 let item_digest = crate::utils::hash::digest(&text_to_embed);
                 
-                // 3. 중복 검사 및 벡터 임베딩 추출
                 let mut existing_vector = None;
+                let mut is_new = true;
+
                 if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &hashed_item_id).await {
+                    is_new = false;
                     if existing_item.digest == item_digest {
                         existing_vector = Some(existing_item.vector);
                     }
+                }
+
+                // 🌟 [클라우드 패리티 일치] 리스트(List) 수집 시: 상세 데이터가 아니므로 무조건 draft++ 처리
+                if is_new {
+                    page_draft_diff += 1;
+                    global_count_diff += 1;
                 }
                 
                 let vector = if let Some(v) = existing_vector {
@@ -1842,7 +2057,111 @@ async fn process_task(
                     Some(model.get_embedding(text_to_embed).await?)
                 };
 
-                // 4. DB에 낱개 단위로 저장
+                // 🌟 [누락 복구] 교차 업데이트 (Relay) 로직 실행 (리스트 아이템)
+                let related_types = crate::logic::related(&page_type);
+                for foreign_type in related_types {
+                    if let Some((queries, merge_rule)) = crate::logic::relay(foreign_type, &single_item) {
+                        for q in queries {
+                            match store.find_item_by_property(&q.table, &q.column, &q.value).await {
+                                Ok(Some((foreign_id, mut foreign_data))) => {
+                                    let mut needs_update = false;
+
+                                    // 2. Update 속성 병합
+                                    if let Some(update) = &merge_rule.update {
+                                        for field in &update.includes {
+                                            if update.from == page_type {
+                                                if let Some(val) = single_item.get(field).cloned() {
+                                                    foreign_data.as_object_mut().unwrap().insert(field.clone(), val);
+                                                    needs_update = true;
+                                                }
+                                            } else if update.to == page_type {
+                                                if let Some(val) = foreign_data.get(field).cloned() {
+                                                    single_item.as_object_mut().unwrap().insert(field.clone(), val);
+                                                }
+                                            }
+                                        }
+                                        if let Some(foreign_info) = &update.foreign {
+                                            if update.from == page_type {
+                                                if let Some(val) = single_item.get(&foreign_info.to).cloned() {
+                                                    foreign_data.as_object_mut().unwrap().insert(foreign_info.from.clone(), val);
+                                                    needs_update = true;
+                                                }
+                                            } else if update.to == page_type {
+                                                if let Some(val) = foreign_data.get(&foreign_info.to).cloned() {
+                                                    single_item.as_object_mut().unwrap().insert(foreign_info.from.clone(), val);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // 3. Upsert 속성 병합
+                                    if let Some(upsert) = &merge_rule.upsert {
+                                        for field in &upsert.includes {
+                                            if upsert.from == page_type {
+                                                if let Some(val) = single_item.get(field).cloned() {
+                                                    foreign_data.as_object_mut().unwrap().insert(field.clone(), val);
+                                                    needs_update = true;
+                                                }
+                                            } else if upsert.to == page_type {
+                                                if let Some(val) = foreign_data.get(field).cloned() {
+                                                    single_item.as_object_mut().unwrap().insert(field.clone(), val);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // 4. 연관 문서에 변경 사항이 있다면 벡터 재생성 후 DB 재저장
+                                    if needs_update {
+                                        let merged_text = parsing::json_to_natural_language(&foreign_data);
+                                        let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 768]);
+                                        foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
+
+                                        let _ = store.upsert_item(
+                                            &q.table, &foreign_id, foreign_type, foreign_data.clone(), Some(merged_vector.clone()),
+                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                        ).await;
+                                        
+                                        let _ = store.upsert_item(
+                                            "items", &foreign_id, foreign_type, foreign_data, Some(merged_vector),
+                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                        ).await;
+                                    }
+                                },
+                                Ok(None) => {
+                                    // 🌟 연관 문서가 존재하지 않으면 Draft(가계정) 껍데기를 생성합니다.
+                                    let mut draft_data = json!({});
+                                    
+                                    // 🌟 [버그 수정] q.value가 Number(예: index 값)일 때 해시가 증발하는 현상을 방어합니다.
+                                    let val_str = match &q.value {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        serde_json::Value::Number(n) => n.to_string(),
+                                        _ => q.value.to_string(),
+                                    };
+                                    let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, foreign_type, val_str));
+                                    
+                                    if let Some(obj) = draft_data.as_object_mut() {
+                                        obj.insert("id".to_string(), json!(draft_id.clone()));
+                                        obj.insert("type".to_string(), json!(foreign_type));
+                                        obj.insert(q.column.clone(), q.value.clone());
+                                        obj.insert("updated_at".to_string(), json!(0)); // Draft 플래그
+                                    }
+
+                                    let _ = store.upsert_item(
+                                        &q.table, &draft_id, foreign_type, draft_data.clone(), None,
+                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                    ).await;
+
+                                    let _ = store.upsert_item(
+                                        "items", &draft_id, foreign_type, draft_data, None,
+                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                    ).await;
+                                },
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
                 let _ = store.upsert_item(
                     &target_table, &hashed_item_id, &page_type, single_item.clone(), vector.clone(),
                     Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
@@ -1859,9 +2178,8 @@ async fn process_task(
     }
 
     if !items_to_process.is_empty() {
-        // 🌟 추출된 낱개 데이터들로 통계(Base Metrics) 엔진 갱신!
-        let _ = update_team_base_metrics(&store, &team_id, &task.cc, &page_type, &items_to_process, is_new_draft_global).await;
-        println!("[PROCESS] Metrics Engine updated base statistics for {} items.", items_to_process.len());
+        let _ = update_team_base_metrics(&store, &team_id, &task.cc, &page_type, &items_to_process, page_draft_diff, page_count_diff, global_count_diff).await;
+        println!("[PROCESS] Metrics Engine updated base statistics for {} items. (Page Draft: {}, Page Count: {}, Global Count: {})", items_to_process.len(), page_draft_diff, page_count_diff, global_count_diff);
     }
 
     // Final Status Update
@@ -2045,7 +2363,9 @@ async fn update_team_base_metrics(
     task_cc: &str,
     item_type: &str,
     items: &Vec<serde_json::Value>,
-    is_new_draft: bool,
+    page_draft_diff: i64,
+    page_count_diff: i64,
+    global_count_diff: i64,
 ) -> anyhow::Result<()> {
     let (team_json_str, team_vector, t_from, t_to, t_cc, t_bcc, t_ref, t_digest) = match store.get_item_by_id("users", team_id).await {
         Ok(Some(doc)) => (doc.json_data, doc.vector, doc.from, doc.to, doc.cc, doc.bcc, doc.r#ref, doc.digest),
@@ -2057,8 +2377,6 @@ async fn update_team_base_metrics(
     };
 
     let mut team_data: serde_json::Value = serde_json::from_str(&team_json_str).unwrap_or(json!({ "base": { "pages": {} } }));
-
-    // 🌟 [CRITICAL FIX] 블록({ })을 사용하여 가변 참조(Mutable Borrow)의 생명주기를 분리합니다!
     
     // --- [블록 1: 페이지별 통계 업데이트] ---
     {
@@ -2067,30 +2385,22 @@ async fn update_team_base_metrics(
         let cc_node = pages.entry(task_cc).or_insert(json!({})).as_object_mut().unwrap();
         let page_type_node = cc_node.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
 
-        let items_count = items.len() as i64; // 🌟 [핵심 복구] 실제 추출된 배열의 아이템 개수 구하기
-
-        if is_new_draft {
-            let draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
-            page_type_node.insert("draft".to_string(), json!(draft + items_count)); // 🌟 1 대신 items_count 누적
-        } else {
-            let draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
-            let count = page_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-            if draft > 0 { page_type_node.insert("draft".to_string(), json!(draft - 1)); }
-            page_type_node.insert("count".to_string(), json!(count + items_count)); // 🌟 1 대신 items_count 누적
-        }
-    } // 👈 여기서 첫 번째 참조(pages)가 안전하게 종료됩니다.
+        let current_draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
+        let current_count = page_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+        
+        page_type_node.insert("draft".to_string(), json!(0.max(current_draft + page_draft_diff)));
+        page_type_node.insert("count".to_string(), json!(0.max(current_count + page_count_diff)));
+    } 
 
     // --- [블록 2: 글로벌 전체 통계 및 Min/Max 업데이트] ---
     {
         let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
         let global_type_node = base.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
         
-        let items_count = items.len() as i64; // 🌟 [핵심 복구] 글로벌 통계용 개수 구하기
-
-        if !is_new_draft {
-            let global_count = global_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-            global_type_node.insert("count".to_string(), json!(global_count + items_count)); // 🌟 1 대신 items_count 누적
-        }
+        let global_count = global_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+        
+        // 🌟 [클라우드 패리티 완벽 일치] 클라우드(index.ts)에서는 글로벌 통계에 'draft'를 누적하지 않습니다! 오직 'count'(총 발생 건수)만 누적합니다.
+        global_type_node.insert("count".to_string(), json!(0.max(global_count + global_count_diff)));
 
         let properties = [
             "price", "quantity", "width", "height", "length", "weight", "shipping_fee", 
@@ -2112,17 +2422,25 @@ async fn update_team_base_metrics(
 
                     if num_val == 0.0 && *prop != "started_at" && *prop != "expired_at" { continue; }
 
-                    let prop_node = global_type_node.entry(*prop).or_insert(json!({ "min": 99999999999999.0, "max": -99999999999999.0 })).as_object_mut().unwrap();
+                    // 🌟 [버그 수정] 클라우드 JS 초기화 로직(0.0)과 호환되도록 기본값을 0.0으로 통일
+                    let prop_node = global_type_node.entry(*prop).or_insert(json!({ "min": 0.0, "max": 0.0 })).as_object_mut().unwrap();
                     
-                    let current_min = prop_node.get("min").and_then(|v| v.as_f64()).unwrap_or(99999999999999.0);
-                    let current_max = prop_node.get("max").and_then(|v| v.as_f64()).unwrap_or(-99999999999999.0);
+                    let current_min = prop_node.get("min").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let current_max = prop_node.get("max").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
-                    if num_val < current_min { prop_node.insert("min".to_string(), json!(num_val)); }
-                    if num_val > current_max { prop_node.insert("max".to_string(), json!(num_val)); }
+                    // 🌟 [버그 수정] DB에서 가져온 current_min이 0.0(초기값)일 경우 조건 없이 무조건 첫 값을 덮어쓰도록 예외 처리
+                    // 🌟 [비교 연산자 수정] JS와 동일하게 <=, >= 로 연산자 패리티 일치
+                    if current_min == 0.0 || num_val <= current_min { prop_node.insert("min".to_string(), json!(num_val)); }
+                    if current_max == 0.0 || num_val >= current_max { prop_node.insert("max".to_string(), json!(num_val)); }
                 }
             }
         }
     } // 👈 여기서 두 번째 참조가 종료됩니다.
+
+    // 🌟 [디버깅 로그 추가] 프론트엔드로 전달되기 전, DB에 최종 반영되는 base JSON 전체 구조를 예쁘게 출력합니다.
+    if let Some(base_json) = team_data.get("base") {
+        println!("\n[DEBUG-METRICS] 최종 반영된 Base JSON 값:\n{}", serde_json::to_string_pretty(base_json).unwrap_or_default());
+    }
 
     // 5. Save back to DB
     let _ = store.upsert_item(

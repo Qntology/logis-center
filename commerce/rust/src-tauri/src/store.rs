@@ -347,23 +347,24 @@ impl VectorStore {
 
         println!("[Store] Initializing zombie task recovery process...");
 
-        // 🌟 1. [진행 중 사살] 앱이 죽었을 때 연산 중이던(1) 작업은 무조건 중단(2) 처리합니다.
-        // 🌟 2. [대기열 사살] 앱 종료 후 재시작 시, 큐에 남아있던 모든 대기 중(10)인 작업도 좀비로 간주하고 사살합니다.
+        // 🌟 [자동 재개 복구] 앱이 강제 종료되었을 때, 연산 중이던(1) 작업을 사살하지 않고
+        // 안전한 대기열(10) 상태로 돌려놓아 백그라운드 스케줄러가 [RESUME-LOGIC]을 타도록 유도합니다!
+        // (기존 대기 중이던 10번 작업은 건드리지 않고 자연스럽게 이어서 실행되게 둡니다.)
         let _ = tasks_table.update()
-            .only_if("status = 1 OR status = 10")
-            .column("status", "2") 
+            .only_if("status = 1")
+            .column("status", "10") 
             .execute()
             .await;
 
-        // 🌟 3. [채팅 메시지 동기화] UI 말풍선도 동일하게 업데이트합니다.
+        // 🌟 채팅 메시지 상태도 대기(10)로 돌리고, 사용자에게 복구 중임을 알립니다.
         let _ = talks_table.update()
-            .only_if("status = 1 OR status = 10")
-            .column("status", "2")
-            .column("text", "'Task was interrupted due to app restart.'")
+            .only_if("status = 1")
+            .column("status", "10")
+            .column("text", "'App restarted. Task is queued for auto-resumption...'")
             .execute()
             .await;
 
-        println!("[Store] CRITICAL: Zombie recovery complete. (Status 1 and search_tasks set to STOPPED)");
+        println!("[Store] CRITICAL: Zombie recovery complete. (Interrupted tasks reverted to Pending for Auto-Resume)");
         Ok(())
     }
 
