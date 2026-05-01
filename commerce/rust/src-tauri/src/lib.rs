@@ -4,6 +4,7 @@ mod automation;
 pub mod parsing;
 mod logic;
 mod scheduler;
+pub mod analytic; // 🌟 Analytic 전용 모듈 등록
 
 pub mod models;
 pub mod utils;

@@ -815,6 +815,8 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
     let schema = match page_type {
     "order" => r###"- "order":
+    - "registration_date":yyyy-MM-ddThh:mm:ss | string
+    - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
     - "title":title | string
     - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
@@ -822,45 +824,44 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "quantity":quantity | string
     - "currency":ISO 4217 Currency Code | string
     - "sale_price":sale price | number
-    - "tracking_number":Tracking Number or equivalent term in English | string
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string"###.to_string(),
+    - "tracking_number":Tracking Number or equivalent term in English | string"###.to_string(),
 
     "goods" => r###"- "goods":
+    - "registration_date":yyyy-MM-ddThh:mm:ss | string
+    - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string
     - "title":title | string
     - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage goods link | string
     - "quantity":quantity | string
     - "currency":ISO 4217 Currency Code | string
-    - "sale_price":sale price | number
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string"###.to_string(),
+    - "sale_price":sale price | number"###.to_string(),
     
     "tracking" | "review" => r###"- "{TYPE}":
+    - "registration_date":yyyy-MM-ddThh:mm:ss | string
+    - "status":'start' or 'progress' or 'stop' or 'cancel' or 'return' | string
     - "title":author and content | string
     - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
-    - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'start' or 'progress' or 'stop' or 'cancel' or 'return' | string"###.to_string(),
+    - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string"###.to_string(),
     
     "coupon" | "event" => r###"- "{TYPE}":
+    - "registration_date":yyyy-MM-ddThh:mm:ss | string
+    - "status":'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' | string
     - "title":type based item title | string
     - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
     - "started_at":yyyy-MM-ddThh:mm:ss | string
-    - "expired_at":yyyy-MM-ddThh:mm:ss | string
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' | string"###.to_string(),
+    - "expired_at":yyyy-MM-ddThh:mm:ss | string"###.to_string(),
     
         _ => r###"- "{TYPE}":
+    - "registration_date":yyyy-MM-ddThh:mm:ss | string
+    - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
     - "title":title | string
     - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
-    - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
-    - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string"###.to_string()
+    - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string"###.to_string()
     };
 
     // 🌟 [최종 반영] .txt 파일 구조와 동일하게 thead/tbody 태그 및 계층형 들여쓰기 적용
@@ -1270,4 +1271,56 @@ Generate the exact CSS selectors for both containers.
             .replace("{ITEM_SELECTOR}", item_selector)
             .replace("{PUG_CONTENT}", pug_content)
             .replace("{REFERENCE_ROW}", reference_row)
+}
+
+
+pub fn analytic_report_prompt() -> String {
+    r###"## Role
+You are a **User Behavior Analysis Expert**. Your goal is to interpret raw HTML interactions to understand the user's specific intent and analyze the selection context within a list.
+
+## Task
+Analyze the **one or more pairs** of 'Clicked HTML' (the selected item) and 'Related HTML' (the surrounding list structure). The inputs are provided as parallel arrays of HTML strings, meaning the Nth item in the 'Clicked HTML' array corresponds to the Nth item in the 'Related HTML' array.
+
+**For each pair**, perform the analysis according to the guidelines below.  
+If 'Previous Analysis' is provided, use it to infer the user's behavioral flow.
+
+Use this information to connect the previous action with the current click.
+
+## Analysis Guidelines
+1. **action (User Intent)**
+    - Determine the specific user intent for clicking the item.
+    - If 'Previous Analysis' exists, assume a continuous flow (e.g., "Search" -> "Select Result") to refine the intent.
+    - **Must explicitly include the 상품 제목(product title) 및 옵션 정보(option attributes) extracted from the clicked HTML.**
+    - Output as a short verb phrase (Korean).
+
+2. **relate (Neighboring Items Context)**
+    - Treat 'Related HTML' as a **list or collection of items** where the user made a selection.
+    - Identify **neighboring items** (siblings) that were displayed near the clicked element but *not* selected.
+    - Summarize these surrounding items to capture the context of the choice (e.g., competitors, other options, or list categories).
+    - **Constraint**: Do not summarize the clicked item itself in this field; focus on what surrounds it.
+
+3. **summary (Page-level Goal)**
+    - Provide a detailed explanation of what the user aimed to accomplish on this page.
+    - **Must explicitly reference the 상품 제목(product title) 및 옵션 정보(option attributes) to explain the user’s goal.**
+
+## Output Format
+Output ONLY a raw JSON object, where the outer structure is an array of analysis objects, corresponding to each analyzed pair:
+{
+    "actions": {
+        "https://hostname.com/pathname?search=parameter": {
+            "records": [
+                {
+                    "id": "String",
+                    "relate": ["String"],
+                    "action": "String"
+                }
+            ],
+            "summary": "String"
+        }
+    },
+    "cross_action_flow": "String",
+    "intent_evolution": "String",
+    "consistent_preferences": "String"
+}
+"###.to_string()
 }

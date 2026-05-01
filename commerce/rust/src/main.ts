@@ -1868,23 +1868,25 @@ btnExtract?.addEventListener("click", async () => {
                         device_preference: getDevicePref(), search_mode: currentSearchMode
                     });
                 } else {
-                    console.log("[WIDGET] Queuing LOCAL HTML task...");
+                    console.log("[WIDGET] Queuing LOCAL HTML/ANALYTIC task...");
                     const html = await invoke<string>("extract_html_from_current_tab");
                     const urlObj = new URL(currentDetectedUrl.toLowerCase());
                     const cc = await hashId(urlObj.hostname);
                     const rawPath = urlObj.pathname + urlObj.search;
-                    // 🌟 [CRITICAL FIX] 버튼 노출 로직과 동일하게 Team ID 병합
                     const teamId = currentSession.team || "";
                     const hashedRefId = await hashId(teamId + cc + rawPath.toLowerCase());
                     
+                    // 🌟 [추가] 사용자의 모드 선택에 따라 전처리 파이프라인(Task Type) 분기
+                    const extractType = currentSearchMode === "analytic" ? "analytic_extraction" : "html_extraction";
+                    
                     // 🚀 큐에 등록
-                    await GlobalTaskManager.addToQueue(taskId, "html_extraction", { 
-                        id: taskId, type: "html_extraction", html: html, link: rawPath, 
+                    await GlobalTaskManager.addToQueue(taskId, extractType, { 
+                        id: taskId, type: extractType, html: html, link: rawPath, 
                         cc: activeContext.cc || cc, 
                         ref: activeContext.ref || hashedRefId, 
                         bcc: activeContext.bcc || "", 
                         from: currentSession.address, to: currentSession.team,
-                        device_preference: getDevicePref()
+                        device_preference: getDevicePref(), search_mode: currentSearchMode
                     });
                 }
             }
@@ -3171,7 +3173,8 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         if (currentSearchMode === "shipping") {
             baseFilter = "type IN ('tracking', 'receiving', 'shipping', 'bl', 'awb', 'BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'TRACKING', 'shipping_doc', 'Unknown')";
         } else if (currentSearchMode === "analytic") {
-            baseFilter = "type IN ('sales', 'event', 'users', 'pages')"; 
+            // 🌟 [추가] Analytic 모드에서는 raw user interaction 로그와 리포트를 불러옵니다.
+            baseFilter = "type IN ('click', 'hover', 'change', 'report')"; 
         } else {
             baseFilter = "type IN ('sales', 'goods', 'order', 'event', 'coupon', 'review', 'pages')";
         }

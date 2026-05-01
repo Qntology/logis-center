@@ -439,6 +439,13 @@ async fn process_task(
     emit_term(&format!("[PROCESS] ⚙️ Task {} started processing.", task.id));
     emit_term(&format!("[DEBUG] Pug logs directory: {:?}", pug_logs_dir));
 
+    // 🌟 [추가] Analytic 작업일 경우 별도의 파이프라인으로 위임(Delegate)하여 처리합니다.
+    if task.r#type == "analytic_extraction" {
+        return crate::analytic::process_analytic_task(
+            task, store_mutex, model_mutex, cancellation_token, app_handle, device_preference
+        ).await;
+    }
+
     let kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id);
     if kv_path.exists() {
         emit_term(&format!("[PROCESS] Found existing KV cache for task {}. Ready to reuse.", task.id));
