@@ -1309,33 +1309,22 @@ async fn process_task(
                 if !ref_row.is_empty() {
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Analyzing table header structure...", "spinner": "⠋" }));
                     
-                    // 🌟 [CRITICAL FIX] Qwen(0.6B) 캐시와 호환되도록 pug_content 부분을 비워서 User 메시지를 가볍게 만듭니다.
-                    let thead_prompt = crate::parsing::extract_table_structure_prompt(&page_type, &target_selector, "", &ref_row);
+                    let thead_prompt = crate::parsing::extract_table_structure_prompt(&page_type, &target_selector, &light_pug, &ref_row);
                     let params = ChatCompletionParameters {
-                        messages: vec![
-                            // 🌟 System 메시지에 미리 구워둔 base_session_id(PUG 전체)를 주입하여 초고속으로 인식하게 만듭니다.
-                            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                                content: system_content.clone(),
-                                name: None,
-                            }),
-                            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                                content: ChatCompletionRequestUserMessageContent::Text(thead_prompt),
-                                name: None,
-                            })
-                        ],
-                        model: "qwen".to_string(), // 🌟 Qwen(0.6B) 모델 사용
+                        messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                            content: ChatCompletionRequestUserMessageContent::Text(thead_prompt),
+                            name: None,
+                        })],
+                        model: "qwen3.5".to_string(), 
                         max_tokens: Some(256), 
                         temperature: Some(0.0), 
                         top_p: Some(0.01),
                         ..Default::default()
                     };
 
-                    // 🌟 [CRITICAL FIX] Qwen3.5 대신 Qwen(0.6B) 모델의 캐시 라인을 열어 기존에 구워둔 PUG를 재활용합니다.
-                    model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                    model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
-                    // 🌟 qwen3_5_generator 가 아닌 기본 generator 를 사용합니다.
-                    if let Some(gen) = model.generator.lock().await.as_mut() {
-                        // 🌟 Qwen(0.6B)의 generate 함수를 통해 String 텍스트를 바로 반환받습니다.
+                    if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
                         if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_step_thead", task.id)), kv_name.clone()).await {
                             let thead_json = crate::parsing::parse_json_from_llm(&res);
                             

@@ -388,17 +388,34 @@ Based on the provided Pug template, identify the primary category of this webpag
 }"###.to_string() }
 
 pub fn extract_titles_prompt(page_type: &str) -> String {
+    let (category_desc, titles_desc, title_desc) = match page_type {
+        "goods" => ("product", "product titles", "product title"),
+        "order" => ("product", "order product titles", "order product title"),
+        "tracking" => ("product", "tracking product titles", "tracking product title"),
+        "review" => ("title", "review titles", "review title"),
+        "coupon" => ("title", "coupon titles", "coupon title"),
+        "event" => ("title", "event titles", "event title"),
+        _ => ("title", "titles", "title"),
+    };
+
     let template = r###"[TASK]
-Find all the {TYPE} titles from the following PUG/HTML content.
+Find all the {TITLES} from the following PUG/HTML content.
+
+[CONTEXT]
+Page Type: {TYPE}
 
 [SCHEMA DEFINITIONS]
-- title: {TYPE} title {String}
+- 'title': {TITLE} {String}
 
 [OUTPUT FORMAT]
-{ "{TYPE}" : [...] }
+{ "{CATEGORY}" : [...] }
 
 RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
-    template.replace("{TYPE}", page_type)
+
+    template.replace("{CATEGORY}", category_desc)
+            .replace("{TITLES}", titles_desc)
+            .replace("{TITLE}", title_desc)
+            .replace("{TYPE}", page_type)
 }
 
 pub fn is_detail_prompt(page_type: &str) -> String {
@@ -419,9 +436,9 @@ Look past global navigation menus and overarching search/filter forms at the top
 
 [SCHEMA DEFINITIONS]
 - {TYPE}:
-  - has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
-  - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
-  - detail: Boolean. True ONLY if has_list is false AND has_form is true.
+  - 'has_list': Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
+  - 'has_form': Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
+  - 'detail': Boolean. True ONLY if has_list is false AND has_form is true.
 
 [OUTPUT FORMAT]
 {
@@ -463,9 +480,9 @@ pub fn para2graph(language: &str) -> String {
 - original_text: String. The exact, unaltered full natural language input.
 - segmented_plan: String. The original text with '[type] text | ' format inserted strictly at type boundaries.
 - context:
-  - text: String.
-  - language: String. Default '{LANG}'.
-  - type: String. Choose one:
+  - 'text': String.
+  - 'language': String. Default '{LANG}'.
+  - 'type': String. Choose one:
     * 'order': Intent to measure sales performance or direct transactions. Triggers: conversion rate, sales volume, checkout, payment, cancellation, refund. (RULE: If the context measures buying success or revenue, classify as 'order' even if the word 'product' or 'item' is present).
     * 'goods': Intent to describe product catalog data, exposure, or traffic metrics. Triggers: page views, clicks, physical attributes, stock limits, unit prices. (RULE: Focuses on item specifications and customer traffic before the actual purchase).
     * 'tracking': Intent to manage logistics and fulfillment. Triggers: shipment status, dispatch, delivery duration, courier information.

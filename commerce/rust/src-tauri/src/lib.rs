@@ -25,6 +25,8 @@ use serde_json::{Value, json};
 
 // 🌟 [CRITICAL FIX] 전역 검색 상태 락: 검색 중 스레드 데드락 방지
 static IS_SEARCHING: AtomicBool = AtomicBool::new(false);
+// 브라우저가 실행되는 도중 상태를 방어하기 위한 락 추가
+pub static IS_BROWSER_LAUNCHING: AtomicBool = AtomicBool::new(false);
 
 pub static ACTIVE_TASK_MEM: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::new(None));
 pub static CURRENT_UI_CATEGORY: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::from("Processing")));
@@ -200,9 +202,22 @@ async fn launch_browser(
     state.cancellation_token.store(false, Ordering::SeqCst);
     crate::utils::set_extraction_stop_signal(false);
 
-    automation::run_browser_automation(browser, url, script, app_handle)
-        .await
-        .map_err(|e| e.to_string())
+    crate::IS_BROWSER_LAUNCHING.store(true, Ordering::SeqCst);
+    
+    let result = automation::run_browser_automation(browser, url, script, app_handle).await;
+
+    // 🌟 [CRITICAL FIX] Error 반환과 관계없이, 크롬 프로세스 포트가 물리적으로 응답(reachable)하거나 
+    // 메모리(is_some)에 오를 때까지 최대 10초간 대기하여 시작 도중 버튼이 깜빡이는 현상을 원천 차단합니다.
+    for _ in 0..20 {
+        if automation::GLOBAL_BROWSER.lock().await.is_some() || automation::is_browser_reachable().await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    crate::IS_BROWSER_LAUNCHING.store(false, Ordering::SeqCst);
+
+    result.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -227,10 +242,22 @@ async fn launch_best_browser(
         return Err("No supported browser found.".to_string());
     };
     
-    // Launch with default empty script
-    automation::run_browser_automation(target.to_string(), url, "".to_string(), app_handle)
-        .await
-        .map_err(|e| e.to_string())
+    crate::IS_BROWSER_LAUNCHING.store(true, Ordering::SeqCst);
+    
+    let result = automation::run_browser_automation(target.to_string(), url, "".to_string(), app_handle).await;
+
+    // 🌟 [CRITICAL FIX] Error 반환과 관계없이, 크롬 프로세스 포트가 물리적으로 응답(reachable)하거나 
+    // 메모리(is_some)에 오를 때까지 최대 10초간 대기하여 시작 도중 버튼이 깜빡이는 현상을 원천 차단합니다.
+    for _ in 0..20 {
+        if automation::GLOBAL_BROWSER.lock().await.is_some() || automation::is_browser_reachable().await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    crate::IS_BROWSER_LAUNCHING.store(false, Ordering::SeqCst);
+
+    result.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1155,11 +1182,21 @@ async fn extract_html_from_current_tab() -> Result<String, String> {
 
 #[tauri::command]
 async fn get_browser_status() -> Result<Value, String> {
-    let is_running = {
-        let guard = automation::GLOBAL_BROWSER.lock().await;
-        guard.is_some() || automation::is_browser_reachable().await
-    };
+    let is_launching = crate::IS_BROWSER_LAUNCHING.load(std::sync::atomic::Ordering::SeqCst);
+    
+    // 🌟 [CRITICAL FIX] 시간/스트라이크 예측을 완전히 배제하고 OS 포트 응답과 메모리 상태의 교집합으로만 판별합니다.
+    let reachable = automation::is_browser_reachable().await;
+    let mut guard = automation::GLOBAL_BROWSER.lock().await;
+    
+    if guard.is_some() && !reachable {
+        println!("[BROWSER-STATUS] 🔴 [{}] Browser closed (Port disconnected). Memory cleared.", chrono::Utc::now().format("%H:%M:%S%.3f"));
+        *guard = None; // 물리적으로 꺼졌다면 즉시 메모리 비움
+    }
+    
+    // 론칭 중이거나, 메모리에 있거나, 포트가 살아있다면 무조건 실행 중으로 판정
+    let is_running = is_launching || guard.is_some() || reachable;
 
+    // 실행 중이거나 실행을 시작하는 중이면 프론트엔드 버튼을 숨기기 위해 running으로 응답
     let status = if is_running { "running" } else { "stopped" };
 
     // 🌟 [추가] 브라우저가 살아있다면, 백엔드가 기억하는 최신 URL 상태도 함께 묶어서 반환합니다.
@@ -1364,8 +1401,16 @@ async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, St
     }
     
     let browser_status = {
-        let guard = automation::GLOBAL_BROWSER.lock().await;
-        if guard.is_some() || automation::is_browser_reachable().await { "running".to_string() } else { "stopped".to_string() }
+        let is_launching = crate::IS_BROWSER_LAUNCHING.load(std::sync::atomic::Ordering::SeqCst);
+        let reachable = automation::is_browser_reachable().await;
+        let mut guard = automation::GLOBAL_BROWSER.lock().await;
+        
+        if guard.is_some() && !reachable {
+            *guard = None;
+        }
+        
+        let is_running = is_launching || guard.is_some() || reachable;
+        if is_running { "running".to_string() } else { "stopped".to_string() }
     };
 
     let (current_url, is_client, is_admin) = {
@@ -1461,6 +1506,33 @@ pub fn run() {
             let auto_reconnect_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let _ = automation::try_reconnect_existing_browser(auto_reconnect_handle).await;
+            });
+
+            // 🌟 [CRITICAL FIX] Rust 백엔드에서 브라우저 상태를 주기적으로 감시하여 프론트엔드에 시그널을 보내는 전용 데몬 추가
+            let status_monitor_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut last_status = String::new();
+                loop {
+                    let is_launching = crate::IS_BROWSER_LAUNCHING.load(std::sync::atomic::Ordering::SeqCst);
+                    let reachable = automation::is_browser_reachable().await;
+                    let mut guard = automation::GLOBAL_BROWSER.lock().await;
+                    
+                    if guard.is_some() && !reachable {
+                        *guard = None; // 즉각적인 메모리 해제
+                    }
+                    
+                    let is_running = is_launching || guard.is_some() || reachable;
+                    let current_status = if is_running { "running".to_string() } else { "stopped".to_string() };
+                    
+                    if current_status != last_status {
+                        println!("[BROWSER-STATUS] 🔵 [{}] State Changed: {} -> {}", chrono::Utc::now().format("%H:%M:%S%.3f"), last_status, current_status);
+                        use tauri::Emitter;
+                        let _ = status_monitor_handle.emit("browser-status", current_status.clone());
+                        last_status = current_status;
+                    }
+                    // 빠른 UI 복구를 위해 1초 간격으로 감시 속도 단축
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
             });
 
             let event_store = app.state::<AppState>().store.clone();

@@ -2369,12 +2369,12 @@ btnStopTask?.addEventListener("click", async () => {
 // --- Browser Auto ---
 btnAutoLaunch?.addEventListener("click", async () => { 
     try { 
-        // [FIX] Hide immediately on click for better UX
+        // 클릭 즉시 프론트엔드 버튼을 숨깁니다.
+        // 성공/실패 여부 및 버튼 복구는 100% Rust 백그라운드 상태 모니터(browser-status)에 위임합니다.
         btnAutoLaunch.style.display = "none";
         await invoke("launch_best_browser", { url: "about:blank" }); 
     } catch (e) { 
-        console.error("Launch error:", e); 
-        btnAutoLaunch.style.display = "flex"; // Restore on error
+        console.error("Launch command sent, delegating state to Rust signal:", e); 
     } 
 });
 const autoBrowser = document.getElementById("auto-browser") as HTMLSelectElement;
@@ -2401,9 +2401,19 @@ autoBtn?.addEventListener("click", async () => {
 
 listen("browser-status", async (event: any) => {
     const status = event.payload; 
-    console.log("[WIDGET] Browser Status Changed:", status);
+    const timeLog = new Date().toISOString().split('T')[1].slice(0, -1);
+    console.log(`[WIDGET] 🔵 [${timeLog}] Browser Status Event Received: ${status}`);
+    
+    // Rust가 보내주는 정확한 상태에만 의존하여 버튼을 노출/숨김 처리합니다.
     if (btnAutoLaunch) btnAutoLaunch.style.display = (status === "running") ? "none" : "flex";
-    if (status === "stopped") { currentDetectedUrl = ""; await updateExtractButtonVisibility(); }
+    
+    if (status === "stopped") { 
+        currentDetectedUrl = ""; 
+        await updateExtractButtonVisibility(); 
+    }
+    // 🌟 [CRITICAL FIX] 백엔드에서 온 'running' 이벤트를 100% 신뢰합니다.
+    // 여기서 syncBrowserStatus()를 다시 호출하면, 백엔드가 아직 브라우저를 띄우는 중일 때
+    // 오판하여 버튼을 다시 노출시켜버리는 레이스 컨디션(깜빡임)이 발생하므로 재확인 로직을 삭제합니다.
 });
 
 // --- List Logic (Updated for Cards) ---
