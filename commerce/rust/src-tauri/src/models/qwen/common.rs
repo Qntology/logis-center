@@ -703,7 +703,20 @@ pub fn eager_attention_forward(
         let k_block = key_states.narrow(2, start, end - start)?;
         let v_block = value_states.narrow(2, start, end - start)?; 
 
-        let attn_weights = (q_aligned.matmul(&k_block.transpose(2, 3)?)? * scaling)?; 
+        // 🌟 [CRITICAL FIX] VRAM 폭발 없이 완벽한 정확도를 회복하는 비결!
+        // 3.4만 토큰 전체가 아닌, 4096 단위로 잘라낸 작은 블록(k_block, v_block)에 대해서만 
+        // GQA (repeat_kv) 텐서 확장을 수행하여 메모리를 아끼고 수학적 정합성을 100% 복구합니다.
+        let (mut k, mut v) = (k_block, v_block);
+        if let Some(groups) = num_key_value_groups {
+            if groups > 1 {
+                let (b, h, s, d) = k.dims4()?;
+                k = k.unsqueeze(2)?.expand((b, h, groups, s, d))?.reshape((b, h * groups, s, d))?;
+                v = v.unsqueeze(2)?.expand((b, h, groups, s, d))?.reshape((b, h * groups, s, d))?;
+            }
+        }
+
+        // 확장된 k와 v를 사용하여 정상적으로 연산 진행
+        let attn_weights = (q_aligned.matmul(&k.transpose(2, 3)?)? * scaling)?;
         
         // 마스크 처리
         let attn_weights = if let Some(mask) = attention_mask {
@@ -721,19 +734,12 @@ pub fn eager_attention_forward(
             attn_weights
         };
 
-        // 수치적 안정성을 위한 Max 로짓 추출 및 통합 준비
         let max_logits = attn_weights.max_keepdim(D::Minus1)?;
-        
-        // 🌟 [CRITICAL FIX] NaN 파괴 현상 원천 차단 패치
-        let safe_floor = Tensor::new(-10000.0_f32, max_logits.device())?
-            .to_dtype(max_logits.dtype())?
-            .broadcast_as(max_logits.shape())?;
-        let max_logits_safe = max_logits.maximum(&safe_floor)?;
-
-        let exp_weights = attn_weights.broadcast_sub(&max_logits_safe)?.exp()?;
+        let exp_weights = attn_weights.broadcast_sub(&max_logits)?.exp()?; // safe_floor 없이 순수 exp 연산!
         let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
         
-        let out_block = exp_weights.to_dtype(v_block.dtype())?.matmul(&v_block)?;
+        // v 역시 위에서 확장된 v를 사용
+        let out_block = exp_weights.to_dtype(v.dtype())?.matmul(&v)?;
 
         block_outputs.push(out_block);
         block_lse.push((sum_exp, max_logits));
