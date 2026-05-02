@@ -1561,7 +1561,7 @@ pub fn run() {
                     if current_status != last_status {
                         println!("[BROWSER-STATUS] 🔵 [{}] State Changed: {} -> {}", chrono::Utc::now().format("%H:%M:%S%.3f"), last_status, current_status);
                         
-                        // 🌟 [CRITICAL FIX] 백그라운드 워커인지 사용자 화면인지 구분하기 위해 현재 상태를 조회합니다.
+                        // 🌟 [CRITICAL FIX] 백그라운드 워커인지 사용자 화면인지 구분하기 위해 현재 상태를 조회합니다
                         let is_launching = crate::IS_BROWSER_LAUNCHING.load(std::sync::atomic::Ordering::SeqCst);
                         let (is_client, is_admin, url) = {
                             let state = automation::LAST_DETECTED_STATE.lock().await;

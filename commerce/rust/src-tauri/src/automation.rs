@@ -186,41 +186,46 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
 
             // 🌟 1. 모든 탭에 고유 ID를 부여하고 상태를 가져옵니다.
             for page in pages.iter().rev() {
-                // 브라우저 탭 내부에 몰래 ID를 심고 가져오는 JS 스크립트
                 let script = r#"
                     (function() {
-                        window.__logis_tab_id = window.__logis_tab_id || Math.random().toString(36).substring(2);
-                        return JSON.stringify({
-                            id: window.__logis_tab_id,
-                            url: window.location.href,
-                            focus: document.hasFocus(),
-                            visible: document.visibilityState === 'visible'
-                        });
+                        try {
+                            window.__logis_tab_id = window.__logis_tab_id || Math.random().toString(36).substring(2);
+                            return JSON.stringify({
+                                id: window.__logis_tab_id,
+                                url: window.location.href,
+                                focus: document.hasFocus ? document.hasFocus() : false,
+                                visible: document.visibilityState === 'visible'
+                            });
+                        } catch(e) { return null; }
                     })();
                 "#;
 
-                if let Ok(res) = page.evaluate(script).await {
-                    if let Some(val_str) = res.into_value::<String>().ok() {
-                        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str) {
-                            let tab_id = json_val.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                            let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                            let has_focus = json_val.get("focus").and_then(|v| v.as_bool()).unwrap_or(false);
+                // 🌟 [핵심] 300ms 타임아웃을 적용하여 탭 응답 지연이 전체 모니터링 루프를 블로킹하지 않도록 합니다.
+                let eval_result = tokio::time::timeout(Duration::from_millis(300), page.evaluate(script)).await;
 
-                            // [A] 사용자가 특정 탭(빈 탭 포함)을 클릭해서 포커스를 가졌다면 무조건 장부 갱신!
-                            if has_focus {
-                                last_focused_tab_id = tab_id.to_string();
-                                active_tab_id = tab_id.to_string();
-                                active_url = tab_url.to_string();
-                                found_focus = true;
-                                break;
-                            }
+                match eval_result {
+                    Ok(Ok(res)) => {
+                        if let Some(val_str) = res.into_value::<String>().ok() {
+                            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str) {
+                                let tab_id = json_val.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                let has_focus = json_val.get("focus").and_then(|v| v.as_bool()).unwrap_or(false);
 
-                            // [B] 포커스는 없지만, 장부에 적어둔 ID와 일치하는 탭이 아직 닫히지 않고 살아있다면 주소 킵
-                            if !last_focused_tab_id.is_empty() && tab_id == last_focused_tab_id {
-                                remembered_url = tab_url.to_string();
+                                if has_focus {
+                                    last_focused_tab_id = tab_id.to_string();
+                                    active_tab_id = tab_id.to_string();
+                                    active_url = tab_url.to_string();
+                                    found_focus = true;
+                                    break;
+                                }
+
+                                if !last_focused_tab_id.is_empty() && tab_id == last_focused_tab_id {
+                                    remembered_url = tab_url.to_string();
+                                }
                             }
                         }
-                    }
+                    },
+                    _ => continue, // 타임아웃이나 에러 발생 시 해당 탭은 무시하고 루프 유지
                 }
             }
 
@@ -279,15 +284,21 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                 state.is_admin = is_admin;
             }
 
-            // UI 통신
+            // UI 통신: URL이 변경되지 않았더라도 브라우저가 물리적으로 살아있다면 
+            // 프론트엔드에 "running" 상태와 현재 URL 정보를 매 루프(800ms)마다 강제 동기화합니다.
+            // URL이 비어있어도(about:blank) status가 running이면 Launch 버튼은 숨겨져야 합니다.
+            let payload = json!({
+                "url": active_url.clone(),
+                "is_client": is_client,
+                "is_admin": is_admin,
+                "status": "running",
+                "hide_button": true
+            });
+            
+            // URL 변경 시 즉시 알림 및 3회 루프마다 생존 신호(Heartbeat) 발송
             if active_url != last_detected_url || current_is_shop != last_is_shop {
-                let payload = json!({
-                    "url": active_url.clone(),
-                    "is_client": is_client,
-                    "is_admin": is_admin
-                });
-                
                 let _ = app_handle.emit("browser-match-found", &payload);
+                let _ = app_handle.emit("browser-status", &payload);
                 
                 last_detected_url = active_url;
                 last_is_shop = current_is_shop;
@@ -306,6 +317,9 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                         let _ = std::fs::write("tmp/index.json", json_str);
                     }
                 }
+            } else {
+                // 변경이 없더라도 브라우저가 실행 중임을 UI에 주기적으로 알려 플리커링 방지
+                let _ = app_handle.emit("browser-status", &payload);
             }
             tokio::time::sleep(Duration::from_millis(800)).await; 
         }

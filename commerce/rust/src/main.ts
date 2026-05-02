@@ -556,153 +556,142 @@ if (pillNav) {
 let extractClickLock = false; 
 
 async function updateExtractButtonVisibility() {
-    if (!btnExtract) return;
+    if (!btnExtract || !btnAutoLaunch) return;
 
-    // 🌟 [CRITICAL FIX] 대기열 추가를 허용하기 위해 isExtracting/isSearching 등의 전역 잠금을 해제합니다.
-    // 오직 더블클릭 방지용 extractClickLock만 유지합니다.
-    if (extractClickLock) {
+    // 1. 브라우저 물리 상태 체크 (동기/즉시 실행)
+    if (!isBrowserRunning && !isAutoLaunchLocked) {
+        btnAutoLaunch.style.display = "flex";
+        btnAutoLaunch.classList.remove("hidden");
         btnExtract.style.display = "none";
         return;
     }
 
-    // 5초 고아 락 해제 로직은 유지하되 버튼 숨김은 제거합니다. (UI 정리를 위함)
-    const currentLock = await kvGet("sys_lock");
-    if (currentLock) {
-        const lockEl = document.getElementById(currentLock);
-        if (!lockEl) {
-            const lockTime = parseInt(currentLock.split('_')[1] || "0");
-            if (Date.now() - lockTime > 5000) {
-                console.warn(`[LOCK] Orphaned lock detected: ${currentLock}. Releasing.`);
-                await kvRemove("sys_lock");
-            }
-        }
+    btnAutoLaunch.style.display = "none";
+    btnAutoLaunch.classList.add("hidden");
+
+    // 2. URL 유효성 및 이미지 업로드 즉시 검사
+    const isInvalidUrl = !currentDetectedUrl || 
+                         currentDetectedUrl === "" || 
+                         currentDetectedUrl === "about:blank" || 
+                         currentDetectedUrl.startsWith("chrome://") || 
+                         currentDetectedUrl.startsWith("edge://");
+
+    if (!currentImage && isInvalidUrl) {
+        btnExtract.style.display = "none";
+        btnExtract.classList.add("hidden");
+        return;
     }
 
-    // 1. 이미지가 올라와 있을 때 중복 대기열 방어 로직
-    if (currentImage) {
+    // 3. 도메인 허용 여부 판별 (DB 조회 없이 DOM 캐시 활용)
+    let isAllowedDomain = isCurrentShop;
+
+    if (!isAllowedDomain && currentDetectedUrl) {
         try {
-            const ccHash = activeContext.cc || "";
-            const imageRefHash = await hashId(currentImage); 
-
-            const isImageActive = await invoke<boolean>("check_active_task", {
-                payload: { cc: ccHash, ref: imageRefHash }
-            });
-            
-            // 🌟 프론트엔드 대기열(큐)에 동일한 이미지가 이미 들어있는지 검사
-            const isImageQueued = GlobalTaskManager.queue.some(q => q.payload && q.payload.ref === imageRefHash);
-
-            if (isImageActive || isImageQueued) {
-                btnExtract.style.display = "none";
-            } else {
-                btnExtract.style.display = "flex";
-                btnExtract.innerHTML = "⚡";
-                btnExtract.classList.remove("active-spinner");
-                btnExtract.title = "Extract from Image";
+            const currentHostname = new URL(currentDetectedUrl.toLowerCase()).hostname;
+            // DB를 비동기로 호출하지 않고 이미 그려진 내비게이션 요소에서 도메인 목록을 즉시 확인합니다.
+            const pageList = document.getElementById("nav-list-pages");
+            if (pageList) {
+                const labels = Array.from(pageList.querySelectorAll(".logis-label")) as HTMLElement[];
+                isAllowedDomain = labels.some(label => {
+                    const domain = label.dataset.domain;
+                    return domain && (currentHostname === domain || currentHostname.endsWith("." + domain));
+                });
             }
-        } catch (e) {
-            btnExtract.style.display = "flex";
-        }
-        return;
+        } catch (e) { isAllowedDomain = false; }
     }
 
-    // 2. URL이 아예 감지되지 않았다면 숨김
-    if (!currentDetectedUrl) {
+    // 4. 즉시 가시성 결정 (사용자 체감 지연 제거)
+    if (isAllowedDomain || currentImage) {
+        btnExtract.style.display = "flex";
+        btnExtract.innerHTML = "⚡";
+        btnExtract.classList.remove("hidden");
+    } else {
         btnExtract.style.display = "none";
-        return;
+        btnExtract.classList.add("hidden");
+        return; 
     }
 
-    try {
-        const currentUrlObj = new URL(currentDetectedUrl.toLowerCase());
-        const currentHostname = currentUrlObj.hostname;
-
-        // 🌟 [CRITICAL FIX] 백엔드에서 인증한 샵(isCurrentShop)이 아니더라도, 
-        // 내가 가진 Pages 도메인 목록에 포함되어 있다면 추출을 허용합니다.
-        let isAllowedDomain = isCurrentShop;
-        
-        if (!isAllowedDomain) {
-            const pages = await Select["pages"]({});
-            isAllowedDomain = pages.some((p: any) => {
-                const data = p.data || p;
-                if (!data.origin) return false;
-                try {
-                    const originHost = new URL(data.origin.toLowerCase()).hostname;
-                    // 정확한 호스트명 일치 또는 서브도메인 여부만 검사하여 오작동 방지
-                    return currentHostname === originHost || currentHostname.endsWith("." + originHost);
-                } catch(e) {
-                    return false;
-                }
-            });
-        }
-
-        // 허용되지 않은 도메인이면 버튼을 숨김
-        if (!isAllowedDomain) {
+    // 5. 무거운 비동기 작업(Lock 확인 및 태스크 상태 질의)은 UI 노출 후에 백그라운드에서 처리
+    (async () => {
+        // 더블 클릭 락만 최우선 방어
+        if (extractClickLock) {
             btnExtract.style.display = "none";
             return;
         }
 
-        // 🌟 [신규] 3. Pages 네비게이션 검증 로직
-        // 사용자가 사이드바에서 선택한 도메인 태그를 찾습니다.
-        const domainTag = activeTags.find(t => t.type === 'domain');
-
-        if (domainTag) {
-            // 태그 값(예: "demofran.com")과 현재 호스트네임 비교
-            if (!currentHostname.includes(domainTag.value)) {
-                // 도메인이 다르면 추출 버튼을 숨기고 로직을 종료합니다.
-                btnExtract.style.display = "none";
-                return;
+        // 고아 락 해제용 로직 (버튼 가시성에는 영향 주지 않음)
+        const currentLock = await kvGet("sys_lock");
+        if (currentLock) {
+            const lockEl = document.getElementById(currentLock);
+            if (!lockEl) {
+                const lockTime = parseInt(currentLock.split('_')[1] || "0");
+                if (Date.now() - lockTime > 5000) { await kvRemove("sys_lock"); }
             }
         }
 
-        // 4. 백엔드에 현재 페이지 작업 상태 질의 및 ID 생성
-        const link = (currentUrlObj.pathname + currentUrlObj.search).toLowerCase();
-        const ccHash = await hashId(currentHostname);
-        // 🌟 [CRITICAL FIX] 클라우드 로직(index.ts)과 완벽히 동일하게 Team ID를 포함하여 고유 Ref ID를 생성합니다.
-        const teamId = currentSession.team || "";
-        const hashedRefId = await hashId(teamId + ccHash + link);
+        try {
+            // 🌟 [CRITICAL FIX] 전역 변수(isExtracting)에 의존하지 않고, 
+            // 오직 "현재 포커스된 URL/이미지"가 대기열에 있는지 1:1로만 대조합니다.
+            if (currentImage) {
+                const imageRefHash = await hashId(currentImage); 
+                const isActive = await invoke<boolean>("check_active_task", { payload: { cc: activeContext.cc || "", ref: imageRefHash } });
+                const isQueued = GlobalTaskManager.queue.some(q => q.payload && q.payload.ref === imageRefHash);
 
-        btnExtract.title = `Extract from ${currentHostname}`;
-
-        const isActive = await invoke<boolean>("check_active_task", {
-            payload: { cc: ccHash, ref: hashedRefId }
-        });
-
-        // 🌟 프론트엔드 대기열(큐)에 동일한 주소가 이미 들어있는지 검사
-        const isQueued = GlobalTaskManager.queue.some(q => q.payload && (q.payload.ref === hashedRefId || q.payload.link === link));
-
-        if (isActive || isQueued) {
-            btnExtract.style.display = "none";
-        } else {
-            btnExtract.style.display = "flex";
-            btnExtract.innerHTML = "⚡";
-            btnExtract.classList.remove("active-spinner");
+                if (isActive || isQueued) {
+                    btnExtract.style.display = "none";
+                }
+            } else if (currentDetectedUrl) {
+                const urlObj = new URL(currentDetectedUrl.toLowerCase());
+                const link = (urlObj.pathname + urlObj.search).toLowerCase();
+                const ccHash = await hashId(urlObj.hostname);
+                const hashedRefId = await hashId((currentSession.team || "") + ccHash + link);
+                
+                const isActive = await invoke<boolean>("check_active_task", { payload: { cc: ccHash, ref: hashedRefId } });
+                const isQueued = GlobalTaskManager.queue.some(q => q.payload && (q.payload.ref === hashedRefId || q.payload.link === link));
+                
+                if (isActive || isQueued) {
+                    btnExtract.style.display = "none";
+                }
+            }
+        } catch (e) {
+            // 통신 에러 발생 시 기존 상태(노출) 유지
         }
-    } catch (e) {
-        console.warn("[WIDGET] visibility check error:", e);
-        btnExtract.style.display = "none"; // 에러 시에는 안전하게 숨김 처리
-    }
+    })();
 }
 
 listen("browser-match-found", async (event: any) => {
     const payload = event.payload;
-    console.log("[WIDGET] Browser Match Found:", payload);
     
-    currentDetectedUrl = payload.url;
-    isCurrentShop = payload.is_client || payload.is_admin;
-
-    if (!payload.url) {
-        // 🌟 [CRITICAL FIX] 확실한 앱 종료 신호(빈 URL)가 수신될 때만 락을 해제하고 버튼을 즉각 복구합니다.
-        isAutoLaunchLocked = false;
+    // 신호가 오면 즉시 브라우저 실행 상태를 확정 짓습니다.
+    if (payload.status === "running" || (payload.url && payload.url !== "")) {
+        isBrowserRunning = true;
+    } else if (payload.status === "stopped") {
         isBrowserRunning = false;
-        if (btnAutoLaunch) {
-            btnAutoLaunch.style.display = "flex";
-            btnAutoLaunch.classList.remove("hidden");
-        }
-        await updateExtractButtonVisibility();
-        return;
+        isAutoLaunchLocked = false;
+    }
+
+    currentDetectedUrl = payload.url || "";
+    isCurrentShop = payload.is_client || payload.is_admin || false;
+
+    // 통합 가시성 로직 호출
+    await updateExtractButtonVisibility();
+    await renderNavigation();
+});
+
+listen("browser-status", async (event: any) => {
+    const payload = event.payload; 
+    const statusStr = typeof payload === "object" ? payload.status : payload;
+    
+    if (statusStr === "running") {
+        isBrowserRunning = true;
+        isAutoLaunchLocked = true; // 실행 중엔 런처 버튼 잠금
+    } else if (statusStr === "stopped") {
+        isBrowserRunning = false;
+        isAutoLaunchLocked = false;
+        currentDetectedUrl = "";
     }
     
     await updateExtractButtonVisibility();
-    await renderNavigation();
 });
 
 const handleSearchInteraction = () => {
@@ -3961,6 +3950,8 @@ async function initSession() {
         if (data.current_url) {
             currentDetectedUrl = data.current_url;
             isCurrentShop = data.is_client || data.is_admin;
+            // 🌟 [CRITICAL FIX] URL 복구 직후 명시적으로 버튼 UI 업데이트 로직을 트리거하여 화면에 즉시 노출되도록 강제
+            await updateExtractButtonVisibility();
         }
 
         // 아이템 리스트 캐싱
@@ -4070,6 +4061,12 @@ async function syncBrowserStatus() {
     try { 
         const res = await invoke<any>("get_browser_status"); 
         const s = res.status;
+
+        // 🌟 [CRITICAL FIX] 백엔드 응답에서 URL과 권한 상태도 즉시 추출하여 동기화 (초기 로드 시 버튼 숨김 방지)
+        if (res.url) {
+            currentDetectedUrl = res.url;
+            isCurrentShop = res.is_client || res.is_admin;
+        }
 
         if (s === "running") {
             isBrowserRunning = true;
