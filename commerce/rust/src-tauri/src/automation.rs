@@ -118,7 +118,7 @@ pub async fn try_reconnect_existing_browser(app_handle: tauri::AppHandle) -> any
                 }
                 let mut global = GLOBAL_BROWSER.lock().await; 
                 *global = None; 
-                let _ = app_handle.emit("browser-status", "stopped");
+                // 🌟 [CRITICAL FIX] 가짜 종료 시그널 전송 제거
             });
             Ok(())
         },
@@ -312,7 +312,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
         
         let mut global = GLOBAL_BROWSER.lock().await;
         *global = None;
-        let _ = app_handle.emit("browser-status", "stopped");
+        // 🌟 [CRITICAL FIX] 가짜 종료 시그널 전송 제거
         let _ = app_handle.emit("browser-match-found", json!({ "url": "", "is_client": false, "is_admin": false }));
         println!("[AUTO] Browser monitor exited cleanly.");
     });
@@ -337,7 +337,7 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
                     tokio::spawn(async move {
                         while let Some(h) = handler.next().await { if let Err(_) = h { break; } }
                         let mut g = GLOBAL_BROWSER.lock().await; *g = None; 
-                        let _ = app_handle_clone.emit("browser-status", "stopped");
+                        // 🌟 [CRITICAL FIX] 가짜 종료 시그널 전송 제거
                     });
                 }
             }
@@ -406,16 +406,30 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
         tokio::spawn(async move {
             while let Some(h) = handler.next().await { if let Err(_) = h { break; } }
             let mut global = GLOBAL_BROWSER.lock().await; *global = None; 
-            let _ = app_handle_clone.emit("browser-status", "stopped");
+            // 🌟 [CRITICAL FIX] 가짜 종료 시그널 전송 제거
         });
         new_arc
     };
 
-    println!("[AUTO] Navigating to {}...", url);
-    let page = browser_arc.new_page(url).await.map_err(|e| anyhow!("Page creation failed: {}", e))?;
+    println!("[AUTO] Targeting initial page for {}...", url);
     
-    // [CRITICAL STEALTH] Redefine navigator.webdriver to bypass detection
+    // 새 페이지를 생성(new_page)하지 않고, 브라우저 시작 시 자동 생성된 기존 페이지들을 가져옵니다.
+    let pages = browser_arc.pages().await.map_err(|e| anyhow!("Failed to get pages: {}", e))?;
+    
+    // 첫 번째 페이지를 선택합니다. 만약 없다면(이례적인 상황) 새 페이지를 만듭니다.
+    let page = if let Some(first_page) = pages.first() {
+        first_page.clone()
+    } else {
+        browser_arc.new_page("about:blank").await.map_err(|e| anyhow!("Page creation failed: {}", e))?
+    };
+
+    // [CRITICAL STEALTH] 탐지 우회 스크립트 설정
     let _ = page.evaluate_on_new_document("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})").await;
+
+    // 기존 페이지가 이미 about:blank라면 굳이 다시 이동(goto)하지 않고, 다른 URL일 때만 이동시킵니다.
+    if !url.is_empty() && url != "about:blank" {
+        page.goto(url).await.map_err(|e| anyhow!("Navigation failed: {}", e))?;
+    }
     
     Ok(format!("Automation Started."))
 }

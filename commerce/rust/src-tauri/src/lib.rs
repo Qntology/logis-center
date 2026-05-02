@@ -28,6 +28,10 @@ static IS_SEARCHING: AtomicBool = AtomicBool::new(false);
 // 브라우저가 실행되는 도중 상태를 방어하기 위한 락 추가
 pub static IS_BROWSER_LAUNCHING: AtomicBool = AtomicBool::new(false);
 
+// 🌟 [CRITICAL FIX] 상태 토글(깜빡임) 방어용 전역 상태 및 시간값 저장소
+pub static CURRENT_BROWSER_STATE: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("stopped".to_string()));
+pub static LAST_BROWSER_STATE_CHANGE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
 pub static ACTIVE_TASK_MEM: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::new(None));
 pub static CURRENT_UI_CATEGORY: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::from("Processing")));
 // 🌟 [CRITICAL FIX] SSD에 적히지 않는 실시간 퍼센트 데이터를 붙잡아둘 0.01초 단위 메모리 캐시!
@@ -202,19 +206,25 @@ async fn launch_browser(
     state.cancellation_token.store(false, Ordering::SeqCst);
     crate::utils::set_extraction_stop_signal(false);
 
+    // 함수 진입 시점에 즉시 락을 걸어 get_browser_status가 stopped를 반환하지 못하게 함
     crate::IS_BROWSER_LAUNCHING.store(true, Ordering::SeqCst);
+    {
+        let mut current_state = crate::CURRENT_BROWSER_STATE.write().unwrap();
+        *current_state = "running".to_string();
+        crate::LAST_BROWSER_STATE_CHANGE.store(chrono::Utc::now().timestamp_millis(), Ordering::SeqCst);
+    }
     
     let result = automation::run_browser_automation(browser, url, script, app_handle).await;
 
-    // 🌟 [CRITICAL FIX] Error 반환과 관계없이, 크롬 프로세스 포트가 물리적으로 응답(reachable)하거나 
-    // 메모리(is_some)에 오를 때까지 최대 10초간 대기하여 시작 도중 버튼이 깜빡이는 현상을 원천 차단합니다.
+    // 실행 결과와 상관없이 포트가 열릴 때까지 기다리거나, 실패 시에도 IS_BROWSER_LAUNCHING은 유지됨
     for _ in 0..20 {
-        if automation::GLOBAL_BROWSER.lock().await.is_some() || automation::is_browser_reachable().await {
+        if automation::is_browser_reachable().await {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
+    // 충분한 안정화 시간을 거친 후 런칭 플래그 해제
     crate::IS_BROWSER_LAUNCHING.store(false, Ordering::SeqCst);
 
     result.map_err(|e| e.to_string())
@@ -246,10 +256,10 @@ async fn launch_best_browser(
     
     let result = automation::run_browser_automation(target.to_string(), url, "".to_string(), app_handle).await;
 
-    // 🌟 [CRITICAL FIX] Error 반환과 관계없이, 크롬 프로세스 포트가 물리적으로 응답(reachable)하거나 
-    // 메모리(is_some)에 오를 때까지 최대 10초간 대기하여 시작 도중 버튼이 깜빡이는 현상을 원천 차단합니다.
+    // 🌟 [CRITICAL FIX] 메모리 등재(is_some)는 즉시 이루어지므로 대기열을 바로 통과해버리는 버그를 차단합니다.
+    // Error 반환과 관계없이, 크롬 프로세스 포트가 100% 물리적으로 응답(reachable)할 때까지 최대 10초간 대기합니다.
     for _ in 0..20 {
-        if automation::GLOBAL_BROWSER.lock().await.is_some() || automation::is_browser_reachable().await {
+        if automation::is_browser_reachable().await {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1184,30 +1194,44 @@ async fn extract_html_from_current_tab() -> Result<String, String> {
 async fn get_browser_status() -> Result<Value, String> {
     let is_launching = crate::IS_BROWSER_LAUNCHING.load(std::sync::atomic::Ordering::SeqCst);
     
-    // 🌟 [CRITICAL FIX] 시간/스트라이크 예측을 완전히 배제하고 OS 포트 응답과 메모리 상태의 교집합으로만 판별합니다.
+    // 1. 물리적 포트 응답 확인 및 메모리 가드 획득
     let reachable = automation::is_browser_reachable().await;
-    let mut guard = automation::GLOBAL_BROWSER.lock().await;
+    let guard = automation::GLOBAL_BROWSER.lock().await; // 🌟 mut 제거
     
-    if guard.is_some() && !reachable {
-        println!("[BROWSER-STATUS] 🔴 [{}] Browser closed (Port disconnected). Memory cleared.", chrono::Utc::now().format("%H:%M:%S%.3f"));
-        *guard = None; // 물리적으로 꺼졌다면 즉시 메모리 비움
-    }
+    // 🌟 [CRITICAL FIX] TcpStream 타임아웃 등 네트워크 지연으로 인한 오판독(reachable=false) 시 
+    // 브라우저 객체를 강제로 None 처리해버리는 치명적 버그 삭제. 실제 종료 정리는 백그라운드 핸들러가 수행함.
     
-    // 론칭 중이거나, 메모리에 있거나, 포트가 살아있다면 무조건 실행 중으로 판정
+    // 2. 현재 브라우저의 물리적 실행 여부 판별
     let is_running = is_launching || guard.is_some() || reachable;
+    let target_status = if is_running { "running" } else { "stopped" };
 
-    // 실행 중이거나 실행을 시작하는 중이면 프론트엔드 버튼을 숨기기 위해 running으로 응답
-    let status = if is_running { "running" } else { "stopped" };
-
-    // 🌟 [추가] 브라우저가 살아있다면, 백엔드가 기억하는 최신 URL 상태도 함께 묶어서 반환합니다.
-    let (url, is_client, is_admin) = {
+    // 3. 브라우저 상세 상태(URL, 권한 등) 추출
+    // 에러 해결: LAST_DETECTED_STATE에서 안전하게 변수를 복사해옵니다.
+    let (detected_url, is_client, is_admin) = {
         let state = automation::LAST_DETECTED_STATE.lock().await;
         (state.url.clone(), state.is_client, state.is_admin)
     };
 
+    // 4. 즉각적인 상태 반영 (플리커링의 원인이었던 3초 지연 로직 철거)
+    let status = target_status.to_string();
+    {
+        let mut current_state = crate::CURRENT_BROWSER_STATE.write().unwrap();
+        *current_state = status.clone();
+    }
+
+    // 5. UI 버튼 숨김 여부 결정
+    let hide_button = status == "running";
+
+    println!(
+        "[BROWSER-STATUS] 🟡 State: {}, Expected UI Button: {}", 
+        status, 
+        if hide_button { "HIDDEN" } else { "VISIBLE" }
+    );
+
     Ok(json!({
         "status": status,
-        "url": url,
+        "hide_button": hide_button,
+        "url": detected_url,
         "is_client": is_client,
         "is_admin": is_admin
     }))
@@ -1403,14 +1427,17 @@ async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, St
     let browser_status = {
         let is_launching = crate::IS_BROWSER_LAUNCHING.load(std::sync::atomic::Ordering::SeqCst);
         let reachable = automation::is_browser_reachable().await;
-        let mut guard = automation::GLOBAL_BROWSER.lock().await;
+        let guard = automation::GLOBAL_BROWSER.lock().await; // 🌟 mut 제거
         
-        if guard.is_some() && !reachable {
-            *guard = None;
-        }
+        // 강제 메모리 해제 로직 제거
         
         let is_running = is_launching || guard.is_some() || reachable;
-        if is_running { "running".to_string() } else { "stopped".to_string() }
+        let target_status = if is_running { "running" } else { "stopped" };
+
+        // 지연 없이 물리적 상태를 즉시 동기화
+        let mut current_state = crate::CURRENT_BROWSER_STATE.write().unwrap();
+        *current_state = target_status.to_string();
+        current_state.clone()
     };
 
     let (current_url, is_client, is_admin) = {
@@ -1515,19 +1542,44 @@ pub fn run() {
                 loop {
                     let is_launching = crate::IS_BROWSER_LAUNCHING.load(std::sync::atomic::Ordering::SeqCst);
                     let reachable = automation::is_browser_reachable().await;
-                    let mut guard = automation::GLOBAL_BROWSER.lock().await;
+                    let guard = automation::GLOBAL_BROWSER.lock().await; // 🌟 mut 제거
                     
-                    if guard.is_some() && !reachable {
-                        *guard = None; // 즉각적인 메모리 해제
-                    }
+                    // 강제 메모리 해제 로직 제거
                     
                     let is_running = is_launching || guard.is_some() || reachable;
-                    let current_status = if is_running { "running".to_string() } else { "stopped".to_string() };
+                    
+                    // [수정] 런칭 중이거나 물리적으로 감지되었을 때는 무조건 running으로 고정합니다.
+                    // 특히 is_launching이 true인 동안은 target_status가 절대로 stopped가 될 수 없습니다.
+                    let target_status = if is_running { "running" } else { "stopped" };
+                    
+                    let current_status = {
+                        let mut current_state = crate::CURRENT_BROWSER_STATE.write().unwrap();
+                        *current_state = target_status.to_string();
+                        current_state.clone()
+                    };
                     
                     if current_status != last_status {
                         println!("[BROWSER-STATUS] 🔵 [{}] State Changed: {} -> {}", chrono::Utc::now().format("%H:%M:%S%.3f"), last_status, current_status);
+                        
+                        // 🌟 [CRITICAL FIX] 백그라운드 워커인지 사용자 화면인지 구분하기 위해 현재 상태를 조회합니다.
+                        let is_launching = crate::IS_BROWSER_LAUNCHING.load(std::sync::atomic::Ordering::SeqCst);
+                        let (is_client, is_admin, url) = {
+                            let state = automation::LAST_DETECTED_STATE.lock().await;
+                            (state.is_client, state.is_admin, state.url.clone())
+                        };
+                        // [수정] 상태 모니터에서도 브라우저가 실행 중(running)이라면 새 탭(빈 URL)이든 아니든 무조건 버튼을 숨겨 
+                        // 프론트엔드로 hide_button: false가 날아가 깜빡이는 현상을 원천 차단합니다.
+                        let hide_button = current_status == "running";
+                        
+                        println!("[BROWSER-STATUS] 🟡 Expected UI Button State from Event: {}", if hide_button { "HIDDEN" } else { "VISIBLE" });
                         use tauri::Emitter;
-                        let _ = status_monitor_handle.emit("browser-status", current_status.clone());
+                        // [수정] 이벤트 페이로드를 생성할 때, 런칭 중(is_launching)이라면 
+                        // URL 감지 결과와 상관없이 hide_button을 무조건 true로 고정하여 발송합니다.
+                        let payload = json!({
+                            "status": current_status.clone(),
+                            "hide_button": if is_launching { true } else { hide_button }
+                        });
+                        let _ = status_monitor_handle.emit("browser-status", payload);
                         last_status = current_status;
                     }
                     // 빠른 UI 복구를 위해 1초 간격으로 감시 속도 단축

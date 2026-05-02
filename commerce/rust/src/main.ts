@@ -44,6 +44,9 @@ let chatPollInterval: number | null = null;
 let isSearching = false;
 let isExtracting = false;
 let lastSearchedQuery = "";
+// 🌟 [CRITICAL FIX] 프론트엔드 상태 토글 및 중복 전송 방어용 락
+let isBrowserRunning = false;
+let isAutoLaunchLocked = false; // 🌟 런처 클릭 후 stopped 시그널 전까지 버튼 강제 숨김 락
 
 // [통합 락 매니저 & 프론트엔드 큐 관리자]
 import "./dexie.min.js";
@@ -686,15 +689,19 @@ listen("browser-match-found", async (event: any) => {
     currentDetectedUrl = payload.url;
     isCurrentShop = payload.is_client || payload.is_admin;
 
-    // [FIX] 해당 이벤트가 발송되고 있다면 브라우저가 실행 중인 상태이므로 무조건 버튼을 숨김
-    if (btnAutoLaunch) {
-        btnAutoLaunch.style.display = "none";
+    if (!payload.url) {
+        // 🌟 [CRITICAL FIX] 확실한 앱 종료 신호(빈 URL)가 수신될 때만 락을 해제하고 버튼을 즉각 복구합니다.
+        isAutoLaunchLocked = false;
+        isBrowserRunning = false;
+        if (btnAutoLaunch) {
+            btnAutoLaunch.style.display = "flex";
+            btnAutoLaunch.classList.remove("hidden");
+        }
+        await updateExtractButtonVisibility();
+        return;
     }
     
     await updateExtractButtonVisibility();
-    
-    // 🌟 [CRITICAL FIX] 크롬 브라우저에서 주소를 이동할 때마다, 
-    // 해당 도메인에 맞는 Pages를 네비게이션에 즉시 다시 그려줍니다!
     await renderNavigation();
 });
 
@@ -2368,13 +2375,25 @@ btnStopTask?.addEventListener("click", async () => {
 
 // --- Browser Auto ---
 btnAutoLaunch?.addEventListener("click", async () => { 
+    if (isBrowserRunning || isAutoLaunchLocked) return;
+
     try { 
-        // 클릭 즉시 프론트엔드 버튼을 숨깁니다.
-        // 성공/실패 여부 및 버튼 복구는 100% Rust 백그라운드 상태 모니터(browser-status)에 위임합니다.
-        btnAutoLaunch.style.display = "none";
+        isAutoLaunchLocked = true; // 🌟 런칭 락 활성화 (무식하게 전부 무시 시작)
+        isBrowserRunning = true; 
+        
+        if (btnAutoLaunch) {
+            btnAutoLaunch.style.display = "none";
+            btnAutoLaunch.classList.add("hidden");
+        }
+        
+        console.log(`[WIDGET] UI LOCKED: Chrome Launching...`);
         await invoke("launch_best_browser", { url: "about:blank" }); 
+        console.log(`[WIDGET] UI LOCKED: Waiting for Rust signal...`);
     } catch (e) { 
-        console.error("Launch command sent, delegating state to Rust signal:", e); 
+        console.error("Launch failed:", e); 
+        isAutoLaunchLocked = false; // 🌟 에러 시에만 락 해제
+        isBrowserRunning = false;
+        syncBrowserStatus();
     } 
 });
 const autoBrowser = document.getElementById("auto-browser") as HTMLSelectElement;
@@ -2400,20 +2419,28 @@ autoBtn?.addEventListener("click", async () => {
 });
 
 listen("browser-status", async (event: any) => {
-    const status = event.payload; 
-    const timeLog = new Date().toISOString().split('T')[1].slice(0, -1);
-    console.log(`[WIDGET] 🔵 [${timeLog}] Browser Status Event Received: ${status}`);
+    const payload = event.payload; 
+    const statusStr = typeof payload === "object" ? payload.status : payload;
     
-    // Rust가 보내주는 정확한 상태에만 의존하여 버튼을 노출/숨김 처리합니다.
-    if (btnAutoLaunch) btnAutoLaunch.style.display = (status === "running") ? "none" : "flex";
-    
-    if (status === "stopped") { 
-        currentDetectedUrl = ""; 
-        await updateExtractButtonVisibility(); 
+    if (statusStr === "running") {
+        isBrowserRunning = true;
+        // 🌟 [CRITICAL FIX] 정상 실행 신호가 오더라도 락을 해제하지 않고 앱 종료 때까지 무조건 숨김을 유지합니다.
+        if (btnAutoLaunch) {
+            btnAutoLaunch.style.display = "none";
+            btnAutoLaunch.classList.add("hidden");
+        }
+    } else {
+        if (!isAutoLaunchLocked) {
+            console.log("[WIDGET] Browser stopped. Resetting UI.");
+            isBrowserRunning = false;
+            if (btnAutoLaunch) {
+                btnAutoLaunch.style.display = "flex";
+                btnAutoLaunch.classList.remove("hidden");
+            }
+            currentDetectedUrl = "";
+        }
     }
-    // 🌟 [CRITICAL FIX] 백엔드에서 온 'running' 이벤트를 100% 신뢰합니다.
-    // 여기서 syncBrowserStatus()를 다시 호출하면, 백엔드가 아직 브라우저를 띄우는 중일 때
-    // 오판하여 버튼을 다시 노출시켜버리는 레이스 컨디션(깜빡임)이 발생하므로 재확인 로직을 삭제합니다.
+    await updateExtractButtonVisibility();
 });
 
 // --- List Logic (Updated for Cards) ---
@@ -3914,7 +3941,20 @@ async function initSession() {
 
         // 브라우저 런처 상태 동기화
         if (btnAutoLaunch) {
-            btnAutoLaunch.style.display = (data.browser_status === "running") ? "none" : "flex";
+            if (data.browser_status === "running") {
+                isBrowserRunning = true;
+                // 🌟 [CRITICAL FIX] 새로고침 시에도 앱이 이미 실행 중이면 락을 강제로 잠가 버튼 노출을 완벽 차단합니다.
+                if (!isAutoLaunchLocked) isAutoLaunchLocked = true; 
+                btnAutoLaunch.style.display = "none";
+                btnAutoLaunch.classList.add("hidden");
+            } else {
+                if (!isAutoLaunchLocked) {
+                    isBrowserRunning = false;
+                    btnAutoLaunch.style.display = "flex";
+                    btnAutoLaunch.classList.remove("hidden");
+                }
+            }
+            console.log(`[WIDGET] 🔵 [${new Date().toISOString().split('T')[1].slice(0, -1)}] UI Ready Browser Status: ${data.browser_status}`);
         }
 
         // 🌟 [CRITICAL FIX] 앱 새로고침 시 백엔드에서 감지 중인 브라우저 현재 URL 상태를 완벽 복구합니다.
@@ -4028,24 +4068,31 @@ document.getElementById("invite-email-input")?.addEventListener("input", (e) => 
 
 async function syncBrowserStatus() { 
     try { 
-        // 🌟 문자열 대신 객체로 응답을 받아옵니다.
         const res = await invoke<any>("get_browser_status"); 
         const s = res.status;
-        
-        if (btnAutoLaunch) btnAutoLaunch.style.display = (s === "running") ? "none" : "flex"; 
-        
-        if (s === "stopped") { 
-            currentDetectedUrl = ""; 
-            await updateExtractButtonVisibility(); 
-        } else if (s === "running") {
-            // 🌟 [CRITICAL FIX] 휴면 상태에서 깨어났을 때 최신 URL 상태를 즉각 복구하여 추출 버튼을 노출시킵니다.
-            if (res.url) {
-                currentDetectedUrl = res.url;
-                isCurrentShop = res.is_client || res.is_admin;
-                await updateExtractButtonVisibility();
+
+        if (s === "running") {
+            isBrowserRunning = true;
+            // 🌟 [CRITICAL FIX] 런칭 성공 시그널이 오더라도 락을 해제하지 않고 앱 종료 때까지 무조건 숨김을 유지합니다.
+            if (btnAutoLaunch) {
+                btnAutoLaunch.style.display = "none";
+                btnAutoLaunch.classList.add("hidden");
+            }
+        } else {
+            if (!isAutoLaunchLocked) {
+                console.log("[WIDGET] Browser stopped. Resetting UI.");
+                isBrowserRunning = false;
+                if (btnAutoLaunch) {
+                    btnAutoLaunch.style.display = "flex";
+                    btnAutoLaunch.classList.remove("hidden");
+                }
+                currentDetectedUrl = ""; 
             }
         }
-    } catch (e) {} 
+        await updateExtractButtonVisibility();
+    } catch (e) {
+        console.warn("Status sync failed", e);
+    } 
 }
 
 // --- Device Preference Logic ---
