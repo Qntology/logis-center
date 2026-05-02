@@ -398,6 +398,7 @@ pub fn extract_titles_prompt(page_type: &str) -> String {
         _ => ("title", "titles", "title"),
     };
 
+
     let template = r###"[TASK]
 Find all the {TITLES} from the following PUG/HTML content.
 
@@ -405,7 +406,9 @@ Find all the {TITLES} from the following PUG/HTML content.
 Page Type: {TYPE}
 
 [SCHEMA DEFINITIONS]
-- 'title': {TITLE} {String}
+{ 
+  "{CATEGORY}" : ["{TITLE}"]
+}
 
 [OUTPUT FORMAT]
 { "{CATEGORY}" : [...] }

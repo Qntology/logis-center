@@ -236,18 +236,20 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                     active_url = remembered_url;
                     active_tab_id = last_focused_tab_id.clone();
                 } else {
-                    // 장부에 적힌 탭이 닫혀버렸음 -> 장부 초기화
+                    // 장부에 적힌 탭이 닫혀버렸음 (SSO 팝업 종료 등) -> 장부 초기화
                     last_focused_tab_id.clear();
                     
-                    // Fallback: 처음 켰거나 탭이 다 닫힌 경우, 화면에 보이는(visible) 첫 번째 탭을 강제 픽업하여 장부에 등록
+                    // Fallback 1: 처음 켰거나 탭이 다 닫힌 경우, 화면에 보이는(visible) 첫 번째 탭을 강제 픽업하여 장부에 등록
                     for page in pages.iter().rev() {
                         let script = r#"
                             (function() {
-                                window.__logis_tab_id = window.__logis_tab_id || Math.random().toString(36).substring(2);
-                                return JSON.stringify({ id: window.__logis_tab_id, url: window.location.href, visible: document.visibilityState === 'visible' });
+                                try {
+                                    window.__logis_tab_id = window.__logis_tab_id || Math.random().toString(36).substring(2);
+                                    return JSON.stringify({ id: window.__logis_tab_id, url: window.location.href, visible: document.visibilityState === 'visible' });
+                                } catch(e) { return null; }
                             })();
                         "#;
-                        if let Ok(res) = page.evaluate(script).await {
+                        if let Ok(Ok(res)) = tokio::time::timeout(Duration::from_millis(300), page.evaluate(script)).await {
                             if let Some(val_str) = res.into_value::<String>().ok() {
                                 if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str) {
                                     let is_visible = json_val.get("visible").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -259,6 +261,33 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                                         active_tab_id = tab_id.to_string();
                                         active_url = tab_url.to_string();
                                         break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 🌟 [CRITICAL FIX] Fallback 2: SSO 팝업 종료 직후 브라우저가 포커스를 잃고 visible 상태도 false로 떨어졌을 때,
+                    // 여전히 url을 찾지 못했다면 무조건 가장 우측에 열려있는 탭을 강제로 활성 탭으로 지정하여 빈 주소 전송을 막습니다.
+                    if active_url.is_empty() {
+                        if let Some(page) = pages.last() {
+                            let script = r#"
+                                (function() {
+                                    try {
+                                        window.__logis_tab_id = window.__logis_tab_id || Math.random().toString(36).substring(2);
+                                        return JSON.stringify({ id: window.__logis_tab_id, url: window.location.href });
+                                    } catch(e) { return null; }
+                                })();
+                            "#;
+                            if let Ok(Ok(res)) = tokio::time::timeout(Duration::from_millis(300), page.evaluate(script)).await {
+                                if let Some(val_str) = res.into_value::<String>().ok() {
+                                    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str) {
+                                        let tab_id = json_val.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                        let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                        
+                                        last_focused_tab_id = tab_id.to_string(); 
+                                        active_tab_id = tab_id.to_string();
+                                        active_url = tab_url.to_string();
                                     }
                                 }
                             }

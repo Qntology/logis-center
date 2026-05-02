@@ -1252,8 +1252,6 @@ async function renderNavigation() {
             }
 
             // 3. Local Devices 렌더링 (단일 리스트 구조)
-
-            // 3. Local Devices 렌더링 (단일 리스트 구조)
             if (localUsers.length > 0 && localUserList) {
                 // 로컬 기기는 자식(children)이 없는 플랫한 노드로 렌더링합니다.
                 const localNodes = localUsers.map(u => ({ ...u, children: [] }));
@@ -1269,6 +1267,8 @@ async function renderNavigation() {
             isFirstNavRender = false;
             stopSpinner();
         }
+        // 🌟 [CRITICAL FIX] 네비게이션 렌더링 완료 후 DOM을 참조하는 버튼 가시성 로직을 강제 재평가하여 버튼을 복구합니다.
+        await updateExtractButtonVisibility();
     }
 }
 

@@ -984,6 +984,8 @@ async fn process_task(
                 let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY.", title_prompt);
                 let snapshot_id = format!("{}_step_b_titles", task.id);
 
+                println!("title_prompt {}", title_prompt);
+
                 let mut titles = Vec::new();
                 {
                     model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
@@ -999,7 +1001,7 @@ async fn process_task(
                                 name: None,
                             })
                         ],
-                        model: "qwen".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
+                        model: "qwen".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.01),
                         ..Default::default()
                     };
 
