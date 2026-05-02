@@ -19,7 +19,7 @@ use crate::{
     utils::tensor_utils::{
         mask_index_add, masked_scatter_dim0,
         prod_tensor_last_dim, split_tensor,
-        prepare_causal_attention_mask, // 🌟 [CRITICAL FIX] 이 녀석을 추가했습니다!
+        prepare_causal_attention_mask, 
     },
 };
 use crate::models::qwen::generate::SLOT_MANAGER;
@@ -146,7 +146,7 @@ impl QLinear {
         Ok(())
     }
 
-    // 🌟 [추가] 압축 해제를 방어하는 특수 이동 함수
+    
     pub fn to_device_keep_quantized(&mut self, device: &Device) -> Result<()> {
         if self.is_cleared() {
             return Err(anyhow!("Linear weight is cleared. Reload required."));
@@ -464,7 +464,7 @@ impl QuantizedQwenVLTextAttention {
         self.q_norm.clear();
         self.k_norm.clear();
         
-        // 🌟 [수압 조절 완결] 이제 핑퐁 대기열을 확실하게 타므로, 이전 레이어의 찌꺼기 캐시가 
+        
         // 다음 레이어 연산 시 VRAM을 차지하지 못하도록 확실하게 파괴(None)해 줍니다!
         self.vram_merged_k = None;
         self.vram_merged_v = None;
@@ -612,7 +612,7 @@ impl QuantizedQwenVLTextAttention {
         // [CRITICAL] Internal Causal Mask Generation for Prefill Integrity
         let total_len = seqlen_offset + q_len;
         
-        // 🌟 [VRAM 2GB+ 폭발 원천 차단] 
+        
         // 수만 토큰의 거대 마스크를 한 번에 만들면 VRAM이 누수처럼 증가합니다.
         // 전체 마스크 생성을 지우고, 동적 생성을 위한 플래그만 남깁니다.
         let has_dynamic_mask = q_len > 1 && attention_mask_in.is_none();
@@ -672,7 +672,7 @@ impl QuantizedQwenVLTextAttention {
             if !appended {
                 let take = tokens_to_process.min(1024);
                 
-                // 🌟 [CRITICAL FIX] 새로운 캐시 조각을 만들 때도 연속성을 보장합니다.
+                
                 let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
                 let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
                 
@@ -709,7 +709,7 @@ impl QuantizedQwenVLTextAttention {
         let mut m_n: Option<Tensor> = None;
         let mut l_n: Option<Tensor> = None;
         
-        // 🌟 [CRITICAL FIX] 여기서도 연속성을 보장하여 행렬 곱셈 시 데이터가 꼬이지 않도록 합니다.
+        
         let q_aligned = query_states.to_dtype(target_dtype)?.contiguous()?;
 
         for block in &self.kv_blocks {
@@ -736,7 +736,7 @@ impl QuantizedQwenVLTextAttention {
                         let reg = self.registry.entries.read().unwrap();
                         let cache = reg[index].bitkv_cache.read().unwrap();
                         if let Some(m) = &cache[self.layer_idx] {
-                            // 🌟 [CRITICAL FIX 1] F32 뻥튀기 방지! BF16 포맷 그대로 RAM에 유지
+                            
                             k_cpu = Some(m.k_data.clone());
                             v_cpu = Some(m.v_data.clone());
                             ram_count += 1;
@@ -776,7 +776,7 @@ impl QuantizedQwenVLTextAttention {
                                                     let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                                                     let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
                                                     
-                                                    // 🌟 [CRITICAL FIX 2] 디스크에서 읽은 BF16 데이터를 F32로 해제(decompress)하지 않고 원본 그대로 RAM에 적재!
+                                                    
                                                     // 이 한 줄의 수정으로 System RAM 점유율이 50% 이상 박살 납니다.
                                                     k_cpu = Some(Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap());
                                                     v_cpu = Some(Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap());
@@ -793,14 +793,14 @@ impl QuantizedQwenVLTextAttention {
                     }
                     
                     let fallback_shape = vec![1, self.num_key_value_heads, _b_len, self.head_dim];
-                    // 🌟 만약 비어있다면 F32 대신 BF16 0.0 텐서로 초기화!
+                    
                     let k_safe = k_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::BF16, &Device::Cpu).unwrap());
                     let v_safe = v_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::BF16, &Device::Cpu).unwrap());
                     
                     let k_gpu = k_safe.to_device(dev)?.to_dtype(target_dtype)?;
                     let v_gpu = v_safe.to_device(dev)?.to_dtype(target_dtype)?;
 
-                    // 🌟 RAM 캐시 장부에도 절반으로 다이어트된 BF16 텐서를 그대로 적어둡니다.
+                    
                     inner.k_cache = Some(k_safe); 
                     inner.v_cache = Some(v_safe); 
                     inner.location = KVLocation::RAM;
@@ -824,12 +824,12 @@ impl QuantizedQwenVLTextAttention {
             v = v.contiguous()?;
 
             let actual_kv_len = k.dim(2)?;
-            // 🌟 [CRITICAL FIX 3] 이전에 속도를 위해 뺐었지만, ROCm 환경에서 안전성을 위해 다시 부활시킵니다.
+            
             let k_t = k.transpose(2, 3)?.contiguous()?; 
             
             let mut s_chunk = (q_aligned.matmul(&k_t)? * self.scaling)?;
 
-            // 🌟 [VRAM 누수 해결] 블록이 겹치는 부위만 512KB짜리 소형 마스크를 만들어 즉시 연산!
+            
             if has_dynamic_mask {
                 if b_off + actual_kv_len > seqlen_offset {
                     let k_indices = Tensor::arange(b_off as u32, (b_off + actual_kv_len) as u32, dev)?.unsqueeze(0)?;
@@ -1123,7 +1123,7 @@ impl QuantizedQwenVLTextAttention {
                                 if let Some(block) = self.kv_blocks.get(b_idx) {
                                     let mut inner = block.inner.write().unwrap();
                                     
-                                    // 🌟 [초고속 VRAM 파이프라인] 읽어온 텐서를 바로 GPU(self.device())로 밀어 넣습니다.
+                                    
                                     let target_device = self.q_proj.device();
                                     let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
                                     
@@ -1133,7 +1133,7 @@ impl QuantizedQwenVLTextAttention {
                                     inner.location = KVLocation::VRAM; // RAM을 건너뛰고 VRAM 상주 확정!
                                     reg[b_idx].location[self.layer_idx] = KVLocation::VRAM;
                                     reg[b_idx].ssd_path = Some(file_path.parent().unwrap().to_path_buf());
-                                    // 🌟 [CRITICAL FIX 2] 여기서도 중복 저장 스팸을 막아 파일 락(Lock) 에러를 방지합니다!
+                                    
                                     if self.layer_idx < reg[b_idx].is_dirty.len() {
                                         reg[b_idx].is_dirty[self.layer_idx] = false;
                                     }
@@ -1372,7 +1372,7 @@ impl QuantizedQwenVLTextAttention {
             if i < reg.len() {
                 reg[i].location[self.layer_idx] = KVLocation::SSD;
                 reg[i].ssd_path = Some(frag_path.clone()); 
-                // 🌟 [CRITICAL FIX 1] 로드된 블록은 디스크에 이미 존재하므로, 중복 저장을 막기 위해 dirty 플래그를 꺼줍니다!
+                
                 // 이 3줄이 없으면 10GB의 텐서를 매번 무한대로 다시 구워버리며 시스템을 다운시킵니다.
                 if self.layer_idx < reg[i].is_dirty.len() {
                     reg[i].is_dirty[self.layer_idx] = false;
@@ -1546,7 +1546,7 @@ impl QuantizedQwenVLTextDecoderLayer {
 
         self.self_attn.load_weights_inplace(ct, reader, &attn_base, is_gguf_naming, device, dtype)?;
 
-        // 🌟 [CRITICAL FIX] if !baking_only 껍데기 삭제!
+        
         self.mlp_gate = Some(get_qlinear(ct, reader, &format!("{base_name}.{gate}"), device, dtype)?);
         self.mlp_up = Some(get_qlinear(ct, reader, &format!("{base_name}.{up}"), device, dtype)?);
         self.mlp_down = Some(get_qlinear(ct, reader, &format!("{base_name}.{down}"), device, dtype)?);
@@ -1717,10 +1717,10 @@ impl QuantizedQwenVLTextModel {
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
         
-        // 🌟 [수정] ct.tensor 호출 시 &mut 를 제거하고 reader 만 넘깁니다.
+        
         let embed_dtype = if is_forced_cpu { DType::F32 } else { DType::F16 };
         
-        // 🌟 [최적화 1] CPU 우회를 삭제하고, GPU(device)로 즉시 로딩하여 13초 걸리던 로딩을 3초로 단축 + RAM 피크 완벽 제거!
+        
         let (embed_tokens, actual_hidden_size) = if let Ok(tensor) = ct.tensor(&mut reader, &token_emb_name, device) {
              let tensor = tensor.dequantize_f16(device).or_else(|_| tensor.dequantize(device))?.to_dtype(embed_dtype)?; 
              let h = tensor.dim(1)?;
@@ -1740,7 +1740,7 @@ impl QuantizedQwenVLTextModel {
         let current_device = device.clone(); 
         let registry = KVRegistry::new();
         
-        // 🌟 [CRITICAL FIX] 심연에 숨어있던 마지막 1층 깎기 코드를 파괴합니다! 이제 Baking 시 28개 층이 모두 구워집니다.
+        
         let num_layers_to_load = config.num_hidden_layers;
 
         let mut layers = Vec::with_capacity(num_layers_to_load);
@@ -1806,10 +1806,10 @@ impl QuantizedQwenVLTextModel {
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
         
-        // 🌟 [수정] ct.tensor 호출 시 &mut 를 제거하고 reader 만 넘깁니다.
+        
         let embed_dtype = if is_forced_cpu { DType::F32 } else { DType::F16 };
         
-        // 🌟 [최적화 1] CPU 우회를 삭제하고, GPU(device)로 즉시 로딩하여 13초 걸리던 로딩을 3초로 단축 + RAM 피크 완벽 제거!
+        
         let (embed_tokens, actual_hidden_size) = if let Ok(tensor) = ct.tensor(reader, &token_emb_name, device) {
              let tensor = tensor.dequantize_f16(device).or_else(|_| tensor.dequantize(device))?.to_dtype(embed_dtype)?; 
              let h = tensor.dim(1)?;
@@ -1954,7 +1954,7 @@ impl QuantizedQwenVLTextModel {
         kv_name: Option<String>,
         baking_only: bool,
     ) -> Result<Tensor> {
-        // 🌟 [UI & 속도 최적화] 256 -> 2048로 확장하여 텐서 뻥튀기 속도를 극대화!
+        
         let chunk_size = 2048; 
         let current_seq_len = xs.dim(1)?;
         let is_decoding = current_seq_len <= 1;
@@ -1964,7 +1964,7 @@ impl QuantizedQwenVLTextModel {
         let mut chunk_outputs = Vec::with_capacity(total_chunks);
 
         for (chunk_idx, &i) in chunk_offsets.iter().enumerate() {
-            // 🌟 [CRITICAL FIX] 내부 청크 연산 중에도 즉각 취소(Stop)가 가능하도록 차단기 설치!
+            
             if crate::utils::is_extraction_stopped() {
                 return Err(anyhow::anyhow!("Task cancelled"));
             }
@@ -2036,7 +2036,7 @@ impl QuantizedQwenVLTextModel {
             } else {
                 let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
                 
-                // 🌟 [CRITICAL FIX] CPU 큐 폭발로 인한 0.1GB 지속 상승 방지
+                
                 // 매 청크(256 토큰)마다 GPU 연산 완료를 대기하여, 과거 블록의 VRAM을 즉시 회수합니다.
                 let dev = self.layers[layer_idx].device();
                 if dev.is_cuda() {
@@ -2162,7 +2162,7 @@ impl QuantizedQwenVLTextModel {
         }
 
         let current_seq_len = xs.dim(1)?;
-        // 🌟 [CRITICAL FIX] 썰어내는 크기(2048)에 맞춰 칼질하는 보폭도 2048로 동기화!
+        
         let chunk_offsets: Vec<usize> = (0..current_seq_len).step_by(2048).collect(); 
         
         // 청크 분할 및 연산
@@ -2181,7 +2181,7 @@ impl QuantizedQwenVLTextModel {
         }
 
         if let Some(sid) = session_id {
-            // 🌟 [CRITICAL FIX] 프리필(Prefill) 단계(토큰이 2개 이상일 때)에서만 VRAM 전체 캐시를 디스크로 밀어냅니다!
+            
             // 디코딩(1토큰 생성) 단계에서 이 코드가 실행되면, AI의 이전 기억이 매 토큰마다 강제 삭제되어 
             // 텅 빈 0.0 텐서만 남게 되고, 이로 인해 외계어를 내뱉는 "기억상실증(환각)"이 발생합니다.
             if current_seq_len > 1 {
@@ -2420,7 +2420,7 @@ impl QuantizedQwenVLTextModel {
         // ====================================================================
         // 🛡️ [절대 방어 핑퐁 패스] 🛡️ (프리필 & 디코딩 공통)
         // ====================================================================
-        // 🌟 [CRITICAL FIX 1] 환각(외계어)의 가장 큰 원인입니다!
+        
         // 억지로 만든 마스크가 과거 기억(10,000 토큰)을 블라인드 처리해버렸습니다.
         // 어텐션 내부에 완벽한 동적 마스크 생성기가 이미 존재하므로, 여기서는 무조건 None을 던져야 합니다!
         let attention_mask: Option<Tensor> = None;
@@ -2487,7 +2487,7 @@ impl QuantizedQwenVLTextModel {
         
         let final_output = xs.apply(&self.norm)?;
 
-        // 🌟 [RAM 대청소] 프리필 연산이 모두 끝나고 거대한 텐서들이 스코프를 벗어날 때, OS에 잔류한 RAM을 완벽히 뜯어냅니다!
+        
         if !is_decoding {
             #[cfg(target_os = "windows")]
             unsafe {
@@ -2715,7 +2715,7 @@ impl QuantizedQwenVLModel {
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
         let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { DType::F16 };
         
-        // 🌟 [RAM 피크 차단] Baking 모드일 경우 2GB짜리 비전 가중치를 아예 로딩하지 않습니다!
+        
         let visual = if baking_only {
             println!("[MODEL] Baking Mode: Skipping Vision Model Load to save 2GB RAM.");
             None
@@ -2727,7 +2727,7 @@ impl QuantizedQwenVLModel {
         };
 
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
-        // 🌟 [삭제 완료]
+        
         let language_model = QuantizedQwenVLTextModel::new_with_mmap(
             &t_config, ct_main.clone(), main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
         )?;
@@ -2783,7 +2783,7 @@ impl QuantizedQwenVLModel {
         
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
-        // 🌟 [CRITICAL FIX] 제한 삭제
+        
 
         let language_model = QuantizedQwenVLTextModel::new(&t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
         
@@ -2928,7 +2928,7 @@ impl QuantizedQwenVLModel {
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
         let (b_sz, seq_len) = input_ids.dims2()?;
 
-        // 🌟 [TYPE 최적화] 임베딩 처리 후 나온 작고 얇은 텐서만 BF16으로 캐스팅합니다!
+        
         let mut inputs_embeds = self.language_model.embed_tokens.forward(&input_ids)?;
         let target_dtype = if self.text_device.is_cuda() { DType::BF16 } else { DType::F32 };
         inputs_embeds = inputs_embeds.to_dtype(target_dtype)?;
@@ -2946,7 +2946,7 @@ impl QuantizedQwenVLModel {
             self.rope_deltas = Some(deltas_tensor);
             self.rope_deltas_cpu = Some(deltas_cpu); 
             
-            // 🌟 [CRITICAL FIX] Partial Prefill 시 157개짜리 텐서의 시작 인덱스를 강제로 0에서 10679로 밀어줍니다!
+            
             // 이렇게 해야 SSD에서 불러온 과거 기억과 새로 계산하는 기억의 문맥 위치가 어긋나지 않습니다.
             if seqlen_offset > 0 {
                 let shift = Tensor::new(seqlen_offset as u32, input_ids.device())?.reshape((1, 1, 1))?;
@@ -2973,7 +2973,7 @@ impl QuantizedQwenVLModel {
         self.language_model.active_session_id = session_id.clone();
         self.language_model.active_kv_name = kv_name.clone();
  
-        // 🌟 E0282 Fix: None의 타입 명시!
+        
         let outputs = self.language_model.forward(
             &inputs_embeds, seqlen_offset, total_len, Some(&position_ids), 
             None::<&Tensor>, None::<Vec<Tensor>>, session_id, kv_name
@@ -2987,7 +2987,7 @@ impl QuantizedQwenVLModel {
         } else { hidden_state };
         let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state };
         
-        // 🌟 E0308 Fix: lm_head는 Option이 아니므로 바로 호출
+        
         let logits = self.lm_head.forward(&hidden_state)?;
         
         Ok(logits)
@@ -3004,7 +3004,7 @@ impl QuantizedQwenVLModel {
         self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) 
     }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { 
-        // 🌟 [CRITICAL FIX] Option으로 감싸졌으므로, visual이 존재할 때만 to_device를 호출합니다!
+        
         if let Some(v) = &mut self.visual {
             v.to_device(device)?;
         }
@@ -3039,7 +3039,7 @@ impl QuantizedQwenTextModel {
     ) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
-        // 🌟 [삭제 완료]
+        
         let language_model = QuantizedQwenVLTextModel::new_with_mmap(
             &t_config, ct_main.clone(), mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
         )?;
@@ -3067,7 +3067,7 @@ impl QuantizedQwenTextModel {
     ) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
-        // 🌟 [삭제 완료]
+        
         let language_model = QuantizedQwenVLTextModel::new(
             &t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only
         )?;
@@ -3102,8 +3102,8 @@ impl QuantizedQwenTextModel {
         self.language_model.active_session_id = session_id.clone();
         self.language_model.active_kv_name = kv_name.clone();
 
-        // 🌟 [OOM 방지 핵심] 15만 개 토큰을 한 번에 넣지 않고, VL 모델처럼 안전하게 쪼개서 넣습니다!
-        // 🌟 [UI 자연스러움] 1024 -> 256으로 줄여 0%가 2~3초간 멈춰있는 현상을 제거하고 매우 부드럽게 채웁니다.
+        
+        
         let chunk_size = 2048; 
         let mut final_hidden_state = None;
 
@@ -3112,7 +3112,7 @@ impl QuantizedQwenTextModel {
             let mut current_offset = seqlen_offset;
             
             while processed < seq_len {
-                // 🌟 [CRITICAL FIX] 1만 토큰 프리필(Prefill) 중에도 취소 버튼이 즉각 작동하도록!
+                
                 if crate::utils::is_extraction_stopped() {
                     return Err(anyhow::anyhow!("Task cancelled"));
                 }
@@ -3138,7 +3138,7 @@ impl QuantizedQwenTextModel {
                 processed += take;
                 current_offset += take;
                 
-                // 🌟 [CRITICAL FIX] Prefill 진행률(%) 계산 및 AI 검색/문서 전처리 분기 처리
+                
                 let pct = ((processed as f32 / seq_len as f32) * 100.0) as i32;
                 if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
                     if let Some(sid) = &session_id {
@@ -3147,7 +3147,7 @@ impl QuantizedQwenTextModel {
                             if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
                         } else { sid.clone() };
                         
-                        // 🌟 [성능 최적화] 파일 읽기를 제거하고 초고속 전역 메모리에서 카테고리를 즉시 가져옵니다!
+                        
                         let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
 
                         let summary_msg = format!("Reading context ({}%)...", pct);
@@ -3167,7 +3167,7 @@ impl QuantizedQwenTextModel {
             }
             println!("\n[TEXT-PREFILL] Complete.");
         } else {
-            // 🌟 [CRITICAL FIX] 여기도 3번째 파라미터로 total_len을 넘겨줍니다!
+            
             let outputs = self.language_model.forward(
                 &inputs_embeds, seqlen_offset, total_len, Some(&position_ids), 
                 None::<&Tensor>, None::<Vec<Tensor>>, session_id.clone(), kv_name.clone()
@@ -3206,7 +3206,7 @@ impl QuantizedQwenTextModel {
     
     pub fn offload_kv_cache(&mut self, path: &std::path::Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     
-    // 🌟 [E0061 픽스] load_kv_cache의 인자를 5개로 완벽히 맞췄습니다.
+    
     pub fn load_kv_cache(&mut self, path: &std::path::Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { 
         self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) 
     }
@@ -3216,9 +3216,6 @@ impl QuantizedQwenTextModel {
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, _total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, _total_len) }
 }
 
-// ==============================================
-// [이 아래를 덮어쓰세요 (Zone 1 교체 코드)]
-// ==============================================
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
     let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
     let weight = QMatMul::from_qtensor(weight)?;
@@ -3271,7 +3268,7 @@ fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &QwenVLConfig, ct
         if let Some(last_dot) = new_name.rfind('.') { if let Ok(idx) = new_name[last_dot+1..].parse::<usize>() { if name.ends_with(&format!(".{}", idx)) { base_split_name = new_name[..last_dot].to_string(); split_idx = idx; is_split = true; } } }
         
         let t = ct.tensor(reader, name, device)?;
-        // 🌟 [TYPE 최적화] GPU 직행. F16으로 요청될 경우 캐스팅 없이 원본 그대로 유지됨.
+        
         let t = t.dequantize_f16(device).or_else(|_| t.dequantize(device))?.to_dtype(dtype)?;
         if is_split { split_tensors.entry(base_split_name).or_default().push((split_idx, t)); } else { data.insert(new_name, t); }
     }
@@ -3279,6 +3276,3 @@ fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &QwenVLConfig, ct
     if let Some(weight) = data.get("visual.patch_embed.proj.weight") { if weight.rank() == 4 { if let Ok(reshaped) = weight.unsqueeze(2)?.repeat((1, 1, 2, 1, 1)) { data.insert("visual.patch_embed.proj.weight".to_string(), reshaped); } } }
     Ok(VarBuilder::from_tensors(data, dtype, device))
 }
-// ==============================================
-// [여기까지 덮어쓰세요]
-// ==============================================
