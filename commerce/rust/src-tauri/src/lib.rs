@@ -1222,12 +1222,6 @@ async fn get_browser_status() -> Result<Value, String> {
     // 5. UI 버튼 숨김 여부 결정
     let hide_button = status == "running";
 
-    println!(
-        "[BROWSER-STATUS] 🟡 State: {}, Expected UI Button: {}", 
-        status, 
-        if hide_button { "HIDDEN" } else { "VISIBLE" }
-    );
-
     Ok(json!({
         "status": status,
         "hide_button": hide_button,
@@ -1558,9 +1552,7 @@ pub fn run() {
                         current_state.clone()
                     };
                     
-                    if current_status != last_status {
-                        println!("[BROWSER-STATUS] 🔵 [{}] State Changed: {} -> {}", chrono::Utc::now().format("%H:%M:%S%.3f"), last_status, current_status);
-                        
+                    if current_status != last_status {                        
                         // 🌟 [CRITICAL FIX] 백그라운드 워커인지 사용자 화면인지 구분하기 위해 현재 상태를 조회합니다
                         let is_launching = crate::IS_BROWSER_LAUNCHING.load(std::sync::atomic::Ordering::SeqCst);
                         let (is_client, is_admin, url) = {
@@ -1571,7 +1563,6 @@ pub fn run() {
                         // 프론트엔드로 hide_button: false가 날아가 깜빡이는 현상을 원천 차단합니다.
                         let hide_button = current_status == "running";
                         
-                        println!("[BROWSER-STATUS] 🟡 Expected UI Button State from Event: {}", if hide_button { "HIDDEN" } else { "VISIBLE" });
                         use tauri::Emitter;
                         // [수정] 이벤트 페이로드를 생성할 때, 런칭 중(is_launching)이라면 
                         // URL 감지 결과와 상관없이 hide_button을 무조건 true로 고정하여 발송합니다.
