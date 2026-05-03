@@ -781,7 +781,7 @@ impl LogisModel {
 
     // 🌟 [CRITICAL FIX] config.json의 물리적 텐서 크기와 실제 훈련된 Context Length를 완벽히 분리합니다.
     pub async fn truncate_pug_context(&self, pug: &str) -> String {
-        let margin_tokens = 3_000;
+        let margin_tokens = 5_000;
         
         // 1. 로드된 모델(또는 타겟 모델)에 따라 공식 컨텍스트 한계값을 명확히 지정합니다.
         // 🌟 사용자의 현재 Enum 상태(Qwen3_5)에 맞춰 롤백 반영
