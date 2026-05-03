@@ -28,17 +28,23 @@ pub struct GenerationResult {
 
 pub struct Qwen3_5GenerateModel {
     chat_template: ChatTemplate,
-    tokenizer: TokenizerModel,
+    pub tokenizer: TokenizerModel, // 🌟 [CRITICAL FIX] 외부 모듈 접근을 위해 pub 추가!
     pub pre_processor: Option<Qwen3VLProcessor>,
-    pub qwen3_5: Qwen3_5Model, // 🌟 [CRITICAL FIX] pub 추가!
+    pub qwen3_5: Qwen3_5Model,
     device: Device,
     pub eos_token_id: u32,
     model_name: String,
     repeat_penalty: f32,
     repeat_last_n: usize,
+    pub max_position_embeddings: usize, // 🌟 [CRITICAL FIX] config 의존성을 끊고 자체적으로 한계치 보관
 }
 
 impl Qwen3_5GenerateModel {
+    /// 로드 시 설정된 max_position_embeddings 값을 반환합니다.
+    pub fn get_max_tokens(&self) -> usize {
+        self.max_position_embeddings
+    }
+
     pub fn init(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
         let model_name = std::path::Path::new(path)
             .file_name()
@@ -55,6 +61,8 @@ impl Qwen3_5GenerateModel {
         let model_list = find_type_files(path, "safetensors")?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_list, dtype, &device)? };
         let eos_token_id = cfg.text_config.eos_token_id;
+        
+        let max_pos = cfg.text_config.max_position_embeddings;
         let qwen3_5 = Qwen3_5Model::new_from_vb(vb, cfg)?;
 
         Ok(Self {
@@ -67,6 +75,7 @@ impl Qwen3_5GenerateModel {
             model_name: model_name.to_string(),
             repeat_penalty: 1.1,
             repeat_last_n: 64,
+            max_position_embeddings: max_pos, // 🌟 저장
         })
     }
 
@@ -97,6 +106,16 @@ impl Qwen3_5GenerateModel {
         
         let model_dir = std::path::Path::new(model_file).parent().unwrap().to_str().unwrap();
         let chat_template = ChatTemplate::init(model_dir)?;
+
+        // 🌟 GGUF 폴백 시에도 config.json을 찾거나 메타데이터에서 max_position_embeddings를 읽어옵니다.
+        let config_path = std::path::Path::new(model_dir).join("config.json");
+        let max_pos = if config_path.exists() {
+            let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(config_path)?)?;
+            cfg.get("max_position_embeddings").or_else(|| cfg.get("text_config").and_then(|t| t.get("max_position_embeddings"))).and_then(|v| v.as_u64()).unwrap_or(262144) as usize
+        } else {
+            // 🌟 [CRITICAL FIX] anyhow::Error 와 candle_core::Error 충돌을 막기 위해 .ok() 로 Option 체이닝 처리
+            model_gguf.get_matedata("qwen35.context_length").ok().and_then(|m| m.to_u32().ok()).unwrap_or(262144) as usize
+        };
 
         let tokenizer = model_gguf.build_tokenizer(Some(false), Some(false), Some(false))?;
         let (pre_processor, mut mmproj_gguf) = if let Some(mmproj_f) = mmproj_file {
@@ -151,6 +170,7 @@ impl Qwen3_5GenerateModel {
             model_name: stem.to_string(),
             repeat_penalty: 1.1, 
             repeat_last_n: 64,
+            max_position_embeddings: max_pos, // 🌟 저장
         })
     }
 

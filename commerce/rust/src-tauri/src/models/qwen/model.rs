@@ -837,7 +837,7 @@ impl QwenVLTextModel {
 
 #[derive(Debug, Clone)]
 pub struct QwenVLModel {
-    config: QwenVLConfig,
+    pub config: QwenVLConfig,
     visual: QwenVLVisionModel,
     language_model: QwenVLTextModel,
     lm_head: Linear,

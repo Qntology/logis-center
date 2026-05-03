@@ -100,6 +100,28 @@ pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMo
     convert_doc_to_clean_pug_selector(&document, selector_str, mode)
 }
 
+// 🌟 [CRITICAL FIX] Tokenizer를 주입받아 실제 토큰 수를 계산하며 줄 단위로 자르는 함수 추가
+pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::tokenizer::TokenizerModel) -> String {
+    let mut current_tokens = 0;
+    let mut kept_lines = Vec::new();
+    
+    // 🌟 끝에서부터 역순으로 줄을 읽어 올라가며 끝단을 우선적으로 보존합니다.
+    for line in pug.lines().rev() {
+        let line_with_newline = format!("{}\n", line);
+        let token_count = tokenizer.text_encode_vec(line_with_newline.clone(), false).map(|v| v.len()).unwrap_or(0);
+        
+        // 한도를 초과하면 누적을 멈춥니다. (즉, 앞단이 자연스럽게 버려집니다)
+        if current_tokens + token_count > max_tokens {
+            break;
+        }
+        kept_lines.push(line_with_newline);
+        current_tokens += token_count;
+    }
+    
+    // 🌟 역순으로 수집된 배열을 다시 정방향으로 뒤집어서 문자열로 병합합니다.
+    kept_lines.into_iter().rev().collect()
+}
+
 #[derive(Default, Clone)]
 pub struct TableContext {
     pub headers: Vec<Vec<String>>, // Row -> Col -> Title
@@ -405,6 +427,14 @@ Find all the {TITLES} from the following PUG/HTML content.
 [CONTEXT]
 Page Type: {TYPE}
 
+[FORCED DOCUMENT SCANNING LOGIC]
+Read the entire document from top to bottom, applying the following strict filters and evaluations:
+
+1. IGNORE (Exclusion):
+   - Strictly ignore global navigation menus, headers, footers, sidebars, and overarching search/filter forms at the top.
+2. TARGET (Focus Area):
+   - Focus purely on the main data payload where "{CATEGORY}", "{TYPE}", or actual items are listed.
+
 [SCHEMA DEFINITIONS]
 { 
   "{CATEGORY}" : ["{TITLE}"]
@@ -423,24 +453,31 @@ RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
 pub fn is_detail_prompt(page_type: &str) -> String {
     let template = r###"[TASK]
-Analyze the provided Pug HTML content from top to bottom. Determine if the main content represents a "{TYPE} Detail/{TYPE} Edit Form/{TYPE} Manage Form" (true) or a "{TYPE} List/Index Page/Home Page/Dashboard Page" (false).
+Analyze the provided PUG/HTML content from top to bottom. Determine if the main content represents a "{TYPE} Detail/{TYPE} Edit Form/{TYPE} Manage Form" (true) or a "{TYPE} List/Index Page/Home Page/Dashboard Page" (false).
 
 [ENTITY CONTEXT: {TYPE}]
 You are evaluating a page managing this specific domain entity. Use this context to conceptually understand the abstract structures:
-- Single Entity (has_form): A property configuration interface. It features a large overarching form dedicated to inputting or updating the specific attributes of ONE primary entity.
-- Collection (has_list): A catalog or inventory interface dedicated to displaying, filtering, or batch-processing multiple DIFFERENT primary entities.
+- has_form: A property configuration interface. It features a large overarching form dedicated to inputting or updating the specific attributes of ONE primary entity.
+- has_list: A catalog or inventory interface dedicated to displaying, filtering, or batch-processing multiple DIFFERENT primary entities.
 
 [FORCED DOCUMENT SCANNING LOGIC]
-Read the entire document from top to bottom. You MUST evaluate the concluding elements at the very bottom of the main content area first.
-Look past global navigation menus and overarching search/filter forms at the top. Focus purely on the main data payload and abstract structural signatures:
-1. Does the page terminate with dataset navigation (pagination, "next/prev") or bulk-action execution elements?
-2. Does the main data area consist of a repeating multi-entity grid?
-3. Does the main data area contain an extensive configuration/input form (inputs, textareas, image uploads, save buttons) for a single entity?
+Read the entire document from top to bottom, applying the following strict filters and evaluations:
+
+1. IGNORE (Exclusion):
+   - Strictly ignore global navigation menus, headers, footers, sidebars, and overarching search/filter forms at the top.
+2. TARGET (Focus Area):
+   - Focus purely on the main data payload where "{CATEGORY}", "{TYPE}", or actual items are listed.
+3. EVALUATE (Structural Signatures):
+   - You MUST evaluate the concluding elements at the very bottom of the main content area first. Check for the following:
+     A. Does the page terminate with dataset navigation (pagination, "next/prev") or bulk-action execution elements?
+     B. Does the main data area consist of a repeating multi-entity grid?
+     C. Does the main data area contain an extensive configuration/input form (inputs, textareas, image uploads, save buttons) for a single entity?
 
 [SCHEMA DEFINITIONS]
-- has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
-- has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
-- detail: Boolean. True ONLY if has_list is false AND has_form is true.
+- {TYPE}:
+    - has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
+    - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
+    - detail: Boolean. True ONLY if has_list is false AND has_form is true.
 
 [OUTPUT FORMAT]
 {
@@ -451,7 +488,7 @@ Look past global navigation menus and overarching search/filter forms at the top
   }
 }
 
-NO EXPLANATION. NO THINKING. /no_think"###;
+JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{TYPE}", page_type)
 }
 
@@ -500,8 +537,7 @@ pub fn para2graph(language: &str) -> String {
   "context": [...]
 }
 
-[ACTION] RETURN STRICTLY VALID JSON ONLY.
-NO EXPLANATION. NO THINKING. /no_think"###;
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{LANG}", language)
 }
 

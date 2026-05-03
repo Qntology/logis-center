@@ -175,9 +175,9 @@ impl QLinear {
                 let xs_f32 = xs_flat.to_dtype(DType::F32)?;
                 self.inner.forward(&xs_f32)?
             },
-            QMatMul::Tensor(_t) => {
-                // 이미 완벽한 타입(BF16)이므로 다이렉트 연산
-                self.inner.forward(&xs_flat)?
+            QMatMul::Tensor(t) => {
+                let xs_aligned = xs_flat.to_dtype(t.dtype())?;
+                self.inner.forward(&xs_aligned)?
             },
             _ => {
                 let xs_f32 = xs_flat.to_dtype(DType::F32)?;
@@ -186,12 +186,13 @@ impl QLinear {
         };
         
         let out = out.reshape((b, s, ()))?;
-        if let Some(bias) = &self.bias {
-            // bias도 초기화 시 맞춰두었으므로 캐스팅 없이 바로 덧셈
-            Ok(out.broadcast_add(bias)?)
+        let final_out = if let Some(bias) = &self.bias {
+            out.to_dtype(bias.dtype())?.broadcast_add(bias)?
         } else {
-            Ok(out)
-        }
+            out.to_dtype(xs.dtype())?
+        };
+        
+        Ok(final_out)
     }
 }
 
@@ -3218,11 +3219,17 @@ impl QuantizedQwenTextModel {
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
     let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
-    let weight = QMatMul::from_qtensor(weight)?;
+    let mut weight_q = QMatMul::from_qtensor(weight)?;
+    
+    weight_q = match weight_q {
+        QMatMul::Tensor(t) => QMatMul::Tensor(t.to_dtype(dtype)?),
+        other => other,
+    };
+
     let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { 
         Some(t.dequantize_f16(device).or_else(|_| t.dequantize(device))?.to_dtype(dtype)?) 
     } else { None };
-    Ok(QLinear::new(weight, bias, device.clone()))
+    Ok(QLinear::new(weight_q, bias, device.clone()))
 }
 
 fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, eps: f64, device: &Device, dtype: DType) -> Result<RmsNorm> {

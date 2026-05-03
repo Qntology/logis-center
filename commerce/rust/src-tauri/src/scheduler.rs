@@ -662,6 +662,10 @@ async fn process_task(
             };
             
             let p = parsing::convert_to_clean_pug(&clean, PugMode::FullContent);
+            
+            // 🌟 [CRITICAL FIX] 모델이 VRAM에 없어도 Tokenizer를 디스크에서 직접 구동하여 완벽하게 절단합니다!
+            let p = model.truncate_pug_context(&p).await;
+
             println!("[DEBUG-PUG] Generated PUG. Length: {}. Snippet: {}...", 
                 p.len(), 
                 if p.len() > 100 { &p[..100] } else { &p }.replace("\n", " ")
@@ -1026,9 +1030,9 @@ async fn process_task(
                         let title_info = parsing::parse_json_from_llm(&res);
                         let items_opt = title_info.get("order")
                             .or(title_info.get("goods"))
-                            .or(title_info.get("items"))
+                            .or(title_info.get("title"))
                             .or(title_info.get("titles"))
-                            .or(title_info.get("products"))
+                            .or(title_info.get("product"))
                             .and_then(|v| v.as_array());
 
                         if let Some(items) = items_opt {
@@ -1651,7 +1655,10 @@ async fn process_task(
         let content_pug = {
             let clean_html_path = data_manager.get_path("clean_html");
             let clean_content = data_manager.load(&clean_html_path)?;
-            parsing::convert_to_clean_pug(&clean_content, PugMode::FullContent)
+            let raw_pug = parsing::convert_to_clean_pug(&clean_content, PugMode::FullContent);
+            
+            // 🌟 [CRITICAL FIX] 디테일 모드에서도 통일된 절단 로직을 호출하여 모델 부재 시의 누수를 막습니다.
+            model.truncate_pug_context(&raw_pug).await
         };
 
         if !content_pug.trim().is_empty() {

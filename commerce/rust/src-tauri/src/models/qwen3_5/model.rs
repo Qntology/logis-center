@@ -1862,7 +1862,7 @@ impl Qwen3_5TextModel {
                 attn.merged_vram_block_count = 0;
 
                 for block in &mut attn.kv_blocks {
-                    // 🌟 [CRITICAL FIX] 값을 수정해야 하므로 다시 write() 권한을 가져옵니다!
+                    // 🌟 [CRITICAL FIX] 블록 하단에서 inner.k_cache 등을 덮어쓰므로 반드시 mut가 필요합니다.
                     let mut inner = block.inner.write().unwrap();
                     let is_dirty = {
                         let reg = attn.registry.entries.read().unwrap();

@@ -503,6 +503,15 @@ pub struct QwenVLGenerateModel {
 }
 
 impl QwenVLGenerateModel {
+    /// config.json에서 로드된 모델의 최대 토큰 한계치를 반환합니다.
+    pub fn get_max_tokens(&self) -> usize {
+        match &self.qwen {
+            ModelVariant::QuantizedVL(m) => m.language_model.config.max_position_embeddings,
+            ModelVariant::QuantizedText(m) => m.language_model.config.max_position_embeddings,
+            ModelVariant::Standard(m) => m.config.text_config.as_ref().map(|tc| tc.max_position_embeddings).unwrap_or(32768),
+        }
+    }
+
     pub fn init_with_config(path: &str, tokenizer_path: Option<&str>, config_path: Option<&str>, text_device: Option<&Device>, text_device_id: usize, vision_device: Option<&Device>, vision_device_id: usize, dtype: Option<DType>, hard_token_limit: Option<usize>, force_text_only: bool, baking_only: bool, _is_disk_swap: bool, kv_root: std::path::PathBuf) -> Result<Self> {
         let path = path.strip_prefix(r"\\?\").unwrap_or(path);
         let tok_path = tokenizer_path.unwrap_or(path).strip_prefix(r"\\?\").unwrap_or(tokenizer_path.unwrap_or(path));

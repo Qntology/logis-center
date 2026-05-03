@@ -779,6 +779,38 @@ impl LogisModel {
         Ok(())
     }
 
+    // 🌟 [CRITICAL FIX] 모델이 VRAM에 로드되지 않은 상태라도 config.json과 Tokenizer를 직접 읽어 토큰을 절단하는 함수 추가
+    pub async fn truncate_pug_context(&self, pug: &str) -> String {
+        let margin_tokens = 3_000;
+        
+        // 1. 이미 로드된 모델이 있다면 그 토크나이저와 한계치를 즉시 사용
+        if let Some(gen) = self.qwen3_5_generator.lock().await.as_ref() {
+            return crate::parsing::truncate_pug_by_tokens(pug, gen.get_max_tokens() - margin_tokens, &gen.tokenizer);
+        }
+        if let Some(gen) = self.generator.lock().await.as_ref() {
+            return crate::parsing::truncate_pug_by_tokens(pug, gen.get_max_tokens() - margin_tokens, &gen.tokenizer);
+        }
+
+        // 2. 아무 모델도 로드되지 않은 상태(PUG 생성 직후)라면, 무거운 모델을 올리지 않고 디스크에서 가볍게 설정만 읽어옵니다.
+        let path = &self.qwen_model_path; 
+        let config_path = std::path::Path::new(path).join("config.json");
+        
+        let max_tokens = if let Ok(content) = std::fs::read(&config_path) {
+            if let Ok(cfg) = serde_json::from_slice::<serde_json::Value>(&content) {
+                cfg.get("max_position_embeddings")
+                   .or_else(|| cfg.get("text_config").and_then(|t| t.get("max_position_embeddings")))
+                   .and_then(|v| v.as_u64())
+                   .unwrap_or(32768) as usize
+            } else { 32768 }
+        } else { 32768 };
+
+        if let Ok(tokenizer) = crate::tokenizer::TokenizerModel::init(path) {
+            crate::parsing::truncate_pug_by_tokens(pug, max_tokens - margin_tokens, &tokenizer)
+        } else {
+            pug.to_string()
+        }
+    }
+
     pub async fn new(app_handle: tauri::AppHandle, device_preference: Option<&str>) -> anyhow::Result<Self> {
         // Default to true for SSD-Swap unless user explicitly wants pure CPU
         let is_disk_swap = match device_preference {
