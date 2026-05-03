@@ -557,14 +557,12 @@ impl QwenVLGenerateModel {
         Ok(Self { chat_template, tokenizer, pre_processor: QwenVLProcessor::new(tok_path, &v_dev, effective_dtype)?, qwen, text_device: t_dev, vision_device: v_dev, eos_token_id1: e1, eos_token_id2: e2, generation_config: g_cfg, model_name: loaded_model_name, hard_token_limit, kv_root })
     }
 
-    pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut QwenVLGenerateModel>, _kv_name: Option<String>) -> Result<usize> {
+    pub async fn prefill_only(&mut self, raw_text: String, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut QwenVLGenerateModel>, _kv_name: Option<String>) -> Result<usize> {
         self.clear_kv_cache();
         if let ModelVariant::QuantizedVL(m) = &mut self.qwen { m.language_model.truncate_kv_cache(0)?; }
         if let ModelVariant::QuantizedText(m) = &mut self.qwen { m.language_model.truncate_kv_cache(0)?; }
 
-        let mes_render = self.chat_template.apply_chat_template(&mes)?;
-        let input = self.pre_processor.process_info(&mes, &mes_render)?;
-        let full_ids = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
+        let full_ids = self.tokenizer.text_encode_vec(raw_text, false)?;
         let total_toks = full_ids.len();
         self.qwen.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
         if let Some(s_id) = &session_id {

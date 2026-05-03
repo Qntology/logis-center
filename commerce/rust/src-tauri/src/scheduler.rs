@@ -811,18 +811,13 @@ async fn process_task(
                 // 🌟 [CRITICAL FIX] is_baking을 true로 전달하여 안 써도 되는 2GB짜리 비전(이미지) 모델 로딩을 강제 차단합니다! (로딩 속도 13초 -> 3초)
                 model.secure_vram_relay(crate::model::ModelSize::Qwen, None, Some(cancellation_token.clone()), true, kv_name.clone()).await?;
                 
-                let params = ChatCompletionParameters {
-                    messages: vec![ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                        content: system_content.clone(),
-                        name: None,
-                    })],
-                    model: "qwen".to_string(),
-                    ..Default::default()
-                };
-
                 if let Some(gen) = model.generator.lock().await.as_mut() {
+                    // 🌟 [CRITICAL FIX] ChatTemplate을 거치지 않고, 후속 질문과 100% 동일한 접두사(Prefix)를 생성하여 굽습니다!
+                    // 이렇게 해야 f_ids[kv_len..] 슬라이싱 시 토큰이 엇갈려 환각(Hallucination)이 발생하는 것을 원천 차단할 수 있습니다.
+                    let raw_system_prefix = format!("<|im_start|>system\n{}<|im_end|>\n", system_content);
+                    
                     // System 메시지(PUG)만 1만 토큰을 읽어서 base_session_id 로 저장합니다.
-                    gen.prefill_only(params, Some(cancellation_token.clone()), Some(base_session_id.clone()), None, kv_name.clone()).await?;
+                    gen.prefill_only(raw_system_prefix, Some(cancellation_token.clone()), Some(base_session_id.clone()), None, kv_name.clone()).await?;
                 }
             }
         }
