@@ -427,8 +427,8 @@ Analyze the provided Pug HTML content from top to bottom. Determine if the main 
 
 [ENTITY CONTEXT: {TYPE}]
 You are evaluating a page managing this specific domain entity. Use this context to conceptually understand the abstract structures:
-- Single Entity (Detail): A property configuration interface. It features a large overarching form dedicated to inputting or updating the specific attributes of ONE primary entity. (Minor sub-lists for options/variants do not make it a global list).
-- Collection (List): A catalog or inventory interface dedicated to displaying, filtering, or batch-processing multiple DIFFERENT primary entities.
+- Single Entity (has_form): A property configuration interface. It features a large overarching form dedicated to inputting or updating the specific attributes of ONE primary entity.
+- Collection (has_list): A catalog or inventory interface dedicated to displaying, filtering, or batch-processing multiple DIFFERENT primary entities.
 
 [FORCED DOCUMENT SCANNING LOGIC]
 Read the entire document from top to bottom. You MUST evaluate the concluding elements at the very bottom of the main content area first.
@@ -438,10 +438,9 @@ Look past global navigation menus and overarching search/filter forms at the top
 3. Does the main data area contain an extensive configuration/input form (inputs, textareas, image uploads, save buttons) for a single entity?
 
 [SCHEMA DEFINITIONS]
-- {TYPE}:
-  - 'has_list': Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
-  - 'has_form': Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
-  - 'detail': Boolean. True ONLY if has_list is false AND has_form is true.
+- has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
+- has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
+- detail: Boolean. True ONLY if has_list is false AND has_form is true.
 
 [OUTPUT FORMAT]
 {

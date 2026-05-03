@@ -1,0 +1,57 @@
+[package]
+name = "oxibonsai-runtime"
+description = "Inference runtime, sampling, tokenizer, and server for OxiBonsai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxibonsai-runtime"
+readme = "README.md"
+keywords = ["inference", "runtime", "sampling", "generation", "llm"]
+categories = ["science", "algorithms"]
+
+[features]
+default = ["server"]
+server = ["dep:axum", "dep:tower", "dep:tower-http"]
+rag = ["dep:axum", "dep:tower", "dep:tower-http"]
+wasm = []
+metal = ["oxibonsai-kernels/metal", "oxibonsai-model/metal"]
+native-cuda = ["oxibonsai-kernels/native-cuda", "oxibonsai-model/native-cuda"]
+
+[dependencies]
+oxibonsai-core.workspace = true
+oxibonsai-kernels.workspace = true
+oxibonsai-model.workspace = true
+oxibonsai-tokenizer.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+memmap2.workspace = true
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+oxibonsai-rag.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tracing-subscriber.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokenizers.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tower.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["full"] }
+http-body-util.workspace = true

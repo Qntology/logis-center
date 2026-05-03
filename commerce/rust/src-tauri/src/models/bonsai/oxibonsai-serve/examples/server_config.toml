@@ -1,0 +1,55 @@
+# Canonical oxibonsai-serve configuration.
+#
+# Every field shown below has a default; values set here override the
+# default and can in turn be overridden by `OXIBONSAI_*` environment
+# variables or command-line flags.
+#
+# Precedence (highest wins):
+#     defaults < this TOML < env (OXIBONSAI_*) < CLI (--flag)
+
+# ─── Bind address ──────────────────────────────────────────────────
+[bind]
+host = "0.0.0.0"
+port = 8080
+
+# ─── Model ─────────────────────────────────────────────────────────
+[model]
+# Path to a GGUF file on disk.  Leave unset to fall back to the
+# built-in tiny_test config (for smoke tests only).
+# path = "/var/lib/oxibonsai/qwen3-1.7b.gguf"
+
+# Optional hint; the loader picks the real quantization from the file,
+# this is for logging / metrics only.
+# quantization_hint = "TQ2"
+
+# ─── Tokenizer ─────────────────────────────────────────────────────
+[tokenizer]
+# path = "/var/lib/oxibonsai/tokenizer.json"
+# kind = "huggingface"
+
+# ─── Sampling defaults ─────────────────────────────────────────────
+[sampling]
+default_max_tokens = 256
+default_temperature = 0.7
+default_top_p = 1.0
+
+# ─── Resource limits ───────────────────────────────────────────────
+[limits]
+max_input_tokens = 8192
+max_concurrent_requests = 32
+per_request_timeout_ms = 60_000
+
+# ─── Authentication ────────────────────────────────────────────────
+[auth]
+# Set to require `Authorization: Bearer <token>` on all endpoints
+# except `/health` and `/metrics`.  Must be at least 16 chars.
+# bearer_token = "change-me-to-a-real-16+char-token"
+
+# ─── Observability ─────────────────────────────────────────────────
+[observability]
+log_level = "info"
+metrics_enabled = true
+metrics_path = "/metrics"
+
+# ─── Top-level ─────────────────────────────────────────────────────
+seed = 42

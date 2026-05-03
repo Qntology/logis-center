@@ -680,21 +680,13 @@ impl QwenVLGenerateModel {
             let len = logits_vec.len();
 
             if !gen_ids.is_empty() {
-                // 🌟 [CRITICAL FIX] 할루시네이션(P000001)의 진범! 
-                // "테스트상품" 처럼 반복되는 단어가 필수적인 추출 작업에서 1.2라는 가혹한 페널티는 
-                // 모델이 정답을 말하지 못하도록 입을 틀어막아 강제로 가짜 아이디를 창조하게 만듭니다.
-                // 엄격한 JSON 추출 작업에서는 1.0(비활성화) 수준으로 대폭 낮춰야 LM Studio와 동일한 결과를 얻습니다.
-                let penalty = if is_strict_json { 1.0 } else { 1.05 };
-                
-                // 페널티가 1.0 초과일 때만 연산을 수행하여 속도 최적화
-                if penalty > 1.0 {
-                    let mut set = std::collections::HashSet::new();
-                    for &t in &gen_ids {
-                        if !set.contains(&t) && (t as usize) < len {
-                            let logit = logits_vec[t as usize];
-                            logits_vec[t as usize] = if logit < 0.0 { logit * penalty } else { logit / penalty };
-                            set.insert(t);
-                        }
+                let penalty = 1.2;
+                let mut set = std::collections::HashSet::new();
+                for &t in &gen_ids {
+                    if !set.contains(&t) && (t as usize) < len {
+                        let logit = logits_vec[t as usize];
+                        logits_vec[t as usize] = if logit < 0.0 { logit * penalty } else { logit / penalty };
+                        set.insert(t);
                     }
                 }
             }

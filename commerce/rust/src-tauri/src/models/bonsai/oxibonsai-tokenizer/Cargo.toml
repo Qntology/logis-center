@@ -1,0 +1,27 @@
+[package]
+name = "oxibonsai-tokenizer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxibonsai-tokenizer"
+description = "Pure Rust BPE tokenizer for OxiBonsai (MeCrab-compatible)"
+keywords = ["tokenizer", "bpe", "nlp", "llm", "wasm"]
+categories = ["text-processing", "encoding"]
+readme = "README.md"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "tokenizer_bench"
+harness = false

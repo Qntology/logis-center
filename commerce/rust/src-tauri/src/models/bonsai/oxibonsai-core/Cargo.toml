@@ -1,0 +1,30 @@
+[package]
+name = "oxibonsai-core"
+description = "GGUF Q1_0_g128 loader, tensor types, and configuration for OxiBonsai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxibonsai-core"
+readme = "README.md"
+keywords = ["gguf", "1-bit", "quantization", "llm", "inference"]
+categories = ["science", "algorithms"]
+
+[features]
+default = ["mmap"]
+mmap = ["dep:memmap2"]
+wasm = []
+
+[dependencies]
+thiserror.workspace = true
+byteorder.workspace = true
+half.workspace = true
+memmap2 = { workspace = true, optional = true }
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

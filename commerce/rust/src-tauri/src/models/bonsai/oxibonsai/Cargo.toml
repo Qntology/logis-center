@@ -1,0 +1,41 @@
+[package]
+name = "oxibonsai"
+description = "Pure Rust 1-bit LLM inference engine for PrismML Bonsai models — umbrella crate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxibonsai"
+readme = "README.md"
+keywords = ["llm", "inference", "gguf", "bonsai", "1-bit"]
+categories = ["science", "algorithms", "command-line-utilities"]
+
+[features]
+default = []
+server = ["oxibonsai-runtime/server"]
+rag = ["dep:oxibonsai-rag"]
+simd-avx2 = ["oxibonsai-kernels/simd-avx2"]
+simd-avx512 = ["oxibonsai-kernels/simd-avx512"]
+simd-neon = ["oxibonsai-kernels/simd-neon"]
+native-tokenizer = ["dep:oxibonsai-tokenizer"]
+eval = ["dep:oxibonsai-eval"]
+full = ["server", "rag", "native-tokenizer", "eval"]
+wasm = [
+    "oxibonsai-core/wasm",
+    "oxibonsai-kernels/wasm",
+    "oxibonsai-model/wasm",
+    "oxibonsai-runtime/wasm",
+]
+
+[dependencies]
+oxibonsai-core.workspace = true
+oxibonsai-kernels.workspace = true
+oxibonsai-model.workspace = true
+oxibonsai-runtime = { workspace = true, default-features = false }
+oxibonsai-rag = { workspace = true, optional = true }
+oxibonsai-eval = { workspace = true, optional = true }
+oxibonsai-tokenizer = { workspace = true, optional = true }
+oxibonsai-serve = { workspace = true, optional = true }

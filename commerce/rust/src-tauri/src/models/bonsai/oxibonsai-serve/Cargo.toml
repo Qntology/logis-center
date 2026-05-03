@@ -1,0 +1,39 @@
+[package]
+name = "oxibonsai-serve"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/oxibonsai-serve"
+description = "Standalone OpenAI-compatible inference server for OxiBonsai"
+categories = ["command-line-utilities", "science"]
+readme = "README.md"
+keywords = ["llm", "inference", "server", "openai", "bonsai"]
+
+[[bin]]
+name = "oxibonsai-serve"
+path = "src/main.rs"
+
+[dependencies]
+oxibonsai-core.workspace = true
+oxibonsai-runtime = { workspace = true, features = ["server"] }
+oxibonsai-tokenizer.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
