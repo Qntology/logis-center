@@ -575,7 +575,41 @@ pub async fn extract_html_from_current_tab() -> Result<String, String> {
         let target_page = active_page.or(pages.last());
 
         if let Some(page) = target_page {
-            let html = page.content().await.map_err(|e| e.to_string())?;
+            let js_script = r#"
+                (function() {
+                    try {
+                        const elements = document.querySelectorAll('*');
+                        
+                        // 1. 살아있는(Live) 원본 DOM에서 ComputedStyle을 검사해 플로팅 요소들에 마킹
+                        elements.forEach(el => {
+                            const style = window.getComputedStyle(el);
+                            if (style.position === 'absolute' || style.position === 'fixed') {
+                                el.setAttribute('data-logis-remove', 'true');
+                            }
+                        });
+                        
+                        // 2. 마킹된 상태에서 문서 전체를 복제
+                        const clone = document.documentElement.cloneNode(true);
+                        
+                        // 3. 복제본에서 마킹된 찌꺼기들을 전부 삭제
+                        clone.querySelectorAll('[data-logis-remove="true"]').forEach(el => el.remove());
+                        
+                        // 4. 사용자가 보는 원본 화면에서는 마킹을 다시 지워서 아무 일도 없었던 것처럼 복구
+                        document.querySelectorAll('[data-logis-remove="true"]').forEach(el => {
+                            el.removeAttribute('data-logis-remove');
+                        });
+                        
+                        // 5. 찌꺼기가 제거된 순수 HTML 반환
+                        return clone.outerHTML;
+                    } catch(e) {
+                        return document.documentElement.outerHTML; // 에러 시 폴백
+                    }
+                })();
+            "#;
+
+            let eval_result = page.evaluate(js_script).await.map_err(|e| e.to_string())?;
+            let html = eval_result.into_value::<String>().unwrap_or_default();
+            
             return Ok(html);
         }
         Err("No open tabs found.".to_string())

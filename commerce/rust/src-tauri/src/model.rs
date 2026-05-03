@@ -793,7 +793,7 @@ impl LogisModel {
             },
             Some(ModelSize::Qwen3) => {
                 // Qwen3 (0.6B Text) Natively Trained Context Length
-                (32_768, &self.qwen3_model_path)
+                (20_000, &self.qwen3_model_path)
             },
             _ => {
                 // Qwen (0.6B VLM) 및 기본값

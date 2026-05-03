@@ -868,7 +868,7 @@ async fn process_task(
                     ],
                     model: "qwen".to_string(), 
                     max_tokens: Some(16),
-                    temperature: Some(0.0), top_p: Some(0.01),
+                    temperature: Some(0.0), top_p: Some(0.95),
                     ..Default::default()
                 };
 
@@ -928,7 +928,7 @@ async fn process_task(
                 ],
                 model: "qwen".to_string(), // 🌟 qwen 으로 복구
                 max_tokens: Some(128),     // JSON 스키마가 길어졌으므로 토큰 길이는 128로 유지
-                temperature: Some(0.0), top_p: Some(0.01),
+                temperature: Some(0.0), top_p: Some(0.95),
                 ..Default::default()
             };
 
@@ -1006,7 +1006,7 @@ async fn process_task(
                                 name: None,
                             })
                         ],
-                        model: "qwen".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.01),
+                        model: "qwen".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
                         ..Default::default()
                     };
 
