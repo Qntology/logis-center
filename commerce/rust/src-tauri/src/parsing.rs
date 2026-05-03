@@ -33,8 +33,8 @@ pub fn pre_clean_html(html: &str) -> String {
     let html = re_comm.replace_all(html, "");
 
     // 2. 불필요한 태그 및 내부 콘텐츠 통째로 제거
-    // JS filter list: script, style, link, noscript, iframe
-    let re_tags = Regex::new(r"(?is)<(script|style|link|noscript|iframe)\b[^>]*>.*?</(script|style|link|noscript|iframe)>").unwrap();
+    // JS filter list: script, style, link, noscript, iframe, svg
+    let re_tags = Regex::new(r"(?is)<(script|style|link|noscript|iframe|svg)\b[^>]*>.*?</(script|style|link|noscript|iframe|svg)>").unwrap();
     let html = re_tags.replace_all(&html, "");
 
     // 3. 단일 태그 및 불필요한 메타 태그 정리 (input은 제외하고 보존)
@@ -100,26 +100,223 @@ pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMo
     convert_doc_to_clean_pug_selector(&document, selector_str, mode)
 }
 
-// 🌟 [CRITICAL FIX] Tokenizer를 주입받아 실제 토큰 수를 계산하며 줄 단위로 자르는 함수 추가
+/*
+HTML5 명세서(W3C/MDN) 기준으로, 자기 자신 안에 다른 태그(자식)나 텍스트를 감싸 안을 수 있는 태그들을 의미론적(Semantic) 및 시각적 용도에 따라 분류했습니다. 이 태그들이 바로 PUG에서 뎁스를 만들고, 우리가 역추적 시 구출해야 할 '부모 후보군'입니다.
+
+1. 문서 전체의 골격 (Root & Sectioning Roots)
+문서 전체의 레이아웃을 나누는 가장 거대한 컨테이너입니다.
+
+<html>: HTML 문서의 최상위 부모.
+
+<body>: 브라우저 화면에 보이는 모든 내용의 부모.
+
+<head>: 메타데이터, 스크립트, 스타일의 부모 (보통 우리가 파싱할 땐 제외하지만 구조상 부모임).
+
+2. 페이지 레이아웃 및 구획 분할 (Sectioning Content & Semantic)
+페이지를 머리말, 본문, 꼬리말, 사이드바 등 커다란 덩어리로 나눌 때 사용하는 부모 태그입니다.
+
+<main>: 문서의 핵심 본문을 감싸는 부모.
+
+<header>: 상단 영역(로고, 메뉴 등)을 묶는 부모.
+
+<footer>: 하단 영역(카피라이트 등)을 묶는 부모.
+
+<nav>: 네비게이션(메뉴) 링크들을 묶는 부모.
+
+<section>: 논리적으로 연관된 콘텐츠들을 묶는 구역 부모.
+
+<article>: 뉴스 기사, 블로그 포스트처럼 독립적으로 배포 가능한 콘텐츠 부모.
+
+<aside>: 본문과 직접적 연관이 적은 사이드바 등을 감싸는 부모.
+
+3. 범용 컨테이너 (Grouping Content)
+의미를 부여하기보다는 단순히 CSS 스타일링이나 스크립트 제어를 위해 여러 요소를 묶을 때 사용하는 가장 흔한 부모 태그입니다.
+
+<div>: 블록 단위의 범용 부모 껍데기. (가장 많이 쓰임)
+
+<span>: 텍스트나 인라인 요소들을 묶는 범용 부모.
+
+4. 목록 구조 (Lists)
+리스트 항목들을 계층적으로 묶어주는 부모 태그입니다.
+
+<ul>: 순서가 없는(글머리 기호) 목록 전체를 감싸는 부모.
+
+<ol>: 순서가 있는(숫자) 목록 전체를 감싸는 부모.
+
+<li>: 목록의 개별 항목을 감싸는 부모. (ul이나 ol의 자식이자, 내부 텍스트의 부모)
+
+<dl>, <dt>, <dd>: 용어와 그 정의를 묶어주는 구조적 부모.
+
+5. 표 구조 (Tables)
+2차원 격자 형태의 데이터를 표현하기 위해 깊은 뎁스를 만드는 대표적인 부모 그룹입니다.
+
+<table>: 표 전체를 감싸는 최상위 부모.
+
+<thead>, <tbody>, <tfoot>: 표의 머리, 본문, 바닥글 행들을 묶는 중간 부모.
+
+<tr>: 표의 한 줄(행)을 감싸는 부모.
+
+<th>, <td>: 표의 개별 칸(셀)을 감싸는 부모. (텍스트의 직접적인 부모)
+
+<colgroup>: 열 묶음 부모.
+
+6. 폼 및 입력 제어 (Forms)
+사용자로부터 데이터를 입력받는 요소들을 시각적, 논리적으로 묶어주는 부모 태그입니다.
+
+<form>: 폼 전체를 감싸는 부모.
+
+<fieldset>: 폼 내부에서 관련 요소들을 그룹화하는 부모.
+
+<select>: 드롭다운 목록 전체를 감싸는 부모.
+
+<optgroup>: 드롭다운 내의 옵션들을 다시 묶는 중간 부모.
+
+<option>: 개별 선택 항목 텍스트를 감싸는 부모. (단, input은 자식을 가질 수 없는 Void 태그임)
+
+<button>, <label>, <textarea>: 내부 텍스트나 이미지를 가질 수 있는 부모.
+
+7. 텍스트 단락 및 서식 (Text Formatting)
+텍스트의 의미나 서식을 지정하기 위해 텍스트를 얇게 감싸는 부모 태그입니다.
+
+<p>: 하나의 문단을 감싸는 부모.
+
+<blockquote>, <q>: 인용구를 감싸는 부모.
+
+<pre>: 구조화된 텍스트 전체를 감싸는 부모.
+
+<strong>, <b>, <em>, <i>, <mark>, <del>, <ins>, <code> 등 수많은 인라인 텍스트 래퍼들.
+
+<a>: 하이퍼링크를 만들기 위해 텍스트나 이미지를 감싸는 부모.
+
+8. 미디어 래퍼 (Media & Interactive)
+<figure>: 이미지와 캡션을 하나로 묶어주는 부모.
+
+<picture>, <audio>, <video>: 미디어 소스를 묶는 부모.
+
+<details>, <summary>: 접고 펴는 UI 구조의 부모.
+
+🛑 자식을 가질 수 없는 태그 (Void Elements) 요약
+위의 수많은 부모 태그들과 달리, 태생적으로 닫는 태그가 없어서 자식을 가질 수 없는 태그는 명세서에 딱 14개로 정해져 있습니다.
+
+area, base, br, col, embed, hr, img, input, link, meta, param, source, track, wbr
+*/
+
+// 🌟 [HTML5 부모/자식 뎁스 판별 절대 규칙 (Parent Trace Rule)]
+// 1. Void Elements (자식 불가 태그): area, base, br, col, embed, hr, img, input, link, meta, param, source, track, wbr 및 PUG 텍스트(|)
+// 2. Root/Layout Elements (역추적 한계선): html, body, head, main, section, article, aside, nav, header, footer
+// 3. Container Elements (합법적 부모): 위 1번과 2번을 제외한 모든 태그 (div, table, ul, li, span, p 등)
+// 이 원칙을 바탕으로 잘려나간 PUG의 잃어버린 뎁스(부모 껍데기)를 역추적하여 100% 복구하고 불필요한 전체 뼈대는 버립니다.
+
+/// HTML 명세상 자식을 가질 수 없는 단일 태그(Void Elements) 판별
+fn is_void_element(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() { return true; }
+    
+    // 1. PUG 텍스트 노드(|)는 부모가 될 수 없음
+    if trimmed.starts_with('|') { return true; }
+    
+    // 2. HTML Void Elements 14개 리스트 완벽 적용
+    let void_tags = [
+        "area", "base", "br", "col", "embed", "hr", "img", "input", 
+        "link", "meta", "param", "source", "track", "wbr"
+    ];
+    
+    // 태그 이름만 추출 (예: "img[src='...']" -> "img")
+    let tag_name = trimmed.split(|c| c == '[' || c == ' ' || c == '(').next().unwrap_or("").to_lowercase();
+    
+    void_tags.contains(&tag_name.as_str())
+}
+
+/// 문서의 최상위 골격을 형성하는 레이아웃 태그 판별 (만나면 역추적 중단)
+fn is_root_layout_element(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('|') { return false; }
+    
+    // 태그 이름만 정확히 추출
+    let tag_name = trimmed.split(|c| c == '[' || c == ' ' || c == '(').next().unwrap_or("").to_lowercase();
+    
+    // HTML5 시맨틱 레이아웃/구역 경계 태그 10개 리스트
+    let root_tags = [
+        "html", "body", "head", 
+        "main", "section", "article", "aside", "nav", 
+        "header", "footer"
+    ];
+    
+    root_tags.contains(&tag_name.as_str())
+}
+
+// 🌟 [CRITICAL FIX] Token Optimizer를 주입받아 앞단을 잘라내고, 필수 부모를 복구하며, 최상위 껍데기를 버리는 완전체 함수
 pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::tokenizer::TokenizerModel) -> String {
     let mut current_tokens = 0;
     let mut kept_lines = Vec::new();
+    let mut lines_iter = pug.lines().rev();
     
-    // 🌟 끝에서부터 역순으로 줄을 읽어 올라가며 끝단을 우선적으로 보존합니다.
-    for line in pug.lines().rev() {
+    let mut last_valid_indent = None;
+
+    // 1. [수집 단계] 끝에서부터 역순으로 토큰 한도까지 수집
+    while let Some(line) = lines_iter.next() {
         let line_with_newline = format!("{}\n", line);
         let token_count = tokenizer.text_encode_vec(line_with_newline.clone(), false).map(|v| v.len()).unwrap_or(0);
         
-        // 한도를 초과하면 누적을 멈춥니다. (즉, 앞단이 자연스럽게 버려집니다)
         if current_tokens + token_count > max_tokens {
-            break;
+            break; // 절단 지점 도달 (앞단은 1차적으로 버려짐)
         }
+        
         kept_lines.push(line_with_newline);
         current_tokens += token_count;
+        
+        if !line.trim().is_empty() {
+            last_valid_indent = Some(line.chars().take_while(|c| c.is_whitespace()).count());
+        }
     }
     
-    // 🌟 역순으로 수집된 배열을 다시 정방향으로 뒤집어서 문자열로 병합합니다.
-    kept_lines.into_iter().rev().collect()
+    // 2. [복구 단계] 절단면 위쪽으로 거슬러 올라가며 필수 부모 껍데기(table, ul, div 등) 구출
+    if let Some(mut target_indent) = last_valid_indent {
+        while target_indent > 0 {
+            if let Some(line) = lines_iter.next() {
+                if line.trim().is_empty() { continue; }
+                let current_indent = line.chars().take_while(|c| c.is_whitespace()).count();
+                
+                // 🌟 핵심: html, body, main, header 등을 만나면 역추적을 즉시 중단하여 앞단이 확실히 잘리도록 보장!
+                if is_root_layout_element(line) {
+                    break;
+                }
+
+                // 현재 기준보다 뎁스가 얕고, Void 태그가 아닌 진짜 부모만 구출
+                if current_indent < target_indent && !is_void_element(line) {
+                    kept_lines.push(format!("{}\n", line));
+                    target_indent = current_indent; // 부모의 부모를 찾기 위해 기준점 갱신
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    
+    // 3. [정렬 단계] 수집된 라인을 정방향으로 뒤집고 다이내믹 뎁스 정렬 수행
+    let mut final_lines: Vec<String> = kept_lines.into_iter().rev().collect();
+    
+    if !final_lines.is_empty() {
+        let mut current_shift = final_lines.iter()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.chars().take_while(|c| c.is_whitespace()).count())
+            .unwrap_or(0);
+        
+        for line in final_lines.iter_mut() {
+            if line.trim().is_empty() { continue; }
+            let original_indent = line.chars().take_while(|c| c.is_whitespace()).count();
+            
+            // 더 얕은 부모 태그를 만나면 깎아낼 기준점을 낮춰서 계층 구조 붕괴 방지
+            if original_indent < current_shift {
+                current_shift = original_indent;
+            }
+            
+            let remove_count = current_shift.min(original_indent);
+            *line = line.chars().skip(remove_count).collect();
+        }
+    }
+    
+    final_lines.concat()
 }
 
 #[derive(Default, Clone)]
@@ -147,8 +344,8 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 }
             }
 
-            // 불필요한 태그들을 만나면 건너뛰기
-            if ["script", "style", "link", "noscript", "iframe"].contains(&tag_name.as_str()) {
+            // 불필요한 태그들을 만나면 건너뛰기 (svg 추가)
+            if ["script", "style", "link", "noscript", "iframe", "svg"].contains(&tag_name.as_str()) {
                 return;
             }
 
@@ -430,18 +627,18 @@ Page Type: {TYPE}
 [FORCED DOCUMENT SCANNING LOGIC]
 Read the entire document from top to bottom, applying the following strict filters and evaluations:
 
-1. IGNORE (Exclusion):
-   - Strictly ignore global navigation menus, headers, footers, sidebars, and overarching search/filter forms at the top.
-2. TARGET (Focus Area):
+1. IGNORE:
+   - Strictly ignore global navigation, menus, headers, footers, aside, search, filter, form.
+2. TARGET:
    - Focus purely on the main data payload where "{CATEGORY}", "{TYPE}", or actual items are listed.
 
 [SCHEMA DEFINITIONS]
 { 
-  "{CATEGORY}" : ["{TITLE}"]
+  {CATEGORY} : ["{TITLE}"]
 }
 
 [OUTPUT FORMAT]
-{ "{CATEGORY}" : [...] }
+{ {CATEGORY} : [...] }
 
 RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
@@ -463,11 +660,11 @@ You are evaluating a page managing this specific domain entity. Use this context
 [FORCED DOCUMENT SCANNING LOGIC]
 Read the entire document from top to bottom, applying the following strict filters and evaluations:
 
-1. IGNORE (Exclusion):
-   - Strictly ignore global navigation menus, headers, footers, sidebars, and overarching search/filter forms at the top.
-2. TARGET (Focus Area):
+1. IGNORE:
+   - Strictly ignore global navigation, menus, headers, footers, aside, search, filter, form.
+2. TARGET:
    - Focus purely on the main data payload where "{CATEGORY}", "{TYPE}", or actual items are listed.
-3. EVALUATE (Structural Signatures):
+3. EVALUATE:
    - You MUST evaluate the concluding elements at the very bottom of the main content area first. Check for the following:
      A. Does the page terminate with dataset navigation (pagination, "next/prev") or bulk-action execution elements?
      B. Does the main data area consist of a repeating multi-entity grid?

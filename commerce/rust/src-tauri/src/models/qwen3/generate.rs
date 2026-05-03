@@ -13,7 +13,7 @@ use crate::{chat_template::ChatTemplate, tokenizer::TokenizerModel};
 
 pub struct Qwen3GenerateModel {
     chat_template: ChatTemplate,
-    tokenizer: TokenizerModel,
+    pub tokenizer: TokenizerModel,
     qwen3: Qwen3Model,
     device: Device,
     eos_token_id1: u32,

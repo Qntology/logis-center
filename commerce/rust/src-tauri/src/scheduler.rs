@@ -666,9 +666,10 @@ async fn process_task(
             // 🌟 [CRITICAL FIX] 모델이 VRAM에 없어도 Tokenizer를 디스크에서 직접 구동하여 완벽하게 절단합니다!
             let p = model.truncate_pug_context(&p).await;
 
+            // 🌟 [CRITICAL FIX] 바이트 단위 슬라이싱(&p[..100]) 시 한글 등 멀티바이트 문자가 잘리면서 발생하는 panic을 방지하기 위해 chars().take(100) 사용
             println!("[DEBUG-PUG] Generated PUG. Length: {}. Snippet: {}...", 
                 p.len(), 
-                if p.len() > 100 { &p[..100] } else { &p }.replace("\n", " ")
+                p.chars().take(100).collect::<String>().replace("\n", " ")
             );
             
             // [DEBUG-LOG] Save generated Pug

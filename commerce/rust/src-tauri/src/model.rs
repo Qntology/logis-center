@@ -779,33 +779,42 @@ impl LogisModel {
         Ok(())
     }
 
-    // 🌟 [CRITICAL FIX] 모델이 VRAM에 로드되지 않은 상태라도 config.json과 Tokenizer를 직접 읽어 토큰을 절단하는 함수 추가
+    // 🌟 [CRITICAL FIX] config.json의 물리적 텐서 크기와 실제 훈련된 Context Length를 완벽히 분리합니다.
     pub async fn truncate_pug_context(&self, pug: &str) -> String {
         let margin_tokens = 3_000;
         
-        // 1. 이미 로드된 모델이 있다면 그 토크나이저와 한계치를 즉시 사용
+        // 1. 로드된 모델(또는 타겟 모델)에 따라 공식 컨텍스트 한계값을 명확히 지정합니다.
+        // 🌟 사용자의 현재 Enum 상태(Qwen3_5)에 맞춰 롤백 반영
+        let current_size = *self.current_size.lock().await;
+        let (max_context_length, tokenizer_path) = match current_size {
+            Some(ModelSize::Qwen3_5) => {
+                // Qwen3.5 (0.8B) Natively Trained Context Length
+                (262_144, &self.qwen3_5_model_path)
+            },
+            Some(ModelSize::Qwen3) => {
+                // Qwen3 (0.6B Text) Natively Trained Context Length
+                (32_768, &self.qwen3_model_path)
+            },
+            _ => {
+                // Qwen (0.6B VLM) 및 기본값
+                (32_768, &self.qwen_model_path)
+            }
+        };
+
+        // 2. 이미 활성화된 제너레이터가 있다면 그 안에 탑재된 토크나이저를 즉시 재사용합니다.
         if let Some(gen) = self.qwen3_5_generator.lock().await.as_ref() {
-            return crate::parsing::truncate_pug_by_tokens(pug, gen.get_max_tokens() - margin_tokens, &gen.tokenizer);
+            return crate::parsing::truncate_pug_by_tokens(pug, max_context_length - margin_tokens, &gen.tokenizer);
+        }
+        if let Some(gen) = self.qwen3_generator.lock().await.as_ref() {
+            return crate::parsing::truncate_pug_by_tokens(pug, max_context_length - margin_tokens, &gen.tokenizer);
         }
         if let Some(gen) = self.generator.lock().await.as_ref() {
-            return crate::parsing::truncate_pug_by_tokens(pug, gen.get_max_tokens() - margin_tokens, &gen.tokenizer);
+            return crate::parsing::truncate_pug_by_tokens(pug, max_context_length - margin_tokens, &gen.tokenizer);
         }
 
-        // 2. 아무 모델도 로드되지 않은 상태(PUG 생성 직후)라면, 무거운 모델을 올리지 않고 디스크에서 가볍게 설정만 읽어옵니다.
-        let path = &self.qwen_model_path; 
-        let config_path = std::path::Path::new(path).join("config.json");
-        
-        let max_tokens = if let Ok(content) = std::fs::read(&config_path) {
-            if let Ok(cfg) = serde_json::from_slice::<serde_json::Value>(&content) {
-                cfg.get("max_position_embeddings")
-                   .or_else(|| cfg.get("text_config").and_then(|t| t.get("max_position_embeddings")))
-                   .and_then(|v| v.as_u64())
-                   .unwrap_or(32768) as usize
-            } else { 32768 }
-        } else { 32768 };
-
-        if let Ok(tokenizer) = crate::tokenizer::TokenizerModel::init(path) {
-            crate::parsing::truncate_pug_by_tokens(pug, max_tokens - margin_tokens, &tokenizer)
+        // 3. 모델이 VRAM에 없을 경우, 디스크에서 가볍게 토크나이저만 읽어와서 정확한 토큰 수 기반으로 절단합니다.
+        if let Ok(tokenizer) = crate::tokenizer::TokenizerModel::init(tokenizer_path) {
+            crate::parsing::truncate_pug_by_tokens(pug, max_context_length - margin_tokens, &tokenizer)
         } else {
             pug.to_string()
         }
