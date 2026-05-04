@@ -129,8 +129,6 @@ pub async fn start_background_worker(
         }
     });
 
-    clear_all_temp_data(Some(&app_handle));
-
     // 🌟 [삭제] 이미 lib.rs 의 setup 블록에서 동기적으로 정리가 완료되었으므로, 
     // 여기서 다시 spawn 하여 불필요한 DB 락 경쟁을 일으킬 필요가 없습니다.
     
@@ -232,7 +230,6 @@ pub async fn start_background_worker(
                             let _ = db.update_message_status(&task.id, crate::logic::parse_status("complete"), Some("Task Completed")).await;
                         }
 
-                        cleanup_task_resources(&task.id, Some(&app_handle));
                         current_device_pref = None; 
                         oom_retry_map.remove(&task.id); // 성공 시 장부 삭제
                     },
@@ -262,7 +259,6 @@ pub async fn start_background_worker(
                                 "task_id": task.id,
                                 "category": "Done", "summary": "Cancelled by user", "spinner": "🛑", "data": null 
                              }));
-                             cleanup_task_resources(&task.id, Some(&app_handle));
                              
                              current_device_pref = None;
                              continue;
@@ -2097,11 +2093,6 @@ async fn process_task(
     Ok(())
 }
 
-fn cleanup_task_resources(task_id: &str, app_handle: Option<&tauri::AppHandle>) {
-    // [FIX] Only remove the specific directory for this task
-    let _ = fs::remove_dir_all(utils::paths::get_task_specific_dir(app_handle, task_id));
-}
-
 // [3번 가속: PRE-FETCH] OS 페이지 캐시에 무게추 파일을 미리 로드함
 fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
     use std::io::Read;
@@ -2159,11 +2150,6 @@ pub fn log_task_progress(app: &tauri::AppHandle, task_id: &str, payload: &serde_
     }
 
     let _ = app.emit("extraction-progress", &final_payload);
-}
-
-fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {
-    println!("[Cleanup] Clearing all temporary data directories...");
-    utils::paths::cleanup_temp_dirs(app_handle);
 }
 
 async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, cancellation_token: Option<&Arc<AtomicBool>>) -> Result<()> {
