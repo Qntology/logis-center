@@ -145,92 +145,95 @@ fn is_root_layout_element(line: &str) -> bool {
 }
 
 // 🌟 [CRITICAL FIX] Token Optimizer를 주입받아 앞단을 잘라내고, 필수 부모를 복구하며, 최상위 껍데기를 버리는 완전체 함수
-pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::tokenizer::TokenizerModel, keep_top: bool) -> String {
-    let mut current_tokens = 0;
-    let mut kept_lines = Vec::new();
-    
-    if keep_top {
-        // [위에서 아래로 수집] HTML 상단부터 수집하며 아래쪽을 자름 (thead 등 추출 시 유리)
-        for line in pug.lines() {
+pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::tokenizer::TokenizerModel, bottom_drop_tokens: Option<usize>) -> String {
+    let mut lines: Vec<&str> = pug.lines().collect();
+
+    // 🌟 1. 아래서 한 번 자르기 (bottom_drop_tokens 가 주어지면 뒤에서부터 해당 토큰 수만큼 버림)
+    if let Some(drop_limit) = bottom_drop_tokens {
+        let mut dropped_tokens = 0;
+        let mut drop_count = 0;
+        for line in lines.iter().rev() {
             let line_with_newline = format!("{}\n", line);
-            let token_count = tokenizer.text_encode_vec(line_with_newline.clone(), false).map(|v| v.len()).unwrap_or(0);
-            
-            if current_tokens + token_count > max_tokens {
+            let token_count = tokenizer.text_encode_vec(line_with_newline, false).map(|v| v.len()).unwrap_or(0);
+            if dropped_tokens + token_count > drop_limit {
                 break; 
             }
-            
-            kept_lines.push(line_with_newline);
-            current_tokens += token_count;
+            dropped_tokens += token_count;
+            drop_count += 1;
         }
-        // 정방향 수집이므로 뒤집기나 부모 복구 필요 없음
-        kept_lines.concat()
-    } else {
-        // [밑에서 위로 수집] 기존 로직: 끝에서부터 역순으로 수집 (위쪽을 자름)
-        let mut lines_iter = pug.lines().rev();
-        let mut last_valid_indent = None;
+        // 문서가 너무 짧아 통째로 날아가는 것을 방지하기 위해 최소 1줄은 남깁니다.
+        let safe_drop_count = drop_count.min(lines.len().saturating_sub(1));
+        lines.truncate(lines.len() - safe_drop_count);
+    }
 
-        // 1. [수집 단계]
-        while let Some(line) = lines_iter.next() {
-            let line_with_newline = format!("{}\n", line);
-            let token_count = tokenizer.text_encode_vec(line_with_newline.clone(), false).map(|v| v.len()).unwrap_or(0);
-            
-            if current_tokens + token_count > max_tokens {
-                break;
-            }
-            
-            kept_lines.push(line_with_newline);
-            current_tokens += token_count;
-            
-            if !line.trim().is_empty() {
-                last_valid_indent = Some(line.chars().take_while(|c| c.is_whitespace()).count());
-            }
+    // 🌟 2. 위에서 한 번 자르기 (남은 덩어리에서 밑에서부터 max_tokens 만큼 수집하여 앞단을 버림)
+    let mut current_tokens = 0;
+    let mut kept_lines = Vec::new();
+    let mut last_valid_indent = None;
+
+    let mut lines_iter = lines.into_iter().rev();
+
+    // 1. [수집 단계]
+    while let Some(line) = lines_iter.next() {
+        let line_with_newline = format!("{}\n", line);
+        let token_count = tokenizer.text_encode_vec(line_with_newline.clone(), false).map(|v| v.len()).unwrap_or(0);
+        
+        if current_tokens + token_count > max_tokens {
+            break;
         }
         
-        // 2. [복구 단계] 절단면 위쪽으로 거슬러 올라가며 필수 부모 껍데기 구출
-        if let Some(mut target_indent) = last_valid_indent {
-            while target_indent > 0 {
-                if let Some(line) = lines_iter.next() {
-                    if line.trim().is_empty() { continue; }
-                    let current_indent = line.chars().take_while(|c| c.is_whitespace()).count();
-                    
-                    if is_root_layout_element(line) {
-                        break;
-                    }
-
-                    if current_indent < target_indent && !is_void_element(line) {
-                        kept_lines.push(format!("{}\n", line));
-                        target_indent = current_indent; 
-                    }
-                } else {
+        kept_lines.push(line_with_newline);
+        current_tokens += token_count;
+        
+        if !line.trim().is_empty() {
+            last_valid_indent = Some(line.chars().take_while(|c| c.is_whitespace()).count());
+        }
+    }
+    
+    // 2. [복구 단계] 절단면 위쪽으로 거슬러 올라가며 필수 부모 껍데기 구출
+    if let Some(mut target_indent) = last_valid_indent {
+        while target_indent > 0 {
+            if let Some(line) = lines_iter.next() {
+                if line.trim().is_empty() { continue; }
+                let current_indent = line.chars().take_while(|c| c.is_whitespace()).count();
+                
+                if is_root_layout_element(line) {
                     break;
                 }
-            }
-        }
-        
-        // 3. [정렬 단계] 수집된 라인을 정방향으로 뒤집고 다이내믹 뎁스 정렬 수행
-        let mut final_lines: Vec<String> = kept_lines.into_iter().rev().collect();
-        
-        if !final_lines.is_empty() {
-            let mut current_shift = final_lines.iter()
-                .find(|line| !line.trim().is_empty())
-                .map(|line| line.chars().take_while(|c| c.is_whitespace()).count())
-                .unwrap_or(0);
-            
-            for line in final_lines.iter_mut() {
-                if line.trim().is_empty() { continue; }
-                let original_indent = line.chars().take_while(|c| c.is_whitespace()).count();
-                
-                if original_indent < current_shift {
-                    current_shift = original_indent;
+
+                if current_indent < target_indent && !is_void_element(line) {
+                    kept_lines.push(format!("{}\n", line));
+                    target_indent = current_indent; 
                 }
-                
-                let remove_count = current_shift.min(original_indent);
-                *line = line.chars().skip(remove_count).collect();
+            } else {
+                break;
             }
         }
-        
-        final_lines.concat()
     }
+    
+    // 3. [정렬 단계] 수집된 라인을 정방향으로 뒤집고 다이내믹 뎁스 정렬 수행
+    let mut final_lines: Vec<String> = kept_lines.into_iter().rev().collect();
+    
+    if !final_lines.is_empty() {
+        let mut current_shift = final_lines.iter()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.chars().take_while(|c| c.is_whitespace()).count())
+            .unwrap_or(0);
+        
+        for line in final_lines.iter_mut() {
+            if line.trim().is_empty() { continue; }
+            let original_indent = line.chars().take_while(|c| c.is_whitespace()).count();
+            
+            if original_indent < current_shift {
+                current_shift = original_indent;
+            }
+            
+            let remove_count = current_shift.min(original_indent);
+            *line = line.chars().skip(remove_count).collect();
+        }
+    }
+    
+    final_lines.concat()
 }
 
 #[derive(Default, Clone)]

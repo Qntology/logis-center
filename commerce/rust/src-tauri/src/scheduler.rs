@@ -1212,7 +1212,7 @@ async fn process_task(
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Analyzing table header structure...", "spinner": "⠋" }));
                     
                     // 🌟 [추가] ref_row의 텍스트 길이를 기반으로 대략적인 토큰을 산출하여 컨텍스트 사이즈를 예약하고 뒤에서 자릅니다.
-                    let ref_row_context_size = ref_row.len() / 3;
+                    let ref_row_context_size = ref_row.len() + 1000;
                     let thead_light_pug = model.truncate_pug_context(&raw_pug, false, 2000, Some(ref_row_context_size)).await;
                     let thead_prompt = crate::parsing::extract_table_structure_prompt(&page_type, &target_selector, &thead_light_pug, &ref_row);
                     let params = ChatCompletionParameters {
