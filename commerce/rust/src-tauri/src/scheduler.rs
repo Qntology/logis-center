@@ -576,7 +576,7 @@ async fn process_task(
 
     let clean_html_content = parsing::pre_clean_html(&raw_html_content);
     let raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::FullContent);
-    let light_pug = model.truncate_pug_context(&raw_pug).await;
+    let light_pug = model.truncate_pug_context(&raw_pug, false).await;
 
     println!("[DEBUG-PUG] Generated PUG. Length: {}. Snippet: {}...", 
         light_pug.len(), 
@@ -648,7 +648,11 @@ async fn process_task(
 
                         if is_valid && !item_sel.is_empty() {
                             let target_sel_str = if !node_sel.is_empty() && !item_sel.contains(",") {
-                                format!("{} {}", node_sel, item_sel)
+                                if item_sel.starts_with(node_sel) {
+                                    item_sel.to_string()
+                                } else {
+                                    format!("{} {}", node_sel, item_sel)
+                                }
                             } else {
                                 item_sel.to_string()
                             };
@@ -1165,7 +1169,11 @@ async fn process_task(
         let node_selector = selector_info.get("node").or_else(|| selector_info.get("parent")).and_then(|s| s.as_str()).unwrap_or("");
         
         let target_selector = if !node_selector.is_empty() && !item_selector.is_empty() && !item_selector.contains(",") {
-            format!("{} {}", node_selector, item_selector) 
+            if item_selector.starts_with(node_selector) {
+                item_selector.to_string()
+            } else {
+                format!("{} {}", node_selector, item_selector) 
+            }
         } else if !item_selector.is_empty() { 
             item_selector.to_string() 
         } else { 
@@ -1534,7 +1542,7 @@ async fn process_task(
             let raw_pug = parsing::convert_to_clean_pug(clean_content, PugMode::FullContent);
             
             // 🌟 [CRITICAL FIX] 디테일 모드에서도 통일된 절단 로직을 호출하여 모델 부재 시의 누수를 막습니다.
-            model.truncate_pug_context(&raw_pug).await
+            model.truncate_pug_context(&raw_pug, true).await
         };
 
         if !content_pug.trim().is_empty() {
