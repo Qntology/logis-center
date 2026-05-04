@@ -1219,8 +1219,8 @@ async fn process_task(
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Analyzing table header structure...", "spinner": "⠋" }));
                     
                     // 🌟 [추가] ref_row의 텍스트 길이를 기반으로 대략적인 토큰을 산출하여 컨텍스트 사이즈를 예약하고 뒤에서 자릅니다.
-                    let ref_row_context_size = ref_row.len() + 1000;
-                    let thead_light_pug = model.truncate_pug_context(&raw_pug, false, 2000, Some(ref_row_context_size)).await;
+                    let ref_row_context_size = ref_row.len() + 3000;
+                    let thead_light_pug = model.truncate_pug_context(&raw_pug, false, 0, Some(ref_row_context_size)).await;
                     let thead_prompt = crate::parsing::extract_table_structure_prompt(&page_type, &target_selector, &thead_light_pug, &ref_row);
                     let params = ChatCompletionParameters {
                         messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -1682,7 +1682,13 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     // [PARITY] ID Generation
-    let id_val_raw = extracted_data.get("id").or_else(|| extracted_data.get("index")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let id_val_raw = extracted_data.get("no")
+        .or_else(|| extracted_data.get("code"))
+        .or_else(|| extracted_data.get("tracking_number"))
+        .or_else(|| extracted_data.get("id"))
+        .or_else(|| extracted_data.get("index"))
+        .and_then(|v| if v.is_number() { Some(v.to_string()) } else { v.as_str().map(|s| s.to_string()) })
+        .unwrap_or_default();
     let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(&id_val_raw).replace("-", "").replace("_", "");
     let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));
     
@@ -1690,7 +1696,7 @@ async fn process_task(
 
     if let Some(obj) = extracted_data.as_object_mut() {
         obj.insert("index".to_string(), json!(index_val));
-        obj.insert("id".to_string(), json!(generated_id));
+        obj.insert("id".to_string(), json!(generated_id.clone()));
     }
 
     log_task_progress(app_handle, &task.id, &json!({ "category": "Saving", "summary": "Syncing to database..." }));
@@ -1766,12 +1772,13 @@ async fn process_task(
         // 🌟 [DETAIL MODE] 단일 문서일 경우
         let text_to_embed = parsing::json_to_natural_language(&extracted_data);
         let item_digest = crate::utils::hash::digest(&text_to_embed); 
-        let target_id = if !task.r#ref.is_empty() { task.r#ref.clone() } else { generated_id.clone() }; 
+        let mut target_id = generated_id.clone(); 
         
         let mut existing_vector = None;
         let mut is_new = true;
         let mut was_draft = false;
 
+        // 🌟 [CRITICAL FIX] 1. 우선 리스트 추출 시 생성된 진짜 ID(generated_id)로 DB를 검색합니다.
         if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
             is_new = false;
             if existing_item.updated_at_ts == 0 {
@@ -1779,6 +1786,27 @@ async fn process_task(
             }
             if existing_item.digest == item_digest {
                 existing_vector = Some(existing_item.vector);
+            }
+        } 
+        // 🌟 [CRITICAL FIX] 2. 못 찾았을 경우, 프론트엔드가 넘겨준 참조 링크(ref)를 통해 역추적하여 덮어씁니다.
+        else if !task.r#ref.is_empty() {
+            if let Ok(Some((found_id, _))) = store.find_item_by_property(&target_table, "ref", &json!(task.r#ref)).await {
+                target_id = found_id.clone();
+                is_new = false;
+                
+                // 찾은 진짜 ID로 내부 JSON 데이터도 수정하여 완벽하게 덮어쓰기할 준비를 합니다.
+                if let Some(obj) = extracted_data.as_object_mut() {
+                    obj.insert("id".to_string(), json!(target_id.clone()));
+                }
+                
+                if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
+                    if existing_item.updated_at_ts == 0 {
+                        was_draft = true;
+                    }
+                    if existing_item.digest == item_digest {
+                        existing_vector = Some(existing_item.vector);
+                    }
+                }
             }
         }
 
@@ -1921,10 +1949,15 @@ async fn process_task(
             for item_val in items.iter() {
                 let mut single_item = item_val.clone();
                 
-                let original_id = single_item.get("id").or_else(|| single_item.get("no")).and_then(|v| v.as_str())
-                    .unwrap_or_else(|| single_item.get("link").and_then(|v| v.as_str()).unwrap_or(""));
+                let original_id = single_item.get("no")
+                    .or_else(|| single_item.get("code"))
+                    .or_else(|| single_item.get("tracking_number"))
+                    .or_else(|| single_item.get("id"))
+                    .or_else(|| single_item.get("index"))
+                    .and_then(|v| if v.is_number() { Some(v.to_string()) } else { v.as_str().map(|s| s.to_string()) })
+                    .unwrap_or_else(|| single_item.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string());
                 
-                let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(original_id).replace("-", "").replace("_", "");
+                let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(&original_id).replace("-", "").replace("_", "");
                 let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));
                 let hashed_item_id = if original_id.is_empty() {
                     crate::utils::hash::hash_id(&format!("{}{}", team_id, uuid::Uuid::new_v4()))

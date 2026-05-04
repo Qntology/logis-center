@@ -783,7 +783,7 @@ impl LogisModel {
     pub async fn truncate_pug_context(&self, pug: &str, is_detail: bool, margin_tokens: usize, bottom_drop_tokens: Option<usize>) -> String {
         let current_size = *self.current_size.lock().await;
         
-        let max_context_length: usize = if is_detail { 40_000 } else { 9_000 };
+        let max_context_length: usize = if is_detail { 60_000 } else { 9_000 };
         let tokenizer_path = &self.qwen_model_path;
 
         // 🌟 한도(최대 토큰)를 계산하고, 버릴 하단 토큰(bottom_drop_tokens)을 파서에 함께 전달합니다.
