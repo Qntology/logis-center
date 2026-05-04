@@ -533,7 +533,6 @@ pub async fn extract_html_from_current_tab() -> Result<String, String> {
         let pages = browser.pages().await.map_err(|e| e.to_string())?;
         let mut active_page = None;
 
-        // 🌟 1. 전역 상태에 기록된 고유 탭 ID(target_tab_id)와 100% 일치하는 창을 최우선 타격!
         if !target_tab_id.is_empty() {
             for page in pages.iter().rev() {
                 let script = "window.__logis_tab_id || ''";
@@ -546,7 +545,6 @@ pub async fn extract_html_from_current_tab() -> Result<String, String> {
             }
         }
 
-        // 🌟 2. 안전장치: 혹시라도 ID를 못 찾았다면, 현재 포커스된 창 타격
         if active_page.is_none() {
             for page in pages.iter().rev() {
                 if let Ok(res) = page.evaluate("document.hasFocus()").await {
@@ -558,7 +556,6 @@ pub async fn extract_html_from_current_tab() -> Result<String, String> {
             }
         }
 
-        // 🌟 3. 그래도 없으면 visible한 최신 창 찾기
         if active_page.is_none() {
             for page in pages.iter().rev() {
                 let is_visible = match page.evaluate("document.visibilityState").await {
@@ -580,29 +577,34 @@ pub async fn extract_html_from_current_tab() -> Result<String, String> {
                     try {
                         const elements = document.querySelectorAll('*');
                         
-                        // 1. 살아있는(Live) 원본 DOM에서 ComputedStyle을 검사해 플로팅 요소들에 마킹
                         elements.forEach(el => {
                             const style = window.getComputedStyle(el);
                             if (style.position === 'absolute' || style.position === 'fixed') {
-                                el.setAttribute('data-logis-remove', 'true');
+                                const currentStyle = el.getAttribute('style') || '';
+                                el.setAttribute('data-logis-original-style', currentStyle);
+                                el.setAttribute('style', currentStyle + `; position: ${style.position};`);
                             }
                         });
                         
-                        // 2. 마킹된 상태에서 문서 전체를 복제
                         const clone = document.documentElement.cloneNode(true);
                         
-                        // 3. 복제본에서 마킹된 찌꺼기들을 전부 삭제
-                        clone.querySelectorAll('[data-logis-remove="true"]').forEach(el => el.remove());
-                        
-                        // 4. 사용자가 보는 원본 화면에서는 마킹을 다시 지워서 아무 일도 없었던 것처럼 복구
-                        document.querySelectorAll('[data-logis-remove="true"]').forEach(el => {
-                            el.removeAttribute('data-logis-remove');
+                        document.querySelectorAll('[data-logis-original-style]').forEach(el => {
+                            const original = el.getAttribute('data-logis-original-style');
+                            if (original) {
+                                el.setAttribute('style', original);
+                            } else {
+                                el.removeAttribute('style');
+                            }
+                            el.removeAttribute('data-logis-original-style');
                         });
                         
-                        // 5. 찌꺼기가 제거된 순수 HTML 반환
+                        clone.querySelectorAll('[data-logis-original-style]').forEach(el => {
+                            el.removeAttribute('data-logis-original-style');
+                        });
+                        
                         return clone.outerHTML;
                     } catch(e) {
-                        return document.documentElement.outerHTML; // 에러 시 폴백
+                        return document.documentElement.outerHTML;
                     }
                 })();
             "#;

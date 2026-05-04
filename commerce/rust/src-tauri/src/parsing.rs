@@ -335,6 +335,15 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
         Node::Element(element) => {
             let tag_name = element.name().to_lowercase();
 
+            if let Some(style) = element.attr("style") {
+                let style_lower = style.to_lowercase();
+                if style_lower.contains("position") && 
+                   (style_lower.contains("absolute") || style_lower.contains("fixed")) 
+                {
+                    return;
+                }
+            }
+
             // --- base64 이미지를 포함하는 img 태그 제외 ---
             if tag_name == "img" {
                 if let Some(src) = element.attr("src") {

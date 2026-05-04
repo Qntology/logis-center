@@ -13,58 +13,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::fs;
 use std::path::PathBuf;
 
-// --- [MEMORY OPTIMIZATION] Task Data Manager (RAII) ---
-// Handles offloading of large text data to disk to prevent RAM/VRAM bloating.
-// Automatically cleans up files when the task scope ends.
-struct TaskDataManager {
-    task_id: String,
-    created_files: Vec<PathBuf>,
-    app_handle: Option<tauri::AppHandle>,
-}
-
-impl TaskDataManager {
-    fn new(task_id: &str, app_handle: Option<tauri::AppHandle>) -> Self {
-        Self {
-            task_id: task_id.to_string(),
-            created_files: Vec::new(),
-            app_handle,
-        }
-    }
-
-    fn offload(&mut self, content: &str, suffix: &str) -> Result<PathBuf> {
-        let dir = utils::paths::get_task_specific_dir(self.app_handle.as_ref(), &self.task_id);
-        
-        // [FIX] Use fixed filenames for intermediate steps to support resumption
-        let filename = format!("{}.txt", suffix);
-        let path = dir.join(filename);
-        fs::write(&path, content)?;
-        self.created_files.push(path.clone());
-        Ok(path)
-    }
-
-    fn load(&self, path: &std::path::Path) -> Result<String> {
-        Ok(fs::read_to_string(path)?)
-    }
-
-    fn get_path(&self, suffix: &str) -> PathBuf {
-        let dir = utils::paths::get_task_specific_dir(self.app_handle.as_ref(), &self.task_id);
-        dir.join(format!("{}.txt", suffix))
-    }
-}
-
-impl Drop for TaskDataManager {
-    fn drop(&mut self) {
-        // [DEBUG] 디버깅 및 Resume을 위해 생성된 파일을 보존합니다.
-        println!("[Cleanup] TaskDataManager dropping. Keeping {} files for debugging: {}", self.created_files.len(), self.task_id);
-        for path in &self.created_files {
-            if path.exists() {
-                println!("[DEBUG] File available: {:?}", path);
-            }
-        }
-        // KV 캐시는 재사용을 위해 디스크에 유지합니다.
-    }
-}
-
 // Helper to chunk text, strictly respecting Pug line boundaries (\n)
 fn chunk_text(text: &str, target_size: usize) -> Vec<String> {
     let mut chunks = Vec::new();
@@ -294,11 +242,6 @@ pub async fn start_background_worker(
                         
                         if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() { *w = None; }
 
-                        let task_dir = utils::paths::get_task_specific_dir(Some(&app_handle), &task.id);
-                        if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
-                        let error_file = task_dir.join("error_reason.txt");
-                        let _ = std::fs::write(&error_file, format!("Timestamp: {}\nError: {}\n", chrono::Utc::now(), err_msg));
-
                         {
                             let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
                             if let Some(m) = model_lock.as_ref() {
@@ -434,10 +377,8 @@ async fn process_task(
 
     let team_id = if !task.to.is_empty() { task.to.clone() } else { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") };
 
-    let pug_logs_dir = utils::paths::get_pug_logs_dir(Some(app_handle), &task.id);
     emit_term("\n=======================================");
     emit_term(&format!("[PROCESS] ⚙️ Task {} started processing.", task.id));
-    emit_term(&format!("[DEBUG] Pug logs directory: {:?}", pug_logs_dir));
 
     // 🌟 [추가] Analytic 작업일 경우 별도의 파이프라인으로 위임(Delegate)하여 처리합니다.
     if task.r#type == "analytic_extraction" {
@@ -462,7 +403,6 @@ async fn process_task(
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    let mut data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
     let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
     // [FIX] 작업 유형에 따라 파일명을 자동으로 결정합니다.
     let kv_name = if task.r#type == "image_extraction" {
@@ -605,83 +545,47 @@ async fn process_task(
         return Err(anyhow::anyhow!("Task missing target URL or unsupported type for background extraction.")); 
     }
 
-    // [RESUME-LOGIC] Check if PUG already exists
-    let light_pug_path = data_manager.get_path("light_pug");
-    let light_pug = if light_pug_path.exists() {
-        println!("[PROCESS] Resuming from existing PUG file.");
-        data_manager.load(&light_pug_path)?
-    } else {
-        // [MEMORY] Fetch and immediately offload Raw HTML
-        // [FIX] Prefix with underscore to suppress unused variable warning
-        let _raw_html_path = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
-            let p = data_manager.offload(raw_html, "raw_html")?;
-            if let Some(obj) = task_data.as_object_mut() { obj.remove("html"); }
-            p
-        } else if !url.is_empty() {
-            let response = reqwest::get(&url).await?;
-            let bytes = response.bytes().await?;
-            
-            // [ENCODING-FIX] UTF-8 First Strategy
-            let (decoded_utf8, _, malformed_utf8) = encoding_rs::UTF_8.decode(&bytes);
-            let utf8_str = decoded_utf8.as_ref();
-            
-            // Check for explicit EUC-KR/CP949 markers in the UTF-8 decoded string
-            let needs_euc = utf8_str.to_lowercase().contains("charset=euc-kr") || 
-                            utf8_str.to_lowercase().contains("charset=\"euc-kr\"") ||
-                            utf8_str.to_lowercase().contains("charset=cp949") ||
-                            utf8_str.to_lowercase().contains("charset=ks_c_5601");
-
-            let content = if needs_euc && malformed_utf8 {
-                // Only use EUC-KR if it's explicitly requested AND UTF-8 decoding had issues
-                let (decoded_euc, _, _) = encoding_rs::EUC_KR.decode(&bytes);
-                decoded_euc.into_owned()
-            } else {
-                // Default to UTF-8 (Lossy fallback if needed)
-                utf8_str.to_string()
-            };
-            
-            data_manager.offload(&content, "raw_html")?
-        } else {
-            return Ok(());
-        };
+    // [MEMORY] Fetch and process directly in memory
+    let raw_html_content = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
+        let content = raw_html.to_string();
+        if let Some(obj) = task_data.as_object_mut() { obj.remove("html"); }
+        content
+    } else if !url.is_empty() {
+        let response = reqwest::get(&url).await?;
+        let bytes = response.bytes().await?;
         
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        // [ENCODING-FIX] UTF-8 First Strategy
+        let (decoded_utf8, _, malformed_utf8) = encoding_rs::UTF_8.decode(&bytes);
+        let utf8_str = decoded_utf8.as_ref();
+        
+        // Check for explicit EUC-KR/CP949 markers in the UTF-8 decoded string
+        let needs_euc = utf8_str.to_lowercase().contains("charset=euc-kr") || 
+                        utf8_str.to_lowercase().contains("charset=\"euc-kr\"") ||
+                        utf8_str.to_lowercase().contains("charset=cp949") ||
+                        utf8_str.to_lowercase().contains("charset=ks_c_5601");
 
-        // 2. Clean & Pug Conversion
-        let pug = {
-            let raw_html_path = data_manager.get_path("raw_html");
-            let clean_html_path = data_manager.get_path("clean_html");
-            
-            let clean = if clean_html_path.exists() {
-                data_manager.load(&clean_html_path)?
-            } else {
-                let raw_content = data_manager.load(&raw_html_path)?;
-                let c = parsing::pre_clean_html(&raw_content);
-                data_manager.offload(&c, "clean_html")?;
-                c
-            };
-            
-            let p = parsing::convert_to_clean_pug(&clean, PugMode::FullContent);
-            
-            // 🌟 [CRITICAL FIX] 모델이 VRAM에 없어도 Tokenizer를 디스크에서 직접 구동하여 완벽하게 절단합니다!
-            let p = model.truncate_pug_context(&p).await;
-
-            // 🌟 [CRITICAL FIX] 바이트 단위 슬라이싱(&p[..100]) 시 한글 등 멀티바이트 문자가 잘리면서 발생하는 panic을 방지하기 위해 chars().take(100) 사용
-            println!("[DEBUG-PUG] Generated PUG. Length: {}. Snippet: {}...", 
-                p.len(), 
-                p.chars().take(100).collect::<String>().replace("\n", " ")
-            );
-            
-            // [DEBUG-LOG] Save generated Pug
-            let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-            let log_path = pug_logs_dir.join(format!("light_{}_{}.pug", task.id, ts_nano));
-            let _ = std::fs::write(&log_path, &p);
-            
-            let _ = data_manager.offload(&p, "light_pug")?;
-            p // Return String
-        };
-        pug
+        if needs_euc && malformed_utf8 {
+            // Only use EUC-KR if it's explicitly requested AND UTF-8 decoding had issues
+            let (decoded_euc, _, _) = encoding_rs::EUC_KR.decode(&bytes);
+            decoded_euc.into_owned()
+        } else {
+            // Default to UTF-8 (Lossy fallback if needed)
+            utf8_str.to_string()
+        }
+    } else {
+        return Ok(());
     };
+
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+    let clean_html_content = parsing::pre_clean_html(&raw_html_content);
+    let raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::FullContent);
+    let light_pug = model.truncate_pug_context(&raw_pug).await;
+
+    println!("[DEBUG-PUG] Generated PUG. Length: {}. Snippet: {}...", 
+        light_pug.len(), 
+        light_pug.chars().take(100).collect::<String>().replace("\n", " ")
+    );
 
 
     use crate::openai_types::{
@@ -735,9 +639,9 @@ async fn process_task(
                     let head_sel = val.get("head").and_then(|v| v.as_str()).unwrap_or("");
                     
                     // 🌟 유효성 검증: 캐시된 부모(node), 아이템(item), 헤더(head) 셀렉터가 현재 웹페이지 구조에 온전히 존재하는가?
-                    let clean_html_path = data_manager.get_path("clean_html");
-                    if let Ok(clean_content) = data_manager.load(&clean_html_path) {
-                        let document = scraper::Html::parse_document(&clean_content);
+                    let clean_content = &clean_html_content;
+                    {
+                        let document = scraper::Html::parse_document(clean_content);
                         let mut is_valid = true;
 
                         if !node_sel.is_empty() && node_sel != "body" {
@@ -872,7 +776,6 @@ async fn process_task(
                     let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
                     println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
                     
-                    let _ = data_manager.offload(&res, "step_a_res");
                     let type_info = parsing::parse_json_from_llm(&res); 
                     
                     // 🌟 [CRITICAL FIX 복구] AI가 뱉어낸 값의 공백 및 대소문자 오염 방어!
@@ -1019,9 +922,6 @@ async fn process_task(
                         
                         println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
 
-                        // 🌟 [추가] LLM 원본 응답(Raw Response)을 파일로 저장합니다.
-                        let _ = data_manager.offload(&res, "js_bridge_llm_raw");
-
                         // res.text 가 아닌 res 를 그대로 파싱
                         let title_info = parsing::parse_json_from_llm(&res);
                         let items_opt = title_info.get("order")
@@ -1053,8 +953,7 @@ async fn process_task(
                     println!("[JS-BRIDGE] 2. Starting boa-engine for DOM analysis...");
                     let mut context = Context::default();
                     
-                    let clean_html = data_manager.load(&data_manager.get_path("clean_html"))?;
-                    let document = scraper::Html::parse_document(&clean_html);
+                    let document = scraper::Html::parse_document(&clean_html_content);
                     
                     let mut nodes_json = Vec::new();
                     let mut node_to_idx = std::collections::HashMap::new();
@@ -1252,9 +1151,6 @@ async fn process_task(
                             let res_str = val.as_string().unwrap().to_std_string_escaped();
                             println!("[JS-BRIDGE] Boa Final Result: {}", res_str);
 
-                            // 🌟 [추가] Boa 엔진의 최종 분석 결과(Selector JSON)를 파일로 저장합니다.
-                            let _ = data_manager.offload(&res_str, "js_bridge_boa_result");
-
                             selector_info = serde_json::from_str(&res_str).unwrap_or(json!({}));
                         },
                         Err(e) => {
@@ -1295,9 +1191,9 @@ async fn process_task(
         // 2. 캐시가 없거나 비어있는 경우 AI를 통해 테이블 헤더 구조를 분석합니다.
         if final_thead_selector.is_empty() {
             // Document를 다시 생성하여 안전하게 target_selector 기반으로 샘플 첫 행(ref_row)을 뽑아냅니다.
-            let clean_html_path = data_manager.get_path("clean_html");
-            let reference_row_for_thead = if let Ok(clean_content) = data_manager.load(&clean_html_path) {
-                let document = scraper::Html::parse_document(&clean_content);
+            let reference_row_for_thead = {
+                let clean_content = &clean_html_content;
+                let document = scraper::Html::parse_document(clean_content);
                 if let Ok(sel) = scraper::Selector::parse(&target_selector) {
                     document.select(&sel).next().map(|first_match| {
                         let mut temp_pug = String::new();
@@ -1305,7 +1201,7 @@ async fn process_task(
                         temp_pug.trim().to_string()
                     })
                 } else { None }
-            } else { None };
+            };
 
             if let Some(ref_row) = reference_row_for_thead {
                 if !ref_row.is_empty() {
@@ -1360,35 +1256,34 @@ async fn process_task(
 
         // 3. 최종 결정된 selector를 사용하여 head PUG를 추출합니다.
         if !final_thead_selector.is_empty() && final_thead_selector != "..." {
-            if let Ok(clean_content) = data_manager.load(&data_manager.get_path("clean_html")) {
-                let doc = scraper::Html::parse_document(&clean_content);
-                if let Ok(tsel) = scraper::Selector::parse(&final_thead_selector) {
-                    if let Some(first_match) = doc.select(&tsel).next() {
-                        // 🌟 [구조 보존 로직] 매칭된 요소가 th나 td일 경우, 다중 tr 계층 구조를 잃지 않기 위해 DOM 트리를 거슬러 올라가 최상위 thead(또는 tr) 블록 전체를 통째로 가져옵니다.
-                        let mut target_node = first_match;
-                        let mut current = target_node.parent();
-                        
-                        while let Some(parent) = current {
-                            if let Some(el) = parent.value().as_element() {
-                                let tag = el.name().to_lowercase();
-                                if tag == "thead" || tag == "tr" {
-                                    if let Some(wrapped) = scraper::ElementRef::wrap(parent) {
-                                        target_node = wrapped;
-                                        // thead를 찾으면 가장 완벽한 다중 행 헤더 그룹이므로 즉시 탐색 종료
-                                        if tag == "thead" { break; } 
-                                    }
+            let clean_content = &clean_html_content;
+            let doc = scraper::Html::parse_document(clean_content);
+            if let Ok(tsel) = scraper::Selector::parse(&final_thead_selector) {
+                if let Some(first_match) = doc.select(&tsel).next() {
+                    // 🌟 [구조 보존 로직] 매칭된 요소가 th나 td일 경우, 다중 tr 계층 구조를 잃지 않기 위해 DOM 트리를 거슬러 올라가 최상위 thead(또는 tr) 블록 전체를 통째로 가져옵니다.
+                    let mut target_node = first_match;
+                    let mut current = target_node.parent();
+                    
+                    while let Some(parent) = current {
+                        if let Some(el) = parent.value().as_element() {
+                            let tag = el.name().to_lowercase();
+                            if tag == "thead" || tag == "tr" {
+                                if let Some(wrapped) = scraper::ElementRef::wrap(parent) {
+                                    target_node = wrapped;
+                                    // thead를 찾으면 가장 완벽한 다중 행 헤더 그룹이므로 즉시 탐색 종료
+                                    if tag == "thead" { break; } 
                                 }
                             }
-                            current = parent.parent();
                         }
-                        
-                        let mut tpug = String::new();
-                        crate::parsing::generate_pug_lines((*target_node).into(), 0, &mut tpug, &PugMode::FullContent, &mut None);
-                        thead_pug = tpug.trim().to_string();
-                        
-                        if !thead_pug.is_empty() {
-                            println!("[Scheduler] 🎉 thead_pug extraction successful ({} bytes)", thead_pug.len());
-                        }
+                        current = parent.parent();
+                    }
+                    
+                    let mut tpug = String::new();
+                    crate::parsing::generate_pug_lines((*target_node).into(), 0, &mut tpug, &PugMode::FullContent, &mut None);
+                    thead_pug = tpug.trim().to_string();
+                    
+                    if !thead_pug.is_empty() {
+                        println!("[Scheduler] 🎉 thead_pug extraction successful ({} bytes)", thead_pug.len());
                     }
                 }
             }
@@ -1472,9 +1367,8 @@ async fn process_task(
         let mut merge_countdown = 0;
 
         let pug_list = {
-            let clean_html_path = data_manager.get_path("clean_html");
-            let clean_content = data_manager.load(&clean_html_path)?;
-            let document = scraper::Html::parse_document(&clean_content);
+            let clean_content = &clean_html_content;
+            let document = scraper::Html::parse_document(clean_content);
             
             // 🌟 5. alt 속성 주입을 위한 headers 수집을 완전히 폐기하고 None으로 PUG를 생성합니다.
             parsing::split_doc_to_pug_list_advanced(
@@ -1513,15 +1407,6 @@ async fn process_task(
                     &thead_pug, 
                     item_pug
                 );
-                
-                // ==================================================================
-                // 🌟 [DEBUG] 회원님 요청: 각 루프마다 LLM에 들어가는 100% 날것의 Context를 텍스트 파일로 박제합니다.
-                // ==================================================================
-                let debug_file_path = pug_logs_dir.join(format!("debug_context_item_{}.txt", idx + 1));
-                let _ = std::fs::write(&debug_file_path, &task_question);
-                println!("\n[DEBUG-CONTEXT] 📝 Item {}/{} 의 Context가 저장되었습니다: {:?}", idx + 1, pug_list.len(), debug_file_path);
-                println!("[DEBUG-CONTEXT] 🔍 텍스트 길이: {} 글자", task_question.len());
-                // ==================================================================
                 
                 // 🌟 [교체 구간 2-B] src/scheduler.rs 의 리스트 추출 루프 내부
                 let res = if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
@@ -1649,9 +1534,8 @@ async fn process_task(
         println!("[Scheduler] Starting DISK BRIDGE RELAY for Details");
         
         let content_pug = {
-            let clean_html_path = data_manager.get_path("clean_html");
-            let clean_content = data_manager.load(&clean_html_path)?;
-            let raw_pug = parsing::convert_to_clean_pug(&clean_content, PugMode::FullContent);
+            let clean_content = &clean_html_content;
+            let raw_pug = parsing::convert_to_clean_pug(clean_content, PugMode::FullContent);
             
             // 🌟 [CRITICAL FIX] 디테일 모드에서도 통일된 절단 로직을 호출하여 모델 부재 시의 누수를 막습니다.
             model.truncate_pug_context(&raw_pug).await
@@ -1700,9 +1584,6 @@ async fn process_task(
                     let res = gen.generate_part(&params, false, 0, None, Some(snapshot_id.clone()), kv_name.clone()).await?;
                     
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res.text);
-
-                    // [DEBUG] AI 응답 저장
-                    let _ = data_manager.offload(&res.text, "step_c_res");
 
                     let mut parsed_json = parsing::parse_json_from_llm(&res.text);
                     
