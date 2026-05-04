@@ -780,9 +780,7 @@ impl LogisModel {
     }
 
     // 🌟 [CRITICAL FIX] config.json의 물리적 텐서 크기와 실제 훈련된 Context Length를 완벽히 분리합니다.
-    pub async fn truncate_pug_context(&self, pug: &str, is_detail: bool) -> String {
-        let margin_tokens = 2_000;
-        
+    pub async fn truncate_pug_context(&self, pug: &str, is_detail: bool, margin_tokens: usize) -> String {
         let current_size = *self.current_size.lock().await;
         
         let max_context_length = if is_detail { 40_000 } else { 9_000 };

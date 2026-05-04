@@ -529,17 +529,6 @@ pub fn extract_titles_prompt(page_type: &str) -> String {
     let template = r###"[TASK]
 Find all the {TITLES} from the following PUG/HTML content.
 
-[CONTEXT]
-Page Type: {TYPE}
-
-[FORCED DOCUMENT SCANNING LOGIC]
-Read the entire document from top to bottom, applying the following strict filters and evaluations:
-
-1. IGNORE:
-   - Strictly ignore global navigation, menus, headers, footers, aside, search, filter, form.
-2. TARGET:
-   - Focus purely on the main data payload where "{CATEGORY}", "{TYPE}", or actual items are listed.
-
 [SCHEMA DEFINITIONS]
 { 
   {CATEGORY} : ["{TITLE}"]

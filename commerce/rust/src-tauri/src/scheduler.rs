@@ -576,7 +576,7 @@ async fn process_task(
 
     let clean_html_content = parsing::pre_clean_html(&raw_html_content);
     let raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::FullContent);
-    let light_pug = model.truncate_pug_context(&raw_pug, false).await;
+    let light_pug = model.truncate_pug_context(&raw_pug, false, 2000).await;
 
     println!("[DEBUG-PUG] Generated PUG. Length: {}. Snippet: {}...", 
         light_pug.len(), 
@@ -1211,7 +1211,9 @@ async fn process_task(
                 if !ref_row.is_empty() {
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Analyzing table header structure...", "spinner": "⠋" }));
                     
-                    let thead_prompt = crate::parsing::extract_table_structure_prompt(&page_type, &target_selector, &light_pug, &ref_row);
+                    // 🌟 [추가] 테이블 구조 분석 시에는 마진을 3000으로 늘린 별도의 PUG 컨텍스트를 생성하여 전달합니다.
+                    let thead_light_pug = model.truncate_pug_context(&raw_pug, false, 3000).await;
+                    let thead_prompt = crate::parsing::extract_table_structure_prompt(&page_type, &target_selector, &thead_light_pug, &ref_row);
                     let params = ChatCompletionParameters {
                         messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
                             content: ChatCompletionRequestUserMessageContent::Text(thead_prompt),
@@ -1542,7 +1544,7 @@ async fn process_task(
             let raw_pug = parsing::convert_to_clean_pug(clean_content, PugMode::FullContent);
             
             // 🌟 [CRITICAL FIX] 디테일 모드에서도 통일된 절단 로직을 호출하여 모델 부재 시의 누수를 막습니다.
-            model.truncate_pug_context(&raw_pug, true).await
+            model.truncate_pug_context(&raw_pug, true, 2000).await
         };
 
         if !content_pug.trim().is_empty() {
