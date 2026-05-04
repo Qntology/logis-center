@@ -1213,11 +1213,49 @@ pub fn normalize_to_json_string(input: &str) -> String {
     let re_trailing = Regex::new(r",\s*([\]}])").unwrap();
     s = re_trailing.replace_all(&s, "$1").to_string();
 
-    // 6. Force close braces
-    let open_braces = s.matches('{').count();
-    let close_braces = s.matches('}').count();
-    if open_braces > close_braces {
-        s.push_str(&"}".repeat(open_braces - close_braces));
+    // 🌟 6. Force close braces, arrays, and strings (Stack-based repair)
+    let mut in_string = false;
+    let mut escape = false;
+    let mut stack = Vec::new();
+
+    for c in s.chars() {
+        if escape {
+            escape = false;
+        } else if c == '\\' {
+            escape = true;
+        } else if c == '"' {
+            in_string = !in_string;
+        } else if !in_string {
+            match c {
+                '{' => stack.push('}'),
+                '[' => stack.push(']'),
+                '}' | ']' => {
+                    if stack.last() == Some(&c) {
+                        stack.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // 문자열이 끊겼을 경우 닫는 따옴표 추가 (끝부분 이스케이프 문자 방어)
+    if in_string {
+        if s.ends_with('\\') {
+            s.pop(); 
+        }
+        s.push('"');
+    }
+
+    // 뒤에 쉼표가 남은 상태로 끊겼을 경우 쉼표 제거
+    s = s.trim_end().to_string();
+    if s.ends_with(',') {
+        s.pop();
+    }
+
+    // 남은 괄호 스택을 순서대로 역전하여 전부 조립
+    while let Some(c) = stack.pop() {
+        s.push(c);
     }
 
     s
@@ -1245,17 +1283,21 @@ pub fn parse_json_from_llm(text: &str) -> serde_json::Value {
     if let Some(start) = clean_text.find("{") {
         if let Some(end) = clean_text.rfind("}") {
             if start < end {
-                extracted = clean_text[start..=end].to_string();
-                if let Ok(v) = serde_json::from_str(&extracted) { return v; }
+                let attempt = clean_text[start..=end].to_string();
+                if let Ok(v) = serde_json::from_str(&attempt) { return v; }
             }
         }
+        // 🌟 닫는 괄호가 없어도 여는 괄호 이후부터 끝까지 가져와 복구 시도
+        extracted = clean_text[start..].to_string();
     } else if let Some(start) = clean_text.find("[") {
         if let Some(end) = clean_text.rfind("]") {
             if start < end {
-                extracted = clean_text[start..=end].to_string();
-                if let Ok(v) = serde_json::from_str(&extracted) { return v; }
+                let attempt = clean_text[start..=end].to_string();
+                if let Ok(v) = serde_json::from_str(&attempt) { return v; }
             }
         }
+        // 🌟 닫는 괄호가 없어도 여는 괄호 이후부터 끝까지 가져와 복구 시도
+        extracted = clean_text[start..].to_string();
     }
 
     // 3. Last attempt: Normalize/Repair then parse
