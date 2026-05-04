@@ -781,25 +781,13 @@ impl LogisModel {
 
     // 🌟 [CRITICAL FIX] config.json의 물리적 텐서 크기와 실제 훈련된 Context Length를 완벽히 분리합니다.
     pub async fn truncate_pug_context(&self, pug: &str) -> String {
-        let margin_tokens = 5_000;
+        let margin_tokens = 2_000;
         
         // 1. 로드된 모델(또는 타겟 모델)에 따라 공식 컨텍스트 한계값을 명확히 지정합니다.
         // 🌟 사용자의 현재 Enum 상태(Qwen3_5)에 맞춰 롤백 반영
         let current_size = *self.current_size.lock().await;
-        let (max_context_length, tokenizer_path) = match current_size {
-            Some(ModelSize::Qwen3_5) => {
-                // Qwen3.5 (0.8B) Natively Trained Context Length
-                (262_144, &self.qwen3_5_model_path)
-            },
-            Some(ModelSize::Qwen3) => {
-                // Qwen3 (0.6B Text) Natively Trained Context Length
-                (20_000, &self.qwen3_model_path)
-            },
-            _ => {
-                // Qwen (0.6B VLM) 및 기본값
-                (32_768, &self.qwen_model_path)
-            }
-        };
+        let max_context_length = 11_000;
+        let tokenizer_path = &self.qwen_model_path;
 
         // 2. 이미 활성화된 제너레이터가 있다면 그 안에 탑재된 토크나이저를 즉시 재사용합니다.
         if let Some(gen) = self.qwen3_5_generator.lock().await.as_ref() {
