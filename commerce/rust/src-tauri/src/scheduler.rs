@@ -576,7 +576,7 @@ async fn process_task(
 
     let clean_html_content = parsing::pre_clean_html(&raw_html_content);
     let raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::FullContent);
-    let light_pug = model.truncate_pug_context(&raw_pug, false, 2000).await;
+    let light_pug = model.truncate_pug_context(&raw_pug, false, 2000, None).await;
 
     println!("[DEBUG-PUG] Generated PUG. Length: {}. Snippet: {}...", 
         light_pug.len(), 
@@ -1211,18 +1211,19 @@ async fn process_task(
                 if !ref_row.is_empty() {
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Analyzing table header structure...", "spinner": "⠋" }));
                     
-                    // 🌟 [추가] 테이블 구조 분석 시에는 마진을 3000으로 늘린 별도의 PUG 컨텍스트를 생성하여 전달합니다.
-                    let thead_light_pug = model.truncate_pug_context(&raw_pug, false, 3000).await;
+                    // 🌟 [추가] ref_row의 텍스트 길이를 기반으로 대략적인 토큰을 산출하여 컨텍스트 사이즈를 예약하고 뒤에서 자릅니다.
+                    let ref_row_context_size = ref_row.len() / 3;
+                    let thead_light_pug = model.truncate_pug_context(&raw_pug, false, 2000, Some(ref_row_context_size)).await;
                     let thead_prompt = crate::parsing::extract_table_structure_prompt(&page_type, &target_selector, &thead_light_pug, &ref_row);
                     let params = ChatCompletionParameters {
                         messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
                             content: ChatCompletionRequestUserMessageContent::Text(thead_prompt),
                             name: None,
                         })],
-                        model: "qwen3.5".to_string(), 
+                        model: "qwen3.5".to_string(),
                         max_tokens: Some(256), 
                         temperature: Some(0.0), 
-                        top_p: Some(0.01),
+                        top_p: Some(0.95),
                         ..Default::default()
                     };
 
@@ -1426,7 +1427,7 @@ async fn process_task(
                             content: ChatCompletionRequestUserMessageContent::Text(task_question),
                             name: None,
                         })],
-                        model: "qwen3.5".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.01),
+                        model: "qwen3.5".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
                         ..Default::default()
                     };
                     gen.generate(
@@ -1544,7 +1545,7 @@ async fn process_task(
             let raw_pug = parsing::convert_to_clean_pug(clean_content, PugMode::FullContent);
             
             // 🌟 [CRITICAL FIX] 디테일 모드에서도 통일된 절단 로직을 호출하여 모델 부재 시의 누수를 막습니다.
-            model.truncate_pug_context(&raw_pug, true, 2000).await
+            model.truncate_pug_context(&raw_pug, true, 2000, None).await
         };
 
         if !content_pug.trim().is_empty() {
@@ -1573,7 +1574,7 @@ async fn process_task(
                     model: "qwen3.5".to_string(), 
                     max_tokens: Some(1048), 
                     temperature: Some(0.0), 
-                    top_p: Some(0.01),
+                    top_p: Some(0.95),
                     ..Default::default()
                 };
 

@@ -780,26 +780,35 @@ impl LogisModel {
     }
 
     // 🌟 [CRITICAL FIX] config.json의 물리적 텐서 크기와 실제 훈련된 Context Length를 완벽히 분리합니다.
-    pub async fn truncate_pug_context(&self, pug: &str, is_detail: bool, margin_tokens: usize) -> String {
+    pub async fn truncate_pug_context(&self, pug: &str, is_detail: bool, margin_tokens: usize, reverse_cut_reserve: Option<usize>) -> String {
         let current_size = *self.current_size.lock().await;
         
-        let max_context_length = if is_detail { 40_000 } else { 9_000 };
+        let max_context_length: usize = if is_detail { 40_000 } else { 9_000 };
         let tokenizer_path = &self.qwen_model_path;
+
+        // 🌟 [추가] 후방 절단 예약(reserve) 토큰이 존재한다면, 한도에서 추가로 차감하고 위쪽을 보존합니다.
+        let mut final_max = max_context_length.saturating_sub(margin_tokens);
+        let keep_top = if let Some(reserve) = reverse_cut_reserve {
+            final_max = final_max.saturating_sub(reserve);
+            true
+        } else {
+            false
+        };
 
         // 2. 이미 활성화된 제너레이터가 있다면 그 안에 탑재된 토크나이저를 즉시 재사용합니다.
         if let Some(gen) = self.qwen3_5_generator.lock().await.as_ref() {
-            return crate::parsing::truncate_pug_by_tokens(pug, max_context_length - margin_tokens, &gen.tokenizer);
+            return crate::parsing::truncate_pug_by_tokens(pug, final_max, &gen.tokenizer, keep_top);
         }
         if let Some(gen) = self.qwen3_generator.lock().await.as_ref() {
-            return crate::parsing::truncate_pug_by_tokens(pug, max_context_length - margin_tokens, &gen.tokenizer);
+            return crate::parsing::truncate_pug_by_tokens(pug, final_max, &gen.tokenizer, keep_top);
         }
         if let Some(gen) = self.generator.lock().await.as_ref() {
-            return crate::parsing::truncate_pug_by_tokens(pug, max_context_length - margin_tokens, &gen.tokenizer);
+            return crate::parsing::truncate_pug_by_tokens(pug, final_max, &gen.tokenizer, keep_top);
         }
 
         // 3. 모델이 VRAM에 없을 경우, 디스크에서 가볍게 토크나이저만 읽어와서 정확한 토큰 수 기반으로 절단합니다.
         if let Ok(tokenizer) = crate::tokenizer::TokenizerModel::init(tokenizer_path) {
-            crate::parsing::truncate_pug_by_tokens(pug, max_context_length - margin_tokens, &tokenizer)
+            crate::parsing::truncate_pug_by_tokens(pug, final_max, &tokenizer, keep_top)
         } else {
             pug.to_string()
         }
