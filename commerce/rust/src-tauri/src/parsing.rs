@@ -1321,6 +1321,23 @@ pub fn parse_json_from_llm(text: &str) -> serde_json::Value {
                 }
             }
         }
+
+        // 🌟 [추가] Absolute Final Fallback: 맨 끝 글자를 하나씩 지워가며 에러가 나지 않을 때까지 파싱을 재시도합니다.
+        println!("[Parsing] Attempting aggressive character-by-character truncation repair...");
+        let mut shrink_attempt = to_repair.to_string();
+        let mut attempts = 0;
+        
+        // 시스템 랙(Freezing)을 방지하기 위해 최대 500번(글자)까지만 깎아내며 재시도합니다. (최소 5글자 유지)
+        while shrink_attempt.len() > 5 && attempts < 500 {
+            shrink_attempt.pop(); // 맨 끝 글자 하나 제거
+            attempts += 1;
+            
+            let attempt_repaired = normalize_to_json_string(&shrink_attempt);
+            if let Ok(v) = serde_json::from_str(&attempt_repaired) {
+                println!("[Parsing] Success: JSON repaired by aggressive truncation after dropping {} characters!", attempts);
+                return v;
+            }
+        }
     }
 
     println!("[Parsing] Warning: Failed to repair dirty JSON: {}", clean_text);
