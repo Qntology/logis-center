@@ -211,6 +211,11 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                                 let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
                                 let has_focus = json_val.get("focus").and_then(|v| v.as_bool()).unwrap_or(false);
 
+                                // 🌟 [CRITICAL FIX] 개발자 도구 및 브라우저 기본 페이지는 탭 추적 대상에서 원천 배제합니다.
+                                if tab_url.starts_with("devtools://") || tab_url.starts_with("chrome://") || tab_url.starts_with("edge://") {
+                                    continue;
+                                }
+
                                 if has_focus {
                                     last_focused_tab_id = tab_id.to_string();
                                     active_tab_id = tab_id.to_string();
@@ -252,10 +257,16 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                         if let Ok(Ok(res)) = tokio::time::timeout(Duration::from_millis(300), page.evaluate(script)).await {
                             if let Some(val_str) = res.into_value::<String>().ok() {
                                 if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str) {
+                                    let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                    
+                                    // 🌟 [CRITICAL FIX] 개발자 도구 배제
+                                    if tab_url.starts_with("devtools://") || tab_url.starts_with("chrome://") || tab_url.starts_with("edge://") {
+                                        continue;
+                                    }
+
                                     let is_visible = json_val.get("visible").and_then(|v| v.as_bool()).unwrap_or(false);
                                     if is_visible {
                                         let tab_id = json_val.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                                        let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
                                         
                                         last_focused_tab_id = tab_id.to_string(); // 장부 각인!
                                         active_tab_id = tab_id.to_string();
@@ -270,7 +281,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                     // 🌟 [CRITICAL FIX] Fallback 2: SSO 팝업 종료 직후 브라우저가 포커스를 잃고 visible 상태도 false로 떨어졌을 때,
                     // 여전히 url을 찾지 못했다면 무조건 가장 우측에 열려있는 탭을 강제로 활성 탭으로 지정하여 빈 주소 전송을 막습니다.
                     if active_url.is_empty() {
-                        if let Some(page) = pages.last() {
+                        for page in pages.iter().rev() {
                             let script = r#"
                                 (function() {
                                     try {
@@ -282,12 +293,19 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                             if let Ok(Ok(res)) = tokio::time::timeout(Duration::from_millis(300), page.evaluate(script)).await {
                                 if let Some(val_str) = res.into_value::<String>().ok() {
                                     if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str) {
-                                        let tab_id = json_val.get("id").and_then(|v| v.as_str()).unwrap_or("");
                                         let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                        
+                                        // 🌟 [CRITICAL FIX] 개발자 도구 배제
+                                        if tab_url.starts_with("devtools://") || tab_url.starts_with("chrome://") || tab_url.starts_with("edge://") {
+                                            continue;
+                                        }
+
+                                        let tab_id = json_val.get("id").and_then(|v| v.as_str()).unwrap_or("");
                                         
                                         last_focused_tab_id = tab_id.to_string(); 
                                         active_tab_id = tab_id.to_string();
                                         active_url = tab_url.to_string();
+                                        break; // 🌟 유효한 첫 번째(가장 우측) 탭을 찾았으므로 즉시 탈출!
                                     }
                                 }
                             }
