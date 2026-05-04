@@ -786,7 +786,7 @@ impl LogisModel {
         // 1. 로드된 모델(또는 타겟 모델)에 따라 공식 컨텍스트 한계값을 명확히 지정합니다.
         // 🌟 사용자의 현재 Enum 상태(Qwen3_5)에 맞춰 롤백 반영
         let current_size = *self.current_size.lock().await;
-        let max_context_length = 13_000;
+        let max_context_length = 11_000;
         let tokenizer_path = &self.qwen_model_path;
 
         // 2. 이미 활성화된 제너레이터가 있다면 그 안에 탑재된 토크나이저를 즉시 재사용합니다.

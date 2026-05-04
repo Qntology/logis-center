@@ -883,7 +883,7 @@ async fn process_task(
                 let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY.", title_prompt);
                 let snapshot_id = format!("{}_step_b_titles", task.id);
 
-                println!("title_prompt {}", title_prompt);
+                // println!("title_prompt {}", title_prompt);
 
                 let mut titles = Vec::new();
                 {
