@@ -924,6 +924,12 @@ async fn process_task(
 
                         // res.text 가 아닌 res 를 그대로 파싱
                         let title_info = parsing::parse_json_from_llm(&res);
+                        
+                        // 🌟 [CRITICAL FIX] 파싱 결과가 실패하여 빈 깡통({})이 반환되었다면 즉시 에러를 던져 작업을 중단합니다.
+                        if title_info.as_object().map_or(true, |obj| obj.is_empty()) {
+                            return Err(anyhow::anyhow!("LLM returned invalid or unparseable JSON response during title extraction."));
+                        }
+
                         let items_opt = title_info.get("order")
                             .or(title_info.get("goods"))
                             .or(title_info.get("title"))
@@ -945,7 +951,8 @@ async fn process_task(
                 }
 
                 if titles.is_empty() {
-                     println!("[JS-BRIDGE] Warning: No titles extracted from LLM. Falling back to default.");
+                    // 🌟 [CRITICAL FIX] 쓸데없는 태그까지 전부 긁어오는 불상사를 막기 위해 폴백(Fallback)으로 진행하지 않고 확실하게 끊어냅니다.
+                    return Err(anyhow::anyhow!("[JS-BRIDGE] No titles extracted from LLM. Aborting task to prevent invalid DOM fallback."));
                 }
 
                 // 2. Boa Engine으로 DOM 분석

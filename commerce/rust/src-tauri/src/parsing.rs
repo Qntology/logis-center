@@ -1213,6 +1213,10 @@ pub fn normalize_to_json_string(input: &str) -> String {
     let re_trailing = Regex::new(r",\s*([\]}])").unwrap();
     s = re_trailing.replace_all(&s, "$1").to_string();
 
+    // 🌟 [추가] LLM이 뱉어낸 말줄임표(..., ...) 가비지를 닫는 괄호 앞에서 깔끔하게 제거합니다.
+    let re_artifact = Regex::new(r",?\s*\.\.\.\s*([\]}])").unwrap();
+    s = re_artifact.replace_all(&s, "$1").to_string();
+
     // 🌟 6. Force close braces, arrays, and strings (Stack-based repair)
     let mut in_string = false;
     let mut escape = false;
@@ -1305,12 +1309,16 @@ pub fn parse_json_from_llm(text: &str) -> serde_json::Value {
     let repaired = normalize_to_json_string(to_repair);
     
     if let Ok(v) = serde_json::from_str(&repaired) {
+        println!("[Parsing] Success: JSON successfully repaired and parsed!");
         return v;
     } else {
         // Final fallback: try extracting from repaired string again
         if let Some(start) = repaired.find("{") {
             if let Some(end) = repaired.rfind("}") {
-                if let Ok(v) = serde_json::from_str(&repaired[start..=end]) { return v; }
+                if let Ok(v) = serde_json::from_str(&repaired[start..=end]) { 
+                    println!("[Parsing] Success: JSON successfully repaired and parsed on final fallback!");
+                    return v; 
+                }
             }
         }
     }
