@@ -877,15 +877,16 @@ impl QuantizedQwenVLTextAttention {
                 p_j.to_dtype(v.dtype())?.matmul(&v)?
             };
             
-            let out_j_f32 = out_j.to_dtype(DType::F32)?;
+            // [CRITICAL FIX] Attention Output을 F32로 승격시키지 않고 원본 타입(BF16)을 유지하여 VRAM을 50% 절약합니다.
+            let out_j_target = out_j;
 
             match out_res {
                 None => {
-                    out_res = Some(out_j_f32); 
+                    out_res = Some(out_j_target); 
                     m_n = Some(m_j);
                     l_n = Some(l_j);
                 }
-                Some(prev_out_f32) => { 
+                Some(prev_out_target) => { 
                     let prev_m = m_n.as_ref().unwrap();
                     let prev_l = l_n.as_ref().unwrap();
                     
@@ -894,9 +895,13 @@ impl QuantizedQwenVLTextAttention {
                     let diff_new = m_j.broadcast_sub(&m_new)?.exp()?;
                     
                     let l_new = prev_l.broadcast_mul(&diff_old)?.add(&l_j.broadcast_mul(&diff_new)?)?;
-                    let out_new_f32 = prev_out_f32.broadcast_mul(&diff_old)?.add(&out_j_f32.broadcast_mul(&diff_new)?)?;
                     
-                    out_res = Some(out_new_f32); 
+                    // 스케일링 계수만 타겟 타입으로 내린 후 곱셈을 수행하여, 거대한 Output 텐서의 VRAM 팽창을 막습니다.
+                    let diff_old_cast = diff_old.to_dtype(target_dtype)?;
+                    let diff_new_cast = diff_new.to_dtype(target_dtype)?;
+                    let out_new_target = prev_out_target.broadcast_mul(&diff_old_cast)?.add(&out_j_target.broadcast_mul(&diff_new_cast)?)?;
+                    
+                    out_res = Some(out_new_target); 
                     m_n = Some(m_new);
                     l_n = Some(l_new);
                 }
@@ -907,8 +912,9 @@ impl QuantizedQwenVLTextAttention {
         }
 
         // [STEP C] Finalize Attention Output
-        let attn_output = if let (Some(out_f32), Some(l_f32)) = (out_res, l_n) {
-            out_f32.broadcast_div(&l_f32)?.to_dtype(target_dtype)?
+        let attn_output = if let (Some(out_target), Some(l_f32)) = (out_res, l_n) {
+            // 나누기 연산을 위해 l_f32 스칼라 값만 타겟 타입으로 캐스팅하여 나눕니다.
+            out_target.broadcast_div(&l_f32.to_dtype(target_dtype)?)?
         } else {
             return Err(anyhow!("No KV data processed"));
         };

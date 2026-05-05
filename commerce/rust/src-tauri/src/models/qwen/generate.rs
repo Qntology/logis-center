@@ -388,8 +388,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let k_contig = k_aligned.contiguous().unwrap_or(k_aligned);
                                 let v_contig = v_aligned.contiguous().unwrap_or(v_aligned);
 
-                                src.k_data = k_contig.to_dtype(DType::BF16).unwrap_or_else(|_| k_contig.clone());
-                                src.v_data = v_contig.to_dtype(DType::BF16).unwrap_or_else(|_| v_contig.clone());
+                                // [CRITICAL FIX] 텐서가 이미 BF16일 경우 to_dtype 호출을 생략하여 RAM 메모리 중복 할당(Peak)을 완벽하게 차단합니다.
+                                src.k_data = if k_contig.dtype() == candle_core::DType::BF16 { k_contig.clone() } else { k_contig.to_dtype(candle_core::DType::BF16).unwrap_or_else(|_| k_contig.clone()) };
+                                src.v_data = if v_contig.dtype() == candle_core::DType::BF16 { v_contig.clone() } else { v_contig.to_dtype(candle_core::DType::BF16).unwrap_or_else(|_| v_contig.clone()) };
                             }
                             let mut map = std::collections::HashMap::new();
                             let prefix = format!("b{}_l{}_", off, act_l);
