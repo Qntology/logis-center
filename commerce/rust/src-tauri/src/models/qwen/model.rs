@@ -980,14 +980,8 @@ impl QwenVLModel {
             mrope_position_deltas.push(curr_pos as i64 - seq_len as i64);
         }
 
-        // 🌟 [CRITICAL FIX] 거대 위치 텐서를 CPU에서 안전하게 조립한 뒤 딱 한 번만 GPU로 전송하여 PCIe 병목과 RAM 스파이크를 없앱니다.
-        let position_ids = Tensor::from_vec(flat_pos_ids, (3, b_sz, seq_len), &Device::Cpu)?
-            .to_device(input_ids.device())?;
-            
-        let deltas = Tensor::from_vec(mrope_position_deltas, (b_sz, 1), &Device::Cpu)?
-            .to_dtype(input_ids.dtype())?
-            .to_device(input_ids.device())?;
-            
+        let position_ids = Tensor::from_vec(flat_pos_ids, (3, b_sz, seq_len), input_ids.device())?;
+        let deltas = Tensor::from_vec(mrope_position_deltas, (b_sz, 1), input_ids.device())?.to_dtype(input_ids.dtype())?;
         Ok((position_ids, deltas))
     }
 
