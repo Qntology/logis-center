@@ -801,23 +801,31 @@ impl QuantizedQwenVLTextAttention {
             };
 
             // [STEP B] Online Softmax for this Chunk
-            let mut k = k_block;
-            let mut v = v_block;
-
-            if self.num_kv_groups > 1 {
-                let (b, h, s, d) = k.dims4()?;
-                k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-            }
-
-            k = k.contiguous()?;
-            v = v.contiguous()?;
+            let k = k_block; // Unified 최적화: expand와 reshape를 금지하므로 mut 속성 제거
+            let v = v_block; // 원본 압축 KV 형태 (b, kv_h, s, d) 그대로 유지!
 
             let actual_kv_len = k.dim(2)?;
-            
             let k_t = k.transpose(2, 3)?.contiguous()?; 
             
-            let mut s_chunk = (q_aligned.matmul(&k_t)? * self.scaling)?;
+            // 1. Q * K^T 연산 (Dimension Folding 기법 적용)
+            let mut s_chunk = if self.num_kv_groups > 1 {
+                let (b, h, q_l, d) = q_aligned.dims4()?;
+                let kv_h = self.num_key_value_heads;
+                let groups = self.num_kv_groups;
+                
+                // [CRITICAL FIX] 5차원(Rank 5) MatMul 불가를 회피하기 위해, 
+                // groups와 q_l(시퀀스 길이) 차원을 수학적으로 하나로 접어(Flatten) 4차원으로 속입니다!
+                // 이렇게 하면 K를 억지로 broadcast 하거나 VRAM을 복사할 필요 없이 완벽한 Zero-Copy BMM이 가능합니다.
+                let q_flat = q_aligned.reshape((b, kv_h, groups * q_l, d))?;
+                
+                // K^T 는 이미 (b, kv_h, d, actual_kv_len) 4차원이므로 즉시 초고속 MatMul!
+                let s_chunk_flat = q_flat.matmul(&k_t)?;
+                
+                // 연산 후 다시 (b, h, q_l, actual_kv_len) 차원으로 원상복구
+                (s_chunk_flat.reshape((b, h, q_l, actual_kv_len))? * self.scaling)?
+            } else {
+                (q_aligned.matmul(&k_t)? * self.scaling)?
+            };
 
             
             if has_dynamic_mask {
@@ -850,7 +858,25 @@ impl QuantizedQwenVLTextAttention {
             let p_j = s_chunk_f32.broadcast_sub(&m_j)?.exp()?;
             let l_j = p_j.sum_keepdim(candle_core::D::Minus1)?;
             
-            let out_j = p_j.to_dtype(v.dtype())?.matmul(&v)?;
+            // 2. P * V 연산 (Dimension Folding 기법 적용)
+            let out_j = if self.num_kv_groups > 1 {
+                let (b, h, q_l, s_len) = p_j.dims4()?;
+                let kv_h = self.num_key_value_heads;
+                let groups = self.num_kv_groups;
+                let d = v.dim(3)?;
+
+                // P를 (b, kv_h, groups * q_l, s_len) 로 변환
+                let p_j_flat = p_j.to_dtype(v.dtype())?.reshape((b, kv_h, groups * q_l, s_len))?;
+                
+                // V는 이미 (b, kv_h, s_len, d) 4차원이므로 메모리 복사 없이 바로 연산!
+                let out_j_flat = p_j_flat.matmul(&v)?;
+                
+                // 연산 후 (b, h, q_l, d) 차원으로 원상복구
+                out_j_flat.reshape((b, h, q_l, d))?
+            } else {
+                p_j.to_dtype(v.dtype())?.matmul(&v)?
+            };
+            
             let out_j_f32 = out_j.to_dtype(DType::F32)?;
 
             match out_res {
