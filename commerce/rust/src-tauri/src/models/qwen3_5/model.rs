@@ -1861,35 +1861,54 @@ impl Qwen3_5TextModel {
                 attn.vram_merged_v = None;
                 attn.merged_vram_block_count = 0;
 
-                for block in &mut attn.kv_blocks {
-                    // 🌟 [CRITICAL FIX] 블록 하단에서 inner.k_cache 등을 덮어쓰므로 반드시 mut가 필요합니다.
-                    let mut inner = block.inner.write().unwrap();
-                    let is_dirty = {
-                        let reg = attn.registry.entries.read().unwrap();
-                        if inner.index < reg.len() && l_idx < reg[inner.index].is_dirty.len() { 
-                            reg[inner.index].is_dirty[l_idx] 
-                        } else { true }
-                    };
+                let mut gpu_k_list = Vec::new();
+                let mut gpu_v_list = Vec::new();
+                let mut target_indices = Vec::new();
 
+                // 1. 읽기 락만 짧게 잡고 넘길 대상들을 수집 및 VRAM 선행 처리
+                for (idx, block) in attn.kv_blocks.iter().enumerate() {
+                    let inner = block.inner.read().unwrap(); 
                     let is_full = inner.len == 1024;
-                    let should_evacuate = is_full; 
                     
-                    if should_evacuate && inner.k_cache.is_some() && inner.location == crate::models::qwen::quantized_model::KVLocation::VRAM {
-                        // 🌟 [CRITICAL FIX] k_cpu, v_cpu를 if 블록 바깥으로 빼내어 컴파일 에러를 완벽히 해결합니다.
-                        let (k_cpu, v_cpu) = {
-                            let k = inner.k_cache.as_ref().unwrap();
-                            let v = inner.v_cache.as_ref().unwrap();
-                            
-                            // 🌟 SSD 워커의 압축 포맷인 BF16으로 VRAM에서 미리 캐스팅하여 CPU 연산 병목을 제거합니다.
-                            let k_bf16 = k.to_dtype(candle_core::DType::BF16).unwrap_or_else(|_| k.clone());
-                            let v_bf16 = v.to_dtype(candle_core::DType::BF16).unwrap_or_else(|_| v.clone());
-                            
-                            let k_aligned = k_bf16.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k_bf16.clone());
-                            let v_aligned = v_bf16.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v_bf16.clone());
-                            (
-                                k_aligned.contiguous().unwrap_or_else(|_| k_aligned.clone()),
-                                v_aligned.contiguous().unwrap_or_else(|_| v_aligned.clone())
-                            )
+                    if is_full && inner.k_cache.is_some() && inner.location == crate::models::qwen::quantized_model::KVLocation::VRAM {
+                        let k = inner.k_cache.as_ref().unwrap();
+                        let v = inner.v_cache.as_ref().unwrap();
+                        
+                        // 🌟 [핵심 1: VRAM 선행 처리] CPU 연산을 0으로 만들기 위해 VRAM 코어를 활용하여 BF16 캐스팅 및 메모리 정렬(contiguous)을 완료해둡니다!
+                        let k_gpu = k.to_dtype(candle_core::DType::BF16).unwrap_or_else(|_| k.clone()).contiguous().unwrap_or_else(|_| k.clone());
+                        let v_gpu = v.to_dtype(candle_core::DType::BF16).unwrap_or_else(|_| v.clone()).contiguous().unwrap_or_else(|_| v.clone());
+                        
+                        gpu_k_list.push(k_gpu);
+                        gpu_v_list.push(v_gpu);
+                        target_indices.push(idx);
+                    }
+                }
+
+                // 2. 모인 VRAM 텐서가 있다면 통째로 합쳐서 한 방에 보냄
+                if !gpu_k_list.is_empty() {
+                    // 🌟 [핵심 2: 병합] VRAM 내부에서 여러 개의 블록을 하나의 거대 텐서로 묶습니다.
+                    let merged_k_gpu = candle_core::Tensor::cat(&gpu_k_list, 2).unwrap_or_else(|_| gpu_k_list[0].clone());
+                    let merged_v_gpu = candle_core::Tensor::cat(&gpu_v_list, 2).unwrap_or_else(|_| gpu_v_list[0].clone());
+
+                    // 🌟 [핵심 3: 고속 PCIe 전송] N번 오가던 통신을 단 1번의 병목 없는 통짜 전송으로 밀어버립니다!
+                    let merged_k_cpu = merged_k_gpu.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
+                    let merged_v_cpu = merged_v_gpu.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
+
+                    // 3. CPU(RAM)로 무사히 넘어온 거대 텐서를 다시 원래 블록 크기대로 썰어서 캐시에 재할당
+                    let mut current_offset = 0;
+                    for (i, &idx) in target_indices.iter().enumerate() {
+                        let chunk_len = gpu_k_list[i].dim(2).unwrap_or(1024);
+                        
+                        let k_cpu = merged_k_cpu.narrow(2, current_offset, chunk_len).unwrap_or_else(|_| merged_k_cpu.clone()).contiguous().unwrap_or_else(|_| merged_k_cpu.clone());
+                        let v_cpu = merged_v_cpu.narrow(2, current_offset, chunk_len).unwrap_or_else(|_| merged_v_cpu.clone()).contiguous().unwrap_or_else(|_| merged_v_cpu.clone());
+                        current_offset += chunk_len;
+
+                        let mut inner = attn.kv_blocks[idx].inner.write().unwrap();
+                        let is_dirty = {
+                            let reg = attn.registry.entries.read().unwrap();
+                            if inner.index < reg.len() && l_idx < reg[inner.index].is_dirty.len() { 
+                                reg[inner.index].is_dirty[l_idx] 
+                            } else { true }
                         };
 
                         if is_dirty {
@@ -1900,8 +1919,8 @@ impl Qwen3_5TextModel {
                                 k_data: candle_core::Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(),
                                 v_data: candle_core::Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(),
                                 k_shape: candle_core::Tensor::from_vec(k_shape_u32, (k_cpu.shape().dims().len(),), &candle_core::Device::Cpu).unwrap(),
-                                raw_k: Some(k_cpu.contiguous().unwrap_or_else(|_| k_cpu.clone())),
-                                raw_v: Some(v_cpu.contiguous().unwrap_or_else(|_| v_cpu.clone())),
+                                raw_k: Some(k_cpu.clone()),
+                                raw_v: Some(v_cpu.clone()),
                             });
                             
                             let mut reg = attn.registry.entries.write().unwrap();
