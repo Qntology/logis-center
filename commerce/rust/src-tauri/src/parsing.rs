@@ -147,80 +147,155 @@ fn is_root_layout_element(line: &str) -> bool {
 // 🌟 [CRITICAL FIX] Token Optimizer를 주입받아 앞단을 잘라내고, 필수 부모를 복구하며, 최상위 껍데기를 버리는 완전체 함수
 pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::tokenizer::TokenizerModel, bottom_drop_tokens: Option<usize>) -> String {
     let mut lines: Vec<&str> = pug.lines().collect();
+    if lines.is_empty() { return String::new(); }
+
+    // 🌟 0. 지능형 트리 스캔 (Pre-scan)
+    // 의미 있는 자식(input, option, td 등)을 품고 있는 구조적 부모(form, table, select 등)를 찾아내어
+    // 절단기(Truncator)가 이 블록을 반토막 내지 못하도록 "Unbreakable Block"으로 묶어버립니다.
+    #[derive(Clone, Copy)]
+    struct Block { start: usize, end: usize }
+    let mut unbreakable_blocks = Vec::new();
+    let target_tags = ["form", "table", "select", "ul", "ol", "dl", "fieldset"];
+    let meaningful_children = ["input", "button", "textarea", "option", "th", "td", "li", "dt", "dd", "a", "img", "label"];
+
+    for i in 0..lines.len() {
+        let trimmed = lines[i].trim();
+        if trimmed.is_empty() { continue; }
+        
+        let indent = lines[i].chars().take_while(|c| c.is_whitespace()).count();
+        let tag_name = trimmed.split(|c| c == '[' || c == ' ' || c == '(').next().unwrap_or("").to_lowercase();
+        
+        if target_tags.contains(&tag_name.as_str()) {
+            let mut end_idx = i;
+            let mut has_meaningful = false;
+            
+            for j in (i + 1)..lines.len() {
+                let child_line = lines[j];
+                if child_line.trim().is_empty() { continue; }
+                let child_indent = child_line.chars().take_while(|c| c.is_whitespace()).count();
+                
+                if child_indent <= indent {
+                    break; // 부모의 들여쓰기와 같거나 작아지면 블록 종료
+                }
+                
+                let child_tag = child_line.trim().split(|c| c == '[' || c == ' ' || c == '(').next().unwrap_or("").to_lowercase();
+                if meaningful_children.contains(&child_tag.as_str()) {
+                    has_meaningful = true;
+                }
+                end_idx = j;
+            }
+            
+            // 유의미한 자식이 하나라도 있다면 이 구역은 절대 잘려선 안 되는 보호 구역으로 지정합니다.
+            if has_meaningful {
+                unbreakable_blocks.push(Block { start: i, end: end_idx });
+            }
+        }
+    }
+
+    // 중첩된 보호 구역(예: form 안에 table)들을 하나의 거대한 보호 구역으로 병합 매핑합니다.
+    let mut block_of_line: Vec<Option<(usize, usize)>> = vec![None; lines.len()];
+    for block in &unbreakable_blocks {
+        for idx in block.start..=block.end {
+            if let Some(existing) = block_of_line[idx] {
+                let new_start = existing.0.min(block.start);
+                let new_end = existing.1.max(block.end);
+                for k in new_start..=new_end {
+                    block_of_line[k] = Some((new_start, new_end));
+                }
+            } else {
+                block_of_line[idx] = Some((block.start, block.end));
+            }
+        }
+    }
 
     // 🌟 1. 아래서 한 번 자르기 (bottom_drop_tokens 가 주어지면 뒤에서부터 해당 토큰 수만큼 버림)
     if let Some(drop_limit) = bottom_drop_tokens {
         let mut dropped_tokens = 0;
-        let mut drop_count = 0;
-        for line in lines.iter().rev() {
-            let line_with_newline = format!("{}\n", line);
+        let mut cut_idx = lines.len();
+        
+        for i in (0..lines.len()).rev() {
+            let line_with_newline = format!("{}\n", lines[i]);
             let token_count = tokenizer.text_encode_vec(line_with_newline, false).map(|v| v.len()).unwrap_or(0);
+            
             if dropped_tokens + token_count > drop_limit {
+                cut_idx = i + 1;
                 break; 
             }
             dropped_tokens += token_count;
-            drop_count += 1;
+            cut_idx = i;
         }
+        
+        // 🌟 [지능형 보호 개입] 절단선이 보호 구역 한가운데를 지나간다면, 절단선을 구역 밖(아래쪽)으로 밀어내어 구역을 살려냅니다.
+        if cut_idx < lines.len() {
+            if let Some((_, b_end)) = block_of_line[cut_idx] {
+                cut_idx = (b_end + 1).min(lines.len());
+            }
+        }
+
         // 문서가 너무 짧아 통째로 날아가는 것을 방지하기 위해 최소 1줄은 남깁니다.
-        let safe_drop_count = drop_count.min(lines.len().saturating_sub(1));
-        lines.truncate(lines.len() - safe_drop_count);
+        let safe_cut_idx = cut_idx.min(lines.len().saturating_sub(1));
+        lines.truncate(safe_cut_idx);
     }
 
     // 🌟 2. 위에서 한 번 자르기 (남은 덩어리에서 밑에서부터 max_tokens 만큼 수집하여 앞단을 버림)
     let mut current_tokens = 0;
-    let mut kept_lines = Vec::new();
-    let mut last_valid_indent = None;
+    let mut start_keep_idx = lines.len();
 
-    let mut lines_iter = lines.into_iter().rev();
-
-    // 1. [수집 단계]
-    while let Some(line) = lines_iter.next() {
-        let line_with_newline = format!("{}\n", line);
-        let token_count = tokenizer.text_encode_vec(line_with_newline.clone(), false).map(|v| v.len()).unwrap_or(0);
+    for i in (0..lines.len()).rev() {
+        let line_with_newline = format!("{}\n", lines[i]);
+        let token_count = tokenizer.text_encode_vec(line_with_newline, false).map(|v| v.len()).unwrap_or(0);
         
         if current_tokens + token_count > max_tokens {
+            start_keep_idx = i + 1;
             break;
         }
-        
-        kept_lines.push(line_with_newline);
         current_tokens += token_count;
-        
-        if !line.trim().is_empty() {
-            last_valid_indent = Some(line.chars().take_while(|c| c.is_whitespace()).count());
+        start_keep_idx = i;
+    }
+    
+    // 🌟 [지능형 보호 개입] 시작선이 보호 구역 한가운데를 지나간다면, 시작선을 구역 꼭대기로 끌어올려 전체 껍데기를 살려냅니다.
+    if start_keep_idx < lines.len() && start_keep_idx > 0 {
+        if let Some((b_start, _)) = block_of_line[start_keep_idx] {
+            start_keep_idx = b_start;
+        }
+    }
+    
+    let mut final_kept_lines = Vec::new();
+    let mut last_valid_indent = None;
+
+    for i in start_keep_idx..lines.len() {
+        final_kept_lines.push(format!("{}\n", lines[i]));
+        if last_valid_indent.is_none() && !lines[i].trim().is_empty() {
+            last_valid_indent = Some(lines[i].chars().take_while(|c| c.is_whitespace()).count());
         }
     }
     
     // 2. [복구 단계] 절단면 위쪽으로 거슬러 올라가며 필수 부모 껍데기 구출
     if let Some(mut target_indent) = last_valid_indent {
-        while target_indent > 0 {
-            if let Some(line) = lines_iter.next() {
-                if line.trim().is_empty() { continue; }
-                let current_indent = line.chars().take_while(|c| c.is_whitespace()).count();
-                
-                if is_root_layout_element(line) {
-                    break;
-                }
-
-                if current_indent < target_indent && !is_void_element(line) {
-                    kept_lines.push(format!("{}\n", line));
-                    target_indent = current_indent; 
-                }
-            } else {
+        for i in (0..start_keep_idx).rev() {
+            let line = lines[i];
+            if line.trim().is_empty() { continue; }
+            let current_indent = line.chars().take_while(|c| c.is_whitespace()).count();
+            
+            if is_root_layout_element(line) {
                 break;
+            }
+
+            if current_indent < target_indent && !is_void_element(line) {
+                final_kept_lines.insert(0, format!("{}\n", line));
+                target_indent = current_indent; 
             }
         }
     }
     
-    // 3. [정렬 단계] 수집된 라인을 정방향으로 뒤집고 다이내믹 뎁스 정렬 수행
-    let mut final_lines: Vec<String> = kept_lines.into_iter().rev().collect();
-    
-    if !final_lines.is_empty() {
-        let mut current_shift = final_lines.iter()
+    // 3. [정렬 단계] 수집된 라인을 정방향으로 유지한 채 다이내믹 뎁스 정렬 수행
+    if !final_kept_lines.is_empty() {
+        let mut current_shift = final_kept_lines.iter()
             .find(|line| !line.trim().is_empty())
             .map(|line| line.chars().take_while(|c| c.is_whitespace()).count())
             .unwrap_or(0);
         
-        for line in final_lines.iter_mut() {
+        for line in final_kept_lines.iter_mut() {
             if line.trim().is_empty() { continue; }
             let original_indent = line.chars().take_while(|c| c.is_whitespace()).count();
             
@@ -233,7 +308,7 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::t
         }
     }
     
-    final_lines.concat()
+    final_kept_lines.concat()
 }
 
 #[derive(Default, Clone)]
@@ -825,7 +900,7 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     "tracking" => r###"- "{TYPE}":
     - "status":'draft' or 'progress' or 'return' or 'complete' or 'error' | string
     - "id":tracking number | string
-    - "title":tracking goods title | string
+    - "title":tracking product title | string
     - "sender_name":sender_name | string
     - "sender_address":sender_address | string
     - "sender_phone":sender_phone | string
@@ -898,7 +973,7 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "id":Refer to the ID value from the link | string
     - "tracking_number":tracking number | string
     - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
-    - "goods":[{ title:{ value:goods title | string }, path:{ value:URL includes a manage path, an administrative or edit Link | string }, id:{ value:Refer to the product no value from the link or an attribute or input value | string }, link:{ value:Refer to the ID to find a URL that includes a manage link | string } }]
+    - "goods":[{ title:{ value:product title | string }, path:{ value:URL includes a manage path, an administrative or edit Link | string }, id:{ value:Refer to the product no value from the link or an attribute or input value | string }, link:{ value:Refer to the ID to find a URL that includes a manage link | string } }]
     - "sender_name":sender_name | string
     - "sender_address":sender_address, Filter the addresses to District-level and up | string
     - "sender_phone":sender_phone | string

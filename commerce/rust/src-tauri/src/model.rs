@@ -185,34 +185,6 @@ impl LogisModel {
         }
     }
 
-    // --- [NEW] CPU System RAM Optimizer ---
-    async fn optimize_system_ram(&self) {
-        if !self.is_cpu_mode { return; }
-
-        let mut sys = System::new();
-        sys.refresh_memory();
-        let free_ram = sys.total_memory().saturating_sub(sys.used_memory()); // Bytes in sysinfo 0.30
-
-        // Threshold: 4GB
-        if free_ram < 4 * 1024 * 1024 * 1024 {
-            println!("[RAM-WATCH] Low System Memory ({:.2} GB). Flushing Working Set...", free_ram as f64 / 1024.0 / 1024.0 / 1024.0);
-            
-            #[cfg(target_os = "windows")]
-            unsafe {
-                use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                use windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx;
-                use windows_sys::Win32::System::Memory::QUOTA_LIMITS_HARDWS_MIN_DISABLE;
-                use windows_sys::Win32::System::Memory::QUOTA_LIMITS_HARDWS_MAX_DISABLE;
-                let process = GetCurrentProcess();
-                let _ = SetProcessWorkingSetSizeEx(process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-            }
-            
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        } else {
-            println!("[RAM-WATCH] Sufficient Memory ({:.2} GB). Skipping flush.", free_ram as f64 / 1024.0 / 1024.0 / 1024.0);
-        }
-    }
-
     /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced with Diagnostics)
     pub async fn deep_purge_resources(&self) {
         println!("[DIAG-PURGE] Step 0: Waiting for background IO to finish...");
@@ -588,39 +560,6 @@ impl LogisModel {
             }
         }
         Ok(())
-    }
-
-
-    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<QwenVLGenerateModel> {
-        println!("[MODEL] Loading Generator from {} (Text-Only: {})...", path, force_text_only);
-        let dev = self.device_config.device.clone();
-        let dev_id = self.device_config.gpu_id;
-
-        let dtype = if self.device_config.is_cpu { Some(DType::F32) } else { Some(DType::BF16) };
-        let limit = self.max_tokens_limit;
-        let path_clone = path.to_string();
-        let shared_path = shared_config_path.map(|s| s.to_string());
-
-        let handle_clone = self.app_handle.clone();
-
-        let is_disk_swap = self.is_disk_swap;
-
-        let generator = tokio::task::spawn_blocking(move || {
-            let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
-            // [CRITICAL] Use init_with_config to force shared settings (Config + Tokenizer)
-            QwenVLGenerateModel::init_with_config(
-                &path_clone, 
-                shared_path.as_deref(), // Tokenizer path
-                shared_path.as_deref(), // Config path
-                Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize),
-                force_text_only,
-                false, // [NEW] baking_only
-                is_disk_swap, 
-                kv_root
-            )
-        }).await??;
-        
-        Ok(generator)
     }
 
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
@@ -1580,7 +1519,6 @@ impl LogisModel {
     // [신규] Commerce 파이프라인: 2-Stage (0.8B 단일 모델 연속 처리)
     pub async fn parse_commerce_query(&self, task_id: &str, app_handle: &tauri::AppHandle, query: String, language: &str, metrics_json: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {
         use tauri::Emitter;
-        let current_time = chrono::Utc::now().to_rfc3339();
 
         // 🌟 [신규] 터미널 로거 헬퍼 주입
         let emit_term = |msg: &str| {

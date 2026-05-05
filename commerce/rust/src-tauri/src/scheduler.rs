@@ -10,47 +10,6 @@ use serde_json::{Value, json};
 use anyhow::Result;
 use tauri::Emitter;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::fs;
-use std::path::PathBuf;
-
-// Helper to chunk text, strictly respecting Pug line boundaries (\n)
-fn chunk_text(text: &str, target_size: usize) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    let bytes = text.as_bytes();
-
-    while start < text.len() {
-        let mut end = (start + target_size).min(text.len());
-
-        // [BACKTRACKING] If mid-line, move back until we find a newline
-        if end < text.len() {
-            let mut temp_end = end;
-            while temp_end > start && bytes[temp_end] != b'\n' {
-                temp_end -= 1;
-            }
-            
-            // If found a newline, use it as the end
-            if temp_end > start {
-                end = temp_end + 1; // Include the \n
-            } else {
-                // No newline found in the whole chunk? Force char boundary to avoid hang
-                while end < text.len() && !text.is_char_boundary(end) {
-                    end += 1;
-                }
-            }
-        } else {
-            // Reached the end of string
-            end = text.len();
-        }
-
-        let slice = &text[start..end];
-        if !slice.trim().is_empty() {
-            chunks.push(slice.to_string());
-        }
-        start = end;
-    }
-    chunks
-}
 
 // Deep merge for JSON objects
 fn merge_json_results(target: &mut Value, source: &Value) {
@@ -698,7 +657,6 @@ async fn process_task(
     // ==================================================================================
 
     let base_session_id = format!("{}_base", task.id);
-    let base_session_id_35 = format!("{}_base_q35", task.id); // 🌟 0.8B 전용 세션 ID
     let system_content = format!("[PUG CONTENT]\n{}", light_pug);
 
     // 🌟 [핵심 변경 1] 캐시 적중 시(skip_ai_analysis = true), 무거운 0.6B 분석을 통째로 건너뜁니다!
@@ -2141,32 +2099,6 @@ async fn process_task(
     log_task_progress(app_handle, &task.id, &payload);
     
     println!("[PROCESS] Task {} completed. Handover to Embedding finished.", task.id);
-    Ok(())
-}
-
-// [3번 가속: PRE-FETCH] OS 페이지 캐시에 무게추 파일을 미리 로드함
-fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
-    use std::io::Read;
-    println!("[PRE-FETCH] Warming up OS Page Cache for weights in: {:?}", path);
-    if path.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let p = entry.path();
-                    if p.extension().map_or(false, |ext| ext == "gguf" || ext == "safetensors") {
-                        if let Ok(mut file) = std::fs::File::open(p) {
-                            let mut buffer = [0u8; 1024 * 1024]; // 1MB buffer
-                            // 파일 전체를 읽어서 OS가 램에 캐싱하도록 유도함
-                            while let Ok(n) = file.read(&mut buffer) {
-                                if n == 0 { break; }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    println!("[PRE-FETCH] Warm-up complete.");
     Ok(())
 }
 

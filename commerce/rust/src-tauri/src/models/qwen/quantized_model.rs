@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use candle_core::{D, DType, Device, IndexOp, Tensor};
+use candle_core::{D, DType, Device, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder}; 
 use candle_core::quantized::{gguf_file, QMatMul};
 use std::path::Path;
@@ -18,8 +18,6 @@ use crate::{
     },
     utils::tensor_utils::{
         mask_index_add, masked_scatter_dim0,
-        prod_tensor_last_dim, split_tensor,
-        prepare_causal_attention_mask, 
     },
 };
 use crate::models::qwen::generate::SLOT_MANAGER;
@@ -601,19 +599,13 @@ impl QuantizedQwenVLTextAttention {
         
         let dev = self.q_proj.device();
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
-        let mut vram_count = 0;
-        let mut ram_count = 0;
-        let mut ssd_count = 0;
 
         // 1. [ALIGNMENT] Input & Rotary
         let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
         let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
         let (b_sz, q_len, _) = xs.dims3()?;
 
-        // [CRITICAL] Internal Causal Mask Generation for Prefill Integrity
-        let total_len = seqlen_offset + q_len;
-        
-        
+
         // 수만 토큰의 거대 마스크를 한 번에 만들면 VRAM이 누수처럼 증가합니다.
         // 전체 마스크 생성을 지우고, 동적 생성을 위한 플래그만 남깁니다.
         let has_dynamic_mask = q_len > 1 && attention_mask_in.is_none();
@@ -704,7 +696,6 @@ impl QuantizedQwenVLTextAttention {
         // =========================================================================
         // 🚀 [최적화 2] 0.6B 디코딩 초고속 가속 (No-Cat Fast-Path)
         // =========================================================================
-        let is_decoding = q_len == 1;
         
         let mut out_res: Option<Tensor> = None;
         let mut m_n: Option<Tensor> = None;
@@ -740,7 +731,6 @@ impl QuantizedQwenVLTextAttention {
                             
                             k_cpu = Some(m.k_data.clone());
                             v_cpu = Some(m.v_data.clone());
-                            ram_count += 1;
                         }
                     }
 
@@ -809,7 +799,6 @@ impl QuantizedQwenVLTextAttention {
                     (k_gpu, v_gpu, true)
                 }
             };
-            if !is_temporary { vram_count += 1; }
 
             // [STEP B] Online Softmax for this Chunk
             let mut k = k_block;
@@ -957,9 +946,7 @@ impl QuantizedQwenVLTextAttention {
     // [QuantizedQwenVLTextAttention 나머지 구현부]
     // Part 7의 clear_kv_cache() 아래에 이어서 작성됩니다.
     // -----------------------------------------------------------------------
-    pub fn trigger_realtime_incremental_bake(&self, session_id: &str, is_last_chunk: bool, baking_only: bool, is_decoding: bool) -> Result<()> {
-        use crate::models::qwen::generate::{BakeTask, SlotTask, BAKE_TX, SLOT_MANAGER, LayerKVDump};
-        
+    pub fn trigger_realtime_incremental_bake(&self, session_id: &str, is_last_chunk: bool, baking_only: bool, _is_decoding: bool) -> Result<()> {
         let target_indices: Vec<usize> = self.kv_blocks.iter().enumerate().filter_map(|(i, b)| {
             let inner = b.inner.read().unwrap();
             let is_full = inner.len == 1024;
@@ -1072,7 +1059,7 @@ impl QuantizedQwenVLTextAttention {
         };
         let index: LayerIndex = serde_json::from_str(&index_json)?;
         
-        for (b_idx, block_info) in index.blocks.into_iter().enumerate() {
+        for (_b_idx, block_info) in index.blocks.into_iter().enumerate() {
             let block_parent = kv_dir.join(kv_name).join(format!("b{}", block_info.offset));
             let l_file = block_parent.join(format!("l{}.st", self.layer_idx));
             let file_path = if l_file.exists() { l_file } else { block_parent.join("l0.st") };
@@ -1423,7 +1410,7 @@ impl QuantizedQwenVLTextDecoderLayer {
         device: &Device,
         dtype: DType,
         layer_idx: usize,
-        baking_only: bool,
+        _baking_only: bool,
         registry: KVRegistry,
     ) -> Result<Self> {
         let is_gguf_naming = base_name.starts_with("blk.");
@@ -1498,7 +1485,7 @@ impl QuantizedQwenVLTextDecoderLayer {
         device: &Device,
         dtype: DType,
         layer_idx: usize,
-        baking_only: bool,
+        _baking_only: bool,
         registry: KVRegistry, 
     ) -> Result<Self> {
         let is_gguf_naming = base_name.starts_with("blk.");
@@ -1536,7 +1523,7 @@ impl QuantizedQwenVLTextDecoderLayer {
         base_name: &str,
         device: &Device,
         dtype: DType,
-        baking_only: bool,
+        _baking_only: bool,
     ) -> Result<()> {
         let is_gguf_naming = base_name.starts_with("blk.");
         let (attn_base, gate, up, down, in_ln, post_ln) = if is_gguf_naming {
@@ -1705,7 +1692,7 @@ impl QuantizedQwenVLTextModel {
         device: &Device,
         device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
@@ -1798,7 +1785,7 @@ impl QuantizedQwenVLTextModel {
         device: &Device,
         device_id: usize,
         dtype: DType,
-        kv_reserve: u64,
+        _kv_reserve: u64,
         baking_only: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
@@ -2782,7 +2769,7 @@ impl QuantizedQwenVLModel {
             Some(QwenVLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?)
         };
         
-        let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
+        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
         
 
@@ -3039,7 +3026,7 @@ impl QuantizedQwenTextModel {
         single_layer_mode: bool,
     ) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
-        let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
+        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
         let language_model = QuantizedQwenVLTextModel::new_with_mmap(
             &t_config, ct_main.clone(), mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
@@ -3067,7 +3054,7 @@ impl QuantizedQwenTextModel {
         single_layer_mode: bool,
     ) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
-        let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
+        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
         let language_model = QuantizedQwenVLTextModel::new(
             &t_config, ct_main.clone(), reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only
