@@ -225,17 +225,15 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::t
             cut_idx = i;
         }
         
-        // 🌟 [CRITICAL FIX] 절단선이 table이나 form 블록 한복판을 자르면 문법이 파괴되어 AI가 환각을 일으킵니다.
-        // 보호 구역(Unbreakable Block)을 만났을 때 아래로 밀어내는 대신, '위로 올려서' 블록 전체를 버리거나 전체를 살리도록 강제합니다.
+        // 🌟 [지능형 보호 개입] 절단선이 보호 구역 한가운데를 지나간다면, 절단선을 구역 밖(아래쪽)으로 밀어내어 구역을 살려냅니다.
         if cut_idx < lines.len() {
-            if let Some((b_start, _)) = block_of_line[cut_idx] {
-                // 절단선이 블록 중간이면 블록 시작점(b_start)까지만 남기고 블록 전체를 잘라내어 문법 무결성을 유지합니다.
-                cut_idx = b_start;
+            if let Some((_, b_end)) = block_of_line[cut_idx] {
+                cut_idx = (b_end + 1).min(lines.len());
             }
         }
 
-        // 최소 5줄 이상의 컨텍스트를 보장하여 모델이 페이지의 기본 정보를 인지하게 합니다.
-        let safe_cut_idx = cut_idx.max(5).min(lines.len());
+        // 문서가 너무 짧아 통째로 날아가는 것을 방지하기 위해 최소 1줄은 남깁니다.
+        let safe_cut_idx = cut_idx.min(lines.len().saturating_sub(1));
         lines.truncate(safe_cut_idx);
     }
 

@@ -801,30 +801,25 @@ impl QuantizedQwenVLTextAttention {
             };
 
             // [STEP B] Online Softmax for this Chunk
-            let k = k_block; // Unified 최적화: expand와 reshape를 금지하므로 mut 속성 제거
-            let v = v_block; // 원본 압축 KV 형태 (b, kv_h, s, d) 그대로 유지!
+            let mut k = k_block;
+            let mut v = v_block;
+
+            if self.num_kv_groups > 1 {
+                let (b, h, s, d) = k.dims4()?;
+                k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+            }
+
+            k = k.contiguous()?;
+            v = v.contiguous()?;
 
             let actual_kv_len = k.dim(2)?;
+            
             let k_t = k.transpose(2, 3)?.contiguous()?; 
             
-            // 1. Q * K^T 연산 (Dimension Folding 기법 적용)
-            let mut s_chunk = if self.num_kv_groups > 1 {
-                let (b, h, q_l, d) = q_aligned.dims4()?;
-                let kv_h = self.num_key_value_heads;
-                let groups = self.num_kv_groups;
-                
-                // Q를 (b, kv_h, groups * q_l, d) 로 수학적으로 접어서 K 차원에 맞춥니다.
-                let q_flat = q_aligned.reshape((b, kv_h, groups * q_l, d))?;
-                
-                // VRAM 복사 없이 초고속 MatMul 연산 진행
-                let s_chunk_flat = q_flat.matmul(&k_t)?;
-                
-                // 연산 후 다시 (b, h, q_l, actual_kv_len) 차원으로 원상복구
-                (s_chunk_flat.reshape((b, h, q_l, actual_kv_len))? * self.scaling)?
-            } else {
-                (q_aligned.matmul(&k_t)? * self.scaling)?
-            };
+            let mut s_chunk = (q_aligned.matmul(&k_t)? * self.scaling)?;
 
+            
             if has_dynamic_mask {
                 if b_off + actual_kv_len > seqlen_offset {
                     let k_indices = Tensor::arange(b_off as u32, (b_off + actual_kv_len) as u32, dev)?.unsqueeze(0)?;
@@ -833,13 +828,15 @@ impl QuantizedQwenVLTextAttention {
                     s_chunk = s_chunk.broadcast_add(&chunk_mask)?;
                 }
             } else if let Some(mask) = attention_mask_in {
+                // 커스텀 Vision 마스크 처리 유지
                 let mask_len = mask.dim(candle_core::D::Minus1)?;
                 if b_off < mask_len {
                     let take = std::cmp::min(actual_kv_len, mask_len - b_off);
                     let chunk_mask = mask.narrow(candle_core::D::Minus1, b_off, take)?;
                     
                     if take < actual_kv_len {
-                        let left_masked = s_chunk.narrow(candle_core::D::Minus1, 0, take)?.broadcast_add(&chunk_mask)?;
+                        let left_masked = s_chunk.narrow(candle_core::D::Minus1, 0, take)?
+                            .broadcast_add(&chunk_mask)?;
                         let right_unmasked = s_chunk.narrow(candle_core::D::Minus1, take, actual_kv_len - take)?;
                         s_chunk = Tensor::cat(&[&left_masked, &right_unmasked], candle_core::D::Minus1)?;
                     } else {
@@ -848,48 +845,21 @@ impl QuantizedQwenVLTextAttention {
                 }
             }
 
-            // 🌟 [에러 해결] s_chunk를 먼저 F32로 올려서 모든 누적(m_j, p_j, l_j)이 F32에서 안전하게 이뤄지도록 합니다.
             let s_chunk_f32 = s_chunk.to_dtype(DType::F32)?;
             let m_j = s_chunk_f32.max_keepdim(candle_core::D::Minus1)?;
-            
-            // 🌟 [CRITICAL FIX] 1024 토큰을 넘어갈 때 미래 토큰들이 완전히 마스킹(-inf)되면 
-            // -inf - (-inf) = NaN이 발생하여 비전 모델 뇌가 파괴되는 현상을 원천 차단합니다.
-            let safe_floor = Tensor::new(-10000.0_f32, m_j.device())?.broadcast_as(m_j.shape())?;
-            let m_j_safe = m_j.maximum(&safe_floor)?;
-
-            // m_j 대신 m_j_safe를 사용하여 빼기 연산 수행
-            let p_j = s_chunk_f32.broadcast_sub(&m_j_safe)?.exp()?;
+            let p_j = s_chunk_f32.broadcast_sub(&m_j)?.exp()?;
             let l_j = p_j.sum_keepdim(candle_core::D::Minus1)?;
             
-            // 2. P * V 연산 (Dimension Folding 기법 적용)
-            let out_j = if self.num_kv_groups > 1 {
-                let (b, h, q_l, s_len) = p_j.dims4()?;
-                let kv_h = v.dim(1)?;
-                let groups = self.num_kv_groups;
-                let d = v.dim(3)?;
-
-                // P를 (b, kv_h, groups * q_l, s_len) 로 변환
-                let p_j_flat = p_j.to_dtype(v.dtype())?.reshape((b, kv_h, groups * q_l, s_len))?;
-                
-                // V는 이미 (b, kv_h, s_len, d) 4차원이므로 VRAM 복사(contiguous) 없이 바로 연산!
-                let out_j_flat = p_j_flat.matmul(&v)?;
-                
-                // 연산 후 (b, h, q_l, d) 차원으로 원상복구
-                out_j_flat.reshape((b, h, q_l, d))?
-            } else {
-                p_j.to_dtype(v.dtype())?.matmul(&v)?
-            };
-            
-            // [CRITICAL FIX] Attention Output을 F32로 승격시키지 않고 원본 타입(BF16)을 유지하여 VRAM을 50% 절약합니다.
-            let out_j_target = out_j;
+            let out_j = p_j.to_dtype(v.dtype())?.matmul(&v)?;
+            let out_j_f32 = out_j.to_dtype(DType::F32)?;
 
             match out_res {
                 None => {
-                    out_res = Some(out_j_target); 
-                    m_n = Some(m_j); // 병합 계산을 위해 안전장치가 없는 "원본 m_j"를 유지해야 합니다!
+                    out_res = Some(out_j_f32); 
+                    m_n = Some(m_j);
                     l_n = Some(l_j);
                 }
-                Some(prev_out_target) => { 
+                Some(prev_out_f32) => { 
                     let prev_m = m_n.as_ref().unwrap();
                     let prev_l = l_n.as_ref().unwrap();
                     
@@ -898,13 +868,9 @@ impl QuantizedQwenVLTextAttention {
                     let diff_new = m_j.broadcast_sub(&m_new)?.exp()?;
                     
                     let l_new = prev_l.broadcast_mul(&diff_old)?.add(&l_j.broadcast_mul(&diff_new)?)?;
+                    let out_new_f32 = prev_out_f32.broadcast_mul(&diff_old)?.add(&out_j_f32.broadcast_mul(&diff_new)?)?;
                     
-                    // 스케일링 계수만 타겟 타입으로 내린 후 곱셈을 수행하여, 거대한 Output 텐서의 VRAM 팽창을 막습니다.
-                    let diff_old_cast = diff_old.to_dtype(target_dtype)?;
-                    let diff_new_cast = diff_new.to_dtype(target_dtype)?;
-                    let out_new_target = prev_out_target.broadcast_mul(&diff_old_cast)?.add(&out_j_target.broadcast_mul(&diff_new_cast)?)?;
-                    
-                    out_res = Some(out_new_target); 
+                    out_res = Some(out_new_f32); 
                     m_n = Some(m_new);
                     l_n = Some(l_new);
                 }
@@ -915,9 +881,8 @@ impl QuantizedQwenVLTextAttention {
         }
 
         // [STEP C] Finalize Attention Output
-        let attn_output = if let (Some(out_target), Some(l_f32)) = (out_res, l_n) {
-            // 나누기 연산을 위해 l_f32 스칼라 값만 타겟 타입으로 캐스팅하여 나눕니다.
-            out_target.broadcast_div(&l_f32.to_dtype(target_dtype)?)?
+        let attn_output = if let (Some(out_f32), Some(l_f32)) = (out_res, l_n) {
+            out_f32.broadcast_div(&l_f32)?.to_dtype(target_dtype)?
         } else {
             return Err(anyhow!("No KV data processed"));
         };
@@ -931,8 +896,7 @@ impl QuantizedQwenVLTextAttention {
 
     pub fn compress_to_bf16(&self, t: &Tensor) -> Result<(Tensor, Vec<usize>)> {
         let original_shape = t.shape().dims().to_vec();
-        // 🌟 [PCIe 병목 해결] 저장(Save) 시 잘라낸 텐서를 GPU에서 미리 압축(contiguous)하여 통로 대역폭을 낭비하지 않습니다.
-        let t_bf16 = t.contiguous()?.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
+        let t_bf16 = t.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
         Ok((t_bf16, original_shape))
     }
 
@@ -1119,10 +1083,8 @@ impl QuantizedQwenVLTextAttention {
                             let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, dev)?;
                             let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, dev)?;
 
-                            // [CRITICAL FIX] CPU 상에서 불필요하게 F32로 압축을 풀었다가 GPU로 전송하는 병목(Double-Casting)을 차단합니다.
-                            // 16비트(BF16) 상태 그대로 형태(Shape)만 맞춘 뒤 GPU로 쏘아보내어 PCIe 대역폭과 시스템 RAM 점유율을 절반으로 아낍니다!
-                            let mut k_raw = kd_t;
-                            let mut v_raw = vd_t;
+                            let mut k_raw = self.decompress_from_bf16(&kd_t, &meta_os, dev)?;
+                            let mut v_raw = self.decompress_from_bf16(&vd_t, &meta_os, dev)?;
 
                             let target_heads = self.num_key_value_heads;
                             let target_dim = self.head_dim;
@@ -1187,9 +1149,8 @@ impl QuantizedQwenVLTextAttention {
         let target_dtype = if self.q_proj.device().is_cpu() { DType::F32 } else { DType::BF16 };
 
         if let (Some(mk), Some(mv)) = (&self.vram_merged_k, &self.vram_merged_v) {
-            // 🌟 [PCIe 병목 해결] VRAM에서 병합(cat)된 비연속 텐서를 GPU 내부에서 초고속으로 정렬(contiguous) 후 전송!
-            let mk_cpu = mk.contiguous()?.to_device(dev)?.to_dtype(target_dtype)?;
-            let mv_cpu = mv.contiguous()?.to_device(dev)?.to_dtype(target_dtype)?;
+            let mk_cpu = mk.to_device(dev)?.to_dtype(target_dtype)?;
+            let mv_cpu = mv.to_device(dev)?.to_dtype(target_dtype)?;
             
             let mut current_pos = 0;
             for block in &mut self.kv_blocks {
@@ -1224,9 +1185,8 @@ impl QuantizedQwenVLTextAttention {
 
             if let (Some(k), Some(v)) = (k_to_move, v_to_move) {
                 let mut inner = block.inner.write().unwrap();
-                // 🌟 개별 블록 전송 시에도 무조건 VRAM에서 선행 정렬!
-                inner.k_cache = Some(k.contiguous()?.to_device(dev)?.to_dtype(target_dtype)?);
-                inner.v_cache = Some(v.contiguous()?.to_device(dev)?.to_dtype(target_dtype)?);
+                inner.k_cache = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
+                inner.v_cache = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
                 inner.location = KVLocation::RAM;
                 
                 let mut reg = self.registry.entries.write().unwrap();
@@ -1983,9 +1943,7 @@ impl QuantizedQwenVLTextModel {
         baking_only: bool,
     ) -> Result<Tensor> {
         
-        // 🌟 [CRITICAL FIX] 4GB VRAM 환경 보호를 위해 어텐션 연산 청크를 2048 -> 512로 보수적 하향 조정.
-        // OOM 스파이크 방지 및 VRAM 메모리 파편화 억제에 극적인 효과가 있습니다.
-        let chunk_size = 256; 
+        let chunk_size = 2048; 
         let current_seq_len = xs.dim(1)?;
         let is_decoding = current_seq_len <= 1;
         let total_kv_blocks = self.layers[layer_idx].self_attn.kv_blocks.len();
@@ -2265,16 +2223,13 @@ impl QuantizedQwenVLTextModel {
                     let k = inner.k_cache.as_ref().unwrap();
                     let k_shape_u32: Vec<u32> = k.shape().dims().iter().map(|&x| x as u32).collect();
                     
-                    // [CRITICAL FIX] VRAM -> RAM 오프로딩 시 PCIe 대역폭 폭발을 막기 위해, 
-                    // CPU로 넘기기 전 VRAM 내부에서 미리 contiguous()로 텐서를 하나로 묶은 뒤 단번에 쏘아보냅니다!
-                    let target_dtype = if k.device().is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
                     block_groups.entry((inner.offset, inner.index)).or_default().push(LayerKVDump {
                         layer_idx: l_idx,
-                        k_data: Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(),
-                        v_data: Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(),
-                        k_shape: Tensor::from_vec(k_shape_u32, (k.shape().dims().len(),), &candle_core::Device::Cpu).unwrap(),
-                        raw_k: Some(k.contiguous().unwrap_or_else(|_| k.clone()).to_dtype(target_dtype).unwrap_or_else(|_| k.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k.clone())), 
-                        raw_v: Some(inner.v_cache.as_ref().unwrap().contiguous().unwrap_or_else(|_| inner.v_cache.as_ref().unwrap().clone()).to_dtype(target_dtype).unwrap_or_else(|_| inner.v_cache.as_ref().unwrap().clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| inner.v_cache.as_ref().unwrap().clone())),
+                        k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
+                        v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
+                        k_shape: Tensor::from_vec(k_shape_u32, (k.shape().dims().len(),), &Device::Cpu)?,
+                        raw_k: Some(k.to_device(&Device::Cpu).unwrap_or(k.clone()).contiguous().unwrap_or_else(|_| k.clone())), 
+                        raw_v: Some(inner.v_cache.as_ref().unwrap().to_device(&Device::Cpu).unwrap_or(inner.v_cache.as_ref().unwrap().clone()).contiguous().unwrap_or_else(|_| inner.v_cache.as_ref().unwrap().clone())),
                     });
                     
                     let mut reg = self.registry.entries.write().unwrap();
@@ -2334,57 +2289,36 @@ impl QuantizedQwenVLTextModel {
                 if inner.k_cache.is_some() || inner.v_cache.is_some() {
                     let is_dirty = if idx < reg.len() { reg[idx].is_dirty[layer_idx] } else { true };
                     
-                    // 🌟 [CRITICAL FIX] k_cpu, v_cpu 변수를 if 블록 밖에서 미리 선언하여 스코프 문제를 완벽하게 해결합니다.
-                    let mut k_cpu_final = None;
-                    let mut v_cpu_final = None;
-
                     if is_dirty {
                         let k = inner.k_cache.as_ref().unwrap();
                         let v = inner.v_cache.as_ref().unwrap();
                         let k_shape_vec: Vec<u32> = k.shape().dims().iter().map(|&x| x as u32).collect();
                         
-                        let target_dtype = if k.device().is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
-                        
-                        // GPU에서 미리 BF16 압축 후 CPU로 전송
-                        let k_cpu = k.contiguous().unwrap_or_else(|_| k.clone()).to_dtype(target_dtype).unwrap_or_else(|_| k.clone()).to_device(&Device::Cpu).unwrap();
-                        let v_cpu = v.contiguous().unwrap_or_else(|_| v.clone()).to_dtype(target_dtype).unwrap_or_else(|_| v.clone()).to_device(&Device::Cpu).unwrap();
-
                         dumps_to_send.push((
                             LayerKVDump { 
                                 layer_idx, 
-                                k_data: Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(), 
-                                v_data: Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(), 
-                                k_shape: Tensor::from_vec(k_shape_vec, (k_cpu.shape().dims().len(),), &candle_core::Device::Cpu).unwrap(),
-                                raw_k: Some(k_cpu.clone()), 
-                                raw_v: Some(v_cpu.clone()), 
+                                k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(), 
+                                v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(), 
+                                k_shape: Tensor::from_vec(k_shape_vec, (k.shape().dims().len(),), &Device::Cpu).unwrap(),
+                                raw_k: Some(k.to_device(&Device::Cpu).unwrap()), 
+                                raw_v: Some(v.to_device(&Device::Cpu).unwrap()), 
                             },
                             inner.offset,
                             inner.len,
                             idx 
                         ));
                         
-                        k_cpu_final = Some(k_cpu);
-                        v_cpu_final = Some(v_cpu);
-                        
                         if idx < reg.len() { reg[idx].is_dirty[layer_idx] = false; }
-                    } else {
-                        // 이미 SSD에 있는 데이터라면 VRAM에 있는 것을 그대로 BF16 변환하여 RAM 보존용으로 사용
-                        if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                            let target_dtype = if k.device().is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
-                            k_cpu_final = Some(k.contiguous().unwrap_or_else(|_| k.clone()).to_dtype(target_dtype).unwrap_or_else(|_| k.clone()).to_device(&Device::Cpu).unwrap());
-                            v_cpu_final = Some(v.contiguous().unwrap_or_else(|_| v.clone()).to_dtype(target_dtype).unwrap_or_else(|_| v.clone()).to_device(&Device::Cpu).unwrap());
-                        }
                     }
 
-                    // 🌟 [스코프 해결 완료] 이제 k_cpu_final 변수를 통해 안전하게 캐시를 업데이트합니다.
-                    if k_cpu_final.is_some() && v_cpu_final.is_some() {
-                        inner.k_cache = k_cpu_final;
-                        inner.v_cache = v_cpu_final;
-                        inner.location = KVLocation::RAM; 
-                        
-                        if idx < reg.len() {
-                            reg[idx].location[layer_idx] = KVLocation::RAM;
-                        }
+                    inner.k_cache = None;
+                    inner.v_cache = None;
+                    inner.location = KVLocation::SSD; 
+                    
+                    if idx < reg.len() {
+                        reg[idx].location[layer_idx] = KVLocation::SSD;
+                        let mut cache = reg[idx].bitkv_cache.write().unwrap();
+                        cache[layer_idx] = None; 
                     }
                 }
             }
@@ -2664,46 +2598,24 @@ impl QuantizedQwenVLTextModel {
         if fragments.is_empty() { return Ok(()); }
         fragments.sort_by_key(|f| f.0);
 
-        // 🌟 [CRITICAL FIX] 장부(JSON) 파일 유무와 관계없이 디스크에 저장된 물리적 블록 조각들을 전수 조사합니다.
-        // max_offset(마지막 블록의 시작점)에 해당 블록의 실제 데이터 길이(fragmented_len)를 더해 7009토큰을 1토큰 오차 없이 찾아냅니다.
-        let mut total_kv_len = 0;
-        if let Some(last_frag) = fragments.last() {
-            let (last_off, last_path) = last_frag;
-            let mut last_chunk_len = 0;
-            
-            // 마지막 블록 파일(l0.st)을 직접 열어 실제 저장된 seq_len 차원을 읽어옵니다.
-            if let Ok(encrypted_content) = crate::utils::direct_loader::load_kv_block(&last_path.join("l0.st")) {
-                if let Ok(content) = crate::utils::crypto::decrypt_data(&encrypted_content) {
-                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                        if let Some(name) = st.names().iter().find(|n| n.contains("k_shape")) {
-                            if let Ok(view) = st.tensor(name) {
-                                let data = view.data();
-                                if data.len() >= 12 {
-                                    // safetensors 저장 포맷의 3번째 차원(index 2)인 실제 토큰 길이를 추출
-                                    last_chunk_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
-                                }
+        let mut last_chunk_len = 1024;
+        let (_, last_st_path) = fragments.last().unwrap();
+        if let Ok(encrypted_content) = crate::utils::direct_loader::load_kv_block(&last_st_path.join("l0.st")) {
+            if let Ok(content) = crate::utils::crypto::decrypt_data(&encrypted_content) {
+                if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                    if let Some(name) = st.names().iter().find(|n| n.contains("k_shape")) {
+                        if let Ok(view) = st.tensor(name) {
+                            let data = view.data();
+                            if data.len() >= 12 {
+                                last_chunk_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
                             }
-                        }
-                    }
-                }
-            }
-            total_kv_len = *last_off + (if last_chunk_len > 0 { last_chunk_len } else { 1024 });
-        }
-
-        // 장부가 있다면 장부의 total_tokens 값을 최종 신뢰하여 검증합니다.
-        let index_path = scan_path.join("layer0.json");
-        if index_path.exists() {
-            if let Ok(data) = crate::utils::direct_loader::load_kv_block(&index_path) {
-                if let Ok(json_str) = String::from_utf8(data) {
-                    if let Ok(index_json) = serde_json::from_str::<crate::models::qwen::generate::LayerIndex>(&json_str) {
-                        if index_json.total_tokens > total_kv_len {
-                            total_kv_len = index_json.total_tokens;
                         }
                     }
                 }
             }
         }
         
+        let total_kv_len = max_offset + last_chunk_len;
         self.current_kv_len = total_kv_len;
         println!("[SSD-GLOBAL] Snapshot loaded. Total context length: {} tokens.", total_kv_len);
 
