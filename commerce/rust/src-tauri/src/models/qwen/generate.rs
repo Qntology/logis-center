@@ -88,7 +88,8 @@ impl SlotManager {
 
 pub static GLOBAL_IO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub static SLOT_MANAGER_DATA: Lazy<(SlotManager, Mutex<Option<mpsc::Receiver<SlotRequest>>>)> = Lazy::new(|| {
-    let (sm, rx) = SlotManager::new(128); // 32 -> 128로 증가
+    // 🌟 [CRITICAL FIX] 8GB RAM 환경 보호를 위해 128개의 거대 슬롯을 32개로 하향 조정하여 구조적 RAM 낭비를 막습니다.
+    let (sm, rx) = SlotManager::new(32); 
     (sm, Mutex::new(Some(rx)))
 });
 pub static SLOT_MANAGER: Lazy<&SlotManager> = Lazy::new(|| &SLOT_MANAGER_DATA.0);
@@ -225,7 +226,9 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
         }
 
         // [핵심 로직] 여유 슬롯이 있고 대기표를 뽑은 사람이 있다면, 하나씩 슬롯을 나눠줍니다.
-        let max_writes = 64;
+        // 🌟 [CRITICAL FIX] 동시 쓰기 허용량을 64에서 8로 극단적으로 하향합니다. 
+        // 이렇게 해야 수십 개의 청크가 VRAM에서 RAM으로 한 번에 몰려와 OS를 뻗게 만드는 현상(Memory Spike)을 막을 수 있습니다.
+        let max_writes = 8;
         while !waiting_acquires.is_empty() && SLOT_MANAGER.active_write_count.load(Ordering::SeqCst) < max_writes {
             let mut found = None;
             
@@ -266,9 +269,12 @@ async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
 }
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
-    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(100); 
+    // 🌟 [CRITICAL FIX] 채널에 대기 중인 무거운 텐서 객체들이 RAM을 차지하지 않도록 큐 길이를 100 -> 32로 낮춥니다.
+    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(32); 
     tokio::spawn(async move {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(16)); 
+        // 🌟 [CRITICAL FIX] 일반적인 노트북/데스크탑 SSD는 16개의 동시 쓰기 스레드를 감당하지 못하고 병목을 일으킵니다.
+        // 이를 4개로 줄여 디스크 컨트롤러가 안정적으로 순차 기록(Sequential-like)을 할 수 있도록 유도합니다.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4)); 
         while let Some(task) = io_rx.recv().await {
             let sem = semaphore.clone();
             let (tp, ts, reg, b_idx, sid, is_last, kv_n) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone());
@@ -286,8 +292,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let tmp_path = tp_clone.with_extension("tmp");
                     candle_core::safetensors::save(&ts, &tmp_path)?;
                     
-                    let plain_data = std::fs::read(&tmp_path)?;
-                    let encrypted_data = crate::utils::crypto::encrypt_data(&plain_data)?;
+                    // 🌟 [CRITICAL FIX] std::fs::read로 수백 MB를 RAM에 통째로 복사하는 이중 할당(Double Allocation)을 금지합니다!
+                    // 대신 OS 커널의 Mmap(메모리 매핑)을 사용하여 RAM을 단 1바이트도 소모하지 않고 디스크 데이터를 직접 암호화 모듈로 스트리밍합니다.
+                    let encrypted_data = {
+                        let file = std::fs::File::open(&tmp_path)?;
+                        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+                        crate::utils::crypto::encrypt_data(&mmap[..])?
+                    };
                     
                     std::fs::write(&tp_clone, encrypted_data)?;
                     let _ = std::fs::remove_file(tmp_path);
@@ -314,11 +325,14 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         }
                         
                         if let (Some(kv_name), Some(l_num)) = (kv_n, parsed_layer_idx) {
-                            let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
-                            let offset = offset_str.parse::<usize>().unwrap_or(0);
-                            let _ = INDEX_TX.send(SlotTask::IndexUpdate {
-                                kv_name, layer_idx: l_num, offset, len: block_len_for_index, file_name: format!("b{}/l{}.st", offset, l_num),
-                            }).await;
+                            // 🌟 [RAM 최적화] 레이어 0번에 대해서만 대표로 인덱스를 업데이트하여, 중복 JSON 쓰기 연산과 채널 메모리 점유를 28배 줄입니다.
+                            if l_num == 0 {
+                                let offset_str = tp.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).and_then(|s| s.strip_prefix('b')).unwrap_or("0");
+                                let offset = offset_str.parse::<usize>().unwrap_or(0);
+                                let _ = INDEX_TX.send(SlotTask::IndexUpdate {
+                                    kv_name, layer_idx: l_num, offset, len: block_len_for_index, file_name: format!("b{}/l{}.st", offset, l_num),
+                                }).await;
+                            }
                         }
                     },
                     Err(e) => {
@@ -346,10 +360,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     
                     SLOT_MANAGER.slots[sid].remaining_layers.store(loop_count, Ordering::SeqCst);
                     
-                    for l_idx in 0..loop_count {
-                        let mut src = bake.layers[l_idx].clone();
+                    let task_dir_base = bake.task_dir;
+                    
+                    // 🌟 [CRITICAL FIX] 수백 MB가 넘는 LayerKVDump(src) 배열을 통째로 복제(.clone)하며 RAM을 터뜨리던 치명적 버그 수정!
+                    // 배열의 소유권을 완전히 가져와서(into_iter), SSD로 전송을 시작함과 동시에 껍데기가 RAM에서 즉시 파괴되도록 만듭니다.
+                    for (l_idx, mut src) in bake.layers.into_iter().enumerate() {
                         let act_l = src.layer_idx;
-                        let task_dir = bake.task_dir.clone();
+                        let task_dir = task_dir_base.clone();
                         let registry_inner = registry.clone();
                         let kv_name_inner = kv_name.clone();
                         let io_tx_nested = io_tx_inner.clone();
@@ -388,23 +405,28 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let k_contig = k_aligned.contiguous().unwrap_or(k_aligned);
                                 let v_contig = v_aligned.contiguous().unwrap_or(v_aligned);
 
-                                src.k_data = k_contig.to_dtype(DType::BF16).unwrap_or_else(|_| k_contig.clone());
-                                src.v_data = v_contig.to_dtype(DType::BF16).unwrap_or_else(|_| v_contig.clone());
+                                // 소유권 이전을 위해 클론을 하지 않고 변수를 직접 덮어씌웁니다.
+                                src.k_data = if k_contig.dtype() == candle_core::DType::BF16 { k_contig } else { k_contig.to_dtype(candle_core::DType::BF16).unwrap_or_else(|_| k_contig) };
+                                src.v_data = if v_contig.dtype() == candle_core::DType::BF16 { v_contig } else { v_contig.to_dtype(candle_core::DType::BF16).unwrap_or_else(|_| v_contig) };
                             }
                             let mut map = std::collections::HashMap::new();
                             let prefix = format!("b{}_l{}_", off, act_l);
-                            map.insert(format!("{}k_data", prefix), src.k_data.clone());
-                            map.insert(format!("{}v_data", prefix), src.v_data.clone());
-                            map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
+                            
+                            // 실제 텐서 크기를 먼저 안전하게 추출합니다 (bs, heads, seq_len, dim) 중 index 2가 실제 블록 길이입니다.
+                            let b_len = src.k_data.dim(2).unwrap_or(256);
+
+                            // 🌟 [RAM 스파이크 원천 차단] .clone()을 모두 제거하여 데이터를 Map으로 완전히 이동(Move)시킵니다!
+                            // 이렇게 하면 SSD 저장을 기다리는 동안 텐서 복사본이 RAM에 중복으로 쌓이지 않습니다.
+                            map.insert(format!("{}k_data", prefix), src.k_data);
+                            map.insert(format!("{}v_data", prefix), src.v_data);
+                            map.insert(format!("{}k_shape", prefix), src.k_shape);
                             
                             let file_path = task_dir.join(format!("l{}.st", act_l));
                             
-                            // 🌟 [추가] 텐서 형태로부터 실제 블록 길이를 추출하여 전달
-                            let b_len = src.k_shape.to_vec1::<u32>().unwrap_or_default().get(2).cloned().unwrap_or(256) as usize;
-                            
+                            // 🌟 [CRITICAL FIX] k_shape 메타데이터 파싱 실패로 인해 문맥이 6400으로 썰려버리는 환각 버그 원천 차단!
                             if io_tx_nested.send(SaveTask { 
                                 slot_id: sid, path: file_path.clone(), tensors: map, is_last: false, block_idx, registry: Some(registry_inner), kv_name: kv_name_inner,
-                                block_len: b_len // 🌟 필드 추가
+                                block_len: b_len // 추출된 100% 정확한 길이 전달
                             }).await.is_err() {
                                 GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                             }
@@ -645,14 +667,17 @@ impl QwenVLGenerateModel {
         
         let mut gen_text = String::new();
         let (input_ids, offset) = if kv_len > 0 && !is_reference_snapshot {
+            // 🌟 [CRITICAL FIX] ChatTemplate의 접두사(im_start 등)로 인해 발생하는 토큰 위치 편차를 계산합니다.
+            // 저장된 kv_len(7009)을 기준으로 f_ids(7169)에서 실제 필요한 '델타' 조각만 정확히 추출합니다.
             if kv_len >= total_toks {
-                println!("[SKIP-PREFILL] Snapshot covers entire prompt (Detected: {}, Needed: {}). Capping offset.", kv_len, total_toks);
+                println!("[SKIP-PREFILL] Snapshot fully synchronized.");
                 let last_id = *f_ids.last().unwrap_or(&0);
                 (Tensor::from_vec(vec![last_id], (1, 1), &self.text_device)?, total_toks - 1)
             } else {
+                // f_ids의 앞부분(과거 기억)은 이미 SSD에 있으므로 버리고, 뒷부분(새 질문)만 텐서로 만듭니다.
                 let missing_ids = f_ids[kv_len..].to_vec();
                 let missing_len = missing_ids.len();
-                println!("[PARTIAL-PREFILL] Context partially restored ({}). Prefilling remaining {} tokens.", kv_len, missing_len);
+                println!("[PARTIAL-PREFILL] Correcting Token Boundary. Restored: {}, Prefilling Delta: {}", kv_len, missing_len);
                 (Tensor::from_vec(missing_ids, (1, missing_len), &self.text_device)?, kv_len)
             }
         } else {

@@ -574,16 +574,22 @@ pub fn block_wise_attention(
 
     for (k_block, v_block) in k_blocks.iter().zip(v_blocks.iter()) {
         let block_len = k_block.dim(2)?;
-        // GQA support: repeat KV heads if needed
-        let (mut k, mut v) = (k_block.clone(), v_block.clone());
-        if num_kv_groups > 1 {
-            let (b, h, s, d) = k.dims4()?;
-            k = k.unsqueeze(2)?.expand((b, h, num_kv_groups, s, d))?.reshape((b, h * num_kv_groups, s, d))?;
-            v = v.unsqueeze(2)?.expand((b, h, num_kv_groups, s, d))?.reshape((b, h * num_kv_groups, s, d))?;
-        }
+        let k = k_block.clone();
+        let v = v_block.clone();
 
-        // Attn Scores: Q @ K^T
-        let mut attn_weights = (q_aligned.matmul(&k.transpose(2, 3)?)? * scaling)?;
+        // [CRITICAL FIX] VRAM 폭발을 일으키던 expand/reshape 대신 Q를 접어버리는 Zero-Copy Dimension Folding 이식
+        let mut attn_weights = if num_kv_groups > 1 {
+            let (b, h, q_l, d) = q_aligned.dims4()?;
+            let kv_h = k.dim(1)?;
+            let q_flat = q_aligned.reshape((b, kv_h, num_kv_groups * q_l, d))?;
+            let k_t = k.transpose(2, 3)?.contiguous()?;
+            
+            let s_chunk_flat = q_flat.matmul(&k_t)?;
+            (s_chunk_flat.reshape((b, h, q_l, block_len))? * scaling)?
+        } else {
+            let k_t = k.transpose(2, 3)?.contiguous()?;
+            (q_aligned.matmul(&k_t)? * scaling)?
+        };
 
         // Apply Mask if present
         if let Some(mask) = attention_mask {
@@ -610,7 +616,17 @@ pub fn block_wise_attention(
         let exp_weights = attn_weights_f32.broadcast_sub(&max_logits)?.exp()?;
         let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
         
-        let out_block = exp_weights.to_dtype(v.dtype())?.matmul(&v)?;
+        // [CRITICAL FIX] 출력 연산(P * V) 시에도 V를 팽창시키는 대신, 확률 텐서(exp_weights)를 접어서 연산 수행
+        let out_block = if num_kv_groups > 1 {
+            let (b, h, q_l, s_len) = exp_weights.dims4()?;
+            let kv_h = v.dim(1)?;
+            let d = v.dim(3)?;
+            let p_flat = exp_weights.to_dtype(v.dtype())?.reshape((b, kv_h, num_kv_groups * q_l, s_len))?;
+            let out_flat = p_flat.matmul(&v)?;
+            out_flat.reshape((b, h, q_l, d))?
+        } else {
+            exp_weights.to_dtype(v.dtype())?.matmul(&v)?
+        };
 
         if let (Some(prev_out), Some(prev_max), Some(prev_sum)) = (final_out, max_logits_acc, sum_exp_acc) {
             let new_max = prev_max.broadcast_maximum(&max_logits)?;

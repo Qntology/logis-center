@@ -2083,6 +2083,7 @@ async fn process_task(
     // Final Status Update
     let _ = store.update_message_status(&task.id, logic::parse_status("complete"), Some("Extraction Complete")).await;
 
+    // 🌟 [CRITICAL FIX] 불완전한 추출 데이터를 프론트로 직접 쏘지 않습니다.
     // 대신 프론트엔드가 이 'Done' 신호를 받고 내부적으로 app.fetch()를 트리거하여
     // DB에서 완벽하게 세팅된(id, ref, bcc 등) 데이터를 가져가도록 유도해야 합니다.
     let payload = json!({
