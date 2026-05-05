@@ -1035,7 +1035,11 @@ impl Qwen3VLModel {
                     - input_ids_i.dim(0)? as i64;
                 mrope_position_deltas.push(position_deltas);
             }
-            let mut mrope_position_deltas = Tensor::new(mrope_position_deltas, input_ids.device())?;
+            
+            // 🌟 [CRITICAL FIX] CPU에서 텐서를 안전하게 감싼 후 한 번만 GPU로 전송합니다!
+            let mut mrope_position_deltas = Tensor::new(mrope_position_deltas, &Device::Cpu)?
+                .to_device(input_ids.device())?;
+                
             if mrope_position_deltas.rank() == 1 {
                 mrope_position_deltas = mrope_position_deltas.unsqueeze(0)?;
             }
@@ -1157,11 +1161,34 @@ impl Qwen3VLModel {
                 let image_mask_ = image_mask_.squeeze(0)?;
                 let video_mask_ = video_mask_.squeeze(0)?;
                 let visual_mask = bitor_tensor(&image_mask_, &video_mask_)?;
-                let visual_none_zero_index = nonzero_index(&visual_mask)?;
-                let image_mask_joint: Tensor = image_mask_.gather(&visual_none_zero_index, 0)?;
-                let image_nonzero_joint = nonzero_index(&image_mask_joint)?;
-                let video_mask_joint: Tensor = video_mask_.gather(&visual_none_zero_index, 0)?;
-                let video_nonzero_joint = nonzero_index(&video_mask_joint)?;
+                
+                // 🌟 [CRITICAL FIX] Qwen 0.6B에 적용했던 3연속 GPU Sync Stall 압축 최적화를 Qwen3VL에도 이식합니다!
+                // nonzero_index는 길이를 알기 위해 GPU->CPU 통신을 강제하므로, 3번 호출 시 프레임 드랍이 발생합니다.
+                let img_mask_vec = image_mask_.to_vec1::<u32>()?;
+                let vid_mask_vec = video_mask_.to_vec1::<u32>()?;
+
+                let mut visual_indices = Vec::new();
+                let mut image_joint_indices = Vec::new();
+                let mut video_joint_indices = Vec::new();
+
+                let mut visual_counter = 0;
+                for i in 0..img_mask_vec.len() {
+                    let is_img = img_mask_vec[i] > 0;
+                    let is_vid = vid_mask_vec[i] > 0;
+
+                    if is_img || is_vid {
+                        visual_indices.push(i as u32);
+                        if is_img { image_joint_indices.push(visual_counter as u32); }
+                        if is_vid { video_joint_indices.push(visual_counter as u32); }
+                        visual_counter += 1;
+                    }
+                }
+
+                let dev = image_mask_.device();
+                let visual_none_zero_index = Tensor::from_vec(visual_indices.clone(), visual_indices.len(), dev)?;
+                let image_nonzero_joint = Tensor::from_vec(image_joint_indices.clone(), image_joint_indices.len(), dev)?;
+                let video_nonzero_joint = Tensor::from_vec(video_joint_indices.clone(), video_joint_indices.len(), dev)?;
+                
                 let mut deepstack_embeds = vec![];
                 let visual_len = visual_none_zero_index.dim(0)?;
                 for (img_embed, vid_embed) in deepstack_image_embeds
@@ -1178,7 +1205,7 @@ impl Qwen3VLModel {
                     let embed_joint = embed_joint.index_add(&video_nonzero_joint, vid_embed, 0)?;
                     deepstack_embeds.push(embed_joint);
                 }
-                visual_pos_mask = Some(visual_mask.unsqueeze(0)?);
+                visual_pos_mask = Some(visual_none_zero_index.unsqueeze(0)?);
                 deepstack_visual_embeds = Some(deepstack_embeds);
             } else {
                 visual_pos_mask = Some(image_mask_);

@@ -80,8 +80,9 @@ impl Qwen3_5RMSNormGated {
         let w = self.weight.to_dtype(xs.dtype())?;
         let mut out = candle_nn::ops::rms_norm(xs, &w, self.eps as f32)?;
         if let Some(gate) = gate {
-            // 🌟 [정화 5] silu() 결과값을 즉시 BF16으로 변환하여 충돌 원천 차단
-            let gate_val = gate.to_dtype(candle_core::DType::F32)?.silu()?.to_dtype(xs.dtype())?;
+            // 🌟 [CRITICAL FIX] F32로 올렸다가 내리는 이중 캐스팅(Double Casting)을 제거하여 VRAM 스파이크를 억제합니다.
+            // 최신 Candle의 silu 커널은 BF16을 기본 지원하므로 불필요한 캐스팅 오버헤드 없이 초고속 통과가 가능합니다.
+            let gate_val = gate.silu()?;
             out = out.broadcast_mul(&gate_val)?;
         }
         Ok(out)
@@ -1001,22 +1002,29 @@ impl Qwen3_5Attention {
                 }
             };
 
-            let mut k = k_block;
-            let mut v = v_block;
-
-            if self.num_kv_groups > 1 {
-                let (b, h, s, d) = k.dims4()?;
-                k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-            }
-
-            k = k.contiguous()?;
-            v = v.contiguous()?;
+            let k = k_block; // Unified 최적화: expand와 reshape를 금지하므로 mut 속성 제거
+            let v = v_block; // 원본 압축 KV 형태 (b, kv_h, s, d) 그대로 유지!
 
             let actual_kv_len = k.dim(2)?;
             let k_t = k.transpose(2, 3)?.contiguous()?;
             
-            let mut s_chunk = q_aligned.matmul(&k_t)?;
+            // 1. Q * K^T 연산 (Dimension Folding 기법 적용)
+            let mut s_chunk = if self.num_kv_groups > 1 {
+                let (b, h, q_l, d) = q_aligned.dims4()?;
+                let kv_h = self.num_key_value_heads;
+                let groups = self.num_kv_groups;
+                
+                // Q를 (b, kv_h, groups * q_l, d) 로 수학적으로 접어서 K 차원에 맞춥니다.
+                let q_flat = q_aligned.reshape((b, kv_h, groups * q_l, d))?;
+                
+                // VRAM 복사 없이 초고속 MatMul 연산 진행
+                let s_chunk_flat = q_flat.matmul(&k_t)?;
+                
+                // 연산 후 다시 (b, h, q_l, s) 차원으로 원상복구
+                s_chunk_flat.reshape((b, h, q_l, actual_kv_len))?
+            } else {
+                q_aligned.matmul(&k_t)?
+            };
 
             if let Some(mask) = &attention_mask {
                 let mask_len = mask.dim(candle_core::D::Minus1)?;
@@ -1046,17 +1054,34 @@ impl Qwen3_5Attention {
             let p_j = s_chunk_f32.broadcast_sub(&m_j_safe)?.exp()?;
             let l_j = p_j.sum_keepdim(candle_core::D::Minus1)?;
             
-            // v와 곱할 때는 타겟 타입(BF16)으로 맞추고, 다시 누적기(out_res)에 넣기 위해 F32로 올립니다.
-            let out_j = p_j.to_dtype(v.dtype())?.matmul(&v)?;
-            let out_j_f32 = out_j.to_dtype(DType::F32)?;
+            // 2. P * V 연산 (Dimension Folding 기법 적용)
+            let out_j = if self.num_kv_groups > 1 {
+                let (b, h, q_l, s_len) = p_j.dims4()?;
+                let kv_h = v.dim(1)?;
+                let groups = self.num_kv_groups;
+                let d = v.dim(3)?;
+
+                // P를 (b, kv_h, groups * q_l, s_len) 로 변환
+                let p_j_flat = p_j.to_dtype(v.dtype())?.reshape((b, kv_h, groups * q_l, s_len))?;
+                
+                // V는 이미 4차원이므로 메모리 복사 없이 바로 연산!
+                let out_j_flat = p_j_flat.matmul(&v)?;
+                
+                // 연산 후 (b, h, q_l, d) 차원으로 원상복구
+                out_j_flat.reshape((b, h, q_l, d))?
+            } else {
+                p_j.to_dtype(v.dtype())?.matmul(&v)?
+            };
+            // [CRITICAL FIX] Attention Output을 F32로 승격시키지 않고 원본 타입(BF16/F16)을 유지하여 VRAM을 50% 절약합니다.
+            let out_j_target = out_j;
 
             match out_res.as_ref() {
                 None => {
-                    out_res = Some(out_j_f32); // 🌟 누적기는 완벽한 F32로 유지됨
-                    m_n = Some(m_j); // 🌟 병합 계산을 위해 m_n에는 안전장치가 없는 "원본 m_j"를 유지해야 합니다!
+                    out_res = Some(out_j_target); 
+                    m_n = Some(m_j); 
                     l_n = Some(l_j);
                 }
-                Some(prev_out_f32) => {
+                Some(prev_out_target) => {
                     let prev_m = m_n.as_ref().unwrap();
                     let prev_l = l_n.as_ref().unwrap();
                     
@@ -1065,9 +1090,13 @@ impl Qwen3_5Attention {
                     let diff_new = m_j.broadcast_sub(&m_new)?.exp()?;
                     
                     let l_new = prev_l.broadcast_mul(&diff_old)?.add(&l_j.broadcast_mul(&diff_new)?)?;
-                    let out_new_f32 = prev_out_f32.broadcast_mul(&diff_old)?.add(&out_j_f32.broadcast_mul(&diff_new)?)?;
                     
-                    out_res = Some(out_new_f32);
+                    // 스케일링 계수만 타겟 타입으로 내린 후 곱셈을 수행하여, 거대한 Output 텐서의 VRAM 팽창을 막습니다.
+                    let diff_old_cast = diff_old.to_dtype(target_dtype)?;
+                    let diff_new_cast = diff_new.to_dtype(target_dtype)?;
+                    let out_new_target = prev_out_target.broadcast_mul(&diff_old_cast)?.add(&out_j_target.broadcast_mul(&diff_new_cast)?)?;
+                    
+                    out_res = Some(out_new_target);
                     m_n = Some(m_new);
                     l_n = Some(l_new);
                 }
@@ -1078,8 +1107,9 @@ impl Qwen3_5Attention {
         }
 
         // 🌟 [수정] Online Softmax 결과를 BF16으로 내리고, 게이트 역시 BF16으로 맞춰줍니다.
-        let attn_output = if let (Some(out_res_val), Some(l_val)) = (out_res, l_n) {
-            out_res_val.broadcast_div(&l_val)?.to_dtype(target_dtype)? // 👈 F32 정밀도 연산 후 BF16 변환
+        let attn_output = if let (Some(out_target), Some(l_val)) = (out_res, l_n) {
+            // 나누기 연산을 위해 l_val 스칼라 값만 타겟 타입으로 캐스팅하여 나눕니다.
+            out_target.broadcast_div(&l_val.to_dtype(target_dtype)?)?
         } else {
             return Err(anyhow!("No KV data processed"));
         };
@@ -1635,10 +1665,10 @@ impl Qwen3_5TextModel {
                                 for _retry in 0..3 {
                                     if let Ok(encrypted_data) = std::fs::read(&st_path) {
                                         if let Ok(plain_data) = crate::utils::crypto::decrypt_data(&encrypted_data) {
-                                            // Device 강제 할당 제거: CPU에서 풀어서 안전하게 GPU로 넘깁니다.
-                                            if let Ok(tensors) = candle_core::safetensors::load_buffer(&plain_data, &candle_core::Device::Cpu) {
-                                                let loaded_conv = tensors.get("conv_state").map(|t| t.to_device(xs.device()).unwrap_or(t.clone()));
-                                                let loaded_rec = tensors.get("recurrent_state").map(|t| t.to_device(xs.device()).unwrap_or(t.clone()));
+                                            // 🌟 [RAM 최적화] CPU로 로드된 버퍼를 clone하지 않고 즉시 target device로 이동시킵니다.
+                                            if let Ok(tensors) = candle_core::safetensors::load_buffer(&plain_data, xs.device()) {
+                                                let loaded_conv = tensors.get("conv_state").cloned();
+                                                let loaded_rec = tensors.get("recurrent_state").cloned();
                                                 if loaded_conv.is_some() && loaded_rec.is_some() {
                                                     layer.set_ssm_states(loaded_conv, loaded_rec);
                                                     loaded = true;
@@ -1879,9 +1909,11 @@ impl Qwen3_5TextModel {
                         let (k_cpu, v_cpu) = {
                             let k = inner.k_cache.as_ref().unwrap();
                             let v = inner.v_cache.as_ref().unwrap();
+                            let target_dtype = if k.device().is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
                             (
-                                k.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k.clone()),
-                                v.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v.clone())
+                                // 🌟 [CRITICAL FIX] 순서 역전 버그 해결! CPU로 전송(to_device)하기 전에 GPU에서 먼저 BF16으로 압축(to_dtype)해야 무거운 F32 텐서가 RAM을 찢어버리는 스파이크를 막을 수 있습니다.
+                                k.contiguous().unwrap_or_else(|_| k.clone()).to_dtype(target_dtype).unwrap_or_else(|_| k.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k.clone()),
+                                v.contiguous().unwrap_or_else(|_| v.clone()).to_dtype(target_dtype).unwrap_or_else(|_| v.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v.clone())
                             )
                         };
 
@@ -1893,8 +1925,8 @@ impl Qwen3_5TextModel {
                                 k_data: candle_core::Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(),
                                 v_data: candle_core::Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(),
                                 k_shape: candle_core::Tensor::from_vec(k_shape_u32, (k_cpu.shape().dims().len(),), &candle_core::Device::Cpu).unwrap(),
-                                raw_k: Some(k_cpu.contiguous().unwrap_or_else(|_| k_cpu.clone())),
-                                raw_v: Some(v_cpu.contiguous().unwrap_or_else(|_| v_cpu.clone())),
+                                raw_k: Some(k_cpu.clone()), // GPU에서 이미 묶었으므로 더 이상의 CPU 연산 불필요
+                                raw_v: Some(v_cpu.clone()), // GPU에서 이미 묶었으므로 더 이상의 CPU 연산 불필요
                             });
                             
                             let mut reg = attn.registry.entries.write().unwrap();
@@ -1953,10 +1985,16 @@ impl Qwen3_5TextModel {
                     let tmp_path = st_path.with_extension("tmp");
                     
                     if candle_core::safetensors::save(&map, &tmp_path).is_ok() {
-                        if let Ok(plain_data) = std::fs::read(&tmp_path) {
-                            if let Ok(encrypted_data) = crate::utils::crypto::encrypt_data(&plain_data) {
-                                let _ = std::fs::write(&st_path, encrypted_data);
-                            }
+                        // 🌟 [RAM 스파이크 원천 차단] std::fs::read로 수십 MB의 상태 데이터를 통째로 RAM에 복사하는 이중 할당을 제거하고, Mmap(Zero-Copy)으로 스트리밍 암호화합니다!
+                        let encrypted_data = {
+                            if let Ok(file) = std::fs::File::open(&tmp_path) {
+                                if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().map(&file) } {
+                                    crate::utils::crypto::encrypt_data(&mmap[..]).ok()
+                                } else { None }
+                            } else { None }
+                        };
+                        if let Some(enc) = encrypted_data {
+                            let _ = std::fs::write(&st_path, enc);
                         }
                         let _ = std::fs::remove_file(tmp_path);
                     }

@@ -559,7 +559,8 @@ async function updateExtractButtonVisibility() {
     if (!btnExtract || !btnAutoLaunch) return;
 
     // 1. 브라우저 물리 상태 체크 (동기/즉시 실행)
-    if (!isBrowserRunning && !isAutoLaunchLocked) {
+    // 이미지(currentImage)가 선택된 상태라면 브라우저 실행 여부와 무관하게 반환하지 않고 진행합니다.
+    if (!isBrowserRunning && !isAutoLaunchLocked && !currentImage) {
         btnAutoLaunch.style.display = "flex";
         btnAutoLaunch.classList.remove("hidden");
         btnExtract.style.display = "none";
