@@ -40,7 +40,8 @@ impl RmsNorm {
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-        self.weight = self.weight.to_device(device)?.to_dtype(target_dtype)?;
+        // 🌟 장치 이동 전에 먼저 캐스팅을 수행하여 전송 및 변환 병목을 제거합니다.
+        self.weight = self.weight.to_dtype(target_dtype)?.to_device(device)?;
         Ok(())
     }
 
@@ -129,15 +130,16 @@ impl QLinear {
                     QMatMul::Tensor(t)
                 },
                 QMatMul::Tensor(t) => {
-                    QMatMul::Tensor(t.to_device(device)?.to_dtype(target_dtype)?)
+                    QMatMul::Tensor(t.to_dtype(target_dtype)?.to_device(device)?)
                 },
                 QMatMul::TensorF16(t) => {
-                    QMatMul::TensorF16(t.to_device(device)?.to_dtype(target_dtype)?)
+                    QMatMul::TensorF16(t.to_dtype(target_dtype)?.to_device(device)?)
                 }
             };
 
             if let Some(b) = &self.bias {
-                self.bias = Some(b.to_device(device)?.to_dtype(target_dtype)?);
+                // 🌟 bias 역시 캐스팅 먼저!
+                self.bias = Some(b.to_dtype(target_dtype)?.to_device(device)?);
             }
             self.device = device.clone();
         }
@@ -444,10 +446,12 @@ impl QuantizedQwenVLTextAttention {
             };
             if loc == KVLocation::VRAM {
                 if let Some(k) = &inner.k_cache {
-                    inner.k_cache = Some(k.to_device(device)?.to_dtype(target_dtype)?);
+                    // 🌟 VRAM에서 캐스팅 선행 후 전송
+                    inner.k_cache = Some(k.to_dtype(target_dtype)?.to_device(device)?);
                 }
                 if let Some(v) = &inner.v_cache {
-                    inner.v_cache = Some(v.to_device(device)?.to_dtype(target_dtype)?);
+                    // 🌟 VRAM에서 캐스팅 선행 후 전송
+                    inner.v_cache = Some(v.to_dtype(target_dtype)?.to_device(device)?);
                 }
             }
         }
@@ -896,20 +900,22 @@ impl QuantizedQwenVLTextAttention {
 
     pub fn compress_to_bf16(&self, t: &Tensor) -> Result<(Tensor, Vec<usize>)> {
         let original_shape = t.shape().dims().to_vec();
-        let t_bf16 = t.to_device(&Device::Cpu)?.to_dtype(DType::BF16)?;
+        // 🌟 VRAM에서 BF16 변환을 끝낸 뒤 넘겨서 PCIe 버스 전송량을 절반으로 줄입니다.
+        let t_bf16 = t.to_dtype(DType::BF16)?.to_device(&Device::Cpu)?.contiguous()?;
         Ok((t_bf16, original_shape))
     }
 
     pub fn decompress_from_bf16(&self, data: &Tensor, _original_shape: &[usize], device: &Device) -> Result<Tensor> {
-        let t = data.to_device(device)?;
-        let t = if device.is_cpu() { t.to_dtype(DType::F32)? } else { t };
+        // 🌟 목적지가 CPU라면 VRAM에서 캐스팅을 완료한 후 전송합니다.
+        let t = if device.is_cpu() { data.to_dtype(DType::F32)?.to_device(device)? } else { data.to_device(device)? };
         Ok(t) 
     }
 
     pub fn decompress_from_8bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
         let device = packed.device();
         let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
-        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        // 🌟 VRAM에서 F32 변환을 마친 뒤 CPU로 전송하여 CPU 스톨(Stall)을 차단합니다.
+        let scales_vec = scales.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
         let last_dim = original_shape[original_shape.len() - 1];
         let total_elements: usize = original_shape.iter().product();
         let mut decoded = vec![0.0f32; total_elements];
@@ -964,7 +970,6 @@ impl QuantizedQwenVLTextAttention {
         for idx in target_indices {
             let block = self.kv_blocks[idx].clone();
             
-            // 중복 무한 저장을 막기 위해, 큐에 넣기 직전 즉시 dirty 상태 해제
             {
                 let mut reg = self.registry.entries.write().unwrap();
                 if idx < reg.len() && self.layer_idx < reg[idx].is_dirty.len() {
@@ -978,9 +983,12 @@ impl QuantizedQwenVLTextAttention {
             };
 
             if let (Some(k), Some(v)) = (k_opt, v_opt) {
-                // 백그라운드 큐에 넣기 전에 즉시 VRAM -> CPU RAM으로 이동하여 VRAM 해제
-                let k_cpu = k.to_device(&Device::Cpu).unwrap_or_else(|_| k.clone());
-                let v_cpu = v.to_device(&Device::Cpu).unwrap_or_else(|_| v.clone());
+                // 🌟 SSD 백그라운드 워커가 BF16으로 압축하므로, CPU 연산 부하를 없애기 위해 VRAM에서 선행하여 BF16으로 변환합니다.
+                let k_bf16 = k.to_dtype(DType::BF16).unwrap_or_else(|_| k.clone());
+                let v_bf16 = v.to_dtype(DType::BF16).unwrap_or_else(|_| v.clone());
+                
+                let k_cpu = k_bf16.to_device(&Device::Cpu).unwrap_or_else(|_| k_bf16.clone()).contiguous().unwrap_or_else(|_| k_bf16.clone());
+                let v_cpu = v_bf16.to_device(&Device::Cpu).unwrap_or_else(|_| v_bf16.clone()).contiguous().unwrap_or_else(|_| v_bf16.clone());
                 
                 let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
                 let last_part = kv_name_raw.split('/').last().unwrap_or("text");
@@ -994,12 +1002,6 @@ impl QuantizedQwenVLTextAttention {
                 crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                 tauri::async_runtime::spawn(async move {
-                    let (k_vram, v_vram) = tokio::task::spawn_blocking(move || {
-                        let k_res = k_cpu.contiguous().unwrap_or_else(|_| k_cpu.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| k_cpu.clone());
-                        let v_res = v_cpu.contiguous().unwrap_or_else(|_| v_cpu.clone()).to_dtype(DType::BF16).unwrap_or_else(|_| v_cpu.clone());
-                        (k_res, v_res)
-                    }).await.unwrap_or_else(|_| (Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(), Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap()));
-                    
                     if let Some(tx) = crate::models::qwen::generate::BAKE_TX.get() {
                         let sub_path = if baking_only { format!("{}/reference/{}", session_id_owned, kv_type) } else { format!("{}/inference/{}", session_id_owned, kv_type) };
                         let kv_dir = crate::utils::paths::get_kv_dir(None);
@@ -1012,8 +1014,9 @@ impl QuantizedQwenVLTextAttention {
                             k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
                             v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
                             k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
-                            raw_k: Some(k_vram),
-                            raw_v: Some(v_vram),
+                            // 이중 캐스팅을 막고, 정렬된 CPU 텐서를 그대로 워커에 넘깁니다.
+                            raw_k: Some(k_cpu),
+                            raw_v: Some(v_cpu),
                         };
                         let sid = crate::models::qwen::generate::SLOT_MANAGER.acquire_write_slot(b_len).await;
                         
@@ -1146,11 +1149,12 @@ impl QuantizedQwenVLTextAttention {
 
     pub fn evacuate_vram_to_cache(&mut self) -> Result<()> {
         let dev = &Device::Cpu;
-        let target_dtype = if self.q_proj.device().is_cpu() { DType::F32 } else { DType::BF16 };
+        let target_dtype = DType::F32; // 🌟 RAM 친화적인 F32로 고정
 
         if let (Some(mk), Some(mv)) = (&self.vram_merged_k, &self.vram_merged_v) {
-            let mk_cpu = mk.to_device(dev)?.to_dtype(target_dtype)?;
-            let mv_cpu = mv.to_device(dev)?.to_dtype(target_dtype)?;
+            // 🌟 VRAM 선행 캐스팅 및 정렬 후 CPU 전송
+            let mk_cpu = mk.to_dtype(target_dtype)?.to_device(dev)?.contiguous()?;
+            let mv_cpu = mv.to_dtype(target_dtype)?.to_device(dev)?.contiguous()?;
             
             let mut current_pos = 0;
             for block in &mut self.kv_blocks {
@@ -1185,8 +1189,9 @@ impl QuantizedQwenVLTextAttention {
 
             if let (Some(k), Some(v)) = (k_to_move, v_to_move) {
                 let mut inner = block.inner.write().unwrap();
-                inner.k_cache = Some(k.to_device(dev)?.to_dtype(target_dtype)?);
-                inner.v_cache = Some(v.to_device(dev)?.to_dtype(target_dtype)?);
+                // 🌟 VRAM 선행 캐스팅 및 정렬 후 CPU 전송
+                inner.k_cache = Some(k.to_dtype(target_dtype)?.to_device(dev)?.contiguous()?);
+                inner.v_cache = Some(v.to_dtype(target_dtype)?.to_device(dev)?.contiguous()?);
                 inner.location = KVLocation::RAM;
                 
                 let mut reg = self.registry.entries.write().unwrap();
@@ -2076,14 +2081,15 @@ impl QuantizedQwenVLTextModel {
             if vram_indices.len() > vram_limit {
                 vram_indices.sort_by_key(|k| k.1); 
                 let num_to_evict = vram_indices.len().saturating_sub(vram_limit);
-                let target_dtype = if self.is_forced_cpu { DType::F32 } else { DType::BF16 }; 
+                let target_dtype = DType::F32; // 🌟 RAM 전송용이므로 F32로 강제 고정
 
                 for i in 0..num_to_evict {
                     let (idx, _) = vram_indices[i];
                     let mut inner = kv_blocks[idx].inner.write().unwrap();
                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                        let k_cpu = k.to_device(&Device::Cpu)?.to_dtype(target_dtype)?;
-                        let v_cpu = v.to_device(&Device::Cpu)?.to_dtype(target_dtype)?;
+                        // 🌟 VRAM의 수천 개 코어를 이용해 F32로 먼저 변환하고 정렬한 뒤 CPU로 보냅니다.
+                        let k_cpu = k.to_dtype(target_dtype)?.to_device(&Device::Cpu)?.contiguous()?;
+                        let v_cpu = v.to_dtype(target_dtype)?.to_device(&Device::Cpu)?.contiguous()?;
                         inner.k_cache = Some(k_cpu);
                         inner.v_cache = Some(v_cpu);
                         inner.location = KVLocation::RAM;
@@ -2208,52 +2214,89 @@ impl QuantizedQwenVLTextModel {
         use crate::models::qwen::generate::{SLOT_MANAGER, SlotTask, BakeTask, BAKE_TX, LayerKVDump};
         
         let mut block_groups: std::collections::HashMap<(usize, usize), Vec<LayerKVDump>> = std::collections::HashMap::new();
-        
+
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
-            for block in &mut layer.self_attn.kv_blocks {
-                let inner = block.inner.read().unwrap();
+            let attn = &mut layer.self_attn;
+            
+            attn.vram_merged_k = None;
+            attn.vram_merged_v = None;
+            attn.merged_vram_block_count = 0;
+
+            for block in &mut attn.kv_blocks {
+                let mut inner = block.inner.write().unwrap();
                 let is_dirty = {
-                    let reg = self.registry.entries.read().unwrap();
-                    if inner.index < reg.len() { 
-                        if l_idx < reg[inner.index].is_dirty.len() { reg[inner.index].is_dirty[l_idx] } else { true }
+                    let reg = attn.registry.entries.read().unwrap();
+                    if inner.index < reg.len() && l_idx < reg[inner.index].is_dirty.len() { 
+                        reg[inner.index].is_dirty[l_idx] 
                     } else { true }
                 };
 
-                if inner.k_cache.is_some() && is_dirty {
-                    let k = inner.k_cache.as_ref().unwrap();
-                    let k_shape_u32: Vec<u32> = k.shape().dims().iter().map(|&x| x as u32).collect();
+                let is_full = inner.len == 1024;
+                let should_evacuate = is_full; 
+                
+                if should_evacuate && inner.k_cache.is_some() && inner.location == crate::models::qwen::quantized_model::KVLocation::VRAM {
+                    // 🌟 0.6B 모델에서도 RAM 파편화 방지를 위해 contiguous()를 즉시 적용합니다.
+                    let (k_cpu, v_cpu) = {
+                        let k = inner.k_cache.as_ref().unwrap();
+                        let v = inner.v_cache.as_ref().unwrap();
+                        // 🌟 VRAM에서 BF16 캐스팅 및 정렬을 선행 완료하여 전송 대역폭과 백그라운드 CPU 점유율을 대폭 낮춥니다.
+                        let k_gpu = k.to_dtype(candle_core::DType::BF16).unwrap_or_else(|_| k.clone()).contiguous().unwrap_or_else(|_| k.clone());
+                        let v_gpu = v.to_dtype(candle_core::DType::BF16).unwrap_or_else(|_| v.clone()).contiguous().unwrap_or_else(|_| v.clone());
+                        (
+                            k_gpu.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k_gpu.clone()),
+                            v_gpu.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v_gpu.clone())
+                        )
+                    };
+
+                    if is_dirty {
+                        let k_shape_u32: Vec<u32> = k_cpu.shape().dims().iter().map(|&x| x as u32).collect();
+                        
+                        block_groups.entry((inner.offset, inner.index)).or_default().push(LayerKVDump {
+                            layer_idx: l_idx,
+                            k_data: candle_core::Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(),
+                            v_data: candle_core::Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(),
+                            k_shape: candle_core::Tensor::from_vec(k_shape_u32, (k_cpu.shape().dims().len(),), &candle_core::Device::Cpu).unwrap(),
+                            raw_k: Some(k_cpu.clone()),
+                            raw_v: Some(v_cpu.clone()),
+                        });
+                        
+                        let mut reg = attn.registry.entries.write().unwrap();
+                        if inner.index < reg.len() {
+                            reg[inner.index].is_dirty[l_idx] = false;
+                        }
+                    }
+
+                    inner.k_cache = Some(k_cpu);
+                    inner.v_cache = Some(v_cpu);
+                    inner.location = crate::models::qwen::quantized_model::KVLocation::RAM;
                     
-                    block_groups.entry((inner.offset, inner.index)).or_default().push(LayerKVDump {
-                        layer_idx: l_idx,
-                        k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
-                        v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu)?,
-                        k_shape: Tensor::from_vec(k_shape_u32, (k.shape().dims().len(),), &Device::Cpu)?,
-                        raw_k: Some(k.to_device(&Device::Cpu).unwrap_or(k.clone()).contiguous().unwrap_or_else(|_| k.clone())), 
-                        raw_v: Some(inner.v_cache.as_ref().unwrap().to_device(&Device::Cpu).unwrap_or(inner.v_cache.as_ref().unwrap().clone()).contiguous().unwrap_or_else(|_| inner.v_cache.as_ref().unwrap().clone())),
-                    });
-                    
-                    let mut reg = self.registry.entries.write().unwrap();
+                    let mut reg = attn.registry.entries.write().unwrap();
                     if inner.index < reg.len() {
-                        if l_idx < reg[inner.index].is_dirty.len() { reg[inner.index].is_dirty[l_idx] = false; }
+                        reg[inner.index].location[l_idx] = crate::models::qwen::quantized_model::KVLocation::RAM;
                     }
                 }
             }
         }
 
+        let kv_dir = crate::utils::paths::get_kv_dir(None);
+        let mode = self.baking_only; 
+        
+        let kv_name_raw = kv_name.unwrap_or("text");
+        let last_part = kv_name_raw.split('/').last().unwrap_or("text");
+        let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text" } else { last_part };
+        let sub_path = if mode {
+            format!("{}/reference/{}", session_id, kv_type)
+        } else {
+            format!("{}/inference/{}", session_id, kv_type)
+        };
+        let base_dir = kv_dir.join(&sub_path);
+
         if block_groups.is_empty() { return Ok(()); }
 
         if let Some(tx) = BAKE_TX.get() {
-            let kv_dir = crate::utils::paths::get_kv_dir(None);
-            let mode = self.baking_only;
-            let kv_name_raw = kv_name.unwrap_or("text");
-            let last_part = kv_name_raw.split('/').last().unwrap_or("text");
-            let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text".to_string() } else { last_part.to_string() };
-            
-            let sub_path = if mode { format!("{}/reference/{}", session_id, kv_type) } else { format!("{}/inference/{}", session_id, kv_type) };
-
             for ((off, idx), layers) in block_groups {
                 let sid = SLOT_MANAGER.acquire_write_slot(1024).await;
-                let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
+                let block_dir = base_dir.join(format!("b{}", off));
                 if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
 
                 crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2294,14 +2337,20 @@ impl QuantizedQwenVLTextModel {
                         let v = inner.v_cache.as_ref().unwrap();
                         let k_shape_vec: Vec<u32> = k.shape().dims().iter().map(|&x| x as u32).collect();
                         
+                        // 🌟 VRAM에서 BF16 캐스팅과 contiguous() 정렬을 먼저 끝마친 뒤 CPU로 던져 백그라운드 부하를 0으로 만듭니다.
+                        let k_gpu = k.to_dtype(candle_core::DType::BF16).unwrap_or_else(|_| k.clone()).contiguous().unwrap_or_else(|_| k.clone());
+                        let v_gpu = v.to_dtype(candle_core::DType::BF16).unwrap_or_else(|_| v.clone()).contiguous().unwrap_or_else(|_| v.clone());
+                        let k_aligned = k_gpu.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k_gpu.clone());
+                        let v_aligned = v_gpu.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v_gpu.clone());
+
                         dumps_to_send.push((
                             LayerKVDump { 
                                 layer_idx, 
                                 k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(), 
                                 v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(), 
                                 k_shape: Tensor::from_vec(k_shape_vec, (k.shape().dims().len(),), &Device::Cpu).unwrap(),
-                                raw_k: Some(k.to_device(&Device::Cpu).unwrap()), 
-                                raw_v: Some(v.to_device(&Device::Cpu).unwrap()), 
+                                raw_k: Some(k_aligned), 
+                                raw_v: Some(v_aligned), 
                             },
                             inner.offset,
                             inner.len,
@@ -2805,8 +2854,9 @@ impl QuantizedQwenVLModel {
         let (image_embeds, deepstack_image_embeds) = visual_model.forward(&pixel_values, &image_grid_thw)?;
         
         let target_dtype = if self.text_device.is_cuda() { DType::BF16 } else { DType::F32 };
-        let image_embeds = image_embeds.to_device(&self.text_device)?.to_dtype(target_dtype)?;
-        let deepstack_image_embeds: Result<Vec<Tensor>> = deepstack_image_embeds.into_iter().map(|t| Ok(t.to_device(&self.text_device)?.to_dtype(target_dtype)?)).collect();
+        // 🌟 VRAM에서 target_dtype으로 선행 변환한 뒤 전송합니다.
+        let image_embeds = image_embeds.to_dtype(target_dtype)?.to_device(&self.text_device)?;
+        let deepstack_image_embeds: Result<Vec<Tensor>> = deepstack_image_embeds.into_iter().map(|t| Ok(t.to_dtype(target_dtype)?.to_device(&self.text_device)?)).collect();
         
         Ok((image_embeds, deepstack_image_embeds?))
     }
@@ -2971,9 +3021,9 @@ impl QuantizedQwenVLModel {
         
         let head_dev = self.lm_head.device();
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
-        let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)?
-        } else { hidden_state };
+        // 🌟 VRAM 환경에서 캐스팅을 먼저 수행합니다.
         let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state };
+        let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };
         
         
         let logits = self.lm_head.forward(&hidden_state)?;
@@ -3168,8 +3218,9 @@ impl QuantizedQwenTextModel {
         
         let head_dev = self.lm_head.as_ref().map(|h| h.device()).unwrap_or(&self.text_device);
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
-        let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };
+        // 🌟 VRAM 환경에서 캐스팅을 먼저 수행합니다.
         let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state };
+        let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };
         
         let logits = if let Some(head) = &self.lm_head {
             head.forward(&hidden_state)?

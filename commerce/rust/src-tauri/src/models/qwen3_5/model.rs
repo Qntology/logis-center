@@ -1879,9 +1879,16 @@ impl Qwen3_5TextModel {
                         let (k_cpu, v_cpu) = {
                             let k = inner.k_cache.as_ref().unwrap();
                             let v = inner.v_cache.as_ref().unwrap();
+                            
+                            // 🌟 SSD 워커의 압축 포맷인 BF16으로 VRAM에서 미리 캐스팅하여 CPU 연산 병목을 제거합니다.
+                            let k_bf16 = k.to_dtype(candle_core::DType::BF16).unwrap_or_else(|_| k.clone());
+                            let v_bf16 = v.to_dtype(candle_core::DType::BF16).unwrap_or_else(|_| v.clone());
+                            
+                            let k_aligned = k_bf16.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k_bf16.clone());
+                            let v_aligned = v_bf16.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v_bf16.clone());
                             (
-                                k.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k.clone()),
-                                v.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v.clone())
+                                k_aligned.contiguous().unwrap_or_else(|_| k_aligned.clone()),
+                                v_aligned.contiguous().unwrap_or_else(|_| v_aligned.clone())
                             )
                         };
 
@@ -2166,8 +2173,9 @@ impl Qwen3_5Model {
             
         let target_dtype = if input_ids.device().is_cuda() { DType::BF16 } else { DType::F32 };
         let deltas = Tensor::from_vec(mrope_position_deltas.clone(), (b_sz, 1), &Device::Cpu)?
-            .to_dtype(target_dtype)?
-            .to_device(input_ids.device())?; 
+            .to_dtype(DType::F32)? // 🌟 CPU에서는 네이티브 F32로 가볍게 변환
+            .to_device(input_ids.device())? // 🌟 VRAM으로 전송
+            .to_dtype(target_dtype)?; // 🌟 VRAM 도달 후 GPU 코어로 BF16 고속 변환 
         
         Ok((position_ids.contiguous()?, deltas, mrope_position_deltas))
     }
@@ -2269,8 +2277,8 @@ impl Qwen3_5Model {
             
             // 🌟 CPU에서 안전하게 F32 덧셈 수행 후 GPU로 전송
             let delta = cache_position.unwrap().i(0)?
-                .to_device(&Device::Cpu)?
-                .to_dtype(candle_core::DType::F32)?
+                .to_dtype(candle_core::DType::F32)? // 🌟 VRAM에서 선행 캐스팅
+                .to_device(&Device::Cpu)? // 🌟 F32 상태로 CPU 전송
                 .broadcast_add(&Tensor::new(seqlen_offset as f32, &Device::Cpu)?)?;
             
             position_ids = Tensor::arange(0f32, seq_len as f32, &Device::Cpu)?
