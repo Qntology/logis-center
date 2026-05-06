@@ -967,71 +967,90 @@ impl QuantizedQwenVLTextAttention {
             if (is_full || is_last_chunk) && inner.k_cache.is_some() && is_dirty { Some(i) } else { None }
         }).collect();
 
+        let mut gpu_k_list = Vec::new();
+        let mut gpu_v_list = Vec::new();
+        let mut valid_indices = Vec::new();
+
         for idx in target_indices {
             let block = self.kv_blocks[idx].clone();
-            
             {
                 let mut reg = self.registry.entries.write().unwrap();
                 if idx < reg.len() && self.layer_idx < reg[idx].is_dirty.len() {
                     reg[idx].is_dirty[self.layer_idx] = false;
                 }
             }
+            let inner = block.inner.read().unwrap();
+            if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                gpu_k_list.push(k.clone());
+                gpu_v_list.push(v.clone());
+                valid_indices.push(idx);
+            }
+        }
 
-            let (k_opt, v_opt, off, b_idx, b_len) = {
+        if gpu_k_list.is_empty() { return Ok(()); }
+
+        // 🌟 [최적화: Pure BF16 Batching] 단 한 번의 커널 호출로 병합 및 CPU 전송을 수행합니다.
+        let merged_k_gpu = Tensor::cat(&gpu_k_list, 2).unwrap_or_else(|_| gpu_k_list[0].clone()).contiguous().unwrap_or_else(|_| gpu_k_list[0].clone());
+        let merged_v_gpu = Tensor::cat(&gpu_v_list, 2).unwrap_or_else(|_| gpu_v_list[0].clone()).contiguous().unwrap_or_else(|_| gpu_v_list[0].clone());
+
+        let merged_k_cpu = merged_k_gpu.to_device(&Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
+        let merged_v_cpu = merged_v_gpu.to_device(&Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
+
+        let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
+        let last_part = kv_name_raw.split('/').last().unwrap_or("text");
+        let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text".to_string() } else { last_part.to_string() };
+        let session_id_owned = session_id.to_string();
+        let registry_clone = self.registry.clone();
+        let layer_idx = self.layer_idx;
+        let num_kv_h = self.num_key_value_heads;
+        let h_d = self.head_dim;
+
+        let mut current_offset = 0;
+        for (i, &idx) in valid_indices.iter().enumerate() {
+            let chunk_len = gpu_k_list[i].dim(2).unwrap_or(1024);
+            let k_cpu = merged_k_cpu.narrow(2, current_offset, chunk_len).unwrap_or_else(|_| merged_k_cpu.clone()).contiguous().unwrap_or_else(|_| merged_k_cpu.clone());
+            let v_cpu = merged_v_cpu.narrow(2, current_offset, chunk_len).unwrap_or_else(|_| merged_v_cpu.clone()).contiguous().unwrap_or_else(|_| merged_v_cpu.clone());
+            current_offset += chunk_len;
+
+            let block = self.kv_blocks[idx].clone();
+            let (off, b_idx, b_len) = {
                 let inner = block.inner.read().unwrap();
-                (inner.k_cache.clone(), inner.v_cache.clone(), inner.offset, inner.index, inner.len)
+                (inner.offset, inner.index, inner.len)
             };
 
-            if let (Some(k), Some(v)) = (k_opt, v_opt) {
-                // 🌟 SSD 백그라운드 워커가 BF16으로 압축하므로, CPU 연산 부하를 없애기 위해 VRAM에서 선행하여 BF16으로 변환합니다.
-                let k_bf16 = k.to_dtype(DType::BF16).unwrap_or_else(|_| k.clone());
-                let v_bf16 = v.to_dtype(DType::BF16).unwrap_or_else(|_| v.clone());
-                
-                let k_cpu = k_bf16.to_device(&Device::Cpu).unwrap_or_else(|_| k_bf16.clone()).contiguous().unwrap_or_else(|_| k_bf16.clone());
-                let v_cpu = v_bf16.to_device(&Device::Cpu).unwrap_or_else(|_| v_bf16.clone()).contiguous().unwrap_or_else(|_| v_bf16.clone());
-                
-                let kv_name_raw = self.active_kv_name.clone().unwrap_or_else(|| "text".to_string());
-                let last_part = kv_name_raw.split('/').last().unwrap_or("text");
-                let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text".to_string() } else { last_part.to_string() };
-                let session_id_owned = session_id.to_string();
-                let registry_clone = self.registry.clone();
-                let layer_idx = self.layer_idx;
-                let num_kv_h = self.num_key_value_heads;
-                let h_d = self.head_dim;
-                
-                crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let sub_path = if baking_only { format!("{}/reference/{}", session_id_owned, kv_type) } else { format!("{}/inference/{}", session_id_owned, kv_type) };
+            let registry_inner = registry_clone.clone();
+            
+            crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-                tauri::async_runtime::spawn(async move {
-                    if let Some(tx) = crate::models::qwen::generate::BAKE_TX.get() {
-                        let sub_path = if baking_only { format!("{}/reference/{}", session_id_owned, kv_type) } else { format!("{}/inference/{}", session_id_owned, kv_type) };
-                        let kv_dir = crate::utils::paths::get_kv_dir(None);
-                        let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
-                        if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
+            tauri::async_runtime::spawn(async move {
+                if let Some(tx) = crate::models::qwen::generate::BAKE_TX.get() {
+                    let kv_dir = crate::utils::paths::get_kv_dir(None);
+                    let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
+                    if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
 
-                        let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
-                        let dump = crate::models::qwen::generate::LayerKVDump {
-                            layer_idx,
-                            k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
-                            v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
-                            k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
-                            // 이중 캐스팅을 막고, 정렬된 CPU 텐서를 그대로 워커에 넘깁니다.
-                            raw_k: Some(k_cpu),
-                            raw_v: Some(v_cpu),
-                        };
-                        let sid = crate::models::qwen::generate::SLOT_MANAGER.acquire_write_slot(b_len).await;
-                        
-                        if tx.send(crate::models::qwen::generate::SlotTask::Bake(crate::models::qwen::generate::BakeTask {
-                            slot_id: sid, task_dir: block_dir, kv_name: Some(sub_path), offset: off, layers: vec![dump],
-                            is_relay_baking: baking_only, block_idx: Some(b_idx), registry: registry_clone,
-                        })).await.is_err() {
-                            crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                            crate::models::qwen::generate::SLOT_MANAGER.release_slot(sid).await;
-                        }
-                    } else {
+                    let k_shape_u32 = vec![1u32, num_kv_h as u32, b_len as u32, h_d as u32];
+                    let dump = crate::models::qwen::generate::LayerKVDump {
+                        layer_idx,
+                        k_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
+                        v_data: Tensor::zeros((1,), DType::U8, &Device::Cpu).unwrap(),
+                        k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
+                        raw_k: Some(k_cpu),
+                        raw_v: Some(v_cpu),
+                    };
+                    let sid = crate::models::qwen::generate::SLOT_MANAGER.acquire_write_slot(b_len).await;
+                    
+                    if tx.send(crate::models::qwen::generate::SlotTask::Bake(crate::models::qwen::generate::BakeTask {
+                        slot_id: sid, task_dir: block_dir, kv_name: Some(sub_path), offset: off, layers: vec![dump],
+                        is_relay_baking: baking_only, block_idx: Some(b_idx), registry: registry_inner,
+                    })).await.is_err() {
                         crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        crate::models::qwen::generate::SLOT_MANAGER.release_slot(sid).await;
                     }
-                });
-            }
+                } else {
+                    crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
         }
         Ok(())
     }
@@ -1149,20 +1168,19 @@ impl QuantizedQwenVLTextAttention {
 
     pub fn evacuate_vram_to_cache(&mut self) -> Result<()> {
         let dev = &Device::Cpu;
-        let target_dtype = DType::F32; // 🌟 RAM 친화적인 F32로 고정
 
         if let (Some(mk), Some(mv)) = (&self.vram_merged_k, &self.vram_merged_v) {
-            // 🌟 VRAM 선행 캐스팅 및 정렬 후 CPU 전송
-            let mk_cpu = mk.to_dtype(target_dtype)?.to_device(dev)?.contiguous()?;
-            let mv_cpu = mv.to_dtype(target_dtype)?.to_device(dev)?.contiguous()?;
+            // 🌟 [최적화: Pure BF16 Batching] F32 강제 변환 제거 및 BF16 메모리 유지
+            let mk_cpu = mk.contiguous()?.to_device(dev)?;
+            let mv_cpu = mv.contiguous()?.to_device(dev)?;
             
             let mut current_pos = 0;
             for block in &mut self.kv_blocks {
                 let mut inner = block.inner.write().unwrap();
                 let b_len = inner.len;
                 if inner.location == KVLocation::VRAM {
-                    let k_part = mk_cpu.narrow(2, current_pos, b_len)?;
-                    let v_part = mv_cpu.narrow(2, current_pos, b_len)?;
+                    let k_part = mk_cpu.narrow(2, current_pos, b_len)?.contiguous()?;
+                    let v_part = mv_cpu.narrow(2, current_pos, b_len)?.contiguous()?;
                     inner.k_cache = Some(k_part);
                     inner.v_cache = Some(v_part);
                     inner.location = KVLocation::RAM;
@@ -1179,19 +1197,37 @@ impl QuantizedQwenVLTextAttention {
             self.merged_vram_block_count = 0;
         }
 
-        for block in &mut self.kv_blocks {
-            let (k_to_move, v_to_move) = {
-                let inner = block.inner.read().unwrap();
-                if inner.location == KVLocation::VRAM && inner.k_cache.is_some() {
-                    (inner.k_cache.clone(), inner.v_cache.clone())
-                } else { (None, None) }
-            };
+        let mut k_list = Vec::new();
+        let mut v_list = Vec::new();
+        let mut target_idxs = Vec::new();
 
-            if let (Some(k), Some(v)) = (k_to_move, v_to_move) {
-                let mut inner = block.inner.write().unwrap();
-                // 🌟 VRAM 선행 캐스팅 및 정렬 후 CPU 전송
-                inner.k_cache = Some(k.to_dtype(target_dtype)?.to_device(dev)?.contiguous()?);
-                inner.v_cache = Some(v.to_dtype(target_dtype)?.to_device(dev)?.contiguous()?);
+        for (idx, block) in self.kv_blocks.iter().enumerate() {
+            let inner = block.inner.read().unwrap();
+            if inner.location == KVLocation::VRAM && inner.k_cache.is_some() {
+                k_list.push(inner.k_cache.clone().unwrap());
+                v_list.push(inner.v_cache.clone().unwrap());
+                target_idxs.push(idx);
+            }
+        }
+
+        if !k_list.is_empty() {
+            // 🌟 [최적화: Pure BF16 Batching] 개별 전송을 없애고 단 1번의 PCIe 통신으로 묶음 처리
+            let merged_k = Tensor::cat(&k_list, 2)?.contiguous()?;
+            let merged_v = Tensor::cat(&v_list, 2)?.contiguous()?;
+            
+            let merged_k_cpu = merged_k.to_device(dev)?;
+            let merged_v_cpu = merged_v.to_device(dev)?;
+            
+            let mut current_pos = 0;
+            for (i, &idx) in target_idxs.iter().enumerate() {
+                let chunk_len = k_list[i].dim(2)?;
+                let k_cpu = merged_k_cpu.narrow(2, current_pos, chunk_len)?.contiguous()?;
+                let v_cpu = merged_v_cpu.narrow(2, current_pos, chunk_len)?.contiguous()?;
+                current_pos += chunk_len;
+                
+                let mut inner = self.kv_blocks[idx].inner.write().unwrap();
+                inner.k_cache = Some(k_cpu);
+                inner.v_cache = Some(v_cpu);
                 inner.location = KVLocation::RAM;
                 
                 let mut reg = self.registry.entries.write().unwrap();
@@ -2081,23 +2117,45 @@ impl QuantizedQwenVLTextModel {
             if vram_indices.len() > vram_limit {
                 vram_indices.sort_by_key(|k| k.1); 
                 let num_to_evict = vram_indices.len().saturating_sub(vram_limit);
-                let target_dtype = DType::F32; // 🌟 RAM 전송용이므로 F32로 강제 고정
-
+                
+                let mut k_list = Vec::new();
+                let mut v_list = Vec::new();
+                let mut target_idxs = Vec::new();
+                
                 for i in 0..num_to_evict {
                     let (idx, _) = vram_indices[i];
-                    let mut inner = kv_blocks[idx].inner.write().unwrap();
+                    let inner = kv_blocks[idx].inner.read().unwrap();
                     if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                        // 🌟 VRAM의 수천 개 코어를 이용해 F32로 먼저 변환하고 정렬한 뒤 CPU로 보냅니다.
-                        let k_cpu = k.to_dtype(target_dtype)?.to_device(&Device::Cpu)?.contiguous()?;
-                        let v_cpu = v.to_dtype(target_dtype)?.to_device(&Device::Cpu)?.contiguous()?;
+                        k_list.push(k.clone());
+                        v_list.push(v.clone());
+                        target_idxs.push(idx);
+                    }
+                }
+
+                if !k_list.is_empty() {
+                    // 🌟 [최적화: Pure BF16 Batching] F32 변환 삭제 & 단 1번의 PCIe 통신으로 대역폭 확보
+                    let merged_k = Tensor::cat(&k_list, 2)?.contiguous()?;
+                    let merged_v = Tensor::cat(&v_list, 2)?.contiguous()?;
+                    
+                    let merged_k_cpu = merged_k.to_device(&Device::Cpu)?;
+                    let merged_v_cpu = merged_v.to_device(&Device::Cpu)?;
+                    
+                    let mut current_pos = 0;
+                    for (i, &idx) in target_idxs.iter().enumerate() {
+                        let chunk_len = k_list[i].dim(2)?;
+                        let k_cpu = merged_k_cpu.narrow(2, current_pos, chunk_len)?.contiguous()?;
+                        let v_cpu = merged_v_cpu.narrow(2, current_pos, chunk_len)?.contiguous()?;
+                        current_pos += chunk_len;
+                        
+                        let mut inner = kv_blocks[idx].inner.write().unwrap();
                         inner.k_cache = Some(k_cpu);
                         inner.v_cache = Some(v_cpu);
                         inner.location = KVLocation::RAM;
                         if inner.index < reg.len() {
                             reg[inner.index].location[layer_idx] = KVLocation::RAM;
                         }
-                        vram_evicted = true;
                     }
+                    vram_evicted = true;
                 }
             }
         } 
@@ -2180,6 +2238,38 @@ impl QuantizedQwenVLTextModel {
             // 텅 빈 0.0 텐서만 남게 되고, 이로 인해 외계어를 내뱉는 "기억상실증(환각)"이 발생합니다.
             if current_seq_len > 1 {
                 let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, current_seq_len).await;
+            } else {
+                // 🌟 [속도 보장 지연 파괴(Async Drop)] 제안해주신 로직의 궁극적 형태!
+                // 다음 글자까지 기다릴 필요 없이, RAM 해제 작업을 백그라운드 스레드에 던져버려서 메인 디코딩 렉(Stutter)을 0으로 만듭니다.
+                let mut reg = self.registry.entries.write().unwrap();
+                let kv_blocks = &mut self.layers[layer_idx].self_attn.kv_blocks;
+                let total_blocks = kv_blocks.len();
+                
+                let mut garbage_bin = Vec::new(); // 백그라운드로 보낼 쓰레기통
+                
+                for (idx, block) in kv_blocks.iter_mut().enumerate() {
+                    if idx + 1 >= total_blocks { continue; } // 현재 활성 블록은 제외
+                    
+                    let mut inner = block.inner.write().unwrap();
+                    if inner.location == KVLocation::RAM && idx < reg.len() && reg[idx].ssd_path.is_some() {
+                        // Tensor를 파괴하는 대신 take()로 소유권을 뺏어서 쓰레기통에 담습니다.
+                        let old_k = inner.k_cache.take();
+                        let old_v = inner.v_cache.take();
+                        garbage_bin.push((old_k, old_v));
+                        
+                        inner.location = KVLocation::SSD;
+                        reg[idx].location[layer_idx] = KVLocation::SSD;
+                        let mut cache = reg[idx].bitkv_cache.write().unwrap();
+                        cache[layer_idx] = None;
+                    }
+                }
+                
+                // 수집된 쓰레기들을 메인 스레드가 아닌 비동기 런타임에서 조용히 파괴합니다.
+                if !garbage_bin.is_empty() {
+                    tauri::async_runtime::spawn(async move {
+                        drop(garbage_bin);
+                    });
+                }
             }
         }
         

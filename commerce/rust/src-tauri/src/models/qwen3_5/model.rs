@@ -1678,6 +1678,36 @@ impl Qwen3_5TextModel {
             }
             layer.clear_weights();
 
+            // 🌟 [속도 보장 지연 파괴(Async Drop)] RAM 점유율 스파이크를 막으면서도 디코딩 속도는 100% 유지합니다.
+            if is_decoding {
+                if let AttnKind::SelfAttn(attn) = &mut layer.attn {
+                    let mut reg = attn.registry.entries.write().unwrap();
+                    let total_blocks = attn.kv_blocks.len();
+                    
+                    let mut garbage_bin = Vec::new();
+                    
+                    for (idx, block) in attn.kv_blocks.iter_mut().enumerate() {
+                        if idx + 1 >= total_blocks { continue; } 
+                        
+                        let mut inner = block.inner.write().unwrap();
+                        if inner.location == KVLocation::RAM && idx < reg.len() && reg[idx].ssd_path.is_some() {
+                            garbage_bin.push((inner.k_cache.take(), inner.v_cache.take()));
+                            inner.location = KVLocation::SSD;
+                            
+                            reg[idx].location[l_idx] = KVLocation::SSD;
+                            let mut cache = reg[idx].bitkv_cache.write().unwrap();
+                            cache[l_idx] = None;
+                        }
+                    }
+                    
+                    if !garbage_bin.is_empty() {
+                        tokio::task::spawn_blocking(move || {
+                            drop(garbage_bin);
+                        });
+                    }
+                }
+            }
+
             // 🌟 [교체 구간] Qwen3_5TextModel::forward 내부의 세션 ID 저장 블록 전체
             if let Some(sid) = &session_id {
                 let kv_dir = crate::utils::paths::get_kv_dir(None);
