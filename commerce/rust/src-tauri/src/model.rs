@@ -677,34 +677,13 @@ impl LogisModel {
     }
 
     pub async fn ensure_embedding(&self) -> anyhow::Result<()> {
-        let current_size = { *self.current_size.lock().await };
-        
-        // [STRATEGY] High-priority exclusion logic
-        match current_size {
-            Some(ModelSize::Qwen3) => { // 🌟 Large -> Qwen3
-                // If Qwen3 is active, Embedding must stay on CPU to avoid OOM
-                println!("[MODEL] Qwen3 model active. Forcing Embedding to CPU to prevent swapping.");
-            },
-            Some(ModelSize::Qwen) | Some(ModelSize::Qwen3_5) => { // 🌟 Small -> Qwen
-                // Qwen/Qwen3.5 and Embedding can coexist. 
-                println!("[MODEL] Qwen/Qwen3.5 model active. Embedding will coexist.");
-            },
-            None => {
-                // No generator active, safe to clean up any leftovers
-                self.unload_generator().await;
-            }
-        }
-
         let mut emb_guard = self.embedding_model.lock().await;
         if emb_guard.is_none() {
             let self_clone = self.embedding_path.clone();
             
-            // Determine target device: CPU if Qwen3 is active, else use default GPU
-            let target_device = if current_size == Some(ModelSize::Qwen3) { // 🌟 Large -> Qwen3
-                candle_core::Device::Cpu 
-            } else { 
-                self.device_config.device.clone() 
-            };
+            // 🌟 [수정] 핸드오버 단계에서 이미 VRAM이 확보되었거나 모델이 충분히 가벼우므로, 
+            // 강제 CPU(RAM) 우회 로직을 제거하고 항상 기본 디바이스(GPU)를 사용하도록 직결합니다.
+            let target_device = self.device_config.device.clone();
             
             println!("[MODEL] Loading Embedding Model on {:?}...", if target_device.is_cpu() { "CPU" } else { "GPU" });
             

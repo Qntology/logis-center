@@ -1313,7 +1313,7 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
             }
 
             // Determine table based on cleaned type
-            let _table = match type_str.as_str() {
+            let final_table = match type_str.as_str() {
                 "sales" | "goods" | "order" => "sales",
                 "tracking" | "receiving" | "shipping" => "tracking",
                 "event" | "coupon" => "event",
@@ -1326,14 +1326,6 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                         "items" 
                     }
                 }
-            };
-
-            let final_table = if type_str == "team" || type_str == "user" || type_str == "member" {
-                "users"
-            } else if clean_item.get("data").and_then(|d| d.get("origin")).is_some() {
-                "pages"
-            } else {
-                "items" 
             };
 
             // 🌟 [CRITICAL FIX] Move 에러 방지: clean_item 대신 원본 item을 사용하여 참조를 분리합니다.
@@ -1603,8 +1595,18 @@ pub fn run() {
                         let store_guard = store_clone.lock().await;
                         if let Some(db) = store_guard.as_ref() {
                             let now = chrono::Utc::now().timestamp_millis();
-                            let from_addr = payload_val.get("from").and_then(|v| v.as_str()).unwrap_or("0x0000000000000000000000000000000000000000").to_string();
-                            let team_id = payload_val.get("to").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| crate::utils::hash::hash_id(&from_addr));
+                            
+                            // 🌟 [클라우드 패리티 일치] 0번 주소 상수화 및 팀 ID 매핑 로직 강화
+                            let zero_addr = "0x0000000000000000000000000000000000000000";
+                            let from_addr = payload_val.get("from").and_then(|v| v.as_str()).unwrap_or(zero_addr).to_string();
+                            
+                            let raw_to = payload_val.get("to").and_then(|v| v.as_str()).unwrap_or("");
+                            let team_id = if raw_to.is_empty() || raw_to == zero_addr {
+                                crate::utils::hash::hash_id(&from_addr)
+                            } else {
+                                raw_to.to_string()
+                            };
+
                             let task = crate::store::Task {
                                 id: payload_val.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                                 r#type: payload_val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),

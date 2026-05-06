@@ -6,6 +6,7 @@ use regex::Regex;
 pub enum PugMode {
     StructureOnly,
     FullContent,
+    DetailMode,
 }
 
 pub fn sanitize_llm_input(text: &str) -> String {
@@ -357,15 +358,19 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             // --- 허용된 속성만 Pug 문법으로 변환 ---
             let mut other_attributes = Vec::new();
 
-            // ID 속성 처리
-            if let Some(id) = element.id() {
-                other_attributes.push(format!("id=\"{}\"", id));
+            // ID 속성 처리 (DetailMode가 아닐 때만 유지)
+            if *mode != PugMode::DetailMode {
+                if let Some(id) = element.id() {
+                    other_attributes.push(format!("id=\"{}\"", id));
+                }
             }
 
-            // Class 속성 처리
-            if let Some(classes) = element.attr("class") {
-                if !classes.is_empty() {
-                    other_attributes.push(format!("class=\"{}\"", classes));
+            // Class 속성 처리 (DetailMode가 아닐 때만 유지)
+            if *mode != PugMode::DetailMode {
+                if let Some(classes) = element.attr("class") {
+                    if !classes.is_empty() {
+                        other_attributes.push(format!("class=\"{}\"", classes));
+                    }
                 }
             }
 
@@ -458,7 +463,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             if tag_name == "tbody" { if let Some(c) = ctx.as_mut() { c.is_in_tbody = false; } }
         }
         Node::Text(text) => {
-            if *mode == PugMode::FullContent {
+            if *mode == PugMode::FullContent || *mode == PugMode::DetailMode {
                 let text_content = text.trim();
                 if !text_content.is_empty() {
                     output.push_str(&format!("{}| {}\n", indent, text_content.replace("\"", "'")));
@@ -898,9 +903,12 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
     "tracking" => r###"- "{TYPE}":
-    - "status":'draft' or 'progress' or 'return' or 'complete' or 'error' | string
+    - "link":'{HREF}' | string
     - "id":tracking number | string
+    - "status":'draft' or 'progress' or 'return' or 'complete' or 'error' | string
     - "title":tracking product title | string
+    - "registration_date":yyyy-MM-ddThh:mm:ss | string
+    - "shipping_date":yyyy-MM-ddThh:mm:ss | string
     - "sender_name":sender_name | string
     - "sender_address":sender_address | string
     - "sender_phone":sender_phone | string
@@ -915,15 +923,14 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "shipping_fee":Shipping cost | number
     - "shipping_method":'standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid' | string
     - "shipping_duration":Estimated delivery days | number
-    - "bundle_shipping":Allow combined shipping | string
-    - "shipping_date":yyyy-MM-ddThh:mm:ss | string
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string"###.to_string(),
+    - "bundle_shipping":Allow combined shipping | string"###.to_string(),
     "goods" => r###"- "{TYPE}":
-    - "node":goods form container CSS selector | string
-    - "code":product constant code | string
     - "link":'{HREF}' | string
     - "id":Refer to the ID value from the link | string
+    - "code":product code | string
     - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string
+    - "title":product name | string
+    - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "payment_method":payment method | string
     - "bank":bank company name or '' | string
     - "card":card company name or '' | string
@@ -964,15 +971,13 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "length":Package length(cm) | number
     - "weight":Package weight(kg) | number
     - "options":[ { value:option name | string, inputs:[{ value:option input value | string }] } ]
-    - "additional_goods":[ { path:{ value:URL includes a manage path, an administrative or edit Link | string }, id:{ value:Refer to the product no value from the link or an attribute or input value | string }, link:{ value:Refer to the ID to find a URL that includes a manage link | string } } ]
-    - "title":product name | string
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string"###.to_string(),
+    - "additional_goods":[ { path:{ value:URL includes a manage path, an administrative or edit Link | string }, id:{ value:Refer to the product no value from the link or an attribute or input value | string }, link:{ value:Refer to the ID to find a URL that includes a manage link | string } } ]"###.to_string(),
         "order" => r###"- "{TYPE}":
-    - "node":order form container CSS selector | string
     - "link":'{HREF}' | string
     - "id":Refer to the ID value from the link | string
     - "tracking_number":tracking number | string
     - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
+    - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "goods":[{ title:{ value:product title | string }, path:{ value:URL includes a manage path, an administrative or edit Link | string }, id:{ value:Refer to the product no value from the link or an attribute or input value | string }, link:{ value:Refer to the ID to find a URL that includes a manage link | string } }]
     - "sender_name":sender_name | string
     - "sender_address":sender_address, Filter the addresses to District-level and up | string
@@ -985,10 +990,8 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "order_date":order date | string
     - "payment_date":payment date or '' | string
     - "payment_method":'C.O.D.' or 'CARD' or 'BANK' or '' | string
-    - "payment_origin":Payment Gateway Service Name or '' | string
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string"###.to_string(),
+    - "payment_origin":Payment Gateway Service Name or '' | string"###.to_string(),
     "coupon" | "event" => r###"- "{TYPE}":
-    - "node":{TYPE} container CSS selector | string
     - "link":'{HREF}' | string
     - "id":Refer to the ID value from the link | string
     - "type":'percentage' or 'fixed_amount' or 'free_shipping' or '' | string
@@ -1011,7 +1014,6 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "address":offline location address | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string"###.to_string(),
     "review" => r###"- "{TYPE}":
-    - "node":review container CSS selector | string
     - "link":'{HREF}' | string
     - "id":Refer to the ID value from the link | string
     - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
@@ -1060,7 +1062,6 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage order link | string
-    - "quantity":quantity | string
     - "currency":ISO 4217 Currency Code | string
     - "sale_price":sale price | number
     - "tracking_number":Tracking Number | string
@@ -1072,7 +1073,6 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage goods link | string
-    - "quantity":quantity | string
     - "currency":ISO 4217 Currency Code | string
     - "sale_price":sale price | number
     - "registration_date":yyyy-MM-ddThh:mm:ss | string

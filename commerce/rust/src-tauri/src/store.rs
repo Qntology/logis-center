@@ -480,10 +480,14 @@ impl VectorStore {
          let status = data_val.get("status").and_then(|v| v.as_str()).map(|s| crate::logic::parse_status(s)).unwrap_or(0);
          let amount = data_val.get("total_amount").or_else(|| data_val.get("sale_price")).or_else(|| data_val.get("supply_price")).or_else(|| data_val.get("price")).or_else(|| data_val.get("shipping_fee")).or_else(|| data_val.get("discount")).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))).unwrap_or(0.0) as f32;
          let doc_date_str = data_val.get("order_date").or_else(|| data_val.get("registration_date")).or_else(|| data_val.get("release_date")).or_else(|| data_val.get("manufacture_date")).or_else(|| data_val.get("shipping_date")).or_else(|| data_val.get("started_at")).or_else(|| data_val.get("expired_at")).or_else(|| data_val.get("payment_date")).and_then(|v| v.as_str()).unwrap_or("");
-         let now_ts = chrono::Utc::now().timestamp_millis();
+         
+         // 🌟 [CRITICAL FIX] 데이터에 명시된 updated_at과 created_at을 우선적으로 존중하여 Draft 상태(0)를 보호합니다.
+         let now_ts = data_val.get("updated_at").and_then(|v| v.as_i64()).unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
          let created_at = if !doc_date_str.is_empty() {
              chrono::DateTime::parse_from_rfc3339(doc_date_str).map(|dt| dt.timestamp_millis()).unwrap_or_else(|_| chrono::NaiveDateTime::parse_from_str(doc_date_str, "%Y-%m-%dT%H:%M:%S").map(|dt| dt.and_utc().timestamp_millis()).unwrap_or(now_ts))
-         } else { now_ts };
+         } else { 
+             data_val.get("created_at").and_then(|v| v.as_i64()).unwrap_or(now_ts) 
+         };
          let schema = table.schema().await?;
          let values_builder = Float32Array::from(vector.unwrap_or(vec![0.0; 768]));
          let list_field = Field::new("item", DataType::Float32, true);
@@ -673,7 +677,9 @@ pub struct TradeDocument {
     pub json_data: String,
     pub digest: String,
     pub vector: Vec<f32>,
+    #[serde(rename = "created_at")]
     pub created_at_ts: i64, 
+    #[serde(rename = "updated_at")]
     pub updated_at_ts: i64,
     pub item_descriptions: Vec<String>,
     pub item_hs_codes: Vec<String>,

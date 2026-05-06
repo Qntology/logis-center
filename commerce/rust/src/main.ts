@@ -91,6 +91,48 @@ class GlobalTaskManager {
         // sessionStorage는 F5 새로고침 시에는 유지되지만, 앱 종료 시에는 초기화됩니다.
         if (!sessionStorage.getItem("app_running_session")) {
             sessionStorage.setItem("app_running_session", "true");
+            
+            // 🌟 [추가] 강제 종료 전 Dexie에 남아있던 대기열을 가져와 LanceDB에 에러(Error) 히스토리로 남깁니다.
+            try {
+                const leftoverTasks = await appDb.table("ts_queue").toArray();
+                if (leftoverTasks && leftoverTasks.length > 0) {
+                    const errorItems = leftoverTasks.map((task: any) => {
+                        const now = Date.now();
+                        let taskRef = "Queued Task";
+                        if (task.payload) {
+                            taskRef = task.payload.query || task.payload.link || task.payload.image_path || "Queued Task";
+                        }
+                        
+                        const textMsg = `[Cancelled] ${taskRef} (App closed unexpectedly)`;
+
+                        return {
+                            id: task.taskId,
+                            type: "talk",
+                            role: "system_task",
+                            from: "system",
+                            to: "user",
+                            cc: task.payload?.cc || "",
+                            bcc: task.payload?.bcc || "",
+                            ref: task.payload?.refId || task.payload?.ref || "",
+                            status: 6, // 6: Error 상태 코드로 UI에 붉게 표기됨
+                            created_at: now,
+                            updated_at: now,
+                            data: {
+                                text: textMsg,
+                                link: "",
+                                origin: "https://commerce.logis.center"
+                            }
+                        };
+                    });
+                    
+                    // 백엔드 LanceDB에 에러 히스토리 일괄 삽입
+                    await invoke("upsert_items", { items: errorItems });
+                    console.log(`[QUEUE] Recorded ${errorItems.length} leftover tasks as ERROR in LanceDB.`);
+                }
+            } catch (e) {
+                console.error("[QUEUE] Failed to log leftover tasks to LanceDB:", e);
+            }
+
             await appDb.table("ts_queue").clear();
             console.log("[QUEUE] App restarted. Cleared persistent Dexie queue to mark as STOPPED.");
             this.queue = [];
@@ -601,63 +643,62 @@ async function updateExtractButtonVisibility() {
         } catch (e) { isAllowedDomain = false; }
     }
 
-    // 4. 즉시 가시성 결정 (사용자 체감 지연 제거)
-    if (isAllowedDomain || currentImage) {
-        btnExtract.style.display = "flex";
-        btnExtract.innerHTML = "⚡";
-        btnExtract.classList.remove("hidden");
-    } else {
+    // 4. 도메인 및 이미지 업로드 여부로 1차 필터링
+    if (!isAllowedDomain && !currentImage) {
         btnExtract.style.display = "none";
         btnExtract.classList.add("hidden");
         return; 
     }
 
-    // 5. 무거운 비동기 작업(Lock 확인 및 태스크 상태 질의)은 UI 노출 후에 백그라운드에서 처리
-    (async () => {
-        // 더블 클릭 락만 최우선 방어
-        if (extractClickLock) {
-            btnExtract.style.display = "none";
-            return;
-        }
+    // 5. 더블 클릭 및 비동기 작업(Lock 확인 및 태스크 상태 질의) 처리 후 최종 가시성 결정
+    // 🌟 [CRITICAL FIX] 즉시 렌더링(flex) 후 비동기로 숨기는(none) 로직 때문에 깜빡임이 발생했습니다. 
+    // 비동기 검증을 먼저 await로 대기한 뒤 최종적으로 한 번만 렌더링하여 깜빡임을 원천 차단합니다.
+    if (extractClickLock) {
+        btnExtract.style.display = "none";
+        return;
+    }
 
-        // 고아 락 해제용 로직 (버튼 가시성에는 영향 주지 않음)
-        const currentLock = await kvGet("sys_lock");
-        if (currentLock) {
-            const lockEl = document.getElementById(currentLock);
-            if (!lockEl) {
-                const lockTime = parseInt(currentLock.split('_')[1] || "0");
-                if (Date.now() - lockTime > 5000) { await kvRemove("sys_lock"); }
-            }
+    // 고아 락 해제용 로직 (버튼 가시성에는 영향 주지 않음)
+    const currentLock = await kvGet("sys_lock");
+    if (currentLock) {
+        const lockEl = document.getElementById(currentLock);
+        if (!lockEl) {
+            const lockTime = parseInt(currentLock.split('_')[1] || "0");
+            if (Date.now() - lockTime > 5000) { await kvRemove("sys_lock"); }
         }
+    }
 
-        try {
-            // 🌟 [CRITICAL FIX] 전역 변수(isExtracting)에 의존하지 않고, 
-            // 오직 "현재 포커스된 URL/이미지"가 대기열에 있는지 1:1로만 대조합니다.
-            if (currentImage) {
-                const imageRefHash = await hashId(currentImage); 
-                const isActive = await invoke<boolean>("check_active_task", { payload: { cc: activeContext.cc || "", ref: imageRefHash } });
-                const isQueued = GlobalTaskManager.queue.some(q => q.payload && q.payload.ref === imageRefHash);
+    let shouldHide = false;
+    try {
+        if (currentImage) {
+            const imageRefHash = await hashId(currentImage); 
+            const isActive = await invoke<boolean>("check_active_task", { payload: { cc: activeContext.cc || "", ref: imageRefHash } });
+            const isQueued = GlobalTaskManager.queue.some(q => q.payload && q.payload.ref === imageRefHash);
 
-                if (isActive || isQueued) {
-                    btnExtract.style.display = "none";
-                }
-            } else if (currentDetectedUrl) {
-                const urlObj = new URL(currentDetectedUrl.toLowerCase());
-                const link = (urlObj.pathname + urlObj.search).toLowerCase();
-                const ccHash = await hashId(urlObj.hostname);
-                const hashedRefId = await hashId((currentSession.team || "") + ccHash + link);
-                
-                const isActive = await invoke<boolean>("check_active_task", { payload: { cc: ccHash, ref: hashedRefId } });
-                const isQueued = GlobalTaskManager.queue.some(q => q.payload && (q.payload.ref === hashedRefId || q.payload.link === link));
-                
-                if (isActive || isQueued) {
-                    btnExtract.style.display = "none";
-                }
-            }
-        } catch (e) {
-            // 통신 에러 발생 시 기존 상태(노출) 유지
+            if (isActive || isQueued) shouldHide = true;
+        } else if (currentDetectedUrl) {
+            const urlObj = new URL(currentDetectedUrl.toLowerCase());
+            const link = (urlObj.pathname + urlObj.search).toLowerCase();
+            const ccHash = await hashId(urlObj.hostname);
+            const hashedRefId = await hashId((currentSession.team || "") + ccHash + link);
+            
+            const isActive = await invoke<boolean>("check_active_task", { payload: { cc: ccHash, ref: hashedRefId } });
+            const isQueued = GlobalTaskManager.queue.some(q => q.payload && (q.payload.ref === hashedRefId || q.payload.link === link));
+            
+            if (isActive || isQueued) shouldHide = true;
         }
-    })();
+    } catch (e) {
+        // 통신 에러 발생 시 노출 유지
+    }
+
+    if (shouldHide) {
+        btnExtract.style.display = "none";
+        btnExtract.classList.add("hidden");
+    } else {
+        btnExtract.style.display = "flex";
+        btnExtract.innerHTML = "⚡";
+        btnExtract.classList.remove("hidden");
+    }
 }
 
 listen("browser-match-found", async (event: any) => {
@@ -3241,25 +3282,24 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
             // [Top Pull] Newer than latest update
             const syncFilter = `updated_at > ${latestUpdateTime}`;
             finalFilter = baseFilter ? `${baseFilter} AND (${syncFilter})` : syncFilter;
-        } else if (!reset && oldestCreatedAt > 0) {
-            // [Bottom Pull] Older than oldest created
-            const historyFilter = `created_at < ${oldestCreatedAt}`;
-            finalFilter = baseFilter ? `${baseFilter} AND (${historyFilter})` : historyFilter;
+        } else {
+            // 🌟 [CRITICAL FIX] 무한 스크롤(Bottom Pull) 시 시간 기반 필터가 벡터/텍스트 검색의 score 정렬과 충돌하므로, 안전하게 offset 페이징으로 대체합니다.
+            finalFilter = baseFilter;
         }
 
         let docs: any[] = [];
         
+        // 🌟 [CRITICAL FIX] 새로고침/동기화(isSync)가 아닐 경우 currentPage 기반의 offset을 적용합니다.
+        const currentOffset = isSync ? 0 : currentPage * pageSize;
+        
         if (textQuery) {
-            // 🌟 텍스트 검색 시에도 프론트 래퍼를 버리고 Rust의 search_documents를 직접 타격합니다.
             const searchResults = await invoke<any[]>("search_documents", {
                 query: textQuery,
                 limit: pageSize,
-                offset: 0,
-                filter: finalFilter || null // 👈 이제 필터가 절대 증발하지 않고 Rust로 꽂힙니다!
+                offset: currentOffset,
+                filter: finalFilter || null 
             });
             
-            // Rust의 search_documents는 [id, text, score] 형태의 배열만 반환하므로, 
-            // 받아온 ID를 이용해 리스트 카드 생성에 필요한 원본 문서(Full Document)를 직접 꺼내옵니다.
             for (const res of searchResults) {
                 const docId = res[0];
                 const fullDoc = await invoke<any>("get_document", { uuid: docId });
@@ -3268,10 +3308,9 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
                 }
             }
         } else {
-            // 🌟 탭을 클릭하거나 일반 스크롤을 할 때는 Tauri Invoke를 직접 타격하여 완벽한 필터링을 보장합니다.
             docs = await invoke<any[]>("get_all_documents", {
                 limit: pageSize,
-                offset: 0,
+                offset: currentOffset,
                 filter: finalFilter || null
             });
         }
@@ -3282,13 +3321,17 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
             const mode = isSync ? 'prepend' : 'append';
             upsertListItems(docs, mode);
             
-            // [NEW] If syncing, also refresh the navigation tree (Pages / Users)
+            // 🌟 [CRITICAL FIX] 문서가 성공적으로 추가되었으므로 페이지 카운터를 정상적으로 증가시킵니다.
+            if (!isSync) {
+                if (reset) currentPage = 1;
+                else currentPage++;
+            }
+            
             if (isSync) {
                 renderNavigation();
             }
         } else if (reset) {
             docListContainer.innerHTML = `<div class="empty">No documents found.</div>`;
-
         }
     } catch (e) { 
         console.error("[WIDGET] loadMoreDocs error:", e);
