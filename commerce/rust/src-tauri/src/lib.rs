@@ -1393,11 +1393,12 @@ async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, St
         };
 
         for t in raw_tasks {
-            // 🌟 1. DB엔 1(Processing)인데 Rust 메모리에 없다면? -> 진짜 좀비! 즉시 중단(2) 처리
+            // 🌟 1. DB엔 1(Processing)인데 Rust 메모리에 없다면? -> 진짜 좀비! 즉시 에러(error) 처리
             if t.status == 1 && t.id != mem_task_id {
-                println!("[DB-SYNC] Zombie task detected in DB: {}. Marking as STOPPED.", t.id);
-                let _ = db.update_task_status(&t.id, 2).await;
-                let _ = db.update_message_status(&t.id, 2, Some("Task was interrupted due to refresh/error.")).await;
+                let error_status = crate::logic::parse_status("error");
+                println!("[DB-SYNC] Zombie task detected in DB: {}. Marking as ERROR.", t.id);
+                let _ = db.update_task_status(&t.id, error_status).await;
+                let _ = db.update_message_status(&t.id, error_status, Some("App closed unexpectedly. Task failed.")).await;
             } 
             // 🌟 2. 진짜 돌고 있는 작업이거나 정상 대기열(10)인 경우만 프론트엔드로 전달
             else if t.status == 1 || t.status == 10 {
@@ -1502,6 +1503,22 @@ pub fn run() {
                     
                     // 🌟 [핵심] 스케줄러 스레드가 생성되기 전에 DB를 먼저 정리합니다.
                     let _ = s.cleanup_unfinished_tasks_on_startup().await;
+                    
+                    let error_status = crate::logic::parse_status("error");
+                    
+                    if let Ok(processing_tasks) = s.get_processing_tasks(100).await {
+                        for t in processing_tasks {
+                            let _ = s.update_task_status(&t.id, error_status).await;
+                            let _ = s.update_message_status(&t.id, error_status, Some("App closed unexpectedly. Task failed.")).await;
+                        }
+                    }
+                    
+                    if let Ok(pending_tasks) = s.get_pending_tasks(100).await {
+                        for t in pending_tasks {
+                            let _ = s.update_task_status(&t.id, error_status).await;
+                            let _ = s.update_message_status(&t.id, error_status, Some("App closed unexpectedly. Task failed.")).await;
+                        }
+                    }
                     
                     *store_guard = Some(s);
                     println!("[Setup] Zombie cleanup complete. VectorStore is ready.");

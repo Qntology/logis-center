@@ -1057,53 +1057,53 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
     let schema = match page_type {
     "order" => r###"- "order":
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
-    - "title":title | string
     - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage order link | string
     - "quantity":quantity | string
     - "currency":ISO 4217 Currency Code | string
     - "sale_price":sale price | number
-    - "tracking_number":Tracking Number or equivalent term in English | string"###.to_string(),
+    - "tracking_number":Tracking Number | string
+    - "registration_date":yyyy-MM-ddThh:mm:ss | string
+    - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
+    - "title":title | string"###.to_string(),
 
     "goods" => r###"- "goods":
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string
-    - "title":title | string
     - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage goods link | string
     - "quantity":quantity | string
     - "currency":ISO 4217 Currency Code | string
-    - "sale_price":sale price | number"###.to_string(),
+    - "sale_price":sale price | number
+    - "registration_date":yyyy-MM-ddThh:mm:ss | string
+    - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string
+    - "title":title | string"###.to_string(),
     
     "tracking" | "review" => r###"- "{TYPE}":
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'start' or 'progress' or 'stop' or 'cancel' or 'return' | string
-    - "title":author and content | string
     - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
-    - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string"###.to_string(),
+    - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
+    - "registration_date":yyyy-MM-ddThh:mm:ss | string
+    - "status":'start' or 'progress' or 'stop' or 'cancel' or 'return' | string
+    - "title":author and content | string"###.to_string(),
     
     "coupon" | "event" => r###"- "{TYPE}":
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' | string
-    - "title":type based item title | string
     - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
     - "started_at":yyyy-MM-ddThh:mm:ss | string
-    - "expired_at":yyyy-MM-ddThh:mm:ss | string"###.to_string(),
+    - "expired_at":yyyy-MM-ddThh:mm:ss | string
+    - "registration_date":yyyy-MM-ddThh:mm:ss | string
+    - "status":'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' | string
+    - "title":type based item title | string"###.to_string(),
     
         _ => r###"- "{TYPE}":
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
-    - "title":title | string
     - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
-    - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string"###.to_string()
+    - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
+    - "registration_date":yyyy-MM-ddThh:mm:ss | string
+    - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
+    - "title":title | string"###.to_string()
     };
 
     // 🌟 [최종 반영] .txt 파일 구조와 동일하게 thead/tbody 태그 및 계층형 들여쓰기 적용
