@@ -7,6 +7,7 @@ pub enum PugMode {
     StructureOnly,
     FullContent,
     DetailMode,
+    TheadMode,
 }
 
 pub fn sanitize_llm_input(text: &str) -> String {
@@ -358,15 +359,15 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             // --- 허용된 속성만 Pug 문법으로 변환 ---
             let mut other_attributes = Vec::new();
 
-            // ID 속성 처리 (DetailMode가 아닐 때만 유지)
-            if *mode != PugMode::DetailMode {
+            // ID 속성 처리 (DetailMode, TheadMode가 아닐 때만 유지)
+            if *mode != PugMode::DetailMode && *mode != PugMode::TheadMode {
                 if let Some(id) = element.id() {
                     other_attributes.push(format!("id=\"{}\"", id));
                 }
             }
 
-            // Class 속성 처리 (DetailMode가 아닐 때만 유지)
-            if *mode != PugMode::DetailMode {
+            // Class 속성 처리 (DetailMode, TheadMode가 아닐 때만 유지)
+            if *mode != PugMode::DetailMode && *mode != PugMode::TheadMode {
                 if let Some(classes) = element.attr("class") {
                     if !classes.is_empty() {
                         other_attributes.push(format!("class=\"{}\"", classes));
@@ -391,13 +392,20 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             // 필수 속성 정의
             let always_include = [
                 "src", "href", "type", "name", "value", "placeholder", 
-                "checked", "selected", "disabled", "readonly", "rows", "cols"
+                "checked", "selected", "disabled", "readonly", "rows", "cols", "rowspan", "colspan"
             ];
+            let thead_include = ["scope", "rowspan", "colspan"];
 
             for (name, value) in element.attrs() {
                 if name == "id" || name == "class" || name == "alt" { continue; }
 
-                if name.starts_with("data-") || always_include.contains(&name) {
+                let should_include = if *mode == PugMode::TheadMode {
+                    thead_include.contains(&name)
+                } else {
+                    name.starts_with("data-") || always_include.contains(&name)
+                };
+
+                if should_include {
                     if ["checked", "selected", "disabled", "readonly"].contains(&name) && (value.is_empty() || value == name) {
                         other_attributes.push(name.to_string());
                     } else if !value.is_empty() {
@@ -463,7 +471,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             if tag_name == "tbody" { if let Some(c) = ctx.as_mut() { c.is_in_tbody = false; } }
         }
         Node::Text(text) => {
-            if *mode == PugMode::FullContent || *mode == PugMode::DetailMode {
+            if *mode == PugMode::FullContent || *mode == PugMode::DetailMode || *mode == PugMode::TheadMode {
                 let text_content = text.trim();
                 if !text_content.is_empty() {
                     output.push_str(&format!("{}| {}\n", indent, text_content.replace("\"", "'")));

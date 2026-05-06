@@ -1258,7 +1258,8 @@ async fn process_task(
                     }
                     
                     let mut tpug = String::new();
-                    crate::parsing::generate_pug_lines((*target_node).into(), 0, &mut tpug, &PugMode::FullContent, &mut None);
+                    // 🌟 [최적화] TheadMode를 적용하여 th/td의 scope, rowspan, colspan만 남기고 모든 속성(href, id, class 등) 제거
+                    crate::parsing::generate_pug_lines((*target_node).into(), 0, &mut tpug, &PugMode::TheadMode, &mut None);
                     thead_pug = tpug.trim().to_string();
                     
                     if !thead_pug.is_empty() {
