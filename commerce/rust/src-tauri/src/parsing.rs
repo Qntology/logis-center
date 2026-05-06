@@ -911,8 +911,8 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
     "tracking" => r###"- "{TYPE}":
-    - "link":'{HREF}' | string
     - "id":tracking number | string
+    - "link":'{HREF}' | string
     - "status":'draft' or 'progress' or 'return' or 'complete' or 'error' | string
     - "title":tracking product title | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
@@ -933,8 +933,8 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "shipping_duration":Estimated delivery days | number
     - "bundle_shipping":Allow combined shipping | string"###.to_string(),
     "goods" => r###"- "{TYPE}":
-    - "link":'{HREF}' | string
     - "id":Refer to the ID value from the link | string
+    - "link":'{HREF}' | string
     - "code":product code | string
     - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string
     - "title":product name | string
@@ -981,8 +981,8 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "options":[ { value:option name | string, inputs:[{ value:option input value | string }] } ]
     - "additional_goods":[ { path:{ value:URL includes a manage path, an administrative or edit Link | string }, id:{ value:Refer to the product no value from the link or an attribute or input value | string }, link:{ value:Refer to the ID to find a URL that includes a manage link | string } } ]"###.to_string(),
         "order" => r###"- "{TYPE}":
-    - "link":'{HREF}' | string
     - "id":Refer to the ID value from the link | string
+    - "link":'{HREF}' | string
     - "tracking_number":tracking number | string
     - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
@@ -1000,8 +1000,8 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "payment_method":'C.O.D.' or 'CARD' or 'BANK' or '' | string
     - "payment_origin":Payment Gateway Service Name or '' | string"###.to_string(),
     "coupon" | "event" => r###"- "{TYPE}":
-    - "link":'{HREF}' | string
     - "id":Refer to the ID value from the link | string
+    - "link":'{HREF}' | string
     - "type":'percentage' or 'fixed_amount' or 'free_shipping' or '' | string
     - "status":'draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error' | string
     - "title":{TYPE} title | string
@@ -1022,8 +1022,8 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "address":offline location address | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string"###.to_string(),
     "review" => r###"- "{TYPE}":
-    - "link":'{HREF}' | string
     - "id":Refer to the ID value from the link | string
+    - "link":'{HREF}' | string
     - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
     - "name":reviewer name | string
     - "title":reviewer item title | string
