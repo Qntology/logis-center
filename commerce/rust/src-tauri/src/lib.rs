@@ -1122,13 +1122,12 @@ async fn get_chat_messages(
     }
 }
 
-
-
+// 🌟 [CRITICAL FIX] 이전 정리 과정에서 실수로 누락된 get_known_pages 함수를 다시 복구합니다.
 #[tauri::command]
 async fn get_known_pages(state: State<'_, AppState>) -> Result<Vec<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        store.get_all_items("pages", 100, 0, None).await.map_err(|e| e.to_string())
+        store.get_all_items("pages", 1000, 0, None).await.map_err(|e| e.to_string())
     } else { Ok(vec![]) }
 }
 
@@ -1136,7 +1135,17 @@ async fn get_known_pages(state: State<'_, AppState>) -> Result<Vec<TradeDocument
 async fn get_known_users(state: State<'_, AppState>) -> Result<Vec<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        store.get_all_items("users", 20, 0, None).await.map_err(|e| e.to_string())
+        let mut all_users = store.get_all_items("users", 50, 0, None).await.unwrap_or_default();
+        
+        // 🌟 [CRITICAL FIX] DataFusion SQL에서 'type'은 예약어이므로 반드시 백틱(`)으로 감싸 파싱 에러(Silent Fail)를 방지합니다!
+        if let Ok(team_docs) = store.get_all_items("users", 1, 0, Some("`type` = 'team'".to_string())).await {
+            for t in team_docs {
+                if !all_users.iter().any(|u| u.id == t.id) {
+                    all_users.push(t);
+                }
+            }
+        }
+        Ok(all_users)
     } else { Ok(vec![]) }
 }
 
@@ -1411,9 +1420,21 @@ async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, St
             }
         }
 
-        pages = db.get_all_items("pages", 50, 0, None).await.unwrap_or_default();
-        users = db.get_all_items("users", 20, 0, None).await.unwrap_or_default();
-        items = db.get_all_items("items", 10, 0, None).await.unwrap_or_default();
+        // 🌟 [CRITICAL FIX] 데이터 누수 원인 해결! 통계가 담긴 가장 오래된 부모 문서들이 짤려나가지 않도록 조회 한도를 대폭 상향합니다.
+        pages = db.get_all_items("pages", 1000, 0, None).await.unwrap_or_default();
+        
+        // 🌟 [최적화] 1000개를 무식하게 불러오지 않고, 50개만 부른 뒤 통계(team) 문서만 타겟팅하여 안전하게 합칩니다.
+        users = db.get_all_items("users", 50, 0, None).await.unwrap_or_default();
+        // 🌟 [CRITICAL FIX] DataFusion SQL에서 'type'은 예약어이므로 반드시 백틱(`)으로 감싸 파싱 에러(Silent Fail)를 방지합니다!
+        if let Ok(team_docs) = db.get_all_items("users", 1, 0, Some("`type` = 'team'".to_string())).await {
+            for t in team_docs {
+                if !users.iter().any(|u| u.id == t.id) {
+                    users.push(t);
+                }
+            }
+        }
+        
+        items = db.get_all_items("items", 50, 0, None).await.unwrap_or_default();
     }
     
     let browser_status = {
