@@ -8,7 +8,8 @@ pub enum PugMode {
     FullContent,
     DetailMode,
     TheadMode,
-    ListMode, // 🌟 리스트 아이템 추출 시 href 등 주요 속성을 보존하고 id, class만 제거하기 위한 전용 모드
+    ListMode, 
+    NoAttributesMode, // 🌟 구조 판별을 위해 HTML의 모든 속성을 완벽히 비워버리는 전용 모드
 }
 
 pub fn sanitize_llm_input(text: &str) -> String {
@@ -372,15 +373,15 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             // --- 허용된 속성만 Pug 문법으로 변환 ---
             let mut other_attributes = Vec::new();
 
-            // ID 속성 처리 (DetailMode, TheadMode, ListMode가 아닐 때만 유지 -> 3가지 모드에선 id 비움)
-            if *mode != PugMode::DetailMode && *mode != PugMode::TheadMode && *mode != PugMode::ListMode {
+            // ID 속성 처리 (DetailMode, TheadMode, ListMode, NoAttributesMode 가 아닐 때만 유지)
+            if *mode != PugMode::DetailMode && *mode != PugMode::TheadMode && *mode != PugMode::ListMode && *mode != PugMode::NoAttributesMode {
                 if let Some(id) = element.id() {
                     other_attributes.push(format!("id=\"{}\"", id));
                 }
             }
 
-            // Class 속성 처리 (DetailMode, TheadMode, ListMode가 아닐 때만 유지 -> 3가지 모드에선 class 비움)
-            if *mode != PugMode::DetailMode && *mode != PugMode::TheadMode && *mode != PugMode::ListMode {
+            // Class 속성 처리 (DetailMode, TheadMode, ListMode, NoAttributesMode 가 아닐 때만 유지)
+            if *mode != PugMode::DetailMode && *mode != PugMode::TheadMode && *mode != PugMode::ListMode && *mode != PugMode::NoAttributesMode {
                 if let Some(classes) = element.attr("class") {
                     if !classes.is_empty() {
                         other_attributes.push(format!("class=\"{}\"", classes));
@@ -414,6 +415,8 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
 
                 let should_include = if *mode == PugMode::TheadMode {
                     thead_include.contains(&name)
+                } else if *mode == PugMode::NoAttributesMode {
+                    false // 🌟 어떠한 속성도 포함하지 않고 완벽히 비웁니다.
                 } else {
                     name.starts_with("data-") || always_include.contains(&name)
                 };
@@ -498,7 +501,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             if tag_name == "tbody" { if let Some(c) = ctx.as_mut() { c.is_in_tbody = false; } }
         }
         Node::Text(text) => {
-            if *mode == PugMode::FullContent || *mode == PugMode::DetailMode || *mode == PugMode::TheadMode || *mode == PugMode::ListMode {
+            if *mode == PugMode::FullContent || *mode == PugMode::DetailMode || *mode == PugMode::TheadMode || *mode == PugMode::ListMode || *mode == PugMode::NoAttributesMode {
                 let text_content = text.trim();
                 if !text_content.is_empty() {
                     output.push_str(&format!("{}| {}\n", indent, text_content.replace("\"", "'")));

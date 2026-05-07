@@ -752,7 +752,7 @@ async fn process_task(
                     ],
                     model: "qwen".to_string(), 
                     max_tokens: Some(16),
-                    temperature: Some(0.0), top_p: Some(0.0),
+                    temperature: Some(0.0), top_p: Some(0.95),
                     ..Default::default()
                 };
 
@@ -795,13 +795,19 @@ async fn process_task(
             
             let snapshot_id = format!("{}_step_a2", task.id); // 🌟 q35 접미사 제거
 
-            // 🌟 [CRITICAL FIX] 다시 0.6B(Qwen)로 복구하고, 0.6B의 특권인 미리 구워둔 base_session_id를 전달하여 엄청난 속도 향상을 누립니다!
-            model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            // 🌟 [CRITICAL FIX] 속성을 완전히 비운 NoAttributesMode로 PUG를 새로 생성하고 자릅니다.
+            let no_attr_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, None);
+            let light_no_attr_pug = model.truncate_pug_context(&no_attr_pug, false, 2000, None).await;
+            let specific_system_content = format!("[PUG CONTENT]\n{}", light_no_attr_pug);
+
+            // 🌟 [CRITICAL FIX] System 프롬프트가 변경되었으므로, 기존 base_session_id 캐시를 쓰면 오염됩니다.
+            // None을 전달하여 독립된 세션으로 깨끗하게 0.6B 모델을 올립니다.
+            model.secure_vram_relay(crate::model::ModelSize::Qwen, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![
                     ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                        content: system_content.clone(),
+                        content: specific_system_content, // 🌟 새로 만든 무속성 프롬프트 주입
                         name: None,
                     }),
                     ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -811,7 +817,7 @@ async fn process_task(
                 ],
                 model: "qwen".to_string(), // 🌟 qwen 으로 복구
                 max_tokens: Some(128),     // JSON 스키마가 길어졌으므로 토큰 길이는 128로 유지
-                temperature: Some(0.0), top_p: Some(0.0),
+                temperature: Some(0.0), top_p: Some(0.95),
                 ..Default::default()
             };
 
@@ -889,7 +895,7 @@ async fn process_task(
                                 name: None,
                             })
                         ],
-                        model: "qwen".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.0),
+                        model: "qwen".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
                         ..Default::default()
                     };
 
@@ -1215,7 +1221,7 @@ async fn process_task(
                         model: "qwen3.5".to_string(),
                         max_tokens: Some(256), 
                         temperature: Some(0.0), 
-                        top_p: Some(0.0),
+                        top_p: Some(0.95),
                         ..Default::default()
                     };
 
@@ -1421,7 +1427,7 @@ async fn process_task(
                             content: ChatCompletionRequestUserMessageContent::Text(task_question),
                             name: None,
                         })],
-                        model: "qwen3.5".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.0),
+                        model: "qwen3.5".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
                         ..Default::default()
                     };
                     gen.generate(
@@ -1572,7 +1578,7 @@ async fn process_task(
                     model: "qwen3.5".to_string(), 
                     max_tokens: Some(1048), 
                     temperature: Some(0.0), 
-                    top_p: Some(0.0),
+                    top_p: Some(0.95),
                     ..Default::default()
                 };
 
