@@ -979,7 +979,7 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "length":Package length(cm) | number
     - "weight":Package weight(kg) | number
     - "options":[ { value:option name | string, inputs:[{ value:option input value | string }] } ]
-    - "additional_goods":[ { path:{ value:URL includes a manage path, an administrative or edit Link | string }, id:{ value:Refer to the product no value from the link or an attribute or input value | string }, link:{ value:Refer to the ID to find a URL that includes a manage link | string } } ]"###.to_string(),
+    - "additional_goods":[ { path:{ value:URL includes a additional product manage path, an administrative or additional product edit Link | string }, id:{ value:Refer to the additional product no value from the link or an attribute or additional product input value | string }, link:{ value:Refer to the ID to find a URL that includes a additional product manage link | string } } ]"###.to_string(),
         "order" => r###"- "{TYPE}":
     - "id":Refer to the ID value from the link | string
     - "link":'{HREF}' | string

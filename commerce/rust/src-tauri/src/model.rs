@@ -22,7 +22,6 @@ use tauri::Emitter;
 use std::io::Cursor;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
-use sysinfo::System;
 
 pub struct Spinner {
     pub frames: Vec<&'static str>,

@@ -41,7 +41,12 @@ pub struct AppConfig {
 
 impl VectorStore {
     pub async fn new(base_path: &str) -> Result<Self> {
-        let uri = format!("{}/{}", base_path, DB_URI);
+        // 🌟 [CRITICAL FIX] "data/lancedb/data/lancedb" 와 같이 이중 경로가 생성되어 DB가 오염(Not found 에러)되는 것을 원천 차단합니다.
+        let uri = if base_path.ends_with(DB_URI) || base_path.ends_with("lancedb") { 
+            base_path.to_string() 
+        } else { 
+            format!("{}/{}", base_path, DB_URI) 
+        };
         let conn = connect(&uri).execute().await?;
         Ok(Self { conn, base_path: base_path.to_string() })
     }
@@ -78,24 +83,39 @@ impl VectorStore {
             Field::new("status", DataType::Int32, false), 
         ]));
 
+        let uri = if self.base_path.ends_with("lancedb") { self.base_path.to_string() } else { format!("{}/{}", self.base_path, DB_URI) };
         let existing = self.conn.table_names().execute().await?;
+        
         if existing.contains(&"tasks".to_string()) {
-            let table = self.conn.open_table("tasks").execute().await?;
-            let current_schema = table.schema().await?;
-            // [MIGRATION] Ensure 'ref' field exists and 'status' is Int32
-            let has_ref = current_schema.field_with_name("ref").is_ok();
-            let status_is_int = if let Ok(field) = current_schema.field_with_name("status") {
-                field.data_type() == &DataType::Int32
-            } else { false };
+            match self.conn.open_table("tasks").execute().await {
+                Ok(table) => {
+                    let current_schema = table.schema().await.unwrap_or_else(|_| Arc::new(Schema::new(Vec::<Field>::new())));
+                    let has_ref = current_schema.field_with_name("ref").is_ok();
+                    let status_is_int = if let Ok(field) = current_schema.field_with_name("status") {
+                        field.data_type() == &DataType::Int32
+                    } else { false };
 
-            if !has_ref || !status_is_int {
-                println!("[Store] tasks table schema mismatch. Dropping for recreation.");
-                let _ = self.conn.drop_table("tasks", &[]).await;
+                    if !has_ref || !status_is_int {
+                        println!("[Store] tasks table schema mismatch. Dropping for recreation.");
+                        let _ = self.conn.drop_table("tasks", &[]).await;
+                    }
+                },
+                Err(_) => {
+                    // 🌟 [CRITICAL FIX] _versions 디렉토리 증발 등 데이터셋 오염 시 폴더까지 물리적으로 강제 삭제 후 복구합니다.
+                    println!("[Store] Corrupted tasks table detected. Force dropping.");
+                    let _ = self.conn.drop_table("tasks", &[]).await;
+                    let _ = std::fs::remove_dir_all(format!("{}/tasks.lance", uri));
+                }
             }
         }
+        
         let existing = self.conn.table_names().execute().await?;
         if !existing.contains(&"tasks".to_string()) {
-            let _ = self.conn.create_table("tasks", RecordBatchIterator::new(vec![], task_schema)).execute().await;
+            if let Err(_) = self.conn.create_table("tasks", RecordBatchIterator::new(vec![], task_schema.clone())).execute().await {
+                println!("[Store] tasks create failed, cleaning up dir and retrying...");
+                let _ = std::fs::remove_dir_all(format!("{}/tasks.lance", uri));
+                let _ = self.conn.create_table("tasks", RecordBatchIterator::new(vec![], task_schema)).execute().await;
+            }
         }
 
         let msg_schema = Arc::new(Schema::new(vec![
@@ -115,19 +135,31 @@ impl VectorStore {
             Field::new("updated_at", DataType::Int64, false),
         ]));
 
+        let existing = self.conn.table_names().execute().await?;
         if existing.contains(&"talks".to_string()) {
-            let table = self.conn.open_table("talks").execute().await?;
-            let current_schema = table.schema().await?;
-            // [MIGRATION] Check for 'text' field to see if it's the old schema
-            let needs_recreate = current_schema.field_with_name("text").is_err();
-            if needs_recreate {
-                println!("[Store] talks table schema outdated (missing 'text'). Dropping for migration.");
-                let _ = self.conn.drop_table("talks", &[]).await;
+            match self.conn.open_table("talks").execute().await {
+                Ok(table) => {
+                    let current_schema = table.schema().await.unwrap_or_else(|_| Arc::new(Schema::new(Vec::<Field>::new())));
+                    let needs_recreate = current_schema.field_with_name("text").is_err();
+                    if needs_recreate {
+                        println!("[Store] talks table schema outdated. Dropping for migration.");
+                        let _ = self.conn.drop_table("talks", &[]).await;
+                    }
+                },
+                Err(_) => {
+                    println!("[Store] Corrupted talks table detected. Force dropping.");
+                    let _ = self.conn.drop_table("talks", &[]).await;
+                    let _ = std::fs::remove_dir_all(format!("{}/talks.lance", uri));
+                }
             }
         }
+        
         let existing = self.conn.table_names().execute().await?;
         if !existing.contains(&"talks".to_string()) {
-            let _ = self.conn.create_table("talks", RecordBatchIterator::new(vec![], msg_schema)).execute().await;
+            if let Err(_) = self.conn.create_table("talks", RecordBatchIterator::new(vec![], msg_schema.clone())).execute().await {
+                let _ = std::fs::remove_dir_all(format!("{}/talks.lance", uri));
+                let _ = self.conn.create_table("talks", RecordBatchIterator::new(vec![], msg_schema)).execute().await;
+            }
         }
         Ok(())
     }
@@ -403,26 +435,40 @@ impl VectorStore {
             Field::new("created_at", DataType::Int64, false), 
             Field::new("updated_at", DataType::Int64, false),
         ]));
+        
+        let uri = if self.base_path.ends_with("lancedb") { self.base_path.to_string() } else { format!("{}/{}", self.base_path, DB_URI) };
         let existing = self.conn.table_names().execute().await?;
+        
         for name in tables {
             if existing.contains(&name.to_string()) {
-                let table = self.conn.open_table(name).execute().await?;
-                let current_schema = table.schema().await?;
-                
-                // [FIX] Check for 'ref' column existence and 'status' type to trigger migration
-                let has_ref = current_schema.field_with_name("ref").is_ok();
-                let status_is_int = if let Ok(field) = current_schema.field_with_name("status") {
-                    field.data_type() == &DataType::Int32
-                } else { false };
+                match self.conn.open_table(name).execute().await {
+                    Ok(table) => {
+                        let current_schema = table.schema().await.unwrap_or_else(|_| Arc::new(Schema::new(Vec::<Field>::new())));
+                        let has_ref = current_schema.field_with_name("ref").is_ok();
+                        let status_is_int = if let Ok(field) = current_schema.field_with_name("status") {
+                            field.data_type() == &DataType::Int32
+                        } else { false };
 
-                if !has_ref || !status_is_int {
-                    println!("[Store] Schema mismatch for {}. Dropping and recreating...", name);
-                    let _ = self.conn.drop_table(name, &[]).await;
-                } else {
-                    continue;
+                        if !has_ref || !status_is_int {
+                            println!("[Store] Schema mismatch for {}. Dropping and recreating...", name);
+                            let _ = self.conn.drop_table(name, &[]).await;
+                        } else {
+                            continue;
+                        }
+                    },
+                    Err(_) => {
+                        // 🌟 [CRITICAL FIX] 메인 테이블들(items, sales 등)이 오염되었을 때도 강제로 삭제 후 복구합니다.
+                        println!("[Store] Corrupted table {} detected. Force dropping.", name);
+                        let _ = self.conn.drop_table(name, &[]).await;
+                        let _ = std::fs::remove_dir_all(format!("{}/{}.lance", uri, name));
+                    }
                 }
             }
-            let _table = self.conn.create_table(name, RecordBatchIterator::new(vec![], schema.clone())).execute().await?;
+            
+            if let Err(_) = self.conn.create_table(name, RecordBatchIterator::new(vec![], schema.clone())).execute().await {
+                let _ = std::fs::remove_dir_all(format!("{}/{}.lance", uri, name));
+                let _ = self.conn.create_table(name, RecordBatchIterator::new(vec![], schema.clone())).execute().await;
+            }
         }
         Ok(())
     }

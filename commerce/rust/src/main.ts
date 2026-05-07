@@ -2004,6 +2004,37 @@ listen("task-db-registered", async (event: any) => {
     });
 });
 
+// 🌟 [CRITICAL FIX] 백엔드(LanceDB)와 프론트엔드(Dexie)의 업데이트 시간을 비교하여 최신 데이터만 선택적으로 반영하는 동기화 헬퍼 함수
+async function syncLocalToDexie(lanceItems: any[], tableName: string) {
+    if (!lanceItems || lanceItems.length === 0) return;
+    try {
+        const localItems = await (Select as any)[tableName]({});
+        const localMap = new Map();
+        localItems.forEach((item: any) => {
+            // Dexie에 저장된 기존 업데이트 시간 캐싱
+            localMap.set(item.id, item.updated_at_ts || item.updated_at || 0);
+        });
+
+        const needsUpdate = lanceItems.filter((newItem: any) => {
+            const localUpdated = localMap.get(newItem.id) || 0;
+            // LanceDB에서 온 최신 업데이트 시간 (TradeDocument 구조체는 updated_at_ts를 사용)
+            const lanceUpdated = newItem.updated_at_ts || newItem.updated_at || 0;
+            
+            // 🌟 백엔드 시간이 프론트엔드 시간보다 최신일 때만 업데이트 대상에 포함
+            return lanceUpdated > localUpdated;
+        });
+
+        if (needsUpdate.length > 0) {
+            console.log(`[LOCAL-SYNC] ${tableName} 테이블 최신화 중... (${needsUpdate.length}건 변경됨)`);
+            await (Upsert as any)[tableName](needsUpdate);
+        } else {
+            console.log(`[LOCAL-SYNC] ${tableName} 테이블은 이미 최신 상태입니다.`);
+        }
+    } catch (e) {
+        console.error(`[LOCAL-SYNC] ${tableName} 동기화 실패:`, e);
+    }
+}
+
 listen("extraction-progress", async (event: any) => { 
     const payload = event.payload;
     if (payload.task_id) livePayloads.set(payload.task_id, payload);
@@ -2234,30 +2265,25 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
                         tData = tData || teamDocs[0];
                         
                         console.log("[TRACKING-3] Dexie에 덮어쓸 최신 Base 통계:", JSON.stringify(tData.base?.pages, null, 2));
-                        await Upsert["users"](teamDocs);
+                        // 🌟 [CRITICAL FIX] 단순히 덮어쓰지 않고 타임스탬프를 비교하여 최신화합니다.
+                        await syncLocalToDexie(teamDocs, "users");
                     } else {
                         console.warn("[TRACKING-WARN] get_known_users에 'team' 문서가 포함되지 않았습니다! (Limit 제한 의심)");
                     }
                 }
-                if (pages && pages.length > 0) await Upsert["pages"](pages);
+                if (pages && pages.length > 0) await syncLocalToDexie(pages, "pages");
+                            
+                console.log("[SYNC] LanceDB의 최신 데이터(통계, 페이지)를 Dexie로 타임스탬프 동기화 완료!");
                 
-                console.log("[SYNC] LanceDB의 최신 데이터(통계, 페이지)를 Dexie로 동기화 완료!");
-                
-                if (currentSession.email) {
-                    syncData(); // 🌟 Dexie 업데이트 완료 후 서버 동기화 시작
-                } else {
-                    renderNavigation().then(() => {
-                        if (currentTab === "list") refreshList();
-                    });
+                // 🌟 [CRITICAL FIX] 프론트엔드 최신화 버그 해결! 서버 동기화(네트워크 상태)와 무관하게, 로컬 통계가 갱신되었으므로 무조건 즉시 UI를 새로고침합니다.
+                await renderNavigation();
+                if (currentTab === "list") {
+                    refreshList();
                 }
-            }).catch(e => {
-                console.error("[SYNC] Dexie 동기화 실패:", e);
+                
+                // 🌟 UI를 100% 최신 상태로 바꾼 뒤에 백그라운드에서 조용히 서버와 동기화를 진행합니다.
                 if (currentSession.email) {
-                    syncData();
-                } else {
-                    renderNavigation().then(() => {
-                        if (currentTab === "list") refreshList();
-                    });
+                    syncData(); 
                 }
             });
         }
@@ -4003,6 +4029,14 @@ async function initSession() {
             cachedDocs = data.items;
             renderDocs(data.items);
             currentPage = 1;
+        }
+
+        // 🌟 [CRITICAL FIX] 앱 초기화 시 백엔드(LanceDB)에서 가져온 사용자(통계) 및 페이지 데이터를 프론트엔드(Dexie)에 타임스탬프 기반으로 안전하게 복구 동기화합니다.
+        if (data.users && data.users.length > 0) {
+            await syncLocalToDexie(data.users, "users");
+        }
+        if (data.pages && data.pages.length > 0) {
+            await syncLocalToDexie(data.pages, "pages");
         }
 
         // 🌟 [핵심 분기 로직] 로그인 상태 확인 후 렌더링 방식 결정

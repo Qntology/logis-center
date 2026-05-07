@@ -1274,6 +1274,19 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
             if let Some(obj) = clean_item.as_object_mut() {
                 obj.insert("type".to_string(), serde_json::json!(type_str));
             }
+
+            // 🌟 [CRITICAL FIX] 클라우드(aa.ts)에서 넘어온 데이터 객체의 이중 래핑(Matryoshka) 해제
+            // item 안에 "data"가 객체로 존재한다면, 그 안의 알맹이를 최상위로 끌어올립니다.
+            if type_str != "talk" && type_str != "prompt" && type_str != "ai_search" {
+                if let Some(data_obj) = clean_item.get("data").and_then(|v| v.as_object()).cloned() {
+                    if let Some(main_obj) = clean_item.as_object_mut() {
+                        for (k, v) in data_obj {
+                            main_obj.insert(k, v);
+                        }
+                        main_obj.remove("data"); // 기존 껍데기 data 제거
+                    }
+                }
+            }
             
             // 🌟 [CRITICAL FIX] "talk" 타입의 데이터 구조를 프론트엔드 및 Cloud 백엔드의 표준 구조와 동일하게 강제 정규화합니다.
             if type_str == "talk" || type_str == "prompt" || type_str == "ai_search" {

@@ -732,7 +732,7 @@ async fn process_task(
                     ],
                     model: "qwen".to_string(), 
                     max_tokens: Some(16),
-                    temperature: Some(0.0), top_p: Some(0.95),
+                    temperature: Some(0.0), top_p: Some(0.0),
                     ..Default::default()
                 };
 
@@ -791,7 +791,7 @@ async fn process_task(
                 ],
                 model: "qwen".to_string(), // 🌟 qwen 으로 복구
                 max_tokens: Some(128),     // JSON 스키마가 길어졌으므로 토큰 길이는 128로 유지
-                temperature: Some(0.0), top_p: Some(0.95),
+                temperature: Some(0.0), top_p: Some(0.0),
                 ..Default::default()
             };
 
@@ -869,7 +869,7 @@ async fn process_task(
                                 name: None,
                             })
                         ],
-                        model: "qwen".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
+                        model: "qwen".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.0),
                         ..Default::default()
                     };
 
@@ -1195,7 +1195,7 @@ async fn process_task(
                         model: "qwen3.5".to_string(),
                         max_tokens: Some(256), 
                         temperature: Some(0.0), 
-                        top_p: Some(0.95),
+                        top_p: Some(0.0),
                         ..Default::default()
                     };
 
@@ -1401,7 +1401,7 @@ async fn process_task(
                             content: ChatCompletionRequestUserMessageContent::Text(task_question),
                             name: None,
                         })],
-                        model: "qwen3.5".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
+                        model: "qwen3.5".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.0),
                         ..Default::default()
                     };
                     gen.generate(
@@ -1434,7 +1434,8 @@ async fn process_task(
                                 if let Some(relative_path) = link_val.as_str() {
                                     if let Ok(base_url) = url::Url::parse(&url) {
                                         if let Ok(absolute_url) = base_url.join(relative_path) {
-                                            *link_val = json!(absolute_url.to_string());
+                                            let path_query = format!("{}{}", absolute_url.path(), absolute_url.query().map(|q| format!("?{}", q)).unwrap_or_default());
+                                            *link_val = json!(path_query.to_lowercase());
                                         }
                                     }
                                 }
@@ -1550,7 +1551,7 @@ async fn process_task(
                     model: "qwen3.5".to_string(), 
                     max_tokens: Some(1048), 
                     temperature: Some(0.0), 
-                    top_p: Some(0.95),
+                    top_p: Some(0.0),
                     ..Default::default()
                 };
 
@@ -1619,7 +1620,7 @@ async fn process_task(
                 obj.insert("quantity".to_string(), json!(q_val));
             }
             
-            // 🌟 [날짜 포맷 정규화] 다양한 형태(YY-MM-DD, YYYY.MM.DD 등)의 날짜 문자열을 ISO 8601 형태로 완벽 교정
+            // 🌟 [날짜 포맷 정규화] moment.js 수준의 강력한 날짜 추론 및 보정 엔진
             let date_keys = [
                 "registration_date", "order_date", "payment_date", "shipping_date", 
                 "manufacture_date", "expiration_date", "release_date", "started_at", "expired_at"
@@ -1628,13 +1629,46 @@ async fn process_task(
                 for key in date_keys.iter() {
                     if let Some(date_val) = obj.get(*key).and_then(|v| v.as_str()) {
                         let s = date_val.trim();
-                        if !s.is_empty() && s != "null" && !s.contains('T') {
+                        if !s.is_empty() && s != "null" {
+                            // 1. Unix Timestamp 감지 (순수 숫자 10자리 혹은 13자리)
+                            if s.chars().all(char::is_numeric) && (s.len() == 10 || s.len() == 13) {
+                                if let Ok(ts) = s.parse::<i64>() {
+                                    let ts_ms = if s.len() == 10 { ts * 1000 } else { ts };
+                                    if let Some(dt) = chrono::NaiveDateTime::from_timestamp_millis(ts_ms) {
+                                        let iso_date = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
+                                        obj.insert(key.to_string(), json!(iso_date));
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            // 2. 이미 완벽한 ISO 포맷인 경우 스킵 (T 포함, 글자수 충분)
+                            if s.contains('T') && s.len() >= 19 {
+                                continue;
+                            }
+
+                            // 3. 다양한 형태의 문자열 분해 및 논리적 역추론 (MM/DD/YYYY, YY-MM-DD 등)
                             let nums: Vec<u32> = re_date.find_iter(s).filter_map(|m| m.as_str().parse().ok()).collect();
                             if nums.len() >= 3 {
                                 let mut year = nums[0];
-                                if year < 100 { year += 2000; } // 24 -> 2024 처리
-                                let month = nums[1].clamp(1, 12);
-                                let day = nums[2].clamp(1, 31);
+                                let mut month = nums[1];
+                                let mut day = nums[2];
+
+                                // MM/DD/YYYY 또는 DD/MM/YYYY 형태 대응 (마지막 숫자가 31을 초과하면 연도로 간주)
+                                if day > 31 && year <= 31 {
+                                    year = nums[2];
+                                    day = nums[1]; // 월/일 판별은 모호하므로 순서 유지
+                                    month = nums[0];
+                                }
+
+                                // 2자리 연도 보정 (예: 24 -> 2024, 99 -> 1999)
+                                if year < 100 {
+                                    year += if year > 50 { 1900 } else { 2000 };
+                                }
+                                
+                                month = month.clamp(1, 12);
+                                day = day.clamp(1, 31);
+                                
                                 let hour = if nums.len() > 3 { nums[3].clamp(0, 23) } else { 0 };
                                 let minute = if nums.len() > 4 { nums[4].clamp(0, 59) } else { 0 };
                                 let second = if nums.len() > 5 { nums[5].clamp(0, 59) } else { 0 };
@@ -1642,6 +1676,13 @@ async fn process_task(
                                 let iso_date = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", year, month, day, hour, minute, second);
                                 obj.insert(key.to_string(), json!(iso_date));
                             }
+                        }
+                    } else if let Some(date_num) = obj.get(*key).and_then(|v| v.as_i64()) {
+                        // LLM이 문자열이 아닌 정수형(Unix Time)으로 뱉어냈을 경우 방어
+                        let ts_ms = if date_num < 10_000_000_000 { date_num * 1000 } else { date_num };
+                        if let Some(dt) = chrono::NaiveDateTime::from_timestamp_millis(ts_ms) {
+                            let iso_date = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
+                            obj.insert(key.to_string(), json!(iso_date));
                         }
                     }
                 }
@@ -1679,21 +1720,26 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     // [PARITY] ID Generation
-    let id_val_raw = extracted_data.get("no")
+    let id_val_raw = extracted_data.get("id")
+        .or_else(|| extracted_data.get("no"))
         .or_else(|| extracted_data.get("code"))
         .or_else(|| extracted_data.get("tracking_number"))
-        .or_else(|| extracted_data.get("id"))
         .or_else(|| extracted_data.get("index"))
         .and_then(|v| if v.is_number() { Some(v.to_string()) } else { v.as_str().map(|s| s.to_string()) })
         .unwrap_or_default();
-    let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(&id_val_raw).replace("-", "").replace("_", "");
-    let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));
     
+    // 🌟 [CRITICAL FIX] aa.ts의 cleanNumber() 로직 완벽 일치: 온점(.)과 쉼표(,)도 함께 제거하여 해시 불일치 차단
+    let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(&id_val_raw)
+        .replace("-", "").replace("_", "").replace(".", "").replace(",", "");
+    
+    let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));
     let generated_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val));
 
     if let Some(obj) = extracted_data.as_object_mut() {
         obj.insert("index".to_string(), json!(index_val));
         obj.insert("id".to_string(), json!(generated_id.clone()));
+        // 🌟 [CRITICAL FIX] 상세(Detail) 모드에서는 정상 전처리되었으므로 현재 시간을 갱신하여 Draft가 아님을 확정합니다.
+        obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
     }
 
     log_task_progress(app_handle, &task.id, &json!({ "category": "Saving", "summary": "Syncing to database..." }));
@@ -1755,14 +1801,22 @@ async fn process_task(
         }
     }
 
-    let target_table = page_type.to_string();
+    // 🌟 [CRITICAL FIX] DB 테이블 매핑 패리티 일치화: aa.ts와 동일하게 goods, order는 sales 테이블에, coupon은 event 테이블에 저장하고 조회해야 합니다.
+    let target_table = match page_type.as_str() {
+        "sales" | "goods" | "order" => "sales",
+        "tracking" | "receiving" | "shipping" => "tracking",
+        "event" | "coupon" => "event",
+        "member" | "team" | "user" => "users",
+        "talk" | "prompt" | "ai_search" => "talks",
+        _ => "items",
+    }.to_string();
+
     let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
     let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_val));
     let ref_val = task.r#ref.clone();
 
     let mut items_to_process = Vec::new();
-    let mut page_draft_diff = 0i64;
-    let mut page_count_diff = 0i64;
+    let mut stats_diff: std::collections::HashMap<String, (i64, i64, i64)> = std::collections::HashMap::new();
 
     if is_detail {
         // 🌟 [DETAIL MODE] 단일 문서일 경우
@@ -1777,7 +1831,6 @@ async fn process_task(
         // 🌟 [CRITICAL FIX] 1. 우선 리스트 추출 시 생성된 진짜 ID(generated_id)로 DB를 검색합니다.
         if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
             is_new = false;
-            // 🌟 [CRITICAL FIX] updated_at이 0인 순수 가계정이거나, 상세 데이터가 없는(detail: false) 리스트 출신 항목이면 Draft로 간주합니다.
             was_draft = if existing_item.updated_at_ts == 0 {
                 true
             } else if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
@@ -1790,9 +1843,14 @@ async fn process_task(
                 existing_vector = Some(existing_item.vector);
             }
         } 
-        // 🌟 [CRITICAL FIX] 2. 못 찾았을 경우, 프론트엔드가 넘겨준 참조 링크(ref)를 통해 역추적하여 덮어씁니다.
-        else if !task.r#ref.is_empty() {
-            if let Ok(Some((found_id, _))) = store.find_item_by_property(&target_table, "ref", &json!(task.r#ref)).await {
+        // 🌟 [CRITICAL FIX] 2. 못 찾았을 경우, 상세페이지의 실제 URL(url)을 통해 리스트 아이템이 저장해둔 "link" 속성과 대조하여 역추적합니다.
+        else if !url.is_empty() {
+            let normalized_link = if let Ok(parsed_url) = url::Url::parse(&url) {
+                format!("{}{}", parsed_url.path(), parsed_url.query().map(|q| format!("?{}", q)).unwrap_or_default()).to_lowercase()
+            } else {
+                url.clone()
+            };
+            if let Ok(Some((found_id, _))) = store.find_item_by_property(&target_table, "link", &json!(normalized_link)).await {
                 target_id = found_id.clone();
                 is_new = false;
                 
@@ -1802,7 +1860,6 @@ async fn process_task(
                 }
                 
                 if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
-                    // 🌟 [CRITICAL FIX] Fallback 추적 시에도 동일하게 Draft 조건을 적용합니다.
                     was_draft = if existing_item.updated_at_ts == 0 {
                         true
                     } else if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
@@ -1819,14 +1876,19 @@ async fn process_task(
         }
 
         // 🌟 [클라우드 패리티 일치] 상세(Detail) 페이지 수집 시: 
-        // 새 항목이면 count++, 기존 Draft 항목이었다면 draft--, count++ 승급
+        // 새 항목이면 pages: count++, global: count++
+        // 기존 Draft 항목이었다면 pages: draft--, count++ 승급 (global은 이미 리스트에서 올렸으므로 변동 없음)
         if is_new {
-            page_count_diff += 1;
+            let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
+            e.1 += 1; // pages count++
+            e.2 += 1; // global count++
         } else if was_draft {
-            page_draft_diff -= 1;
-            page_count_diff += 1;
+            let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
+            e.0 -= 1; // pages draft--
+            e.1 += 1; // pages count++
         }
 
+        // 🌟 [CRITICAL FIX] 이전 코드 교체 시 누락되었던 vector 변수 선언을 복구합니다.
         let vector = if let Some(v) = existing_vector {
             Some(v)
         } else {
@@ -1840,6 +1902,7 @@ async fn process_task(
                 for q in queries {
                     match store.find_item_by_property(&q.table, &q.column, &q.value).await {
                         Ok(Some((foreign_id, mut foreign_data))) => {
+                            let was_foreign_draft = foreign_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
                             let mut needs_update = false;
 
                             // 2. Update 속성 병합 (Import/Export)
@@ -1888,6 +1951,12 @@ async fn process_task(
 
                             // 4. 연관 문서에 변경 사항이 있다면 벡터 재생성 후 DB 재저장
                             if needs_update {
+                                if was_foreign_draft && merge_rule.update.as_ref().map_or(false, |u| u.to == foreign_type) {
+                                    let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
+                                    e.0 -= 1; // pages draft--
+                                    e.1 += 1; // pages count++
+                                    foreign_data.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                                }
                                 let merged_text = parsing::json_to_natural_language(&foreign_data);
                                 let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 768]);
                                 foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
@@ -1905,6 +1974,10 @@ async fn process_task(
                         },
                         Ok(None) => {
                             // 🌟 연관 문서가 존재하지 않으면 Draft(가계정) 껍데기를 생성합니다.
+                            let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
+                            e.0 += 1; // pages draft++
+                            e.2 += 1; // global count++
+
                             let mut draft_data = json!({});
                             
                             // 🌟 [버그 수정] q.value가 Number(예: index 값)일 때 해시가 증발하는 현상을 방어합니다.
@@ -1956,15 +2029,19 @@ async fn process_task(
             for item_val in items.iter() {
                 let mut single_item = item_val.clone();
                 
-                let original_id = single_item.get("no")
+                // 🌟 [CRITICAL FIX] aa.ts와 동일하게 무조건 "id" 속성을 최우선으로 탐색하여 상세/리스트 간 해시 불일치를 방지합니다.
+                let original_id = single_item.get("id")
+                    .or_else(|| single_item.get("no"))
                     .or_else(|| single_item.get("code"))
                     .or_else(|| single_item.get("tracking_number"))
-                    .or_else(|| single_item.get("id"))
                     .or_else(|| single_item.get("index"))
                     .and_then(|v| if v.is_number() { Some(v.to_string()) } else { v.as_str().map(|s| s.to_string()) })
                     .unwrap_or_else(|| single_item.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string());
                 
-                let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(&original_id).replace("-", "").replace("_", "");
+                // 🌟 [CRITICAL FIX] aa.ts의 cleanNumber() 로직 완벽 일치: 온점(.)과 쉼표(,)도 함께 제거
+                let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(&original_id)
+                    .replace("-", "").replace("_", "").replace(".", "").replace(",", "");
+                
                 let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));
                 let hashed_item_id = if original_id.is_empty() {
                     crate::utils::hash::hash_id(&format!("{}{}", team_id, uuid::Uuid::new_v4()))
@@ -1977,6 +2054,8 @@ async fn process_task(
                     obj.insert("detail".to_string(), json!(false));
                     obj.insert("id".to_string(), json!(hashed_item_id.clone()));
                     obj.insert("index".to_string(), json!(index_val));
+                    // 🌟 [CRITICAL FIX] 증감 버그의 핵심 원인 해결! 리스트 추출 시에는 무조건 updated_at을 0으로 덮어씌워 이 항목이 Draft(가계정)임을 DB에 확실하게 각인시킵니다.
+                    obj.insert("updated_at".to_string(), json!(0));
                 }
 
                 let text_to_embed = parsing::json_to_natural_language(&single_item);
@@ -1998,9 +2077,11 @@ async fn process_task(
                 }
 
                 // 🌟 [클라우드 패리티 일치] 리스트(List) 수집 시: 
-                // 새 항목이면 draft++, 이미 상세페이지에서 동기화 완료된 항목이면 증감 없음
+                // 새 항목이면 pages: draft++, global: count++
                 if is_new {
-                    page_draft_diff += 1;
+                    let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
+                    e.0 += 1; // pages draft++
+                    e.2 += 1; // global count++
                 }
                 
                 let vector = if let Some(v) = existing_vector {
@@ -2081,6 +2162,10 @@ async fn process_task(
                                 },
                                 Ok(None) => {
                                     // 🌟 연관 문서가 존재하지 않으면 Draft(가계정) 껍데기를 생성합니다.
+                                    let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
+                                    e.0 += 1; // pages draft++
+                                    e.2 += 1; // global count++
+
                                     let mut draft_data = json!({});
                                     
                                     // 🌟 [버그 수정] q.value가 Number(예: index 값)일 때 해시가 증발하는 현상을 방어합니다.
@@ -2130,8 +2215,8 @@ async fn process_task(
     }
 
     if !items_to_process.is_empty() {
-        let _ = update_team_base_metrics(&store, &team_id, &task.cc, &page_type, &items_to_process, page_draft_diff, page_count_diff).await;
-        println!("[PROCESS] Metrics Engine updated base statistics for {} items. (Draft Diff: {}, Count Diff: {})", items_to_process.len(), page_draft_diff, page_count_diff);
+        let _ = update_team_base_metrics(&store, &team_id, &task.cc, &items_to_process, stats_diff.clone()).await;
+        println!("[PROCESS] Metrics Engine updated base statistics for {} items. (Stats Diff: {:?})", items_to_process.len(), stats_diff);
     }
 
     // Final Status Update
@@ -2277,10 +2362,8 @@ async fn update_team_base_metrics(
     store: &crate::store::VectorStore,
     team_id: &str,
     task_cc: &str,
-    item_type: &str,
     items: &Vec<serde_json::Value>,
-    page_draft_diff: i64,
-    page_count_diff: i64,
+    stats_diff: std::collections::HashMap<String, (i64, i64, i64)>,
 ) -> anyhow::Result<()> {
     let (team_json_str, team_vector, t_from, t_to, t_cc, t_bcc, t_ref, t_digest) = match store.get_item_by_id("users", team_id).await {
         Ok(Some(doc)) => (doc.json_data, doc.vector, doc.from, doc.to, doc.cc, doc.bcc, doc.r#ref, doc.digest),
@@ -2291,34 +2374,45 @@ async fn update_team_base_metrics(
         )
     };
 
-    let mut team_data: serde_json::Value = serde_json::from_str(&team_json_str).unwrap_or(json!({ "base": { "pages": {} } }));
+    // 🌟 [CRITICAL FIX] 덮어씌워짐(0표기) 원인 제거! 이중 래핑(json_data 안에 또 json_data가 문자열로 존재)된 경우 알맹이를 꺼내서 파싱합니다.
+    let mut parsed_val: serde_json::Value = serde_json::from_str(&team_json_str).unwrap_or(json!({ "base": { "pages": {} } }));
+    if let Some(inner_str) = parsed_val.get("json_data").and_then(|v| v.as_str()) {
+        if let Ok(inner_obj) = serde_json::from_str(inner_str) {
+            parsed_val = inner_obj;
+        }
+    }
+    let mut team_data = parsed_val;
     
-    // --- [블록 1: 페이지별 통계 업데이트] ---
+    // --- [블록 1 & 2: 맵 순회로 모든 타입의 통계 업데이트] ---
+    for (t_name, (pages_draft_diff, pages_count_diff, global_count_diff)) in stats_diff.iter() {
+        // 페이지별 통계 업데이트
+        {
+            let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
+            let pages = base.entry("pages").or_insert(json!({})).as_object_mut().unwrap();
+            let cc_node = pages.entry(task_cc).or_insert(json!({})).as_object_mut().unwrap();
+            let page_type_node = cc_node.entry(t_name).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
+
+            let current_draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
+            let current_count = page_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+            
+            page_type_node.insert("draft".to_string(), json!(0.max(current_draft + pages_draft_diff)));
+            page_type_node.insert("count".to_string(), json!(0.max(current_count + pages_count_diff)));
+        } 
+
+        // 글로벌 전체 통계 업데이트 (aa.ts와 동일하게 draft는 건드리지 않고 count만 누적)
+        {
+            let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
+            let global_type_node = base.entry(t_name).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
+            
+            let global_count = global_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+            
+            // 글로벌 draft는 클라우드 로직 상 사용되지 않으므로 보존하거나 건드리지 않습니다.
+            global_type_node.insert("count".to_string(), json!(0.max(global_count + global_count_diff)));
+        }
+    }
+
+    // Min/Max 업데이트는 items 내의 데이터에 한해서 진행
     {
-        let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
-        let pages = base.entry("pages").or_insert(json!({})).as_object_mut().unwrap();
-        let cc_node = pages.entry(task_cc).or_insert(json!({})).as_object_mut().unwrap();
-        let page_type_node = cc_node.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
-
-        let current_draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
-        let current_count = page_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-        
-        page_type_node.insert("draft".to_string(), json!(0.max(current_draft + page_draft_diff)));
-        page_type_node.insert("count".to_string(), json!(0.max(current_count + page_count_diff)));
-    } 
-
-    // --- [블록 2: 글로벌 전체 통계 및 Min/Max 업데이트] ---
-    {
-        let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
-        let global_type_node = base.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
-        
-        let global_draft = global_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
-        let global_count = global_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-        
-        // 🌟 [클라우드 패리티 완벽 일치] team.data.base.pages와 team.data.base[type] 공통으로 draft와 count 증감을 적용합니다.
-        global_type_node.insert("draft".to_string(), json!(0.max(global_draft + page_draft_diff)));
-        global_type_node.insert("count".to_string(), json!(0.max(global_count + page_count_diff)));
-
         let properties = [
             "price", "quantity", "width", "height", "length", "weight", "shipping_fee", 
             "shipping_duration", "sale_price", "supply_price", "low_stock_threshold", 
@@ -2327,6 +2421,10 @@ async fn update_team_base_metrics(
         ];
 
         for item in items {
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
+            let global_type_node = base.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
+
             for prop in properties.iter() {
                 if let Some(val) = item.get(*prop) {
                     let num_val = if val.is_number() {
@@ -2359,7 +2457,12 @@ async fn update_team_base_metrics(
         println!("\n[DEBUG-METRICS] 최종 반영된 Base JSON 값:\n{}", serde_json::to_string_pretty(base_json).unwrap_or_default());
     }
 
-    // 5. Save back to DB
+    // 🌟 [CRITICAL FIX] 팀 통계 업데이트 시 DB의 변경 스킵 조건(updated_at, digest)에 걸리지 않도록 명시적으로 최신 시간을 주입합니다.
+    if let Some(obj) = team_data.as_object_mut() {
+        obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+    }
+
+    // 5. Save back to DB (digest 파라미터에 None을 전달하여 강제 쓰기를 유도합니다)
     let _ = store.upsert_item(
         "users", 
         team_id, 
@@ -2371,7 +2474,7 @@ async fn update_team_base_metrics(
         Some(&t_cc),
         Some(&t_bcc),
         Some(&t_ref),
-        Some(&t_digest)
+        None
     ).await;
 
     Ok(())
