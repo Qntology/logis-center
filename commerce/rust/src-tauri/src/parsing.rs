@@ -8,6 +8,7 @@ pub enum PugMode {
     FullContent,
     DetailMode,
     TheadMode,
+    ListMode, // 🌟 리스트 아이템 추출 시 href 등 주요 속성을 보존하고 id, class만 제거하기 위한 전용 모드
 }
 
 pub fn sanitize_llm_input(text: &str) -> String {
@@ -319,6 +320,7 @@ pub struct TableContext {
     pub current_row_idx: usize,
     pub current_col_idx: usize,
     pub is_in_tbody: bool,
+    pub base_url: Option<String>, // 🌟 상대 주소를 절대 주소로 치환하기 위한 base_url 추가
 }
 
 pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output: &mut String, mode: &PugMode, ctx: &mut Option<TableContext>) {
@@ -359,15 +361,15 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             // --- 허용된 속성만 Pug 문법으로 변환 ---
             let mut other_attributes = Vec::new();
 
-            // ID 속성 처리 (DetailMode, TheadMode가 아닐 때만 유지)
-            if *mode != PugMode::DetailMode && *mode != PugMode::TheadMode {
+            // ID 속성 처리 (DetailMode, TheadMode, ListMode가 아닐 때만 유지 -> 3가지 모드에선 id 비움)
+            if *mode != PugMode::DetailMode && *mode != PugMode::TheadMode && *mode != PugMode::ListMode {
                 if let Some(id) = element.id() {
                     other_attributes.push(format!("id=\"{}\"", id));
                 }
             }
 
-            // Class 속성 처리 (DetailMode, TheadMode가 아닐 때만 유지)
-            if *mode != PugMode::DetailMode && *mode != PugMode::TheadMode {
+            // Class 속성 처리 (DetailMode, TheadMode, ListMode가 아닐 때만 유지 -> 3가지 모드에선 class 비움)
+            if *mode != PugMode::DetailMode && *mode != PugMode::TheadMode && *mode != PugMode::ListMode {
                 if let Some(classes) = element.attr("class") {
                     if !classes.is_empty() {
                         other_attributes.push(format!("class=\"{}\"", classes));
@@ -409,7 +411,21 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                     if ["checked", "selected", "disabled", "readonly"].contains(&name) && (value.is_empty() || value == name) {
                         other_attributes.push(name.to_string());
                     } else if !value.is_empty() {
-                        let safe_value = value.replace("\"", "'");
+                        let mut safe_value = value.replace("\"", "'");
+                        
+                        // 🌟 [CRITICAL FIX] href, src 속성에 들어있는 상대 경로(./ 또는 /)를 완벽한 절대 경로로 자동 치환합니다.
+                        if name == "href" || name == "src" {
+                            if let Some(c) = ctx.as_ref() {
+                                if let Some(base) = &c.base_url {
+                                    if let Ok(base_url_obj) = url::Url::parse(base) {
+                                        if let Ok(resolved_url) = base_url_obj.join(&safe_value) {
+                                            safe_value = resolved_url.to_string();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         other_attributes.push(format!("{}=\"{}\"", name, safe_value));
                     }
                 }
@@ -471,7 +487,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             if tag_name == "tbody" { if let Some(c) = ctx.as_mut() { c.is_in_tbody = false; } }
         }
         Node::Text(text) => {
-            if *mode == PugMode::FullContent || *mode == PugMode::DetailMode || *mode == PugMode::TheadMode {
+            if *mode == PugMode::FullContent || *mode == PugMode::DetailMode || *mode == PugMode::TheadMode || *mode == PugMode::ListMode {
                 let text_content = text.trim();
                 if !text_content.is_empty() {
                     output.push_str(&format!("{}| {}\n", indent, text_content.replace("\"", "'")));
@@ -483,10 +499,10 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
 }
 
 pub fn split_doc_to_pug_list(document: &Html, selector_str: &str, mode: PugMode) -> Vec<String> {
-    split_doc_to_pug_list_advanced(document, selector_str, mode, None)
+    split_doc_to_pug_list_advanced(document, selector_str, mode, None, None)
 }
 
-pub fn split_doc_to_pug_list_advanced(document: &Html, selector_str: &str, mode: PugMode, headers: Option<Vec<Vec<String>>>) -> Vec<String> {
+pub fn split_doc_to_pug_list_advanced(document: &Html, selector_str: &str, mode: PugMode, headers: Option<Vec<Vec<String>>>, base_url: Option<&str>) -> Vec<String> {
     let selector = match Selector::parse(selector_str) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -504,9 +520,11 @@ pub fn split_doc_to_pug_list_advanced(document: &Html, selector_str: &str, mode:
                 let mut pug_output = String::new();
                 pug_output.reserve(2048);
                 
-                let mut ctx = headers.as_ref().map(|h| TableContext {
-                    headers: h.clone(),
+                // 🌟 [CRITICAL FIX] headers가 없더라도 base_url을 전달받아 절대 주소 치환이 가능하도록 구조체를 무조건 생성합니다.
+                let mut ctx = Some(TableContext {
+                    headers: headers.clone().unwrap_or_default(),
                     is_in_tbody: true,
+                    base_url: base_url.map(|s| s.to_string()),
                     ..Default::default()
                 });
                 
@@ -1080,7 +1098,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     "goods" => r###"- "goods":
     - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
-    - "link":Refer to the ID to find a URL that includes a manage goods link | string
+    - "link":Refer to the ID to find a URL that includes a manage product link | string
     - "currency":ISO 4217 Currency Code | string
     - "sale_price":sale price | number
     - "registration_date":yyyy-MM-ddThh:mm:ss | string

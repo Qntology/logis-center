@@ -1261,7 +1261,7 @@ async fn process_task(
                     // 🌟 [최적화] TheadMode를 적용하여 th/td의 scope, rowspan, colspan만 남기고 모든 속성(href, id, class 등) 제거
                     crate::parsing::generate_pug_lines((*target_node).into(), 0, &mut tpug, &PugMode::TheadMode, &mut None);
                     thead_pug = tpug.trim().to_string();
-                    
+
                     if !thead_pug.is_empty() {
                         println!("[Scheduler] 🎉 thead_pug extraction successful ({} bytes)", thead_pug.len());
                     }
@@ -1350,13 +1350,13 @@ async fn process_task(
             let clean_content = &clean_html_content;
             let document = scraper::Html::parse_document(clean_content);
             
-            // 🌟 5. alt 속성 주입을 위한 headers 수집을 완전히 폐기하고 None으로 PUG를 생성합니다.
-            // 🌟 [최적화] DetailMode를 적용하여 item_pug 생성 시 불필요한 class와 id 속성을 모두 제거합니다.
+            // 🌟 [최적화] 리스트 전용 ListMode를 적용하여 href 속성은 완벽히 보존하고, 불필요한 class와 id 속성만 제거합니다.
             parsing::split_doc_to_pug_list_advanced(
                 &document, 
                 &target_selector, 
-                PugMode::DetailMode, 
-                None
+                PugMode::ListMode, 
+                None,
+                Some(&url) // 🌟 [CRITICAL FIX] 추가된 5번째 인자로 현재 작업 중인 URL을 전달하여 상대 주소가 절대 주소로 치환되도록 합니다!
             )
         };
 
@@ -1379,6 +1379,8 @@ async fn process_task(
                 });
                 log_task_progress(app_handle, &task.id, &payload);
                 emit_term(&format!("[STAGE-3] {}", summary_msg));
+                
+                println!("item_pug {}", item_pug);
 
                 // 🌟 [CRITICAL FIX 3] E0061 해결: 인자 5개를 받도록 변경된 list2json 구조에 완벽하게 맞춥니다.
                 let task_question = parsing::list2json(
