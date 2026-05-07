@@ -51,16 +51,22 @@ pub fn pre_clean_html(html: &str) -> String {
     clean.trim().to_string()
 }
 
-pub fn convert_doc_to_clean_pug(document: &Html, mode: PugMode) -> String {
+pub fn convert_doc_to_clean_pug(document: &Html, mode: PugMode, base_url: Option<&str>) -> String {
     let mut pug_output = String::new();
     pug_output.reserve(1024 * 50);
     
+    // 🌟 [CRITICAL FIX] 상세 모드(Detail Mode) 등에서도 상대 주소를 절대 주소로 치환하기 위한 컨텍스트 주입
+    let mut ctx = Some(TableContext {
+        base_url: base_url.map(|s| s.to_string()),
+        ..Default::default()
+    });
+
     // Discovery 모드(StructureOnly)일 때는 body 내부만 집중
     let mut found_body = false;
     for child in document.tree.root().children() {
         if let Some(element) = child.value().as_element() {
             if element.name() == "body" {
-                generate_pug_lines(child, 0, &mut pug_output, &mode, &mut None);
+                generate_pug_lines(child, 0, &mut pug_output, &mode, &mut ctx);
                 found_body = true;
                 break;
             }
@@ -68,25 +74,30 @@ pub fn convert_doc_to_clean_pug(document: &Html, mode: PugMode) -> String {
     }
     if !found_body {
         for child in document.tree.root().children() {
-            generate_pug_lines(child, 0, &mut pug_output, &mode, &mut None);
+            generate_pug_lines(child, 0, &mut pug_output, &mode, &mut ctx);
         }
     }
     sanitize_llm_input(&pug_output)
 }
     
-pub fn convert_to_clean_pug(html: &str, mode: PugMode) -> String {
+pub fn convert_to_clean_pug(html: &str, mode: PugMode, base_url: Option<&str>) -> String {
     let document = Html::parse_document(html);
-    convert_doc_to_clean_pug(&document, mode)
+    convert_doc_to_clean_pug(&document, mode, base_url)
 }
 
-pub fn convert_doc_to_clean_pug_selector(document: &Html, selector_str: &str, mode: PugMode) -> String {
+pub fn convert_doc_to_clean_pug_selector(document: &Html, selector_str: &str, mode: PugMode, base_url: Option<&str>) -> String {
     let selector = match Selector::parse(selector_str) {
         Ok(s) => s,
         Err(_) => return String::new(),
     };
     let mut pug_output = String::new();
     pug_output.reserve(1024 * 5);
-    let mut ctx = None;
+    
+    let mut ctx = Some(TableContext {
+        base_url: base_url.map(|s| s.to_string()),
+        ..Default::default()
+    });
+    
     for node in document.tree.root().descendants() {
         if let Some(element_ref) = scraper::ElementRef::wrap(node) {
             if selector.matches(&element_ref) {
@@ -98,9 +109,9 @@ pub fn convert_doc_to_clean_pug_selector(document: &Html, selector_str: &str, mo
     pug_output
 }
 
-pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMode) -> String {
+pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMode, base_url: Option<&str>) -> String {
     let document = Html::parse_document(html);
-    convert_doc_to_clean_pug_selector(&document, selector_str, mode)
+    convert_doc_to_clean_pug_selector(&document, selector_str, mode, base_url)
 }
 
 // 🌟 [HTML5 부모/자식 뎁스 판별 절대 규칙 (Parent Trace Rule)]

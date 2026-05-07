@@ -46,6 +46,25 @@ fn merge_json_results(target: &mut Value, source: &Value) {
     }
 }
 
+// 🌟 [CRITICAL FIX] aa.ts의 mergeNode 로직 완벽 이식: 빈 값(null, 0, "")은 무시하고 유효한 값만 덮어씁니다.
+fn merge_node(obj1: &Value, obj2: &Value) -> Value {
+    let mut merged = obj1.clone();
+    if let (Some(m_obj), Some(o2_obj)) = (merged.as_object_mut(), obj2.as_object()) {
+        for (k, v) in o2_obj {
+            let is_empty = match v {
+                Value::Null => true,
+                Value::String(s) => s.is_empty(),
+                Value::Number(n) => n.as_f64().unwrap_or(0.0) == 0.0,
+                _ => false,
+            };
+            if !is_empty {
+                m_obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    merged
+}
+
 use tokio::sync::Notify;
 use once_cell::sync::Lazy;
 use once_cell::sync::OnceCell;
@@ -541,7 +560,8 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let clean_html_content = parsing::pre_clean_html(&raw_html_content);
-    let raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::FullContent);
+    // 🌟 [CRITICAL FIX] 1단계 분석에서도 현재 URL을 넘겨 PUG 상의 모든 상대 주소를 절대 주소로 치환합니다.
+    let raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::FullContent, Some(&url));
     let light_pug = model.truncate_pug_context(&raw_pug, false, 2000, None).await;
 
     println!("[DEBUG-PUG] Generated PUG. Length: {}. Snippet: {}...", 
@@ -1379,8 +1399,6 @@ async fn process_task(
                 });
                 log_task_progress(app_handle, &task.id, &payload);
                 emit_term(&format!("[STAGE-3] {}", summary_msg));
-                
-                println!("item_pug {}", item_pug);
 
                 // 🌟 [CRITICAL FIX 3] E0061 해결: 인자 5개를 받도록 변경된 list2json 구조에 완벽하게 맞춥니다.
                 let task_question = parsing::list2json(
@@ -1520,7 +1538,8 @@ async fn process_task(
         let content_pug = {
             let clean_content = &clean_html_content;
             // 🌟 [최적화] 정규식 대신 파서 단에서 DetailMode를 적용하여 안전하게 id와 class 속성을 제거합니다.
-            let raw_pug = parsing::convert_to_clean_pug(clean_content, PugMode::DetailMode);
+            // 🌟 [CRITICAL FIX] 상세 페이지 전처리 시에도 URL을 넘겨 item2json 등에서 LLM이 절대 주소를 뽑아내도록 유도합니다!
+            let raw_pug = parsing::convert_to_clean_pug(clean_content, PugMode::DetailMode, Some(&url));
             
             // 🌟 [CRITICAL FIX] 디테일 모드에서도 통일된 절단 로직을 호출하여 모델 부재 시의 누수를 막습니다.
             model.truncate_pug_context(&raw_pug, true, 2000, None).await
@@ -1844,6 +1863,11 @@ async fn process_task(
             if existing_item.digest == item_digest {
                 existing_vector = Some(existing_item.vector);
             }
+
+            // 🌟 [CRITICAL FIX] 병합(Merge) 패리티 일치: 상세 데이터로 기존 리스트 데이터를 엎어버려 식별자가 날아가는 현상을 막습니다.
+            if let Ok(existing_json) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
+                extracted_data = merge_node(&existing_json, &extracted_data);
+            }
         } 
         // 🌟 [CRITICAL FIX] 2. 못 찾았을 경우, 상세페이지의 실제 URL(url)을 통해 리스트 아이템이 저장해둔 "link" 속성과 대조하여 역추적합니다.
         else if !url.is_empty() {
@@ -1852,14 +1876,9 @@ async fn process_task(
             } else {
                 url.clone()
             };
-            if let Ok(Some((found_id, _))) = store.find_item_by_property(&target_table, "link", &json!(normalized_link)).await {
+            if let Ok(Some((found_id, json_val))) = store.find_item_by_property(&target_table, "link", &json!(normalized_link)).await {
                 target_id = found_id.clone();
                 is_new = false;
-                
-                // 찾은 진짜 ID로 내부 JSON 데이터도 수정하여 완벽하게 덮어쓰기할 준비를 합니다.
-                if let Some(obj) = extracted_data.as_object_mut() {
-                    obj.insert("id".to_string(), json!(target_id.clone()));
-                }
                 
                 if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
                     was_draft = if existing_item.updated_at_ts == 0 {
@@ -1873,6 +1892,12 @@ async fn process_task(
                     if existing_item.digest == item_digest {
                         existing_vector = Some(existing_item.vector);
                     }
+                }
+                
+                // 🌟 [CRITICAL FIX] 병합(Merge) 패리티 일치
+                extracted_data = merge_node(&json_val, &extracted_data);
+                if let Some(obj) = extracted_data.as_object_mut() {
+                    obj.insert("id".to_string(), json!(target_id.clone()));
                 }
             }
         }
@@ -1957,6 +1982,8 @@ async fn process_task(
                                     let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
                                     e.0 -= 1; // pages draft--
                                     e.1 += 1; // pages count++
+                                    // 🌟 [CRITICAL FIX] 취합(Aggregation) 패리티 일치: 상세(Detail) 모드에서 연관 문서가 Draft에서 정식으로 승급될 때, 글로벌 카운트도 함께 올려줍니다.
+                                    e.2 += 1; // global count++
                                     foreign_data.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
                                 }
                                 let merged_text = parsing::json_to_natural_language(&foreign_data);
