@@ -1342,24 +1342,57 @@ async fn process_task(
             let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
             let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
 
-            let mut page_data: serde_json::Value = selector_info.clone();
-            if let Some(obj) = page_data.as_object_mut() {
-                obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
-                obj.insert("link".to_string(), json!(url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()));
-                obj.insert("type".to_string(), json!(page_type.clone()));
-                
-                if let Some(item_sel) = selector_info.get("itemSelector") {
-                    obj.insert("item".to_string(), item_sel.clone()); 
-                }
-                if let Some(parent_sel) = selector_info.get("parent") {
-                    obj.insert("node".to_string(), parent_sel.clone()); 
-                }
-                obj.insert("detail".to_string(), json!(false));
-            }
-
             let ref_for_page = if !task.r#ref.is_empty() { &task.r#ref } else { raw_path };
-            let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(ref_for_page), None).await;
-            println!("[Scheduler] Page cache updated in DB (including head selector).");
+
+            // 🌟 [CRITICAL FIX] bb.ts 패리티 완벽 복원: 
+            // 상세(Detail) 페이지일 때 List 캐시를 덮어씌워 날려버리는 버그를 방어하고,
+            // 리스트 페이지를 전처리할 때는 아코디언 메뉴(자식 노드) 렌더링을 위한 Detail 껍데기를 DB에 함께 생성해 줍니다.
+            if !is_detail {
+                let mut page_data: serde_json::Value = selector_info.clone();
+                if let Some(obj) = page_data.as_object_mut() {
+                    obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
+                    obj.insert("link".to_string(), json!(url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()));
+                    obj.insert("type".to_string(), json!(page_type.clone()));
+                    
+                    if let Some(item_sel) = selector_info.get("itemSelector") {
+                        obj.insert("item".to_string(), item_sel.clone()); 
+                    }
+                    if let Some(parent_sel) = selector_info.get("parent") {
+                        obj.insert("node".to_string(), parent_sel.clone()); 
+                    }
+                    obj.insert("detail".to_string(), json!(false));
+                }
+
+                let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(ref_for_page), None).await;
+                println!("[Scheduler] Page cache updated in DB (including head selector).");
+
+                // 🌟 상세 페이지용 껍데기(자식 노드) 동시 생성
+                let detail_page_id = crate::utils::hash::hash_id(&format!("{}{}{}", page_type, task.cc.to_uppercase(), url_obj.path()));
+                let detail_bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, task.cc.to_uppercase()));
+                let detail_page_data = json!({
+                    "origin": format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or("")),
+                    "link": url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str(),
+                    "type": page_type.clone(),
+                    "detail": true,
+                    "node": true,
+                    "item": ""
+                });
+                let _ = store.upsert_item("pages", &detail_page_id, "pages", detail_page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
+
+            } else {
+                // 🌟 상세 페이지일 때는 List의 셀렉터를 건드리지 않고, Detail 본인의 껍데기만 저장/갱신합니다.
+                let detail_page_id = crate::utils::hash::hash_id(&format!("{}{}{}", page_type, task.cc.to_uppercase(), url_obj.path()));
+                let detail_bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, task.cc.to_uppercase()));
+                let detail_page_data = json!({
+                    "origin": format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or("")),
+                    "link": url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str(),
+                    "type": page_type.clone(),
+                    "detail": true,
+                    "node": true,
+                    "item": ""
+                });
+                let _ = store.upsert_item("pages", &detail_page_id, "pages", detail_page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
+            }
         }
         
         // [LIST MODE] 지능형 리스트 추출 (LLM 기반)
@@ -2411,12 +2444,21 @@ async fn update_team_base_metrics(
 
     // 🌟 [CRITICAL FIX] 덮어씌워짐(0표기) 원인 제거! 이중 래핑(json_data 안에 또 json_data가 문자열로 존재)된 경우 알맹이를 꺼내서 파싱합니다.
     let mut parsed_val: serde_json::Value = serde_json::from_str(&team_json_str).unwrap_or(json!({ "base": { "pages": {} } }));
-    if let Some(inner_str) = parsed_val.get("json_data").and_then(|v| v.as_str()) {
+    
+    // 🌟 [CRITICAL FIX] 무한 중첩된 json_data(Matryoshka 버그) 완벽 해제
+    while let Some(inner_str) = parsed_val.get("json_data").and_then(|v| v.as_str()) {
         if let Ok(inner_obj) = serde_json::from_str(inner_str) {
             parsed_val = inner_obj;
+        } else {
+            break;
         }
     }
     let mut team_data = parsed_val;
+    
+    // 🌟 기존에 껍데기로 남아있는 json_data 프로퍼티는 삭제하여 다음 저장 시 재귀적 중첩을 방지합니다.
+    if let Some(obj) = team_data.as_object_mut() {
+        obj.remove("json_data");
+    }
     
     // --- [블록 1 & 2: 맵 순회로 모든 타입의 통계 업데이트] ---
     for (t_name, (pages_draft_diff, pages_count_diff, global_count_diff)) in stats_diff.iter() {

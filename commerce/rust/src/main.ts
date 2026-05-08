@@ -877,18 +877,19 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
             } else if (node.data || node.type) {
                 type = 'page';
                 const data = node.data || {};
-                const nodeType = node.type || data.type || 'unknown';
+                // 🌟 [CRITICAL FIX] DB 테이블명(pages)이 아닌 진짜 속성(goods, tracking)을 우선적으로 참조하도록 수정합니다.
+                const nodeType = data.type || node.type || 'unknown';
                 console.log("[DEBUG] renderAccordion Page Node:", { id: nodeId, type: nodeType, domain: node.domain, origin: data.origin, link: data.link });
-                name = `<span>${nodeType}</span> <span>${(data.item ? " Draft" : " ")}</span>`;
 
                 if (data.origin) {
                     _url = new URL(data.origin);
                     const domain = node.domain || _url.hostname;
                     if (!navTmp[domain] && data.item) {
-                        // 🌟 [추가] Host명 옆에 일괄 Show Hidden 버튼을 숨김 상태로 렌더링
-                        host = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
-                                  <strong style="margin-bottom:0;">${domain}<button class="btn-show-domain-hidden" data-domain="${domain}" style="display:none; margin-left: 10px; background:none; border:none; cursor:pointer; font-size:10px; font-style: italic; text-decoration:underline;">Show</button></strong>
-                                </div>`;
+                        // 🌟 [CRITICAL FIX] bb.ts 패리티 완벽 복원: CSS 파괴를 막기 위해 불필요한 div 래핑을 모두 제거하고 원본 구조 유지
+                        host = `<strong>${domain}</strong>`;
+                        if (API_HOST.includes(domain)) {
+                            host += `<label for="membership">Edit</label>`;
+                        }
                         navTmp[domain] = true;
                     }
                     if (nodeId === activeContext.ref || (currentDetectedUrl && currentDetectedUrl.includes(data.link))) {
@@ -917,12 +918,15 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                         // 🌟 [CRITICAL FIX 1] AI 검색(Select)을 타격하여 무한 스피너가 도는 현상을 원천 차단합니다.
                         const _items = await invoke<any[]>("get_all_documents", { limit: 1, offset: 0, filter: `bcc = '${bcc}'` });
                         if (_items.length && _items[0].created_at) {
-                            recent = `<strong>${time2text(Number(_items[0].created_at))}</strong>`;
+                            // 🌟 bb.ts의 유저 이름 표기 로직과 동일하게 작성자 정보를 가져와 병합 표기
+                            const timeStr = time2text(Number(_items[0].created_at));
+                            const author = _items[0].from ? _items[0].from.substring(0,6) : "system";
+                            recent = `<strong>${timeStr} - ${author}</strong>`;
                         }
                     }
                 } catch (err) {}
 
-                // 🌟 [CRITICAL FIX] front.js 패리티: 리스트 페이지(data.item 존재)일 경우 'Draft' 문구와 draft 카운트를 정확히 표기합니다!
+                // 🌟 [CRITICAL FIX] bb.ts 패리티 완벽 복원: 실제 타입(nodeType)을 최우선으로 출력하여 'pages'로 노출되는 버그를 고칩니다!
                 name = `<span>${nodeType}</span> <span>${(data.item ? " Draft" : " ")}</span>`;
                 
                 var count = '';
@@ -936,14 +940,12 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                 const isHidden = hiddenPages.includes(nodeId);
                 const visibilityIcon = isHidden ? "show" : "hide";
                 
-                const visibilityBtn = `<button class="btn-toggle-visibility" data-id="${nodeId}">${visibilityIcon}</button>`;
+                // 🌟 [CRITICAL FIX] 기존 CSS 레이아웃을 파괴하지 않도록 절대 위치(absolute)를 사용하여 우측 상단에 버튼을 배치합니다.
+                const visibilityBtn = `<button class="btn-toggle-visibility" data-id="${nodeId}" style="position: absolute; right: 10px; top: 10px; background: none; border: none; cursor: pointer; font-size: 10px; text-decoration: underline; color: #888; z-index: 10;">${visibilityIcon}</button>`;
 
-                // 🌟 [CRITICAL FIX] 숨김 상태일 때 내용(content)이 완전히 증발하여 다시 Show를 누를 수 없게 되는 치명적 버그 해결!
+                // 🌟 [CRITICAL FIX] 실수로 누락했던 visibilityBtn 변수를 content 문자열 맨 끝에 다시 포함시킵니다!
                 const opacityStyle = isHidden ? 'opacity: 0.3;' : 'opacity: 1;';
-                content = `<div style="display:flex; align-items:center; width:100%; justify-content:space-between; ${opacityStyle}">
-                    ${visibilityBtn}
-                    <div style="display:flex; align-items:center; gap:4px;"><span>${name} ${count}</span> ${recent}</div>
-                </div>`;
+                content = `<span style="${opacityStyle}">${name}\n${count}\n</span>\n${recent}\n${visibilityBtn}`;
             }
 
             var hasChildren = node.children && node.children.length > 0;
@@ -1041,61 +1043,95 @@ async function renderNavigation() {
             // 🌟 일치하는 데이터가 있으면 섹션을 화면에 표시하되, 세팅/Shipping 상태에 맞춰 제어합니다.
             if (navSection) navSection.style.display = (isSettingsOpen || currentSearchMode === "shipping") ? "none" : "block";
             
+            // 🌟 [CRITICAL FIX] bb.ts의 페이지 트리(Branch) 조립 로직을 완벽히 복원하여 뎁스가 깨지는 현상을 해결합니다.
             const branchs: Record<string, any> = {};
 
-            // 1. Build branch Map (origin#type and id)
-            for (var p = 0; p < _pages.length; p++) {
-                var _page = _pages[p];
+            for (let p = 0; p < _pages.length; p++) {
+                let _page = _pages[p];
                 const data = _page.data || _page;
                 if (!data.origin) continue;
 
                 const domain = new URL(data.origin).hostname;
                 _page.domain = domain;
-                _page.id = _page.id || _page.uuid; // Ensure ID exists
+                _page.id = _page.id || _page.uuid;
 
                 if (data.item) {
-                    const listKey = `${data.origin}#${_page.type}`;
-                    if (!branchs[listKey]) {
-                        branchs[listKey] = { ..._page, children: [] };
-                    } else {
-                        // If we already have a shell, upgrade it to a full List node
-                        Object.assign(branchs[listKey], _page);
+                    branchs[`${data.origin}#${_page.type}`] = { ..._page, children: [] };
+                }
+                branchs[_page.id] = { ..._page, children: [] };
+            }
+
+            const temp: Record<string, any> = {};
+            for (let key in branchs) {
+                if (branchs.hasOwnProperty(key)) {
+                    let _page = safeClone(branchs[key]);
+                    const data = _page.data || _page;
+
+                    if (!temp[_page.id]) {
+                        temp[_page.id] = true;
+
+                        let parent = branchs[`${data.origin}#${_page.type}`];
+
+                        if (parent) {
+                            if (data.item) {
+                                let children = safeClone(parent.children);
+                                branchs[`${data.origin}#${_page.type}`] = {
+                                    ..._page,
+                                    children: children
+                                };
+                            } else if (!temp[`${data.origin}#${_page.type}`]) {
+                                temp[`${data.origin}#${_page.type}`] = true;
+                                branchs[`${data.origin}#${_page.type}`].children.push(_page);
+                            } else if (typeof data.node === "string" && typeof data.item === "string" && !data.item && typeof temp[`${data.origin}#${_page.type}`] !== "string") {
+                                if (branchs[`${data.origin}#${_page.type}`].children.length) {
+                                    temp[`${data.origin}#${_page.type}`] = 'true';
+                                    let index = 0;
+                                    for (let b = 0; b < branchs[`${data.origin}#${_page.type}`].children.length; b++) {
+                                        if (data.node === true) {
+                                            index = b;
+                                        }
+                                    }
+                                    branchs[`${data.origin}#${_page.type}`].children.splice(index, 1);
+                                    branchs[`${data.origin}#${_page.type}`].children.push(_page);
+                                }
+                            }
+                        } else {
+                            if (data.item) {
+                                if (!branchs[`${data.origin}#${_page.type}`]) {
+                                    branchs[`${data.origin}#${_page.type}`] = {
+                                        ..._page,
+                                        children: []
+                                    };
+                                }
+                            } else if (!temp[`${data.origin}#${_page.type}`]) {
+                                temp[`${data.origin}#${_page.type}`] = true;
+                                if (!branchs[`${data.origin}#${_page.type}`]) branchs[`${data.origin}#${_page.type}`] = { children: [] };
+                                branchs[`${data.origin}#${_page.type}`].children.push(_page);
+                            } else if (typeof data.node === "string" && typeof data.item === "string" && !data.item && typeof temp[`${data.origin}#${_page.type}`] !== "string") {
+                                if (branchs[`${data.origin}#${_page.type}`] && branchs[`${data.origin}#${_page.type}`].children && branchs[`${data.origin}#${_page.type}`].children.length) {
+                                    temp[`${data.origin}#${_page.type}`] = 'true';
+                                    let index = 0;
+                                    for (let b = 0; b < branchs[`${data.origin}#${_page.type}`].children.length; b++) {
+                                        if (data.node === true) {
+                                            index = b;
+                                        }
+                                    }
+                                    branchs[`${data.origin}#${_page.type}`].children.splice(index, 1);
+                                    branchs[`${data.origin}#${_page.type}`].children.push(_page);
+                                }
+                            }
+                        }
                     }
                 }
-                // Always keep a ref by ID for grouping details
-                if (!branchs[_page.id]) {
-                    branchs[_page.id] = { ..._page, children: [] };
-                }
             }
 
-            // 2. Logic Tree Assembly
             const tree: any[] = [];
-            const processedIds = new Set();
-
-            // First, process all nodes that are Lists (Parents)
             for (let key in branchs) {
-                let node = branchs[key];
-                if (key.includes('#')) { // It's an origin#type group
-                    tree.push(node);
-                    processedIds.add(node.id);
+                if (branchs.hasOwnProperty(key)) {
+                    if (key.includes('#')) {
+                        tree.push(branchs[key]);
+                    }
                 }
-            }
-
-            // Second, attach Details to their respective Lists, or add as top-level if standalone
-            for (var p = 0; p < _pages.length; p++) {
-                let _page = _pages[p];
-                const pageId = _page.id || _page.uuid;
-                if (processedIds.has(pageId)) continue;
-
-                const data = _page.data || _page;
-                const parentKey = `${data.origin}#${_page.type}`;
-                
-                if (branchs[parentKey]) {
-                    branchs[parentKey].children.push(_page);
-                } else {
-                    tree.push({ ..._page, children: [] });
-                }
-                processedIds.add(pageId);
             }
 
             // 🌟 [CRITICAL FIX] 네비게이션(Accordion)을 렌더링하기 직전에, 
@@ -1106,12 +1142,24 @@ async function renderNavigation() {
                 if (teamDoc) {
                     // 🌟 [CRITICAL FIX] LanceDB(TradeDocument)와 Server(JSON)의 포맷 차이 완벽 호환
                     // TradeDocument의 경우 최신 데이터가 문자열 형태의 json_data에 들어있으므로 최우선으로 파싱합니다.
-                    let teamData: any = null;
-                    if (teamDoc.json_data && typeof teamDoc.json_data === "string") {
-                        try { teamData = JSON.parse(teamDoc.json_data); } catch(e) {}
+                    let teamData: any = teamDoc;
+                    
+                    // 🌟 [CRITICAL FIX] 백엔드에서 이중, 삼중으로 인코딩된 json_data(Matryoshka 버그)를 완벽하게 벗겨냅니다.
+                    while (teamData && teamData.json_data && typeof teamData.json_data === "string") {
+                        try {
+                            const parsed = JSON.parse(teamData.json_data);
+                            if (parsed && typeof parsed === "object") {
+                                teamData = parsed;
+                            } else {
+                                break;
+                            }
+                        } catch(e) {
+                            break;
+                        }
                     }
-                    if (!teamData && teamDoc.data) {
-                        teamData = typeof teamDoc.data === "string" ? JSON.parse(teamDoc.data) : teamDoc.data;
+                    
+                    if (teamData && !teamData.base && teamData.data) {
+                        teamData = typeof teamData.data === "string" ? JSON.parse(teamData.data) : teamData.data;
                     }
                     teamData = teamData || teamDoc;
 
@@ -1244,26 +1292,34 @@ async function renderNavigation() {
 
             // 2. Cloud Team Members 렌더링 (중복 Row 제거 로직 추가)
             if (cloudUsers.length > 0 && userList) {
-                const uniqueCloudMembers: any[] = [];
-                const seenMemberMap = new Map();
+                // 🌟 [CRITICAL FIX] bb.ts의 유저 트리(Tree) 조립 로직을 완벽히 복원하여 팀과 멤버의 구조를 맞춥니다.
+                const tempUsers: Record<string, any> = {};
+                const treeUsers: any[] = [];
 
-                cloudUsers.forEach(u => {
-                    if (u.type === "team") {
-                        uniqueCloudMembers.push(u);
-                    } else {
-                        const memberKey = u.to || u.id;
-                        if (!seenMemberMap.has(memberKey)) {
-                            seenMemberMap.set(memberKey, true);
-                            uniqueCloudMembers.push(u);
+                for (let u = 0; u < cloudUsers.length; u++) {
+                    let user = cloudUsers[u];
+                    tempUsers[user.id] = { ...user, children: [] };
+                }
+
+                for (let key in tempUsers) {
+                    if (tempUsers.hasOwnProperty(key)) {
+                        let user = tempUsers[key];
+                        let parentId = user.to;
+
+                        // 클라우드 동기화 과정에서 member 타입으로도 내려올 수 있으므로 포괄 처리
+                        if (user.type === "user" || user.type === "member") { 
+                            if (tempUsers[parentId]) {
+                                tempUsers[parentId].children.push(tempUsers[key]);
+                            } else {
+                                treeUsers.push(tempUsers[key]);
+                            }
+                        } else if (user.type === "team") {
+                            treeUsers.push(tempUsers[key]);
                         }
                     }
-                });
-
-                const teamNodes = uniqueCloudMembers.filter(u => u.type === "team").map(u => ({
-                    ...u, 
-                    children: uniqueCloudMembers.filter(m => (m.to === u.id || m.cc === u.id) && m.id !== u.id)
-                }));
-                userList.innerHTML = await renderAccordion(teamNodes);
+                }
+                
+                userList.innerHTML = await renderAccordion(treeUsers);
 
                 // 🌟 [수정] 방장(Owner)인 경우에만 ADD 버튼 노출 (폼은 HTML에 정적으로 존재)
                 const myTeam = cloudUsers.find(u => u.type === "team" && u.from === currentSession.address && u.id === u.to);
@@ -3277,7 +3333,8 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
             // 🌟 [추가] Analytic 모드에서는 raw user interaction 로그와 리포트를 불러옵니다.
             baseFilter = "type IN ('click', 'hover', 'change', 'report')"; 
         } else {
-            baseFilter = "type IN ('sales', 'goods', 'order', 'event', 'coupon', 'review', 'pages')";
+            // 🌟 [CRITICAL FIX] 'pages' 타입은 내부 캐시용이므로 메인 리스트에 노출되지 않도록 필터에서 제거합니다.
+            baseFilter = "type IN ('sales', 'goods', 'order', 'event', 'coupon', 'review')";
         }
 
         // 기존 내비게이션 필터가 있다면 안전하게 괄호로 묶어서 AND 조건 추가
