@@ -938,12 +938,12 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                 
                 const visibilityBtn = `<button class="btn-toggle-visibility" data-id="${nodeId}">${visibilityIcon}</button>`;
 
-                if(!isHidden){
-                    content = `<div style="display:flex; align-items:center; width:100%; justify-content:space-between;">
-                        ${visibilityBtn}
-                        <div style="display:flex; align-items:center; gap:4px;"><span>${name} ${count}</span> ${recent}</div>
-                    </div>`;
-                }
+                // 🌟 [CRITICAL FIX] 숨김 상태일 때 내용(content)이 완전히 증발하여 다시 Show를 누를 수 없게 되는 치명적 버그 해결!
+                const opacityStyle = isHidden ? 'opacity: 0.3;' : 'opacity: 1;';
+                content = `<div style="display:flex; align-items:center; width:100%; justify-content:space-between; ${opacityStyle}">
+                    ${visibilityBtn}
+                    <div style="display:flex; align-items:center; gap:4px;"><span>${name} ${count}</span> ${recent}</div>
+                </div>`;
             }
 
             var hasChildren = node.children && node.children.length > 0;
@@ -1004,8 +1004,16 @@ async function renderNavigation() {
 
     try {
         navTmp = {}; // Reset for fresh render
-        let _pages = await Select["pages"]({});
+        let _pagesRaw = await Select["pages"]({});
         
+        // 🌟 [CRITICAL FIX] 백엔드(LanceDB)에서 가져온 TradeDocument는 알맹이가 json_data 문자열에 있으므로 반드시 파싱해 주어야 UI 필터링에서 증발하지 않습니다!
+        let _pages = _pagesRaw.map(p => {
+            if (!p.data && p.json_data && typeof p.json_data === "string") {
+                try { p.data = JSON.parse(p.json_data); } catch(e) {}
+            }
+            return p;
+        });
+
         // 🌟 [CRITICAL FIX] 크롬 브라우저의 현재 접속 도메인과 일치하는 페이지만 남깁니다.
         let currentDomain = "";
         if (currentDetectedUrl) {
@@ -1216,7 +1224,15 @@ async function renderNavigation() {
 
         // Users rendering (simplified parity)
         const localUserList = document.getElementById("nav-list-local-users");
-        const users = await Select["users"]({});
+        const usersRaw = await Select["users"]({});
+        
+        // 🌟 [CRITICAL FIX] 백엔드(LanceDB)에서 가져온 유저 데이터 역시 json_data를 파싱해 주어야 Local/Cloud 분류가 정상 작동합니다!
+        const users = usersRaw.map(u => {
+            if (!u.data && u.json_data && typeof u.json_data === "string") {
+                try { u.data = JSON.parse(u.json_data); } catch(e) {}
+            }
+            return u;
+        });
         
         if (userList) userList.innerHTML = "";
         if (localUserList) localUserList.innerHTML = `<div class="empty">No local Members/Devices</div>`;

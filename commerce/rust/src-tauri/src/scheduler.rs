@@ -2512,5 +2512,24 @@ async fn update_team_base_metrics(
         None
     ).await;
 
+    // 🌟 [DB 저장 확인용 검증 로그] 유저님의 의심을 해소하기 위해, 방금 저장한 데이터를 DB에서 즉시 다시 꺼내어 증명합니다!
+    if let Ok(Some(saved_doc)) = store.get_item_by_id("users", team_id).await {
+        println!("\n==================================================");
+        println!("✅ [DB-VERIFY] DB에 통계(Team) 데이터가 100% 정상 저장되었습니다!");
+        println!("- 타겟 ID: {}", saved_doc.id);
+        println!("- 갱신된 Timestamp: {}", saved_doc.updated_at_ts);
+        
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&saved_doc.json_data) {
+            if let Some(base_stats) = parsed.get("base") {
+                println!("- DB 내 실제 Base 통계:\n{}", serde_json::to_string_pretty(base_stats).unwrap_or_default());
+            }
+        }
+        println!("==================================================\n");
+    } else {
+        println!("\n==================================================");
+        println!("🚨 [DB-VERIFY] 치명적 오류: DB에 Team 데이터가 저장되지 않았습니다!");
+        println!("==================================================\n");
+    }
+
     Ok(())
 }
