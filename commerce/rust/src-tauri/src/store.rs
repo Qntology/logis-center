@@ -535,7 +535,14 @@ impl VectorStore {
              data_val.get("created_at").and_then(|v| v.as_i64()).unwrap_or(now_ts) 
          };
          let schema = table.schema().await?;
-         let values_builder = Float32Array::from(vector.unwrap_or(vec![0.0; 768]));
+         
+         // 🌟 [CRITICAL FIX] get_item_by_id 등에서 빈 벡터(vec![])가 넘어왔을 때 768차원 고정 배열 생성에 실패하여 데이터가 증발하는 현상을 완벽 방어합니다.
+         let safe_vector = match vector {
+             Some(v) if v.len() == 768 => v,
+             _ => vec![0.0; 768],
+         };
+         let values_builder = Float32Array::from(safe_vector);
+         
          let list_field = Field::new("item", DataType::Float32, true);
          let list_array = FixedSizeListArray::try_new(Arc::new(list_field), 768, Arc::new(values_builder), None)?;
          let batch = RecordBatch::try_new(schema.clone(), vec![
@@ -576,7 +583,9 @@ impl VectorStore {
         let table = self.conn.open_table(table_name).execute().await?;
         let mut q = table.query();
         if let Some(f) = filter { q = q.only_if(f); }
-        let results = q.limit(limit).offset(offset).execute().await?.try_collect::<Vec<_>>().await?;
+        // 🌟 [CRITICAL FIX] LanceDB의 .offset()은 명시적 정렬이 불가능해 청크가 겹치는 현상(중복)이 발생합니다.
+        // 데이터를 모두 메모리에 올려 정렬한 뒤 안전하게 Slice하여 반환하도록 limit/offset을 제거합니다.
+        let results = q.execute().await?.try_collect::<Vec<_>>().await?;
         let mut docs = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
@@ -612,7 +621,11 @@ impl VectorStore {
             }
         }
         docs.sort_by_key(|d| std::cmp::Reverse(d.created_at_ts));
-        Ok(docs)
+        
+        // 🌟 [CRITICAL FIX] 정렬이 완벽하게 끝난 전체 리스트에서 안전하게 Limit과 Offset을 적용합니다.
+        let start = offset.min(docs.len());
+        let end = (start + limit).min(docs.len());
+        Ok(docs[start..end].to_vec())
     }
 
     pub async fn get_item_by_id(&self, table_name: &str, id: &str) -> Result<Option<TradeDocument>> {
@@ -651,15 +664,19 @@ impl VectorStore {
         }))
     }
     
-    pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, filter: Option<String>) -> Result<Vec<(String, String, f32)>> {
+    pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, offset: usize, filter: Option<String>) -> Result<Vec<(String, String, f32)>> {
          let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
          let table = self.conn.open_table(target).execute().await?;
          let mut combined = std::collections::HashMap::new();
+         
+         // 🌟 [CRITICAL FIX] 프론트엔드가 요청한 Offset 만큼 깊이 파고들기 위해 DB 조회 범위를 늘립니다.
+         let fetch_limit = limit + offset;
+
          if !query_text.is_empty() {
              let clean = query_text.replace("'", "''");
              let mut q = table.query();
              if let Some(ref f) = filter { q = q.only_if(f); }
-             if let Ok(res) = q.only_if(format!("text MATCH '{0}' OR data MATCH '{0}'", clean)).limit(limit).execute().await {
+             if let Ok(res) = q.only_if(format!("text MATCH '{0}' OR data MATCH '{0}'", clean)).limit(fetch_limit).execute().await {
                 if let Ok(batches) = res.try_collect::<Vec<_>>().await {
                     for b in batches {
                         let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
@@ -671,7 +688,7 @@ impl VectorStore {
          }
          let mut vq = table.query();
          if let Some(ref f) = filter { vq = vq.only_if(f); }
-         let vres = vq.limit(limit).nearest_to(query_vec)?.execute().await?.try_collect::<Vec<_>>().await?;
+         let vres = vq.limit(fetch_limit).nearest_to(query_vec)?.execute().await?.try_collect::<Vec<_>>().await?;
          for b in vres {
              let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap(); 
              let txs = b.column(12).as_any().downcast_ref::<StringArray>().unwrap();
@@ -683,7 +700,11 @@ impl VectorStore {
          }
          let mut final_list: Vec<_> = combined.into_iter().map(|(id, (txt, s))| (id, txt, s)).collect();
          final_list.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-         Ok(final_list)
+         
+         // 🌟 [CRITICAL FIX] 점수순으로 정렬이 끝난 결과에서 Offset 만큼 잘라내어 반환합니다.
+         let start = offset.min(final_list.len());
+         let end = (start + limit).min(final_list.len());
+         Ok(final_list[start..end].to_vec())
     }
 
     pub async fn find_item_by_property(&self, table_name: &str, property: &str, value: &Value) -> Result<Option<(String, Value)>> {

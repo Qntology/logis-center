@@ -2024,30 +2024,15 @@ listen("task-db-registered", async (event: any) => {
 async function syncLocalToDexie(lanceItems: any[], tableName: string) {
     if (!lanceItems || lanceItems.length === 0) return;
     try {
-        const localItems = await (Select as any)[tableName]({});
-        const localMap = new Map();
-        localItems.forEach((item: any) => {
-            // Dexie에 저장된 기존 업데이트 시간 캐싱
-            localMap.set(item.id, item.updated_at_ts || item.updated_at || 0);
-        });
-
-        const needsUpdate = lanceItems.filter((newItem: any) => {
-            const localUpdated = localMap.get(newItem.id) || 0;
-            // LanceDB에서 온 최신 업데이트 시간 (TradeDocument 구조체는 updated_at_ts를 사용)
-            const lanceUpdated = newItem.updated_at_ts || newItem.updated_at || 0;
-            
-            // 🌟 백엔드 시간이 프론트엔드 시간보다 최신일 때만 업데이트 대상에 포함
-            return lanceUpdated > localUpdated;
-        });
-
-        if (needsUpdate.length > 0) {
-            console.log(`[LOCAL-SYNC] ${tableName} 테이블 최신화 중... (${needsUpdate.length}건 변경됨)`);
-            await (Upsert as any)[tableName](needsUpdate);
-        } else {
-            console.log(`[LOCAL-SYNC] ${tableName} 테이블은 이미 최신 상태입니다.`);
+        // 🌟 [CRITICAL FIX] Rust(LanceDB)가 완벽한 원본이므로, 기존 Dexie의 시간 비교 로직을 전부 삭제하고 무조건 덮어씌웁니다.
+        // 대기열(Task)은 이 함수를 타지 않으므로 안전하며, Users(통계)와 Pages 데이터가 100% 동기화됩니다.
+        console.log(`[LOCAL-SYNC] ${tableName} 테이블 강제 최신화 중... (${lanceItems.length}건 덮어쓰기)`);
+        
+        for (const item of lanceItems) {
+            await (Upsert as any)[tableName](item);
         }
     } catch (e) {
-        console.error(`[LOCAL-SYNC] ${tableName} 동기화 실패:`, e);
+        console.error(`[LOCAL-SYNC] ${tableName} 강제 동기화 실패:`, e);
     }
 }
 
@@ -3280,14 +3265,11 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
     if (!isSync) startSpinner();
     isLoading = true;
     
-    // 🌟 오직 숨겨둔 span 태그(headerLoading)만 살짝 켭니다. 
-    // h2 태그(listTitle)를 덮어씌우는 코드는 완전히 삭제했습니다.
     if (headerLoading) {
         headerLoading.style.display = "inline-block";
     }
     
     try {
-        // 🌟 [CRITICAL FIX] 현재 탭에 맞는 데이터만 필터링!
         let baseFilter = "";
         if (currentSearchMode === "shipping") {
             baseFilter = "type IN ('tracking', 'receiving', 'shipping', 'bl', 'awb', 'BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'TRACKING', 'shipping_doc', 'Unknown')";

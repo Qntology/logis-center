@@ -316,7 +316,7 @@ async fn search_documents(
     state: State<'_, AppState>,
     query: String,
     limit: usize,
-    _offset: usize,
+    offset: usize, // 🌟 [CRITICAL FIX] _offset에서 언더바(_)를 제거하여 값을 활성화합니다.
     filter: Option<String>,
 ) -> Result<Vec<(String, String, f32)>, String> {
     // 🌟 [추가] 프론트엔드가 텍스트 검색을 요청할 때마다 터미널에 로그를 찍습니다.
@@ -353,7 +353,8 @@ async fn search_documents(
     };
 
     if let Some(store) = store_opt {
-        store.search_items("items", &query, query_vec, limit, filter).await.map_err(|e| e.to_string())
+        // 🌟 [CRITICAL FIX] 무시되던 offset 파라미터를 추가로 전달합니다.
+        store.search_items("items", &query, query_vec, limit, offset, filter).await.map_err(|e| e.to_string())
     } else {
         Err("DB not initialized".to_string())
     }
@@ -785,12 +786,14 @@ async fn ai_search_complex(
                 let sql_filter = convert_conditions_to_sql(ctx);
                 let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 768]);
                 
-                let search_result = store.search_items(target_table, text, emb.clone(), 5, sql_filter.clone()).await;
+                // 🌟 [CRITICAL FIX] 인자 개수를 맞추기 위해 기본값 0 (offset) 추가
+                let search_result = store.search_items(target_table, text, emb.clone(), 5, 0, sql_filter.clone()).await;
                 
                 let final_results = match search_result {
                     Ok(res) => res,
                     Err(_) => {
-                        store.search_items(target_table, text, emb, 5, None).await.unwrap_or_default()
+                        // 🌟 [CRITICAL FIX] 기본값 0 (offset) 추가
+                        store.search_items(target_table, text, emb, 5, 0, None).await.unwrap_or_default()
                     }
                 };
 
@@ -905,7 +908,8 @@ async fn deep_research_command(
     if let Some(store) = store_guard.as_ref() {
         // General search for context
         let emb = model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 768]);
-        if let Ok(results) = store.search_items("items", &query, emb, 3, None).await {
+        // 🌟 [CRITICAL FIX] 0 (offset) 인자 추가
+        if let Ok(results) = store.search_items("items", &query, emb, 3, 0, None).await {
             let docs: Vec<String> = results.iter()
                 .map(|(_, text, _)| format!("- {}", text))
                 .collect();
