@@ -2229,7 +2229,7 @@ impl QuantizedQwenVLTextModel {
         if target_device.is_cuda() { let _ = target_device.synchronize(); }
         let is_decoding = current_seq_len <= 1;
         if !is_decoding {
-            println!("[MEMORY-OPT] Layer {} Weights and Gradients cleared from RAM/VRAM.", layer_idx);
+            // println!("[MEMORY-OPT] Layer {} Weights and Gradients cleared from RAM/VRAM.", layer_idx);
         }
 
         if let Some(sid) = session_id {
@@ -2630,7 +2630,7 @@ impl QuantizedQwenVLTextModel {
         for layer_idx in 0..total_layers {
             if !is_decoding && (layer_idx % 7 == 0 || layer_idx == total_layers - 1) {
                 let phase = if !is_decoding { "Prefill" } else { "Decode" };
-                println!("[ENGINE] Running Layer {}/{} (Ping-Pong {} Active)", layer_idx + 1, total_layers, phase);
+                // println!("[ENGINE] Running Layer {}/{} (Ping-Pong {} Active)", layer_idx + 1, total_layers, phase);
             }
 
             if layer_idx + 1 < total_layers {

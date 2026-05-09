@@ -1172,6 +1172,15 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "title":title | string"###.to_string()
     };
 
+    // 🌟 [CRITICAL FIX] item_pug 내용에 링크(href)가 없을 경우 스키마에서 link와 path 요구 조건을 동적으로 제거합니다.
+    let mut final_schema = schema;
+    if !item_pug.contains("href=") && !item_pug.contains("href=\"") {
+        final_schema = final_schema.lines()
+            .filter(|line| !line.contains("\"link\":") && !line.contains("\"path\":"))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
     // 🌟 [최종 반영] .txt 파일 구조와 동일하게 thead/tbody 태그 및 계층형 들여쓰기 적용
     let mut final_pug = String::new();
 
@@ -1216,8 +1225,8 @@ Language: {LANGUAGE}
 [ACTION] RETURN JSON ONLY. 
 NO EXPLANATION. NO THINKING. /no_think"###;
 
-    // 🌟 {COMBINED_INPUT} 대신 {INPUT_SECTION}으로 정확히 치환합니다.
-    template.replace("{SCHEMA}", &schema)
+    // 🌟 [CRITICAL FIX] moved 에러 해결: 기존 schema 대신 조건부로 처리된 final_schema를 참조합니다.
+    template.replace("{SCHEMA}", &final_schema)
             .replace("{TYPE}", page_type)
             .replace("{HREF}", href)
             .replace("{LANGUAGE}", language)

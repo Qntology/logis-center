@@ -578,10 +578,11 @@ async fn process_task(
 
     let mut page_type = String::new();
     let mut selector_info: serde_json::Value = json!({});
-    let mut is_detail = false;
-    let mut skip_ai_analysis = false; // 🌟 [핵심] AI 분석 스킵 플래그 추가
+    // 🌟 [CRITICAL FIX] 프론트엔드가 전달한 task_data에서 detail 여부를 최우선으로 읽어옵니다.
+    let mut is_detail = task_data.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut skip_ai_analysis = false; 
 
-    let raw_path = {
+    let (raw_path, url_obj) = {
         let mut shared_origin = None;
         if let Ok(mem) = crate::ACTIVE_TASK_MEM.read() {
             if let Some(json_val) = mem.as_ref() {
@@ -606,77 +607,66 @@ async fn process_task(
 
         let base_url = url::Url::parse(&origin_str).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
         let url_obj = base_url.join(&url).unwrap_or(base_url);
-        url_obj.path().to_string()
+        (url_obj.path().to_string(), url_obj)
     };
 
-    let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path));
+    // 🌟 [CRITICAL FIX] aa.ts의 해시 생성 규칙을 완벽 복원하여 리스트와 상세 캐시가 충돌하지 않게 분리합니다.
+    let cc_for_hash = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
+    let page_id = crate::utils::hash::hash_id(&format!("{}{}", cc_for_hash, raw_path));
 
     {
         let store_guard = store_mutex.lock().await;
         if let Some(db) = store_guard.as_ref() {
+            
+            // 🌟 URL 역추적(Fallback) 시에도 Detail 속성이 일치하는 캐시만 선별하도록 강화
+            let mut cached_page_doc = None;
+            
             if let Ok(Some(page_doc)) = db.get_item_by_id("pages", &page_id).await {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&page_doc.json_data) {
-                    let node_sel = val.get("node").and_then(|v| v.as_str()).unwrap_or("");
-                    let item_sel = val.get("item").or_else(|| val.get("itemSelector")).and_then(|v| v.as_str()).unwrap_or("");
-                    let head_sel = val.get("head").and_then(|v| v.as_str()).unwrap_or("");
-                    
-                    // 🌟 유효성 검증: 캐시된 부모(node), 아이템(item), 헤더(head) 셀렉터가 현재 웹페이지 구조에 온전히 존재하는가?
-                    let clean_content = &clean_html_content;
-                    let mut is_valid = true;
-                    
-                    // 🌟 [CRITICAL FIX] scraper::Html(document)는 스레드 간 전송(Send)이 불가능한 타입입니다.
-                    // 따라서 document가 존재하는 스코프 내부에서 .await를 호출하면 컴파일 에러가 발생합니다.
-                    // 스코프를 분리하여 document를 완전히 메모리에서 해제한 뒤에 .await를 호출하도록 수정합니다.
-                    {
-                        let document = scraper::Html::parse_document(clean_content);
-
-                        if !node_sel.is_empty() && node_sel != "body" {
-                            if let Ok(sel) = scraper::Selector::parse(node_sel) {
-                                if document.select(&sel).next().is_none() { is_valid = false; }
-                            } else { is_valid = false; }
-                        }
-
-                        if is_valid && !item_sel.is_empty() {
-                            let target_sel_str = if !node_sel.is_empty() && !item_sel.contains(",") {
-                                if item_sel.starts_with(node_sel) {
-                                    item_sel.to_string()
-                                } else {
-                                    format!("{} {}", node_sel, item_sel)
+                cached_page_doc = Some(page_doc);
+            } else if let Ok(Some(page_doc)) = db.get_item_by_id("items", &page_id).await {
+                cached_page_doc = Some(page_doc);
+            } else {
+                let link_val = url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str();
+                
+                // pages 테이블과 items 테이블 모두 검색하여 현재 is_detail 상태와 일치하는 것만 채택
+                let tables_to_check = ["pages", "items"];
+                for tbl in tables_to_check {
+                    if let Ok(docs) = db.get_all_items(tbl, 1000, 0, None).await {
+                        for doc in docs {
+                            if doc.json_data.contains(&link_val) {
+                                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&doc.json_data) {
+                                    let cached_detail = json_val.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+                                    if cached_detail == is_detail {
+                                        cached_page_doc = Some(doc);
+                                        break;
+                                    }
                                 }
-                            } else {
-                                item_sel.to_string()
-                            };
-                            
-                            // 🌟 [CRITICAL FIX] E0597 해결: 에러 객체가 target_sel_str의 참조를 물고 늘어지지 않도록, 
-                            // 즉시 boolean으로 매핑하여 Result 객체를 그 줄에서 완전 소멸시킵니다.
-                            let is_match_found = scraper::Selector::parse(&target_sel_str)
-                                .map(|sel| document.select(&sel).next().is_some())
-                                .unwrap_or(false);
-                                
-                            if !is_match_found { is_valid = false; }
+                            }
                         }
-
-                        if is_valid && !head_sel.is_empty() && head_sel != "..." {
-                            if let Ok(sel) = scraper::Selector::parse(head_sel) {
-                                if document.select(&sel).next().is_none() { is_valid = false; }
-                            } else { is_valid = false; }
-                        }
-                    } // 👈 여기서 document 객체가 소멸되어 비동기 Send 제약이 풀립니다!
-
-                    if is_valid {
-                        emit_term(&format!("[Scheduler] ⚡ CACHE HIT! Selectors validated. Skipping AI Pre-processing for: {}", raw_path));
-                        page_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();
-                        is_detail = val.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
-                        selector_info = val.clone();
-                        skip_ai_analysis = true; // 스킵 활성화!
-                        
-                        log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Loaded valid config from cache.", "spinner": "⚡" }));
-                    } else {
-                        emit_term("[Scheduler] Cache found but UI changed (Selector mismatch). Falling back to AI Analysis.");
-                        // 🌟 [CRITICAL FIX 3] 오염되거나 낡은 캐시가 무한 루프를 유발하지 않도록, 검증 실패 시 DB에서 즉시 삭제해 버립니다.
-                        // 이제 바깥 스코프로 분리되었으므로 에러 없이 안전하게 .await 호출이 가능합니다.
-                        let _ = db.delete_item("pages", &page_id).await;
                     }
+                    if cached_page_doc.is_some() { break; }
+                }
+            }
+
+            if let Some(page_doc) = cached_page_doc {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&page_doc.json_data) {
+                    let cached_detail = val.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let node_sel = val.get("node").or_else(|| val.get("parent")).and_then(|v| v.as_str()).unwrap_or("");
+                    let item_sel = val.get("item").or_else(|| val.get("itemSelector")).and_then(|v| v.as_str()).unwrap_or("");
+                    
+                    // 🌟 [CRITICAL FIX] aa.ts의 캐싱 사상을 완벽 반영: 캐시가 존재하면 의심(Validation) 없이 무조건 채택하여 AI 전처리를 스킵합니다!
+                    let target_sel_str = if !node_sel.is_empty() && !item_sel.is_empty() && !item_sel.contains(",") {
+                        if item_sel.starts_with(node_sel) { item_sel.to_string() } else { format!("{} {}", node_sel, item_sel) }
+                    } else if !item_sel.is_empty() { item_sel.to_string() } else { node_sel.to_string() };
+
+                    emit_term(&format!("[Scheduler] ⚡ CACHE HIT! Skipping AI Pre-processing for: {}", raw_path));
+                    page_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();
+                    is_detail = cached_detail; 
+                    selector_info = val.clone();
+                    selector_info.as_object_mut().unwrap().insert("final_target_selector".to_string(), json!(target_sel_str));
+                    skip_ai_analysis = true; 
+                    
+                    log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Loaded valid config from cache.", "spinner": "⚡" }));
                 }
             }
         }
@@ -1196,24 +1186,31 @@ async fn process_task(
             }
         } // 👈 🌟 [핵심 변경 2 끝] JS 선택자 분석 스킵 괄호 닫기!
 
-        // 🌟 [CRITICAL FIX 1] E0425 해결: 타겟 선택자(target_selector)를 가장 먼저 정의합니다.
-        let item_selector = selector_info.get("itemSelector")
-            .or_else(|| selector_info.get("item"))
+        // 🌟 [CRITICAL FIX] Cache Hit 시 검증에 성공했던 선택자(final_target_selector)가 있다면 최우선으로 사용하여 추출 실패(Silent Fail)를 방벽합니다.
+        let target_selector = selector_info.get("final_target_selector")
             .and_then(|s| s.as_str())
-            .unwrap_or("");
-        let node_selector = selector_info.get("node").or_else(|| selector_info.get("parent")).and_then(|s| s.as_str()).unwrap_or("");
-        
-        let target_selector = if !node_selector.is_empty() && !item_selector.is_empty() && !item_selector.contains(",") {
-            if item_selector.starts_with(node_selector) {
-                item_selector.to_string()
-            } else {
-                format!("{} {}", node_selector, item_selector) 
-            }
-        } else if !item_selector.is_empty() { 
-            item_selector.to_string() 
-        } else { 
-            node_selector.to_string() 
-        };
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                let item_selector = selector_info.get("itemSelector")
+                    .or_else(|| selector_info.get("item"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                let node_selector = selector_info.get("node").or_else(|| selector_info.get("parent")).and_then(|s| s.as_str()).unwrap_or("");
+                
+                if !node_selector.is_empty() && !item_selector.is_empty() && !item_selector.contains(",") {
+                    if item_selector.starts_with(node_selector) {
+                        item_selector.to_string()
+                    } else {
+                        format!("{} {}", node_selector, item_selector) 
+                    }
+                } else if !item_selector.is_empty() { 
+                    item_selector.to_string() 
+                } else { 
+                    node_selector.to_string() 
+                }
+            });
+            
+        emit_term(&format!("[Scheduler] Target Selector configured as: '{}'", target_selector));
 
         let mut final_thead_selector = String::new();
         let mut cache_updated = false; // DB 업데이트가 필요한지 추적하는 플래그
@@ -1375,15 +1372,15 @@ async fn process_task(
             let base_url = url::Url::parse(&origin_str).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
             let url_obj = base_url.join(&url).unwrap_or(base_url);
             let raw_path = url_obj.path();
-            let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
+            let cc_for_hash = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
+            let page_id = crate::utils::hash::hash_id(&format!("{}{}", cc_for_hash, raw_path)); 
+            
             let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
             let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
 
             let ref_for_page = if !task.r#ref.is_empty() { &task.r#ref } else { raw_path };
 
-            // 🌟 [CRITICAL FIX] bb.ts 패리티 완벽 복원: 
-            // 상세(Detail) 페이지일 때 List 캐시를 덮어씌워 날려버리는 버그를 방어하고,
-            // 리스트 페이지를 전처리할 때는 아코디언 메뉴(자식 노드) 렌더링을 위한 Detail 껍데기를 DB에 함께 생성해 줍니다.
+            // 🌟 [CRITICAL FIX] aa.ts 패리티 완벽 복원: ID 해시 조합 및 테이블 라우팅 타입 불일치 해결
             if !is_detail {
                 let mut page_data: serde_json::Value = selector_info.clone();
                 if let Some(obj) = page_data.as_object_mut() {
@@ -1391,20 +1388,19 @@ async fn process_task(
                     obj.insert("link".to_string(), json!(url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()));
                     obj.insert("type".to_string(), json!(page_type.clone()));
                     
-                    if let Some(item_sel) = selector_info.get("itemSelector") {
-                        obj.insert("item".to_string(), item_sel.clone()); 
-                    }
-                    if let Some(parent_sel) = selector_info.get("parent") {
-                        obj.insert("node".to_string(), parent_sel.clone()); 
-                    }
+                    if let Some(item_sel) = selector_info.get("itemSelector") { obj.insert("item".to_string(), item_sel.clone()); }
+                    if let Some(parent_sel) = selector_info.get("parent") { obj.insert("node".to_string(), parent_sel.clone()); }
                     obj.insert("detail".to_string(), json!(false));
                 }
 
-                let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(ref_for_page), None).await;
+                // 🌟 pages 테이블에는 실제 카테고리(page_type)를, items 테이블에는 "pages"를 기록하여 UI 렌더링 버그(pages로 노출되는 현상)를 완벽 해결합니다!
+                let _ = store.upsert_item("pages", &page_id, &page_type, page_data.clone(), None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(ref_for_page), None).await;
+                let _ = store.upsert_item("items", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(ref_for_page), None).await;
+                
                 println!("[Scheduler] Page cache updated in DB (including head selector).");
 
-                // 🌟 상세 페이지용 껍데기(자식 노드) 동시 생성
-                let detail_page_id = crate::utils::hash::hash_id(&format!("{}{}{}", page_type, task.cc.to_uppercase(), url_obj.path()));
+                // 🌟 상세 페이지용 껍데기(자식 노드) 동시 생성 (page_type을 포함한 정확한 ID 복원)
+                let detail_page_id = crate::utils::hash::hash_id(&format!("{}{}{}", page_type, task.cc.to_uppercase(), raw_path));
                 let detail_bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, task.cc.to_uppercase()));
                 let detail_page_data = json!({
                     "origin": format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or("")),
@@ -1414,11 +1410,11 @@ async fn process_task(
                     "node": true,
                     "item": ""
                 });
-                let _ = store.upsert_item("pages", &detail_page_id, "pages", detail_page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
+                let _ = store.upsert_item("pages", &detail_page_id, &page_type, detail_page_data.clone(), None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
+                let _ = store.upsert_item("items", &detail_page_id, "pages", detail_page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
 
             } else {
-                // 🌟 상세 페이지일 때는 List의 셀렉터를 건드리지 않고, Detail 본인의 껍데기만 저장/갱신합니다.
-                let detail_page_id = crate::utils::hash::hash_id(&format!("{}{}{}", page_type, task.cc.to_uppercase(), url_obj.path()));
+                let detail_page_id = crate::utils::hash::hash_id(&format!("{}{}{}", page_type, task.cc.to_uppercase(), raw_path));
                 let detail_bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, task.cc.to_uppercase()));
                 let detail_page_data = json!({
                     "origin": format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or("")),
@@ -1428,7 +1424,8 @@ async fn process_task(
                     "node": true,
                     "item": ""
                 });
-                let _ = store.upsert_item("pages", &detail_page_id, "pages", detail_page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
+                let _ = store.upsert_item("pages", &detail_page_id, &page_type, detail_page_data.clone(), None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
+                let _ = store.upsert_item("items", &detail_page_id, "pages", detail_page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
             }
         }
         

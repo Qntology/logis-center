@@ -1349,6 +1349,7 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                 "event" | "coupon" => "event",
                 "member" | "team" | "user" => "users",
                 "talk" | "prompt" | "ai_search" => "talks", // 🌟 talk 관련 타입들을 명확히 talks 테이블로 라우팅
+                "pages" | "page" => "pages", // 🌟 [CRITICAL FIX] "pages" 타입 데이터가 items 테이블로 유실되지 않도록 명시적 라우팅 추가!
                 _ => {
                     if clean_item.get("data").and_then(|d| d.get("origin")).is_some() {
                         "pages"
