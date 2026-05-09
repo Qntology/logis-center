@@ -242,12 +242,14 @@ body {
 }
 
 .nav-btn:hover {
+  font-family: "Noto Color Emoji", sans-serif;
   background: var(--glass-highlight);
   color: #000;
 }
 
 .nav-btn.active {
   color: #000;
+  font-family: "Noto Color Emoji", sans-serif;
 }
 
 #tab-settings{overflow: hidden;}
@@ -954,6 +956,8 @@ tr:hover { background: rgba(0,0,0,0.05); }
     color: #000;
     font-size: 8px;
 }
+
+.logis-label.active u{color: #fff;}
 
 /* Child Container / Accordion */
 .logis-child {

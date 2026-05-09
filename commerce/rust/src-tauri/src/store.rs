@@ -401,14 +401,36 @@ impl VectorStore {
     }
 
     pub async fn delete_item(&self, table_name: &str, id: &str) -> Result<()> {
-        let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
+        // 🌟 [CRITICAL FIX 2-3] 삭제 시에도 동일한 라우팅 규칙 강제 적용
+        let target = match table_name {
+            "sales" | "goods" | "order" => "sales",
+            "tracking" | "receiving" | "shipping" => "tracking",
+            "event" | "coupon" => "event",
+            "member" | "team" | "user" => "users",
+            "talk" | "prompt" | "ai_search" => "talks",
+            "pages" => "pages",
+            "items" => "items",
+            t if t.starts_with("commerce_") => &t[9..],
+            _ => "items"
+        };
         let table = self.conn.open_table(target).execute().await?;
         table.delete(&format!("id = '{}'", id)).await?;
         Ok(())
     }
 
     pub async fn delete_items(&self, table_name: &str, ids: Vec<String>) -> Result<()> {
-        let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
+        // 🌟 [CRITICAL FIX 2-4] 다중 삭제 시에도 동일한 라우팅 규칙 강제 적용
+        let target = match table_name {
+            "sales" | "goods" | "order" => "sales",
+            "tracking" | "receiving" | "shipping" => "tracking",
+            "event" | "coupon" => "event",
+            "member" | "team" | "user" => "users",
+            "talk" | "prompt" | "ai_search" => "talks",
+            "pages" => "pages",
+            "items" => "items",
+            t if t.starts_with("commerce_") => &t[9..],
+            _ => "items"
+        };
         let table = self.conn.open_table(target).execute().await?;
         let id_list = ids.iter().map(|id| format!("'{}'", id)).collect::<Vec<_>>().join(",");
         table.delete(&format!("id IN ({})", id_list)).await?;
@@ -708,9 +730,23 @@ impl VectorStore {
     }
 
     pub async fn find_item_by_property(&self, table_name: &str, property: &str, value: &Value) -> Result<Option<(String, Value)>> {
-        let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
+        // 🌟 [CRITICAL FIX 2-1] upsert_item과 완벽하게 동일한 테이블 라우팅 로직 적용 (Silent Fail 차단)
+        let target = match table_name {
+            "sales" | "goods" | "order" => "sales",
+            "tracking" | "receiving" | "shipping" => "tracking",
+            "event" | "coupon" => "event",
+            "member" | "team" | "user" => "users",
+            "talk" | "prompt" | "ai_search" => "talks",
+            "pages" => "pages",
+            "items" => "items",
+            t if t.starts_with("commerce_") => &t[9..],
+            _ => "items"
+        };
+        
         let table = self.conn.open_table(target).execute().await?;
-        let results = table.query().limit(1000).execute().await?.try_collect::<Vec<_>>().await?;
+        
+        // 🌟 [CRITICAL FIX 2-2] limit(1000) 제한을 삭제하여, DB 전체를 훑어 기존에 저장된 Draft를 100% 찾아내도록 수정
+        let results = table.query().execute().await?.try_collect::<Vec<_>>().await?;
         let target_str = match value { Value::String(s) => s.clone(), Value::Number(n) => n.to_string(), _ => value.to_string() };
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();

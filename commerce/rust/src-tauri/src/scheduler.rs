@@ -622,9 +622,13 @@ async fn process_task(
                     
                     // 🌟 유효성 검증: 캐시된 부모(node), 아이템(item), 헤더(head) 셀렉터가 현재 웹페이지 구조에 온전히 존재하는가?
                     let clean_content = &clean_html_content;
+                    let mut is_valid = true;
+                    
+                    // 🌟 [CRITICAL FIX] scraper::Html(document)는 스레드 간 전송(Send)이 불가능한 타입입니다.
+                    // 따라서 document가 존재하는 스코프 내부에서 .await를 호출하면 컴파일 에러가 발생합니다.
+                    // 스코프를 분리하여 document를 완전히 메모리에서 해제한 뒤에 .await를 호출하도록 수정합니다.
                     {
                         let document = scraper::Html::parse_document(clean_content);
-                        let mut is_valid = true;
 
                         if !node_sel.is_empty() && node_sel != "body" {
                             if let Ok(sel) = scraper::Selector::parse(node_sel) {
@@ -657,18 +661,21 @@ async fn process_task(
                                 if document.select(&sel).next().is_none() { is_valid = false; }
                             } else { is_valid = false; }
                         }
+                    } // 👈 여기서 document 객체가 소멸되어 비동기 Send 제약이 풀립니다!
 
-                        if is_valid {
-                            emit_term(&format!("[Scheduler] ⚡ CACHE HIT! Selectors validated. Skipping AI Pre-processing for: {}", raw_path));
-                            page_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();
-                            is_detail = val.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
-                            selector_info = val.clone();
-                            skip_ai_analysis = true; // 스킵 활성화!
-                            
-                            log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Loaded valid config from cache.", "spinner": "⚡" }));
-                        } else {
-                            emit_term("[Scheduler] Cache found but UI changed (Selector mismatch). Falling back to AI Analysis.");
-                        }
+                    if is_valid {
+                        emit_term(&format!("[Scheduler] ⚡ CACHE HIT! Selectors validated. Skipping AI Pre-processing for: {}", raw_path));
+                        page_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();
+                        is_detail = val.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+                        selector_info = val.clone();
+                        skip_ai_analysis = true; // 스킵 활성화!
+                        
+                        log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Loaded valid config from cache.", "spinner": "⚡" }));
+                    } else {
+                        emit_term("[Scheduler] Cache found but UI changed (Selector mismatch). Falling back to AI Analysis.");
+                        // 🌟 [CRITICAL FIX 3] 오염되거나 낡은 캐시가 무한 루프를 유발하지 않도록, 검증 실패 시 DB에서 즉시 삭제해 버립니다.
+                        // 이제 바깥 스코프로 분리되었으므로 에러 없이 안전하게 .await 호출이 가능합니다.
+                        let _ = db.delete_item("pages", &page_id).await;
                     }
                 }
             }
@@ -1128,8 +1135,38 @@ async fn process_task(
                             return null;
                         }
 
-                        const findText = titles.length > 0 ? titles[0].toLowerCase().replace(/\s+/g, ' ') : "";
-                        const matches = nodes.filter(n => n && n.text && n.text.toLowerCase().replace(/\s+/g, ' ').includes(findText));
+                        let matches = [];
+                        for (let i = 0; i < titles.length; i++) {
+                            let t = titles[i].toLowerCase().replace(/\s+/g, ' ');
+                            let potentialMatches = [];
+                            
+                            // 깨진 문자(\uFFFD)가 포함되어 있는지 확인합니다.
+                            if (t.includes('\uFFFD')) {
+                                // 깨진 경우: 쪼개서 조각들로 유연하게 검색
+                                let chunks = t.split(/[\uFFFD]+/).map(c => c.trim()).filter(c => c.length > 1);
+                                if (chunks.length === 0) continue;
+                                
+                                potentialMatches = nodes.filter(n => {
+                                    if (!n || !n.text) return false;
+                                    let nText = n.text.toLowerCase().replace(/\s+/g, ' ');
+                                    return chunks.every(chunk => nText.includes(chunk));
+                                });
+                            } else {
+                                // 온전한 경우: 전체 문자열을 하나의 컬렉션으로 취급하여 정확하게 포함 여부 검색
+                                potentialMatches = nodes.filter(n => {
+                                    if (!n || !n.text) return false;
+                                    let nText = n.text.toLowerCase().replace(/\s+/g, ' ');
+                                    return nText.includes(t);
+                                });
+                            }
+                            
+                            if (potentialMatches.length > 0) {
+                                // 부모 노드(body, tr 등)를 배제하고, 텍스트 길이가 가장 짧은(가장 타이트한) 진짜 제목 단일 노드만 추출합니다.
+                                potentialMatches.sort((a, b) => a.text.length - b.text.length);
+                                matches = [potentialMatches[0]];
+                                break;
+                            }
+                        }
                         
                         let res = { "parent": "body", "itemSelector": "div", "matchCount": matches.length };
                         if (matches.length > 0) {

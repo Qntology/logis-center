@@ -1037,8 +1037,12 @@ async fn check_active_task(
     if let Ok(mem_guard) = crate::ACTIVE_TASK_MEM.read() {
         if let Some(active) = mem_guard.as_ref() {
             let active_ref = active.get("ref").and_then(|v| v.as_str()).unwrap_or("");
-            if active_ref == payload.r#ref {
-                return Ok(true); // 현재 메모리에서 해당 페이지가 돌아가고 있음
+            let status = active.get("status").and_then(|v| v.as_i64()).unwrap_or(0);
+            
+            // 🌟 [CRITICAL FIX] 작업 상태가 1(Processing) 또는 10(Queued)일 때만 진행 중인 것으로 판단해야 
+            // 완료된 작업(9)에 의해 추출 버튼이 영구적으로 숨겨지는 버그를 완벽히 막을 수 있습니다.
+            if active_ref == payload.r#ref && (status == 1 || status == 10) {
+                return Ok(true); // 현재 메모리에서 해당 페이지가 아직 처리 또는 대기 중임
             }
         }
     }

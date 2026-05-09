@@ -504,7 +504,19 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             if *mode == PugMode::FullContent || *mode == PugMode::DetailMode || *mode == PugMode::TheadMode || *mode == PugMode::ListMode || *mode == PugMode::NoAttributesMode {
                 let text_content = text.trim();
                 if !text_content.is_empty() {
-                    output.push_str(&format!("{}| {}\n", indent, text_content.replace("\"", "'")));
+                    // 🌟 [CRITICAL FIX 1] 숫자 사이의 콤마(,) 제거 (소수점은 완벽히 보존)
+                    let mut clean_text = text_content.replace("\"", "'");
+                    
+                    // 정규식: 1~3자리 숫자 뒤에 (콤마 + 3자리 숫자)가 1번 이상 반복되고, 선택적으로 소수점이 붙는 패턴
+                    if let Ok(re) = regex::Regex::new(r"(\d{1,3}(?:,\d{3})+)(\.\d+)?") {
+                        clean_text = re.replace_all(&clean_text, |caps: &regex::Captures| {
+                            let int_part = caps.get(1).map_or("", |m| m.as_str()).replace(",", "");
+                            let dec_part = caps.get(2).map_or("", |m| m.as_str());
+                            format!("{}{}", int_part, dec_part)
+                        }).to_string();
+                    }
+                    
+                    output.push_str(&format!("{}| {}\n", indent, clean_text));
                 }
             }
         }
@@ -1010,8 +1022,22 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "height":Package height(cm) | number
     - "length":Package length(cm) | number
     - "weight":Package weight(kg) | number
-    - "options":[ { value:option name | string, inputs:[{ value:option input value | string }] } ]
-    - "additional_goods":[ { path:{ value:URL includes a additional product manage path, an administrative or additional product edit Link | string }, id:{ value:Refer to the additional product no value from the link or an attribute or additional product input value | string }, link:{ value:Refer to the ID to find a URL that includes a additional product manage link | string } } ]"###.to_string(),
+    - "options":[ 
+        { 
+            value:product option name | string, 
+            inputs:[
+                { value:product option input value | string } | null
+            ] 
+        } | null
+    ]
+    - "additional_goods":[ 
+        { 
+            path:value:URL includes a additional product manage path, an administrative or additional product edit Link | string, 
+            id:Refer to the additional product no value from the link or an attribute or additional product input value | string, 
+            link:value:Refer to the ID to find a URL that includes a additional product manage link | string
+        } | null
+    ]"###.to_string(),
+
         "order" => r###"- "{TYPE}":
     - "id":Refer to the ID value from the link | string
     - "link":'{HREF}' | string
@@ -1101,12 +1127,12 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     "order" => r###"- "order":
     - "path":{HREF}
     - "id":Refer to the ID value from the link or an attribute | string
-    - "link":Refer to the ID to find a URL that includes a manage order link | string
+    - "link":Refer to the ID to find a URL that includes a manage order link or tracking detail link | string
     - "currency":ISO 4217 Currency Code | string
     - "sale_price":sale price | number
-    - "tracking_number":Tracking Number | string
+    - "tracking_number":tracking Number or shipping number | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
+    - "status":tracking status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete') | string
     - "title":title | string"###.to_string(),
 
     "goods" => r###"- "goods":

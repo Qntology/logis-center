@@ -1811,7 +1811,7 @@ impl QuantizedQwenVLTextModel {
     /// [MEMORY-OPT] 모든 레이어를 한꺼번에 로드합니다. (디코딩 시작 시 호출)
     pub fn reload_all_layers(&mut self) -> Result<()> {
         let count = self.layers.len();
-        println!("[MEMORY-OPT] Prefill complete. Reloading all {} layers for high-speed decoding...", count);
+        // println!("[MEMORY-OPT] Prefill complete. Reloading all {} layers for high-speed decoding...", count);
         for i in 0..count {
             self.reload_layer(i)?;
         }

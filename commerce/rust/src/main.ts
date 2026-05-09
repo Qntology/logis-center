@@ -927,12 +927,15 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                 } catch (err) {}
 
                 // 🌟 [CRITICAL FIX] bb.ts 패리티 완벽 복원: 실제 타입(nodeType)을 최우선으로 출력하여 'pages'로 노출되는 버그를 고칩니다!
-                name = `<span>${nodeType}</span> <span>${(data.item ? " Draft" : " ")}</span>`;
+                // Draft 텍스트는 아래 count 변수 조립 시 명시적으로 통합합니다.
+                name = `<span>${nodeType}</span>`;
                 
                 var count = '';
                 if (data.item) {
-                    count = `<u>(${total.draft || 0})</u>`;
+                    // 🌟 전처리 중인 리스트 페이지일 경우, Draft 수량과 정식 처리된 Count 수량을 함께 노출합니다.
+                    count = `<span style="font-size: 0.9em; margin-left: 4px;"> Draft <u>(${total.draft || 0})</u></span>`;
                 } else {
+                    // 🌟 상세 페이지일 경우 기존처럼 Count만 노출합니다.
                     count = `<u>(${total.count || 0})</u>`;
                 }
                 
