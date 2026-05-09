@@ -654,19 +654,38 @@ async fn process_task(
                     let node_sel = val.get("node").or_else(|| val.get("parent")).and_then(|v| v.as_str()).unwrap_or("");
                     let item_sel = val.get("item").or_else(|| val.get("itemSelector")).and_then(|v| v.as_str()).unwrap_or("");
                     
-                    // 🌟 [CRITICAL FIX] aa.ts의 캐싱 사상을 완벽 반영: 캐시가 존재하면 의심(Validation) 없이 무조건 채택하여 AI 전처리를 스킵합니다!
                     let target_sel_str = if !node_sel.is_empty() && !item_sel.is_empty() && !item_sel.contains(",") {
                         if item_sel.starts_with(node_sel) { item_sel.to_string() } else { format!("{} {}", node_sel, item_sel) }
                     } else if !item_sel.is_empty() { item_sel.to_string() } else { node_sel.to_string() };
 
-                    emit_term(&format!("[Scheduler] ⚡ CACHE HIT! Skipping AI Pre-processing for: {}", raw_path));
-                    page_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();
-                    is_detail = cached_detail; 
-                    selector_info = val.clone();
-                    selector_info.as_object_mut().unwrap().insert("final_target_selector".to_string(), json!(target_sel_str));
-                    skip_ai_analysis = true; 
-                    
-                    log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Loaded valid config from cache.", "spinner": "⚡" }));
+                    let mut is_valid = true;
+
+                    // 🌟 [CRITICAL FIX] aa.ts 사상 반영: List 캐시를 불러왔더라도 실제 DOM에 요소가 없다면 
+                    // 상세(Detail) 페이지로 넘어왔을 확률이 높으므로 캐시를 무시하고 AI 판별로 넘깁니다. 
+                    // 단, 다른 페이지에서 쓸 수 있으므로 기존 캐시를 DB에서 삭제하진 않습니다.
+                    if !cached_detail && !target_sel_str.is_empty() {
+                        let document = scraper::Html::parse_document(&clean_html_content);
+                        let is_match_found = scraper::Selector::parse(&target_sel_str)
+                            .map(|sel| document.select(&sel).next().is_some())
+                            .unwrap_or(false);
+                            
+                        if !is_match_found {
+                            is_valid = false;
+                        }
+                    }
+
+                    if is_valid {
+                        emit_term(&format!("[Scheduler] ⚡ CACHE HIT! Skipping AI Pre-processing for: {}", raw_path));
+                        page_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();
+                        is_detail = cached_detail; 
+                        selector_info = val.clone();
+                        selector_info.as_object_mut().unwrap().insert("final_target_selector".to_string(), json!(target_sel_str));
+                        skip_ai_analysis = true; 
+                        
+                        log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Loaded valid config from cache.", "spinner": "⚡" }));
+                    } else {
+                        emit_term("[Scheduler] Cache loaded but elements not found in DOM. Likely a Detail page. Falling back to AI Analysis.");
+                    }
                 }
             }
         }
