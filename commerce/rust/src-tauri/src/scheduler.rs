@@ -561,7 +561,7 @@ async fn process_task(
 
     let clean_html_content = parsing::pre_clean_html(&raw_html_content);
     // 🌟 [CRITICAL FIX] 1단계 분석에서도 현재 URL을 넘겨 PUG 상의 모든 상대 주소를 절대 주소로 치환합니다.
-    let raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::FullContent, Some(&url));
+    let raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, Some(&url));
     let light_pug = model.truncate_pug_context(&raw_pug, false, 2000, None).await;
 
     println!("[DEBUG-PUG] Generated PUG. Length: {}. Snippet: {}...", 
@@ -1221,7 +1221,7 @@ async fn process_task(
                 } else { 
                     node_selector.to_string() 
                 }
-            });
+            }).replace(">", " "); // 🌟 꺾쇠(>) 문자를 공백으로 치환하여 파싱 유연성 확보
             
         emit_term(&format!("[Scheduler] Target Selector configured as: '{}'", target_selector));
 
@@ -1258,7 +1258,8 @@ async fn process_task(
                     
                     // 🌟 [추가] ref_row의 텍스트 길이를 기반으로 대략적인 토큰을 산출하여 컨텍스트 사이즈를 예약하고 뒤에서 자릅니다.
                     let ref_row_context_size = ref_row.len() + 3000;
-                    let thead_light_pug = model.truncate_pug_context(&raw_pug, false, 0, Some(ref_row_context_size)).await;
+                    let full_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::FullContent, Some(&url));
+                    let thead_light_pug = model.truncate_pug_context(&full_pug, false, 0, Some(ref_row_context_size)).await;
                     let thead_prompt = crate::parsing::extract_table_structure_prompt(&page_type, &target_selector, &thead_light_pug, &ref_row);
                     let params = ChatCompletionParameters {
                         messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -1293,7 +1294,7 @@ async fn process_task(
                                 .and_then(|v| v.get("thead"))
                                 .and_then(|v| v.get("selector"))
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("").to_string();
+                                .unwrap_or("").to_string().replace(">", " "); // 🌟 꺾쇠(>) 문자를 공백으로 치환하여 파싱 유연성 확보
                             
                             if !final_thead_selector.is_empty() && final_thead_selector != "..." {
                                 selector_info.as_object_mut().unwrap().insert("head".to_string(), json!(final_thead_selector.clone()));
@@ -1628,10 +1629,10 @@ async fn process_task(
             let clean_content = &clean_html_content;
             // 🌟 [최적화] 정규식 대신 파서 단에서 DetailMode를 적용하여 안전하게 id와 class 속성을 제거합니다.
             // 🌟 [CRITICAL FIX] 상세 페이지 전처리 시에도 URL을 넘겨 item2json 등에서 LLM이 절대 주소를 뽑아내도록 유도합니다!
-            let raw_pug = parsing::convert_to_clean_pug(clean_content, PugMode::DetailMode, Some(&url));
+            let full_pug = parsing::convert_to_clean_pug(clean_content, PugMode::DetailMode, Some(&url));
             
             // 🌟 [CRITICAL FIX] 디테일 모드에서도 통일된 절단 로직을 호출하여 모델 부재 시의 누수를 막습니다.
-            model.truncate_pug_context(&raw_pug, true, 2000, None).await
+            model.truncate_pug_context(&full_pug, true, 2000, None).await
         };
 
         if !content_pug.trim().is_empty() {

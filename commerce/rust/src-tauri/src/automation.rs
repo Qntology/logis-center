@@ -183,6 +183,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
 
             let mut found_focus = false;
             let mut remembered_url = String::new();
+            let mut remembered_visible = false;
 
             // 🌟 1. 모든 탭에 고유 ID를 부여하고 상태를 가져옵니다.
             for page in pages.iter().rev() {
@@ -226,6 +227,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
 
                                 if !last_focused_tab_id.is_empty() && tab_id == last_focused_tab_id {
                                     remembered_url = tab_url.to_string();
+                                    remembered_visible = json_val.get("visible").and_then(|v| v.as_bool()).unwrap_or(false);
                                 }
                             }
                         }
@@ -236,12 +238,13 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
 
             // 🌟 2. 아무 탭도 포커스를 가지지 않은 상태 (Tauri 앱을 클릭한 경우)
             if !found_focus {
-                if !remembered_url.is_empty() {
-                    // 장부에 적힌 탭이 아직 살아있으므로 그대로 유지 (hidden 이든 visible 이든 상관 안 함!)
+                if !remembered_url.is_empty() && remembered_visible {
+                    // 장부에 적힌 탭이 아직 살아있고 화면에 "보이는(visible)" 상태일 때만 유지!
+                    // (만약 다른 탭(chrome:// 등)으로 이동했다면 기존 탭은 hidden이 되므로 이 조건을 통과하지 못함)
                     active_url = remembered_url;
                     active_tab_id = last_focused_tab_id.clone();
                 } else {
-                    // 장부에 적힌 탭이 닫혀버렸음 (SSO 팝업 종료 등) -> 장부 초기화
+                    // 장부에 적힌 탭이 닫혀버렸거나 백그라운드(hidden)로 밀려났음 -> 장부 초기화
                     last_focused_tab_id.clear();
                     
                     // Fallback 1: 처음 켰거나 탭이 다 닫힌 경우, 화면에 보이는(visible) 첫 번째 탭을 강제 픽업하여 장부에 등록
@@ -278,38 +281,11 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                         }
                     }
 
-                    // 🌟 [CRITICAL FIX] Fallback 2: SSO 팝업 종료 직후 브라우저가 포커스를 잃고 visible 상태도 false로 떨어졌을 때,
-                    // 여전히 url을 찾지 못했다면 무조건 가장 우측에 열려있는 탭을 강제로 활성 탭으로 지정하여 빈 주소 전송을 막습니다.
+                    // 🌟 [CRITICAL FIX] Fallback 2: 새 탭(chrome:// 등) 생성으로 인해 스크립트 실행이 실패하여 
+                    // visible 상태를 읽어올 수 없는 경우, 엉뚱한 백그라운드 탭을 잡지 않도록 
+                    // 명시적으로 "about:blank"를 주어 프론트엔드가 즉시 번개 버튼(extract)을 숨기도록 유도합니다!
                     if active_url.is_empty() {
-                        for page in pages.iter().rev() {
-                            let script = r#"
-                                (function() {
-                                    try {
-                                        window.__logis_tab_id = window.__logis_tab_id || Math.random().toString(36).substring(2);
-                                        return JSON.stringify({ id: window.__logis_tab_id, url: window.location.href });
-                                    } catch(e) { return null; }
-                                })();
-                            "#;
-                            if let Ok(Ok(res)) = tokio::time::timeout(Duration::from_millis(300), page.evaluate(script)).await {
-                                if let Some(val_str) = res.into_value::<String>().ok() {
-                                    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str) {
-                                        let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                                        
-                                        // 🌟 [CRITICAL FIX] 새 탭 포커스 감지를 위해 개발자 도구만 배제합니다.
-                                        if tab_url.starts_with("devtools://") {
-                                            continue;
-                                        }
-
-                                        let tab_id = json_val.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                                        
-                                        last_focused_tab_id = tab_id.to_string(); 
-                                        active_tab_id = tab_id.to_string();
-                                        active_url = tab_url.to_string();
-                                        break; // 🌟 유효한 첫 번째(가장 우측) 탭을 찾았으므로 즉시 탈출!
-                                    }
-                                }
-                            }
-                        }
+                        active_url = "about:blank".to_string();
                     }
                 }
             }

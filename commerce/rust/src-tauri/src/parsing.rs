@@ -192,8 +192,8 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::t
     #[derive(Clone, Copy)]
     struct Block { start: usize, end: usize }
     let mut unbreakable_blocks = Vec::new();
-    let target_tags = ["form", "table"];
-    let meaningful_children = ["input", "button", "textarea", "option", "th", "td", "li", "dt", "dd", "a", "img", "label"];
+    let target_tags = ["form", "table", "ul", "ol", "dl", "fieldset"];
+    let meaningful_children = ["input", "button", "textarea", "th", "td", "li", "dt", "dd", "a", "img", "label"];
 
     for i in 0..lines.len() {
         let trimmed = lines[i].trim();
@@ -388,9 +388,71 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 return;
             }
 
+            // 🌟 PugMode::NoAttributesMode일 때 select, option, input, textarea 태그와 그 자식들을 원천 제거합니다.
+            if *mode == PugMode::NoAttributesMode {
+                if ["select", "option", "input", "textarea"].contains(&tag_name.as_str()) {
+                    return;
+                }
+            }
+
             // Context Management
             if tag_name == "tbody" { if let Some(c) = ctx.as_mut() { c.is_in_tbody = true; c.current_row_idx = 0; } }
             if tag_name == "tr" { if let Some(c) = ctx.as_mut() { c.current_col_idx = 0; } }
+
+            // 🌟 [새로운 태그 축약(평탄화) 로직] 
+            // 껍데기 태그 자체가 출력되지 않고 자식에게 뎁스(indent)를 그대로 패스합니다.
+            let useless_wrappers = [
+                "div", "span", "section", "article", "main", "aside", 
+                "header", "footer", "nav", "p", "strong", "b", "em", "i", "center", "font"
+            ];
+            
+            let is_useless = useless_wrappers.contains(&tag_name.as_str());
+            
+            let has_meaningful_attrs = if *mode == PugMode::NoAttributesMode {
+                false // NoAttributesMode에서는 모든 속성이 무의미하므로 모조리 벗겨냅니다.
+            } else {
+                element.attrs().any(|(k, _)| {
+                    ["src", "href", "type", "name", "value", "placeholder", "checked", "selected", "disabled", "readonly", "rows", "cols", "rowspan", "colspan"].contains(&k) || k.starts_with("data-")
+                })
+            };
+
+            // 🌟 [빈 태그 원천 삭제 로직] 내부 자식을 깊게 탐색하여 의미 있는 컨텐츠가 있는지 검사합니다.
+            let valid_children: Vec<_> = node.children().filter(|n| {
+                match n.value() {
+                    Node::Element(_) => {
+                        let void_tags = ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"];
+                        let preserve_empty = ["td", "th", "textarea", "select", "button"];
+                        
+                        // 하위에 텍스트나 필수 보존 태그가 단 하나라도 존재하는지 확인 (빈 껍데기 필터링)
+                        n.descendants().any(|desc| match desc.value() {
+                            Node::Text(t) => !t.trim().is_empty(),
+                            Node::Element(de) => {
+                                let d_tag = de.name().to_lowercase();
+                                void_tags.contains(&d_tag.as_str()) || preserve_empty.contains(&d_tag.as_str())
+                            },
+                            _ => false
+                        })
+                    },
+                    Node::Text(t) => !t.trim().is_empty(),
+                    _ => false
+                }
+            }).collect();
+
+            let void_tags = ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"];
+            let preserve_empty_tags = ["td", "th", "textarea", "select", "button"]; // 폼이나 표의 구조적 형태 유지를 위해 빈 셀/입력창은 예외적으로 보존
+            
+            // 🌟 유효한 자식(텍스트, 내부 엘리먼트 등)이 전혀 없는 빈 껍데기 태그는 렌더링하지 않고 즉시 폐기합니다.
+            if valid_children.is_empty() && !void_tags.contains(&tag_name.as_str()) && !preserve_empty_tags.contains(&tag_name.as_str()) {
+                return;
+            }
+
+            // 현재 태그가 무의미한 껍데기이고 유효한 자식이 딱 1개라면, 자신을 숨기고 뎁스 유지
+            if is_useless && !has_meaningful_attrs && valid_children.len() == 1 {
+                for child in node.children() {
+                    generate_pug_lines(child, indent_level, output, mode, ctx);
+                }
+                return;
+            }
 
             // --- 허용된 속성만 Pug 문법으로 변환 ---
             let mut other_attributes = Vec::new();
@@ -473,35 +535,11 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 attributes_string.push_str(&format!("[{}]", other_attributes.join(" ")));
             }
 
-            // div 축약 로직 (JS Parity)
-            let mut current_node = node;
-            while let Some(current_el) = current_node.value().as_element() {
-                if current_el.name().to_lowercase() != "div" { break; }
-                
-                let valid_children: Vec<_> = current_node.children().filter(|n| {
-                    match n.value() {
-                        Node::Element(_) => true,
-                        Node::Text(t) => !t.trim().is_empty(),
-                        _ => false
-                    }
-                }).collect();
-
-                if valid_children.len() == 1 {
-                    if let Some(child_el) = valid_children[0].value().as_element() {
-                        if child_el.name().to_lowercase() == "div" {
-                            current_node = valid_children[0];
-                            continue;
-                        }
-                    }
-                }
-                break;
-            }
-
             output.push_str(&format!("{}{}{}\n", indent, tag_name, attributes_string));
 
             if tag_name == "textarea" {
                 let mut text_content = String::new();
-                for child in current_node.children() {
+                for child in node.children() {
                     if let Node::Text(t) = child.value() { text_content.push_str(t); }
                 }
                 if !text_content.trim().is_empty() {
@@ -513,7 +551,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                     }
                 }
             } else {
-                for child in current_node.children() {
+                for child in node.children() {
                     generate_pug_lines(child, indent_level + 1, output, mode, ctx);
                 }
             }
@@ -1156,7 +1194,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "tracking_number":tracking Number or shipping number | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":tracking status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete') | string
-    - "title":title | string"###.to_string(),
+    - "title":{TYPE} item title | string"###.to_string(),
 
     "goods" => r###"- "goods":
     - "path":{HREF}
@@ -1166,7 +1204,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "sale_price":sale price | number
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string
-    - "title":title | string"###.to_string(),
+    - "title":{TYPE} item title | string"###.to_string(),
     
     "tracking" | "review" => r###"- "{TYPE}":
     - "path":{HREF}
@@ -1184,7 +1222,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "expired_at":yyyy-MM-ddThh:mm:ss | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' | string
-    - "title":type based item title | string"###.to_string(),
+    - "title":{TYPE} item  title | string"###.to_string(),
     
         _ => r###"- "{TYPE}":
     - "path":{HREF}
@@ -1192,7 +1230,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
-    - "title":title | string"###.to_string()
+    - "title":{TYPE} item title | string"###.to_string()
     };
 
     // 🌟 [CRITICAL FIX] item_pug 내용에 링크(href)가 없을 경우 스키마에서 link와 path 요구 조건을 동적으로 제거합니다.
