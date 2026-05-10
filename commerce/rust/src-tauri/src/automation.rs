@@ -211,8 +211,8 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                                 let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
                                 let has_focus = json_val.get("focus").and_then(|v| v.as_bool()).unwrap_or(false);
 
-                                // 🌟 [CRITICAL FIX] 개발자 도구 및 브라우저 기본 페이지는 탭 추적 대상에서 원천 배제합니다.
-                                if tab_url.starts_with("devtools://") || tab_url.starts_with("chrome://") || tab_url.starts_with("edge://") {
+                                // 🌟 [CRITICAL FIX] 새 탭 이동 시 번개 버튼을 숨기기 위해 chrome://, edge:// 등은 포커스 감지 대상에 포함합니다. (개발자 도구만 배제)
+                                if tab_url.starts_with("devtools://") {
                                     continue;
                                 }
 
@@ -259,8 +259,8 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                                 if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str) {
                                     let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
                                     
-                                    // 🌟 [CRITICAL FIX] 개발자 도구 배제
-                                    if tab_url.starts_with("devtools://") || tab_url.starts_with("chrome://") || tab_url.starts_with("edge://") {
+                                    // 🌟 [CRITICAL FIX] 새 탭 포커스 감지를 위해 개발자 도구만 배제합니다.
+                                    if tab_url.starts_with("devtools://") {
                                         continue;
                                     }
 
@@ -295,8 +295,8 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                                     if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str) {
                                         let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
                                         
-                                        // 🌟 [CRITICAL FIX] 개발자 도구 배제
-                                        if tab_url.starts_with("devtools://") || tab_url.starts_with("chrome://") || tab_url.starts_with("edge://") {
+                                        // 🌟 [CRITICAL FIX] 새 탭 포커스 감지를 위해 개발자 도구만 배제합니다.
+                                        if tab_url.starts_with("devtools://") {
                                             continue;
                                         }
 
@@ -418,7 +418,8 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
         // 2. Build Config
         let build_config = || -> anyhow::Result<BrowserConfig> {
             let port_arg = format!("--remote-debugging-port={}", CHROME_DEBUG_PORT);
-            let args = vec![
+            // 🌟 args를 mut로 선언하여 변형 가능하게 만듭니다.
+            let mut args = vec![
                 "--start-maximized", 
                 "--disable-gpu", 
                 "--disable-software-rasterizer",
@@ -436,6 +437,11 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
                 &port_arg,
                 "--remote-allow-origins=*", 
             ];
+
+            // 🌟 [CRITICAL FIX] 탭 두 개 열림 방지: 크롬 실행 시 첫 탭을 무조건 빈 페이지나 목표 URL로 덮어씌웁니다.
+            let target_url = if url.is_empty() { "about:blank" } else { url };
+            args.push(target_url);
+
             let mut builder = BrowserConfig::builder()
                 .chrome_executable(&exec_path)
                 .with_head()
@@ -474,8 +480,16 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
 
     println!("[AUTO] Targeting initial page for {}...", url);
     
-    // 새 페이지를 생성(new_page)하지 않고, 브라우저 시작 시 자동 생성된 기존 페이지들을 가져옵니다.
-    let pages = browser_arc.pages().await.map_err(|e| anyhow!("Failed to get pages: {}", e))?;
+    // 🌟 [CRITICAL FIX] 브라우저가 막 켜졌을 때 첫 번째 탭이 준비될 때까지 아주 짧게 기다려줍니다.
+    // 이 대기가 없으면 pages()가 비어있다고 착각하여 불필요한 두 번째 탭(new_page)을 강제 생성해버립니다.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    
+    let mut pages = browser_arc.pages().await.map_err(|e| anyhow!("Failed to get pages: {}", e))?;
+    
+    if pages.is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        pages = browser_arc.pages().await.unwrap_or_default();
+    }
     
     // 첫 번째 페이지를 선택합니다. 만약 없다면(이례적인 상황) 새 페이지를 만듭니다.
     let page = if let Some(first_page) = pages.first() {
@@ -487,10 +501,10 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
     // [CRITICAL STEALTH] 탐지 우회 스크립트 설정
     let _ = page.evaluate_on_new_document("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})").await;
 
-    // 기존 페이지가 이미 about:blank라면 굳이 다시 이동(goto)하지 않고, 다른 URL일 때만 이동시킵니다.
-    if !url.is_empty() && url != "about:blank" {
-        page.goto(url).await.map_err(|e| anyhow!("Navigation failed: {}", e))?;
-    }
+    // 🌟 [CRITICAL FIX] url이 "about:blank" 이더라도 강제로 해당 페이지로 이동(goto)시켜서
+    // 남아있는 "chrome://new-tab-page/" 흔적을 깔끔하게 덮어씌워 단일 탭으로 통일합니다.
+    let nav_target = if url.is_empty() { "about:blank" } else { url };
+    let _ = page.goto(nav_target).await;
     
     Ok(format!("Automation Started."))
 }

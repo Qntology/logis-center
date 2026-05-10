@@ -4247,8 +4247,8 @@ async function syncBrowserStatus() {
         const res = await invoke<any>("get_browser_status"); 
         const s = res.status;
 
-        // 🌟 [CRITICAL FIX] 백엔드 응답에서 URL과 권한 상태도 즉시 추출하여 동기화 (초기 로드 시 버튼 숨김 방지)
-        if (res.url) {
+        // 🌟 [CRITICAL FIX] 새 탭(빈 주소) 이동 시에도 currentDetectedUrl을 정상적으로 덮어씌워 버튼을 비활성화합니다!
+        if (res.url !== undefined) {
             currentDetectedUrl = res.url;
             isCurrentShop = res.is_client || res.is_admin;
         }

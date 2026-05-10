@@ -160,9 +160,13 @@ fn is_root_layout_element(line: &str) -> bool {
 }
 
 // 🌟 [CRITICAL FIX] Token Optimizer를 주입받아 앞단을 잘라내고, 필수 부모를 복구하며, 최상위 껍데기를 버리는 완전체 함수
-pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::tokenizer::TokenizerModel, bottom_drop_tokens: Option<usize>) -> String {
+pub fn truncate_pug_by_tokens(pug: &str, counting_pug: &str, max_tokens: usize, tokenizer: &crate::tokenizer::TokenizerModel, bottom_drop_tokens: Option<usize>) -> String {
     let mut lines: Vec<&str> = pug.lines().collect();
+    let counting_lines: Vec<&str> = counting_pug.lines().collect();
     if lines.is_empty() { return String::new(); }
+
+    // 🌟 [CRITICAL FIX] 속성값이 없는 깔끔한 PUG(counting_lines)와 실제 PUG(lines)의 줄 수가 다를 경우를 대비한 안전 장치
+    let use_counting = lines.len() == counting_lines.len();
 
     // 🌟 0. 지능형 트리 스캔 (Pre-scan)
     // 의미 있는 자식(input, option, td 등)을 품고 있는 구조적 부모(form, table, select 등)를 찾아내어
@@ -170,7 +174,7 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::t
     #[derive(Clone, Copy)]
     struct Block { start: usize, end: usize }
     let mut unbreakable_blocks = Vec::new();
-    let target_tags = ["form", "table", "select", "ul", "ol", "dl", "fieldset"];
+    let target_tags = ["form", "table"];
     let meaningful_children = ["input", "button", "textarea", "option", "th", "td", "li", "dt", "dd", "a", "img", "label"];
 
     for i in 0..lines.len() {
@@ -229,7 +233,9 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::t
         let mut cut_idx = lines.len();
         
         for i in (0..lines.len()).rev() {
-            let line_with_newline = format!("{}\n", lines[i]);
+            // 🌟 [최적화] E0502 에러 해결: lines를 미리 참조하지 않고 루프 내부에서 즉시 판별하여 참조합니다.
+            let target_line = if use_counting { counting_lines[i] } else { lines[i] };
+            let line_with_newline = format!("{}\n", target_line);
             let token_count = tokenizer.text_encode_vec(line_with_newline, false).map(|v| v.len()).unwrap_or(0);
             
             if dropped_tokens + token_count > drop_limit {
@@ -257,7 +263,9 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::t
     let mut start_keep_idx = lines.len();
 
     for i in (0..lines.len()).rev() {
-        let line_with_newline = format!("{}\n", lines[i]);
+        // 🌟 [최적화] E0502 에러 해결: lines를 미리 참조하지 않고 루프 내부에서 즉시 판별하여 참조합니다.
+        let target_line = if use_counting { counting_lines[i] } else { lines[i] };
+        let line_with_newline = format!("{}\n", target_line);
         let token_count = tokenizer.text_encode_vec(line_with_newline, false).map(|v| v.len()).unwrap_or(0);
         
         if current_tokens + token_count > max_tokens {
@@ -1134,7 +1142,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "tracking_number":tracking Number or shipping number | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":tracking status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete') | string
-    - "title":title | string"###.to_string(),
+    - "title":product title | string"###.to_string(),
 
     "goods" => r###"- "goods":
     - "path":{HREF}
@@ -1144,7 +1152,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "sale_price":sale price | number
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string
-    - "title":title | string"###.to_string(),
+    - "title":product title | string"###.to_string(),
     
     "tracking" | "review" => r###"- "{TYPE}":
     - "path":{HREF}
@@ -1162,7 +1170,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "expired_at":yyyy-MM-ddThh:mm:ss | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' | string
-    - "title":type based item title | string"###.to_string(),
+    - "title":title | string"###.to_string(),
     
         _ => r###"- "{TYPE}":
     - "path":{HREF}

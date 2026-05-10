@@ -562,7 +562,8 @@ async fn process_task(
     let clean_html_content = parsing::pre_clean_html(&raw_html_content);
     // 🌟 [CRITICAL FIX] 1단계 분석에서도 현재 URL을 넘겨 PUG 상의 모든 상대 주소를 절대 주소로 치환합니다.
     let raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::FullContent, Some(&url));
-    let light_pug = model.truncate_pug_context(&raw_pug, false, 2000, None).await;
+    let raw_pug_no_attr = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, None);
+    let light_pug = model.truncate_pug_context(&raw_pug, &raw_pug_no_attr, false, 2000, None).await;
 
     println!("[DEBUG-PUG] Generated PUG. Length: {}. Snippet: {}...", 
         light_pug.len(), 
@@ -811,19 +812,13 @@ async fn process_task(
             
             let snapshot_id = format!("{}_step_a2", task.id); // 🌟 q35 접미사 제거
 
-            // 🌟 [CRITICAL FIX] 속성을 완전히 비운 NoAttributesMode로 PUG를 새로 생성하고 자릅니다.
-            let no_attr_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, None);
-            let light_no_attr_pug = model.truncate_pug_context(&no_attr_pug, false, 2000, None).await;
-            let specific_system_content = format!("[PUG CONTENT]\n{}", light_no_attr_pug);
-
-            // 🌟 [CRITICAL FIX] System 프롬프트가 변경되었으므로, 기존 base_session_id 캐시를 쓰면 오염됩니다.
-            // None을 전달하여 독립된 세션으로 깨끗하게 0.6B 모델을 올립니다.
-            model.secure_vram_relay(crate::model::ModelSize::Qwen, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            // 🌟 [CRITICAL FIX] 이미 구워진 FullContent 기반의 Base 스냅샷(base_session_id)을 재사용하여 효율을 극대화합니다.
+            model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![
                     ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                        content: specific_system_content, // 🌟 새로 만든 무속성 프롬프트 주입
+                        content: system_content.clone(), // 🌟 기존에 구워진 system_content 재사용
                         name: None,
                     }),
                     ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -1264,7 +1259,7 @@ async fn process_task(
                     
                     // 🌟 [추가] ref_row의 텍스트 길이를 기반으로 대략적인 토큰을 산출하여 컨텍스트 사이즈를 예약하고 뒤에서 자릅니다.
                     let ref_row_context_size = ref_row.len() + 3000;
-                    let thead_light_pug = model.truncate_pug_context(&raw_pug, false, 0, Some(ref_row_context_size)).await;
+                    let thead_light_pug = model.truncate_pug_context(&raw_pug, &raw_pug_no_attr, false, 0, Some(ref_row_context_size)).await;
                     let thead_prompt = crate::parsing::extract_table_structure_prompt(&page_type, &target_selector, &thead_light_pug, &ref_row);
                     let params = ChatCompletionParameters {
                         messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -1492,6 +1487,9 @@ async fn process_task(
                 log_task_progress(app_handle, &task.id, &payload);
                 emit_term(&format!("[STAGE-3] {}", summary_msg));
 
+                println!("thead_pug {}", thead_pug);
+                println!("item_pug {}", item_pug);
+
                 // 🌟 [CRITICAL FIX 3] E0061 해결: 인자 5개를 받도록 변경된 list2json 구조에 완벽하게 맞춥니다.
                 let task_question = parsing::list2json(
                     &page_type, 
@@ -1631,10 +1629,11 @@ async fn process_task(
             let clean_content = &clean_html_content;
             // 🌟 [최적화] 정규식 대신 파서 단에서 DetailMode를 적용하여 안전하게 id와 class 속성을 제거합니다.
             // 🌟 [CRITICAL FIX] 상세 페이지 전처리 시에도 URL을 넘겨 item2json 등에서 LLM이 절대 주소를 뽑아내도록 유도합니다!
-            let raw_pug = parsing::convert_to_clean_pug(clean_content, PugMode::DetailMode, Some(&url));
+            let raw_pug_detail = parsing::convert_to_clean_pug(clean_content, PugMode::DetailMode, Some(&url));
+            let raw_pug_detail_no_attr = parsing::convert_to_clean_pug(clean_content, PugMode::NoAttributesMode, None);
             
             // 🌟 [CRITICAL FIX] 디테일 모드에서도 통일된 절단 로직을 호출하여 모델 부재 시의 누수를 막습니다.
-            model.truncate_pug_context(&raw_pug, true, 2000, None).await
+            model.truncate_pug_context(&raw_pug_detail, &raw_pug_detail_no_attr, true, 2000, None).await
         };
 
         if !content_pug.trim().is_empty() {
