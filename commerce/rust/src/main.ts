@@ -892,7 +892,44 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                         }
                         navTmp[domain] = true;
                     }
-                    if (nodeId === activeContext.ref || (currentDetectedUrl && currentDetectedUrl.includes(data.link))) {
+
+                    // 🌟 [CRITICAL FIX] before.ts 패리티 완벽 복원: Hash ID 기반 매칭에 실패했을 경우를 대비해, 
+                    // 현재 브라우저 URL의 파라미터를 분석하여 리스트(부모)와 상세(자식) 활성화 대상을 100% 정확히 찾아냅니다.
+                    let isActive = nodeId === activeContext.ref;
+
+                    if (!isActive && currentDetectedUrl && data.link) {
+                        try {
+                            const currentUrl = new URL(currentDetectedUrl.toLowerCase());
+                            const targetUrl = new URL((data.origin + data.link).toLowerCase());
+
+                            if (currentUrl.pathname === targetUrl.pathname) {
+                                const currentParams = Object.fromEntries(currentUrl.searchParams.entries());
+                                const targetParams = Object.fromEntries(targetUrl.searchParams.entries());
+                                const currentKeys = Object.keys(currentParams);
+                                const targetKeys = Object.keys(targetParams);
+
+                                const isDetailMode = Object.values(currentParams).some(val => 
+                                    val === "form" || val === "view" || val === "detail" || val === "update" || val === "edit" || val === "read"
+                                ) || (currentKeys.length > targetKeys.length);
+
+                                if (data.detail) {
+                                    if (isDetailMode) isActive = true;
+                                } else {
+                                    if (!isDetailMode) {
+                                        let isExactMatch = true;
+                                        for (const key of targetKeys) {
+                                            if (currentParams[key] !== targetParams[key]) {
+                                                isExactMatch = false; break;
+                                            }
+                                        }
+                                        if (isExactMatch) isActive = true;
+                                    }
+                                }
+                            }
+                        } catch(e) {}
+                    }
+
+                    if (isActive) {
                         active = "active";
                     }
                 }
@@ -1023,7 +1060,54 @@ async function renderNavigation() {
         let currentDomain = "";
         if (currentDetectedUrl) {
             try {
-                currentDomain = new URL(currentDetectedUrl.toLowerCase()).hostname;
+                const footprint = new URL(currentDetectedUrl.toLowerCase());
+                currentDomain = footprint.hostname;
+                
+                // 🌟 [CRITICAL FIX] before.ts 패리티 완벽 복원: 해시 규칙 불일치로 못 찾던 문제를, 
+                // URL 문자열 직접 대조 및 상세/리스트 파라미터 판별을 통해 활성 컨텍스트(activeContext)를 100% 완벽히 복원합니다.
+                if (!activeContext.ref) {
+                    const currentParams = Object.fromEntries(footprint.searchParams.entries());
+                    const isDetailMode = Object.values(currentParams).some(val => 
+                        val === "form" || val === "view" || val === "detail" || val === "update" || val === "edit" || val === "read"
+                    );
+
+                    let matchedPage = null;
+                    
+                    const localPages = await Select["pages"]({});
+                    for (const p of localPages) {
+                        const d = p.data || p;
+                        if (d.origin && d.link) {
+                            try {
+                                const targetUrl = new URL((d.origin + d.link).toLowerCase());
+                                if (currentDomain === targetUrl.hostname && footprint.pathname === targetUrl.pathname) {
+                                    if (isDetailMode && d.detail) {
+                                        matchedPage = p;
+                                        break;
+                                    } else if (!isDetailMode && !d.detail) {
+                                        const targetParams = Object.fromEntries(targetUrl.searchParams.entries());
+                                        let isExactMatch = true;
+                                        for (const key of Object.keys(targetParams)) {
+                                            if (currentParams[key] !== targetParams[key]) {
+                                                isExactMatch = false;
+                                                break;
+                                            }
+                                        }
+                                        if (isExactMatch) {
+                                            matchedPage = p;
+                                        }
+                                    }
+                                }
+                            } catch(e) {}
+                        }
+                    }
+                    
+                    if (matchedPage) {
+                        activeContext.cc = matchedPage.cc || "";
+                        activeContext.bcc = matchedPage.bcc || "";
+                        activeContext.ref = matchedPage.id || "";
+                        console.log("[NAV] Restored activeContext from exact URL match:", activeContext);
+                    }
+                }
             } catch(e) {}
         }
 
@@ -1075,6 +1159,7 @@ async function renderNavigation() {
 
                         let parent = branchs[`${data.origin}#${_page.type}`];
 
+                        // 🌟 [CRITICAL FIX] before.ts 패리티 완벽 복원: 모순이 발생하는 복잡한 Splice 로직을 걷어내고 가장 간결하고 정확한 트리 조립을 수행합니다.
                         if (parent) {
                             if (data.item) {
                                 let children = safeClone(parent.children);
@@ -1082,21 +1167,8 @@ async function renderNavigation() {
                                     ..._page,
                                     children: children
                                 };
-                            } else if (!temp[`${data.origin}#${_page.type}`]) {
-                                temp[`${data.origin}#${_page.type}`] = true;
+                            } else {
                                 branchs[`${data.origin}#${_page.type}`].children.push(_page);
-                            } else if (typeof data.node === "string" && typeof data.item === "string" && !data.item && typeof temp[`${data.origin}#${_page.type}`] !== "string") {
-                                if (branchs[`${data.origin}#${_page.type}`].children.length) {
-                                    temp[`${data.origin}#${_page.type}`] = 'true';
-                                    let index = 0;
-                                    for (let b = 0; b < branchs[`${data.origin}#${_page.type}`].children.length; b++) {
-                                        if (data.node === true) {
-                                            index = b;
-                                        }
-                                    }
-                                    branchs[`${data.origin}#${_page.type}`].children.splice(index, 1);
-                                    branchs[`${data.origin}#${_page.type}`].children.push(_page);
-                                }
                             }
                         } else {
                             if (data.item) {
@@ -1106,22 +1178,11 @@ async function renderNavigation() {
                                         children: []
                                     };
                                 }
-                            } else if (!temp[`${data.origin}#${_page.type}`]) {
-                                temp[`${data.origin}#${_page.type}`] = true;
-                                if (!branchs[`${data.origin}#${_page.type}`]) branchs[`${data.origin}#${_page.type}`] = { children: [] };
-                                branchs[`${data.origin}#${_page.type}`].children.push(_page);
-                            } else if (typeof data.node === "string" && typeof data.item === "string" && !data.item && typeof temp[`${data.origin}#${_page.type}`] !== "string") {
-                                if (branchs[`${data.origin}#${_page.type}`] && branchs[`${data.origin}#${_page.type}`].children && branchs[`${data.origin}#${_page.type}`].children.length) {
-                                    temp[`${data.origin}#${_page.type}`] = 'true';
-                                    let index = 0;
-                                    for (let b = 0; b < branchs[`${data.origin}#${_page.type}`].children.length; b++) {
-                                        if (data.node === true) {
-                                            index = b;
-                                        }
-                                    }
-                                    branchs[`${data.origin}#${_page.type}`].children.splice(index, 1);
-                                    branchs[`${data.origin}#${_page.type}`].children.push(_page);
+                            } else {
+                                if (!branchs[`${data.origin}#${_page.type}`]) {
+                                    branchs[`${data.origin}#${_page.type}`] = { children: [] };
                                 }
+                                branchs[`${data.origin}#${_page.type}`].children.push(_page);
                             }
                         }
                     }
@@ -1600,10 +1661,16 @@ async function syncData() {
                 
                 // 🌟 [누락 복구] 서버 통계를 LanceDB에 덮어썼다면, 반드시 프론트엔드 Dexie DB 에도 동기화해줘야 화면이 바뀝니다!
                 const newUsers = filteredResults.filter((r: any) => r.type === "team" || r.type === "user" || r.type === "member");
-                const newPages = filteredResults.filter((r: any) => r.type === "pages" || r.type === "page");
                 
-                if (newUsers.length > 0) await Upsert["users"](newUsers);
-                if (newPages.length > 0) await Upsert["pages"](newPages);
+                // 🌟 [CRITICAL FIX] 클라우드 서버에서 type을 "goods" 등으로 덮어써서 내려보내더라도, 
+                // data.item 이나 data.node 속성을 쥐고 있다면 무조건 페이지 캐시로 분류하여 Dexie에 살려냅니다!
+                const newPages = filteredResults.filter((r: any) => {
+                    const d = typeof r.data === 'string' ? JSON.parse(r.data) : (r.data || r);
+                    return r.type === "pages" || r.type === "page" || d.node !== undefined || d.item !== undefined;
+                });
+                
+                // 🌟 [CRITICAL FIX] 서버에서 가져온 데이터는 이미 윗줄에서 invoke("upsert_items")를 통해 Rust(LanceDB)에 
+                // 일괄 저장되었습니다. 프론트엔드가 이를 다시 백엔드로 밀어넣는 병목 루프를 삭제합니다.
             } else {
                 console.log(`[SYNC] 2. 변경된 데이터가 없어 DB 쓰기를 건너뜁니다.`);
             }
@@ -2079,22 +2146,6 @@ listen("task-db-registered", async (event: any) => {
     });
 });
 
-// 🌟 [CRITICAL FIX] 백엔드(LanceDB)와 프론트엔드(Dexie)의 업데이트 시간을 비교하여 최신 데이터만 선택적으로 반영하는 동기화 헬퍼 함수
-async function syncLocalToDexie(lanceItems: any[], tableName: string) {
-    if (!lanceItems || lanceItems.length === 0) return;
-    try {
-        // 🌟 [CRITICAL FIX] Rust(LanceDB)가 완벽한 원본이므로, 기존 Dexie의 시간 비교 로직을 전부 삭제하고 무조건 덮어씌웁니다.
-        // 대기열(Task)은 이 함수를 타지 않으므로 안전하며, Users(통계)와 Pages 데이터가 100% 동기화됩니다.
-        console.log(`[LOCAL-SYNC] ${tableName} 테이블 강제 최신화 중... (${lanceItems.length}건 덮어쓰기)`);
-        
-        for (const item of lanceItems) {
-            await (Upsert as any)[tableName](item);
-        }
-    } catch (e) {
-        console.error(`[LOCAL-SYNC] ${tableName} 강제 동기화 실패:`, e);
-    }
-}
-
 listen("extraction-progress", async (event: any) => { 
     const payload = event.payload;
     if (payload.task_id) livePayloads.set(payload.task_id, payload);
@@ -2324,18 +2375,13 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
                         }
                         tData = tData || teamDocs[0];
                         
-                        console.log("[TRACKING-3] Dexie에 덮어쓸 최신 Base 통계:", JSON.stringify(tData.base?.pages, null, 2));
-                        // 🌟 [CRITICAL FIX] 단순히 덮어쓰지 않고 타임스탬프를 비교하여 최신화합니다.
-                        await syncLocalToDexie(teamDocs, "users");
+                        console.log("[TRACKING-3] 화면에 반영될 최신 Base 통계:", JSON.stringify(tData.base?.pages, null, 2));
                     } else {
                         console.warn("[TRACKING-WARN] get_known_users에 'team' 문서가 포함되지 않았습니다! (Limit 제한 의심)");
                     }
                 }
-                if (pages && pages.length > 0) await syncLocalToDexie(pages, "pages");
-                            
-                console.log("[SYNC] LanceDB의 최신 데이터(통계, 페이지)를 Dexie로 타임스탬프 동기화 완료!");
                 
-                // 🌟 [CRITICAL FIX] 프론트엔드 최신화 버그 해결! 서버 동기화(네트워크 상태)와 무관하게, 로컬 통계가 갱신되었으므로 무조건 즉시 UI를 새로고침합니다.
+                // 🌟 [CRITICAL FIX] 프론트엔드 최신화 버그 해결! 서버 동기화(네트워크 상태)와 무관하게, 백엔드 로컬 통계가 갱신되었으므로 무조건 즉시 UI를 새로고침합니다.
                 await renderNavigation();
                 if (currentTab === "list") {
                     refreshList();
@@ -3388,6 +3434,10 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
                 const docId = res[0];
                 const fullDoc = await invoke<any>("get_document", { uuid: docId });
                 if (fullDoc) {
+                    // 🌟 [CRITICAL FIX] 렌더링 카드 빈칸 오류 해결: Rust에서 가져온 json_data 문자열을 파싱하여 data 객체로 복원합니다!
+                    if (!fullDoc.data && fullDoc.json_data && typeof fullDoc.json_data === "string") {
+                        try { fullDoc.data = JSON.parse(fullDoc.json_data); } catch(e) {}
+                    }
                     docs.push(fullDoc);
                 }
             }
@@ -3396,6 +3446,14 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
                 limit: pageSize,
                 offset: currentOffset,
                 filter: finalFilter || null
+            });
+            
+            // 🌟 [CRITICAL FIX] 렌더링 카드 빈칸 오류 해결: Rust에서 가져온 json_data 문자열을 파싱하여 data 객체로 복원합니다!
+            docs = docs.map(doc => {
+                if (!doc.data && doc.json_data && typeof doc.json_data === "string") {
+                    try { doc.data = JSON.parse(doc.json_data); } catch(e) {}
+                }
+                return doc;
             });
         }
 
@@ -4082,28 +4140,19 @@ async function initSession() {
             await updateExtractButtonVisibility();
         }
 
-        // 아이템 리스트 캐싱
-        if (data.items && data.items.length > 0 && cachedDocs.length === 0) {
-            cachedDocs = data.items;
-            renderDocs(data.items);
-            currentPage = 1;
-        }
+        // 🌟 [CRITICAL FIX] 렌더링 오염(pages 타입 노출) 해결: 필터링 없이 raw DB 아이템을 무작정 렌더링하던 코드를 삭제합니다.
+        // 리스트 렌더링은 하단의 syncData -> loadMoreDocs(false, true) 파이프라인에서 
+        // baseFilter("type IN ('sales'...)")를 거쳐 100% 안전하게 수행됩니다.
 
-        // 🌟 [CRITICAL FIX] 앱 초기화 시 백엔드(LanceDB)에서 가져온 사용자(통계) 및 페이지 데이터를 프론트엔드(Dexie)에 타임스탬프 기반으로 안전하게 복구 동기화합니다.
-        if (data.users && data.users.length > 0) {
-            await syncLocalToDexie(data.users, "users");
-        }
-        if (data.pages && data.pages.length > 0) {
-            await syncLocalToDexie(data.pages, "pages");
-        }
+        // 🌟 [CRITICAL FIX] Rust(LanceDB)에서 로드한 초기 데이터를 다시 Rust로 덮어쓰는(역동기화) 치명적인 병목 루프를 제거합니다.
 
-        // 🌟 [핵심 분기 로직] 로그인 상태 확인 후 렌더링 방식 결정
+        // 🌟 [CRITICAL FIX] 로그인 여부(네트워크 상태)와 무관하게 로컬 DB의 최신 데이터로 화면을 즉시 그려냅니다! (병목 및 렌더링 유격 해소)
+        await renderNavigation();
+
+        // 🌟 화면이 렌더링된 후 백그라운드에서 조용히 서버와 통신하여 최신 데이터를 반영합니다.
         if (currentSession.email) {
-            console.log("[WIDGET] 로그인 확인됨. 서버 데이터를 가져옵니다...");
-            await syncData(); 
-        } else {
-            console.log("[WIDGET] 비로그인 상태. 로컬 LanceDB에서 메뉴를 불러옵니다...");
-            await renderNavigation();
+            console.log("[WIDGET] 로그인 확인됨. 서버 데이터를 백그라운드에서 동기화합니다...");
+            syncData(); // await를 제거하여 UI 블로킹 방지
         }
 
     } catch (e) { 

@@ -132,9 +132,17 @@ Select["pages"] = async function(query: DbQuery = {}) {
                 if (isPage) {
                     const data = parsed.data || parsed;
                     const realTitle = itemsMap.get(doc.ref) || data.title || data.text || "";
+                    
+                    // 🌟 [CRITICAL FIX] before.ts 패리티: JSON 내부에 실수로 비어있는 cc, bcc, ref가 있다면 
+                    // LanceDB 원본 Row가 가진 확실한 값을 유지하도록 병합 순서 및 검증을 강화합니다.
+                    const safeParsed = { ...parsed };
+                    if (!safeParsed.cc) delete safeParsed.cc;
+                    if (!safeParsed.bcc) delete safeParsed.bcc;
+                    if (!safeParsed.ref) delete safeParsed.ref;
+
                     unique.set(docId, {
-                        ...doc, // Spread original DB fields first (id, cc, bcc, ref, etc.)
-                        ...parsed, // Overwrite with parsed fields
+                        ...doc, // Spread original DB fields first (guarantees valid cc, bcc, ref)
+                        ...safeParsed, // Overwrite with parsed fields safely
                         id: docId,
                         type: typeStr,
                         title: realTitle,
@@ -163,8 +171,9 @@ Select["users"] = async function(query: DbQuery = {}) {
             const parsed = parseItemData(doc.json_data);
             return {
                 ...parsed,
-                id: parsed.id || doc.uuid,
-                type: parsed.type || doc.doc_type,
+                ...doc, // 🌟 [CRITICAL FIX] Rust의 TradeDocument 속성(id, type)을 유실하지 않고 완벽하게 병합합니다.
+                id: parsed.id || doc.id || doc.uuid,
+                type: parsed.type || doc.type || doc.doc_type,
                 data: parsed.data || parsed
             };
         });
@@ -176,7 +185,8 @@ Select["crons"] = async function(query: DbQuery = {}) {
     try {
         const tasks = await invoke<any[]>("get_active_tasks");
         if (query.key === 'ref' && query.value) {
-            return tasks.filter(t => t.ref_id === query.value);
+            // 🌟 [CRITICAL FIX] Task 구조체에는 ref_id가 아니라 ref 속성이 존재합니다.
+            return tasks.filter((t: any) => t.ref === query.value || (t.data_json && JSON.parse(t.data_json).ref === query.value));
         }
         return tasks;
     } catch (e) { return []; }

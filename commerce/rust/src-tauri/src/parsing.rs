@@ -432,7 +432,8 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                             if let Some(c) = ctx.as_ref() {
                                 if let Some(base) = &c.base_url {
                                     if let Ok(base_url_obj) = url::Url::parse(base) {
-                                        if let Ok(resolved_url) = base_url_obj.join(&safe_value) {
+                                        // 🌟 지저분한 HTML의 공백(띄어쓰기) 때문에 URL 파싱이 실패하여 상대경로가 그대로 남는 현상을 방어하기 위해 trim() 추가
+                                        if let Ok(resolved_url) = base_url_obj.join(safe_value.trim()) {
                                             safe_value = resolved_url.to_string();
                                         }
                                     }
@@ -1026,16 +1027,16 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
         { 
             value:product option name | string, 
             inputs:[
-                { value:product option input value | string } | null
+                { value:product option input value | string }
             ] 
-        } | null
+        }
     ]
     - "additional_goods":[ 
         { 
             path:value:URL includes a additional product manage path, an administrative or additional product edit Link | string, 
             id:Refer to the additional product no value from the link or an attribute or additional product input value | string, 
             link:value:Refer to the ID to find a URL that includes a additional product manage link | string
-        } | null
+        }
     ]"###.to_string(),
 
         "order" => r###"- "{TYPE}":
