@@ -390,7 +390,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
 
             // 🌟 PugMode::NoAttributesMode일 때 select, option, input, textarea 태그와 그 자식들을 원천 제거합니다.
             if *mode == PugMode::NoAttributesMode {
-                if ["select", "option", "input", "textarea"].contains(&tag_name.as_str()) {
+                if ["select", "option"].contains(&tag_name.as_str()) {
                     return;
                 }
             }
@@ -1194,7 +1194,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "tracking_number":tracking Number or shipping number | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":tracking status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete') | string
-    - "title":{TYPE} item title | string"###.to_string(),
+    - "title":title | string"###.to_string(),
 
     "goods" => r###"- "goods":
     - "path":{HREF}
@@ -1204,7 +1204,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "sale_price":sale price | number
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string
-    - "title":{TYPE} item title | string"###.to_string(),
+    - "title":title | string"###.to_string(),
     
     "tracking" | "review" => r###"- "{TYPE}":
     - "path":{HREF}
@@ -1222,7 +1222,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "expired_at":yyyy-MM-ddThh:mm:ss | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' | string
-    - "title":{TYPE} item  title | string"###.to_string(),
+    - "title": title | string"###.to_string(),
     
         _ => r###"- "{TYPE}":
     - "path":{HREF}
@@ -1230,7 +1230,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
-    - "title":{TYPE} item title | string"###.to_string()
+    - "title":title | string"###.to_string()
     };
 
     // 🌟 [CRITICAL FIX] item_pug 내용에 링크(href)가 없을 경우 스키마에서 link와 path 요구 조건을 동적으로 제거합니다.
