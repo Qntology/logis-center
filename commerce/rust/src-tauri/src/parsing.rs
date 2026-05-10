@@ -45,12 +45,34 @@ pub fn pre_clean_html(html: &str) -> String {
     let re_single = Regex::new(r"(?is)<(meta|link|br|hr|source)\b[^>]*>").unwrap();
     let clean = re_single.replace_all(&html, "");
 
-    // 4. 연속된 줄바꿈 및 불필요한 공백 제거
+    // 4. 허용된 속성 외 모두 제거 (지정된 16개 속성만 보존)
+    let re_tag = Regex::new(r"(?i)<([a-zA-Z0-9\-]+)([^>]*)>").unwrap();
+    let re_attr = Regex::new(r#"(?i)\b(id|class|src|href|type|name|value|placeholder|checked|selected|disabled|readonly|rows|cols|rowspan|colspan)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?"#).unwrap();
+    
+    let clean = re_tag.replace_all(&clean, |caps: &regex::Captures| {
+        let tag_name = &caps[1];
+        let attrs_str = &caps[2];
+        
+        let mut keep_attrs = String::new();
+        for attr_cap in re_attr.captures_iter(attrs_str) {
+            keep_attrs.push(' ');
+            keep_attrs.push_str(&attr_cap[0]);
+        }
+        
+        if attrs_str.trim_end().ends_with('/') {
+            keep_attrs.push_str(" /");
+        }
+        
+        format!("<{}{}>", tag_name, keep_attrs)
+    }).to_string();
+
+    // 5. 연속된 줄바꿈 및 불필요한 공백 제거
     let re_whitespace = Regex::new(r"(?m)^\s*\n").unwrap();
     let clean = re_whitespace.replace_all(&clean, "");
     
     clean.trim().to_string()
 }
+
 
 pub fn convert_doc_to_clean_pug(document: &Html, mode: PugMode, base_url: Option<&str>) -> String {
     let mut pug_output = String::new();
@@ -160,13 +182,9 @@ fn is_root_layout_element(line: &str) -> bool {
 }
 
 // 🌟 [CRITICAL FIX] Token Optimizer를 주입받아 앞단을 잘라내고, 필수 부모를 복구하며, 최상위 껍데기를 버리는 완전체 함수
-pub fn truncate_pug_by_tokens(pug: &str, counting_pug: &str, max_tokens: usize, tokenizer: &crate::tokenizer::TokenizerModel, bottom_drop_tokens: Option<usize>) -> String {
+pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::tokenizer::TokenizerModel, bottom_drop_tokens: Option<usize>) -> String {
     let mut lines: Vec<&str> = pug.lines().collect();
-    let counting_lines: Vec<&str> = counting_pug.lines().collect();
     if lines.is_empty() { return String::new(); }
-
-    // 🌟 [CRITICAL FIX] 속성값이 없는 깔끔한 PUG(counting_lines)와 실제 PUG(lines)의 줄 수가 다를 경우를 대비한 안전 장치
-    let use_counting = lines.len() == counting_lines.len();
 
     // 🌟 0. 지능형 트리 스캔 (Pre-scan)
     // 의미 있는 자식(input, option, td 등)을 품고 있는 구조적 부모(form, table, select 등)를 찾아내어
@@ -233,9 +251,7 @@ pub fn truncate_pug_by_tokens(pug: &str, counting_pug: &str, max_tokens: usize, 
         let mut cut_idx = lines.len();
         
         for i in (0..lines.len()).rev() {
-            // 🌟 [최적화] E0502 에러 해결: lines를 미리 참조하지 않고 루프 내부에서 즉시 판별하여 참조합니다.
-            let target_line = if use_counting { counting_lines[i] } else { lines[i] };
-            let line_with_newline = format!("{}\n", target_line);
+            let line_with_newline = format!("{}\n", lines[i]);
             let token_count = tokenizer.text_encode_vec(line_with_newline, false).map(|v| v.len()).unwrap_or(0);
             
             if dropped_tokens + token_count > drop_limit {
@@ -263,9 +279,7 @@ pub fn truncate_pug_by_tokens(pug: &str, counting_pug: &str, max_tokens: usize, 
     let mut start_keep_idx = lines.len();
 
     for i in (0..lines.len()).rev() {
-        // 🌟 [최적화] E0502 에러 해결: lines를 미리 참조하지 않고 루프 내부에서 즉시 판별하여 참조합니다.
-        let target_line = if use_counting { counting_lines[i] } else { lines[i] };
-        let line_with_newline = format!("{}\n", target_line);
+        let line_with_newline = format!("{}\n", lines[i]);
         let token_count = tokenizer.text_encode_vec(line_with_newline, false).map(|v| v.len()).unwrap_or(0);
         
         if current_tokens + token_count > max_tokens {
@@ -1142,7 +1156,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "tracking_number":tracking Number or shipping number | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":tracking status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete') | string
-    - "title":product title | string"###.to_string(),
+    - "title":title | string"###.to_string(),
 
     "goods" => r###"- "goods":
     - "path":{HREF}
@@ -1152,7 +1166,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "sale_price":sale price | number
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string
-    - "title":product title | string"###.to_string(),
+    - "title":title | string"###.to_string(),
     
     "tracking" | "review" => r###"- "{TYPE}":
     - "path":{HREF}
@@ -1170,7 +1184,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "expired_at":yyyy-MM-ddThh:mm:ss | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' | string
-    - "title":title | string"###.to_string(),
+    - "title":type based item title | string"###.to_string(),
     
         _ => r###"- "{TYPE}":
     - "path":{HREF}

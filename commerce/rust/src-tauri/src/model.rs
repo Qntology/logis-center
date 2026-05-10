@@ -697,10 +697,10 @@ impl LogisModel {
     }
 
     // 🌟 [CRITICAL FIX] config.json의 물리적 텐서 크기와 실제 훈련된 Context Length를 완벽히 분리합니다.
-    pub async fn truncate_pug_context(&self, target_pug: &str, counting_pug: &str, is_detail: bool, margin_tokens: usize, bottom_drop_tokens: Option<usize>) -> String {
+    pub async fn truncate_pug_context(&self, pug: &str, is_detail: bool, margin_tokens: usize, bottom_drop_tokens: Option<usize>) -> String {
         let current_size = *self.current_size.lock().await;
         
-        let max_context_length: usize = if is_detail { 60_000 } else { 9_000 };
+        let max_context_length: usize = if is_detail { 60_000 } else { 8_000 };
         let tokenizer_path = &self.qwen_model_path;
 
         // 🌟 한도(최대 토큰)를 계산하고, 버릴 하단 토큰(bottom_drop_tokens)을 파서에 함께 전달합니다.
@@ -708,20 +708,20 @@ impl LogisModel {
 
         // 2. 이미 활성화된 제너레이터가 있다면 그 안에 탑재된 토크나이저를 즉시 재사용합니다.
         if let Some(gen) = self.qwen3_5_generator.lock().await.as_ref() {
-            return crate::parsing::truncate_pug_by_tokens(target_pug, counting_pug, final_max, &gen.tokenizer, bottom_drop_tokens);
+            return crate::parsing::truncate_pug_by_tokens(pug, final_max, &gen.tokenizer, bottom_drop_tokens);
         }
         if let Some(gen) = self.qwen3_generator.lock().await.as_ref() {
-            return crate::parsing::truncate_pug_by_tokens(target_pug, counting_pug, final_max, &gen.tokenizer, bottom_drop_tokens);
+            return crate::parsing::truncate_pug_by_tokens(pug, final_max, &gen.tokenizer, bottom_drop_tokens);
         }
         if let Some(gen) = self.generator.lock().await.as_ref() {
-            return crate::parsing::truncate_pug_by_tokens(target_pug, counting_pug, final_max, &gen.tokenizer, bottom_drop_tokens);
+            return crate::parsing::truncate_pug_by_tokens(pug, final_max, &gen.tokenizer, bottom_drop_tokens);
         }
 
         // 3. 모델이 VRAM에 없을 경우, 디스크에서 가볍게 토크나이저만 읽어와서 정확한 토큰 수 기반으로 절단합니다.
         if let Ok(tokenizer) = crate::tokenizer::TokenizerModel::init(tokenizer_path) {
-            crate::parsing::truncate_pug_by_tokens(target_pug, counting_pug, final_max, &tokenizer, bottom_drop_tokens)
+            crate::parsing::truncate_pug_by_tokens(pug, final_max, &tokenizer, bottom_drop_tokens)
         } else {
-            target_pug.to_string()
+            pug.to_string()
         }
     }
 
