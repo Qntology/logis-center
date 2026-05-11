@@ -1686,13 +1686,13 @@ pub fn extract_table_structure_prompt(page_type: &str, item_selector: &str, pug_
 {REFERENCE_ROW}
 
 [Instruction]
-Your task is to analyze the [Reference: Row Structure] and locate both its body container and its corresponding header container within the [PUG CONTENT].
-Generate the exact CSS selectors for both containers.
+Your task is to analyze the [Reference: Row Structure] and locate its corresponding header container within the [PUG CONTENT].
+Generate the exact CSS selector for the header container based on the provided item selector.
 
 [Rules]
 1. Analyze Reference: Carefully examine the [Reference: Row Structure] to understand the context, structure, and attributes of a single data item/row.
-2. Locate Body Container: Scan the [PUG CONTENT] to find the exact wrapper containing these data rows. Generate a precise CSS selector for this body container.
-3. Locate Header Container: Identify the wrapper or container element that acts as the "Header" for this list (the element containing the column titles or labels). Generate a precise CSS selector for this header container.
+2. Keep Body Item Selector: The selector for the individual data item (row) within the body is already provided in the output format under `tr` as "{ITEM_SELECTOR}". You MUST return it exactly as is. DO NOT modify it.
+3. Locate Header Container: Identify the wrapper or container element that acts as the "Header" for this list (the element containing the column titles or labels). Use the provided body item selector ("{ITEM_SELECTOR}") as a reference point to infer the table/list structure and locate the matching header container. Generate a precise CSS selector for this header container.
 4. Tag Agnostic: Do NOT assume the structure uses traditional <table>, <thead>, or <tbody> tags. It could be built using <div>, <ul>/<li>, or other semantic tags. Analyze the relationship logically.
 5. Strict JSON Output: Output the result strictly in valid JSON format exactly matching the structure below. Do not include any other text, markdown formatting, or explanations.
 
@@ -1701,11 +1701,11 @@ Generate the exact CSS selectors for both containers.
   "{TYPE}" : {
     "table" : {
       "tbody" : {
-        "readonly" : true,
-        "selector" : "{ITEM_SELECTOR}"
+        "tr" : {
+          "selector" : "{ITEM_SELECTOR}"
+        }
       },
       "thead" : {
-        "readonly" : false,
         "selector" : "..."
       }
     }
