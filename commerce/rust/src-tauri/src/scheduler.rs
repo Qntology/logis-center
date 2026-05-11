@@ -940,10 +940,22 @@ async fn process_task(
 
                         if let Some(items) = items_opt {
                             for item in items {
-                                if let Some(t) = item.as_str() {
-                                    titles.push(t.to_string());
+                                let t_val = if let Some(t) = item.as_str() {
+                                    Some(t)
                                 } else if let Some(t) = item.get("title").and_then(|v| v.as_str()) {
-                                    titles.push(t.to_string());
+                                    Some(t)
+                                } else {
+                                    None
+                                };
+                                
+                                if let Some(t) = t_val {
+                                    // 🌟 [CRITICAL FIX] 가격(12300) 등 순수 숫자값만 있는 결과는 DOM 매칭의 신뢰도를 떨어뜨리므로 배열에서 완전히 제외합니다.
+                                    let clean_t = t.replace(",", "").replace(".", "").trim().to_string();
+                                    let is_only_numbers = !clean_t.is_empty() && clean_t.chars().all(|c| c.is_ascii_digit());
+                                    
+                                    if !is_only_numbers {
+                                        titles.push(t.to_string());
+                                    }
                                 }
                             }
                         }
@@ -1259,7 +1271,10 @@ async fn process_task(
                     // 🌟 [추가] ref_row의 텍스트 길이를 기반으로 대략적인 토큰을 산출하여 컨텍스트 사이즈를 예약하고 뒤에서 자릅니다.
                     let ref_row_context_size = ref_row.len() + 3000;
                     let full_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::FullContent, Some(&url));
-                    let thead_light_pug = model.truncate_pug_context(&full_pug, false, 0, Some(ref_row_context_size)).await;
+                    let thead_light_pug = model.truncate_pug_context(&full_pug, false, 2000, Some(ref_row_context_size)).await;
+
+                    println!("ref_row: {}", ref_row);
+                    
                     let thead_prompt = crate::parsing::extract_table_structure_prompt(&page_type, &target_selector, &thead_light_pug, &ref_row);
                     let params = ChatCompletionParameters {
                         messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 

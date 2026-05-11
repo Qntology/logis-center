@@ -388,9 +388,9 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 return;
             }
 
-            // 🌟 PugMode::NoAttributesMode일 때 select, option, input, textarea 태그와 그 자식들을 원천 제거합니다.
+            // 🌟 PugMode::NoAttributesMode일 때 select, datalist, option, input, textarea 태그와 그 자식들을 원천 제거합니다.
             if *mode == PugMode::NoAttributesMode {
-                if ["select", "option"].contains(&tag_name.as_str()) {
+                if ["select", "datalist", "option"].contains(&tag_name.as_str()) {
                     return;
                 }
             }
@@ -1701,9 +1701,11 @@ Generate the exact CSS selectors for both containers.
   "{TYPE}" : {
     "table" : {
       "tbody" : {
+        "readonly" : true,
         "selector" : "{ITEM_SELECTOR}"
       },
       "thead" : {
+        "readonly" : false,
         "selector" : "..."
       }
     }
