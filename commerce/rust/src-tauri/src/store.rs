@@ -456,6 +456,7 @@ impl VectorStore {
             Field::new("data", DataType::Utf8, false),
             Field::new("created_at", DataType::Int64, false), 
             Field::new("updated_at", DataType::Int64, false),
+            Field::new("mode", DataType::Utf8, true), // 🌟 [CRITICAL FIX] 통합 인덱스 내 모드 격리를 위한 컬럼 추가
         ]));
         
         let uri = if self.base_path.ends_with("lancedb") { self.base_path.to_string() } else { format!("{}/{}", self.base_path, DB_URI) };
@@ -467,11 +468,12 @@ impl VectorStore {
                     Ok(table) => {
                         let current_schema = table.schema().await.unwrap_or_else(|_| Arc::new(Schema::new(Vec::<Field>::new())));
                         let has_ref = current_schema.field_with_name("ref").is_ok();
+                        let has_mode = current_schema.field_with_name("mode").is_ok(); // 🌟 필드 존재 여부 검사
                         let status_is_int = if let Ok(field) = current_schema.field_with_name("status") {
                             field.data_type() == &DataType::Int32
                         } else { false };
 
-                        if !has_ref || !status_is_int {
+                        if !has_ref || !status_is_int || !has_mode { // 🌟 스키마 업데이트 시 기존 테이블 강제 드랍
                             println!("[Store] Schema mismatch for {}. Dropping and recreating...", name);
                             let _ = self.conn.drop_table(name, &[]).await;
                         } else {
@@ -490,6 +492,22 @@ impl VectorStore {
             if let Err(_) = self.conn.create_table(name, RecordBatchIterator::new(vec![], schema.clone())).execute().await {
                 let _ = std::fs::remove_dir_all(format!("{}/{}.lance", uri, name));
                 let _ = self.conn.create_table(name, RecordBatchIterator::new(vec![], schema.clone())).execute().await;
+            }
+
+            // 🌟 [CRITICAL FIX] 통합 검색 아키텍처: 파편화된 테이블마다 FTS 인덱스를 만들지 않고, 
+            // 오직 원본 데이터를 모두 참조하고 있는 마스터 테이블인 "items"에만 전용 FTS 인덱스를 구축합니다.
+            if let Ok(table) = self.conn.open_table(name).execute().await {
+                if name == "items" {
+                    let _ = table.create_index(&["text"], lancedb::index::Index::FTS(
+                        lancedb::index::scalar::FtsIndexBuilder::default().with_position(true)
+                    )).execute().await;
+                    
+                    let _ = table.create_index(&["data"], lancedb::index::Index::FTS(
+                        lancedb::index::scalar::FtsIndexBuilder::default().with_position(true)
+                    )).execute().await;
+                    
+                    println!("[Store] FTS Master Index verified/created exclusively for table: {}", name);
+                }
             }
         }
         Ok(())
@@ -556,6 +574,10 @@ impl VectorStore {
          } else { 
              data_val.get("created_at").and_then(|v| v.as_i64()).unwrap_or(now_ts) 
          };
+         
+         // 🌟 [CRITICAL FIX] JSON 객체 내부에서 mode 값을 안전하게 추출합니다. 기본값은 commerce입니다.
+         let mode_str = data_val.get("mode").and_then(|v| v.as_str()).unwrap_or("commerce").to_string();
+         
          let schema = table.schema().await?;
          
          // 🌟 [CRITICAL FIX] get_item_by_id 등에서 빈 벡터(vec![])가 넘어왔을 때 768차원 고정 배열 생성에 실패하여 데이터가 증발하는 현상을 완벽 방어합니다.
@@ -575,6 +597,7 @@ impl VectorStore {
                 Arc::new(arrow_array::Int32Array::from(vec![status])), Arc::new(arrow_array::Float32Array::from(vec![amount])),
                 Arc::new(list_array), Arc::new(StringArray::from(vec![text_content])), Arc::new(StringArray::from(vec![json_str])),
                 Arc::new(Int64Array::from(vec![created_at])), Arc::new(Int64Array::from(vec![now_ts])),
+                Arc::new(StringArray::from(vec![mode_str])), // 🌟 새로 추가된 mode 컬럼에 데이터 삽입
          ])?;
          table.add(RecordBatchIterator::new(vec![Ok(batch)], schema)).execute().await?;
          Ok(())
@@ -623,8 +646,8 @@ impl VectorStore {
             let jsons = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
             let digests = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
             let createds = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
-            // 🌟 [추가] 14번 컬럼(updated_at)을 추출하여 updateds 변수에 할당합니다.
             let updateds = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
+            let modes = batch.column(15).as_any().downcast_ref::<StringArray>().unwrap(); // 🌟 mode 컬럼 추출
             
             for i in 0..batch.num_rows() {
                 docs.push(TradeDocument { 
@@ -636,8 +659,8 @@ impl VectorStore {
                     digest: digests.value(i).to_string(), total_amount: amounts.value(i),
                     status: statuses.value(i).to_string(), 
                     created_at_ts: createds.value(i), 
-                    // 🌟 이제 선언된 updateds를 정상적으로 사용할 수 있습니다.
                     updated_at_ts: updateds.value(i),
+                    mode: modes.value(i).to_string(), // 🌟 모델 구조체에 매핑
                     ..Default::default() 
                 });
             }
@@ -668,8 +691,8 @@ impl VectorStore {
         let jsons = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
         let digests = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
         let createds = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
-        // 🌟 [추가] updated_at 컬럼 선언
         let updateds = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
+        let modes = batch.column(15).as_any().downcast_ref::<StringArray>().unwrap(); // 🌟 mode 컬럼 추출
 
         Ok(Some(TradeDocument { 
             id: ids.value(0).to_string(), r#type: types.value(0).to_string(), 
@@ -680,14 +703,16 @@ impl VectorStore {
             digest: digests.value(0).to_string(), total_amount: amounts.value(0),
             status: statuses.value(0).to_string(), 
             created_at_ts: createds.value(0), 
-            // 🌟 선언된 변수 매핑
             updated_at_ts: updateds.value(0),
+            mode: modes.value(0).to_string(), // 🌟 모델 구조체에 매핑
             ..Default::default() 
         }))
     }
     
-    pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, offset: usize, filter: Option<String>) -> Result<Vec<(String, String, f32)>> {
-         let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
+    pub async fn search_items(&self, _table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, offset: usize, filter: Option<String>) -> Result<Vec<(String, String, f32)>> {
+         // 🌟 [CRITICAL FIX] 테이블 파편화 해결: 프론트엔드나 LLM이 어떤 개별 테이블 이름(_table_name)을 요청하든 무시하고, 
+         // 100% 통합 FTS 인덱스가 구축된 "items" 마스터 테이블로만 쿼리를 강제 라우팅하여 중앙 검색을 수행합니다.
+         let target = "items";
          let table = self.conn.open_table(target).execute().await?;
          let mut combined = std::collections::HashMap::new();
          
@@ -697,8 +722,17 @@ impl VectorStore {
          if !query_text.is_empty() {
              let clean = query_text.replace("'", "''");
              let mut q = table.query();
-             if let Some(ref f) = filter { q = q.only_if(f); }
-             if let Ok(res) = q.only_if(format!("text MATCH '{0}' OR data MATCH '{0}'", clean)).limit(fetch_limit).execute().await {
+             
+             // 🌟 [CRITICAL FIX] FTS 인덱스를 성공적으로 구축했으므로, 압도적인 성능의 MATCH 문법(Tantivy 검색 엔진)으로 다시 격상시킵니다!
+             // only_if 두 번 호출 시 덮어씌워지는 버그는 방어하되, LIKE 대비 수십 배 빠르고 형태소 분석이 지원되는 MATCH를 사용합니다.
+             let text_filter = format!("(text MATCH '{0}' OR data MATCH '{0}')", clean);
+             let final_filter = if let Some(ref f) = filter {
+                 format!("({}) AND {}", f, text_filter)
+             } else {
+                 text_filter
+             };
+             
+             if let Ok(res) = q.only_if(final_filter).limit(fetch_limit).execute().await {
                 if let Ok(batches) = res.try_collect::<Vec<_>>().await {
                     for b in batches {
                         let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
@@ -708,16 +742,29 @@ impl VectorStore {
                 }
              }
          }
-         let mut vq = table.query();
-         if let Some(ref f) = filter { vq = vq.only_if(f); }
-         let vres = vq.limit(fetch_limit).nearest_to(query_vec)?.execute().await?.try_collect::<Vec<_>>().await?;
-         for b in vres {
-             let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap(); 
-             let txs = b.column(12).as_any().downcast_ref::<StringArray>().unwrap();
-             for i in 0..b.num_rows() {
-                 let id = ids.value(i).to_string();
-                 if let Some((_, s)) = combined.get_mut(&id) { *s += 0.5; } 
-                 else { combined.insert(id, (txs.value(i).to_string(), 0.5)); }
+         // 🌟 [CRITICAL FIX] 백그라운드 작업 중 VRAM 절약을 위해 빈 벡터([0.0; 768])가 넘어왔을 때, 
+         // LanceDB가 아직 내용이 없는 빈 껍데기(Draft) 문서들을 완벽 일치(거리 0)로 착각하여 
+         // 스크롤 시 무더기로 반환하는 현상을 원천 차단합니다.
+         let is_empty_vec = query_vec.iter().all(|&x| x == 0.0);
+         
+         if !is_empty_vec {
+             let mut vq = table.query();
+             if let Some(ref f) = filter { vq = vq.only_if(f); }
+             let vres = vq.limit(fetch_limit).nearest_to(query_vec)?.execute().await?.try_collect::<Vec<_>>().await?;
+             
+             // 🌟 [CRITICAL FIX] vector search 결과는 거리가 가까운 순서대로 반환됩니다.
+             // HashMap에 담을 때 순서가 뒤섞이는 것을 막기 위해, 순위(rank)에 따라 점수를 미세하게 깎아서 고유 정렬 순서를 보존합니다.
+             let mut rank = 0;
+             for b in vres {
+                 let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap(); 
+                 let txs = b.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+                 for i in 0..b.num_rows() {
+                     let id = ids.value(i).to_string();
+                     let vec_score = 0.5 - (rank as f32 * 0.001);
+                     if let Some((_, s)) = combined.get_mut(&id) { *s += vec_score; } 
+                     else { combined.insert(id, (txs.value(i).to_string(), vec_score)); }
+                     rank += 1;
+                 }
              }
          }
          let mut final_list: Vec<_> = combined.into_iter().map(|(id, (txt, s))| (id, txt, s)).collect();
@@ -784,6 +831,7 @@ pub struct TradeDocument {
     pub created_at_ts: i64, 
     #[serde(rename = "updated_at")]
     pub updated_at_ts: i64,
+    pub mode: String, // 🌟 [추가] 탭 모드별 완벽한 필터링 격리를 위한 전용 컬럼
     pub item_descriptions: Vec<String>,
     pub item_hs_codes: Vec<String>,
     pub item_sku_numbers: Vec<String>,

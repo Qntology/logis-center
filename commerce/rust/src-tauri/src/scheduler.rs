@@ -385,6 +385,10 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
+    
+    // 🌟 [CRITICAL FIX] search_mode를 특정 조건문 안이 아닌, 최상단 스코프에서 추출하여 함수 전체에서 안전하게 사용할 수 있게 만듭니다.
+    let search_mode = task_data.get("search_mode").and_then(|s| s.as_str()).unwrap_or("commerce").to_string();
+
     // [FIX] 작업 유형에 따라 파일명을 자동으로 결정합니다.
     let kv_name = if task.r#type == "image_extraction" {
         Some("image".to_string())
@@ -446,7 +450,7 @@ async fn process_task(
     // --- Image Extraction Logic (Qwen 3.5 Pipeline) ---
     if task.r#type == "image_extraction" {
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        let search_mode = task_data.get("search_mode").and_then(|s| s.as_str()).unwrap_or("commerce").to_string();
+        // 🌟 [CRITICAL FIX] search_mode 변수 선언부는 최상단으로 이동되었으므로 삭제합니다.
 
         if !image_path.is_empty() {
             println!("[Scheduler] Starting Image Extraction for {}", task.id);
@@ -481,28 +485,40 @@ async fn process_task(
         .to_string();
 
     // 🌟 [CRITICAL FIX] 도메인이 누락되었거나 상대경로만 들어왔을 경우, 
-    // 브라우저 자동화 모듈이 감지한 '진짜 현재 URL'을 강제로 끌어와서 복구합니다!
-    if url.starts_with("/") || origin_candidate.is_empty() || origin_candidate.contains("localhost") {
+    // 브라우저 자동화 모듈이 감지한 '진짜 현재 활성화 탭 URL'을 강제로 끌어와서 완벽한 절대 주소로 병합(Join)합니다!
+    {
         let state = crate::automation::LAST_DETECTED_STATE.lock().await;
-        let real_url = state.url.clone();
+        let active_tab_url = state.url.clone();
         
-        if let Ok(parsed) = url::Url::parse(&real_url) {
-            let real_origin = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or("localhost"));
-            
-            if origin_candidate.is_empty() || origin_candidate.contains("localhost") {
-                origin_candidate = real_origin.clone();
-            }
-            if url.starts_with("/") {
-                url = format!("{}{}", real_origin, url);
-            } else if url.is_empty() {
-                url = real_url;
+        if !active_tab_url.is_empty() {
+            if let Ok(active_parsed) = url::Url::parse(&active_tab_url) {
+                let active_origin = format!("{}://{}", active_parsed.scheme(), active_parsed.host_str().unwrap_or("localhost"));
+                
+                if origin_candidate.is_empty() || origin_candidate.contains("localhost") {
+                    origin_candidate = active_origin;
+                }
+                
+                if url.is_empty() {
+                    url = active_tab_url;
+                } else if !url.starts_with("http") {
+                    // 🌟 기존의 단순 문자열 병합(format) 대신 URL 파서의 join을 사용하여 './', '?' 등 모든 형태의 상대 경로를 완벽히 절대 경로로 치환합니다.
+                    if let Ok(joined) = active_parsed.join(&url) {
+                        url = joined.to_string();
+                    }
+                }
             }
         }
     }
 
-    if url.starts_with("/") && !origin_candidate.is_empty() && !origin_candidate.contains("localhost") {
+    // 🌟 탭 URL 감지가 실패했을 경우를 대비한 2차 안전망
+    if !url.starts_with("http") && !origin_candidate.is_empty() && !origin_candidate.contains("localhost") {
         let scheme = if origin_candidate.starts_with("http") { "" } else { "http://" };
-        url = format!("{}{}{}", scheme, origin_candidate, url);
+        let base_str = format!("{}{}", scheme, origin_candidate);
+        if let Ok(base) = url::Url::parse(&base_str) {
+            if let Ok(joined) = base.join(&url) {
+                url = joined.to_string();
+            }
+        }
     }
     
     // 🌟 [CRITICAL FIX] 메모리 덮어쓰기 시 origin과 ref를 보존하여 프론트엔드 중복 노출 방어 로직이 도메인을 알 수 있게 합니다.
@@ -1468,7 +1484,7 @@ async fn process_task(
         let mut pending_merge: Option<serde_json::Value> = None;
         let mut merge_countdown = 0;
 
-        let pug_list = {
+        let mut pug_list = {
             let clean_content = &clean_html_content;
             let document = scraper::Html::parse_document(clean_content);
             
@@ -1481,6 +1497,41 @@ async fn process_task(
                 Some(&url) // 🌟 [CRITICAL FIX] 추가된 5번째 인자로 현재 작업 중인 URL을 전달하여 상대 주소가 절대 주소로 치환되도록 합니다!
             )
         };
+
+        // 🌟 [CRITICAL FIX] 1순위: thead 내의 colspan 또는 rowspan 값을 추출하여 다중 행 그룹 사이즈를 파악합니다.
+        // 2순위: 속성이 없을 경우 thead의 tr 태그 개수로 폴백(Fallback)하여 완벽하게 묶어냅니다.
+        let group_size = if !thead_pug.is_empty() {
+            let mut max_span = 1;
+            if let Ok(re) = regex::Regex::new(r#"(?:colspan|rowspan)="(\d+)""#) {
+                for cap in re.captures_iter(&thead_pug) {
+                    if let Ok(val) = cap[1].parse::<usize>() {
+                        if val > max_span {
+                            max_span = val;
+                        }
+                    }
+                }
+            }
+            
+            if max_span > 1 {
+                max_span
+            } else {
+                thead_pug.lines().filter(|line| {
+                    let s = line.trim_start();
+                    s == "tr" || s.starts_with("tr[")
+                }).count().max(1)
+            }
+        } else {
+            1
+        };
+
+        if group_size > 1 && !pug_list.is_empty() {
+            let mut grouped = Vec::new();
+            for chunk in pug_list.chunks(group_size) {
+                grouped.push(chunk.join("\n"));
+            }
+            pug_list = grouped;
+            println!("[Scheduler] 🌟 Grouped multi-row items: {} rows per item. Total items reduced to {}.", group_size, pug_list.len());
+        }
 
         if !pug_list.is_empty() {
             // 🌟 [CRITICAL FIX 2] 리스트 추출은 짧은 item_pug 조각만 독립적으로 읽으므로, 
@@ -1729,9 +1780,12 @@ async fn process_task(
 
     // --- DB OPS & SIDE EFFECTS ---
     // Normalize Data
+    let search_mode_str = search_mode.clone();
     let normalize_data = |item: &mut serde_json::Value| {
         if let Some(obj) = item.as_object_mut() {
             if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type.clone())); }
+            // 🌟 [CRITICAL FIX] 추출된 데이터 객체 내부에 현재 mode(search_mode)를 꽂아 넣어 DB 저장 시 컬럼으로 빠지게 합니다.
+            if obj.get("mode").is_none() { obj.insert("mode".to_string(), json!(search_mode_str.clone())); }
             
             // 통화 대문자 변환
             if let Some(c) = obj.get("currency").and_then(|v| v.as_str()) {
@@ -2145,6 +2199,13 @@ async fn process_task(
             }
         }
 
+        // 🌟 [CRITICAL FIX] 상세(Detail) 모드: FTS 인덱싱을 위해 변환된 자연어 텍스트를 JSON의 "text" 속성에 명시적으로 주입합니다.
+        // Rust의 Borrow Checker 제약을 피하기 위해 읽기(변환)를 먼저 수행하고 쓰기(주입)를 나중에 수행합니다.
+        let natural_text = parsing::json_to_natural_language(&extracted_data);
+        if let Some(obj) = extracted_data.as_object_mut() {
+            obj.insert("text".to_string(), json!(natural_text));
+        }
+
         let _ = store.upsert_item(
             &target_table, &target_id, &page_type, extracted_data.clone(), vector.clone(),
             Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
@@ -2331,6 +2392,13 @@ async fn process_task(
                             }
                         }
                     }
+                }
+
+                // 🌟 [CRITICAL FIX] 리스트(List) 모드: 리스트 아이템 역시 FTS 인덱싱을 위해 자연어 텍스트를 "text" 속성에 주입합니다.
+                // Rust의 Borrow Checker 제약을 피하기 위해 읽기(변환)를 먼저 수행하고 쓰기(주입)를 나중에 수행합니다.
+                let natural_text = parsing::json_to_natural_language(&single_item);
+                if let Some(obj) = single_item.as_object_mut() {
+                    obj.insert("text".to_string(), json!(natural_text));
                 }
 
                 let _ = store.upsert_item(

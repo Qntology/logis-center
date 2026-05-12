@@ -763,6 +763,8 @@ const handleSearchInteraction = () => {
         cachedDocs = [];
         currentPage = 0;
         hasMore = true;
+        // 🌟 [CRITICAL FIX] 빈 검색창 클릭으로 위젯을 열었을 때, 목록을 지우기만 하고 다시 불러오지 않아 빈 화면이 출력되는 현상 수정
+        loadMoreDocs(true);
     }
 };
 
@@ -3360,6 +3362,8 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         cachedDocs = [];
         listCurrentY = 0;
         updateListTransform();
+        // 🌟 [CRITICAL FIX] 검색어가 지워지는 등 새로운 초기화 요청이 들어오면, 기존에 대기 중이던 로딩 락(isLoading)을 강제로 해제하여 먹통 현상을 방지합니다.
+        isLoading = false; 
     }
 
     if (isLoading || (!reset && !isSync && !hasMore)) {
@@ -3375,15 +3379,15 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
     }
     
     try {
-        let baseFilter = "";
+        // 🌟 [CRITICAL FIX] 새로 추가된 DB의 'mode' 컬럼을 이용하여 완벽하게 격리된 데이터를 불러옵니다.
+        let baseFilter = `mode = '${currentSearchMode}'`;
+        
         if (currentSearchMode === "shipping") {
-            baseFilter = "type IN ('tracking', 'receiving', 'shipping', 'bl', 'awb', 'BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'TRACKING', 'shipping_doc', 'Unknown')";
+            baseFilter += " AND type IN ('tracking', 'receiving', 'shipping', 'bl', 'awb', 'BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'TRACKING', 'shipping_doc', 'Unknown')";
         } else if (currentSearchMode === "analytic") {
-            // 🌟 [추가] Analytic 모드에서는 raw user interaction 로그와 리포트를 불러옵니다.
-            baseFilter = "type IN ('click', 'hover', 'change', 'report')"; 
+            baseFilter += " AND type IN ('click', 'hover', 'change', 'report')"; 
         } else {
-            // 🌟 [CRITICAL FIX] 'pages' 타입은 내부 캐시용이므로 메인 리스트에 노출되지 않도록 필터에서 제거합니다.
-            baseFilter = "type IN ('sales', 'goods', 'order', 'event', 'coupon', 'review')";
+            baseFilter += " AND type IN ('sales', 'goods', 'order', 'event', 'coupon', 'review')";
         }
 
         // 기존 내비게이션 필터가 있다면 안전하게 괄호로 묶어서 AND 조건 추가
@@ -3455,6 +3459,11 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
                 }
                 return doc;
             });
+        }
+
+        // 🌟 [CRITICAL FIX] 데이터를 불러오는 동안 사용자가 검색어를 변경했거나 지웠다면, 과거 데이터가 화면에 렌더링되어 혼선을 주는 것을 즉시 차단합니다.
+        if (textQuery !== (searchInput?.value.trim() || "")) {
+            return;
         }
 
         if (!isSync && docs.length < pageSize) hasMore = false;

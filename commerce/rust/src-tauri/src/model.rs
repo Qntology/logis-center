@@ -982,6 +982,8 @@ impl LogisModel {
                 let mut final_data = if extracted_data.is_object() { extracted_data.clone() } else { json!({ "raw_output": extracted_data }) };
                 final_data.as_object_mut().unwrap().insert("index".to_string(), json!(index_val));
                 final_data.as_object_mut().unwrap().insert("id".to_string(), json!(hashed_id));
+                // 🌟 [CRITICAL FIX] 이미지 추출 결과에도 모드 필터를 위한 mode 값을 명시적으로 주입합니다.
+                final_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
 
                 // 🌟 [추가 보완] 무역 문서(Trade Doc)일 경우 Python처럼 핵심 컬럼 평탄화 (Flattening)
                 if is_trade_doc {
@@ -1542,9 +1544,11 @@ impl LogisModel {
                             })
                         ],
                         model: "qwen3".to_string(),
-                        max_tokens: Some(512),
-                        temperature: Some(if attempt == 1 { 1.0 } else { 0.1 }), 
-                        top_p: Some(0.9),
+                        max_tokens: Some(256),
+                        temperature: Some(1.0), 
+                        // 🌟 [CRITICAL FIX] top_k(80) 효과를 온전히 보려면 top_p를 1.0으로 개방해야 합니다.
+                        // (0.95일 경우 상위 5~10개 토큰 선에서 먼저 잘려버려 top_k 80이 무시되는 것처럼 보입니다)
+                        top_p: Some(1.0), 
                         ..Default::default()
                     };
                     gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))

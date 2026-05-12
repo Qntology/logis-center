@@ -409,7 +409,8 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             let is_useless = useless_wrappers.contains(&tag_name.as_str());
             
             let has_meaningful_attrs = if *mode == PugMode::NoAttributesMode {
-                false // NoAttributesMode에서는 모든 속성이 무의미하므로 모조리 벗겨냅니다.
+                // 🌟 [CRITICAL FIX] 구조 판별을 위해 colspan, rowspan, scope 속성은 예외적으로 보존합니다.
+                element.attrs().any(|(k, _)| ["colspan", "rowspan", "scope"].contains(&k))
             } else {
                 element.attrs().any(|(k, _)| {
                     ["src", "href", "type", "name", "value", "placeholder", "checked", "selected", "disabled", "readonly", "rows", "cols", "rowspan", "colspan"].contains(&k) || k.starts_with("data-")
@@ -500,7 +501,8 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 let should_include = if *mode == PugMode::TheadMode {
                     thead_include.contains(&name)
                 } else if *mode == PugMode::NoAttributesMode {
-                    false // 🌟 어떠한 속성도 포함하지 않고 완벽히 비웁니다.
+                    // 🌟 [CRITICAL FIX] 구조 판별을 위해 colspan, rowspan, scope 속성은 예외적으로 보존합니다.
+                    ["colspan", "rowspan", "scope"].contains(&name)
                 } else {
                     name.starts_with("data-") || always_include.contains(&name)
                 };
@@ -1296,102 +1298,65 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 
 /// Converts a JSON Value into a human-readable natural language narrative.
 /// [STRICT ALIGNMENT] This logic perfectly synchronizes with every column in `parsing.rs`.
-pub fn json_to_natural_language(value: &serde_json::Value) -> String {
+pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
     let mut output = String::new();
-    
-    if let Some(obj) = value.as_object() {
-        if obj.len() == 1 && obj.contains_key("value") {
-            return obj.get("value").unwrap().as_str().unwrap_or(&obj.get("value").unwrap().to_string()).to_string();
-        }
-    }
 
-    if let serde_json::Value::Object(map) = value {
-        let page_type = map.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let is_detail = map.get("detail").and_then(|v| v.as_bool()).unwrap_or(true);
+    match json_val {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map {
+                // 1. null 이나 빈 값은 검색에 도움 안 되므로 무시
+                if val.is_null() || (val.is_string() && val.as_str().unwrap_or("").trim().is_empty()) {
+                    continue;
+                }
 
-        // 🌟 [CRITICAL FIX] 추출 스키마와 완벽하게 일치하도록 이름표 동기화 및 누락 항목 추가 완료!
-        let keys: Vec<&str> = match page_type {
-            "tracking" => {
-                if is_detail {
-                    vec!["status", "id", "title", "sender_name", "sender_address", "sender_phone", "recipient_name", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping", "shipping_date", "registration_date"]
-                } else {
-                    vec!["status", "id", "title", "link", "registration_date"]
-                }
-            },
-            "goods" => {
-                if is_detail {
-                    vec!["code", "link", "id", "status", "payment_method", "bank", "card", "model_name", "brand_name", "condition", "description", "short_description", "tags", "origin_country", "manufacturer", "release_date", "manufacture_date", "expiration_date", "gtin", "mpn", "barcode", "sale_price", "supply_price", "currency", "compare_at_price", "quantity", "stock_keeping_unit", "low_stock_threshold", "unit", "tax_included", "tax_code", "main_image_url", "additional_image_url", "video_url", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping", "width", "height", "length", "weight", "options", "additional_goods", "title", "registration_date"]
-                } else {
-                    vec!["status", "link", "id", "title", "sale_price", "supply_price", "currency", "quantity", "tracking_number", "registration_date"]
-                }
-            },
-            "order" => {
-                if is_detail {
-                    vec!["link", "id", "tracking_number", "status", "goods", "sender_name", "sender_address", "sender_phone", "recipient_name", "recipient_address", "recipient_phone", "bank", "card", "order_date", "payment_date", "payment_method", "payment_origin", "registration_date"]
-                } else {
-                    vec!["status", "link", "id", "title", "sale_price", "supply_price", "currency", "quantity", "tracking_number", "registration_date"]
-                }
-            },
-            "coupon" | "event" => {
-                if is_detail {
-                    vec!["link", "id", "type", "status", "title", "started_at", "expired_at", "code", "discount", "quantity", "usage_limit", "usage_per", "new_customer_only", "first_purchase_only", "min_order_amount", "max_order_amount", "max_discount_amount", "region_restrictions", "number", "address", "registration_date"]
-                } else {
-                    vec!["status", "id", "title", "started_at", "expired_at", "registration_date"]
-                }
-            },
-            "review" => {
-                if is_detail {
-                    vec!["link", "id", "status", "name", "title", "completed", "registration_date"]
-                } else {
-                    vec!["status", "id", "title", "link", "registration_date"]
-                }
-            },
-            _ => map.keys().map(|s| s.as_str()).collect()
-        };
+                // 2. Key 이름을 읽기 좋게 정제 (sale_price -> sale price)
+                let clean_key = key.replace("_", " ");
 
-        for key in keys {
-            if let Some(v) = map.get(key) {
-                if v.is_null() { continue; }
-                let key_name = key.replace("_", " ");
-                if v.is_array() {
-                    let arr = v.as_array().unwrap();
-                    let mut items = Vec::new();
-                    for item in arr.iter().take(5) {
-                        let sub = json_to_natural_language(item);
-                        if !sub.is_empty() { items.push(sub); }
+                // 3. Value가 객체나 배열일 경우 내부로 재귀 탐색
+                if val.is_object() {
+                    let sub_text = json_to_natural_language(val);
+                    if !sub_text.is_empty() {
+                        output.push_str(&format!("{}: {}. ", clean_key, sub_text));
                     }
-                    if !items.is_empty() {
-                        output.push_str(&format!("{}: [{}]. ", key_name, items.join(", ")));   
+                } else if val.is_array() {
+                    let arr = val.as_array().unwrap();
+                    let mut arr_items = Vec::new();
+                    for item in arr {
+                        let sub_text = json_to_natural_language(item);
+                        if !sub_text.is_empty() {
+                            arr_items.push(sub_text);
+                        }
                     }
-                } else if v.is_object() {
-                    let sub = json_to_natural_language(v);
-                    if !sub.is_empty() {
-                        output.push_str(&format!("{}: {}. ", key_name, sub));
+                    if !arr_items.is_empty() {
+                        output.push_str(&format!("{}: [{}]. ", clean_key, arr_items.join(", ")));
                     }
                 } else {
-                    let s = match v {
+                    // 4. 일반 문자열/숫자일 경우 최종 조립
+                    let val_str = match val {
                         serde_json::Value::String(s) => s.clone(),
                         serde_json::Value::Number(n) => n.to_string(),
                         serde_json::Value::Bool(b) => b.to_string(),
                         _ => String::new(),
                     };
-                    if !s.is_empty() && s != "null" {
-                        let s_clean = if s.len() > 400 { format!("{}...", &s[..400]) } else { s };
-                        output.push_str(&format!("{}: {}. ", key_name, s_clean));
-                    }
+                    output.push_str(&format!("{}: {}. ", clean_key, val_str));
                 }
             }
-        }
-    } else if let serde_json::Value::Array(arr) = value {
-        for item in arr.iter().take(10) {
-            let sub = json_to_natural_language(item);
-            if !sub.is_empty() {
-                output.push_str(&sub);
-                output.push_str(" ");
+        },
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                let sub = json_to_natural_language(item);
+                if !sub.is_empty() {
+                    output.push_str(&format!("{} ", sub));
+                }
+            }
+        },
+        _ => {
+            if let Some(s) = json_val.as_str() {
+                output.push_str(s);
+            } else {
+                output.push_str(&json_val.to_string());
             }
         }
-    } else {
-        output.push_str(&value.as_str().unwrap_or(&value.to_string()));
     }
 
     output.trim().to_string()
@@ -1686,13 +1651,13 @@ pub fn extract_table_structure_prompt(page_type: &str, item_selector: &str, pug_
 {REFERENCE_ROW}
 
 [Instruction]
-Your task is to analyze the [Reference: Row Structure] and locate its corresponding header container within the [PUG CONTENT].
-Generate the exact CSS selector for the header container based on the provided item selector.
+Your task is to analyze the [Reference: Row Structure] and locate both its body container and its corresponding header container within the [PUG CONTENT].
+Generate the exact CSS selectors for both containers.
 
 [Rules]
 1. Analyze Reference: Carefully examine the [Reference: Row Structure] to understand the context, structure, and attributes of a single data item/row.
-2. Keep Body Item Selector: The selector for the individual data item (row) within the body is already provided in the output format under `tr` as "{ITEM_SELECTOR}". You MUST return it exactly as is. DO NOT modify it.
-3. Locate Header Container: Identify the wrapper or container element that acts as the "Header" for this list (the element containing the column titles or labels). Use the provided body item selector ("{ITEM_SELECTOR}") as a reference point to infer the table/list structure and locate the matching header container. Generate a precise CSS selector for this header container.
+2. Locate Body Container: The `tbody` selector is already provided in the output format as "{ITEM_SELECTOR}". You MUST return it exactly as is. DO NOT modify it.
+3. Locate Header Container: Identify the wrapper or container element that acts as the "Header" for this list (the element containing the column titles or labels). Use the body container selector ("{ITEM_SELECTOR}") as a reference point to locate the matching header container, which is typically placed just above the body container or as a sibling. Generate a precise CSS selector for this header container.
 4. Tag Agnostic: Do NOT assume the structure uses traditional <table>, <thead>, or <tbody> tags. It could be built using <div>, <ul>/<li>, or other semantic tags. Analyze the relationship logically.
 5. Strict JSON Output: Output the result strictly in valid JSON format exactly matching the structure below. Do not include any other text, markdown formatting, or explanations.
 
@@ -1701,9 +1666,7 @@ Generate the exact CSS selector for the header container based on the provided i
   "{TYPE}" : {
     "table" : {
       "tbody" : {
-        "tr" : {
-          "selector" : "{ITEM_SELECTOR}"
-        }
+        "selector" : "{ITEM_SELECTOR}"
       },
       "thead" : {
         "selector" : "..."

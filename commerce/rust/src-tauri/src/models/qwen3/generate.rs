@@ -126,7 +126,13 @@ impl Qwen3GenerateModel {
             .temperature
             .unwrap_or(self.generation_config.temperature as f64);
         let top_p = mes.top_p.unwrap_or(self.generation_config.top_p as f64);
-        let top_k = self.generation_config.top_k;
+        
+        // 🌟 [CRITICAL FIX] 프론트엔드/API에서 넘어온 top_k 값이 있다면 최우선 적용합니다.
+        // (만약 openai_types.rs의 ChatCompletionParameters에 top_k 필드를 추가하셨다면 아래 1번 주석을 풀고, 2번 라인을 지워주세요)
+        
+        // 1. let top_k = mes.top_k.map(|k| k as usize).unwrap_or(self.generation_config.top_k);
+        let top_k = self.generation_config.top_k; // 2. 현재는 구조체 안전성을 위해 기본값으로 유지
+        
         let seed = mes.seed.unwrap_or(34562) as u64;
         let mut logit_processor =
             get_logit_processor(Some(temperature as f32), Some(top_p as f32), Some(top_k), seed);
