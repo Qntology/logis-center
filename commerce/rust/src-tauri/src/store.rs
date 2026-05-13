@@ -111,10 +111,10 @@ impl VectorStore {
         
         let existing = self.conn.table_names().execute().await?;
         if !existing.contains(&"tasks".to_string()) {
-            if let Err(_) = self.conn.create_table("tasks", RecordBatchIterator::new(vec![], task_schema.clone())).execute().await {
+            if let Err(_) = self.conn.create_empty_table("tasks", task_schema.clone()).execute().await {
                 println!("[Store] tasks create failed, cleaning up dir and retrying...");
                 let _ = std::fs::remove_dir_all(format!("{}/tasks.lance", uri));
-                let _ = self.conn.create_table("tasks", RecordBatchIterator::new(vec![], task_schema)).execute().await;
+                let _ = self.conn.create_empty_table("tasks", task_schema).execute().await;
             }
         }
 
@@ -156,9 +156,9 @@ impl VectorStore {
         
         let existing = self.conn.table_names().execute().await?;
         if !existing.contains(&"talks".to_string()) {
-            if let Err(_) = self.conn.create_table("talks", RecordBatchIterator::new(vec![], msg_schema.clone())).execute().await {
+            if let Err(_) = self.conn.create_empty_table("talks", msg_schema.clone()).execute().await {
                 let _ = std::fs::remove_dir_all(format!("{}/talks.lance", uri));
-                let _ = self.conn.create_table("talks", RecordBatchIterator::new(vec![], msg_schema)).execute().await;
+                let _ = self.conn.create_empty_table("talks", msg_schema).execute().await;
             }
         }
         Ok(())
@@ -201,7 +201,7 @@ impl VectorStore {
                 Arc::new(Int64Array::from(vec![0])), // updated_at
             ],
         )?;
-        table.add(RecordBatchIterator::new(vec![Ok(batch)], schema)).execute().await?;
+        table.add(vec![batch]).execute().await?;
         Ok(())
     }
 
@@ -276,7 +276,7 @@ impl VectorStore {
                 Arc::new(arrow_array::Int32Array::from(vec![task.status])),
             ],
         )?;
-        table.add(RecordBatchIterator::new(vec![Ok(batch)], schema)).execute().await?;
+        table.add(vec![batch]).execute().await?;
         Ok(())
     }
 
@@ -489,9 +489,9 @@ impl VectorStore {
                 }
             }
             
-            if let Err(_) = self.conn.create_table(name, RecordBatchIterator::new(vec![], schema.clone())).execute().await {
+            if let Err(_) = self.conn.create_empty_table(name, schema.clone()).execute().await {
                 let _ = std::fs::remove_dir_all(format!("{}/{}.lance", uri, name));
-                let _ = self.conn.create_table(name, RecordBatchIterator::new(vec![], schema.clone())).execute().await;
+                let _ = self.conn.create_empty_table(name, schema.clone()).execute().await;
             }
 
             // 🌟 [CRITICAL FIX] 통합 검색 아키텍처: 파편화된 테이블마다 FTS 인덱스를 만들지 않고, 
@@ -499,11 +499,19 @@ impl VectorStore {
             if let Ok(table) = self.conn.open_table(name).execute().await {
                 if name == "items" {
                     let _ = table.create_index(&["text"], lancedb::index::Index::FTS(
-                        lancedb::index::scalar::FtsIndexBuilder::default().with_position(true)
+                        lancedb::index::scalar::FtsIndexBuilder::default()
+                            .with_position(true)
+                            .base_tokenizer("ngram".to_string())
+                            .ngram_min_length(2)
+                            .ngram_max_length(3)
                     )).execute().await;
                     
                     let _ = table.create_index(&["data"], lancedb::index::Index::FTS(
-                        lancedb::index::scalar::FtsIndexBuilder::default().with_position(true)
+                        lancedb::index::scalar::FtsIndexBuilder::default()
+                            .with_position(true)
+                            .base_tokenizer("ngram".to_string())
+                            .ngram_min_length(2)
+                            .ngram_max_length(3)
                     )).execute().await;
                     
                     println!("[Store] FTS Master Index verified/created exclusively for table: {}", name);
@@ -599,7 +607,7 @@ impl VectorStore {
                 Arc::new(Int64Array::from(vec![created_at])), Arc::new(Int64Array::from(vec![now_ts])),
                 Arc::new(StringArray::from(vec![mode_str])), // 🌟 새로 추가된 mode 컬럼에 데이터 삽입
          ])?;
-         table.add(RecordBatchIterator::new(vec![Ok(batch)], schema)).execute().await?;
+         table.add(vec![batch]).execute().await?;
          Ok(())
     }
 
@@ -724,19 +732,28 @@ impl VectorStore {
              let mut q = table.query();
              
              // 🌟 [CRITICAL FIX] 분기 처리: Fast Search(실시간 검색)일 때는 다국어가 지원되는 ILIKE를 사용하고,
-             // AI Deep Search(엔터/돋보기)일 때는 영어로 번역된 키워드를 MATCH로 초고속 검색합니다.
-             let text_filter = if use_fts {
-                 format!("(text MATCH '{0}' OR data MATCH '{0}')", clean)
+             // AI Deep Search(엔터/돋보기)일 때는 SDK 내장 full_text_search API를 호출합니다.
+             if use_fts {
+                 // 공식 문서에 따른 FTS 전용 메서드 체이닝
+                 // 🌟 [CRITICAL FIX] String 타입 오류 해결: FullTextSearchQuery 객체로 감싸서 전달합니다.
+                 q = q.full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(clean.clone()));
+                 
+                 // 추가 필터(status, type 등)가 존재하면 AND 조건으로 체이닝
+                 if let Some(ref f) = filter {
+                     q = q.only_if(f);
+                 }
              } else {
-                 format!("(text ILIKE '%{}%' OR data ILIKE '%{}%')", clean, clean)
-             };
-             let final_filter = if let Some(ref f) = filter {
-                 format!("({}) AND {}", f, text_filter)
-             } else {
-                 text_filter
-             };
+                 // 기존 ILIKE 스캔 로직 유지
+                 let text_filter = format!("(text ILIKE '%{}%' OR data ILIKE '%{}%')", clean, clean);
+                 let final_filter = if let Some(ref f) = filter {
+                     format!("({}) AND {}", f, text_filter)
+                 } else {
+                     text_filter
+                 };
+                 q = q.only_if(final_filter);
+             }
              
-             if let Ok(res) = q.only_if(final_filter).limit(fetch_limit).execute().await {
+             if let Ok(res) = q.limit(fetch_limit).execute().await {
                 if let Ok(batches) = res.try_collect::<Vec<_>>().await {
                     for b in batches {
                         let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
