@@ -1765,21 +1765,8 @@ async fn process_task(
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // --- PHASE 3: HANDOVER (Unload -> Load Embedding) ---
-    {
-        println!("[Scheduler] PHASE 3: Handover - Unloading, Preparing for Embedding...");
-        // 🌟 스피너(⠋) 속성 추가
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model...", "spinner": "⠋" }));
-        
-        // 1. Explicitly Unload to free VRAM for Embedding Model
-        model.deep_purge_resources().await;
-        
-        // 2. Wait for VRAM to settle (Driver latency)
-        wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
-    }
-
     // --- DB OPS & SIDE EFFECTS ---
-    // Normalize Data
+    // 🌟 [CRITICAL FIX] VRAM 교체 지옥 방지: 정규화 로직을 Handover 이전으로 끌어올립니다.
     let search_mode_str = search_mode.clone();
     let normalize_data = |item: &mut serde_json::Value| {
         if let Some(obj) = item.as_object_mut() {
@@ -1899,6 +1886,114 @@ async fn process_task(
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
+    // 🌟 [CRITICAL FIX] VRAM 교체 지옥 방지: Embedding 모델 교체 전, Qwen 3 (0.6B) 모델로 영어 번역을 수행합니다.
+    {
+        println!("[Scheduler] Batch translating English FTS keywords using Qwen3 (0.6B)...");
+        
+        // 🌟 Qwen3 모델을 VRAM에 로드합니다.
+        model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, None).await?;
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+        let mut target_items = Vec::new();
+        if is_detail {
+            target_items.push(extracted_data.clone());
+        } else {
+            if let Some(items) = extracted_data.get("items").and_then(|v| v.as_array()) {
+                target_items = items.clone();
+            }
+        }
+
+        let mut enriched_texts = Vec::new();
+        for (idx, item) in target_items.iter().enumerate() {
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            
+            let payload = json!({ "task_id": task.id, "category": format!("Indexing ({}/{})", idx+1, target_items.len()), "summary": "Generating FTS English keywords...", "spinner": "⠋" });
+            let _ = app_handle.emit("extraction-progress", &payload);
+            crate::scheduler::log_task_progress(app_handle, &task.id, &payload);
+
+            let natural_text = parsing::json_to_natural_language(item);
+            let mut final_text = natural_text.clone();
+
+            // 🌟 [CRITICAL FIX] 이미 알고 있는 page_type을 프롬프트에 직접 넘겨주어 LLM의 타입 판별 연산을 생략시킵니다.
+            let eng_prompt = parsing::english_summary_for_fts_prompt(&natural_text, &page_type);
+            let params = crate::openai_types::ChatCompletionParameters {
+                messages: vec![
+                    crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
+                        content: "You are an FTS semantic segmenter and translator. Output strictly in JSON format.".to_string(),
+                        name: None,
+                    }),
+                    crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                        content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(eng_prompt),
+                        name: None,
+                    })
+                ],
+                // 🌟 Qwen3 (0.6B) 사용 선언 (context 배열 생성을 위해 토큰을 여유있게 잡습니다)
+                model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.1), top_p: Some(0.95),
+                ..Default::default()
+            };
+            
+            // 🌟 메인 비동기 스레드 블로킹 방지를 위해 tokio::task::spawn_blocking으로 Qwen3의 동기 엔진 호출
+            let gen_arc = model.qwen3_generator.clone();
+            let res_opt = tokio::task::spawn_blocking(move || -> Option<String> {
+                let mut gen_guard = gen_arc.blocking_lock();
+                if let Some(gen) = gen_guard.as_mut() {
+                    gen.generate(params).ok()
+                } else {
+                    None
+                }
+            }).await.unwrap_or(None);
+
+            if let Some(res) = res_opt {
+                let parsed_json = crate::parsing::parse_json_from_llm(&res);
+                
+                // 🌟 para2graph 구조를 완벽히 모방한 segmented_plan 키를 추출하여 반영합니다.
+                let plan = parsed_json.get("segmented_plan")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                    
+                let plan_clean = plan.trim();
+                
+                if !plan_clean.is_empty() {
+                    // 🌟 FTS 엔진이 정확하게 파싱할 수 있도록 [FTS_PLAN] 태그를 붙여 원본 텍스트에 병합합니다.
+                    final_text = format!("{} [FTS_PLAN] {}", natural_text, plan_clean);
+                }
+            }
+            
+            enriched_texts.push(final_text);
+        }
+
+        // 반영
+        if is_detail {
+            if let Some(obj) = extracted_data.as_object_mut() {
+                obj.insert("text".to_string(), json!(enriched_texts[0].clone()));
+            }
+        } else {
+            if let Some(items) = extracted_data.get_mut("items").and_then(|v| v.as_array_mut()) {
+                for (i, item) in items.iter_mut().enumerate() {
+                    if let Some(obj) = item.as_object_mut() {
+                        if i < enriched_texts.len() {
+                            obj.insert("text".to_string(), json!(enriched_texts[i].clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- PHASE 3: HANDOVER (Unload Qwen -> Load Embedding) ---
+    {
+        println!("[Scheduler] PHASE 3: Handover - Unloading, Preparing for Embedding...");
+        // 🌟 스피너(⠋) 속성 추가
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model...", "spinner": "⠋" }));
+        
+        // 1. Explicitly Unload to free VRAM for Embedding Model
+        model.deep_purge_resources().await;
+        
+        // 2. Wait for VRAM to settle (Driver latency)
+        wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
+    }
+
     // [PARITY] ID Generation
     let id_val_raw = extracted_data.get("id")
         .or_else(|| extracted_data.get("no"))
@@ -2000,7 +2095,8 @@ async fn process_task(
 
     if is_detail {
         // 🌟 [DETAIL MODE] 단일 문서일 경우
-        let text_to_embed = parsing::json_to_natural_language(&extracted_data);
+        // Phase 2.5에서 주입된 영문 FTS 키워드가 포함된 text 속성을 최우선으로 사용하여 벡터화합니다.
+        let text_to_embed = extracted_data.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| parsing::json_to_natural_language(&extracted_data));
         let item_digest = crate::utils::hash::digest(&text_to_embed); 
         let mut target_id = generated_id.clone(); 
         
@@ -2199,12 +2295,8 @@ async fn process_task(
             }
         }
 
-        // 🌟 [CRITICAL FIX] 상세(Detail) 모드: FTS 인덱싱을 위해 변환된 자연어 텍스트를 JSON의 "text" 속성에 명시적으로 주입합니다.
-        // Rust의 Borrow Checker 제약을 피하기 위해 읽기(변환)를 먼저 수행하고 쓰기(주입)를 나중에 수행합니다.
-        let natural_text = parsing::json_to_natural_language(&extracted_data);
-        if let Some(obj) = extracted_data.as_object_mut() {
-            obj.insert("text".to_string(), json!(natural_text));
-        }
+        // 🌟 [CRITICAL FIX] 상세(Detail) 모드: FTS 영어 키워드가 포함된 text는 이미 앞선 일괄 번역 단계에서 주입되었으므로 
+        // 여기서 다시 덮어씌우는 과정을 생략하여 보호합니다.
 
         let _ = store.upsert_item(
             &target_table, &target_id, &page_type, extracted_data.clone(), vector.clone(),
@@ -2253,7 +2345,8 @@ async fn process_task(
                     obj.insert("updated_at".to_string(), json!(0));
                 }
 
-                let text_to_embed = parsing::json_to_natural_language(&single_item);
+                // Phase 2.5에서 주입된 영문 FTS 키워드가 포함된 text 속성을 최우선으로 사용하여 벡터화합니다.
+                let text_to_embed = single_item.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| parsing::json_to_natural_language(&single_item));
                 let item_digest = crate::utils::hash::digest(&text_to_embed);
                 
                 let mut existing_vector = None;
@@ -2394,12 +2487,8 @@ async fn process_task(
                     }
                 }
 
-                // 🌟 [CRITICAL FIX] 리스트(List) 모드: 리스트 아이템 역시 FTS 인덱싱을 위해 자연어 텍스트를 "text" 속성에 주입합니다.
-                // Rust의 Borrow Checker 제약을 피하기 위해 읽기(변환)를 먼저 수행하고 쓰기(주입)를 나중에 수행합니다.
-                let natural_text = parsing::json_to_natural_language(&single_item);
-                if let Some(obj) = single_item.as_object_mut() {
-                    obj.insert("text".to_string(), json!(natural_text));
-                }
+                // 🌟 [CRITICAL FIX] 리스트(List) 모드: FTS 영어 키워드가 포함된 text는 이미 앞선 일괄 번역 단계에서 주입되었으므로 
+                // 여기서 다시 덮어씌우는 과정을 생략하여 보호합니다.
 
                 let _ = store.upsert_item(
                     &target_table, &hashed_item_id, &page_type, single_item.clone(), vector.clone(),

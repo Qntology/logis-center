@@ -2180,10 +2180,10 @@ listen("extraction-progress", async (event: any) => {
                 aiResultsArea.style.display = "block";
                 aiResultsTitle.innerText = "🧠 AI Deep Analysis";
                 
-                let html = `<div style="margin-bottom:15px; padding:10px; background:#222; border-left:3px solid var(--primary); font-size:0.8rem;"><strong style="display:block; margin-bottom:5px; color:#aaa;">Query Intent:</strong>`;
+                let html = `<div><strong>Query Intent:</strong>`;
                 if (response.structured && response.structured.context) {
                     response.structured.context.forEach((ctx: any) => {
-                        html += `<div style="margin-bottom:5px;">• ${ctx.text} <span style="color:var(--primary)">[${ctx.type}]</span></div>`;
+                        html += `<div>• ${ctx.text} <span>[${ctx.type}]</span></div>`;
                     });
                 }
                 html += `</div>`;
@@ -2192,12 +2192,12 @@ listen("extraction-progress", async (event: any) => {
                     html += `<div class="empty">No matching data found</div>`;
                 } else {
                     html += response.results.map((res: any) => 
-                        `<div style="border-bottom:1px solid #333; padding:8px 0;">
-                           <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
-                             <strong style="color:var(--primary)">${res.context_type} (Score: ${res.score.toFixed(2)})</strong>
+                        `<div>
+                           <div>
+                             <strong>${res.context_type} (Score: ${res.score.toFixed(2)})</strong>
                              <button class="link-btn" onclick="document.dispatchEvent(new CustomEvent('show-doc', {detail:'${res.id}'}))">View Detail</button>
                            </div>
-                           <div style="color:#ddd; line-height:1.4;">${res.text}</div>
+                           <div>${res.text}</div>
                          </div>`
                     ).join("");
                 }

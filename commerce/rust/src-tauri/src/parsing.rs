@@ -853,6 +853,37 @@ pub fn para2graph(language: &str) -> String {
 // ==============================================
 // [Zone: src/parsing.rs 교체 코드]
 // ==============================================
+pub fn english_summary_for_fts_prompt(korean_text: &str, page_type: &str) -> String {
+    let template = r###"Convert the given Korean natural language content into English by segmenting it into granular semantic chunks.
+
+[DOCUMENT SCANNING & STRICT SEGMENTATION LOGIC]
+1. EXACT COPY: Copy the full Korean input sentence into 'original_text' without changing anything.
+2. TRANSLATE & TAGGED PIPE PLANNING: Translate the content into English. In the 'segmented_plan' field, you MUST prefix every translated segment with the assigned type tag [{TYPE}], followed by the exact English substring, separated by pipes ('|'). Structure it strictly as '[{TYPE}] english chunk1 | [{TYPE}] english chunk2'.
+3. MAXIMAL GROUPING: Group all contiguous words belonging to the same entity into a SINGLE translated segment. Break the segment ONLY when the context logically shifts.
+4. STRICT ARRAY MAPPING: For EVERY tagged segment in 'segmented_plan', create exactly one object in the 'context' array sequentially.
+
+[SCHEMA DEFINITIONS]
+- original_text: String. The exact, unaltered full Korean natural language input.
+- segmented_plan: String. The translated English text with '[{TYPE}] english text | ' format inserted strictly at context boundaries.
+- context:
+  - 'text': String. The translated English chunk.
+  - 'type': String. Always use '{TYPE}'.
+
+[INPUT DATA]
+{INPUT}
+
+[OUTPUT FORMAT]
+{
+  "original_text": "String",
+  "segmented_plan": "String",
+  "context": [...]
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template.replace("{INPUT}", korean_text).replace("{TYPE}", page_type)
+}
+
 pub fn extract_numeric_conditions(current: &str, input: &str, seg_type: &str, metrics_json: &str) -> String {
     let template = r###"[Task]
 Act as a deterministic semantic parser.

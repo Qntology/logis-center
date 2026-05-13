@@ -354,7 +354,21 @@ async fn search_documents(
 
     if let Some(store) = store_opt {
         // 🌟 [CRITICAL FIX] 무시되던 offset 파라미터를 추가로 전달합니다.
-        store.search_items("items", &query, query_vec, limit, offset, filter).await.map_err(|e| e.to_string())
+        let search_result = store.search_items("items", &query, query_vec, limit, offset, filter).await.map_err(|e| e.to_string());
+        
+        // 🌟 [추가] DB 검색이 완료된 후 반환된 결과 건수와 상세 내용(벡터 제외)을 터미널에 로그로 남깁니다.
+        match &search_result {
+            Ok(items) => {
+                println!("[DB-SEARCH] 검색 완료: {}건 반환", items.len());
+                for (i, (id, text, score)) in items.iter().enumerate() {
+                    // 터미널 가독성을 위해 줄바꿈 문자를 공백으로 치환하여 한 줄로 출력합니다.
+                    println!("  ↳ {}. ID: [{}] | Score: {:.4} | Text: {}", i + 1, id, score, text.replace("\n", " "));
+                }
+            },
+            Err(e) => println!("[DB-SEARCH] 검색 실패: {}", e),
+        }
+        
+        search_result
     } else {
         Err("DB not initialized".to_string())
     }
