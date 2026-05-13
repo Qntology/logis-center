@@ -1944,6 +1944,9 @@ async fn process_task(
             }).await.unwrap_or(None);
 
             if let Some(res) = res_opt {
+                // 🌟 [추가] Qwen3 모델이 번역한 원본 JSON 문자열을 터미널에 출력하여 품질을 확인합니다.
+                println!("\n[FTS-TRANSLATION] LLM Raw Response:\n{}", res);
+
                 let parsed_json = crate::parsing::parse_json_from_llm(&res);
                 
                 // 🌟 para2graph 구조를 완벽히 모방한 segmented_plan 키를 추출하여 반영합니다.
@@ -1957,6 +1960,9 @@ async fn process_task(
                 if !plan_clean.is_empty() {
                     // 🌟 FTS 엔진이 정확하게 파싱할 수 있도록 [FTS_PLAN] 태그를 붙여 원본 텍스트에 병합합니다.
                     final_text = format!("{} [FTS_PLAN] {}", natural_text, plan_clean);
+                    
+                    // 🌟 [추가] DB의 text 컬럼에 최종적으로 들어가는 데이터를 터미널에 출력하여 확인합니다.
+                    println!("[FTS-TRANSLATION] Final Text to DB:\n{}\n", final_text);
                 }
             }
             

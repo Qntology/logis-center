@@ -709,7 +709,7 @@ impl VectorStore {
         }))
     }
     
-    pub async fn search_items(&self, _table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, offset: usize, filter: Option<String>) -> Result<Vec<(String, String, f32)>> {
+    pub async fn search_items(&self, _table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, offset: usize, filter: Option<String>, use_fts: bool) -> Result<Vec<(String, String, f32)>> {
          // 🌟 [CRITICAL FIX] 테이블 파편화 해결: 프론트엔드나 LLM이 어떤 개별 테이블 이름(_table_name)을 요청하든 무시하고, 
          // 100% 통합 FTS 인덱스가 구축된 "items" 마스터 테이블로만 쿼리를 강제 라우팅하여 중앙 검색을 수행합니다.
          let target = "items";
@@ -723,9 +723,13 @@ impl VectorStore {
              let clean = query_text.replace("'", "''");
              let mut q = table.query();
              
-             // 🌟 [CRITICAL FIX] FTS 인덱스를 성공적으로 구축했으므로, 압도적인 성능의 MATCH 문법(Tantivy 검색 엔진)으로 다시 격상시킵니다!
-             // only_if 두 번 호출 시 덮어씌워지는 버그는 방어하되, LIKE 대비 수십 배 빠르고 형태소 분석이 지원되는 MATCH를 사용합니다.
-             let text_filter = format!("(text MATCH '{0}' OR data MATCH '{0}')", clean);
+             // 🌟 [CRITICAL FIX] 분기 처리: Fast Search(실시간 검색)일 때는 다국어가 지원되는 ILIKE를 사용하고,
+             // AI Deep Search(엔터/돋보기)일 때는 영어로 번역된 키워드를 MATCH로 초고속 검색합니다.
+             let text_filter = if use_fts {
+                 format!("(text MATCH '{0}' OR data MATCH '{0}')", clean)
+             } else {
+                 format!("(text ILIKE '%{}%' OR data ILIKE '%{}%')", clean, clean)
+             };
              let final_filter = if let Some(ref f) = filter {
                  format!("({}) AND {}", f, text_filter)
              } else {

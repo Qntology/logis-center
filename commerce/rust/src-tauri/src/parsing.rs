@@ -814,19 +814,19 @@ JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 // }
 
 pub fn para2graph(language: &str) -> String {
-    let template = r###"Convert the given natural language content into the specified JSON dataset structure by segmenting it into granular semantic chunks.
+    let template = r###"Translate and convert the given natural language search query into English, then segment it into the specified JSON dataset structure.
 
 [DOCUMENT SCANNING & STRICT SEGMENTATION LOGIC]
-1. EXACT COPY: Copy the full input sentence into 'original_text' without changing anything.
-2. TAGGED PIPE PLANNING: In the 'segmented_plan' field, you MUST prefix every segment with its assigned type tag in brackets, followed by the exact substring, separated by pipes ('|'). Structure it strictly as '[tag1] chunk1 | [tag2] chunk2'.
-3. MAXIMAL GROUPING: Group all contiguous words belonging to the same type into a SINGLE segment. DO NOT split subjects from their numeric conditions. Break the segment ONLY when the type logically shifts.
-4. STRICT ARRAY MAPPING: For EVERY tagged segment in 'segmented_plan', create exactly one object in the 'context' array sequentially.
+1. EXACT COPY: Copy the full original input into 'original_text' without changing anything.
+2. TRANSLATE & TAGGED PIPE PLANNING: Translate the query into English. In the 'segmented_plan' field, prefix every translated segment with its assigned type tag in brackets, separated by pipes ('|'). Structure it strictly as '[tag1] english chunk1 | [tag2] english chunk2'.
+3. MAXIMAL GROUPING: Group all contiguous words belonging to the same type into a SINGLE English segment. DO NOT split subjects from their numeric conditions. Break the segment ONLY when the type logically shifts.
+4. STRICT ARRAY MAPPING: For EVERY tagged English segment in 'segmented_plan', create exactly one object in the 'context' array sequentially.
 
 [SCHEMA DEFINITIONS]
 - original_text: String. The exact, unaltered full natural language input.
-- segmented_plan: String. The original text with '[type] text | ' format inserted strictly at type boundaries.
+- segmented_plan: String. Translated English text with '[type] english text | ' format inserted strictly at type boundaries.
 - context:
-  - 'text': String.
+  - 'text': String. The translated English chunk.
   - 'language': String. Default '{LANG}'.
   - 'type': String. Choose one:
     * 'order': Intent to measure sales performance or direct transactions. Triggers: conversion rate, sales volume, checkout, payment, cancellation, refund. (RULE: If the context measures buying success or revenue, classify as 'order' even if the word 'product' or 'item' is present).
@@ -853,20 +853,21 @@ pub fn para2graph(language: &str) -> String {
 // ==============================================
 // [Zone: src/parsing.rs 교체 코드]
 // ==============================================
-pub fn english_summary_for_fts_prompt(korean_text: &str, page_type: &str) -> String {
-    let template = r###"Convert the given Korean natural language content into English by segmenting it into granular semantic chunks.
+pub fn english_summary_for_fts_prompt(input_text: &str, page_type: &str) -> String {
+    let template = r###"You are a strict EN-US translator and FTS segmenter. You MUST translate all non-English words into English.
 
-[DOCUMENT SCANNING & STRICT SEGMENTATION LOGIC]
-1. EXACT COPY: Copy the full Korean input sentence into 'original_text' without changing anything.
-2. TRANSLATE & TAGGED PIPE PLANNING: Translate the content into English. In the 'segmented_plan' field, you MUST prefix every translated segment with the assigned type tag [{TYPE}], followed by the exact English substring, separated by pipes ('|'). Structure it strictly as '[{TYPE}] english chunk1 | [{TYPE}] english chunk2'.
-3. MAXIMAL GROUPING: Group all contiguous words belonging to the same entity into a SINGLE translated segment. Break the segment ONLY when the context logically shifts.
+[TRANSLATION & SEGMENTATION LOGIC]
+1. EXACT COPY: Copy the exact original input into 'original_text' without translating it.
+2. FORCE ENGLISH TRANSLATION: You MUST translate all non-English nouns, product names, and attributes into English. DO NOT output any non-English characters in the 'segmented_plan' and 'context' fields.
+3. TAGGED PIPE PLANNING: In the 'segmented_plan' field, prefix every TRANSLATED English segment with the assigned type tag [{TYPE}], separated by pipes ('|'). Structure: '[{TYPE}] translated english 1 | [{TYPE}] translated english 2'.
 4. STRICT ARRAY MAPPING: For EVERY tagged segment in 'segmented_plan', create exactly one object in the 'context' array sequentially.
 
 [SCHEMA DEFINITIONS]
-- original_text: String. The exact, unaltered full Korean natural language input.
-- segmented_plan: String. The translated English text with '[{TYPE}] english text | ' format inserted strictly at context boundaries.
+- original_text: String. The exact, unaltered original input.
+- segmented_plan: String. TRANSLATED ENGLISH TEXT ONLY.
 - context:
-  - 'text': String. The translated English chunk.
+  - 'text': String. TRANSLATED ENGLISH TEXT ONLY.
+  - 'language': String. Default 'ENGLISH'.'
   - 'type': String. Always use '{TYPE}'.
 
 [INPUT DATA]
@@ -881,7 +882,7 @@ pub fn english_summary_for_fts_prompt(korean_text: &str, page_type: &str) -> Str
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
-    template.replace("{INPUT}", korean_text).replace("{TYPE}", page_type)
+    template.replace("{INPUT}", input_text).replace("{TYPE}", page_type)
 }
 
 pub fn extract_numeric_conditions(current: &str, input: &str, seg_type: &str, metrics_json: &str) -> String {

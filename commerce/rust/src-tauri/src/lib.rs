@@ -353,8 +353,8 @@ async fn search_documents(
     };
 
     if let Some(store) = store_opt {
-        // 🌟 [CRITICAL FIX] 무시되던 offset 파라미터를 추가로 전달합니다.
-        let search_result = store.search_items("items", &query, query_vec, limit, offset, filter).await.map_err(|e| e.to_string());
+        // 🌟 [CRITICAL FIX] 실시간 빠른 검색(#global-search)이므로 use_fts 파라미터에 false를 전달하여 ILIKE로 스캔합니다.
+        let search_result = store.search_items("items", &query, query_vec, limit, offset, filter, false).await.map_err(|e| e.to_string());
         
         // 🌟 [추가] DB 검색이 완료된 후 반환된 결과 건수와 상세 내용(벡터 제외)을 터미널에 로그로 남깁니다.
         match &search_result {
@@ -800,14 +800,15 @@ async fn ai_search_complex(
                 let sql_filter = convert_conditions_to_sql(ctx);
                 let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 768]);
                 
-                // 🌟 [CRITICAL FIX] 인자 개수를 맞추기 위해 기본값 0 (offset) 추가
-                let search_result = store.search_items(target_table, text, emb.clone(), 5, 0, sql_filter.clone()).await;
+                // 🌟 [CRITICAL FIX] Deep Search(#btn-submit)일 때 LLM이 영어로 번역한 텍스트를 제공하므로, 
+                // Commerce 모드에서는 FTS(MATCH)를 활성화하여 벡터 검색과 동시에 실행합니다.
+                let use_fts = search_mode == "commerce";
+                let search_result = store.search_items(target_table, text, emb.clone(), 5, 0, sql_filter.clone(), use_fts).await;
                 
                 let final_results = match search_result {
                     Ok(res) => res,
                     Err(_) => {
-                        // 🌟 [CRITICAL FIX] 기본값 0 (offset) 추가
-                        store.search_items(target_table, text, emb, 5, 0, None).await.unwrap_or_default()
+                        store.search_items(target_table, text, emb, 5, 0, None, use_fts).await.unwrap_or_default()
                     }
                 };
 
@@ -922,8 +923,8 @@ async fn deep_research_command(
     if let Some(store) = store_guard.as_ref() {
         // General search for context
         let emb = model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 768]);
-        // 🌟 [CRITICAL FIX] 0 (offset) 인자 추가
-        if let Ok(results) = store.search_items("items", &query, emb, 3, 0, None).await {
+        // 🌟 [CRITICAL FIX] 파라미터 시그니처 변경에 맞추어 use_fts 인자(false)를 추가합니다.
+        if let Ok(results) = store.search_items("items", &query, emb, 3, 0, None, false).await {
             let docs: Vec<String> = results.iter()
                 .map(|(_, text, _)| format!("- {}", text))
                 .collect();
