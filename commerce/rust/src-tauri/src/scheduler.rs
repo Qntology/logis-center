@@ -1886,101 +1886,118 @@ async fn process_task(
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // 🌟 [CRITICAL FIX] VRAM 교체 지옥 방지: Embedding 모델 교체 전, Qwen 3 (0.6B) 모델로 영어 번역을 수행합니다.
+    // 🌟 [CRITICAL FIX] VRAM 교체 지옥 방지: Embedding 모델 교체 전, Qwen 3.5 (0.8B) 모델로 영어 번역을 수행합니다.
     {
-        println!("[Scheduler] Batch translating English FTS keywords using Qwen3 (0.6B)...");
+        println!("[Scheduler] Batch translating English FTS keywords using Qwen3.5 (0.8B)...");
         
-        // 🌟 Qwen3 모델을 VRAM에 로드합니다.
-        model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, None).await?;
+        model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, None).await?;
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-        let mut target_items = Vec::new();
-        if is_detail {
-            target_items.push(extracted_data.clone());
-        } else {
-            if let Some(items) = extracted_data.get("items").and_then(|v| v.as_array()) {
-                target_items = items.clone();
+        // 1. 전체 데이터 구조에서 번역이 필요한 텍스트의 경로를 전부 수집합니다.
+        fn collect_values(val: &serde_json::Value, path: Vec<String>, target_list: &mut Vec<(Vec<String>, String)>) {
+            if let Some(obj) = val.as_object() {
+                for (k, v) in obj {
+                    // 🌟 사용자 논의 반영: 링크, ID, 각종 시간/날짜, 바코드, 이미지 URL 등 번역이 절대 필요 없는 시스템 및 메타 데이터를 완벽하게 차단합니다.
+                    if [
+                        "origin", "link", "path", "id", "no", "code", "currency", "mode", "type", 
+                        "registration_date", "created_at", "updated_at", "order_date", "payment_date", "shipping_date", 
+                        "manufacture_date", "expiration_date", "release_date", "started_at", "expired_at",
+                        "tracking_number", "main_image_url", "additional_image_url", "video_url", "gtin", "mpn", "barcode",
+                        "text", "json_data"
+                    ].contains(&k.as_str()) { 
+                        continue; 
+                    }
+                    let mut next_path = path.clone(); next_path.push(k.clone());
+                    collect_values(v, next_path, target_list);
+                }
+            } else if let Some(arr) = val.as_array() {
+                for (i, v) in arr.iter().enumerate() {
+                    let mut next_path = path.clone(); next_path.push(i.to_string());
+                    collect_values(v, next_path, target_list);
+                }
+            } else if let Some(s) = val.as_str() {
+                if !s.is_ascii() && !s.trim().is_empty() { target_list.push((path, s.to_string())); }
             }
         }
 
-        let mut enriched_texts = Vec::new();
-        for (idx, item) in target_items.iter().enumerate() {
+        // 2. 번역된 텍스트를 원본 구조에 꽂아 넣습니다.
+        fn apply_value(root: &mut serde_json::Value, path: &[String], new_val: String) {
+            let mut current = root;
+            for (i, part) in path.iter().enumerate() {
+                if i == path.len() - 1 {
+                    if let Some(obj) = current.as_object_mut() { obj.insert(part.clone(), json!(new_val)); }
+                    else if let Some(arr) = current.as_array_mut() {
+                        if let Ok(idx) = part.parse::<usize>() { if idx < arr.len() { arr[idx] = json!(new_val); } }
+                    }
+                } else {
+                    if current.is_object() { current = current.get_mut(part).unwrap(); }
+                    else if current.is_array() {
+                        if let Ok(idx) = part.parse::<usize>() { current = current.get_mut(idx).unwrap(); }
+                    }
+                }
+            }
+        }
+
+        let mut keys_to_translate = Vec::new();
+        collect_values(&extracted_data, Vec::new(), &mut keys_to_translate);
+
+        // 3. 중복 텍스트 묶기 (LLM 호출 최적화)
+        let mut unique_texts = std::collections::HashMap::new();
+        for (path, text) in keys_to_translate {
+            unique_texts.entry(text).or_insert_with(Vec::new).push(path);
+        }
+
+        let total_count = unique_texts.len();
+        println!("[FTS-TRANSLATION] Found {} unique values to translate.", total_count);
+
+        for (idx, (text_to_trans, paths)) in unique_texts.into_iter().enumerate() {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-            
-            let payload = json!({ "task_id": task.id, "category": format!("Indexing ({}/{})", idx+1, target_items.len()), "summary": "Generating FTS English keywords...", "spinner": "⠋" });
+
+            let payload = json!({ "task_id": task.id, "category": "Translating", "summary": format!("Translating content ({}/{})", idx+1, total_count), "spinner": "⠋" });
             let _ = app_handle.emit("extraction-progress", &payload);
             crate::scheduler::log_task_progress(app_handle, &task.id, &payload);
 
-            let natural_text = parsing::json_to_natural_language(item);
-            let mut final_text = natural_text.clone();
-
-            // 🌟 [CRITICAL FIX] 이미 알고 있는 page_type을 프롬프트에 직접 넘겨주어 LLM의 타입 판별 연산을 생략시킵니다.
-            let eng_prompt = parsing::english_summary_for_fts_prompt(&natural_text, &page_type);
+            let eng_prompt = parsing::english_summary_for_fts_prompt(&text_to_trans);
             let params = crate::openai_types::ChatCompletionParameters {
-                messages: vec![
-                    crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
-                        content: "You are an FTS semantic segmenter and translator. Output strictly in JSON format.".to_string(),
-                        name: None,
-                    }),
-                    crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                        content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(eng_prompt),
-                        name: None,
-                    })
-                ],
-                // 🌟 Qwen3 (0.6B) 사용 선언 (context 배열 생성을 위해 토큰을 여유있게 잡습니다)
-                model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.1), top_p: Some(0.95),
+                messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(eng_prompt), name: None,
+                })],
+                model: "qwen3.5".to_string(), max_tokens: Some(128), temperature: Some(0.1), top_p: Some(0.95),
                 ..Default::default()
             };
             
-            // 🌟 메인 비동기 스레드 블로킹 방지를 위해 tokio::task::spawn_blocking으로 Qwen3의 동기 엔진 호출
-            let gen_arc = model.qwen3_generator.clone();
-            let res_opt = tokio::task::spawn_blocking(move || -> Option<String> {
-                let mut gen_guard = gen_arc.blocking_lock();
-                if let Some(gen) = gen_guard.as_mut() {
-                    gen.generate(params).ok()
-                } else {
-                    None
-                }
-            }).await.unwrap_or(None);
-
-            if let Some(res) = res_opt {
-                // 🌟 [추가] Qwen3 모델이 번역한 원본 JSON 문자열을 터미널에 출력하여 품질을 확인합니다.
-                println!("\n[FTS-TRANSLATION] LLM Raw Response:\n{}", res);
-
-                let parsed_json = crate::parsing::parse_json_from_llm(&res);
-                
-                // 🌟 para2graph 구조를 완벽히 모방한 segmented_plan 키를 추출하여 반영합니다.
-                let plan = parsed_json.get("segmented_plan")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
+            if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+                if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), None, None).await {
+                    let mut clean_text = res.clone();
+                    if let Some(start) = clean_text.find("<think>") {
+                        if let Some(end) = clean_text.find("</think>") { clean_text.replace_range(start..end + 8, ""); }
+                        else { clean_text.replace_range(start.., ""); }
+                    }
+                    let clean_text = clean_text.replace("[Result]", "").replace("Result]", "").trim().to_string();
                     
-                let plan_clean = plan.trim();
-                
-                if !plan_clean.is_empty() {
-                    // 🌟 FTS 엔진이 정확하게 파싱할 수 있도록 [FTS_PLAN] 태그를 붙여 원본 텍스트에 병합합니다.
-                    final_text = format!("{} [FTS_PLAN] {}", natural_text, plan_clean);
-                    
-                    // 🌟 [추가] DB의 text 컬럼에 최종적으로 들어가는 데이터를 터미널에 출력하여 확인합니다.
-                    println!("[FTS-TRANSLATION] Final Text to DB:\n{}\n", final_text);
+                    if !clean_text.is_empty() {
+                        println!("[FTS-TRANSLATION] '{}' -> '{}'", text_to_trans, clean_text);
+                        for path in paths {
+                            apply_value(&mut extracted_data, &path, clean_text.clone());
+                        }
+                    }
                 }
             }
-            
-            enriched_texts.push(final_text);
         }
 
-        // 반영
+        // 4. 번역이 완료된 JSON 구조를 바탕으로 단 한 번 자연어 문장을 렌더링합니다!
+        println!("[FTS-TRANSLATION] All values translated. Generating natural language sentences...");
         if is_detail {
+            let final_text = parsing::json_to_natural_language(&extracted_data);
             if let Some(obj) = extracted_data.as_object_mut() {
-                obj.insert("text".to_string(), json!(enriched_texts[0].clone()));
+                obj.insert("text".to_string(), json!(final_text));
             }
         } else {
             if let Some(items) = extracted_data.get_mut("items").and_then(|v| v.as_array_mut()) {
-                for (i, item) in items.iter_mut().enumerate() {
+                for item in items.iter_mut() {
+                    let final_text = parsing::json_to_natural_language(item);
                     if let Some(obj) = item.as_object_mut() {
-                        if i < enriched_texts.len() {
-                            obj.insert("text".to_string(), json!(enriched_texts[i].clone()));
-                        }
+                        obj.insert("text".to_string(), json!(final_text));
                     }
                 }
             }

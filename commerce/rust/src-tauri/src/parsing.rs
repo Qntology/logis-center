@@ -47,7 +47,8 @@ pub fn pre_clean_html(html: &str) -> String {
 
     // 4. 허용된 속성 외 모두 제거 (지정된 16개 속성만 보존)
     let re_tag = Regex::new(r"(?i)<([a-zA-Z0-9\-]+)([^>]*)>").unwrap();
-    let re_attr = Regex::new(r#"(?i)\b(id|class|src|href|type|name|value|placeholder|checked|selected|disabled|readonly|rows|cols|rowspan|colspan)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?"#).unwrap();
+    // 🌟 [CRITICAL FIX] FTS 엔진의 테이블 매칭 정확도를 위해 'scope' 속성을 허용 목록에 추가하여 증발을 막습니다.
+    let re_attr = Regex::new(r#"(?i)\b(id|class|src|href|type|name|value|placeholder|checked|selected|disabled|readonly|rows|cols|rowspan|colspan|scope)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?"#).unwrap();
     
     let clean = re_tag.replace_all(&clean, |caps: &regex::Captures| {
         let tag_name = &caps[1];
@@ -409,11 +410,12 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             let is_useless = useless_wrappers.contains(&tag_name.as_str());
             
             let has_meaningful_attrs = if *mode == PugMode::NoAttributesMode {
-                // 🌟 [CRITICAL FIX] 구조 판별을 위해 colspan, rowspan, scope 속성은 예외적으로 보존합니다.
-                element.attrs().any(|(k, _)| ["colspan", "rowspan", "scope"].contains(&k))
+                // 🌟 [CRITICAL FIX] 대소문자 무결성: HTML 속성의 대소문자 혼용으로 인한 증발을 완벽 방어합니다.
+                element.attrs().any(|(k, _)| ["colspan", "rowspan", "scope"].contains(&k.to_lowercase().as_str()))
             } else {
                 element.attrs().any(|(k, _)| {
-                    ["src", "href", "type", "name", "value", "placeholder", "checked", "selected", "disabled", "readonly", "rows", "cols", "rowspan", "colspan"].contains(&k) || k.starts_with("data-")
+                    let k_lower = k.to_lowercase();
+                    ["src", "href", "type", "name", "value", "placeholder", "checked", "selected", "disabled", "readonly", "rows", "cols", "rowspan", "colspan", "scope"].contains(&k_lower.as_str()) || k_lower.starts_with("data-")
                 })
             };
 
@@ -491,34 +493,36 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             // 필수 속성 정의
             let always_include = [
                 "src", "href", "type", "name", "value", "placeholder", 
-                "checked", "selected", "disabled", "readonly", "rows", "cols", "rowspan", "colspan"
+                "checked", "selected", "disabled", "readonly", "rows", "cols", "rowspan", "colspan", "scope"
             ];
             let thead_include = ["scope", "rowspan", "colspan"];
 
             for (name, value) in element.attrs() {
-                if name == "id" || name == "class" || name == "alt" { continue; }
+                // 🌟 [CRITICAL FIX] HTML 속성명에 대소문자(CamelCase 등)가 섞여 있어 rowspan, colspan이 누락되는 현상을 완벽 방어하기 위해 소문자로 강제 변환
+                let name_lower = name.to_lowercase();
+                let name_str = name_lower.as_str();
 
-                let should_include = if *mode == PugMode::TheadMode {
-                    thead_include.contains(&name)
+                if name_str == "id" || name_str == "class" || name_str == "alt" { continue; }
+
+                // 🌟 [CRITICAL FIX] colspan, rowspan, scope는 어떠한 경우에도 무조건 통과하도록 강제(Hardcode)합니다!
+                let should_include = ["colspan", "rowspan", "scope"].contains(&name_str) || if *mode == PugMode::TheadMode {
+                    thead_include.contains(&name_str)
                 } else if *mode == PugMode::NoAttributesMode {
-                    // 🌟 [CRITICAL FIX] 구조 판별을 위해 colspan, rowspan, scope 속성은 예외적으로 보존합니다.
-                    ["colspan", "rowspan", "scope"].contains(&name)
+                    false
                 } else {
-                    name.starts_with("data-") || always_include.contains(&name)
+                    name_str.starts_with("data-") || always_include.contains(&name_str)
                 };
 
                 if should_include {
-                    if ["checked", "selected", "disabled", "readonly"].contains(&name) && (value.is_empty() || value == name) {
-                        other_attributes.push(name.to_string());
+                    if ["checked", "selected", "disabled", "readonly"].contains(&name_str) && (value.is_empty() || value == name) {
+                        other_attributes.push(name_str.to_string());
                     } else if !value.is_empty() {
                         let mut safe_value = value.replace("\"", "'");
                         
-                        // 🌟 [CRITICAL FIX] href, src 속성에 들어있는 상대 경로(./ 또는 /)를 완벽한 절대 경로로 자동 치환합니다.
-                        if name == "href" || name == "src" {
+                        if name_str == "href" || name_str == "src" {
                             if let Some(c) = ctx.as_ref() {
                                 if let Some(base) = &c.base_url {
                                     if let Ok(base_url_obj) = url::Url::parse(base) {
-                                        // 🌟 지저분한 HTML의 공백(띄어쓰기) 때문에 URL 파싱이 실패하여 상대경로가 그대로 남는 현상을 방어하기 위해 trim() 추가
                                         if let Ok(resolved_url) = base_url_obj.join(safe_value.trim()) {
                                             safe_value = resolved_url.to_string();
                                         }
@@ -527,7 +531,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                             }
                         }
 
-                        other_attributes.push(format!("{}=\"{}\"", name, safe_value));
+                        other_attributes.push(format!("{}=\"{}\"", name_str, safe_value));
                     }
                 }
             }
@@ -853,36 +857,10 @@ pub fn para2graph(language: &str) -> String {
 // ==============================================
 // [Zone: src/parsing.rs 교체 코드]
 // ==============================================
-pub fn english_summary_for_fts_prompt(input_text: &str, page_type: &str) -> String {
-    let template = r###"You are a strict EN-US translator and FTS segmenter. You MUST translate all non-English words into English.
+pub fn english_summary_for_fts_prompt(text: &str) -> String {
+    let template = r###"[Translate to English] {TEXT} [ACTION] RETURN TRANSLATED TEXT ONLY. NO EXPLANATION. /no_think"###;
 
-[TRANSLATION & SEGMENTATION LOGIC]
-1. EXACT COPY: Copy the exact original input into 'original_text' without translating it.
-2. FORCE ENGLISH TRANSLATION: You MUST translate all non-English nouns, product names, and attributes into English. DO NOT output any non-English characters in the 'segmented_plan' and 'context' fields.
-3. TAGGED PIPE PLANNING: In the 'segmented_plan' field, prefix every TRANSLATED English segment with the assigned type tag [{TYPE}], separated by pipes ('|'). Structure: '[{TYPE}] translated english 1 | [{TYPE}] translated english 2'.
-4. STRICT ARRAY MAPPING: For EVERY tagged segment in 'segmented_plan', create exactly one object in the 'context' array sequentially.
-
-[SCHEMA DEFINITIONS]
-- original_text: String. The exact, unaltered original input.
-- segmented_plan: String. TRANSLATED ENGLISH TEXT ONLY.
-- context:
-  - 'text': String. TRANSLATED ENGLISH TEXT ONLY.
-  - 'language': String. Default 'ENGLISH'.'
-  - 'type': String. Always use '{TYPE}'.
-
-[INPUT DATA]
-{INPUT}
-
-[OUTPUT FORMAT]
-{
-  "original_text": "String",
-  "segmented_plan": "String",
-  "context": [...]
-}
-
-[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
-
-    template.replace("{INPUT}", input_text).replace("{TYPE}", page_type)
+    template.replace("{TEXT}", text)
 }
 
 pub fn extract_numeric_conditions(current: &str, input: &str, seg_type: &str, metrics_json: &str) -> String {
@@ -1224,7 +1202,9 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage order link or tracking detail link | string
     - "currency":ISO 4217 Currency Code | string
-    - "sale_price":sale price | number
+    - "compare_at_price":normal price, market price | number
+    - "supply_price":supply price, wholesale price | number
+    - "sale_price":actual selling price, discounted price | number
     - "tracking_number":tracking Number or shipping number | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":tracking status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete') | string
@@ -1235,7 +1215,9 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage product link | string
     - "currency":ISO 4217 Currency Code | string
-    - "sale_price":sale price | number
+    - "compare_at_price":normal price, market price | number
+    - "supply_price":supply price, wholesale price | number
+    - "sale_price":actual selling price, discounted price | number
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string
     - "title":title | string"###.to_string(),
@@ -1296,13 +1278,25 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     }
 
     // 3. 전체 PUG를 프롬프트에 넣기 위해 일괄적으로 4칸 들여쓰기 적용
+    // 3. 전체 PUG를 프롬프트에 넣기 위해 일괄적으로 4칸 들여쓰기 적용
     let pug_content = final_pug.trim_end().lines()
         .map(|line| format!("    {}", line))
         .collect::<Vec<_>>()
         .join("\n");
 
+    // 🌟 [CRITICAL FIX] thead 유무에 따라 TASK 지시사항만 변수로 분리하여 할당합니다.
+    let task_desc = if !head_pug.is_empty() {
+        r###"Extract detailed information from the provided Pug content into a single structured JSON object.
+
+[INSTRUCTION]
+1. The content contains data rows inside 'tbody'.
+2. MUST strictly map the table headers ('th') in 'thead' to the corresponding data cells ('td') in 'tbody' based on their structural order, 'scope', 'colspan', and 'rowspan' attributes."###
+    } else {
+        "Extract detailed information from the provided Pug tbody into a single structured JSON object."
+    };
+
     let template = r###"[TASK]
-Extract detailed information from the provided Pug tbody into a single structured JSON object.
+{TASK}
 
 [PUG CONTENT]
 {PUG_CONTENT}
@@ -1320,8 +1314,9 @@ Language: {LANGUAGE}
 [ACTION] RETURN JSON ONLY. 
 NO EXPLANATION. NO THINKING. /no_think"###;
 
-    // 🌟 [CRITICAL FIX] moved 에러 해결: 기존 schema 대신 조건부로 처리된 final_schema를 참조합니다.
-    template.replace("{SCHEMA}", &final_schema)
+    // 🌟 {TASK} 변수를 포함하여 일괄 치환합니다.
+    template.replace("{TASK}", task_desc)
+            .replace("{SCHEMA}", &final_schema)
             .replace("{TYPE}", page_type)
             .replace("{HREF}", href)
             .replace("{LANGUAGE}", language)
@@ -1331,67 +1326,95 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 /// Converts a JSON Value into a human-readable natural language narrative.
 /// [STRICT ALIGNMENT] This logic perfectly synchronizes with every column in `parsing.rs`.
 pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
-    let mut output = String::new();
+    let mut sentences = Vec::new();
 
-    match json_val {
-        serde_json::Value::Object(map) => {
-            for (key, val) in map {
-                // 1. null 이나 빈 값은 검색에 도움 안 되므로 무시
-                if val.is_null() || (val.is_string() && val.as_str().unwrap_or("").trim().is_empty()) {
-                    continue;
+    // 최상위 식별자(ID, Link 등)를 먼저 추출하여 문장 생성
+    if let Some(obj) = json_val.as_object() {
+        if let Some(id) = obj.get("id").or(obj.get("no")).and_then(|v| v.as_str()) {
+            sentences.push(format!("The unique identifier is {}.", id));
+        }
+        if let Some(link) = obj.get("link").or(obj.get("path")).and_then(|v| v.as_str()) {
+            sentences.push(format!("It can be accessed at {}.", link));
+        }
+    }
+
+    fn parse_node(val: &serde_json::Value, context_name: &str, sentences: &mut Vec<String>) {
+        match val {
+            serde_json::Value::Object(map) => {
+                let title = map.get("title").or(map.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                let item_type = map.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                
+                let mut intro = String::new();
+                if !title.is_empty() {
+                    let type_str = if item_type.is_empty() { "item" } else { item_type };
+                    intro.push_str(&format!("This {} is titled '{}'.", type_str, title));
+                } else if !context_name.is_empty() && context_name != "item" {
+                    intro.push_str(&format!("Regarding {},", context_name));
+                }
+                
+                if !intro.is_empty() && !sentences.contains(&intro) {
+                    sentences.push(intro);
                 }
 
-                // 2. Key 이름을 읽기 좋게 정제 (sale_price -> sale price)
-                let clean_key = key.replace("_", " ");
-
-                // 3. Value가 객체나 배열일 경우 내부로 재귀 탐색
-                if val.is_object() {
-                    let sub_text = json_to_natural_language(val);
-                    if !sub_text.is_empty() {
-                        output.push_str(&format!("{}: {}. ", clean_key, sub_text));
-                    }
-                } else if val.is_array() {
-                    let arr = val.as_array().unwrap();
-                    let mut arr_items = Vec::new();
-                    for item in arr {
-                        let sub_text = json_to_natural_language(item);
-                        if !sub_text.is_empty() {
-                            arr_items.push(sub_text);
+                for (key, v) in map {
+                    // 이미 처리된 핵심 속성 및 시스템 변수는 스킵
+                    if ["title", "name", "type", "currency", "text", "json_data", "data", "id", "index", "no", "link", "path", "origin", "mode", "detail"].contains(&key.as_str()) { continue; }
+                    if v.is_null() || (v.is_string() && v.as_str().unwrap_or("").trim().is_empty()) { continue; }
+                    
+                    let clean_key = key.replace("_", " ");
+                    
+                    if v.is_object() || v.is_array() {
+                        parse_node(v, &clean_key, sentences);
+                    } else {
+                        let val_str = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            serde_json::Value::Number(n) => n.to_string(),
+                            serde_json::Value::Bool(b) => b.to_string(),
+                            _ => String::new(),
+                        };
+                        
+                        if ["sale_price", "supply_price", "price", "amount", "shipping_fee", "discount"].contains(&key.as_str()) {
+                            let curr = map.get("currency").and_then(|c| c.as_str()).unwrap_or("");
+                            let curr_str = if curr.is_empty() { String::new() } else { format!(" {}", curr) };
+                            sentences.push(format!("The {} is {}{}.", clean_key, val_str, curr_str));
+                        } else if key == "status" {
+                            sentences.push(format!("It is currently in '{}' status.", val_str));
+                        } else {
+                            sentences.push(format!("Its {} is {}.", clean_key, val_str));
                         }
                     }
-                    if !arr_items.is_empty() {
-                        output.push_str(&format!("{}: [{}]. ", clean_key, arr_items.join(", ")));
+                }
+            },
+            serde_json::Value::Array(arr) => {
+                let mut arr_vals = Vec::new();
+                for item in arr {
+                    if item.is_string() || item.is_number() || item.is_boolean() {
+                        arr_vals.push(item.as_str().map(|s| s.to_string()).unwrap_or_else(|| item.to_string()));
+                    } else {
+                        parse_node(item, context_name, sentences);
                     }
-                } else {
-                    // 4. 일반 문자열/숫자일 경우 최종 조립
-                    let val_str = match val {
-                        serde_json::Value::String(s) => s.clone(),
-                        serde_json::Value::Number(n) => n.to_string(),
-                        serde_json::Value::Bool(b) => b.to_string(),
-                        _ => String::new(),
-                    };
-                    output.push_str(&format!("{}: {}. ", clean_key, val_str));
                 }
-            }
-        },
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                let sub = json_to_natural_language(item);
-                if !sub.is_empty() {
-                    output.push_str(&format!("{} ", sub));
+                if !arr_vals.is_empty() {
+                    sentences.push(format!("The {} includes: {}.", context_name, arr_vals.join(", ")));
                 }
-            }
-        },
-        _ => {
-            if let Some(s) = json_val.as_str() {
-                output.push_str(s);
-            } else {
-                output.push_str(&json_val.to_string());
+            },
+            _ => {
+                let val_str = val.as_str().map(|s| s.to_string()).unwrap_or_else(|| val.to_string());
+                if !val_str.is_empty() {
+                    sentences.push(format!("The {} is {}.", context_name, val_str));
+                }
             }
         }
     }
 
-    output.trim().to_string()
+    parse_node(json_val, "item", &mut sentences);
+    
+    let mut unique_sentences = Vec::new();
+    for s in sentences {
+        if !unique_sentences.contains(&s) { unique_sentences.push(s); }
+    }
+    
+    unique_sentences.join(" ").replace("  ", " ").trim().to_string()
 }
 
 pub fn normalize_to_json_string(input: &str) -> String {
