@@ -2175,7 +2175,7 @@ listen("extraction-progress", async (event: any) => {
 
         // 🌟 [추가] 검색 작업이 완료(Done)되었을 경우, 백엔드가 보내준 데이터를 결과창에 렌더링합니다.
         if (payload.task_id.startsWith("search_") && payload.category === "Done" && payload.data) {
-            const response = payload.data; // 백엔드에서 넘겨준 결과 객체
+            const response = payload.data; 
             if (aiResultsArea && aiResultsContent) {
                 aiResultsArea.style.display = "block";
                 aiResultsTitle.innerText = "🧠 AI Deep Analysis";
@@ -2203,6 +2203,9 @@ listen("extraction-progress", async (event: any) => {
                 }
                 aiResultsContent.innerHTML = html;
                 aiResultsArea.scrollIntoView({ behavior: 'smooth' });
+
+                // 🌟 추가된 코드: 생성된 검색 결과 HTML을 로컬 DB에 영구 저장합니다.
+                kvSet(`search_res_${payload.task_id}`, html).catch(e => console.error("Failed to cache search result:", e));
             }
         }
     }
@@ -3083,6 +3086,14 @@ async function handleTaskClick(el: HTMLElement) {
         listView.style.display = "block";
         detailView.style.display = "none";
         if (aiResultsArea) {
+            // 🌟 추가된 코드: 클릭한 테스크 ID에 해당하는 과거 검색 결과를 불러와 복구합니다.
+            const savedHtml = await kvGet(`search_res_${taskId}`);
+            if (savedHtml && aiResultsContent) {
+                aiResultsContent.innerHTML = savedHtml;
+            } else if (aiResultsContent) {
+                aiResultsContent.innerHTML = `<div class="empty">This search result has expired or was not saved.</div>`;
+            }
+
             aiResultsArea.style.display = "block";
             aiResultsArea.scrollIntoView({ behavior: 'smooth' });
         }
@@ -3966,11 +3977,30 @@ async function initSession() {
         try { hiddenPages = JSON.parse(savedHiddenPages); } catch(e) {}
     }
 
-    // 🌟 [CRITICAL FIX 1] 앱 최초 실행 시, Dexie에서 묵은 터미널 찌꺼기를 완벽 청소합니다!
+    // 🌟 [CRITICAL FIX 1] 앱 최초 실행 시, Dexie에서 묵은 터미널 찌꺼기 및 30일이 지난 오래된 검색 결과를 완벽 청소합니다!
     const allKeys = await appDb.table("kv_store").toCollection().primaryKeys();
+    const nowTimeMs = Date.now();
+    // 30일을 밀리초 단위로 계산 (30일 * 24시간 * 60분 * 60초 * 1000)
+    const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+
     for (const key of allKeys) {
-        if (typeof key === "string" && key.startsWith("term_")) {
-            await kvRemove(key);
+        if (typeof key === "string") {
+            // 1. 기존 터미널 로그 찌꺼기는 즉시 청소
+            if (key.startsWith("term_")) {
+                await kvRemove(key);
+            }
+            // 2. 30일이 지난 과거 검색 결과 가비지 컬렉션 (자동 청소)
+            else if (key.startsWith("search_res_search_")) {
+                // key 포맷: search_res_search_1715610000000 -> 타임스탬프 숫자만 추출
+                const timestampStr = key.replace("search_res_search_", "");
+                const timestamp = parseInt(timestampStr, 10);
+                
+                // 유효한 숫자인지 확인 후, 30일이 경과했으면 로컬 DB에서 삭제
+                if (!isNaN(timestamp) && (nowTimeMs - timestamp > thirtyDaysMs)) {
+                    console.log(`[GC] Deleting expired search result (older than 30 days): ${key}`);
+                    await kvRemove(key);
+                }
+            }
         }
     }
 
