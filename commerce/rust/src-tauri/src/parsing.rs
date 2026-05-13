@@ -1202,9 +1202,10 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage order link or tracking detail link | string
     - "currency":ISO 4217 Currency Code | string
-    - "compare_at_price":normal price, market price | number
-    - "supply_price":supply price, wholesale price | number
-    - "sale_price":actual selling price, discounted price | number
+    - "shipping_fee":Cost of delivery | number
+    - "shipping_method":'standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid' | string
+    - "shipping_duration":product Estimated delivery days | number
+    - "sale_price":actual selling price(discounted price) | number
     - "tracking_number":tracking Number or shipping number | string
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":tracking status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete') | string
@@ -1215,9 +1216,9 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     - "id":Refer to the ID value from the link or an attribute | string
     - "link":Refer to the ID to find a URL that includes a manage product link | string
     - "currency":ISO 4217 Currency Code | string
-    - "compare_at_price":normal price, market price | number
-    - "supply_price":supply price, wholesale price | number
-    - "sale_price":actual selling price, discounted price | number
+    - "compare_at_price":product Original price for showing discounts(normal price, market price) | number
+    - "supply_price":supply price(wholesale price) | number
+    - "sale_price":actual selling price(discounted price) | number
     - "registration_date":yyyy-MM-ddThh:mm:ss | string
     - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string
     - "title":title | string"###.to_string(),

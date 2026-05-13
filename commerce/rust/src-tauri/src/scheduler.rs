@@ -1897,7 +1897,6 @@ async fn process_task(
         fn collect_values(val: &serde_json::Value, path: Vec<String>, target_list: &mut Vec<(Vec<String>, String)>) {
             if let Some(obj) = val.as_object() {
                 for (k, v) in obj {
-                    // 🌟 사용자 논의 반영: 링크, ID, 각종 시간/날짜, 바코드, 이미지 URL 등 번역이 절대 필요 없는 시스템 및 메타 데이터를 완벽하게 차단합니다.
                     if [
                         "origin", "link", "path", "id", "no", "code", "currency", "mode", "type", 
                         "registration_date", "created_at", "updated_at", "order_date", "payment_date", "shipping_date", 
@@ -1920,24 +1919,6 @@ async fn process_task(
             }
         }
 
-        // 2. 번역된 텍스트를 원본 구조에 꽂아 넣습니다.
-        fn apply_value(root: &mut serde_json::Value, path: &[String], new_val: String) {
-            let mut current = root;
-            for (i, part) in path.iter().enumerate() {
-                if i == path.len() - 1 {
-                    if let Some(obj) = current.as_object_mut() { obj.insert(part.clone(), json!(new_val)); }
-                    else if let Some(arr) = current.as_array_mut() {
-                        if let Ok(idx) = part.parse::<usize>() { if idx < arr.len() { arr[idx] = json!(new_val); } }
-                    }
-                } else {
-                    if current.is_object() { current = current.get_mut(part).unwrap(); }
-                    else if current.is_array() {
-                        if let Ok(idx) = part.parse::<usize>() { current = current.get_mut(idx).unwrap(); }
-                    }
-                }
-            }
-        }
-
         let mut keys_to_translate = Vec::new();
         collect_values(&extracted_data, Vec::new(), &mut keys_to_translate);
 
@@ -1950,7 +1931,9 @@ async fn process_task(
         let total_count = unique_texts.len();
         println!("[FTS-TRANSLATION] Found {} unique values to translate.", total_count);
 
-        for (idx, (text_to_trans, paths)) in unique_texts.into_iter().enumerate() {
+        let mut english_translation_buffer = String::new();
+
+        for (idx, (text_to_trans, _paths)) in unique_texts.into_iter().enumerate() {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
             let payload = json!({ "task_id": task.id, "category": "Translating", "summary": format!("Translating content ({}/{})", idx+1, total_count), "spinner": "⠋" });
@@ -1977,25 +1960,38 @@ async fn process_task(
                     
                     if !clean_text.is_empty() {
                         println!("[FTS-TRANSLATION] '{}' -> '{}'", text_to_trans, clean_text);
-                        for path in paths {
-                            apply_value(&mut extracted_data, &path, clean_text.clone());
-                        }
+                        // 원본 JSON 구조(extracted_data)를 파괴하지 않고, 영어 번역본을 버퍼에만 차곡차곡 모아둡니다.
+                        english_translation_buffer.push_str(&format!("{} ", clean_text));
                     }
                 }
             }
         }
 
-        // 4. 번역이 완료된 JSON 구조를 바탕으로 단 한 번 자연어 문장을 렌더링합니다!
+        // 4. 원본(한글) JSON 구조를 바탕으로 자연어 문장을 렌더링하고, 영어 번역본과 통합합니다.
         println!("[FTS-TRANSLATION] All values translated. Generating natural language sentences...");
         if is_detail {
-            let final_text = parsing::json_to_natural_language(&extracted_data);
+            let original_lang_text = parsing::json_to_natural_language(&extracted_data);
+            let final_text = if !english_translation_buffer.trim().is_empty() {
+                // 🌟 사용자의 의도대로 영어 번역 내용과 원본 언어(한글) 내용을 하나의 텍스트로 합쳐서 저장합니다.
+                format!("{}, {}", english_translation_buffer.trim(), original_lang_text)
+            } else {
+                original_lang_text
+            };
+            
             if let Some(obj) = extracted_data.as_object_mut() {
                 obj.insert("text".to_string(), json!(final_text));
             }
         } else {
             if let Some(items) = extracted_data.get_mut("items").and_then(|v| v.as_array_mut()) {
                 for item in items.iter_mut() {
-                    let final_text = parsing::json_to_natural_language(item);
+                    let original_lang_text = parsing::json_to_natural_language(item);
+                    let final_text = if !english_translation_buffer.trim().is_empty() {
+                        // 🌟 리스트의 각 아이템에도 동일하게 영어 내용과 원본 언어 내용을 합쳐서 저장합니다.
+                        format!("{}, {}", english_translation_buffer.trim(), original_lang_text)
+                    } else {
+                        original_lang_text
+                    };
+                    
                     if let Some(obj) = item.as_object_mut() {
                         obj.insert("text".to_string(), json!(final_text));
                     }
