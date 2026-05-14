@@ -1553,9 +1553,7 @@ async fn process_task(
                 log_task_progress(app_handle, &task.id, &payload);
                 emit_term(&format!("[STAGE-3] {}", summary_msg));
 
-                println!("thead_pug {}", thead_pug);
-                println!("item_pug {}", item_pug);
-
+                
                 // 🌟 [CRITICAL FIX 3] E0061 해결: 인자 5개를 받도록 변경된 list2json 구조에 완벽하게 맞춥니다.
                 let task_question = parsing::list2json(
                     &page_type, 
@@ -1564,6 +1562,8 @@ async fn process_task(
                     &thead_pug, 
                     item_pug
                 );
+
+                // println!("task_question {}", task_question);
                 
                 // 🌟 [교체 구간 2-B] src/scheduler.rs 의 리스트 추출 루프 내부
                 let res = if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {

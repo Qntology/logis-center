@@ -682,8 +682,11 @@ async function updateExtractButtonVisibility() {
             const ccHash = await hashId(urlObj.hostname);
             const hashedRefId = await hashId((currentSession.team || "") + ccHash + link);
             
-            const isActive = await invoke<boolean>("check_active_task", { payload: { cc: ccHash, ref: hashedRefId } });
-            const isQueued = GlobalTaskManager.queue.some(q => q.payload && (q.payload.ref === hashedRefId || q.payload.link === link));
+            // 🌟 [CRITICAL FIX] 추출 작업 등록 시와 동일하게 activeContext.ref를 최우선 식별자로 사용하여 상태 질의
+            const currentRefToCheck = activeContext.ref || hashedRefId;
+            
+            const isActive = await invoke<boolean>("check_active_task", { payload: { cc: ccHash, ref: currentRefToCheck } });
+            const isQueued = GlobalTaskManager.queue.some(q => q.payload && (q.payload.ref === currentRefToCheck || q.payload.link === link));
             
             if (isActive || isQueued) shouldHide = true;
         }

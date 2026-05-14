@@ -1027,143 +1027,143 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 
 pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
-    "tracking" => r###"- "{TYPE}":
-    - "id":tracking number | string
-    - "link":'{HREF}' | string
-    - "status":'draft' or 'progress' or 'return' or 'complete' or 'error' | string
-    - "title":tracking product title | string
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "shipping_date":yyyy-MM-ddThh:mm:ss | string
-    - "sender_name":sender_name | string
-    - "sender_address":sender_address | string
-    - "sender_phone":sender_phone | string
-    - "recipient_name":recipient_name | string
-    - "recipient_address":recipient_address | string
-    - "recipient_phone":recipient_phone | string
-    - "width":Package width | number
-    - "height":Package height | number
-    - "length":Package length | number
-    - "weight":Package weight | number
-    - "carrier":carrier name translated into English | string
-    - "shipping_fee":Shipping cost | number
-    - "shipping_method":'standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid' | string
-    - "shipping_duration":Estimated delivery days | number
-    - "bundle_shipping":Allow combined shipping | string"###.to_string(),
-    "goods" => r###"- "{TYPE}":
-    - "id":Refer to the ID value from the link | string
-    - "link":'{HREF}' | string
-    - "code":product code | string
-    - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string
-    - "title":product name | string
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "payment_method":payment method | string
-    - "bank":bank company name or '' | string
-    - "card":card company name or '' | string
-    - "model_name":product Model name | string
-    - "brand_name":product Brand name | string
+    "tracking" => r###"- "{TYPE}":Object.
+    - "id":String. tracking number.
+    - "link":String. '{HREF}'
+    - "status":String. tracking status('draft' or 'progress' or 'return' or 'complete' or 'error').
+    - "title":String. tracking product title.
+    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
+    - "shipping_date":String. yyyy-MM-ddThh:mm:ss.
+    - "sender_name":String. sender_name.
+    - "sender_address":String. sender address.
+    - "sender_phone":String. senderphone.
+    - "recipient_name":String. recipient name.
+    - "recipient_address":String. recipient address.
+    - "recipient_phone":String. recipient phone.
+    - "width":Number. Package width.
+    - "height":Number. Package height.
+    - "length":Number. Package length.
+    - "weight":Number. Package weight.
+    - "carrier":String. carrier name translated into English
+    - "shipping_fee":Number. Shipping cost.
+    - "shipping_method":String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid').
+    - "shipping_duration":Number. Estimated delivery days.
+    - "bundle_shipping":String. Allow combined shipping."###.to_string(),
+    "goods" => r###"- "{TYPE}":Object.
+    - "id":String. Refer to the ID value from the link.
+    - "link":String. '{HREF}'.
+    - "code":String. Displayed alphanumeric item code (SKU) shown as text in the table cell.
+    - "status":String. 'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire'.
+    - "title":String. product name.
+    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
+    - "payment_method":String. payment method.
+    - "bank":String. bank company name or ''.
+    - "card":String. card company name or ''.
+    - "model_name":String. product Model name.
+    - "brand_name":String. product Brand name.
     - "condition":['new' or 'used' or 'lease' or 'rental' or 'refurbish']
-    - "description":product Full description (HTML allowed) | string
-    - "short_description":product short description | string
-    - "tags":[{ tag : product keyword or tag | string }]
-    - "origin_country":product Country of origin/manufacture | string
-    - "manufacturer":product Manufacturer name | string
-    - "release_date":Product release date(yyyy-MM-ddThh:mm:ss) | string
-    - "manufacture_date":product Date(yyyy-MM-ddThh:mm:ss) of manufacture | string
-    - "expiration_date":product Expiration or use-by date(yyyy-MM-ddThh:mm:ss) | string
-    - "gtin":product Global Trade Item Number | string
-    - "mpn":product Manufacturer Part Number | string
-    - "barcode":product Barcode value | string
-    - "sale_price":product sale price | number
-    - "supply_price":product supply price | number
-    - "currency":ISO 4217 Currency Code | string
-    - "compare_at_price":product Original price for showing discounts | number
-    - "quantity":product Inventory quantity | number
-    - "stock_keeping_unit":Stock Keeping Unit | string
-    - "low_stock_threshold":product Low stock alert threshold | number
-    - "unit":product Selling unit | string
-    - "tax_included":product Whether tax | number
-    - "tax_code":product Tax code for region-specific rules | string
-    - "main_image_url":Main product image URL | string
-    - "additional_image_url":additional product image URL | string
-    - "video_url":product Promotional video URL | string
-    - "carrier":product carrier name translated into English | string
-    - "shipping_fee":product Shipping cost | number
-    - "shipping_method":'standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid' | string
-    - "shipping_duration":product Estimated delivery days | number
-    - "bundle_shipping":product Allow combined shipping | string
-    - "width":Package width(cm) | number
-    - "height":Package height(cm) | number
-    - "length":Package length(cm) | number
-    - "weight":Package weight(kg) | number
+    - "description":String. product Full description (HTML allowed).
+    - "short_description":String. product short description.
+    - "tags":[{ tag : String. product keyword or tag. }]
+    - "origin_country":String. product Country of origin/manufacture.
+    - "manufacturer":String. product Manufacturer name.
+    - "release_date":String. Product release date(yyyy-MM-ddThh:mm:ss).
+    - "manufacture_date":String. product Date(yyyy-MM-ddThh:mm:ss) of manufacture.
+    - "expiration_date":String. product Expiration or use-by date(yyyy-MM-ddThh:mm:ss).
+    - "gtin":String. product Global Trade Item Number.
+    - "mpn":String. product Manufacturer Part Number.
+    - "barcode":String. product Barcode value.
+    - "sale_price":Number. product sale price.
+    - "supply_price":Number. product supply price.
+    - "currency":String. ISO 4217 Currency Code.
+    - "compare_at_price":Number. product Original price for showing discounts.
+    - "quantity":Number. product Inventory quantity.
+    - "stock_keeping_unit":String. Stock Keeping Unit.
+    - "low_stock_threshold":Number. product Low stock alert threshold.
+    - "unit":String. product Selling unit.
+    - "tax_included":Number. product Whether tax.
+    - "tax_code":String. product Tax code for region-specific rules.
+    - "main_image_url":String. Main product image URL.
+    - "additional_image_url":String. additional product image URL.
+    - "video_url":String. product Promotional video URL.
+    - "carrier":String. product carrier name translated into English.
+    - "shipping_fee":Number. product Shipping cost.
+    - "shipping_method":String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid')
+    - "shipping_duration":Number. product Estimated delivery days.
+    - "bundle_shipping":String. product Allow combined shipping.
+    - "width":Number. Package width(cm).
+    - "height":Number. Package height(cm).
+    - "length":Number. Package length(cm).
+    - "weight":Number. Package weight(kg).
     - "options":[ 
         { 
-            value:product option name | string, 
+            value:String. product option name., 
             inputs:[
-                { value:product option input value | string }
+                { value:String. product option input value. }
             ] 
         }
     ]
     - "additional_goods":[ 
         { 
-            path:value:URL includes a additional product manage path, an administrative or additional product edit Link | string, 
-            id:Refer to the additional product no value from the link or an attribute or additional product input value | string, 
-            link:value:Refer to the ID to find a URL that includes a additional product manage link | string
+            path:String. value:URL includes a additional product manage path, an administrative or additional product edit Link., 
+            id:String. Refer to the additional product no value from the link or an attribute or additional product input value., 
+            link:String. value:Refer to the ID to find a URL that includes a additional product manage link.
         }
     ]"###.to_string(),
 
-        "order" => r###"- "{TYPE}":
-    - "id":Refer to the ID value from the link | string
-    - "link":'{HREF}' | string
-    - "tracking_number":tracking number | string
-    - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "goods":[{ title:{ value:product title | string }, path:{ value:URL includes a manage path, an administrative or edit Link | string }, id:{ value:Refer to the product no value from the link or an attribute or input value | string }, link:{ value:Refer to the ID to find a URL that includes a manage link | string } }]
-    - "sender_name":sender_name | string
-    - "sender_address":sender_address, Filter the addresses to District-level and up | string
-    - "sender_phone":sender_phone | string
-    - "recipient_name":recipient_name | string
-    - "recipient_address":recipient_address, Filter the addresses to District-level and up | string
-    - "recipient_phone":recipient_phone | string
-    - "bank":bank company name | string
-    - "card":card company name | string
-    - "order_date":order date | string
-    - "payment_date":payment date or '' | string
-    - "payment_method":'C.O.D.' or 'CARD' or 'BANK' or '' | string
-    - "payment_origin":Payment Gateway Service Name or '' | string"###.to_string(),
-    "coupon" | "event" => r###"- "{TYPE}":
-    - "id":Refer to the ID value from the link | string
-    - "link":'{HREF}' | string
-    - "type":'percentage' or 'fixed_amount' or 'free_shipping' or '' | string
-    - "status":'draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error' | string
-    - "title":{TYPE} title | string
-    - "started_at":yyyy-MM-ddThh:mm:ss | string
-    - "expired_at":yyyy-MM-ddThh:mm:ss | string
-    - "code":{TYPE} code used at checkout | string
-    - "discount":Discount value | number
-    - "quantity":{TYPE} quantity | number
-    - "usage_limit":Total usage limit for the coupon | number
-    - "usage_per":Usage limit per customer | number
-    - "new_customer_only":new customer only | boolean
-    - "first_purchase_only":first purchase only | boolean
-    - "min_order_amount":Minimum order amount required to apply coupon | number
-    - "max_order_amount":Maximum order amount allowed to apply coupon | number
-    - "max_discount_amount":Maximum discount limit allowed for the coupon | number
-    - "region_restrictions":region restrictions | boolean
-    - "number":contact phone number | string
-    - "address":offline location address | string
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string"###.to_string(),
-    "review" => r###"- "{TYPE}":
-    - "id":Refer to the ID value from the link | string
-    - "link":'{HREF}' | string
-    - "status":'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
-    - "name":reviewer name | string
-    - "title":reviewer item title | string
-    - "completed":order complete | boolean
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string"###.to_string(),
-        _ => r###"- "{TYPE}":
-    - "id": Unique identifier | string
-    - "title": General name or title | string
-    - "status": Current state | string"###.to_string()
+        "order" => r###"- "{TYPE}":Object.
+    - "id":String. Refer to the ID value from the link.
+    - "link":String. '{HREF}'.
+    - "tracking_number":String. tracking number.
+    - "status":String. order status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
+    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
+    - "goods":[{ title:{ value:String. product title. }, path:{ value:String. URL includes a manage path, an administrative or edit Link. }, id:{ value:String. Refer to the product no value from the link or an attribute or input value. }, link:{ value:String. Refer to the ID to find a URL that includes a manage link. } }]
+    - "sender_name":String. sender_name.
+    - "sender_address":String. sender_address, Filter the addresses to District-level and up.
+    - "sender_phone":String. sender_phone.
+    - "recipient_name":String. recipient_name.
+    - "recipient_address":String. recipient_address, Filter the addresses to District-level and up.
+    - "recipient_phone":String. recipient_phone.
+    - "bank":String. bank company name.
+    - "card":String. card company name.
+    - "order_date":String. order date.
+    - "payment_date":String. payment date(payment date or '').
+    - "payment_method":String. payment method('C.O.D.' or 'CARD' or 'BANK' or '').
+    - "payment_origin":String. payment origin(Payment Gateway Service Name or '')."###.to_string(),
+    "coupon" | "event" => r###"- "{TYPE}":Object.
+    - "id":String. Refer to the ID value from the link.
+    - "link":String. '{HREF}'.
+    - "type":String. coupon type('percentage' or 'fixed_amount' or 'free_shipping' or '').
+    - "status":String. coupon status('draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error').
+    - "title":String. title.
+    - "started_at":String. yyyy-MM-ddThh:mm:ss.
+    - "expired_at":String. yyyy-MM-ddThh:mm:ss.
+    - "code":String. {TYPE} code used at checkout.
+    - "discount":Number. Discount value.
+    - "quantity":Number. {TYPE} quantity.
+    - "usage_limit":Number. Total usage limit for the coupon.
+    - "usage_per":Number. Usage limit per customer.
+    - "new_customer_only":Boolean. new customer only.
+    - "first_purchase_only":Boolean. first purchase only.
+    - "min_order_amount":Number. Minimum order amount required to apply coupon.
+    - "max_order_amount":Number. Maximum order amount allowed to apply coupon.
+    - "max_discount_amount":Number. Maximum discount limit allowed for the coupon.
+    - "region_restrictions":Boolean. region restrictions.
+    - "number":String. contact phone number.
+    - "address":String. offline location address.
+    - "registration_date":String. yyyy-MM-ddThh:mm:ss."###.to_string(),
+    "review" => r###"- "{TYPE}":Object.
+    - "id":String. Refer to the ID value from the link.
+    - "link":String. '{HREF}'.
+    - "status":String. review status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
+    - "name":String. reviewer name.
+    - "title":String. reviewer item title.
+    - "completed":boolean. order complete.
+    - "registration_date":String. yyyy-MM-ddThh:mm:ss."###.to_string(),
+        _ => r###"- "{TYPE}":Object.
+    - "id":String. Unique identifier.
+    - "title":String. General name or title.
+    - "status":String. Current state."###.to_string()
     };
 
     let template = r###"[TASK]
@@ -1197,57 +1197,56 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 
 pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
     let schema = match page_type {
-    "order" => r###"- "order":
-    - "path":{HREF}
-    - "id":Refer to the ID value from the link or an attribute | string
-    - "link":Refer to the ID to find a URL that includes a manage order link or tracking detail link | string
-    - "currency":ISO 4217 Currency Code | string
-    - "shipping_fee":Cost of delivery | number
-    - "shipping_method":'standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid' | string
-    - "shipping_duration":product Estimated delivery days | number
-    - "sale_price":actual selling price(discounted price) | number
-    - "tracking_number":tracking Number or shipping number | string
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":tracking status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete') | string
-    - "title":title | string"###.to_string(),
+    "order" => r###"- "{TYPE}":Object.
+    - "path":String. {HREF}.
+    - "link":String. Refer to the ID to find a URL that includes a manage order link or tracking detail link.
+    - "id":String. Refer to the ID value from the link or an attribute.
+    - "currency":String. ISO 4217 Currency Code.
+    - "sale_price":Number.. actual selling price(discounted price).
+    - "tracking_number":String. tracking Number or shipping number.
+    - "shipping_method":String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid').
+    - "shipping_fee":Number.. Cost of delivery.
+    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
+    - "status":String. {TYPE} status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
+    - "title":String. product title."###.to_string(),
 
-    "goods" => r###"- "goods":
-    - "path":{HREF}
-    - "id":Refer to the ID value from the link or an attribute | string
-    - "link":Refer to the ID to find a URL that includes a manage product link | string
-    - "currency":ISO 4217 Currency Code | string
-    - "compare_at_price":product Original price for showing discounts(normal price, market price) | number
-    - "supply_price":supply price(wholesale price) | number
-    - "sale_price":actual selling price(discounted price) | number
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire' | string
-    - "title":title | string"###.to_string(),
+    "goods" => r###"- "{TYPE}":Object.
+    - "path":String. {HREF}.
+    - "link":String. Refer to the ID to find a URL that includes a manage product link.
+    - "id":String. Refer to the ID value from the link or an attribute.
+    - "currency":String. ISO 4217 Currency Code.
+    - "compare_at_price":Number. product Original price for showing discounts(normal price, market price).
+    - "supply_price":Number. supply price(wholesale price).
+    - "sale_price":Number. actual selling price(discounted price).
+    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
+    - "status":String. {TYPE} status('show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire').
+    - "title":String. product title."###.to_string(),
     
-    "tracking" | "review" => r###"- "{TYPE}":
-    - "path":{HREF}
-    - "id":Refer to the ID value from the link or an attribute | string
-    - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'start' or 'progress' or 'stop' or 'cancel' or 'return' | string
-    - "title":author and content | string"###.to_string(),
+    "tracking" | "review" => r###"- "{TYPE}":Object.
+    - "path":String. {HREF}.
+    - "link":String. Refer to the ID to find a URL that includes a manage {TYPE} link.
+    - "id":String. Refer to the ID value from the link or an attribute.
+    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
+    - "status":String. 'progress' or 'stop' or 'cancel' or 'return'.
+    - "title":String. author and content.###.to_string(),
     
-    "coupon" | "event" => r###"- "{TYPE}":
-    - "path":{HREF}
-    - "id":Refer to the ID value from the link or an attribute | string
-    - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
-    - "started_at":yyyy-MM-ddThh:mm:ss | string
-    - "expired_at":yyyy-MM-ddThh:mm:ss | string
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' | string
-    - "title": title | string"###.to_string(),
+    "coupon" | "event" => r###"- "{TYPE}":Object.
+    - "path":String. {HREF}.
+    - "link":String. Refer to the ID to find a URL that includes a manage {TYPE} link.
+    - "id":String. Refer to the ID value from the link or an attribute.
+    - "started_at":String. yyyy-MM-ddThh:mm:ss.
+    - "expired_at":String. yyyy-MM-ddThh:mm:ss.
+    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
+    - "status":String. {TYPE} status('show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete').
+    - "title":String. title."###.to_string(),
     
-        _ => r###"- "{TYPE}":
-    - "path":{HREF}
-    - "id":Refer to the ID value from the link or an attribute | string
-    - "link":Refer to the ID to find a URL that includes a manage {TYPE} link | string
-    - "registration_date":yyyy-MM-ddThh:mm:ss | string
-    - "status":'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' | string
-    - "title":title | string"###.to_string()
+        _ => r###"- "{TYPE}":Object.
+    - "path":String. {HREF}.
+    - "id":String. Refer to the ID value from the link or an attribute.
+    - "link":String. Refer to the ID to find a URL that includes a manage {TYPE} link.
+    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
+    - "status":String. {TYPE} status('show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
+    - "title":String. title."###.to_string()
     };
 
     // 🌟 [CRITICAL FIX] item_pug 내용에 링크(href)가 없을 경우 스키마에서 link와 path 요구 조건을 동적으로 제거합니다.
@@ -1259,11 +1258,20 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
             .join("\n");
     }
 
+    // 🌟 [CRITICAL FIX] item_pug 내부에 다중 행(rowspan) 데이터가 존재하는지 판별합니다.
+    // let has_rowspan = item_pug.contains("rowspan=") || item_pug.contains("rowspan=\"");
+    // let include_thead = has_rowspan && !head_pug.is_empty();
+    let include_thead = !head_pug.is_empty();
+
     // 🌟 [최종 반영] .txt 파일 구조와 동일하게 thead/tbody 태그 및 계층형 들여쓰기 적용
     let mut final_pug = String::new();
 
-    // 1. 헤더 영역 (thead 태그 추가 및 내부 1단계 들여쓰기)
-    if !head_pug.is_empty() {
+    if head_pug.trim_start().starts_with("thead") {
+        final_pug.push_str(head_pug);
+        if !head_pug.ends_with('\n') {
+            final_pug.push('\n');
+        }
+    } else {
         final_pug.push_str("thead\n");
         for line in head_pug.lines() {
             final_pug.push_str(&format!("    {}\n", line));
@@ -1279,25 +1287,24 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
     }
 
     // 3. 전체 PUG를 프롬프트에 넣기 위해 일괄적으로 4칸 들여쓰기 적용
-    // 3. 전체 PUG를 프롬프트에 넣기 위해 일괄적으로 4칸 들여쓰기 적용
     let pug_content = final_pug.trim_end().lines()
         .map(|line| format!("    {}", line))
         .collect::<Vec<_>>()
         .join("\n");
 
-    // 🌟 [CRITICAL FIX] thead 유무에 따라 TASK 지시사항만 변수로 분리하여 할당합니다.
-    let task_desc = if !head_pug.is_empty() {
-        r###"Extract detailed information from the provided Pug content into a single structured JSON object.
+    // 🌟 [CRITICAL FIX] include_thead 조건에 따라 TASK 지시사항을 동적으로 할당합니다.
+//     let task_desc = if include_thead {
+//         r###"Extract detailed information from the provided Pug content into a single structured JSON object.
 
-[INSTRUCTION]
-1. The content contains data rows inside 'tbody'.
-2. MUST strictly map the table headers ('th') in 'thead' to the corresponding data cells ('td') in 'tbody' based on their structural order, 'scope', 'colspan', and 'rowspan' attributes."###
-    } else {
-        "Extract detailed information from the provided Pug tbody into a single structured JSON object."
-    };
+// [INSTRUCTION]
+// 1. The content contains data rows inside 'tbody'.
+// 2. Use the table headers ('th') and their structural order (including 'scope', 'colspan', and 'rowspan' attributes) as the primary baseline to understand the context of each data cell ('td')."###
+//     } else {
+//         "Extract detailed information from the provided Pug content into a single structured JSON object."
+//     };
 
     let template = r###"[TASK]
-{TASK}
+Extract detailed information from the provided Pug content into a single structured JSON object.
 
 [PUG CONTENT]
 {PUG_CONTENT}
@@ -1316,8 +1323,8 @@ Language: {LANGUAGE}
 NO EXPLANATION. NO THINKING. /no_think"###;
 
     // 🌟 {TASK} 변수를 포함하여 일괄 치환합니다.
-    template.replace("{TASK}", task_desc)
-            .replace("{SCHEMA}", &final_schema)
+    // template.replace("{TASK}", task_desc)
+    template.replace("{SCHEMA}", &final_schema)
             .replace("{TYPE}", page_type)
             .replace("{HREF}", href)
             .replace("{LANGUAGE}", language)
@@ -1707,15 +1714,13 @@ pub fn extract_table_structure_prompt(page_type: &str, item_selector: &str, pug_
 {REFERENCE_ROW}
 
 [Instruction]
-Your task is to analyze the [Reference: Row Structure] and locate both its body container and its corresponding header container within the [PUG CONTENT].
-Generate the exact CSS selectors for both containers.
+Locate the body container and its corresponding header container within the [PUG CONTENT].
 
 [Rules]
-1. Analyze Reference: Carefully examine the [Reference: Row Structure] to understand the context, structure, and attributes of a single data item/row.
-2. Locate Body Container: The `tbody` selector is already provided in the output format as "{ITEM_SELECTOR}". You MUST return it exactly as is. DO NOT modify it.
-3. Locate Header Container: Identify the wrapper or container element that acts as the "Header" for this list (the element containing the column titles or labels). Use the body container selector ("{ITEM_SELECTOR}") as a reference point to locate the matching header container, which is typically placed just above the body container or as a sibling. Generate a precise CSS selector for this header container.
-4. Tag Agnostic: Do NOT assume the structure uses traditional <table>, <thead>, or <tbody> tags. It could be built using <div>, <ul>/<li>, or other semantic tags. Analyze the relationship logically.
-5. Strict JSON Output: Output the result strictly in valid JSON format exactly matching the structure below. Do not include any other text, markdown formatting, or explanations.
+1. Tag Agnostic: Do NOT assume traditional <table> tags. The structure could be built using <div>, <ul>/<li>, or other semantic tags. Analyze logically.
+2. Fill out the 'wrapper' keys FIRST to logically establish the context hierarchy.
+3. The `tbody` selector is "{ITEM_SELECTOR}". Return it exactly.
+4. Provide the final exact CSS selector for the `thead` based on your analysis.
 
 [Expected Output Format]
 {
@@ -1724,6 +1729,7 @@ Generate the exact CSS selectors for both containers.
       "tbody" : {
         "selector" : "{ITEM_SELECTOR}"
       },
+      "wrapper" : "CSS selector of the common table wrapper",
       "thead" : {
         "selector" : "..."
       }
@@ -1731,7 +1737,7 @@ Generate the exact CSS selectors for both containers.
   }
 }
 
-[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
     template.replace("{TYPE}", page_type)
             .replace("{ITEM_SELECTOR}", item_selector)
@@ -1741,52 +1747,41 @@ Generate the exact CSS selectors for both containers.
 
 
 pub fn analytic_report_prompt() -> String {
-    r###"## Role
-You are a **User Behavior Analysis Expert**. Your goal is to interpret raw HTML interactions to understand the user's specific intent and analyze the selection context within a list.
+    r###"[TASK]
+You are a User Behavior Analysis Expert. Interpret raw HTML interactions to understand the user's specific intent and analyze the selection context within a list or a group of items.
 
-## Task
-Analyze the **one or more pairs** of 'Clicked HTML' (the selected item) and 'Related HTML' (the surrounding list structure). The inputs are provided as parallel arrays of HTML strings, meaning the Nth item in the 'Clicked HTML' array corresponds to the Nth item in the 'Related HTML' array.
+Analyze the parallel arrays of 'Clicked HTML' (the selected element) and 'Related HTML' (the surrounding structure).
+If 'Previous Analysis' is provided, use it to infer the user's behavioral flow and connect past actions with the current click.
 
-**For each pair**, perform the analysis according to the guidelines below.  
-If 'Previous Analysis' is provided, use it to infer the user's behavioral flow.
+[ANALYSIS GUIDELINES & CHAIN OF THOUGHT]
+Fill out the JSON keys in the exact order specified below. Use 'analysis_*' keys to logically establish the context before finalizing the outputs.
 
-Use this information to connect the previous action with the current click.
+1. analysis_target: Identify the primary entity name and its key attributes from the Clicked HTML.
+2. analysis_surroundings: Identify the neighboring items or alternatives displayed in the Related HTML that were NOT selected.
+3. action: Determine the specific user intent for clicking the item. Must explicitly include the primary entity name and key attributes. Output as a short verb phrase.
+4. relate: Summarize the surrounding unselected items to capture the context of the choice. Do not summarize the clicked item itself in this field.
+5. summary: Provide a detailed explanation of what the user aimed to accomplish on this page. Must explicitly reference the extracted primary entity and its key attributes.
 
-## Analysis Guidelines
-1. **action (User Intent)**
-    - Determine the specific user intent for clicking the item.
-    - If 'Previous Analysis' exists, assume a continuous flow (e.g., "Search" -> "Select Result") to refine the intent.
-    - **Must explicitly include the 상품 제목(product title) 및 옵션 정보(option attributes) extracted from the clicked HTML.**
-    - Output as a short verb phrase (Korean).
-
-2. **relate (Neighboring Items Context)**
-    - Treat 'Related HTML' as a **list or collection of items** where the user made a selection.
-    - Identify **neighboring items** (siblings) that were displayed near the clicked element but *not* selected.
-    - Summarize these surrounding items to capture the context of the choice (e.g., competitors, other options, or list categories).
-    - **Constraint**: Do not summarize the clicked item itself in this field; focus on what surrounds it.
-
-3. **summary (Page-level Goal)**
-    - Provide a detailed explanation of what the user aimed to accomplish on this page.
-    - **Must explicitly reference the 상품 제목(product title) 및 옵션 정보(option attributes) to explain the user’s goal.**
-
-## Output Format
-Output ONLY a raw JSON object, where the outer structure is an array of analysis objects, corresponding to each analyzed pair:
+[OUTPUT FORMAT]
 {
     "actions": {
         "https://hostname.com/pathname?search=parameter": {
             "records": [
                 {
-                    "id": "String",
-                    "relate": ["String"],
-                    "action": "String"
+                    "id": "...",
+                    "analysis_target": "...",
+                    "analysis_surroundings": "...",
+                    "relate": [...],
+                    "action": "..."
                 }
             ],
-            "summary": "String"
+            "summary": "..."
         }
     },
-    "cross_action_flow": "String",
-    "intent_evolution": "String",
-    "consistent_preferences": "String"
+    "cross_action_flow": "...",
+    "intent_evolution": "...",
+    "consistent_preferences": "..."
 }
-"###.to_string()
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###.to_string()
 }
