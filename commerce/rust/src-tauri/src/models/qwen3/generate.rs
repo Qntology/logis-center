@@ -1,4 +1,4 @@
-use crate::openai_types::{ChatCompletionParameters, ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseMessage};
+use crate::openai_types::ChatCompletionParameters;
 use anyhow::{Result, anyhow};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -201,7 +201,7 @@ impl Qwen3GenerateModel {
         _task_id: Option<String>,
         load_session_id: Option<String>,
         cache_dir: Option<String>,
-    ) -> Result<ChatCompletionResponse> {
+    ) -> Result<String> {
         if is_prefill {
             self.clear_kv_cache();
         } else if let Some(session_id) = load_session_id {
@@ -244,22 +244,7 @@ impl Qwen3GenerateModel {
 
         let res_text = self.tokenizer.token_decode(generate)?;
         
-        Ok(ChatCompletionResponse {
-            id: "qwen3_eval".to_string(),
-            object: "chat.completion".to_string(),
-            created: 0,
-            model: "qwen3".to_string(),
-            choices: vec![ChatCompletionResponseChoice {
-                index: 0,
-                message: ChatCompletionResponseMessage {
-                    role: "assistant".to_string(),
-                    content: Some(res_text.clone()),
-                },
-                finish_reason: Some("stop".to_string()),
-            }],
-            usage: None,
-            text: res_text,
-        })
+        Ok(res_text)
     }
 
     pub fn generate(&mut self, mes: ChatCompletionParameters) -> Result<String> {

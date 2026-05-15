@@ -427,7 +427,7 @@ pub struct QKNormAttention {
     num_kv_groups: usize,
     head_dim: usize,
     scaling: f64,
-    kv_cache: Option<(Tensor, Tensor)>,
+    pub kv_cache: Option<(Tensor, Tensor)>,
 }
 
 impl QKNormAttention {
