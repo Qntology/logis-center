@@ -74,8 +74,11 @@ async function kvRemove(key: string) {
 class GlobalTaskManager {
     static isBusy: boolean = false;
     static currentTaskId: string | null = null;
+    static currentTaskPayload: any = null; 
     static activeRefs: Set<string> = new Set();
     static queue: Array<{taskId: string, type: string, payload: any}> = [];
+    static backendQueued: any[] = []; // 🌟 [CRITICAL FIX] 백엔드가 이미 관리 중인 대기열 추적용 배열 추가
+    static cancelledTasks: Set<string> = new Set(); // 🌟 [CRITICAL FIX] 취소된 작업 ID 블랙리스트 추가
 
     // 🌟 [추가] 큐를 Dexie(IndexedDB)에 저장하여 새로고침 시에도 증발 방지
     static async saveQueue() {
@@ -199,19 +202,22 @@ class GlobalTaskManager {
         await this.saveQueue(); // 🌟 큐에서 항목이 나갔으므로 갱신 (Dexie)
         
         this.currentTaskId = task.taskId;
+        this.currentTaskPayload = task.payload; // 🌟 추가: 실행중인 페이로드 동시 기록
         await kvSet("sys_lock", task.taskId);
 
         console.log(`[QUEUE] Starting Task: ${task.taskId}`);
         
-        try {
-            if (task.type === "ai_search") {
-                await invoke("ai_search_complex", task.payload);
-            } else {
-                await emit("new-task-from-browser", task.payload);
-            }
-        } catch (e) {
-            console.error(`[QUEUE] Task execution failed:`, e);
-            await this.release(task.taskId, task.taskId);
+        // 🌟 [CRITICAL FIX] await로 인한 프론트엔드 프리징 및 큐 막힘 현상 원천 차단 (Fire-and-Forget)
+        if (task.type === "ai_search") {
+            invoke("ai_search_complex", task.payload).catch(async e => {
+                console.error(`[QUEUE] Task execution failed:`, e);
+                await this.release(task.taskId, task.taskId);
+            });
+        } else {
+            emit("new-task-from-browser", task.payload).catch(async e => {
+                console.error(`[QUEUE] Task execution failed:`, e);
+                await this.release(task.taskId, task.taskId);
+            });
         }
     }
 
@@ -219,8 +225,11 @@ class GlobalTaskManager {
         if (this.currentTaskId === taskId) {
             this.isBusy = false;
             this.currentTaskId = null;
+            this.currentTaskPayload = null; 
         }
         this.activeRefs.delete(taskId);
+        this.backendQueued = this.backendQueued.filter(p => p.id !== taskId && p.taskId !== taskId); // 🌟 종료된 작업은 가림막에서 제거
+        
         if (await kvGet("sys_lock") === taskId) {
             await kvRemove("sys_lock");
         }
@@ -231,8 +240,10 @@ class GlobalTaskManager {
     static async forceReset() {
         this.isBusy = false;
         this.currentTaskId = null;
+        this.currentTaskPayload = null; 
         this.activeRefs.clear();
         this.queue = [];
+        this.backendQueued = []; // 🌟 전체 초기화 반영
         await kvRemove("sys_lock");
         await appDb.table("ts_queue").clear(); // 🌟 완전 초기화 시 Dexie도 비움
     }
@@ -673,22 +684,31 @@ async function updateExtractButtonVisibility() {
         if (currentImage) {
             const imageRefHash = await hashId(currentImage); 
             const isActive = await invoke<boolean>("check_active_task", { payload: { cc: activeContext.cc || "", ref: imageRefHash } });
-            const isQueued = GlobalTaskManager.queue.some(q => q.payload && q.payload.ref === imageRefHash);
+            // 🌟 프론트엔드 대기 큐 및 백엔드 대기 큐(backendQueued) 동시 확인
+            const isQueued = GlobalTaskManager.queue.some(q => q.payload && q.payload.ref === imageRefHash) ||
+                             GlobalTaskManager.backendQueued.some(p => p.ref === imageRefHash);
+            
+            const isCurrentExecuting = GlobalTaskManager.currentTaskId && GlobalTaskManager.currentTaskPayload && 
+                GlobalTaskManager.currentTaskPayload.ref === imageRefHash;
 
-            if (isActive || isQueued) shouldHide = true;
+            if (isActive || isQueued || isCurrentExecuting) shouldHide = true;
         } else if (currentDetectedUrl) {
             const urlObj = new URL(currentDetectedUrl.toLowerCase());
             const link = (urlObj.pathname + urlObj.search).toLowerCase();
             const ccHash = await hashId(urlObj.hostname);
             const hashedRefId = await hashId((currentSession.team || "") + ccHash + link);
             
-            // 🌟 [CRITICAL FIX] 추출 작업 등록 시와 동일하게 activeContext.ref를 최우선 식별자로 사용하여 상태 질의
             const currentRefToCheck = activeContext.ref || hashedRefId;
             
             const isActive = await invoke<boolean>("check_active_task", { payload: { cc: ccHash, ref: currentRefToCheck } });
-            const isQueued = GlobalTaskManager.queue.some(q => q.payload && (q.payload.ref === currentRefToCheck || q.payload.link === link));
+            // 🌟 프론트엔드 대기 큐 및 백엔드 대기 큐(backendQueued) 동시 확인
+            const isQueued = GlobalTaskManager.queue.some(q => q.payload && (q.payload.ref === currentRefToCheck || q.payload.link === link)) ||
+                             GlobalTaskManager.backendQueued.some(p => p.ref === currentRefToCheck || p.link === link);
             
-            if (isActive || isQueued) shouldHide = true;
+            const isCurrentExecuting = GlobalTaskManager.currentTaskId && GlobalTaskManager.currentTaskPayload && 
+                (GlobalTaskManager.currentTaskPayload.ref === currentRefToCheck || GlobalTaskManager.currentTaskPayload.link === link);
+            
+            if (isActive || isQueued || isCurrentExecuting) shouldHide = true;
         }
     } catch (e) {
         // 통신 에러 발생 시 노출 유지
@@ -2173,6 +2193,12 @@ listen("task-db-registered", async (event: any) => {
 
 listen("extraction-progress", async (event: any) => { 
     const payload = event.payload;
+
+    // 🌟 [CRITICAL FIX] 취소된 작업의 이벤트가 뒤늦게 도착하면 DOM을 파괴/재생성하지 못하도록 가장 먼저 폐기합니다.
+    if (payload.task_id && GlobalTaskManager.cancelledTasks.has(payload.task_id)) {
+        return;
+    }
+
     if (payload.task_id) livePayloads.set(payload.task_id, payload);
 
     const summary = (payload.summary || "").toLowerCase();
@@ -2246,6 +2272,9 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     payload.task_id = payload.task_id || activeTaskId || (document.getElementById("extraction-log")?.dataset.activeTaskId);
     const tId = payload.task_id;
     if (!tId) return;
+
+    // 🌟 [CRITICAL FIX] 렌더링 함수 내부에서도 블랙리스트를 한 번 더 검사하여 좀비 UI 생성을 이중으로 방어합니다.
+    if (GlobalTaskManager.cancelledTasks.has(tId)) return;
 
     const summary = (payload.summary || "").toLowerCase();
     const isTerminal = payload.category === "Done" || payload.category === "Error" || summary.includes("cancelled") || summary.includes("stopped");
@@ -2527,9 +2556,18 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
 
 btnStopTask?.addEventListener("click", async () => {
     if (await ask("Stop the current extraction/search? (The record will be deleted)", { title: "Stop Task", kind: "warning" })) {
-        // 🌟 [통합 락 매니저] 강제 초기화 호출 (isBusy, currentTaskId, activeRefs, Dexie 일괄 정리)
-        await GlobalTaskManager.forceReset();
+        const targetTaskId = activeTaskId; // 지우려는 대상 고정
         
+        if (targetTaskId) {
+            GlobalTaskManager.cancelledTasks.add(targetTaskId); // 🌟 [CRITICAL FIX] 취소 블랙리스트에 등록하여 지연 도착하는 이벤트를 완벽 차단
+        }
+        
+        // 🌟 [CRITICAL FIX] 취소 즉시 락을 강제 해제하여 취소 후 #btn-extract 버튼이 먹통되는 현상을 완벽 방어합니다.
+        activeTaskId = null;
+        GlobalTaskManager.isBusy = false;
+        GlobalTaskManager.currentTaskId = null;
+        GlobalTaskManager.currentTaskPayload = null;
+
         isExtracting = false; 
         isSearching = false; 
         stopSpinner();
@@ -2542,21 +2580,22 @@ btnStopTask?.addEventListener("click", async () => {
         if (btnStopTask) btnStopTask.style.display = "none";
 
         try {
-            console.log("[WIDGET] Stopping task:", activeTaskId);
-            await invoke<string>("stop_current_extraction", { taskId: activeTaskId });
+            console.log("[WIDGET] Stopping task:", targetTaskId);
+            // 1. 백엔드 작업 중단
+            await invoke<string>("stop_current_extraction", { taskId: targetTaskId });
             
-            if (activeTaskId) {
-                // 취소 시 UI 로그 데이터 및 엘리먼트 삭제
-                await kvRemove(`term_${activeTaskId}`);
-                const el = document.getElementById(activeTaskId);
+            if (targetTaskId) {
+                await kvRemove(`term_${targetTaskId}`);
+                const el = document.getElementById(targetTaskId);
                 if (el) el.remove();
+
+                // 2. 큐 매니저에서 식별자 제거 및 다음 대기열 진행
+                await GlobalTaskManager.release(targetTaskId, targetTaskId);
             }
 
-            activeTaskId = null;
             detailTitle.innerText = "Cancelled";
             detailContent.innerHTML = "<div style='color:#ef4444; padding:20px;'>Extraction stopped and deleted by user.</div>";
             
-            // 버튼 상태 즉시 재계산
             await updateExtractButtonVisibility();
         } catch (e) { 
             console.error("Stop failed:", e); 
@@ -4111,13 +4150,12 @@ async function initSession() {
 
         // 🌟 새로고침 시 DB에 살아남은 진짜 대기열 목록만 복구
         if (data.tasks && data.tasks.length > 0) {
-            // 🌟 [CRITICAL FIX] forEach의 콜백은 동기 함수이므로 내부에서 await를 쓸 수 없습니다. 비동기 순차 처리를 위해 for...of 루프로 변경합니다.
             for (const t of data.tasks) {
                 if (t.status === 10 || t.status === 1) {
+                    let taskData: any = {};
                     let taskQuery = "";
                     try {
-                        // 🌟 t.data_json에 저장된 원본 query를 추출합니다.
-                        const taskData = typeof t.data_json === 'string' ? JSON.parse(t.data_json) : t.data_json;
+                        taskData = typeof t.data_json === 'string' ? JSON.parse(t.data_json) : t.data_json;
                         taskQuery = taskData.query || "";
                     } catch(e) {
                         console.warn("[WIDGET] Failed to parse task data for query recovery:", e);
@@ -4158,21 +4196,35 @@ async function initSession() {
                     const isSearchGhost = t.id.startsWith("search_") && !GlobalTaskManager.queue.some(q => q.taskId === t.id);
 
                     if (!isSearchGhost) {
-                        await kvSet("sys_lock", t.id);
-                        
-                        if (t.id.startsWith("search_")) {
-                            isSearching = true;
-                            if (btnSubmit) btnSubmit.style.display = "none";
-                        } else {
-                            isExtracting = true;
+                        // 🌟 [CRITICAL FIX] 상태가 10(대기)인 작업까지 스피너를 돌리고 활성 작업으로 덮어쓰는 치명적 버그 수정!
+                        // 오직 상태가 1(Processing)인 진짜 진행 중인 작업만 UI 락을 걸고 스피너를 돌립니다.
+                        if (t.status === 1) {
+                            await kvSet("sys_lock", t.id);
+                            
+                            if (t.id.startsWith("search_")) {
+                                isSearching = true;
+                                if (btnSubmit) btnSubmit.style.display = "none";
+                            } else {
+                                isExtracting = true;
+                            }
+                            activeTaskId = t.id;
+                            startSpinner();
+
+                            GlobalTaskManager.isBusy = true;
+                            GlobalTaskManager.currentTaskId = t.id;
+                            GlobalTaskManager.currentTaskPayload = taskData;
+                        } else if (t.status === 10) {
+                            // 대기열은 락을 걸지 않고, 오직 버튼 가림막(backendQueued) 목록에만 조용히 추가합니다.
+                            taskData.taskId = t.id;
+                            GlobalTaskManager.backendQueued.push(taskData);
+                            GlobalTaskManager.activeRefs.add(t.id);
                         }
-                        activeTaskId = t.id;
-                        startSpinner();
                     } else {
                         console.log(`[WIDGET] Ignoring ghost search task: ${t.id}`);
                     }
                 }
             }
+            await GlobalTaskManager.saveQueue(); // 🌟 Dexie에 복구된 전체 큐 상태를 영구 저장
             await updateExtractButtonVisibility();
         }
 

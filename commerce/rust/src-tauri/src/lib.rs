@@ -79,23 +79,31 @@ async fn stop_current_extraction(
     crate::utils::set_extraction_stop_signal(true);
     
     // 2. Clear from DB
-    if let Ok(store_guard) = state.store.try_lock() {
-        if let Some(db) = store_guard.as_ref() {
-            if let Some(ref id) = task_id {
-                let _ = db.update_task_status(id, crate::logic::parse_status("cancel")).await;
-                let _ = db.delete_message_by_task_id(id).await;
-                println!("[STOP] Task and message {} cleared from DB.", id);
-            } else {
-                // 🌟 [수정] 존재하지 않는 cleanup_zombie_tasks 대신 통합된 cleanup_unfinished_tasks_on_startup 호출
-                let _ = db.cleanup_unfinished_tasks_on_startup().await;
-                println!("[STOP] All pending tasks cleared from DB.");
-            }
+    // 🌟 [CRITICAL FIX] try_lock() 사용 시 스케줄러가 DB를 잠시 사용 중이면 삭제 명령이 무시되어 유령(Ghost) 작업이 남는 치명적 버그를 해결합니다.
+    // lock().await를 사용하여 스케줄러의 DB 작업이 끝날 때까지 찰나를 기다린 후 100% 확실하게 지워버립니다.
+    let store_guard = state.store.lock().await;
+    if let Some(db) = store_guard.as_ref() {
+        if let Some(ref id) = task_id {
+            let _ = db.update_task_status(id, crate::logic::parse_status("cancel")).await;
+            let _ = db.delete_message_by_task_id(id).await;
+            println!("[STOP] Task and message {} cleared from DB.", id);
+        } else {
+            // 🌟 [수정] 존재하지 않는 cleanup_zombie_tasks 대신 통합된 cleanup_unfinished_tasks_on_startup 호출
+            let _ = db.cleanup_unfinished_tasks_on_startup().await;
+            println!("[STOP] All pending tasks cleared from DB.");
         }
     }
+    drop(store_guard); // 다음 단계(Model Clear) 진행을 위해 즉시 락 해제
 
     // 3. Try to clear model
     if let Ok(mut model_guard) = state.model.try_lock() {
         *model_guard = None;
+    }
+
+    // 🌟 [CRITICAL FIX] ACTIVE_TASK_MEM 메모리 명시적 해제 추가
+    // 백엔드의 현재 작업 캐시를 즉시 비워야 프론트엔드의 #btn-extract 버튼이 정상적으로 부활합니다.
+    if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() {
+        *w = None;
     }
 
     Ok("Stop signal sent.".to_string())

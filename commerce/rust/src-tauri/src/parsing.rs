@@ -1809,7 +1809,7 @@ Locate the body container and its corresponding header container within the [PUG
 
 [Rules]
 1. Tag Agnostic: Do NOT assume traditional <table> tags. The structure could be built using <div>, <ul>/<li>, or other semantic tags. Analyze logically.
-2. Fill out the 'wrapper' keys FIRST to logically establish the context hierarchy.
+2. Fill out the 'wrapper' key FIRST to logically establish the table parent wrapper.
 3. The `tbody` selector is "{ITEM_SELECTOR}". Return it exactly.
 4. Provide the final exact CSS selector for the `thead` based on your analysis.
 
@@ -1820,7 +1820,7 @@ Locate the body container and its corresponding header container within the [PUG
       "tbody" : {
         "selector" : "{ITEM_SELECTOR}"
       },
-      "wrapper" : "CSS selector of the common table wrapper",
+      "wrapper" : "CSS selector of the table parent wrapper",
       "thead" : {
         "selector" : "..."
       }

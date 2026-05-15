@@ -228,16 +228,8 @@ pub async fn start_background_worker(
 
                         if err_msg.contains("Task cancelled") {
                              println!("[Scheduler] Task cancelled: {}", task.id);
-                             let store_guard = store.lock().await;
-                             if let Some(db) = store_guard.as_ref() {
-                                 let _ = db.update_task_status(&task.id, crate::logic::parse_status("cancel")).await;
-                                 let _ = db.update_message_status(&task.id, crate::logic::parse_status("cancel"), Some("Cancelled by user")).await;
-                             }
-                             let _ = app_handle.emit("extraction-progress", json!({
-                                "task_id": task.id,
-                                "category": "Done", "summary": "Cancelled by user", "spinner": "🛑", "data": null 
-                             }));
-                             
+                             // 🌟 [CRITICAL FIX] 취소된 작업은 프론트엔드에서 이미 UI와 DB 레코드를 날린 상태입니다.
+                             // 여기서 백엔드가 메시지를 다시 생성하거나 이벤트를 쏘면 UI가 좀비처럼 부활하므로 조용히 종료만 합니다.
                              current_device_pref = None;
                              continue;
                         } else if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
@@ -749,6 +741,9 @@ async fn process_task(
                 // 🌟 [CRITICAL FIX] is_baking을 true로 전달하여 안 써도 되는 2GB짜리 비전(이미지) 모델 로딩을 강제 차단합니다! (로딩 속도 13초 -> 3초)
                 model.secure_vram_relay(crate::model::ModelSize::Qwen, None, Some(cancellation_token.clone()), true, kv_name.clone()).await?;
                 
+                // 🌟 모델 로딩(수 초 소요) 직후 취소되었는지 즉시 확인하여 좀비 실행 차단
+                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
                 if let Some(gen) = model.generator.lock().await.as_mut() {
                     // 🌟 [CRITICAL FIX] ChatTemplate을 거치지 않고, 후속 질문과 100% 동일한 접두사(Prefix)를 생성하여 굽습니다!
                     // 이렇게 해야 f_ids[kv_len..] 슬라이싱 시 토큰이 엇갈려 환각(Hallucination)이 발생하는 것을 원천 차단할 수 있습니다.
@@ -785,6 +780,9 @@ async fn process_task(
             {
                 // [핵심] Step A가 아니라 '미리 구워둔 Base' 스냅샷을 불러옵니다!
                 model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+
+                // 🌟 모델 로딩 직후 즉시 중단 체크
+                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
                 let params = ChatCompletionParameters {
                     messages: vec![
@@ -846,6 +844,9 @@ async fn process_task(
 
             // 🌟 [CRITICAL FIX] 이미 구워진 FullContent 기반의 Base 스냅샷(base_session_id)을 재사용하여 효율을 극대화합니다.
             model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+
+            // 🌟 모델 로딩 직후 즉시 중단 체크
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
             let params = ChatCompletionParameters {
                 messages: vec![
@@ -1776,6 +1777,9 @@ async fn process_task(
             {
                 // 🌟 [CRITICAL FIX 3] 디테일 모드에서도 0.6B Base 스냅샷 로드 시도를 완벽히 끊어버립니다. 
                 model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+
+                // 🌟 거대한 모델 교체 직후 추출 시작 전에 취소를 잡아내어 GPU 헛도는 현상 차단
+                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
                 let params = ChatCompletionParameters {
                     messages: vec![
