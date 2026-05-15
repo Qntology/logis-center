@@ -10,7 +10,6 @@ pub enum PugMode {
     TheadMode,
     ListMode, 
     NoAttributesMode, // 🌟 구조 판별을 위해 HTML의 모든 속성을 완벽히 비워버리는 전용 모드
-    IdClassOnlyMode,
 }
 
 pub fn sanitize_llm_input(text: &str) -> String {
@@ -45,22 +44,6 @@ pub fn pre_clean_html(html: &str) -> String {
     // 3. 단일 태그 및 불필요한 메타 태그 정리 (input은 제외하고 보존)
     let re_single = Regex::new(r"(?is)<(meta|link|br|hr|source)\b[^>]*>").unwrap();
     let clean = re_single.replace_all(&html, "");
-
-    // 3.5. select 태그 내에서 selected 속성이 없는 option 태그 통째로 제거
-    let re_select = Regex::new(r"(?is)<select\b[^>]*>.*?</select>").unwrap();
-    let re_option = Regex::new(r"(?is)<option\b([^>]*)>.*?</option>").unwrap();
-    let re_selected = Regex::new(r"(?i)\bselected\b").unwrap();
-    
-    let clean = re_select.replace_all(&clean, |caps: &regex::Captures| {
-        let select_block = &caps[0];
-        re_option.replace_all(select_block, |opt_caps: &regex::Captures| {
-            if re_selected.is_match(&opt_caps[1]) {
-                opt_caps[0].to_string()
-            } else {
-                String::new()
-            }
-        }).to_string()
-    }).to_string();
 
     // 4. 허용된 속성 외 모두 제거 (지정된 16개 속성만 보존)
     let re_tag = Regex::new(r"(?i)<([a-zA-Z0-9\-]+)([^>]*)>").unwrap();
@@ -406,6 +389,11 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 return;
             }
 
+            // 🌟 option 태그일 때 selected 속성이 없다면 렌더링하지 않고 즉시 스킵
+            if tag_name == "option" && !element.attrs().any(|(k, _)| k.to_lowercase() == "selected") {
+                return;
+            }
+
             // 🌟 PugMode::NoAttributesMode일 때 select, datalist, option, input, textarea 태그와 그 자식들을 원천 제거합니다.
             if *mode == PugMode::NoAttributesMode {
                 if ["select", "datalist", "option"].contains(&tag_name.as_str()) {
@@ -524,7 +512,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 // 🌟 [CRITICAL FIX] colspan, rowspan, scope는 어떠한 경우에도 무조건 통과하도록 강제(Hardcode)합니다!
                 let should_include = ["colspan", "rowspan", "scope"].contains(&name_str) || if *mode == PugMode::TheadMode {
                     thead_include.contains(&name_str)
-                } else if *mode == PugMode::NoAttributesMode || *mode == PugMode::IdClassOnlyMode {
+                } else if *mode == PugMode::NoAttributesMode {
                     false
                 } else {
                     name_str.starts_with("data-") || always_include.contains(&name_str)
@@ -585,7 +573,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             if tag_name == "tbody" { if let Some(c) = ctx.as_mut() { c.is_in_tbody = false; } }
         }
         Node::Text(text) => {
-            if *mode == PugMode::FullContent || *mode == PugMode::DetailMode || *mode == PugMode::TheadMode || *mode == PugMode::ListMode || *mode == PugMode::NoAttributesMode || *mode == PugMode::IdClassOnlyMode {
+            if *mode == PugMode::FullContent || *mode == PugMode::DetailMode || *mode == PugMode::TheadMode || *mode == PugMode::ListMode || *mode == PugMode::NoAttributesMode {
                 let text_content = text.trim();
                 if !text_content.is_empty() {
                     // 🌟 [CRITICAL FIX 1] 숫자 사이의 콤마(,) 제거 (소수점은 완벽히 보존)

@@ -1303,7 +1303,7 @@ async fn process_task(
                     
                     // 🌟 [추가] ref_row의 텍스트 길이를 기반으로 대략적인 토큰을 산출하여 컨텍스트 사이즈를 예약하고 뒤에서 자릅니다.
                     let ref_row_context_size = ref_row.len() + 3000;
-                    let full_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::IdClassOnlyMode, Some(&url));
+                    let full_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, Some(&url));
                     let thead_light_pug = model.truncate_pug_context(&full_pug, false, 2000, Some(ref_row_context_size)).await;
 
                     println!("ref_row: {}", ref_row);
