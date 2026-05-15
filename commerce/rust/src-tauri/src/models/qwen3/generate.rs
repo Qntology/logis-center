@@ -1,7 +1,9 @@
-use crate::openai_types::ChatCompletionParameters;
+use crate::openai_types::{ChatCompletionParameters, ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseMessage};
 use anyhow::{Result, anyhow};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::models::qwen3::config::{Qwen3Config, Qwen3GenerationConfig};
 use crate::models::qwen3::model::Qwen3Model;
@@ -118,6 +120,145 @@ impl Qwen3GenerateModel {
             eos_token_id2: generation_config.eos_token_id.get(1).cloned().unwrap_or(151645) as u32,
             generation_config,
             model_name: "qwen3".to_string(),
+        })
+    }
+
+    pub fn get_kv_cache(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.qwen3.get_kv_cache()
+    }
+
+    pub fn set_kv_cache(&mut self, cache: Vec<Option<(Tensor, Tensor)>>) {
+        self.qwen3.set_kv_cache(cache);
+    }
+
+    pub fn save_kv_cache(&self, session_id: &str, cache_dir: Option<String>) -> Result<()> {
+        let kv_cache = self.get_kv_cache();
+        let mut tensors = std::collections::HashMap::new();
+        for (i, layer_cache) in kv_cache.iter().enumerate() {
+            if let Some((k, v)) = layer_cache {
+                tensors.insert(format!("k_{}", i), k.clone());
+                tensors.insert(format!("v_{}", i), v.clone());
+            }
+        }
+        if tensors.is_empty() { return Ok(()); }
+        
+        let dir = cache_dir.unwrap_or_else(|| "tmp/kv/".to_string());
+        std::fs::create_dir_all(&dir)?;
+        let path = std::path::Path::new(&dir).join(format!("{}.safetensors", session_id));
+        candle_core::safetensors::save(&tensors, path)?;
+        Ok(())
+    }
+
+    pub fn load_kv_cache(&mut self, session_id: &str, cache_dir: Option<String>) -> Result<bool> {
+        let dir = cache_dir.unwrap_or_else(|| "tmp/kv/".to_string());
+        let path = std::path::Path::new(&dir).join(format!("{}.safetensors", session_id));
+        if !path.exists() { return Ok(false); }
+        
+        let tensors = candle_core::safetensors::load(&path, &self.device)?;
+        let mut cache = Vec::new();
+        let mut i = 0;
+        loop {
+            let k_key = format!("k_{}", i);
+            let v_key = format!("v_{}", i);
+            if let (Some(k), Some(v)) = (tensors.get(&k_key), tensors.get(&v_key)) {
+                cache.push(Some((k.clone(), v.clone())));
+            } else {
+                break;
+            }
+            i += 1;
+        }
+        if cache.is_empty() { return Ok(false); }
+        self.set_kv_cache(cache);
+        Ok(true)
+    }
+
+    pub async fn prefill_only(
+        &mut self,
+        prompt: String,
+        _cancellation_token: Option<Arc<AtomicBool>>,
+        save_session_id: Option<String>,
+        _task_id: Option<String>,
+        cache_dir: Option<String>,
+    ) -> Result<()> {
+        self.clear_kv_cache();
+        let input_ids = self.tokenizer.text_encode(prompt, &self.device)?;
+        let seq_len = input_ids.dim(1)?;
+        if seq_len == 0 { return Ok(()); }
+
+        let _ = self.qwen3.forward(Some(&input_ids), None, 0)?;
+
+        if let Some(session_id) = save_session_id {
+            self.save_kv_cache(&session_id, cache_dir)?;
+        }
+        Ok(())
+    }
+
+    pub async fn generate_part(
+        &mut self,
+        mes: &ChatCompletionParameters,
+        is_prefill: bool,
+        start_len: usize,
+        _task_id: Option<String>,
+        load_session_id: Option<String>,
+        cache_dir: Option<String>,
+    ) -> Result<ChatCompletionResponse> {
+        if is_prefill {
+            self.clear_kv_cache();
+        } else if let Some(session_id) = load_session_id {
+            self.load_kv_cache(&session_id, cache_dir)?;
+        }
+
+        let temperature = mes.temperature.unwrap_or(self.generation_config.temperature as f64);
+        let top_p = mes.top_p.unwrap_or(self.generation_config.top_p as f64);
+        let top_k = self.generation_config.top_k;
+        let seed = mes.seed.unwrap_or(34562) as u64;
+        let mut logit_processor = get_logit_processor(Some(temperature as f32), Some(top_p as f32), Some(top_k), seed);
+
+        let mes_render = self.chat_template.apply_chat_template(mes)?;
+        let f_ids = self.tokenizer.text_encode_vec(mes_render, false)?;
+        
+        if start_len >= f_ids.len() {
+            return Err(anyhow::anyhow!("start_len exceeds or equals prompt length"));
+        }
+
+        let p_ids = &f_ids[start_len..];
+        let mut input_ids = Tensor::from_vec(p_ids.to_vec(), (1, p_ids.len()), &self.device)?;
+        
+        let mut seq_len = input_ids.dim(1)?;
+        let mut seqlen_offset = start_len;
+        let mut generate = Vec::new();
+        let sample_len = mes.max_tokens.unwrap_or(2048);
+
+        for _ in 0..sample_len {
+            let logits = self.qwen3.forward(Some(&input_ids), None, seqlen_offset)?;
+            let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+            let next_token = logit_processor.sample(&logits)?;
+            generate.push(next_token);
+            if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
+                break;
+            }
+            seqlen_offset += seq_len;
+            seq_len = 1;
+            input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
+        }
+
+        let res_text = self.tokenizer.token_decode(generate)?;
+        
+        Ok(ChatCompletionResponse {
+            id: "qwen3_eval".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "qwen3".to_string(),
+            choices: vec![ChatCompletionResponseChoice {
+                index: 0,
+                message: ChatCompletionResponseMessage {
+                    role: "assistant".to_string(),
+                    content: Some(res_text.clone()),
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: None,
+            text: res_text,
         })
     }
 

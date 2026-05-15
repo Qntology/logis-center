@@ -728,15 +728,21 @@ impl VectorStore {
          let fetch_limit = limit + offset;
 
          if !query_text.is_empty() {
-             let clean = query_text.replace("'", "''");
+             // 🌟 SQL(ILIKE)용 이스케이프 문자열
+             let sql_clean = query_text.replace("'", "''");
              let mut q = table.query();
              
              // 🌟 [CRITICAL FIX] 분기 처리: Fast Search(실시간 검색)일 때는 다국어가 지원되는 ILIKE를 사용하고,
              // AI Deep Search(엔터/돋보기)일 때는 SDK 내장 full_text_search API를 호출합니다.
              if use_fts {
+                 // 🌟 [CRITICAL FIX] CJK N-gram 검색의 치명적 함정 완벽 해결!
+                 // ngram_max_length가 3인데 4글자 이상을 검색하면 엔진 내부에 토큰이 없어 100% 매칭에 실패합니다.
+                 // 검색어를 반드시 큰따옴표("")로 감싸 Phrase Query(구문 검색)로 강제 변환해야 
+                 // Tantivy 쿼리 파서가 검색어 자체도 N-gram으로 쪼개서(예: "대한민국" -> "대한민" + "한민국") 정확히 찾아냅니다!
+                 let fts_query_str = format!("\"{}\"", query_text.replace("\"", "\\\""));
+                 
                  // 공식 문서에 따른 FTS 전용 메서드 체이닝
-                 // 🌟 [CRITICAL FIX] String 타입 오류 해결: FullTextSearchQuery 객체로 감싸서 전달합니다.
-                 q = q.full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(clean.clone()));
+                 q = q.full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query_str));
                  
                  // 추가 필터(status, type 등)가 존재하면 AND 조건으로 체이닝
                  if let Some(ref f) = filter {
@@ -744,7 +750,7 @@ impl VectorStore {
                  }
              } else {
                  // 기존 ILIKE 스캔 로직 유지
-                 let text_filter = format!("(text ILIKE '%{}%' OR data ILIKE '%{}%')", clean, clean);
+                 let text_filter = format!("(text ILIKE '%{}%' OR data ILIKE '%{}%')", sql_clean, sql_clean);
                  let final_filter = if let Some(ref f) = filter {
                      format!("({}) AND {}", f, text_filter)
                  } else {

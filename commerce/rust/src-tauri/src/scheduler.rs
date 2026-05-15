@@ -634,75 +634,92 @@ async fn process_task(
         let store_guard = store_mutex.lock().await;
         if let Some(db) = store_guard.as_ref() {
             
-            // 🌟 URL 역추적(Fallback) 시에도 Detail 속성이 일치하는 캐시만 선별하도록 강화
-            let mut cached_page_doc = None;
+            // 🌟 [CRITICAL FIX 1] 대소문자 매칭 오류 방지: 
+            // 클라우드(aa.ts)는 원본 대소문자를 유지하여 저장하고, 로컬(main.ts)은 소문자로 변환하여 요청합니다.
+            // 경로 비교 시 반드시 소문자로 통일하여 검색해야 100% 매칭됩니다!
+            let link_val = (url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()).to_lowercase();
+            let path_only = url_obj.path().to_lowercase(); 
             
+            let mut potential_caches = Vec::new();
+
+            // 1. ID 기반 조회 (정확한 매칭 1차 수집)
             if let Ok(Some(page_doc)) = db.get_item_by_id("pages", &page_id).await {
-                cached_page_doc = Some(page_doc);
+                potential_caches.push(page_doc);
             } else if let Ok(Some(page_doc)) = db.get_item_by_id("items", &page_id).await {
-                cached_page_doc = Some(page_doc);
-            } else {
-                let link_val = url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str();
-                
-                // pages 테이블과 items 테이블 모두 검색하여 현재 is_detail 상태와 일치하는 것만 채택
-                let tables_to_check = ["pages", "items"];
-                for tbl in tables_to_check {
-                    if let Ok(docs) = db.get_all_items(tbl, 1000, 0, None).await {
-                        for doc in docs {
-                            if doc.json_data.contains(&link_val) {
-                                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&doc.json_data) {
-                                    let cached_detail = json_val.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
-                                    if cached_detail == is_detail {
-                                        cached_page_doc = Some(doc);
-                                        break;
-                                    }
-                                }
+                potential_caches.push(page_doc);
+            }
+
+            // 2. URL 경로 기반 역추적 조회 (대소문자 무시)
+            let tables_to_check = ["pages", "items"];
+            for tbl in tables_to_check {
+                if let Ok(docs) = db.get_all_items(tbl, 1000, 0, None).await {
+                    for doc in docs {
+                        let json_lower = doc.json_data.to_lowercase();
+                        if json_lower.contains(&link_val) || json_lower.contains(&path_only) {
+                            if !potential_caches.iter().any(|c| c.id == doc.id) {
+                                potential_caches.push(doc);
                             }
                         }
                     }
-                    if cached_page_doc.is_some() { break; }
                 }
             }
 
-            if let Some(page_doc) = cached_page_doc {
+            // 3. 수집된 캐시 중 현재 DOM 구조와 가장 잘 맞는 캐시 선별
+            let mut final_cache = None;
+
+            for page_doc in potential_caches {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&page_doc.json_data) {
                     let cached_detail = val.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
                     let node_sel = val.get("node").or_else(|| val.get("parent")).and_then(|v| v.as_str()).unwrap_or("");
                     let item_sel = val.get("item").or_else(|| val.get("itemSelector")).and_then(|v| v.as_str()).unwrap_or("");
-                    
+
                     let target_sel_str = if !node_sel.is_empty() && !item_sel.is_empty() && !item_sel.contains(",") {
                         if item_sel.starts_with(node_sel) { item_sel.to_string() } else { format!("{} {}", node_sel, item_sel) }
                     } else if !item_sel.is_empty() { item_sel.to_string() } else { node_sel.to_string() };
 
-                    let mut is_valid = true;
+                    // 🌟 [CRITICAL FIX 2] 꺾쇠(>) 문자를 공백으로 치환하여 scraper 파싱 에러(Silent Fail) 방지
+                    let target_sel_clean = target_sel_str.replace(">", " ");
 
-                    // 🌟 [CRITICAL FIX] aa.ts 사상 반영: List 캐시를 불러왔더라도 실제 DOM에 요소가 없다면 
-                    // 상세(Detail) 페이지로 넘어왔을 확률이 높으므로 캐시를 무시하고 AI 판별로 넘깁니다. 
-                    // 단, 다른 페이지에서 쓸 수 있으므로 기존 캐시를 DB에서 삭제하진 않습니다.
-                    if !cached_detail && !target_sel_str.is_empty() {
-                        let document = scraper::Html::parse_document(&clean_html_content);
-                        let is_match_found = scraper::Selector::parse(&target_sel_str)
-                            .map(|sel| document.select(&sel).next().is_some())
-                            .unwrap_or(false);
-                            
-                        if !is_match_found {
-                            is_valid = false;
+                    if !cached_detail {
+                        let mut is_dom_matched = false;
+                        if !target_sel_clean.is_empty() {
+                            let document = scraper::Html::parse_document(&clean_html_content);
+                            is_dom_matched = scraper::Selector::parse(&target_sel_clean)
+                                .map(|sel| document.select(&sel).next().is_some())
+                                .unwrap_or(false);
+                        }
+
+                        if is_dom_matched {
+                            // DOM까지 완벽 일치하는 리스트 캐시 -> 최우선 채택 및 탐색 종료
+                            final_cache = Some((page_doc, val, false, target_sel_clean));
+                            break;
+                        } 
+                        // 🌟 [CRITICAL FIX 3] DOM이 매치되지 않으면, 리스트 캐시는 기각하고 과감히 버립니다.
+                        // (빈 리스트일 가능성보다, 동일한 주소 체계를 가진 상세 페이지일 가능성이 99%이기 때문입니다.)
+                    } else {
+                        // Detail 캐시인 경우
+                        if final_cache.is_none() {
+                            final_cache = Some((page_doc, val, true, target_sel_clean));
                         }
                     }
-
-                    if is_valid {
-                        emit_term(&format!("[Scheduler] ⚡ CACHE HIT! Skipping AI Pre-processing for: {}", raw_path));
-                        page_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();
-                        is_detail = cached_detail; 
-                        selector_info = val.clone();
-                        selector_info.as_object_mut().unwrap().insert("final_target_selector".to_string(), json!(target_sel_str));
-                        skip_ai_analysis = true; 
-                        
-                        log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Loaded valid config from cache.", "spinner": "⚡" }));
-                    } else {
-                        emit_term("[Scheduler] Cache loaded but elements not found in DOM. Likely a Detail page. Falling back to AI Analysis.");
-                    }
                 }
+            }
+
+            // 4. 최종 결정된 캐시 적용 및 파이프라인 패스
+            if let Some((_page_doc, val, cached_detail, target_sel_str)) = final_cache {
+                emit_term(&format!("[Scheduler] ⚡ CACHE HIT! Skipping AI Pre-processing for: {}", raw_path));
+                page_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();
+                
+                // 🌟 [CRITICAL FIX] 부정확할 수 있는 초기 is_detail 상태를 실제 검증이 끝난 DB 캐시 값으로 완벽히 덮어씌웁니다!
+                is_detail = cached_detail; 
+                
+                selector_info = val.clone();
+                selector_info.as_object_mut().unwrap().insert("final_target_selector".to_string(), json!(target_sel_str));
+                skip_ai_analysis = true; 
+                
+                log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Loaded valid config from cache.", "spinner": "⚡" }));
+            } else {
+                emit_term("[Scheduler] Cache miss or elements not found in DOM. Falling back to AI Analysis.");
             }
         }
     }
@@ -1534,78 +1551,127 @@ async fn process_task(
         }
 
         if !pug_list.is_empty() {
-            // 🌟 [CRITICAL FIX 2] 리스트 추출은 짧은 item_pug 조각만 독립적으로 읽으므로, 
-            // 무겁고 호환되지 않는 Base 스냅샷 로딩을 원천 차단합니다.
-            model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+            let total_items = pug_list.len();
+
+            // ==========================================
+            // 🌟 ALL PHASES: QWEN 3 (Meta, Info, Data Extraction 일괄 처리)
+            // ==========================================
+            // 모델 가중치 변경(스위칭) 없이 가장 가벼운 모델인 Qwen3 하나만으로 전체 파이프라인을 관통하여 속도를 극대화합니다!
+            model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
             for (idx, item_pug) in pug_list.iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { break; }
                 
-                let percent = (((idx + 1) as f32 / pug_list.len() as f32) * 100.0) as i32;
+                let percent = (((idx as f32) / (total_items as f32)) * 100.0) as i32;
                 let summary_msg = format!("Extracting item data ({}%)...", percent);
                 
                 let payload = json!({ 
                     "task_id": task.id, 
-                    "category": format!("List Extraction ({}/{})", idx + 1, pug_list.len()), 
+                    "category": format!("List Extraction ({}/{})", idx + 1, total_items), 
                     "summary": summary_msg, 
                     "spinner": "⠋" 
                 });
                 log_task_progress(app_handle, &task.id, &payload);
                 emit_term(&format!("[STAGE-3] {}", summary_msg));
 
-                
-                // 🌟 [CRITICAL FIX 3] E0061 해결: 인자 5개를 받도록 변경된 list2json 구조에 완벽하게 맞춥니다.
-                let task_question = parsing::list2json(
-                    &page_type, 
-                    &url, 
-                    language, 
-                    &thead_pug, 
-                    item_pug
-                );
+                let task_question_meta = parsing::list2json_meta(&page_type, &url, language, &thead_pug, item_pug);
+                let task_question_info = parsing::list2json_info(&page_type, language, &thead_pug, item_pug);
+                let task_question_data = parsing::list2json_data(&page_type, language, &thead_pug, item_pug);
 
-                // println!("task_question {}", task_question);
-                
-                // 🌟 [교체 구간 2-B] src/scheduler.rs 의 리스트 추출 루프 내부
-                let res = if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-                    println!("[Scheduler] Qwen3.5 Extracting Item {}/{}...", idx + 1, pug_list.len());
-                    
-                    // 🌟 리스트 아이템별로 덮어쓰지 않도록 고유 세션 ID 생성
-                    let item_session_id = format!("{}_list_item_{}", task.id, idx); 
-                    
-                    let params = ChatCompletionParameters {
-                        messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                            content: ChatCompletionRequestUserMessageContent::Text(task_question),
-                            name: None,
-                        })],
-                        model: "qwen3.5".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
-                        ..Default::default()
-                    };
-                    gen.generate(
-                        params, 
-                        Some(cancellation_token.clone()), 
-                        Some(item_session_id), // 🌟 None 에서 생성한 고유 세션 ID로 변경
-                        Some("inference".to_string())
-                    ).await.map_err(|e| anyhow::anyhow!("Qwen 3.5 Inference failed: {}", e))
-                } else {
-                    Err(anyhow::anyhow!("Qwen 3.5 Generator not available"))
-                };
-
-                match res {
-                    Ok(res_text) => {
-                        let mut parsed_json = parsing::parse_json_from_llm(&res_text);
-                        
-                        // 🌟 [CRITICAL FIX] LLM이 {"order": {...}} 형태로 껍데기를 씌워서 반환하므로,
-                        // page_type(예: "order", "goods") 키를 찾아서 알맹이만 빼냅니다.
-                        let mut item_json = if let Some(inner) = parsed_json.get_mut(&page_type) {
-                            inner.take() // 알맹이 적중 시 꺼냄
-                        } else {
-                            parsed_json // 방어 로직: LLM이 껍데기 없이 바로 뱉었을 경우 그대로 사용
+                // 🌟 Meta 추출
+                let q3_gen_meta = model.qwen3_generator.clone();
+                let res_meta = tokio::task::spawn_blocking(move || {
+                    let mut gen_guard = q3_gen_meta.blocking_lock();
+                    if let Some(gen) = gen_guard.as_mut() {
+                        println!("[Scheduler] Qwen3 Extracting Item Meta {}/{}...", idx + 1, total_items);
+                        let params = ChatCompletionParameters {
+                            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                                content: ChatCompletionRequestUserMessageContent::Text(task_question_meta),
+                                name: None,
+                            })],
+                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
+                            ..Default::default()
                         };
+                        gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen 3 Meta failed: {}", e))
+                    } else {
+                        Err(anyhow::anyhow!("Qwen 3 Generator not available"))
+                    }
+                }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+
+                // 🌟 Info 추출 (Qwen 3.5 -> Qwen 3 완전 통합)
+                let q3_gen_info = model.qwen3_generator.clone();
+                let res_info = tokio::task::spawn_blocking(move || {
+                    let mut gen_guard = q3_gen_info.blocking_lock();
+                    if let Some(gen) = gen_guard.as_mut() {
+                        println!("[Scheduler] Qwen3 Extracting Item Info {}/{}...", idx + 1, total_items);
+                        let params = ChatCompletionParameters {
+                            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                                content: ChatCompletionRequestUserMessageContent::Text(task_question_info),
+                                name: None,
+                            })],
+                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
+                            ..Default::default()
+                        };
+                        gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen 3 Info failed: {}", e))
+                    } else {
+                        Err(anyhow::anyhow!("Qwen 3 Generator not available"))
+                    }
+                }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+
+                // 🌟 Data 추출 (Qwen 3.5 -> Qwen 3 완전 통합)
+                let q3_gen_data = model.qwen3_generator.clone();
+                let res_data = tokio::task::spawn_blocking(move || {
+                    let mut gen_guard = q3_gen_data.blocking_lock();
+                    if let Some(gen) = gen_guard.as_mut() {
+                        println!("[Scheduler] Qwen3 Extracting Item Data {}/{}...", idx + 1, total_items);
+                        let params = ChatCompletionParameters {
+                            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                                content: ChatCompletionRequestUserMessageContent::Text(task_question_data),
+                                name: None,
+                            })],
+                            model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.95),
+                            ..Default::default()
+                        };
+                        gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen 3 Data failed: {}", e))
+                    } else {
+                        Err(anyhow::anyhow!("Qwen 3 Generator not available"))
+                    }
+                }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+
+                match (res_meta, res_info, res_data) {
+                    (Ok(res_m), Ok(res_i), Ok(res_d)) => {
+                        let mut parsed_meta = parsing::parse_json_from_llm(&res_m);
+                        let mut parsed_info = parsing::parse_json_from_llm(&res_i);
+                        let mut parsed_data = parsing::parse_json_from_llm(&res_d);
+                        
+                        let mut item_meta = if let Some(inner) = parsed_meta.get_mut(&page_type) { inner.take() } else { parsed_meta };
+                        let mut item_info = if let Some(inner) = parsed_info.get_mut(&page_type) { inner.take() } else { parsed_info };
+                        let mut item_data = if let Some(inner) = parsed_data.get_mut(&page_type) { inner.take() } else { parsed_data };
+                        
+                        // 🌟 3단계로 추출된 데이터를 메타 객체 안으로 완전히 병합
+                        if let (Some(m_obj), Some(i_obj)) = (item_meta.as_object_mut(), item_info.as_object_mut()) {
+                            for (k, v) in i_obj {
+                                m_obj.insert(k.clone(), v.clone());
+                            }
+                        }
+                        if let (Some(m_obj), Some(d_obj)) = (item_meta.as_object_mut(), item_data.as_object_mut()) {
+                            for (k, v) in d_obj {
+                                m_obj.insert(k.clone(), v.clone());
+                            }
+                        }
+
+                        // 🌟 [CRITICAL FIX] ID에서 파라미터 제외 숫자만 독립 추출 (product_no=13 -> 13)
+                        if let Some(id_val) = item_meta.get("id").and_then(|v| v.as_str()) {
+                            let num_str: String = id_val.chars().filter(|c| c.is_ascii_digit()).collect();
+                            if !num_str.is_empty() {
+                                item_meta.as_object_mut().unwrap().insert("id".to_string(), json!(num_str));
+                            }
+                        }
+
+                        let mut item_json = item_meta;
 
                         if !item_json.is_null() && (item_json.is_object() || item_json.is_array()) {
                             
-                            // (이전에 있던 {TYPE}_status 를 status로 롤백하던 코드는 이제 필요 없으므로 완전 삭제!)
-
                             if let Some(link_val) = item_json.get_mut("link") {
                                 if let Some(relative_path) = link_val.as_str() {
                                     if let Ok(base_url) = url::Url::parse(&url) {
@@ -1636,7 +1702,6 @@ async fn process_task(
                                     pending_merge = Some(item_json);
                                     merge_countdown = rowspan - 1;
                                 } else {
-                                    // 기존에 대기 중이던 게 꼬였다면 일단 push하고 비움
                                     if let Some(stray) = pending_merge.take() {
                                         all_extracted_items.push(stray);
                                     }
@@ -1645,16 +1710,19 @@ async fn process_task(
                             }
                         }
                     },
-                    Err(e) => println!("[Scheduler] Error extracting item {}: {:?}", idx, e),
+                    (Err(e), _, _) => println!("[Scheduler] Error extracting item meta: {:?}", e),
+                    (_, Err(e), _) => println!("[Scheduler] Error extracting item info: {:?}", e),
+                    (_, _, Err(e)) => println!("[Scheduler] Error extracting item data: {:?}", e),
                 }
 
-
-                // 1. 모델 내부에 쌓인 과거 문맥(KV 캐시) 명시적 파괴 및 GPU 파이프라인 강제 동기화
-                if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-                    gen.clear_kv_cache();
-                }
+                let q3_clear_arc = model.qwen3_generator.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
+                        gen.clear_kv_cache();
+                    }
+                }).await;
                 
-                // 🌟 [추가] GPU에 남아있는 비동기 연산 찌꺼기까지 완벽하게 털어내기
+                // 🌟 GPU에 남아있는 비동기 연산 찌꺼기까지 완벽하게 털어내기
                 if !model.is_cpu_mode {
                     let dev = model.device_config.device.clone();
                     let _ = tokio::task::spawn_blocking(move || {
@@ -1662,10 +1730,10 @@ async fn process_task(
                     }).await;
                 }
 
-                // 2. IO 작업이 꼬이지 않도록 대기
+                // IO 작업 대기
                 crate::models::qwen::generate::wait_for_global_io().await;
 
-                // 3. OS 커널 레벨에서 가비지 컬렉터(Garbage Collector)를 강제 호출하여 RAM 피크를 박살 냅니다.
+                // OS 커널 레벨에서 가비지 컬렉터 강제 호출
                 #[cfg(target_os = "windows")]
                 unsafe {
                     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -1677,8 +1745,7 @@ async fn process_task(
                 #[cfg(target_os = "macos")]
                 unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
 
-                // 4. GPU와 OS가 메모리를 반환할 시간을 아주 짧게(0.1초) 줍니다.
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             }
 
             if let Some(last_item) = pending_merge.take() {
@@ -1886,114 +1953,20 @@ async fn process_task(
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // 🌟 [CRITICAL FIX] VRAM 교체 지옥 방지: Embedding 모델 교체 전, Qwen 3.5 (0.8B) 모델로 영어 번역을 수행합니다.
+    // 🌟 [최적화] 네이티브 한글 N-gram 검색 완벽 지원으로 인해 불필요해진 영어 번역 릴레이를 삭제하고, 바로 자연어 렌더링을 꽂아 넣습니다.
     {
-        println!("[Scheduler] Batch translating English FTS keywords using Qwen3.5 (0.8B)...");
-        
-        model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, None).await?;
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-        // 1. 전체 데이터 구조에서 번역이 필요한 텍스트의 경로를 전부 수집합니다.
-        fn collect_values(val: &serde_json::Value, path: Vec<String>, target_list: &mut Vec<(Vec<String>, String)>) {
-            if let Some(obj) = val.as_object() {
-                for (k, v) in obj {
-                    if [
-                        "origin", "link", "path", "id", "no", "code", "currency", "mode", "type", 
-                        "registration_date", "created_at", "updated_at", "order_date", "payment_date", "shipping_date", 
-                        "manufacture_date", "expiration_date", "release_date", "started_at", "expired_at",
-                        "tracking_number", "main_image_url", "additional_image_url", "video_url", "gtin", "mpn", "barcode",
-                        "text", "json_data"
-                    ].contains(&k.as_str()) { 
-                        continue; 
-                    }
-                    let mut next_path = path.clone(); next_path.push(k.clone());
-                    collect_values(v, next_path, target_list);
-                }
-            } else if let Some(arr) = val.as_array() {
-                for (i, v) in arr.iter().enumerate() {
-                    let mut next_path = path.clone(); next_path.push(i.to_string());
-                    collect_values(v, next_path, target_list);
-                }
-            } else if let Some(s) = val.as_str() {
-                if !s.is_ascii() && !s.trim().is_empty() { target_list.push((path, s.to_string())); }
-            }
-        }
-
-        let mut keys_to_translate = Vec::new();
-        collect_values(&extracted_data, Vec::new(), &mut keys_to_translate);
-
-        // 3. 중복 텍스트 묶기 (LLM 호출 최적화)
-        let mut unique_texts = std::collections::HashMap::new();
-        for (path, text) in keys_to_translate {
-            unique_texts.entry(text).or_insert_with(Vec::new).push(path);
-        }
-
-        let total_count = unique_texts.len();
-        println!("[FTS-TRANSLATION] Found {} unique values to translate.", total_count);
-
-        let mut english_translation_buffer = String::new();
-
-        for (idx, (text_to_trans, _paths)) in unique_texts.into_iter().enumerate() {
-            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-            let payload = json!({ "task_id": task.id, "category": "Translating", "summary": format!("Translating content ({}/{})", idx+1, total_count), "spinner": "⠋" });
-            let _ = app_handle.emit("extraction-progress", &payload);
-            crate::scheduler::log_task_progress(app_handle, &task.id, &payload);
-
-            let eng_prompt = parsing::english_summary_for_fts_prompt(&text_to_trans);
-            let params = crate::openai_types::ChatCompletionParameters {
-                messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(eng_prompt), name: None,
-                })],
-                model: "qwen3.5".to_string(), max_tokens: Some(128), temperature: Some(0.1), top_p: Some(0.95),
-                ..Default::default()
-            };
-            
-            if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-                if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), None, None).await {
-                    let mut clean_text = res.clone();
-                    if let Some(start) = clean_text.find("<think>") {
-                        if let Some(end) = clean_text.find("</think>") { clean_text.replace_range(start..end + 8, ""); }
-                        else { clean_text.replace_range(start.., ""); }
-                    }
-                    let clean_text = clean_text.replace("[Result]", "").replace("Result]", "").trim().to_string();
-                    
-                    if !clean_text.is_empty() {
-                        println!("[FTS-TRANSLATION] '{}' -> '{}'", text_to_trans, clean_text);
-                        // 원본 JSON 구조(extracted_data)를 파괴하지 않고, 영어 번역본을 버퍼에만 차곡차곡 모아둡니다.
-                        english_translation_buffer.push_str(&format!("{} ", clean_text));
-                    }
-                }
-            }
-        }
-
-        // 4. 원본(한글) JSON 구조를 바탕으로 자연어 문장을 렌더링하고, 영어 번역본과 통합합니다.
-        println!("[FTS-TRANSLATION] All values translated. Generating natural language sentences...");
+        println!("[Scheduler] Generating natural language sentences for FTS/Vector matching...");
         if is_detail {
             let original_lang_text = parsing::json_to_natural_language(&extracted_data);
-            let final_text = if !english_translation_buffer.trim().is_empty() {
-                // 🌟 사용자의 의도대로 영어 번역 내용과 원본 언어(한글) 내용을 하나의 텍스트로 합쳐서 저장합니다.
-                format!("{}, {}", english_translation_buffer.trim(), original_lang_text)
-            } else {
-                original_lang_text
-            };
-            
             if let Some(obj) = extracted_data.as_object_mut() {
-                obj.insert("text".to_string(), json!(final_text));
+                obj.insert("text".to_string(), json!(original_lang_text));
             }
         } else {
             if let Some(items) = extracted_data.get_mut("items").and_then(|v| v.as_array_mut()) {
                 for item in items.iter_mut() {
                     let original_lang_text = parsing::json_to_natural_language(item);
-                    let final_text = if !english_translation_buffer.trim().is_empty() {
-                        // 🌟 리스트의 각 아이템에도 동일하게 영어 내용과 원본 언어 내용을 합쳐서 저장합니다.
-                        format!("{}, {}", english_translation_buffer.trim(), original_lang_text)
-                    } else {
-                        original_lang_text
-                    };
-                    
                     if let Some(obj) = item.as_object_mut() {
-                        obj.insert("text".to_string(), json!(final_text));
+                        obj.insert("text".to_string(), json!(original_lang_text));
                     }
                 }
             }

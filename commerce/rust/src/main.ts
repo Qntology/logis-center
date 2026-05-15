@@ -727,6 +727,11 @@ listen("browser-status", async (event: any) => {
     const payload = event.payload; 
     const statusStr = typeof payload === "object" ? payload.status : payload;
     
+    if (typeof payload === "object" && payload.url !== undefined) {
+        currentDetectedUrl = payload.url || "";
+        isCurrentShop = payload.is_client || payload.is_admin || false;
+    }
+
     if (statusStr === "running") {
         isBrowserRunning = true;
         isAutoLaunchLocked = true; // 실행 중엔 런처 버튼 잠금
@@ -2055,7 +2060,21 @@ btnExtract?.addEventListener("click", async () => {
                 } else {
                     console.log("[WIDGET] Queuing LOCAL HTML/ANALYTIC task...");
                     const html = await invoke<string>("extract_html_from_current_tab");
-                    const urlObj = new URL(currentDetectedUrl.toLowerCase());
+                    
+                    // 🌟 [CRITICAL FIX] 브라우저가 유휴 상태(Idle/Background)로 전환되어 currentDetectedUrl이 
+                    // 빈 값이거나 about:blank로 날아갔을 경우, localhost로 엉뚱하게 매칭되는 것을 방어합니다!
+                    let validUrl = currentDetectedUrl;
+                    if (!validUrl || validUrl === "" || validUrl === "about:blank") {
+                        const pageList = document.getElementById("nav-list-pages");
+                        const activeLabel = pageList?.querySelector(".logis-label.active") as HTMLElement;
+                        if (activeLabel && activeLabel.dataset.domain) {
+                            validUrl = `https://${activeLabel.dataset.domain}`;
+                        } else {
+                            validUrl = "https://commerce.logis.center"; // 최후의 수단
+                        }
+                    }
+
+                    const urlObj = new URL(validUrl.toLowerCase());
                     const cc = await hashId(urlObj.hostname);
                     const rawPath = urlObj.pathname + urlObj.search;
                     const teamId = currentSession.team || "";
@@ -2067,6 +2086,7 @@ btnExtract?.addEventListener("click", async () => {
                     // 🚀 큐에 등록
                     await GlobalTaskManager.addToQueue(taskId, extractType, { 
                         id: taskId, type: extractType, html: html, link: rawPath, 
+                        origin: urlObj.origin, // 🌟 [핵심] Rust 스케줄러가 localhost로 오판하지 않도록 origin(도메인)을 명시적으로 전달!
                         cc: activeContext.cc || cc, 
                         ref: activeContext.ref || hashedRefId, 
                         bcc: activeContext.bcc || "", 

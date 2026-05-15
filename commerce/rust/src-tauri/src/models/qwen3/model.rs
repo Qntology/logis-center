@@ -209,6 +209,14 @@ impl Qwen3DecoderLayer {
     pub fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
     }
+
+    pub fn get_kv_cache(&self) -> Option<(Tensor, Tensor)> {
+        self.self_attn.kv_cache.clone()
+    }
+
+    pub fn set_kv_cache(&mut self, cache: Option<(Tensor, Tensor)>) {
+        self.self_attn.kv_cache = cache;
+    }
 }
 
 pub struct Qwen3Model {
@@ -246,6 +254,7 @@ impl Qwen3Model {
             lm_head,
         })
     }
+    
     pub fn forward(
         &mut self,
         input_ids: Option<&Tensor>,
@@ -291,6 +300,7 @@ impl Qwen3Model {
         let logits = self.lm_head.forward(&hidden_state)?;
         Ok(logits)
     }
+    
     pub fn embedding_token_id(&self, input_ids: &Tensor) -> Result<Tensor> {
         Ok(self.embed_tokens.forward(input_ids)?)
     }
@@ -298,6 +308,16 @@ impl Qwen3Model {
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
+        }
+    }
+
+    pub fn get_kv_cache(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.layers.iter().map(|l| l.get_kv_cache()).collect()
+    }
+
+    pub fn set_kv_cache(&mut self, cache: Vec<Option<(Tensor, Tensor)>>) {
+        for (layer, c) in self.layers.iter_mut().zip(cache.into_iter()) {
+            layer.set_kv_cache(c);
         }
     }
 }

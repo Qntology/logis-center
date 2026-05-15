@@ -45,6 +45,22 @@ pub fn pre_clean_html(html: &str) -> String {
     let re_single = Regex::new(r"(?is)<(meta|link|br|hr|source)\b[^>]*>").unwrap();
     let clean = re_single.replace_all(&html, "");
 
+    // 3.5. select 태그 내에서 selected 속성이 없는 option 태그 통째로 제거
+    let re_select = Regex::new(r"(?is)<select\b[^>]*>.*?</select>").unwrap();
+    let re_option = Regex::new(r"(?is)<option\b([^>]*)>.*?</option>").unwrap();
+    let re_selected = Regex::new(r"(?i)\bselected\b").unwrap();
+    
+    let clean = re_select.replace_all(&clean, |caps: &regex::Captures| {
+        let select_block = &caps[0];
+        re_option.replace_all(select_block, |opt_caps: &regex::Captures| {
+            if re_selected.is_match(&opt_caps[1]) {
+                opt_caps[0].to_string()
+            } else {
+                String::new()
+            }
+        }).to_string()
+    }).to_string();
+
     // 4. 허용된 속성 외 모두 제거 (지정된 16개 속성만 보존)
     let re_tag = Regex::new(r"(?i)<([a-zA-Z0-9\-]+)([^>]*)>").unwrap();
     // 🌟 [CRITICAL FIX] FTS 엔진의 테이블 매칭 정확도를 위해 'scope' 속성을 허용 목록에 추가하여 증발을 막습니다.
@@ -857,12 +873,6 @@ pub fn para2graph(language: &str) -> String {
 // ==============================================
 // [Zone: src/parsing.rs 교체 코드]
 // ==============================================
-pub fn english_summary_for_fts_prompt(text: &str) -> String {
-    let template = r###"[Translate to English] {TEXT} [ACTION] RETURN TRANSLATED TEXT ONLY. NO EXPLANATION. /no_think"###;
-
-    template.replace("{TEXT}", text)
-}
-
 pub fn extract_numeric_conditions(current: &str, input: &str, seg_type: &str, metrics_json: &str) -> String {
     let template = r###"[Task]
 Act as a deterministic semantic parser.
@@ -1075,7 +1085,7 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "barcode":String. product Barcode value.
     - "sale_price":Number. product sale price.
     - "supply_price":Number. product supply price.
-    - "currency":String. ISO 4217 Currency Code.
+    - "currency":String. ISO 4217 Currency Code(If the currency is not explicitly stated, infer the currency based on PUG CONTENT).
     - "compare_at_price":Number. product Original price for showing discounts.
     - "quantity":Number. product Inventory quantity.
     - "stock_keeping_unit":String. Stock Keeping Unit.
@@ -1195,61 +1205,12 @@ NO EXPLANATION. NO THINKING. /no_think"###;
             .replace("{LANGUAGE}", language)
 }
 
-pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
-    let schema = match page_type {
-    "order" => r###"- "{TYPE}":Object.
-    - "path":String. {HREF}.
-    - "link":String. Refer to the ID to find a URL that includes a manage order link or tracking detail link.
-    - "id":String. Refer to the ID value from the link or an attribute.
-    - "currency":String. ISO 4217 Currency Code.
-    - "sale_price":Number.. actual selling price(discounted price).
-    - "tracking_number":String. tracking Number or shipping number.
-    - "shipping_method":String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid').
-    - "shipping_fee":Number.. Cost of delivery.
-    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
-    - "status":String. {TYPE} status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
-    - "title":String. product title."###.to_string(),
+pub fn list2json_meta(page_type: &str, href: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
+    let schema = r###"- "{TYPE}":Object.
+- "path":String. {HREF}.
+- "id":String. Extract ONLY the numeric ID value from the link or attribute (e.g. '13' from 'product_no=13').
+- "link":String. Refer to the ID to find a URL that includes a manage link."###.to_string();
 
-    "goods" => r###"- "{TYPE}":Object.
-    - "path":String. {HREF}.
-    - "link":String. Refer to the ID to find a URL that includes a manage product link.
-    - "id":String. Refer to the ID value from the link or an attribute.
-    - "currency":String. ISO 4217 Currency Code.
-    - "compare_at_price":Number. product Original price for showing discounts(normal price, market price).
-    - "supply_price":Number. supply price(wholesale price).
-    - "sale_price":Number. actual selling price(discounted price).
-    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
-    - "status":String. {TYPE} status('show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire').
-    - "title":String. product title."###.to_string(),
-    
-    "tracking" | "review" => r###"- "{TYPE}":Object.
-    - "path":String. {HREF}.
-    - "link":String. Refer to the ID to find a URL that includes a manage {TYPE} link.
-    - "id":String. Refer to the ID value from the link or an attribute.
-    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
-    - "status":String. 'progress' or 'stop' or 'cancel' or 'return'.
-    - "title":String. author and content.###.to_string(),
-    
-    "coupon" | "event" => r###"- "{TYPE}":Object.
-    - "path":String. {HREF}.
-    - "link":String. Refer to the ID to find a URL that includes a manage {TYPE} link.
-    - "id":String. Refer to the ID value from the link or an attribute.
-    - "started_at":String. yyyy-MM-ddThh:mm:ss.
-    - "expired_at":String. yyyy-MM-ddThh:mm:ss.
-    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
-    - "status":String. {TYPE} status('show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete').
-    - "title":String. title."###.to_string(),
-    
-        _ => r###"- "{TYPE}":Object.
-    - "path":String. {HREF}.
-    - "id":String. Refer to the ID value from the link or an attribute.
-    - "link":String. Refer to the ID to find a URL that includes a manage {TYPE} link.
-    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
-    - "status":String. {TYPE} status('show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
-    - "title":String. title."###.to_string()
-    };
-
-    // 🌟 [CRITICAL FIX] item_pug 내용에 링크(href)가 없을 경우 스키마에서 link와 path 요구 조건을 동적으로 제거합니다.
     let mut final_schema = schema;
     if !item_pug.contains("href=") && !item_pug.contains("href=\"") {
         final_schema = final_schema.lines()
@@ -1258,14 +1219,7 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
             .join("\n");
     }
 
-    // 🌟 [CRITICAL FIX] item_pug 내부에 다중 행(rowspan) 데이터가 존재하는지 판별합니다.
-    // let has_rowspan = item_pug.contains("rowspan=") || item_pug.contains("rowspan=\"");
-    // let include_thead = has_rowspan && !head_pug.is_empty();
-    let include_thead = !head_pug.is_empty();
-
-    // 🌟 [최종 반영] .txt 파일 구조와 동일하게 thead/tbody 태그 및 계층형 들여쓰기 적용
     let mut final_pug = String::new();
-
     if head_pug.trim_start().starts_with("thead") {
         final_pug.push_str(head_pug);
         if !head_pug.ends_with('\n') {
@@ -1278,7 +1232,6 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
         }
     }
 
-    // 2. 바디 영역 (tbody 태그 추가 및 내부 1단계 들여쓰기)
     if !item_pug.is_empty() {
         final_pug.push_str("tbody\n");
         for line in item_pug.lines() {
@@ -1286,25 +1239,13 @@ pub fn list2json(page_type: &str, href: &str, language: &str, head_pug: &str, it
         }
     }
 
-    // 3. 전체 PUG를 프롬프트에 넣기 위해 일괄적으로 4칸 들여쓰기 적용
     let pug_content = final_pug.trim_end().lines()
         .map(|line| format!("    {}", line))
         .collect::<Vec<_>>()
         .join("\n");
 
-    // 🌟 [CRITICAL FIX] include_thead 조건에 따라 TASK 지시사항을 동적으로 할당합니다.
-//     let task_desc = if include_thead {
-//         r###"Extract detailed information from the provided Pug content into a single structured JSON object.
-
-// [INSTRUCTION]
-// 1. The content contains data rows inside 'tbody'.
-// 2. Use the table headers ('th') and their structural order (including 'scope', 'colspan', and 'rowspan' attributes) as the primary baseline to understand the context of each data cell ('td')."###
-//     } else {
-//         "Extract detailed information from the provided Pug content into a single structured JSON object."
-//     };
-
     let template = r###"[TASK]
-Extract detailed information from the provided Pug content into a single structured JSON object.
+Extract ID and Link information from the provided Pug content into a single structured JSON object.
 
 [PUG CONTENT]
 {PUG_CONTENT}
@@ -1322,11 +1263,172 @@ Language: {LANGUAGE}
 [ACTION] RETURN JSON ONLY. 
 NO EXPLANATION. NO THINKING. /no_think"###;
 
-    // 🌟 {TASK} 변수를 포함하여 일괄 치환합니다.
-    // template.replace("{TASK}", task_desc)
     template.replace("{SCHEMA}", &final_schema)
             .replace("{TYPE}", page_type)
             .replace("{HREF}", href)
+            .replace("{LANGUAGE}", language)
+            .replace("{PUG_CONTENT}", &pug_content)
+}
+
+pub fn list2json_info(page_type: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
+    let schema = match page_type {
+    "order" => r###"- "{TYPE}":Object.
+- "summary":String. pug content summarize.
+- "registration_date":String. yyyy-MM-ddThh:mm:ss.
+- "status":String. {TYPE} status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
+- "title":String. title."###.to_string(),
+
+    "goods" => r###"- "product":Object.
+- "summary":String. pug content summarize.
+- "registration_date":String. yyyy-MM-ddThh:mm:ss.
+- "status":String. {TYPE} status('show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire').
+- "code":String. product code (Stock Keeping Unit).
+- "title":String. title."###.to_string(),
+    
+    "tracking" | "review" => r###"- "{TYPE}":Object.
+- "summary":String. pug content summarize.
+- "registration_date":String. yyyy-MM-ddThh:mm:ss.
+- "status":String. 'progress' or 'stop' or 'cancel' or 'return'.
+- "title":String. author and content."###.to_string(),
+    
+    "coupon" | "event" => r###"- "{TYPE}":Object.
+- "summary":String. pug content summarize.
+- "registration_date":String. yyyy-MM-ddThh:mm:ss.
+- "status":String. {TYPE} status('show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete').
+- "title":String. title."###.to_string(),
+    
+        _ => r###"- "{TYPE}":Object.
+- "summary":String. pug content summarize.
+- "registration_date":String. yyyy-MM-ddThh:mm:ss.
+- "status":String. {TYPE} status('show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
+- "title":String. title."###.to_string()
+    };
+
+    let mut final_pug = String::new();
+    if head_pug.trim_start().starts_with("thead") {
+        final_pug.push_str(head_pug);
+        if !head_pug.ends_with('\n') {
+            final_pug.push('\n');
+        }
+    } else {
+        final_pug.push_str("thead\n");
+        for line in head_pug.lines() {
+            final_pug.push_str(&format!("    {}\n", line));
+        }
+    }
+
+    if !item_pug.is_empty() {
+        final_pug.push_str("tbody\n");
+        for line in item_pug.lines() {
+            final_pug.push_str(&format!("    {}\n", line));
+        }
+    }
+
+    let pug_content = final_pug.trim_end().lines()
+        .map(|line| format!("    {}", line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let template = r###"[TASK]
+Extract Status, Date, and Title information from the provided Pug content into a single structured JSON object.
+
+[PUG CONTENT]
+{PUG_CONTENT}
+
+[CONTEXT]
+Language: {LANGUAGE}
+
+[SCHEMA DEFINITIONS]
+{SCHEMA}
+
+[OUTPUT FORMAT]
+{...}
+
+[ACTION] RETURN JSON ONLY. 
+NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template.replace("{SCHEMA}", &schema)
+            .replace("{TYPE}", page_type)
+            .replace("{LANGUAGE}", language)
+            .replace("{PUG_CONTENT}", &pug_content)
+}
+
+pub fn list2json_data(page_type: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
+    let schema = match page_type {
+    "order" => r###"- "{TYPE}":Object.
+- "summary":String. pug content summarize.
+- "currency":String. ISO 4217 Currency Code(If the currency is not explicitly stated, infer the currency based on PUG CONTENT).
+- "sale_price":Number.. actual selling price(discounted price).
+- "tracking_number":String. tracking Number or shipping number.
+- "shipping_method":String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid').
+- "shipping_fee":Number.. Cost of delivery."###.to_string(),
+
+    "goods" => r###"- "{TYPE}":Object.
+- "summary":String. pug content summarize.
+- "currency":String. ISO 4217 Currency Code(If the currency is not explicitly stated, infer the currency based on PUG CONTENT).
+- "compare_at_price":Number. product Original price for showing discounts(normal price, market price).
+- "supply_price":Number. supply price(wholesale price).
+- "sale_price":Number. actual selling price(discounted price)."###.to_string(),
+    
+    "tracking" | "review" => r###"- "{TYPE}":Object.
+- "summary":String. pug content summarize.
+- "additional_info":String. any other useful info."###.to_string(),
+    
+    "coupon" | "event" => r###"- "{TYPE}":Object.
+- "summary":String. pug content summarize.
+- "started_at":String. yyyy-MM-ddThh:mm:ss.
+- "expired_at":String. yyyy-MM-ddThh:mm:ss."###.to_string(),
+    
+        _ => r###"- "{TYPE}":Object.
+- "summary":String. pug content summarize.
+- "additional_info":String. any other useful info."###.to_string()
+    };
+
+    let mut final_pug = String::new();
+    if head_pug.trim_start().starts_with("thead") {
+        final_pug.push_str(head_pug);
+        if !head_pug.ends_with('\n') {
+            final_pug.push('\n');
+        }
+    } else {
+        final_pug.push_str("thead\n");
+        for line in head_pug.lines() {
+            final_pug.push_str(&format!("    {}\n", line));
+        }
+    }
+
+    if !item_pug.is_empty() {
+        final_pug.push_str("tbody\n");
+        for line in item_pug.lines() {
+            final_pug.push_str(&format!("    {}\n", line));
+        }
+    }
+
+    let pug_content = final_pug.trim_end().lines()
+        .map(|line| format!("    {}", line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let template = r###"[TASK]
+Extract detailed information (excluding IDs and Links) from the provided Pug content into a single structured JSON object.
+
+[PUG CONTENT]
+{PUG_CONTENT}
+
+[CONTEXT]
+Language: {LANGUAGE}
+
+[SCHEMA DEFINITIONS]
+{SCHEMA}
+
+[OUTPUT FORMAT]
+{...}
+
+[ACTION] RETURN JSON ONLY. 
+NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template.replace("{SCHEMA}", &schema)
+            .replace("{TYPE}", page_type)
             .replace("{LANGUAGE}", language)
             .replace("{PUG_CONTENT}", &pug_content)
 }
