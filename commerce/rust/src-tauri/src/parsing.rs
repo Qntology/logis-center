@@ -10,6 +10,7 @@ pub enum PugMode {
     TheadMode,
     ListMode, 
     NoAttributesMode, // 🌟 구조 판별을 위해 HTML의 모든 속성을 완벽히 비워버리는 전용 모드
+    IdClassOnlyMode,
 }
 
 pub fn sanitize_llm_input(text: &str) -> String {
@@ -523,7 +524,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 // 🌟 [CRITICAL FIX] colspan, rowspan, scope는 어떠한 경우에도 무조건 통과하도록 강제(Hardcode)합니다!
                 let should_include = ["colspan", "rowspan", "scope"].contains(&name_str) || if *mode == PugMode::TheadMode {
                     thead_include.contains(&name_str)
-                } else if *mode == PugMode::NoAttributesMode {
+                } else if *mode == PugMode::NoAttributesMode || *mode == PugMode::IdClassOnlyMode {
                     false
                 } else {
                     name_str.starts_with("data-") || always_include.contains(&name_str)
@@ -584,7 +585,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             if tag_name == "tbody" { if let Some(c) = ctx.as_mut() { c.is_in_tbody = false; } }
         }
         Node::Text(text) => {
-            if *mode == PugMode::FullContent || *mode == PugMode::DetailMode || *mode == PugMode::TheadMode || *mode == PugMode::ListMode || *mode == PugMode::NoAttributesMode {
+            if *mode == PugMode::FullContent || *mode == PugMode::DetailMode || *mode == PugMode::TheadMode || *mode == PugMode::ListMode || *mode == PugMode::NoAttributesMode || *mode == PugMode::IdClassOnlyMode {
                 let text_content = text.trim();
                 if !text_content.is_empty() {
                     // 🌟 [CRITICAL FIX 1] 숫자 사이의 콤마(,) 제거 (소수점은 완벽히 보존)
