@@ -1805,25 +1805,25 @@ pub fn extract_table_structure_prompt(page_type: &str, item_selector: &str, pug_
 {REFERENCE_ROW}
 
 [Instruction]
-Locate the body container and its corresponding header container within the [PUG CONTENT].
+Locate the main table wrapper, its body container, and its corresponding header container within the [PUG CONTENT].
 
 [Rules]
 1. Tag Agnostic: Do NOT assume traditional <table> tags. The structure could be built using <div>, <ul>/<li>, or other semantic tags. Analyze logically.
-2. Fill out the 'wrapper' key FIRST to logically establish the table parent wrapper.
-3. The `tbody` selector is "{ITEM_SELECTOR}". Return it exactly.
-4. Provide the final exact CSS selector for the `thead` based on your analysis.
+2. Fill out the `table` selector FIRST to logically establish the common parent wrapper that encompasses both the header (thead) and the items (tbody).
+3. The `tbody` selector is exactly "{ITEM_SELECTOR}". Return it as provided.
+4. Provide the final exact CSS selector for the `thead` based on your analysis within that table wrapper.
 
 [Expected Output Format]
 {
   "{TYPE}" : {
+    "tbody" : {
+      "selector" : "{ITEM_SELECTOR}"
+    },
     "table" : {
-      "tbody" : {
-        "selector" : "{ITEM_SELECTOR}"
-      },
-      "wrapper" : "CSS selector of the table parent wrapper",
-      "thead" : {
         "selector" : "..."
-      }
+    },
+    "thead" : {
+      "selector" : "..."
     }
   }
 }

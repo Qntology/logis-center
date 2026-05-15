@@ -1338,17 +1338,31 @@ async fn process_task(
                                 }
                             }
 
+                            // 1. thead 선택자 추출 (Flat 구조에 맞추어 get("table") 제거)
                             final_thead_selector = thead_val
-                                .and_then(|v| v.get("table"))
                                 .and_then(|v| v.get("thead"))
                                 .and_then(|v| v.get("selector"))
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("").to_string().replace(">", " "); // 🌟 꺾쇠(>) 문자를 공백으로 치환하여 파싱 유연성 확보
                             
+                            // 2. tbody와 thead를 감싸는 부모 wrapper(table) 선택자 추출
+                            let final_table_selector = thead_val
+                                .and_then(|v| v.get("table"))
+                                .and_then(|v| v.get("selector"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("").to_string().replace(">", " ");
+
                             if !final_thead_selector.is_empty() && final_thead_selector != "..." {
                                 selector_info.as_object_mut().unwrap().insert("head".to_string(), json!(final_thead_selector.clone()));
                                 println!("[Scheduler] AI determined head selector and cached: {}", final_thead_selector);
                                 cache_updated = true; // 새로운 head를 찾았으므로 DB 업데이트 예약
+                            }
+
+                            // 🌟 [추가] 추출된 table 선택자도 향후 렌더링/추출 보호를 위해 DB에 "wrapper"라는 속성명으로 저장 예약
+                            if !final_table_selector.is_empty() && !final_table_selector.contains("CSS selector") && final_table_selector != "..." {
+                                selector_info.as_object_mut().unwrap().insert("wrapper".to_string(), json!(final_table_selector.clone()));
+                                println!("[Scheduler] AI determined table wrapper selector and cached: {}", final_table_selector);
+                                cache_updated = true;
                             }
                         }
                     }
