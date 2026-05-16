@@ -1263,32 +1263,32 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 pub fn list2json_info(page_type: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
     let schema = match page_type {
     "order" => r###"- "{TYPE}":Object.
-- "summary":String. pug content summarize.
+- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
 - "registration_date":String. yyyy-MM-ddThh:mm:ss.
 - "status":String. {TYPE} status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
 - "title":String. title."###.to_string(),
 
     "goods" => r###"- "product":Object.
-- "summary":String. pug content summarize.
+- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
 - "registration_date":String. yyyy-MM-ddThh:mm:ss.
 - "status":String. {TYPE} status('show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire').
 - "code":String. product code (Stock Keeping Unit).
 - "title":String. title."###.to_string(),
     
     "tracking" | "review" => r###"- "{TYPE}":Object.
-- "summary":String. pug content summarize.
+- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
 - "registration_date":String. yyyy-MM-ddThh:mm:ss.
 - "status":String. 'progress' or 'stop' or 'cancel' or 'return'.
 - "title":String. author and content."###.to_string(),
     
     "coupon" | "event" => r###"- "{TYPE}":Object.
-- "summary":String. pug content summarize.
+- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
 - "registration_date":String. yyyy-MM-ddThh:mm:ss.
 - "status":String. {TYPE} status('show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete').
 - "title":String. title."###.to_string(),
     
         _ => r###"- "{TYPE}":Object.
-- "summary":String. pug content summarize.
+- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
 - "registration_date":String. yyyy-MM-ddThh:mm:ss.
 - "status":String. {TYPE} status('show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
 - "title":String. title."###.to_string()
@@ -1346,7 +1346,7 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 pub fn list2json_data(page_type: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
     let schema = match page_type {
     "order" => r###"- "{TYPE}":Object.
-- "summary":String. pug content summarize.
+- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
 - "currency":String. ISO 4217 Currency Code(If the currency is not explicitly stated, infer the currency based on PUG CONTENT).
 - "sale_price":Number.. actual selling price(discounted price).
 - "tracking_number":String. tracking Number or shipping number.
@@ -1354,23 +1354,23 @@ pub fn list2json_data(page_type: &str, language: &str, head_pug: &str, item_pug:
 - "shipping_fee":Number.. Cost of delivery."###.to_string(),
 
     "goods" => r###"- "{TYPE}":Object.
-- "summary":String. pug content summarize.
+- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
 - "currency":String. ISO 4217 Currency Code(If the currency is not explicitly stated, infer the currency based on PUG CONTENT).
 - "compare_at_price":Number. product Original price for showing discounts(normal price, market price).
 - "supply_price":Number. supply price(wholesale price).
 - "sale_price":Number. actual selling price(discounted price)."###.to_string(),
     
     "tracking" | "review" => r###"- "{TYPE}":Object.
-- "summary":String. pug content summarize.
+- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
 - "additional_info":String. any other useful info."###.to_string(),
     
     "coupon" | "event" => r###"- "{TYPE}":Object.
-- "summary":String. pug content summarize.
+- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
 - "started_at":String. yyyy-MM-ddThh:mm:ss.
 - "expired_at":String. yyyy-MM-ddThh:mm:ss."###.to_string(),
     
         _ => r###"- "{TYPE}":Object.
-- "summary":String. pug content summarize.
+- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
 - "additional_info":String. any other useful info."###.to_string()
     };
 
