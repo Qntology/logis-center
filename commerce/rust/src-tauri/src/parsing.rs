@@ -1196,8 +1196,9 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 
 pub fn list2json_meta(page_type: &str, href: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
     let schema = r###"- "{TYPE}":Object.
+- "code":String. product code (Stock Keeping Unit).
 - "path":String. {HREF}.
-- "id":String. Extract ONLY the numeric ID value from the link or attribute (e.g. '13' from 'product_no=13').
+- "id":String. Refer to the ID value from the link.
 - "link":String. Refer to the ID to find a URL that includes a manage link."###.to_string();
 
     let mut final_schema = schema;

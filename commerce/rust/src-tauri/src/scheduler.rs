@@ -1352,6 +1352,23 @@ async fn process_task(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("").to_string().replace(">", " ");
 
+                            // 🌟 [CRITICAL FIX] thead 선택자에 table 선택자가 포함되어 있지 않으면 조합하여 유효성을 검증합니다.
+                            if !final_thead_selector.is_empty() && final_thead_selector != "..." && !final_table_selector.is_empty() && final_table_selector != "..." {
+                                if !final_thead_selector.contains(&final_table_selector) {
+                                    let combined_sel = format!("{} {}", final_table_selector, final_thead_selector);
+                                    let doc = scraper::Html::parse_document(&clean_html_content);
+                                    
+                                    // 컴파일 에러 해결: Result의 에러 객체가 참조를 붙잡지 않도록 즉시 boolean으로 변환 후 스코프를 닫습니다.
+                                    let is_valid = scraper::Selector::parse(&combined_sel)
+                                        .map(|parsed_sel| doc.select(&parsed_sel).next().is_some())
+                                        .unwrap_or(false);
+
+                                    if is_valid {
+                                        final_thead_selector = combined_sel;
+                                    }
+                                }
+                            }
+
                             if !final_thead_selector.is_empty() && final_thead_selector != "..." {
                                 selector_info.as_object_mut().unwrap().insert("head".to_string(), json!(final_thead_selector.clone()));
                                 println!("[Scheduler] AI determined head selector and cached: {}", final_thead_selector);
@@ -1675,11 +1692,19 @@ async fn process_task(
                             }
                         }
 
-                        // 🌟 [CRITICAL FIX] ID에서 파라미터 제외 숫자만 독립 추출 (product_no=13 -> 13)
+                        // 🌟 [CRITICAL FIX] aa.ts 패리티 일치: 파라미터(key=value) 형태면 value만 추출하고, 
+                        // 영문이 포함된 상품코드(P000000S)가 파괴되지 않도록 알파벳을 보존합니다!
                         if let Some(id_val) = item_meta.get("id").and_then(|v| v.as_str()) {
-                            let num_str: String = id_val.chars().filter(|c| c.is_ascii_digit()).collect();
-                            if !num_str.is_empty() {
-                                item_meta.as_object_mut().unwrap().insert("id".to_string(), json!(num_str));
+                            let extracted = if let Some(idx) = id_val.rfind('=') {
+                                &id_val[idx + 1..]
+                            } else {
+                                id_val
+                            };
+                            
+                            // aa.ts의 cleanNumber()와 동일하게 하이픈, 언더바, 온점, 쉼표만 제거
+                            let clean_str = extracted.replace("-", "").replace("_", "").replace(".", "").replace(",", "");
+                            if !clean_str.is_empty() {
+                                item_meta.as_object_mut().unwrap().insert("id".to_string(), json!(clean_str.trim()));
                             }
                         }
 
@@ -1698,31 +1723,7 @@ async fn process_task(
                                 }
                             }
                             
-                            // 단순 push 대신 후처리 병합 수행 (rowspan 처리)
-                            let is_continuation = item_json.get("is_continuation").and_then(|v| v.as_bool()).unwrap_or(false);
-                            
-                            if is_continuation && pending_merge.is_some() {
-                                let mut parent = pending_merge.take().unwrap();
-                                crate::scheduler::merge_json_results(&mut parent, &item_json);
-                                merge_countdown -= 1;
-                                
-                                if merge_countdown > 0 {
-                                    pending_merge = Some(parent);
-                                } else {
-                                    all_extracted_items.push(parent);
-                                }
-                            } else {
-                                let rowspan = item_json.get("rowspan_count").and_then(|v| v.as_u64()).unwrap_or(1);
-                                if rowspan > 1 {
-                                    pending_merge = Some(item_json);
-                                    merge_countdown = rowspan - 1;
-                                } else {
-                                    if let Some(stray) = pending_merge.take() {
-                                        all_extracted_items.push(stray);
-                                    }
-                                    all_extracted_items.push(item_json);
-                                }
-                            }
+                            all_extracted_items.push(item_json);
                         }
                     },
                     (Err(e), _, _) => println!("[Scheduler] Error extracting item meta: {:?}", e),
@@ -1761,10 +1762,6 @@ async fn process_task(
                 unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
 
                 tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-            }
-
-            if let Some(last_item) = pending_merge.take() {
-                all_extracted_items.push(last_item);
             }
         }
         extracted_data = json!({ "items": all_extracted_items, "type": page_type, "detail": false });

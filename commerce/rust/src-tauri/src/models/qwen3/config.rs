@@ -52,7 +52,7 @@ pub struct Qwen3GenerationConfig {
 }
 
 fn default_repetition_penalty() -> f32 {
-    1.0
+    1.2
 }
 
 
@@ -66,7 +66,7 @@ impl Default for Qwen3GenerationConfig {
             top_p: 0.95,
             top_k: 80,
             temperature: 1.0,
-            repetition_penalty: 1.1,
+            repetition_penalty: 1.2,
         }
     }
 }
