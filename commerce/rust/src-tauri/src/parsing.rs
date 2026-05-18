@@ -786,6 +786,16 @@ RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 }
 
 pub fn is_detail_prompt(page_type: &str) -> String {
+    let (category_desc, titles_desc, title_desc) = match page_type {
+        "goods" => ("product", "product titles", "product title"),
+        "order" => ("product", "order product titles", "order product title"),
+        "tracking" => ("product", "tracking product titles", "tracking product title"),
+        "review" => ("title", "review titles", "review title"),
+        "coupon" => ("title", "coupon titles", "coupon title"),
+        "event" => ("title", "event titles", "event title"),
+        _ => ("title", "titles", "title"),
+    };
+
     let template = r###"[TASK]
 Analyze the provided PUG/HTML content from top to bottom. Determine if the main content represents a "{TYPE} Detail/{TYPE} Edit Form/{TYPE} Manage Form" (true) or a "{TYPE} List/Index Page/Home Page/Dashboard Page" (false).
 
@@ -828,6 +838,7 @@ Read the entire document from top to bottom, applying the following strict filte
 
 JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{TYPE}", page_type)
+        .replace("{CATEGORY}", category_desc)
 }
 
 // pub fn para2graph(language: &str) -> String {
