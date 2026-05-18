@@ -290,7 +290,7 @@ impl PrivacyFilterModel {
                 }
             }
             l
-        }).unwrap_or_else(crate::privacy_filter::config::build_label_list)
+        }).unwrap_or_else(config::build_label_list)
     }
 
     pub fn load(model_dir: &Path, device: &Device) -> Result<Self> {
@@ -312,7 +312,6 @@ impl PrivacyFilterModel {
     }
 
     pub fn forward(&self, input_ids: &[u32]) -> candle_core::Result<Tensor> {
-        // Look up on CPU, then move to device
         let mut x = self.embed_tokens.forward(&Tensor::new(input_ids, &Device::Cpu)?)?.to_device(&self.device)?.unsqueeze(0)?;
         
         let rope = RotaryEmbedding::new_yarn(&self.config.rope_parameters, self.config.head_dim, input_ids.len(), self.dtype, &self.device).map_err(candle_core::Error::msg)?;
@@ -327,19 +326,123 @@ impl PrivacyFilterModel {
     }
 
     pub fn predict(&self, text: &str) -> Result<Vec<PrivacySpan>> {
+        // VRAM 한계 보호를 위해 기본적으로 2048 사이즈로 청크 분할 및 SSD 오프로딩 호출
+        let chunk_size = 2048;
+        let overlap = 256;
+        self.predict_chunked(text, chunk_size, overlap)
+    }
+
+    pub fn predict_chunked(&self, text: &str, chunk_size: usize, overlap: usize) -> Result<Vec<PrivacySpan>> {
         let tokens = self.tokenizer.encode(text, false).map_err(anyhow::Error::msg)?;
         let input_ids = tokens.get_ids();
-        let s = input_ids.len();
-        let logits = self.forward(input_ids).map_err(anyhow::Error::msg)?;
-        let logits_data = logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>().map_err(anyhow::Error::msg)?;
-        
+        let total_len = input_ids.len();
         let num_labels = self.config.num_labels();
-        let label_list = self.config.id2label.as_ref().map(|m| {
-            let mut l = vec![String::new(); num_labels];
-            for (id, name) in m { l[id.parse::<usize>().unwrap()] = name.clone(); }
-            l
-        }).unwrap_or_else(crate::privacy_filter::config::build_label_list);
+        
+        // 텍스트가 청크 사이즈보다 작으면 SSD I/O 없이 바로 인퍼런스
+        if total_len <= chunk_size {
+            let logits = self.forward(input_ids).map_err(anyhow::Error::msg)?;
+            let logits_data = logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>().map_err(anyhow::Error::msg)?;
+            let label_list = self.get_label_list();
+            return Ok(viterbi::extract_spans(
+                &viterbi::viterbi_decode(&logits_data, total_len, num_labels, &self.viterbi_config), 
+                &logits_data, num_labels, &label_list, &tokens.get_tokens().iter().map(|s| s.to_string()).collect::<Vec<_>>(), 
+                tokens.get_offsets(), text
+            ));
+        }
 
-        Ok(viterbi::extract_spans(&viterbi::viterbi_decode(&logits_data, s, num_labels, &self.viterbi_config), &logits_data, num_labels, &label_list, &tokens.get_tokens().iter().map(|s| s.to_string()).collect::<Vec<_>>(), tokens.get_offsets(), text))
+        // SSD 오프로딩을 위한 임시 디렉토리 세팅
+        let temp_dir = std::env::temp_dir().join("privacy_filter_offload");
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let step = chunk_size - overlap;
+        let mut offset = 0;
+        let mut chunk_idx = 0;
+        let mut valid_logits_meta = Vec::new();
+
+        println!("[PRIVACY] Processing large document in chunks (Total Tokens: {})", total_len);
+
+        while offset < total_len {
+            let end = (offset + chunk_size).min(total_len);
+            let chunk_ids = &input_ids[offset..end];
+
+            // 1. Forward Pass (GPU 사용)
+            let logits_gpu = self.forward(chunk_ids).map_err(anyhow::Error::msg)?;
+
+            // 2. 즉시 CPU RAM으로 이동하여 VRAM 해제
+            let logits_cpu = logits_gpu.to_device(&Device::Cpu).map_err(anyhow::Error::msg)?;
+            
+            // 3. 오버랩 영역을 제외한 순수 유효 구간(Valid Range) 계산
+            let actual_len = end - offset;
+            let valid_start = if offset == 0 { 0 } else { overlap / 2 };
+            let valid_end = if end == total_len { actual_len } else { actual_len - overlap / 2 };
+
+            let valid_chunk = logits_cpu.narrow(1, valid_start, valid_end - valid_start).map_err(anyhow::Error::msg)?;
+            let valid_data = valid_chunk.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>().map_err(anyhow::Error::msg)?;
+
+            // 4. SSD로 오프로딩 (바이트 변환)
+            let chunk_path = temp_dir.join(format!("logits_chunk_{}.bin", chunk_idx));
+            let mut bytes = Vec::with_capacity(valid_data.len() * 4);
+            for val in valid_data {
+                bytes.extend_from_slice(&val.to_le_bytes());
+            }
+            std::fs::write(&chunk_path, bytes)?;
+
+            valid_logits_meta.push(chunk_path);
+
+            if end == total_len { break; }
+            offset += step;
+            chunk_idx += 1;
+        }
+
+        // 5. 모든 GPU 연산 완료 후 SSD에서 RAM으로 최종 병합
+        let mut merged_logits = Vec::with_capacity(total_len * num_labels);
+        for path in valid_logits_meta {
+            let bytes = std::fs::read(&path)?;
+            for chunk in bytes.chunks_exact(4) {
+                merged_logits.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            let _ = std::fs::remove_file(path); // 사용 완료된 파일 삭제
+        }
+
+        let label_list = self.get_label_list();
+
+        // 6. 단 1번의 통합 Viterbi 디코딩
+        Ok(viterbi::extract_spans(
+            &viterbi::viterbi_decode(&merged_logits, total_len, num_labels, &self.viterbi_config), 
+            &merged_logits, num_labels, &label_list, &tokens.get_tokens().iter().map(|s| s.to_string()).collect::<Vec<_>>(), 
+            tokens.get_offsets(), text
+        ))
     }
+}
+
+pub fn apply_mask(text: &str) -> String {
+    // 모델 경로와 디바이스 세팅
+    let model_dir = std::path::Path::new("models/privacy_filter");
+    let device = crate::utils::get_optimal_device_config().device;
+
+    // 모델을 로드하고 추론을 수행 (실제 운영 시에는 I/O 부하를 줄이기 위해 모델 인스턴스를 캐싱하는 것을 권장합니다)
+    if let Ok(model) = PrivacyFilterModel::load(model_dir, &device) {
+        if let Ok(spans) = model.predict(text) {
+            return mask_text_from_spans(text, &spans);
+        }
+    }
+    // 실패 시 원본 텍스트 반환
+    text.to_string()
+}
+
+fn mask_text_from_spans(text: &str, spans: &[PrivacySpan]) -> String {
+    let mut chars: Vec<char> = text.chars().collect();
+    let char_offsets: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+
+    for span in spans {
+        for (idx, &offset) in char_offsets.iter().enumerate() {
+            // Span 좌표에 해당하는 실제 문자열의 구간을 찾아 '*' 로 치환
+            if offset >= span.start && offset < span.end {
+                if let Some(c) = chars.get_mut(idx) {
+                    *c = '*';
+                }
+            }
+        }
+    }
+    chars.into_iter().collect()
 }

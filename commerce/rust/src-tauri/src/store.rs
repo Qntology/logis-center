@@ -453,6 +453,7 @@ impl VectorStore {
             Field::new("amount", DataType::Float32, true),
             Field::new("vector", DataType::FixedSizeList(Arc::new(item_field), 768), true),
             Field::new("text", DataType::Utf8, false),
+            Field::new("masked_text", DataType::Utf8, true),
             Field::new("data", DataType::Utf8, false),
             Field::new("created_at", DataType::Int64, false), 
             Field::new("updated_at", DataType::Int64, false),
@@ -469,11 +470,12 @@ impl VectorStore {
                         let current_schema = table.schema().await.unwrap_or_else(|_| Arc::new(Schema::new(Vec::<Field>::new())));
                         let has_ref = current_schema.field_with_name("ref").is_ok();
                         let has_mode = current_schema.field_with_name("mode").is_ok(); 
+                        let has_masked_text = current_schema.field_with_name("masked_text").is_ok();
                         let status_is_int = if let Ok(field) = current_schema.field_with_name("status") {
                             field.data_type() == &DataType::Int32
                         } else { false };
 
-                        if !has_ref || !status_is_int || !has_mode { 
+                        if !has_ref || !status_is_int || !has_mode || !has_masked_text { 
                             println!("[Store] Schema mismatch for {}. Dropping and recreating...", name);
                             let _ = self.conn.drop_table(name, &[]).await;
                         } else {
@@ -499,6 +501,14 @@ impl VectorStore {
             if let Ok(table) = self.conn.open_table(name).execute().await {
                 if name == "items" {
                     let _ = table.create_index(&["text"], lancedb::index::Index::FTS(
+                        lancedb::index::scalar::FtsIndexBuilder::default()
+                            .with_position(true)
+                            .base_tokenizer("ngram".to_string())
+                            .ngram_min_length(2)
+                            .ngram_max_length(3)
+                    )).execute().await;
+                    
+                    let _ = table.create_index(&["masked_text"], lancedb::index::Index::FTS(
                         lancedb::index::scalar::FtsIndexBuilder::default()
                             .with_position(true)
                             .base_tokenizer("ngram".to_string())
@@ -571,6 +581,7 @@ impl VectorStore {
          }
          let json_str = final_data.to_string();
          let text_content = final_data.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
+         let masked_text_content = final_data.get("masked_text").and_then(|s| s.as_str()).unwrap_or("").to_string();
          let status = data_val.get("status").and_then(|v| v.as_str()).map(|s| crate::logic::parse_status(s)).unwrap_or(0);
          let amount = data_val.get("total_amount").or_else(|| data_val.get("sale_price")).or_else(|| data_val.get("supply_price")).or_else(|| data_val.get("price")).or_else(|| data_val.get("shipping_fee")).or_else(|| data_val.get("discount")).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))).unwrap_or(0.0) as f32;
          let doc_date_str = data_val.get("order_date").or_else(|| data_val.get("registration_date")).or_else(|| data_val.get("release_date")).or_else(|| data_val.get("manufacture_date")).or_else(|| data_val.get("shipping_date")).or_else(|| data_val.get("started_at")).or_else(|| data_val.get("expired_at")).or_else(|| data_val.get("payment_date")).and_then(|v| v.as_str()).unwrap_or("");
@@ -603,7 +614,7 @@ impl VectorStore {
                 Arc::new(StringArray::from(vec![cc.unwrap_or("")])), Arc::new(StringArray::from(vec![bcc.unwrap_or("")])),
                 Arc::new(StringArray::from(vec![r#ref.unwrap_or("")])), Arc::new(StringArray::from(vec![digest.unwrap_or("")])),
                 Arc::new(arrow_array::Int32Array::from(vec![status])), Arc::new(arrow_array::Float32Array::from(vec![amount])),
-                Arc::new(list_array), Arc::new(StringArray::from(vec![text_content])), Arc::new(StringArray::from(vec![json_str])),
+                Arc::new(list_array), Arc::new(StringArray::from(vec![text_content])), Arc::new(StringArray::from(vec![masked_text_content])), Arc::new(StringArray::from(vec![json_str])),
                 Arc::new(Int64Array::from(vec![created_at])), Arc::new(Int64Array::from(vec![now_ts])),
                 Arc::new(StringArray::from(vec![mode_str])), 
          ])?;
@@ -651,11 +662,12 @@ impl VectorStore {
             let statuses = batch.column(8).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
             let amounts = batch.column(9).as_any().downcast_ref::<Float32Array>().unwrap();
             let texts = batch.column(11).as_any().downcast_ref::<StringArray>().unwrap();
-            let jsons = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+            let masked_texts = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+            let jsons = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
             let digests = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
-            let createds = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
-            let updateds = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
-            let modes = batch.column(15).as_any().downcast_ref::<StringArray>().unwrap(); 
+            let createds = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
+            let updateds = batch.column(15).as_any().downcast_ref::<Int64Array>().unwrap();
+            let modes = batch.column(16).as_any().downcast_ref::<StringArray>().unwrap(); 
             
             for i in 0..batch.num_rows() {
                 docs.push(TradeDocument { 
@@ -663,7 +675,7 @@ impl VectorStore {
                     from: froms.value(i).to_string(), to: tos.value(i).to_string(),
                     cc: ccs.value(i).to_string(), bcc: bccs.value(i).to_string(),
                     r#ref: refs.value(i).to_string(),
-                    text: texts.value(i).to_string(), json_data: jsons.value(i).to_string(),
+                    text: texts.value(i).to_string(), masked_text: masked_texts.value(i).to_string(), json_data: jsons.value(i).to_string(),
                     digest: digests.value(i).to_string(), total_amount: amounts.value(i),
                     status: statuses.value(i).to_string(), 
                     created_at_ts: createds.value(i), 
@@ -696,18 +708,19 @@ impl VectorStore {
         let statuses = batch.column(8).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
         let amounts = batch.column(9).as_any().downcast_ref::<Float32Array>().unwrap();
         let texts = batch.column(11).as_any().downcast_ref::<StringArray>().unwrap();
-        let jsons = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+        let masked_texts = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+        let jsons = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
         let digests = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
-        let createds = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
-        let updateds = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
-        let modes = batch.column(15).as_any().downcast_ref::<StringArray>().unwrap(); 
+        let createds = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
+        let updateds = batch.column(15).as_any().downcast_ref::<Int64Array>().unwrap();
+        let modes = batch.column(16).as_any().downcast_ref::<StringArray>().unwrap(); 
 
         Ok(Some(TradeDocument { 
             id: ids.value(0).to_string(), r#type: types.value(0).to_string(), 
             from: froms.value(0).to_string(), to: tos.value(0).to_string(),
             cc: ccs.value(0).to_string(), bcc: bccs.value(0).to_string(),
             r#ref: refs.value(0).to_string(),
-            text: texts.value(0).to_string(), json_data: jsons.value(0).to_string(), 
+            text: texts.value(0).to_string(), masked_text: masked_texts.value(0).to_string(), json_data: jsons.value(0).to_string(), 
             digest: digests.value(0).to_string(), total_amount: amounts.value(0),
             status: statuses.value(0).to_string(), 
             created_at_ts: createds.value(0), 
@@ -749,8 +762,8 @@ impl VectorStore {
                      q = q.only_if(f);
                  }
              } else {
-                 // 기존 ILIKE 스캔 로직 유지
-                 let text_filter = format!("(text ILIKE '%{}%' OR data ILIKE '%{}%')", sql_clean, sql_clean);
+                 // 기존 ILIKE 스캔 로직 유지 + 마스킹 텍스트까지 포함
+                 let text_filter = format!("(masked_text ILIKE '%{}%' OR text ILIKE '%{}%' OR data ILIKE '%{}%')", sql_clean, sql_clean, sql_clean);
                  let final_filter = if let Some(ref f) = filter {
                      format!("({}) AND {}", f, text_filter)
                  } else {
@@ -763,7 +776,7 @@ impl VectorStore {
                 if let Ok(batches) = res.try_collect::<Vec<_>>().await {
                     for b in batches {
                         let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-                        let txs = b.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+                        let txs = b.column(13).as_any().downcast_ref::<StringArray>().unwrap();
                         for i in 0..b.num_rows() { combined.insert(ids.value(i).to_string(), (txs.value(i).to_string(), 1.0)); }
                     }
                 }
@@ -784,7 +797,7 @@ impl VectorStore {
              let mut rank = 0;
              for b in vres {
                  let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap(); 
-                 let txs = b.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+                 let txs = b.column(13).as_any().downcast_ref::<StringArray>().unwrap();
                  for i in 0..b.num_rows() {
                      let id = ids.value(i).to_string();
                      let vec_score = 0.5 - (rank as f32 * 0.001);
@@ -824,7 +837,7 @@ impl VectorStore {
         let target_str = match value { Value::String(s) => s.clone(), Value::Number(n) => n.to_string(), _ => value.to_string() };
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            let datas = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+            let datas = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
             for i in 0..batch.num_rows() {
                 let json_str = datas.value(i);
                 if let Ok(data) = serde_json::from_str::<Value>(json_str) {
@@ -851,6 +864,7 @@ pub struct TradeDocument {
     #[serde(rename = "ref")]
     pub r#ref: String,
     pub text: String,
+    pub masked_text: String,
     pub json_data: String,
     pub digest: String,
     pub vector: Vec<f32>,

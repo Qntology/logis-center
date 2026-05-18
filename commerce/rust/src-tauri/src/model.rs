@@ -938,6 +938,24 @@ impl LogisModel {
             emit_term("=======================================\n");
 
             let nl = crate::parsing::json_to_natural_language(&extracted_data);
+            
+            // [PRIVACY] 무역 문서(BL, CI 등) 및 송장(Tracking)은 개인정보 밀집 구역이므로 반드시 마스킹을 적용합니다.
+            // 커머스 상품(goods) 이미지인 경우에만 예외적으로 우회합니다.
+            let doc_type = if is_trade_doc { 
+                extracted_data.get("header")
+                    .and_then(|h| h.get("doc_type"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("shipping_doc") 
+            } else { 
+                "tracking" 
+            };
+            
+            let masked_nl = if doc_type != "goods" {
+                crate::models::privacy_filter::apply_mask(&nl)
+            } else {
+                nl.clone()
+            };
+
             let item_digest = crate::utils::hash::digest(&nl);
 
             emit_term("[STAGE-3] Syncing extracted data to LanceDB...");
@@ -964,16 +982,6 @@ impl LogisModel {
                 
                 // 🌟 [CRITICAL FIX] 프론트엔드 리스트(#doc-list)와 완벽 동기화하기 위해 "items" 테이블로 저장 위치를 강제 통합합니다!
                 let table_name = "items"; 
-                
-                // 🌟 [수정] 사용자님 의견 반영: "shipping"으로 강제하지 않고, AI가 판별한 고유 문서 타입(BL, CI 등)을 그대로 저장합니다!
-                let doc_type = if is_trade_doc { 
-                    extracted_data.get("header")
-                        .and_then(|h| h.get("doc_type"))
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("shipping_doc") 
-                } else { 
-                    "tracking" 
-                };
 
                 let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}", doc_type, clean_no)));
                 let hashed_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val));
@@ -984,6 +992,8 @@ impl LogisModel {
                 final_data.as_object_mut().unwrap().insert("id".to_string(), json!(hashed_id));
                 // 🌟 [CRITICAL FIX] 이미지 추출 결과에도 모드 필터를 위한 mode 값을 명시적으로 주입합니다.
                 final_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                final_data.as_object_mut().unwrap().insert("text".to_string(), json!(nl));
+                final_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_nl));
 
                 // 🌟 [추가 보완] 무역 문서(Trade Doc)일 경우 Python처럼 핵심 컬럼 평탄화 (Flattening)
                 if is_trade_doc {

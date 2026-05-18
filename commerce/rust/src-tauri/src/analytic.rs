@@ -116,6 +116,12 @@ pub async fn process_analytic_task(
                             new_data.as_object_mut().unwrap().insert("action".to_string(), json!(action));
                             new_data.as_object_mut().unwrap().insert("relate".to_string(), json!(relate));
                             
+                            // [PRIVACY] 개별 분석 로그의 action과 summary를 결합하여 자연어 텍스트로 만들고 마스킹 처리
+                            let combined_text = format!("Action: {}. Summary: {}.", action, summary);
+                            let masked_text = crate::models::privacy_filter::apply_mask(&combined_text);
+                            new_data.as_object_mut().unwrap().insert("text".to_string(), json!(combined_text));
+                            new_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_text));
+
                             let emb = model.get_embedding(action.to_string()).await.unwrap_or(vec![0.0; 768]);
                             
                             // updated_at 을 now_ts 로 갱신하여 정식 데이터로 편입시킵니다.
@@ -131,13 +137,23 @@ pub async fn process_analytic_task(
     }
     
     // 6. Report 생성 및 통합 저장
+    let cross_action = tracking_res.get("cross_action_flow").and_then(|v| v.as_str()).unwrap_or("");
+    let intent_evo = tracking_res.get("intent_evolution").and_then(|v| v.as_str()).unwrap_or("");
+    let preferences = tracking_res.get("consistent_preferences").and_then(|v| v.as_str()).unwrap_or("");
+    
+    // [PRIVACY] 최종 리포트 결과물도 검색(FTS) 및 벡터화를 위해 텍스트로 추출 후 마스킹 적용
+    let report_text = format!("Flow: {}. Intent: {}. Preferences: {}.", cross_action, intent_evo, preferences);
+    let report_masked = crate::models::privacy_filter::apply_mask(&report_text);
+
     let report_id = crate::utils::hash::hash_id(&format!("report_{}", now_ts));
     let report_data = json!({
-        "cross_action_flow": tracking_res.get("cross_action_flow").and_then(|v| v.as_str()).unwrap_or(""),
-        "intent_evolution": tracking_res.get("intent_evolution").and_then(|v| v.as_str()).unwrap_or(""),
-        "consistent_preferences": tracking_res.get("consistent_preferences").and_then(|v| v.as_str()).unwrap_or(""),
+        "cross_action_flow": cross_action,
+        "intent_evolution": intent_evo,
+        "consistent_preferences": preferences,
         "time": now_ts,
-        "mode": "analytic" 
+        "mode": "analytic",
+        "text": report_text,
+        "masked_text": report_masked
     });
     
     let _ = store.upsert_item(
