@@ -248,21 +248,24 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::t
 
     
     if let Some(drop_limit) = bottom_drop_tokens {
-        let mut dropped_tokens = 0;
+        let mut low = 0;
+        let mut high = lines.len();
         let mut cut_idx = lines.len();
-        
-        for i in (0..lines.len()).rev() {
-            let line_with_newline = format!("{}\n", lines[i]);
-            let token_count = tokenizer.text_encode_vec(line_with_newline, false).map(|v| v.len()).unwrap_or(0);
-            
-            if dropped_tokens + token_count > drop_limit {
-                cut_idx = i + 1;
-                break; 
+
+        // 1. 하단 버리기(bottom_drop) 이진 탐색
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            let bottom_part = lines[mid..].join("\n");
+            let tokens = tokenizer.text_encode_vec(bottom_part, false).map(|v| v.len()).unwrap_or(0);
+
+            if tokens > drop_limit {
+                low = mid + 1;
+            } else {
+                cut_idx = mid;
+                if mid == 0 { break; }
+                high = mid - 1;
             }
-            dropped_tokens += token_count;
-            cut_idx = i;
         }
-        
         
         if cut_idx < lines.len() {
             if let Some((_, b_end)) = block_of_line[cut_idx] {
@@ -275,22 +278,24 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::t
         lines.truncate(safe_cut_idx);
     }
 
-    
-    let mut current_tokens = 0;
-    let mut start_keep_idx = lines.len();
+    let mut low = 0;
+    let mut high = lines.len();
+    let mut start_keep_idx = 0;
 
-    for i in (0..lines.len()).rev() {
-        let line_with_newline = format!("{}\n", lines[i]);
-        let token_count = tokenizer.text_encode_vec(line_with_newline, false).map(|v| v.len()).unwrap_or(0);
-        
-        if current_tokens + token_count > max_tokens {
-            start_keep_idx = i + 1;
-            break;
+    // 2. 최대 토큰(max_tokens) 제한 이진 탐색
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let part = lines[mid..].join("\n");
+        let tokens = tokenizer.text_encode_vec(part, false).map(|v| v.len()).unwrap_or(0);
+
+        if tokens > max_tokens {
+            low = mid + 1;
+        } else {
+            start_keep_idx = mid;
+            if mid == 0 { break; }
+            high = mid - 1;
         }
-        current_tokens += token_count;
-        start_keep_idx = i;
     }
-    
     
     if start_keep_idx < lines.len() && start_keep_idx > 0 {
         if let Some((b_start, _)) = block_of_line[start_keep_idx] {
@@ -309,14 +314,23 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::t
     }
     
     // 2. [복구 단계] 절단면 위쪽으로 거슬러 올라가며 필수 부모 껍데기 구출
+    let mut extracted_title = None;
+    
     if let Some(mut target_indent) = last_valid_indent {
         for i in (0..start_keep_idx).rev() {
             let line = lines[i];
-            if line.trim().is_empty() { continue; }
-            let current_indent = line.chars().take_while(|c| c.is_whitespace()).count();
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
             
-            if is_root_layout_element(line) {
-                break;
+            let current_indent = line.chars().take_while(|c| c.is_whitespace()).count();
+            let tag_name = trimmed.split(|c| c == '[' || c == ' ' || c == '(').next().unwrap_or("").to_lowercase();
+            
+            if tag_name == "title" && extracted_title.is_none() {
+                let mut title_block = format!("{}\n", line);
+                if i + 1 < lines.len() && lines[i+1].trim().starts_with('|') {
+                    title_block.push_str(&format!("{}\n", lines[i+1]));
+                }
+                extracted_title = Some(title_block);
             }
 
             if current_indent < target_indent && !is_void_element(line) {
@@ -324,6 +338,10 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::t
                 target_indent = current_indent; 
             }
         }
+    }
+    
+    if let Some(title_str) = extracted_title {
+        final_kept_lines.insert(0, title_str);
     }
     
     // 3. [정렬 단계] 수집된 라인을 정방향으로 유지한 채 다이내믹 뎁스 정렬 수행

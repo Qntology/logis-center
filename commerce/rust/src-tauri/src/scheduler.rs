@@ -569,8 +569,25 @@ async fn process_task(
 
     let clean_html_content = parsing::pre_clean_html(&raw_html_content);
     
-    let raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, Some(&url));
-    let light_pug = model.truncate_pug_context(&raw_pug, false, 2000, None).await;
+    let mut raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, Some(&url));
+    let mut light_pug = model.truncate_pug_context(&raw_pug, false, 2000, None).await;
+
+    // 1. 정확한 토큰 수 측정을 위해 Tokenizer 로드 (파일 경로 탐색)
+    let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap_or_default();
+    let tokenizer_path = base_path.join("Qwen3-0.6B-Instruct-gguf").to_string_lossy().to_string();
+    
+    let mut token_count = light_pug.len() / 8; // 로드 실패 시 대비용 안전 압축률 (1토큰 ≒ 8글자)
+    
+    if let Ok(tokenizer) = crate::tokenizer::TokenizerModel::init(&tokenizer_path) {
+        token_count = tokenizer.text_encode_vec(light_pug.clone(), false).map(|v| v.len()).unwrap_or(token_count);
+    }
+
+    // 2. 실제 계산된 토큰 수가 3000 이하일 경우 FullContent 모드로 승급
+    if token_count <= 3000 {
+        println!("[Scheduler] Document is short enough ({} tokens). Upgrading to FullContent Mode...", token_count);
+        raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, Some(&url));
+        light_pug = model.truncate_pug_context(&raw_pug, true, 0, None).await;
+    }
 
     println!("[DEBUG-PUG] Generated PUG. Length: {}. Snippet: {}...", 
         light_pug.len(), 

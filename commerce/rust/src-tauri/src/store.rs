@@ -1,7 +1,7 @@
 use anyhow::Result;
 use lancedb::{Connection, connect};
 use lancedb::query::{ExecutableQuery, QueryBase};
-use arrow_array::{RecordBatch, StringArray, Int64Array, Float32Array, FixedSizeListArray, RecordBatchIterator};
+use arrow_array::{RecordBatch, StringArray, Int64Array, Float32Array, FixedSizeListArray, RecordBatchIterator, Array};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use serde::{Serialize, Deserialize};
@@ -458,6 +458,7 @@ impl VectorStore {
             Field::new("created_at", DataType::Int64, false), 
             Field::new("updated_at", DataType::Int64, false),
             Field::new("mode", DataType::Utf8, true), 
+            Field::new("is_masked", DataType::Boolean, true),
         ]));
         
         let uri = if self.base_path.ends_with("lancedb") { self.base_path.to_string() } else { format!("{}/{}", self.base_path, DB_URI) };
@@ -471,11 +472,12 @@ impl VectorStore {
                         let has_ref = current_schema.field_with_name("ref").is_ok();
                         let has_mode = current_schema.field_with_name("mode").is_ok(); 
                         let has_masked_text = current_schema.field_with_name("masked_text").is_ok();
+                        let has_is_masked = current_schema.field_with_name("is_masked").is_ok();
                         let status_is_int = if let Ok(field) = current_schema.field_with_name("status") {
                             field.data_type() == &DataType::Int32
                         } else { false };
 
-                        if !has_ref || !status_is_int || !has_mode || !has_masked_text { 
+                        if !has_ref || !status_is_int || !has_mode || !has_masked_text || !has_is_masked { 
                             println!("[Store] Schema mismatch for {}. Dropping and recreating...", name);
                             let _ = self.conn.drop_table(name, &[]).await;
                         } else {
@@ -596,6 +598,7 @@ impl VectorStore {
          
          
          let mode_str = data_val.get("mode").and_then(|v| v.as_str()).unwrap_or("commerce").to_string();
+         let is_masked_val = data_val.get("is_masked").and_then(|v| v.as_bool()).unwrap_or(false);
          
          let schema = table.schema().await?;
          
@@ -616,7 +619,7 @@ impl VectorStore {
                 Arc::new(arrow_array::Int32Array::from(vec![status])), Arc::new(arrow_array::Float32Array::from(vec![amount])),
                 Arc::new(list_array), Arc::new(StringArray::from(vec![text_content])), Arc::new(StringArray::from(vec![masked_text_content])), Arc::new(StringArray::from(vec![json_str])),
                 Arc::new(Int64Array::from(vec![created_at])), Arc::new(Int64Array::from(vec![now_ts])),
-                Arc::new(StringArray::from(vec![mode_str])), 
+                Arc::new(StringArray::from(vec![mode_str])), Arc::new(arrow_array::BooleanArray::from(vec![Some(is_masked_val)])),
          ])?;
          table.add(vec![batch]).execute().await?;
          Ok(())
@@ -668,6 +671,7 @@ impl VectorStore {
             let createds = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
             let updateds = batch.column(15).as_any().downcast_ref::<Int64Array>().unwrap();
             let modes = batch.column(16).as_any().downcast_ref::<StringArray>().unwrap(); 
+            let maskeds = batch.column(17).as_any().downcast_ref::<arrow_array::BooleanArray>().unwrap();
             
             for i in 0..batch.num_rows() {
                 docs.push(TradeDocument { 
@@ -681,6 +685,7 @@ impl VectorStore {
                     created_at_ts: createds.value(i), 
                     updated_at_ts: updateds.value(i),
                     mode: modes.value(i).to_string(), 
+                    is_masked: maskeds.is_valid(i) && maskeds.value(i),
                     ..Default::default() 
                 });
             }
@@ -714,6 +719,7 @@ impl VectorStore {
         let createds = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
         let updateds = batch.column(15).as_any().downcast_ref::<Int64Array>().unwrap();
         let modes = batch.column(16).as_any().downcast_ref::<StringArray>().unwrap(); 
+        let maskeds = batch.column(17).as_any().downcast_ref::<arrow_array::BooleanArray>().unwrap();
 
         Ok(Some(TradeDocument { 
             id: ids.value(0).to_string(), r#type: types.value(0).to_string(), 
@@ -726,6 +732,7 @@ impl VectorStore {
             created_at_ts: createds.value(0), 
             updated_at_ts: updateds.value(0),
             mode: modes.value(0).to_string(), 
+            is_masked: maskeds.is_valid(0) && maskeds.value(0),
             ..Default::default() 
         }))
     }
@@ -873,6 +880,7 @@ pub struct TradeDocument {
     #[serde(rename = "updated_at")]
     pub updated_at_ts: i64,
     pub mode: String, 
+    pub is_masked: bool,
     pub item_descriptions: Vec<String>,
     pub item_hs_codes: Vec<String>,
     pub item_sku_numbers: Vec<String>,
