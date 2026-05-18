@@ -66,7 +66,7 @@ impl Qwen3VLVisionPatchEmbed {
     }
 
     pub fn new_from_gguf<R: Read + Seek>(gguf: &mut Gguf<R>) -> Result<Self> {
-        // 🌟 [RAM 피크 방어 2] F32 변환 스파이크 제거
+        
         let conv3d_weight_0 = gguf.get_dequantized_f16("v.patch_embd.weight")?.to_dtype(candle_core::DType::F16)?.unsqueeze(2)?;
         let conv3d_weight_1 = gguf.get_dequantized_f16("v.patch_embd.weight.1")?.to_dtype(candle_core::DType::F16)?.unsqueeze(2)?;
         let conv3d_weight = Tensor::cat(&[conv3d_weight_0, conv3d_weight_1], 2)?.flatten(1, 4)?.t()?;
@@ -237,7 +237,7 @@ impl Qwen3VLVisionAttention {
         let seq_length = xs.dim(0)?;
         let qkv_states = self.qkv.forward(xs)?.reshape((seq_length, 3, self.num_heads, ()))?.permute((1, 0, 2, 3))?; 
         
-        // 🌟 [CRITICAL FIX] 메모리 꼬임으로 인한 CUDA NaN(쓰레기값) 생성을 막기 위해 contiguous()를 부활시킵니다!
+        
         let query_states = qkv_states.i(0)?.contiguous()?; 
         let key_states = qkv_states.i(1)?.contiguous()?; 
         let value_states = qkv_states.i(2)?.contiguous()?; 
@@ -423,7 +423,7 @@ impl Qwen3VLVisionModel {
             .to_u32()? as usize;
         let patch_embed = Qwen3VLVisionPatchEmbed::new_from_gguf(mmproj_gguf)?;
         
-        // 🌟 [RAM 피크 방어 3] 640MB짜리 거대 위치 텐서의 F32 스파이크 방지
+        
         let pos_emb_weight = mmproj_gguf.get_dequantized_f16("v.position_embd.weight")?.to_dtype(candle_core::DType::F16)?;
         
         let hidden_size = mmproj_gguf
@@ -572,7 +572,7 @@ impl Qwen3VLVisionModel {
             Tensor::cat(&weight_tensors[2], 0)?, Tensor::cat(&weight_tensors[3], 0)?,
         ], 0)?.to_device(dev)?.to_dtype(self.dtype)?; 
         
-        // 🌟 [타입 충돌 픽스] RAM 최적화를 위해 BF16으로 압축해둔 위치 텐서를, 곱셈 직전에만 안전하게 F32(self.dtype)로 풀어줍니다!
+        
         let pos_embeds = self.pos_embed.forward(&idx_tensor)?.to_dtype(self.dtype)?.broadcast_mul(&weight_tensor.unsqueeze(D::Minus1)?)?;
         
         let patch_pos_embeds = pos_embeds.i(0)?.add(&pos_embeds.i(1)?)?.add(&pos_embeds.i(2)?)?.add(&pos_embeds.i(3)?)?;
@@ -595,7 +595,7 @@ impl Qwen3VLVisionModel {
                 pos_emebd_last_dim,
             ]);
             
-            // 🌟 [CRITICAL FIX] permute(차원 뒤섞기) 직후에 무조건 contiguous()로 메모리를 물리적으로 재정렬해야만
+            
             // 뒤따라오는 flatten(0, 4) 연산이 정상적으로 수행되며, 이미지가 깨지는 환각(공백 출력) 증세가 완벽하게 사라집니다!
             let pos_embed = pos_embed
                 .reshape(shape)?
@@ -850,7 +850,7 @@ impl Qwen3VLModel {
             self.config.video_token_id as u32
         };
         
-        // 🌟 CPU 왕복 및 캐스팅을 완전히 삭제하고 VRAM 내에서 즉시 고속 비교 연산을 수행합니다.
+        
         let special_token = Tensor::new(vec![special_token_id], input_ids.device())?;
         let special_mask = input_ids
             .broadcast_eq(&special_token)?

@@ -1324,7 +1324,7 @@ pub fn conv1d_depthwise(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>) 
             .narrow(2, 0, len_out)?
             .broadcast_mul(&weight.narrow(1, 0, 1)?.unsqueeze(0)?)?;
         for k in 1..kernel_size {
-            // 🌟 [수정] 루프 내부에서도 타입을 일치시켜서 더하기
+            
             let piece = input.narrow(2, k, len_out)?.broadcast_mul(&weight.narrow(1, k, 1)?.unsqueeze(0)?)?;
             out = out.add(&piece)?;
         }
@@ -1335,7 +1335,7 @@ pub fn conv1d_depthwise(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>) 
         None => Ok(out),
         Some(bias) => {
             let b = bias.dims1()?;
-            // 🌟 [수정] 바이어스도 입력 타입(BF16)으로 변환 후 더하기
+            
             let bias = bias.reshape((1, b, 1))?.to_dtype(input.dtype())?;
             Ok(out.broadcast_add(&bias)?)
         }

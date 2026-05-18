@@ -344,7 +344,7 @@ impl QuantizedDecoderLayer {
         
         let prefix = format!("blk.{}.", layer_idx);
         
-        // 🌟 [VRAM 피크 방어] 레이어별 Norm 텐서 CPU 우회
+        
         let t_in = ct.tensor(reader, &format!("{}attn_norm.weight", prefix), &Device::Cpu)?;
         let input_ln_w = t_in.dequantize_f16(&Device::Cpu).or_else(|_| t_in.dequantize(&Device::Cpu))?.to_dtype(candle_core::DType::F32)?.to_device(device)?;
         
@@ -368,7 +368,7 @@ pub struct QuantizedModel {
 
 impl QuantizedModel {
     pub fn new<R: std::io::Seek + std::io::Read>(cfg: &Config, ct: &gguf_file::Content, reader: &mut R, device: &Device) -> Result<Self> {
-        // 🌟 [VRAM 피크 방어] 임베딩 텐서를 CPU에 유지합니다.
+        
         let t_emb = ct.tensor(reader, "token_embd.weight", &Device::Cpu)?;
         let tok_emb = t_emb.dequantize_f16(&Device::Cpu).or_else(|_| t_emb.dequantize(&Device::Cpu))?.to_dtype(candle_core::DType::F32)?;
         let embed_tokens = candle_nn::Embedding::new(tok_emb, cfg.hidden_size);
@@ -380,7 +380,7 @@ impl QuantizedModel {
             layers.push(QuantizedDecoderLayer::new(cfg, ct, reader, i, device, rotary.clone())?);
         }
         
-        // 🌟 [VRAM 피크 방어] Norm 가중치도 CPU에서 안전하게 처리 후 GPU로 전송
+        
         let t_norm = ct.tensor(reader, "output_norm.weight", &Device::Cpu)?;
         let norm_w = t_norm.dequantize_f16(&Device::Cpu).or_else(|_| t_norm.dequantize(&Device::Cpu))?.to_dtype(candle_core::DType::F32)?.to_device(device)?;
         let norm = RmsNorm::from_tensor(norm_w, cfg.rms_norm_eps);

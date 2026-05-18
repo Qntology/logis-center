@@ -189,7 +189,7 @@ impl Qwen3VLProcessor {
         if let Ok(nvml) = nvml_wrapper::Nvml::init() {
             if let Ok(dev) = nvml.device_by_index(0) {
                 if let Ok(mem) = dev.memory_info() {
-                    // 🌟 [CRITICAL FIX] Qwen 3.5 (Vision)의 Eager Attention OOM 완벽 방어!
+                    
                     // 비전 모델은 이미지 패치(Patch) 개수의 제곱(N^2)에 비례하여 VRAM을 폭식합니다.
                     // 1344x1344 (1.8M 픽셀) = 7056 토큰 = 3.2GB의 행렬 연산 메모리가 일시적으로 필요하므로 4GB 환경에서는 무조건 터집니다.
                     // 따라서 VRAM 용량별로 안전한 "최대 픽셀 수"를 철저하게 보수적으로 재조정합니다.
@@ -448,7 +448,7 @@ impl Qwen3VLProcessor {
         let merge_length = self.img_process_cfg.merge_size.pow(2);
         let mut text = text.to_string();
         
-        // 🌟 방탄 로직 1: 템플릿 파서가 이미지를 날려버렸을 경우를 대비해 자동 복구
+        
         if image_grid_thw.is_some() && !text.contains(&self.image_token) {
             if let Some(idx) = text.find("<|im_start|>user\n") {
                 text.insert_str(idx + 17, &format!("{}\n", self.image_token));
@@ -457,7 +457,7 @@ impl Qwen3VLProcessor {
             }
         }
         
-        // 🌟 방탄 로직 2: 태그 중복 방지 및 초과 토큰 삭제
+        
         if let Some(ref image_grid_thw) = image_grid_thw {
             let mut index = 0;
             let num_images = image_grid_thw.dim(0)?;

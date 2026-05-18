@@ -4,7 +4,7 @@ mod automation;
 pub mod parsing;
 mod logic;
 mod scheduler;
-pub mod analytic; // 🌟 Analytic 전용 모듈 등록
+pub mod analytic; 
 
 pub mod models;
 pub mod utils;
@@ -13,28 +13,28 @@ pub mod openai_types;
 pub mod chat_template;
 pub mod tokenizer;
 
-use tauri::{State, Manager, Listener, Emitter}; // 🌟 Emitter 추가!
+use tauri::{State, Manager, Listener, Emitter}; 
 use tokio::sync::Mutex as TokioMutex;
-use std::sync::RwLock; // 🌟 추가
-use once_cell::sync::Lazy; // 🌟 추가
+use std::sync::RwLock; 
+use once_cell::sync::Lazy; 
 use model::LogisModel;
 use store::{VectorStore, TradeDocument};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{Value, json};
 
-// 🌟 [CRITICAL FIX] 전역 검색 상태 락: 검색 중 스레드 데드락 방지
+
 static IS_SEARCHING: AtomicBool = AtomicBool::new(false);
 // 브라우저가 실행되는 도중 상태를 방어하기 위한 락 추가
 pub static IS_BROWSER_LAUNCHING: AtomicBool = AtomicBool::new(false);
 
-// 🌟 [CRITICAL FIX] 상태 토글(깜빡임) 방어용 전역 상태 및 시간값 저장소
+
 pub static CURRENT_BROWSER_STATE: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("stopped".to_string()));
 pub static LAST_BROWSER_STATE_CHANGE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 pub static ACTIVE_TASK_MEM: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::new(None));
 pub static CURRENT_UI_CATEGORY: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::from("Processing")));
-// 🌟 [CRITICAL FIX] SSD에 적히지 않는 실시간 퍼센트 데이터를 붙잡아둘 0.01초 단위 메모리 캐시!
+
 pub static LATEST_PROGRESS_PAYLOAD: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::new(None));
 
 pub struct AppState {
@@ -58,7 +58,7 @@ async fn get_active_task_context() -> Result<Value, String> {
                     if let Some(summary) = latest.get("summary") {
                         result.as_object_mut().unwrap().insert("summary".to_string(), summary.clone());
                     }
-                    // 🌟 [CRITICAL FIX] 프론트엔드가 퍼센트(%)를 즉시 복구할 수 있도록 최신 전체 페이로드도 통째로 꽂아줍니다!
+                    
                     result.as_object_mut().unwrap().insert("latest_payload".to_string(), latest.clone());
                 }
             }
@@ -79,7 +79,7 @@ async fn stop_current_extraction(
     crate::utils::set_extraction_stop_signal(true);
     
     // 2. Clear from DB
-    // 🌟 [CRITICAL FIX] try_lock() 사용 시 스케줄러가 DB를 잠시 사용 중이면 삭제 명령이 무시되어 유령(Ghost) 작업이 남는 치명적 버그를 해결합니다.
+    
     // lock().await를 사용하여 스케줄러의 DB 작업이 끝날 때까지 찰나를 기다린 후 100% 확실하게 지워버립니다.
     let store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
@@ -88,7 +88,7 @@ async fn stop_current_extraction(
             let _ = db.delete_message_by_task_id(id).await;
             println!("[STOP] Task and message {} cleared from DB.", id);
         } else {
-            // 🌟 [수정] 존재하지 않는 cleanup_zombie_tasks 대신 통합된 cleanup_unfinished_tasks_on_startup 호출
+            
             let _ = db.cleanup_unfinished_tasks_on_startup().await;
             println!("[STOP] All pending tasks cleared from DB.");
         }
@@ -100,7 +100,7 @@ async fn stop_current_extraction(
         *model_guard = None;
     }
 
-    // 🌟 [CRITICAL FIX] ACTIVE_TASK_MEM 메모리 명시적 해제 추가
+    
     // 백엔드의 현재 작업 캐시를 즉시 비워야 프론트엔드의 #btn-extract 버튼이 정상적으로 부활합니다.
     if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() {
         *w = None;
@@ -125,7 +125,7 @@ async fn delete_message(
 
 #[tauri::command]
 async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
-    // 🌟 [CRITICAL FIX] 검색 중일 때는 unload를 즉시 튕겨냅니다. (Mutex 락 꼬임 및 UI 프리징 완벽 차단!)
+    
     if IS_SEARCHING.load(Ordering::SeqCst) {
         println!("[UNLOAD] AI Search is active. Skipping unload to prevent deadlock.");
         return Ok("Search active. Memory kept.".to_string());
@@ -197,13 +197,13 @@ async fn set_ignore_cursor_events(app_handle: tauri::AppHandle, ignore: bool) {
 
 #[tauri::command]
 async fn launch_browser(
-    state: State<'_, AppState>, // 🌟 Tauri State 주입
+    state: State<'_, AppState>, 
     app_handle: tauri::AppHandle,
     browser: String,
     url: String,
     script: String,
 ) -> Result<String, String> {
-    // 🌟 [CRITICAL FIX] 브라우저 실행 전, 잔류한 Stop 시그널을 강제 해제합니다!
+    
     state.cancellation_token.store(false, Ordering::SeqCst);
     crate::utils::set_extraction_stop_signal(false);
 
@@ -233,11 +233,11 @@ async fn launch_browser(
 
 #[tauri::command]
 async fn launch_best_browser(
-    state: State<'_, AppState>, // 🌟 Tauri State 주입
+    state: State<'_, AppState>, 
     app_handle: tauri::AppHandle,
     url: String,
 ) -> Result<String, String> {
-    // 🌟 [CRITICAL FIX] 브라우저 실행 전, 잔류한 Stop 시그널을 강제 해제합니다!
+    
     state.cancellation_token.store(false, Ordering::SeqCst);
     crate::utils::set_extraction_stop_signal(false);
 
@@ -257,7 +257,7 @@ async fn launch_best_browser(
     
     let result = automation::run_browser_automation(target.to_string(), url, "".to_string(), app_handle).await;
 
-    // 🌟 [CRITICAL FIX] 메모리 등재(is_some)는 즉시 이루어지므로 대기열을 바로 통과해버리는 버그를 차단합니다.
+    
     // Error 반환과 관계없이, 크롬 프로세스 포트가 100% 물리적으로 응답(reachable)할 때까지 최대 10초간 대기합니다.
     for _ in 0..20 {
         if automation::is_browser_reachable().await {
@@ -324,10 +324,10 @@ async fn search_documents(
     state: State<'_, AppState>,
     query: String,
     limit: usize,
-    offset: usize, // 🌟 [CRITICAL FIX] _offset에서 언더바(_)를 제거하여 값을 활성화합니다.
+    offset: usize, 
     filter: Option<String>,
 ) -> Result<Vec<(String, String, f32)>, String> {
-    // 🌟 [추가] 프론트엔드가 텍스트 검색을 요청할 때마다 터미널에 로그를 찍습니다.
+    
     println!("[DB-SEARCH] 텍스트 검색 요청 수신 (Query: '{}', Filter: {:?})", query, filter);
 
     let store_opt = {
@@ -339,17 +339,17 @@ async fn search_documents(
             }
         }
         store_guard.as_ref().cloned()
-    }; // 🌟 즉시 자물쇠 해제!
+    }; 
     
-    // 🌟 [CRITICAL FIX] 빈 쿼리일 때는 임베딩 모델을 절대 로드하지 않음 (검색 직후 VRAM이 다시 차버리는 현상 해결!)
+    
     let query_vec = if !query.trim().is_empty() {
-        // 🌟 [CRITICAL FIX] 백그라운드 연산이 돌아가고 있을 때는 임베딩 모델 로드(VRAM 차지)를 원천 차단하고 텍스트 검색만 수행합니다.
+        
         let is_task_active = crate::ACTIVE_TASK_MEM.read().unwrap().is_some();
         if is_task_active {
             println!("[DB-SEARCH] Background task is active. Skipping embedding model load to prevent VRAM overflow.");
             vec![0.0; 768]
         } else {
-            let model_opt = { state.model.lock().await.as_ref().cloned() }; // 🌟 즉시 자물쇠 해제!
+            let model_opt = { state.model.lock().await.as_ref().cloned() }; 
             if let Some(model) = model_opt {
                 model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 768])
             } else {
@@ -361,10 +361,10 @@ async fn search_documents(
     };
 
     if let Some(store) = store_opt {
-        // 🌟 [CRITICAL FIX] 실시간 빠른 검색(#global-search)이므로 use_fts 파라미터에 false를 전달하여 ILIKE로 스캔합니다.
+        
         let search_result = store.search_items("items", &query, query_vec, limit, offset, filter, false).await.map_err(|e| e.to_string());
         
-        // 🌟 [추가] DB 검색이 완료된 후 반환된 결과 건수와 상세 내용(벡터 제외)을 터미널에 로그로 남깁니다.
+        
         match &search_result {
             Ok(items) => {
                 println!("[DB-SEARCH] 검색 완료: {}건 반환", items.len());
@@ -392,7 +392,7 @@ fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
 
     if let Some(status) = ctx.get("status").and_then(|v| v.as_str()) {
         if !status.is_empty() && status != "null" {
-            // 🌟 [CRITICAL FIX 2] 상태값은 문자열이 아니라 Int32로 치환해서 검색해야 합니다.
+            
             let status_int = crate::logic::parse_status(status);
             filters.push(format!("status = {}", status_int));
         }
@@ -400,18 +400,18 @@ fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
 
     if let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()) {
         for (key, val_obj) in cond {
-            // 🌟 [CRITICAL FIX] Python의 PATH_MAP 역할을 수행하도록 무역 문서용 필드 완벽 추가!
+            
             let valid_cols = [
                 "amount", "status", "type", "created_at", "updated_at",
                 "no", "carrier", "shipping_method", "sender_address", "recipient_address", 
                 "shipping_date", "delivery_date", "weight",
-                // 🌟 [무역 문서 전용 컬럼 추가]
+                
                 "vessel", "pol", "pod", "incoterms", "sender_name", "recipient_name", "issue_date"
             ];
             
             let mapped_key = match key.as_str() {
                 "price" | "sale_price" | "discount" | "supply_price" | "order" | "goods" => "amount",
-                // 🌟 무역 문서의 중첩 키 평탄화 매핑 (Python PATH_MAP과 동일한 역할)
+                
                 "document_number" | "tracking_number" => "no",
                 "supplier_name" | "shipper_name" => "sender_name",
                 "buyer_name" | "consignee_name" => "recipient_name",
@@ -454,12 +454,12 @@ async fn get_all_documents(
     offset: usize,
     filter: Option<String>,
 ) -> Result<Vec<TradeDocument>, String> {
-    // 🌟 [추가] 프론트엔드가 리스트를 요청할 때마다 터미널에 로그를 찍습니다.
+    
     println!("[DB-FETCH] 리스트 불러오기 요청 수신 (Limit: {}, Filter: {:?})", limit, filter);
 
-    let mut store_guard = state.store.lock().await; // 🌟 mut로 변경하여 쓰기 가능하게 만듭니다.
+    let mut store_guard = state.store.lock().await; 
     
-    // 🌟 [CRITICAL FIX] DB 초기화 레이스 컨디션 해결
+    
     // 프론트엔드가 데이터를 요청했는데 DB가 아직 없으면 즉시 여기서 로드합니다.
     if store_guard.is_none() {
         let db_path = "data/lancedb";
@@ -610,7 +610,7 @@ async fn ai_search_complex(
     bcc: String,
     ref_id: String,
 ) -> Result<Value, String> {
-    // 🌟 [대격변] 프론트엔드(LocalStorage)에서 100% 입구를 통제하므로, 
+    
     // 백엔드의 무거운 LanceDB 조회 및 락 대기열 로직을 전면 철거했습니다! (속도 대폭 향상)
     
     let emit_term = |msg: &str| {
@@ -640,7 +640,7 @@ async fn ai_search_complex(
         store_guard.as_ref().cloned() 
     };
 
-    // 🌟 1. DB에 Task 및 Message 등록 (시간차를 두어 정렬 순서 물리적 고정)
+    
     if let Some(store) = store_opt.as_ref() {
         let now = chrono::Utc::now().timestamp_millis();
         
@@ -682,10 +682,10 @@ async fn ai_search_complex(
         ).await;
     }
 
-    // 🌟 [결단] 대기열 진입 시 프론트엔드에 'PENDING'임을 명시적으로 알립니다.
+    
     let payload_pending = json!({ 
         "task_id": task_id, 
-        "category": "Pending", // 🌟 Processing이 아닌 Pending 카테고리 사용
+        "category": "Pending", 
         "summary": "Waiting for AI Engine access...", 
         "spinner": "📥" 
     });
@@ -735,7 +735,7 @@ async fn ai_search_complex(
         model_guard.as_ref().unwrap().clone() 
     }; 
 
-    // 🌟 2. 대기열(Pending) 통과 후 상태 업데이트
+    
     if let Some(store) = store_opt.as_ref() {
         let _ = store.update_task_status(&task_id, 1).await; // 1: Processing
         
@@ -753,7 +753,7 @@ async fn ai_search_complex(
     let _ = app_handle.emit("extraction-progress", &payload_start);
     crate::scheduler::log_task_progress(&app_handle, &task_id, &payload_start);
 
-    // 🌟 model_guard가 여기서 소멸되지 않고 이 아래 비동기 블록이 끝날 때까지 유지됩니다.
+    
     let search_process = async {
         let mut all_results = Vec::new();
         
@@ -770,7 +770,7 @@ async fn ai_search_complex(
             }
         }
 
-        // 🌟 취소 토큰(cancel_token)을 파싱 함수에 전달!
+        
         let structured_query = match search_mode.as_str() {
             "shipping" => {
                 model.parse_shipping_query(&task_id, &app_handle, query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
@@ -785,7 +785,7 @@ async fn ai_search_complex(
 
         if let (Some(store), Some(ctx_arr)) = (store_opt.clone(), structured_query.get("context").and_then(|v| v.as_array())) {
             for ctx in ctx_arr {
-                // 🌟 매 루프마다 사용자가 Cancel 버튼을 눌렀는지 체크!
+                
                 if cancel_token.load(Ordering::Relaxed) { 
                     return Err("Search cancelled by user".to_string()); 
                 }
@@ -797,7 +797,7 @@ async fn ai_search_complex(
                 
                 let ctx_type = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
                 
-                // 🌟 [CRITICAL FIX] 데이터 파편화를 막고 프론트엔드 검색과 완벽 동기화하기 위해 타겟을 "items"로 통일!
+                
                 let target_table = match ctx_type {
                     "member" | "team" | "user" => "users",
                     "page" | "pages" => "pages",
@@ -808,7 +808,7 @@ async fn ai_search_complex(
                 let sql_filter = convert_conditions_to_sql(ctx);
                 let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 768]);
                 
-                // 🌟 [CRITICAL FIX] Deep Search(#btn-submit)일 때 LLM이 영어로 번역한 텍스트를 제공하므로, 
+                
                 // Commerce 모드에서는 FTS(MATCH)를 활성화하여 벡터 검색과 동시에 실행합니다.
                 let use_fts = search_mode == "commerce";
                 let search_result = store.search_items(target_table, text, emb.clone(), 5, 0, sql_filter.clone(), use_fts).await;
@@ -836,7 +836,7 @@ async fn ai_search_complex(
                 let _ = store.update_task_status(&task_id, 9).await; 
                 let _ = store.update_message_status(&task_id, 9, None).await;
 
-                // 🌟 [수정] 프론트엔드 UI 렌더링을 위해 추출된 결과(result_data)를 페이로드에 담아 보냅니다.
+                
                 let payload_done = json!({ 
                     "task_id": task_id, 
                     "category": "Done", 
@@ -857,7 +857,7 @@ async fn ai_search_complex(
         }
     }
 
-    // 🌟 [CRITICAL FIX] 검색 파이프라인 완료 후 메모리 캐시를 깔끔하게 비워줍니다.
+    
     {
         let mut mem_guard = crate::ACTIVE_TASK_MEM.write().unwrap();
         if let Some(mem) = mem_guard.as_ref() {
@@ -869,7 +869,7 @@ async fn ai_search_complex(
 
     model.deep_purge_resources().await; 
     
-    // 🌟 함수 종료 직전 가드와 락을 명시적으로 정리
+    
     drop(model_guard);
     IS_SEARCHING.store(false, Ordering::SeqCst);
     
@@ -931,7 +931,7 @@ async fn deep_research_command(
     if let Some(store) = store_guard.as_ref() {
         // General search for context
         let emb = model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 768]);
-        // 🌟 [CRITICAL FIX] 파라미터 시그니처 변경에 맞추어 use_fts 인자(false)를 추가합니다.
+        
         if let Ok(results) = store.search_items("items", &query, emb, 3, 0, None, false).await {
             let docs: Vec<String> = results.iter()
                 .map(|(_, text, _)| format!("- {}", text))
@@ -1056,13 +1056,13 @@ async fn check_active_task(
     _state: State<'_, AppState>,
     payload: ActiveTaskQuery,
 ) -> Result<bool, String> {
-    // 🌟 [CRITICAL FIX] LanceDB 대신 초고속 RAM 캐시인 ACTIVE_TASK_MEM만 확인합니다.
+    
     if let Ok(mem_guard) = crate::ACTIVE_TASK_MEM.read() {
         if let Some(active) = mem_guard.as_ref() {
             let active_ref = active.get("ref").and_then(|v| v.as_str()).unwrap_or("");
             let status = active.get("status").and_then(|v| v.as_i64()).unwrap_or(0);
             
-            // 🌟 [CRITICAL FIX] 작업 상태가 1(Processing) 또는 10(Queued)일 때만 진행 중인 것으로 판단해야 
+            
             // 완료된 작업(9)에 의해 추출 버튼이 영구적으로 숨겨지는 버그를 완벽히 막을 수 있습니다.
             if active_ref == payload.r#ref && (status == 1 || status == 10) {
                 return Ok(true); // 현재 메모리에서 해당 페이지가 아직 처리 또는 대기 중임
@@ -1128,7 +1128,7 @@ async fn get_chat_messages(
         // 1. 일반 메시지 쿼리 (프론트엔드에서 요청한 limit, offset 적용)
         let mut messages = db.get_all_messages(limit, offset, filter.clone()).await.unwrap_or_default();
         
-        // 🌟 [근본 해결책] 2. limit에 밀려 잘려나가는 것을 방지하기 위해, 
+        
         // 진행 중(1)이거나 대기 중(10)인 활성 Task는 DB에서 한 번 더 쿼리하여 무조건 포함시킵니다!
         let active_filter = if let Some(ref f) = filter {
             format!("({}) AND status IN (1, 10)", f)
@@ -1153,7 +1153,7 @@ async fn get_chat_messages(
     }
 }
 
-// 🌟 [CRITICAL FIX] 이전 정리 과정에서 실수로 누락된 get_known_pages 함수를 다시 복구합니다.
+
 #[tauri::command]
 async fn get_known_pages(state: State<'_, AppState>) -> Result<Vec<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
@@ -1168,7 +1168,7 @@ async fn get_known_users(state: State<'_, AppState>) -> Result<Vec<TradeDocument
     if let Some(store) = store_guard.as_ref() {
         let mut all_users = store.get_all_items("users", 50, 0, None).await.unwrap_or_default();
         
-        // 🌟 [CRITICAL FIX] DataFusion SQL에서 'type'은 예약어이므로 반드시 백틱(`)으로 감싸 파싱 에러(Silent Fail)를 방지합니다!
+        
         if let Ok(team_docs) = store.get_all_items("users", 1, 0, Some("`type` = 'team'".to_string())).await {
             for t in team_docs {
                 if !all_users.iter().any(|u| u.id == t.id) {
@@ -1228,9 +1228,9 @@ async fn get_browser_status() -> Result<Value, String> {
     
     // 1. 물리적 포트 응답 확인 및 메모리 가드 획득
     let reachable = automation::is_browser_reachable().await;
-    let guard = automation::GLOBAL_BROWSER.lock().await; // 🌟 mut 제거
+    let guard = automation::GLOBAL_BROWSER.lock().await; 
     
-    // 🌟 [CRITICAL FIX] TcpStream 타임아웃 등 네트워크 지연으로 인한 오판독(reachable=false) 시 
+    
     // 브라우저 객체를 강제로 None 처리해버리는 치명적 버그 삭제. 실제 종료 정리는 백그라운드 핸들러가 수행함.
     
     // 2. 현재 브라우저의 물리적 실행 여부 판별
@@ -1268,7 +1268,7 @@ async fn get_active_tasks(state: State<'_, AppState>) -> Result<Vec<store::Task>
     let store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
         let mut tasks = db.get_pending_tasks(10).await.unwrap_or_default();
-        // 🌟 [CRITICAL FIX] get_pending_tasks(1) 오타 수정: 진행 중인 작업(1)은 get_processing_tasks 로 명확히 가져옵니다.
+        
         if let Ok(mut active) = db.get_processing_tasks(10).await {
             tasks.append(&mut active);
         }
@@ -1282,7 +1282,7 @@ async fn get_active_tasks(state: State<'_, AppState>) -> Result<Vec<store::Task>
 async fn get_task_logs(app_handle: tauri::AppHandle, task_id: String) -> Result<Vec<Value>, String> {
     let log_path = crate::utils::paths::get_task_log_file(Some(&app_handle), &task_id);
     
-    // 🌟 [CRITICAL FIX] 파일에 적힌 100% 확실한 과거 순서만 믿습니다! 
+    
     // 메모리에 떠도는 최신 퍼센트를 강제로 끝에 끼워 넣으면 스텝 순서(stepMap)가 꼬입니다.
     if log_path.exists() {
         let content = std::fs::read_to_string(log_path).map_err(|e| e.to_string())?;
@@ -1298,24 +1298,24 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
     if let Some(db) = store_guard.as_ref() {
         let mut count = 0;
         for item in items {
-            // 🌟 [보강] id가 데이터 최상위에 없을 경우 data 객체 내부를 한 번 더 탐색하여 정합성을 확보합니다.
+            
             let id = item.get("id").and_then(|v| v.as_str())
                         .or_else(|| item.get("data").and_then(|d| d.get("id")).and_then(|v| v.as_str()))
                         .unwrap_or("").to_string();
             
-            // 🌟 [CRITICAL FIX] 클라우드(index.ts) 로직 반영: type 문자열 무조건 공백제거 및 소문자 통일
+            
             let type_str = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();
 
-            // 🌟 [수정] 터미널을 도배하던 거대한 배열(Data Buffer) 로그 출력을 지우고 ID와 Type만 심플하게 남깁니다.
+            
             println!("[DEBUG] Syncing item - ID: {}, Type: {}", id, type_str);
             
-            // 🌟 [CRITICAL FIX] 세탁된 type_str을 원본 JSON(clean_item)에도 강제로 덮어씌웁니다.
+            
             let mut clean_item = item.clone();
             if let Some(obj) = clean_item.as_object_mut() {
                 obj.insert("type".to_string(), serde_json::json!(type_str));
             }
 
-            // 🌟 [CRITICAL FIX] 클라우드(aa.ts)에서 넘어온 데이터 객체의 이중 래핑(Matryoshka) 해제
+            
             // item 안에 "data"가 객체로 존재한다면, 그 안의 알맹이를 최상위로 끌어올립니다.
             if type_str != "talk" && type_str != "prompt" && type_str != "ai_search" {
                 if let Some(data_obj) = clean_item.get("data").and_then(|v| v.as_object()).cloned() {
@@ -1328,7 +1328,7 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                 }
             }
             
-            // 🌟 [CRITICAL FIX] "talk" 타입의 데이터 구조를 프론트엔드 및 Cloud 백엔드의 표준 구조와 동일하게 강제 정규화합니다.
+            
             if type_str == "talk" || type_str == "prompt" || type_str == "ai_search" {
                 let text_val = clean_item.get("text")
                     .or_else(|| clean_item.get("query"))
@@ -1371,8 +1371,8 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                 "tracking" | "receiving" | "shipping" => "tracking",
                 "event" | "coupon" => "event",
                 "member" | "team" | "user" => "users",
-                "talk" | "prompt" | "ai_search" => "talks", // 🌟 talk 관련 타입들을 명확히 talks 테이블로 라우팅
-                "pages" | "page" => "pages", // 🌟 [CRITICAL FIX] "pages" 타입 데이터가 items 테이블로 유실되지 않도록 명시적 라우팅 추가!
+                "talk" | "prompt" | "ai_search" => "talks", 
+                "pages" | "page" => "pages", 
                 _ => {
                     if clean_item.get("data").and_then(|d| d.get("origin")).is_some() {
                         "pages"
@@ -1382,7 +1382,7 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                 }
             };
 
-            // 🌟 [CRITICAL FIX] Move 에러 방지: clean_item 대신 원본 item을 사용하여 참조를 분리합니다.
+            
             let from = item.get("from").and_then(|v| v.as_str());
             let to = item.get("to").and_then(|v| v.as_str());
             let cc = item.get("cc").and_then(|v| v.as_str());
@@ -1426,12 +1426,12 @@ async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, St
     
     if let Some(db) = store_guard.as_ref() {
         let mut raw_tasks = db.get_pending_tasks(10).await.unwrap_or_default();
-        // 🌟 [CRITICAL FIX] limit=1 로 인해 다른 진행 중인 작업들이 증발하던 버그를 해결하고 전용 함수 사용
+        
         if let Ok(mut active) = db.get_processing_tasks(10).await {
             raw_tasks.append(&mut active);
         }
         
-        // 🌟 [핵심 변경] 현재 Rust 메모리에서 실제로 돌고 있는 유일한 태스크 ID 추출
+        
         let mem_task_id = if let Ok(mem) = crate::ACTIVE_TASK_MEM.read() {
             mem.as_ref().and_then(|v| v.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_string()
         } else { 
@@ -1439,25 +1439,25 @@ async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, St
         };
 
         for t in raw_tasks {
-            // 🌟 1. DB엔 1(Processing)인데 Rust 메모리에 없다면? -> 진짜 좀비! 즉시 에러(error) 처리
+            
             if t.status == 1 && t.id != mem_task_id {
                 let error_status = crate::logic::parse_status("error");
                 println!("[DB-SYNC] Zombie task detected in DB: {}. Marking as ERROR.", t.id);
                 let _ = db.update_task_status(&t.id, error_status).await;
                 let _ = db.update_message_status(&t.id, error_status, Some("App closed unexpectedly. Task failed.")).await;
             } 
-            // 🌟 2. 진짜 돌고 있는 작업이거나 정상 대기열(10)인 경우만 프론트엔드로 전달
+            
             else if t.status == 1 || t.status == 10 {
                 tasks.push(t);
             }
         }
 
-        // 🌟 [CRITICAL FIX] 데이터 누수 원인 해결! 통계가 담긴 가장 오래된 부모 문서들이 짤려나가지 않도록 조회 한도를 대폭 상향합니다.
+        
         pages = db.get_all_items("pages", 1000, 0, None).await.unwrap_or_default();
         
-        // 🌟 [최적화] 1000개를 무식하게 불러오지 않고, 50개만 부른 뒤 통계(team) 문서만 타겟팅하여 안전하게 합칩니다.
+        
         users = db.get_all_items("users", 50, 0, None).await.unwrap_or_default();
-        // 🌟 [CRITICAL FIX] DataFusion SQL에서 'type'은 예약어이므로 반드시 백틱(`)으로 감싸 파싱 에러(Silent Fail)를 방지합니다!
+        
         if let Ok(team_docs) = db.get_all_items("users", 1, 0, Some("`type` = 'team'".to_string())).await {
             for t in team_docs {
                 if !users.iter().any(|u| u.id == t.id) {
@@ -1472,7 +1472,7 @@ async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, St
     let browser_status = {
         let is_launching = crate::IS_BROWSER_LAUNCHING.load(std::sync::atomic::Ordering::SeqCst);
         let reachable = automation::is_browser_reachable().await;
-        let guard = automation::GLOBAL_BROWSER.lock().await; // 🌟 mut 제거
+        let guard = automation::GLOBAL_BROWSER.lock().await; 
         
         // 강제 메모리 해제 로직 제거
         
@@ -1548,7 +1548,7 @@ pub fn run() {
             crate::utils::set_extraction_stop_signal(false);
 
             let setup_store = app.state::<AppState>().store.clone();
-            // 🌟 [CRITICAL FIX] 좀비 정리는 앱의 다른 기능이 시작되기 전에 '동기적'으로 완료되어야 합니다.
+            
             // spawn 대신 block_on 계열의 처리를 통해 순서를 보장합니다.
             tauri::async_runtime::block_on(async move {
                 let mut store_guard = setup_store.lock().await;
@@ -1559,7 +1559,7 @@ pub fn run() {
                     let _ = s.init_task_table().await;
                     let _ = s.init_all_tables().await;
                     
-                    // 🌟 [핵심] 스케줄러 스레드가 생성되기 전에 DB를 먼저 정리합니다.
+                    
                     let _ = s.cleanup_unfinished_tasks_on_startup().await;
                     
                     let error_status = crate::logic::parse_status("error");
@@ -1596,14 +1596,14 @@ pub fn run() {
                 let _ = automation::try_reconnect_existing_browser(auto_reconnect_handle).await;
             });
 
-            // 🌟 [CRITICAL FIX] Rust 백엔드에서 브라우저 상태를 주기적으로 감시하여 프론트엔드에 시그널을 보내는 전용 데몬 추가
+            
             let status_monitor_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut last_status = String::new();
                 loop {
                     let is_launching = crate::IS_BROWSER_LAUNCHING.load(std::sync::atomic::Ordering::SeqCst);
                     let reachable = automation::is_browser_reachable().await;
-                    let guard = automation::GLOBAL_BROWSER.lock().await; // 🌟 mut 제거
+                    let guard = automation::GLOBAL_BROWSER.lock().await; 
                     
                     // 강제 메모리 해제 로직 제거
                     
@@ -1620,7 +1620,7 @@ pub fn run() {
                     };
                     
                     if current_status != last_status {                        
-                        // 🌟 [CRITICAL FIX] 백그라운드 워커인지 사용자 화면인지 구분하기 위해 현재 상태를 조회합니다
+                        
                         let is_launching = crate::IS_BROWSER_LAUNCHING.load(std::sync::atomic::Ordering::SeqCst);
                         let (is_client, is_admin, url) = {
                             let state = automation::LAST_DETECTED_STATE.lock().await;
@@ -1647,13 +1647,13 @@ pub fn run() {
 
             let event_store = app.state::<AppState>().store.clone();
             let event_cancel = app.state::<AppState>().cancellation_token.clone();
-            // 🌟 [수정] 핸들러 내부에서 이벤트를 쏘기 위해 app_handle을 획득합니다.
+            
             let handle_for_event = app.handle().clone(); 
 
             app.listen("new-task-from-browser", move |event| {
                 event_cancel.store(false, Ordering::SeqCst);
                 crate::utils::set_extraction_stop_signal(false);
-                let app_handle = handle_for_event.clone(); // 🌟 [수정] 클로저 내부에서 사용할 이름 정의
+                let app_handle = handle_for_event.clone(); 
 
                 if let Ok(payload_val) = serde_json::from_str::<serde_json::Value>(event.payload()) {
                     let store_clone = event_store.clone();
@@ -1662,7 +1662,7 @@ pub fn run() {
                         if let Some(db) = store_guard.as_ref() {
                             let now = chrono::Utc::now().timestamp_millis();
                             
-                            // 🌟 [클라우드 패리티 일치] 0번 주소 상수화 및 팀 ID 매핑 로직 강화
+                            
                             let zero_addr = "0x0000000000000000000000000000000000000000";
                             let from_addr = payload_val.get("from").and_then(|v| v.as_str()).unwrap_or(zero_addr).to_string();
                             
@@ -1692,7 +1692,7 @@ pub fn run() {
                             
                             let _ = db.add_task(task.clone()).await;
                             
-                            // 🌟 [수정] 유효한 app_handle을 사용하여 이벤트를 발송합니다.
+                            
                             let _ = app_handle.emit("task-db-registered", json!({
                                 "task_id": task.id,
                                 "status": task.status,
@@ -1713,7 +1713,7 @@ pub fn run() {
             get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
             upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message, check_gpu_availability,
             save_mobile_temp_file, crate::utils::network::get_local_network_prefix, crate::utils::network::get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer,
-            get_active_task_context // 🌟 새로 추가됨
+            get_active_task_context 
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

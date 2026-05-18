@@ -254,7 +254,7 @@ impl QwenVLTextRotaryEmbedding {
         
         let cos_select: Vec<Tensor> = cos_all.split(&mrope_section_doubled, D::Minus1)?
             .iter().enumerate().map(|(i, m)| m.i(i % 3).unwrap()).collect();
-        // 🌟 [CRITICAL FIX 3] 비연속 메모리로 인한 GPU NaN(쓰레기값) 생성을 원천 차단하기 위해 contiguous()를 복원합니다!
+        
         let cos = Tensor::cat(&cos_select, D::Minus1)?.unsqueeze(1)?.contiguous()?; 
 
         let sin_select: Vec<Tensor> = sin_all.split(&mrope_section_doubled, D::Minus1)?

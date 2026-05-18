@@ -28,7 +28,7 @@ pub struct GenerationResult {
 
 pub struct Qwen3_5GenerateModel {
     chat_template: ChatTemplate,
-    pub tokenizer: TokenizerModel, // 🌟 [CRITICAL FIX] 외부 모듈 접근을 위해 pub 추가!
+    pub tokenizer: TokenizerModel, 
     pub pre_processor: Option<Qwen3VLProcessor>,
     pub qwen3_5: Qwen3_5Model,
     device: Device,
@@ -36,7 +36,7 @@ pub struct Qwen3_5GenerateModel {
     model_name: String,
     repeat_penalty: f32,
     repeat_last_n: usize,
-    pub max_position_embeddings: usize, // 🌟 [CRITICAL FIX] config 의존성을 끊고 자체적으로 한계치 보관
+    pub max_position_embeddings: usize, 
 }
 
 impl Qwen3_5GenerateModel {
@@ -75,7 +75,7 @@ impl Qwen3_5GenerateModel {
             model_name: model_name.to_string(),
             repeat_penalty: 1.1,
             repeat_last_n: 64,
-            max_position_embeddings: max_pos, // 🌟 저장
+            max_position_embeddings: max_pos, 
         })
     }
 
@@ -107,13 +107,13 @@ impl Qwen3_5GenerateModel {
         let model_dir = std::path::Path::new(model_file).parent().unwrap().to_str().unwrap();
         let chat_template = ChatTemplate::init(model_dir)?;
 
-        // 🌟 GGUF 폴백 시에도 config.json을 찾거나 메타데이터에서 max_position_embeddings를 읽어옵니다.
+        
         let config_path = std::path::Path::new(model_dir).join("config.json");
         let max_pos = if config_path.exists() {
             let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(config_path)?)?;
             cfg.get("max_position_embeddings").or_else(|| cfg.get("text_config").and_then(|t| t.get("max_position_embeddings"))).and_then(|v| v.as_u64()).unwrap_or(262144) as usize
         } else {
-            // 🌟 [CRITICAL FIX] anyhow::Error 와 candle_core::Error 충돌을 막기 위해 .ok() 로 Option 체이닝 처리
+            
             model_gguf.get_matedata("qwen35.context_length").ok().and_then(|m| m.to_u32().ok()).unwrap_or(262144) as usize
         };
 
@@ -146,7 +146,7 @@ impl Qwen3_5GenerateModel {
             .and_then(|s| s.to_str())
             .unwrap_or("qwen3.5");
             
-        // 🌟 [최종 RAM 피크 박살] 비전 모델과 텍스트 모델 로딩이 완전히 끝난 직후!
+        
         // OS 할당자가 붙잡고 있는 수 기가바이트의 찌꺼기 램을 OS 커널 레벨에서 강제로 토해내게 만듭니다.
         #[cfg(target_os = "windows")]
         unsafe {
@@ -170,7 +170,7 @@ impl Qwen3_5GenerateModel {
             model_name: stem.to_string(),
             repeat_penalty: 1.1, 
             repeat_last_n: 64,
-            max_position_embeddings: max_pos, // 🌟 저장
+            max_position_embeddings: max_pos, 
         })
     }
 
@@ -349,12 +349,12 @@ impl Qwen3_5GenerateModel {
             let current_pos = seqlen_offset + seq_len;
             let is_eos = next_token == self.eos_token_id;
             
-            // 🌟 [UI 자연스러움] 매 토큰(1글자)마다 즉각 업데이트!
+            
             if true {
                 let pct = if is_json_finished || is_eos {
                     100
                 } else {
-                    // 🌟 15% 시작 & 고속 점근 곡선 적용
+                    
                     15 + (84.0 * (1.0 - (-0.05 * (i as f32)).exp())) as i32
                 };
                 
@@ -588,12 +588,12 @@ impl Qwen3_5GenerateModel {
             let current_pos = seqlen_offset + seq_len;
             let is_eos = next_token == self.eos_token_id;
             
-            // 🌟 [UI 자연스러움] 매 토큰(1글자)마다 즉각 업데이트!
+            
             if true {
                 let pct = if is_json_finished || is_eos {
                     100
                 } else {
-                    // 🌟 15% 시작 & 고속 점근 곡선 적용
+                    
                     15 + (84.0 * (1.0 - (-0.05 * (i as f32)).exp())) as i32
                 };
                 
@@ -696,7 +696,7 @@ impl Qwen3_5GenerateModel {
         let input_ids = self.tokenizer.text_encode_vec(mes_render.clone(), false)?;
         let total_toks = input_ids.len();
 
-        // 🌟 [CRITICAL FIX] Token Boundary Merge로 인한 SSM 상태 오염 원천 차단!
+        
         // Qwen 3.5의 Mamba(SSM) 레이어는 과거로 롤백(Truncate)이 불가능합니다.
         // 뒤에 이어붙을 질문([TASK]) 때문에 마지막 토큰 경계가 변형되어 뇌가 깨지는 것을 막기 위해,
         // 안전하게 마지막 10개 토큰은 굽지 않고 남겨둡니다. (generate_part에서 자연스럽게 이어서 연산됨)
@@ -715,7 +715,7 @@ impl Qwen3_5GenerateModel {
         if let Some(s_id) = &session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(s_id);
             if !path.exists() { std::fs::create_dir_all(&path)?; }
-            // 🌟 저장도 안전하게 자른 텐서 기준(safe_input_ids)으로 저장합니다.
+            
             std::fs::write(path.join("tokens.json"), serde_json::to_string(&safe_input_ids)?)?;
 
             let _ = self.qwen3_5.language_model.force_flush_all_active_blocks(s_id, kv_name.as_deref()).await;

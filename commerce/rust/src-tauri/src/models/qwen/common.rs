@@ -8,7 +8,7 @@ use candle_nn::{
 
 use crate::{
     position_embed::rope::{RoPE, apply_rotary_pos_emb, apply_rotary_pos_emb_roformer},
-    utils::tensor_utils::prepare_causal_attention_mask, // 🌟 Warning의 원인이었던 repeat_kv만 쏙 뺐습니다!
+    utils::tensor_utils::prepare_causal_attention_mask, 
 };
 
 #[derive(Debug, Clone)]
@@ -724,7 +724,7 @@ pub fn eager_attention_forward(
         // 수치적 안정성을 위한 Max 로짓 추출 및 통합 준비
         let max_logits = attn_weights.max_keepdim(D::Minus1)?;
         
-        // 🌟 [CRITICAL FIX] NaN 파괴 현상 원천 차단 패치
+        
         let safe_floor = Tensor::new(-10000.0_f32, max_logits.device())?
             .to_dtype(max_logits.dtype())?
             .broadcast_as(max_logits.shape())?;

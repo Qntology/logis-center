@@ -46,7 +46,7 @@ fn merge_json_results(target: &mut Value, source: &Value) {
     }
 }
 
-// 🌟 [CRITICAL FIX] aa.ts의 mergeNode 로직 완벽 이식: 빈 값(null, 0, "")은 무시하고 유효한 값만 덮어씁니다.
+
 fn merge_node(obj1: &Value, obj2: &Value) -> Value {
     let mut merged = obj1.clone();
     if let (Some(m_obj), Some(o2_obj)) = (merged.as_object_mut(), obj2.as_object()) {
@@ -107,7 +107,7 @@ pub async fn start_background_worker(
         }
     });
 
-    // 🌟 [삭제] 이미 lib.rs 의 setup 블록에서 동기적으로 정리가 완료되었으므로, 
+    
     // 여기서 다시 spawn 하여 불필요한 DB 락 경쟁을 일으킬 필요가 없습니다.
     
     tokio::spawn(async move {
@@ -117,7 +117,7 @@ pub async fn start_background_worker(
         
         let mut delay_secs = 1;
         let mut current_device_pref: Option<String> = None;
-        // 🌟 [CRITICAL FIX] 무한 OOM 재시도를 막기 위한 재시도 장부 추가
+        
         let mut oom_retry_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         
         loop {
@@ -132,7 +132,7 @@ pub async fn start_background_worker(
                 if let Some(db) = store_opt.as_ref() {
                     match db.get_pending_tasks(5).await {
                         Ok(tasks) => {
-                            // 🌟 [CRITICAL FIX] 스케줄러는 프론트엔드가 큐로 통제하는 검색 작업(ai_search)을 절대 훔쳐가지 않습니다!
+                            
                             pending_tasks = tasks.into_iter().filter(|t| t.r#type != "ai_search").collect();
                         },
                         Err(e) => println!("[Scheduler] Failed to fetch tasks: {:?}", e),
@@ -171,7 +171,7 @@ pub async fn start_background_worker(
                         let _ = db.update_task_status(&task.id, 1).await;
                         let _ = db.update_message_status(&task.id, 1, Some("Processing...")).await;
                         
-                        // 🌟 [CRITICAL FIX] 프론트엔드의 중복 대기열 방어 로직(check_active_task)이 정상 작동하도록 ref도 함께 저장합니다.
+                        
                         if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() {
                             *w = Some(json!({ "id": task.id, "ref": task.r#ref, "status": 1 }));
                         }
@@ -182,7 +182,7 @@ pub async fn start_background_worker(
                     Ok(_) => {
                         println!("[Scheduler] Task completed: {}", task.id);
                         
-                        // 🌟 [CRITICAL FIX] 메모리의 상태를 9(Complete)로 업데이트하여 UI가 완료되었음을 확실히 인지하게 만듭니다.
+                        
                         if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() { 
                             if let Some(task_val) = w.as_mut() {
                                 if let Some(obj) = task_val.as_object_mut() {
@@ -228,7 +228,7 @@ pub async fn start_background_worker(
 
                         if err_msg.contains("Task cancelled") {
                              println!("[Scheduler] Task cancelled: {}", task.id);
-                             // 🌟 [CRITICAL FIX] 취소된 작업은 프론트엔드에서 이미 UI와 DB 레코드를 날린 상태입니다.
+                             
                              // 여기서 백엔드가 메시지를 다시 생성하거나 이벤트를 쏘면 UI가 좀비처럼 부활하므로 조용히 종료만 합니다.
                              current_device_pref = None;
                              continue;
@@ -240,14 +240,14 @@ pub async fn start_background_worker(
                                 println!("[Scheduler] OOM Detected! VRAM is purged. Retrying on GPU...");
                                 current_device_pref = None;
 
-                                // 🌟 [CRITICAL FIX 2] Warning 로그를 장부(파일)에 적지 않고 화면에만 즉시 쏩니다!
+                                
                                 let payload = json!({
                                     "task_id": task.id,
                                     "category": "Warning", "summary": "Memory pressure detected. VRAM cleared. Retrying on GPU...", "spinner": "♻️"
                                 });
                                 let _ = app_handle.emit("extraction-progress", &payload);
 
-                                // 🌟 그리고 파일을 삭제하여 다음 시작(Processing)이 100% 깨끗한 1번 스텝이 되게 만듭니다.
+                                
                                 let log_path = crate::utils::paths::get_task_log_file(Some(&app_handle), &task.id);
                                 let _ = std::fs::remove_file(&log_path);
                                 
@@ -332,7 +332,7 @@ async fn process_task(
     device_preference: Option<String>,
 ) -> Result<()> {
     
-    // 🌟 [CRITICAL FIX] 비동기 채널과 스레드 꼬임으로 인한 로그 역전 현상 원천 차단!
+    
     let app_handle_clone = app_handle.clone();
     let tid_clone = task.id.clone();
     let emit_term = move |msg: &str| {
@@ -341,7 +341,7 @@ async fn process_task(
         let _ = app_handle_clone.emit("task-console-log", serde_json::json!({"task_id": tid_clone, "text": format!("{}\n", msg)}));
     };
 
-    // 🌟 [클라우드 패리티 일치] 로그인이 안 된 경우(0번 주소)에도 일관된 팀 해시 ID를 사용하도록 수정
+    
     let zero_addr = "0x0000000000000000000000000000000000000000";
     let from_addr = if task.from.is_empty() { zero_addr.to_string() } else { task.from.clone() };
     let team_id = if task.to.is_empty() || task.to == zero_addr { 
@@ -353,7 +353,7 @@ async fn process_task(
     emit_term("\n=======================================");
     emit_term(&format!("[PROCESS] ⚙️ Task {} started processing.", task.id));
 
-    // 🌟 [추가] Analytic 작업일 경우 별도의 파이프라인으로 위임(Delegate)하여 처리합니다.
+    
     if task.r#type == "analytic_extraction" {
         return crate::analytic::process_analytic_task(
             task, store_mutex, model_mutex, cancellation_token, app_handle, device_preference
@@ -365,7 +365,7 @@ async fn process_task(
         emit_term(&format!("[PROCESS] Found existing KV cache for task {}. Ready to reuse.", task.id));
     }
 
-    // 🌟 [CRITICAL FIX 1] 프론트엔드가 1단계부터 총 스텝 수(분모)를 헷갈리지 않게 task_type을 강제 주입합니다!
+    
     let payload = json!({ 
         "task_id": task.id,
         "task_type": task.r#type, 
@@ -378,7 +378,7 @@ async fn process_task(
 
     let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
     
-    // 🌟 [CRITICAL FIX] search_mode를 특정 조건문 안이 아닌, 최상단 스코프에서 추출하여 함수 전체에서 안전하게 사용할 수 있게 만듭니다.
+    
     let search_mode = task_data.get("search_mode").and_then(|s| s.as_str()).unwrap_or("commerce").to_string();
 
     // [FIX] 작업 유형에 따라 파일명을 자동으로 결정합니다.
@@ -442,12 +442,12 @@ async fn process_task(
     // --- Image Extraction Logic (Qwen 3.5 Pipeline) ---
     if task.r#type == "image_extraction" {
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        // 🌟 [CRITICAL FIX] search_mode 변수 선언부는 최상단으로 이동되었으므로 삭제합니다.
+        
 
         if !image_path.is_empty() {
             println!("[Scheduler] Starting Image Extraction for {}", task.id);
             
-            // 🌟 [CRITICAL FIX 1] 이 녀석이 스텝을 5단계로 부풀리는 주범입니다! 과감히 삭제합니다.
+            
             // log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Analyzing visual context with Qwen 3.5...", "spinner": "⠋" }));
             
             model.extract_from_image(
@@ -476,7 +476,7 @@ async fn process_task(
         .unwrap_or("")
         .to_string();
 
-    // 🌟 [CRITICAL FIX] 도메인이 누락되었거나 상대경로만 들어왔을 경우, 
+    
     // 브라우저 자동화 모듈이 감지한 '진짜 현재 활성화 탭 URL'을 강제로 끌어와서 완벽한 절대 주소로 병합(Join)합니다!
     {
         let state = crate::automation::LAST_DETECTED_STATE.lock().await;
@@ -493,7 +493,7 @@ async fn process_task(
                 if url.is_empty() {
                     url = active_tab_url;
                 } else if !url.starts_with("http") {
-                    // 🌟 기존의 단순 문자열 병합(format) 대신 URL 파서의 join을 사용하여 './', '?' 등 모든 형태의 상대 경로를 완벽히 절대 경로로 치환합니다.
+                    
                     if let Ok(joined) = active_parsed.join(&url) {
                         url = joined.to_string();
                     }
@@ -502,7 +502,7 @@ async fn process_task(
         }
     }
 
-    // 🌟 탭 URL 감지가 실패했을 경우를 대비한 2차 안전망
+    
     if !url.starts_with("http") && !origin_candidate.is_empty() && !origin_candidate.contains("localhost") {
         let scheme = if origin_candidate.starts_with("http") { "" } else { "http://" };
         let base_str = format!("{}{}", scheme, origin_candidate);
@@ -513,7 +513,7 @@ async fn process_task(
         }
     }
     
-    // 🌟 [CRITICAL FIX] 메모리 덮어쓰기 시 origin과 ref를 보존하여 프론트엔드 중복 노출 방어 로직이 도메인을 알 수 있게 합니다.
+    
     let active_task_json = json!({
         "id": task.id.clone(),
         "type": task.r#type.clone(),
@@ -529,7 +529,7 @@ async fn process_task(
         *w = Some(active_task_json.clone());
     }
 
-    // 🌟 [CRITICAL FIX] URL이 없어서 처리가 불가능한 경우 조용히 성공 처리하지 않고 명시적 에러를 던져 UI의 스피너를 중단시킵니다.
+    
     if url.is_empty() { 
         return Err(anyhow::anyhow!("Task missing target URL or unsupported type for background extraction.")); 
     }
@@ -568,7 +568,7 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let clean_html_content = parsing::pre_clean_html(&raw_html_content);
-    // 🌟 [CRITICAL FIX] 1단계 분석에서도 현재 URL을 넘겨 PUG 상의 모든 상대 주소를 절대 주소로 치환합니다.
+    
     let raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, Some(&url));
     let light_pug = model.truncate_pug_context(&raw_pug, false, 2000, None).await;
 
@@ -586,7 +586,7 @@ async fn process_task(
 
     let mut page_type = String::new();
     let mut selector_info: serde_json::Value = json!({});
-    // 🌟 [CRITICAL FIX] 프론트엔드가 전달한 task_data에서 detail 여부를 최우선으로 읽어옵니다.
+    
     let mut is_detail = task_data.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
     let mut skip_ai_analysis = false; 
 
@@ -618,7 +618,7 @@ async fn process_task(
         (url_obj.path().to_string(), url_obj)
     };
 
-    // 🌟 [CRITICAL FIX] aa.ts의 해시 생성 규칙을 완벽 복원하여 리스트와 상세 캐시가 충돌하지 않게 분리합니다.
+    
     let cc_for_hash = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
     let page_id = crate::utils::hash::hash_id(&format!("{}{}", cc_for_hash, raw_path));
 
@@ -626,7 +626,7 @@ async fn process_task(
         let store_guard = store_mutex.lock().await;
         if let Some(db) = store_guard.as_ref() {
             
-            // 🌟 [CRITICAL FIX 1] 대소문자 매칭 오류 방지: 
+            
             // 클라우드(aa.ts)는 원본 대소문자를 유지하여 저장하고, 로컬(main.ts)은 소문자로 변환하여 요청합니다.
             // 경로 비교 시 반드시 소문자로 통일하여 검색해야 100% 매칭됩니다!
             let link_val = (url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()).to_lowercase();
@@ -669,7 +669,7 @@ async fn process_task(
                         if item_sel.starts_with(node_sel) { item_sel.to_string() } else { format!("{} {}", node_sel, item_sel) }
                     } else if !item_sel.is_empty() { item_sel.to_string() } else { node_sel.to_string() };
 
-                    // 🌟 [CRITICAL FIX 2] 꺾쇠(>) 문자를 공백으로 치환하여 scraper 파싱 에러(Silent Fail) 방지
+                    
                     let target_sel_clean = target_sel_str.replace(">", " ");
 
                     if !cached_detail {
@@ -686,7 +686,7 @@ async fn process_task(
                             final_cache = Some((page_doc, val, false, target_sel_clean));
                             break;
                         } 
-                        // 🌟 [CRITICAL FIX 3] DOM이 매치되지 않으면, 리스트 캐시는 기각하고 과감히 버립니다.
+                        
                         // (빈 리스트일 가능성보다, 동일한 주소 체계를 가진 상세 페이지일 가능성이 99%이기 때문입니다.)
                     } else {
                         // Detail 캐시인 경우
@@ -702,7 +702,7 @@ async fn process_task(
                 emit_term(&format!("[Scheduler] ⚡ CACHE HIT! Skipping AI Pre-processing for: {}", raw_path));
                 page_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();
                 
-                // 🌟 [CRITICAL FIX] 부정확할 수 있는 초기 is_detail 상태를 실제 검증이 끝난 DB 캐시 값으로 완벽히 덮어씌웁니다!
+                
                 is_detail = cached_detail; 
                 
                 selector_info = val.clone();
@@ -727,7 +727,7 @@ async fn process_task(
     let base_session_id = format!("{}_base", task.id);
     let system_content = format!("[PUG CONTENT]\n{}", light_pug);
 
-    // 🌟 [핵심 변경 1] 캐시 적중 시(skip_ai_analysis = true), 무거운 0.6B 분석을 통째로 건너뜁니다!
+    
     if !skip_ai_analysis {
         // --- STEP 0: BASE BAKING (공통 컨텍스트 딱 1번만 굽기) ---
         {
@@ -738,14 +738,14 @@ async fn process_task(
                 println!("[Scheduler] Baking Base PUG Context to SSD...");
                 log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Reading document structure...", "spinner": "⠋" }));
                 
-                // 🌟 [CRITICAL FIX] is_baking을 true로 전달하여 안 써도 되는 2GB짜리 비전(이미지) 모델 로딩을 강제 차단합니다! (로딩 속도 13초 -> 3초)
+                
                 model.secure_vram_relay(crate::model::ModelSize::Qwen, None, Some(cancellation_token.clone()), true, kv_name.clone()).await?;
                 
-                // 🌟 모델 로딩(수 초 소요) 직후 취소되었는지 즉시 확인하여 좀비 실행 차단
+                
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
                 if let Some(gen) = model.generator.lock().await.as_mut() {
-                    // 🌟 [CRITICAL FIX] ChatTemplate을 거치지 않고, 후속 질문과 100% 동일한 접두사(Prefix)를 생성하여 굽습니다!
+                    
                     // 이렇게 해야 f_ids[kv_len..] 슬라이싱 시 토큰이 엇갈려 환각(Hallucination)이 발생하는 것을 원천 차단할 수 있습니다.
                     let raw_system_prefix = format!("<|im_start|>system\n{}<|im_end|>\n", system_content);
                     
@@ -766,7 +766,7 @@ async fn process_task(
             let task_question = format!("[TASK] Identify the page type.\n\n[INSTRUCTION]\n{}\n\n[ACTION] RETURN JSON ONLY.", type_prompt);
             let snapshot_id = format!("{}_step_a", task.id);
             
-            // 🌟 [성능 최적화] 파일 읽기/쓰기를 삭제하고 RAM 메모리에 직접 꽂아 넣습니다.
+            
             if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() {
                 if let Some(task_val) = w.as_mut() {
                     if let Some(obj) = task_val.as_object_mut() {
@@ -781,7 +781,7 @@ async fn process_task(
                 // [핵심] Step A가 아니라 '미리 구워둔 Base' 스냅샷을 불러옵니다!
                 model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
-                // 🌟 모델 로딩 직후 즉시 중단 체크
+                
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
                 let params = ChatCompletionParameters {
@@ -810,7 +810,7 @@ async fn process_task(
                     
                     let type_info = parsing::parse_json_from_llm(&res); 
                     
-                    // 🌟 [CRITICAL FIX 복구] AI가 뱉어낸 값의 공백 및 대소문자 오염 방어!
+                    
                     page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").trim().to_lowercase();                
                     
                     if page_type.is_empty() {
@@ -840,18 +840,18 @@ async fn process_task(
             // LLM이 지시사항을 잘 따르도록 래핑
             let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think", detail_prompt);
             
-            let snapshot_id = format!("{}_step_a2", task.id); // 🌟 q35 접미사 제거
+            let snapshot_id = format!("{}_step_a2", task.id); 
 
-            // 🌟 [CRITICAL FIX] 이미 구워진 FullContent 기반의 Base 스냅샷(base_session_id)을 재사용하여 효율을 극대화합니다.
+            
             model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
-            // 🌟 모델 로딩 직후 즉시 중단 체크
+            
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
             let params = ChatCompletionParameters {
                 messages: vec![
                     ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                        content: system_content.clone(), // 🌟 기존에 구워진 system_content 재사용
+                        content: system_content.clone(), 
                         name: None,
                     }),
                     ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -859,13 +859,13 @@ async fn process_task(
                         name: None,
                     })
                 ],
-                model: "qwen".to_string(), // 🌟 qwen 으로 복구
+                model: "qwen".to_string(), 
                 max_tokens: Some(128),     // JSON 스키마가 길어졌으므로 토큰 길이는 128로 유지
                 temperature: Some(0.0), top_p: Some(0.95),
                 ..Default::default()
             };
 
-            // 🌟 0.6B 제너레이터(generator)로 복구
+            
             if let Some(gen) = model.generator.lock().await.as_mut() {
                 println!("[Scheduler] 0.6B (Qwen) Step A-2: Asking detail classification...");
                 let res = gen.generate(
@@ -907,7 +907,7 @@ async fn process_task(
 
     // --- PHASE 2 Continue: Detail Extraction (If needed) --- 
     if !is_detail {
-        // 🌟 [핵심 변경 2] 캐시가 없을 때만 자바스크립트 엔진(Boa)을 돌리고 DB에 저장합니다.
+        
         if !skip_ai_analysis {
             // --- STEP B: SELECTORS (선택자 추출 - JS 기반 신규 로직) ---
             {
@@ -960,7 +960,7 @@ async fn process_task(
                         // res.text 가 아닌 res 를 그대로 파싱
                         let title_info = parsing::parse_json_from_llm(&res);
                         
-                        // 🌟 [CRITICAL FIX] 파싱 결과가 실패하여 빈 깡통({})이 반환되었다면 즉시 에러를 던져 작업을 중단합니다.
+                        
                         if title_info.as_object().map_or(true, |obj| obj.is_empty()) {
                             return Err(anyhow::anyhow!("LLM returned invalid or unparseable JSON response during title extraction."));
                         }
@@ -983,7 +983,7 @@ async fn process_task(
                                 };
                                 
                                 if let Some(t) = t_val {
-                                    // 🌟 [CRITICAL FIX] 가격(12300) 등 순수 숫자값만 있는 결과는 DOM 매칭의 신뢰도를 떨어뜨리므로 배열에서 완전히 제외합니다.
+                                    
                                     let clean_t = t.replace(",", "").replace(".", "").trim().to_string();
                                     let is_only_numbers = !clean_t.is_empty() && clean_t.chars().all(|c| c.is_ascii_digit());
                                     
@@ -998,7 +998,7 @@ async fn process_task(
                 }
 
                 if titles.is_empty() {
-                    // 🌟 [CRITICAL FIX] 쓸데없는 태그까지 전부 긁어오는 불상사를 막기 위해 폴백(Fallback)으로 진행하지 않고 확실하게 끊어냅니다.
+                    
                     return Err(anyhow::anyhow!("[JS-BRIDGE] No titles extracted from LLM. Aborting task to prevent invalid DOM fallback."));
                 }
 
@@ -1029,7 +1029,7 @@ async fn process_task(
                                 .trim()
                                 .to_string();
                                 
-                            // 🌟 [CRITICAL FIX 1] Rust에서 DOM의 colspan, rowspan 값을 추출하여 JS로 전달합니다!
+                            
                             nodes_json.push(json!({
                                 "index": idx,
                                 "parentIndex": parent_idx,
@@ -1082,7 +1082,7 @@ async fn process_task(
                         function calculateSimilarity(nodeA, nodeB) {
                             if (nodeA.tagName !== nodeB.tagName) return 0;
                             
-                            // 🌟 [CRITICAL FIX 2] TR(행) 비교 시, 하위 TD들의 colspan 총합 구조가 다르면 다른 아이템으로 취급합니다!
+                            
                             // (예: 일반 데이터 행 vs colspan=10 인 안내/합계 행)
                             if (nodeA.tagName === 'tr') {
                                 const aKids = getChildren(nodeA.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
@@ -1097,7 +1097,7 @@ async fn process_task(
                                 }
                             }
                             
-                            // 🌟 [CRITICAL FIX 3] TD/TH(셀) 자체를 비교할 때 rowspan/colspan 이 다르면 감점
+                            
                             if (nodeA.tagName === 'td' || nodeA.tagName === 'th') {
                                 if (nodeA.colspan !== nodeB.colspan || nodeA.rowspan !== nodeB.rowspan) return 0;
                             }
@@ -1121,7 +1121,7 @@ async fn process_task(
                                 if (pIdx === undefined || pIdx === -1) break;
                                 
                                 if (node.tagName === "td" || node.tagName === "th") {
-                                    // 🌟 [CRITICAL FIX 4] 현재 셀이 rowspan이나 colspan을 가지고 있다면, 
+                                    
                                     // 이는 단일 항목이 아니라 복잡한 그리드의 부속품입니다. 묻지도 따지지도 않고 부모(tr)로 올라갑니다.
                                     if (parseInt(node.colspan || '1', 10) > 1 || parseInt(node.rowspan || '1', 10) > 1) {
                                         cur = pIdx;
@@ -1245,7 +1245,7 @@ async fn process_task(
             }
         } // 👈 🌟 [핵심 변경 2 끝] JS 선택자 분석 스킵 괄호 닫기!
 
-        // 🌟 [CRITICAL FIX] Cache Hit 시 검증에 성공했던 선택자(final_target_selector)가 있다면 최우선으로 사용하여 추출 실패(Silent Fail)를 방벽합니다.
+        
         let target_selector = selector_info.get("final_target_selector")
             .and_then(|s| s.as_str())
             .map(|s| s.to_string())
@@ -1267,7 +1267,7 @@ async fn process_task(
                 } else { 
                     node_selector.to_string() 
                 }
-            }).replace(">", " "); // 🌟 꺾쇠(>) 문자를 공백으로 치환하여 파싱 유연성 확보
+            }).replace(">", " "); 
             
         emit_term(&format!("[Scheduler] Target Selector configured as: '{}'", target_selector));
 
@@ -1302,7 +1302,7 @@ async fn process_task(
                 if !ref_row.is_empty() {
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Analyzing table header structure...", "spinner": "⠋" }));
                     
-                    // 🌟 [추가] ref_row의 텍스트 길이를 기반으로 대략적인 토큰을 산출하여 컨텍스트 사이즈를 예약하고 뒤에서 자릅니다.
+                    
                     let ref_row_context_size = ref_row.len() + 3000;
                     let full_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, Some(&url));
                     let thead_light_pug = model.truncate_pug_context(&full_pug, false, 2000, Some(ref_row_context_size)).await;
@@ -1343,7 +1343,7 @@ async fn process_task(
                                 .and_then(|v| v.get("thead"))
                                 .and_then(|v| v.get("selector"))
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("").to_string().replace(">", " "); // 🌟 꺾쇠(>) 문자를 공백으로 치환하여 파싱 유연성 확보
+                                .unwrap_or("").to_string().replace(">", " "); 
                             
                             // 2. tbody와 thead를 감싸는 부모 wrapper(table) 선택자 추출
                             let final_table_selector = thead_val
@@ -1352,7 +1352,7 @@ async fn process_task(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("").to_string().replace(">", " ");
 
-                            // 🌟 [CRITICAL FIX] thead 선택자에 table 선택자가 포함되어 있지 않으면 조합하여 유효성을 검증합니다.
+                            
                             if !final_thead_selector.is_empty() && final_thead_selector != "..." && !final_table_selector.is_empty() && final_table_selector != "..." {
                                 if !final_thead_selector.contains(&final_table_selector) {
                                     let combined_sel = format!("{} {}", final_table_selector, final_thead_selector);
@@ -1375,7 +1375,7 @@ async fn process_task(
                                 cache_updated = true; // 새로운 head를 찾았으므로 DB 업데이트 예약
                             }
 
-                            // 🌟 [추가] 추출된 table 선택자도 향후 렌더링/추출 보호를 위해 DB에 "wrapper"라는 속성명으로 저장 예약
+                            
                             if !final_table_selector.is_empty() && !final_table_selector.contains("CSS selector") && final_table_selector != "..." {
                                 selector_info.as_object_mut().unwrap().insert("wrapper".to_string(), json!(final_table_selector.clone()));
                                 println!("[Scheduler] AI determined table wrapper selector and cached: {}", final_table_selector);
@@ -1393,7 +1393,7 @@ async fn process_task(
             let doc = scraper::Html::parse_document(clean_content);
             if let Ok(tsel) = scraper::Selector::parse(&final_thead_selector) {
                 if let Some(first_match) = doc.select(&tsel).next() {
-                    // 🌟 [구조 보존 로직] 매칭된 요소가 th나 td일 경우, 다중 tr 계층 구조를 잃지 않기 위해 DOM 트리를 거슬러 올라가 최상위 thead(또는 tr) 블록 전체를 통째로 가져옵니다.
+                    
                     let mut target_node = first_match;
                     let mut current = target_node.parent();
                     
@@ -1412,7 +1412,7 @@ async fn process_task(
                     }
                     
                     let mut tpug = String::new();
-                    // 🌟 [최적화] TheadMode를 적용하여 th/td의 scope, rowspan, colspan만 남기고 모든 속성(href, id, class 등) 제거
+                    
                     crate::parsing::generate_pug_lines((*target_node).into(), 0, &mut tpug, &PugMode::TheadMode, &mut None);
                     thead_pug = tpug.trim().to_string();
 
@@ -1474,7 +1474,7 @@ async fn process_task(
 
             let ref_for_page = if !task.r#ref.is_empty() { &task.r#ref } else { raw_path };
 
-            // 🌟 [CRITICAL FIX] aa.ts 패리티 완벽 복원: ID 해시 조합 및 테이블 라우팅 타입 불일치 해결
+            
             if !is_detail {
                 let mut page_data: serde_json::Value = selector_info.clone();
                 if let Some(obj) = page_data.as_object_mut() {
@@ -1487,13 +1487,13 @@ async fn process_task(
                     obj.insert("detail".to_string(), json!(false));
                 }
 
-                // 🌟 pages 테이블에는 실제 카테고리(page_type)를, items 테이블에는 "pages"를 기록하여 UI 렌더링 버그(pages로 노출되는 현상)를 완벽 해결합니다!
+                
                 let _ = store.upsert_item("pages", &page_id, &page_type, page_data.clone(), None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(ref_for_page), None).await;
                 let _ = store.upsert_item("items", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(ref_for_page), None).await;
                 
                 println!("[Scheduler] Page cache updated in DB (including head selector).");
 
-                // 🌟 상세 페이지용 껍데기(자식 노드) 동시 생성 (page_type을 포함한 정확한 ID 복원)
+                
                 let detail_page_id = crate::utils::hash::hash_id(&format!("{}{}{}", page_type, task.cc.to_uppercase(), raw_path));
                 let detail_bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, task.cc.to_uppercase()));
                 let detail_page_data = json!({
@@ -1537,17 +1537,17 @@ async fn process_task(
             let clean_content = &clean_html_content;
             let document = scraper::Html::parse_document(clean_content);
             
-            // 🌟 [최적화] 리스트 전용 ListMode를 적용하여 href 속성은 완벽히 보존하고, 불필요한 class와 id 속성만 제거합니다.
+            
             parsing::split_doc_to_pug_list_advanced(
                 &document, 
                 &target_selector, 
                 PugMode::ListMode, 
                 None,
-                Some(&url) // 🌟 [CRITICAL FIX] 추가된 5번째 인자로 현재 작업 중인 URL을 전달하여 상대 주소가 절대 주소로 치환되도록 합니다!
+                Some(&url) 
             )
         };
 
-        // 🌟 [CRITICAL FIX] 1순위: thead 내의 colspan 또는 rowspan 값을 추출하여 다중 행 그룹 사이즈를 파악합니다.
+        
         // 2순위: 속성이 없을 경우 thead의 tr 태그 개수로 폴백(Fallback)하여 완벽하게 묶어냅니다.
         let group_size = if !thead_pug.is_empty() {
             let mut max_span = 1;
@@ -1586,7 +1586,7 @@ async fn process_task(
             let total_items = pug_list.len();
 
             // ==========================================
-            // 🌟 ALL PHASES: QWEN 3 (Meta, Info, Data Extraction 일괄 처리)
+            
             // ==========================================
             // 모델 가중치 변경(스위칭) 없이 가장 가벼운 모델인 Qwen3 하나만으로 전체 파이프라인을 관통하여 속도를 극대화합니다!
             model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
@@ -1610,7 +1610,7 @@ async fn process_task(
                 let task_question_info = parsing::list2json_info(&page_type, language, &thead_pug, item_pug);
                 let task_question_data = parsing::list2json_data(&page_type, language, &thead_pug, item_pug);
 
-                // 🌟 Meta 추출
+                
                 let q3_gen_meta = model.qwen3_generator.clone();
                 let res_meta = tokio::task::spawn_blocking(move || {
                     let mut gen_guard = q3_gen_meta.blocking_lock();
@@ -1630,7 +1630,7 @@ async fn process_task(
                     }
                 }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
 
-                // 🌟 Info 추출 (Qwen 3.5 -> Qwen 3 완전 통합)
+                
                 let q3_gen_info = model.qwen3_generator.clone();
                 let res_info = tokio::task::spawn_blocking(move || {
                     let mut gen_guard = q3_gen_info.blocking_lock();
@@ -1650,7 +1650,7 @@ async fn process_task(
                     }
                 }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
 
-                // 🌟 Data 추출 (Qwen 3.5 -> Qwen 3 완전 통합)
+                
                 let q3_gen_data = model.qwen3_generator.clone();
                 let res_data = tokio::task::spawn_blocking(move || {
                     let mut gen_guard = q3_gen_data.blocking_lock();
@@ -1680,7 +1680,7 @@ async fn process_task(
                         let mut item_info = if let Some(inner) = parsed_info.get_mut(&page_type) { inner.take() } else { parsed_info };
                         let mut item_data = if let Some(inner) = parsed_data.get_mut(&page_type) { inner.take() } else { parsed_data };
                         
-                        // 🌟 3단계로 추출된 데이터를 메타 객체 안으로 완전히 병합
+                        
                         if let (Some(m_obj), Some(i_obj)) = (item_meta.as_object_mut(), item_info.as_object_mut()) {
                             for (k, v) in i_obj {
                                 m_obj.insert(k.clone(), v.clone());
@@ -1692,7 +1692,7 @@ async fn process_task(
                             }
                         }
 
-                        // 🌟 [CRITICAL FIX] aa.ts 패리티 일치: 파라미터(key=value) 형태면 value만 추출하고, 
+                        
                         // 영문이 포함된 상품코드(P000000S)가 파괴되지 않도록 알파벳을 보존합니다!
                         if let Some(id_val) = item_meta.get("id").and_then(|v| v.as_str()) {
                             let extracted = if let Some(idx) = id_val.rfind('=') {
@@ -1738,7 +1738,7 @@ async fn process_task(
                     }
                 }).await;
                 
-                // 🌟 GPU에 남아있는 비동기 연산 찌꺼기까지 완벽하게 털어내기
+                
                 if !model.is_cpu_mode {
                     let dev = model.device_config.device.clone();
                     let _ = tokio::task::spawn_blocking(move || {
@@ -1772,11 +1772,11 @@ async fn process_task(
         
         let content_pug = {
             let clean_content = &clean_html_content;
-            // 🌟 [최적화] 정규식 대신 파서 단에서 DetailMode를 적용하여 안전하게 id와 class 속성을 제거합니다.
-            // 🌟 [CRITICAL FIX] 상세 페이지 전처리 시에도 URL을 넘겨 item2json 등에서 LLM이 절대 주소를 뽑아내도록 유도합니다!
+            
+            
             let full_pug = parsing::convert_to_clean_pug(clean_content, PugMode::DetailMode, Some(&url));
             
-            // 🌟 [CRITICAL FIX] 디테일 모드에서도 통일된 절단 로직을 호출하여 모델 부재 시의 누수를 막습니다.
+            
             model.truncate_pug_context(&full_pug, true, 2000, None).await
         };
 
@@ -1786,16 +1786,16 @@ async fn process_task(
 
             // 1. [Large] Load & Generate (Direct Qwen3.5 0.8B-Layer Generation)
             {
-                // 🌟 [CRITICAL FIX 3] 디테일 모드에서도 0.6B Base 스냅샷 로드 시도를 완벽히 끊어버립니다. 
+                
                 model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
-                // 🌟 거대한 모델 교체 직후 추출 시작 전에 취소를 잡아내어 GPU 헛도는 현상 차단
+                
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
                 let params = ChatCompletionParameters {
                     messages: vec![
                         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                            // 🌟 [CRITICAL FIX] 9,000 토큰으로 깎여있던 기존 system_content 대신, 60,000 토큰 한도로 생성된 content_pug를 주입합니다!
+                            
                             content: format!("[PUG CONTENT]\n{}", content_pug),
                             name: None,
                         }),
@@ -1814,23 +1814,23 @@ async fn process_task(
                     ..Default::default()
                 };
 
-                // 🌟 [교체 구간 2-C] src/scheduler.rs 의 Detail Extraction 내부 (하단부)
+                
                 if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
                     println!("[Scheduler] Qwen3.5 Step C: Asking extraction question...");
                     
-                    // 🌟 [CRITICAL FIX] 줄이 나뉘지 않도록 카테고리를 통합하고 문구를 부드럽게 이어줍니다.
+                    
                     let payload = json!({ "task_id": task.id, "category": "AI Inference", "summary": "Preparing AI engine...", "spinner": "⠋" });
                     let _ = app_handle.emit("extraction-progress", &payload);
                     emit_term("[STAGE-3] Preparing AI engine...");
                     
-                    // 🌟 generate_part 에 None 대신 Some(snapshot_id.clone()) 전달
+                    
                     let res = gen.generate_part(&params, false, 0, None, Some(snapshot_id.clone()), kv_name.clone()).await?;
                     
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res.text);
 
                     let mut parsed_json = parsing::parse_json_from_llm(&res.text);
                     
-                    // 🌟 [CRITICAL FIX] LLM이 {"order": {...}} 형태로 껍데기를 씌워서 반환하므로,
+                    
                     // page_type(예: "order", "goods") 키를 찾아서 알맹이만 빼냅니다.
                     extracted_data = if let Some(inner) = parsed_json.get_mut(&page_type) {
                         inner.take() // 알맹이 적중 시 꺼냄
@@ -1848,12 +1848,12 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     // --- DB OPS & SIDE EFFECTS ---
-    // 🌟 [CRITICAL FIX] VRAM 교체 지옥 방지: 정규화 로직을 Handover 이전으로 끌어올립니다.
+    
     let search_mode_str = search_mode.clone();
     let normalize_data = |item: &mut serde_json::Value| {
         if let Some(obj) = item.as_object_mut() {
             if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type.clone())); }
-            // 🌟 [CRITICAL FIX] 추출된 데이터 객체 내부에 현재 mode(search_mode)를 꽂아 넣어 DB 저장 시 컬럼으로 빠지게 합니다.
+            
             if obj.get("mode").is_none() { obj.insert("mode".to_string(), json!(search_mode_str.clone())); }
             
             // 통화 대문자 변환
@@ -1869,7 +1869,7 @@ async fn process_task(
                 obj.insert("quantity".to_string(), json!(q_val));
             }
             
-            // 🌟 [날짜 포맷 정규화] moment.js 수준의 강력한 날짜 추론 및 보정 엔진
+            
             let date_keys = [
                 "registration_date", "order_date", "payment_date", "shipping_date", 
                 "manufacture_date", "expiration_date", "release_date", "started_at", "expired_at"
@@ -1968,7 +1968,7 @@ async fn process_task(
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // 🌟 [최적화] 네이티브 한글 N-gram 검색 완벽 지원으로 인해 불필요해진 영어 번역 릴레이를 삭제하고, 바로 자연어 렌더링을 꽂아 넣습니다.
+    
     {
         println!("[Scheduler] Generating natural language sentences for FTS/Vector matching...");
         if is_detail {
@@ -1991,7 +1991,7 @@ async fn process_task(
     // --- PHASE 3: HANDOVER (Unload Qwen -> Load Embedding) ---
     {
         println!("[Scheduler] PHASE 3: Handover - Unloading, Preparing for Embedding...");
-        // 🌟 스피너(⠋) 속성 추가
+        
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model...", "spinner": "⠋" }));
         
         // 1. Explicitly Unload to free VRAM for Embedding Model
@@ -2010,7 +2010,7 @@ async fn process_task(
         .and_then(|v| if v.is_number() { Some(v.to_string()) } else { v.as_str().map(|s| s.to_string()) })
         .unwrap_or_default();
     
-    // 🌟 [CRITICAL FIX] aa.ts의 cleanNumber() 로직 완벽 일치: 온점(.)과 쉼표(,)도 함께 제거하여 해시 불일치 차단
+    
     let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(&id_val_raw)
         .replace("-", "").replace("_", "").replace(".", "").replace(",", "");
     
@@ -2020,7 +2020,7 @@ async fn process_task(
     if let Some(obj) = extracted_data.as_object_mut() {
         obj.insert("index".to_string(), json!(index_val));
         obj.insert("id".to_string(), json!(generated_id.clone()));
-        // 🌟 [CRITICAL FIX] 상세(Detail) 모드에서는 정상 전처리되었으므로 현재 시간을 갱신하여 Draft가 아님을 확정합니다.
+        
         obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
     }
 
@@ -2040,7 +2040,7 @@ async fn process_task(
                 if !g_no.is_empty() {
                     let clean_g_no = crate::utils::hash::normalize_numeric_homoglyphs(g_no).replace("-", "").replace("_", "");
                     
-                    // 🌟 [버그 수정] 부모(Order)의 송장번호와 자식(Goods)의 고유값을 결합하여 완벽한 Tracking 객체로 조립합니다.
+                    
                     let tracking_number = extracted_data.get("tracking_number").and_then(|v| v.as_str()).unwrap_or("");
                     let clean_tracking_no = crate::utils::hash::normalize_numeric_homoglyphs(tracking_number).replace("-", "").replace("_", "");
                     let tracking_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tracking_no)));
@@ -2057,7 +2057,7 @@ async fn process_task(
                         obj.insert("order".to_string(), json!(index_val)); // 부모 오더 index 매핑
                     }
                     
-                    // 🌟 배송 정보 분리 시 자연어 요약 및 임베딩 추출 로직 추가
+                    
                     let tracking_text = parsing::json_to_natural_language(&tracking_data);
                     let tracking_vector = model.get_embedding(tracking_text.clone()).await.unwrap_or(vec![0.0; 768]);
                     tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(tracking_text));
@@ -2070,7 +2070,7 @@ async fn process_task(
                         None
                     ).await;
 
-                    // 🌟 공용 items 테이블에도 벡터와 함께 저장하여 통합 검색이 가능하게 합니다.
+                    
                     let _ = store.upsert_item(
                         "items", &tracking_id, "tracking", tracking_data, Some(tracking_vector),
                         Some(&task.from), Some(&team_id), Some(&task.cc),
@@ -2083,7 +2083,7 @@ async fn process_task(
         }
     }
 
-    // 🌟 [CRITICAL FIX] DB 테이블 매핑 패리티 일치화: aa.ts와 동일하게 goods, order는 sales 테이블에, coupon은 event 테이블에 저장하고 조회해야 합니다.
+    
     let target_table = match page_type.as_str() {
         "sales" | "goods" | "order" => "sales",
         "tracking" | "receiving" | "shipping" => "tracking",
@@ -2101,7 +2101,7 @@ async fn process_task(
     let mut stats_diff: std::collections::HashMap<String, (i64, i64, i64)> = std::collections::HashMap::new();
 
     if is_detail {
-        // 🌟 [DETAIL MODE] 단일 문서일 경우
+        
         // Phase 2.5에서 주입된 영문 FTS 키워드가 포함된 text 속성을 최우선으로 사용하여 벡터화합니다.
         let text_to_embed = extracted_data.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| parsing::json_to_natural_language(&extracted_data));
         let item_digest = crate::utils::hash::digest(&text_to_embed); 
@@ -2111,7 +2111,7 @@ async fn process_task(
         let mut is_new = true;
         let mut was_draft = false;
 
-        // 🌟 [CRITICAL FIX] 1. 우선 리스트 추출 시 생성된 진짜 ID(generated_id)로 DB를 검색합니다.
+        
         if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
             is_new = false;
             was_draft = if existing_item.updated_at_ts == 0 {
@@ -2126,12 +2126,12 @@ async fn process_task(
                 existing_vector = Some(existing_item.vector);
             }
 
-            // 🌟 [CRITICAL FIX] 병합(Merge) 패리티 일치: 상세 데이터로 기존 리스트 데이터를 엎어버려 식별자가 날아가는 현상을 막습니다.
+            
             if let Ok(existing_json) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
                 extracted_data = merge_node(&existing_json, &extracted_data);
             }
         } 
-        // 🌟 [CRITICAL FIX] 2. 못 찾았을 경우, 상세페이지의 실제 URL(url)을 통해 리스트 아이템이 저장해둔 "link" 속성과 대조하여 역추적합니다.
+        
         else if !url.is_empty() {
             let normalized_link = if let Ok(parsed_url) = url::Url::parse(&url) {
                 format!("{}{}", parsed_url.path(), parsed_url.query().map(|q| format!("?{}", q)).unwrap_or_default()).to_lowercase()
@@ -2156,7 +2156,7 @@ async fn process_task(
                     }
                 }
                 
-                // 🌟 [CRITICAL FIX] 병합(Merge) 패리티 일치
+                
                 extracted_data = merge_node(&json_val, &extracted_data);
                 if let Some(obj) = extracted_data.as_object_mut() {
                     obj.insert("id".to_string(), json!(target_id.clone()));
@@ -2164,7 +2164,7 @@ async fn process_task(
             }
         }
 
-        // 🌟 [클라우드 패리티 일치] 상세(Detail) 페이지 수집 시: 
+        
         // 새 항목이면 pages: count++, global: count++
         // 기존 Draft 항목이었다면 pages: draft--, count++ 승급 (global은 이미 리스트에서 올렸으므로 변동 없음)
         if is_new {
@@ -2177,14 +2177,14 @@ async fn process_task(
             e.1 += 1; // pages count++
         }
 
-        // 🌟 [CRITICAL FIX] 이전 코드 교체 시 누락되었던 vector 변수 선언을 복구합니다.
+        
         let vector = if let Some(v) = existing_vector {
             Some(v)
         } else {
             Some(model.get_embedding(text_to_embed).await?)
         };
 
-        // 🌟 [누락 복구] 교차 업데이트 (Relay) 로직 실행 (단일 상세 항목)
+        
         let related_types = crate::logic::related(&page_type);
         for foreign_type in related_types {
             if let Some((queries, merge_rule)) = crate::logic::relay(foreign_type, &extracted_data) {
@@ -2244,7 +2244,7 @@ async fn process_task(
                                     let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
                                     e.0 -= 1; // pages draft--
                                     e.1 += 1; // pages count++
-                                    // 🌟 [CRITICAL FIX] 취합(Aggregation) 패리티 일치: 상세(Detail) 모드에서 연관 문서가 Draft에서 정식으로 승급될 때, 글로벌 카운트도 함께 올려줍니다.
+                                    
                                     e.2 += 1; // global count++
                                     foreign_data.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
                                 }
@@ -2264,14 +2264,14 @@ async fn process_task(
                             }
                         },
                         Ok(None) => {
-                            // 🌟 연관 문서가 존재하지 않으면 Draft(가계정) 껍데기를 생성합니다.
+                            
                             let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
                             e.0 += 1; // pages draft++
                             e.2 += 1; // global count++
 
                             let mut draft_data = json!({});
                             
-                            // 🌟 [버그 수정] q.value가 Number(예: index 값)일 때 해시가 증발하는 현상을 방어합니다.
+                            
                             let val_str = match &q.value {
                                 serde_json::Value::String(s) => s.clone(),
                                 serde_json::Value::Number(n) => n.to_string(),
@@ -2302,7 +2302,7 @@ async fn process_task(
             }
         }
 
-        // 🌟 [CRITICAL FIX] 상세(Detail) 모드: FTS 영어 키워드가 포함된 text는 이미 앞선 일괄 번역 단계에서 주입되었으므로 
+        
         // 여기서 다시 덮어씌우는 과정을 생략하여 보호합니다.
 
         let _ = store.upsert_item(
@@ -2318,12 +2318,12 @@ async fn process_task(
         items_to_process.push(extracted_data.clone());
         
     } else {
-        // 🌟 [LIST MODE] 리스트 배열 순회
+        
         if let Some(items) = extracted_data.get("items").and_then(|v| v.as_array()) {
             for item_val in items.iter() {
                 let mut single_item = item_val.clone();
                 
-                // 🌟 [CRITICAL FIX] aa.ts와 동일하게 무조건 "id" 속성을 최우선으로 탐색하여 상세/리스트 간 해시 불일치를 방지합니다.
+                
                 let original_id = single_item.get("id")
                     .or_else(|| single_item.get("no"))
                     .or_else(|| single_item.get("code"))
@@ -2332,7 +2332,7 @@ async fn process_task(
                     .and_then(|v| if v.is_number() { Some(v.to_string()) } else { v.as_str().map(|s| s.to_string()) })
                     .unwrap_or_else(|| single_item.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string());
                 
-                // 🌟 [CRITICAL FIX] aa.ts의 cleanNumber() 로직 완벽 일치: 온점(.)과 쉼표(,)도 함께 제거
+                
                 let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(&original_id)
                     .replace("-", "").replace("_", "").replace(".", "").replace(",", "");
                 
@@ -2348,7 +2348,7 @@ async fn process_task(
                     obj.insert("detail".to_string(), json!(false));
                     obj.insert("id".to_string(), json!(hashed_item_id.clone()));
                     obj.insert("index".to_string(), json!(index_val));
-                    // 🌟 [CRITICAL FIX] 증감 버그의 핵심 원인 해결! 리스트 추출 시에는 무조건 updated_at을 0으로 덮어씌워 이 항목이 Draft(가계정)임을 DB에 확실하게 각인시킵니다.
+                    
                     obj.insert("updated_at".to_string(), json!(0));
                 }
 
@@ -2371,7 +2371,7 @@ async fn process_task(
                     }
                 }
 
-                // 🌟 [클라우드 패리티 일치] 리스트(List) 수집 시: 
+                
                 // 새 항목이면 pages: draft++, global: count++
                 if is_new {
                     let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
@@ -2385,7 +2385,7 @@ async fn process_task(
                     Some(model.get_embedding(text_to_embed).await?)
                 };
 
-                // 🌟 [누락 복구] 교차 업데이트 (Relay) 로직 실행 (리스트 아이템)
+                
                 let related_types = crate::logic::related(&page_type);
                 for foreign_type in related_types {
                     if let Some((queries, merge_rule)) = crate::logic::relay(foreign_type, &single_item) {
@@ -2456,14 +2456,14 @@ async fn process_task(
                                     }
                                 },
                                 Ok(None) => {
-                                    // 🌟 연관 문서가 존재하지 않으면 Draft(가계정) 껍데기를 생성합니다.
+                                    
                                     let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
                                     e.0 += 1; // pages draft++
                                     e.2 += 1; // global count++
 
                                     let mut draft_data = json!({});
                                     
-                                    // 🌟 [버그 수정] q.value가 Number(예: index 값)일 때 해시가 증발하는 현상을 방어합니다.
+                                    
                                     let val_str = match &q.value {
                                         serde_json::Value::String(s) => s.clone(),
                                         serde_json::Value::Number(n) => n.to_string(),
@@ -2494,7 +2494,7 @@ async fn process_task(
                     }
                 }
 
-                // 🌟 [CRITICAL FIX] 리스트(List) 모드: FTS 영어 키워드가 포함된 text는 이미 앞선 일괄 번역 단계에서 주입되었으므로 
+                
                 // 여기서 다시 덮어씌우는 과정을 생략하여 보호합니다.
 
                 let _ = store.upsert_item(
@@ -2520,7 +2520,7 @@ async fn process_task(
     // Final Status Update
     let _ = store.update_message_status(&task.id, logic::parse_status("complete"), Some("Extraction Complete")).await;
 
-    // 🌟 [CRITICAL FIX] 불완전한 추출 데이터를 프론트로 직접 쏘지 않습니다.
+    
     // 대신 프론트엔드가 이 'Done' 신호를 받고 내부적으로 app.fetch()를 트리거하여
     // DB에서 완벽하게 세팅된(id, ref, bcc 등) 데이터를 가져가도록 유도해야 합니다.
     let payload = json!({
@@ -2543,7 +2543,7 @@ pub fn log_task_progress(app: &tauri::AppHandle, task_id: &str, payload: &serde_
     use std::io::Write;
     use tauri::Emitter;
 
-    // 🌟 [CRITICAL FIX] 백엔드에서 쏘는 모든 익명 로그에 task_id를 강제 주입하여 프론트엔드 오작동 차단!
+    
     let mut final_payload = payload.clone();
     if let Some(obj) = final_payload.as_object_mut() {
         obj.insert("task_id".to_string(), serde_json::json!(task_id));
@@ -2672,10 +2672,10 @@ async fn update_team_base_metrics(
         )
     };
 
-    // 🌟 [CRITICAL FIX] 덮어씌워짐(0표기) 원인 제거! 이중 래핑(json_data 안에 또 json_data가 문자열로 존재)된 경우 알맹이를 꺼내서 파싱합니다.
+    
     let mut parsed_val: serde_json::Value = serde_json::from_str(&team_json_str).unwrap_or(json!({ "base": { "pages": {} } }));
     
-    // 🌟 [CRITICAL FIX] 무한 중첩된 json_data(Matryoshka 버그) 완벽 해제
+    
     while let Some(inner_str) = parsed_val.get("json_data").and_then(|v| v.as_str()) {
         if let Ok(inner_obj) = serde_json::from_str(inner_str) {
             parsed_val = inner_obj;
@@ -2685,7 +2685,7 @@ async fn update_team_base_metrics(
     }
     let mut team_data = parsed_val;
     
-    // 🌟 기존에 껍데기로 남아있는 json_data 프로퍼티는 삭제하여 다음 저장 시 재귀적 중첩을 방지합니다.
+    
     if let Some(obj) = team_data.as_object_mut() {
         obj.remove("json_data");
     }
@@ -2744,14 +2744,14 @@ async fn update_team_base_metrics(
 
                     if num_val == 0.0 && *prop != "started_at" && *prop != "expired_at" { continue; }
 
-                    // 🌟 [버그 수정] 클라우드 JS 초기화 로직(0.0)과 호환되도록 기본값을 0.0으로 통일
+                    
                     let prop_node = global_type_node.entry(*prop).or_insert(json!({ "min": 0.0, "max": 0.0 })).as_object_mut().unwrap();
                     
                     let current_min = prop_node.get("min").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let current_max = prop_node.get("max").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
-                    // 🌟 [버그 수정] DB에서 가져온 current_min이 0.0(초기값)일 경우 조건 없이 무조건 첫 값을 덮어쓰도록 예외 처리
-                    // 🌟 [비교 연산자 수정] JS와 동일하게 <=, >= 로 연산자 패리티 일치
+                    
+                    
                     if current_min == 0.0 || num_val <= current_min { prop_node.insert("min".to_string(), json!(num_val)); }
                     if current_max == 0.0 || num_val >= current_max { prop_node.insert("max".to_string(), json!(num_val)); }
                 }
@@ -2759,12 +2759,12 @@ async fn update_team_base_metrics(
         }
     } // 👈 여기서 두 번째 참조가 종료됩니다.
 
-    // 🌟 [디버깅 로그 추가] 프론트엔드로 전달되기 전, DB에 최종 반영되는 base JSON 전체 구조를 예쁘게 출력합니다.
+    
     if let Some(base_json) = team_data.get("base") {
         println!("\n[DEBUG-METRICS] 최종 반영된 Base JSON 값:\n{}", serde_json::to_string_pretty(base_json).unwrap_or_default());
     }
 
-    // 🌟 [CRITICAL FIX] 팀 통계 업데이트 시 DB의 변경 스킵 조건(updated_at, digest)에 걸리지 않도록 명시적으로 최신 시간을 주입합니다.
+    
     if let Some(obj) = team_data.as_object_mut() {
         obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
     }
@@ -2784,7 +2784,7 @@ async fn update_team_base_metrics(
         None
     ).await;
 
-    // 🌟 [DB 저장 확인용 검증 로그] 유저님의 의심을 해소하기 위해, 방금 저장한 데이터를 DB에서 즉시 다시 꺼내어 증명합니다!
+    
     if let Ok(Some(saved_doc)) = store.get_item_by_id("users", team_id).await {
         println!("\n==================================================");
         println!("✅ [DB-VERIFY] DB에 통계(Team) 데이터가 100% 정상 저장되었습니다!");

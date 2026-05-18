@@ -188,7 +188,7 @@ impl QwenVLVisionAttention {
         let seq_length = xs.dim(0)?;
         let qkv_states = xs.apply(&self.qkv)?.reshape((seq_length, 3, self.num_heads, ()))?.permute((1, 0, 2, 3))?; 
         
-        // 🌟 [CRITICAL FIX] 이 부분을 지우면 이미지가 완전히 깨져서 AI가 환각 증세를 일으킵니다. 복구 완료!
+        
         let query_states = qkv_states.i(0)?.contiguous()?; 
         let key_states = qkv_states.i(1)?.contiguous()?; 
         let value_states = qkv_states.i(2)?.contiguous()?; 

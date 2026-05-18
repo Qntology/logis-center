@@ -117,7 +117,7 @@ pub struct SaveTask {
     pub block_idx: Option<usize>, 
     pub registry: Option<KVRegistry>,
     pub kv_name: Option<String>,
-    pub block_len: usize, // 🌟 동적 크기 전달용 필드 추가
+    pub block_len: usize, 
 }
 
 pub enum SlotTask { 
@@ -272,7 +272,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         while let Some(task) = io_rx.recv().await {
             let sem = semaphore.clone();
             let (tp, ts, reg, b_idx, sid, is_last, kv_n) = (task.path.clone(), task.tensors, task.registry.clone(), task.block_idx, task.slot_id, task.is_last, task.kv_name.clone());
-            let block_len_for_index = task.block_len; // 🌟 텐서 크기 동적 반영
+            let block_len_for_index = task.block_len; 
 
             tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
@@ -399,12 +399,12 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             
                             let file_path = task_dir.join(format!("l{}.st", act_l));
                             
-                            // 🌟 [추가] 텐서 형태로부터 실제 블록 길이를 추출하여 전달
+                            
                             let b_len = src.k_shape.to_vec1::<u32>().unwrap_or_default().get(2).cloned().unwrap_or(256) as usize;
                             
                             if io_tx_nested.send(SaveTask { 
                                 slot_id: sid, path: file_path.clone(), tensors: map, is_last: false, block_idx, registry: Some(registry_inner), kv_name: kv_name_inner,
-                                block_len: b_len // 🌟 필드 추가
+                                block_len: b_len 
                             }).await.is_err() {
                                 GLOBAL_IO_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                             }
@@ -747,12 +747,12 @@ impl QwenVLGenerateModel {
             
             let current_pos = total_tokens_after_prefill + i as usize;
             
-            // 🌟 [UI 자연스러움] 매 토큰(1글자)마다 즉시 UI를 업데이트하여 60FPS 급의 부드러움을 제공합니다!
+            
             if true {
                 let pct = if is_json_finished || is_eos {
                     100
                 } else {
-                    // 🌟 [비선형 곡선 정확도 튜닝]
+                    
                     // 기존 가속도(-0.05)가 너무 빨라 20토큰 만에 69%에 도달한 뒤 100%로 튀는 현상을 방지합니다.
                     // 일반적인 JSON 응답 길이(50~200토큰)에 맞춰 -0.012로 조정하여 부드럽고 정확하게 증가하도록 개선했습니다.
                     // (예: 10토큰=25%, 50토큰=53%, 100토큰=73%, 200토큰=91%)
@@ -768,7 +768,7 @@ impl QwenVLGenerateModel {
                         
                         let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
 
-                        // 🌟 상태에 따라 더 자연스러운 텍스트로 분기 처리
+                        
                         let summary_msg = if current_cat.contains("Classification") {
                             format!("Analyzing structure ({}%)...", pct)
                         } else if task_id.starts_with("search_") {

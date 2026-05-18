@@ -9,7 +9,7 @@ pub enum PugMode {
     DetailMode,
     TheadMode,
     ListMode, 
-    NoAttributesMode, // 🌟 구조 판별을 위해 HTML의 모든 속성을 완벽히 비워버리는 전용 모드
+    NoAttributesMode, 
 }
 
 pub fn sanitize_llm_input(text: &str) -> String {
@@ -47,7 +47,7 @@ pub fn pre_clean_html(html: &str) -> String {
 
     // 4. 허용된 속성 외 모두 제거 (지정된 16개 속성만 보존)
     let re_tag = Regex::new(r"(?i)<([a-zA-Z0-9\-]+)([^>]*)>").unwrap();
-    // 🌟 [CRITICAL FIX] FTS 엔진의 테이블 매칭 정확도를 위해 'scope' 속성을 허용 목록에 추가하여 증발을 막습니다.
+    
     let re_attr = Regex::new(r#"(?i)\b(id|class|src|href|type|name|value|placeholder|checked|selected|disabled|readonly|rows|cols|rowspan|colspan|scope)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?"#).unwrap();
     
     let clean = re_tag.replace_all(&clean, |caps: &regex::Captures| {
@@ -79,7 +79,7 @@ pub fn convert_doc_to_clean_pug(document: &Html, mode: PugMode, base_url: Option
     let mut pug_output = String::new();
     pug_output.reserve(1024 * 50);
     
-    // 🌟 [CRITICAL FIX] 상세 모드(Detail Mode) 등에서도 상대 주소를 절대 주소로 치환하기 위한 컨텍스트 주입
+    
     let mut ctx = Some(TableContext {
         base_url: base_url.map(|s| s.to_string()),
         ..Default::default()
@@ -138,7 +138,7 @@ pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMo
     convert_doc_to_clean_pug_selector(&document, selector_str, mode, base_url)
 }
 
-// 🌟 [HTML5 부모/자식 뎁스 판별 절대 규칙 (Parent Trace Rule)]
+
 // 1. Void Elements (자식 불가 태그): area, base, br, col, embed, hr, img, input, link, meta, param, source, track, wbr 및 PUG 텍스트(|)
 // 2. Root/Layout Elements (역추적 한계선): html, body, head, main, section, article, aside, nav, header, footer
 // 3. Container Elements (합법적 부모): 위 1번과 2번을 제외한 모든 태그 (div, table, ul, li, span, p 등)
@@ -182,12 +182,12 @@ fn is_root_layout_element(line: &str) -> bool {
     root_tags.contains(&tag_name.as_str())
 }
 
-// 🌟 [CRITICAL FIX] Token Optimizer를 주입받아 앞단을 잘라내고, 필수 부모를 복구하며, 최상위 껍데기를 버리는 완전체 함수
+
 pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::tokenizer::TokenizerModel, bottom_drop_tokens: Option<usize>) -> String {
     let mut lines: Vec<&str> = pug.lines().collect();
     if lines.is_empty() { return String::new(); }
 
-    // 🌟 0. 지능형 트리 스캔 (Pre-scan)
+    
     // 의미 있는 자식(input, option, td 등)을 품고 있는 구조적 부모(form, table, select 등)를 찾아내어
     // 절단기(Truncator)가 이 블록을 반토막 내지 못하도록 "Unbreakable Block"으로 묶어버립니다.
     #[derive(Clone, Copy)]
@@ -246,7 +246,7 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::t
         }
     }
 
-    // 🌟 1. 아래서 한 번 자르기 (bottom_drop_tokens 가 주어지면 뒤에서부터 해당 토큰 수만큼 버림)
+    
     if let Some(drop_limit) = bottom_drop_tokens {
         let mut dropped_tokens = 0;
         let mut cut_idx = lines.len();
@@ -263,7 +263,7 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::t
             cut_idx = i;
         }
         
-        // 🌟 [지능형 보호 개입] 절단선이 보호 구역 한가운데를 지나간다면, 절단선을 구역 밖(아래쪽)으로 밀어내어 구역을 살려냅니다.
+        
         if cut_idx < lines.len() {
             if let Some((_, b_end)) = block_of_line[cut_idx] {
                 cut_idx = (b_end + 1).min(lines.len());
@@ -275,7 +275,7 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::t
         lines.truncate(safe_cut_idx);
     }
 
-    // 🌟 2. 위에서 한 번 자르기 (남은 덩어리에서 밑에서부터 max_tokens 만큼 수집하여 앞단을 버림)
+    
     let mut current_tokens = 0;
     let mut start_keep_idx = lines.len();
 
@@ -291,7 +291,7 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::t
         start_keep_idx = i;
     }
     
-    // 🌟 [지능형 보호 개입] 시작선이 보호 구역 한가운데를 지나간다면, 시작선을 구역 꼭대기로 끌어올려 전체 껍데기를 살려냅니다.
+    
     if start_keep_idx < lines.len() && start_keep_idx > 0 {
         if let Some((b_start, _)) = block_of_line[start_keep_idx] {
             start_keep_idx = b_start;
@@ -355,7 +355,7 @@ pub struct TableContext {
     pub current_row_idx: usize,
     pub current_col_idx: usize,
     pub is_in_tbody: bool,
-    pub base_url: Option<String>, // 🌟 상대 주소를 절대 주소로 치환하기 위한 base_url 추가
+    pub base_url: Option<String>, 
 }
 
 pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output: &mut String, mode: &PugMode, ctx: &mut Option<TableContext>) {
@@ -389,12 +389,12 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 return;
             }
 
-            // 🌟 option 태그일 때 selected 속성이 없다면 렌더링하지 않고 즉시 스킵
+            
             if tag_name == "option" && !element.attrs().any(|(k, _)| k.to_lowercase() == "selected") {
                 return;
             }
 
-            // 🌟 PugMode::NoAttributesMode일 때 select, datalist, option, input, textarea 태그와 그 자식들을 원천 제거합니다.
+            
             if *mode == PugMode::NoAttributesMode {
                 if ["select", "datalist", "option"].contains(&tag_name.as_str()) {
                     return;
@@ -405,7 +405,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             if tag_name == "tbody" { if let Some(c) = ctx.as_mut() { c.is_in_tbody = true; c.current_row_idx = 0; } }
             if tag_name == "tr" { if let Some(c) = ctx.as_mut() { c.current_col_idx = 0; } }
 
-            // 🌟 [새로운 태그 축약(평탄화) 로직] 
+            
             // 껍데기 태그 자체가 출력되지 않고 자식에게 뎁스(indent)를 그대로 패스합니다.
             let useless_wrappers = [
                 "div", "span", "section", "article", "main", "aside", 
@@ -415,7 +415,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             let is_useless = useless_wrappers.contains(&tag_name.as_str());
             
             let has_meaningful_attrs = if *mode == PugMode::NoAttributesMode {
-                // 🌟 [CRITICAL FIX] 대소문자 무결성: HTML 속성의 대소문자 혼용으로 인한 증발을 완벽 방어합니다.
+                
                 element.attrs().any(|(k, _)| ["colspan", "rowspan", "scope"].contains(&k.to_lowercase().as_str()))
             } else {
                 element.attrs().any(|(k, _)| {
@@ -424,7 +424,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 })
             };
 
-            // 🌟 [빈 태그 원천 삭제 로직] 내부 자식을 깊게 탐색하여 의미 있는 컨텐츠가 있는지 검사합니다.
+            
             let valid_children: Vec<_> = node.children().filter(|n| {
                 match n.value() {
                     Node::Element(_) => {
@@ -449,7 +449,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             let void_tags = ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"];
             let preserve_empty_tags = ["td", "th", "textarea", "select", "button"]; // 폼이나 표의 구조적 형태 유지를 위해 빈 셀/입력창은 예외적으로 보존
             
-            // 🌟 유효한 자식(텍스트, 내부 엘리먼트 등)이 전혀 없는 빈 껍데기 태그는 렌더링하지 않고 즉시 폐기합니다.
+            
             if valid_children.is_empty() && !void_tags.contains(&tag_name.as_str()) && !preserve_empty_tags.contains(&tag_name.as_str()) {
                 return;
             }
@@ -503,13 +503,13 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             let thead_include = ["scope", "rowspan", "colspan"];
 
             for (name, value) in element.attrs() {
-                // 🌟 [CRITICAL FIX] HTML 속성명에 대소문자(CamelCase 등)가 섞여 있어 rowspan, colspan이 누락되는 현상을 완벽 방어하기 위해 소문자로 강제 변환
+                
                 let name_lower = name.to_lowercase();
                 let name_str = name_lower.as_str();
 
                 if name_str == "id" || name_str == "class" || name_str == "alt" { continue; }
 
-                // 🌟 [CRITICAL FIX] colspan, rowspan, scope는 어떠한 경우에도 무조건 통과하도록 강제(Hardcode)합니다!
+                
                 let should_include = ["colspan", "rowspan", "scope"].contains(&name_str) || if *mode == PugMode::TheadMode {
                     thead_include.contains(&name_str)
                 } else if *mode == PugMode::NoAttributesMode {
@@ -576,7 +576,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             if *mode == PugMode::FullContent || *mode == PugMode::DetailMode || *mode == PugMode::TheadMode || *mode == PugMode::ListMode || *mode == PugMode::NoAttributesMode {
                 let text_content = text.trim();
                 if !text_content.is_empty() {
-                    // 🌟 [CRITICAL FIX 1] 숫자 사이의 콤마(,) 제거 (소수점은 완벽히 보존)
+                    
                     let mut clean_text = text_content.replace("\"", "'");
                     
                     // 정규식: 1~3자리 숫자 뒤에 (콤마 + 3자리 숫자)가 1번 이상 반복되고, 선택적으로 소수점이 붙는 패턴
@@ -618,7 +618,7 @@ pub fn split_doc_to_pug_list_advanced(document: &Html, selector_str: &str, mode:
                 let mut pug_output = String::new();
                 pug_output.reserve(2048);
                 
-                // 🌟 [CRITICAL FIX] headers가 없더라도 base_url을 전달받아 절대 주소 치환이 가능하도록 구조체를 무조건 생성합니다.
+                
                 let mut ctx = Some(TableContext {
                     headers: headers.clone().unwrap_or_default(),
                     is_in_tbody: true,
@@ -914,7 +914,7 @@ Metrics: {METRICS}
 // ==============================================
 
 pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
-    // 🌟 도메인(Type)별로 허용되는 상태(Status) 값을 완벽히 분리하여 매핑합니다.
+    
     let status_options = match seg_type {
         "tracking" => "* 'draft': Shipment preparation or pending pickup.
     * 'progress': Currently in transit or out for delivery.
@@ -1017,7 +1017,7 @@ pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
 [ACTION] RETURN STRICTLY VALID JSON ONLY.
 NO EXPLANATION. NO THINKING. /no_think"###;
 
-    // 🌟 {STATUS_OPTIONS} 를 먼저 치환한 뒤 {TYPE}을 치환합니다.
+    
     template.replace("{STATUS_OPTIONS}", status_options)
             .replace("{TYPE}", seg_type)
             .replace("{TEXT}", current_text)
@@ -1544,11 +1544,11 @@ pub fn normalize_to_json_string(input: &str) -> String {
     let re_trailing = Regex::new(r",\s*([\]}])").unwrap();
     s = re_trailing.replace_all(&s, "$1").to_string();
 
-    // 🌟 [추가] LLM이 뱉어낸 말줄임표(..., ...) 가비지를 닫는 괄호 앞에서 깔끔하게 제거합니다.
+    
     let re_artifact = Regex::new(r",?\s*\.\.\.\s*([\]}])").unwrap();
     s = re_artifact.replace_all(&s, "$1").to_string();
 
-    // 🌟 6. Force close braces, arrays, and strings (Stack-based repair)
+    
     let mut in_string = false;
     let mut escape = false;
     let mut stack = Vec::new();
@@ -1622,7 +1622,7 @@ pub fn parse_json_from_llm(text: &str) -> serde_json::Value {
                 if let Ok(v) = serde_json::from_str(&attempt) { return v; }
             }
         }
-        // 🌟 닫는 괄호가 없어도 여는 괄호 이후부터 끝까지 가져와 복구 시도
+        
         extracted = clean_text[start..].to_string();
     } else if let Some(start) = clean_text.find("[") {
         if let Some(end) = clean_text.rfind("]") {
@@ -1631,7 +1631,7 @@ pub fn parse_json_from_llm(text: &str) -> serde_json::Value {
                 if let Ok(v) = serde_json::from_str(&attempt) { return v; }
             }
         }
-        // 🌟 닫는 괄호가 없어도 여는 괄호 이후부터 끝까지 가져와 복구 시도
+        
         extracted = clean_text[start..].to_string();
     }
 
@@ -1653,7 +1653,7 @@ pub fn parse_json_from_llm(text: &str) -> serde_json::Value {
             }
         }
 
-        // 🌟 [추가] Absolute Final Fallback: 맨 끝 글자를 하나씩 지워가며 에러가 나지 않을 때까지 파싱을 재시도합니다.
+        
         println!("[Parsing] Attempting aggressive character-by-character truncation repair...");
         let mut shrink_attempt = to_repair.to_string();
         let mut attempts = 0;

@@ -118,7 +118,7 @@ pub async fn try_reconnect_existing_browser(app_handle: tauri::AppHandle) -> any
                 }
                 let mut global = GLOBAL_BROWSER.lock().await; 
                 *global = None; 
-                // 🌟 [CRITICAL FIX] 가짜 종료 시그널 전송 제거
+                
             });
             Ok(())
         },
@@ -133,7 +133,7 @@ pub async fn try_reconnect_existing_browser(app_handle: tauri::AppHandle) -> any
 // Global storage for the last detected browser state
 pub struct DetectedState {
     pub url: String,
-    pub tab_id: String, // 🌟 [NEW] 고유 탭 ID 추적용
+    pub tab_id: String, 
     pub is_client: bool,
     pub is_admin: bool,
 }
@@ -141,7 +141,7 @@ pub struct DetectedState {
 pub(crate) static LAST_DETECTED_STATE: Lazy<Arc<tokio::sync::Mutex<DetectedState>>> = Lazy::new(|| {
     Arc::new(tokio::sync::Mutex::new(DetectedState {
         url: String::new(),
-        tab_id: String::new(), // 🌟 [NEW]
+        tab_id: String::new(), 
         is_client: false,
         is_admin: false,
     }))
@@ -153,7 +153,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
         let mut last_is_shop = false;
         let mut fail_count = 0; 
         
-        // 🌟 [핵심 장부] 마지막으로 클릭했던 탭의 고유 ID
+        
         let mut last_focused_tab_id = String::new();
 
         loop {
@@ -185,7 +185,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
             let mut remembered_url = String::new();
             let mut remembered_visible = false;
 
-            // 🌟 1. 모든 탭에 고유 ID를 부여하고 상태를 가져옵니다.
+            
             for page in pages.iter().rev() {
                 let script = r#"
                     (function() {
@@ -201,7 +201,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                     })();
                 "#;
 
-                // 🌟 [핵심] 300ms 타임아웃을 적용하여 탭 응답 지연이 전체 모니터링 루프를 블로킹하지 않도록 합니다.
+                
                 let eval_result = tokio::time::timeout(Duration::from_millis(300), page.evaluate(script)).await;
 
                 match eval_result {
@@ -212,7 +212,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                                 let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
                                 let has_focus = json_val.get("focus").and_then(|v| v.as_bool()).unwrap_or(false);
 
-                                // 🌟 [CRITICAL FIX] 새 탭 이동 시 번개 버튼을 숨기기 위해 chrome://, edge:// 등은 포커스 감지 대상에 포함합니다. (개발자 도구만 배제)
+                                
                                 if tab_url.starts_with("devtools://") {
                                     continue;
                                 }
@@ -236,7 +236,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                 }
             }
 
-            // 🌟 2. 아무 탭도 포커스를 가지지 않은 상태 (Tauri 앱을 클릭한 경우)
+            
             if !found_focus {
                 if !remembered_url.is_empty() && remembered_visible {
                     // 장부에 적힌 탭이 아직 살아있고 화면에 "보이는(visible)" 상태일 때만 유지!
@@ -262,7 +262,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                                 if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str) {
                                     let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
                                     
-                                    // 🌟 [CRITICAL FIX] 새 탭 포커스 감지를 위해 개발자 도구만 배제합니다.
+                                    
                                     if tab_url.starts_with("devtools://") {
                                         continue;
                                     }
@@ -281,7 +281,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                         }
                     }
 
-                    // 🌟 [CRITICAL FIX] Fallback 2: 새 탭(chrome:// 등) 생성으로 인해 스크립트 실행이 실패하여 
+                    
                     // visible 상태를 읽어올 수 없는 경우, 엉뚱한 백그라운드 탭을 잡지 않도록 
                     // 명시적으로 "about:blank"를 주어 프론트엔드가 즉시 번개 버튼(extract)을 숨기도록 유도합니다!
                     if active_url.is_empty() {
@@ -349,7 +349,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
         
         let mut global = GLOBAL_BROWSER.lock().await;
         *global = None;
-        // 🌟 [CRITICAL FIX] 가짜 종료 시그널 전송 제거
+        
         let _ = app_handle.emit("browser-match-found", json!({ "url": "", "is_client": false, "is_admin": false }));
         println!("[AUTO] Browser monitor exited cleanly.");
     });
@@ -374,7 +374,7 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
                     tokio::spawn(async move {
                         while let Some(h) = handler.next().await { if let Err(_) = h { break; } }
                         let mut g = GLOBAL_BROWSER.lock().await; *g = None; 
-                        // 🌟 [CRITICAL FIX] 가짜 종료 시그널 전송 제거
+                        
                     });
                 }
             }
@@ -394,7 +394,7 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
         // 2. Build Config
         let build_config = || -> anyhow::Result<BrowserConfig> {
             let port_arg = format!("--remote-debugging-port={}", CHROME_DEBUG_PORT);
-            // 🌟 args를 mut로 선언하여 변형 가능하게 만듭니다.
+            
             let mut args = vec![
                 "--start-maximized", 
                 "--disable-gpu", 
@@ -414,7 +414,7 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
                 "--remote-allow-origins=*", 
             ];
 
-            // 🌟 [CRITICAL FIX] 탭 두 개 열림 방지: 크롬 실행 시 첫 탭을 무조건 빈 페이지나 목표 URL로 덮어씌웁니다.
+            
             let target_url = if url.is_empty() { "about:blank" } else { url };
             args.push(target_url);
 
@@ -449,14 +449,14 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
         tokio::spawn(async move {
             while let Some(h) = handler.next().await { if let Err(_) = h { break; } }
             let mut global = GLOBAL_BROWSER.lock().await; *global = None; 
-            // 🌟 [CRITICAL FIX] 가짜 종료 시그널 전송 제거
+            
         });
         new_arc
     };
 
     println!("[AUTO] Targeting initial page for {}...", url);
     
-    // 🌟 [CRITICAL FIX] 브라우저가 막 켜졌을 때 첫 번째 탭이 준비될 때까지 아주 짧게 기다려줍니다.
+    
     // 이 대기가 없으면 pages()가 비어있다고 착각하여 불필요한 두 번째 탭(new_page)을 강제 생성해버립니다.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     
@@ -477,7 +477,7 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
     // [CRITICAL STEALTH] 탐지 우회 스크립트 설정
     let _ = page.evaluate_on_new_document("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})").await;
 
-    // 🌟 [CRITICAL FIX] url이 "about:blank" 이더라도 강제로 해당 페이지로 이동(goto)시켜서
+    
     // 남아있는 "chrome://new-tab-page/" 흔적을 깔끔하게 덮어씌워 단일 탭으로 통일합니다.
     let nav_target = if url.is_empty() { "about:blank" } else { url };
     let _ = page.goto(nav_target).await;

@@ -137,7 +137,7 @@ pub async fn process_analytic_task(
         "intent_evolution": tracking_res.get("intent_evolution").and_then(|v| v.as_str()).unwrap_or(""),
         "consistent_preferences": tracking_res.get("consistent_preferences").and_then(|v| v.as_str()).unwrap_or(""),
         "time": now_ts,
-        "mode": "analytic" // 🌟 [CRITICAL FIX] 새로 추가된 mode 컬럼 매핑을 위해 명시적으로 속성을 주입합니다.
+        "mode": "analytic" 
     });
     
     let _ = store.upsert_item(
