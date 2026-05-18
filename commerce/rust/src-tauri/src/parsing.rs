@@ -798,7 +798,7 @@ You are evaluating a page managing this specific domain entity. Use this context
 Read the entire document from top to bottom, applying the following strict filters and evaluations:
 
 1. IGNORE:
-   - Strictly ignore global navigation, menus, headers, footers, aside, search, filter, form.
+   - Strictly ignore global navigation, menus, headers, footers, aside, search, filter.
 2. TARGET:
    - Focus purely on the main data payload where "{CATEGORY}", "{TYPE}", or actual items are listed.
 3. EVALUATE:
@@ -809,6 +809,8 @@ Read the entire document from top to bottom, applying the following strict filte
 
 [SCHEMA DEFINITIONS]
 - {TYPE}:
+    - has_header: Boolean True if the document contains a header.
+    - has_footer: Boolean True if the document contains a footer.
     - has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
     - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
     - detail: Boolean. True ONLY if has_list is false AND has_form is true.
@@ -817,7 +819,9 @@ Read the entire document from top to bottom, applying the following strict filte
 {
   "{TYPE}": {
     "has_list": Boolean,
+    "has_header": Boolean,
     "has_form": Boolean,
+    "has_footer": Boolean,
     "detail": Boolean
   }
 }

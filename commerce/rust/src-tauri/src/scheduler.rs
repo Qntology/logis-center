@@ -859,6 +859,8 @@ async fn process_task(
             
             let snapshot_id = format!("{}_step_a2", task.id); 
 
+            println!("detail_prompt {}" , detail_prompt);
+
             
             model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
