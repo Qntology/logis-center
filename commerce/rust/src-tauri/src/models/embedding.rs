@@ -59,7 +59,7 @@ impl RmsNorm {
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let x_dtype = x.dtype();
-        let internal_dtype = DType::F32;
+        let internal_dtype = if x_dtype == DType::BF16 { DType::BF16 } else { DType::F32 };
         let x = x.to_dtype(internal_dtype)?;
         let variance = x.powf(2.0)?.mean_keepdim(candle_core::D::Minus1)?;
         let x_normed = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
@@ -208,7 +208,8 @@ pub struct FloatModel {
 
 impl FloatModel {
     pub fn new(cfg: &Config, vb: VarBuilder, device: &Device) -> candle_core::Result<Self> {
-        let embed_tokens = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
+        let vb_cpu = vb.clone().set_device(Device::Cpu);
+        let embed_tokens = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_cpu.pp("embed_tokens"))?;
         let rotary = Arc::new(RotaryEmbedding::new(cfg.head_dim, cfg.max_position_embeddings, cfg.rope_theta, device)?);
         let mut layers = Vec::new();
         for i in 0..cfg.num_hidden_layers {
@@ -218,9 +219,10 @@ impl FloatModel {
         Ok(Self { embed_tokens, layers, norm })
     }
 
-    pub fn forward(&self, input_ids: &Tensor) -> candle_core::Result<Tensor> {
+    pub fn forward(&self, input_ids: &Tensor, device: &Device) -> candle_core::Result<Tensor> {
         let seq_len = input_ids.dim(0)?;
-        let mut x = self.embed_tokens.forward(input_ids)?;
+        // Lookup on CPU, then move to device
+        let mut x = self.embed_tokens.forward(input_ids)?.to_device(device)?;
         x = x.reshape((1, seq_len, ()))?;
         let scale = (x.dim(candle_core::D::Minus1)? as f64).sqrt();
         x = (x * scale)?;
@@ -366,9 +368,9 @@ pub struct QuantizedModel {
 
 impl QuantizedModel {
     pub fn new<R: std::io::Seek + std::io::Read>(cfg: &Config, ct: &gguf_file::Content, reader: &mut R, device: &Device) -> Result<Self> {
-        // 🌟 [VRAM 피크 방어] 거대한 임베딩 텐서를 GPU에 넣고 풀지 않고, CPU에서 먼저 풀어서 전송합니다!
+        // 🌟 [VRAM 피크 방어] 임베딩 텐서를 CPU에 유지합니다.
         let t_emb = ct.tensor(reader, "token_embd.weight", &Device::Cpu)?;
-        let tok_emb = t_emb.dequantize_f16(&Device::Cpu).or_else(|_| t_emb.dequantize(&Device::Cpu))?.to_dtype(candle_core::DType::F32)?.to_device(device)?;
+        let tok_emb = t_emb.dequantize_f16(&Device::Cpu).or_else(|_| t_emb.dequantize(&Device::Cpu))?.to_dtype(candle_core::DType::F32)?;
         let embed_tokens = candle_nn::Embedding::new(tok_emb, cfg.hidden_size);
         
         let rotary = Arc::new(RotaryEmbedding::new(cfg.head_dim, cfg.max_position_embeddings, cfg.rope_theta, device)?);
@@ -386,9 +388,10 @@ impl QuantizedModel {
         Ok(Self { embed_tokens, layers, norm })
     }
 
-    pub fn forward(&self, input_ids: &Tensor) -> candle_core::Result<Tensor> {
+    pub fn forward(&self, input_ids: &Tensor, device: &Device) -> candle_core::Result<Tensor> {
         let seq_len = input_ids.dim(0)?;
-        let mut x = self.embed_tokens.forward(input_ids)?;
+        // Lookup on CPU, then move result to device
+        let mut x = self.embed_tokens.forward(input_ids)?.to_device(device)?;
         x = x.reshape((1, seq_len, ()))?;
         let scale = (x.dim(candle_core::D::Minus1)? as f64).sqrt();
         x = (x * scale)?;
@@ -438,6 +441,8 @@ impl EmbeddingModel {
         let config: Config = serde_json::from_str(&config_str)?;
         let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(anyhow::Error::msg)?;
 
+        let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+
         let model_enum = if gguf_path.exists() {
             println!("[EmbeddingModel] Loading GGUF model from {:?}", gguf_path);
             let mut file = std::fs::File::open(&gguf_path)?;
@@ -446,7 +451,7 @@ impl EmbeddingModel {
             ModelEnum::Quantized(model)
         } else if weights_path.exists() {
              println!("[EmbeddingModel] Loading Safetensors model from {:?}", weights_path);
-             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, device).map_err(anyhow::Error::msg)? };
+             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, device).map_err(anyhow::Error::msg)? };
              let model = FloatModel::new(&config, vb, device).map_err(anyhow::Error::msg)?;
              ModelEnum::Float(model)
         } else {
@@ -462,17 +467,19 @@ impl EmbeddingModel {
         
         if token_ids.is_empty() { return Ok(vec![0.0; 768]); }
 
-        let chunk_size = 2000;
+        // VRAM 피크 방지를 위해 청크 사이즈를 512로 축소
+        let chunk_size = 512;
         let chunks: Vec<&[u32]> = token_ids.chunks(chunk_size).collect();
         
         let mut accumulated_vector = vec![0.0; 768];
         let mut total_chunks = 0.0;
 
         for chunk in chunks {
-            let input_tensor = Tensor::new(chunk, &self.device).map_err(anyhow::Error::msg)?;
+            // input_tensor를 CPU에 생성 (임베딩 룩업용)
+            let input_tensor = Tensor::new(chunk, &Device::Cpu).map_err(anyhow::Error::msg)?;
             let hidden_states = match &self.model {
-                ModelEnum::Float(m) => m.forward(&input_tensor).map_err(anyhow::Error::msg)?,
-                ModelEnum::Quantized(m) => m.forward(&input_tensor).map_err(anyhow::Error::msg)?,
+                ModelEnum::Float(m) => m.forward(&input_tensor, &self.device).map_err(anyhow::Error::msg)?,
+                ModelEnum::Quantized(m) => m.forward(&input_tensor, &self.device).map_err(anyhow::Error::msg)?,
             };
             
             let (_b, s, _h) = hidden_states.dims3().map_err(anyhow::Error::msg)?;
