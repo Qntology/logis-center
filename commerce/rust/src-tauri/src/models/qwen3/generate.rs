@@ -297,9 +297,6 @@ impl Qwen3GenerateModel {
         let res = self.tokenizer.token_decode(generate)?;
         self.qwen3.clear_kv_cache();
         Ok(res)
-    } res = self.tokenizer.token_decode(generate)?;
-        self.qwen3.clear_kv_cache();
-        Ok(res)
     }
 
     pub fn clear_kv_cache(&mut self) {
