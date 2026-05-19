@@ -708,7 +708,7 @@ async fn ai_search_complex(
     {
         // 최소한의 동기화 정보만 업데이트 (UI 복구용)
         let mut mem_guard = crate::ACTIVE_TASK_MEM.write().unwrap();
-        let now = chrono::Utc::now().timestamp_millis();
+        // let now = chrono::Utc::now().timestamp_millis();
         *mem_guard = Some(json!({
             "id": task_id.clone(),
             "status": 1

@@ -1315,7 +1315,7 @@ pub fn conv1d_depthwise(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>) 
 
     let len_out = len_in - kernel_size + 1;
 
-    let mut out = if len_out == 1 {
+    let out = if len_out == 1 {
         // 디코딩 초고속 패스
         input.broadcast_mul(&weight.unsqueeze(0)?)?.sum_keepdim(2)?
     } else {

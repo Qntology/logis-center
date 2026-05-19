@@ -1510,8 +1510,8 @@ async fn process_task(
         let mut all_extracted_items = Vec::new();
         
         // 병합 대기열을 위한 변수들
-        let pending_merge: Option<serde_json::Value> = None;
-        let merge_countdown = 0;
+        // let pending_merge: Option<serde_json::Value> = None;
+        // let merge_countdown = 0;
 
         let mut pug_list = {
             let clean_content = &clean_html_content;
@@ -2377,14 +2377,14 @@ async fn process_task(
                 
                 let mut existing_vector = None;
                 let mut is_new = true;
-                let mut is_fully_processed = false;
+                // let is_fully_processed = false;
 
                 if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &hashed_item_id).await {
                     is_new = false;
                     // 이미 상세 페이지에서 처리되어 updated_at이 0보다 큰지 확인
-                    if existing_item.updated_at_ts > 0 {
-                        is_fully_processed = true;
-                    }
+                    // if existing_item.updated_at_ts > 0 {
+                    //     is_fully_processed = true;
+                    // }
                     if existing_item.digest == item_digest {
                         existing_vector = Some(existing_item.vector);
                     }

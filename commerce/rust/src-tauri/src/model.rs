@@ -23,19 +23,6 @@ use std::io::Cursor;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 
-pub struct Spinner {
-    pub frames: Vec<&'static str>,
-    pub interval: u64,
-}
-
-impl Spinner {
-    pub fn dots() -> Self {
-        Self {
-            frames: vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
-            interval: 80,
-        }
-    }
-}
 
 pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
     let type_map = json!({

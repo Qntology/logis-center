@@ -21,7 +21,7 @@ static DEVICE_CACHE: Lazy<Mutex<Vec<Option<Device>>>> = Lazy::new(|| Mutex::new(
 
 pub fn get_gpu_device(id: usize) -> Device {
     {
-        let mut cache = DEVICE_CACHE.lock().unwrap();
+        let cache = DEVICE_CACHE.lock().unwrap();
         if id < cache.len() {
             if let Some(dev) = &cache[id] {
                 return dev.clone();

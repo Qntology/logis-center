@@ -2486,7 +2486,7 @@ impl QuantizedQwenVLTextModel {
                 let v_cpu = merged_v_cpu.narrow(2, current_offset, chunk_len).unwrap_or_else(|_| merged_v_cpu.clone()).contiguous().unwrap_or_else(|_| merged_v_cpu.clone());
                 current_offset += chunk_len;
 
-                let mut inner = kv_blocks[idx].inner.write().unwrap();
+                let inner = kv_blocks[idx].inner.write().unwrap();
                 let k_shape_vec: Vec<u32> = k_cpu.shape().dims().iter().map(|&x| x as u32).collect();
 
                 dumps_to_send.push((
@@ -2615,7 +2615,7 @@ impl QuantizedQwenVLTextModel {
         
         // 억지로 만든 마스크가 과거 기억(10,000 토큰)을 블라인드 처리해버렸습니다.
         // 어텐션 내부에 완벽한 동적 마스크 생성기가 이미 존재하므로, 여기서는 무조건 None을 던져야 합니다!
-        let attention_mask: Option<Tensor> = None;
+        let _attention_mask: Option<Tensor> = None;
 
         let mut next_layer_task = None;
         let mut ping_pong_carrier = QuantizedQwenVLTextDecoderLayer::new_skeleton(
@@ -2628,11 +2628,6 @@ impl QuantizedQwenVLTextModel {
         }
 
         for layer_idx in 0..total_layers {
-            if !is_decoding && (layer_idx % 7 == 0 || layer_idx == total_layers - 1) {
-                let phase = if !is_decoding { "Prefill" } else { "Decode" };
-                // println!("[ENGINE] Running Layer {}/{} (Ping-Pong {} Active)", layer_idx + 1, total_layers, phase);
-            }
-
             if layer_idx + 1 < total_layers {
                 let next_idx = layer_idx + 1;
                 let mmap_clone = self.mmap.clone();
@@ -2918,7 +2913,7 @@ impl QuantizedQwenVLModel {
             Some(QwenVLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?)
         };
 
-        let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
+        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         
         let language_model = QuantizedQwenVLTextModel::new_with_mmap(
             &t_config, ct_main.clone(), main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
@@ -3108,7 +3103,7 @@ impl QuantizedQwenVLModel {
         image_grid_thw: Option<&Tensor>,
         _pixel_values_video: Option<&Tensor>,
         video_grid_thw: Option<&Tensor>,
-        cache_position_in: Option<&Tensor>,
+        _cache_position_in: Option<&Tensor>,
         seqlen_offset: usize,
         total_len: usize,
         session_id: Option<String>,
