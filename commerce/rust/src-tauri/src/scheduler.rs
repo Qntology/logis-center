@@ -1510,8 +1510,8 @@ async fn process_task(
         let mut all_extracted_items = Vec::new();
         
         // 병합 대기열을 위한 변수들
-        let mut pending_merge: Option<serde_json::Value> = None;
-        let mut merge_countdown = 0;
+        let pending_merge: Option<serde_json::Value> = None;
+        let merge_countdown = 0;
 
         let mut pug_list = {
             let clean_content = &clean_html_content;

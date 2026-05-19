@@ -3,16 +3,16 @@ use std::io::{Read, Seek};
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor, quantized::QMatMul};
 use candle_nn::{
-    Conv1d, Embedding, Linear, Module, RmsNorm, VarBuilder, embedding, linear_b, linear_no_bias,
-    ops::sigmoid, rms_norm,
+    Conv1d, Embedding, Linear, Module, VarBuilder, embedding, linear_b, linear_no_bias,
+    ops::sigmoid,
 };
 
-use crate::models::qwen::quantized_model::{KVBlock, KVLocation, KVRegistry, BitKVMetadata};
+use crate::models::qwen::quantized_model::{KVBlock, KVLocation, KVRegistry};
 
 use crate::{
     models::{
         common::{
-            conv1d_depthwise, eager_attention_forward, get_conv1d,
+            conv1d_depthwise, get_conv1d,
             gguf::{GateUpDownMLPGguf, Gguf, ProjKind, QuantizedLinear},
             softplus,
         },
@@ -21,8 +21,8 @@ use crate::{
     },
     position_embed::rope::{Qwen3VLTextRotaryEmbedding, apply_rotary_pos_emb},
     utils::tensor_utils::{
-        get_equal_mask, get_vision_next_indices, l2_normalize, masked_scatter_dim0, nonzero_index,
-        prepare_causal_attention_mask, repeat_interleave, split_tensor, zero_index,
+        l2_normalize, masked_scatter_dim0,
+        prepare_causal_attention_mask, repeat_interleave, split_tensor,
     },
 };
 
@@ -1721,7 +1721,7 @@ impl Qwen3_5TextModel {
                     AttnKind::SelfAttn(attn) => {
                         let mut dumps = Vec::new();
                         for block in attn.kv_blocks.iter_mut() {
-                            let mut inner = block.inner.write().unwrap(); 
+                            let inner = block.inner.write().unwrap(); 
                             let is_full = inner.len == 1024;
                             
                             

@@ -1542,6 +1542,7 @@ impl LogisModel {
             
             let gen_arc = self.qwen3_generator.clone();
             let task_q = task_question_1.clone();
+            let cancel_clone = cancel_token.clone();
             
             let res1 = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
                 let mut gen_guard = gen_arc.blocking_lock();
@@ -1561,7 +1562,7 @@ impl LogisModel {
                         top_p: Some(1.0), 
                         ..Default::default()
                     };
-                    gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+                    gen.generate(params, Some(cancel_clone)).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
                 } else {
                     Err(anyhow::anyhow!("Qwen3 Generator is missing"))
                 }
@@ -1617,6 +1618,7 @@ impl LogisModel {
                 let prompt1_5 = crate::parsing::extract_numeric_conditions(&current_text, &query, &seg_type, metrics_json);
                 
                 let gen_arc = self.qwen3_generator.clone();
+                let cancel_clone = cancel_token.clone();
                 
                 let res1_5 = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
                     let mut gen_guard = gen_arc.blocking_lock();
@@ -1631,7 +1633,7 @@ impl LogisModel {
                             model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
                             ..Default::default()
                         };
-                        gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+                        gen.generate(params, Some(cancel_clone)).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen3 Generator is missing"))
                     }
@@ -1799,6 +1801,7 @@ impl LogisModel {
         emit_term(&format!("[STAGE-1] Extracting shipping filters from query: '{}'", query));
         let prompt = crate::parsing::extract_shipping_conditions(&query, language);
         let gen_arc = self.qwen3_generator.clone();
+        let cancel_clone = cancel_token.clone();
         
         let res = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut gen_guard = gen_arc.blocking_lock();
@@ -1813,7 +1816,7 @@ impl LogisModel {
                     model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
                     ..Default::default()
                 };
-                gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+                gen.generate(params, Some(cancel_clone)).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
             } else {
                 Err(anyhow::anyhow!("Qwen3 Generator is missing"))
             }

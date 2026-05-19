@@ -1,5 +1,5 @@
 use crate::openai_types::ChatCompletionParameters;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use std::sync::Arc;

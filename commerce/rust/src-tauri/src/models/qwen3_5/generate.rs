@@ -1,5 +1,5 @@
 use crate::openai_types::{ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart, ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText, ImageURL};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use candle_core::{DType, Device, Tensor, quantized::gguf_file};
 use candle_nn::VarBuilder;
 use std::io::Write;
