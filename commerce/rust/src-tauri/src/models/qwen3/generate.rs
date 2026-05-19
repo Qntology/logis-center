@@ -201,6 +201,7 @@ impl Qwen3GenerateModel {
         _task_id: Option<String>,
         load_session_id: Option<String>,
         cache_dir: Option<String>,
+        cancel_flag: Option<Arc<AtomicBool>>,
     ) -> Result<String> {
         if is_prefill {
             self.clear_kv_cache();
@@ -230,6 +231,12 @@ impl Qwen3GenerateModel {
         let sample_len = mes.max_tokens.unwrap_or(2048);
 
         for _ in 0..sample_len {
+            if let Some(flag) = &cancel_flag {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+            }
+
             let logits = self.qwen3.forward(Some(&input_ids), None, seqlen_offset)?;
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             let next_token = logit_processor.sample(&logits)?;
@@ -247,7 +254,7 @@ impl Qwen3GenerateModel {
         Ok(res_text)
     }
 
-    pub fn generate(&mut self, mes: ChatCompletionParameters) -> Result<String> {
+    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>) -> Result<String> {
         let temperature = mes
             .temperature
             .unwrap_or(self.generation_config.temperature as f64);
@@ -270,6 +277,12 @@ impl Qwen3GenerateModel {
         let mut generate = Vec::new();
         let sample_len = mes.max_tokens.unwrap_or(2048);
         for _ in 0..sample_len {
+            if let Some(flag) = &cancel_flag {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+            }
+
             let logits = self.qwen3.forward(Some(&input_ids), None, seqlen_offset)?;
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             let next_token = logit_processor.sample(&logits)?;
@@ -282,6 +295,9 @@ impl Qwen3GenerateModel {
             input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
         }
         let res = self.tokenizer.token_decode(generate)?;
+        self.qwen3.clear_kv_cache();
+        Ok(res)
+    } res = self.tokenizer.token_decode(generate)?;
         self.qwen3.clear_kv_cache();
         Ok(res)
     }

@@ -11,42 +11,6 @@ use anyhow::Result;
 use tauri::Emitter;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-// Deep merge for JSON objects
-fn merge_json_results(target: &mut Value, source: &Value) {
-    if let (Some(target_obj), Some(source_obj)) = (target.as_object_mut(), source.as_object()) {
-        for (k, v) in source_obj {
-            // If value is null or empty string/array, ignore
-            if v.is_null() { continue; }
-            if let Some(s) = v.as_str() { if s.is_empty() { continue; } }
-            if let Some(a) = v.as_array() { if a.is_empty() { continue; } }
-            
-            // If target doesn't have it or target is empty, overwrite
-            let should_update = match target_obj.get(k) {
-                None => true,
-                Some(tv) => {
-                    tv.is_null() || 
-                    (tv.is_string() && tv.as_str() == Some("")) ||
-                    (tv.is_array() && tv.as_array().unwrap().is_empty())
-                }
-            };
-
-            if should_update {
-                target_obj.insert(k.clone(), v.clone());
-            } else if let Some(target_inner) = target_obj.get_mut(k) {
-                // If both are objects, recurse
-                if target_inner.is_object() && v.is_object() {
-                    merge_json_results(target_inner, v);
-                }
-                // Lists? Simply append for now (might duplicate, but safe for search)
-                else if let (Some(ta), Some(sa)) = (target_inner.as_array_mut(), v.as_array()) {
-                    ta.extend(sa.clone());
-                }
-            }
-        }
-    }
-}
-
-
 fn merge_node(obj1: &Value, obj2: &Value) -> Value {
     let mut merged = obj1.clone();
     if let (Some(m_obj), Some(o2_obj)) = (merged.as_object_mut(), obj2.as_object()) {
@@ -859,9 +823,6 @@ async fn process_task(
             
             let snapshot_id = format!("{}_step_a2", task.id); 
 
-            println!("detail_prompt {}" , detail_prompt);
-
-            
             model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             
@@ -1611,7 +1572,7 @@ async fn process_task(
             model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
             for (idx, item_pug) in pug_list.iter().enumerate() {
-                if cancellation_token.load(Ordering::Relaxed) { break; }
+                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
                 let percent = (((idx as f32) / (total_items as f32)) * 100.0) as i32;
                 let summary_msg = format!("Extracting item data ({}%)...", percent);
@@ -1631,6 +1592,7 @@ async fn process_task(
 
                 
                 let q3_gen_meta = model.qwen3_generator.clone();
+                let cancel_meta = cancellation_token.clone();
                 let res_meta = tokio::task::spawn_blocking(move || {
                     let mut gen_guard = q3_gen_meta.blocking_lock();
                     if let Some(gen) = gen_guard.as_mut() {
@@ -1643,7 +1605,7 @@ async fn process_task(
                             model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
                             ..Default::default()
                         };
-                        gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen 3 Meta failed: {}", e))
+                        gen.generate(params, Some(cancel_meta)).map_err(|e| anyhow::anyhow!("Qwen 3 Meta failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                     }
@@ -1651,6 +1613,7 @@ async fn process_task(
 
                 
                 let q3_gen_info = model.qwen3_generator.clone();
+                let cancel_info = cancellation_token.clone();
                 let res_info = tokio::task::spawn_blocking(move || {
                     let mut gen_guard = q3_gen_info.blocking_lock();
                     if let Some(gen) = gen_guard.as_mut() {
@@ -1663,7 +1626,7 @@ async fn process_task(
                             model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
                             ..Default::default()
                         };
-                        gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen 3 Info failed: {}", e))
+                        gen.generate(params, Some(cancel_info)).map_err(|e| anyhow::anyhow!("Qwen 3 Info failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                     }
@@ -1671,6 +1634,7 @@ async fn process_task(
 
                 
                 let q3_gen_data = model.qwen3_generator.clone();
+                let cancel_data = cancellation_token.clone();
                 let res_data = tokio::task::spawn_blocking(move || {
                     let mut gen_guard = q3_gen_data.blocking_lock();
                     if let Some(gen) = gen_guard.as_mut() {
@@ -1683,7 +1647,7 @@ async fn process_task(
                             model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.95),
                             ..Default::default()
                         };
-                        gen.generate(params).map_err(|e| anyhow::anyhow!("Qwen 3 Data failed: {}", e))
+                        gen.generate(params, Some(cancel_data)).map_err(|e| anyhow::anyhow!("Qwen 3 Data failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                     }
@@ -1843,7 +1807,7 @@ async fn process_task(
                     emit_term("[STAGE-3] Preparing AI engine...");
                     
                     
-                    let res = gen.generate_part(&params, false, 0, None, Some(snapshot_id.clone()), kv_name.clone()).await?;
+                    let res = gen.generate_part(&params, false, 0, Some(cancellation_token.clone()), None, Some(snapshot_id.clone()), kv_name.clone()).await?;
                     
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res.text);
 
@@ -2077,6 +2041,8 @@ async fn process_task(
         if let Some(goods_arr) = extracted_data.get("goods").and_then(|v| v.as_array()) {
             let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
             for good in goods_arr {
+                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
                 let g_no = good.get("id").or_else(|| good.get("no")).and_then(|v| v.as_str()).unwrap_or("");
                 if !g_no.is_empty() {
                     let clean_g_no = crate::utils::hash::normalize_numeric_homoglyphs(g_no).replace("-", "").replace("_", "");
@@ -2372,6 +2338,8 @@ async fn process_task(
         
         if let Some(items) = extracted_data.get("items").and_then(|v| v.as_array()) {
             for item_val in items.iter() {
+                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
                 let mut single_item = item_val.clone();
                 
                 

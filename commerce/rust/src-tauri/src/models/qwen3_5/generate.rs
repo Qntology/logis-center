@@ -417,6 +417,7 @@ impl Qwen3_5GenerateModel {
         mes: &ChatCompletionParameters,
         is_continuation: bool,
         last_offset: usize,
+        cancel_flag: Option<Arc<AtomicBool>>,
         last_token: Option<u32>,
         session_id: Option<String>,
         kv_name: Option<String>
@@ -510,6 +511,12 @@ impl Qwen3_5GenerateModel {
         let mut print_buffer = String::new();
 
         for i in 0..sample_len {
+            if let Some(flag) = &cancel_flag {
+                if flag.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+
             crate::models::qwen::generate::wait_for_global_io().await;
 
             let logits = self.qwen3_5.forward(

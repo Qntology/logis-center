@@ -2,6 +2,7 @@ use crate::openai_types::ChatCompletionParameters;
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use crate::{
     chat_template::ChatTemplate,
@@ -55,7 +56,7 @@ impl Qwen3VLGenerateModel {
         })
     }
 
-    pub fn generate(&mut self, mes: ChatCompletionParameters) -> Result<String> {
+    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>) -> Result<String> {
         let temperature = mes
             .temperature
             .unwrap_or(self.generation_config.temperature as f64);
@@ -80,6 +81,12 @@ impl Qwen3VLGenerateModel {
         let mut generate = Vec::new();
         let sample_len = mes.max_tokens.unwrap_or(1024);
         for _ in 0..sample_len {
+            if let Some(flag) = &cancel_flag {
+                if flag.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+
             let logits = self.qwen3_vl.forward(
                 &input_ids,
                 pixel_values,
