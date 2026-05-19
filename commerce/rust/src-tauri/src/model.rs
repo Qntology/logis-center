@@ -1950,33 +1950,33 @@ impl LogisModel {
         Ok(report)
     }
 
-    fn get_search_schema_definitions(&self, _doc_type: &str) -> String {
-        r###"{ 
-  "header.document_type": { "desc": "Type (Invoice, BL, AWB, PO, BC, AN, DO...)", "type": "String" },
-  "header.document_number": { "desc": "ID, Doc No, Reference No", "type": "String" },
-  "header.po_number": { "desc": "Purchase Order No (PO)", "type": "String" },
-  "header.booking_number": { "desc": "Booking Reference No (BC)", "type": "String" },
-  "header.an_number": { "desc": "Arrival Notice No (AN)", "type": "String" },
-  "header.do_number": { "desc": "Delivery Order No (DO)", "type": "String" },
-  "header.issue_date": { "desc": "Date (YYYY-MM-DD)", "type": "String" },
+//     fn get_search_schema_definitions(&self, _doc_type: &str) -> String {
+//         r###"{ 
+//   "header.document_type": { "desc": "Type (Invoice, BL, AWB, PO, BC, AN, DO...)", "type": "String" },
+//   "header.document_number": { "desc": "ID, Doc No, Reference No", "type": "String" },
+//   "header.po_number": { "desc": "Purchase Order No (PO)", "type": "String" },
+//   "header.booking_number": { "desc": "Booking Reference No (BC)", "type": "String" },
+//   "header.an_number": { "desc": "Arrival Notice No (AN)", "type": "String" },
+//   "header.do_number": { "desc": "Delivery Order No (DO)", "type": "String" },
+//   "header.issue_date": { "desc": "Date (YYYY-MM-DD)", "type": "String" },
   
-  "parties.supplier_name": { "desc": "Seller, Shipper, Exporter, Vendor", "type": "String" },
-  "parties.buyer_name": { "desc": "Buyer, Consignee, Importer", "type": "String" },
-  "parties.notify_party_name": { "desc": "Notify Party", "type": "String" },
+//   "parties.supplier_name": { "desc": "Seller, Shipper, Exporter, Vendor", "type": "String" },
+//   "parties.buyer_name": { "desc": "Buyer, Consignee, Importer", "type": "String" },
+//   "parties.notify_party_name": { "desc": "Notify Party", "type": "String" },
   
-  "financials.amount_total": { "desc": "Total Value/Amount", "type": "Number" },
-  "financials.local_charges_total": { "desc": "Total Local Charges (AN)", "type": "Number" },
+//   "financials.amount_total": { "desc": "Total Value/Amount", "type": "Number" },
+//   "financials.local_charges_total": { "desc": "Total Local Charges (AN)", "type": "Number" },
   
-  "logistics.vehicle_name": { "desc": "Vessel Name, Flight No", "type": "String" },
-  "logistics.location_port_of_loading": { "desc": "POL, Origin", "type": "String" },
-  "logistics.location_port_of_discharge": { "desc": "POD, Destination", "type": "String" },
-  "logistics.pickup_location": { "desc": "Pickup Location (DO)", "type": "String" },
-  "logistics.etd": { "desc": "Estimated Departure", "type": "String" },
-  "logistics.eta": { "desc": "Estimated Arrival", "type": "String" },
+//   "logistics.vehicle_name": { "desc": "Vessel Name, Flight No", "type": "String" },
+//   "logistics.location_port_of_loading": { "desc": "POL, Origin", "type": "String" },
+//   "logistics.location_port_of_discharge": { "desc": "POD, Destination", "type": "String" },
+//   "logistics.pickup_location": { "desc": "Pickup Location (DO)", "type": "String" },
+//   "logistics.etd": { "desc": "Estimated Departure", "type": "String" },
+//   "logistics.eta": { "desc": "Estimated Arrival", "type": "String" },
   
-  "conditions.incoterms_code": { "desc": "Incoterms (FOB, CIF)", "type": "String" }
-}"###.to_string()
-    }
+//   "conditions.incoterms_code": { "desc": "Incoterms (FOB, CIF)", "type": "String" }
+// }"###.to_string()
+//     }
 }
 
 pub fn get_image_extraction_prompt(region: &str, language: &str, page_type: &str, address: &str) -> String {

@@ -41,19 +41,19 @@ pub struct ForeignInfo {
     pub to: String,
 }
 
-pub fn merge_node(target: &mut Value, source: &Value) {
-    if let (Value::Object(target_map), Value::Object(source_map)) = (target, source) {
-        for (key, source_value) in source_map {
-            let is_empty = source_value.is_null() || 
-                           (source_value.is_string() && source_value.as_str() == Some("")) ||
-                           (source_value.is_number() && source_value.as_f64() == Some(0.0));
+// pub fn merge_node(target: &mut Value, source: &Value) {
+//     if let (Value::Object(target_map), Value::Object(source_map)) = (target, source) {
+//         for (key, source_value) in source_map {
+//             let is_empty = source_value.is_null() || 
+//                            (source_value.is_string() && source_value.as_str() == Some("")) ||
+//                            (source_value.is_number() && source_value.as_f64() == Some(0.0));
 
-            if !is_empty {
-                target_map.insert(key.clone(), source_value.clone());
-            }
-        }
-    }
-}
+//             if !is_empty {
+//                 target_map.insert(key.clone(), source_value.clone());
+//             }
+//         }
+//     }
+// }
 
 #[allow(dead_code)]
 

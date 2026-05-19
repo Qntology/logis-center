@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use tokio::sync::Mutex;
 use serde_json::{Value, json};
 use anyhow::Result;

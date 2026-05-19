@@ -7,8 +7,7 @@ use candle_nn::{
 };
 
 use crate::{
-    position_embed::rope::{RoPE, apply_rotary_pos_emb, apply_rotary_pos_emb_roformer},
-    utils::tensor_utils::prepare_causal_attention_mask, 
+    position_embed::rope::apply_rotary_pos_emb,
 };
 
 #[derive(Debug, Clone)]
@@ -480,12 +479,12 @@ pub fn decoding_attention_parallel(
     query_states: &Tensor,
     key_states: &Tensor,
     value_states: &Tensor,
-    num_key_value_groups: Option<usize>, // <-- Add this argument here!
+    _num_key_value_groups: Option<usize>, // <-- Add this argument here!
     scaling: f64,
 ) -> Result<Tensor> {
     // Flash-Decoding style optimization for seq_len = 1 (Decoding)
     // Splits KV into chunks and parallelizes attention calculation
-    let (_b_sz, n_heads, q_len, _head_dim) = query_states.dims4()?;
+    let (_b_sz, _n_heads, q_len, _head_dim) = query_states.dims4()?;
     
     // [FIX] Early exit if not a decoding step (q_len > 1)
     if q_len != 1 {
@@ -493,7 +492,7 @@ pub fn decoding_attention_parallel(
     }
 
     // [FIX] GQA Support: Repeat KV heads if they are fewer than query heads
-    let n_kv_heads = key_states.dim(1)?;
+    let _n_kv_heads = key_states.dim(1)?;
 
     let kv_seq_len = key_states.dim(2)?;
     let chunk_size = 128; // Optimal chunk size for parallel reduction
@@ -641,7 +640,7 @@ pub fn eager_attention_forward(
     query_states: &Tensor,
     key_states: &Tensor,
     value_states: &Tensor,
-    num_key_value_groups: Option<usize>,
+    _num_key_value_groups: Option<usize>,
     attention_mask: Option<&Tensor>,
     scaling: f64,
 ) -> Result<Tensor> {

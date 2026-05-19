@@ -2,7 +2,7 @@ use anyhow::Result;
 use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_transformers::models::deepseek2::SplitOp;
 
-use crate::utils::tensor_utils::{index_select_2d, split_tensor};
+use crate::utils::tensor_utils::{split_tensor};
 
 pub fn compute_default_rope_parameters(dim: usize, base: f32) -> Vec<f32> {
     let inv_freq: Vec<f32> = (0..dim)

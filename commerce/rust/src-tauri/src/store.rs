@@ -1,7 +1,7 @@
 use anyhow::Result;
 use lancedb::{Connection, connect};
 use lancedb::query::{ExecutableQuery, QueryBase};
-use arrow_array::{RecordBatch, StringArray, Int64Array, Float32Array, FixedSizeListArray, RecordBatchIterator, Array};
+use arrow_array::{RecordBatch, StringArray, Int64Array, Float32Array, FixedSizeListArray, Array};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use serde::{Serialize, Deserialize};

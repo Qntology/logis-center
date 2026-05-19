@@ -1,5 +1,5 @@
 use crate::openai_types::ChatCompletionParameters;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 
@@ -25,7 +25,6 @@ pub struct Qwen3VLGenerateModel {
     eos_token_id1: u32,
     eos_token_id2: u32,
     generation_config: Qwen3GenerationConfig,
-    model_name: String,
 }
 
 impl Qwen3VLGenerateModel {
@@ -53,7 +52,6 @@ impl Qwen3VLGenerateModel {
             eos_token_id1: generation_config.eos_token_id[0] as u32,
             eos_token_id2: generation_config.eos_token_id[1] as u32,
             generation_config,
-            model_name: "qwen3vl".to_string(),
         })
     }
 

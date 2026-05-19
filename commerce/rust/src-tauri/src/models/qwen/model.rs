@@ -16,9 +16,8 @@ use crate::{
         },
     },
     utils::tensor_utils::{
-        bitor_tensor, get_vision_next_indices, linspace, mask_index_add, masked_scatter_dim0,
-        nonzero_index, prepare_causal_attention_mask, prod_tensor_last_dim, split_tensor,
-        zero_index,
+        bitor_tensor, linspace, mask_index_add, masked_scatter_dim0,
+        prepare_causal_attention_mask, split_tensor,
     },
 };
 
@@ -1028,7 +1027,7 @@ impl QwenVLModel {
             if let Some(video_mask_) = video_mask {
                 let image_mask_ = image_mask_.squeeze(0)?;
                 let video_mask_ = video_mask_.squeeze(0)?;
-                let visual_mask = bitor_tensor(&image_mask_, &video_mask_)?;
+                let _visual_mask = bitor_tensor(&image_mask_, &video_mask_)?;
                 
                 // [CRITICAL FIX] 3연속 GPU Sync Stall을 1번의 CPU 스캔으로 통합 압축
                 let img_mask_vec = image_mask_.to_vec1::<u32>()?;

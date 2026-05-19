@@ -11,7 +11,7 @@ use crate::{
     },
 };
 use anyhow::Result;
-use candle_core::{DType, Device, IndexOp, Shape, Tensor};
+use candle_core::{DType, Device, Shape, Tensor};
 use image::DynamicImage;
 use sysinfo::System;
 

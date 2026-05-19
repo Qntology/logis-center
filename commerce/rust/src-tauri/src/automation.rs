@@ -370,7 +370,6 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
                     *global = Some(b_arc.clone());
                     spawn_browser_monitor(b_arc.clone(), app_handle.clone());
                     
-                    let app_handle_clone = app_handle.clone();
                     tokio::spawn(async move {
                         while let Some(h) = handler.next().await { if let Err(_) = h { break; } }
                         let mut g = GLOBAL_BROWSER.lock().await; *g = None; 
@@ -445,7 +444,6 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
         }
         let _ = app_handle.emit("browser-status", "running");
         spawn_browser_monitor(new_arc.clone(), app_handle.clone());
-        let app_handle_clone = app_handle.clone();
         tokio::spawn(async move {
             while let Some(h) = handler.next().await { if let Err(_) = h { break; } }
             let mut global = GLOBAL_BROWSER.lock().await; *global = None; 
