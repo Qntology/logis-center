@@ -753,10 +753,10 @@ impl LogisModel {
             }
         };
 
-        let qwen_model_path = normalize_path(base_path.join("qwen3")); 
-        let qwen3_model_path = normalize_path(base_path.join("qwen3")); 
-        let qwen3_5_model_path = normalize_path(base_path.join("qwen3_5"));
-        let embedding_path = base_path.join("embeddings");
+        let qwen_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf")); 
+        let qwen3_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf")); 
+        let qwen3_5_model_path = normalize_path(base_path.join("Qwen3.5-0.8B-Instruct-gguf"));
+        let embedding_path = base_path.join("embeddinggemma-300m");
 
         let max_tokens_limit = 65536; 
 

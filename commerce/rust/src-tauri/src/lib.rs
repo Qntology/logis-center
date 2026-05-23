@@ -1526,18 +1526,28 @@ async fn save_mobile_temp_file(
 #[tauri::command]
 async fn check_model_status() -> Result<serde_json::Value, String> {
     let app_dir = crate::utils::get_app_dir();
-    let is_valid_model = |p: &std::path::PathBuf| -> bool {
-        p.exists() && std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) > 10_000_000
+    let base_path = app_dir.join("models");
+
+    // 특정 폴더 내에 10MB 이상의 GGUF 파일이 존재하는지 검사 (이름 무관)
+    let has_gguf = |dir: &std::path::PathBuf| -> bool {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            entries.flatten().any(|e| {
+                e.path().extension().map_or(false, |ext| ext == "gguf") && 
+                e.metadata().map(|m| m.len()).unwrap_or(0) > 10_000_000
+            })
+        } else {
+            false
+        }
     };
     
-    let qwen3_weights = app_dir.join("models").join("qwen3").join("qwen3.gguf");
-    let qwen_weights = app_dir.join("models").join("qwen3_5").join("qwen3.5.gguf");
-    let embed_weights = app_dir.join("models").join("embeddings").join("embeddinggemma-300m-Q4_0.gguf");
+    let qwen3_dir = base_path.join("Qwen3-0.6B-Instruct-gguf");
+    let qwen3_5_dir = base_path.join("Qwen3.5-0.8B-Instruct-gguf");
+    let embed_dir = base_path.join("embeddinggemma-300m");
 
     Ok(serde_json::json!({
-        "Qwen3": is_valid_model(&qwen3_weights),
-        "Qwen3.5": is_valid_model(&qwen_weights),
-        "Embedding": is_valid_model(&embed_weights)
+        "Qwen3": has_gguf(&qwen3_dir),
+        "Qwen3.5": has_gguf(&qwen3_5_dir),
+        "Embedding": has_gguf(&embed_dir)
     }))
 }
 
@@ -1557,14 +1567,16 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
     let app_dir_clone = app_dir.clone();
     
     tokio::task::spawn(async move {
+        let base_path = app_dir_clone.join("models");
+
         let folder_name = match model_name.as_str() {
-            "Qwen3" => "qwen3",
-            "Qwen3.5" => "qwen3_5",
-            "Embedding" => "embeddings",
+            "Qwen3" => "Qwen3-0.6B-Instruct-gguf",
+            "Qwen3.5" => "Qwen3.5-0.8B-Instruct-gguf",
+            "Embedding" => "embeddinggemma-300m",
             _ => "unknown"
         };
 
-        let dir_path = app_dir_clone.join("models").join(folder_name);
+        let dir_path = base_path.join(folder_name);
         if let Err(e) = std::fs::create_dir_all(&dir_path) {
             let _ = app_handle.emit("download_error", serde_json::json!({"model": model_name, "error": e.to_string()}));
             return;
@@ -1572,21 +1584,14 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
         
         let files_to_download = match model_name.as_str() {
             "Qwen3" => vec![
-                ("https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf", "qwen3.gguf"),
-                ("https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/config.json", "config.json"),
-                ("https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/tokenizer.json", "tokenizer.json"),
+                ("https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf", "Qwen3-0.6B-Q8_0.gguf")
             ],
             "Qwen3.5" => vec![
                 ("https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-BF16.gguf", "mmproj-BF16.gguf"),
-                ("https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q8_0.gguf", "qwen3.5.gguf"),
-                ("https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/config.json", "config.json"),
-                ("https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/tokenizer.json", "tokenizer.json"),
-                ("https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/preprocessor_config.json", "preprocessor_config.json"),
+                ("https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q8_0.gguf", "Qwen3.5-0.8B-Q8_0.gguf")
             ],
             "Embedding" => vec![
-                ("https://huggingface.co/unsloth/embeddinggemma-300m-GGUF/resolve/main/embeddinggemma-300m-Q4_0.gguf", "embeddinggemma-300m-Q4_0.gguf"),
-                ("https://huggingface.co/unsloth/embeddinggemma-300m-GGUF/resolve/main/config.json", "config.json"),
-                ("https://huggingface.co/unsloth/embeddinggemma-300m-GGUF/resolve/main/tokenizer.json", "tokenizer.json"),
+                ("https://huggingface.co/unsloth/embeddinggemma-300m-GGUF/resolve/main/embeddinggemma-300m-Q4_0.gguf", "embeddinggemma-300m-Q4_0.gguf")
             ],
             _ => vec![]
         };
