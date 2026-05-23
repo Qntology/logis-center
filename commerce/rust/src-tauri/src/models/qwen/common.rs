@@ -670,59 +670,59 @@ pub fn eager_attention_forward(
     
     #[cfg(feature = "flash-attn")]
     {
-        // 1. 차원 정보 추출 (배치, 시퀀스 길이, 헤드 수, 헤드 차원)
-        let (b_sz, seq_len, num_heads, head_dim) = query_states.dims4()?;
+        if query_states.device().is_cuda() && query_states.dtype() == candle_core::DType::F16 {
+            // 1. 차원 정보 추출 (배치, 시퀀스 길이, 헤드 수, 헤드 차원)
+            let (b_sz, seq_len, num_heads, head_dim) = query_states.dims4()?;
 
-        // 2. 결과를 담을 빈 텐서(VRAM) 미리 할당
-        let out_tensor = Tensor::zeros(
-            (b_sz, seq_len, num_heads, head_dim),
-            query_states.dtype(),
-            query_states.device(),
-        )?;
+            // 2. 결과를 담을 빈 텐서(VRAM) 미리 할당
+            let out_tensor = Tensor::zeros(
+                (b_sz, seq_len, num_heads, head_dim),
+                query_states.dtype(),
+                query_states.device(),
+            )?;
 
-        // 3. Candle 텐서에서 CudaSlice 기반의 Device Pointer를 추출하는 로직 적용
-        // (실제 프로젝트의 extract_cuda_ptr 유틸리티 또는 Storage Data 접근 API 사용 필요)
-        unsafe {
-            use candle_core::Storage;
-            use candle_core::backend::BackendStorage;
-            let get_ptr = |t: &Tensor| -> *const std::ffi::c_void {
-                let (storage, _layout) = t.storage_and_layout();
-                match &*storage {
-                    Storage::Cuda(c) => c.as_cuda_slice::<f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
-                    _ => std::ptr::null(),
+            // 3. Candle 텐서에서 CudaSlice 기반의 Device Pointer를 추출
+            unsafe {
+                use candle_core::Storage;
+                use candle_core::backend::BackendStorage;
+                let get_ptr = |t: &Tensor| -> *const std::ffi::c_void {
+                    let (storage, _layout) = t.storage_and_layout();
+                    match &*storage {
+                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
+                        _ => std::ptr::null(),
+                    }
+                };
+                
+                let get_mut_ptr = |t: &Tensor| -> *mut std::ffi::c_void {
+                    let (storage, _layout) = t.storage_and_layout();
+                    match &*storage {
+                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
+                        _ => std::ptr::null_mut(),
+                    }
+                };
+
+                let q_ptr = get_ptr(query_states);
+                let k_ptr = get_ptr(key_states);
+                let v_ptr = get_ptr(value_states);
+                let out_ptr = get_mut_ptr(&out_tensor);
+
+                // 4. 작성한 C++ Flash Attention 커널 호출
+                if !q_ptr.is_null() && !k_ptr.is_null() && !v_ptr.is_null() && !out_ptr.is_null() {
+                    flash_attn(
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        out_ptr,
+                        b_sz as i32,
+                        seq_len as i32,
+                        num_heads as i32,
+                        head_dim as i32,
+                        scaling as f32,
+                    );
+                    return Ok(out_tensor.contiguous()?);
                 }
-            };
-            
-            let get_mut_ptr = |t: &Tensor| -> *mut std::ffi::c_void {
-                let (storage, _layout) = t.storage_and_layout();
-                match &*storage {
-                    Storage::Cuda(c) => c.as_cuda_slice::<f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
-                    _ => std::ptr::null_mut(),
-                }
-            };
-
-            let q_ptr = get_ptr(query_states);
-            let k_ptr = get_ptr(key_states);
-            let v_ptr = get_ptr(value_states);
-            let out_ptr = get_mut_ptr(&out_tensor);
-
-            // 4. 작성한 C++ Flash Attention 커널 호출
-            if !q_ptr.is_null() && !out_ptr.is_null() {
-                flash_attn(
-                    q_ptr,
-                    k_ptr,
-                    v_ptr,
-                    out_ptr,
-                    b_sz as i32,
-                    seq_len as i32,
-                    num_heads as i32,
-                    head_dim as i32,
-                    scaling as f32,
-                );
             }
         }
-
-        return Ok(out_tensor.contiguous()?);
     }
 
     if kv_seq_len <= block_size {
@@ -1113,6 +1113,40 @@ pub fn z_score_normalize(t: &Tensor, dim: usize) -> Result<Tensor> {
                     return Ok(out_tensor);
                 }
             }
+        }
+    }
+
+    if t.device().is_cpu() && dim == rank - 1 {
+        use rayon::prelude::*;
+        if t.dtype() == candle_core::DType::F32 {
+            let shape = t.shape().clone();
+            let hidden_dim = shape.dims()[dim];
+            let t_vec = t.to_vec1::<f32>().unwrap_or_else(|_| t.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+            
+            let mut out_vec = vec![0.0f32; t_vec.len()];
+            
+            out_vec.par_chunks_mut(hidden_dim).enumerate().for_each(|(row, out_chunk)| {
+                let start = row * hidden_dim;
+                let mut sum = 0.0;
+                for i in 0..hidden_dim {
+                    sum += t_vec[start + i];
+                }
+                let mean = sum / hidden_dim as f32;
+                
+                let mut var_sum = 0.0;
+                for i in 0..hidden_dim {
+                    let diff = t_vec[start + i] - mean;
+                    var_sum += diff * diff;
+                }
+                let var = var_sum / hidden_dim as f32;
+                let inv_std = 1.0 / (var + 1e-5).sqrt();
+                
+                for i in 0..hidden_dim {
+                    out_chunk[i] = (t_vec[start + i] - mean) * inv_std;
+                }
+            });
+            
+            return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
         }
     }
 

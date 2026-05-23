@@ -671,6 +671,32 @@ pub fn l2_normalize(t: &Tensor, dim: usize) -> Result<Tensor> {
         }
     }
 
+    if t.device().is_cpu() && dim == rank - 1 {
+        use rayon::prelude::*;
+        if t.dtype() == candle_core::DType::F32 {
+            let shape = t.shape().clone();
+            let hidden_dim = shape.dims()[dim];
+            let t_vec = t.to_vec1::<f32>().unwrap_or_else(|_| t.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+            
+            let mut out_vec = vec![0.0f32; t_vec.len()];
+            
+            out_vec.par_chunks_mut(hidden_dim).enumerate().for_each(|(row, out_chunk)| {
+                let start = row * hidden_dim;
+                let mut sum_sq = 0.0;
+                for i in 0..hidden_dim {
+                    let val = t_vec[start + i];
+                    sum_sq += val * val;
+                }
+                let inv_norm = 1.0 / (sum_sq + 1e-6).sqrt();
+                for i in 0..hidden_dim {
+                    out_chunk[i] = t_vec[start + i] * inv_norm;
+                }
+            });
+            
+            return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
+        }
+    }
+
     let l2_norm = t.sqr()?.sum_keepdim(dim)?.affine(1.0, 1e-6)?.sqrt()?;
     Ok(t.broadcast_div(&l2_norm)?)
 }
@@ -680,13 +706,37 @@ pub fn l1_normalize(t: &Tensor, dim: usize) -> Result<Tensor> {
     if dim >= rank {
         return Err(anyhow!(format!("input dim {} must < rank {}", dim, rank)));
     }
+
+    if t.device().is_cpu() && dim == rank - 1 {
+        use rayon::prelude::*;
+        if t.dtype() == candle_core::DType::F32 {
+            let shape = t.shape().clone();
+            let hidden_dim = shape.dims()[dim];
+            let t_vec = t.to_vec1::<f32>().unwrap_or_else(|_| t.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+            
+            let mut out_vec = vec![0.0f32; t_vec.len()];
+            
+            out_vec.par_chunks_mut(hidden_dim).enumerate().for_each(|(row, out_chunk)| {
+                let start = row * hidden_dim;
+                let mut sum_abs = 0.0f32;
+                for i in 0..hidden_dim {
+                    sum_abs += t_vec[start + i].abs();
+                }
+                let inv_norm = 1.0 / (sum_abs + 1e-9);
+                for i in 0..hidden_dim {
+                    out_chunk[i] = t_vec[start + i] * inv_norm;
+                }
+            });
+            
+            return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
+        }
+    }
+
     let l1_norm = t.abs()?.sum_keepdim(dim)?;
     Ok(t.broadcast_div(&l1_norm)?)
 }
 
 pub fn pool1d(xs: &Tensor, pool_size: usize, ceil_mode: bool, stype: &str) -> Result<Tensor> {
-    // xs: (bs, c, dim)
-    // ceil_mode: 是否保留不完整窗口，为true时通过pad实现
     if pool_size == 0 {
         return Err(anyhow!("pool_size must be greater than 0"));
     }
@@ -732,7 +782,32 @@ pub fn statistics_pooling(xs: &Tensor, dim: D, keepdim: bool) -> Result<Tensor> 
     }
     Ok(stats)
 }
+
 pub fn float_range_normalize(t: &Tensor) -> Result<Tensor> {
+    if t.device().is_cpu() && t.dtype() == candle_core::DType::F32 {
+        use rayon::prelude::*;
+        let shape = t.shape().clone();
+        let t_vec = t.to_vec1::<f32>().unwrap_or_else(|_| t.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+        
+        let peak = t_vec.par_iter().map(|&x| x.abs()).reduce(|| 0.0f32, f32::max);
+        
+        if peak == 0.0 {
+            return Ok(t.clone());
+        }
+        
+        let scale = if peak > 1.0 { 1.0 / peak } else { 1.0 };
+        
+        let mut out_vec = vec![0.0f32; t_vec.len()];
+        out_vec.par_iter_mut().enumerate().for_each(|(i, out)| {
+            let mut val = t_vec[i] * scale;
+            if val < -1.0 { val = -1.0; }
+            if val > 1.0 { val = 1.0; }
+            *out = val;
+        });
+        
+        return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
+    }
+
     let peak = t
         .to_dtype(DType::F32)?
         .abs()?

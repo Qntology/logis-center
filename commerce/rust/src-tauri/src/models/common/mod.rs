@@ -1729,6 +1729,40 @@ pub fn conv1d_depthwise(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>) 
         }
     }
 
+    if input.device().is_cpu() {
+        use rayon::prelude::*;
+        if input.dtype() == candle_core::DType::F32 {
+            let (bs, c, _) = input.dims3()?;
+            let in_vec = input.to_vec1::<f32>().unwrap_or_else(|_| input.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+            let w_vec = weight.to_vec1::<f32>().unwrap_or_else(|_| weight.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+            let b_vec = if let Some(b) = bias {
+                Some(b.to_vec1::<f32>().unwrap_or_else(|_| b.flatten_all().unwrap().to_vec1::<f32>().unwrap()))
+            } else {
+                None
+            };
+
+            let mut out_vec = vec![0.0f32; bs * c * len_out];
+            
+            out_vec.par_chunks_mut(len_out).enumerate().for_each(|(chunk_idx, out_chunk)| {
+                let batch = chunk_idx / c;
+                let channel = chunk_idx % c;
+                let b_val = if let Some(ref b_v) = b_vec { b_v[channel] } else { 0.0 };
+                
+                for l in 0..len_out {
+                    let mut sum = b_val;
+                    for k in 0..kernel_size {
+                        let in_idx = batch * (c * len_in) + channel * len_in + (l + k);
+                        let w_idx = channel * kernel_size + k;
+                        sum += in_vec[in_idx] * w_vec[w_idx];
+                    }
+                    out_chunk[l] = sum;
+                }
+            });
+            
+            return Ok(candle_core::Tensor::from_vec(out_vec, (bs, c, len_out), &candle_core::Device::Cpu)?);
+        }
+    }
+
     let out = if len_out == 1 {
         input.broadcast_mul(&weight.unsqueeze(0)?)?.sum_keepdim(2)?
     } else {

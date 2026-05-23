@@ -7,6 +7,7 @@
 #define MAX_HEAD_DIM 128
 
 // Flash Attention v1의 핵심 원리인 Online Softmax를 레지스터 레벨에서 구현한 커널
+// [최적화] half2 벡터화를 통해 VRAM 대역폭 효율을 2배로 극대화
 __global__ void online_softmax_attention_f16_kernel(
     const half* __restrict__ q,
     const half* __restrict__ k,
@@ -23,29 +24,33 @@ __global__ void online_softmax_attention_f16_kernel(
     if (q_idx >= seq_len) return;
 
     int base_offset = batch_head_idx * seq_len * head_dim;
-    const half* q_row = q + base_offset + q_idx * head_dim;
-    half* out_row = out + base_offset + q_idx * head_dim;
+    
+    // 메모리 1회 접근량을 16bit -> 32bit(half2)로 2배 증가시키기 위한 포인터 캐스팅
+    const half2* q_row = reinterpret_cast<const half2*>(q + base_offset + q_idx * head_dim);
+    half2* out_row = reinterpret_cast<half2*>(out + base_offset + q_idx * head_dim);
 
     // Flash Attention: Shared Memory 대신 레지스터에 누적값을 보관하여 메모리 한계 극복
     float m_i = -FLT_MAX;
     float l_i = 0.0f;
     float out_val[MAX_HEAD_DIM] = {0.0f};
 
-    // Query 토큰을 레지스터로 미리 로드 (메모리 접근 최소화)
-    float q_reg[MAX_HEAD_DIM];
-    for(int d = 0; d < head_dim; ++d) {
-        q_reg[d] = __half2float(q_row[d]);
+    // Query 토큰을 레지스터로 미리 로드 (루프 횟수 50% 절감)
+    int half_head_dim = head_dim / 2;
+    float2 q_reg[MAX_HEAD_DIM / 2];
+    for(int d = 0; d < half_head_dim; ++d) {
+        q_reg[d] = __half22float2(q_row[d]);
     }
 
     // Key, Value를 순회하며 Online Softmax 계산
     for (int k_idx = 0; k_idx < seq_len; ++k_idx) {
-        const half* k_row = k + base_offset + k_idx * head_dim;
-        const half* v_row = v + base_offset + k_idx * head_dim;
+        const half2* k_row = reinterpret_cast<const half2*>(k + base_offset + k_idx * head_dim);
+        const half2* v_row = reinterpret_cast<const half2*>(v + base_offset + k_idx * head_dim);
         
-        // 1. Score 계산: Q_i * K_j^T * scale
+        // 1. Score 계산: Q_i * K_j^T * scale (2차원 벡터 내적 동시 처리)
         float s_ij = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-            s_ij += q_reg[d] * __half2float(k_row[d]);
+        for (int d = 0; d < half_head_dim; ++d) {
+            float2 k_val = __half22float2(k_row[d]);
+            s_ij += q_reg[d].x * k_val.x + q_reg[d].y * k_val.y;
         }
         s_ij *= scale;
 
@@ -56,17 +61,22 @@ __global__ void online_softmax_attention_f16_kernel(
 
         l_i = l_i * exp_old + exp_new;
 
-        // 3. V 값 누적
-        for (int d = 0; d < head_dim; ++d) {
-            out_val[d] = out_val[d] * exp_old + exp_new * __half2float(v_row[d]);
+        // 3. V 값 누적 (2개의 출력을 동시 융합 연산)
+        for (int d = 0; d < half_head_dim; ++d) {
+            float2 v_val = __half22float2(v_row[d]);
+            out_val[d * 2] = out_val[d * 2] * exp_old + exp_new * v_val.x;
+            out_val[d * 2 + 1] = out_val[d * 2 + 1] * exp_old + exp_new * v_val.y;
         }
         
         m_i = m_new;
     }
 
-    // 4. 최종 정규화 및 Global Memory 출력
-    for (int d = 0; d < head_dim; ++d) {
-        out_row[d] = __float2half(out_val[d] / l_i);
+    // 4. 최종 정규화 및 Global Memory 출력 (half2로 한 번에 쓰기)
+    for (int d = 0; d < half_head_dim; ++d) {
+        float2 res;
+        res.x = out_val[d * 2] / l_i;
+        res.y = out_val[d * 2 + 1] / l_i;
+        out_row[d] = __float22half2_rn(res);
     }
 }
 
@@ -112,39 +122,81 @@ __global__ void fused_rope_f16_kernel(
     int head_dim,
     int batch_size
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     int half_dim = head_dim / 2;
     int total_elements = batch_size * seq_len * q_heads * half_dim;
 
     if (idx >= total_elements) return;
 
-    int d_idx = idx % half_dim;
-    int head_idx = (idx / half_dim) % q_heads;
-    int seq_idx = (idx / (half_dim * q_heads)) % seq_len;
-    int b_idx = idx / (half_dim * q_heads * seq_len);
+    if (idx + 1 < total_elements && (idx % half_dim) + 1 < half_dim) {
+        int d_idx = idx % half_dim;
+        int head_idx = (idx / half_dim) % q_heads;
+        int seq_idx = (idx / (half_dim * q_heads)) % seq_len;
+        int b_idx = idx / (half_dim * q_heads * seq_len);
 
-    int q_offset1 = b_idx * (seq_len * q_heads * head_dim) + seq_idx * (q_heads * head_dim) + head_idx * head_dim + d_idx;
-    int q_offset2 = q_offset1 + half_dim;
+        int q_offset1 = b_idx * (seq_len * q_heads * head_dim) + seq_idx * (q_heads * head_dim) + head_idx * head_dim + d_idx;
+        int q_offset2 = q_offset1 + half_dim;
+        int cos_sin_offset = seq_idx * head_dim + d_idx;
 
-    int cos_sin_offset = seq_idx * head_dim + d_idx;
-    float c = __half2float(cos[cos_sin_offset]);
-    float s = __half2float(sin[cos_sin_offset]);
+        float2 c2 = __half22float2(*reinterpret_cast<const half2*>(&cos[cos_sin_offset]));
+        float2 s2 = __half22float2(*reinterpret_cast<const half2*>(&sin[cos_sin_offset]));
+        float2 q1_f2 = __half22float2(*reinterpret_cast<const half2*>(&q[q_offset1]));
+        float2 q2_f2 = __half22float2(*reinterpret_cast<const half2*>(&q[q_offset2]));
 
-    float q1 = __half2float(q[q_offset1]);
-    float q2 = __half2float(q[q_offset2]);
+        float2 res_q1, res_q2;
+        res_q1.x = q1_f2.x * c2.x - q2_f2.x * s2.x;
+        res_q1.y = q1_f2.y * c2.y - q2_f2.y * s2.y;
+        res_q2.x = q2_f2.x * c2.x + q1_f2.x * s2.x;
+        res_q2.y = q2_f2.y * c2.y + q1_f2.y * s2.y;
 
-    q[q_offset1] = __float2half(q1 * c - q2 * s);
-    q[q_offset2] = __float2half(q2 * c + q1 * s);
+        *reinterpret_cast<half2*>(&q[q_offset1]) = __float22half2_rn(res_q1);
+        *reinterpret_cast<half2*>(&q[q_offset2]) = __float22half2_rn(res_q2);
 
-    if (head_idx < k_heads) {
-        int k_offset1 = b_idx * (seq_len * k_heads * head_dim) + seq_idx * (k_heads * head_dim) + head_idx * head_dim + d_idx;
-        int k_offset2 = k_offset1 + half_dim;
+        if (head_idx < k_heads) {
+            int k_offset1 = b_idx * (seq_len * k_heads * head_dim) + seq_idx * (k_heads * head_dim) + head_idx * head_dim + d_idx;
+            int k_offset2 = k_offset1 + half_dim;
+            float2 k1_f2 = __half22float2(*reinterpret_cast<const half2*>(&k[k_offset1]));
+            float2 k2_f2 = __half22float2(*reinterpret_cast<const half2*>(&k[k_offset2]));
 
-        float k1 = __half2float(k[k_offset1]);
-        float k2 = __half2float(k[k_offset2]);
+            float2 res_k1, res_k2;
+            res_k1.x = k1_f2.x * c2.x - k2_f2.x * s2.x;
+            res_k1.y = k1_f2.y * c2.y - k2_f2.y * s2.y;
+            res_k2.x = k2_f2.x * c2.x + k1_f2.x * s2.x;
+            res_k2.y = k2_f2.y * c2.y + k1_f2.y * s2.y;
 
-        k[k_offset1] = __float2half(k1 * c - k2 * s);
-        k[k_offset2] = __float2half(k2 * c + k1 * s);
+            *reinterpret_cast<half2*>(&k[k_offset1]) = __float22half2_rn(res_k1);
+            *reinterpret_cast<half2*>(&k[k_offset2]) = __float22half2_rn(res_k2);
+        }
+    } else {
+        for(int i=0; i<2; ++i) {
+            int curr = idx + i;
+            if (curr >= total_elements) break;
+            int d_idx = curr % half_dim;
+            int head_idx = (curr / half_dim) % q_heads;
+            int seq_idx = (curr / (half_dim * q_heads)) % seq_len;
+            int b_idx = curr / (half_dim * q_heads * seq_len);
+
+            int q_offset1 = b_idx * (seq_len * q_heads * head_dim) + seq_idx * (q_heads * head_dim) + head_idx * head_dim + d_idx;
+            int q_offset2 = q_offset1 + half_dim;
+            int cos_sin_offset = seq_idx * head_dim + d_idx;
+
+            float c = __half2float(cos[cos_sin_offset]);
+            float s = __half2float(sin[cos_sin_offset]);
+            float q1 = __half2float(q[q_offset1]);
+            float q2 = __half2float(q[q_offset2]);
+
+            q[q_offset1] = __float2half(q1 * c - q2 * s);
+            q[q_offset2] = __float2half(q2 * c + q1 * s);
+
+            if (head_idx < k_heads) {
+                int k_offset1 = b_idx * (seq_len * k_heads * head_dim) + seq_idx * (k_heads * head_dim) + head_idx * head_dim + d_idx;
+                int k_offset2 = k_offset1 + half_dim;
+                float k1 = __half2float(k[k_offset1]);
+                float k2 = __half2float(k[k_offset2]);
+                k[k_offset1] = __float2half(k1 * c - k2 * s);
+                k[k_offset2] = __float2half(k2 * c + k1 * s);
+            }
+        }
     }
 }
 
@@ -197,13 +249,19 @@ __global__ void fused_gated_rmsnorm_f16_kernel(
     int row_start = row_idx * hidden_size;
 
     float sum_sq = 0.0f;
-    for (int i = 0; i < hidden_size; ++i) {
-        float val = __half2float(xs[row_start + i]);
+    int half_hidden = hidden_size / 2;
+    const half2* row_ptr = reinterpret_cast<const half2*>(xs + row_start);
+    for (int i = 0; i < half_hidden; ++i) {
+        float2 val = __half22float2(row_ptr[i]);
+        sum_sq += val.x * val.x + val.y * val.y;
+    }
+    if (hidden_size % 2 != 0) {
+        float val = __half2float(xs[row_start + hidden_size - 1]);
         sum_sq += val * val;
     }
+
     float variance = sum_sq / hidden_size;
     float inv_std = rsqrtf(variance + eps);
-
     float xs_val = __half2float(xs[idx]);
     float w_val = __half2float(weight[col_idx]);
     float norm_val = xs_val * inv_std * w_val;
@@ -213,7 +271,6 @@ __global__ void fused_gated_rmsnorm_f16_kernel(
         float silu_val = gate_val / (1.0f + expf(-gate_val));
         norm_val *= silu_val;
     }
-
     out[idx] = __float2half(norm_val);
 }
 
@@ -316,33 +373,50 @@ __global__ void fused_ssm_state_f16_kernel(
     int num_v_heads,
     int total_elements
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     if (idx >= total_elements) return;
 
-    int head_idx = idx % num_v_heads;
+    if (idx + 1 < total_elements) {
+        half2 b2 = *reinterpret_cast<const half2*>(&b[idx]);
+        half2 a2 = *reinterpret_cast<const half2*>(&a[idx]);
 
-    // Beta = sigmoid(b)
-    float b_val = __half2float(b[idx]);
-    float beta_val = 1.0f / (1.0f + expf(-b_val));
-    beta_out[idx] = __float2half(beta_val);
+        float2 b_f2 = __half22float2(b2);
+        float2 a_f2 = __half22float2(a2);
 
-    // a_plus_bias = softplus(a + dt_bias) -> ln(1 + exp(x))
-    float a_val = __half2float(a[idx]);
-    float dt_b_val = dt_bias[head_idx];
-    float sum_a = a_val + dt_b_val;
-    
-    // Prevent overflow in expf
-    float softplus_a;
-    if (sum_a > 20.0f) {
-        softplus_a = sum_a;
+        int h_idx1 = idx % num_v_heads;
+        int h_idx2 = (idx + 1) % num_v_heads;
+
+        // Beta = sigmoid(b) 동시 연산
+        float2 beta_val;
+        beta_val.x = 1.0f / (1.0f + expf(-b_f2.x));
+        beta_val.y = 1.0f / (1.0f + expf(-b_f2.y));
+
+        *reinterpret_cast<half2*>(&beta_out[idx]) = __float22half2_rn(beta_val);
+
+        // a_plus_bias = softplus(a + dt_bias) 동시 연산
+        float sum_a1 = a_f2.x + dt_bias[h_idx1];
+        float sum_a2 = a_f2.y + dt_bias[h_idx2];
+        
+        float sp_a1 = sum_a1 > 20.0f ? sum_a1 : logf(1.0f + expf(sum_a1));
+        float sp_a2 = sum_a2 > 20.0f ? sum_a2 : logf(1.0f + expf(sum_a2));
+
+        float2 g_val;
+        g_val.x = a_log[h_idx1] * sp_a1;
+        g_val.y = a_log[h_idx2] * sp_a2;
+
+        *reinterpret_cast<half2*>(&g_out[idx]) = __float22half2_rn(g_val);
     } else {
-        softplus_a = logf(1.0f + expf(sum_a));
-    }
+        int h_idx = idx % num_v_heads;
+        float b_val = __half2float(b[idx]);
+        float beta_val = 1.0f / (1.0f + expf(-b_val));
+        beta_out[idx] = __float2half(beta_val);
 
-    // g = a_log * a_plus_bias
-    float alog_val = a_log[head_idx];
-    float g_val = alog_val * softplus_a;
-    g_out[idx] = __float2half(g_val);
+        float a_val = __half2float(a[idx]);
+        float sum_a = a_val + dt_bias[h_idx];
+        float softplus_a = sum_a > 20.0f ? sum_a : logf(1.0f + expf(sum_a));
+        float g_val = a_log[h_idx] * softplus_a;
+        g_out[idx] = __float2half(g_val);
+    }
 }
 
 // 2. Fused L2 Normalization Kernel (for Tensor Utils)
@@ -356,20 +430,31 @@ __global__ void fused_l2_normalize_f16_kernel(
     int row_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (row_idx >= total_rows) return;
 
-    const half* in_row = input + row_idx * hidden_dim;
-    half* out_row = output + row_idx * hidden_dim;
+    int half_dim = hidden_dim / 2;
+    const half2* in_row = reinterpret_cast<const half2*>(input + row_idx * hidden_dim);
+    half2* out_row = reinterpret_cast<half2*>(output + row_idx * hidden_dim);
 
     float sum_sq = 0.0f;
-    for (int i = 0; i < hidden_dim; ++i) {
-        float val = __half2float(in_row[i]);
+    for (int i = 0; i < half_dim; ++i) {
+        float2 val = __half22float2(in_row[i]);
+        sum_sq += val.x * val.x + val.y * val.y;
+    }
+    if (hidden_dim % 2 != 0) {
+        float val = __half2float(input[row_idx * hidden_dim + hidden_dim - 1]);
         sum_sq += val * val;
     }
 
     float inv_norm = rsqrtf(sum_sq + eps);
 
-    for (int i = 0; i < hidden_dim; ++i) {
-        float val = __half2float(in_row[i]);
-        out_row[i] = __float2half(val * inv_norm);
+    for (int i = 0; i < half_dim; ++i) {
+        float2 val = __half22float2(in_row[i]);
+        val.x *= inv_norm;
+        val.y *= inv_norm;
+        out_row[i] = __float22half2_rn(val);
+    }
+    if (hidden_dim % 2 != 0) {
+        float val = __half2float(input[row_idx * hidden_dim + hidden_dim - 1]);
+        output[row_idx * hidden_dim + hidden_dim - 1] = __float2half(val * inv_norm);
     }
 }
 
@@ -384,8 +469,9 @@ extern "C" {
         int num_v_heads,
         int total_elements
     ) {
+        int total_threads = (total_elements + 1) / 2;
         int block_dim = 256;
-        int grid_dim = (total_elements + block_dim - 1) / block_dim;
+        int grid_dim = (total_threads + block_dim - 1) / block_dim;
 
         fused_ssm_state_f16_kernel<<<grid_dim, block_dim>>>(
             reinterpret_cast<const half*>(b_ptr),
@@ -427,17 +513,30 @@ __global__ void fused_attn_gate_f16_kernel(
     const half* __restrict__ gate,
     int total_elements
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     if (idx >= total_elements) return;
 
-    float g = __half2float(gate[idx]);
-    float a = __half2float(attn_output[idx]);
-    
-    // Sigmoid: 1 / (1 + exp(-x))
-    float sig_g = 1.0f / (1.0f + expf(-g));
-    
-    // Multiply in-place
-    attn_output[idx] = __float2half(a * sig_g);
+    if (idx + 1 < total_elements) {
+        half2 g2 = *reinterpret_cast<const half2*>(&gate[idx]);
+        half2 a2 = *reinterpret_cast<const half2*>(&attn_output[idx]);
+
+        float2 g_f2 = __half22float2(g2);
+        float2 a_f2 = __half22float2(a2);
+
+        float sig_g0 = 1.0f / (1.0f + expf(-g_f2.x));
+        float sig_g1 = 1.0f / (1.0f + expf(-g_f2.y));
+
+        float2 out_f2;
+        out_f2.x = a_f2.x * sig_g0;
+        out_f2.y = a_f2.y * sig_g1;
+
+        *reinterpret_cast<half2*>(&attn_output[idx]) = __float22half2_rn(out_f2);
+    } else {
+        float g = __half2float(gate[idx]);
+        float a = __half2float(attn_output[idx]);
+        float sig_g = 1.0f / (1.0f + expf(-g));
+        attn_output[idx] = __float2half(a * sig_g);
+    }
 }
 
 // 2. Fused RoFormer RoPE Kernel (GLM, RoFormer)
@@ -452,44 +551,39 @@ __global__ void fused_rope_roformer_f16_kernel(
     int head_dim,
     int batch_size
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+    int pair_idx_global = blockIdx.x * blockDim.x + threadIdx.x; 
     int half_dim = head_dim / 2;
     int total_pairs = batch_size * seq_len * q_heads * half_dim;
 
-    if (idx >= total_pairs) return;
+    if (pair_idx_global >= total_pairs) return;
 
-    int pair_idx = idx % half_dim;
-    int head_idx = (idx / half_dim) % q_heads;
-    int seq_idx = (idx / (half_dim * q_heads)) % seq_len;
-    int b_idx = idx / (half_dim * q_heads * seq_len);
+    int pair_idx = pair_idx_global % half_dim;
+    int head_idx = (pair_idx_global / half_dim) % q_heads;
+    int seq_idx = (pair_idx_global / (half_dim * q_heads)) % seq_len;
+    int b_idx = pair_idx_global / (half_dim * q_heads * seq_len);
 
     int q_offset1 = b_idx * (seq_len * q_heads * head_dim) + seq_idx * (q_heads * head_dim) + head_idx * head_dim + pair_idx * 2;
-    int q_offset2 = q_offset1 + 1;
-
     int cos_offset1 = seq_idx * head_dim + pair_idx * 2;
-    int cos_offset2 = cos_offset1 + 1;
 
-    float c1 = __half2float(cos[cos_offset1]);
-    float c2 = __half2float(cos[cos_offset2]);
-    float s1 = __half2float(sin[cos_offset1]);
-    float s2 = __half2float(sin[cos_offset2]);
+    float2 c2 = __half22float2(*reinterpret_cast<const half2*>(&cos[cos_offset1]));
+    float2 s2 = __half22float2(*reinterpret_cast<const half2*>(&sin[cos_offset1]));
+    float2 q2 = __half22float2(*reinterpret_cast<const half2*>(&q[q_offset1]));
 
-    float q1 = __half2float(q[q_offset1]);
-    float q2 = __half2float(q[q_offset2]);
+    float2 res_q;
+    res_q.x = q2.x * c2.x - q2.y * s2.x;
+    res_q.y = q2.y * c2.y + q2.x * s2.y;
 
-    // RoFormer rotate: [-x2, x1]
-    q[q_offset1] = __float2half(q1 * c1 - q2 * s1);
-    q[q_offset2] = __float2half(q2 * c2 + q1 * s2);
+    *reinterpret_cast<half2*>(&q[q_offset1]) = __float22half2_rn(res_q);
 
     if (head_idx < k_heads) {
         int k_offset1 = b_idx * (seq_len * k_heads * head_dim) + seq_idx * (k_heads * head_dim) + head_idx * head_dim + pair_idx * 2;
-        int k_offset2 = k_offset1 + 1;
+        float2 k2 = __half22float2(*reinterpret_cast<const half2*>(&k[k_offset1]));
 
-        float k1 = __half2float(k[k_offset1]);
-        float k2 = __half2float(k[k_offset2]);
+        float2 res_k;
+        res_k.x = k2.x * c2.x - k2.y * s2.x;
+        res_k.y = k2.y * c2.y + k2.x * s2.y;
 
-        k[k_offset1] = __float2half(k1 * c1 - k2 * s1);
-        k[k_offset2] = __float2half(k2 * c2 + k1 * s2);
+        *reinterpret_cast<half2*>(&k[k_offset1]) = __float22half2_rn(res_k);
     }
 }
 
@@ -499,8 +593,9 @@ extern "C" {
         const void* gate_ptr,
         int total_elements
     ) {
+        int total_threads = (total_elements + 1) / 2;
         int block_dim = 256;
-        int grid_dim = (total_elements + block_dim - 1) / block_dim;
+        int grid_dim = (total_threads + block_dim - 1) / block_dim;
         fused_attn_gate_f16_kernel<<<grid_dim, block_dim>>>(
             reinterpret_cast<half*>(attn_output_ptr),
             reinterpret_cast<const half*>(gate_ptr),
@@ -547,20 +642,37 @@ __global__ void fused_glu_f16_kernel(
     int half_dim, 
     int total_out_elements
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     if (idx >= total_out_elements) return;
 
-    int row = idx / half_dim;
-    int col = idx % half_dim;
-    
-    int in_idx1 = row * (half_dim * 2) + col;
-    int in_idx2 = in_idx1 + half_dim;
+    if (idx + 1 < total_out_elements && (idx % half_dim) + 1 < half_dim) {
+        int row = idx / half_dim;
+        int col = idx % half_dim;
+        int in_idx1 = row * (half_dim * 2) + col;
+        int in_idx2 = in_idx1 + half_dim;
 
-    float x0 = __half2float(input[in_idx1]);
-    float x1 = __half2float(input[in_idx2]);
+        float2 x0_f2 = __half22float2(*reinterpret_cast<const half2*>(&input[in_idx1]));
+        float2 x1_f2 = __half22float2(*reinterpret_cast<const half2*>(&input[in_idx2]));
 
-    float sig_x1 = 1.0f / (1.0f + expf(-x1));
-    output[idx] = __float2half(x0 * sig_x1);
+        float2 res;
+        res.x = x0_f2.x * (1.0f / (1.0f + expf(-x1_f2.x)));
+        res.y = x0_f2.y * (1.0f / (1.0f + expf(-x1_f2.y)));
+
+        *reinterpret_cast<half2*>(&output[idx]) = __float22half2_rn(res);
+    } else {
+        for(int i=0; i<2; ++i) {
+            int curr = idx + i;
+            if (curr >= total_out_elements) break;
+            int row = curr / half_dim;
+            int col = curr % half_dim;
+            int in_idx1 = row * (half_dim * 2) + col;
+            int in_idx2 = in_idx1 + half_dim;
+
+            float x0 = __half2float(input[in_idx1]);
+            float x1 = __half2float(input[in_idx2]);
+            output[curr] = __float2half(x0 * (1.0f / (1.0f + expf(-x1))));
+        }
+    }
 }
 
 __global__ void fused_geglu_f16_kernel(
@@ -569,59 +681,128 @@ __global__ void fused_geglu_f16_kernel(
     int half_dim, 
     int total_out_elements
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     if (idx >= total_out_elements) return;
 
-    int row = idx / half_dim;
-    int col = idx % half_dim;
-    
-    int in_idx1 = row * (half_dim * 2) + col;
-    int in_idx2 = in_idx1 + half_dim;
+    if (idx + 1 < total_out_elements && (idx % half_dim) + 1 < half_dim) {
+        int row = idx / half_dim;
+        int col = idx % half_dim;
+        int in_idx1 = row * (half_dim * 2) + col;
+        int in_idx2 = in_idx1 + half_dim;
 
-    float x0 = __half2float(input[in_idx1]);
-    float x1 = __half2float(input[in_idx2]);
+        float2 x0_f2 = __half22float2(*reinterpret_cast<const half2*>(&input[in_idx1]));
+        float2 x1_f2 = __half22float2(*reinterpret_cast<const half2*>(&input[in_idx2]));
 
-    float k0 = 0.7978845608f; // sqrt(2/pi)
-    float k1 = 0.044715f;
-    float inner = k0 * (x1 + k1 * x1 * x1 * x1);
-    float gelu_x1 = 0.5f * x1 * (1.0f + tanhf(inner));
-    
-    output[idx] = __float2half(x0 * gelu_x1);
+        float k0 = 0.7978845608f;
+        float k1 = 0.044715f;
+        float2 res;
+
+        float inner_x = k0 * (x1_f2.x + k1 * x1_f2.x * x1_f2.x * x1_f2.x);
+        res.x = 0.5f * x1_f2.x * (1.0f + tanhf(inner_x));
+        res.x *= x0_f2.x;
+
+        float inner_y = k0 * (x1_f2.y + k1 * x1_f2.y * x1_f2.y * x1_f2.y);
+        res.y = 0.5f * x1_f2.y * (1.0f + tanhf(inner_y));
+        res.y *= x0_f2.y;
+
+        *reinterpret_cast<half2*>(&output[idx]) = __float22half2_rn(res);
+    } else {
+        for(int i=0; i<2; ++i) {
+            int curr = idx + i;
+            if (curr >= total_out_elements) break;
+            int row = curr / half_dim;
+            int col = curr % half_dim;
+            int in_idx1 = row * (half_dim * 2) + col;
+            int in_idx2 = in_idx1 + half_dim;
+
+            float x0 = __half2float(input[in_idx1]);
+            float x1 = __half2float(input[in_idx2]);
+            float k0 = 0.7978845608f;
+            float k1 = 0.044715f;
+            float inner = k0 * (x1 + k1 * x1 * x1 * x1);
+            output[curr] = __float2half(x0 * 0.5f * x1 * (1.0f + tanhf(inner)));
+        }
+    }
 }
 
 // 4. Fused Activation Kernels (QuickGELU, Mish, SoftplusStable)
 __global__ void fused_quick_gelu_f16_kernel(const half* __restrict__ input, half* __restrict__ output, int total_elements) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     if (idx >= total_elements) return;
 
-    float x = __half2float(input[idx]);
-    float sig = 1.0f / (1.0f + expf(-x * 1.702f));
-    output[idx] = __float2half(x * sig);
+    if (idx + 1 < total_elements) {
+        half2 in2 = *reinterpret_cast<const half2*>(&input[idx]);
+        float2 x_f2 = __half22float2(in2);
+
+        float sig0 = 1.0f / (1.0f + expf(-x_f2.x * 1.702f));
+        float sig1 = 1.0f / (1.0f + expf(-x_f2.y * 1.702f));
+
+        float2 out_f2;
+        out_f2.x = x_f2.x * sig0;
+        out_f2.y = x_f2.y * sig1;
+
+        *reinterpret_cast<half2*>(&output[idx]) = __float22half2_rn(out_f2);
+    } else {
+        float x = __half2float(input[idx]);
+        float sig = 1.0f / (1.0f + expf(-x * 1.702f));
+        output[idx] = __float2half(x * sig);
+    }
 }
 
 __global__ void fused_mish_f16_kernel(const half* __restrict__ input, half* __restrict__ output, int total_elements) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     if (idx >= total_elements) return;
 
-    float x = __half2float(input[idx]);
-    float sp;
-    if (x > 20.0f) {
-        sp = x;
+    if (idx + 1 < total_elements) {
+        half2 in2 = *reinterpret_cast<const half2*>(&input[idx]);
+        float2 x_f2 = __half22float2(in2);
+
+        float sp0 = x_f2.x > 20.0f ? x_f2.x : logf(1.0f + expf(x_f2.x));
+        float sp1 = x_f2.y > 20.0f ? x_f2.y : logf(1.0f + expf(x_f2.y));
+
+        float2 out_f2;
+        out_f2.x = x_f2.x * tanhf(sp0);
+        out_f2.y = x_f2.y * tanhf(sp1);
+
+        *reinterpret_cast<half2*>(&output[idx]) = __float22half2_rn(out_f2);
     } else {
-        sp = logf(1.0f + expf(x));
+        float x = __half2float(input[idx]);
+        float sp;
+        if (x > 20.0f) {
+            sp = x;
+        } else {
+            sp = logf(1.0f + expf(x));
+        }
+        float th = tanhf(sp);
+        output[idx] = __float2half(x * th);
     }
-    float th = tanhf(sp);
-    output[idx] = __float2half(x * th);
 }
 
 __global__ void fused_softplus_stable_f16_kernel(const half* __restrict__ input, half* __restrict__ output, int total_elements) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     if (idx >= total_elements) return;
 
-    float x = __half2float(input[idx]);
-    float x_max_0 = fmaxf(x, 0.0f);
-    float sp = logf(1.0f + expf(-fabsf(x))) + x_max_0;
-    output[idx] = __float2half(sp);
+    if (idx + 1 < total_elements) {
+        half2 in2 = *reinterpret_cast<const half2*>(&input[idx]);
+        float2 x_f2 = __half22float2(in2);
+
+        float x_max_0_x = fmaxf(x_f2.x, 0.0f);
+        float x_max_0_y = fmaxf(x_f2.y, 0.0f);
+
+        float sp_x = logf(1.0f + expf(-fabsf(x_f2.x))) + x_max_0_x;
+        float sp_y = logf(1.0f + expf(-fabsf(x_f2.y))) + x_max_0_y;
+
+        float2 out_f2;
+        out_f2.x = sp_x;
+        out_f2.y = sp_y;
+
+        *reinterpret_cast<half2*>(&output[idx]) = __float22half2_rn(out_f2);
+    } else {
+        float x = __half2float(input[idx]);
+        float x_max_0 = fmaxf(x, 0.0f);
+        float sp = logf(1.0f + expf(-fabsf(x))) + x_max_0;
+        output[idx] = __float2half(sp);
+    }
 }
 
 extern "C" {
@@ -636,18 +817,21 @@ extern "C" {
         fused_geglu_f16_kernel<<<grid_dim, block_dim>>>(reinterpret_cast<const half*>(in_ptr), reinterpret_cast<half*>(out_ptr), half_dim, total_out_elements);
     }
     void fused_quick_gelu(const void* in_ptr, void* out_ptr, int total_elements) {
+        int total_threads = (total_elements + 1) / 2;
         int block_dim = 256;
-        int grid_dim = (total_elements + block_dim - 1) / block_dim;
+        int grid_dim = (total_threads + block_dim - 1) / block_dim;
         fused_quick_gelu_f16_kernel<<<grid_dim, block_dim>>>(reinterpret_cast<const half*>(in_ptr), reinterpret_cast<half*>(out_ptr), total_elements);
     }
     void fused_mish(const void* in_ptr, void* out_ptr, int total_elements) {
+        int total_threads = (total_elements + 1) / 2;
         int block_dim = 256;
-        int grid_dim = (total_elements + block_dim - 1) / block_dim;
+        int grid_dim = (total_threads + block_dim - 1) / block_dim;
         fused_mish_f16_kernel<<<grid_dim, block_dim>>>(reinterpret_cast<const half*>(in_ptr), reinterpret_cast<half*>(out_ptr), total_elements);
     }
     void fused_softplus_stable(const void* in_ptr, void* out_ptr, int total_elements) {
+        int total_threads = (total_elements + 1) / 2;
         int block_dim = 256;
-        int grid_dim = (total_elements + block_dim - 1) / block_dim;
+        int grid_dim = (total_threads + block_dim - 1) / block_dim;
         fused_softplus_stable_f16_kernel<<<grid_dim, block_dim>>>(reinterpret_cast<const half*>(in_ptr), reinterpret_cast<half*>(out_ptr), total_elements);
     }
 }
@@ -732,26 +916,43 @@ __global__ void fused_z_score_normalize_f16_kernel(
     int row_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (row_idx >= total_rows) return;
 
-    const half* in_row = input + row_idx * hidden_dim;
-    half* out_row = output + row_idx * hidden_dim;
+    int half_dim = hidden_dim / 2;
+    const half2* in_row = reinterpret_cast<const half2*>(input + row_idx * hidden_dim);
+    half2* out_row = reinterpret_cast<half2*>(output + row_idx * hidden_dim);
 
     float sum = 0.0f;
-    for (int i = 0; i < hidden_dim; ++i) {
-        sum += __half2float(in_row[i]);
+    for (int i = 0; i < half_dim; ++i) {
+        float2 val = __half22float2(in_row[i]);
+        sum += val.x + val.y;
+    }
+    if (hidden_dim % 2 != 0) {
+        sum += __half2float(input[row_idx * hidden_dim + hidden_dim - 1]);
     }
     float mean = sum / hidden_dim;
 
     float var_sum = 0.0f;
-    for (int i = 0; i < hidden_dim; ++i) {
-        float diff = __half2float(in_row[i]) - mean;
+    for (int i = 0; i < half_dim; ++i) {
+        float2 val = __half22float2(in_row[i]);
+        float diff_x = val.x - mean;
+        float diff_y = val.y - mean;
+        var_sum += diff_x * diff_x + diff_y * diff_y;
+    }
+    if (hidden_dim % 2 != 0) {
+        float diff = __half2float(input[row_idx * hidden_dim + hidden_dim - 1]) - mean;
         var_sum += diff * diff;
     }
     float var = var_sum / hidden_dim;
     float inv_std = rsqrtf(var + 1e-5f);
 
-    for (int i = 0; i < hidden_dim; ++i) {
-        float val = __half2float(in_row[i]);
-        out_row[i] = __float2half((val - mean) * inv_std);
+    for (int i = 0; i < half_dim; ++i) {
+        float2 val = __half22float2(in_row[i]);
+        val.x = (val.x - mean) * inv_std;
+        val.y = (val.y - mean) * inv_std;
+        out_row[i] = __float22half2_rn(val);
+    }
+    if (hidden_dim % 2 != 0) {
+        float val = __half2float(input[row_idx * hidden_dim + hidden_dim - 1]);
+        output[row_idx * hidden_dim + hidden_dim - 1] = __float2half((val - mean) * inv_std);
     }
 }
 
@@ -915,19 +1116,33 @@ __global__ void fused_mrope_select_f16_kernel(
     int bs, int seq_len, int head_dim,
     int sec0, int sec1, int sec2
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     int total = bs * seq_len * head_dim;
     if (idx >= total) return;
 
-    int d = idx % head_dim;
-    int spatial_idx = 0;
-    if (d >= sec0 && d < sec0 + sec1) {
-        spatial_idx = 1;
-    } else if (d >= sec0 + sec1) {
-        spatial_idx = 2;
+    int half_dim = head_dim / 2;
+    if (idx + 1 < total) {
+        int d_half = (idx / 2) % half_dim;
+        int d = d_half * 2;
+        int spatial_idx = 0;
+        if (d >= sec0 && d < sec0 + sec1) {
+            spatial_idx = 1;
+        } else if (d >= sec0 + sec1) {
+            spatial_idx = 2;
+        }
+        int in_idx = spatial_idx * total + idx;
+        *reinterpret_cast<half2*>(&out[idx]) = *reinterpret_cast<const half2*>(&in_all[in_idx]);
+    } else {
+        int d = idx % head_dim;
+        int spatial_idx = 0;
+        if (d >= sec0 && d < sec0 + sec1) {
+            spatial_idx = 1;
+        } else if (d >= sec0 + sec1) {
+            spatial_idx = 2;
+        }
+        int in_idx = spatial_idx * total + idx;
+        out[idx] = in_all[in_idx];
     }
-    int in_idx = spatial_idx * (bs * seq_len * head_dim) + idx;
-    out[idx] = in_all[in_idx];
 }
 
 extern "C" {
@@ -957,8 +1172,9 @@ extern "C" {
         int sec0, int sec1, int sec2
     ) {
         int total = bs * seq_len * head_dim;
+        int total_threads = (total + 1) / 2;
         int block_dim = 256;
-        int grid_dim = (total + block_dim - 1) / block_dim;
+        int grid_dim = (total_threads + block_dim - 1) / block_dim;
         fused_mrope_select_f16_kernel<<<grid_dim, block_dim>>>(
             reinterpret_cast<const half*>(in_all_ptr),
             reinterpret_cast<half*>(out_ptr),
@@ -981,23 +1197,34 @@ __global__ void fused_softmax_reduce_f16_kernel(
     if (row_idx >= total_rows) return;
 
     half* row_data = attn_weights + row_idx * kv_len;
+    int half_len = kv_len / 2;
+    half2* row_data_h2 = reinterpret_cast<half2*>(row_data);
 
     // 1. Find max
     float max_val = -10000.0f;
-    for (int i = 0; i < kv_len; ++i) {
-        float val = __half2float(row_data[i]);
-        if (val > max_val) {
-            max_val = val;
-        }
+    for (int i = 0; i < half_len; ++i) {
+        float2 val = __half22float2(row_data_h2[i]);
+        max_val = fmaxf(max_val, fmaxf(val.x, val.y));
+    }
+    if (kv_len % 2 != 0) {
+        float val = __half2float(row_data[kv_len - 1]);
+        max_val = fmaxf(max_val, val);
     }
     max_logits[row_idx] = __float2half(max_val);
 
     // 2. Compute exp and sum in-place
     float sum_val = 0.0f;
-    for (int i = 0; i < kv_len; ++i) {
-        float val = __half2float(row_data[i]);
+    for (int i = 0; i < half_len; ++i) {
+        float2 val = __half22float2(row_data_h2[i]);
+        val.x = expf(val.x - max_val);
+        val.y = expf(val.y - max_val);
+        row_data_h2[i] = __float22half2_rn(val);
+        sum_val += val.x + val.y;
+    }
+    if (kv_len % 2 != 0) {
+        float val = __half2float(row_data[kv_len - 1]);
         float e = expf(val - max_val);
-        row_data[i] = __float2half(e);
+        row_data[kv_len - 1] = __float2half(e);
         sum_val += e;
     }
     sum_exp[row_idx] = __float2half(sum_val);

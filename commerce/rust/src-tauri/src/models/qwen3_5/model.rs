@@ -140,6 +140,43 @@ impl Qwen3_5RMSNormGated {
             }
         }
 
+        if xs.device().is_cpu() {
+            if let Some(gate_tensor) = gate {
+                let dtype = xs.dtype();
+                if dtype == candle_core::DType::F32 && gate_tensor.dtype() == candle_core::DType::F32 {
+                    use rayon::prelude::*;
+                    let hidden_size = xs.dim(candle_core::D::Minus1)?;
+                    let shape = xs.shape().clone();
+                    let xs_vec = xs.to_vec1::<f32>().unwrap_or_else(|_| xs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+                    let w_vec = w.to_vec1::<f32>().unwrap_or_else(|_| w.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+                    let g_vec = gate_tensor.to_vec1::<f32>().unwrap_or_else(|_| gate_tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+                    
+                    let mut out_vec = vec![0.0f32; xs_vec.len()];
+                    let eps = self.eps as f32;
+
+                    out_vec.par_chunks_mut(hidden_size).enumerate().for_each(|(row, out_chunk)| {
+                        let start = row * hidden_size;
+                        let mut sum_sq = 0.0;
+                        for i in 0..hidden_size {
+                            let val = xs_vec[start + i];
+                            sum_sq += val * val;
+                        }
+                        let variance = sum_sq / hidden_size as f32;
+                        let inv_std = 1.0 / (variance + eps).sqrt();
+
+                        for i in 0..hidden_size {
+                            let x_val = xs_vec[start + i];
+                            let norm_val = x_val * inv_std * w_vec[i];
+                            let g_val = g_vec[start + i];
+                            let silu_val = g_val / (1.0 + (-g_val).exp());
+                            out_chunk[i] = norm_val * silu_val;
+                        }
+                    });
+                    return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
+                }
+            }
+        }
+
         let mut out = candle_nn::ops::rms_norm(xs, &w, self.eps as f32)?;
         if let Some(gate) = gate {
             let gate_val = gate.to_dtype(candle_core::DType::F32)?.silu()?.to_dtype(xs.dtype())?;

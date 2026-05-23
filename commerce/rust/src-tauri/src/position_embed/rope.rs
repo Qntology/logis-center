@@ -173,8 +173,67 @@ pub fn apply_rotary_pos_emb(
         }
     }
 
-    let q_embed = q_work.broadcast_mul(&cos)?.add(&rotate_half(&q_work)?.broadcast_mul(&sin)?)?; 
-    let k_embed = k_work.broadcast_mul(&cos)?.add(&rotate_half(&k_work)?.broadcast_mul(&sin)?)?; 
+    if q_work.device().is_cpu() && q_work.dtype() == candle_core::DType::F32 {
+        use rayon::prelude::*;
+        let (b_sz, q_heads, seq_len, head_dim) = q_work.dims4()?;
+        let (_, k_heads, _, _) = k_work.dims4()?;
+        let half_dim = head_dim / 2;
+
+        let q_vec = q_work.to_vec1::<f32>().unwrap_or_else(|_| q_work.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+        let k_vec = k_work.to_vec1::<f32>().unwrap_or_else(|_| k_work.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+        let cos_vec = cos_f.to_vec1::<f32>().unwrap_or_else(|_| cos_f.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+        let sin_vec = sin_f.to_vec1::<f32>().unwrap_or_else(|_| sin_f.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+
+        let mut q_out = vec![0.0f32; q_vec.len()];
+        let mut k_out = vec![0.0f32; k_vec.len()];
+
+        q_out.par_chunks_mut(head_dim).enumerate().for_each(|(idx, q_chunk)| {
+            let rem = idx % (seq_len * q_heads);
+            let seq_idx = rem / q_heads;
+            let q_base = idx * head_dim;
+            let cos_base = seq_idx * head_dim;
+
+            for d in 0..half_dim {
+                let q1 = q_vec[q_base + d];
+                let q2 = q_vec[q_base + d + half_dim];
+                let c = cos_vec[cos_base + d];
+                let s = sin_vec[cos_base + d];
+
+                q_chunk[d] = q1 * c - q2 * s;
+                q_chunk[d + half_dim] = q2 * c + q1 * s;
+            }
+        });
+
+        k_out.par_chunks_mut(head_dim).enumerate().for_each(|(idx, k_chunk)| {
+            let rem = idx % (seq_len * k_heads);
+            let seq_idx = rem / k_heads;
+            let k_base = idx * head_dim;
+            let cos_base = seq_idx * head_dim;
+
+            for d in 0..half_dim {
+                let k1 = k_vec[k_base + d];
+                let k2 = k_vec[k_base + d + half_dim];
+                let c = cos_vec[cos_base + d];
+                let s = sin_vec[cos_base + d];
+
+                k_chunk[d] = k1 * c - k2 * s;
+                k_chunk[d + half_dim] = k2 * c + k1 * s;
+            }
+        });
+
+        let q_final_t = Tensor::from_vec(q_out, q_work.shape().clone(), &Device::Cpu)?;
+        let k_final_t = Tensor::from_vec(k_out, k_work.shape().clone(), &Device::Cpu)?;
+        
+        let (q_final, k_final) = if tof32 {
+            (q_final_t.to_dtype(orig_dtype)?, k_final_t.to_dtype(orig_dtype)?) 
+        } else {
+            (q_final_t, k_final_t)
+        };
+        return Ok((q_final, k_final));
+    }
+
+    let q_embed = q_work.broadcast_mul(&cos_f)?.add(&rotate_half(&q_work)?.broadcast_mul(&sin_f)?)?; 
+    let k_embed = k_work.broadcast_mul(&cos_f)?.add(&rotate_half(&k_work)?.broadcast_mul(&sin_f)?)?; 
 
     let (q_final, k_final) = if tof32 {
         (q_embed.to_dtype(orig_dtype)?, k_embed.to_dtype(orig_dtype)?) 
@@ -475,12 +534,10 @@ impl Qwen2_5VLTextRotaryEmbedding {
         dtype: DType,
         mrope_section: Vec<usize>,
     ) -> Result<(Tensor, Tensor)> {
-        // position_ids shape: (3, bs, position) -> (3, bs, 1, position)
         let position_ids_expanded = position_ids
             .unsqueeze(D::Minus2)?
             .to_dtype(DType::F32)?
             .contiguous()?;
-        // inv_freq Vec<f32> -> Tensor(1, 1, head_dim / 2, 1) -> (3, bs, head_dim / 2, 1)
         let inv_freq_expanded = Tensor::from_vec(
             self.inv_freq.clone(),
             (1, 1, self.inv_freq.len(), 1),
@@ -490,37 +547,94 @@ impl Qwen2_5VLTextRotaryEmbedding {
         .to_dtype(DType::F32)?
         .contiguous()?;
 
-        // (3, bs, head_dim / 2, 1) matmul (3, bs, 1, position)
-        //    -> (3, bs, head_dim / 2, seq_len) -> (3, bs, seq_len, head_dim / 2)
         let freqs = inv_freq_expanded
             .matmul(&position_ids_expanded)?
             .transpose(2, 3)?;
-        // let freqs = position_ids_expanded.matmul(&inv_freq_expanded)?;
-        // (3, bs, seq_len, head_dim / 2) -> (3, bs, seq_len, head_dim)
         let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?.contiguous()?;
-        let cos = emb.cos()?;
-        let sin = emb.sin()?;
-        let mrope_section = mrope_section.repeat(2);
-        let cos_select: Vec<Tensor> = cos
-            .split(&mrope_section, D::Minus1)?
-            .iter()
-            .enumerate()
-            .map(|(i, m)| m.i(i % 3).unwrap())
-            .collect();
-        // (bs, seq_len, head_dim) -> (bs, 1, seq_len, head_dim)
-        let cos = Tensor::cat(&cos_select, D::Minus1)?
-            .unsqueeze(1)?
-            .contiguous()?;
-        let sin_select: Vec<Tensor> = sin
-            .split(&mrope_section, D::Minus1)?
-            .iter()
-            .enumerate()
-            .map(|(i, m)| m.i(i % 3).unwrap())
-            .collect();
-        // (bs, seq_len, head_dim) -> (bs, 1, seq_len, head_dim)
-        let sin = Tensor::cat(&sin_select, D::Minus1)?
-            .unsqueeze(1)?
-            .contiguous()?;
+        let cos_all = emb.cos()?;
+        let sin_all = emb.sin()?;
+        let mrope_section_doubled = mrope_section.iter().map(|&s| s * 2).collect::<Vec<_>>();
+        
+        if mrope_section_doubled.is_empty() {
+            return Ok((
+                cos_all.i(0)?.unsqueeze(1)?.to_dtype(dtype)?, 
+                sin_all.i(0)?.unsqueeze(1)?.to_dtype(dtype)?
+            ));
+        }
+
+        let sec0 = *mrope_section_doubled.get(0).unwrap_or(&0) as i32;
+        let sec1 = *mrope_section_doubled.get(1).unwrap_or(&0) as i32;
+        let sec2 = *mrope_section_doubled.get(2).unwrap_or(&0) as i32;
+
+        #[cfg(feature = "cuda")]
+        {
+            if cos_all.device().is_cuda() && cos_all.dtype() == candle_core::DType::F16 && mrope_section_doubled.len() == 3 {
+                let (dim3, bs, seq_len, head_dim) = cos_all.dims4()?;
+                if dim3 == 3 {
+                    let mut cos_out = Tensor::zeros((bs, seq_len, head_dim), candle_core::DType::F16, cos_all.device())?;
+                    let mut sin_out = Tensor::zeros((bs, seq_len, head_dim), candle_core::DType::F16, sin_all.device())?;
+                    
+                    unsafe {
+                        use candle_core::Storage;
+                        use candle_core::backend::BackendStorage;
+                        let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
+                            let (storage, _) = t.storage_and_layout();
+                            match &*storage { Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void, _ => std::ptr::null() }
+                        };
+                        let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
+                            let (storage, _) = t.storage_and_layout();
+                            match &*storage { Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void, _ => std::ptr::null_mut() }
+                        };
+
+                        let c_in_ptr = get_const_ptr(&cos_all);
+                        let s_in_ptr = get_const_ptr(&sin_all);
+                        let c_out_ptr = get_mut_ptr(&mut cos_out);
+                        let s_out_ptr = get_mut_ptr(&mut sin_out);
+
+                        if !c_in_ptr.is_null() && !s_in_ptr.is_null() && !c_out_ptr.is_null() && !s_out_ptr.is_null() {
+                            fused_mrope_select(c_in_ptr, c_out_ptr, bs as i32, seq_len as i32, head_dim as i32, sec0, sec1, sec2);
+                            fused_mrope_select(s_in_ptr, s_out_ptr, bs as i32, seq_len as i32, head_dim as i32, sec0, sec1, sec2);
+                            return Ok((cos_out.unsqueeze(1)?.to_dtype(dtype)?, sin_out.unsqueeze(1)?.to_dtype(dtype)?));
+                        }
+                    }
+                }
+            }
+        }
+
+        if cos_all.device().is_cpu() && cos_all.dtype() == DType::F32 {
+            use rayon::prelude::*;
+            let (dim3, bs, seq_len, head_dim) = cos_all.dims4()?;
+            let total_elements = bs * seq_len * head_dim;
+            let out_shape = (bs, seq_len, head_dim);
+            
+            let cos_all_vec = cos_all.to_vec1::<f32>().unwrap_or_else(|_| cos_all.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+            let sin_all_vec = sin_all.to_vec1::<f32>().unwrap_or_else(|_| sin_all.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+            
+            let mut cos_out = vec![0.0f32; total_elements];
+            let mut sin_out = vec![0.0f32; total_elements];
+            
+            cos_out.par_chunks_mut(head_dim).zip(sin_out.par_chunks_mut(head_dim)).enumerate().for_each(|(row, (c_chunk, s_chunk))| {
+                for d in 0..head_dim {
+                    let spatial_idx = if d >= sec0 as usize && d < (sec0 + sec1) as usize { 1 } else if d >= (sec0 + sec1) as usize { 2 } else { 0 };
+                    let in_idx = spatial_idx * total_elements + row * head_dim + d;
+                    c_chunk[d] = cos_all_vec[in_idx];
+                    s_chunk[d] = sin_all_vec[in_idx];
+                }
+            });
+            
+            let cos_t = Tensor::from_vec(cos_out, out_shape.clone(), &Device::Cpu)?.unsqueeze(1)?.to_dtype(dtype)?;
+            let sin_t = Tensor::from_vec(sin_out, out_shape, &Device::Cpu)?.unsqueeze(1)?.to_dtype(dtype)?;
+            return Ok((cos_t, sin_t));
+        }
+
+        let cos_select: Vec<Tensor> = cos_all.split(&mrope_section_doubled, D::Minus1)?
+            .iter().enumerate().map(|(i, m)| m.i(i % 3).unwrap()).collect();
+        let cos = Tensor::cat(&cos_select, D::Minus1)?.unsqueeze(1)?.contiguous()?; 
+
+        let sin_select: Vec<Tensor> = sin_all.split(&mrope_section_doubled, D::Minus1)?
+            .iter().enumerate().map(|(i, m)| m.i(i % 3).unwrap()).collect();
+        let sin = Tensor::cat(&sin_select, D::Minus1)?.unsqueeze(1)?.contiguous()?; 
+
         Ok((cos.to_dtype(dtype)?, sin.to_dtype(dtype)?))
     }
 }
@@ -561,14 +675,37 @@ impl Qwen3VLTextRotaryEmbedding {
         freqs: &Tensor,
         mrope_section: Vec<usize>,
     ) -> Result<Tensor> {
-        let mut freqs_t = freqs.i(0)?.contiguous()?; //(3, bs, seq_len, head_dim //2) -> (bs, seq_len, head_dim //2)
+        if freqs.device().is_cpu() && freqs.dtype() == DType::F32 {
+            use rayon::prelude::*;
+            let (_dim3, bs, seq_len, half_dim) = freqs.dims4()?;
+            let total_elements = bs * seq_len * half_dim;
+            let freqs_vec = freqs.to_vec1::<f32>().unwrap_or_else(|_| freqs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+            
+            let mut out_vec = vec![0.0f32; total_elements];
+            
+            out_vec.par_chunks_mut(half_dim).enumerate().for_each(|(row, chunk)| {
+                for d in 0..half_dim {
+                    let mut spatial_idx = 0;
+                    for dim in 1..3 {
+                        if let Some(&sec) = mrope_section.get(dim) {
+                            if d < sec * 3 && d % 3 == dim {
+                                spatial_idx = dim;
+                            }
+                        }
+                    }
+                    let in_idx = spatial_idx * total_elements + row * half_dim + d;
+                    chunk[d] = freqs_vec[in_idx];
+                }
+            });
+            return Ok(Tensor::from_vec(out_vec, (bs, seq_len, half_dim), &Device::Cpu)?);
+        }
 
-        // for dim in 1..3 {
+        let mut freqs_t = freqs.i(0)?.contiguous()?; 
+
         for (dim, section) in mrope_section.iter().enumerate().skip(1) {
-            // let length = mrope_section[dim] * 3;
             let length = section * 3;
             let idx = Tensor::arange_step(dim as u32, length as u32, 3, freqs.device())?;
-            let src = freqs.i(dim)?.contiguous()?; // (bs, seq_len, head_dim //2)
+            let src = freqs.i(dim)?.contiguous()?; 
             let src = src.index_select(&idx, D::Minus1)?.contiguous()?;
             let idx = idx
                 .unsqueeze(0)?
@@ -585,14 +722,39 @@ impl Qwen3VLTextRotaryEmbedding {
         freqs: &Tensor,
         mrope_section: Vec<usize>,
     ) -> Result<Tensor> {
-        let mut freqs_t = freqs.i(0)?.contiguous()?; //(3, bs, seq_len, head_dim //2) -> (bs, seq_len, head_dim //2)
+        if freqs.device().is_cpu() && freqs.dtype() == DType::F32 {
+            use rayon::prelude::*;
+            let (_dim3, bs, seq_len, half_dim) = freqs.dims4()?;
+            let total_elements = bs * seq_len * half_dim;
+            let freqs_vec = freqs.to_vec1::<f32>().unwrap_or_else(|_| freqs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+            
+            let mut out_vec = vec![0.0f32; total_elements];
+            
+            out_vec.par_chunks_mut(half_dim).enumerate().for_each(|(row, chunk)| {
+                for d in 0..half_dim {
+                    let mut spatial_idx = 0;
+                    for (offset_idx, offset) in (1..3).enumerate() {
+                        let dim = offset_idx + 1;
+                        if let Some(&length) = mrope_section.get(dim) {
+                            if d < length && d % 3 == offset {
+                                spatial_idx = dim;
+                            }
+                        }
+                    }
+                    let in_idx = spatial_idx * total_elements + row * half_dim + d;
+                    chunk[d] = freqs_vec[in_idx];
+                }
+            });
+            return Ok(Tensor::from_vec(out_vec, (bs, seq_len, half_dim), &Device::Cpu)?);
+        }
 
-        // for dim in 1..3 {
+        let mut freqs_t = freqs.i(0)?.contiguous()?; 
+
         for (dim, offset) in (1..3).enumerate() {
             let dim = dim + 1;
             let length = mrope_section[dim];
             let idx = Tensor::arange_step(offset as u32, length as u32, 3, freqs.device())?;
-            let src = freqs.i(dim)?.contiguous()?; // (bs, seq_len, head_dim //2)
+            let src = freqs.i(dim)?.contiguous()?; 
             let src = src.index_select(&idx, D::Minus1)?.contiguous()?;
             let idx = idx
                 .unsqueeze(0)?
