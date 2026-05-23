@@ -3,8 +3,11 @@
 #include <stdint.h>
 #include <float.h>
 
-// 기본적인 Tiled Attention 커널 (seq_len이 크지 않을 때의 메모리 최적화 버전)
-__global__ void basic_flash_attn_f16_kernel(
+// 최신 LLM(Qwen 등)에서 주로 사용하는 최대 Head Dimension 크기
+#define MAX_HEAD_DIM 128
+
+// Flash Attention v1의 핵심 원리인 Online Softmax를 레지스터 레벨에서 구현한 커널
+__global__ void online_softmax_attention_f16_kernel(
     const half* __restrict__ q,
     const half* __restrict__ k,
     const half* __restrict__ v,
@@ -13,8 +16,9 @@ __global__ void basic_flash_attn_f16_kernel(
     int head_dim,
     float scale
 ) {
+    // 2D Grid를 사용하여 seq_len이 1024를 초과하더라도 안정적으로 스레드 분배
     int batch_head_idx = blockIdx.x; 
-    int q_idx = threadIdx.x; 
+    int q_idx = blockIdx.y * blockDim.x + threadIdx.x; 
 
     if (q_idx >= seq_len) return;
 
@@ -22,43 +26,47 @@ __global__ void basic_flash_attn_f16_kernel(
     const half* q_row = q + base_offset + q_idx * head_dim;
     half* out_row = out + base_offset + q_idx * head_dim;
 
-    float max_val = -FLT_MAX;
-    float sum_exp = 0.0f;
+    // Flash Attention: Shared Memory 대신 레지스터에 누적값을 보관하여 메모리 한계 극복
+    float m_i = -FLT_MAX;
+    float l_i = 0.0f;
+    float out_val[MAX_HEAD_DIM] = {0.0f};
 
-    // Attention Score 계산 (Q * K^T)을 위한 로컬 버퍼 (최대 seq_len은 제약에 맞게 할당 필요, 여기서는 동적 메모리 가정)
-    extern __shared__ float s_logits[];
-    float* logits = s_logits + q_idx * seq_len;
+    // Query 토큰을 레지스터로 미리 로드 (메모리 접근 최소화)
+    float q_reg[MAX_HEAD_DIM];
+    for(int d = 0; d < head_dim; ++d) {
+        q_reg[d] = __half2float(q_row[d]);
+    }
 
-    // 1. Q * K^T
+    // Key, Value를 순회하며 Online Softmax 계산
     for (int k_idx = 0; k_idx < seq_len; ++k_idx) {
         const half* k_row = k + base_offset + k_idx * head_dim;
-        float score = 0.0f;
+        const half* v_row = v + base_offset + k_idx * head_dim;
+        
+        // 1. Score 계산: Q_i * K_j^T * scale
+        float s_ij = 0.0f;
         for (int d = 0; d < head_dim; ++d) {
-            score += __half2float(q_row[d]) * __half2float(k_row[d]);
+            s_ij += q_reg[d] * __half2float(k_row[d]);
         }
-        score *= scale;
-        logits[k_idx] = score;
-        if (score > max_val) {
-            max_val = score;
+        s_ij *= scale;
+
+        // 2. Online Softmax 수학 공식 적용 (OOM 원천 차단)
+        float m_new = max(m_i, s_ij);
+        float exp_old = expf(m_i - m_new);
+        float exp_new = expf(s_ij - m_new);
+
+        l_i = l_i * exp_old + exp_new;
+
+        // 3. V 값 누적
+        for (int d = 0; d < head_dim; ++d) {
+            out_val[d] = out_val[d] * exp_old + exp_new * __half2float(v_row[d]);
         }
+        
+        m_i = m_new;
     }
 
-    // 2. Softmax
-    for (int k_idx = 0; k_idx < seq_len; ++k_idx) {
-        float exp_val = expf(logits[k_idx] - max_val);
-        logits[k_idx] = exp_val;
-        sum_exp += exp_val;
-    }
-
-    // 3. Score * V
+    // 4. 최종 정규화 및 Global Memory 출력
     for (int d = 0; d < head_dim; ++d) {
-        float out_val = 0.0f;
-        for (int k_idx = 0; k_idx < seq_len; ++k_idx) {
-            const half* v_row = v + base_offset + k_idx * head_dim;
-            float prob = logits[k_idx] / sum_exp;
-            out_val += prob * __half2float(v_row[d]);
-        }
-        out_row[d] = __float2half(out_val);
+        out_row[d] = __float2half(out_val[d] / l_i);
     }
 }
 
@@ -74,14 +82,12 @@ extern "C" {
         int head_dim,
         float softmax_scale
     ) {
-        // 블록당 1개의 Query 토큰을 처리 (예시: 최대 1024 토큰)
-        int grid_dim = batch_size * num_heads;
-        int block_dim = seq_len;
+        // block_dim이 1024를 넘어가면 터지므로 256으로 고정하고 Grid_Y로 분할합니다.
+        dim3 block_dim(256);
+        dim3 grid_dim(batch_size * num_heads, (seq_len + block_dim.x - 1) / block_dim.x);
         
-        // Shared memory for logits: block_dim * seq_len * sizeof(float)
-        size_t shared_mem_size = block_dim * seq_len * sizeof(float);
-
-        basic_flash_attn_f16_kernel<<<grid_dim, block_dim, shared_mem_size>>>(
+        // Shared Memory(0) 없이 실행 가능
+        online_softmax_attention_f16_kernel<<<grid_dim, block_dim, 0>>>(
             reinterpret_cast<const half*>(q_ptr),
             reinterpret_cast<const half*>(k_ptr),
             reinterpret_cast<const half*>(v_ptr),
@@ -217,17 +223,30 @@ __global__ void fused_silu_mul_f16_kernel(
     half* __restrict__ out,
     int total_elements
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     if (idx >= total_elements) return;
 
-    float g = __half2float(gate[idx]);
-    float u = __half2float(up[idx]);
-    
-    // SiLU(x) = x / (1.0 + exp(-x))
-    float silu_g = g / (1.0f + expf(-g));
-    
-    // Element-wise multiplication
-    out[idx] = __float2half(silu_g * u);
+    if (idx + 1 < total_elements) {
+        half2 g2 = *reinterpret_cast<const half2*>(&gate[idx]);
+        half2 u2 = *reinterpret_cast<const half2*>(&up[idx]);
+
+        float2 g_f2 = __half22float2(g2);
+        float2 u_f2 = __half22float2(u2);
+
+        float sig_g0 = g_f2.x / (1.0f + expf(-g_f2.x));
+        float sig_g1 = g_f2.y / (1.0f + expf(-g_f2.y));
+
+        float2 out_f2;
+        out_f2.x = sig_g0 * u_f2.x;
+        out_f2.y = sig_g1 * u_f2.y;
+
+        *reinterpret_cast<half2*>(&out[idx]) = __float22half2_rn(out_f2);
+    } else {
+        float g = __half2float(gate[idx]);
+        float u = __half2float(up[idx]);
+        float silu_g = g / (1.0f + expf(-g));
+        out[idx] = __float2half(silu_g * u);
+    }
 }
 
 // ==============================================================================
@@ -271,8 +290,9 @@ extern "C" {
         void* out_ptr,
         int total_elements
     ) {
-        int grid_dim, block_dim;
-        get_launch_config(total_elements, grid_dim, block_dim);
+        int total_threads = (total_elements + 1) / 2;
+        int block_dim = 256;
+        int grid_dim = (total_threads + block_dim - 1) / block_dim;
 
         fused_silu_mul_f16_kernel<<<grid_dim, block_dim>>>(
             reinterpret_cast<const half*>(gate_ptr),

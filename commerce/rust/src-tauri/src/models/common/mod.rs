@@ -109,7 +109,28 @@ impl UnifiedKernels {
             }
         }
 
-        // CPU 및 기타 디바이스(Metal 등)를 위한 범용 폴백 (Fallback) 연산
+        if lhs.device().is_cpu() && matches!(act_fn, Activation::Silu) {
+            use rayon::prelude::*;
+            let dtype = lhs.dtype();
+            
+            if dtype == candle_core::DType::F32 {
+                let shape = lhs.shape().clone();
+                let lhs_vec = lhs.to_vec1::<f32>().unwrap_or_else(|_| lhs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+                let rhs_vec = rhs.to_vec1::<f32>().unwrap_or_else(|_| rhs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+                
+                let mut out_vec = vec![0.0f32; lhs_vec.len()];
+                
+                out_vec.par_iter_mut().enumerate().for_each(|(i, out)| {
+                    let x = lhs_vec[i];
+                    let y = rhs_vec[i];
+                    let silu_x = x / (1.0 + (-x).exp());
+                    *out = silu_x * y;
+                });
+                
+                return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
+            }
+        }
+
         let lhs_act = lhs.apply(act_fn)?;
         lhs_act * rhs
     }
