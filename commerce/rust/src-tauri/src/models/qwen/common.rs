@@ -481,26 +481,20 @@ pub fn decoding_attention_parallel(
     query_states: &Tensor,
     key_states: &Tensor,
     value_states: &Tensor,
-    _num_key_value_groups: Option<usize>, // <-- Add this argument here!
+    _num_key_value_groups: Option<usize>,
     scaling: f64,
 ) -> Result<Tensor> {
-    // Flash-Decoding style optimization for seq_len = 1 (Decoding)
-    // Splits KV into chunks and parallelizes attention calculation
     let (_b_sz, _n_heads, q_len, _head_dim) = query_states.dims4()?;
     
-    // [FIX] Early exit if not a decoding step (q_len > 1)
     if q_len != 1 {
         return eager_attention_forward(query_states, key_states, value_states, None, None, scaling);
     }
 
-    // [FIX] GQA Support: Repeat KV heads if they are fewer than query heads
     let _n_kv_heads = key_states.dim(1)?;
-
     let kv_seq_len = key_states.dim(2)?;
-    let chunk_size = 128; // Optimal chunk size for parallel reduction
+    let chunk_size = 128; 
     
     if kv_seq_len <= chunk_size {
-        // [FIX] Pass by reference to resolve E0308
         return eager_attention_forward(query_states, &key_states, &value_states, None, None, scaling);
     }
 
@@ -508,8 +502,10 @@ pub fn decoding_attention_parallel(
     let mut chunk_outputs = Vec::with_capacity(num_chunks);
     let mut chunk_logsumexp = Vec::with_capacity(num_chunks);
 
-    // [CRITICAL FIX] 루프 내부에서 매번 발생하던 query_states의 형변환을 루프 밖으로 빼내 GPU 스톨을 제거합니다!
     let q_aligned = query_states.to_dtype(key_states.dtype())?;
+
+    let mut row_shape = q_aligned.dims().to_vec();
+    *row_shape.last_mut().unwrap() = 1;
 
     for i in 0..num_chunks {
         let start = i * chunk_size;
@@ -517,20 +513,104 @@ pub fn decoding_attention_parallel(
         let k_chunk = key_states.narrow(2, start, end - start)?;
         let v_chunk = value_states.narrow(2, start, end - start)?;
 
-        let attn_weights = (q_aligned.matmul(&k_chunk.transpose(2, 3)?)? * scaling)?;
-        let max_logits = attn_weights.max_keepdim(D::Minus1)?;
-        let exp_weights = attn_weights.broadcast_sub(&max_logits)?.exp()?;
-        let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
+        let mut exp_weights = q_aligned.matmul(&k_chunk.transpose(2, 3)?)?.affine(scaling, 0.0)?.contiguous()?;
+        let kv_len = exp_weights.dim(D::Minus1)?;
+        
+        // [CRITICAL FIX] 루프 내부로 이동: 메모리 무단 덮어쓰기(Overwrite) 및 Borrow 에러 완벽 해결
+        let mut max_logits = Tensor::zeros(row_shape.as_slice(), key_states.dtype(), key_states.device())?;
+        let mut sum_exp = Tensor::zeros(row_shape.as_slice(), key_states.dtype(), key_states.device())?;
+
+        let mut executed_fused = false;
+
+        #[cfg(feature = "cuda")]
+        {
+            if exp_weights.device().is_cuda() && exp_weights.dtype() == candle_core::DType::F16 {
+                let total_rows = exp_weights.elem_count() / kv_len;
+                unsafe {
+                    use candle_core::Storage;
+                    use candle_core::backend::BackendStorage;
+                    let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
+                        let (storage, _) = t.storage_and_layout();
+                        match &*storage {
+                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
+                            _ => std::ptr::null_mut(),
+                        }
+                    };
+
+                    #[cfg(feature = "cuda")]
+                    extern "C" {
+                        fn fused_softmax_reduce(
+                            attn_weights_ptr: *mut std::ffi::c_void,
+                            max_logits_ptr: *mut std::ffi::c_void,
+                            sum_exp_ptr: *mut std::ffi::c_void,
+                            kv_len: std::ffi::c_int,
+                            total_rows: std::ffi::c_int,
+                        );
+                    }
+
+                    let attn_ptr = get_mut_ptr(&mut exp_weights);
+                    let max_ptr = get_mut_ptr(&mut max_logits);
+                    let sum_ptr = get_mut_ptr(&mut sum_exp);
+
+                    if !attn_ptr.is_null() && !max_ptr.is_null() && !sum_ptr.is_null() {
+                        fused_softmax_reduce(
+                            attn_ptr, max_ptr, sum_ptr,
+                            kv_len as i32, total_rows as i32
+                        );
+                        executed_fused = true;
+                    }
+                }
+            }
+        }
+
+        if !executed_fused {
+            if exp_weights.device().is_cpu() && exp_weights.dtype() == candle_core::DType::F32 {
+                use rayon::prelude::*;
+                let total_rows = exp_weights.elem_count() / kv_len;
+                
+                let mut ew_vec = exp_weights.flatten_all()?.to_vec1::<f32>()?;
+                let mut max_vec = vec![0.0f32; total_rows];
+                let mut sum_vec = vec![0.0f32; total_rows];
+                
+                // [CRITICAL FIX] iter_mut().zip()을 통해 안전한 병렬 메모리 쓰기 보장
+                ew_vec.par_chunks_mut(kv_len)
+                    .zip(max_vec.par_iter_mut())
+                    .zip(sum_vec.par_iter_mut())
+                    .for_each(|((chunk, max_out), sum_out)| {
+                        let mut max_v = -10000.0f32;
+                        for &val in chunk.iter() {
+                            if val > max_v { max_v = val; }
+                        }
+                        *max_out = max_v;
+                        
+                        let mut sum_v = 0.0f32;
+                        for val in chunk.iter_mut() {
+                            let e = (*val - max_v).exp();
+                            *val = e;
+                            sum_v += e;
+                        }
+                        *sum_out = sum_v;
+                    });
+                
+                exp_weights = Tensor::from_vec(ew_vec, exp_weights.shape(), exp_weights.device())?;
+                max_logits = Tensor::from_vec(max_vec, row_shape.as_slice(), exp_weights.device())?;
+                sum_exp = Tensor::from_vec(sum_vec, row_shape.as_slice(), exp_weights.device())?;
+            } else {
+                max_logits = exp_weights.max_keepdim(D::Minus1)?;
+                let safe_floor = Tensor::new(-10000.0_f32, max_logits.device())?.to_dtype(max_logits.dtype())?.broadcast_as(max_logits.shape())?;
+                max_logits = max_logits.maximum(&safe_floor)?;
+                exp_weights = exp_weights.broadcast_sub(&max_logits)?.exp()?;
+                sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
+            }
+        }
         
         let out_chunk = exp_weights.to_dtype(v_chunk.dtype())?.matmul(&v_chunk)?;
-        // [OPTIMIZATION] log()를 취하지 않고 가중치 합(sum_exp)과 max_logits만 보관
         let exp_sum_val = sum_exp; 
 
         chunk_outputs.push(out_chunk);
-        chunk_logsumexp.push((exp_sum_val, max_logits)); // 튜플 형태로 저장
+        chunk_logsumexp.push((exp_sum_val, max_logits)); 
     }
 
-    // Parallel Reduction 시작 부분 수정
     let (mut current_exp_sum, mut current_max_logit) = chunk_logsumexp[0].clone();
     let mut final_output = chunk_outputs[0].clone();
 
@@ -548,7 +628,6 @@ pub fn decoding_attention_parallel(
         current_max_logit = new_max_logit;
     }
 
-    // 루프가 다 끝난 후 마지막에 딱 한 번 정규화
     Ok(final_output.broadcast_div(&current_exp_sum)?)
 }
 

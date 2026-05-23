@@ -1010,8 +1010,8 @@ __global__ void fused_recurrent_gated_delta_step_kernel(
     half* __restrict__ out, 
     int k_dim, int v_dim
 ) {
-    int head = blockIdx.x; // batch_size * num_heads
-    int v_idx = threadIdx.x; // v_dim
+    int head = blockIdx.x; 
+    int v_idx = threadIdx.x; 
 
     if (v_idx >= v_dim) return;
 
@@ -1020,30 +1020,53 @@ __global__ void fused_recurrent_gated_delta_step_kernel(
     float v_val = __half2float(v[head * v_dim + v_idx]);
     
     float kv_mem = 0.0f;
+    int half_k_dim = k_dim / 2;
+    const half2* k_row = reinterpret_cast<const half2*>(k + head * k_dim);
+    const half2* q_row = reinterpret_cast<const half2*>(q + head * k_dim);
     
-    // 1. Decay state and compute kv_mem reduction simultaneously
-    for (int k_idx = 0; k_idx < k_dim; ++k_idx) {
-        int state_idx = head * (k_dim * v_dim) + k_idx * v_dim + v_idx;
+    for (int k_idx = 0; k_idx < half_k_dim; ++k_idx) {
+        int state_idx1 = head * (k_dim * v_dim) + (k_idx * 2) * v_dim + v_idx;
+        int state_idx2 = head * (k_dim * v_dim) + (k_idx * 2 + 1) * v_dim + v_idx;
+        
+        float s_val1 = state[state_idx1] * g_val;
+        float s_val2 = state[state_idx2] * g_val;
+        state[state_idx1] = s_val1;
+        state[state_idx2] = s_val2;
+        
+        float2 k_val = __half22float2(k_row[k_idx]);
+        kv_mem += s_val1 * k_val.x + s_val2 * k_val.y;
+    }
+    if (k_dim % 2 != 0) {
+        int state_idx = head * (k_dim * v_dim) + (k_dim - 1) * v_dim + v_idx;
         float s_val = state[state_idx] * g_val;
         state[state_idx] = s_val;
-        
-        float k_val = __half2float(k[head * k_dim + k_idx]);
+        float k_val = __half2float(k[head * k_dim + k_dim - 1]);
         kv_mem += s_val * k_val;
     }
     
     float delta = (v_val - kv_mem) * beta_val;
     float out_val = 0.0f;
     
-    // 2. Add delta to state and compute final output reduction
-    for (int k_idx = 0; k_idx < k_dim; ++k_idx) {
-        int state_idx = head * (k_dim * v_dim) + k_idx * v_dim + v_idx;
-        float k_val = __half2float(k[head * k_dim + k_idx]);
+    for (int k_idx = 0; k_idx < half_k_dim; ++k_idx) {
+        int state_idx1 = head * (k_dim * v_dim) + (k_idx * 2) * v_dim + v_idx;
+        int state_idx2 = head * (k_dim * v_dim) + (k_idx * 2 + 1) * v_dim + v_idx;
         
-        float s_val = state[state_idx];
-        s_val += k_val * delta;
+        float2 k_val = __half22float2(k_row[k_idx]);
+        
+        float s_val1 = state[state_idx1] + k_val.x * delta;
+        float s_val2 = state[state_idx2] + k_val.y * delta;
+        state[state_idx1] = s_val1;
+        state[state_idx2] = s_val2;
+        
+        float2 q_val = __half22float2(q_row[k_idx]);
+        out_val += s_val1 * q_val.x + s_val2 * q_val.y;
+    }
+    if (k_dim % 2 != 0) {
+        int state_idx = head * (k_dim * v_dim) + (k_dim - 1) * v_dim + v_idx;
+        float k_val = __half2float(k[head * k_dim + k_dim - 1]);
+        float s_val = state[state_idx] + k_val * delta;
         state[state_idx] = s_val;
-        
-        float q_val = __half2float(q[head * k_dim + k_idx]);
+        float q_val = __half2float(q[head * k_dim + k_dim - 1]);
         out_val += s_val * q_val;
     }
     

@@ -1273,19 +1273,21 @@ impl Qwen3_5Attention {
             match out_res.as_ref() {
                 None => {
                     out_res = Some(out_j_f32); 
-                    m_n = Some(m_j); 
+                    m_n = Some(m_j_safe); 
                     l_n = Some(l_j);
                 }
                 Some(prev_out_f32) => {
                     let prev_m = m_n.as_ref().unwrap();
                     let prev_l = l_n.as_ref().unwrap();
                     
-                    let m_new = prev_m.maximum(&m_j)?;
-                    let diff_old = prev_m.broadcast_sub(&m_new)?.exp()?;
-                    let diff_new = m_j.broadcast_sub(&m_new)?.exp()?;
+                    let m_new = prev_m.maximum(&m_j_safe)?;
                     
-                    let l_new = prev_l.broadcast_mul(&diff_old)?.add(&l_j.broadcast_mul(&diff_new)?)?;
-                    let out_new_f32 = prev_out_f32.broadcast_mul(&diff_old)?.add(&out_j_f32.broadcast_mul(&diff_new)?)?;
+                    // [CRITICAL FIX] 변수 바인딩을 제거하고 즉시 체이닝 연산하여 텐서 메모리 재할당(OOM) 방어
+                    let l_new = prev_l.broadcast_mul(&prev_m.broadcast_sub(&m_new)?.exp()?)?
+                                      .add(&l_j.broadcast_mul(&m_j_safe.broadcast_sub(&m_new)?.exp()?)?)?;
+                    
+                    let out_new_f32 = prev_out_f32.broadcast_mul(&prev_m.broadcast_sub(&m_new)?.exp()?)?
+                                                  .add(&out_j_f32.broadcast_mul(&m_j_safe.broadcast_sub(&m_new)?.exp()?)?)?;
                     
                     out_res = Some(out_new_f32);
                     m_n = Some(m_new);
