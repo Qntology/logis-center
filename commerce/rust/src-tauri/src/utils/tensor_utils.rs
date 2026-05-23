@@ -483,6 +483,26 @@ pub fn quick_gelu(xs: &Tensor) -> Result<Tensor> {
         }
     }
     
+    if xs.device().is_cpu() {
+        use rayon::prelude::*;
+        let dtype = xs.dtype();
+        
+        if dtype == candle_core::DType::F32 {
+            let shape = xs.shape().clone();
+            let xs_vec = xs.to_vec1::<f32>().unwrap_or_else(|_| xs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+            
+            let mut out_vec = vec![0.0f32; xs_vec.len()];
+            
+            out_vec.par_iter_mut().enumerate().for_each(|(i, out)| {
+                let x = xs_vec[i];
+                let sig = 1.0 / (1.0 + (-x * 1.702).exp());
+                *out = x * sig;
+            });
+            
+            return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
+        }
+    }
+
     let x = xs.affine(1.702, 0.0)?;
     let x = sigmoid(&x)?;
     Ok(xs.mul(&x)?)

@@ -1239,6 +1239,33 @@ impl UnifiedKernels {
             }
         }
 
+        if xs.device().is_cpu() && dim == rank - 1 {
+            use rayon::prelude::*;
+            let dtype = xs.dtype();
+            if dtype == candle_core::DType::F32 {
+                let mut dims = xs.dims().to_vec();
+                dims[dim] /= 2;
+                let shape = candle_core::Shape::from(dims);
+                let xs_vec = xs.to_vec1::<f32>().unwrap_or_else(|_| xs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+                
+                let half_dim = shape.dims()[dim];
+                let total_out_elements = shape.elem_count();
+                let mut out_vec = vec![0.0f32; total_out_elements];
+                
+                out_vec.par_chunks_mut(half_dim).enumerate().for_each(|(row, out_chunk)| {
+                    let in_start = row * half_dim * 2;
+                    for i in 0..half_dim {
+                        let x0 = xs_vec[in_start + i];
+                        let x1 = xs_vec[in_start + half_dim + i];
+                        let sig_x1 = 1.0 / (1.0 + (-x1).exp());
+                        out_chunk[i] = x0 * sig_x1;
+                    }
+                });
+                
+                return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
+            }
+        }
+
         let x_ = xs.chunk(2, dim)?;
         let x_1 = sigmoid(x_[1].as_ref())?;
         Ok(x_1.mul(x_[0].as_ref())?)
@@ -1284,6 +1311,36 @@ impl UnifiedKernels {
             }
         }
 
+        if xs.device().is_cpu() && dim == rank - 1 {
+            use rayon::prelude::*;
+            let dtype = xs.dtype();
+            if dtype == candle_core::DType::F32 {
+                let mut dims = xs.dims().to_vec();
+                dims[dim] /= 2;
+                let shape = candle_core::Shape::from(dims);
+                let xs_vec = xs.to_vec1::<f32>().unwrap_or_else(|_| xs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+                
+                let half_dim = shape.dims()[dim];
+                let total_out_elements = shape.elem_count();
+                let mut out_vec = vec![0.0f32; total_out_elements];
+                
+                out_vec.par_chunks_mut(half_dim).enumerate().for_each(|(row, out_chunk)| {
+                    let in_start = row * half_dim * 2;
+                    for i in 0..half_dim {
+                        let x0 = xs_vec[in_start + i];
+                        let x1 = xs_vec[in_start + half_dim + i];
+                        let k0 = 0.7978845608f32;
+                        let k1 = 0.044715f32;
+                        let inner = k0 * (x1 + k1 * x1 * x1 * x1);
+                        let gelu_x1 = 0.5 * x1 * (1.0 + inner.tanh());
+                        out_chunk[i] = x0 * gelu_x1;
+                    }
+                });
+                
+                return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
+            }
+        }
+
         let x_ = xs.chunk(2, dim)?;
         let x_1 = x_[1].as_ref().gelu()?;
         Ok(x_1.mul(x_[0].as_ref())?)
@@ -1317,13 +1374,36 @@ impl UnifiedKernels {
                     let out_ptr = get_mut_ptr(&mut out_tensor);
 
                     if !in_ptr.is_null() && !out_ptr.is_null() {
-                        fused_softplus_stable(in_ptr, out_ptr, total_elements as i32);
+                        fused_mish(in_ptr, out_ptr, total_elements as i32);
                         return Ok(out_tensor);
                     }
                 }
             }
         }
         
+        if xs.device().is_cpu() {
+            use rayon::prelude::*;
+            let dtype = xs.dtype();
+            
+            if dtype == candle_core::DType::F32 {
+                let shape = xs.shape().clone();
+                let xs_vec = xs.to_vec1::<f32>().unwrap_or_else(|_| xs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+                
+                let mut out_vec = vec![0.0f32; xs_vec.len()];
+                
+                out_vec.par_iter_mut().enumerate().for_each(|(i, out)| {
+                    let x = xs_vec[i];
+                    // Mish 수학 공식: x * tanh(ln(1 + exp(x)))
+                    // x > 20.0 인 경우 exp(x) 연산 오버플로우를 막기 위해 x로 직접 치환(안정성 확보)
+                    let sp = if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+                    let th = sp.tanh();
+                    *out = x * th;
+                });
+                
+                return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
+            }
+        }
+
         let tanh = xs.exp()?.affine(1.0, 1.0)?.log()?.tanh()?;
         Ok(xs.mul(&tanh)?)
     }
@@ -1360,6 +1440,26 @@ impl UnifiedKernels {
                         return Ok(out_tensor);
                     }
                 }
+            }
+        }
+
+        if xs.device().is_cpu() {
+            use rayon::prelude::*;
+            let dtype = xs.dtype();
+            
+            if dtype == candle_core::DType::F32 {
+                let shape = xs.shape().clone();
+                let xs_vec = xs.to_vec1::<f32>().unwrap_or_else(|_| xs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
+                
+                let mut out_vec = vec![0.0f32; xs_vec.len()];
+                
+                out_vec.par_iter_mut().enumerate().for_each(|(i, out)| {
+                    let x = xs_vec[i];
+                    let x_max_0 = if x > 0.0 { x } else { 0.0 };
+                    *out = (1.0 + (-x.abs()).exp()).ln() + x_max_0;
+                });
+                
+                return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
             }
         }
 
