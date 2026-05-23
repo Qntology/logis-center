@@ -814,12 +814,11 @@ impl QwenVLTextModel {
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
-                    xs = mask_index_add(
-                        &xs.squeeze(0)?,
+                    xs = xs.squeeze(0)?.index_add(
                         &visual_pos_masks.unwrap().squeeze(0)?,
                         &deepstack_embeds[layer_idx],
-                    )?
-                    .unsqueeze(0)?;
+                        0
+                    )?.unsqueeze(0)?;
                 }
             }
         }
@@ -1070,7 +1069,7 @@ impl QwenVLModel {
                     let embed_joint = embed_joint.index_add(&video_nonzero_joint, vid_embed, 0)?;
                     deepstack_embeds.push(embed_joint);
                 }
-                visual_pos_mask = Some(visual_none_zero_index.clone());
+                visual_pos_mask = Some(visual_none_zero_index.unsqueeze(0)?);
                 deepstack_visual_embeds = Some(deepstack_embeds);
             } else {
                 visual_pos_mask = Some(image_mask_);

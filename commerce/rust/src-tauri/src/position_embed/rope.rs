@@ -1,5 +1,7 @@
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
+#[cfg(feature = "cuda")]
+use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_transformers::models::deepseek2::SplitOp;
 
 use crate::utils::tensor_utils::{index_select_2d, split_tensor};
@@ -77,6 +79,21 @@ pub fn apply_rotary_pos_emb_vision(
     Ok((q_embed, k_embed))
 }
 
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn fused_apply_rotary_pos_emb(
+        q_ptr: *mut std::ffi::c_void,
+        k_ptr: *mut std::ffi::c_void,
+        cos_ptr: *const std::ffi::c_void,
+        sin_ptr: *const std::ffi::c_void,
+        batch_size: std::ffi::c_int,
+        seq_len: std::ffi::c_int,
+        q_heads: std::ffi::c_int,
+        k_heads: std::ffi::c_int,
+        head_dim: std::ffi::c_int,
+    );
+}
+
 pub fn apply_rotary_pos_emb(
     q: &Tensor,
     k: &Tensor,
@@ -84,35 +101,88 @@ pub fn apply_rotary_pos_emb(
     sin: &Tensor,
     tof32: bool,
 ) -> Result<(Tensor, Tensor)> {
-    // sin/cos: to (bs, 1, seq_len, head_dim)
-    // q/k: (bs, n_head, seq_len, head_dim)
-    let mut cos = cos.clone();
-    let mut sin = sin.clone();
-    if cos.rank() == 2 {
-        // (seq_len, head_dim) -> (1, 1, seq_len, head_dim)
-        cos = cos.unsqueeze(0)?.unsqueeze(0)?;
-        sin = sin.unsqueeze(0)?.unsqueeze(0)?;
-    }
-    if cos.rank() == 3 {
-        // (bs, seq_len, head_dim) -> (bs, 1, seq_len, head_dim)
-        cos = cos.unsqueeze(1)?;
-        sin = sin.unsqueeze(1)?;
-    }
-    let orig_dtype = q.dtype();
-    let q = if tof32 { &q.to_dtype(DType::F32)? } else { q };
-    let k = if tof32 { &k.to_dtype(DType::F32)? } else { k };
-    let cos = cos.to_dtype(q.dtype())?;
-    let sin = sin.to_dtype(q.dtype())?;
+    let cos = if cos.rank() == 2 { cos.unsqueeze(0)?.unsqueeze(0)? } 
+              else if cos.rank() == 3 { cos.unsqueeze(1)? } 
+              else { cos.clone() }; 
+    let sin = if sin.rank() == 2 { sin.unsqueeze(0)?.unsqueeze(0)? } 
+              else if sin.rank() == 3 { sin.unsqueeze(1)? } 
+              else { sin.clone() }; 
 
-    let q_embed = q
-        .broadcast_mul(&cos)?
-        .add(&rotate_half(q)?.broadcast_mul(&sin)?)?
-        .to_dtype(orig_dtype)?;
-    let k_embed = k
-        .broadcast_mul(&cos)?
-        .add(&rotate_half(k)?.broadcast_mul(&sin)?)?
-        .to_dtype(orig_dtype)?;
-    Ok((q_embed, k_embed))
+    let orig_dtype = q.dtype();
+    
+    let (mut q_work, mut k_work) = if tof32 { 
+        (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?) 
+    } else { 
+        (q.clone(), k.clone()) 
+    };
+
+    let cos = if cos.dtype() != q_work.dtype() { cos.to_dtype(q_work.dtype())? } else { cos }; 
+    let sin = if sin.dtype() != q_work.dtype() { sin.to_dtype(q_work.dtype())? } else { sin }; 
+
+    #[cfg(feature = "cuda")]
+    {
+        if q_work.device().is_cuda() && q_work.dtype() == DType::F16 {
+            let (b_sz, q_heads, seq_len, head_dim) = q_work.dims4()?;
+            let (_, k_heads, _, _) = k_work.dims4()?;
+
+            unsafe {
+                use candle_core::Storage;
+                use candle_core::backend::BackendStorage;
+                let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
+                    let (storage, _) = t.storage_and_layout();
+                    match &*storage {
+                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
+                        _ => std::ptr::null_mut(),
+                    }
+                };
+                let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
+                    let (storage, _) = t.storage_and_layout();
+                    match &*storage {
+                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
+                        _ => std::ptr::null(),
+                    }
+                };
+
+                let q_ptr = get_mut_ptr(&mut q_work);
+                let k_ptr = get_mut_ptr(&mut k_work);
+                let cos_ptr = get_const_ptr(&cos);
+                let sin_ptr = get_const_ptr(&sin);
+
+                if !q_ptr.is_null() && !k_ptr.is_null() && !cos_ptr.is_null() && !sin_ptr.is_null() {
+                    fused_apply_rotary_pos_emb(
+                        q_ptr,
+                        k_ptr,
+                        cos_ptr,
+                        sin_ptr,
+                        b_sz as i32,
+                        seq_len as i32,
+                        q_heads as i32,
+                        k_heads as i32,
+                        head_dim as i32,
+                    );
+                    
+                    let (q_final, k_final) = if tof32 {
+                        (q_work.to_dtype(orig_dtype)?, k_work.to_dtype(orig_dtype)?) 
+                    } else {
+                        (q_work, k_work)
+                    };
+                    
+                    return Ok((q_final, k_final));
+                }
+            }
+        }
+    }
+
+    let q_embed = q_work.broadcast_mul(&cos)?.add(&rotate_half(&q_work)?.broadcast_mul(&sin)?)?; 
+    let k_embed = k_work.broadcast_mul(&cos)?.add(&rotate_half(&k_work)?.broadcast_mul(&sin)?)?; 
+
+    let (q_final, k_final) = if tof32 {
+        (q_embed.to_dtype(orig_dtype)?, k_embed.to_dtype(orig_dtype)?) 
+    } else {
+        (q_embed, k_embed)
+    };
+
+    Ok((q_final, k_final)) 
 }
 
 pub fn glm_asr_apply_rotary_pos_emb(
@@ -285,6 +355,21 @@ pub fn roformer_rotate(x: &Tensor) -> Result<Tensor> {
     Ok(rotate_x.flatten(D::Minus2, D::Minus1)?)
 }
 
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn fused_apply_rotary_pos_emb_roformer(
+        q_ptr: *mut std::ffi::c_void,
+        k_ptr: *mut std::ffi::c_void,
+        cos_ptr: *const std::ffi::c_void,
+        sin_ptr: *const std::ffi::c_void,
+        batch_size: std::ffi::c_int,
+        seq_len: std::ffi::c_int,
+        q_heads: std::ffi::c_int,
+        k_heads: std::ffi::c_int,
+        head_dim: std::ffi::c_int,
+    );
+}
+
 pub fn apply_rotary_pos_emb_roformer(
     q: &Tensor,
     k: &Tensor,
@@ -292,31 +377,85 @@ pub fn apply_rotary_pos_emb_roformer(
     sin: &Tensor,
     tof32: bool,
 ) -> Result<(Tensor, Tensor)> {
-    let mut cos = cos.clone();
-    let mut sin = sin.clone();
-    if cos.rank() == 2 {
-        // (seq_len, head_dim) -> (1, 1, seq_len, head_dim)
-        cos = cos.unsqueeze(0)?.unsqueeze(0)?;
-        sin = sin.unsqueeze(0)?.unsqueeze(0)?;
+    let mut cos_orig = cos.clone();
+    let mut sin_orig = sin.clone();
+    if cos_orig.rank() == 2 {
+        cos_orig = cos_orig.unsqueeze(0)?.unsqueeze(0)?;
+        sin_orig = sin_orig.unsqueeze(0)?.unsqueeze(0)?;
     }
-    if cos.rank() == 3 {
-        // (bs, seq_len, head_dim) -> (bs, 1, seq_len, head_dim)
-        cos = cos.unsqueeze(1)?;
-        sin = sin.unsqueeze(1)?;
+    if cos_orig.rank() == 3 {
+        cos_orig = cos_orig.unsqueeze(1)?;
+        sin_orig = sin_orig.unsqueeze(1)?;
     }
+
     let orig_dtype = q.dtype();
-    let q = if tof32 { &q.to_dtype(DType::F32)? } else { q };
-    let k = if tof32 { &k.to_dtype(DType::F32)? } else { k };
-    let cos = cos.to_dtype(q.dtype())?;
-    let sin = sin.to_dtype(q.dtype())?;
-    let q_embed = q
-        .broadcast_mul(&cos)?
-        .add(&roformer_rotate(q)?.broadcast_mul(&sin)?)?
-        .to_dtype(orig_dtype)?;
-    let k_embed = k
-        .broadcast_mul(&cos)?
-        .add(&roformer_rotate(k)?.broadcast_mul(&sin)?)?
-        .to_dtype(orig_dtype)?;
+    
+    let (mut q_work, mut k_work) = if tof32 { 
+        (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?) 
+    } else { 
+        (q.clone(), k.clone()) 
+    };
+
+    let cos_f = if cos_orig.dtype() != q_work.dtype() { cos_orig.to_dtype(q_work.dtype())? } else { cos_orig }; 
+    let sin_f = if sin_orig.dtype() != q_work.dtype() { sin_orig.to_dtype(q_work.dtype())? } else { sin_orig }; 
+
+    #[cfg(feature = "cuda")]
+    {
+        if q_work.device().is_cuda() && q_work.dtype() == DType::F16 {
+            let (b_sz, q_heads, seq_len, head_dim) = q_work.dims4()?;
+            let (_, k_heads, _, _) = k_work.dims4()?;
+
+            unsafe {
+                use candle_core::Storage;
+                use candle_core::backend::BackendStorage;
+                let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
+                    let (storage, _) = t.storage_and_layout();
+                    match &*storage {
+                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
+                        _ => std::ptr::null_mut(),
+                    }
+                };
+                let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
+                    let (storage, _) = t.storage_and_layout();
+                    match &*storage {
+                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
+                        _ => std::ptr::null(),
+                    }
+                };
+
+                let q_ptr = get_mut_ptr(&mut q_work);
+                let k_ptr = get_mut_ptr(&mut k_work);
+                let cos_ptr = get_const_ptr(&cos_f);
+                let sin_ptr = get_const_ptr(&sin_f);
+
+                if !q_ptr.is_null() && !k_ptr.is_null() && !cos_ptr.is_null() && !sin_ptr.is_null() {
+                    fused_apply_rotary_pos_emb_roformer(
+                        q_ptr,
+                        k_ptr,
+                        cos_ptr,
+                        sin_ptr,
+                        b_sz as i32,
+                        seq_len as i32,
+                        q_heads as i32,
+                        k_heads as i32,
+                        head_dim as i32,
+                    );
+                    
+                    let (q_final, k_final) = if tof32 {
+                        (q_work.to_dtype(orig_dtype)?, k_work.to_dtype(orig_dtype)?) 
+                    } else {
+                        (q_work, k_work)
+                    };
+                    
+                    return Ok((q_final, k_final));
+                }
+            }
+        }
+    }
+
+    let q_embed = q_work.broadcast_mul(&cos_f)?.add(&roformer_rotate(&q_work)?.broadcast_mul(&sin_f)?)?.to_dtype(orig_dtype)?;
+    let k_embed = k_work.broadcast_mul(&cos_f)?.add(&roformer_rotate(&k_work)?.broadcast_mul(&sin_f)?)?.to_dtype(orig_dtype)?;
+
     Ok((q_embed, k_embed))
 }
 
@@ -619,4 +758,15 @@ pub fn get_xd_cos_sin(
     let cos = Tensor::cat(&cos_select, D::Minus1)?;
     let sin = Tensor::cat(&sin_select, D::Minus1)?;
     Ok((cos, sin))
+}
+
+
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn fused_mrope_select(
+        in_all_ptr: *const std::ffi::c_void,
+        out_ptr: *mut std::ffi::c_void,
+        bs: std::ffi::c_int, seq_len: std::ffi::c_int, head_dim: std::ffi::c_int,
+        sec0: std::ffi::c_int, sec1: std::ffi::c_int, sec2: std::ffi::c_int,
+    );
 }

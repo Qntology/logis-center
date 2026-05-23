@@ -2,6 +2,8 @@ use std::io::{Read, Seek};
 
 use ahash::AHashMap;
 use anyhow::{Result, anyhow};
+#[cfg(feature = "cuda")]
+use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::{
     DType, Device, Tensor,
     quantized::{
@@ -360,11 +362,64 @@ impl GateUpDownMLPGguf {
     }
 }
 
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn fused_silu_mul(
+        gate_ptr: *const std::ffi::c_void,
+        up_ptr: *const std::ffi::c_void,
+        out_ptr: *mut std::ffi::c_void,
+        total_elements: std::ffi::c_int,
+    );
+}
+
 impl Module for GateUpDownMLPGguf {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let w1 = self.gate_proj.forward(xs)?.apply(&self.act)?;
+        let w1 = self.gate_proj.forward(xs)?;
         let w3 = self.up_proj.forward(xs)?;
-        self.down_proj.forward(&(w1 * w3)?)
+
+        #[cfg(feature = "cuda")]
+        {
+            if w1.device().is_cuda() && w1.dtype() == candle_core::DType::F16 && matches!(self.act, Activation::Silu) {
+                let mut out_tensor = Tensor::zeros_like(&w1)?;
+                let total_elements = w1.elem_count();
+
+                unsafe {
+                    use candle_core::Storage;
+                    use candle_core::backend::BackendStorage;
+                    let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
+                        let (storage, _) = t.storage_and_layout();
+                        match &*storage {
+                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
+                            _ => std::ptr::null(),
+                        }
+                    };
+                    let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
+                        let (storage, _) = t.storage_and_layout();
+                        match &*storage {
+                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
+                            _ => std::ptr::null_mut(),
+                        }
+                    };
+
+                    let w1_ptr = get_const_ptr(&w1);
+                    let w3_ptr = get_const_ptr(&w3);
+                    let out_ptr = get_mut_ptr(&mut out_tensor);
+
+                    if !w1_ptr.is_null() && !w3_ptr.is_null() && !out_ptr.is_null() {
+                        fused_silu_mul(
+                            w1_ptr,
+                            w3_ptr,
+                            out_ptr,
+                            total_elements as i32,
+                        );
+                        return self.down_proj.forward(&out_tensor);
+                    }
+                }
+            }
+        }
+
+        let w1_act = w1.apply(&self.act)?;
+        self.down_proj.forward(&(w1_act * w3)?)
     }
 }
 

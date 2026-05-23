@@ -1,5 +1,7 @@
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor, shape::Dim};
+#[cfg(feature = "cuda")]
+use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_nn::ops::sigmoid;
 
 pub enum PaddingSide {
@@ -441,7 +443,46 @@ pub fn index_select_2d(t: &Tensor, index: &Tensor) -> Result<Tensor> {
     Ok(res)
 }
 
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn fused_quick_gelu(in_ptr: *const std::ffi::c_void, out_ptr: *mut std::ffi::c_void, total_elements: std::ffi::c_int);
+}
+
 pub fn quick_gelu(xs: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        if xs.device().is_cuda() && xs.dtype() == candle_core::DType::F16 {
+            let mut out_tensor = Tensor::zeros_like(xs)?;
+            let total_elements = xs.elem_count();
+            unsafe {
+                use candle_core::Storage;
+                use candle_core::backend::BackendStorage;
+                let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
+                    let (storage, _) = t.storage_and_layout();
+                    match &*storage {
+                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
+                        _ => std::ptr::null(),
+                    }
+                };
+                let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
+                    let (storage, _) = t.storage_and_layout();
+                    match &*storage {
+                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
+                        _ => std::ptr::null_mut(),
+                    }
+                };
+
+                let in_ptr = get_const_ptr(xs);
+                let out_ptr = get_mut_ptr(&mut out_tensor);
+
+                if !in_ptr.is_null() && !out_ptr.is_null() {
+                    fused_quick_gelu(in_ptr, out_ptr, total_elements as i32);
+                    return Ok(out_tensor);
+                }
+            }
+        }
+    }
+    
     let x = xs.affine(1.702, 0.0)?;
     let x = sigmoid(&x)?;
     Ok(xs.mul(&x)?)
@@ -549,11 +590,67 @@ pub fn z_score_normalize(t: &Tensor, dim: usize) -> Result<Tensor> {
         .broadcast_div(&t.var_keepdim(dim)?.sqrt()?)?)
 }
 
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn fused_l2_normalize(
+        in_ptr: *const std::ffi::c_void,
+        out_ptr: *mut std::ffi::c_void,
+        eps: std::ffi::c_float,
+        hidden_dim: std::ffi::c_int,
+        total_rows: std::ffi::c_int,
+    );
+}
+
 pub fn l2_normalize(t: &Tensor, dim: usize) -> Result<Tensor> {
     let rank = t.rank();
     if dim >= rank {
         return Err(anyhow!(format!("input dim {} must < rank {}", dim, rank)));
     }
+
+    #[cfg(feature = "cuda")]
+    {
+        // 최적화: 마지막 차원에 대한 정규화일 때만 커널 사용 (연속된 메모리 보장)
+        if t.device().is_cuda() && t.dtype() == candle_core::DType::F16 && dim == rank - 1 {
+            let mut out_tensor = Tensor::zeros_like(t)?;
+            let hidden_dim = t.dim(dim)?;
+            let total_elements = t.elem_count();
+            let total_rows = total_elements / hidden_dim;
+
+            unsafe {
+                use candle_core::Storage;
+                use candle_core::backend::BackendStorage;
+                let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
+                    let (storage, _) = t.storage_and_layout();
+                    match &*storage {
+                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
+                        _ => std::ptr::null(),
+                    }
+                };
+                let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
+                    let (storage, _) = t.storage_and_layout();
+                    match &*storage {
+                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
+                        _ => std::ptr::null_mut(),
+                    }
+                };
+
+                let in_ptr = get_const_ptr(t);
+                let out_ptr = get_mut_ptr(&mut out_tensor);
+
+                if !in_ptr.is_null() && !out_ptr.is_null() {
+                    fused_l2_normalize(
+                        in_ptr,
+                        out_ptr,
+                        1e-6 as f32,
+                        hidden_dim as i32,
+                        total_rows as i32,
+                    );
+                    return Ok(out_tensor);
+                }
+            }
+        }
+    }
+
     let l2_norm = t.sqr()?.sum_keepdim(dim)?.affine(1.0, 1e-6)?.sqrt()?;
     Ok(t.broadcast_div(&l2_norm)?)
 }

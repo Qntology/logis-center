@@ -2,6 +2,8 @@ use std::io::{Read, Seek};
 
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor, quantized::QMatMul};
+#[cfg(feature = "cuda")]
+use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_nn::{
     Conv1d, Embedding, Linear, Module, VarBuilder, embedding, linear_b, linear_no_bias,
     ops::sigmoid,
@@ -64,6 +66,19 @@ pub struct Qwen3_5RMSNormGated {
     dtype: DType,
 }
 
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn fused_gated_rmsnorm(
+        xs_ptr: *const std::ffi::c_void,
+        weight_ptr: *const std::ffi::c_void,
+        gate_ptr: *const std::ffi::c_void,
+        out_ptr: *mut std::ffi::c_void,
+        eps: std::ffi::c_float,
+        hidden_size: std::ffi::c_int,
+        total_elements: std::ffi::c_int,
+    );
+}
+
 impl Qwen3_5RMSNormGated {
     pub fn new(vb: VarBuilder, hidden_size: usize, eps: f64) -> Result<Self> {
         let dtype = vb.dtype();
@@ -78,9 +93,55 @@ impl Qwen3_5RMSNormGated {
 
     pub fn forward(&self, xs: &Tensor, gate: Option<&Tensor>) -> Result<Tensor> {
         let w = self.weight.to_dtype(xs.dtype())?;
+        
+        #[cfg(feature = "cuda")]
+        {
+            if xs.device().is_cuda() && xs.dtype() == candle_core::DType::F16 {
+                let mut out_tensor = Tensor::zeros_like(xs)?;
+                let total_elements = xs.elem_count();
+                let hidden_size = xs.dim(candle_core::D::Minus1)?;
+
+                unsafe {
+                    use candle_core::Storage;
+                    use candle_core::backend::BackendStorage;
+                    let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
+                        let (storage, _) = t.storage_and_layout();
+                        match &*storage {
+                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
+                            _ => std::ptr::null(),
+                        }
+                    };
+                    let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
+                        let (storage, _) = t.storage_and_layout();
+                        match &*storage {
+                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
+                            _ => std::ptr::null_mut(),
+                        }
+                    };
+
+                    let xs_ptr = get_const_ptr(xs);
+                    let weight_ptr = get_const_ptr(&w);
+                    let gate_ptr = if let Some(g) = gate { get_const_ptr(g) } else { std::ptr::null() };
+                    let out_ptr = get_mut_ptr(&mut out_tensor);
+
+                    if !xs_ptr.is_null() && !weight_ptr.is_null() && !out_ptr.is_null() {
+                        fused_gated_rmsnorm(
+                            xs_ptr,
+                            weight_ptr,
+                            gate_ptr,
+                            out_ptr,
+                            self.eps as f32,
+                            hidden_size as i32,
+                            total_elements as i32,
+                        );
+                        return Ok(out_tensor);
+                    }
+                }
+            }
+        }
+
         let mut out = candle_nn::ops::rms_norm(xs, &w, self.eps as f32)?;
         if let Some(gate) = gate {
-            
             let gate_val = gate.to_dtype(candle_core::DType::F32)?.silu()?.to_dtype(xs.dtype())?;
             out = out.broadcast_mul(&gate_val)?;
         }
@@ -462,27 +523,85 @@ impl Qwen3_5GatedDeltaNet {
         };
 
         if sequence_length == 1 {
-            
+            #[cfg(feature = "cuda")]
+            {
+                if query.device().is_cuda() && query.dtype() == candle_core::DType::F16 {
+                    let mut out_tensor = Tensor::zeros((batch_size, num_heads, v_head_dim), candle_core::DType::F16, query.device())?;
+                    let batch_heads = batch_size * num_heads;
+                    
+                    unsafe {
+                        use candle_core::Storage;
+                        use candle_core::backend::BackendStorage;
+                        let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
+                            let (storage, _) = t.storage_and_layout();
+                            match &*storage {
+                                Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
+                                _ => std::ptr::null(),
+                            }
+                        };
+                        let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
+                            let (storage, _) = t.storage_and_layout();
+                            match &*storage {
+                                Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
+                                _ => std::ptr::null_mut(),
+                            }
+                        };
+                        let get_mut_f32_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
+                            let (storage, _) = t.storage_and_layout();
+                            match &*storage {
+                                Storage::Cuda(c) => c.as_cuda_slice::<f32>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
+                                _ => std::ptr::null_mut(),
+                            }
+                        };
+
+                        #[cfg(feature = "cuda")]
+                        extern "C" {
+                            fn fused_recurrent_gated_delta_step(
+                                state_ptr: *mut std::ffi::c_void, q_ptr: *const std::ffi::c_void, k_ptr: *const std::ffi::c_void,
+                                v_ptr: *const std::ffi::c_void, g_ptr: *const std::ffi::c_void, beta_ptr: *const std::ffi::c_void,
+                                out_ptr: *mut std::ffi::c_void, batch_heads: std::ffi::c_int, k_dim: std::ffi::c_int, v_dim: std::ffi::c_int,
+                            );
+                        }
+
+                        let q_squeeze = query.squeeze(1)?.contiguous()?;
+                        let k_squeeze = key.squeeze(1)?.contiguous()?;
+                        let v_squeeze = value.squeeze(1)?.contiguous()?;
+                        let g_squeeze = g.squeeze(1)?.contiguous()?;
+                        let beta_squeeze = beta.squeeze(1)?.contiguous()?;
+
+                        let state_ptr = get_mut_f32_ptr(&mut last_recurrent_state);
+                        let q_ptr = get_const_ptr(&q_squeeze);
+                        let k_ptr = get_const_ptr(&k_squeeze);
+                        let v_ptr = get_const_ptr(&v_squeeze);
+                        let g_ptr = get_const_ptr(&g_squeeze);
+                        let beta_ptr = get_const_ptr(&beta_squeeze);
+                        let out_ptr = get_mut_ptr(&mut out_tensor);
+
+                        if !state_ptr.is_null() && !q_ptr.is_null() && !k_ptr.is_null() && !v_ptr.is_null() && !g_ptr.is_null() && !beta_ptr.is_null() && !out_ptr.is_null() {
+                            fused_recurrent_gated_delta_step(
+                                state_ptr, q_ptr, k_ptr, v_ptr, g_ptr, beta_ptr, out_ptr,
+                                batch_heads as i32, k_head_dim as i32, v_head_dim as i32
+                            );
+                            self.recurrent_state_cache = Some(last_recurrent_state);
+                            return Ok(out_tensor.reshape((batch_size, num_heads, 1, v_head_dim))?.transpose(1, 2)?.contiguous()?.to_dtype(initial_dtype)?);
+                        }
+                    }
+                }
+            }
+
             let q_i = query.squeeze(1)?.contiguous()?.to_dtype(candle_core::DType::F32)?;
             let k_i = key.squeeze(1)?.contiguous()?.to_dtype(candle_core::DType::F32)?;
             let v_i = value.squeeze(1)?.contiguous()?.to_dtype(candle_core::DType::F32)?;
-            
             let g_i = g.squeeze(1)?.contiguous()?.to_dtype(candle_core::DType::F32)?.exp()?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?.contiguous()?;
             let beta_i = beta.squeeze(1)?.contiguous()?.to_dtype(candle_core::DType::F32)?.unsqueeze(D::Minus1)?.contiguous()?;
             
-            // println!("[DEBUG-CONTIG] SSM Fast-Path Q: {}, K: {}, V: {}", q_i.is_contiguous(), k_i.is_contiguous(), v_i.is_contiguous());
-
             last_recurrent_state = last_recurrent_state.broadcast_mul(&g_i)?;
             let kv_mem = last_recurrent_state.broadcast_mul(&k_i.unsqueeze(D::Minus1)?.contiguous()?)?.sum(D::Minus2)?;
             let delta = v_i.broadcast_sub(&kv_mem)?.broadcast_mul(&beta_i)?;
-            last_recurrent_state = last_recurrent_state.broadcast_add(
-                &k_i.unsqueeze(D::Minus1)?.contiguous()?.broadcast_mul(&delta.unsqueeze(D::Minus2)?.contiguous()?)?,
-            )?;
+            last_recurrent_state = last_recurrent_state.broadcast_add(&k_i.unsqueeze(D::Minus1)?.contiguous()?.broadcast_mul(&delta.unsqueeze(D::Minus2)?.contiguous()?)?)?;
             let out_i = last_recurrent_state.broadcast_mul(&q_i.unsqueeze(D::Minus1)?.contiguous()?)?.sum_keepdim(D::Minus2)?;
             
             self.recurrent_state_cache = Some(last_recurrent_state);
-            
-            
             return Ok(out_i.transpose(1, 2)?.contiguous()?.to_dtype(initial_dtype)?); 
         }
 
@@ -588,14 +707,78 @@ impl Qwen3_5GatedDeltaNet {
         let value = qkv_split[2].contiguous()?.reshape((bs, seq_len, (), self.head_v_dim))?;
 
         
-        let beta = sigmoid(&b)?.to_dtype(dtype)?; 
-        
-        
-        let a_plus_bias = softplus(
-            &a.to_dtype(candle_core::DType::F32)?.broadcast_add(&self.dt_bias.to_dtype(candle_core::DType::F32)?)?,
-        )?.to_dtype(dtype)?;
-        let g = self.a_log.to_dtype(dtype)?.broadcast_mul(&a_plus_bias)?;
+        #[cfg(feature = "cuda")]
+        extern "C" {
+            fn fused_ssm_state(
+                b_ptr: *const std::ffi::c_void,
+                a_ptr: *const std::ffi::c_void,
+                dt_bias_ptr: *const std::ffi::c_void,
+                a_log_ptr: *const std::ffi::c_void,
+                beta_out_ptr: *mut std::ffi::c_void,
+                g_out_ptr: *mut std::ffi::c_void,
+                num_v_heads: std::ffi::c_int,
+                total_elements: std::ffi::c_int,
+            );
+        }
 
+        let mut beta = Tensor::zeros_like(&b)?;
+        let mut g = Tensor::zeros_like(&a)?;
+        let mut executed_fused = false;
+
+        #[cfg(feature = "cuda")]
+        {
+            if b.device().is_cuda() && b.dtype() == candle_core::DType::F16 && self.dt_bias.dtype() == candle_core::DType::F32 {
+                let total_elements = b.elem_count();
+                unsafe {
+                    use candle_core::Storage;
+                    use candle_core::backend::BackendStorage;
+                    let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
+                        let (storage, _) = t.storage_and_layout();
+                        match &*storage {
+                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
+                            _ => std::ptr::null(),
+                        }
+                    };
+                    let get_const_f32_ptr = |t: &Tensor| -> *const std::ffi::c_void {
+                        let (storage, _) = t.storage_and_layout();
+                        match &*storage {
+                            Storage::Cuda(c) => c.as_cuda_slice::<f32>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
+                            _ => std::ptr::null(),
+                        }
+                    };
+                    let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
+                        let (storage, _) = t.storage_and_layout();
+                        match &*storage {
+                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
+                            _ => std::ptr::null_mut(),
+                        }
+                    };
+
+                    let b_ptr = get_const_ptr(&b);
+                    let a_ptr = get_const_ptr(&a);
+                    let dt_ptr = get_const_f32_ptr(&self.dt_bias);
+                    let alog_ptr = get_const_f32_ptr(&self.a_log);
+                    let beta_out_ptr = get_mut_ptr(&mut beta);
+                    let g_out_ptr = get_mut_ptr(&mut g);
+
+                    if !b_ptr.is_null() && !a_ptr.is_null() && !dt_ptr.is_null() && !alog_ptr.is_null() && !beta_out_ptr.is_null() && !g_out_ptr.is_null() {
+                        fused_ssm_state(
+                            b_ptr, a_ptr, dt_ptr, alog_ptr, beta_out_ptr, g_out_ptr,
+                            self.num_v_heads as i32, total_elements as i32
+                        );
+                        executed_fused = true;
+                    }
+                }
+            }
+        }
+
+        if !executed_fused {
+            beta = sigmoid(&b)?.to_dtype(dtype)?; 
+            let a_plus_bias = softplus(
+                &a.to_dtype(candle_core::DType::F32)?.broadcast_add(&self.dt_bias.to_dtype(candle_core::DType::F32)?)?,
+            )?.to_dtype(dtype)?;
+            g = self.a_log.to_dtype(dtype)?.broadcast_mul(&a_plus_bias)?;
+        }
         if self.num_v_heads / self.num_k_heads > 1 {
             query = repeat_interleave(&query, self.num_v_heads / self.num_k_heads, 2)?;
             key = repeat_interleave(&key, self.num_v_heads / self.num_k_heads, 2)?;
@@ -1084,12 +1267,51 @@ impl Qwen3_5Attention {
             return Err(anyhow!("No KV data processed"));
         };
 
-        let attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?.contiguous()?;
+        #[cfg(feature = "cuda")]
+        extern "C" {
+            fn fused_attn_gate(
+                attn_output_ptr: *mut std::ffi::c_void,
+                gate_ptr: *const std::ffi::c_void,
+                total_elements: std::ffi::c_int,
+            );
+        }
+
+        let mut attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?.contiguous()?;
         
-        // 💡 gate(F32/BF16)를 확실히 target_dtype으로 sigmoid 취한 뒤 다시 target_dtype으로 고정
+        #[cfg(feature = "cuda")]
+        {
+            if attn_output.device().is_cuda() && attn_output.dtype() == candle_core::DType::F16 && gate.dtype() == candle_core::DType::F16 {
+                let total_elements = attn_output.elem_count();
+                unsafe {
+                    use candle_core::Storage;
+                    use candle_core::backend::BackendStorage;
+                    let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
+                        let (storage, _) = t.storage_and_layout();
+                        match &*storage {
+                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
+                            _ => std::ptr::null_mut(),
+                        }
+                    };
+                    let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
+                        let (storage, _) = t.storage_and_layout();
+                        match &*storage {
+                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
+                            _ => std::ptr::null(),
+                        }
+                    };
+
+                    let attn_ptr = get_mut_ptr(&mut attn_output);
+                    let gate_ptr = get_const_ptr(&gate);
+
+                    if !attn_ptr.is_null() && !gate_ptr.is_null() {
+                        fused_attn_gate(attn_ptr, gate_ptr, total_elements as i32);
+                        return Ok(attn_output.apply(&self.o_proj)?.to_dtype(target_dtype)?);
+                    }
+                }
+            }
+        }
+
         let gate_final = candle_nn::ops::sigmoid(&gate.to_dtype(target_dtype)?)?.to_dtype(target_dtype)?; 
-        
-        
         let attn_output = attn_output.mul(&gate_final)?;
         
         Ok(attn_output.apply(&self.o_proj)?.to_dtype(target_dtype)?)
