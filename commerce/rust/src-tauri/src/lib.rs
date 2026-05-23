@@ -1683,6 +1683,26 @@ pub fn run() {
             cancellation_token: cancellation_token.clone(),
         })
         .setup(|app| {
+            // [INIT] Copy model configs from local project source to AppData if they don't exist
+            let app_dir = crate::utils::get_app_dir();
+            let dest_models_dir = app_dir.join("models");
+            
+            let src_models_dir1 = std::env::current_dir().unwrap_or_default().join("models");
+            let src_models_dir2 = std::env::current_dir().unwrap_or_default().join("src-tauri").join("models");
+            
+            let src_dir = if src_models_dir1.exists() {
+                Some(src_models_dir1)
+            } else if src_models_dir2.exists() {
+                Some(src_models_dir2)
+            } else {
+                None
+            };
+
+            if let Some(src) = src_dir {
+                println!("[Setup] Syncing model configs from {:?} to {:?}", src, dest_models_dir);
+                let _ = crate::utils::paths::copy_model_configs(&src, &dest_models_dir);
+            }
+
             // [INIT] KV Bake Worker (Immediate)
             crate::models::qwen::generate::init_bake_worker();
 

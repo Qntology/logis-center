@@ -72,3 +72,27 @@ pub fn cleanup_temp_dirs(app: Option<&AppHandle>) {
     let _ = fs::create_dir_all(&data);
     let _ = fs::create_dir_all(&logs);
 }
+
+/// Copy model configuration files (excluding .gguf) from source to destination
+pub fn copy_model_configs(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let dest_path = dst.join(entry.file_name());
+        
+        if path.is_dir() {
+            copy_model_configs(&path, &dest_path)?;
+        } else {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            // .gguf 파일은 용량이 크므로 제외 (config, json, jinja, txt 등만 복사)
+            if !file_name.ends_with(".gguf") && !dest_path.exists() {
+                let _ = std::fs::copy(&path, &dest_path);
+            }
+        }
+    }
+    Ok(())
+}
