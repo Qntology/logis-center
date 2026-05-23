@@ -118,8 +118,19 @@ impl Qwen3_5GenerateModel {
         };
 
         let tokenizer = model_gguf.build_tokenizer(Some(false), Some(false), Some(false))?;
-        let (pre_processor, mut mmproj_gguf) = if let Some(mmproj_f) = mmproj_file {
-            let mut reader = std::fs::File::open(mmproj_f)?;
+        
+        // 🚀 mmproj_file 인자가 None이더라도, 같은 폴더에 다운로드된 mmproj-BF16.gguf 파일이 존재하면 자동으로 합체하도록 개선
+        let auto_mmproj = std::path::Path::new(model_file).with_file_name("mmproj-BF16.gguf");
+        let target_mmproj = if let Some(f) = mmproj_file {
+            Some(f.to_string())
+        } else if auto_mmproj.exists() {
+            Some(auto_mmproj.to_string_lossy().to_string())
+        } else {
+            None
+        };
+
+        let (pre_processor, mut mmproj_gguf) = if let Some(mmproj_f) = target_mmproj {
+            let mut reader = std::fs::File::open(&mmproj_f)?;
             let content = gguf_file::Content::read(&mut reader)?;
             let mmproj_gguf = Gguf::new(content, reader, device.clone());
             let processor = Qwen3VLProcessor::new_qwen3_5_default(&device, DType::F32)?;
@@ -263,7 +274,10 @@ impl Qwen3_5GenerateModel {
         let mut cur_pixel_values = pixel_values;
         let mut cur_pixel_values_video = pixel_values_video;
 
-        let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
+        let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let think_token_id = self.tokenizer.text_encode_vec("<think>".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(123);
+        let lt_id = self.tokenizer.text_encode_vec("<".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
         
         let is_strict_json = mes_text.contains("/no_think") || mes_text.contains("RETURN JSON ONLY") || mes_text.contains("Return ONLY");
         let mut gen_text_buffer = String::new(); 
@@ -301,17 +315,29 @@ impl Qwen3_5GenerateModel {
                 }
             }
 
+            if is_strict_json {
+                if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 10000.0; }
+                if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 50.0; }
+            }
+
             if i == 0 {
                 if (self.eos_token_id as usize) < len { logits_vec[self.eos_token_id as usize] = -10000.0; }
+                if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
+                if (open_bracket_id as usize) < len {
+                    let boost = if is_strict_json { 10000.0 } else { 20.0 };
+                    logits_vec[open_bracket_id as usize] += boost;
+                }
             }
             
             let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
             let mut next_token = logit_processor.sample(&logits)?;
             
-            // 토큰 경계를 부수던 '{' 강제 덮어쓰기 완전 삭제
-            if i == 0 && next_token == self.eos_token_id {
-                // 만약 첫 토큰이 실수로 EOS라면 최소한의 방어로 줄바꿈 대체
-                next_token = enter_id;
+            if i == 0 {
+                if is_strict_json {
+                    next_token = open_bracket_id;
+                } else if next_token == self.eos_token_id {
+                    next_token = enter_id;
+                }
             }
 
             generate.push(next_token);
@@ -506,7 +532,11 @@ impl Qwen3_5GenerateModel {
         let mes_check = self.chat_template.apply_chat_template(mes).unwrap_or_default();
         let is_strict_json = mes_check.contains("/no_think") || mes_check.contains("RETURN JSON ONLY") || mes_check.contains("Return ONLY");
         
-        let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v| v.first().cloned()).unwrap_or(999999);
+        let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let think_token_id = self.tokenizer.text_encode_vec("<think>".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(123);
+        let lt_id = self.tokenizer.text_encode_vec("<".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        
         let mut gen_text_buffer = String::new();
         let mut print_buffer = String::new();
 
@@ -548,15 +578,29 @@ impl Qwen3_5GenerateModel {
                 }
             }
 
+            if is_strict_json {
+                if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 10000.0; }
+                if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 50.0; }
+            }
+
             if i == 0 {
                 if (self.eos_token_id as usize) < len { logits_vec[self.eos_token_id as usize] = -10000.0; }
+                if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
+                if (open_bracket_id as usize) < len {
+                    let boost = if is_strict_json { 10000.0 } else { 20.0 };
+                    logits_vec[open_bracket_id as usize] += boost;
+                }
             }
 
             let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
             let mut next_token = logit_processor.sample(&logits)?;
             
-            if i == 0 && next_token == self.eos_token_id {
-                next_token = enter_id;
+            if i == 0 {
+                if is_strict_json {
+                    next_token = open_bracket_id;
+                } else if next_token == self.eos_token_id {
+                    next_token = enter_id;
+                }
             }
 
             generate.push(next_token);
@@ -682,7 +726,7 @@ impl Qwen3_5GenerateModel {
                 ChatCompletionRequestMessage::User(user) => {
                     match &user.content {
                         ChatCompletionRequestUserMessageContent::Text(text) => {
-                            mes_render.push_str(&format!("<|im_start|>user\n{}", text)); // 👈 삭제됨
+                            mes_render.push_str(&format!("<|im_start|>user\n{}", text));
                         }
                         ChatCompletionRequestUserMessageContent::Array(parts) => {
                             let mut combined = String::new();
@@ -691,7 +735,7 @@ impl Qwen3_5GenerateModel {
                                     combined.push_str(&t.text);
                                 }
                             }
-                            mes_render.push_str(&format!("<|im_start|>user\n{}", combined)); // 👈 삭제됨
+                            mes_render.push_str(&format!("<|im_start|>user\n{}", combined));
                         }
                     }
                 }
