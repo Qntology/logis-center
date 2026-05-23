@@ -41,13 +41,7 @@ pub struct AppConfig {
 
 impl VectorStore {
     pub async fn new(base_path: &str) -> Result<Self> {
-        
-        let uri = if base_path.ends_with(DB_URI) || base_path.ends_with("lancedb") { 
-            base_path.to_string() 
-        } else { 
-            format!("{}/{}", base_path, DB_URI) 
-        };
-        let conn = connect(&uri).execute().await?;
+        let conn = connect(base_path).execute().await?;
         Ok(Self { conn, base_path: base_path.to_string() })
     }
 
@@ -83,7 +77,7 @@ impl VectorStore {
             Field::new("status", DataType::Int32, false), 
         ]));
 
-        let uri = if self.base_path.ends_with("lancedb") { self.base_path.to_string() } else { format!("{}/{}", self.base_path, DB_URI) };
+        let uri = self.base_path.clone();
         let existing = self.conn.table_names().execute().await?;
         
         if existing.contains(&"tasks".to_string()) {
@@ -461,7 +455,7 @@ impl VectorStore {
             Field::new("is_masked", DataType::Boolean, true),
         ]));
         
-        let uri = if self.base_path.ends_with("lancedb") { self.base_path.to_string() } else { format!("{}/{}", self.base_path, DB_URI) };
+        let uri = self.base_path.clone();
         let existing = self.conn.table_names().execute().await?;
         
         for name in tables {

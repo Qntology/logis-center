@@ -312,3 +312,15 @@ pub fn set_extraction_stop_signal(stopped: bool) {
         let _ = std::fs::remove_file(file);
     }
 }
+
+pub fn get_app_dir() -> std::path::PathBuf {
+    if let Some(mut path) = dirs::data_local_dir() {
+        path.push("logis-center");
+        let _ = std::fs::create_dir_all(&path);
+        path
+    } else {
+        let path = std::path::PathBuf::from("logis-center-data");
+        let _ = std::fs::create_dir_all(&path);
+        path
+    }
+}

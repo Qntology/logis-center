@@ -740,7 +740,8 @@ impl LogisModel {
             println!("🚀 [MODEL] Running in default mode ({})", config.name);
         }
 
-        let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models"))?;
+        let app_dir = crate::utils::get_app_dir();
+        let base_path = app_dir.join("models");
         
         // [FIX] Normalize UNC paths for Windows to prevent "builder error" in model loaders
         let normalize_path = |path: std::path::PathBuf| -> String {
@@ -752,10 +753,10 @@ impl LogisModel {
             }
         };
 
-        let qwen_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf")); 
-        let qwen3_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf")); 
-        let qwen3_5_model_path = normalize_path(base_path.join("Qwen3.5-0.8B-Instruct-gguf"));
-        let embedding_path = base_path.join("embeddinggemma-300m");
+        let qwen_model_path = normalize_path(base_path.join("qwen3")); 
+        let qwen3_model_path = normalize_path(base_path.join("qwen3")); 
+        let qwen3_5_model_path = normalize_path(base_path.join("qwen3_5"));
+        let embedding_path = base_path.join("embeddings");
 
         let max_tokens_limit = 65536; 
 
@@ -937,11 +938,7 @@ impl LogisModel {
                 "tracking" 
             };
             
-            let masked_nl = if doc_type != "goods" {
-                crate::models::privacy_filter::apply_mask(&nl)
-            } else {
-                nl.clone()
-            };
+            let masked_nl = nl.clone(); // 마스킹은 백엔드 push_data 단계에서 동적으로 수행됩니다.
 
             let item_digest = crate::utils::hash::digest(&nl);
 

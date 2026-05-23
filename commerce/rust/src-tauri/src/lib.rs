@@ -333,8 +333,8 @@ async fn search_documents(
     let store_opt = {
         let mut store_guard = state.store.lock().await;
         if store_guard.is_none() {
-            let db_path = "data/lancedb";
-            if let Ok(s) = VectorStore::new(db_path).await {
+            let db_path = crate::utils::get_app_dir().join("db").to_string_lossy().into_owned();
+            if let Ok(s) = VectorStore::new(&db_path).await {
                 *store_guard = Some(s);
             }
         }
@@ -462,9 +462,9 @@ async fn get_all_documents(
     
     // 프론트엔드가 데이터를 요청했는데 DB가 아직 없으면 즉시 여기서 로드합니다.
     if store_guard.is_none() {
-        let db_path = "data/lancedb";
-        let _ = std::fs::create_dir_all(db_path);
-        if let Ok(s) = VectorStore::new(db_path).await {
+        let db_path = crate::utils::get_app_dir().join("db").to_string_lossy().into_owned();
+        let _ = std::fs::create_dir_all(&db_path);
+        if let Ok(s) = VectorStore::new(&db_path).await {
             let _ = s.init_all_tables().await;
             *store_guard = Some(s);
         } else {
@@ -631,8 +631,8 @@ async fn ai_search_complex(
     let store_opt = {
         let mut store_guard = state.store.lock().await;
         if store_guard.is_none() {
-            let db_path = "data/lancedb";
-            if let Ok(s) = VectorStore::new(db_path).await {
+            let db_path = crate::utils::get_app_dir().join("db").to_string_lossy().into_owned();
+            if let Ok(s) = VectorStore::new(&db_path).await {
                 let _ = s.init_all_tables().await;
                 *store_guard = Some(s);
             }
@@ -919,9 +919,9 @@ async fn deep_research_command(
     
     if store_guard.is_none() {
         // Try init
-        let db_path = "data/lancedb";
-        let _ = std::fs::create_dir_all(db_path);
-        if let Ok(s) = VectorStore::new(db_path).await {
+        let db_path = crate::utils::get_app_dir().join("db").to_string_lossy().into_owned();
+        let _ = std::fs::create_dir_all(&db_path);
+        if let Ok(s) = VectorStore::new(&db_path).await {
             let _ = s.init_task_table().await;
             let _ = s.init_all_tables().await;
             *store_guard = Some(s);
@@ -1523,6 +1523,145 @@ async fn save_mobile_temp_file(
     Ok(file_path.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+async fn check_model_status() -> Result<serde_json::Value, String> {
+    let app_dir = crate::utils::get_app_dir();
+    let is_valid_model = |p: &std::path::PathBuf| -> bool {
+        p.exists() && std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) > 10_000_000
+    };
+    
+    let qwen3_weights = app_dir.join("models").join("qwen3").join("qwen3.gguf");
+    let qwen_weights = app_dir.join("models").join("qwen3_5").join("qwen3.5.gguf");
+    let embed_weights = app_dir.join("models").join("embeddings").join("embeddinggemma-300m-Q4_0.gguf");
+
+    Ok(serde_json::json!({
+        "Qwen3": is_valid_model(&qwen3_weights),
+        "Qwen3.5": is_valid_model(&qwen_weights),
+        "Embedding": is_valid_model(&embed_weights)
+    }))
+}
+
+#[tauri::command]
+async fn delete_all_models() -> Result<String, String> {
+    let app_dir = crate::utils::get_app_dir();
+    let models_dir = app_dir.join("models");
+    if models_dir.exists() {
+        std::fs::remove_dir_all(&models_dir).map_err(|e| e.to_string())?;
+    }
+    Ok("Deleted".to_string())
+}
+
+#[tauri::command]
+async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Result<String, String> {
+    let app_dir = crate::utils::get_app_dir();
+    let app_dir_clone = app_dir.clone();
+    
+    tokio::task::spawn(async move {
+        let folder_name = match model_name.as_str() {
+            "Qwen3" => "qwen3",
+            "Qwen3.5" => "qwen3_5",
+            "Embedding" => "embeddings",
+            _ => "unknown"
+        };
+
+        let dir_path = app_dir_clone.join("models").join(folder_name);
+        if let Err(e) = std::fs::create_dir_all(&dir_path) {
+            let _ = app_handle.emit("download_error", serde_json::json!({"model": model_name, "error": e.to_string()}));
+            return;
+        }
+        
+        let files_to_download = match model_name.as_str() {
+            "Qwen3" => vec![
+                ("https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf", "qwen3.gguf"),
+                ("https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/config.json", "config.json"),
+                ("https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/tokenizer.json", "tokenizer.json"),
+            ],
+            "Qwen3.5" => vec![
+                ("https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-BF16.gguf", "mmproj-BF16.gguf"),
+                ("https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q8_0.gguf", "qwen3.5.gguf"),
+                ("https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/config.json", "config.json"),
+                ("https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/tokenizer.json", "tokenizer.json"),
+                ("https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/preprocessor_config.json", "preprocessor_config.json"),
+            ],
+            "Embedding" => vec![
+                ("https://huggingface.co/unsloth/embeddinggemma-300m-GGUF/resolve/main/embeddinggemma-300m-Q4_0.gguf", "embeddinggemma-300m-Q4_0.gguf"),
+                ("https://huggingface.co/unsloth/embeddinggemma-300m-GGUF/resolve/main/config.json", "config.json"),
+                ("https://huggingface.co/unsloth/embeddinggemma-300m-GGUF/resolve/main/tokenizer.json", "tokenizer.json"),
+            ],
+            _ => vec![]
+        };
+
+        let total_files = files_to_download.len();
+        let client = reqwest::Client::new();
+        let mut has_error = false;
+
+        for (file_idx, (url, filename)) in files_to_download.iter().enumerate() {
+            let file_path = dir_path.join(filename);
+            let tmp_path = dir_path.join(format!("{}.tmp", filename));
+            
+            let min_size = if filename.ends_with(".gguf") { 10_000_000 } else { 0 };
+            if file_path.exists() && std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0) > min_size {
+                let percent = (((file_idx as f64 + 1.0) / total_files as f64) * 100.0) as u32;
+                let _ = app_handle.emit("download_progress", serde_json::json!({"model": model_name, "percent": percent}));
+                continue;
+            }
+
+            match client.get(*url).send().await {
+                Ok(res) => {
+                    if !res.status().is_success() {
+                        let _ = app_handle.emit("download_error", serde_json::json!({"model": model_name, "error": format!("HTTP {}", res.status())}));
+                        has_error = true;
+                        break;
+                    }
+                    
+                    let total_size = res.content_length().unwrap_or(0) as f64;
+                    let mut downloaded = 0.0;
+                    
+                    if let Ok(mut file) = tokio::fs::File::create(&tmp_path).await {
+                        use tokio::io::AsyncWriteExt;
+                        use futures::StreamExt;
+                        let mut stream = res.bytes_stream();
+                        let mut write_error = false;
+                        
+                        while let Some(chunk_result) = stream.next().await {
+                            match chunk_result {
+                                Ok(chunk) => {
+                                    if let Err(_) = file.write_all(&chunk).await {
+                                        write_error = true; break;
+                                    }
+                                    downloaded += chunk.len() as f64;
+                                    let file_progress = if total_size > 0.0 { downloaded / total_size } else { 0.0 };
+                                    let percent = (((file_idx as f64 + file_progress) / total_files as f64) * 100.0) as u32;
+                                    let _ = app_handle.emit("download_progress", serde_json::json!({"model": model_name, "percent": percent}));
+                                },
+                                Err(_) => { write_error = true; break; }
+                            }
+                        }
+                        
+                        if write_error {
+                            let _ = std::fs::remove_file(&tmp_path);
+                            has_error = true;
+                            break;
+                        } else {
+                            let _ = std::fs::rename(&tmp_path, &file_path);
+                        }
+                    }
+                },
+                Err(_) => {
+                    has_error = true;
+                    break;
+                }
+            }
+        }
+        
+        if !has_error {
+            let _ = app_handle.emit("download_complete", serde_json::json!({"model": model_name}));
+        }
+    });
+
+    Ok("Started".to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let model = Arc::new(TokioMutex::new(None));
@@ -1552,9 +1691,9 @@ pub fn run() {
             // spawn 대신 block_on 계열의 처리를 통해 순서를 보장합니다.
             tauri::async_runtime::block_on(async move {
                 let mut store_guard = setup_store.lock().await;
-                let db_path = "data/lancedb";
-                let _ = std::fs::create_dir_all(db_path);
-                if let Ok(s) = VectorStore::new(db_path).await {
+                let db_path = crate::utils::get_app_dir().join("db").to_string_lossy().into_owned();
+                let _ = std::fs::create_dir_all(&db_path);
+                if let Ok(s) = VectorStore::new(&db_path).await {
                     println!("[Setup] VectorStore initialized. Recovering zombie records...");
                     let _ = s.init_task_table().await;
                     let _ = s.init_all_tables().await;
@@ -1713,7 +1852,7 @@ pub fn run() {
             get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
             upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message, check_gpu_availability,
             save_mobile_temp_file, crate::utils::network::get_local_network_prefix, crate::utils::network::get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer,
-            get_active_task_context 
+            get_active_task_context, check_model_status, download_model, delete_all_models
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

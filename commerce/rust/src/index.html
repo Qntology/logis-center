@@ -85,8 +85,16 @@
                                 <label for="cloud-mode-toggle" style="font-size: 0.75rem; cursor: pointer;">Use Cloud AI</label>
                                 <input type="checkbox" id="cloud-mode-toggle" style="cursor: pointer;" disabled title="Login required to use Cloud AI" />
                             </div>
+                            
+                            <div style="margin-top: 15px; padding-top: 10px; border-top: 1px dashed rgba(0,0,0,0.1);">
+                                <h3 style="font-size: 0.8rem; margin-bottom: 5px; color: #333;">Model Download</h3>
+                                <p style="font-size: 0.7rem; color: #666; margin-bottom: 10px;">Download required AI models for offline processing.</p>
+                                <button id="btn-download-all-models" class="primary-btn" style="width: 100%; margin-bottom: 8px; background: #17a2b8; color: white;">Download Missing Models</button>
+                                <button id="btn-delete-all-models" class="primary-btn" style="width: 100%; margin-bottom: 15px; background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3);">Delete All Models</button>
+                                <div id="model-list-container" style="display: flex; flex-direction: column; gap: 8px;"></div>
+                            </div>
 
-                            <div style="margin-top: 15px; padding-top: 10px; border-top: 1px dashed rgba(255,255,255,0.2); display: flex; flex-direction: column; gap: 8px;">
+                            <div style="margin-top: 15px; padding-top: 10px; border-top: 1px dashed rgba(0,0,0,0.1); display: flex; flex-direction: column; gap: 8px;">
                                 <button id="btn-logout" class="primary-btn" style="width: 100%;">Sign Out</button>
                                 <button id="btn-reset-db" class="primary-btn" style="width: 100%; background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3);">Initialize Local DB</button>
                             </div>

@@ -4,7 +4,7 @@ use std::fs;
 
 pub fn get_app_tmp_root(_app: Option<&AppHandle>) -> PathBuf {
     // [STRICT] All temporary files must be collected in the "tmp" folder in the project root
-    let path = PathBuf::from("tmp");
+    let path = crate::utils::get_app_dir().join("tmp");
     if !path.exists() {
         let _ = fs::create_dir_all(&path);
     }
@@ -48,7 +48,7 @@ pub fn get_task_log_file(app: Option<&AppHandle>, task_id: &str) -> PathBuf {
 }
 
 pub fn get_stop_signal_file() -> PathBuf {
-    PathBuf::from("tmp").join("EXTRACTION_STOPPED")
+    get_app_tmp_root(None).join("EXTRACTION_STOPPED")
 }
 
 /// Initialize all necessary directories

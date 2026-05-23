@@ -43,6 +43,10 @@ let chatPollInterval: number | null = null;
 // 🌟 [추가] 누락된 전역 상태 변수 선언
 let isSearching = false;
 let isExtracting = false;
+
+// 🚀 모델 다운로드 관련 상태 관리 변수 추가
+let modelStatus: Record<string, boolean> = {};
+const TARGET_MODELS = ['Qwen3', 'Qwen3.5', 'Embedding'];
 let lastSearchedQuery = "";
 // 🌟 [CRITICAL FIX] 프론트엔드 상태 토글 및 중복 전송 방어용 락
 let isBrowserRunning = false;
@@ -4306,6 +4310,144 @@ document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
         }
     }
 });
+
+// 🚀 모델 관리 UI 렌더링 엔진
+async function updateModelStatusUI() {
+    try {
+        modelStatus = await invoke("check_model_status");
+    } catch (e) {}
+
+    const container = document.getElementById("model-list-container");
+    if (!container) return;
+    container.innerHTML = "";
+
+    TARGET_MODELS.forEach(m => {
+        const isDownloaded = modelStatus[m];
+        const safeId = m.replace(/[\s\(\)]+/g, '-');
+        
+        const row = document.createElement("div");
+        row.style.display = "flex";
+        row.style.flexDirection = "column";
+        row.style.background = "rgba(0,0,0,0.05)";
+        row.style.border = "1px solid rgba(0,0,0,0.1)";
+        row.style.padding = "8px";
+        row.style.borderRadius = "6px";
+
+        const topRow = document.createElement("div");
+        topRow.style.display = "flex";
+        topRow.style.justifyContent = "space-between";
+        topRow.style.alignItems = "center";
+
+        const nameSpan = document.createElement("span");
+        nameSpan.innerText = m;
+        nameSpan.style.fontSize = "0.75rem";
+        nameSpan.style.fontWeight = "bold";
+
+        const btn = document.createElement("button");
+        btn.id = `btn-download-${safeId}`;
+        btn.style.padding = "4px 8px";
+        btn.style.fontSize = "0.65rem";
+        btn.style.borderRadius = "4px";
+        btn.style.border = "none";
+        btn.style.cursor = "pointer";
+
+        if (isDownloaded) {
+            btn.innerText = "Downloaded";
+            btn.style.background = "#6c757d";
+            btn.style.color = "white";
+            btn.disabled = true;
+        } else {
+            btn.innerText = "Download";
+            btn.style.background = "#28a745";
+            btn.style.color = "white";
+            btn.onclick = async () => {
+                btn.innerText = "Downloading...";
+                btn.disabled = true;
+                btn.style.background = "#6c757d";
+                document.getElementById(`progress-container-${safeId}`)!.style.display = "block";
+                await invoke("download_model", { modelName: m });
+            };
+        }
+
+        topRow.appendChild(nameSpan);
+        topRow.appendChild(btn);
+
+        const progContainer = document.createElement("div");
+        progContainer.id = `progress-container-${safeId}`;
+        progContainer.style.width = "100%";
+        progContainer.style.background = "rgba(0,0,0,0.1)";
+        progContainer.style.marginTop = "6px";
+        progContainer.style.borderRadius = "4px";
+        progContainer.style.display = "none";
+
+        const progBar = document.createElement("div");
+        progBar.id = `progress-bar-${safeId}`;
+        progBar.style.height = "8px";
+        progBar.style.width = "0%";
+        progBar.style.background = "#007bff";
+        progBar.style.borderRadius = "4px";
+        progBar.style.fontSize = "6px";
+        progBar.style.color = "white";
+        progBar.style.textAlign = "center";
+        progBar.style.lineHeight = "8px";
+
+        progContainer.appendChild(progBar);
+        row.appendChild(topRow);
+        row.appendChild(progContainer);
+        container.appendChild(row);
+    });
+}
+
+listen("download_progress", (event: any) => {
+    const payload = event.payload;
+    const safeId = payload.model.replace(/[\s\(\)]+/g, '-');
+    const bar = document.getElementById(`progress-bar-${safeId}`);
+    const btn = document.getElementById(`btn-download-${safeId}`);
+    if (bar) {
+        bar.style.width = `${payload.percent}%`;
+        bar.innerText = `${payload.percent}%`;
+    }
+    if (btn) {
+        btn.innerText = `Wait (${payload.percent}%)`;
+    }
+});
+
+listen("download_complete", (event: any) => {
+    const payload = event.payload;
+    updateModelStatusUI();
+});
+
+listen("download_error", (event: any) => {
+    const payload = event.payload;
+    updateModelStatusUI();
+    alert(`Error downloading ${payload.model}: ${payload.error}`);
+});
+
+document.getElementById("btn-download-all-models")?.addEventListener("click", async () => {
+    const missing = TARGET_MODELS.filter(m => !modelStatus[m]);
+    if (missing.length === 0) {
+        alert("All models are already downloaded.");
+        return;
+    }
+    if (await ask("Download all missing models?", { title: "Confirm Download", kind: "info" })) {
+        for (const m of missing) {
+            const safeId = m.replace(/[\s\(\)]+/g, '-');
+            const btn = document.getElementById(`btn-download-${safeId}`) as HTMLButtonElement;
+            if (btn) btn.click();
+        }
+    }
+});
+
+document.getElementById("btn-delete-all-models")?.addEventListener("click", async () => {
+    if (await ask("Are you sure you want to delete all models? You will need to download them again for offline capabilities.", { title: "Warning", kind: "warning" })) {
+        await invoke("delete_all_models");
+        alert("All models deleted.");
+        updateModelStatusUI();
+    }
+});
+
+// 앱 렌더링 시 모델 UI 즉시 초기화
+updateModelStatusUI();
 
 settingsBtn?.addEventListener("click", () => { if (currentTab === "settings" && isExpanded) collapseWidget(); else openWidget("settings"); });
 document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTab("automation"));

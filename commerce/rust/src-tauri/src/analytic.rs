@@ -116,9 +116,9 @@ pub async fn process_analytic_task(
                             new_data.as_object_mut().unwrap().insert("action".to_string(), json!(action));
                             new_data.as_object_mut().unwrap().insert("relate".to_string(), json!(relate));
                             
-                            // [PRIVACY] 개별 분석 로그의 action과 summary를 결합하여 자연어 텍스트로 만들고 마스킹 처리
+                            // [PRIVACY] 마스킹 로직은 Push 단계에서 수행되므로 원본을 유지합니다.
                             let combined_text = format!("Action: {}. Summary: {}.", action, summary);
-                            let masked_text = crate::models::privacy_filter::apply_mask(&combined_text);
+                            let masked_text = combined_text.clone();
                             new_data.as_object_mut().unwrap().insert("text".to_string(), json!(combined_text));
                             new_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_text));
 
@@ -141,9 +141,9 @@ pub async fn process_analytic_task(
     let intent_evo = tracking_res.get("intent_evolution").and_then(|v| v.as_str()).unwrap_or("");
     let preferences = tracking_res.get("consistent_preferences").and_then(|v| v.as_str()).unwrap_or("");
     
-    // [PRIVACY] 최종 리포트 결과물도 검색(FTS) 및 벡터화를 위해 텍스트로 추출 후 마스킹 적용
+    // [PRIVACY] 최종 리포트 결과물도 검색(FTS) 및 벡터화를 위해 텍스트로 추출
     let report_text = format!("Flow: {}. Intent: {}. Preferences: {}.", cross_action, intent_evo, preferences);
-    let report_masked = crate::models::privacy_filter::apply_mask(&report_text);
+    let report_masked = report_text.clone(); // 마스킹은 Push 단계에서 동적 수행됨
 
     let report_id = crate::utils::hash::hash_id(&format!("report_{}", now_ts));
     let report_data = json!({

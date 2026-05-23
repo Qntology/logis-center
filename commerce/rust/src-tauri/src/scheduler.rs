@@ -1962,11 +1962,7 @@ async fn process_task(
             let original_lang_text = parsing::json_to_natural_language(&extracted_data);
             
             // [PRIVACY] AI를 통한 개인정보 마스킹 로직 주입 (조건부)
-            let masked_lang_text = if should_mask {
-                crate::models::privacy_filter::apply_mask(&original_lang_text)
-            } else {
-                original_lang_text.clone()
-            };
+            let masked_lang_text = original_lang_text.clone(); // 마스킹은 Push 단계에서 동적 수행됨
 
             if let Some(obj) = extracted_data.as_object_mut() {
                 obj.insert("text".to_string(), json!(original_lang_text));
@@ -1978,11 +1974,7 @@ async fn process_task(
                     let original_lang_text = parsing::json_to_natural_language(item);
                     
                     // [PRIVACY] AI를 통한 개인정보 마스킹 로직 주입 (조건부)
-                    let masked_lang_text = if should_mask {
-                        crate::models::privacy_filter::apply_mask(&original_lang_text)
-                    } else {
-                        original_lang_text.clone()
-                    };
+                    let masked_lang_text = original_lang_text.clone(); // 마스킹은 Push 단계에서 동적 수행됨
 
                     if let Some(obj) = item.as_object_mut() {
                         obj.insert("text".to_string(), json!(original_lang_text));
@@ -2066,7 +2058,7 @@ async fn process_task(
                     
                     
                     let tracking_text = parsing::json_to_natural_language(&tracking_data);
-                    let masked_tracking_text = crate::models::privacy_filter::apply_mask(&tracking_text);
+                    let masked_tracking_text = tracking_text.clone(); // 마스킹은 Push 단계에서 동적 수행됨
                     let tracking_vector = model.get_embedding(tracking_text.clone()).await.unwrap_or(vec![0.0; 768]);
                     
                     tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(tracking_text));
@@ -2259,11 +2251,7 @@ async fn process_task(
                                     foreign_data.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
                                 }
                                 let merged_text = parsing::json_to_natural_language(&foreign_data);
-                                let masked_merged_text = if foreign_type != "goods" {
-                                    crate::models::privacy_filter::apply_mask(&merged_text)
-                                } else {
-                                    merged_text.clone()
-                                };
+                                let masked_merged_text = merged_text.clone(); // 마스킹은 Push 단계에서 동적 수행됨
                                 let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 768]);
                                 
                                 foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
@@ -2460,11 +2448,7 @@ async fn process_task(
                                     // 4. 연관 문서에 변경 사항이 있다면 벡터 재생성 후 DB 재저장
                                     if needs_update {
                                         let merged_text = parsing::json_to_natural_language(&foreign_data);
-                                        let masked_merged_text = if foreign_type != "goods" {
-                                            crate::models::privacy_filter::apply_mask(&merged_text)
-                                        } else {
-                                            merged_text.clone()
-                                        };
+                                        let masked_merged_text = merged_text.clone(); // 마스킹은 Push 단계에서 동적 수행됨
                                         let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 768]);
                                         
                                         foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
