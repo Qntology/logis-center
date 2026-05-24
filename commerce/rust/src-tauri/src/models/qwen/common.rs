@@ -1,7 +1,5 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use candle_core::{D, DType, Device, Tensor};
-#[cfg(feature = "cuda")]
-use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_nn::{
     Activation, BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig, LayerNorm, LayerNormConfig,
     Linear, Module, RmsNorm, VarBuilder, batch_norm, conv2d, conv2d_no_bias, layer_norm, linear,
@@ -481,20 +479,26 @@ pub fn decoding_attention_parallel(
     query_states: &Tensor,
     key_states: &Tensor,
     value_states: &Tensor,
-    _num_key_value_groups: Option<usize>,
+    _num_key_value_groups: Option<usize>, // <-- Add this argument here!
     scaling: f64,
 ) -> Result<Tensor> {
+    // Flash-Decoding style optimization for seq_len = 1 (Decoding)
+    // Splits KV into chunks and parallelizes attention calculation
     let (_b_sz, _n_heads, q_len, _head_dim) = query_states.dims4()?;
     
+    // [FIX] Early exit if not a decoding step (q_len > 1)
     if q_len != 1 {
         return eager_attention_forward(query_states, key_states, value_states, None, None, scaling);
     }
 
+    // [FIX] GQA Support: Repeat KV heads if they are fewer than query heads
     let _n_kv_heads = key_states.dim(1)?;
+
     let kv_seq_len = key_states.dim(2)?;
-    let chunk_size = 128; 
+    let chunk_size = 128; // Optimal chunk size for parallel reduction
     
     if kv_seq_len <= chunk_size {
+        // [FIX] Pass by reference to resolve E0308
         return eager_attention_forward(query_states, &key_states, &value_states, None, None, scaling);
     }
 
@@ -502,10 +506,8 @@ pub fn decoding_attention_parallel(
     let mut chunk_outputs = Vec::with_capacity(num_chunks);
     let mut chunk_logsumexp = Vec::with_capacity(num_chunks);
 
+    // [CRITICAL FIX] 루프 내부에서 매번 발생하던 query_states의 형변환을 루프 밖으로 빼내 GPU 스톨을 제거합니다!
     let q_aligned = query_states.to_dtype(key_states.dtype())?;
-
-    let mut row_shape = q_aligned.dims().to_vec();
-    *row_shape.last_mut().unwrap() = 1;
 
     for i in 0..num_chunks {
         let start = i * chunk_size;
@@ -513,104 +515,20 @@ pub fn decoding_attention_parallel(
         let k_chunk = key_states.narrow(2, start, end - start)?;
         let v_chunk = value_states.narrow(2, start, end - start)?;
 
-        let mut exp_weights = q_aligned.matmul(&k_chunk.transpose(2, 3)?)?.affine(scaling, 0.0)?.contiguous()?;
-        let kv_len = exp_weights.dim(D::Minus1)?;
-        
-        // [CRITICAL FIX] 루프 내부로 이동: 메모리 무단 덮어쓰기(Overwrite) 및 Borrow 에러 완벽 해결
-        let mut max_logits = Tensor::zeros(row_shape.as_slice(), key_states.dtype(), key_states.device())?;
-        let mut sum_exp = Tensor::zeros(row_shape.as_slice(), key_states.dtype(), key_states.device())?;
-
-        let mut executed_fused = false;
-
-        #[cfg(feature = "cuda")]
-        {
-            if exp_weights.device().is_cuda() && exp_weights.dtype() == candle_core::DType::F16 {
-                let total_rows = exp_weights.elem_count() / kv_len;
-                unsafe {
-                    use candle_core::Storage;
-                    use candle_core::backend::BackendStorage;
-                    let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
-                        let (storage, _) = t.storage_and_layout();
-                        match &*storage {
-                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
-                            _ => std::ptr::null_mut(),
-                        }
-                    };
-
-                    #[cfg(feature = "cuda")]
-                    extern "C" {
-                        fn fused_softmax_reduce(
-                            attn_weights_ptr: *mut std::ffi::c_void,
-                            max_logits_ptr: *mut std::ffi::c_void,
-                            sum_exp_ptr: *mut std::ffi::c_void,
-                            kv_len: std::ffi::c_int,
-                            total_rows: std::ffi::c_int,
-                        );
-                    }
-
-                    let attn_ptr = get_mut_ptr(&mut exp_weights);
-                    let max_ptr = get_mut_ptr(&mut max_logits);
-                    let sum_ptr = get_mut_ptr(&mut sum_exp);
-
-                    if !attn_ptr.is_null() && !max_ptr.is_null() && !sum_ptr.is_null() {
-                        fused_softmax_reduce(
-                            attn_ptr, max_ptr, sum_ptr,
-                            kv_len as i32, total_rows as i32
-                        );
-                        executed_fused = true;
-                    }
-                }
-            }
-        }
-
-        if !executed_fused {
-            if exp_weights.device().is_cpu() && exp_weights.dtype() == candle_core::DType::F32 {
-                use rayon::prelude::*;
-                let total_rows = exp_weights.elem_count() / kv_len;
-                
-                let mut ew_vec = exp_weights.flatten_all()?.to_vec1::<f32>()?;
-                let mut max_vec = vec![0.0f32; total_rows];
-                let mut sum_vec = vec![0.0f32; total_rows];
-                
-                // [CRITICAL FIX] iter_mut().zip()을 통해 안전한 병렬 메모리 쓰기 보장
-                ew_vec.par_chunks_mut(kv_len)
-                    .zip(max_vec.par_iter_mut())
-                    .zip(sum_vec.par_iter_mut())
-                    .for_each(|((chunk, max_out), sum_out)| {
-                        let mut max_v = -10000.0f32;
-                        for &val in chunk.iter() {
-                            if val > max_v { max_v = val; }
-                        }
-                        *max_out = max_v;
-                        
-                        let mut sum_v = 0.0f32;
-                        for val in chunk.iter_mut() {
-                            let e = (*val - max_v).exp();
-                            *val = e;
-                            sum_v += e;
-                        }
-                        *sum_out = sum_v;
-                    });
-                
-                exp_weights = Tensor::from_vec(ew_vec, exp_weights.shape(), exp_weights.device())?;
-                max_logits = Tensor::from_vec(max_vec, row_shape.as_slice(), exp_weights.device())?;
-                sum_exp = Tensor::from_vec(sum_vec, row_shape.as_slice(), exp_weights.device())?;
-            } else {
-                max_logits = exp_weights.max_keepdim(D::Minus1)?;
-                let safe_floor = Tensor::new(-10000.0_f32, max_logits.device())?.to_dtype(max_logits.dtype())?.broadcast_as(max_logits.shape())?;
-                max_logits = max_logits.maximum(&safe_floor)?;
-                exp_weights = exp_weights.broadcast_sub(&max_logits)?.exp()?;
-                sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
-            }
-        }
+        let attn_weights = (q_aligned.matmul(&k_chunk.transpose(2, 3)?)? * scaling)?;
+        let max_logits = attn_weights.max_keepdim(D::Minus1)?;
+        let exp_weights = attn_weights.broadcast_sub(&max_logits)?.exp()?;
+        let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
         
         let out_chunk = exp_weights.to_dtype(v_chunk.dtype())?.matmul(&v_chunk)?;
+        // [OPTIMIZATION] log()를 취하지 않고 가중치 합(sum_exp)과 max_logits만 보관
         let exp_sum_val = sum_exp; 
 
         chunk_outputs.push(out_chunk);
-        chunk_logsumexp.push((exp_sum_val, max_logits)); 
+        chunk_logsumexp.push((exp_sum_val, max_logits)); // 튜플 형태로 저장
     }
 
+    // Parallel Reduction 시작 부분 수정
     let (mut current_exp_sum, mut current_max_logit) = chunk_logsumexp[0].clone();
     let mut final_output = chunk_outputs[0].clone();
 
@@ -628,6 +546,7 @@ pub fn decoding_attention_parallel(
         current_max_logit = new_max_logit;
     }
 
+    // 루프가 다 끝난 후 마지막에 딱 한 번 정규화
     Ok(final_output.broadcast_div(&current_exp_sum)?)
 }
 
@@ -717,26 +636,11 @@ pub fn block_wise_attention(
     Ok(res)
 }
 
-#[cfg(feature = "flash-attn")]
-extern "C" {
-    fn flash_attn(
-        q_ptr: *const std::ffi::c_void,
-        k_ptr: *const std::ffi::c_void,
-        v_ptr: *const std::ffi::c_void,
-        out_ptr: *mut std::ffi::c_void,
-        batch_size: std::ffi::c_int,
-        seq_len: std::ffi::c_int,
-        num_heads: std::ffi::c_int,
-        head_dim: std::ffi::c_int,
-        softmax_scale: std::ffi::c_float,
-    );
-}
-
 pub fn eager_attention_forward(
     query_states: &Tensor,
     key_states: &Tensor,
     value_states: &Tensor,
-    num_key_value_groups: Option<usize>,
+    _num_key_value_groups: Option<usize>,
     attention_mask: Option<&Tensor>,
     scaling: f64,
 ) -> Result<Tensor> {
@@ -744,64 +648,26 @@ pub fn eager_attention_forward(
     let (_b_sz, _n_heads, _q_len, _d_head) = query_states.dims4()?;
     let kv_seq_len = key_states.dim(2)?;
     
+    // [CRITICAL FIX] 메모리 폭발을 막기 위해 여기서 전체 시퀀스에 대해 repeat_kv를 수행하던 로직을 통째로 삭제합니다!
+    
     // 블록 크기 설정 (GPU SM 효율 및 VRAM 고려)
     let block_size = 4096;
     
+    // 일반적인 짧은 문장이나 Flash-Attn 지원 시 기존 방식 사용
     #[cfg(feature = "flash-attn")]
     {
-        if query_states.device().is_cuda() && query_states.dtype() == candle_core::DType::F16 {
-            // 1. 차원 정보 추출 (배치, 시퀀스 길이, 헤드 수, 헤드 차원)
-            let (b_sz, seq_len, num_heads, head_dim) = query_states.dims4()?;
-
-            // 2. 결과를 담을 빈 텐서(VRAM) 미리 할당
-            let out_tensor = Tensor::zeros(
-                (b_sz, seq_len, num_heads, head_dim),
-                query_states.dtype(),
-                query_states.device(),
-            )?;
-
-            // 3. Candle 텐서에서 CudaSlice 기반의 Device Pointer를 추출
-            unsafe {
-                use candle_core::Storage;
-                use candle_core::backend::BackendStorage;
-                let get_ptr = |t: &Tensor| -> *const std::ffi::c_void {
-                    let (storage, _layout) = t.storage_and_layout();
-                    match &*storage {
-                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
-                        _ => std::ptr::null(),
-                    }
-                };
-                
-                let get_mut_ptr = |t: &Tensor| -> *mut std::ffi::c_void {
-                    let (storage, _layout) = t.storage_and_layout();
-                    match &*storage {
-                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
-                        _ => std::ptr::null_mut(),
-                    }
-                };
-
-                let q_ptr = get_ptr(query_states);
-                let k_ptr = get_ptr(key_states);
-                let v_ptr = get_ptr(value_states);
-                let out_ptr = get_mut_ptr(&out_tensor);
-
-                // 4. 작성한 C++ Flash Attention 커널 호출
-                if !q_ptr.is_null() && !k_ptr.is_null() && !v_ptr.is_null() && !out_ptr.is_null() {
-                    flash_attn(
-                        q_ptr,
-                        k_ptr,
-                        v_ptr,
-                        out_ptr,
-                        b_sz as i32,
-                        seq_len as i32,
-                        num_heads as i32,
-                        head_dim as i32,
-                        scaling as f32,
-                    );
-                    return Ok(out_tensor.contiguous()?);
-                }
-            }
-        }
+        let query_states = query_states.transpose(1, 2)?;
+        let key_states = key_states.transpose(1, 2)?;
+        let value_states = value_states.transpose(1, 2)?;
+        let attn_output = candle_flash_attn::flash_attn(
+            &query_states,
+            &key_states,
+            &value_states,
+            scaling as f32,
+            attention_mask.is_some(),
+        )?
+        .transpose(1, 2)?;
+        return Ok(attn_output.transpose(1, 2)?.contiguous()?);
     }
 
     if kv_seq_len <= block_size {
@@ -854,63 +720,17 @@ pub fn eager_attention_forward(
             attn_weights
         };
 
-        #[cfg(feature = "cuda")]
-        extern "C" {
-            fn fused_softmax_reduce(
-                attn_weights_ptr: *mut std::ffi::c_void,
-                max_logits_ptr: *mut std::ffi::c_void,
-                sum_exp_ptr: *mut std::ffi::c_void,
-                kv_len: std::ffi::c_int,
-                total_rows: std::ffi::c_int,
-            );
-        }
+        // 수치적 안정성을 위한 Max 로짓 추출 및 통합 준비
+        let max_logits = attn_weights.max_keepdim(D::Minus1)?;
         
-        let mut exp_weights = attn_weights.contiguous()?;
-        let kv_len = exp_weights.dim(D::Minus1)?;
-        let mut row_shape = exp_weights.dims().to_vec();
-        *row_shape.last_mut().unwrap() = 1;
         
-        let mut max_logits = Tensor::zeros(row_shape.as_slice(), exp_weights.dtype(), exp_weights.device())?;
-        let mut sum_exp = Tensor::zeros(row_shape.as_slice(), exp_weights.dtype(), exp_weights.device())?;
-        let mut executed_fused = false;
+        let safe_floor = Tensor::new(-10000.0_f32, max_logits.device())?
+            .to_dtype(max_logits.dtype())?
+            .broadcast_as(max_logits.shape())?;
+        let max_logits_safe = max_logits.maximum(&safe_floor)?;
 
-        #[cfg(feature = "cuda")]
-        {
-            if exp_weights.device().is_cuda() && exp_weights.dtype() == candle_core::DType::F16 {
-                let total_rows = exp_weights.elem_count() / kv_len;
-                unsafe {
-                    use candle_core::Storage;
-                    use candle_core::backend::BackendStorage;
-                    let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
-                        let (storage, _) = t.storage_and_layout();
-                        match &*storage {
-                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
-                            _ => std::ptr::null_mut(),
-                        }
-                    };
-
-                    let attn_ptr = get_mut_ptr(&mut exp_weights);
-                    let max_ptr = get_mut_ptr(&mut max_logits);
-                    let sum_ptr = get_mut_ptr(&mut sum_exp);
-
-                    if !attn_ptr.is_null() && !max_ptr.is_null() && !sum_ptr.is_null() {
-                        fused_softmax_reduce(
-                            attn_ptr, max_ptr, sum_ptr,
-                            kv_len as i32, total_rows as i32
-                        );
-                        executed_fused = true;
-                    }
-                }
-            }
-        }
-
-        if !executed_fused {
-            max_logits = exp_weights.max_keepdim(D::Minus1)?;
-            let safe_floor = Tensor::new(-10000.0_f32, max_logits.device())?.to_dtype(max_logits.dtype())?.broadcast_as(max_logits.shape())?;
-            max_logits = max_logits.maximum(&safe_floor)?;
-            exp_weights = exp_weights.broadcast_sub(&max_logits)?.exp()?;
-            sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
-        }
+        let exp_weights = attn_weights.broadcast_sub(&max_logits_safe)?.exp()?;
+        let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
         
         let out_block = exp_weights.to_dtype(v_block.dtype())?.matmul(&v_block)?;
 
@@ -993,31 +813,6 @@ pub fn get_batch_norm(vb: VarBuilder, eps: f64, dim: usize) -> Result<BatchNorm>
     Ok(norm)
 }
 
-#[cfg(feature = "cuda")]
-extern "C" {
-    fn fused_deform_im2col(
-        input_ptr: *const std::ffi::c_void,
-        offset_ptr: *const std::ffi::c_void,
-        mask_ptr: *const std::ffi::c_void,
-        columns_ptr: *mut std::ffi::c_void,
-        in_c: std::ffi::c_int,
-        in_h: std::ffi::c_int,
-        in_w: std::ffi::c_int,
-        ker_h: std::ffi::c_int,
-        ker_w: std::ffi::c_int,
-        out_h: std::ffi::c_int,
-        out_w: std::ffi::c_int,
-        stride: std::ffi::c_int,
-        padding: std::ffi::c_int,
-    );
-    fn fused_z_score_normalize(
-        in_ptr: *const std::ffi::c_void,
-        out_ptr: *mut std::ffi::c_void,
-        hidden_dim: std::ffi::c_int,
-        total_rows: std::ffi::c_int,
-    );
-}
-
 pub fn deform_conv2d_kernel(
     input: &Tensor,
     weight: &Tensor,
@@ -1027,58 +822,13 @@ pub fn deform_conv2d_kernel(
     stride: usize,
     padding: usize,
 ) -> Result<Tensor> {
+    // 不考虑空洞卷积, bs = 1
     let (_, in_c, in_h, in_w) = input.dims4()?;
     let (out_channel, _, ker_h, ker_w) = weight.dims4()?;
     let out_h = ((in_h + 2 * padding - ker_h) / stride) + 1;
     let out_w = ((in_w + 2 * padding - ker_w) / stride) + 1;
+
     let num_kernels = in_c * out_h * out_w;
-
-    #[cfg(feature = "cuda")]
-    {
-        if input.device().is_cuda() && input.dtype() == candle_core::DType::F32 {
-            let mut columns = Tensor::zeros((in_c * ker_h * ker_w, out_h * out_w), candle_core::DType::F32, input.device())?;
-            
-            unsafe {
-                use candle_core::Storage;
-                use candle_core::backend::BackendStorage;
-                let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
-                    let (storage, _) = t.storage_and_layout();
-                    match &*storage {
-                        Storage::Cuda(c) => c.as_cuda_slice::<f32>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
-                        _ => std::ptr::null(),
-                    }
-                };
-                let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
-                    let (storage, _) = t.storage_and_layout();
-                    match &*storage {
-                        Storage::Cuda(c) => c.as_cuda_slice::<f32>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
-                        _ => std::ptr::null_mut(),
-                    }
-                };
-
-                let input_ptr = get_const_ptr(input);
-                let offset_ptr = get_const_ptr(offset);
-                let mask_ptr = if let Some(m) = mask { get_const_ptr(m) } else { std::ptr::null() };
-                let columns_ptr = get_mut_ptr(&mut columns);
-
-                if !input_ptr.is_null() && !offset_ptr.is_null() && !columns_ptr.is_null() {
-                    fused_deform_im2col(
-                        input_ptr, offset_ptr, mask_ptr, columns_ptr,
-                        in_c as i32, in_h as i32, in_w as i32,
-                        ker_h as i32, ker_w as i32, out_h as i32, out_w as i32,
-                        stride as i32, padding as i32
-                    );
-                    
-                    let mut out = weight.flatten_from(1)?.matmul(&columns)?.reshape((1, out_channel, out_h, out_w))?;
-                    if let Some(b) = bias {
-                        out = out.broadcast_add(b)?;
-                    }
-                    return Ok(out);
-                }
-            }
-        }
-    }
-
     let mask_vec = if let Some(mask) = mask {
         Some(mask.squeeze(0)?.to_vec3::<f32>()?)
     } else {
@@ -1090,8 +840,8 @@ pub fn deform_conv2d_kernel(
     for index in 0..num_kernels {
         let out_x = index % out_w;
         let out_y = (index / out_w) % out_h;
-        let c = index / (out_w * out_h);
-        let out_c_base = c * ker_h * ker_w;
+        let in_c = index / (out_w * out_h);
+        let out_c = in_c * ker_h * ker_w;
 
         for i in 0..ker_h {
             for j in 0..ker_w {
@@ -1122,20 +872,28 @@ pub fn deform_conv2d_kernel(
                     let w3 = lh * hw;
                     let w4 = lh * lw;
                     let v1 = if h_low >= 0.0 && w_low >= 0.0 {
-                        input_vec[c][h_low as usize][w_low as usize]
-                    } else { 0.0 };
+                        input_vec[in_c][h_low as usize][w_low as usize]
+                    } else {
+                        0.0
+                    };
                     let v2 = if h_low >= 0.0 && w_high <= (in_w - 1) as f32 {
-                        input_vec[c][h_low as usize][w_high as usize]
-                    } else { 0.0 };
+                        input_vec[in_c][h_low as usize][w_high as usize]
+                    } else {
+                        0.0
+                    };
                     let v3 = if h_high <= (in_h - 1) as f32 && w_low >= 0.0 {
-                        input_vec[c][h_high as usize][w_low as usize]
-                    } else { 0.0 };
+                        input_vec[in_c][h_high as usize][w_low as usize]
+                    } else {
+                        0.0
+                    };
                     let v4 = if h_high <= (in_h - 1) as f32 && w_high <= (in_w - 1) as f32 {
-                        input_vec[c][h_high as usize][w_high as usize]
-                    } else { 0.0 };
+                        input_vec[in_c][h_high as usize][w_high as usize]
+                    } else {
+                        0.0
+                    };
                     w1 * v1 + w2 * v2 + w3 * v3 + w4 * v4
                 };
-                columns_vec[out_c_base + i * ker_w + j][out_y * out_w + out_x] = mask_value * val;
+                columns_vec[out_c + i * ker_w + j][out_y * out_w + out_x] = mask_value * val;
             }
         }
     }
@@ -1146,89 +904,8 @@ pub fn deform_conv2d_kernel(
             .flatten_from(1)?
             .matmul(&columns)?
             .reshape((1, out_channel, out_h, out_w))?;
-    if let Some(b) = bias {
-        out = out.broadcast_add(b)?;
+    if let Some(bias) = bias {
+        out = out.broadcast_add(bias)?;
     }
     Ok(out)
-}
-
-pub fn z_score_normalize(t: &Tensor, dim: usize) -> Result<Tensor> {
-    let rank = t.rank();
-    if dim >= rank {
-        return Err(anyhow!(format!("input dim {} must < rank {}", dim, rank)));
-    }
-
-    #[cfg(feature = "cuda")]
-    {
-        if t.device().is_cuda() && t.dtype() == candle_core::DType::F16 && dim == rank - 1 {
-            let mut out_tensor = Tensor::zeros_like(t)?;
-            let hidden_dim = t.dim(dim)?;
-            let total_elements = t.elem_count();
-            let total_rows = total_elements / hidden_dim;
-
-            unsafe {
-                use candle_core::Storage;
-                use candle_core::backend::BackendStorage;
-                let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
-                    let (storage, _) = t.storage_and_layout();
-                    match &*storage {
-                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
-                        _ => std::ptr::null(),
-                    }
-                };
-                let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
-                    let (storage, _) = t.storage_and_layout();
-                    match &*storage {
-                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
-                        _ => std::ptr::null_mut(),
-                    }
-                };
-
-                let in_ptr = get_const_ptr(t);
-                let out_ptr = get_mut_ptr(&mut out_tensor);
-
-                if !in_ptr.is_null() && !out_ptr.is_null() {
-                    fused_z_score_normalize(in_ptr, out_ptr, hidden_dim as i32, total_rows as i32);
-                    return Ok(out_tensor);
-                }
-            }
-        }
-    }
-
-    if t.device().is_cpu() && dim == rank - 1 {
-        use rayon::prelude::*;
-        if t.dtype() == candle_core::DType::F32 {
-            let shape = t.shape().clone();
-            let hidden_dim = shape.dims()[dim];
-            let t_vec = t.to_vec1::<f32>().unwrap_or_else(|_| t.flatten_all().unwrap().to_vec1::<f32>().unwrap());
-            
-            let mut out_vec = vec![0.0f32; t_vec.len()];
-            
-            out_vec.par_chunks_mut(hidden_dim).enumerate().for_each(|(row, out_chunk)| {
-                let start = row * hidden_dim;
-                let mut sum = 0.0;
-                for i in 0..hidden_dim {
-                    sum += t_vec[start + i];
-                }
-                let mean = sum / hidden_dim as f32;
-                
-                let mut var_sum = 0.0;
-                for i in 0..hidden_dim {
-                    let diff = t_vec[start + i] - mean;
-                    var_sum += diff * diff;
-                }
-                let var = var_sum / hidden_dim as f32;
-                let inv_std = 1.0 / (var + 1e-5).sqrt();
-                
-                for i in 0..hidden_dim {
-                    out_chunk[i] = (t_vec[start + i] - mean) * inv_std;
-                }
-            });
-            
-            return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
-        }
-    }
-
-    Ok(t.broadcast_sub(&t.mean_keepdim(dim)?)?
-        .broadcast_div(&t.var_keepdim(dim)?.sqrt()?)?)
 }

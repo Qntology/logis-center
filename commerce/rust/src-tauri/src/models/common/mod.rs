@@ -1,7 +1,5 @@
 use anyhow::Result;
 use candle_core::{D, IndexOp, Tensor};
-#[cfg(feature = "cuda")]
-use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_nn::{
     Activation, BatchNorm, BatchNormConfig, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig,
     ConvTranspose1d, ConvTranspose1dConfig, Embedding, LayerNorm, LayerNormConfig, Linear, Module,
@@ -50,100 +48,11 @@ impl GateUpDownMLP {
     }
 }
 
-// ==============================================================================
-// [Unified Kernel Layer] 하드웨어 종속적인 커널 호출을 캡슐화하는 공용 인터페이스
-// ==============================================================================
-pub struct UnifiedKernels;
-
-#[cfg(feature = "cuda")]
-extern "C" {
-    fn fused_silu_mul(
-        gate_ptr: *const std::ffi::c_void,
-        up_ptr: *const std::ffi::c_void,
-        out_ptr: *mut std::ffi::c_void,
-        total_elements: std::ffi::c_int,
-    );
-}
-
-impl UnifiedKernels {
-    /// GPU(CUDA) 환경이면 최적화된 C++ 커널을, 그 외 환경(CPU, Metal 등)이면 범용 연산을 자동 배분합니다.
-    pub fn silu_mul(lhs: &Tensor, rhs: &Tensor, act_fn: &Activation) -> candle_core::Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        {
-            if lhs.device().is_cuda() && lhs.dtype() == candle_core::DType::F16 && matches!(act_fn, Activation::Silu) {
-                let mut out_tensor = Tensor::zeros_like(lhs)?;
-                let total_elements = lhs.elem_count();
-
-                unsafe {
-                    use candle_core::Storage;
-                    use candle_core::backend::BackendStorage;
-                    let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
-                        let (storage, _) = t.storage_and_layout();
-                        match &*storage {
-                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
-                            _ => std::ptr::null(),
-                        }
-                    };
-                    let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
-                        let (storage, _) = t.storage_and_layout();
-                        match &*storage {
-                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
-                            _ => std::ptr::null_mut(),
-                        }
-                    };
-
-                    let lhs_ptr = get_const_ptr(lhs);
-                    let rhs_ptr = get_const_ptr(rhs);
-                    let out_ptr = get_mut_ptr(&mut out_tensor);
-
-                    if !lhs_ptr.is_null() && !rhs_ptr.is_null() && !out_ptr.is_null() {
-                        fused_silu_mul(
-                            lhs_ptr,
-                            rhs_ptr,
-                            out_ptr,
-                            total_elements as i32,
-                        );
-                        return Ok(out_tensor);
-                    }
-                }
-            }
-        }
-
-        if lhs.device().is_cpu() && matches!(act_fn, Activation::Silu) {
-            use rayon::prelude::*;
-            let dtype = lhs.dtype();
-            
-            if dtype == candle_core::DType::F32 {
-                let shape = lhs.shape().clone();
-                let lhs_vec = lhs.to_vec1::<f32>().unwrap_or_else(|_| lhs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
-                let rhs_vec = rhs.to_vec1::<f32>().unwrap_or_else(|_| rhs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
-                
-                let mut out_vec = vec![0.0f32; lhs_vec.len()];
-                
-                out_vec.par_iter_mut().enumerate().for_each(|(i, out)| {
-                    let x = lhs_vec[i];
-                    let y = rhs_vec[i];
-                    let silu_x = x / (1.0 + (-x).exp());
-                    *out = silu_x * y;
-                });
-                
-                return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
-            }
-        }
-
-        let lhs_act = lhs.apply(act_fn)?;
-        lhs_act * rhs
-    }
-}
-
 impl Module for GateUpDownMLP {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let lhs = xs.apply(&self.gate_proj)?;
+        let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
         let rhs = xs.apply(&self.up_proj)?;
-
-        // 복잡한 하드웨어 분기를 숨기고 단일 공용 함수 호출로 대체!
-        let out_tensor = UnifiedKernels::silu_mul(&lhs, &rhs, &self.act_fn)?;
-        out_tensor.apply(&self.down_proj)
+        (lhs * rhs)?.apply(&self.down_proj)
     }
 }
 
@@ -1206,290 +1115,6 @@ impl LlamaForCausalLM {
     }
 }
 
-// ==============================================================================
-// [Unified Kernel Layer] Activation & Math Kernels (CPU/GPU Auto Dispatch)
-// ==============================================================================
-// pub struct UnifiedKernels; (위에서 이미 선언되었으므로 생략)
-
-#[cfg(feature = "cuda")]
-extern "C" {
-    fn fused_glu(in_ptr: *const std::ffi::c_void, out_ptr: *mut std::ffi::c_void, half_dim: std::ffi::c_int, total_out_elements: std::ffi::c_int);
-    fn fused_geglu(in_ptr: *const std::ffi::c_void, out_ptr: *mut std::ffi::c_void, half_dim: std::ffi::c_int, total_out_elements: std::ffi::c_int);
-    fn fused_mish(in_ptr: *const std::ffi::c_void, out_ptr: *mut std::ffi::c_void, total_elements: std::ffi::c_int);
-    fn fused_softplus_stable(in_ptr: *const std::ffi::c_void, out_ptr: *mut std::ffi::c_void, total_elements: std::ffi::c_int);
-}
-
-impl UnifiedKernels {
-    pub fn apply_glu(xs: &Tensor, dim: usize) -> Result<Tensor> {
-        let rank = xs.rank();
-        #[cfg(feature = "cuda")]
-        {
-            if xs.device().is_cuda() && xs.dtype() == candle_core::DType::F16 && dim == rank - 1 {
-                let mut dims = xs.dims().to_vec();
-                dims[dim] /= 2;
-                let mut out_tensor = Tensor::zeros(dims.as_slice(), xs.dtype(), xs.device())?;
-                let half_dim = dims[dim];
-                let total_out_elements = out_tensor.elem_count();
-
-                unsafe {
-                    use candle_core::Storage;
-                    use candle_core::backend::BackendStorage;
-                    let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
-                        let (storage, _) = t.storage_and_layout();
-                        match &*storage {
-                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
-                            _ => std::ptr::null(),
-                        }
-                    };
-                    let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
-                        let (storage, _) = t.storage_and_layout();
-                        match &*storage {
-                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
-                            _ => std::ptr::null_mut(),
-                        }
-                    };
-
-                    let in_ptr = get_const_ptr(xs);
-                    let out_ptr = get_mut_ptr(&mut out_tensor);
-
-                    if !in_ptr.is_null() && !out_ptr.is_null() {
-                        fused_glu(in_ptr, out_ptr, half_dim as i32, total_out_elements as i32);
-                        return Ok(out_tensor);
-                    }
-                }
-            }
-        }
-
-        if xs.device().is_cpu() && dim == rank - 1 {
-            use rayon::prelude::*;
-            let dtype = xs.dtype();
-            if dtype == candle_core::DType::F32 {
-                let mut dims = xs.dims().to_vec();
-                dims[dim] /= 2;
-                let shape = candle_core::Shape::from(dims);
-                let xs_vec = xs.to_vec1::<f32>().unwrap_or_else(|_| xs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
-                
-                let half_dim = shape.dims()[dim];
-                let total_out_elements = shape.elem_count();
-                let mut out_vec = vec![0.0f32; total_out_elements];
-                
-                out_vec.par_chunks_mut(half_dim).enumerate().for_each(|(row, out_chunk)| {
-                    let in_start = row * half_dim * 2;
-                    for i in 0..half_dim {
-                        let x0 = xs_vec[in_start + i];
-                        let x1 = xs_vec[in_start + half_dim + i];
-                        let sig_x1 = 1.0 / (1.0 + (-x1).exp());
-                        out_chunk[i] = x0 * sig_x1;
-                    }
-                });
-                
-                return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
-            }
-        }
-
-        let x_ = xs.chunk(2, dim)?;
-        let x_1 = sigmoid(x_[1].as_ref())?;
-        Ok(x_1.mul(x_[0].as_ref())?)
-    }
-
-    pub fn apply_geglu(xs: &Tensor, dim: usize) -> Result<Tensor> {
-        let rank = xs.rank();
-        #[cfg(feature = "cuda")]
-        {
-            if xs.device().is_cuda() && xs.dtype() == candle_core::DType::F16 && dim == rank - 1 {
-                let mut dims = xs.dims().to_vec();
-                dims[dim] /= 2;
-                let mut out_tensor = Tensor::zeros(dims.as_slice(), xs.dtype(), xs.device())?;
-                let half_dim = dims[dim];
-                let total_out_elements = out_tensor.elem_count();
-
-                unsafe {
-                    use candle_core::Storage;
-                    use candle_core::backend::BackendStorage;
-                    let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
-                        let (storage, _) = t.storage_and_layout();
-                        match &*storage {
-                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
-                            _ => std::ptr::null(),
-                        }
-                    };
-                    let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
-                        let (storage, _) = t.storage_and_layout();
-                        match &*storage {
-                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
-                            _ => std::ptr::null_mut(),
-                        }
-                    };
-
-                    let in_ptr = get_const_ptr(xs);
-                    let out_ptr = get_mut_ptr(&mut out_tensor);
-
-                    if !in_ptr.is_null() && !out_ptr.is_null() {
-                        fused_geglu(in_ptr, out_ptr, half_dim as i32, total_out_elements as i32);
-                        return Ok(out_tensor);
-                    }
-                }
-            }
-        }
-
-        if xs.device().is_cpu() && dim == rank - 1 {
-            use rayon::prelude::*;
-            let dtype = xs.dtype();
-            if dtype == candle_core::DType::F32 {
-                let mut dims = xs.dims().to_vec();
-                dims[dim] /= 2;
-                let shape = candle_core::Shape::from(dims);
-                let xs_vec = xs.to_vec1::<f32>().unwrap_or_else(|_| xs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
-                
-                let half_dim = shape.dims()[dim];
-                let total_out_elements = shape.elem_count();
-                let mut out_vec = vec![0.0f32; total_out_elements];
-                
-                out_vec.par_chunks_mut(half_dim).enumerate().for_each(|(row, out_chunk)| {
-                    let in_start = row * half_dim * 2;
-                    for i in 0..half_dim {
-                        let x0 = xs_vec[in_start + i];
-                        let x1 = xs_vec[in_start + half_dim + i];
-                        let k0 = 0.7978845608f32;
-                        let k1 = 0.044715f32;
-                        let inner = k0 * (x1 + k1 * x1 * x1 * x1);
-                        let gelu_x1 = 0.5 * x1 * (1.0 + inner.tanh());
-                        out_chunk[i] = x0 * gelu_x1;
-                    }
-                });
-                
-                return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
-            }
-        }
-
-        let x_ = xs.chunk(2, dim)?;
-        let x_1 = x_[1].as_ref().gelu()?;
-        Ok(x_1.mul(x_[0].as_ref())?)
-    }
-
-    pub fn apply_mish(xs: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        {
-            if xs.device().is_cuda() && xs.dtype() == candle_core::DType::F16 {
-                let mut out_tensor = Tensor::zeros_like(xs)?;
-                let total_elements = xs.elem_count();
-                unsafe {
-                    use candle_core::Storage;
-                    use candle_core::backend::BackendStorage;
-                    let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
-                        let (storage, _) = t.storage_and_layout();
-                        match &*storage {
-                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
-                            _ => std::ptr::null(),
-                        }
-                    };
-                    let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
-                        let (storage, _) = t.storage_and_layout();
-                        match &*storage {
-                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
-                            _ => std::ptr::null_mut(),
-                        }
-                    };
-
-                    let in_ptr = get_const_ptr(xs);
-                    let out_ptr = get_mut_ptr(&mut out_tensor);
-
-                    if !in_ptr.is_null() && !out_ptr.is_null() {
-                        fused_mish(in_ptr, out_ptr, total_elements as i32);
-                        return Ok(out_tensor);
-                    }
-                }
-            }
-        }
-        
-        if xs.device().is_cpu() {
-            use rayon::prelude::*;
-            let dtype = xs.dtype();
-            
-            if dtype == candle_core::DType::F32 {
-                let shape = xs.shape().clone();
-                let xs_vec = xs.to_vec1::<f32>().unwrap_or_else(|_| xs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
-                
-                let mut out_vec = vec![0.0f32; xs_vec.len()];
-                
-                out_vec.par_iter_mut().enumerate().for_each(|(i, out)| {
-                    let x = xs_vec[i];
-                    // Mish 수학 공식: x * tanh(ln(1 + exp(x)))
-                    // x > 20.0 인 경우 exp(x) 연산 오버플로우를 막기 위해 x로 직접 치환(안정성 확보)
-                    let sp = if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
-                    let th = sp.tanh();
-                    *out = x * th;
-                });
-                
-                return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
-            }
-        }
-
-        let tanh = xs.exp()?.affine(1.0, 1.0)?.log()?.tanh()?;
-        Ok(xs.mul(&tanh)?)
-    }
-
-    pub fn apply_softplus_stable(xs: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        {
-            if xs.device().is_cuda() && xs.dtype() == candle_core::DType::F16 {
-                let mut out_tensor = Tensor::zeros_like(xs)?;
-                let total_elements = xs.elem_count();
-                unsafe {
-                    use candle_core::Storage;
-                    use candle_core::backend::BackendStorage;
-                    let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
-                        let (storage, _) = t.storage_and_layout();
-                        match &*storage {
-                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
-                            _ => std::ptr::null(),
-                        }
-                    };
-                    let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
-                        let (storage, _) = t.storage_and_layout();
-                        match &*storage {
-                            Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
-                            _ => std::ptr::null_mut(),
-                        }
-                    };
-
-                    let in_ptr = get_const_ptr(xs);
-                    let out_ptr = get_mut_ptr(&mut out_tensor);
-
-                    if !in_ptr.is_null() && !out_ptr.is_null() {
-                        fused_softplus_stable(in_ptr, out_ptr, total_elements as i32);
-                        return Ok(out_tensor);
-                    }
-                }
-            }
-        }
-
-        if xs.device().is_cpu() {
-            use rayon::prelude::*;
-            let dtype = xs.dtype();
-            
-            if dtype == candle_core::DType::F32 {
-                let shape = xs.shape().clone();
-                let xs_vec = xs.to_vec1::<f32>().unwrap_or_else(|_| xs.flatten_all().unwrap().to_vec1::<f32>().unwrap());
-                
-                let mut out_vec = vec![0.0f32; xs_vec.len()];
-                
-                out_vec.par_iter_mut().enumerate().for_each(|(i, out)| {
-                    let x = xs_vec[i];
-                    let x_max_0 = if x > 0.0 { x } else { 0.0 };
-                    *out = (1.0 + (-x.abs()).exp()).ln() + x_max_0;
-                });
-                
-                return Ok(candle_core::Tensor::from_vec(out_vec, shape, &candle_core::Device::Cpu)?);
-            }
-        }
-
-        let zero = Tensor::zeros_like(xs)?;
-        let x_max_0 = xs.maximum(&zero)?;
-        Ok((xs.abs()?.neg()?.exp()? + 1.0)?.log()?.add(&x_max_0)?)
-    }
-}
-
 pub struct GLU {
     dim: usize,
 }
@@ -1499,7 +1124,10 @@ impl GLU {
         Ok(Self { dim })
     }
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        UnifiedKernels::apply_glu(xs, self.dim)
+        let x_ = xs.chunk(2, self.dim)?;
+        let x_1 = sigmoid(x_[1].as_ref())?;
+        let xs = x_1.mul(x_[0].as_ref())?;
+        Ok(xs)
     }
 }
 
@@ -1512,7 +1140,10 @@ impl GEGLU {
         Ok(Self { dim })
     }
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        UnifiedKernels::apply_geglu(xs, self.dim)
+        let x_ = xs.chunk(2, self.dim)?;
+        let x_1 = x_[1].as_ref().gelu()?;
+        let xs = x_1.mul(x_[0].as_ref())?;
+        Ok(xs)
     }
 }
 
@@ -1660,11 +1291,9 @@ impl WNLinear {
 }
 
 pub fn mish(xs: &Tensor) -> Result<Tensor> {
-    UnifiedKernels::apply_mish(xs)
-}
-
-pub fn softplus_stable(xs: &Tensor) -> Result<Tensor> {
-    UnifiedKernels::apply_softplus_stable(xs)
+    let tanh = xs.exp()?.affine(1.0, 1.0)?.log()?.tanh()?;
+    let xs = xs.mul(&tanh)?;
+    Ok(xs)
 }
 
 pub fn softplus(xs: &Tensor) -> Result<Tensor> {
@@ -1672,104 +1301,30 @@ pub fn softplus(xs: &Tensor) -> Result<Tensor> {
     Ok((xs.exp()? + 1.0)?.log()?)
 }
 
-#[cfg(feature = "cuda")]
-extern "C" {
-    fn fused_conv1d_depthwise(
-        input_ptr: *const std::ffi::c_void,
-        weight_ptr: *const std::ffi::c_void,
-        bias_ptr: *const std::ffi::c_void,
-        out_ptr: *mut std::ffi::c_void,
-        bs: std::ffi::c_int, c: std::ffi::c_int, len_in: std::ffi::c_int, kernel_size: std::ffi::c_int, len_out: std::ffi::c_int,
-    );
+pub fn softplus_stable(xs: &Tensor) -> Result<Tensor> {
+    // max(x, 0) + ln(1 + exp(-abs(x)))
+    let zero = Tensor::zeros_like(xs)?;
+    let x_max_0 = xs.maximum(&zero)?;
+    Ok((xs.abs()?.neg()?.exp()? + 1.0)?.log()?.add(&x_max_0)?)
 }
 
 pub fn conv1d_depthwise(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
     let len_in = input.dim(2)?;
     let weight = weight.squeeze(1)?.to_dtype(input.dtype())?;
     let kernel_size = weight.dim(1)?;
+
     let len_out = len_in - kernel_size + 1;
 
-    #[cfg(feature = "cuda")]
-    {
-        if input.device().is_cuda() && input.dtype() == candle_core::DType::F16 {
-            let (bs, c, _) = input.dims3()?;
-            let mut out_tensor = Tensor::zeros((bs, c, len_out), candle_core::DType::F16, input.device())?;
-            
-            unsafe {
-                use candle_core::Storage;
-                use candle_core::backend::BackendStorage;
-                let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
-                    let (storage, _) = t.storage_and_layout();
-                    match &*storage {
-                        Storage::Cuda(cd) => cd.as_cuda_slice::<half::f16>().unwrap().device_ptr(&cd.device().cuda_stream()).0 as *const std::ffi::c_void,
-                        _ => std::ptr::null(),
-                    }
-                };
-                let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
-                    let (storage, _) = t.storage_and_layout();
-                    match &*storage {
-                        Storage::Cuda(cd) => cd.as_cuda_slice::<half::f16>().unwrap().device_ptr(&cd.device().cuda_stream()).0 as *mut std::ffi::c_void,
-                        _ => std::ptr::null_mut(),
-                    }
-                };
-
-                let in_ptr = get_const_ptr(input);
-                let w_ptr = get_const_ptr(&weight);
-                let b_ptr = if let Some(b) = bias { get_const_ptr(b) } else { std::ptr::null() };
-                let out_ptr = get_mut_ptr(&mut out_tensor);
-
-                if !in_ptr.is_null() && !w_ptr.is_null() && !out_ptr.is_null() {
-                    fused_conv1d_depthwise(
-                        in_ptr, w_ptr, b_ptr, out_ptr,
-                        bs as i32, c as i32, len_in as i32, kernel_size as i32, len_out as i32
-                    );
-                    return Ok(out_tensor);
-                }
-            }
-        }
-    }
-
-    if input.device().is_cpu() {
-        use rayon::prelude::*;
-        if input.dtype() == candle_core::DType::F32 {
-            let (bs, c, _) = input.dims3()?;
-            let in_vec = input.to_vec1::<f32>().unwrap_or_else(|_| input.flatten_all().unwrap().to_vec1::<f32>().unwrap());
-            let w_vec = weight.to_vec1::<f32>().unwrap_or_else(|_| weight.flatten_all().unwrap().to_vec1::<f32>().unwrap());
-            let b_vec = if let Some(b) = bias {
-                Some(b.to_vec1::<f32>().unwrap_or_else(|_| b.flatten_all().unwrap().to_vec1::<f32>().unwrap()))
-            } else {
-                None
-            };
-
-            let mut out_vec = vec![0.0f32; bs * c * len_out];
-            
-            out_vec.par_chunks_mut(len_out).enumerate().for_each(|(chunk_idx, out_chunk)| {
-                let batch = chunk_idx / c;
-                let channel = chunk_idx % c;
-                let b_val = if let Some(ref b_v) = b_vec { b_v[channel] } else { 0.0 };
-                
-                for l in 0..len_out {
-                    let mut sum = b_val;
-                    for k in 0..kernel_size {
-                        let in_idx = batch * (c * len_in) + channel * len_in + (l + k);
-                        let w_idx = channel * kernel_size + k;
-                        sum += in_vec[in_idx] * w_vec[w_idx];
-                    }
-                    out_chunk[l] = sum;
-                }
-            });
-            
-            return Ok(candle_core::Tensor::from_vec(out_vec, (bs, c, len_out), &candle_core::Device::Cpu)?);
-        }
-    }
-
     let out = if len_out == 1 {
+        // 디코딩 초고속 패스
         input.broadcast_mul(&weight.unsqueeze(0)?)?.sum_keepdim(2)?
     } else {
+        // 프리필(Prefill) 처리용 기존 패스
         let mut out = input
             .narrow(2, 0, len_out)?
             .broadcast_mul(&weight.narrow(1, 0, 1)?.unsqueeze(0)?)?;
         for k in 1..kernel_size {
+            
             let piece = input.narrow(2, k, len_out)?.broadcast_mul(&weight.narrow(1, k, 1)?.unsqueeze(0)?)?;
             out = out.add(&piece)?;
         }
@@ -1780,6 +1335,7 @@ pub fn conv1d_depthwise(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>) 
         None => Ok(out),
         Some(bias) => {
             let b = bias.dims1()?;
+            
             let bias = bias.reshape((1, b, 1))?.to_dtype(input.dtype())?;
             Ok(out.broadcast_add(&bias)?)
         }

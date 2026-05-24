@@ -1,8 +1,6 @@
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, Tensor};
-#[cfg(feature = "cuda")]
-use candle_core::cuda_backend::cudarc::driver::DevicePtr;
-use candle_nn::{Embedding, Module, VarBuilder};
+use candle_nn::{Embedding, Module, VarBuilder}; 
 use candle_core::quantized::{gguf_file, QMatMul};
 use std::path::Path;
 use std::fs;
@@ -1432,16 +1430,6 @@ pub struct QuantizedQwenVLTextDecoderLayer {
     pub post_attention_layernorm: Option<RmsNorm>,
 }
 
-#[cfg(feature = "cuda")]
-extern "C" {
-    fn fused_silu_mul(
-        gate_ptr: *const std::ffi::c_void,
-        up_ptr: *const std::ffi::c_void,
-        out_ptr: *mut std::ffi::c_void,
-        total_elements: std::ffi::c_int,
-    );
-}
-
 impl QuantizedQwenVLTextDecoderLayer {
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         if self.self_attn.q_proj.is_cleared() {
@@ -1637,48 +1625,6 @@ impl QuantizedQwenVLTextDecoderLayer {
             let xs = {
                 let gate = gate_proj.forward(&xs)?;
                 let up = up_proj.forward(&xs)?;
-
-                #[cfg(feature = "cuda")]
-                {
-                    if gate.device().is_cuda() && gate.dtype() == candle_core::DType::F16 {
-                        let mut out_tensor = Tensor::zeros_like(&gate)?;
-                        let total_elements = gate.elem_count();
-
-                        unsafe {
-                            use candle_core::Storage;
-                            use candle_core::backend::BackendStorage;
-                            let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
-                                let (storage, _) = t.storage_and_layout();
-                                match &*storage {
-                                    Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
-                                    _ => std::ptr::null(),
-                                }
-                            };
-                            let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
-                                let (storage, _) = t.storage_and_layout();
-                                match &*storage {
-                                    Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
-                                    _ => std::ptr::null_mut(),
-                                }
-                            };
-
-                            let gate_ptr = get_const_ptr(&gate);
-                            let up_ptr = get_const_ptr(&up);
-                            let out_ptr = get_mut_ptr(&mut out_tensor);
-
-                            if !gate_ptr.is_null() && !up_ptr.is_null() && !out_ptr.is_null() {
-                                fused_silu_mul(
-                                    gate_ptr,
-                                    up_ptr,
-                                    out_ptr,
-                                    total_elements as i32,
-                                );
-                                return Ok(residual.add(&down_proj.forward(&out_tensor)?)?);
-                            }
-                        }
-                    }
-                }
-
                 let gate = candle_nn::ops::silu(&gate)?;
                 let hidden = gate.mul(&up)?;
                 down_proj.forward(&hidden)?
@@ -2275,7 +2221,7 @@ impl QuantizedQwenVLTextModel {
         let mut next_xs = self.process_chunks_iterative(layer_idx, &chunk_offsets, &xs, cos, sin, seqlen_offset, session_id.clone(), kv_name.clone(), baking_only).await?;
 
         if let (Some(embed), Some(mask)) = (deepstack_embed, visual_mask) {
-            next_xs = next_xs.squeeze(0)?.index_add(&mask.squeeze(0)?, embed, 0)?.unsqueeze(0)?;
+            next_xs = mask_index_add(&next_xs.squeeze(0)?, &mask.squeeze(0)?, embed)?.unsqueeze(0)?;
         }
 
         // 가중치 비우기 (프리필 중 메모리 안정성 확보)

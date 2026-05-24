@@ -1,7 +1,5 @@
 use anyhow::Result;
 use candle_core::{D, DType, Device, IndexOp, Tensor};
-#[cfg(feature = "cuda")]
-use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_transformers::models::deepseek2::SplitOp;
 
 use crate::utils::tensor_utils::{split_tensor};
@@ -56,86 +54,25 @@ pub fn apply_multimodel_rotary_pos_emb(
     Ok((q_embed, k_embed))
 }
 
-#[cfg(feature = "cuda")]
-extern "C" {
-    fn fused_apply_rotary_pos_emb(
-        q_ptr: *mut std::ffi::c_void,
-        k_ptr: *mut std::ffi::c_void,
-        cos_ptr: *const std::ffi::c_void,
-        sin_ptr: *const std::ffi::c_void,
-        batch_size: std::ffi::c_int,
-        seq_len: std::ffi::c_int,
-        q_heads: std::ffi::c_int,
-        k_heads: std::ffi::c_int,
-        head_dim: std::ffi::c_int,
-    );
-}
-
 pub fn apply_rotary_pos_emb_vision(
     q: &Tensor,
     k: &Tensor,
     cos: &Tensor,
     sin: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
-    #[cfg(feature = "cuda")]
-    {
-        if q.device().is_cuda() && q.dtype() == DType::F16 {
-            let mut q_work = q.clone();
-            let mut k_work = k.clone();
-            let (seq_len, q_heads, head_dim) = q_work.dims3()?;
-            let (_, k_heads, _) = k_work.dims3()?;
-
-            unsafe {
-                use candle_core::Storage;
-                use candle_core::backend::BackendStorage;
-                let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
-                    let (storage, _) = t.storage_and_layout();
-                    match &*storage {
-                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
-                        _ => std::ptr::null_mut(),
-                    }
-                };
-                let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
-                    let (storage, _) = t.storage_and_layout();
-                    match &*storage {
-                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
-                        _ => std::ptr::null(),
-                    }
-                };
-
-                let q_ptr = get_mut_ptr(&mut q_work);
-                let k_ptr = get_mut_ptr(&mut k_work);
-                let cos_ptr = get_const_ptr(cos);
-                let sin_ptr = get_const_ptr(sin);
-
-                if !q_ptr.is_null() && !k_ptr.is_null() && !cos_ptr.is_null() && !sin_ptr.is_null() {
-                    fused_apply_rotary_pos_emb(
-                        q_ptr,
-                        k_ptr,
-                        cos_ptr,
-                        sin_ptr,
-                        1, 
-                        seq_len as i32,
-                        q_heads as i32,
-                        k_heads as i32,
-                        head_dim as i32,
-                    );
-                    return Ok((q_work, k_work));
-                }
-            }
-        }
-    }
-
     // 1. 차원 확장만 수행 (메모리 복사 없음)
-    let cos_ex = cos.unsqueeze(D::Minus2)?; 
-    let sin_ex = sin.unsqueeze(D::Minus2)?; 
+    let cos = cos.unsqueeze(D::Minus2)?; 
+    let sin = sin.unsqueeze(D::Minus2)?; 
+    
+    // [CRITICAL FIX] 이미 외부에서 q.dtype()과 일치하게 넘어오므로 
+    // .to_dtype() 캐스팅 과정을 완전히 삭제하여 GPU Sync Stall을 제거합니다. 
     
     let q_embed = q
-        .broadcast_mul(&cos_ex)?
-        .add(&rotate_half(q)?.broadcast_mul(&sin_ex)?)?; 
+        .broadcast_mul(&cos)?
+        .add(&rotate_half(q)?.broadcast_mul(&sin)?)?; 
     let k_embed = k
-        .broadcast_mul(&cos_ex)?
-        .add(&rotate_half(k)?.broadcast_mul(&sin_ex)?)?; 
+        .broadcast_mul(&cos)?
+        .add(&rotate_half(k)?.broadcast_mul(&sin)?)?; 
     Ok((q_embed, k_embed)) 
 }
 
@@ -146,81 +83,31 @@ pub fn apply_rotary_pos_emb(
     sin: &Tensor,
     tof32: bool,
 ) -> Result<(Tensor, Tensor)> {
-    let cos_orig = if cos.rank() == 2 { cos.unsqueeze(0)?.unsqueeze(0)? } 
+    // 1. [FIX] 무조건적인 clone() 제거. 필요한 랭크일 때만 가상 뷰(unsqueeze) 생성
+    let cos = if cos.rank() == 2 { cos.unsqueeze(0)?.unsqueeze(0)? } 
               else if cos.rank() == 3 { cos.unsqueeze(1)? } 
               else { cos.clone() }; 
-    let sin_orig = if sin.rank() == 2 { sin.unsqueeze(0)?.unsqueeze(0)? } 
+    let sin = if sin.rank() == 2 { sin.unsqueeze(0)?.unsqueeze(0)? } 
               else if sin.rank() == 3 { sin.unsqueeze(1)? } 
               else { sin.clone() }; 
 
     let orig_dtype = q.dtype();
     
-    let (mut q_work, mut k_work) = if tof32 { 
+    // 2. [FIX] tof32 플래그가 참일 때만 물리적 타입 변환 수행 (No-Op 방지)
+    let (q_work, k_work) = if tof32 { 
         (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?) 
     } else { 
         (q.clone(), k.clone()) 
     };
 
-    let cos_f = if cos_orig.dtype() != q_work.dtype() { cos_orig.to_dtype(q_work.dtype())? } else { cos_orig }; 
-    let sin_f = if sin_orig.dtype() != q_work.dtype() { sin_orig.to_dtype(q_work.dtype())? } else { sin_orig }; 
+    // cos, sin의 타입이 연산 대상(q_work)과 다를 때만 1번 캐스팅
+    let cos = if cos.dtype() != q_work.dtype() { cos.to_dtype(q_work.dtype())? } else { cos }; 
+    let sin = if sin.dtype() != q_work.dtype() { sin.to_dtype(q_work.dtype())? } else { sin }; 
 
-    #[cfg(feature = "cuda")]
-    {
-        if q_work.device().is_cuda() && q_work.dtype() == DType::F16 {
-            let (b_sz, q_heads, seq_len, head_dim) = q_work.dims4()?;
-            let (_, k_heads, _, _) = k_work.dims4()?;
+    let q_embed = q_work.broadcast_mul(&cos)?.add(&rotate_half(&q_work)?.broadcast_mul(&sin)?)?; 
+    let k_embed = k_work.broadcast_mul(&cos)?.add(&rotate_half(&k_work)?.broadcast_mul(&sin)?)?; 
 
-            unsafe {
-                use candle_core::Storage;
-                use candle_core::backend::BackendStorage;
-                let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
-                    let (storage, _) = t.storage_and_layout();
-                    match &*storage {
-                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void,
-                        _ => std::ptr::null_mut(),
-                    }
-                };
-                let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
-                    let (storage, _) = t.storage_and_layout();
-                    match &*storage {
-                        Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void,
-                        _ => std::ptr::null(),
-                    }
-                };
-
-                let q_ptr = get_mut_ptr(&mut q_work);
-                let k_ptr = get_mut_ptr(&mut k_work);
-                let cos_ptr = get_const_ptr(&cos_f);
-                let sin_ptr = get_const_ptr(&sin_f);
-
-                if !q_ptr.is_null() && !k_ptr.is_null() && !cos_ptr.is_null() && !sin_ptr.is_null() {
-                    fused_apply_rotary_pos_emb(
-                        q_ptr,
-                        k_ptr,
-                        cos_ptr,
-                        sin_ptr,
-                        b_sz as i32,
-                        seq_len as i32,
-                        q_heads as i32,
-                        k_heads as i32,
-                        head_dim as i32,
-                    );
-                    
-                    let (q_final, k_final) = if tof32 {
-                        (q_work.to_dtype(orig_dtype)?, k_work.to_dtype(orig_dtype)?) 
-                    } else {
-                        (q_work, k_work)
-                    };
-                    
-                    return Ok((q_final, k_final));
-                }
-            }
-        }
-    }
-
-    let q_embed = q_work.broadcast_mul(&cos_f)?.add(&rotate_half(&q_work)?.broadcast_mul(&sin_f)?)?; 
-    let k_embed = k_work.broadcast_mul(&cos_f)?.add(&rotate_half(&k_work)?.broadcast_mul(&sin_f)?)?; 
-
+    // 3. [FIX] 결과 반환 시에도 불필요한 재캐스팅 방지
     let (q_final, k_final) = if tof32 {
         (q_embed.to_dtype(orig_dtype)?, k_embed.to_dtype(orig_dtype)?) 
     } else {
@@ -263,64 +150,27 @@ impl Qwen2_5VLTextRotaryEmbedding {
             .matmul(&position_ids_expanded)?
             .transpose(2, 3)?;
         let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?.contiguous()?;
-        let cos_all = emb.cos()?;
-        let sin_all = emb.sin()?;
-        let mrope_section_doubled = mrope_section.iter().map(|&s| s * 2).collect::<Vec<_>>();
-        
-        if mrope_section_doubled.is_empty() {
-            return Ok((
-                cos_all.i(0)?.unsqueeze(1)?.to_dtype(dtype)?, 
-                sin_all.i(0)?.unsqueeze(1)?.to_dtype(dtype)?
-            ));
-        }
-
-        let sec0 = *mrope_section_doubled.get(0).unwrap_or(&0) as i32;
-        let sec1 = *mrope_section_doubled.get(1).unwrap_or(&0) as i32;
-        let sec2 = *mrope_section_doubled.get(2).unwrap_or(&0) as i32;
-
-        #[cfg(feature = "cuda")]
-        {
-            if cos_all.device().is_cuda() && cos_all.dtype() == candle_core::DType::F16 && mrope_section_doubled.len() == 3 {
-                let (dim3, bs, seq_len, head_dim) = cos_all.dims4()?;
-                if dim3 == 3 {
-                    let mut cos_out = Tensor::zeros((bs, seq_len, head_dim), candle_core::DType::F16, cos_all.device())?;
-                    let mut sin_out = Tensor::zeros((bs, seq_len, head_dim), candle_core::DType::F16, sin_all.device())?;
-                    
-                    unsafe {
-                        use candle_core::Storage;
-                        use candle_core::backend::BackendStorage;
-                        let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
-                            let (storage, _) = t.storage_and_layout();
-                            match &*storage { Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void, _ => std::ptr::null() }
-                        };
-                        let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
-                            let (storage, _) = t.storage_and_layout();
-                            match &*storage { Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void, _ => std::ptr::null_mut() }
-                        };
-
-                        let c_in_ptr = get_const_ptr(&cos_all);
-                        let s_in_ptr = get_const_ptr(&sin_all);
-                        let c_out_ptr = get_mut_ptr(&mut cos_out);
-                        let s_out_ptr = get_mut_ptr(&mut sin_out);
-
-                        if !c_in_ptr.is_null() && !s_in_ptr.is_null() && !c_out_ptr.is_null() && !s_out_ptr.is_null() {
-                            fused_mrope_select(c_in_ptr, c_out_ptr, bs as i32, seq_len as i32, head_dim as i32, sec0, sec1, sec2);
-                            fused_mrope_select(s_in_ptr, s_out_ptr, bs as i32, seq_len as i32, head_dim as i32, sec0, sec1, sec2);
-                            return Ok((cos_out.unsqueeze(1)?.to_dtype(dtype)?, sin_out.unsqueeze(1)?.to_dtype(dtype)?));
-                        }
-                    }
-                }
-            }
-        }
-
-        let cos_select: Vec<Tensor> = cos_all.split(&mrope_section_doubled, D::Minus1)?
-            .iter().enumerate().map(|(i, m)| m.i(i % 3).unwrap()).collect();
-        let cos = Tensor::cat(&cos_select, D::Minus1)?.unsqueeze(1)?.contiguous()?; 
-
-        let sin_select: Vec<Tensor> = sin_all.split(&mrope_section_doubled, D::Minus1)?
-            .iter().enumerate().map(|(i, m)| m.i(i % 3).unwrap()).collect();
-        let sin = Tensor::cat(&sin_select, D::Minus1)?.unsqueeze(1)?.contiguous()?; 
-
+        let cos = emb.cos()?;
+        let sin = emb.sin()?;
+        let mrope_section = mrope_section.repeat(2);
+        let cos_select: Vec<Tensor> = cos
+            .split(&mrope_section, D::Minus1)?
+            .iter()
+            .enumerate()
+            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
+            .collect();
+        let cos = Tensor::cat(&cos_select, D::Minus1)?
+            .unsqueeze(1)?
+            .contiguous()?;
+        let sin_select: Vec<Tensor> = sin
+            .split(&mrope_section, D::Minus1)?
+            .iter()
+            .enumerate()
+            .map(|(i, m): (usize, &Tensor)| m.i(i % 3).unwrap())
+            .collect();
+        let sin = Tensor::cat(&sin_select, D::Minus1)?
+            .unsqueeze(1)?
+            .contiguous()?;
         Ok((cos.to_dtype(dtype)?, sin.to_dtype(dtype)?))
     }
 }
@@ -392,59 +242,24 @@ impl QwenVLTextRotaryEmbedding {
         let cos_all = emb.cos()?;
         let sin_all = emb.sin()?;
 
-        let mrope_section_doubled = mrope_section.iter().map(|&s| s * 2).collect::<Vec<_>>();
-        if mrope_section_doubled.is_empty() {
+        // If no sections defined, fallback to first dimension (Time)
+        if mrope_section.is_empty() {
             let cos = cos_all.i(0)?.unsqueeze(1)?.to_dtype(dtype)?;
             let sin = sin_all.i(0)?.unsqueeze(1)?.to_dtype(dtype)?;
             return Ok((cos, sin));
         }
 
-        let sec0 = *mrope_section_doubled.get(0).unwrap_or(&0) as i32;
-        let sec1 = *mrope_section_doubled.get(1).unwrap_or(&0) as i32;
-        let sec2 = *mrope_section_doubled.get(2).unwrap_or(&0) as i32;
-
-        #[cfg(feature = "cuda")]
-        {
-            if cos_all.device().is_cuda() && cos_all.dtype() == candle_core::DType::F16 && mrope_section_doubled.len() == 3 {
-                let (dim3, bs, seq_len, head_dim) = cos_all.dims4()?;
-                if dim3 == 3 {
-                    let mut cos_out = Tensor::zeros((bs, seq_len, head_dim), candle_core::DType::F16, cos_all.device())?;
-                    let mut sin_out = Tensor::zeros((bs, seq_len, head_dim), candle_core::DType::F16, sin_all.device())?;
-                    
-                    unsafe {
-                        use candle_core::Storage;
-                        use candle_core::backend::BackendStorage;
-                        let get_const_ptr = |t: &Tensor| -> *const std::ffi::c_void {
-                            let (storage, _) = t.storage_and_layout();
-                            match &*storage { Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *const std::ffi::c_void, _ => std::ptr::null() }
-                        };
-                        let get_mut_ptr = |t: &mut Tensor| -> *mut std::ffi::c_void {
-                            let (storage, _) = t.storage_and_layout();
-                            match &*storage { Storage::Cuda(c) => c.as_cuda_slice::<half::f16>().unwrap().device_ptr(&c.device().cuda_stream()).0 as *mut std::ffi::c_void, _ => std::ptr::null_mut() }
-                        };
-
-                        let c_in_ptr = get_const_ptr(&cos_all);
-                        let s_in_ptr = get_const_ptr(&sin_all);
-                        let c_out_ptr = get_mut_ptr(&mut cos_out);
-                        let s_out_ptr = get_mut_ptr(&mut sin_out);
-
-                        if !c_in_ptr.is_null() && !s_in_ptr.is_null() && !c_out_ptr.is_null() && !s_out_ptr.is_null() {
-                            fused_mrope_select(c_in_ptr, c_out_ptr, bs as i32, seq_len as i32, head_dim as i32, sec0, sec1, sec2);
-                            fused_mrope_select(s_in_ptr, s_out_ptr, bs as i32, seq_len as i32, head_dim as i32, sec0, sec1, sec2);
-                            return Ok((cos_out.unsqueeze(1)?.to_dtype(dtype)?, sin_out.unsqueeze(1)?.to_dtype(dtype)?));
-                        }
-                    }
-                }
-            }
-        }
-
+        // Split by sections and select based on dimension index
+        let mrope_section_doubled = mrope_section.iter().map(|&s| s * 2).collect::<Vec<_>>();
+        
         let cos_select: Vec<Tensor> = cos_all.split(&mrope_section_doubled, D::Minus1)?
             .iter().enumerate().map(|(i, m)| m.i(i % 3).unwrap()).collect();
-        let cos = Tensor::cat(&cos_select, D::Minus1)?.unsqueeze(1)?; 
+        
+        let cos = Tensor::cat(&cos_select, D::Minus1)?.unsqueeze(1)?.contiguous()?; 
 
         let sin_select: Vec<Tensor> = sin_all.split(&mrope_section_doubled, D::Minus1)?
             .iter().enumerate().map(|(i, m)| m.i(i % 3).unwrap()).collect();
-        let sin = Tensor::cat(&sin_select, D::Minus1)?.unsqueeze(1)?; 
+        let sin = Tensor::cat(&sin_select, D::Minus1)?.unsqueeze(1)?.contiguous()?; 
 
         Ok((cos.to_dtype(dtype)?, sin.to_dtype(dtype)?))
     }
@@ -514,15 +329,4 @@ pub fn get_xd_cos_sin(
     let cos = Tensor::cat(&cos_select, D::Minus1)?;
     let sin = Tensor::cat(&sin_select, D::Minus1)?;
     Ok((cos, sin))
-}
-
-
-#[cfg(feature = "cuda")]
-extern "C" {
-    fn fused_mrope_select(
-        in_all_ptr: *const std::ffi::c_void,
-        out_ptr: *mut std::ffi::c_void,
-        bs: std::ffi::c_int, seq_len: std::ffi::c_int, head_dim: std::ffi::c_int,
-        sec0: std::ffi::c_int, sec1: std::ffi::c_int, sec2: std::ffi::c_int,
-    );
 }

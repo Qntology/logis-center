@@ -13,7 +13,6 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.5.3", features = [] }
-cc = "1.0" # <- 이 줄을 추가하세요!
 
 [dependencies]
 tauri = { version = "2.9.5", features = [] }

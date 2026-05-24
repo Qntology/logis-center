@@ -8951,7 +8951,6 @@ dependencies = [
  "candle-flash-attn",
  "candle-nn",
  "candle-transformers",
- "cc",
  "chromiumoxide",
  "chrono",
  "direct-storage",
