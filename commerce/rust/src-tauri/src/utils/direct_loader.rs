@@ -21,7 +21,6 @@ mod windows_impl {
         status_array: IDStorageStatusArray,
     }
 
-
     unsafe impl Send for WinContext {}
     unsafe impl Sync for WinContext {}
 
@@ -42,7 +41,6 @@ mod windows_impl {
     });
 
     pub fn load_block(path: &Path) -> Result<Vec<u8>> {
-        // [CRITICAL FIX] DirectStorage 지원 안 되는 PC를 위한 Fallback 추가
         if let Ok(ctx) = CONTEXT.as_ref() {
             unsafe {
                 if let Ok(metadata) = fs::metadata(path) {
@@ -73,7 +71,6 @@ mod windows_impl {
                 }
             }
         }
-        // DirectStorage 초기화 실패(0x80004001) 또는 큐 실패 시, 표준 파일 I/O로 안전하게 우회합니다.
         fs::read(path).map_err(|e| anyhow::anyhow!("Fallback read failed: {}", e))
     }
 
@@ -105,7 +102,6 @@ mod windows_impl {
                 }
             }
         }
-        // Overlapped IO가 실패하거나 핸들을 얻지 못한 경우 표준 파일 I/O로 우회합니다.
         fs::write(path, data).map_err(|e| anyhow::anyhow!("Fallback write failed: {}", e))
     }
 }
