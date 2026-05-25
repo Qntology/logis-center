@@ -86,7 +86,19 @@ async fn stop_current_extraction(
         if let Some(ref id) = task_id {
             let _ = db.update_task_status(id, crate::logic::parse_status("cancel")).await;
             let _ = db.delete_message_by_task_id(id).await;
-            println!("[STOP] Task and message {} cleared from DB.", id);
+            
+            // [CLEANUP] 작업 취소 시 해당 세션의 무거운 KV 캐시와 임시 데이터 폴더를 즉각 삭제하여 디스크 용량을 확보합니다.
+            let kv_dir = crate::utils::paths::get_kv_dir(None).join(id);
+            let base_kv_dir = crate::utils::paths::get_kv_dir(None).join(format!("{}_base", id));
+            let task_data_dir = crate::utils::paths::get_task_specific_dir(None, id);
+            let pug_log_dir = crate::utils::paths::get_pug_logs_dir(None, id);
+
+            let _ = std::fs::remove_dir_all(&kv_dir);
+            let _ = std::fs::remove_dir_all(&base_kv_dir);
+            let _ = std::fs::remove_dir_all(&task_data_dir);
+            let _ = std::fs::remove_dir_all(&pug_log_dir);
+
+            println!("[STOP] Task {} cleared from DB and temporary files deleted.", id);
         } else {
             
             let _ = db.cleanup_unfinished_tasks_on_startup().await;
@@ -97,6 +109,9 @@ async fn stop_current_extraction(
 
     // 3. Try to clear model
     if let Ok(mut model_guard) = state.model.try_lock() {
+        if let Some(m) = model_guard.as_ref() {
+            m.deep_purge_resources().await; // 모델 메모리 및 VRAM 캐시도 확실하게 강제 파기
+        }
         *model_guard = None;
     }
 
@@ -106,7 +121,7 @@ async fn stop_current_extraction(
         *w = None;
     }
 
-    Ok("Stop signal sent.".to_string())
+    Ok("Stop signal sent and resources cleaned.".to_string())
 }
 
 #[tauri::command]
@@ -1702,6 +1717,9 @@ pub fn run() {
                 println!("[Setup] Syncing model configs from {:?} to {:?}", src, dest_models_dir);
                 let _ = crate::utils::paths::copy_model_configs(&src, &dest_models_dir);
             }
+
+            // [INIT] AppData/tmp 내부의 kv, logs, task_data 디렉토리를 초기화하여 이전 실행의 찌꺼기 완벽 삭제
+            crate::utils::paths::cleanup_temp_dirs(Some(app.handle()));
 
             // [INIT] KV Bake Worker (Immediate)
             crate::models::qwen::generate::init_bake_worker();
