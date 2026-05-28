@@ -452,32 +452,43 @@ impl LogisModel {
     
     pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool, kv_name: Option<String>) -> anyhow::Result<()> {
         let start_time = Instant::now();
+
+        // 🌟 [추가] 현재 로드된 모델이 목표와 같다면 로딩 과정을 건너뛰고 즉시 반환하여 VRAM 낭비 및 지연 방지
+        {
+            let current = self.current_size.lock().await;
+            if *current == Some(target_size) {
+                let is_loaded = match target_size {
+                    ModelSize::Qwen => self.generator.lock().await.is_some(),
+                    ModelSize::Qwen3 => self.qwen3_generator.lock().await.is_some(),
+                    ModelSize::Qwen3_5 => self.qwen3_5_generator.lock().await.is_some(),
+                };
+                if is_loaded {
+                    println!("[RELAY] {:?} is already loaded. Skipping purge/reload.", target_size);
+                    return Ok(());
+                }
+            }
+        }
         
         println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
-        self.deep_purge_resources().await; //
+        self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {
             tokio::time::sleep(Duration::from_millis(500)).await;
             self.wait_for_vram_settle(2000, 5, cancel_token.clone()).await?;
         }
 
-        // 🌟 [핵심 변경] Enum 타입에 따라 완벽하게 독립된 로더를 타도록 분기
         match target_size {
             ModelSize::Qwen => {
-                // 기존 0.6B VLM 로직 (Small)
                 self.ensure_generator_ext(ModelSize::Qwen, false, is_baking).await?;
                 if let Some(tid) = task_id {
                     self.load_kv_snapshot(tid, kv_name).await?;
                 }
             },
             ModelSize::Qwen3 => {
-                // 🌟 신규 0.8B 텍스트 전용 로직 (기존 Large 위치 대체)
-                // Part 1에서 만든 ensure_qwen3()를 호출하여 /qwen3/ 로직만 타게 합니다.
                 self.ensure_qwen3().await?;
             },
             ModelSize::Qwen3_5 => {
-                // 0.8B Qwen 3.5 로직
-                self.ensure_qwen3_5(false).await?; // 🌟 ModelSize::Qwen3_5 대신 false 로 변경
+                self.ensure_qwen3_5(false).await?;
             }
         }
 

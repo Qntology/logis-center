@@ -106,14 +106,17 @@ impl Qwen3Attention {
             .transpose(1, 2)?;
         let (query_states, key_states) =
             apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
-        let (key_states, value_states) = match &self.kv_cache {
-            None => (key_states, value_states),
+        
+        // 🌟 [CRITICAL FIX] 동일하게 소유권(take)을 빼앗아 VRAM 2배 널뛰기 스파이크를 완전히 제거합니다.
+        let (key_states, value_states) = match self.kv_cache.take() {
+            None => (key_states.contiguous()?, value_states.contiguous()?),
             Some((prev_k, prev_v)) => {
-                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
-                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
-                (key_states, value_states)
+                let k = Tensor::cat(&[&prev_k, &key_states], 2)?.contiguous()?;
+                let v = Tensor::cat(&[&prev_v, &value_states], 2)?.contiguous()?;
+                (k, v)
             }
         };
+        
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
         let attn_output = eager_attention_forward(
             &query_states,
@@ -280,7 +283,7 @@ impl Qwen3Model {
                 Some(prepare_causal_attention_mask(
                     bs,
                     seq_len,
-                    0,
+                    seqlen_offset, // 🌟 [CRITICAL FIX] 청크 분할로 인해 누적된 과거 토큰 길이만큼 마스크 크기를 동적으로 연장합니다.
                     inputs_embeds.device(),
                 )?)
             }

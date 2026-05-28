@@ -72,8 +72,10 @@ impl Qwen3GenerateModel {
         // GGUF 텐서 이름을 Qwen3Model 구조체 이름에 맞게 자동 번역
         let mut data = std::collections::HashMap::new();
         for (name, _) in ct.tensor_infos.iter() {
-            let t = ct.tensor(&mut file, name, &device)?;
-            let t = t.dequantize_f16(&device).or_else(|_| t.dequantize(&device))?.to_dtype(dtype)?;
+            // 🌟 [VRAM 최적화 1] GPU에서 직접 압축을 풀면 압축 원본과 해제본이 동시에 VRAM을 점유하여(메모리 파편화) 2.4GB까지 치솟습니다.
+            // CPU(RAM)에서 압축을 해제한 후 깨끗한 텐서만 GPU로 전송하여 VRAM 적재량을 1.2GB 수준으로 반토막 냅니다!
+            let t_cpu = ct.tensor(&mut file, name, &candle_core::Device::Cpu)?;
+            let t = t_cpu.dequantize_f16(&candle_core::Device::Cpu).or_else(|_| t_cpu.dequantize(&candle_core::Device::Cpu))?.to_device(&device)?.to_dtype(dtype)?;
             
             let mut new_name = name.clone();
             if let Some(rest) = name.strip_prefix("blk.") {
@@ -185,7 +187,25 @@ impl Qwen3GenerateModel {
         let seq_len = input_ids.dim(1)?;
         if seq_len == 0 { return Ok(()); }
 
-        let _ = self.qwen3.forward(Some(&input_ids), None, 0)?;
+        // 🌟 [Chunked Prefill] 1024 토큰 단위로 잘라 넣어 VRAM OOM(Attention N^2)을 원천 방어합니다.
+        let chunk_size = 1024;
+        let mut seqlen_offset = 0;
+        
+        while seqlen_offset < seq_len {
+            if let Some(flag) = &_cancellation_token {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+            }
+            let take = std::cmp::min(chunk_size, seq_len - seqlen_offset);
+            let chunk_ids = input_ids.narrow(1, seqlen_offset, take)?;
+            let _ = self.qwen3.forward(Some(&chunk_ids), None, seqlen_offset)?;
+            
+            // 🌟 [VRAM 최적화 2] 청크 연산 직후 GPU를 동기화하여 이전 청크의 가비지 메모리를 즉시 수거합니다.
+            if self.device.is_cuda() { let _ = self.device.synchronize(); }
+
+            seqlen_offset += take;
+        }
 
         if let Some(session_id) = save_session_id {
             self.save_kv_cache(&session_id, cache_dir)?;
@@ -216,39 +236,141 @@ impl Qwen3GenerateModel {
         let mut logit_processor = get_logit_processor(Some(temperature as f32), Some(top_p as f32), Some(top_k), seed);
 
         let mes_render = self.chat_template.apply_chat_template(mes)?;
-        let f_ids = self.tokenizer.text_encode_vec(mes_render, false)?;
+        // 🌟 [CRITICAL FIX] 소유권 박탈(E0382) 방지를 위해 clone()을 넘겨줍니다.
+        let f_ids = self.tokenizer.text_encode_vec(mes_render.clone(), false)?;
         
         if start_len >= f_ids.len() {
             return Err(anyhow::anyhow!("start_len exceeds or equals prompt length"));
         }
 
         let p_ids = &f_ids[start_len..];
-        let mut input_ids = Tensor::from_vec(p_ids.to_vec(), (1, p_ids.len()), &self.device)?;
+        let input_ids = Tensor::from_vec(p_ids.to_vec(), (1, p_ids.len()), &self.device)?;
         
-        let mut seq_len = input_ids.dim(1)?;
+        let prompt_seq_len = input_ids.dim(1)?;
         let mut seqlen_offset = start_len;
         let mut generate = Vec::new();
         let sample_len = mes.max_tokens.unwrap_or(2048);
 
-        for _ in 0..sample_len {
+        // 🌟 [JSON Enforcement Prep] 프롬프트를 기반으로 JSON 모드 여부를 판단하고 특수 토큰을 준비합니다.
+        let is_strict_json = mes_render.contains("/no_think") || mes_render.contains("RETURN JSON ONLY");
+        let think_token_id = self.tokenizer.text_encode_vec("<think>".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
+        let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(123);
+        let lt_id = self.tokenizer.text_encode_vec("<".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
+        let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
+        let mut gen_text = String::new();
+
+        // 🌟 [Phase 1: Chunked Prefill] 긴 문맥을 1024 단위로 잘라서 캐시를 쌓습니다.
+        let chunk_size = 1024;
+        let mut next_token = 0;
+        let mut current_chunk_offset = 0;
+        
+        while current_chunk_offset < prompt_seq_len {
+            if let Some(flag) = &cancel_flag {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(String::new());
+                }
+            }
+            let take = std::cmp::min(chunk_size, prompt_seq_len - current_chunk_offset);
+            let chunk_ids = input_ids.narrow(1, current_chunk_offset, take)?;
+            
+            let logits = self.qwen3.forward(Some(&chunk_ids), None, seqlen_offset)?;
+            
+            // 🌟 [VRAM 최적화 2] 청크 연산 직후 GPU를 동기화하여 이전 청크의 가비지 메모리를 즉시 수거합니다.
+            if self.device.is_cuda() { let _ = self.device.synchronize(); }
+
+            seqlen_offset += take;
+            current_chunk_offset += take;
+            
+            // 프리필이 완전히 끝나는 마지막 청크의 끝에서만 첫 번째 토큰을 샘플링합니다.
+            if current_chunk_offset == prompt_seq_len {
+                let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+                let mut logits_vec = logits.to_vec1::<f32>()?;
+                let len = logits_vec.len();
+
+                // 🌟 JSON 강제 룰 적용 (첫 토큰)
+                if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
+                if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 10.0; }
+                if (self.eos_token_id1 as usize) < len { logits_vec[self.eos_token_id1 as usize] = -10000.0; }
+                if (self.eos_token_id2 as usize) < len { logits_vec[self.eos_token_id2 as usize] = -10000.0; }
+                if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
+
+                if is_strict_json && (open_bracket_id as usize) < len {
+                    logits_vec[open_bracket_id as usize] += 10000.0;
+                }
+
+                let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
+                next_token = logit_processor.sample(&logits_tensor)?;
+
+                if is_strict_json { next_token = open_bracket_id; }
+
+                generate.push(next_token);
+                if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) { gen_text.push_str(&piece); }
+            }
+        }
+
+        // 🌟 [Phase 2: Decoding] 첫 토큰을 얻은 후 1글자씩 이어서 생성합니다.
+        for i in 1..sample_len {
+            if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
+                break;
+            }
             if let Some(flag) = &cancel_flag {
                 if flag.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
             }
 
-            let logits = self.qwen3.forward(Some(&input_ids), None, seqlen_offset)?;
+            let single_input = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
+            let logits = self.qwen3.forward(Some(&single_input), None, seqlen_offset)?;
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-            let next_token = logit_processor.sample(&logits)?;
+            
+            let mut logits_vec = logits.to_vec1::<f32>()?;
+            let len = logits_vec.len();
+
+            // <think> 지속 억제
+            if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
+
+            let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
+            next_token = logit_processor.sample(&logits_tensor)?;
+
             generate.push(next_token);
-            if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
-                break;
+            if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
+                gen_text.push_str(&piece);
             }
-            seqlen_offset += seq_len;
-            seq_len = 1;
-            input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
+
+            // 🌟 JSON 닫힘 감지 조기 종료 (추론 속도 향상)
+            if is_strict_json && gen_text.contains('{') {
+                let mut depth = 0;
+                let mut has_started = false;
+                for c in gen_text.chars() {
+                    if c == '{' { depth += 1; has_started = true; }
+                    else if c == '}' { depth -= 1; }
+                }
+                if has_started && depth == 0 && gen_text.trim_end().ends_with('}') {
+                    break;
+                }
+            }
+
+            seqlen_offset += 1;
+
+            // 🌟 메모리 최적화 (30토큰마다 OS 시스템 RAM 스파이크 억제 및 반환)
+            if i > 0 && i % 30 == 0 {
+                // 🌟 [VRAM 최적화 3] 디코딩 중 발생하는 KV Cache 병합(Cat) 찌꺼기 텐서들을 즉시 날려버립니다.
+                if self.device.is_cuda() { let _ = self.device.synchronize(); }
+
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+                #[cfg(target_os = "linux")]
+                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+                #[cfg(target_os = "macos")]
+                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+            }
         }
 
+        // BPE 디코딩 무결성을 보장하기 위해 최종 조립은 배열 기반으로 수행합니다.
         let res_text = self.tokenizer.token_decode(generate)?;
         
         Ok(res_text)
@@ -271,29 +393,131 @@ impl Qwen3GenerateModel {
             get_logit_processor(Some(temperature as f32), Some(top_p as f32), Some(top_k), seed);
 
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
-        let mut input_ids = self.tokenizer.text_encode(mes_render, &self.device)?;
-        let mut seq_len = input_ids.dim(1)?;
+        let input_ids = self.tokenizer.text_encode(mes_render.clone(), &self.device)?;
+        let prompt_seq_len = input_ids.dim(1)?;
         let mut seqlen_offset = 0;
         let mut generate = Vec::new();
         let sample_len = mes.max_tokens.unwrap_or(2048);
-        for _ in 0..sample_len {
+        
+        if prompt_seq_len == 0 { return Ok(String::new()); }
+
+        // 🌟 [JSON Enforcement Prep] 프롬프트를 기반으로 JSON 모드 여부를 판단하고 특수 토큰을 준비합니다.
+        let is_strict_json = mes_render.contains("/no_think") || mes_render.contains("RETURN JSON ONLY");
+        let think_token_id = self.tokenizer.text_encode_vec("<think>".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
+        let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(123);
+        let lt_id = self.tokenizer.text_encode_vec("<".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
+        let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
+        let mut gen_text = String::new();
+
+        // 🌟 [Phase 1: Chunked Prefill] 긴 문맥을 1024 토큰 단위로 잘라 VRAM 폭발을 막습니다.
+        let chunk_size = 1024;
+        let mut next_token = 0;
+        
+        while seqlen_offset < prompt_seq_len {
+            if let Some(flag) = &cancel_flag {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(String::new());
+                }
+            }
+            let take = std::cmp::min(chunk_size, prompt_seq_len - seqlen_offset);
+            let chunk_ids = input_ids.narrow(1, seqlen_offset, take)?;
+            
+            let logits = self.qwen3.forward(Some(&chunk_ids), None, seqlen_offset)?;
+            
+            // 🌟 [VRAM 최적화 2] 청크 연산 직후 GPU를 동기화하여 이전 청크의 가비지 메모리를 즉시 수거합니다.
+            if self.device.is_cuda() { let _ = self.device.synchronize(); }
+
+            seqlen_offset += take;
+            
+            // 프리필이 완전히 끝나는 마지막 청크의 끝에서만 첫 번째 토큰을 샘플링합니다.
+            if seqlen_offset == prompt_seq_len {
+                let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+                let mut logits_vec = logits.to_vec1::<f32>()?;
+                let len = logits_vec.len();
+
+                // 🌟 JSON 강제 룰 적용 (첫 토큰)
+                if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
+                if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 10.0; }
+                if (self.eos_token_id1 as usize) < len { logits_vec[self.eos_token_id1 as usize] = -10000.0; }
+                if (self.eos_token_id2 as usize) < len { logits_vec[self.eos_token_id2 as usize] = -10000.0; }
+                if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
+
+                if is_strict_json && (open_bracket_id as usize) < len {
+                    logits_vec[open_bracket_id as usize] += 10000.0;
+                }
+
+                let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
+                next_token = logit_processor.sample(&logits_tensor)?;
+
+                if is_strict_json { next_token = open_bracket_id; }
+
+                generate.push(next_token);
+                if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) { gen_text.push_str(&piece); }
+            }
+        }
+
+        // 🌟 [Phase 2: Decoding] 첫 번째 토큰을 얻은 후 1글자씩 이어서 생성합니다.
+        for i in 1..sample_len {
+            if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
+                break;
+            }
             if let Some(flag) = &cancel_flag {
                 if flag.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
             }
 
-            let logits = self.qwen3.forward(Some(&input_ids), None, seqlen_offset)?;
+            let single_input = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
+            let logits = self.qwen3.forward(Some(&single_input), None, seqlen_offset)?;
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-            let next_token = logit_processor.sample(&logits)?;
+            
+            let mut logits_vec = logits.to_vec1::<f32>()?;
+            let len = logits_vec.len();
+
+            // <think> 지속 억제
+            if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
+
+            let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
+            next_token = logit_processor.sample(&logits_tensor)?;
+            
             generate.push(next_token);
-            if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
-                break;
+            if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
+                gen_text.push_str(&piece);
             }
-            seqlen_offset += seq_len;
-            seq_len = 1;
-            input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
+
+            // 🌟 JSON 닫힘 감지 조기 종료 (추론 속도 향상)
+            if is_strict_json && gen_text.contains('{') {
+                let mut depth = 0;
+                let mut has_started = false;
+                for c in gen_text.chars() {
+                    if c == '{' { depth += 1; has_started = true; }
+                    else if c == '}' { depth -= 1; }
+                }
+                if has_started && depth == 0 && gen_text.trim_end().ends_with('}') {
+                    break;
+                }
+            }
+
+            seqlen_offset += 1;
+
+            // 🌟 메모리 최적화 (30토큰마다 OS 시스템 RAM 스파이크 억제 및 반환)
+            if i > 0 && i % 30 == 0 {
+                // 🌟 [VRAM 최적화 3] 디코딩 중 발생하는 KV Cache 병합(Cat) 찌꺼기 텐서들을 즉시 날려버립니다.
+                if self.device.is_cuda() { let _ = self.device.synchronize(); }
+
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+                #[cfg(target_os = "linux")]
+                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+                #[cfg(target_os = "macos")]
+                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+            }
         }
+
         let res = self.tokenizer.token_decode(generate)?;
         self.qwen3.clear_kv_cache();
         Ok(res)

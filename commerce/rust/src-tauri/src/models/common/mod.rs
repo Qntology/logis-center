@@ -526,14 +526,18 @@ impl QKNormAttention {
             .transpose(1, 2)?;
         let (query_states, key_states) =
             apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
-        let (key_states, value_states) = match &self.kv_cache {
-            None => (key_states, value_states),
+        
+        // 🌟 [CRITICAL FIX] `&self.kv_cache`로 참조(Borrow)하면 이전 캐시와 새 캐시가 VRAM에 동시에 존재하여 2배 폭발이 일어납니다!
+        // `take()`로 소유권을 완전히 빼앗아 연산 직후 이전 캐시가 VRAM에서 즉시 소멸되도록 수정합니다.
+        let (key_states, value_states) = match self.kv_cache.take() {
+            None => (key_states.contiguous()?, value_states.contiguous()?),
             Some((prev_k, prev_v)) => {
-                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
-                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
-                (key_states, value_states)
+                let k = Tensor::cat(&[&prev_k, &key_states], 2)?.contiguous()?;
+                let v = Tensor::cat(&[&prev_v, &value_states], 2)?.contiguous()?;
+                (k, v)
             }
         };
+        
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
         let attn_output = eager_attention_forward(
             &query_states,
@@ -733,53 +737,123 @@ pub fn eager_attention_forward(
     attention_mask: Option<&Tensor>,
     scaling: f64,
 ) -> Result<Tensor> {
-    // input q shape:(b, num_head, seq_len, dim)
-    // input k/v shape:(b, num_kv_head, seq_len, dim)
-    let key_states = match num_key_value_groups {
-        Some(g) => repeat_kv(key_states.clone(), g)?.contiguous()?,
-        None => key_states.clone(),
-    };
-    let value_states = match num_key_value_groups {
-        Some(g) => repeat_kv(value_states.clone(), g)?.contiguous()?,
-        None => value_states.clone(),
-    };
-    let query_states = query_states.contiguous()?;
-    let key_states = key_states.contiguous()?;
-    let value_states = value_states.contiguous()?;
-    let attn_output = {
-        #[cfg(not(feature = "flash-attn"))]
-        {
-            let attn_weights = query_states.matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?;
+    let dev = query_states.device();
+    let orig_dtype = query_states.dtype();
+    
+    // 🌟 [VRAM 최적화] F32 연산은 VRAM을 2배로 폭식하므로, Attention 연산 직전에만 BF16으로 다운캐스팅하여 OOM을 원천 차단합니다.
+    let target_dtype = if dev.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+
+    #[cfg(feature = "flash-attn")]
+    {
+        // Flash Attention은 GQA를 네이티브로 지원하며 BF16/F16을 요구합니다.
+        let q = query_states.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+        let k = key_states.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+        let v = value_states.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+        
+        let attn_output = candle_flash_attn::flash_attn(
+            &q, &k, &v,
+            scaling as f32,
+            attention_mask.is_some(),
+        )?.transpose(1, 2)?;
+        
+        return Ok(attn_output.to_dtype(orig_dtype)?.contiguous()?);
+    }
+
+    #[cfg(not(feature = "flash-attn"))]
+    {
+        let kv_seq_len = key_states.dim(2)?;
+        let block_size = 4096;
+
+        // GQA 처리를 위한 K, V 복제 (Flash Attention 미사용 시 필수)
+        let key_states_rep = match num_key_value_groups {
+            Some(g) if g > 1 => repeat_kv(key_states.clone(), g)?,
+            _ => key_states.clone(),
+        };
+        let value_states_rep = match num_key_value_groups {
+            Some(g) if g > 1 => repeat_kv(value_states.clone(), g)?,
+            _ => value_states.clone(),
+        };
+        
+        let q_aligned = query_states.to_dtype(target_dtype)?.contiguous()?;
+        let k_aligned = key_states_rep.to_dtype(target_dtype)?.contiguous()?;
+        let v_aligned = value_states_rep.to_dtype(target_dtype)?.contiguous()?;
+
+        // 짧은 문맥이거나 이미지가 작을 경우 기존 방식 사용
+        if kv_seq_len <= block_size {
+            let attn_weights = q_aligned.matmul(&k_aligned.transpose(D::Minus2, D::Minus1)?)?;
             let attn_weights = (attn_weights * scaling)?;
+            
             let attn_weights = match attention_mask {
                 None => attn_weights,
-                Some(mask) => attn_weights.broadcast_add(&mask.to_dtype(attn_weights.dtype())?)?,
+                Some(mask) => {
+                    let mask_aligned = mask.to_dtype(target_dtype)?;
+                    attn_weights.broadcast_add(&mask_aligned)?
+                }
             };
+            
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            attn_weights.matmul(&value_states)?
+            let attn_output = attn_weights.matmul(&v_aligned)?;
+            return Ok(attn_output.to_dtype(orig_dtype)?.transpose(1, 2)?.contiguous()?);
         }
-        #[cfg(feature = "flash-attn")]
-        {
-            // use flash-attn,
-            // flash-attn shape: (bs, seq_len, num_head, head_dim)
-            let query_states = query_states.transpose(1, 2)?;
-            let key_states = key_states.transpose(1, 2)?;
-            let value_states = value_states.transpose(1, 2)?;
-            let attn_output = candle_flash_attn::flash_attn(
-                &query_states,
-                &key_states,
-                &value_states,
-                scaling as f32,
-                attention_mask.is_some(),
-            )?
-            .transpose(1, 2)?;
-            attn_output
-        }
-    };
-    //(b, n_head, seq_len, dim) -> (b, seq_len, n_head, dim)
-    let attn_output = attn_output.transpose(1, 2)?.contiguous()?;
 
-    Ok(attn_output)
+        // [FLASH-DECODING] 5만 토큰 이상의 초장문 문맥을 위한 블록 단위 어텐션 최적화
+        let num_blocks = (kv_seq_len + block_size - 1) / block_size;
+        let mut block_outputs = Vec::with_capacity(num_blocks); 
+        let mut block_lse = Vec::with_capacity(num_blocks); 
+
+        for i in 0..num_blocks {
+            let start = i * block_size;
+            let end = (start + block_size).min(kv_seq_len); 
+            let k_block = k_aligned.narrow(2, start, end - start)?;
+            let v_block = v_aligned.narrow(2, start, end - start)?; 
+
+            let attn_weights = (q_aligned.matmul(&k_block.transpose(2, 3)?)? * scaling)?; 
+            
+            let attn_weights = if let Some(mask) = attention_mask {
+                let m_len = mask.dim(D::Minus1)?;
+                if start < m_len {
+                    let m_end = end.min(m_len);
+                    let sub_mask = mask.narrow(D::Minus1, start, m_end - start)?;
+                    attn_weights.broadcast_add(&sub_mask.to_dtype(target_dtype)?)?
+                } else {
+                    attn_weights
+                }
+            } else {
+                attn_weights
+            };
+
+            let max_logits = attn_weights.max_keepdim(D::Minus1)?;
+            let safe_floor = Tensor::new(-10000.0_f32, max_logits.device())?.to_dtype(max_logits.dtype())?.broadcast_as(max_logits.shape())?;
+            let max_logits_safe = max_logits.maximum(&safe_floor)?;
+
+            let exp_weights = attn_weights.broadcast_sub(&max_logits_safe)?.exp()?;
+            let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
+            
+            let out_block = exp_weights.matmul(&v_block)?;
+
+            block_outputs.push(out_block);
+            block_lse.push((sum_exp, max_logits));
+        }
+
+        let (mut current_exp_sum, mut current_max_logit) = block_lse[0].clone();
+        let mut final_output = block_outputs[0].clone();
+
+        for i in 1..num_blocks {
+            let (next_exp_sum, next_max_logit) = &block_lse[i];
+            let out_i = &block_outputs[i];
+
+            let new_max_logit = current_max_logit.broadcast_maximum(next_max_logit)?;
+            let exp_a = current_max_logit.broadcast_sub(&new_max_logit)?.exp()?;
+            let exp_b = next_max_logit.broadcast_sub(&new_max_logit)?.exp()?;
+
+            final_output = (final_output.broadcast_mul(&exp_a)? + out_i.broadcast_mul(&exp_b)?)?;
+            current_exp_sum = (current_exp_sum.broadcast_mul(&exp_a)? + next_exp_sum.broadcast_mul(&exp_b)?)?;
+            current_max_logit = new_max_logit;
+        }
+
+        let final_output = final_output.broadcast_div(&current_exp_sum)?;
+        Ok(final_output.to_dtype(orig_dtype)?.transpose(1, 2)?.contiguous()?)
+    }
 }
 
 pub fn get_conv2d(
