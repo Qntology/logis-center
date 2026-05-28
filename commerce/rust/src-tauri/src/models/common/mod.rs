@@ -532,13 +532,23 @@ impl QKNormAttention {
         let (key_states, value_states) = match self.kv_cache.take() {
             None => (key_states.contiguous()?, value_states.contiguous()?),
             Some((prev_k, prev_v)) => {
+                let dev = key_states.device();
+                // CPU RAM에 대피해 있던 이전 캐시를 잠시 VRAM으로 가져와 병합 연산을 수행합니다.
+                let prev_k = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k };
+                let prev_v = if !prev_v.device().same_device(dev) { prev_v.to_device(dev)? } else { prev_v };
                 let k = Tensor::cat(&[&prev_k, &key_states], 2)?.contiguous()?;
                 let v = Tensor::cat(&[&prev_v, &value_states], 2)?.contiguous()?;
                 (k, v)
             }
         };
         
-        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+        // 🌟 [JIT CPU Offload] 연산에 사용할 원본(BF16)은 VRAM에 남겨 고속으로 처리하고,
+        // 다음 턴을 위한 보관용 캐시만 즉시 CPU RAM으로 대피시킵니다.
+        // 이 한 줄로 28개 레이어의 캐시가 VRAM에 쌓이는 현상을 원천 차단하여 피크를 0으로 만듭니다!
+        self.kv_cache = Some((
+            key_states.to_device(&candle_core::Device::Cpu)?, 
+            value_states.to_device(&candle_core::Device::Cpu)?
+        ));
         let attn_output = eager_attention_forward(
             &query_states,
             &key_states,

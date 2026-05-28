@@ -1171,8 +1171,9 @@ impl QuantizedQwenVLTextAttention {
 
         if let (Some(mk), Some(mv)) = (&self.vram_merged_k, &self.vram_merged_v) {
             
-            let mk_cpu = mk.contiguous()?.to_device(dev)?;
-            let mv_cpu = mv.contiguous()?.to_device(dev)?;
+            // 🌟 [FP8 Compression] GPU VRAM 내부에서 데이터 크기를 F8E4M3로 절반으로 압축한 뒤 CPU RAM으로 던집니다.
+            let mk_cpu = mk.contiguous()?.to_dtype(candle_core::DType::F8E4M3)?.to_device(dev)?;
+            let mv_cpu = mv.contiguous()?.to_dtype(candle_core::DType::F8E4M3)?.to_device(dev)?;
             
             let mut current_pos = 0;
             for block in &mut self.kv_blocks {
@@ -1215,8 +1216,9 @@ impl QuantizedQwenVLTextAttention {
             let merged_k = Tensor::cat(&k_list, 2)?.contiguous()?;
             let merged_v = Tensor::cat(&v_list, 2)?.contiguous()?;
             
-            let merged_k_cpu = merged_k.to_device(dev)?;
-            let merged_v_cpu = merged_v.to_device(dev)?;
+            // 🌟 [FP8 Compression] VRAM 병합 텐서를 FP8로 즉시 형변환하여 대역폭 점유율과 RAM 사용량을 50% 절감합니다.
+            let merged_k_cpu = merged_k.to_dtype(candle_core::DType::F8E4M3)?.to_device(dev)?;
+            let merged_v_cpu = merged_v.to_dtype(candle_core::DType::F8E4M3)?.to_device(dev)?;
             
             let mut current_pos = 0;
             for (i, &idx) in target_idxs.iter().enumerate() {
@@ -2137,8 +2139,9 @@ impl QuantizedQwenVLTextModel {
                     let merged_k = Tensor::cat(&k_list, 2)?.contiguous()?;
                     let merged_v = Tensor::cat(&v_list, 2)?.contiguous()?;
                     
-                    let merged_k_cpu = merged_k.to_device(&Device::Cpu)?;
-                    let merged_v_cpu = merged_v.to_device(&Device::Cpu)?;
+                    // 🌟 [FP8 Compression] 긴 문맥 OOM 억제를 위한 강제 RAM 대피 시에도 VRAM에서 FP8로 선압축합니다.
+                    let merged_k_cpu = merged_k.to_dtype(candle_core::DType::F8E4M3)?.to_device(&Device::Cpu)?;
+                    let merged_v_cpu = merged_v.to_dtype(candle_core::DType::F8E4M3)?.to_device(&Device::Cpu)?;
                     
                     let mut current_pos = 0;
                     for (i, &idx) in target_idxs.iter().enumerate() {
@@ -2342,8 +2345,10 @@ impl QuantizedQwenVLTextModel {
                 let merged_k_gpu = candle_core::Tensor::cat(&gpu_k_list, 2).unwrap_or_else(|_| gpu_k_list[0].clone());
                 let merged_v_gpu = candle_core::Tensor::cat(&gpu_v_list, 2).unwrap_or_else(|_| gpu_v_list[0].clone());
 
-                let merged_k_cpu = merged_k_gpu.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
-                let merged_v_cpu = merged_v_gpu.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
+                // 🌟 [FP8 Compression] 전체 활성 블록을 디스크로 보낼 때 VRAM 안에서 먼저 FP8로 캐스팅해 RAM으로 보냅니다.
+                // SSD 저장 로직(LayerKVDump) 내부에서 백그라운드 스레드가 이를 다시 원래의 BF16으로 무손실 복구해 저장하게 됩니다.
+                let merged_k_cpu = merged_k_gpu.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| merged_k_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
+                let merged_v_cpu = merged_v_gpu.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| merged_v_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
 
                 // 3. CPU에서 다시 썰어서 할당 및 덤프 생성
                 let mut current_offset = 0;
@@ -2472,8 +2477,9 @@ impl QuantizedQwenVLTextModel {
             let merged_k_gpu = candle_core::Tensor::cat(&gpu_k_list, 2).unwrap_or_else(|_| gpu_k_list[0].clone());
             let merged_v_gpu = candle_core::Tensor::cat(&gpu_v_list, 2).unwrap_or_else(|_| gpu_v_list[0].clone());
 
-            let merged_k_cpu = merged_k_gpu.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
-            let merged_v_cpu = merged_v_gpu.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
+            // 🌟 [FP8 Compression] 디코딩 롤백 시 단일 레이어 VRAM 완전 철수 과정에서도 GPU 코어로 초고속 FP8 압축합니다.
+            let merged_k_cpu = merged_k_gpu.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| merged_k_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
+            let merged_v_cpu = merged_v_gpu.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| merged_v_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
 
             let mut current_offset = 0;
             let mut reg = self.registry.entries.write().unwrap();

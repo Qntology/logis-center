@@ -187,8 +187,8 @@ impl Qwen3GenerateModel {
         let seq_len = input_ids.dim(1)?;
         if seq_len == 0 { return Ok(()); }
 
-        // 🌟 [Chunked Prefill] 1024 토큰 단위로 잘라 넣어 VRAM OOM(Attention N^2)을 원천 방어합니다.
-        let chunk_size = 1024;
+        // 🌟 [Chunked Prefill] VRAM 및 RAM 널뛰기를 원천 방어하기 위해 청크 사이즈를 256으로 축소하여 강하게 압박합니다.
+        let chunk_size = 256;
         let mut seqlen_offset = 0;
         
         while seqlen_offset < seq_len {
@@ -201,8 +201,19 @@ impl Qwen3GenerateModel {
             let chunk_ids = input_ids.narrow(1, seqlen_offset, take)?;
             let _ = self.qwen3.forward(Some(&chunk_ids), None, seqlen_offset)?;
             
-            // 🌟 [VRAM 최적화 2] 청크 연산 직후 GPU를 동기화하여 이전 청크의 가비지 메모리를 즉시 수거합니다.
+            // 🌟 [VRAM/RAM 최적화] 청크 연산 직후 GPU를 동기화하고 시스템 메모리(RAM)를 강제로 반환시킵니다.
             if self.device.is_cuda() { let _ = self.device.synchronize(); }
+
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+            }
+            #[cfg(target_os = "linux")]
+            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+            #[cfg(target_os = "macos")]
+            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
 
             seqlen_offset += take;
         }
@@ -259,8 +270,8 @@ impl Qwen3GenerateModel {
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
         let mut gen_text = String::new();
 
-        // 🌟 [Phase 1: Chunked Prefill] 긴 문맥을 1024 단위로 잘라서 캐시를 쌓습니다.
-        let chunk_size = 1024;
+        // 🌟 [Phase 1: Chunked Prefill] VRAM 폭발과 RAM 널뛰기를 막기 위해 256 토큰 단위로 강하게 압박합니다.
+        let chunk_size = 256;
         let mut next_token = 0;
         let mut current_chunk_offset = 0;
         
@@ -275,8 +286,19 @@ impl Qwen3GenerateModel {
             
             let logits = self.qwen3.forward(Some(&chunk_ids), None, seqlen_offset)?;
             
-            // 🌟 [VRAM 최적화 2] 청크 연산 직후 GPU를 동기화하여 이전 청크의 가비지 메모리를 즉시 수거합니다.
+            // 🌟 [VRAM/RAM 최적화] 청크 연산 직후 GPU를 동기화하고 시스템 메모리를 즉각 수거하여 피크를 억제합니다.
             if self.device.is_cuda() { let _ = self.device.synchronize(); }
+
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+            }
+            #[cfg(target_os = "linux")]
+            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+            #[cfg(target_os = "macos")]
+            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
 
             seqlen_offset += take;
             current_chunk_offset += take;
@@ -352,8 +374,8 @@ impl Qwen3GenerateModel {
 
             seqlen_offset += 1;
 
-            // 🌟 메모리 최적화 (30토큰마다 OS 시스템 RAM 스파이크 억제 및 반환)
-            if i > 0 && i % 30 == 0 {
+            // 🌟 메모리 최적화 (15토큰마다 OS 시스템 RAM 스파이크 억제 및 반환, 주기를 짧게 압박)
+            if i > 0 && i % 15 == 0 {
                 // 🌟 [VRAM 최적화 3] 디코딩 중 발생하는 KV Cache 병합(Cat) 찌꺼기 텐서들을 즉시 날려버립니다.
                 if self.device.is_cuda() { let _ = self.device.synchronize(); }
 
@@ -409,8 +431,8 @@ impl Qwen3GenerateModel {
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
         let mut gen_text = String::new();
 
-        // 🌟 [Phase 1: Chunked Prefill] 긴 문맥을 1024 토큰 단위로 잘라 VRAM 폭발을 막습니다.
-        let chunk_size = 1024;
+        // 🌟 [Phase 1: Chunked Prefill] 긴 문맥을 256 토큰 단위로 강하게 잘라 VRAM 및 RAM 널뛰기를 막습니다.
+        let chunk_size = 256;
         let mut next_token = 0;
         
         while seqlen_offset < prompt_seq_len {
@@ -424,8 +446,19 @@ impl Qwen3GenerateModel {
             
             let logits = self.qwen3.forward(Some(&chunk_ids), None, seqlen_offset)?;
             
-            // 🌟 [VRAM 최적화 2] 청크 연산 직후 GPU를 동기화하여 이전 청크의 가비지 메모리를 즉시 수거합니다.
+            // 🌟 [VRAM/RAM 최적화] 청크 연산 직후 GPU 동기화 및 시스템 메모리 강제 반환을 수행합니다.
             if self.device.is_cuda() { let _ = self.device.synchronize(); }
+
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+            }
+            #[cfg(target_os = "linux")]
+            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+            #[cfg(target_os = "macos")]
+            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
 
             seqlen_offset += take;
             
@@ -500,8 +533,8 @@ impl Qwen3GenerateModel {
 
             seqlen_offset += 1;
 
-            // 🌟 메모리 최적화 (30토큰마다 OS 시스템 RAM 스파이크 억제 및 반환)
-            if i > 0 && i % 30 == 0 {
+            // 🌟 메모리 최적화 (15토큰마다 OS 시스템 RAM 스파이크 억제 및 반환, 잦은 주기로 압박)
+            if i > 0 && i % 15 == 0 {
                 // 🌟 [VRAM 최적화 3] 디코딩 중 발생하는 KV Cache 병합(Cat) 찌꺼기 텐서들을 즉시 날려버립니다.
                 if self.device.is_cuda() { let _ = self.device.synchronize(); }
 
