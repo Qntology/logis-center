@@ -955,8 +955,15 @@ impl Qwen3_5Attention {
                                                     let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                                                     let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
                                                     
-                                                    let mut kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap();
-                                                    let mut vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap();
+                                                    let saved_dtype = match kd.dtype() {
+                                                        safetensors::Dtype::F8_E4M3 => DType::F8E4M3,
+                                                        safetensors::Dtype::F32 => DType::F32,
+                                                        safetensors::Dtype::F16 => DType::F16,
+                                                        _ => DType::BF16,
+                                                    };
+                                                    // 🌟 [버그 수정] F8E4M3/F32로 저장된 텐서를 무조건 BF16으로 읽어와서 파괴되는 현상을 고쳤습니다.
+                                                    let mut kd_t = Tensor::from_raw_buffer(kd.data(), saved_dtype, &meta_os, &Device::Cpu).unwrap();
+                                                    let mut vd_t = Tensor::from_raw_buffer(vd.data(), saved_dtype, &meta_os, &Device::Cpu).unwrap();
                                                     
                                                     if dev.is_cpu() {
                                                         kd_t = kd_t.to_dtype(DType::F32)?;

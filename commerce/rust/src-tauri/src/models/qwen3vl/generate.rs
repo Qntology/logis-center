@@ -73,10 +73,10 @@ impl Qwen3VLGenerateModel {
             .text_encode(input.replace_text.clone(), &self.device)?;
         let mut seq_len = input_ids.dim(1)?;
         let mut seqlen_offset = 0;
-        let pixel_values: Option<&Tensor> = input.pixel_values.as_ref();
-        let image_grid_thw: Option<&Tensor> = input.image_grid_thw.as_ref();
-        let pixel_values_video: Option<&Tensor> = input.pixel_values_video.as_ref();
-        let video_grid_thw: Option<&Tensor> = input.video_grid_thw.as_ref();
+        let mut cur_pixel_values: Option<&Tensor> = input.pixel_values.as_ref();
+        let mut cur_image_grid_thw: Option<&Tensor> = input.image_grid_thw.as_ref();
+        let mut cur_pixel_values_video: Option<&Tensor> = input.pixel_values_video.as_ref();
+        let mut cur_video_grid_thw: Option<&Tensor> = input.video_grid_thw.as_ref();
         let mut cache_position = Tensor::arange(0u32, seq_len as u32, &self.device)?;
         let mut generate = Vec::new();
         let sample_len = mes.max_tokens.unwrap_or(1024);
@@ -89,13 +89,19 @@ impl Qwen3VLGenerateModel {
 
             let logits = self.qwen3_vl.forward(
                 &input_ids,
-                pixel_values,
-                image_grid_thw,
-                pixel_values_video,
-                video_grid_thw,
+                cur_pixel_values,
+                cur_image_grid_thw,
+                cur_pixel_values_video,
+                cur_video_grid_thw,
                 Some(&cache_position),
                 seqlen_offset,
             )?;
+            
+            // 프리필(초기 문맥 파악) 통과 후 다음 글자(디코딩)부터는 무거운 비전 연산을 완전히 생략합니다.
+            cur_pixel_values = None;
+            cur_image_grid_thw = None;
+            cur_pixel_values_video = None;
+            cur_video_grid_thw = None;
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             let next_token = logit_processor.sample(&logits)?;
             generate.push(next_token);
@@ -106,6 +112,22 @@ impl Qwen3VLGenerateModel {
             seq_len = 1;
             input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
             cache_position = Tensor::from_vec(vec![seqlen_offset as u32], 1, &self.device)?;
+
+            // 🌟 [VRAM/RAM 최적화] 15토큰마다 OS 시스템 RAM 스파이크 억제 및 반환
+            if generate.len() % 15 == 0 {
+                if self.device.is_cuda() { let _ = self.device.synchronize(); }
+
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+                #[cfg(target_os = "linux")]
+                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+                #[cfg(target_os = "macos")]
+                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+            }
         }
         let res = self.tokenizer.token_decode(generate)?;
         self.qwen3_vl.clear_kv_cache();

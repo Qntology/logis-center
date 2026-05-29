@@ -235,6 +235,11 @@ impl Qwen3DecoderLayer {
         let residual = xs.clone();
         let xs = self.input_layernorm.forward(xs)?;
         let xs = self.self_attn.forward(&xs, cos, sin, attention_mask)?;
+        
+        // 🌟 [FP8 KV Cache] 레이어 연산이 끝나는 즉시, VRAM 코어를 사용해 초고속 FP8 압축 후 RAM으로 던집니다.
+        // 이 한 줄로 Qwen3, Qwen3VL 모델 모두 PCIe 대역폭이 절반으로 줄고 VRAM 피크가 원천 차단됩니다.
+        self.evacuate_kv_to_cpu()?;
+        
         let xs = residual.add(&xs)?;
         let residual = xs.clone();
         let xs = self.post_attention_layernorm.forward(&xs)?;

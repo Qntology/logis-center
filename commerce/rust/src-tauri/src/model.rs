@@ -121,7 +121,7 @@ use crate::models::qwen3::generate::Qwen3GenerateModel; // 🌟 Qwen3 텍스트 
 pub enum ModelSize {
     Qwen,    // 0.6B for Ingestion (기존 Small)
     Qwen3,   // Qwen3 Text Model (기존 Large, /qwen3/ 로직 전용)
-    Qwen3_5, // 0.8B Qwen 3.5 (Text Optimized)
+    Qwen3_5, // 2B Qwen 3.5 (Text Optimized)
 }
 
 #[derive(Clone)]
@@ -400,7 +400,7 @@ impl LogisModel {
             let kv_type = kv_name_str.split('/').last().unwrap_or("text");
             let kv_type = if kv_type == "inference" || kv_type == "reference" || kv_type.is_empty() { "text" } else { kv_type };
 
-            // 🌟 [핵심 픽스] 현재 모델이 Qwen 3.5(0.8B)라면 0.8B 방(q35_arc)에 스냅샷을 로드합니다!
+            // 🌟 [핵심 픽스] 현재 모델이 Qwen 3.5(2B)라면 2B 방(q35_arc)에 스냅샷을 로드합니다!
             if is_q35 {
                 let mut q35_guard = q35_arc.blocking_lock();
                 if let Some(gen) = q35_guard.as_mut() {
@@ -666,7 +666,7 @@ impl LogisModel {
         };
 
         if needs_load {
-            println!("[MODEL] Loading Qwen 3.5 Generator (0.8B) (Vision: {})...", needs_vision);
+            println!("[MODEL] Loading Qwen 3.5 Generator (2B) (Vision: {})...", needs_vision);
             self.unload_generator().await; 
             
             // 🌟 [핵심 픽스] 여기서도 로딩 전에 미리 방주인 등록!
@@ -794,7 +794,7 @@ impl LogisModel {
 
         let qwen_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf")); 
         let qwen3_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf")); 
-        let qwen3_5_model_path = normalize_path(base_path.join("Qwen3.5-0.8B-Instruct-gguf"));
+        let qwen3_5_model_path = normalize_path(base_path.join("Qwen3.5-2B-Instruct-gguf"));
         let embedding_path = base_path.join("embeddinggemma-300m");
 
         let max_tokens_limit = 65536; 
@@ -840,7 +840,7 @@ impl LogisModel {
 
         emit_term("\n=======================================");
         emit_term(&format!("[ENGINE] 🚀 Starting Image Extraction Pipeline for Task: {}", task_id));
-        emit_term("[STAGE-1] Preparing VRAM and Loading Qwen3.5 (0.8B) Vision Model...");
+        emit_term("[STAGE-1] Preparing VRAM and Loading Qwen3.5 (2B) Vision Model...");
 
         // 🌟 [CRITICAL FIX 1] 이미지 추출 5단계를 완벽하게 맞추기 위한 로딩 스텝(2단계) UI 추가!
         let payload_load = json!({ "task_id": task_id.clone(), "category": "Loading Model", "summary": "Initializing Vision Core...", "spinner": "⠋" });
@@ -1528,8 +1528,8 @@ impl LogisModel {
         }).await?
     }
 
-    // [신규] Commerce 파이프라인: 2-Stage (0.6B para2graph -> 0.8B graph2contexts)
-    // [신규] Commerce 파이프라인: 2-Stage (0.8B 단일 모델 연속 처리)
+    // [신규] Commerce 파이프라인: 2-Stage (0.6B para2graph -> 2B graph2contexts)
+    // [신규] Commerce 파이프라인: 2-Stage (2B 단일 모델 연속 처리)
     pub async fn parse_commerce_query(&self, task_id: &str, app_handle: &tauri::AppHandle, query: String, language: &str, metrics_json: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {
         use tauri::Emitter;
 
@@ -1706,9 +1706,9 @@ impl LogisModel {
         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
         // ----------------------------------------------------
-        // Stage 2: 조건 최종 병합 추출 (graph2contexts) - Qwen 3.5 (0.8B) 사용
+        // Stage 2: 조건 최종 병합 추출 (graph2contexts) - Qwen 3.5 (2B) 사용
         // ----------------------------------------------------
-        let payload = json!({ "task_id": task_id, "category": "Stage 2", "summary": "Switching to 0.8B model...", "spinner": "⠋" });
+        let payload = json!({ "task_id": task_id, "category": "Stage 2", "summary": "Switching to 2B model...", "spinner": "⠋" });
         let _ = app_handle.emit("extraction-progress", &payload);
 
         self.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancel_token.clone()), false, None).await?;

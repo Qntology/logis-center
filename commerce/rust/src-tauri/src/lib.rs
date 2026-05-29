@@ -1556,7 +1556,7 @@ async fn check_model_status() -> Result<serde_json::Value, String> {
     };
     
     let qwen3_dir = base_path.join("Qwen3-0.6B-Instruct-gguf");
-    let qwen3_5_dir = base_path.join("Qwen3.5-0.8B-Instruct-gguf");
+    let qwen3_5_dir = base_path.join("Qwen3.5-2B-Instruct-gguf");
     let embed_dir = base_path.join("embeddinggemma-300m");
 
     Ok(serde_json::json!({
@@ -1586,7 +1586,7 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
 
         let folder_name = match model_name.as_str() {
             "Qwen3" => "Qwen3-0.6B-Instruct-gguf",
-            "Qwen3.5" => "Qwen3.5-0.8B-Instruct-gguf",
+            "Qwen3.5" => "Qwen3.5-2B-Instruct-gguf",
             "Embedding" => "embeddinggemma-300m",
             _ => "unknown"
         };
@@ -1602,8 +1602,8 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
                 ("https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf", "Qwen3-0.6B-Q8_0.gguf")
             ],
             "Qwen3.5" => vec![
-                ("https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/mmproj-BF16.gguf", "mmproj-BF16.gguf"),
-                ("https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q8_0.gguf", "Qwen3.5-0.8B-Q8_0.gguf")
+                ("https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/mmproj-BF16.gguf", "mmproj-BF16.gguf"),
+                ("https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q8_0.gguf", "Qwen3.5-2B-Q8_0.gguf")
             ],
             "Embedding" => vec![
                 ("https://huggingface.co/unsloth/embeddinggemma-300m-GGUF/resolve/main/embeddinggemma-300m-Q4_0.gguf", "embeddinggemma-300m-Q4_0.gguf")

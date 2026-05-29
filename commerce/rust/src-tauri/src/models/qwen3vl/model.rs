@@ -791,6 +791,23 @@ impl Qwen3VLTextModel {
             layer.clear_kv_cache()
         }
     }
+
+    pub fn evacuate_kv_to_cpu(&mut self) -> Result<()> {
+        for layer in self.layers.iter_mut() {
+            layer.evacuate_kv_to_cpu()?;
+        }
+        Ok(())
+    }
+
+    pub fn get_kv_cache(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.layers.iter().map(|l| l.get_kv_cache()).collect()
+    }
+
+    pub fn set_kv_cache(&mut self, cache: Vec<Option<(Tensor, Tensor)>>) {
+        for (layer, c) in self.layers.iter_mut().zip(cache.into_iter()) {
+            layer.set_kv_cache(c);
+        }
+    }
 }
 
 pub struct Qwen3VLModel {
@@ -1217,20 +1234,113 @@ impl Qwen3VLModel {
                 .broadcast_as((3, bs, seq_len))?
                 .contiguous()?;
         }
-        let outputs = self.language_model.forward(
-            &inputs_embeds,
-            seqlen_offset,
-            Some(&position_ids),
-            visual_pos_mask.as_ref(),
-            deepstack_visual_embeds,
-        )?;
-        let seq_len = outputs.dim(1)?;
-        let hidden_state = outputs.narrow(1, seq_len - 1, 1)?;
+        
+        let total_len = inputs_embeds.dim(1)?;
+        let chunk_size = 256;
+        let mut final_hidden_state = None;
+
+        if total_len > 1 {
+            let mut processed = 0;
+            let mut current_offset = seqlen_offset;
+            let mut vision_offset = 0;
+
+            while processed < total_len {
+                let take = (total_len - processed).min(chunk_size);
+                let chunk_embeds = inputs_embeds.narrow(1, processed, take)?;
+                let chunk_pos_ids = position_ids.narrow(2, processed, take)?;
+
+                let mut chunk_visual_pos_mask = None;
+                let mut chunk_deepstack_embeds = None;
+
+                // 🌟 [VISION ALIGNMENT] 딥스택 비전 텐서도 현재 청크에 맞춰서 슬라이싱합니다.
+                if let Some(v_mask) = visual_pos_mask.as_ref() {
+                    let c_mask = v_mask.narrow(1, processed, take)?;
+                    let num_vision_in_chunk = c_mask.to_dtype(candle_core::DType::F32)?.sum_all()?.to_scalar::<f32>()? as usize;
+
+                    if num_vision_in_chunk > 0 {
+                        chunk_visual_pos_mask = Some(c_mask.clone());
+                        let mut sliced_deepstacks = Vec::new();
+                        for ds in deepstack_visual_embeds.as_ref().unwrap() {
+                            let sliced_ds = ds.narrow(0, vision_offset, num_vision_in_chunk)?;
+                            sliced_deepstacks.push(sliced_ds);
+                        }
+                        chunk_deepstack_embeds = Some(sliced_deepstacks);
+                    }
+                    vision_offset += num_vision_in_chunk;
+                }
+
+                let outputs = self.language_model.forward(
+                    &chunk_embeds,
+                    current_offset,
+                    Some(&chunk_pos_ids),
+                    chunk_visual_pos_mask.as_ref(),
+                    chunk_deepstack_embeds,
+                )?;
+
+                // (레이어 내부에서 자동 압축되므로 밖에서 호출할 필요 없음)
+
+                if processed + take == total_len {
+                    let seq_len = outputs.dim(1)?;
+                    final_hidden_state = Some(outputs.narrow(1, seq_len - 1, 1)?.contiguous()?);
+                }
+
+                // 🌟 [VRAM/RAM 최적화]
+                if inputs_embeds.device().is_cuda() {
+                    let _ = inputs_embeds.device().synchronize();
+                }
+
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+                #[cfg(target_os = "linux")]
+                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+                #[cfg(target_os = "macos")]
+                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+
+                processed += take;
+                current_offset += take;
+
+                use std::io::Write;
+                print!("\r[Qwen3VL-PREFILL] {} / {} tokens processed", processed, total_len);
+                let _ = std::io::stdout().flush();
+            }
+            println!("\n[Qwen3VL-PREFILL] Complete. Starting Generation...");
+        } else {
+            let outputs = self.language_model.forward(
+                &inputs_embeds,
+                seqlen_offset,
+                Some(&position_ids),
+                visual_pos_mask.as_ref(),
+                deepstack_visual_embeds,
+            )?;
+            
+            // (레이어 내부에서 자동 압축되므로 밖에서 호출할 필요 없음)
+            
+            let seq_len = outputs.dim(1)?;
+            final_hidden_state = Some(outputs.narrow(1, seq_len - 1, 1)?.contiguous()?);
+        }
+
+        let hidden_state = final_hidden_state.unwrap();
         let logits = self.lm_head.forward(&hidden_state)?;
         Ok(logits)
     }
 
     pub fn clear_kv_cache(&mut self) {
         self.language_model.clear_kv_cache();
+    }
+
+    pub fn evacuate_kv_to_cpu(&mut self) -> Result<()> {
+        self.language_model.evacuate_kv_to_cpu()
+    }
+
+    pub fn get_kv_cache(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        self.language_model.get_kv_cache()
+    }
+
+    pub fn set_kv_cache(&mut self, cache: Vec<Option<(Tensor, Tensor)>>) {
+        self.language_model.set_kv_cache(cache)
     }
 }

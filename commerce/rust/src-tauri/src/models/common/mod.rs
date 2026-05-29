@@ -542,13 +542,9 @@ impl QKNormAttention {
             }
         };
         
-        // 🌟 [JIT CPU Offload] 연산에 사용할 원본(BF16)은 VRAM에 남겨 고속으로 처리하고,
-        // 다음 턴을 위한 보관용 캐시만 즉시 CPU RAM으로 대피시킵니다.
-        // 이 한 줄로 28개 레이어의 캐시가 VRAM에 쌓이는 현상을 원천 차단하여 피크를 0으로 만듭니다!
-        self.kv_cache = Some((
-            key_states.to_device(&candle_core::Device::Cpu)?, 
-            value_states.to_device(&candle_core::Device::Cpu)?
-        ));
+        // 🌟 [JIT CPU Offload 방어] 여기서 즉시 CPU로 내리면 이후 FP8 압축이 CPU 연산으로 돌아가 엄청난 병목이 생깁니다.
+        // VRAM에 잠시 남겨두고, 레이어(Layer) 레벨에서 즉각 FP8 압축 후 대피시키도록 위임합니다.
+        self.kv_cache = Some((key_states.clone(), value_states.clone()));
         let attn_output = eager_attention_forward(
             &query_states,
             &key_states,
