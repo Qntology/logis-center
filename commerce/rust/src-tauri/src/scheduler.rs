@@ -560,8 +560,16 @@ async fn process_task(
         light_pug = model.truncate_pug_context(&raw_pug, true, 2000, None).await;
     }
 
-    println!("[DEBUG-PUG] Generated PUG. Length: {}. Snippet: {}...", 
+    let base_model_size = if token_count > 10000 {
+        crate::model::ModelSize::Qwen
+    } else {
+        crate::model::ModelSize::Qwen3
+    };
+
+    println!("[DEBUG-PUG] Generated PUG. Length: {}. Token Count: {}. Selected Model: {:?}. Snippet: {}...", 
         light_pug.len(), 
+        token_count,
+        base_model_size,
         light_pug.chars().take(100).collect::<String>().replace("\n", " ")
     );
 
@@ -718,7 +726,7 @@ async fn process_task(
     
     if !skip_ai_analysis {
         // --- STEP 0: BASE BAKING (공통 컨텍스트 딱 1번만 굽기) ---
-        {
+        if base_model_size == crate::model::ModelSize::Qwen {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
             
             let base_kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&base_session_id);
@@ -766,10 +774,6 @@ async fn process_task(
             }
 
             {
-                // [핵심] Step A가 아니라 '미리 구워둔 Base' 스냅샷을 불러옵니다!
-                model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
-
-                
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
                 let params = ChatCompletionParameters {
@@ -785,30 +789,50 @@ async fn process_task(
                             name: None,
                         })
                     ],
-                    model: "qwen".to_string(), 
+                    model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
                     max_tokens: Some(16),
                     temperature: Some(0.0), top_p: Some(0.95),
                     ..Default::default()
                 };
 
-                if let Some(gen) = model.generator.lock().await.as_mut() {
-                    println!("[Scheduler] 0.6B Step A: Asking classification question...");
-                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
-                    println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
-                    
-                    let type_info = parsing::parse_json_from_llm(&res); 
-                    
-                    
-                    page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").trim().to_lowercase();                
-                    
-                    if page_type.is_empty() {
-                        page_type = match task.r#type.as_str() {
-                            "image_extraction" => "tracking".to_string(),
-                            _ => "unknown".to_string(),
-                        };
+                let res = if base_model_size == crate::model::ModelSize::Qwen {
+                    // [핵심] Step A가 아니라 '미리 구워둔 Base' 스냅샷을 불러옵니다!
+                    model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+
+                    if let Some(gen) = model.generator.lock().await.as_mut() {
+                        println!("[Scheduler] 0.6B Step A: Asking classification question...");
+                        gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?
+                    } else {
+                        return Err(anyhow::anyhow!("Qwen generator missing"));
                     }
-                    println!("[Scheduler] Classified as: {}", page_type);
+                } else {
+                    model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, None).await?;
+                    let q3_gen_arc = model.qwen3_generator.clone();
+                    let cancel_clone = cancellation_token.clone();
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                        let mut gen_guard = q3_gen_arc.blocking_lock();
+                        if let Some(gen) = gen_guard.as_mut() {
+                            println!("[Scheduler] Qwen3 Step A: Asking classification question...");
+                            gen.generate(params, Some(cancel_clone)).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                        } else {
+                            Err(anyhow::anyhow!("Qwen3 generator missing"))
+                        }
+                    }).await??
+                };
+
+                println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
+                
+                let type_info = parsing::parse_json_from_llm(&res); 
+                    
+                page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").trim().to_lowercase();                
+                
+                if page_type.is_empty() {
+                    page_type = match task.r#type.as_str() {
+                        "image_extraction" => "tracking".to_string(),
+                        _ => "unknown".to_string(),
+                    };
                 }
+                println!("[Scheduler] Classified as: {}", page_type);
             }
             
             if page_type.is_empty() || page_type == "unknown" { 
@@ -830,9 +854,6 @@ async fn process_task(
             
             let snapshot_id = format!("{}_step_a2", task.id); 
 
-            model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
-
-            
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
             let params = ChatCompletionParameters {
@@ -846,24 +867,43 @@ async fn process_task(
                         name: None,
                     })
                 ],
-                model: "qwen".to_string(), 
+                model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
                 max_tokens: Some(128),     // JSON 스키마가 길어졌으므로 토큰 길이는 128로 유지
                 temperature: Some(0.0), top_p: Some(0.95),
                 ..Default::default()
             };
 
+            let res = if base_model_size == crate::model::ModelSize::Qwen {
+                model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                if let Some(gen) = model.generator.lock().await.as_mut() {
+                    println!("[Scheduler] 0.6B (Qwen) Step A-2: Asking detail classification...");
+                    gen.generate(
+                        params, 
+                        Some(cancellation_token.clone()), 
+                        Some(snapshot_id.clone()), 
+                        kv_name.clone()
+                    ).await?
+                } else {
+                    return Err(anyhow::anyhow!("Qwen generator missing"));
+                }
+            } else {
+                model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, None).await?;
+                let q3_gen_arc = model.qwen3_generator.clone();
+                let cancel_clone = cancellation_token.clone();
+                tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                    let mut gen_guard = q3_gen_arc.blocking_lock();
+                    if let Some(gen) = gen_guard.as_mut() {
+                        println!("[Scheduler] Qwen3 Step A-2: Asking detail classification...");
+                        gen.generate(params, Some(cancel_clone)).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                    } else {
+                        Err(anyhow::anyhow!("Qwen3 generator missing"))
+                    }
+                }).await??
+            };
             
-            if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 0.6B (Qwen) Step A-2: Asking detail classification...");
-                let res = gen.generate(
-                    params, 
-                    Some(cancellation_token.clone()), 
-                    Some(snapshot_id.clone()), 
-                    kv_name.clone()
-                ).await?;
-                println!("[DEBUG-SCHED] Step A-2 Raw Response: '{}'", res);
-                
-                let detail_info = parsing::parse_json_from_llm(&res); 
+            println!("[DEBUG-SCHED] Step A-2 Raw Response: '{}'", res);
+            
+            let detail_info = parsing::parse_json_from_llm(&res); 
                 
                 // 바뀐 프롬프트 스키마 형태 {"goods": {"detail": true}} 에 맞춘 파싱 로직 (그대로 유지)
                 is_detail = detail_info
@@ -878,9 +918,6 @@ async fn process_task(
                 }
                     
                 println!("[Scheduler] Classified is_detail as: {}", is_detail);
-            } else {
-                println!("[Scheduler] ERROR: Qwen generator is missing!");
-            }
         }
     } // 👈 🌟 [핵심 변경 1 끝] 0.6B 분석 블록 종료
 
@@ -913,8 +950,6 @@ async fn process_task(
 
                 let mut titles = Vec::new();
                 {
-                    model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
-
                     let params = ChatCompletionParameters {
                         messages: vec![
                             ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
@@ -926,62 +961,78 @@ async fn process_task(
                                 name: None,
                             })
                         ],
-                        model: "qwen".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
+                        model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
+                        max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
                         ..Default::default()
                     };
 
-                    if let Some(gen) = model.generator.lock().await.as_mut() {
-                        println!("[JS-BRIDGE] 1. Requesting titles from LLM (0.6B)...");
-                        
-                        // 0.6B 모델은 generate_part가 아닌 표준 `generate`를 사용하며, 
-                        // 반환값도 구조체가 아닌 단순 String(res) 입니다.
-                        let res = gen.generate(
-                            params, 
-                            Some(cancellation_token.clone()), 
-                            Some(snapshot_id.clone()), 
-                            kv_name.clone()
-                        ).await?;
-                        
-                        println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
-
-                        // res.text 가 아닌 res 를 그대로 파싱
-                        let title_info = parsing::parse_json_from_llm(&res);
-                        
-                        
-                        if title_info.as_object().map_or(true, |obj| obj.is_empty()) {
-                            return Err(anyhow::anyhow!("LLM returned invalid or unparseable JSON response during title extraction."));
+                    let res = if base_model_size == crate::model::ModelSize::Qwen {
+                        model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                        if let Some(gen) = model.generator.lock().await.as_mut() {
+                            println!("[JS-BRIDGE] 1. Requesting titles from LLM (0.6B)...");
+                            
+                            gen.generate(
+                                params, 
+                                Some(cancellation_token.clone()), 
+                                Some(snapshot_id.clone()), 
+                                kv_name.clone()
+                            ).await?
+                        } else {
+                            return Err(anyhow::anyhow!("Qwen generator missing"));
                         }
+                    } else {
+                        model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, None).await?;
+                        let q3_gen_arc = model.qwen3_generator.clone();
+                        let cancel_clone = cancellation_token.clone();
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                            let mut gen_guard = q3_gen_arc.blocking_lock();
+                            if let Some(gen) = gen_guard.as_mut() {
+                                println!("[JS-BRIDGE] 1. Requesting titles from LLM (Qwen3)...");
+                                gen.generate(params, Some(cancel_clone)).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                            } else {
+                                Err(anyhow::anyhow!("Qwen3 generator missing"))
+                            }
+                        }).await??
+                    };
+                    
+                    println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
 
-                        let items_opt = title_info.get("order")
-                            .or(title_info.get("goods"))
-                            .or(title_info.get("title"))
-                            .or(title_info.get("titles"))
-                            .or(title_info.get("product"))
-                            .and_then(|v| v.as_array());
+                    // res.text 가 아닌 res 를 그대로 파싱
+                    let title_info = parsing::parse_json_from_llm(&res);
+                        
+                    if title_info.as_object().map_or(true, |obj| obj.is_empty()) {
+                        return Err(anyhow::anyhow!("LLM returned invalid or unparseable JSON response during title extraction."));
+                    }
 
-                        if let Some(items) = items_opt {
-                            for item in items {
-                                let t_val = if let Some(t) = item.as_str() {
-                                    Some(t)
-                                } else if let Some(t) = item.get("title").and_then(|v| v.as_str()) {
-                                    Some(t)
-                                } else {
-                                    None
-                                };
+                    let items_opt = title_info.get("order")
+                        .or(title_info.get("goods"))
+                        .or(title_info.get("title"))
+                        .or(title_info.get("titles"))
+                        .or(title_info.get("product"))
+                        .and_then(|v| v.as_array());
+
+                    if let Some(items) = items_opt {
+                        for item in items {
+                            let t_val = if let Some(t) = item.as_str() {
+                                Some(t)
+                            } else if let Some(t) = item.get("title").and_then(|v| v.as_str()) {
+                                Some(t)
+                            } else {
+                                None
+                            };
+                            
+                            if let Some(t) = t_val {
                                 
-                                if let Some(t) = t_val {
-                                    
-                                    let clean_t = t.replace(",", "").replace(".", "").trim().to_string();
-                                    let is_only_numbers = !clean_t.is_empty() && clean_t.chars().all(|c| c.is_ascii_digit());
-                                    
-                                    if !is_only_numbers {
-                                        titles.push(t.to_string());
-                                    }
+                                let clean_t = t.replace(",", "").replace(".", "").trim().to_string();
+                                let is_only_numbers = !clean_t.is_empty() && clean_t.chars().all(|c| c.is_ascii_digit());
+                                
+                                if !is_only_numbers {
+                                    titles.push(t.to_string());
                                 }
                             }
                         }
-                        println!("[JS-BRIDGE] Titles extracted (Robust): {:?}", titles);
                     }
+                    println!("[JS-BRIDGE] Titles extracted (Robust): {:?}", titles);
                 }
 
                 if titles.is_empty() {
