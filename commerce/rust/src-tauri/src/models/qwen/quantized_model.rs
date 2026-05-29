@@ -773,10 +773,16 @@ impl QuantizedQwenVLTextAttention {
                                                     
                                                     
                                                     // 이 한 줄의 수정으로 System RAM 점유율이 50% 이상 박살 납니다.
-                                                    k_cpu = Some(Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap());
-                                                    v_cpu = Some(Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, &Device::Cpu).unwrap());
+                                                    let saved_dtype = match kd.dtype() {
+                                                        safetensors::Dtype::F8_E4M3 => DType::F8E4M3,
+                                                        safetensors::Dtype::F32 => DType::F32,
+                                                        safetensors::Dtype::F16 => DType::F16,
+                                                        _ => DType::BF16,
+                                                    };
+                                                    k_cpu = Some(Tensor::from_raw_buffer(kd.data(), saved_dtype, &meta_os, &Device::Cpu).unwrap());
+                                                    v_cpu = Some(Tensor::from_raw_buffer(vd.data(), saved_dtype, &meta_os, &Device::Cpu).unwrap());
                                                 }
-                                                break; 
+                                                break;
                                             }
                                         }
                                     }
@@ -1102,11 +1108,17 @@ impl QuantizedQwenVLTextAttention {
                             let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
                             
                             let dev = &Device::Cpu;
-                            let kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &meta_os, dev)?;
-                            let vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &meta_os, dev)?;
+                            let saved_dtype = match kd.dtype() {
+                                safetensors::Dtype::F8_E4M3 => DType::F8E4M3,
+                                safetensors::Dtype::F32 => DType::F32,
+                                safetensors::Dtype::F16 => DType::F16,
+                                _ => DType::BF16,
+                            };
+                            let kd_t = Tensor::from_raw_buffer(kd.data(), saved_dtype, &meta_os, dev)?;
+                            let vd_t = Tensor::from_raw_buffer(vd.data(), saved_dtype, &meta_os, dev)?;
 
-                            let mut k_raw = self.decompress_from_bf16(&kd_t, &meta_os, dev)?;
-                            let mut v_raw = self.decompress_from_bf16(&vd_t, &meta_os, dev)?;
+                            let mut k_raw = if saved_dtype == DType::F32 { kd_t } else { self.decompress_from_bf16(&kd_t, &meta_os, dev)? };
+                            let mut v_raw = if saved_dtype == DType::F32 { vd_t } else { self.decompress_from_bf16(&vd_t, &meta_os, dev)? };
 
                             let target_heads = self.num_key_value_heads;
                             let target_dim = self.head_dim;

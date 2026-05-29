@@ -458,7 +458,23 @@ impl LogisModel {
             let current = self.current_size.lock().await;
             if *current == Some(target_size) {
                 let is_loaded = match target_size {
-                    ModelSize::Qwen => self.generator.lock().await.is_some(),
+                    ModelSize::Qwen => {
+                        if let Some(gen) = self.generator.lock().await.as_ref() {
+                            let is_baking_loaded = match &gen.qwen {
+                                crate::models::qwen::generate::ModelVariant::QuantizedVL(m) => m.language_model.baking_only,
+                                crate::models::qwen::generate::ModelVariant::QuantizedText(m) => m.language_model.baking_only,
+                                _ => false,
+                            };
+                            // 🌟 [CRITICAL FIX] 베이킹 모드(LM Head 제거)로 떠있는데, 정상 추론이 필요하면 건너뛰지 않고 리로드!
+                            if !is_baking && is_baking_loaded {
+                                false
+                            } else {
+                                true
+                            }
+                        } else {
+                            false
+                        }
+                    },
                     ModelSize::Qwen3 => self.qwen3_generator.lock().await.is_some(),
                     ModelSize::Qwen3_5 => self.qwen3_5_generator.lock().await.is_some(),
                 };
@@ -575,8 +591,20 @@ impl LogisModel {
         let mut current_size_guard = self.current_size.lock().await; // 🌟 첫 번째 자물쇠 획득!
         let mut gen_guard = self.generator.lock().await;
 
-        if *current_size_guard == Some(size) && gen_guard.is_some() && !baking_only {
-            return Ok(());
+        if *current_size_guard == Some(size) {
+            if let Some(gen) = gen_guard.as_ref() {
+                let is_baking_loaded = match &gen.qwen {
+                    crate::models::qwen::generate::ModelVariant::QuantizedVL(m) => m.language_model.baking_only,
+                    crate::models::qwen::generate::ModelVariant::QuantizedText(m) => m.language_model.baking_only,
+                    _ => false,
+                };
+                // 🌟 [CRITICAL FIX] 현재 모델이 Baking(LM Head 부재) 상태인데 추론 요청이 오면 Fresh Loading 진행
+                if !baking_only && is_baking_loaded {
+                    // 통과하여 아래 리로드 로직(Fresh Loading) 실행
+                } else {
+                    return Ok(());
+                }
+            }
         }
 
         println!("[LOAD] Fresh loading {:?} from disk...", size);

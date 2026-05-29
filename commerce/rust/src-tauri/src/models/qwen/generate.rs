@@ -388,8 +388,10 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let k_contig = k_aligned.contiguous().unwrap_or(k_aligned);
                                 let v_contig = v_aligned.contiguous().unwrap_or(v_aligned);
 
-                                src.k_data = k_contig.to_dtype(DType::BF16).unwrap_or_else(|_| k_contig.clone());
-                                src.v_data = v_contig.to_dtype(DType::BF16).unwrap_or_else(|_| v_contig.clone());
+                                // /qwen/ 은 F32 로직, /qwen3/, /qwen3_5/ 은 FP8 로직으로 동적 분기
+                                let target_dtype = if k_contig.dtype() == DType::F8E4M3 { DType::F8E4M3 } else { DType::F32 };
+                                src.k_data = k_contig.to_dtype(target_dtype).unwrap_or_else(|_| k_contig.clone());
+                                src.v_data = v_contig.to_dtype(target_dtype).unwrap_or_else(|_| v_contig.clone());
                             }
                             let mut map = std::collections::HashMap::new();
                             let prefix = format!("b{}_l{}_", off, act_l);
@@ -435,8 +437,16 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                             let file_shape: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
 
                                             let dev = &Device::Cpu;
-                                            let mut kd_t = Tensor::from_raw_buffer(kd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
-                                            let mut vd_t = Tensor::from_raw_buffer(vd.data(), DType::BF16, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), DType::BF16, dev).unwrap());
+                                            // 저장된 파일의 DType을 감지하여 FP8, F32 모두 호환되도록 로드합니다.
+                                            let saved_dtype = match kd.dtype() {
+                                                safetensors::Dtype::F8_E4M3 => DType::F8E4M3,
+                                                safetensors::Dtype::F32 => DType::F32,
+                                                safetensors::Dtype::F16 => DType::F16,
+                                                _ => DType::BF16,
+                                            };
+                                            
+                                            let mut kd_t = Tensor::from_raw_buffer(kd.data(), saved_dtype, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), saved_dtype, dev).unwrap());
+                                            let mut vd_t = Tensor::from_raw_buffer(vd.data(), saved_dtype, &file_shape, dev).unwrap_or_else(|_| Tensor::zeros(file_shape.clone(), saved_dtype, dev).unwrap());
                                             
                                             if load.is_cpu {
                                                 kd_t = kd_t.to_dtype(DType::F32).unwrap_or(kd_t);

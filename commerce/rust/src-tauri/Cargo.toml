@@ -36,7 +36,7 @@ tauri-plugin-shell = "2"
 reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
 sysinfo = "0.30"
 mimalloc = { version = "*", features = ["v3"] }
-
+drag = "2.1.1"
 candle-core = "0.10.2"
 ahash = "0.8.11"
 candle-nn = "0.10.2"
