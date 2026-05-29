@@ -656,18 +656,25 @@ pub fn eager_attention_forward(
     // 일반적인 짧은 문장이나 Flash-Attn 지원 시 기존 방식 사용
     #[cfg(feature = "flash-attn")]
     {
-        let query_states = query_states.transpose(1, 2)?;
-        let key_states = key_states.transpose(1, 2)?;
-        let value_states = value_states.transpose(1, 2)?;
+        // [CRITICAL FIX] Flash Attention은 F32 및 FP8을 네이티브로 지원하지 않습니다.
+        // KV 캐시가 FP8이거나 모델이 F32로 동작 중일 경우 강제로 BF16으로 캐스팅하여 하드웨어 크래시를 방지합니다.
+        let target_dtype = if query_states.device().is_cuda() { candle_core::DType::BF16 } else { query_states.dtype() };
+        
+        let q_aligned = query_states.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+        let k_aligned = key_states.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+        let v_aligned = value_states.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+
         let attn_output = candle_flash_attn::flash_attn(
-            &query_states,
-            &key_states,
-            &value_states,
+            &q_aligned,
+            &k_aligned,
+            &v_aligned,
             scaling as f32,
             attention_mask.is_some(),
         )?
         .transpose(1, 2)?;
-        return Ok(attn_output.transpose(1, 2)?.contiguous()?);
+        
+        // 연산 완료 후 다시 원래 데이터 타입(FP8/F32 등)으로 복구하여 이후 파이프라인의 타입 불일치 방지
+        return Ok(attn_output.to_dtype(query_states.dtype())?.transpose(1, 2)?.contiguous()?);
     }
 
     if kv_seq_len <= block_size {
