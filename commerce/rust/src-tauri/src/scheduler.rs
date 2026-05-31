@@ -560,7 +560,7 @@ async fn process_task(
         light_pug = model.truncate_pug_context(&raw_pug, true, 2000, None).await;
     }
 
-    let base_model_size = if token_count > 10000 {
+    let base_model_size = if token_count > 60000 {
         crate::model::ModelSize::Qwen
     } else {
         crate::model::ModelSize::Qwen3
