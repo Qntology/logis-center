@@ -351,6 +351,23 @@ impl Qwen3GenerateModel {
             // <think> 지속 억제
             if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
 
+            // 🌟 [CRITICAL FIX] 모델이 같은 문장을 무한 반복하는 현상(Loop)을 끊기 위해 페널티를 로짓(Logits)에 직접 연산합니다.
+            let penalty = self.generation_config.repetition_penalty;
+            if penalty > 1.0 {
+                // 최근 512개 토큰에 대해서만 페널티를 적용하여 정상적인 문맥 훼손을 방지합니다.
+                let start_idx = generate.len().saturating_sub(512); 
+                for &t in &generate[start_idx..] {
+                    let t_idx = t as usize;
+                    if t_idx < len {
+                        if logits_vec[t_idx] <= 0.0 {
+                            logits_vec[t_idx] *= penalty;
+                        } else {
+                            logits_vec[t_idx] /= penalty;
+                        }
+                    }
+                }
+            }
+
             let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
             next_token = logit_processor.sample(&logits_tensor)?;
 
@@ -509,6 +526,23 @@ impl Qwen3GenerateModel {
 
             // <think> 지속 억제
             if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
+
+            // 🌟 [CRITICAL FIX] 모델이 같은 문장을 무한 반복하는 현상(Loop)을 끊기 위해 페널티를 로짓(Logits)에 직접 연산합니다.
+            let penalty = self.generation_config.repetition_penalty;
+            if penalty > 1.0 {
+                // 최근 512개 토큰에 대해서만 페널티를 적용하여 정상적인 문맥 훼손을 방지합니다.
+                let start_idx = generate.len().saturating_sub(512); 
+                for &t in &generate[start_idx..] {
+                    let t_idx = t as usize;
+                    if t_idx < len {
+                        if logits_vec[t_idx] <= 0.0 {
+                            logits_vec[t_idx] *= penalty;
+                        } else {
+                            logits_vec[t_idx] /= penalty;
+                        }
+                    }
+                }
+            }
 
             let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
             next_token = logit_processor.sample(&logits_tensor)?;
