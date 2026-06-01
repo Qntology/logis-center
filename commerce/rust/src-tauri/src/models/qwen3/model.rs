@@ -145,7 +145,7 @@ impl Qwen3Attention {
 }
 
 #[derive(Clone)]
-pub struct Fp8RamKVCache {
+pub struct Fp8VramKVCache {
     pub k_fp8: Tensor,
     pub v_fp8: Tensor,
 }
@@ -156,7 +156,7 @@ pub struct Qwen3DecoderLayer {
     mlp: GateUpDownMLP,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
-    pub fp8_cache: Option<Fp8RamKVCache>, // 🌟 [FP8 Compression] VRAM에서 FP8로 초고속 압축 후 RAM 대피
+    pub fp8_cache: Option<Fp8VramKVCache>, // 🌟 [FP8 Compression] RAM으로 내리지 않고 VRAM 내에서 FP8로 압축하여 상주
 }
 
 impl Qwen3DecoderLayer {
@@ -214,19 +214,14 @@ impl Qwen3DecoderLayer {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        // 🌟 [FP8 Compression] RAM에 보관 중이던 FP8 텐서를 VRAM으로 복사한 뒤, GPU 코어에서 즉시 BF16/F32로 압축 해제합니다.
+        // 🌟 [FP8 Compression] VRAM에 보관 중이던 FP8 텐서를 연산을 위해 즉시 BF16/F32로 압축 해제합니다.
         if self.self_attn.kv_cache.is_none() {
             if let Some(cache) = self.fp8_cache.take() {
-                let dev = xs.device();
-                let target_dtype = if dev.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+                let target_dtype = if xs.device().is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
                 
-                // 1. FP8 상태 그대로 VRAM으로 고속 전송 (PCIe 대역폭 2배 절약)
-                let k_gpu = cache.k_fp8.to_device(dev)?;
-                let v_gpu = cache.v_fp8.to_device(dev)?;
-                
-                // 2. VRAM 내부에서 즉시 형변환(압축 해제)
-                let k_restored = k_gpu.to_dtype(target_dtype)?;
-                let v_restored = v_gpu.to_dtype(target_dtype)?;
+                // VRAM 내부에서 즉시 형변환(압축 해제)
+                let k_restored = cache.k_fp8.to_dtype(target_dtype)?;
+                let v_restored = cache.v_fp8.to_dtype(target_dtype)?;
                 
                 self.self_attn.kv_cache = Some((k_restored, v_restored));
             }
@@ -236,9 +231,9 @@ impl Qwen3DecoderLayer {
         let xs = self.input_layernorm.forward(xs)?;
         let xs = self.self_attn.forward(&xs, cos, sin, attention_mask)?;
         
-        // 🌟 [FP8 KV Cache] 레이어 연산이 끝나는 즉시, VRAM 코어를 사용해 초고속 FP8 압축 후 RAM으로 던집니다.
-        // 이 한 줄로 Qwen3, Qwen3VL 모델 모두 PCIe 대역폭이 절반으로 줄고 VRAM 피크가 원천 차단됩니다.
-        self.evacuate_kv_to_cpu()?;
+        // 🌟 [FP8 KV Cache] 레이어 연산이 끝나는 즉시, VRAM 코어를 사용해 초고속 FP8 압축 상태로 VRAM에 보존합니다.
+        // RAM-VRAM 스왑 없이 순수 VRAM 내에서 용량을 50% 절약합니다.
+        self.compress_kv_in_vram()?;
         
         let xs = residual.add(&xs)?;
         let residual = xs.clone();
@@ -253,18 +248,15 @@ impl Qwen3DecoderLayer {
         self.fp8_cache = None;
     }
 
-    pub fn evacuate_kv_to_cpu(&mut self) -> Result<()> {
+    pub fn compress_kv_in_vram(&mut self) -> Result<()> {
         if let Some((k, v)) = self.self_attn.kv_cache.take() {
-            // 🌟 [FP8 Compression] VRAM 내부에서 텐서를 FP8(F8E4M3)로 즉시 압축한 후, 시스템 RAM으로 던져 VRAM을 비웁니다.
-            let cpu_dev = &candle_core::Device::Cpu;
-            
-            // VRAM 상에서 FP8로 캐스팅 (데이터 크기 절반으로 압축, Zlib이나 CPU 연산 병목 없음)
+            // 🌟 [FP8 Compression] RAM으로 던지지 않고, VRAM 내부에서 텐서를 FP8(F8E4M3)로 즉시 압축하여 VRAM에 상주시킵니다.
             let k_fp8 = k.to_dtype(candle_core::DType::F8E4M3)?;
             let v_fp8 = v.to_dtype(candle_core::DType::F8E4M3)?;
             
-            self.fp8_cache = Some(Fp8RamKVCache {
-                k_fp8: k_fp8.to_device(cpu_dev)?,
-                v_fp8: v_fp8.to_device(cpu_dev)?,
+            self.fp8_cache = Some(Fp8VramKVCache {
+                k_fp8,
+                v_fp8,
             });
         }
         Ok(())
@@ -395,9 +387,9 @@ impl Qwen3Model {
         }
     }
 
-    pub fn evacuate_kv_to_cpu(&mut self) -> Result<()> {
+    pub fn compress_kv_in_vram(&mut self) -> Result<()> {
         for layer in self.layers.iter_mut() {
-            layer.evacuate_kv_to_cpu()?;
+            layer.compress_kv_in_vram()?;
         }
         Ok(())
     }
