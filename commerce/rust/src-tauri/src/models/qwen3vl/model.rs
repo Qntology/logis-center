@@ -794,7 +794,7 @@ impl Qwen3VLTextModel {
 
     pub fn evacuate_kv_to_cpu(&mut self) -> Result<()> {
         for layer in self.layers.iter_mut() {
-            layer.evacuate_kv_to_cpu()?;
+            layer.compress_kv_in_vram()?;
         }
         Ok(())
     }
