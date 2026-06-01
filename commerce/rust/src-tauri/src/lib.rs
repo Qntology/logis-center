@@ -232,12 +232,12 @@ async fn launch_browser(
     
     let result = automation::run_browser_automation(browser, url, script, app_handle).await;
 
-    // 실행 결과와 상관없이 포트가 열릴 때까지 기다리거나, 실패 시에도 IS_BROWSER_LAUNCHING은 유지됨
-    for _ in 0..20 {
+    // 🌟 [CRITICAL FIX] 500ms 단위의 느린 대기를 50ms 단위의 초고속 폴링으로 변경하여 브라우저가 준비되는 즉시 락을 해제합니다.
+    for _ in 0..100 {
         if automation::is_browser_reachable().await {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     // 충분한 안정화 시간을 거친 후 런칭 플래그 해제
@@ -273,12 +273,12 @@ async fn launch_best_browser(
     let result = automation::run_browser_automation(target.to_string(), url, "".to_string(), app_handle).await;
 
     
-    // Error 반환과 관계없이, 크롬 프로세스 포트가 100% 물리적으로 응답(reachable)할 때까지 최대 10초간 대기합니다.
-    for _ in 0..20 {
+    // 🌟 [CRITICAL FIX] 500ms 단위의 느린 대기를 50ms 단위의 초고속 폴링으로 변경하여 브라우저가 준비되는 즉시 락을 해제합니다.
+    for _ in 0..100 {
         if automation::is_browser_reachable().await {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     crate::IS_BROWSER_LAUNCHING.store(false, Ordering::SeqCst);

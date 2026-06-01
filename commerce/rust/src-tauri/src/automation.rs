@@ -456,13 +456,20 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
     println!("[AUTO] Targeting initial page for {}...", url);
     
     
-    // 이 대기가 없으면 pages()가 비어있다고 착각하여 불필요한 두 번째 탭(new_page)을 강제 생성해버립니다.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    
-    let mut pages = browser_arc.pages().await.map_err(|e| anyhow!("Failed to get pages: {}", e))?;
+    // 🌟 [CRITICAL FIX] 500ms 강제 지연(Sleep)을 2연속 하던 로직을 폐기하고, 
+    // 50ms 간격의 초고속 폴링(Fast Polling)으로 교체하여 탭이 생성되는 즉시 반응하도록 최적화합니다.
+    let mut pages = vec![];
+    for _ in 0..20 {
+        if let Ok(p) = browser_arc.pages().await {
+            if !p.is_empty() {
+                pages = p;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     
     if pages.is_empty() {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         pages = browser_arc.pages().await.unwrap_or_default();
     }
     
