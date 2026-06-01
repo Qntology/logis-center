@@ -678,8 +678,15 @@ async function updateExtractButtonVisibility() {
     if (currentLock) {
         const lockEl = document.getElementById(currentLock);
         if (!lockEl) {
-            const lockTime = parseInt(currentLock.split('_')[1] || "0");
-            if (Date.now() - lockTime > 5000) { await kvRemove("sys_lock"); }
+            // 🌟 [CRITICAL FIX] 5000ms라는 불확실한 시간 기반 땜질 로직을 전면 폐기하고,
+            // 실제 프론트엔드/백엔드 큐(대기열)에 존재하는지 명확한 상태 기반으로 교차 검증하여 유령 락을 즉각 해제합니다.
+            const isFrontendActive = GlobalTaskManager.currentTaskId === currentLock || GlobalTaskManager.queue.some(q => q.taskId === currentLock);
+            const isBackendActive = GlobalTaskManager.backendQueued.some(p => p.id === currentLock || p.taskId === currentLock);
+            
+            if (!isFrontendActive && !isBackendActive) {
+                console.log(`[LOCK] Zombie lock detected without active queue: ${currentLock}. Releasing immediately.`);
+                await kvRemove("sys_lock");
+            }
         }
     }
 

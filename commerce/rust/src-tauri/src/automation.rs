@@ -466,21 +466,36 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
         pages = browser_arc.pages().await.unwrap_or_default();
     }
     
-    // 첫 번째 페이지를 선택합니다. 만약 없다면(이례적인 상황) 새 페이지를 만듭니다.
-    let page = if let Some(first_page) = pages.first() {
-        first_page.clone()
+    let nav_target = if url.is_empty() { "about:blank" } else { url };
+    
+    // 🌟 [CRITICAL FIX] More 버튼 등 특정 URL 요청 시 기존 탭을 무시하고 항상 '새 탭(New Tab)'으로 엽니다.
+    // 새 탭을 열면 브라우저가 강제로 화면 맨 앞으로 팝업(Focus)되는 효과도 얻을 수 있어 '반응 없음' 문제가 해결됩니다.
+    let page = if nav_target == "about:blank" {
+        // 단순 런처 버튼 클릭 시: 기존 활성 탭을 그대로 유지
+        if let Some(last_page) = pages.last() {
+            last_page.clone()
+        } else {
+            browser_arc.new_page(nav_target).await.map_err(|e| anyhow!("Page creation failed: {}", e))?
+        }
     } else {
-        browser_arc.new_page("about:blank").await.map_err(|e| anyhow!("Page creation failed: {}", e))?
+        // 특정 URL 이동 요청 시: 무조건 새 탭 생성 (자동 팝업 및 포커스 전환)
+        let p = browser_arc.new_page(nav_target).await.map_err(|e| anyhow!("Page creation failed: {}", e))?;
+        
+        // 만약 방금 켜진 브라우저라서 첫 탭이 빈 화면(newtab) 하나뿐이라면 깔끔하게 닫아줍니다.
+        if pages.len() == 1 {
+            let first_page = pages.first().unwrap();
+            let first_url = first_page.url().await.unwrap_or_default().unwrap_or_default();
+            if first_url.is_empty() || first_url == "about:blank" || first_url.contains("newtab") || first_url.contains("new-tab") {
+                // 🌟 [CRITICAL FIX] `first_page`는 참조자(&)이므로 소유권(Ownership) 이동을 위해 .clone()을 호출한 뒤 닫습니다.
+                let _ = first_page.clone().close().await;
+            }
+        }
+        p
     };
 
     // [CRITICAL STEALTH] 탐지 우회 스크립트 설정
     let _ = page.evaluate_on_new_document("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})").await;
 
-    
-    // 남아있는 "chrome://new-tab-page/" 흔적을 깔끔하게 덮어씌워 단일 탭으로 통일합니다.
-    let nav_target = if url.is_empty() { "about:blank" } else { url };
-    let _ = page.goto(nav_target).await;
-    
     Ok(format!("Automation Started."))
 }
 
