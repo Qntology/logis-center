@@ -688,6 +688,10 @@ impl QwenVLGenerateModel {
         let lt_id = self.tokenizer.text_encode_vec("<".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
 
+        let slash_id = self.tokenizer.text_encode_vec("/".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let double_slash_id = self.tokenizer.text_encode_vec("//".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let space_double_slash_id = self.tokenizer.text_encode_vec(" //".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+
         let is_strict_json = input.replace_text.contains("/no_think") || input.replace_text.contains("RETURN JSON ONLY");
 
         for i in 0..mes.max_tokens.unwrap_or(2048) {
@@ -710,6 +714,19 @@ impl QwenVLGenerateModel {
 
             if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
             if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 10.0; }
+
+            if is_strict_json {
+                let is_url_single = gen_text.ends_with("http:/") || gen_text.ends_with("https:/");
+                let is_url_double = gen_text.ends_with("http:") || gen_text.ends_with("https:");
+                
+                if !is_url_single && gen_text.ends_with('/') {
+                    if (slash_id as usize) < len { logits_vec[slash_id as usize] -= 10000.0; }
+                }
+                if !is_url_double {
+                    if (double_slash_id as usize) < len { logits_vec[double_slash_id as usize] -= 10000.0; }
+                    if (space_double_slash_id as usize) < len { logits_vec[space_double_slash_id as usize] -= 10000.0; }
+                }
+            }
             
             if i == 0 {
                 if (self.eos_token_id1 as usize) < len { logits_vec[self.eos_token_id1 as usize] = -10000.0; }

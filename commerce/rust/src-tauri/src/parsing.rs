@@ -785,15 +785,15 @@ RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
             .replace("{TYPE}", page_type)
 }
 
-pub fn is_detail_prompt(page_type: &str) -> String {
-    let (category_desc, titles_desc, title_desc) = match page_type {
-        "goods" => ("product", "product titles", "product title"),
-        "order" => ("product", "order product titles", "order product title"),
-        "tracking" => ("product", "tracking product titles", "tracking product title"),
-        "review" => ("title", "review titles", "review title"),
-        "coupon" => ("title", "coupon titles", "coupon title"),
-        "event" => ("title", "event titles", "event title"),
-        _ => ("title", "titles", "title"),
+pub fn is_detail_prompt(page_type: &str, title: &str) -> String {
+    let category_desc = match page_type {
+        "goods" => "product",
+        "order" => "product",
+        "tracking" => "product",
+        "review" => "title",
+        "coupon" => "title",
+        "event" => "title",
+        _ => "title",
     };
 
     let template = r###"[TASK]
@@ -818,13 +818,13 @@ Read the entire document from top to bottom, applying the following strict filte
      C. Does the main data area contain an extensive configuration/input form (inputs, textareas, image uploads, save buttons) for a single entity?
 
 [SCHEMA DEFINITIONS]
-- {TYPE}:Object.
-    - has_header: Boolean True if the document contains a header.
-    - has_footer: Boolean True if the document contains a footer.
+- {TYPE}:
+    - has_header: Boolean. True if the document contains a header.
+    - has_footer: Boolean. True if the document contains a footer.
     - has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
     - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
     - detail: Boolean. True ONLY if has_list is false AND has_form is true.
-    - title: String. {TITLE}.
+    - title: String. Default '{TITLE}'.
     - language: String. Detect the language of PUG CONTENT and return ISO 639-1 code.
 
 [OUTPUT FORMAT]
@@ -842,7 +842,7 @@ Read the entire document from top to bottom, applying the following strict filte
 
 JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{TYPE}", page_type)
-        .replace("{TITLE}", titles_desc)
+        .replace("{TITLE}", title)
         .replace("{CATEGORY}", category_desc)
 }
 
@@ -1142,9 +1142,8 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     ]
     - "additional_goods":[ 
         { 
-            path:String. URL includes a additional product manage path, an administrative or additional product edit Link., 
-            id:String. Refer to the additional product no value from the link or an attribute or additional product input value., 
-            link:String. Refer to the ID to find a URL that includes a additional product manage link.
+            link:String. Refer to the ID to find a URL that includes a additional goods manage link.,
+            id:String. Refer to the additional goods no value from the link or an attribute or additional goods input value.
         }
     ]"###.to_string(),
 
@@ -1154,7 +1153,13 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "tracking_number":String. tracking number.
     - "status":String. order status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
     - "registration_date":String. yyyy-MM-ddThh:mm:ss.
-    - "goods":[{ title:{ String. product title. }, path:{ String. URL includes a manage path, an administrative or edit Link. }, id:{ String. Refer to the product no value from the link or an attribute or input value. }, link:{ String. Refer to the ID to find a URL that includes a manage link. } }]
+    - "goods":[
+        { 
+            title:String. goods title., 
+            link:String. Refer to the ID to find a URL that includes a manage link.,
+            id:String. Refer to the goods no value from the link or an attribute or input value.
+        }
+    ]
     - "sender_name":String. sender_name.
     - "sender_address":String. sender_address, Filter the addresses to District-level and up.
     - "sender_phone":String. sender_phone.

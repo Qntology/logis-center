@@ -279,6 +279,10 @@ impl Qwen3_5GenerateModel {
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(123);
         let lt_id = self.tokenizer.text_encode_vec("<".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
         
+        let slash_id = self.tokenizer.text_encode_vec("/".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let double_slash_id = self.tokenizer.text_encode_vec("//".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let space_double_slash_id = self.tokenizer.text_encode_vec(" //".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+
         let is_strict_json = mes_text.contains("/no_think") || mes_text.contains("RETURN JSON ONLY") || mes_text.contains("Return ONLY");
         let mut gen_text_buffer = String::new(); 
         let mut print_buffer = String::new();
@@ -318,6 +322,17 @@ impl Qwen3_5GenerateModel {
             if is_strict_json {
                 if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 10000.0; }
                 if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 50.0; }
+                
+                let is_url_single = gen_text_buffer.ends_with("http:/") || gen_text_buffer.ends_with("https:/");
+                let is_url_double = gen_text_buffer.ends_with("http:") || gen_text_buffer.ends_with("https:");
+                
+                if !is_url_single && gen_text_buffer.ends_with('/') {
+                    if (slash_id as usize) < len { logits_vec[slash_id as usize] -= 10000.0; }
+                }
+                if !is_url_double {
+                    if (double_slash_id as usize) < len { logits_vec[double_slash_id as usize] -= 10000.0; }
+                    if (space_double_slash_id as usize) < len { logits_vec[space_double_slash_id as usize] -= 10000.0; }
+                }
             }
 
             if i == 0 {
@@ -537,6 +552,10 @@ impl Qwen3_5GenerateModel {
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(123);
         let lt_id = self.tokenizer.text_encode_vec("<".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
         
+        let slash_id = self.tokenizer.text_encode_vec("/".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let double_slash_id = self.tokenizer.text_encode_vec("//".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let space_double_slash_id = self.tokenizer.text_encode_vec(" //".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        
         let mut gen_text_buffer = String::new();
         let mut print_buffer = String::new();
 
@@ -581,6 +600,17 @@ impl Qwen3_5GenerateModel {
             if is_strict_json {
                 if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 10000.0; }
                 if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 50.0; }
+                
+                let is_url_single = gen_text_buffer.ends_with("http:/") || gen_text_buffer.ends_with("https:/");
+                let is_url_double = gen_text_buffer.ends_with("http:") || gen_text_buffer.ends_with("https:");
+                
+                if !is_url_single && gen_text_buffer.ends_with('/') {
+                    if (slash_id as usize) < len { logits_vec[slash_id as usize] -= 10000.0; }
+                }
+                if !is_url_double {
+                    if (double_slash_id as usize) < len { logits_vec[double_slash_id as usize] -= 10000.0; }
+                    if (space_double_slash_id as usize) < len { logits_vec[space_double_slash_id as usize] -= 10000.0; }
+                }
             }
 
             if i == 0 {

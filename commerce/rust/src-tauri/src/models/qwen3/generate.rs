@@ -269,6 +269,11 @@ impl Qwen3GenerateModel {
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(123);
         let lt_id = self.tokenizer.text_encode_vec("<".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
+        
+        let slash_id = self.tokenizer.text_encode_vec("/".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
+        let double_slash_id = self.tokenizer.text_encode_vec("//".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
+        let space_double_slash_id = self.tokenizer.text_encode_vec(" //".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
+        
         let mut gen_text = String::new();
 
         // 🌟 [Phase 1: Chunked Prefill] VRAM 폭발과 RAM 널뛰기를 막기 위해 256 토큰 단위로 강하게 압박합니다.
@@ -317,8 +322,10 @@ impl Qwen3GenerateModel {
                 if (self.eos_token_id2 as usize) < len { logits_vec[self.eos_token_id2 as usize] = -10000.0; }
                 if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
 
-                if is_strict_json && (open_bracket_id as usize) < len {
-                    logits_vec[open_bracket_id as usize] += 10000.0;
+                if is_strict_json {
+                    if (open_bracket_id as usize) < len { logits_vec[open_bracket_id as usize] += 10000.0; }
+                    if (double_slash_id as usize) < len { logits_vec[double_slash_id as usize] -= 10000.0; }
+                    if (space_double_slash_id as usize) < len { logits_vec[space_double_slash_id as usize] -= 10000.0; }
                 }
 
                 let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
@@ -351,6 +358,20 @@ impl Qwen3GenerateModel {
 
             // <think> 지속 억제
             if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
+
+            // 🌟 [CRITICAL FIX] 주석(//) 지속 억제 (웹 주소 http://, https:// 제외)
+            if is_strict_json {
+                let is_url_single = gen_text.ends_with("http:/") || gen_text.ends_with("https:/");
+                let is_url_double = gen_text.ends_with("http:") || gen_text.ends_with("https:");
+                
+                if !is_url_single && gen_text.ends_with('/') {
+                    if (slash_id as usize) < len { logits_vec[slash_id as usize] -= 10000.0; }
+                }
+                if !is_url_double {
+                    if (double_slash_id as usize) < len { logits_vec[double_slash_id as usize] -= 10000.0; }
+                    if (space_double_slash_id as usize) < len { logits_vec[space_double_slash_id as usize] -= 10000.0; }
+                }
+            }
 
             // 🌟 [CRITICAL FIX] ignore_list에 등재된 잘못된 추출값의 토큰 시퀀스 생성을 억제(Bias)합니다.
             if let Some(ignores) = ignore_list {
@@ -476,6 +497,11 @@ impl Qwen3GenerateModel {
         let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(123);
         let lt_id = self.tokenizer.text_encode_vec("<".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
         let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
+        
+        let slash_id = self.tokenizer.text_encode_vec("/".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
+        let double_slash_id = self.tokenizer.text_encode_vec("//".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
+        let space_double_slash_id = self.tokenizer.text_encode_vec(" //".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
+        
         let mut gen_text = String::new();
 
         // 🌟 [Phase 1: Chunked Prefill] 긴 문맥을 256 토큰 단위로 강하게 잘라 VRAM 및 RAM 널뛰기를 막습니다.
@@ -522,8 +548,10 @@ impl Qwen3GenerateModel {
                 if (self.eos_token_id2 as usize) < len { logits_vec[self.eos_token_id2 as usize] = -10000.0; }
                 if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
 
-                if is_strict_json && (open_bracket_id as usize) < len {
-                    logits_vec[open_bracket_id as usize] += 10000.0;
+                if is_strict_json {
+                    if (open_bracket_id as usize) < len { logits_vec[open_bracket_id as usize] += 10000.0; }
+                    if (double_slash_id as usize) < len { logits_vec[double_slash_id as usize] -= 10000.0; }
+                    if (space_double_slash_id as usize) < len { logits_vec[space_double_slash_id as usize] -= 10000.0; }
                 }
 
                 let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
@@ -556,6 +584,20 @@ impl Qwen3GenerateModel {
 
             // <think> 지속 억제
             if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
+
+            // 🌟 [CRITICAL FIX] 주석(//) 지속 억제 (웹 주소 http://, https:// 제외)
+            if is_strict_json {
+                let is_url_single = gen_text.ends_with("http:/") || gen_text.ends_with("https:/");
+                let is_url_double = gen_text.ends_with("http:") || gen_text.ends_with("https:");
+                
+                if !is_url_single && gen_text.ends_with('/') {
+                    if (slash_id as usize) < len { logits_vec[slash_id as usize] -= 10000.0; }
+                }
+                if !is_url_double {
+                    if (double_slash_id as usize) < len { logits_vec[double_slash_id as usize] -= 10000.0; }
+                    if (space_double_slash_id as usize) < len { logits_vec[space_double_slash_id as usize] -= 10000.0; }
+                }
+            }
 
             // 🌟 [CRITICAL FIX] ignore_list에 등재된 잘못된 추출값의 토큰 시퀀스 생성을 억제(Bias)합니다.
             if let Some(ignores) = ignore_list {

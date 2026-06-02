@@ -80,6 +80,13 @@ impl Qwen3VLGenerateModel {
         let mut cache_position = Tensor::arange(0u32, seq_len as u32, &self.device)?;
         let mut generate = Vec::new();
         let sample_len = mes.max_tokens.unwrap_or(1024);
+        
+        let is_strict_json = mes_render.contains("/no_think") || mes_render.contains("RETURN JSON ONLY") || mes_render.contains("Return ONLY");
+        let slash_id = self.tokenizer.text_encode_vec("/".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let double_slash_id = self.tokenizer.text_encode_vec("//".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let space_double_slash_id = self.tokenizer.text_encode_vec(" //".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let mut gen_text = String::new();
+
         for _ in 0..sample_len {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) {
@@ -102,9 +109,32 @@ impl Qwen3VLGenerateModel {
             cur_image_grid_thw = None;
             cur_pixel_values_video = None;
             cur_video_grid_thw = None;
+            
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-            let next_token = logit_processor.sample(&logits)?;
+            let mut logits_vec = logits.to_vec1::<f32>()?;
+            let len = logits_vec.len();
+
+            if is_strict_json {
+                let is_url_single = gen_text.ends_with("http:/") || gen_text.ends_with("https:/");
+                let is_url_double = gen_text.ends_with("http:") || gen_text.ends_with("https:");
+                
+                if !is_url_single && gen_text.ends_with('/') {
+                    if (slash_id as usize) < len { logits_vec[slash_id as usize] -= 10000.0; }
+                }
+                if !is_url_double {
+                    if (double_slash_id as usize) < len { logits_vec[double_slash_id as usize] -= 10000.0; }
+                    if (space_double_slash_id as usize) < len { logits_vec[space_double_slash_id as usize] -= 10000.0; }
+                }
+            }
+
+            let logits_tensor = Tensor::from_vec(logits_vec, (len,), &self.device)?;
+            let next_token = logit_processor.sample(&logits_tensor)?;
             generate.push(next_token);
+            
+            if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
+                gen_text.push_str(&piece);
+            }
+
             if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
                 break;
             }

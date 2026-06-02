@@ -848,7 +848,17 @@ async fn process_task(
             
             log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining document...", "spinner": "⠋" }));
 
-            let detail_prompt = parsing::is_detail_prompt(&page_type);
+            // HTML 문서를 파싱하여 <head> 내부의 <title> 텍스트를 추출
+            let document_title = {
+                let doc = scraper::Html::parse_document(&clean_html_content);
+                if let Ok(sel) = scraper::Selector::parse("title") {
+                    doc.select(&sel).next().map(|el| el.text().collect::<Vec<_>>().join(" ").trim().to_string()).unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            };
+
+            let detail_prompt = parsing::is_detail_prompt(&page_type, &document_title);
             // LLM이 지시사항을 잘 따르도록 래핑
             let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think", detail_prompt);
             
