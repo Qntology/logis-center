@@ -1563,6 +1563,14 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
 pub fn normalize_to_json_string(input: &str) -> String {
     let mut s = input.replace(&['\u{00A0}', '\u{200B}', '\u{202F}', '\u{FEFF}'][..], " ").trim().to_string();
 
+    // 🌟 [CRITICAL FIX] LLM이 흔히 생성하는 스마트 따옴표 및 전각 기호를 표준 ASCII 기호로 일괄 치환합니다.
+    s = s.replace('“', "\"")
+         .replace('”', "\"")
+         .replace('‘', "'")
+         .replace('’', "'")
+         .replace('，', ",")
+         .replace('：', ":");
+
     // 1. Backticks to quotes
     let re_backtick = Regex::new(r"`([\s\S]*?)`").unwrap();
     s = re_backtick.replace_all(&s, |caps: &regex::Captures| {
