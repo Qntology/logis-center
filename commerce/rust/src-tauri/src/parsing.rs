@@ -1060,7 +1060,7 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "title":String. tracking product title.
     - "registration_date":String. yyyy-MM-ddThh:mm:ss.
     - "shipping_date":String. yyyy-MM-ddThh:mm:ss.
-    - "sender_name":String. sender_name.
+    - "sender_name":String. sender name.
     - "sender_address":String. sender address.
     - "sender_phone":String. senderphone.
     - "recipient_name":String. recipient name.
@@ -1149,12 +1149,12 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
             id:String. Refer to the goods no value from the link or an attribute or input value.
         }
     ]
-    - "sender_name":String. sender_name.
-    - "sender_address":String. sender_address, Filter the addresses to District-level and up.
-    - "sender_phone":String. sender_phone.
-    - "recipient_name":String. recipient_name.
-    - "recipient_address":String. recipient_address, Filter the addresses to District-level and up.
-    - "recipient_phone":String. recipient_phone.
+    - "sender_name":String. sender name or buyer name or Seller name.
+    - "sender_address":String. sender address or buyer address or Seller address, Filter the addresses to District-level and up.
+    - "sender_phone":String. sender phone or buyer phone or Seller phone.
+    - "recipient_name":String. recipient name.
+    - "recipient_address":String. recipient address, Filter the addresses to District-level and up.
+    - "recipient_phone":String. recipient phone.
     - "bank":String. bank company name.
     - "card":String. card company name.
     - "order_date":String. order date.
