@@ -1065,8 +1065,8 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
     "tracking" => r###"- "{TYPE}":Object.
-    - "id":String. tracking number.
     - "link":String. '{HREF}'
+    - "id":String. tracking number.
     - "status":String. tracking status('draft' or 'progress' or 'return' or 'complete' or 'error').
     - "title":String. tracking product title.
     - "registration_date":String. yyyy-MM-ddThh:mm:ss.
@@ -1087,8 +1087,8 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "shipping_duration":Number. Estimated delivery days.
     - "bundle_shipping":String. Allow combined shipping."###.to_string(),
     "goods" => r###"- "{TYPE}":Object.
-    - "id":String. Refer to the ID value from the link.
     - "link":String. '{HREF}'.
+    - "id":String. Refer to the ID value from the link.
     - "code":String. Displayed alphanumeric item code (SKU) shown as text in the table cell.
     - "status":String. 'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire'.
     - "title":String. product name.
@@ -1148,8 +1148,8 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     ]"###.to_string(),
 
         "order" => r###"- "{TYPE}":Object.
-    - "id":String. Refer to the ID value from the link.
     - "link":String. '{HREF}'.
+    - "id":String. Refer to the ID value from the link.
     - "tracking_number":String. tracking number.
     - "status":String. order status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
     - "registration_date":String. yyyy-MM-ddThh:mm:ss.
@@ -1173,8 +1173,8 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "payment_method":String. payment method('C.O.D.' or 'CARD' or 'BANK' or '').
     - "payment_origin":String. payment origin(Payment Gateway Service Name or '')."###.to_string(),
     "coupon" | "event" => r###"- "{TYPE}":Object.
-    - "id":String. Refer to the ID value from the link.
     - "link":String. '{HREF}'.
+    - "id":String. Refer to the ID value from the link.
     - "type":String. coupon type('percentage' or 'fixed_amount' or 'free_shipping' or '').
     - "status":String. coupon status('draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error').
     - "title":String. title.
@@ -1195,8 +1195,8 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "address":String. offline location address.
     - "registration_date":String. yyyy-MM-ddThh:mm:ss."###.to_string(),
     "review" => r###"- "{TYPE}":Object.
-    - "id":String. Refer to the ID value from the link.
     - "link":String. '{HREF}'.
+    - "id":String. Refer to the ID value from the link.
     - "status":String. review status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
     - "name":String. reviewer name.
     - "title":String. reviewer item title.
@@ -1241,8 +1241,8 @@ pub fn list2json_meta(page_type: &str, href: &str, language: &str, head_pug: &st
     let schema = r###"- "{TYPE}":Object.
 - "code":String. product code (Stock Keeping Unit).
 - "path":String. {HREF}.
-- "id":String. Refer to the ID value from the link.
-- "link":String. Refer to the ID to find a URL that includes a manage link."###.to_string();
+- "link":String. Refer to the ID to find a URL that includes a manage link.
+- "id":String. Refer to the ID value from the link."###.to_string();
 
     let mut final_schema = schema;
     if !item_pug.contains("href=") && !item_pug.contains("href=\"") {
