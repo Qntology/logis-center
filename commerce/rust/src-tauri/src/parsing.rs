@@ -797,7 +797,7 @@ pub fn is_detail_prompt(page_type: &str) -> String {
     };
 
     let template = r###"[TASK]
-Analyze the provided PUG/HTML content from top to bottom. Determine if the main content represents a "{TYPE} Detail/{TYPE} Edit Form/{TYPE} Manage Form" (true) or a "{TYPE} List/Index Page/Home Page/Dashboard Page" (false).
+Analyze the provided PUG/HTML content from top to bottom.
 
 [ENTITY CONTEXT: {TYPE}]
 You are evaluating a page managing this specific domain entity. Use this context to conceptually understand the abstract structures:
@@ -819,11 +819,11 @@ Read the entire document from top to bottom, applying the following strict filte
 
 [SCHEMA DEFINITIONS]
 - {TYPE}:
+    - detail: Boolean. True ONLY if has_list is false AND has_form is true.
+    - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
+    - has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
     - has_header: Boolean True if the document contains a header.
     - has_footer: Boolean True if the document contains a footer.
-    - has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
-    - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
-    - detail: Boolean. True ONLY if has_list is false AND has_form is true.
 
 [OUTPUT FORMAT]
 {
@@ -832,7 +832,7 @@ Read the entire document from top to bottom, applying the following strict filte
     "has_header": Boolean,
     "has_form": Boolean,
     "has_footer": Boolean,
-    "detail": Boolean
+    "detail": Boolean,
   }
 }
 

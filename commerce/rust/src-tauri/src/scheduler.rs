@@ -912,9 +912,20 @@ async fn process_task(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 
-                // (방어 로직) LLM이 가끔 depth를 무시하고 1차원에 바로 뱉을 경우 대비
+                // (방어 로직 1) LLM이 가끔 depth를 무시하고 1차원에 바로 뱉을 경우 대비
                 if !is_detail {
                     is_detail = detail_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+                }
+
+                // 🌟 (방어 로직 2) LLM이 detail 필드를 생략했지만 프롬프트 규칙상 has_list=false, has_form=true 일 경우 논리적 추론
+                if !is_detail {
+                    let target_obj = detail_info.get(&page_type).unwrap_or(&detail_info);
+                    let has_list = target_obj.get("has_list").and_then(|v| v.as_bool()).unwrap_or(true); // 보수적으로 기본값 true
+                    let has_form = target_obj.get("has_form").and_then(|v| v.as_bool()).unwrap_or(false);
+                    
+                    if !has_list && has_form {
+                        is_detail = true;
+                    }
                 }
                     
                 println!("[Scheduler] Classified is_detail as: {}", is_detail);
