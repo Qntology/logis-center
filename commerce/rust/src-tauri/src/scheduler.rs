@@ -864,93 +864,123 @@ async fn process_task(
             
             let snapshot_id = format!("{}_step_a2", task.id); 
 
-            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            let mut detail_info = serde_json::json!({});
+            let mut retry_count = 0;
+            let mut ignore_list: Vec<String> = Vec::new();
 
-            let params = ChatCompletionParameters {
-                messages: vec![
-                    ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                        content: system_content.clone(), 
-                        name: None,
-                    }),
-                    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                        content: ChatCompletionRequestUserMessageContent::Text(task_question),
-                        name: None,
-                    })
-                ],
-                model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
-                max_tokens: Some(512),
-                temperature: Some(0.0), top_p: Some(0.95),
-                ..Default::default()
-            };
+            loop {
+                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-            let res = if base_model_size == crate::model::ModelSize::Qwen {
-                model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
-                if let Some(gen) = model.generator.lock().await.as_mut() {
-                    println!("[Scheduler] 0.6B (Qwen) Step A-2: Asking detail classification...");
-                    gen.generate(
-                        params, 
-                        Some(cancellation_token.clone()), 
-                        Some(snapshot_id.clone()), 
-                        kv_name.clone()
-                    ).await?
-                } else {
-                    return Err(anyhow::anyhow!("Qwen generator missing"));
-                }
-            } else {
-                model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, None).await?;
-                let q3_gen_arc = model.qwen3_generator.clone();
-                let cancel_clone = cancellation_token.clone();
-                tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-                    let mut gen_guard = q3_gen_arc.blocking_lock();
-                    if let Some(gen) = gen_guard.as_mut() {
-                        println!("[Scheduler] Qwen3 Step A-2: Asking detail classification...");
-                        gen.generate(params, Some(cancel_clone), None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                let params = ChatCompletionParameters {
+                    messages: vec![
+                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                            content: system_content.clone(), 
+                            name: None,
+                        }),
+                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                            content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                            name: None,
+                        })
+                    ],
+                    model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
+                    max_tokens: Some(512),
+                    temperature: Some(0.0), top_p: Some(0.95),
+                    ..Default::default()
+                };
+
+                let res = if base_model_size == crate::model::ModelSize::Qwen {
+                    model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                    if let Some(gen) = model.generator.lock().await.as_mut() {
+                        println!("[Scheduler] 0.6B (Qwen) Step A-2: Asking detail classification... (Attempt {})", retry_count + 1);
+                        gen.generate(
+                            params, 
+                            Some(cancellation_token.clone()), 
+                            Some(snapshot_id.clone()), 
+                            kv_name.clone()
+                        ).await?
                     } else {
-                        Err(anyhow::anyhow!("Qwen3 generator missing"))
+                        return Err(anyhow::anyhow!("Qwen generator missing"));
                     }
-                }).await??
-            };
-            
-            println!("[DEBUG-SCHED] Step A-2 Raw Response: '{}'", res);
-            
-            let detail_info = parsing::parse_json_from_llm(&res); 
+                } else {
+                    model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, None).await?;
+                    let q3_gen_arc = model.qwen3_generator.clone();
+                    let cancel_clone = cancellation_token.clone();
+                    let ignore_list_clone = ignore_list.clone();
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                        let mut gen_guard = q3_gen_arc.blocking_lock();
+                        if let Some(gen) = gen_guard.as_mut() {
+                            println!("[Scheduler] Qwen3 Step A-2: Asking detail classification... (Attempt {})", retry_count + 1);
+                            gen.generate(params, Some(cancel_clone), Some(ignore_list_clone.as_slice())).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                        } else {
+                            Err(anyhow::anyhow!("Qwen3 generator missing"))
+                        }
+                    }).await??
+                };
                 
-                // 바뀐 프롬프트 스키마 형태 {"goods": {"detail": true}} 에 맞춘 파싱 로직 (그대로 유지)
-                is_detail = detail_info
-                    .get(&page_type)
-                    .and_then(|v| v.get("detail"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                println!("[DEBUG-SCHED] Step A-2 Raw Response: '{}'", res);
                 
-                // (방어 로직 1) LLM이 가끔 depth를 무시하고 1차원에 바로 뱉을 경우 대비
-                if !is_detail {
-                    is_detail = detail_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
-                }
+                detail_info = parsing::parse_json_from_llm(&res); 
+                
+                let target_obj = detail_info.get(&page_type).unwrap_or(&detail_info);
+                let has_list_exists = target_obj.get("has_list").is_some();
+                let has_form_exists = target_obj.get("has_form").is_some();
 
-                // 🌟 (방어 로직 2) LLM이 detail 필드를 생략했지만 프롬프트 규칙상 has_list=false, has_form=true 일 경우 논리적 추론
-                if !is_detail {
-                    let target_obj = detail_info.get(&page_type).unwrap_or(&detail_info);
-                    let has_list = target_obj.get("has_list").and_then(|v| v.as_bool()).unwrap_or(true); // 보수적으로 기본값 true
-                    let has_form = target_obj.get("has_form").and_then(|v| v.as_bool()).unwrap_or(false);
-                    
-                    if !has_list && has_form {
-                        is_detail = true;
+                if has_list_exists && has_form_exists {
+                    break;
+                } else {
+                    retry_count += 1;
+                    if retry_count >= 3 {
+                        println!("[Scheduler] Max retries reached for Step A-2. Proceeding with best effort.");
+                        break;
                     }
-                }
+                    println!("[Scheduler] ⚠️ Missing 'has_list' or 'has_form' in Step A-2. Retrying... ({}/3)", retry_count);
                     
-                println!("[Scheduler] Classified is_detail as: {}", is_detail);
-        }
-    } // 👈 🌟 [핵심 변경 1 끝] 0.6B 분석 블록 종료
+                    let mut ignore_val = res.trim().to_string();
+                    if ignore_val.len() > 100 { ignore_val = ignore_val[..100].to_string(); }
+                    ignore_list.push(ignore_val.clone());
+                    ignore_list.push(format!(" {}", ignore_val));
+                    ignore_list.push(ignore_val.to_lowercase());
+                }
+            }
+                
+            // 바뀐 프롬프트 스키마 형태 {"goods": {"detail": true}} 에 맞춘 파싱 로직 (그대로 유지)
+            is_detail = detail_info
+                .get(&page_type)
+                .and_then(|v| v.get("detail"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            
+            // (방어 로직 1) LLM이 가끔 depth를 무시하고 1차원에 바로 뱉을 경우 대비
+            if !is_detail {
+                is_detail = detail_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+            }
+
+            // 🌟 (방어 로직 2) LLM이 detail 필드를 생략했지만 프롬프트 규칙상 has_list=false, has_form=true 일 경우 논리적 추론
+            if !is_detail {
+                let target_obj = detail_info.get(&page_type).unwrap_or(&detail_info);
+                let has_list = target_obj.get("has_list").and_then(|v| v.as_bool()).unwrap_or(true); // 보수적으로 기본값 true
+                let has_form = target_obj.get("has_form").and_then(|v| v.as_bool()).unwrap_or(false);
+                
+                if !has_list && has_form {
+                    is_detail = true;
+                }
+            }
+                
+            println!("[Scheduler] Classified is_detail as: {}", is_detail);
+        } // 👈 🌟 [핵심 변경 1 끝] 0.6B 분석 블록 종료
+    } // 🌟 [CRITICAL FIX] 누락된 if !skip_ai_analysis 블록 닫기 괄호를 복구합니다!
 
                         
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    model.deep_purge_resources().await;
-    wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
+    // 🌟 [CRITICAL FIX] 이어지는 추출 단계(Step B, List, Detail)에서 Qwen3를 그대로 재사용하므로, VRAM에서 강제로 모델을 내리지 않습니다.
+    // secure_vram_relay 내부의 스마트 스위칭 로직이 모델 변경 여부를 감지하여 필요할 때만 교체합니다.
+    // model.deep_purge_resources().await;
+    // wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
 
     let mut extracted_data = json!({});
 
-    // --- PHASE 2 Continue: Detail Extraction (If needed) --- 
+    // --- PHASE 2 Continue: Detail Extraction (If needed) ---
     if !is_detail {
         
         if !skip_ai_analysis {
@@ -1785,6 +1815,7 @@ async fn process_task(
                                 }
                             }
                             
+                            emit_term(&format!("  ✅ Extracted Item: {}", serde_json::to_string(&item_json).unwrap_or_default()));
                             all_extracted_items.push(item_json);
                         }
                     },
@@ -1834,74 +1865,194 @@ async fn process_task(
         
         let content_pug = {
             let clean_content = &clean_html_content;
-            
-            
             let full_pug = parsing::convert_to_clean_pug(clean_content, PugMode::DetailMode, Some(&url));
-            
-            
             model.truncate_pug_context(&full_pug, true, 2000, None).await
         };
 
         if !content_pug.trim().is_empty() {
-            let extraction_instruction = parsing::item2json(&page_type, &url, language);
-            let snapshot_id = format!("{}_detail", task.id);
+            // 모델 스위칭 딜레이 없이, 가장 가벼운 모델인 Qwen3 하나만으로 필드별 순차 추출(Loop)을 진행합니다!
+            model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
-            // 1. [Large] Load & Generate (Direct Qwen3.5 0.8B-Layer Generation)
-            {
-                
-                model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-                
-                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            // (이전 답변에서 생성된 parsing.rs의 get_detail_schema_fields를 호출합니다)
+            let fields = parsing::get_detail_schema_fields(&page_type, &url);
+            let total_fields = fields.len();
 
-                let params = ChatCompletionParameters {
-                    messages: vec![
-                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                            
-                            content: format!("[PUG CONTENT]\n{}", content_pug),
-                            name: None,
-                        }),
-                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                            content: ChatCompletionRequestUserMessageContent::Text(format!(
-                                "[TASK] {}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think",
-                                extraction_instruction
-                            )),
-                            name: None,
-                        })
-                    ],
-                    model: "qwen3.5".to_string(), 
-                    max_tokens: Some(1048), 
-                    temperature: Some(0.0), 
-                    top_p: Some(0.95),
-                    ..Default::default()
-                };
+            let payload = json!({ "task_id": task.id, "category": "AI Inference", "summary": format!("Extracting {} detail fields sequentially...", total_fields), "spinner": "⠋" });
+            let _ = app_handle.emit("extraction-progress", &payload);
+            emit_term(&format!("[STAGE-3] Extracting {} detailed fields individually...", total_fields));
 
-                
-                if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-                    println!("[Scheduler] Qwen3.5 Step C: Asking extraction question...");
-                    
-                    
-                    let payload = json!({ "task_id": task.id, "category": "AI Inference", "summary": "Preparing AI engine...", "spinner": "⠋" });
-                    let _ = app_handle.emit("extraction-progress", &payload);
-                    emit_term("[STAGE-3] Preparing AI engine...");
-                    
-                    
-                    let res = gen.generate_part(&params, false, 0, Some(cancellation_token.clone()), None, Some(snapshot_id.clone()), kv_name.clone()).await?;
-                    
-                    println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res.text);
+            let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                content: format!("[PUG CONTENT]\n{}", content_pug),
+                name: None,
+            });
 
-                    let mut parsed_json = parsing::parse_json_from_llm(&res.text);
-                    
-                    
-                    // page_type(예: "order", "goods") 키를 찾아서 알맹이만 빼냅니다.
-                    extracted_data = if let Some(inner) = parsed_json.get_mut(&page_type) {
-                        inner.take() // 알맹이 적중 시 꺼냄
-                    } else {
-                        parsed_json // 방어 로직: LLM이 껍데기 없이 바로 뱉었을 경우 그대로 사용
-                    };
-
+            // 문서 타이틀 추출 (환각 검증용)
+            let doc_title = {
+                let doc = scraper::Html::parse_document(&clean_html_content);
+                if let Ok(sel) = scraper::Selector::parse("title") {
+                    doc.select(&sel).next().map(|el| el.text().collect::<Vec<_>>().join(" ").trim().to_string()).unwrap_or_default()
                 } else {
-                    println!("[Scheduler] ERROR: Qwen 3.5 generator is missing!");
+                    String::new()
+                }
+            };
+
+            // 필드 단위로 하나씩 쪼개어 순차 추출 (병렬 처리 시의 VRAM 초과/컨텍스트 환각 방지)
+            for (idx, (field_name, field_desc)) in fields.into_iter().enumerate() {
+                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                
+                let percent = (((idx as f32) / (total_fields as f32)) * 100.0) as i32;
+                let summary_msg = format!("Extracting {} ({}%)...", field_name, percent);
+                
+                let payload = json!({ 
+                    "task_id": task.id, 
+                    "category": format!("Detail Extraction ({}/{})", idx + 1, total_fields), 
+                    "summary": summary_msg, 
+                    "spinner": "⠋" 
+                });
+                log_task_progress(app_handle, &task.id, &payload);
+                emit_term(&format!("[STAGE-3] {}", summary_msg));
+
+                // 🌟 [CRITICAL FIX] 새롭게 추가된 title 파라미터 규격에 맞춰 &doc_title을 주입합니다.
+                let task_question = parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, &doc_title);
+                
+                // 🌟 [BIAS SKIP LOGIC] 본문에 존재하지 않는 잘못된 추출값 기록용 리스트 및 카운터
+                let mut ignore_list: Vec<String> = Vec::new();
+                let mut miss_counter = 0;
+                
+                loop {
+                    if cancellation_token.load(Ordering::Relaxed) { break; }
+
+                    let q3_gen = model.qwen3_generator.clone();
+                    let cancel_clone = cancellation_token.clone();
+                    let sys_msg = system_message.clone();
+                    let field_name_clone = field_name.clone();
+                    let task_q = task_question.clone();
+                    let ignore_list_clone = ignore_list.clone();
+                    
+                    let res = tokio::task::spawn_blocking(move || {
+                        let mut gen_guard = q3_gen.blocking_lock();
+                        if let Some(gen) = gen_guard.as_mut() {
+                            let params = ChatCompletionParameters {
+                                messages: vec![
+                                    sys_msg,
+                                    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                                        content: ChatCompletionRequestUserMessageContent::Text(task_q),
+                                        name: None,
+                                    })
+                                ],
+                                model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
+                                ..Default::default()
+                            };
+                            // 🌟 Qwen3 생성기에 ignore_list를 전달하여 환각 토큰 생성을 억제합니다.
+                            gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone)).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
+                        } else {
+                            Err(anyhow::anyhow!("Qwen 3 Generator not available"))
+                        }
+                    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+
+                    match res {
+                        Ok(res_text) => {
+                            let mut parsed = parsing::parse_json_from_llm(&res_text);
+                            
+                            // type 래퍼 제거 로직
+                            let mut item_val = if let Some(inner) = parsed.get_mut(&page_type) { inner.take() } else { parsed };
+
+                            // 🌟 [BIAS SKIP LOGIC] 추출된 값이 실제로 PUG 본문이나 제목에 존재하는지 검증
+                            let mut requires_retry = false;
+                            let mut extracted_values_for_retry = Vec::new();
+                            
+                            // 🌟 복수 키("id,link") 지원을 위해 Split
+                            let keys: Vec<&str> = field_name_clone.split(',').map(|s| s.trim()).collect();
+                            let mut found_any_key = false;
+
+                            for k in &keys {
+                                if let Some(val) = item_val.get(*k) {
+                                    found_any_key = true;
+                                    if val.is_string() {
+                                        let extracted_str = val.as_str().unwrap_or("").trim().to_string();
+                                        if !extracted_str.is_empty() && extracted_str != "..." && extracted_str != "null" {
+                                            extracted_values_for_retry.push(extracted_str.clone());
+                                            
+                                            // 날짜 포맷, URL, 숫자 등은 PUG와 완벽 매칭이 안될 수 있으므로 예외 처리
+                                            let is_iso_date = extracted_str.contains('T') && extracted_str.len() >= 19;
+                                            let is_url = extracted_str.starts_with("http") || extracted_str.starts_with('/');
+                                            let is_number_like = extracted_str.chars().all(|c| c.is_digit(10) || c == '.' || c == '-');
+                                            
+                                            if !is_iso_date && !is_url && !is_number_like {
+                                                if !content_pug.contains(&extracted_str) && !doc_title.contains(&extracted_str) {
+                                                    requires_retry = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // LLM이 요구한 키를 하나도 안 뱉었으면 (엉뚱한 걸 뱉었으면) 재시도
+                            if !found_any_key {
+                                requires_retry = true;
+                            }
+
+                            if requires_retry {
+                                miss_counter += 1;
+                                if miss_counter > 3 {
+                                    emit_term(&format!("  ⏭️ Skipping field {} due to persistent hallucination.", field_name_clone));
+                                    break; 
+                                }
+                                emit_term(&format!("  ⚠️ Hallucination detected for field {}. Retrying... ({}/3)", field_name_clone, miss_counter));
+                                for ex_str in extracted_values_for_retry {
+                                    ignore_list.push(ex_str.clone());
+                                    ignore_list.push(format!(" {}", ex_str));
+                                    ignore_list.push(ex_str.to_lowercase());
+                                }
+                                continue;
+                            }
+
+                            // 검증 통과 후 저장 및 결과 로그 출력
+                            let mut extracted_results = Vec::new();
+                            for k in &keys {
+                                if let Some(val) = item_val.get(*k) {
+                                    extracted_data.as_object_mut().unwrap().insert(k.to_string(), val.clone());
+                                    extracted_results.push(format!("\"{}\": {}", k, val));
+                                }
+                            }
+                            
+                            // 공통 속성(has_header, title 등)도 데이터에 병합하되, 로그에서는 생략하여 깔끔하게 유지합니다.
+                            for ck in ["has_header", "has_footer", "title", "language"] {
+                                if let Some(val) = item_val.get(ck) {
+                                    extracted_data.as_object_mut().unwrap().insert(ck.to_string(), val.clone());
+                                }
+                            }
+
+                            if !extracted_results.is_empty() {
+                                emit_term(&format!("  ✅ Extracted: {}", extracted_results.join(", ")));
+                            } else {
+                                emit_term(&format!("  ✅ Extracted: (null or empty for {})", field_name_clone));
+                            }
+                            break; // 정상 추출 시 무한루프 탈출
+                        },
+                        Err(e) => {
+                            println!("[Scheduler] Error extracting detail field {}: {:?}", field_name_clone, e);
+                            break;
+                        }
+                    }
+                }
+                
+                // GC 
+                let q3_clear_arc = model.qwen3_generator.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
+                        gen.clear_kv_cache();
+                    }
+                }).await;
+
+                if !model.is_cpu_mode {
+                    let dev = model.device_config.device.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if dev.is_cuda() { let _ = dev.synchronize(); }
+                    }).await;
                 }
             }
         }

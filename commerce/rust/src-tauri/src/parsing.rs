@@ -1051,179 +1051,196 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 }
 
 
-pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
-    let schema = match page_type {
-    "tracking" => r###"- "{TYPE}":Object.
-    - "link":String. '{HREF}'
-    - "id":String. tracking number.
-    - "status":String. tracking status('draft' or 'progress' or 'return' or 'complete' or 'error').
-    - "title":String. tracking product title.
-    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
-    - "shipping_date":String. yyyy-MM-ddThh:mm:ss.
-    - "sender_name":String. sender name.
-    - "sender_address":String. sender address.
-    - "sender_phone":String. senderphone.
-    - "recipient_name":String. recipient name.
-    - "recipient_address":String. recipient address.
-    - "recipient_phone":String. recipient phone.
-    - "width":Number. Package width.
-    - "height":Number. Package height.
-    - "length":Number. Package length.
-    - "weight":Number. Package weight.
-    - "carrier":String. carrier name translated into English
-    - "shipping_fee":Number. Shipping cost.
-    - "shipping_method":String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid').
-    - "shipping_duration":Number. Estimated delivery days.
-    - "bundle_shipping":String. Allow combined shipping."###.to_string(),
-    "goods" => r###"- "{TYPE}":Object.
-    - "link":String. '{HREF}'.
-    - "id":String. Refer to the ID value from the link.
-    - "code":String. Displayed alphanumeric item code (SKU) shown as text in the table cell.
-    - "status":String. 'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire'.
-    - "title":String. product name.
-    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
-    - "payment_method":String. payment method.
-    - "bank":String. bank company name or ''.
-    - "card":String. card company name or ''.
-    - "model_name":String. product Model name.
-    - "brand_name":String. product Brand name.
-    - "condition":['new' or 'used' or 'lease' or 'rental' or 'refurbish']
-    - "description":String. product Full description (HTML allowed).
-    - "short_description":String. product short description.
-    - "tags":[{ tag : String. product keyword or tag. }]
-    - "origin_country":String. product Country of origin/manufacture.
-    - "manufacturer":String. product Manufacturer name.
-    - "release_date":String. Product release date(yyyy-MM-ddThh:mm:ss).
-    - "manufacture_date":String. product Date(yyyy-MM-ddThh:mm:ss) of manufacture.
-    - "expiration_date":String. product Expiration or use-by date(yyyy-MM-ddThh:mm:ss).
-    - "gtin":String. product Global Trade Item Number.
-    - "mpn":String. product Manufacturer Part Number.
-    - "barcode":String. product Barcode value.
-    - "sale_price":Number. product sale price.
-    - "supply_price":Number. product supply price.
-    - "currency":String. ISO 4217 Currency Code(If the currency is not explicitly stated, infer the currency based on PUG CONTENT).
-    - "compare_at_price":Number. product Original price for showing discounts.
-    - "quantity":Number. product Inventory quantity.
-    - "stock_keeping_unit":String. Stock Keeping Unit.
-    - "low_stock_threshold":Number. product Low stock alert threshold.
-    - "unit":String. product Selling unit.
-    - "tax_included":Number. product Whether tax.
-    - "tax_code":String. product Tax code for region-specific rules.
-    - "main_image_url":String. Main product image URL.
-    - "additional_image_url":String. additional product image URL.
-    - "video_url":String. product Promotional video URL.
-    - "carrier":String. product carrier name translated into English.
-    - "shipping_fee":Number. product Shipping cost.
-    - "shipping_method":String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid')
-    - "shipping_duration":Number. product Estimated delivery days.
-    - "bundle_shipping":String. product Allow combined shipping.
-    - "width":Number. Package width(cm).
-    - "height":Number. Package height(cm).
-    - "length":Number. Package length(cm).
-    - "weight":Number. Package weight(kg).
-    - "options":[ 
-        { 
-            value:String. product option name., 
-            inputs:[
-                { value:String. product option input value. }
-            ] 
+pub fn get_detail_schema_fields(page_type: &str, href: &str) -> Vec<(String, String)> {
+    let mut fields = Vec::new();
+    match page_type {
+        "tracking" => {
+            fields.push(("id,link".to_string(), format!("- \"link\": String. '{}'\n- \"id\": String. tracking number.", href)));
+            fields.push(("status".to_string(), "- \"status\": String. tracking status('draft' or 'progress' or 'return' or 'complete' or 'error').".to_string()));
+            fields.push(("title".to_string(), "- \"title\": String. tracking product title.".to_string()));
+            fields.push(("registration_date".to_string(), "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
+            fields.push(("shipping_date".to_string(), "- \"shipping_date\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
+            fields.push(("sender_name".to_string(), "- \"sender_name\": String. sender name or buyer name or Seller name.".to_string()));
+            fields.push(("sender_address".to_string(), "- \"sender_address\": String. sender address or buyer address or Seller address.".to_string()));
+            fields.push(("sender_phone".to_string(), "- \"sender_phone\": String. sender phone or buyer phone or Seller phone.".to_string()));
+            fields.push(("recipient_name".to_string(), "- \"recipient_name\": String. recipient name.".to_string()));
+            fields.push(("recipient_address".to_string(), "- \"recipient_address\": String. recipient address.".to_string()));
+            fields.push(("recipient_phone".to_string(), "- \"recipient_phone\": String. recipient phone.".to_string()));
+            fields.push(("width".to_string(), "- \"width\": Number. Package width.".to_string()));
+            fields.push(("height".to_string(), "- \"height\": Number. Package height.".to_string()));
+            fields.push(("length".to_string(), "- \"length\": Number. Package length.".to_string()));
+            fields.push(("weight".to_string(), "- \"weight\": Number. Package weight.".to_string()));
+            fields.push(("carrier".to_string(), "- \"carrier\": String. carrier name translated into English.".to_string()));
+            fields.push(("shipping_fee".to_string(), "- \"shipping_fee\": Number. Shipping cost.".to_string()));
+            fields.push(("shipping_method".to_string(), "- \"shipping_method\": String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid').".to_string()));
+            fields.push(("shipping_duration".to_string(), "- \"shipping_duration\": Number. Estimated delivery days.".to_string()));
+            fields.push(("bundle_shipping".to_string(), "- \"bundle_shipping\": String. Allow combined shipping.".to_string()));
+        },
+        "goods" => {
+            fields.push(("id,link".to_string(), format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href)));
+            fields.push(("code".to_string(), "- \"code\": String. Displayed alphanumeric item code (SKU) shown as text in the table cell.".to_string()));
+            fields.push(("status".to_string(), "- \"status\": String. 'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire'.".to_string()));
+            fields.push(("title".to_string(), "- \"title\": String. product name.".to_string()));
+            fields.push(("registration_date".to_string(), "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
+            fields.push(("payment_method".to_string(), "- \"payment_method\": String. payment method.".to_string()));
+            fields.push(("bank".to_string(), "- \"bank\": String. bank company name or ''.".to_string()));
+            fields.push(("card".to_string(), "- \"card\": String. card company name or ''.".to_string()));
+            fields.push(("model_name".to_string(), "- \"model_name\": String. product Model name.".to_string()));
+            fields.push(("brand_name".to_string(), "- \"brand_name\": String. product Brand name.".to_string()));
+            fields.push(("condition".to_string(), "- \"condition\": ['new' or 'used' or 'lease' or 'rental' or 'refurbish']".to_string()));
+            fields.push(("description".to_string(), "- \"description\": String. product Full description (HTML allowed).".to_string()));
+            fields.push(("short_description".to_string(), "- \"short_description\": String. product short description.".to_string()));
+            fields.push(("tags".to_string(), "- \"tags\": [{ tag : String. product keyword or tag. }]".to_string()));
+            fields.push(("origin_country".to_string(), "- \"origin_country\": String. product Country of origin/manufacture.".to_string()));
+            fields.push(("manufacturer".to_string(), "- \"manufacturer\": String. product Manufacturer name.".to_string()));
+            fields.push(("release_date".to_string(), "- \"release_date\": String. Product release date(yyyy-MM-ddThh:mm:ss).".to_string()));
+            fields.push(("manufacture_date".to_string(), "- \"manufacture_date\": String. product Date(yyyy-MM-ddThh:mm:ss) of manufacture.".to_string()));
+            fields.push(("expiration_date".to_string(), "- \"expiration_date\": String. product Expiration or use-by date(yyyy-MM-ddThh:mm:ss).".to_string()));
+            fields.push(("gtin".to_string(), "- \"gtin\": String. product Global Trade Item Number.".to_string()));
+            fields.push(("mpn".to_string(), "- \"mpn\": String. product Manufacturer Part Number.".to_string()));
+            fields.push(("barcode".to_string(), "- \"barcode\": String. product Barcode value.".to_string()));
+            fields.push(("sale_price".to_string(), "- \"sale_price\": Number. product sale price.".to_string()));
+            fields.push(("supply_price".to_string(), "- \"supply_price\": Number. product supply price.".to_string()));
+            fields.push(("currency".to_string(), "- \"currency\": String. ISO 4217 Currency Code(If the currency is not explicitly stated, infer the currency based on PUG CONTENT).".to_string()));
+            fields.push(("compare_at_price".to_string(), "- \"compare_at_price\": Number. product Original price for showing discounts.".to_string()));
+            fields.push(("quantity".to_string(), "- \"quantity\": Number. product Inventory quantity.".to_string()));
+            fields.push(("stock_keeping_unit".to_string(), "- \"stock_keeping_unit\": String. Stock Keeping Unit.".to_string()));
+            fields.push(("low_stock_threshold".to_string(), "- \"low_stock_threshold\": Number. product Low stock alert threshold.".to_string()));
+            fields.push(("unit".to_string(), "- \"unit\": String. product Selling unit.".to_string()));
+            fields.push(("tax_included".to_string(), "- \"tax_included\": Number. product Whether tax.".to_string()));
+            fields.push(("tax_code".to_string(), "- \"tax_code\": String. product Tax code for region-specific rules.".to_string()));
+            fields.push(("main_image_url".to_string(), "- \"main_image_url\": String. Main product image URL.".to_string()));
+            fields.push(("additional_image_url".to_string(), "- \"additional_image_url\": String. additional product image URL.".to_string()));
+            fields.push(("video_url".to_string(), "- \"video_url\": String. product Promotional video URL.".to_string()));
+            fields.push(("carrier".to_string(), "- \"carrier\": String. product carrier name translated into English.".to_string()));
+            fields.push(("shipping_fee".to_string(), "- \"shipping_fee\": Number. product Shipping cost.".to_string()));
+            fields.push(("shipping_method".to_string(), "- \"shipping_method\": String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid')".to_string()));
+            fields.push(("shipping_duration".to_string(), "- \"shipping_duration\": Number. product Estimated delivery days.".to_string()));
+            fields.push(("bundle_shipping".to_string(), "- \"bundle_shipping\": String. product Allow combined shipping.".to_string()));
+            fields.push(("width".to_string(), "- \"width\": Number. Package width(cm).".to_string()));
+            fields.push(("height".to_string(), "- \"height\": Number. Package height(cm).".to_string()));
+            fields.push(("length".to_string(), "- \"length\": Number. Package length(cm).".to_string()));
+            fields.push(("weight".to_string(), "- \"weight\": Number. Package weight(kg).".to_string()));
+            fields.push(("options".to_string(), "- \"options\": [ { value:String. product option name., inputs:[ { value:String. product option input value. } ] } ]".to_string()));
+            fields.push(("additional_goods".to_string(), "- \"additional_goods\": [ { link:String. Refer to the ID to find a URL that includes a additional goods manage link., id:String. Refer to the additional goods no value from the link or an attribute or additional goods input value. } ]".to_string()));
+        },
+        "order" => {
+            fields.push(("id,link".to_string(), format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href)));
+            fields.push(("tracking_number".to_string(), "- \"tracking_number\": String. tracking number.".to_string()));
+            fields.push(("status".to_string(), "- \"status\": String. order status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').".to_string()));
+            fields.push(("registration_date".to_string(), "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
+            fields.push(("goods".to_string(), "- \"goods\": [ { title:String. goods title., link:String. Refer to the ID to find a URL that includes a manage link., id:String. Refer to the goods no value from the link or an attribute or input value. } ]".to_string()));
+            fields.push(("sender_name".to_string(), "- \"sender_name\": String. sender name or order name or buyer name or Seller name.".to_string()));
+            fields.push(("sender_address".to_string(), "- \"sender_address\": String. sender address or order address or buyer address or Seller address.".to_string()));
+            fields.push(("sender_phone".to_string(), "- \"sender_phone\": String. sender phone or order phone or buyer phone or Seller phone.".to_string()));
+            fields.push(("recipient_name".to_string(), "- \"recipient_name\": String. recipient name.".to_string()));
+            fields.push(("recipient_address".to_string(), "- \"recipient_address\": String. recipient address.".to_string()));
+            fields.push(("recipient_phone".to_string(), "- \"recipient_phone\": String. recipient phone.".to_string()));
+            fields.push(("bank".to_string(), "- \"bank\": String. bank company name.".to_string()));
+            fields.push(("card".to_string(), "- \"card\": String. card company name.".to_string()));
+            fields.push(("order_date".to_string(), "- \"order_date\": String. order date.".to_string()));
+            fields.push(("payment_date".to_string(), "- \"payment_date\": String. payment date(payment date or '').".to_string()));
+            fields.push(("payment_method".to_string(), "- \"payment_method\": String. payment method('C.O.D.' or 'CARD' or 'BANK' or '').".to_string()));
+            fields.push(("payment_origin".to_string(), "- \"payment_origin\": String. payment origin(Payment Gateway Service Name or '').".to_string()));
+        },
+        "coupon" | "event" => {
+            fields.push(("id,link".to_string(), format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href)));
+            fields.push(("type".to_string(), "- \"type\": String. coupon type('percentage' or 'fixed_amount' or 'free_shipping' or '').".to_string()));
+            fields.push(("status".to_string(), "- \"status\": String. coupon status('draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error').".to_string()));
+            fields.push(("title".to_string(), "- \"title\": String. title.".to_string()));
+            fields.push(("started_at".to_string(), "- \"started_at\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
+            fields.push(("expired_at".to_string(), "- \"expired_at\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
+            fields.push(("code".to_string(), format!("- \"code\": String. {} code used at checkout.", page_type)));
+            fields.push(("discount".to_string(), "- \"discount\": Number. Discount value.".to_string()));
+            fields.push(("quantity".to_string(), format!("- \"quantity\": Number. {} quantity.", page_type)));
+            fields.push(("usage_limit".to_string(), "- \"usage_limit\": Number. Total usage limit for the coupon.".to_string()));
+            fields.push(("usage_per".to_string(), "- \"usage_per\": Number. Usage limit per customer.".to_string()));
+            fields.push(("new_customer_only".to_string(), "- \"new_customer_only\": Boolean. new customer only.".to_string()));
+            fields.push(("first_purchase_only".to_string(), "- \"first_purchase_only\": Boolean. first purchase only.".to_string()));
+            fields.push(("min_order_amount".to_string(), "- \"min_order_amount\": Number. Minimum order amount required to apply coupon.".to_string()));
+            fields.push(("max_order_amount".to_string(), "- \"max_order_amount\": Number. Maximum order amount allowed to apply coupon.".to_string()));
+            fields.push(("max_discount_amount".to_string(), "- \"max_discount_amount\": Number. Maximum discount limit allowed for the coupon.".to_string()));
+            fields.push(("region_restrictions".to_string(), "- \"region_restrictions\": Boolean. region restrictions.".to_string()));
+            fields.push(("number".to_string(), "- \"number\": String. contact phone number.".to_string()));
+            fields.push(("address".to_string(), "- \"address\": String. offline location address.".to_string()));
+            fields.push(("registration_date".to_string(), "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
+        },
+        "review" => {
+            fields.push(("id,link".to_string(), format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href)));
+            fields.push(("status".to_string(), "- \"status\": String. review status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').".to_string()));
+            fields.push(("name".to_string(), "- \"name\": String. reviewer name.".to_string()));
+            fields.push(("title".to_string(), "- \"title\": String. reviewer item title.".to_string()));
+            fields.push(("completed".to_string(), "- \"completed\": boolean. order complete.".to_string()));
+            fields.push(("registration_date".to_string(), "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
+        },
+        _ => {
+            fields.push(("id,link".to_string(), format!("- \"link\": String. '{}'\n- \"id\": String. Unique identifier.", href)));
+            fields.push(("title".to_string(), "- \"title\": String. General name or title.".to_string()));
+            fields.push(("status".to_string(), "- \"status\": String. Current state.".to_string()));
         }
-    ]
-    - "additional_goods":[ 
-        { 
-            link:String. Refer to the ID to find a URL that includes a additional goods manage link.,
-            id:String. Refer to the additional goods no value from the link or an attribute or additional goods input value.
-        }
-    ]"###.to_string(),
+    }
+    fields
+}
 
-        "order" => r###"- "{TYPE}":Object.
-    - "link":String. '{HREF}'.
-    - "id":String. Refer to the ID value from the link.
-    - "tracking_number":String. tracking number.
-    - "status":String. order status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
-    - "registration_date":String. yyyy-MM-ddThh:mm:ss.
-    - "goods":[
-        { 
-            title:String. goods title., 
-            link:String. Refer to the ID to find a URL that includes a manage link.,
-            id:String. Refer to the goods no value from the link or an attribute or input value.
-        }
-    ]
-    - "sender_name":String. sender name or buyer name or Seller name.
-    - "sender_address":String. sender address or buyer address or Seller address, Filter the addresses to District-level and up.
-    - "sender_phone":String. sender phone or buyer phone or Seller phone.
-    - "recipient_name":String. recipient name.
-    - "recipient_address":String. recipient address, Filter the addresses to District-level and up.
-    - "recipient_phone":String. recipient phone.
-    - "bank":String. bank company name.
-    - "card":String. card company name.
-    - "order_date":String. order date.
-    - "payment_date":String. payment date(payment date or '').
-    - "payment_method":String. payment method('C.O.D.' or 'CARD' or 'BANK' or '').
-    - "payment_origin":String. payment origin(Payment Gateway Service Name or '')."###.to_string(),
-    "coupon" | "event" => r###"- "{TYPE}":Object.
-    - "link":String. '{HREF}'.
-    - "id":String. Refer to the ID value from the link.
-    - "type":String. coupon type('percentage' or 'fixed_amount' or 'free_shipping' or '').
-    - "status":String. coupon status('draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error').
-    - "title":String. title.
-    - "started_at":String. yyyy-MM-ddThh:mm:ss.
-    - "expired_at":String. yyyy-MM-ddThh:mm:ss.
-    - "code":String. {TYPE} code used at checkout.
-    - "discount":Number. Discount value.
-    - "quantity":Number. {TYPE} quantity.
-    - "usage_limit":Number. Total usage limit for the coupon.
-    - "usage_per":Number. Usage limit per customer.
-    - "new_customer_only":Boolean. new customer only.
-    - "first_purchase_only":Boolean. first purchase only.
-    - "min_order_amount":Number. Minimum order amount required to apply coupon.
-    - "max_order_amount":Number. Maximum order amount allowed to apply coupon.
-    - "max_discount_amount":Number. Maximum discount limit allowed for the coupon.
-    - "region_restrictions":Boolean. region restrictions.
-    - "number":String. contact phone number.
-    - "address":String. offline location address.
-    - "registration_date":String. yyyy-MM-ddThh:mm:ss."###.to_string(),
-    "review" => r###"- "{TYPE}":Object.
-    - "link":String. '{HREF}'.
-    - "id":String. Refer to the ID value from the link.
-    - "status":String. review status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
-    - "name":String. reviewer name.
-    - "title":String. reviewer item title.
-    - "completed":boolean. order complete.
-    - "registration_date":String. yyyy-MM-ddThh:mm:ss."###.to_string(),
-        _ => r###"- "{TYPE}":Object.
-    - "id":String. Unique identifier.
-    - "title":String. General name or title.
-    - "status":String. Current state."###.to_string()
-    };
+pub fn extract_single_field_prompt(page_type: &str, field_name: &str, field_desc: &str, language: &str, title: &str) -> String {
+    // 🌟 복수 키(예: "id,link") 대응을 위해 동적 JSON 포맷 생성
+    let mut dynamic_output_keys = String::new();
+    for key in field_name.split(',') {
+        dynamic_output_keys.push_str(&format!("\"{}\": \"...\",\n", key.trim()));
+    }
+    let dynamic_output_keys = dynamic_output_keys.trim_end_matches(",\n");
 
     let template = r###"[TASK]
-Extract detailed information from the provided Pug template into a single structured JSON object.
+Analyze the provided PUG/HTML content from top to bottom to extract specific properties into a JSON object.
 
 [CONTEXT]
 Page Type: {TYPE}
-current Link: {HREF}
+Language: {LANGUAGE}
+
+[FORCED DOCUMENT SCANNING LOGIC]
+Read the entire document from top to bottom, applying the following strict filters and evaluations:
+
+1. IGNORE:
+   - Strictly ignore global navigation, menus, headers, footers, aside, search, filter, form.
+   - temporary placeholder (such as SKIP READ N, SKIP_READ_N, LINK_SKIP).
+2. TARGET:
+   - Focus purely on the main data payload where the target properties are located.
+3. EVALUATE:
+   - You MUST evaluate the concluding elements at the very bottom of the main content area first. Check for the following:
+     A. Does the page terminate with dataset navigation (pagination, "next/prev") or bulk-action execution elements?
+     B. Does the main data area consist of a repeating multi-entity grid?
+     C. Does the main data area contain an extensive configuration/input form (inputs, textareas, image uploads, save buttons) for a single entity?
 
 [SCHEMA DEFINITIONS]
-{SCHEMA}
+- "has_header": Boolean. True if the document contains a header.
+- "has_footer": Boolean. True if the document contains a footer.
+- "title": String. Default '{TITLE}'.
+- "language": String. Detect the language of PUG CONTENT and return ISO 639-1 code.
+{FIELDS}
 
 [EXTRACTION RULES]
-1. Return ONLY valid JSON. No preamble, no postscript.
-2. If a field is missing in the data, use null.
+1. Return ONLY valid JSON.
+2. If the field is completely missing in the data, use null.
 3. Normalize all dates to 'yyyy-MM-ddThh:mm:ss'.
 4. Extract only numeric values for price, amount, weight, and dimensions.
 5. Do NOT make up data. Only extract what is present in the Pug structure.
 
 [OUTPUT FORMAT]
-{...}
+{
+    "has_header": Boolean,
+    "title" : String,
+    "has_footer": Boolean,
+    "language": String,
+    {DYNAMIC_KEYS}
+}
 
-[ACTION] RETURN JSON ONLY. 
-NO EXPLANATION. NO THINKING. /no_think"###;
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
 
-    template.replace("{SCHEMA}", &schema)
-            .replace("{TYPE}", page_type)
-            .replace("{HREF}", href)
+    template.replace("{TYPE}", page_type)
             .replace("{LANGUAGE}", language)
+            .replace("{FIELDS}", field_desc)
+            .replace("{TITLE}", title)
+            .replace("{DYNAMIC_KEYS}", &dynamic_output_keys)
 }
 
 pub fn list2json_meta(page_type: &str, href: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
