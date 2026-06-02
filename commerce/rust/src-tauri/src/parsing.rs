@@ -818,26 +818,31 @@ Read the entire document from top to bottom, applying the following strict filte
      C. Does the main data area contain an extensive configuration/input form (inputs, textareas, image uploads, save buttons) for a single entity?
 
 [SCHEMA DEFINITIONS]
-- {TYPE}:
-    - detail: Boolean. True ONLY if has_list is false AND has_form is true.
-    - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
-    - has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
+- {TYPE}:Object.
     - has_header: Boolean True if the document contains a header.
     - has_footer: Boolean True if the document contains a footer.
+    - has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
+    - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
+    - detail: Boolean. True ONLY if has_list is false AND has_form is true.
+    - title: String. {TITLE}.
+    - language: String. Detect the language of PUG CONTENT and return ISO 639-1 code.
 
 [OUTPUT FORMAT]
 {
   "{TYPE}": {
-    "has_list": Boolean,
     "has_header": Boolean,
-    "has_form": Boolean,
+    "title":String,
     "has_footer": Boolean,
-    "detail": Boolean,
+    "language": String,
+    "has_list": Boolean,
+    "has_form": Boolean,
+    "detail": Boolean
   }
 }
 
 JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{TYPE}", page_type)
+        .replace("{TITLE}", titles_desc)
         .replace("{CATEGORY}", category_desc)
 }
 
@@ -1137,9 +1142,9 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     ]
     - "additional_goods":[ 
         { 
-            path:String. value:URL includes a additional product manage path, an administrative or additional product edit Link., 
+            path:String. URL includes a additional product manage path, an administrative or additional product edit Link., 
             id:String. Refer to the additional product no value from the link or an attribute or additional product input value., 
-            link:String. value:Refer to the ID to find a URL that includes a additional product manage link.
+            link:String. Refer to the ID to find a URL that includes a additional product manage link.
         }
     ]"###.to_string(),
 
@@ -1149,7 +1154,7 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     - "tracking_number":String. tracking number.
     - "status":String. order status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
     - "registration_date":String. yyyy-MM-ddThh:mm:ss.
-    - "goods":[{ title:{ value:String. product title. }, path:{ value:String. URL includes a manage path, an administrative or edit Link. }, id:{ value:String. Refer to the product no value from the link or an attribute or input value. }, link:{ value:String. Refer to the ID to find a URL that includes a manage link. } }]
+    - "goods":[{ title:{ String. product title. }, path:{ String. URL includes a manage path, an administrative or edit Link. }, id:{ String. Refer to the product no value from the link or an attribute or input value. }, link:{ String. Refer to the ID to find a URL that includes a manage link. } }]
     - "sender_name":String. sender_name.
     - "sender_address":String. sender_address, Filter the addresses to District-level and up.
     - "sender_phone":String. sender_phone.
