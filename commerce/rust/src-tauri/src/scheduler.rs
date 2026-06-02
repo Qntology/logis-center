@@ -813,7 +813,7 @@ async fn process_task(
                         let mut gen_guard = q3_gen_arc.blocking_lock();
                         if let Some(gen) = gen_guard.as_mut() {
                             println!("[Scheduler] Qwen3 Step A: Asking classification question...");
-                            gen.generate(params, Some(cancel_clone)).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                            gen.generate(params, Some(cancel_clone), None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
                         } else {
                             Err(anyhow::anyhow!("Qwen3 generator missing"))
                         }
@@ -894,7 +894,7 @@ async fn process_task(
                     let mut gen_guard = q3_gen_arc.blocking_lock();
                     if let Some(gen) = gen_guard.as_mut() {
                         println!("[Scheduler] Qwen3 Step A-2: Asking detail classification...");
-                        gen.generate(params, Some(cancel_clone)).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                        gen.generate(params, Some(cancel_clone), None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen3 generator missing"))
                     }
@@ -988,7 +988,7 @@ async fn process_task(
                             let mut gen_guard = q3_gen_arc.blocking_lock();
                             if let Some(gen) = gen_guard.as_mut() {
                                 println!("[JS-BRIDGE] 1. Requesting titles from LLM (Qwen3)...");
-                                gen.generate(params, Some(cancel_clone)).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                                gen.generate(params, Some(cancel_clone), None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
                             } else {
                                 Err(anyhow::anyhow!("Qwen3 generator missing"))
                             }
@@ -1663,7 +1663,7 @@ async fn process_task(
                             model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
                             ..Default::default()
                         };
-                        gen.generate(params, Some(cancel_meta)).map_err(|e| anyhow::anyhow!("Qwen 3 Meta failed: {}", e))
+                        gen.generate(params, Some(cancel_meta), None).map_err(|e| anyhow::anyhow!("Qwen 3 Meta failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                     }
@@ -1684,7 +1684,7 @@ async fn process_task(
                             model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
                             ..Default::default()
                         };
-                        gen.generate(params, Some(cancel_info)).map_err(|e| anyhow::anyhow!("Qwen 3 Info failed: {}", e))
+                        gen.generate(params, Some(cancel_info), None).map_err(|e| anyhow::anyhow!("Qwen 3 Info failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                     }
@@ -1705,7 +1705,7 @@ async fn process_task(
                             model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.95),
                             ..Default::default()
                         };
-                        gen.generate(params, Some(cancel_data)).map_err(|e| anyhow::anyhow!("Qwen 3 Data failed: {}", e))
+                        gen.generate(params, Some(cancel_data), None).map_err(|e| anyhow::anyhow!("Qwen 3 Data failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                     }

@@ -65,7 +65,7 @@ impl Default for Qwen3GenerationConfig {
             eos_token_id: vec![151643, 151645], 
             top_p: 0.95,
             top_k: 80,
-            temperature: 1.0,
+            temperature: 0.0,
             repetition_penalty: 1.2,
         }
     }

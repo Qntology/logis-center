@@ -1585,7 +1585,7 @@ impl LogisModel {
                         top_p: Some(1.0), 
                         ..Default::default()
                     };
-                    gen.generate(params, Some(cancel_clone)).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+                    gen.generate(params, Some(cancel_clone), None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
                 } else {
                     Err(anyhow::anyhow!("Qwen3 Generator is missing"))
                 }
@@ -1656,7 +1656,7 @@ impl LogisModel {
                             model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
                             ..Default::default()
                         };
-                        gen.generate(params, Some(cancel_clone)).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+                        gen.generate(params, Some(cancel_clone), None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen3 Generator is missing"))
                     }
@@ -1839,7 +1839,7 @@ impl LogisModel {
                     model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
                     ..Default::default()
                 };
-                gen.generate(params, Some(cancel_clone)).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+                gen.generate(params, Some(cancel_clone), None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
             } else {
                 Err(anyhow::anyhow!("Qwen3 Generator is missing"))
             }

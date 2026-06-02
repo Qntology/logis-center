@@ -233,6 +233,7 @@ impl Qwen3GenerateModel {
         load_session_id: Option<String>,
         cache_dir: Option<String>,
         cancel_flag: Option<Arc<AtomicBool>>,
+        ignore_list: Option<&[String]>,
     ) -> Result<String> {
         if is_prefill {
             self.clear_kv_cache();
@@ -286,7 +287,7 @@ impl Qwen3GenerateModel {
             
             let logits = self.qwen3.forward(Some(&chunk_ids), None, seqlen_offset)?;
             
-            // 🌟 [VRAM/RAM 최적화] 청크 연산 직후 GPU를 동기화하고 시스템 메모리를 즉각 수거하여 피크를 억제합니다.
+            // 🌟 [VRAM/RAM 최적화] 청크 연산 직후 GPU를 동기화하고 시스템 메모리(RAM)를 강제로 반환시킵니다.
             if self.device.is_cuda() { let _ = self.device.synchronize(); }
 
             #[cfg(target_os = "windows")]
@@ -350,6 +351,35 @@ impl Qwen3GenerateModel {
 
             // <think> 지속 억제
             if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
+
+            // 🌟 [CRITICAL FIX] ignore_list에 등재된 잘못된 추출값의 토큰 시퀀스 생성을 억제(Bias)합니다.
+            if let Some(ignores) = ignore_list {
+                for ign in ignores {
+                    let ign_toks = self.tokenizer.text_encode_vec(ign.to_string(), false).unwrap_or_default();
+                    if ign_toks.is_empty() { continue; }
+                    
+                    let mut overlap = 0;
+                    for l in (1..=ign_toks.len().min(generate.len())).rev() {
+                        if generate.ends_with(&ign_toks[..l]) {
+                            overlap = l;
+                            break;
+                        }
+                    }
+                    
+                    if overlap < ign_toks.len() {
+                        let next_tok = ign_toks[overlap] as usize;
+                        if next_tok < len {
+                            if overlap > 0 {
+                                // 이미 토큰 시퀀스가 일부 매칭되었다면 완성을 방지하기 위해 강하게 억제 (-10000.0)
+                                logits_vec[next_tok] -= 10000.0;
+                            } else if gen_text.ends_with('"') || gen_text.ends_with(':') || gen_text.ends_with(": ") {
+                                // 🌟 [CRITICAL FIX] 따옴표가 없는 불량 JSON 출력을 대비하여 콜론(:) 감지 추가 및 패널티 대폭 상향 (-10000.0)
+                                logits_vec[next_tok] -= 10000.0;
+                            }
+                        }
+                    }
+                }
+            }
 
             // 🌟 [CRITICAL FIX] 모델이 같은 문장을 무한 반복하는 현상(Loop)을 끊기 위해 페널티를 로짓(Logits)에 직접 연산합니다.
             let penalty = self.generation_config.repetition_penalty;
@@ -415,7 +445,7 @@ impl Qwen3GenerateModel {
         Ok(res_text)
     }
 
-    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>) -> Result<String> {
+    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, ignore_list: Option<&[String]>) -> Result<String> {
         let temperature = mes
             .temperature
             .unwrap_or(self.generation_config.temperature as f64);
@@ -526,6 +556,35 @@ impl Qwen3GenerateModel {
 
             // <think> 지속 억제
             if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
+
+            // 🌟 [CRITICAL FIX] ignore_list에 등재된 잘못된 추출값의 토큰 시퀀스 생성을 억제(Bias)합니다.
+            if let Some(ignores) = ignore_list {
+                for ign in ignores {
+                    let ign_toks = self.tokenizer.text_encode_vec(ign.to_string(), false).unwrap_or_default();
+                    if ign_toks.is_empty() { continue; }
+                    
+                    let mut overlap = 0;
+                    for l in (1..=ign_toks.len().min(generate.len())).rev() {
+                        if generate.ends_with(&ign_toks[..l]) {
+                            overlap = l;
+                            break;
+                        }
+                    }
+                    
+                    if overlap < ign_toks.len() {
+                        let next_tok = ign_toks[overlap] as usize;
+                        if next_tok < len {
+                            if overlap > 0 {
+                                // 이미 토큰 시퀀스가 일부 매칭되었다면 완성을 방지하기 위해 강하게 억제 (-10000.0)
+                                logits_vec[next_tok] -= 10000.0;
+                            } else if gen_text.ends_with('"') || gen_text.ends_with(':') || gen_text.ends_with(": ") {
+                                // 🌟 [CRITICAL FIX] 따옴표가 없는 불량 JSON 출력을 대비하여 콜론(:) 감지 추가 및 패널티 대폭 상향 (-10000.0)
+                                logits_vec[next_tok] -= 10000.0;
+                            }
+                        }
+                    }
+                }
+            }
 
             // 🌟 [CRITICAL FIX] 모델이 같은 문장을 무한 반복하는 현상(Loop)을 끊기 위해 페널티를 로짓(Logits)에 직접 연산합니다.
             let penalty = self.generation_config.repetition_penalty;
