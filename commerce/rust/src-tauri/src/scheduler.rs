@@ -878,7 +878,7 @@ async fn process_task(
                     })
                 ],
                 model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
-                max_tokens: Some(128),     // JSON 스키마가 길어졌으므로 토큰 길이는 128로 유지
+                max_tokens: Some(512),
                 temperature: Some(0.0), top_p: Some(0.95),
                 ..Default::default()
             };

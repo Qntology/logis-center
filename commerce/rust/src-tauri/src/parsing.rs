@@ -786,16 +786,6 @@ RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 }
 
 pub fn is_detail_prompt(page_type: &str, title: &str) -> String {
-    let category_desc = match page_type {
-        "goods" => "product",
-        "order" => "product",
-        "tracking" => "product",
-        "review" => "title",
-        "coupon" => "title",
-        "event" => "title",
-        _ => "title",
-    };
-
     let template = r###"[TASK]
 Analyze the provided PUG/HTML content from top to bottom.
 
@@ -810,7 +800,7 @@ Read the entire document from top to bottom, applying the following strict filte
 1. IGNORE:
    - Strictly ignore global navigation, menus, headers, footers, aside, search, filter.
 2. TARGET:
-   - Focus purely on the main data payload where "{CATEGORY}", "{TYPE}", or actual items are listed.
+   - Focus purely on the main data payload where "{TYPE}", or actual items are listed.
 3. EVALUATE:
    - You MUST evaluate the concluding elements at the very bottom of the main content area first. Check for the following:
      A. Does the page terminate with dataset navigation (pagination, "next/prev") or bulk-action execution elements?
@@ -843,7 +833,6 @@ Read the entire document from top to bottom, applying the following strict filte
 JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{TYPE}", page_type)
         .replace("{TITLE}", title)
-        .replace("{CATEGORY}", category_desc)
 }
 
 // pub fn para2graph(language: &str) -> String {
