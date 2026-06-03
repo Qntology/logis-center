@@ -792,7 +792,7 @@ async fn process_task(
                     ],
                     model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
                     max_tokens: Some(16),
-                    temperature: Some(0.0), top_p: Some(0.95),
+                    temperature: Some(0.2), top_p: Some(0.95),
                     ..Default::default()
                 };
 
@@ -898,7 +898,7 @@ async fn process_task(
                     ],
                     model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
                     max_tokens: Some(128),
-                    temperature: Some(0.0), top_p: Some(0.95),
+                    temperature: Some(0.2), top_p: Some(0.95),
                     ..Default::default()
                 };
 
@@ -946,14 +946,40 @@ async fn process_task(
                     doc_lang = lang_val.to_lowercase();
                 }
 
-                let has_form = parse_bool_robust(target_obj.get("has_form"))
-                    .or_else(|| parse_bool_robust(detail_info.get("has_form")));
+                // JSON Object의 Key 값을 순회하여 _form 접미사 혹은 form 정밀 탐색
+                let mut form_bool = None;
+                if let Some(obj) = target_obj.as_object() {
+                    for (k, v) in obj {
+                        if k.ends_with("_form") || k == "form" {
+                            if let Some(b) = parse_bool_robust(Some(v)) {
+                                form_bool = Some(b);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if form_bool.is_none() {
+                    if let Some(obj) = detail_info.as_object() {
+                        for (k, v) in obj {
+                            if k.ends_with("_form") || k == "form" {
+                                if let Some(b) = parse_bool_robust(Some(v)) {
+                                    form_bool = Some(b);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 let res_clean = res.to_lowercase().replace(" ", "").replace("\"", "").replace("'", "");
-                let has_form_exists = target_obj.get("has_form").is_some() || res_clean.contains("has_form:");
+                let form_key_exists = form_bool.is_some() 
+                    || res_clean.contains("form:") 
+                    || res_clean.contains("_form:");
 
-                if has_form_exists {
-                    raw_has_form = has_form.unwrap_or(res_clean.contains("has_form:true"));
+                if form_key_exists {
+                    raw_has_form = form_bool.unwrap_or_else(|| {
+                        res_clean.contains("form:true") || res_clean.contains("_form:true")
+                    });
                     break;
                 } else {
                     retry_count += 1;
@@ -1050,7 +1076,7 @@ async fn process_task(
                             })
                         ],
                         model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
-                        max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
+                        max_tokens: Some(128), temperature: Some(0.2), top_p: Some(0.95),
                         ..Default::default()
                     };
 
@@ -1448,7 +1474,7 @@ async fn process_task(
                         })],
                         model: "qwen3.5".to_string(),
                         max_tokens: Some(256), 
-                        temperature: Some(0.0), 
+                        temperature: Some(0.2), 
                         top_p: Some(0.95),
                         ..Default::default()
                     };
@@ -1758,7 +1784,7 @@ async fn process_task(
                                 content: ChatCompletionRequestUserMessageContent::Text(task_question_meta),
                                 name: None,
                             })],
-                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
+                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.2), top_p: Some(0.95),
                             ..Default::default()
                         };
                         gen.generate(params, Some(cancel_meta), None, Some(&b_meta), Some(&p_meta)).map_err(|e| anyhow::anyhow!("Qwen 3 Meta failed: {}", e))
@@ -1781,7 +1807,7 @@ async fn process_task(
                                 content: ChatCompletionRequestUserMessageContent::Text(task_question_info),
                                 name: None,
                             })],
-                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
+                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.2), top_p: Some(0.95),
                             ..Default::default()
                         };
                         gen.generate(params, Some(cancel_info), None, Some(&b_info), Some(&p_info)).map_err(|e| anyhow::anyhow!("Qwen 3 Info failed: {}", e))
@@ -1804,7 +1830,7 @@ async fn process_task(
                                 content: ChatCompletionRequestUserMessageContent::Text(task_question_data),
                                 name: None,
                             })],
-                            model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.95),
+                            model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.2), top_p: Some(0.95),
                             ..Default::default()
                         };
                         gen.generate(params, Some(cancel_data), None, Some(&b_data), Some(&p_data)).map_err(|e| anyhow::anyhow!("Qwen 3 Data failed: {}", e))
@@ -2002,7 +2028,7 @@ async fn process_task(
                                         name: None,
                                     })
                                 ],
-                                model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
+                                model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.2), top_p: Some(0.95),
                                 ..Default::default()
                             };
                             

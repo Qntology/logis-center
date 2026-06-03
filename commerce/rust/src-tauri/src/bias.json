@@ -2,7 +2,7 @@
   "ko": {
     "tracking": {
       "layout_list": { "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", "bias": "{TYPE}목록 {TYPE}리스트 {TYPE}표 {TYPE}일괄 배송목록 송장출력내역 배송현황 미배송리스트 일괄발송", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세 {TYPE}폼 {TYPE}입력 {TYPE}수정 송장수정 단일배송조회 배송지오류수정 반품처리 상세조회 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세 {TYPE}폼 {TYPE}입력 {TYPE}수정 송장수정 단일배송조회 배송지오류수정 반품처리 상세조회 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "식별자 링크 운송장번호 송장", "bias": "{TYPE}식별자 {TYPE}번호 {TYPE}코드 603145678912, 1Z9999999999999999, 381234567891", "prejudice": "주문번호 상품코드" },
       "status": { "semantic": "상태 배송상태 진행상황", "bias": "{TYPE}상태 {TYPE}진행상황 배송준비중 집화처리 간선상차 배송출발 배송완료 반품", "prejudice": "" },
       "title": { "semantic": "상품명 품목 이름 제목", "bias": "{TYPE}명 {TYPE}제목 {TYPE}이름 나이키 에어포스, 삼성 갤럭시북, 아이폰 케이스, 원피스 세트", "prejudice": "배송지 주소 수령인" },
@@ -26,7 +26,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", "bias": "{TYPE}목록 {TYPE}리스트 {TYPE}표 {TYPE}일괄 상품목록 진열관리 재고관리 일괄수정 품절처리 카테고리분류", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세 {TYPE}폼 {TYPE}입력 {TYPE}수정 상품등록 상품수정 옵션추가 상세설명에디터 썸네일등록 연관상품설정 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세 {TYPE}폼 {TYPE}입력 {TYPE}수정 상품등록 상품수정 옵션추가 상세설명에디터 썸네일등록 연관상품설정 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "식별자 링크 주소", "bias": "{TYPE}식별자 {TYPE}번호 {TYPE}코드 PROD-001, ITEM_9921, /product/view?id=123", "prejudice": "" },
       "code": { "semantic": "상품코드 품번 모델번호", "bias": "{TYPE}식별자 {TYPE}번호 {TYPE}코드 SKU-12345, ABC-9981, NK-AF1-001", "prejudice": "운송장번호 주문번호" },
       "status": { "semantic": "상태 판매상태 노출상태", "bias": "{TYPE}상태 {TYPE}진행상황 판매중 품절 숨김 노출종료 판매중지", "prejudice": "" },
@@ -76,7 +76,7 @@
     },
     "order": {
       "layout_list": { "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", "bias": "{TYPE}목록 {TYPE}리스트 {TYPE}표 {TYPE}일괄 주문목록 결제내역 취소/환불목록 전체주문 발주관리 일괄처리 선택건", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세 {TYPE}폼 {TYPE}입력 {TYPE}수정 주문상세 상세정보 배송지수정 부분취소 결제수정 수령인변경 관리자메모 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세 {TYPE}폼 {TYPE}입력 {TYPE}수정 주문상세 상세정보 배송지수정 부분취소 결제수정 수령인변경 관리자메모 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "식별자 링크 주문번호", "bias": "{TYPE}식별자 {TYPE}번호 {TYPE}코드 ORD-2026-0001, 20260315-123456, 12345-67890", "prejudice": "운송장번호 상품코드" },
       "tracking_number": { "semantic": "운송장번호 송장", "bias": "{TYPE}식별자 {TYPE}번호 {TYPE}코드 603145678912, 1Z9999999999999999, 381234567891", "prejudice": "주문번호 결제번호" },
       "status": { "semantic": "주문상태 배송상태 상태", "bias": "{TYPE}상태 {TYPE}진행상황 결제완료 배송준비중 배송중 배송완료 취소 반품 교환 환불", "prejudice": "" },
@@ -97,7 +97,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", "bias": "{TYPE}목록 {TYPE}리스트 {TYPE}표 {TYPE}일괄 쿠폰목록 이벤트내역 발급현황 기획전리스트 사용내역조회", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세 {TYPE}폼 {TYPE}입력 {TYPE}수정 쿠폰생성 조건설정 이벤트수정 할인율입력 단일발급 타겟설정 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세 {TYPE}폼 {TYPE}입력 {TYPE}수정 쿠폰생성 조건설정 이벤트수정 할인율입력 단일발급 타겟설정 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "식별자 링크 주소", "bias": "{TYPE}식별자 {TYPE}번호 {TYPE}코드 EVT-001, COUPON_9921", "prejudice": "코드 쿠폰번호" },
       "type": { "semantic": "타입 종류 종류명", "bias": "정액할인, 정률할인, 무료배송, 사은품증정", "prejudice": "상태" },
       "status": { "semantic": "상태 진행상태", "bias": "{TYPE}상태 {TYPE}진행상황 진행중 종료 대기중 발급중 발급마감", "prejudice": "타입" },
@@ -121,7 +121,7 @@
     },
     "review": {
       "layout_list": { "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", "bias": "{TYPE}목록 {TYPE}리스트 {TYPE}표 {TYPE}일괄 리뷰목록 상품평관리 평점리스트 일괄승인 미답변게시글", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세 {TYPE}폼 {TYPE}입력 {TYPE}수정 리뷰상세 답변작성 블라인드처리 적립금지급 단일조회 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세 {TYPE}폼 {TYPE}입력 {TYPE}수정 리뷰상세 답변작성 블라인드처리 적립금지급 단일조회 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "식별자 링크 주소", "bias": "{TYPE}식별자 {TYPE}번호 {TYPE}코드 REV-001, 9921, /review/view?id=123", "prejudice": "" },
       "status": { "semantic": "상태 리뷰상태", "bias": "{TYPE}상태 {TYPE}진행상황 승인 반려 대기중 숨김 블라인드", "prejudice": "" },
       "name": { "semantic": "작성자 리뷰어 이름", "bias": "{TYPE}명 {TYPE}제목 {TYPE}이름 홍길동, 김철수, 이영희", "prejudice": "상품명 제목" },
@@ -131,7 +131,7 @@
     },
     "default": {
       "layout_list": { "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", "bias": "{TYPE}목록 {TYPE}리스트 {TYPE}표 {TYPE}일괄 목록 리스트 표 일괄", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세 {TYPE}폼 {TYPE}입력 {TYPE}수정 상세 폼 입력 수정 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세 {TYPE}폼 {TYPE}입력 {TYPE}수정 상세 폼 입력 수정 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "식별자 링크 주소", "bias": "{TYPE}식별자 {TYPE}번호 {TYPE}코드 ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "제목 이름", "bias": "{TYPE}명 {TYPE}제목 {TYPE}이름 공지사항, 상품안내, 이벤트", "prejudice": "" },
       "status": { "semantic": "상태", "bias": "{TYPE}상태 {TYPE}진행상황 정상 대기 오류 완료", "prejudice": "" }
@@ -140,7 +140,7 @@
   "en": {
     "tracking": {
       "layout_list": { "semantic": "List or table page listing multiple items", "bias": "{TYPE} list {TYPE} table {TYPE} bulk shipping list print labels delivery status pending shipments bulk dispatch", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Form page for displaying or entering details of a single item", "bias": "{TYPE} detail {TYPE} form {TYPE} edit edit tracking track single fix address process return detailed view {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Form page for displaying or entering details of a single item", "bias": "{TYPE} detail {TYPE} form {TYPE} edit edit tracking track single fix address process return detailed view {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifier link tracking number", "bias": "{TYPE} identifier {TYPE} number {TYPE} code 1Z9999999999999999, 9400100000000000000000, TBA123456789, 794612345678", "prejudice": "order number product code" },
       "status": { "semantic": "status delivery state", "bias": "{TYPE} status {TYPE} state In Transit, Out for Delivery, Delivered, Pending, Exception, Returned to Sender", "prejudice": "" },
       "title": { "semantic": "product name item title", "bias": "{TYPE} title {TYPE} name Wireless Noise Cancelling Headphones, Organic Cotton T-Shirt, Smart Watch", "prejudice": "shipping address recipient" },
@@ -164,7 +164,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "List or table page listing multiple items", "bias": "{TYPE} list {TYPE} table {TYPE} bulk product list inventory management bulk edit out of stock categories", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Form page for displaying or entering details of a single item", "bias": "{TYPE} detail {TYPE} form {TYPE} edit add product edit product options description editor upload thumbnail related products {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Form page for displaying or entering details of a single item", "bias": "{TYPE} detail {TYPE} form {TYPE} edit add product edit product options description editor upload thumbnail related products {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifier link url", "bias": "{TYPE} identifier {TYPE} number {TYPE} code PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "code sku item number", "bias": "{TYPE} identifier {TYPE} number {TYPE} code SKU-12345, ABC-9981, UP-8821", "prejudice": "tracking number order number" },
       "status": { "semantic": "status condition availability", "bias": "{TYPE} status {TYPE} state In Stock, Out of Stock, Pre-order, Discontinued, Hidden", "prejudice": "" },
@@ -214,7 +214,7 @@
     },
     "order": {
       "layout_list": { "semantic": "List or table page listing multiple items", "bias": "{TYPE} list {TYPE} table {TYPE} bulk order list payment history cancellations bulk process selected", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Form page for displaying or entering details of a single item", "bias": "{TYPE} detail {TYPE} form {TYPE} edit order details shipping update partial cancel edit recipient admin memo {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Form page for displaying or entering details of a single item", "bias": "{TYPE} detail {TYPE} form {TYPE} edit order details shipping update partial cancel edit recipient admin memo {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifier link order number", "bias": "{TYPE} identifier {TYPE} number {TYPE} code ORD-12345, #1001, PO-99982, 114-1234567-8901234", "prejudice": "tracking number product code" },
       "tracking_number": { "semantic": "tracking number awb", "bias": "{TYPE} identifier {TYPE} number {TYPE} code 1Z9999999999999999, 9400100000000000000000, TBA123456789", "prejudice": "order number payment number" },
       "status": { "semantic": "status state order condition", "bias": "{TYPE} status {TYPE} state Processing, Shipped, Delivered, Cancelled, Refunded, On Hold", "prejudice": "" },
@@ -235,7 +235,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "List or table page listing multiple items", "bias": "{TYPE} list {TYPE} table {TYPE} bulk coupon list event history issuance status campaign list usage history", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Form page for displaying or entering details of a single item", "bias": "{TYPE} detail {TYPE} form {TYPE} edit create coupon set conditions edit event discount rate single issue target settings {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Form page for displaying or entering details of a single item", "bias": "{TYPE} detail {TYPE} form {TYPE} edit create coupon set conditions edit event discount rate single issue target settings {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifier link", "bias": "{TYPE} identifier {TYPE} number {TYPE} code EVT-001, COUPON_9921", "prejudice": "code coupon number" },
       "type": { "semantic": "type category", "bias": "Percentage Discount, Fixed Amount, Free Shipping, BOGO", "prejudice": "status state" },
       "status": { "semantic": "status state", "bias": "{TYPE} status {TYPE} state Active, Expired, Upcoming, Paused", "prejudice": "type category" },
@@ -259,7 +259,7 @@
     },
     "review": {
       "layout_list": { "semantic": "List or table page listing multiple items", "bias": "{TYPE} list {TYPE} table {TYPE} bulk review list manage reviews ratings bulk approve unanswered", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Form page for displaying or entering details of a single item", "bias": "{TYPE} detail {TYPE} form {TYPE} edit review details write reply blind reward points single view {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Form page for displaying or entering details of a single item", "bias": "{TYPE} detail {TYPE} form {TYPE} edit review details write reply blind reward points single view {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifier link", "bias": "{TYPE} identifier {TYPE} number {TYPE} code REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "status state", "bias": "{TYPE} status {TYPE} state Approved, Pending, Rejected, Spam", "prejudice": "" },
       "name": { "semantic": "reviewer customer", "bias": "{TYPE} title {TYPE} name John Doe, Jane Smith", "prejudice": "product name title" },
@@ -269,7 +269,7 @@
     },
     "default": {
       "layout_list": { "semantic": "List or table page listing multiple items", "bias": "{TYPE} list {TYPE} table {TYPE} bulk list table grid bulk", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Form page for displaying or entering details of a single item", "bias": "{TYPE} detail {TYPE} form {TYPE} edit detail form input edit {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Form page for displaying or entering details of a single item", "bias": "{TYPE} detail {TYPE} form {TYPE} edit detail form input edit {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifier link", "bias": "{TYPE} identifier {TYPE} number {TYPE} code ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "title name", "bias": "{TYPE} title {TYPE} name Announcement, Product Guide, Special Event", "prejudice": "" },
       "status": { "semantic": "status", "bias": "{TYPE} status {TYPE} state Normal, Pending, Error, Complete", "prejudice": "" }
@@ -278,7 +278,7 @@
   "zh": {
     "tracking": {
       "layout_list": { "semantic": "列出多个项目的列表、表格页面", "bias": "{TYPE}列表 {TYPE}表格 {TYPE}批量 发货列表 面单打印 配送状态 待发货列表 批量发货", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "显示或输入单个项目详细信息的表单页面", "bias": "{TYPE}详情 {TYPE}表单 {TYPE}修改 面单修改 单个物流查询 地址报错修改 退件处理 详情查询 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "显示或输入单个项目详细信息的表单页面", "bias": "{TYPE}详情 {TYPE}表单 {TYPE}修改 面单修改 单个物流查询 地址报错修改 退件处理 详情查询 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "标识符 链接 运单号 快递单号", "bias": "{TYPE}标识符 {TYPE}编号 {TYPE}代码 SF1234567890123, YT9876543210987, JD111222333444", "prejudice": "订单号 商品代码" },
       "status": { "semantic": "状态 配送状态 进度 物流轨迹", "bias": "{TYPE}状态 {TYPE}进度 揽收 运输中 派件中 已签收 异常 退回", "prejudice": "" },
       "title": { "semantic": "商品名称 品名 标题 物品", "bias": "{TYPE}名称 {TYPE}标题 {TYPE}名字 无线蓝牙耳机, 纯棉T恤, 智能手表, 护肤品套装", "prejudice": "收件地址 收件人" },
@@ -302,7 +302,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "列出多个项目的列表、表格页面", "bias": "{TYPE}列表 {TYPE}表格 {TYPE}批量 商品列表 陈列管理 库存管理 批量修改 售罄处理 分类管理", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "显示或输入单个项目详细信息的表单页面", "bias": "{TYPE}详情 {TYPE}表单 {TYPE}修改 商品发布 商品修改 添加选项 详情编辑器 上传主图 关联商品 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "显示或输入单个项目详细信息的表单页面", "bias": "{TYPE}详情 {TYPE}表单 {TYPE}修改 商品发布 商品修改 添加选项 详情编辑器 上传主图 关联商品 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "标识符 链接 网址", "bias": "{TYPE}标识符 {TYPE}编号 {TYPE}代码 PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "商品代码 SKU 货号", "bias": "{TYPE}标识符 {TYPE}编号 {TYPE}代码 SKU-12345, ABC-9981, CN-001", "prejudice": "运单号 订单号" },
       "status": { "semantic": "状态 销售状态 上架状态", "bias": "{TYPE}状态 {TYPE}进度 在售 已售罄 预售 下架 隐藏", "prejudice": "" },
@@ -352,7 +352,7 @@
     },
     "order": {
       "layout_list": { "semantic": "列出多个项目的列表、表格页面", "bias": "{TYPE}列表 {TYPE}表格 {TYPE}批量 订单列表 支付记录 退款列表 全部订单 发货管理 批量处理 选中项", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "显示或输入单个项目详细信息的表单页面", "bias": "{TYPE}详情 {TYPE}表单 {TYPE}修改 订单详情 详细信息 修改收件地址 部分取消 支付修改 更改收件人 管理员备注 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "显示或输入单个项目详细信息的表单页面", "bias": "{TYPE}详情 {TYPE}表单 {TYPE}修改 订单详情 详细信息 修改收件地址 部分取消 支付修改 更改收件人 管理员备注 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "标识符 链接 订单号 编号", "bias": "{TYPE}标识符 {TYPE}编号 {TYPE}代码 ORD-2026-0001, 20260315-123456, 12345-67890", "prejudice": "运单号 商品代码" },
       "tracking_number": { "semantic": "运单号 追踪号 物流单号", "bias": "{TYPE}标识符 {TYPE}编号 {TYPE}代码 SF1234567890123, YT9876543210987, JD111222333444", "prejudice": "订单号 支付编号" },
       "status": { "semantic": "订单状态 交易状态", "bias": "{TYPE}状态 {TYPE}进度 待付款 待发货 已发货 已签收 取消 退款", "prejudice": "" },
@@ -373,7 +373,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "列出多个项目的列表、表格页面", "bias": "{TYPE}列表 {TYPE}表格 {TYPE}批量 优惠券列表 活动记录 发放情况 促销列表 使用记录", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "显示或输入单个项目详细信息的表单页面", "bias": "{TYPE}详情 {TYPE}表单 {TYPE}修改 创建优惠券 条件设置 修改活动 填写折扣 单独发放 目标人群 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "显示或输入单个项目详细信息的表单页面", "bias": "{TYPE}详情 {TYPE}表单 {TYPE}修改 创建优惠券 条件设置 修改活动 填写折扣 单独发放 目标人群 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "标识符 链接", "bias": "{TYPE}标识符 {TYPE}编号 {TYPE}代码 EVT-001, COUPON_9921", "prejudice": "兑换码 优惠码" },
       "type": { "semantic": "类型 种类 分类", "bias": "满减, 折扣, 免邮, 赠品", "prejudice": "状态" },
       "status": { "semantic": "状态 活动状态", "bias": "{TYPE}状态 {TYPE}进度 进行中 已结束 未开始 已发完", "prejudice": "类型 种类" },
@@ -397,7 +397,7 @@
     },
     "review": {
       "layout_list": { "semantic": "列出多个项目的列表、表格页面", "bias": "{TYPE}列表 {TYPE}表格 {TYPE}批量 评价列表 评分列表 批量审核 待回复留言", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "显示或输入单个项目详细信息的表单页面", "bias": "{TYPE}详情 {TYPE}表单 {TYPE}修改 评价详情 写回复 屏蔽评价 发放积分 单个查询 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "显示或输入单个项目详细信息的表单页面", "bias": "{TYPE}详情 {TYPE}表单 {TYPE}修改 评价详情 写回复 屏蔽评价 发放积分 单个查询 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "标识符 链接", "bias": "{TYPE}标识符 {TYPE}编号 {TYPE}代码 REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "状态 审核状态", "bias": "{TYPE}状态 {TYPE}进度 已通过 审核中 拒绝 隐藏", "prejudice": "" },
       "name": { "semantic": "评论者 买家 评价人", "bias": "{TYPE}名称 {TYPE}标题 {TYPE}名字 张三, 李四", "prejudice": "商品名称 标题" },
@@ -407,7 +407,7 @@
     },
     "default": {
       "layout_list": { "semantic": "列出多个项目的列表、表格页面", "bias": "{TYPE}列表 {TYPE}表格 {TYPE}批量 列表 表格 批量", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "显示或输入单个项目详细信息的表单页面", "bias": "{TYPE}详情 {TYPE}表单 {TYPE}修改 详情 表单 输入 修改 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "显示或输入单个项目详细信息的表单页面", "bias": "{TYPE}详情 {TYPE}表单 {TYPE}修改 详情 表单 输入 修改 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "标识符 链接", "bias": "{TYPE}标识符 {TYPE}编号 {TYPE}代码 ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "标题 名称", "bias": "{TYPE}名称 {TYPE}标题 {TYPE}名字 公告, 产品指南, 促销活动", "prejudice": "" },
       "status": { "semantic": "状态", "bias": "{TYPE}状态 {TYPE}进度 正常 待处理 错误 完成", "prejudice": "" }
@@ -416,7 +416,7 @@
   "zh-tw": {
     "tracking": {
       "layout_list": { "semantic": "列出多個項目的列表、表格頁面", "bias": "{TYPE}列表 {TYPE}表格 {TYPE}批量 配送列表 運單列印 配送狀態 未配送清單 批量發貨", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", "bias": "{TYPE}詳情 {TYPE}表單 {TYPE}修改 運單修改 單一配送查詢 地址錯誤修改 退貨處理 詳情查詢 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", "bias": "{TYPE}詳情 {TYPE}表單 {TYPE}修改 運單修改 單一配送查詢 地址錯誤修改 退貨處理 詳情查詢 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "識別碼 連結 運單號 追蹤號", "bias": "{TYPE}識別碼 {TYPE}編號 {TYPE}代碼 SF1234567890123, 1Z9999999999999999, TW123456789", "prejudice": "訂單號 商品代碼" },
       "status": { "semantic": "狀態 配送狀態 進度", "bias": "{TYPE}狀態 {TYPE}進度 攬收 運輸中 派件中 已簽收 異常 退回", "prejudice": "" },
       "title": { "semantic": "商品名稱 品名 標題", "bias": "{TYPE}名稱 {TYPE}標題 {TYPE}名字 無線藍牙耳機, 筆記型電腦, 智慧型手錶, 保養品套組", "prejudice": "收件地址 收件人" },
@@ -440,7 +440,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "列出多個項目的列表、表格頁面", "bias": "{TYPE}列表 {TYPE}表格 {TYPE}批量 商品列表 陳列管理 庫存管理 批量修改 售罄處理 分類管理", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", "bias": "{TYPE}詳情 {TYPE}表單 {TYPE}修改 商品發布 商品修改 新增選項 詳情編輯器 上傳主圖 關聯商品 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", "bias": "{TYPE}詳情 {TYPE}表單 {TYPE}修改 商品發布 商品修改 新增選項 詳情編輯器 上傳主圖 關聯商品 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "識別碼 連結", "bias": "{TYPE}識別碼 {TYPE}編號 {TYPE}代碼 PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "商品代碼 SKU 貨號", "bias": "{TYPE}識別碼 {TYPE}編號 {TYPE}代碼 SKU-12345, ABC-9981, TW-001", "prejudice": "運單號 訂單號" },
       "status": { "semantic": "狀態 銷售狀態", "bias": "{TYPE}狀態 {TYPE}進度 販售中 已售完 預購 下架 隱藏", "prejudice": "" },
@@ -490,7 +490,7 @@
     },
     "order": {
       "layout_list": { "semantic": "列出多個項目的列表、表格頁面", "bias": "{TYPE}列表 {TYPE}表格 {TYPE}批量 訂單列表 支付紀錄 退款列表 全部訂單 發貨管理 批量處理 選中項", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", "bias": "{TYPE}詳情 {TYPE}表單 {TYPE}修改 訂單詳情 詳細資訊 修改收件地址 部分取消 支付修改 更改收件人 管理員備註 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", "bias": "{TYPE}詳情 {TYPE}表單 {TYPE}修改 訂單詳情 詳細資訊 修改收件地址 部分取消 支付修改 更改收件人 管理員備註 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "識別碼 連結 訂單號", "bias": "{TYPE}識別碼 {TYPE}編號 {TYPE}代碼 ORD-2026-0001, 20260315-123456", "prejudice": "運單號 商品代碼" },
       "tracking_number": { "semantic": "運單號 追蹤號", "bias": "{TYPE}識別碼 {TYPE}編號 {TYPE}代碼 SF1234567890123, TW123456789", "prejudice": "訂單號 支付編號" },
       "status": { "semantic": "訂單狀態", "bias": "{TYPE}狀態 {TYPE}進度 待付款 待發貨 已發貨 已簽收 取消 退款", "prejudice": "" },
@@ -511,7 +511,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "列出多個項目的列表、表格頁面", "bias": "{TYPE}列表 {TYPE}表格 {TYPE}批量 優惠券列表 活動紀錄 發放情況 促銷列表 使用紀錄", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", "bias": "{TYPE}詳情 {TYPE}表單 {TYPE}修改 創建優惠券 條件設置 修改活動 填寫折扣 單獨發放 目標人群 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", "bias": "{TYPE}詳情 {TYPE}表單 {TYPE}修改 創建優惠券 條件設置 修改活動 填寫折扣 單獨發放 目標人群 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "識別碼 連結", "bias": "{TYPE}識別碼 {TYPE}編號 {TYPE}代碼 EVT-001, COUPON_9921", "prejudice": "兌換碼 優惠碼" },
       "type": { "semantic": "類型 種類", "bias": "滿額折抵, 折扣碼, 免運費, 贈品", "prejudice": "狀態" },
       "status": { "semantic": "狀態 活動狀態", "bias": "{TYPE}狀態 {TYPE}進度 進行中 已結束 未開始 已發完", "prejudice": "類型 種類" },
@@ -535,7 +535,7 @@
     },
     "review": {
       "layout_list": { "semantic": "列出多個項目的列表、表格頁面", "bias": "{TYPE}列表 {TYPE}表格 {TYPE}批量 評價列表 評分列表 批量審核 待回覆留言", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", "bias": "{TYPE}詳情 {TYPE}表單 {TYPE}修改 評價詳情 寫回覆 屏蔽評價 發放積分 單個查詢 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", "bias": "{TYPE}詳情 {TYPE}表單 {TYPE}修改 評價詳情 寫回覆 屏蔽評價 發放積分 單個查詢 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "識別碼 連結", "bias": "{TYPE}識別碼 {TYPE}編號 {TYPE}代碼 REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "狀態 審核狀態", "bias": "{TYPE}狀態 {TYPE}進度 已通過 審核中 拒絕 隱藏", "prejudice": "" },
       "name": { "semantic": "評論者 買家", "bias": "{TYPE}名稱 {TYPE}標題 {TYPE}名字 王大明, 陳小美", "prejudice": "商品名稱 標題" },
@@ -545,7 +545,7 @@
     },
     "default": {
       "layout_list": { "semantic": "列出多個項目的列表、表格頁面", "bias": "{TYPE}列表 {TYPE}表格 {TYPE}批量 列表 表格 批量", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", "bias": "{TYPE}詳情 {TYPE}表單 {TYPE}修改 詳情 表單 輸入 修改 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", "bias": "{TYPE}詳情 {TYPE}表單 {TYPE}修改 詳情 表單 輸入 修改 {TYPE} input {TYPE} select {TYPE} textarea", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "識別碼 連結", "bias": "{TYPE}識別碼 {TYPE}編號 {TYPE}代碼 ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "標題 名稱", "bias": "{TYPE}名稱 {TYPE}標題 {TYPE}名字 公告, 產品指南, 促銷活動", "prejudice": "" },
       "status": { "semantic": "狀態", "bias": "{TYPE}狀態 {TYPE}進度 正常 待處理 錯誤 完成", "prejudice": "" }
@@ -554,7 +554,7 @@
   "ja": {
     "tracking": {
       "layout_list": { "semantic": "複数の項目を羅列するリスト、テーブルページ", "bias": "{TYPE}一覧 {TYPE}リスト {TYPE}一括 配送一覧 伝票出力 配送状況 未配送リスト 一括発送", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "単一項目の詳細情報を表示または入力するフォームページ", "bias": "{TYPE}詳細 {TYPE}フォーム {TYPE}修正 伝票修正 単一配送照会 配送先エラー修正 返品処理 詳細照会", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "単一項目の詳細情報を表示または入力するフォームページ", "bias": "{TYPE}詳細 {TYPE}フォーム {TYPE}修正 伝票修正 単一配送照会 配送先エラー修正 返品処理 詳細照会", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "識別子 リンク 追跡番号 伝票番号 お問い合わせ番号", "bias": "{TYPE}識別子 {TYPE}番号 {TYPE}コード 1234-5678-9012, 9876-5432-1098", "prejudice": "注文番号 商品コード" },
       "status": { "semantic": "ステータス 配送状況 進行状況 状態", "bias": "{TYPE}ステータス {TYPE}状態 発送準備中 発送済み 配達中 配達完了 持戻 調査中", "prejudice": "" },
       "title": { "semantic": "商品名 アイテム 名前 タイトル", "bias": "{TYPE}名 {TYPE}タイトル {TYPE}名前 ワイヤレスイヤホン, ノートパソコン, サプリメント, 化粧品セット", "prejudice": "お届け先 住所 受取人" },
@@ -578,7 +578,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "複数の項目を羅列するリスト、テーブルページ", "bias": "{TYPE}一覧 {TYPE}リスト {TYPE}一括 商品一覧 陳列管理 在庫管理 一括修正 品切れ処理 カテゴリ分類", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "単一項目の詳細情報を表示または入力するフォームページ", "bias": "{TYPE}詳細 {TYPE}フォーム {TYPE}修正 商品登録 商品修正 オプション追加 詳細説明 サムネイル登録 関連商品", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "単一項目の詳細情報を表示または入力するフォームページ", "bias": "{TYPE}詳細 {TYPE}フォーム {TYPE}修正 商品登録 商品修正 オプション追加 詳細説明 サムネイル登録 関連商品", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "識別子 リンク URL", "bias": "{TYPE}識別子 {TYPE}番号 {TYPE}コード PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "商品コード 品番 SKU", "bias": "{TYPE}識別子 {TYPE}番号 {TYPE}コード SKU-12345, ABC-9981, JP-001", "prejudice": "伝票番号 お問い合わせ番号 注文番号" },
       "status": { "semantic": "ステータス 販売状況 状態", "bias": "{TYPE}ステータス {TYPE}状態 販売中 在庫切れ 予約受付中 取扱終了 非公開", "prejudice": "" },
@@ -628,7 +628,7 @@
     },
     "order": {
       "layout_list": { "semantic": "複数の項目を羅列するリスト、テーブルページ", "bias": "{TYPE}一覧 {TYPE}リスト {TYPE}一括 注文一覧 決済履歴 返金リスト 全体注文 発注管理 一括処理 選択件", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "単一項目の詳細情報を表示または入力するフォームページ", "bias": "{TYPE}詳細 {TYPE}フォーム {TYPE}修正 注文詳細 詳細情報 配送先変更 一部キャンセル 決済修正 受取人変更 管理者メモ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "単一項目の詳細情報を表示または入力するフォームページ", "bias": "{TYPE}詳細 {TYPE}フォーム {TYPE}修正 注文詳細 詳細情報 配送先変更 一部キャンセル 決済修正 受取人変更 管理者メモ", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "注文番号 リンク 識別子", "bias": "{TYPE}識別子 {TYPE}番号 {TYPE}コード ORD-2026-0001, 20260315-123456, 12345-67890", "prejudice": "追跡番号 伝票番号 お問い合わせ番号 商品コード" },
       "tracking_number": { "semantic": "追跡番号 伝票番号 お問い合わせ番号", "bias": "{TYPE}識別子 {TYPE}番号 {TYPE}コード 1234-5678-9012, 9876-5432-1098", "prejudice": "注文番号 決済番号" },
       "status": { "semantic": "注文ステータス 状態", "bias": "{TYPE}ステータス {TYPE}状態 入金待ち 発送準備中 発送済み 配達完了 キャンセル 返品 返金", "prejudice": "" },
@@ -649,7 +649,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "複数の項目を羅列するリスト、テーブルページ", "bias": "{TYPE}一覧 {TYPE}リスト {TYPE}一括 クーポン一覧 イベント履歴 発行状況 企画展リスト 使用履歴", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "単一項目の詳細情報を表示または入力するフォームページ", "bias": "{TYPE}詳細 {TYPE}フォーム {TYPE}修正 クーポン作成 条件設定 イベント修正 割引率入力 単一発行 ターゲット設定", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "単一項目の詳細情報を表示または入力するフォームページ", "bias": "{TYPE}詳細 {TYPE}フォーム {TYPE}修正 クーポン作成 条件設定 イベント修正 割引率入力 単一発行 ターゲット設定", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "識別子 リンク", "bias": "{TYPE}識別子 {TYPE}番号 {TYPE}コード EVT-001, COUPON_9921", "prejudice": "クーポンコード プロモーションコード" },
       "type": { "semantic": "種類 タイプ クーポン種別", "bias": "定額割引, 定率割引, 送料無料, おまけ付き", "prejudice": "ステータス 開催状況" },
       "status": { "semantic": "ステータス 開催状況", "bias": "{TYPE}ステータス {TYPE}状態 開催中 終了 待機中 発行中", "prejudice": "種類 タイプ クーポン種別" },
@@ -673,7 +673,7 @@
     },
     "review": {
       "layout_list": { "semantic": "複数の項目を羅列するリスト、テーブルページ", "bias": "{TYPE}一覧 {TYPE}リスト {TYPE}一括 レビュー一覧 評価リスト 一括承認 未回答掲示板", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "単一項目の詳細情報を表示または入力するフォームページ", "bias": "{TYPE}詳細 {TYPE}フォーム {TYPE}修正 レビュー詳細 返信作成 ブラインド処理 ポイント支給 単一照会", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "単一項目の詳細情報を表示または入力するフォームページ", "bias": "{TYPE}詳細 {TYPE}フォーム {TYPE}修正 レビュー詳細 返信作成 ブラインド処理 ポイント支給 単一照会", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "識別子 リンク", "bias": "{TYPE}識別子 {TYPE}番号 {TYPE}コード REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "ステータス 状態", "bias": "{TYPE}ステータス {TYPE}状態 承認済み 拒否 審査中 非公開", "prejudice": "" },
       "name": { "semantic": "レビュアー 投稿者", "bias": "{TYPE}名 {TYPE}タイトル {TYPE}名前 鈴木一郎, 佐藤花子", "prejudice": "タイトル 件名" },
@@ -683,7 +683,7 @@
     },
     "default": {
       "layout_list": { "semantic": "複数の項目を羅列するリスト、テーブルページ", "bias": "{TYPE}一覧 {TYPE}リスト {TYPE}一括 一覧 リスト テーブル 一括", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "単一項目の詳細情報を表示または入力するフォームページ", "bias": "{TYPE}詳細 {TYPE}フォーム {TYPE}修正 詳細 フォーム 入力 修正", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "単一項目の詳細情報を表示または入力するフォームページ", "bias": "{TYPE}詳細 {TYPE}フォーム {TYPE}修正 詳細 フォーム 入力 修正", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "識別子 リンク URL", "bias": "{TYPE}識別子 {TYPE}番号 {TYPE}コード ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "タイトル 名前", "bias": "{TYPE}名 {TYPE}タイトル {TYPE}名前 お知らせ, 商品ガイド, イベント", "prejudice": "" },
       "status": { "semantic": "ステータス 状態", "bias": "{TYPE}ステータス {TYPE}状態 正常 待機 エラー 完了", "prejudice": "" }
@@ -692,7 +692,7 @@
   "es": {
     "tracking": {
       "layout_list": { "semantic": "Página de lista o tabla que muestra múltiples elementos", "bias": "{TYPE} lista {TYPE} tabla {TYPE} masivo lista de envíos imprimir etiquetas estado de entrega envíos pendientes despacho masivo", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", "bias": "{TYPE} detalle {TYPE} formulario {TYPE} editar editar seguimiento rastrear paquete corregir dirección procesar devolución vista detallada", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", "bias": "{TYPE} detalle {TYPE} formulario {TYPE} editar editar seguimiento rastrear paquete corregir dirección procesar devolución vista detallada", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificador enlace número de seguimiento guía", "bias": "{TYPE} identificador {TYPE} número {TYPE} código 1Z9999999999999999, ES123456789, MX987654321", "prejudice": "número de pedido código de producto" },
       "status": { "semantic": "estado progreso estado de entrega", "bias": "{TYPE} estado {TYPE} progreso En tránsito, En reparto, Entregado, Pendiente, Devuelto, Excepción", "prejudice": "" },
       "title": { "semantic": "nombre del producto título artículo", "bias": "{TYPE} nombre {TYPE} título Auriculares Inalámbricos, Reloj Inteligente, Camiseta de algodón", "prejudice": "dirección de envío destinatario" },
@@ -716,7 +716,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "Página de lista o tabla que muestra múltiples elementos", "bias": "{TYPE} lista {TYPE} tabla {TYPE} masivo lista de productos gestión de inventario edición masiva agotado categorías", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", "bias": "{TYPE} detalle {TYPE} formulario {TYPE} editar añadir producto editar producto opciones editor de descripción subir miniatura productos relacionados", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", "bias": "{TYPE} detalle {TYPE} formulario {TYPE} editar añadir producto editar producto opciones editor de descripción subir miniatura productos relacionados", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificador enlace", "bias": "{TYPE} identificador {TYPE} número {TYPE} código PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "código artículo sku", "bias": "{TYPE} identificador {TYPE} número {TYPE} código SKU-12345, ABC-9981, ES-001", "prejudice": "número de seguimiento guía número de pedido" },
       "status": { "semantic": "estado disponibilidad", "bias": "{TYPE} estado {TYPE} progreso En stock, Agotado, Preventa, Descatalogado, Oculto", "prejudice": "" },
@@ -766,7 +766,7 @@
     },
     "order": {
       "layout_list": { "semantic": "Página de lista o tabla que muestra múltiples elementos", "bias": "{TYPE} lista {TYPE} tabla {TYPE} masivo lista de pedidos historial de pagos cancelaciones proceso masivo seleccionados", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", "bias": "{TYPE} detalle {TYPE} formulario {TYPE} editar detalles del pedido actualizar envío cancelación parcial editar destinatario nota del administrador", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", "bias": "{TYPE} detalle {TYPE} formulario {TYPE} editar detalles del pedido actualizar envío cancelación parcial editar destinatario nota del administrador", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificador enlace número de pedido orden", "bias": "{TYPE} identificador {TYPE} número {TYPE} código ORD-12345, #1001, PO-99982", "prejudice": "número de seguimiento guía código de producto" },
       "tracking_number": { "semantic": "número de seguimiento guía", "bias": "{TYPE} identificador {TYPE} número {TYPE} código 1Z9999999999999999, ES123456789", "prejudice": "número de pedido orden" },
       "status": { "semantic": "estado del pedido", "bias": "{TYPE} estado {TYPE} progreso Procesando, Enviado, Entregado, Cancelado, Reembolsado", "prejudice": "" },
@@ -787,7 +787,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "Página de lista o tabla que muestra múltiples elementos", "bias": "{TYPE} lista {TYPE} tabla {TYPE} masivo lista de cupones historial de eventos estado de emisión campañas historial de uso", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", "bias": "{TYPE} detalle {TYPE} formulario {TYPE} editar crear cupón establecer condiciones editar evento tasa de descuento emisión única configuración de público", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", "bias": "{TYPE} detalle {TYPE} formulario {TYPE} editar crear cupón establecer condiciones editar evento tasa de descuento emisión única configuración de público", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificador enlace", "bias": "{TYPE} identificador {TYPE} número {TYPE} código EVT-001, COUPON_9921", "prejudice": "código promocional" },
       "type": { "semantic": "tipo clase", "bias": "Descuento Fijo, Porcentaje, Envío Gratis, 2x1", "prejudice": "estado" },
       "status": { "semantic": "estado", "bias": "{TYPE} estado {TYPE} progreso Activo, Finalizado, Programado, Agotado", "prejudice": "tipo clase" },
@@ -811,7 +811,7 @@
     },
     "review": {
       "layout_list": { "semantic": "Página de lista o tabla que muestra múltiples elementos", "bias": "{TYPE} lista {TYPE} tabla {TYPE} masivo lista de reseñas gestionar valoraciones aprobar masivamente sin respuesta", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", "bias": "{TYPE} detalle {TYPE} formulario {TYPE} editar detalles de la reseña escribir respuesta ocultar recompensa vista individual", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", "bias": "{TYPE} detalle {TYPE} formulario {TYPE} editar detalles de la reseña escribir respuesta ocultar recompensa vista individual", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificador enlace", "bias": "{TYPE} identificador {TYPE} número {TYPE} código REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "estado", "bias": "{TYPE} estado {TYPE} progreso Aprobado, Pendiente, Rechazado, Oculto", "prejudice": "" },
       "name": { "semantic": "revisor cliente", "bias": "{TYPE} nombre {TYPE} título Carlos López, Ana Martínez", "prejudice": "título asunto" },
@@ -821,7 +821,7 @@
     },
     "default": {
       "layout_list": { "semantic": "Página de lista o tabla que muestra múltiples elementos", "bias": "{TYPE} lista {TYPE} tabla {TYPE} masivo lista tabla cuadrícula masivo", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", "bias": "{TYPE} detalle {TYPE} formulario {TYPE} editar detalle formulario entrada editar", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", "bias": "{TYPE} detalle {TYPE} formulario {TYPE} editar detalle formulario entrada editar", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificador enlace", "bias": "{TYPE} identificador {TYPE} número {TYPE} código ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "título nombre", "bias": "{TYPE} nombre {TYPE} título Aviso, Guía de Productos, Evento Especial", "prejudice": "" },
       "status": { "semantic": "estado", "bias": "{TYPE} estado {TYPE} progreso Normal, Pendiente, Error, Completo", "prejudice": "" }
@@ -830,7 +830,7 @@
   "pt": {
     "tracking": {
       "layout_list": { "semantic": "Página de lista ou tabela que mostra vários itens", "bias": "{TYPE} lista {TYPE} tabela {TYPE} em massa lista de envios imprimir etiquetas status de entrega envios pendentes despacho em massa", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Página de formulário para exibir ou inserir detalhes de um único item", "bias": "{TYPE} detalhe {TYPE} formulário {TYPE} editar editar rastreamento rastrear pacote corrigir endereço processar devolução vista detalhada", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Página de formulário para exibir ou inserir detalhes de um único item", "bias": "{TYPE} detalhe {TYPE} formulário {TYPE} editar editar rastreamento rastrear pacote corrigir endereço processar devolução vista detalhada", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificador link número de rastreamento guia", "bias": "{TYPE} identificador {TYPE} número {TYPE} código 1Z9999999999999999, PT123456789, BR987654321", "prejudice": "número do pedido código do produto" },
       "status": { "semantic": "status progresso estado de entrega", "bias": "{TYPE} status {TYPE} estado {TYPE} progresso Em trânsito, Saiu para entrega, Entregue, Pendente, Devolvido, Exceção", "prejudice": "" },
       "title": { "semantic": "nome do produto título item", "bias": "{TYPE} nome {TYPE} título Fones de ouvido sem fio, Relógio Inteligente, Camiseta de algodão", "prejudice": "endereço de entrega destinatário" },
@@ -854,7 +854,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "Página de lista ou tabela que mostra vários itens", "bias": "{TYPE} lista {TYPE} tabela {TYPE} em massa lista de produtos gestão de inventário edição em massa esgotado categorias", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Página de formulário para exibir ou inserir detalhes de um único item", "bias": "{TYPE} detalhe {TYPE} formulário {TYPE} editar adicionar produto editar produto opções editor de descrição enviar miniatura produtos relacionados", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Página de formulário para exibir ou inserir detalhes de um único item", "bias": "{TYPE} detalhe {TYPE} formulário {TYPE} editar adicionar produto editar produto opções editor de descrição enviar miniatura produtos relacionados", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificador link", "bias": "{TYPE} identificador {TYPE} número {TYPE} código PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "código artigo sku", "bias": "{TYPE} identificador {TYPE} número {TYPE} código SKU-12345, ABC-9981, PT-001", "prejudice": "número de rastreamento número do pedido" },
       "status": { "semantic": "status disponibilidade", "bias": "{TYPE} status {TYPE} estado {TYPE} progresso Em estoque, Esgotado, Pré-venda, Descontinuado, Oculto", "prejudice": "" },
@@ -904,7 +904,7 @@
     },
     "order": {
       "layout_list": { "semantic": "Página de lista ou tabela que mostra vários itens", "bias": "{TYPE} lista {TYPE} tabela {TYPE} em massa lista de pedidos histórico de pagamentos cancelamentos processo em massa selecionados", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Página de formulário para exibir ou inserir detalhes de um único item", "bias": "{TYPE} detalhe {TYPE} formulário {TYPE} editar detalhes do pedido atualizar envio cancelamento parcial editar destinatário nota do administrador", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Página de formulário para exibir ou inserir detalhes de um único item", "bias": "{TYPE} detalhe {TYPE} formulário {TYPE} editar detalhes do pedido atualizar envio cancelamento parcial editar destinatário nota do administrador", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificador link número do pedido ordem", "bias": "{TYPE} identificador {TYPE} número {TYPE} código ORD-12345, #1001, PO-99982", "prejudice": "número de rastreamento código do produto" },
       "tracking_number": { "semantic": "número de rastreamento guia rastreio", "bias": "{TYPE} identificador {TYPE} número {TYPE} código 1Z9999999999999999, PT123456789", "prejudice": "número do pedido ordem" },
       "status": { "semantic": "estado do pedido", "bias": "{TYPE} status {TYPE} estado {TYPE} progresso Processando, Enviado, Entregue, Cancelado, Reembolsado", "prejudice": "" },
@@ -925,7 +925,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "Página de lista ou tabela que mostra vários itens", "bias": "{TYPE} lista {TYPE} tabela {TYPE} em massa lista de cupons histórico de eventos status de emissão campanhas histórico de uso", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Página de formulário para exibir ou inserir detalhes de um único item", "bias": "{TYPE} detalhe {TYPE} formulário {TYPE} editar criar cupom definir condições editar evento taxa de desconto emissão única configurações de público", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Página de formulário para exibir ou inserir detalhes de um único item", "bias": "{TYPE} detalhe {TYPE} formulário {TYPE} editar criar cupom definir condições editar evento taxa de desconto emissão única configurações de público", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificador link", "bias": "{TYPE} identificador {TYPE} número {TYPE} código EVT-001, COUPON_9921", "prejudice": "código promocional" },
       "type": { "semantic": "tipo classe", "bias": "Desconto Fixo, Porcentagem, Frete Grátis, 2x1", "prejudice": "status estado" },
       "status": { "semantic": "status estado", "bias": "{TYPE} status {TYPE} estado {TYPE} progresso Ativo, Finalizado, Programado, Esgotado", "prejudice": "tipo classe" },
@@ -949,7 +949,7 @@
     },
     "review": {
       "layout_list": { "semantic": "Página de lista ou tabela que mostra vários itens", "bias": "{TYPE} lista {TYPE} tabela {TYPE} em massa lista de avaliações gerenciar avaliações aprovar em massa sem resposta", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Página de formulário para exibir ou inserir detalhes de um único item", "bias": "{TYPE} detalhe {TYPE} formulário {TYPE} editar detalhes da avaliação escrever resposta ocultar recompensa vista individual", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Página de formulário para exibir ou inserir detalhes de um único item", "bias": "{TYPE} detalhe {TYPE} formulário {TYPE} editar detalhes da avaliação escrever resposta ocultar recompensa vista individual", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificador link", "bias": "{TYPE} identificador {TYPE} número {TYPE} código REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "status", "bias": "{TYPE} status {TYPE} estado {TYPE} progresso Aprovado, Pendente, Rejeitado, Oculto", "prejudice": "" },
       "name": { "semantic": "avaliador cliente", "bias": "{TYPE} nome {TYPE} título Carlos Ferreira, Ana Santos", "prejudice": "título assunto" },
@@ -959,7 +959,7 @@
     },
     "default": {
       "layout_list": { "semantic": "Página de lista ou tabela que mostra vários itens", "bias": "{TYPE} lista {TYPE} tabela {TYPE} em massa lista tabela grade em massa", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Página de formulário para exibir ou inserir detalhes de um único item", "bias": "{TYPE} detalhe {TYPE} formulário {TYPE} editar detalhe formulário entrada editar", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Página de formulário para exibir ou inserir detalhes de um único item", "bias": "{TYPE} detalhe {TYPE} formulário {TYPE} editar detalhe formulário entrada editar", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificador link", "bias": "{TYPE} identificador {TYPE} número {TYPE} código ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "título nome", "bias": "{TYPE} nome {TYPE} título Aviso, Guia de Produtos, Evento Especial", "prejudice": "" },
       "status": { "semantic": "status", "bias": "{TYPE} status {TYPE} estado {TYPE} progresso Normal, Pendente, Erro, Completo", "prejudice": "" }
@@ -968,7 +968,7 @@
   "de": {
     "tracking": {
       "layout_list": { "semantic": "Listen- oder Tabellenseite, die mehrere Elemente auflistet", "bias": "{TYPE} liste {TYPE} tabelle {TYPE} massen versandliste etiketten drucken lieferstatus ausstehende sendungen massenversand", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", "bias": "{TYPE} detail {TYPE} formular {TYPE} bearbeiten sendungsverfolgung bearbeiten paket verfolgen adresse korrigieren retoure bearbeiten detailansicht", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", "bias": "{TYPE} detail {TYPE} formular {TYPE} bearbeiten sendungsverfolgung bearbeiten paket verfolgen adresse korrigieren retoure bearbeiten detailansicht", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifikator link sendungsnummer", "bias": "{TYPE} identifikator {TYPE} nummer {TYPE} code 1Z9999999999999999, JJD000390000000000000, 00340434123456789012", "prejudice": "bestellnummer artikelnummer" },
       "status": { "semantic": "status lieferstatus zustand", "bias": "{TYPE} status {TYPE} zustand {TYPE} fortschritt Unterwegs, In Zustellung, Zugestellt, Ausstehend, Ausnahme, Rücksendung", "prejudice": "" },
       "title": { "semantic": "titel produktname artikel", "bias": "{TYPE} titel {TYPE} name Kabellose Kopfhörer, Bio-Baumwoll-T-Shirt, Smartwatch", "prejudice": "lieferadresse empfänger" },
@@ -992,7 +992,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "Listen- oder Tabellenseite, die mehrere Elemente auflistet", "bias": "{TYPE} liste {TYPE} tabelle {TYPE} massen produktliste bestandsverwaltung massenbearbeitung ausverkauft kategorien", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", "bias": "{TYPE} detail {TYPE} formular {TYPE} bearbeiten produkt hinzufügen produkt bearbeiten optionen beschreibungseditor thumbnail hochladen ähnliche produkte", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", "bias": "{TYPE} detail {TYPE} formular {TYPE} bearbeiten produkt hinzufügen produkt bearbeiten optionen beschreibungseditor thumbnail hochladen ähnliche produkte", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifikator link", "bias": "{TYPE} identifikator {TYPE} nummer {TYPE} code PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "artikelnummer sku", "bias": "{TYPE} identifikator {TYPE} nummer {TYPE} code SKU-12345, ABC-9981, DE-001", "prejudice": "sendungsnummer bestellnummer" },
       "status": { "semantic": "status verfügbarkeit", "bias": "{TYPE} status {TYPE} zustand {TYPE} fortschritt Auf Lager, Ausverkauft, Vorbestellung, Nicht mehr lieferbar, Versteckt", "prejudice": "" },
@@ -1042,7 +1042,7 @@
     },
     "order": {
       "layout_list": { "semantic": "Listen- oder Tabellenseite, die mehrere Elemente auflistet", "bias": "{TYPE} liste {TYPE} tabelle {TYPE} massen bestellliste zahlungshistorie stornierungen massenverarbeitung ausgewählt", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", "bias": "{TYPE} detail {TYPE} formular {TYPE} bearbeiten bestelldetails versand aktualisieren teilstonierung empfänger bearbeiten admin-notiz", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", "bias": "{TYPE} detail {TYPE} formular {TYPE} bearbeiten bestelldetails versand aktualisieren teilstonierung empfänger bearbeiten admin-notiz", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifikator link bestellnummer", "bias": "{TYPE} identifikator {TYPE} nummer {TYPE} code ORD-12345, #1001, PO-99982", "prejudice": "sendungsnummer artikelnummer" },
       "tracking_number": { "semantic": "sendungsnummer", "bias": "{TYPE} identifikator {TYPE} nummer {TYPE} code 1Z9999999999999999, JJD000390000000000000", "prejudice": "bestellnummer zahlungsnummer" },
       "status": { "semantic": "bestellstatus", "bias": "{TYPE} status {TYPE} zustand {TYPE} fortschritt In Bearbeitung, Versandt, Zugestellt, Storniert, Erstattet", "prejudice": "" },
@@ -1063,7 +1063,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "Listen- oder Tabellenseite, die mehrere Elemente auflistet", "bias": "{TYPE} liste {TYPE} tabelle {TYPE} massen gutscheinliste event-historie ausgabestatus kampagnen nutzungshistorie", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", "bias": "{TYPE} detail {TYPE} formular {TYPE} bearbeiten gutschein erstellen bedingungen festlegen event bearbeiten rabatt festlegen einzelausgabe zielgruppeneinstellungen", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", "bias": "{TYPE} detail {TYPE} formular {TYPE} bearbeiten gutschein erstellen bedingungen festlegen event bearbeiten rabatt festlegen einzelausgabe zielgruppeneinstellungen", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifikator link", "bias": "{TYPE} identifikator {TYPE} nummer {TYPE} code EVT-001, COUPON_9921", "prejudice": "gutscheincode" },
       "type": { "semantic": "typ art", "bias": "Fester Rabatt, Prozentual, Kostenloser Versand, 2-für-1", "prejudice": "status" },
       "status": { "semantic": "status", "bias": "{TYPE} status {TYPE} zustand {TYPE} fortschritt Aktiv, Beendet, Geplant, Ausverkauft", "prejudice": "typ art" },
@@ -1087,7 +1087,7 @@
     },
     "review": {
       "layout_list": { "semantic": "Listen- oder Tabellenseite, die mehrere Elemente auflistet", "bias": "{TYPE} liste {TYPE} tabelle {TYPE} massen bewertungsliste bewertungen verwalten massenfreigabe unbeantwortet", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", "bias": "{TYPE} detail {TYPE} formular {TYPE} bearbeiten bewertungsdetails antwort schreiben ausblenden belohnung einzelansicht", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", "bias": "{TYPE} detail {TYPE} formular {TYPE} bearbeiten bewertungsdetails antwort schreiben ausblenden belohnung einzelansicht", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifikator link", "bias": "{TYPE} identifikator {TYPE} nummer {TYPE} code REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "status", "bias": "{TYPE} status {TYPE} zustand {TYPE} fortschritt Genehmigt, Ausstehend, Abgelehnt, Versteckt", "prejudice": "" },
       "name": { "semantic": "rezensent", "bias": "{TYPE} name {TYPE} titel Felix Schmidt, Anna Müller", "prejudice": "titel betreff" },
@@ -1097,7 +1097,7 @@
     },
     "default": {
       "layout_list": { "semantic": "Listen- oder Tabellenseite, die mehrere Elemente auflistet", "bias": "{TYPE} liste {TYPE} tabelle {TYPE} massen liste tabelle raster massen", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", "bias": "{TYPE} detail {TYPE} formular {TYPE} bearbeiten detail formular eingabe bearbeiten", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", "bias": "{TYPE} detail {TYPE} formular {TYPE} bearbeiten detail formular eingabe bearbeiten", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifikator link", "bias": "{TYPE} identifikator {TYPE} nummer {TYPE} code ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "titel name", "bias": "{TYPE} titel {TYPE} name Ankündigung, Produktleitfaden, Sonderaktion", "prejudice": "" },
       "status": { "semantic": "status", "bias": "{TYPE} status {TYPE} zustand {TYPE} fortschritt Normal, Ausstehend, Fehler, Abgeschlossen", "prejudice": "" }
@@ -1106,7 +1106,7 @@
   "fr": {
     "tracking": {
       "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste d'expéditions imprimer étiquettes statut de livraison expéditions en attente envoi groupé", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier modifier suivi suivre colis corriger adresse traiter retour vue détaillée", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier modifier suivi suivre colis corriger adresse traiter retour vue détaillée", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifiant lien numéro de suivi", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code 1Z9999999999999999, 6A12345678901, FR123456789", "prejudice": "numéro de commande code article" },
       "status": { "semantic": "statut état de livraison", "bias": "{TYPE} statut {TYPE} état {TYPE} progression En transit, En cours de livraison, Livré, En attente, Retourné à l'expéditeur, Exception", "prejudice": "" },
       "title": { "semantic": "titre nom du produit", "bias": "{TYPE} titre {TYPE} nom Écouteurs sans fil, T-shirt en coton, Montre connectée", "prejudice": "adresse de livraison destinataire" },
@@ -1130,7 +1130,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste de produits gestion des stocks édition en masse rupture de stock catégories", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier ajouter produit modifier produit options éditeur de description télécharger miniature produits associés", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier ajouter produit modifier produit options éditeur de description télécharger miniature produits associés", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifiant lien", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "code article sku", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code SKU-12345, ABC-9981, FR-001", "prejudice": "numéro de suivi numéro de commande" },
       "status": { "semantic": "statut disponibilité", "bias": "{TYPE} statut {TYPE} état {TYPE} progression En stock, Épuisé, Précommande, Fin de série, Masqué", "prejudice": "" },
@@ -1180,7 +1180,7 @@
     },
     "order": {
       "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste de commandes historique des paiements annulations traitement en masse sélectionnés", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier détails de la commande mettre à jour l'expédition annulation partielle modifier le destinataire note de l'administrateur", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier détails de la commande mettre à jour l'expédition annulation partielle modifier le destinataire note de l'administrateur", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifiant lien numéro de commande", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code ORD-12345, #1001, PO-99982", "prejudice": "numéro de suivi code article" },
       "tracking_number": { "semantic": "numéro de suivi", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code 1Z9999999999999999, 6A12345678901", "prejudice": "numéro de commande numéro de paiement" },
       "status": { "semantic": "statut de la commande", "bias": "{TYPE} statut {TYPE} état {TYPE} progression En traitement, Expédié, Livré, Annulé, Remboursé", "prejudice": "" },
@@ -1201,7 +1201,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste de coupons historique des événements statut d'émission campagnes historique d'utilisation", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier créer coupon définir conditions modifier événement taux de remise émission unique paramètres de la cible", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier créer coupon définir conditions modifier événement taux de remise émission unique paramètres de la cible", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifiant lien", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code EVT-001, COUPON_9921", "prejudice": "code promo" },
       "type": { "semantic": "type catégorie", "bias": "Remise Fixe, Pourcentage, Livraison Gratuite, 2 pour 1", "prejudice": "statut" },
       "status": { "semantic": "statut", "bias": "{TYPE} statut {TYPE} état {TYPE} progression Actif, Terminé, Programmé, Épuisé", "prejudice": "type catégorie" },
@@ -1225,7 +1225,7 @@
     },
     "review": {
       "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste d'avis gérer les évaluations approuver en masse sans réponse", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier détails de l'avis rédiger une réponse masquer récompense vue individuelle", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier détails de l'avis rédiger une réponse masquer récompense vue individuelle", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifiant lien", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "statut", "bias": "{TYPE} statut {TYPE} état {TYPE} progression Approuvé, En attente, Rejeté, Masqué", "prejudice": "" },
       "name": { "semantic": "évaluateur", "bias": "{TYPE} nom {TYPE} titre Pierre Bernard, Sylvie Dubois", "prejudice": "titre sujet" },
@@ -1235,7 +1235,7 @@
     },
     "default": {
       "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste tableau grille en masse", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier détail formulaire entrée modifier", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier détail formulaire entrée modifier", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identifiant lien", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "titre", "bias": "{TYPE} titre {TYPE} nom Annonce, Guide Produit, Événement Spécial", "prejudice": "" },
       "status": { "semantic": "statut", "bias": "{TYPE} statut {TYPE} état {TYPE} progression Normal, En attente, Erreur, Terminé", "prejudice": "" }
@@ -1244,7 +1244,7 @@
   "nl": {
     "tracking": {
       "layout_list": { "semantic": "Lijst of tabel pagina met meerdere items", "bias": "{TYPE} lijst {TYPE} tabel {TYPE} bulk verzendlijst labels afdrukken leveringsstatus in afwachting bulkverzending", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", "bias": "{TYPE} detail {TYPE} formulier {TYPE} bewerken tracking bewerken pakket volgen adres corrigeren retour verwerken detailweergave", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", "bias": "{TYPE} detail {TYPE} formulier {TYPE} bewerken tracking bewerken pakket volgen adres corrigeren retour verwerken detailweergave", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatie link trackingnummer", "bias": "{TYPE} identificatie {TYPE} nummer {TYPE} code 1Z9999999999999999, NL123456789, BE987654321", "prejudice": "bestelnummer productcode" },
       "status": { "semantic": "status voortgang leveringsstatus", "bias": "{TYPE} status {TYPE} voortgang Onderweg, Wordt bezorgd, Afgeleverd, In afwachting, Geretourneerd, Uitzondering", "prejudice": "" },
       "title": { "semantic": "productnaam titel", "bias": "{TYPE} naam {TYPE} titel Draadloze Koptelefoon, Smartwatch, Katoenen T-shirt", "prejudice": "verzendadres ontvanger" },
@@ -1268,7 +1268,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "Lijst of tabel pagina met meerdere items", "bias": "{TYPE} lijst {TYPE} tabel {TYPE} bulk productlijst voorraadbeheer bulkbewerking uitverkocht categorieën", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", "bias": "{TYPE} detail {TYPE} formulier {TYPE} bewerken product toevoegen product bewerken opties beschrijving editor miniatuur uploaden gerelateerde producten", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", "bias": "{TYPE} detail {TYPE} formulier {TYPE} bewerken product toevoegen product bewerken opties beschrijving editor miniatuur uploaden gerelateerde producten", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatie link url", "bias": "{TYPE} identificatie {TYPE} nummer {TYPE} code PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "artikelcode sku", "bias": "{TYPE} identificatie {TYPE} nummer {TYPE} code SKU-12345, ABC-9981, NL-001", "prejudice": "trackingnummer bestelnummer" },
       "status": { "semantic": "status beschikbaarheid", "bias": "{TYPE} status {TYPE} voortgang Op voorraad, Uitverkocht, Pre-order, Stopgezet, Verborgen", "prejudice": "" },
@@ -1318,7 +1318,7 @@
     },
     "order": {
       "layout_list": { "semantic": "Lijst of tabel pagina met meerdere items", "bias": "{TYPE} lijst {TYPE} tabel {TYPE} bulk bestellijst betalingsgeschiedenis annuleringen bulkverwerking geselecteerde", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", "bias": "{TYPE} detail {TYPE} formulier {TYPE} bewerken besteldetails verzending bijwerken gedeeltelijke annulering ontvanger bewerken beheerdersnotitie", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", "bias": "{TYPE} detail {TYPE} formulier {TYPE} bewerken besteldetails verzending bijwerken gedeeltelijke annulering ontvanger bewerken beheerdersnotitie", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatie link bestelnummer", "bias": "{TYPE} identificatie {TYPE} nummer {TYPE} code ORD-12345, #1001, PO-99982", "prejudice": "trackingnummer productcode" },
       "tracking_number": { "semantic": "trackingnummer", "bias": "{TYPE} identificatie {TYPE} nummer {TYPE} code 1Z9999999999999999, NL123456789", "prejudice": "bestelnummer" },
       "status": { "semantic": "bestelstatus", "bias": "{TYPE} status {TYPE} voortgang Verwerken, Verzonden, Afgeleverd, Geannuleerd, Terugbetaald", "prejudice": "" },
@@ -1339,7 +1339,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "Lijst of tabel pagina met meerdere items", "bias": "{TYPE} lijst {TYPE} tabel {TYPE} bulk couponlijst evenementgeschiedenis uitgiftestatus campagnes gebruiksgeschiedenis", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", "bias": "{TYPE} detail {TYPE} formulier {TYPE} bewerken coupon aanmaken voorwaarden instellen evenement bewerken kortingspercentage enkele uitgifte doelgroepinstellingen", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", "bias": "{TYPE} detail {TYPE} formulier {TYPE} bewerken coupon aanmaken voorwaarden instellen evenement bewerken kortingspercentage enkele uitgifte doelgroepinstellingen", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatie link", "bias": "{TYPE} identificatie {TYPE} nummer {TYPE} code EVT-001, COUPON_9921", "prejudice": "kortingscode" },
       "type": { "semantic": "type categorie", "bias": "Vast bedrag, Percentage, Gratis verzending, 1+1 Gratis", "prejudice": "status" },
       "status": { "semantic": "status", "bias": "{TYPE} status {TYPE} voortgang Actief, Verlopen, Gepland, Uitgeput", "prejudice": "type categorie" },
@@ -1363,7 +1363,7 @@
     },
     "review": {
       "layout_list": { "semantic": "Lijst of tabel pagina met meerdere items", "bias": "{TYPE} lijst {TYPE} tabel {TYPE} bulk beoordelingenlijst beoordelingen beheren bulk goedkeuren onbeantwoord", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", "bias": "{TYPE} detail {TYPE} formulier {TYPE} bewerken beoordelingsdetails antwoord schrijven verbergen beloning individuele weergave", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", "bias": "{TYPE} detail {TYPE} formulier {TYPE} bewerken beoordelingsdetails antwoord schrijven verbergen beloning individuele weergave", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatie link", "bias": "{TYPE} identificatie {TYPE} nummer {TYPE} code REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "status", "bias": "{TYPE} status {TYPE} voortgang Goedgekeurd, In afwachting, Afgewezen, Verborgen", "prejudice": "" },
       "name": { "semantic": "beoordelaar klant", "bias": "{TYPE} naam {TYPE} titel Pieter Bakker, Maria de Vries", "prejudice": "titel onderwerp" },
@@ -1373,7 +1373,7 @@
     },
     "default": {
       "layout_list": { "semantic": "Lijst of tabel pagina met meerdere items", "bias": "{TYPE} lijst {TYPE} tabel {TYPE} bulk lijst tabel raster bulk", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", "bias": "{TYPE} detail {TYPE} formulier {TYPE} bewerken detail formulier invoer bewerken", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", "bias": "{TYPE} detail {TYPE} formulier {TYPE} bewerken detail formulier invoer bewerken", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatie link", "bias": "{TYPE} identificatie {TYPE} nummer {TYPE} code ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "titel naam", "bias": "{TYPE} naam {TYPE} titel Aankondiging, Productgids, Speciaal Evenement", "prejudice": "" },
       "status": { "semantic": "status", "bias": "{TYPE} status {TYPE} voortgang Normaal, In afwachting, Fout, Voltooid", "prejudice": "" }
@@ -1382,7 +1382,7 @@
   "it": {
     "tracking": {
       "layout_list": { "semantic": "Pagina a elenco o tabella che mostra più elementi", "bias": "{TYPE} elenco {TYPE} lista {TYPE} tabella {TYPE} massa lista spedizioni stampa etichette stato consegna spedizioni in sospeso spedizione di massa", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "{TYPE} dettaglio {TYPE} modulo {TYPE} modifica modifica tracciamento traccia pacco correggi indirizzo elabora reso vista dettagliata", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "{TYPE} dettaglio {TYPE} modulo {TYPE} modifica modifica tracciamento traccia pacco correggi indirizzo elabora reso vista dettagliata", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatore link numero di tracciamento lettera di vettura", "bias": "{TYPE} identificatore {TYPE} numero {TYPE} codice 1Z9999999999999999, IT123456789, SM987654321", "prejudice": "numero ordine codice prodotto" },
       "status": { "semantic": "stato avanzamento stato di consegna", "bias": "{TYPE} stato {TYPE} progresso In transito, In consegna, Consegnato, In sospeso, Restituito, Eccezione", "prejudice": "" },
       "title": { "semantic": "nome prodotto titolo articolo", "bias": "{TYPE} nome {TYPE} titolo Cuffie Wireless, Smartwatch, Maglietta in cotone", "prejudice": "indirizzo di spedizione destinatario" },
@@ -1406,7 +1406,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "Pagina a elenco o tabella che mostra più elementi", "bias": "{TYPE} elenco {TYPE} lista {TYPE} tabella {TYPE} massa lista prodotti gestione inventario modifica di massa esaurito categorie", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "{TYPE} dettaglio {TYPE} modulo {TYPE} modifica aggiungi prodotto modifica prodotto opzioni editor descrizione carica miniatura prodotti correlati", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "{TYPE} dettaglio {TYPE} modulo {TYPE} modifica aggiungi prodotto modifica prodotto opzioni editor descrizione carica miniatura prodotti correlati", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatore link url", "bias": "{TYPE} identificatore {TYPE} numero {TYPE} codice PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "codice articolo sku", "bias": "{TYPE} identificatore {TYPE} numero {TYPE} codice SKU-12345, ABC-9981, IT-001", "prejudice": "numero di tracciamento numero ordine" },
       "status": { "semantic": "stato disponibilità", "bias": "{TYPE} stato {TYPE} progresso Disponibile, Esaurito, Pre-ordine, Fuori produzione, Nascosto", "prejudice": "" },
@@ -1456,7 +1456,7 @@
     },
     "order": {
       "layout_list": { "semantic": "Pagina a elenco o tabella che mostra più elementi", "bias": "{TYPE} elenco {TYPE} lista {TYPE} tabella {TYPE} massa lista ordini cronologia pagamenti cancellazioni elaborazione di massa selezionati", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "{TYPE} dettaglio {TYPE} modulo {TYPE} modifica dettagli ordine aggiornare spedizione cancellazione parziale modificare destinatario nota amministratore", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "{TYPE} dettaglio {TYPE} modulo {TYPE} modifica dettagli ordine aggiornare spedizione cancellazione parziale modificare destinatario nota amministratore", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatore link numero ordine", "bias": "{TYPE} identificatore {TYPE} numero {TYPE} codice ORD-12345, #1001, PO-99982", "prejudice": "numero di tracciamento codice prodotto" },
       "tracking_number": { "semantic": "numero di tracciamento lettera di vettura", "bias": "{TYPE} identificatore {TYPE} numero {TYPE} codice 1Z9999999999999999, IT123456789", "prejudice": "numero ordine" },
       "status": { "semantic": "stato dell'ordine", "bias": "{TYPE} stato {TYPE} progresso In elaborazione, Spedito, Consegnato, Annullato, Rimborsato", "prejudice": "" },
@@ -1477,7 +1477,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "Pagina a elenco o tabella che mostra più elementi", "bias": "{TYPE} elenco {TYPE} lista {TYPE} tabella {TYPE} massa lista coupon cronologia eventi stato di emissione campagne cronologia di utilizzo", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "{TYPE} dettaglio {TYPE} modulo {TYPE} modifica crea coupon imposta condizioni modifica evento tasso di sconto emissione singola impostazioni target", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "{TYPE} dettaglio {TYPE} modulo {TYPE} modifica crea coupon imposta condizioni modifica evento tasso di sconto emissione singola impostazioni target", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatore link", "bias": "{TYPE} identificatore {TYPE} numero {TYPE} codice EVT-001, COUPON_9921", "prejudice": "codice promozionale" },
       "type": { "semantic": "tipo categoria", "bias": "Sconto Fisso, Percentuale, Spedizione Gratuita, 2x1", "prejudice": "stato" },
       "status": { "semantic": "stato", "bias": "{TYPE} stato {TYPE} progresso Attivo, Scaduto, Programmato, Esaurito", "prejudice": "tipo categoria" },
@@ -1501,7 +1501,7 @@
     },
     "review": {
       "layout_list": { "semantic": "Pagina a elenco o tabella che mostra più elementi", "bias": "{TYPE} elenco {TYPE} lista {TYPE} tabella {TYPE} massa lista recensioni gestire valutazioni approvare in massa senza risposta", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "{TYPE} dettaglio {TYPE} modulo {TYPE} modifica dettagli recensione scrivere risposta nascondere premio vista singola", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "{TYPE} dettaglio {TYPE} modulo {TYPE} modifica dettagli recensione scrivere risposta nascondere premio vista singola", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatore link", "bias": "{TYPE} identificatore {TYPE} numero {TYPE} codice REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "stato", "bias": "{TYPE} stato {TYPE} progresso Approvato, In attesa, Rifiutato, Nascosto", "prejudice": "" },
       "name": { "semantic": "recensore cliente", "bias": "{TYPE} nome {TYPE} titolo Luca Verdi, Giulia Bianchi", "prejudice": "titolo oggetto" },
@@ -1511,7 +1511,7 @@
     },
     "default": {
       "layout_list": { "semantic": "Pagina a elenco o tabella che mostra più elementi", "bias": "{TYPE} elenco {TYPE} lista {TYPE} tabella {TYPE} massa elenco tabella griglia massa", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "{TYPE} dettaglio {TYPE} modulo {TYPE} modifica dettaglio modulo inserimento modifica", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "{TYPE} dettaglio {TYPE} modulo {TYPE} modifica dettaglio modulo inserimento modifica", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatore link", "bias": "{TYPE} identificatore {TYPE} numero {TYPE} codice ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "titolo nome", "bias": "{TYPE} nome {TYPE} titolo Annuncio, Guida ai Prodotti, Evento Speciale", "prejudice": "" },
       "status": { "semantic": "stato", "bias": "{TYPE} stato {TYPE} progresso Normale, In sospeso, Errore, Completo", "prejudice": "" }
@@ -1520,7 +1520,7 @@
   "it": {
     "tracking": {
       "layout_list": { "semantic": "Pagina di elenco o tabella che mostra più elementi", "bias": "elenco spedizioni stampa etichette stato consegna spedizioni in sospeso", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "modifica tracciamento traccia pacco correggi indirizzo elabora reso", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "modifica tracciamento traccia pacco correggi indirizzo elabora reso", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatore link numero di tracciamento", "bias": "1Z9999999999999999, IT123456789, 381234567891", "prejudice": "numero d'ordine codice prodotto" },
       "status": { "semantic": "stato stato della spedizione", "bias": "In transito, In consegna, Consegnato, In attesa, Restituito, Eccezione", "prejudice": "" },
       "title": { "semantic": "titolo nome del prodotto", "bias": "Auricolari Wireless, T-shirt in cotone, Smartwatch", "prejudice": "indirizzo di consegna destinatario" },
@@ -1544,7 +1544,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "Pagina di elenco o tabella che mostra più elementi", "bias": "elenco prodotti gestione inventario modifica di massa esaurito categorie", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "aggiungi prodotto modifica prodotto opzioni descrizione carica miniatura correlati", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "aggiungi prodotto modifica prodotto opzioni descrizione carica miniatura correlati", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatore link", "bias": "PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "codice articolo sku", "bias": "SKU-12345, ABC-9981, IT-001", "prejudice": "numero di tracciamento numero d'ordine" },
       "status": { "semantic": "stato disponibilità", "bias": "Disponibile, Esaurito, Preordine, Fuori Produzione, Nascosto", "prejudice": "" },
@@ -1615,7 +1615,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "Pagina di elenco o tabella che mostra più elementi", "bias": "elenco coupon cronologia eventi stato emissione campagne", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "crea coupon imposta condizioni modifica evento tasso di sconto emissione singola", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "crea coupon imposta condizioni modifica evento tasso di sconto emissione singola", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatore link", "bias": "EVT-001, COUPON_9921", "prejudice": "codice promozionale" },
       "type": { "semantic": "tipo categoria", "bias": "Sconto Fisso, Percentuale, Spedizione Gratuita, 2x1", "prejudice": "stato" },
       "status": { "semantic": "stato", "bias": "Attivo, Terminato, Programmato, Esaurito", "prejudice": "tipo categoria" },
@@ -1639,7 +1639,7 @@
     },
     "review": {
       "layout_list": { "semantic": "Pagina di elenco o tabella che mostra più elementi", "bias": "elenco recensioni gestisci valutazioni approva in massa senza risposta", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "dettagli recensione scrivi risposta nascondi ricompensa visualizzazione singola", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "dettagli recensione scrivi risposta nascondi ricompensa visualizzazione singola", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatore link", "bias": "REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "stato", "bias": "Approvato, In attesa, Rifiutato, Nascosto", "prejudice": "" },
       "name": { "semantic": "recensore", "bias": "Giulia Bianchi, Luigi Verdi", "prejudice": "titolo argomento" },
@@ -1649,7 +1649,7 @@
     },
     "default": {
       "layout_list": { "semantic": "Pagina di elenco o tabella che mostra più elementi", "bias": "elenco tabella griglia carrello", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "dettaglio ingresso modulo modifica invia salva", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Pagina modulo per visualizzare o inserire dettagli di un singolo elemento", "bias": "dettaglio ingresso modulo modifica invia salva", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "identificatore link", "bias": "ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "titolo nome", "bias": "Annuncio, Guida Prodotto, Evento Speciale", "prejudice": "" },
       "status": { "semantic": "stato", "bias": "Normale, In attesa, Errore, Completo", "prejudice": "" }
@@ -1658,7 +1658,7 @@
   "id": {
     "tracking": {
       "layout_list": { "semantic": "Halaman daftar atau tabel yang menampilkan banyak item", "bias": "{TYPE} daftar {TYPE} tabel {TYPE} massal daftar pengiriman cetak label status pengiriman kiriman tertunda pengiriman massal", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Halaman formulir untuk menampilkan atau memasukkan detail satu item", "bias": "{TYPE} detail {TYPE} formulir {TYPE} edit edit pelacakan lacak paket perbaiki alamat proses pengembalian tampilan detail", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Halaman formulir untuk menampilkan atau memasukkan detail satu item", "bias": "{TYPE} detail {TYPE} formulir {TYPE} edit edit pelacakan lacak paket perbaiki alamat proses pengembalian tampilan detail", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "pengidentifikasi tautan nomor pelacakan resi", "bias": "{TYPE} pengidentifikasi {TYPE} nomor {TYPE} kode 1Z9999999999999999, ID123456789, JNE987654321", "prejudice": "nomor pesanan kode produk" },
       "status": { "semantic": "status kemajuan status pengiriman", "bias": "{TYPE} status {TYPE} kemajuan Sedang Dikirim, Sedang Diantar, Terkirim, Tertunda, Dikembalikan, Pengecualian", "prejudice": "" },
       "title": { "semantic": "nama produk judul barang", "bias": "{TYPE} nama {TYPE} judul Headphone Nirkabel, Jam Tangan Pintar, Kaos Katun", "prejudice": "alamat pengiriman penerima" },
@@ -1682,7 +1682,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "Halaman daftar atau tabel yang menampilkan banyak item", "bias": "{TYPE} daftar {TYPE} tabel {TYPE} massal daftar produk manajemen inventaris edit massal habis kategori", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Halaman formulir untuk menampilkan atau memasukkan detail satu item", "bias": "{TYPE} detail {TYPE} formulir {TYPE} edit tambah produk edit produk opsi editor deskripsi unggah thumbnail produk terkait", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Halaman formulir untuk menampilkan atau memasukkan detail satu item", "bias": "{TYPE} detail {TYPE} formulir {TYPE} edit tambah produk edit produk opsi editor deskripsi unggah thumbnail produk terkait", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "pengidentifikasi tautan url", "bias": "{TYPE} pengidentifikasi {TYPE} nomor {TYPE} kode PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "kode barang sku", "bias": "{TYPE} pengidentifikasi {TYPE} nomor {TYPE} kode SKU-12345, ABC-9981, ID-001", "prejudice": "nomor pelacakan nomor pesanan" },
       "status": { "semantic": "status ketersediaan", "bias": "{TYPE} status {TYPE} kemajuan Tersedia, Habis, Pre-order, Dihentikan, Sembunyi", "prejudice": "" },
@@ -1732,7 +1732,7 @@
     },
     "order": {
       "layout_list": { "semantic": "Halaman daftar atau tabel yang menampilkan banyak item", "bias": "{TYPE} daftar {TYPE} tabel {TYPE} massal daftar pesanan riwayat pembayaran pembatalan proses massal terpilih", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Halaman formulir untuk menampilkan atau memasukkan detail satu item", "bias": "{TYPE} detail {TYPE} formulir {TYPE} edit detail pesanan perbarui pengiriman pembatalan parsial edit penerima memo admin", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Halaman formulir untuk menampilkan atau memasukkan detail satu item", "bias": "{TYPE} detail {TYPE} formulir {TYPE} edit detail pesanan perbarui pengiriman pembatalan parsial edit penerima memo admin", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "pengidentifikasi tautan nomor pesanan", "bias": "{TYPE} pengidentifikasi {TYPE} nomor {TYPE} kode ORD-12345, #1001, PO-99982", "prejudice": "nomor pelacakan resi kode produk" },
       "tracking_number": { "semantic": "nomor pelacakan resi", "bias": "{TYPE} pengidentifikasi {TYPE} nomor {TYPE} kode 1Z9999999999999999, ID123456789", "prejudice": "nomor pesanan" },
       "status": { "semantic": "status pesanan", "bias": "{TYPE} status {TYPE} kemajuan Diproses, Dikirim, Terkirim, Dibatalkan, Dikembalikan", "prejudice": "" },
@@ -1753,7 +1753,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "Halaman daftar atau tabel yang menampilkan banyak item", "bias": "{TYPE} daftar {TYPE} tabel {TYPE} massal daftar kupon riwayat acara status penerbitan kampanye riwayat penggunaan", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Halaman formulir untuk menampilkan atau memasukkan detail satu item", "bias": "{TYPE} detail {TYPE} formulir {TYPE} edit buat kupon tetapkan kondisi edit acara tingkat diskon penerbitan tunggal pengaturan target", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Halaman formulir untuk menampilkan atau memasukkan detail satu item", "bias": "{TYPE} detail {TYPE} formulir {TYPE} edit buat kupon tetapkan kondisi edit acara tingkat diskon penerbitan tunggal pengaturan target", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "pengidentifikasi tautan", "bias": "{TYPE} pengidentifikasi {TYPE} nomor {TYPE} kode EVT-001, COUPON_9921", "prejudice": "kode promo" },
       "type": { "semantic": "jenis kategori", "bias": "Diskon Tetap, Persentase, Gratis Ongkir, Beli 1 Gratis 1", "prejudice": "status" },
       "status": { "semantic": "status", "bias": "{TYPE} status {TYPE} kemajuan Aktif, Kedaluwarsa, Dijadwalkan, Habis", "prejudice": "jenis kategori" },
@@ -1777,7 +1777,7 @@
     },
     "review": {
       "layout_list": { "semantic": "Halaman daftar atau tabel yang menampilkan banyak item", "bias": "{TYPE} daftar {TYPE} tabel {TYPE} massal daftar ulasan kelola penilaian setujui massal belum dijawab", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Halaman formulir untuk menampilkan atau memasukkan detail satu item", "bias": "{TYPE} detail {TYPE} formulir {TYPE} edit detail ulasan tulis balasan sembunyikan hadiah tampilan tunggal", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Halaman formulir untuk menampilkan atau memasukkan detail satu item", "bias": "{TYPE} detail {TYPE} formulir {TYPE} edit detail ulasan tulis balasan sembunyikan hadiah tampilan tunggal", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "pengidentifikasi tautan", "bias": "{TYPE} pengidentifikasi {TYPE} nomor {TYPE} kode REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "status", "bias": "{TYPE} status {TYPE} kemajuan Disetujui, Tertunda, Ditolak, Sembunyi", "prejudice": "" },
       "name": { "semantic": "pengulas pelanggan", "bias": "{TYPE} nama {TYPE} judul Budi Santoso, Siti Aminah", "prejudice": "judul subjek" },
@@ -1787,7 +1787,7 @@
     },
     "default": {
       "layout_list": { "semantic": "Halaman daftar atau tabel yang menampilkan banyak item", "bias": "{TYPE} daftar {TYPE} tabel {TYPE} massal daftar tabel kisi massal", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Halaman formulir untuk menampilkan atau memasukkan detail satu item", "bias": "{TYPE} detail {TYPE} formulir {TYPE} edit detail formulir input edit", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Halaman formulir untuk menampilkan atau memasukkan detail satu item", "bias": "{TYPE} detail {TYPE} formulir {TYPE} edit detail formulir input edit", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "pengidentifikasi tautan", "bias": "{TYPE} pengidentifikasi {TYPE} nomor {TYPE} kode ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "judul nama", "bias": "{TYPE} nama {TYPE} judul Pengumuman, Panduan Produk, Acara Spesial", "prejudice": "" },
       "status": { "semantic": "status", "bias": "{TYPE} status {TYPE} kemajuan Normal, Tertunda, Kesalahan, Selesai", "prejudice": "" }
@@ -1796,7 +1796,7 @@
   "ms": {
     "tracking": {
       "layout_list": { "semantic": "Halaman senarai atau jadual yang memaparkan berbilang item", "bias": "{TYPE} senarai {TYPE} jadual {TYPE} pukal senarai penghantaran cetak label status penghantaran penghantaran tertunda hantar pukal", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan butiran satu item", "bias": "{TYPE} butiran {TYPE} borang {TYPE} edit edit penjejakan jejak pakej baiki alamat proses pemulangan paparan terperinci", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan butiran satu item", "bias": "{TYPE} butiran {TYPE} borang {TYPE} edit edit penjejakan jejak pakej baiki alamat proses pemulangan paparan terperinci", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "pengecam pautan nombor penjejakan", "bias": "{TYPE} pengecam {TYPE} nombor {TYPE} kod 1Z9999999999999999, MY123456789, J&T987654321", "prejudice": "nombor pesanan kod produk" },
       "status": { "semantic": "status kemajuan status penghantaran", "bias": "{TYPE} status {TYPE} kemajuan Sedang Dihantar, Sedang Dihantar, Dihantar, Tertunda, Dikembalikan, Pengecualian", "prejudice": "" },
       "title": { "semantic": "nama produk tajuk item", "bias": "{TYPE} nama {TYPE} tajuk Fon Kepala Wayarles, Jam Tangan Pintar, T-Shirt Kapas", "prejudice": "alamat penghantaran penerima" },
@@ -1820,7 +1820,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "Halaman senarai atau jadual yang memaparkan berbilang item", "bias": "{TYPE} senarai {TYPE} jadual {TYPE} pukal senarai produk pengurusan inventori edit pukal kehabisan stok kategori", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan butiran satu item", "bias": "{TYPE} butiran {TYPE} borang {TYPE} edit tambah produk edit produk pilihan editor penerangan muat naik lakaran kecil produk berkaitan", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan butiran satu item", "bias": "{TYPE} butiran {TYPE} borang {TYPE} edit tambah produk edit produk pilihan editor penerangan muat naik lakaran kecil produk berkaitan", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "pengecam pautan url", "bias": "{TYPE} pengecam {TYPE} nombor {TYPE} kod PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "kod produk sku", "bias": "{TYPE} pengecam {TYPE} nombor {TYPE} kod SKU-12345, ABC-9981, MY-001", "prejudice": "nombor penjejakan nombor pesanan" },
       "status": { "semantic": "status ketersediaan", "bias": "{TYPE} status {TYPE} kemajuan Dalam Stok, Kehabisan Stok, Pra-pesanan, Dihentikan, Tersembunyi", "prejudice": "" },
@@ -1870,7 +1870,7 @@
     },
     "order": {
       "layout_list": { "semantic": "Halaman senarai atau jadual yang memaparkan berbilang item", "bias": "{TYPE} senarai {TYPE} jadual {TYPE} pukal senarai pesanan sejarah pembayaran pembatalan proses pukal terpilih", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan butiran satu item", "bias": "{TYPE} butiran {TYPE} borang {TYPE} edit butiran pesanan kemas kini penghantaran pembatalan separa edit penerima memo pentadbir", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan butiran satu item", "bias": "{TYPE} butiran {TYPE} borang {TYPE} edit butiran pesanan kemas kini penghantaran pembatalan separa edit penerima memo pentadbir", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "pengecam pautan nombor pesanan", "bias": "{TYPE} pengecam {TYPE} nombor {TYPE} kod ORD-12345, #1001, PO-99982", "prejudice": "nombor penjejakan kod produk" },
       "tracking_number": { "semantic": "nomor penjejakan resi", "bias": "{TYPE} pengecam {TYPE} nombor {TYPE} kod 1Z9999999999999999, MY123456789", "prejudice": "nomor pesanan" },
       "status": { "semantic": "status pesanan", "bias": "{TYPE} status {TYPE} kemajuan Sedang Diproses, Dihantar, Terkirim, Dibatalkan, Dikembalikan wang", "prejudice": "" },
@@ -1891,7 +1891,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "Halaman senarai atau jadual yang memaparkan berbilang item", "bias": "{TYPE} senarai {TYPE} jadual {TYPE} pukal senarai kupon sejarah acara status pengeluaran kempen sejarah penggunaan", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan butiran satu item", "bias": "{TYPE} butiran {TYPE} borang {TYPE} edit cipta kupon tetapkan syarat edit acara kadar diskaun pengeluaran tunggal tetapan sasaran", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan butiran satu item", "bias": "{TYPE} butiran {TYPE} borang {TYPE} edit cipta kupon tetapkan syarat edit acara kadar diskaun pengeluaran tunggal tetapan sasaran", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "pengecam pautan", "bias": "{TYPE} pengecam {TYPE} nombor {TYPE} kod EVT-001, COUPON_9921", "prejudice": "kod promo" },
       "type": { "semantic": "jenis kategori", "bias": "Diskaun Tetap, Peratusan, Penghantaran Percuma, Beli 1 Percuma 1", "prejudice": "status" },
       "status": { "semantic": "status", "bias": "{TYPE} status {TYPE} kemajuan Aktif, Tamat Tempoh, Dijadualkan, Habis", "prejudice": "jenis kategori" },
@@ -1915,7 +1915,7 @@
     },
     "review": {
       "layout_list": { "semantic": "Halaman senarai atau jadual yang memaparkan berbilang item", "bias": "{TYPE} senarai {TYPE} jadual {TYPE} pukal senarai ulasan urus penilaian lulus pukal belum dijawab", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan butiran satu item", "bias": "{TYPE} butiran {TYPE} borang {TYPE} edit butiran ulasan tulis balasan sembunyikan ganjaran paparan tunggal", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan butiran satu item", "bias": "{TYPE} butiran {TYPE} borang {TYPE} edit butiran ulasan tulis balasan sembunyikan ganjaran paparan tunggal", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "pengecam pautan", "bias": "{TYPE} pengecam {TYPE} nombor {TYPE} kod REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "status", "bias": "{TYPE} status {TYPE} kemajuan Diluluskan, Tertunda, Ditolak, Tersembunyi", "prejudice": "" },
       "name": { "semantic": "pengulas pelanggan", "bias": "{TYPE} nama {TYPE} tajuk Ahmad bin Abu, Siti binti Ali", "prejudice": "tajuk subjek" },
@@ -1925,7 +1925,7 @@
     },
     "default": {
       "layout_list": { "semantic": "Halaman senarai atau jadual yang memaparkan berbilang item", "bias": "{TYPE} senarai {TYPE} jadual {TYPE} pukal senarai jadual grid pukal", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan butiran satu item", "bias": "{TYPE} butiran {TYPE} borang {TYPE} edit butiran borang input edit", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan butiran satu item", "bias": "{TYPE} butiran {TYPE} borang {TYPE} edit butiran borang input edit", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "pengecam pautan", "bias": "{TYPE} pengecam {TYPE} nombor {TYPE} kod ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "tajuk nama", "bias": "{TYPE} nama {TYPE} tajuk Pengumuman, Panduan Produk, Acara Istimewa", "prejudice": "" },
       "status": { "semantic": "status", "bias": "{TYPE} status {TYPE} kemajuan Normal, Tertunda, Ralat, Selesai", "prejudice": "" }
@@ -1934,7 +1934,7 @@
   "vi": {
     "tracking": {
       "layout_list": { "semantic": "Trang danh sách hoặc bảng hiển thị nhiều mục", "bias": "{TYPE} danh sách {TYPE} bảng {TYPE} hàng loạt danh sách giao hàng in nhãn trạng thái giao hàng lô hàng chờ xử lý gửi hàng loạt", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Trang biểu mẫu để hiển thị hoặc nhập chi tiết của một mục duy nhất", "bias": "{TYPE} chi tiết {TYPE} biểu mẫu {TYPE} chỉnh sửa chỉnh sửa theo dõi theo dõi gói hàng sửa địa chỉ xử lý trả hàng xem chi tiết", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "Trang biểu mẫu để hiển thị hoặc nhập chi tiết của một mục duy nhất", "bias": "{TYPE} chi tiết {TYPE} biểu mẫu {TYPE} chỉnh sửa chỉnh sửa theo dõi theo dõi gói hàng sửa địa chỉ xử lý trả hàng xem chi tiết", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "định danh liên kết số theo dõi", "bias": "{TYPE} định danh {TYPE} số {TYPE} mã 1Z9999999999999999, VN123456789, GHN987654321", "prejudice": "số đơn hàng mã sản phẩm" },
       "status": { "semantic": "trạng thái tiến độ trạng thái giao hàng", "bias": "{TYPE} trạng thái {TYPE} tiến độ Đang vận chuyển, Đang giao, Đã giao, Chờ xử lý, Đã trả lại, Ngoại lệ", "prejudice": "" },
       "title": { "semantic": "tên sản phẩm tiêu đề mặt hàng", "bias": "{TYPE} tên {TYPE} tiêu đề Tai nghe không dây, Đồng hồ thông minh, Áo thun cotton", "prejudice": "địa chỉ giao hàng người nhận" },
@@ -1950,7 +1950,7 @@
       "height": { "semantic": "chiều cao", "bias": "15cm, 30.5, 40", "prejudice": "chiều rộng chiều dài trọng lượng khối lượng" },
       "length": { "semantic": "chiều dài", "bias": "20cm, 100, 15.5", "prejudice": "chiều rộng chiều cao trọng lượng khối lượng" },
       "weight": { "semantic": "trọng lượng khối lượng", "bias": "1.5kg, 500g, 10.5", "prejudice": "chiều rộng chiều cao chiều dài" },
-      "carrier": { "semantic": "hãng vận chuyển đơn vị vận chuyển logistics", "bias": "Viettel Post, Giao Hàng Nhanh, VNPost, J&T Express, Ninja Van", "prejudice": "" },
+      "carrier": { "semantic": "hãng vận chuyển đơn vị vận chuyển logistics", "bias": "Viettel Post, Giao Hàng Nhanh, VNPos, search, filter., J&T Express, Ninja Van", "prejudice": "" },
       "shipping_fee": { "semantic": "phí vận chuyển cước phí", "bias": "15.000 VNĐ, 20000, Miễn phí vận chuyển", "prejudice": "giá bán giá cung cấp" },
       "shipping_method": { "semantic": "phương thức vận chuyển", "bias": "Giao hàng tiêu chuẩn, Giao hàng hỏa tốc, Nhận tại cửa hàng", "prejudice": "" },
       "shipping_duration": { "semantic": "thời gian vận chuyển thời lượng", "bias": "1-2 ngày, 24 giờ, 3-5 ngày", "prejudice": "" },
@@ -2072,7 +2072,7 @@
   "th": {
     "tracking": {
       "layout_list": { "semantic": "หน้าแสดงรายการหรือตารางที่มีหลายรายการ", "bias": "{TYPE} รายการ {TYPE} ตาราง {TYPE} จำนวนมาก รายการจัดส่ง พิมพ์ฉลาก สถานะการจัดส่ง การจัดส่งที่รอดำเนินการ จัดส่งจำนวนมาก", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือป้อนรายละเอียดของรายการเดียว", "bias": "{TYPE} รายละเอียด {TYPE} แบบฟอร์ม {TYPE} แก้ไข แก้ไขการติดตาม ติดตามพัสดุ แก้ไขที่อยู่ ดำเนินการคืนสินค้า ดูรายละเอียด", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือป้อนรายละเอียดของรายการเดียว", "bias": "{TYPE} รายละเอียด {TYPE} แบบฟอร์ม {TYPE} แก้ไข แก้ไขการติดตาม ติดตามพัสดุ แก้ไขที่อยู่ ดำเนินการคืนสินค้า ดูรายละเอียด", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ตัวระบุ ลิงก์ หมายเลขติดตาม", "bias": "{TYPE} ตัวระบุ {TYPE} หมายเลข {TYPE} รหัส 1Z9999999999999999, TH123456789", "prejudice": "หมายเลขคำสั่งซื้อ รหัสสินค้า" },
       "status": { "semantic": "สถานะ ความคืบหน้า สถานะการจัดส่ง", "bias": "{TYPE} สถานะ {TYPE} ความคืบหน้า กำลังจัดส่ง, กำลังนำจ่าย, จัดส่งแล้ว, รอดำเนินการ, ส่งคืน, ข้อยกเว้น", "prejudice": "" },
       "title": { "semantic": "ชื่อสินค้า ชื่อเรื่อง", "bias": "{TYPE} ชื่อ {TYPE} ชื่อเรื่อง หูฟังไร้สาย, สมาร์ทวอทช์, เสื้อยืดผ้าฝ้าย", "prejudice": "ที่อยู่จัดส่ง ผู้รับ" },
@@ -2096,7 +2096,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "หน้าแสดงรายการหรือตารางที่มีหลายรายการ", "bias": "{TYPE} รายการ {TYPE} ตาราง {TYPE} จำนวนมาก รายการสินค้า การจัดการสินค้าคงคลัง แก้ไขจำนวนมาก หมดสต็อก หมวดหมู่", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือป้อนรายละเอียดของรายการเดียว", "bias": "{TYPE} รายละเอียด {TYPE} แบบฟอร์ม {TYPE} แก้ไข เพิ่มสินค้า แก้ไขสินค้า ตัวเลือก ตัวแก้ไขคำอธิบาย อัปโหลดภาพขนาดย่อ สินค้าที่เกี่ยวข้อง", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือป้อนรายละเอียดของรายการเดียว", "bias": "{TYPE} รายละเอียด {TYPE} แบบฟอร์ม {TYPE} แก้ไข เพิ่มสินค้า แก้ไขสินค้า ตัวเลือก ตัวแก้ไขคำอธิบาย อัปโหลดภาพขนาดย่อ สินค้าที่เกี่ยวข้อง", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ตัวระบุ ลิงก์ url", "bias": "{TYPE} ตัวระบุ {TYPE} หมายเลข {TYPE} รหัส PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "รหัสสินค้า sku", "bias": "{TYPE} ตัวระบุ {TYPE} หมายเลข {TYPE} รหัส SKU-12345, ABC-9981, TH-001", "prejudice": "หมายเลขติดตาม หมายเลขคำสั่งซื้อ" },
       "status": { "semantic": "สถานะ ความพร้อมจำหน่าย", "bias": "{TYPE} สถานะ {TYPE} ความคืบหน้า มีสินค้า, หมดสต็อก, พรีออเดอร์, เลิกผลิต, ซ่อน", "prejudice": "" },
@@ -2146,7 +2146,7 @@
     },
     "order": {
       "layout_list": { "semantic": "หน้าแสดงรายการหรือตารางที่มีหลายรายการ", "bias": "{TYPE} รายการ {TYPE} ตาราง {TYPE} จำนวนมาก รายการคำสั่งซื้อ ประวัติการชำระเงิน การยกเลิก ประมวลผลจำนวนมาก รายการที่เลือก", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือป้อนรายละเอียดของรายการเดียว", "bias": "{TYPE} รายละเอียด {TYPE} แบบฟอร์ม {TYPE} แก้ไข รายละเอียดคำสั่งซื้อ อัปเดตการจัดส่ง ยกเลิกบางส่วน แก้ไขผู้รับ บันทึกผู้ดูแลระบบ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือป้อนรายละเอียดของรายการเดียว", "bias": "{TYPE} รายละเอียด {TYPE} แบบฟอร์ม {TYPE} แก้ไข รายละเอียดคำสั่งซื้อ อัปเดตการจัดส่ง ยกเลิกบางส่วน แก้ไขผู้รับ บันทึกผู้ดูแลระบบ", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ตัวระบุ ลิงก์ หมายเลขคำสั่งซื้อ", "bias": "{TYPE} ตัวระบุ {TYPE} หมายเลข {TYPE} รหัส ORD-12345, #1001, PO-99982", "prejudice": "หมายเลขติดตาม รหัสสินค้า" },
       "tracking_number": { "semantic": "หมายเลขติดตาม", "bias": "{TYPE} ตัวระบุ {TYPE} หมายเลข {TYPE} รหัส 1Z9999999999999999, TH123456789", "prejudice": "หมายเลขคำสั่งซื้อ" },
       "status": { "semantic": "สถานะคำสั่งซื้อ", "bias": "{TYPE} สถานะ {TYPE} ความคืบหน้า กำลังประมวลผล, จัดส่งแล้ว, ส่งมอบแล้ว, ยกเลิกแล้ว, คืนเงินแล้ว", "prejudice": "" },
@@ -2167,7 +2167,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "หน้าแสดงรายการหรือตารางที่มีหลายรายการ", "bias": "{TYPE} รายการ {TYPE} ตาราง {TYPE} จำนวนมาก รายการคูปอง ประวัติกิจกรรม สถานะการออก แคมเปญ ประวัติการใช้งาน", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือป้อนรายละเอียดของรายการเดียว", "bias": "{TYPE} รายละเอียด {TYPE} แบบฟอร์ม {TYPE} แก้ไข สร้างคูปอง ตั้งเงื่อนไข แก้ไขกิจกรรม อัตราส่วนลด ออกคูปองเดี่ยว การตั้งค่ากลุ่มเป้าหมาย", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือป้อนรายละเอียดของรายการเดียว", "bias": "{TYPE} รายละเอียด {TYPE} แบบฟอร์ม {TYPE} แก้ไข สร้างคูปอง ตั้งเงื่อนไข แก้ไขกิจกรรม อัตราส่วนลด ออกคูปองเดี่ยว การตั้งค่ากลุ่มเป้าหมาย", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ตัวระบุ ลิงก์", "bias": "{TYPE} ตัวระบุ {TYPE} หมายเลข {TYPE} รหัส EVT-001, COUPON_9921", "prejudice": "รหัสโปรโมชั่น" },
       "type": { "semantic": "ประเภท หมวดหมู่", "bias": "ส่วนลดคงที่, เปอร์เซ็นต์, จัดส่งฟรี, ซื้อ 1 แถม 1", "prejudice": "สถานะ" },
       "status": { "semantic": "สถานะ", "bias": "{TYPE} สถานะ {TYPE} ความคืบหน้า ใช้งานอยู่, หมดอายุ, กำหนดเวลา, หมดสต็อก", "prejudice": "ประเภท หมวดหมู่" },
@@ -2191,7 +2191,7 @@
     },
     "review": {
       "layout_list": { "semantic": "หน้าแสดงรายการหรือตารางที่มีหลายรายการ", "bias": "{TYPE} รายการ {TYPE} ตาราง {TYPE} จำนวนมาก รายการรีวิว จัดการการให้คะแนน อนุมัติจำนวนมาก ยังไม่ตอบ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือป้อนรายละเอียดของรายการเดียว", "bias": "{TYPE} รายละเอียด {TYPE} แบบฟอร์ม {TYPE} แก้ไข รายละเอียดรีวิว เขียนตอบกลับ ซ่อนรางวัล ดูรายการเดียว", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือป้อนรายละเอียดของรายการเดียว", "bias": "{TYPE} รายละเอียด {TYPE} แบบฟอร์ม {TYPE} แก้ไข รายละเอียดรีวิว เขียนตอบกลับ ซ่อนรางวัล ดูรายการเดียว", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ตัวระบุ ลิงก์", "bias": "{TYPE} ตัวระบุ {TYPE} หมายเลข {TYPE} รหัส REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "สถานะ", "bias": "{TYPE} สถานะ {TYPE} ความคืบหน้า อนุมัติแล้ว, รอดำเนินการ, ปฏิเสธ, ซ่อน", "prejudice": "" },
       "name": { "semantic": "ผู้รีวิว ลูกค้า", "bias": "{TYPE} ชื่อ {TYPE} ชื่อเรื่อง สมชาย, สมศรี", "prejudice": "ชื่อเรื่อง หัวข้อ" },
@@ -2201,7 +2201,7 @@
     },
     "default": {
       "layout_list": { "semantic": "หน้าแสดงรายการหรือตารางที่มีหลายรายการ", "bias": "{TYPE} รายการ {TYPE} ตาราง {TYPE} จำนวนมาก รายการ ตาราง กริด จำนวนมาก", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือป้อนรายละเอียดของรายการเดียว", "bias": "{TYPE} รายละเอียด {TYPE} แบบฟอร์ม {TYPE} แก้ไข รายละเอียด ฟอร์ม ป้อน แก้ไข", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือป้อนรายละเอียดของรายการเดียว", "bias": "{TYPE} รายละเอียด {TYPE} แบบฟอร์ม {TYPE} แก้ไข รายละเอียด ฟอร์ม ป้อน แก้ไข", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ตัวระบุ ลิงก์", "bias": "{TYPE} ตัวระบุ {TYPE} หมายเลข {TYPE} รหัส ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "ชื่อเรื่อง ชื่อ", "bias": "{TYPE} ชื่อ {TYPE} ชื่อเรื่อง ประกาศ, คู่มือสินค้า, กิจกรรมพิเศษ", "prejudice": "" },
       "status": { "semantic": "สถานะ", "bias": "{TYPE} สถานะ {TYPE} ความคืบหน้า ปกติ, รอดำเนินการ, ผิดพลาด, เสร็จสิ้น", "prejudice": "" }
@@ -2210,7 +2210,7 @@
   "ar": {
     "tracking": {
       "layout_list": { "semantic": "صفحة قائمة أو جدول تعرض عدة عناصر", "bias": "{TYPE} قائمة {TYPE} جدول {TYPE} بالجملة قائمة الشحن طباعة الملصقات حالة التوصيل طلبات معلقة بالجملة", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "{TYPE} تفاصيل {TYPE} نموذج {TYPE} تعديل تعديل التتبع تتبع الطرد تصحيح العنوان إرجاع تفاصيل", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "{TYPE} تفاصيل {TYPE} نموذج {TYPE} تعديل تعديل التتبع تتبع الطرد تصحيح العنوان إرجاع تفاصيل", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "معرف رابط رقم التتبع بوليصة", "bias": "{TYPE} معرف {TYPE} رقم {TYPE} كود AR123456789, 1Z9999999999999999, ARAMEX123456", "prejudice": "رقم الطلب كود المنتج" },
       "status": { "semantic": "حالة التوصيل الشحن", "bias": "{TYPE} حالة {TYPE} تقدم قيد النقل, قيد التوصيل, تم التوصيل, قيد الانتظار, تم الإرجاع", "prejudice": "" },
       "title": { "semantic": "اسم المنتج عنوان", "bias": "{TYPE} عنوان {TYPE} اسم سماعات لاسلكية, تي شيرت قطن, ساعة ذكية", "prejudice": "عنوان التسليم المستلم" },
@@ -2234,7 +2234,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "صفحة قائمة أو جدول تعرض عدة عناصر", "bias": "{TYPE} قائمة {TYPE} جدول {TYPE} بالجملة قائمة المنتجات إدارة المخزون تعديل بالجملة نفاد الكمية فئات", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "{TYPE} تفاصيل {TYPE} نموذج {TYPE} تعديل إضافة منتج تعديل خيارات وصف رفع صورة منتجات ذات صلة", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "{TYPE} تفاصيل {TYPE} نموذج {TYPE} تعديل إضافة منتج تعديل خيارات وصف رفع صورة منتجات ذات صلة", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "معرف رابط", "bias": "{TYPE} معرف {TYPE} رقم {TYPE} كود PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "كود المنتج", "bias": "{TYPE} معرف {TYPE} رقم {TYPE} كود SKU-12345, ABC-9981, AR-001", "prejudice": "رقم التتبع رقم الطلب" },
       "status": { "semantic": "حالة التوفر", "bias": "{TYPE} حالة {TYPE} تقدم متوفر, نفذت الكمية, طلب مسبق, غير متوفر", "prejudice": "" },
@@ -2284,7 +2284,7 @@
     },
     "order": {
       "layout_list": { "semantic": "صفحة قائمة أو جدول تعرض عدة عناصر", "bias": "{TYPE} قائمة {TYPE} جدول {TYPE} بالجملة قائمة الطلبات سجل الدفع إلغاء معالجة بالجملة", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "{TYPE} تفاصيل {TYPE} نموذج {TYPE} تعديل تفاصيل الطلب تحديث الشحن إلغاء جزئي تعديل المستلم", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "{TYPE} تفاصيل {TYPE} نموذج {TYPE} تعديل تفاصيل الطلب تحديث الشحن إلغاء جزئي تعديل المستلم", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "معرف رابط رقم الطلب", "bias": "{TYPE} معرف {TYPE} رقم {TYPE} كود ORD-12345, #1001, PO-99982", "prejudice": "رقم التتبع كود المنتج" },
       "tracking_number": { "semantic": "رقم التتبع", "bias": "{TYPE} معرف {TYPE} رقم {TYPE} كود AR123456789, ARAMEX123456", "prejudice": "رقم الطلب رقم الدفع" },
       "status": { "semantic": "حالة الطلب", "bias": "{TYPE} حالة {TYPE} تقدم قيد المعالجة, تم الشحن, تم التوصيل, ملغى, تم الاسترداد", "prejudice": "" },
@@ -2305,7 +2305,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "صفحة قائمة أو جدول تعرض عدة عناصر", "bias": "{TYPE} قائمة {TYPE} جدول {TYPE} بالجملة قائمة الكوبونات سجل الأحداث حالة الإصدار حملات", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "{TYPE} تفاصيل {TYPE} نموذج {TYPE} تعديل إنشاء كوبون تحديد الشروط تعديل الخصم إصدار", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "{TYPE} تفاصيل {TYPE} نموذج {TYPE} تعديل إنشاء كوبون تحديد الشروط تعديل الخصم إصدار", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "معرف رابط", "bias": "{TYPE} معرف {TYPE} رقم {TYPE} كود EVT-001, COUPON_9921", "prejudice": "كود الخصم" },
       "type": { "semantic": "نوع فئة", "bias": "خصم ثابت, نسبة مئوية, شحن مجاني, اشترِ 1 واحصل على 1", "prejudice": "حالة" },
       "status": { "semantic": "حالة", "bias": "{TYPE} حالة {TYPE} تقدم نشط, منتهي, مجدول, نفذت الكمية", "prejudice": "نوع فئة" },
@@ -2329,7 +2329,7 @@
     },
     "review": {
       "layout_list": { "semantic": "صفحة قائمة أو جدول تعرض عدة عناصر", "bias": "{TYPE} قائمة {TYPE} جدول {TYPE} بالجملة قائمة المراجعات إدارة التقييمات موافقة بالجملة غير مجاب", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "{TYPE} تفاصيل {TYPE} نموذج {TYPE} تعديل تفاصيل الرد إخفاء مكافأة عرض", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "{TYPE} تفاصيل {TYPE} نموذج {TYPE} تعديل تفاصيل الرد إخفاء مكافأة عرض", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "معرف رابط", "bias": "{TYPE} معرف {TYPE} رقم {TYPE} كود REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "حالة", "bias": "{TYPE} حالة {TYPE} تقدم موافق عليه, قيد الانتظار, مرفوض, مخفي", "prejudice": "" },
       "name": { "semantic": "المراجع", "bias": "{TYPE} عنوان {TYPE} اسم أحمد علي, فاطمة محمد", "prejudice": "عنوان موضوع" },
@@ -2339,7 +2339,7 @@
     },
     "default": {
       "layout_list": { "semantic": "صفحة قائمة أو جدول تعرض عدة عناصر", "bias": "{TYPE} قائمة {TYPE} جدول {TYPE} بالجملة قائمة جدول شبكة عربة كتالوج بالجملة", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "{TYPE} تفاصيل {TYPE} نموذج {TYPE} تعديل تفاصيل إدخال نموذج تحرير إرسال حفظ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "{TYPE} تفاصيل {TYPE} نموذج {TYPE} تعديل تفاصيل إدخال نموذج تحرير إرسال حفظ", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "معرف رابط", "bias": "{TYPE} معرف {TYPE} رقم {TYPE} كود ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "عنوان اسم", "bias": "{TYPE} عنوان {TYPE} اسم إعلان, دليل المنتج, حدث خاص", "prejudice": "" },
       "status": { "semantic": "حالة", "bias": "{TYPE} حالة {TYPE} تقدم عادي, قيد الانتظار, خطأ, مكتمل", "prejudice": "" }
@@ -2348,7 +2348,7 @@
   "ta": {
     "tracking": {
       "layout_list": { "semantic": "பல உருப்படிகளை பட்டியலிடும் பட்டியல் அல்லது அட்டவணை பக்கம்", "bias": "{TYPE} பட்டியல் {TYPE} அட்டவணை {TYPE} மொத்த கப்பல் பட்டியல் லேபிள்களை அச்சிடு விநியோக நிலை நிலுவையில் உள்ள ஏற்றுமதி மொத்த", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விவரங்களைக் காண்பிக்க அல்லது உள்ளிடுவதற்கான படிவப் பக்கம்", "bias": "{TYPE} விவரம் {TYPE} படிவம் {TYPE} திருத்து கண்காணிப்பைத் திருத்து பார்சலைக் கண்காணிக்கவும் முகவரியை சரிசெய்யவும் திரும்பப் பெறுதல் விரிவான காட்சி", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விவரங்களைக் காண்பிக்க அல்லது உள்ளிடுவதற்கான படிவப் பக்கம்", "bias": "{TYPE} விவரம் {TYPE} படிவம் {TYPE} திருத்து கண்காணிப்பைத் திருத்து பார்சலைக் கண்காணிக்கவும் முகவரியை சரிசெய்யவும் திரும்பப் பெறுதல் விரிவான காட்சி", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "அடையாளங்காட்டி இணைப்பு", "bias": "{TYPE} அடையாளங்காட்டி {TYPE} எண் {TYPE} குறியீடு 1Z9999999999999999, 00340434123456789012", "prejudice": "ஆர்டர் எண் உருப்படி குறியீடு" },
       "status": { "semantic": "நிலை விநியோக நிலை", "bias": "{TYPE} நிலை {TYPE} நிபந்தனை {TYPE} முன்னேற்றம் போக்குவரத்தில் உள்ளது, விநியோகத்தில் உள்ளது, வழங்கப்பட்டது, நிலுவையில் உள்ளது, திரும்பப் பெறப்பட்டது", "prejudice": "" },
       "title": { "semantic": "தலைப்பு தயாரிப்பு பெயர்", "bias": "{TYPE} தலைப்பு {TYPE} பெயர் வயர்லெஸ் ஹெட்போன்கள், காட்டன் டி-ஷர்ட், ஸ்மார்ட்வாட்ச்", "prejudice": "விநியோக முகவரி பெறுநர்" },
@@ -2372,7 +2372,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "பல உருப்படிகளை பட்டியலிடும் பட்டியல் அல்லது அட்டவணை பக்கம்", "bias": "{TYPE} பட்டியல் {TYPE} அட்டவணை {TYPE} மொத்த தயாரிப்பு பட்டியல் இருப்பு மேலாண்மை மொத்த திருத்தம் கையிருப்பில்லை வகைகள்", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விவரங்களைக் காண்பிக்க அல்லது உள்ளிடுவதற்கான படிவப் பக்கம்", "bias": "{TYPE} விவரம் {TYPE} படிவம் {TYPE} திருத்து தயாரிப்பைச் சேர் தயாரிப்பைத் திருத்து விருப்பங்கள் விளக்க திருத்தி சிறுபடம் தொடர்பான தயாரிப்புகள்", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விவரங்களைக் காண்பிக்க அல்லது உள்ளிடுவதற்கான படிவப் பக்கம்", "bias": "{TYPE} விவரம் {TYPE} படிவம் {TYPE} திருத்து தயாரிப்பைச் சேர் தயாரிப்பைத் திருத்து விருப்பங்கள் விளக்க திருத்தி சிறுபடம் தொடர்பான தயாரிப்புகள்", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "அடையாளங்காட்டி இணைப்பு", "bias": "{TYPE} அடையாளங்காட்டி {TYPE} எண் {TYPE} குறியீடு PROD-001, ITEM_9921", "prejudice": "" },
       "code": { "semantic": "SKU குறியீடு", "bias": "{TYPE} அடையாளங்காட்டி {TYPE} எண் {TYPE} குறியீடு SKU-12345, ABC-9981", "prejudice": "கண்காணிப்பு எண் ஆர்டர் எண்" },
       "status": { "semantic": "நிலை கிடைக்கும் தன்மை", "bias": "{TYPE} நிலை {TYPE} நிபந்தனை {TYPE} முன்னேற்றம் இருப்பில் உள்ளது, கையிருப்பில்லை, முன்கூட்டிய ஆர்டர், மறைக்கப்பட்டுள்ளது", "prejudice": "" },
@@ -2422,7 +2422,7 @@
     },
     "order": {
       "layout_list": { "semantic": "பல உருப்படிகளை பட்டியலிடும் பட்டியல் அல்லது அட்டவணை பக்கம்", "bias": "{TYPE} பட்டியல் {TYPE} அட்டவணை {TYPE} மொத்த ஆர்டர் பட்டியல் கட்டண வரலாறு ரத்துசெய்தல் மொத்த செயலாக்கம்", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விவரங்களைக் காண்பிக்க அல்லது உள்ளிடுவதற்கான படிவப் பக்கம்", "bias": "{TYPE} விவரம் {TYPE} படிவம் {TYPE} திருத்து ஆர்டர் விவரங்கள் கப்பல் புதுப்பிப்பு பகுதி ரத்துசெய்தல் பெறுநரைத் திருத்து", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விவரங்களைக் காண்பிக்க அல்லது உள்ளிடுவதற்கான படிவப் பக்கம்", "bias": "{TYPE} விவரம் {TYPE} படிவம் {TYPE} திருத்து ஆர்டர் விவரங்கள் கப்பல் புதுப்பிப்பு பகுதி ரத்துசெய்தல் பெறுநரைத் திருத்து", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "அடையாளங்காட்டி இணைப்பு ஆர்டர் எண்", "bias": "{TYPE} அடையாளங்காட்டி {TYPE} எண் {TYPE} குறியீடு ORD-12345, #1001, PO-99982", "prejudice": "கண்காணிப்பு எண் தயாரிப்பு குறியீடு" },
       "tracking_number": { "semantic": "கண்காணிப்பு எண்", "bias": "{TYPE} அடையாளங்காட்டி {TYPE} எண் {TYPE} குறியீடு 1Z9999999999999999, AW123456789", "prejudice": "ஆர்டர் எண் கட்டண எண்" },
       "status": { "semantic": "ஆர்டர் நிலை", "bias": "{TYPE} நிலை {TYPE} நிபந்தனை {TYPE} முன்னேற்றம் செயலாக்கத்தில் உள்ளது, அனுப்பப்பட்டது, வழங்கப்பட்டது, ரத்து செய்யப்பட்டது, பணம் திரும்பப் பெறப்பட்டது", "prejudice": "" },
@@ -2443,7 +2443,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "பல உருப்படிகளை பட்டியலிடும் பட்டியல் அல்லது அட்டவணை பக்கம்", "bias": "{TYPE} பட்டியல் {TYPE} அட்டவணை {TYPE} மொத்த கூப்பன் பட்டியல் நிகழ்வு வரலாறு வெளியீட்டு நிலை பிரச்சாரங்கள் பயன்பாட்டு வரலாறு", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விவரங்களைக் காண்பிக்க அல்லது உள்ளிடுவதற்கான படிவப் பக்கம்", "bias": "{TYPE} விவரம் {TYPE} படிவம் {TYPE} திருத்து கூப்பனை உருவாக்கு நிபந்தனைகளை அமை நிகழ்வை திருத்து தள்ளுபடி அமை ஒற்றை வெளியீடு", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விவரங்களைக் காண்பிக்க அல்லது உள்ளிடுவதற்கான படிவப் பக்கம்", "bias": "{TYPE} விவரம் {TYPE} படிவம் {TYPE} திருத்து கூப்பனை உருவாக்கு நிபந்தனைகளை அமை நிகழ்வை திருத்து தள்ளுபடி அமை ஒற்றை வெளியீடு", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "அடையாளங்காட்டி இணைப்பு", "bias": "{TYPE} அடையாளங்காட்டி {TYPE} எண் {TYPE} குறியீடு EVT-001, COUPON_9921", "prejudice": "கூப்பன் குறியீடு" },
       "type": { "semantic": "வகை", "bias": "நிலையான தள்ளுபடி, சதவீதம், இலவச கப்பல் போக்குவரத்து", "prejudice": "நிலை" },
       "status": { "semantic": "நிலை", "bias": "{TYPE} நிலை {TYPE} நிபந்தனை {TYPE} முன்னேற்றம் செயலில் உள்ளது, முடிந்தது, திட்டமிடப்பட்டுள்ளது", "prejudice": "வகை" },
@@ -2467,7 +2467,7 @@
     },
     "review": {
       "layout_list": { "semantic": "பல உருப்படிகளை பட்டியலிடும் பட்டியல் அல்லது அட்டவணை பக்கம்", "bias": "{TYPE} பட்டியல் {TYPE} அட்டவணை {TYPE} மொத்த விமர்சன பட்டியல் மதிப்பீடுகளை நிர்வகி மொத்த ஒப்புதல் பதிலளிக்கப்படாதது", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விவரங்களைக் காண்பிக்க அல்லது உள்ளிடுவதற்கான படிவப் பக்கம்", "bias": "{TYPE} விவரம் {TYPE} படிவம் {TYPE} திருத்து பதில் விவரங்கள் மறை வெகுமதி தனிப்பட்ட காட்சி", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விவரங்களைக் காண்பிக்க அல்லது உள்ளிடுவதற்கான படிவப் பக்கம்", "bias": "{TYPE} விவரம் {TYPE} படிவம் {TYPE} திருத்து பதில் விவரங்கள் மறை வெகுமதி தனிப்பட்ட காட்சி", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "அடையாளங்காட்டி இணைப்பு", "bias": "{TYPE} அடையாளங்காட்டி {TYPE} எண் {TYPE} குறியீடு REV-001, 9921", "prejudice": "" },
       "status": { "semantic": "நிலை", "bias": "{TYPE} நிலை {TYPE} நிபந்தனை {TYPE} முன்னேற்றம் அங்கீகரிக்கப்பட்டது, நிலுவையில் உள்ளது, நிராகரிக்கப்பட்டது, மறைக்கப்பட்டுள்ளது", "prejudice": "" },
       "name": { "semantic": "விமர்சகர்", "bias": "{TYPE} பெயர் {TYPE} தலைப்பு குமார், அஞ்சலி", "prejudice": "தலைப்பு பொருள்" },
@@ -2477,7 +2477,7 @@
     },
     "default": {
       "layout_list": { "semantic": "பல உருப்படிகளை பட்டியலிடும் பட்டியல் அல்லது அட்டவணை பக்கம்", "bias": "{TYPE} பட்டியல் {TYPE} அட்டவணை {TYPE} மொத்த பட்டியல் அட்டவணை கட்டம் வண்டி மொத்த", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விவரங்களைக் காண்பிக்க அல்லது உள்ளிடுவதற்கான படிவப் பக்கம்", "bias": "{TYPE} விவரம் {TYPE} படிவம் {TYPE} திருத்து விவரம் உள்ளீடு படிவம் திருத்து சமர்ப்பி சேமி", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விவரங்களைக் காண்பிக்க அல்லது உள்ளிடுவதற்கான படிவப் பக்கம்", "bias": "{TYPE} விவரம் {TYPE} படிவம் {TYPE} திருத்து விவரம் உள்ளீடு படிவம் திருத்து சமர்ப்பி சேமி", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "அடையாளங்காட்டி இணைப்பு", "bias": "{TYPE} அடையாளங்காட்டி {TYPE} எண் {TYPE} குறியீடு ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "தலைப்பு பெயர்", "bias": "{TYPE} தலைப்பு {TYPE} பெயர் அறிவிப்பு, தயாரிப்பு வழிகாட்டி, சிறப்பு நிகழ்வு", "prejudice": "" },
       "status": { "semantic": "நிலை", "bias": "{TYPE} நிலை {TYPE} நிபந்தனை {TYPE} முன்னேற்றம் இயல்பானது, நிலுவையில் உள்ளது, பிழை, முடிந்தது", "prejudice": "" }
@@ -2486,7 +2486,7 @@
   "te": {
     "tracking": {
       "layout_list": { "semantic": "బహుళ అంశాలను జాబితా చేసే జాబితా లేదా పట్టిక పేజీ", "bias": "{TYPE} జాబితా {TYPE} పట్టిక {TYPE} సమూహ షిప్పింగ్ జాబితా లేబుళ్ళను ముద్రించు డెలివరీ స్థితి పెండింగ్ ఎగుమతులు సమూహ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ఒకే అంశం వివరాలను ప్రదర్శించడానికి లేదా నమోదు చేయడానికి ఫారం పేజీ", "bias": "{TYPE} వివరాలు {TYPE} ఫారం {TYPE} సవరించు ట్రాకింగ్ సవరించు పార్శిల్ ట్రాక్ చేయి చిరునామా సరిచేయు తిరిగి వివరాల వీక్షణ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ఒకే అంశం వివరాలను ప్రదర్శించడానికి లేదా నమోదు చేయడానికి ఫారం పేజీ", "bias": "{TYPE} వివరాలు {TYPE} ఫారం {TYPE} సవరించు ట్రాకింగ్ సవరించు పార్శిల్ ట్రాక్ చేయి చిరునామా సరిచేయు తిరిగి వివరాల వీక్షణ", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "గుర్తింపు లింక్ ట్రాకింగ్ సంఖ్య", "bias": "{TYPE} గుర్తింపు {TYPE} సంఖ్య {TYPE} కోడ్ 1Z9999999999999999, 00340434123456789012", "prejudice": "ఆర్డర్ సంఖ్య అంశం కోడ్" },
       "status": { "semantic": "స్థితి డెలివరీ స్థితి", "bias": "{TYPE} స్థితి {TYPE} పరిస్థితి {TYPE} పురోగతి రవాణాలో ఉంది, డెలివరీ అవుతోంది, డెలివరీ చేయబడింది, పెండింగ్, తిరిగి పంపబడింది", "prejudice": "" },
       "title": { "semantic": "శీర్షిక ఉత్పత్తి పేరు", "bias": "{TYPE} శీర్షిక {TYPE} పేరు వైర్లెస్ హెడ్ఫోన్లు, కాటన్ టీ-షర్టు, స్మార్ట్వాచ్", "prejudice": "డెలివరీ చిరునామా గ్రహీత" },
@@ -2510,7 +2510,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "బహుళ అంశాలను జాబితా చేసే జాబితా లేదా పట్టిక పేజీ", "bias": "{TYPE} జాబితా {TYPE} పట్టిక {TYPE} సమూహ ఉత్పత్తి జాబితా స్టాక్ నిర్వహణ సమూహ సవరణ స్టాక్ లేదు వర్గాలు", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ఒకే అంశం వివరాలను ప్రదర్శించడానికి లేదా నమోదు చేయడానికి ఫారం పేజీ", "bias": "{TYPE} వివరాలు {TYPE} ఫారం {TYPE} సవరించు ఉత్పత్తి జోడించు ఉత్పత్తి సవరించు ఎంపికలు వివరణ సవరణ థంబ్నెయిల్ సంబంధిత ఉత్పత్తులు", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ఒకే అంశం వివరాలను ప్రదర్శించడానికి లేదా నమోదు చేయడానికి ఫారం పేజీ", "bias": "{TYPE} వివరాలు {TYPE} ఫారం {TYPE} సవరించు ఉత్పత్తి జోడించు ఉత్పత్తి సవరించు ఎంపికలు వివరణ సవరణ థంబ్నెయిల్ సంబంధిత ఉత్పత్తులు", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "గుర్తింపు లింక్", "bias": "{TYPE} గుర్తింపు {TYPE} సంఖ్య {TYPE} కోడ్ PROD-001, ITEM_9921", "prejudice": "" },
       "code": { "semantic": "SKU కోడ్", "bias": "{TYPE} గుర్తింపు {TYPE} సంఖ్య {TYPE} కోడ్ SKU-12345, ABC-9981", "prejudice": "ట్రాకింగ్ సంఖ్య ఆర్డర్ సంఖ్య" },
       "status": { "semantic": "స్థితి లభ్యత", "bias": "{TYPE} స్థితి {TYPE} పరిస్థితి {TYPE} పురోగతి స్టాక్ లో ఉంది, స్టాక్ లేదు, ప్రీ-ఆర్డర్, దాచబడింది", "prejudice": "" },
@@ -2560,7 +2560,7 @@
     },
     "order": {
       "layout_list": { "semantic": "బహుళ అంశాలను జాబితా చేసే జాబితా లేదా పట్టిక పేజీ", "bias": "{TYPE} జాబితా {TYPE} పట్టిక {TYPE} సమూహ ఆర్డర్ జాబితా చెల్లింపు చరిత్ర రద్దు సమూహ ప్రాసెసింగ్", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ఒకే అంశం వివరాలను ప్రదర్శించడానికి లేదా నమోదు చేయడానికి ఫారం పేజీ", "bias": "{TYPE} వివరాలు {TYPE} ఫారం {TYPE} సవరించు ఆర్డర్ వివరాలు షిప్పింగ్ నవీకరణ పాక్షిక రద్దు గ్రహీతను సవరించు", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ఒకే అంశం వివరాలను ప్రదర్శించడానికి లేదా నమోదు చేయడానికి ఫారం పేజీ", "bias": "{TYPE} వివరాలు {TYPE} ఫారం {TYPE} సవరించు ఆర్డర్ వివరాలు షిప్పింగ్ నవీకరణ పాక్షిక రద్దు గ్రహీతను సవరించు", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "గుర్తింపు లింక్ ఆర్డర్ సంఖ్య", "bias": "{TYPE} గుర్తింపు {TYPE} సంఖ్య {TYPE} కోడ్ ORD-12345, #1001, PO-99982", "prejudice": "ట్రాకింగ్ సంఖ్య ఉత్పత్తి కోడ్" },
       "tracking_number": { "semantic": "ట్రాకింగ్ సంఖ్య", "bias": "{TYPE} గుర్తింపు {TYPE} సంఖ్య {TYPE} కోడ్ 1Z9999999999999999, AW123456789", "prejudice": "ఆర్డర్ సంఖ్య చెల్లింపు సంఖ్య" },
       "status": { "semantic": "ఆర్డర్ స్థితి", "bias": "{TYPE} స్థితి {TYPE} పరిస్థితి {TYPE} పురోగతి ప్రాసెసింగ్ లో ఉంది, రవాణా చేయబడింది, డెలివరీ చేయబడింది, రద్దు చేయబడింది, వాపసు ఇవ్వబడింది", "prejudice": "" },
@@ -2581,7 +2581,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "బహుళ అంశాలను జాబితా చేసే జాబితా లేదా పట్టిక పేజీ", "bias": "{TYPE} జాబితా {TYPE} పట్టిక {TYPE} సమూహ కూపన్ జాబితా ఈవెంట్ చరిత్ర జారీ స్థితి ప్రచారాలు వినియోగ చరిత్ర", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ఒకే అంశం వివరాలను ప్రదర్శించడానికి లేదా నమోదు చేయడానికి ఫారం పేజీ", "bias": "{TYPE} వివరాలు {TYPE} ఫారం {TYPE} సవరించు కూపన్ సృష్టించు షరతులు సెట్ చేయి ఈవెంట్ సవరించు తగ్గింపు సెట్ చేయి ఒకే జారీ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ఒకే అంశం వివరాలను ప్రదర్శించడానికి లేదా నమోదు చేయడానికి ఫారం పేజీ", "bias": "{TYPE} వివరాలు {TYPE} ఫారం {TYPE} సవరించు కూపన్ సృష్టించు షరతులు సెట్ చేయి ఈవెంట్ సవరించు తగ్గింపు సెట్ చేయి ఒకే జారీ", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "గుర్తింపు లింక్", "bias": "{TYPE} గుర్తింపు {TYPE} సంఖ్య {TYPE} కోడ్ EVT-001, COUPON_9921", "prejudice": "కూపన్ కోడ్" },
       "type": { "semantic": "రకం", "bias": "స్థిర తగ్గింపు, శాతం, ఉచిత షిప్పింగ్", "prejudice": "స్థితి" },
       "status": { "semantic": "స్థితి", "bias": "{TYPE} స్థితి {TYPE} పరిస్థితి {TYPE} పురోగతి సక్రియ, ముగిసింది, షెడ్యూల్ చేయబడింది", "prejudice": "రకం" },
@@ -2605,7 +2605,7 @@
     },
     "review": {
       "layout_list": { "semantic": "బహుళ అంశాలను జాబితా చేసే జాబితా లేదా పట్టిక పేజీ", "bias": "{TYPE} జాబితా {TYPE} పట్టిక {TYPE} సమూహ సమీక్ష జాబితా రేటింగ్లను నిర్వహించు సమూహ ఆమోదం సమాధానం ఇవ్వనివి", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ఒకే అంశం వివరాలను ప్రదర్శించడానికి లేదా నమోదు చేయడానికి ఫారం పేజీ", "bias": "{TYPE} వివరాలు {TYPE} ఫారం {TYPE} సవరించు సమాధానం వివరాలు దాచు బహుమతి వ్యక్తిగత వీక్షణ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ఒకే అంశం వివరాలను ప్రదర్శించడానికి లేదా నమోదు చేయడానికి ఫారం పేజీ", "bias": "{TYPE} వివరాలు {TYPE} ఫారం {TYPE} సవరించు సమాధానం వివరాలు దాచు బహుమతి వ్యక్తిగత వీక్షణ", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "గుర్తింపు లింక్", "bias": "{TYPE} గుర్తింపు {TYPE} సంఖ్య {TYPE} కోడ్ REV-001, 9921", "prejudice": "" },
       "status": { "semantic": "స్థితి", "bias": "{TYPE} స్థితి {TYPE} పరిస్థితి {TYPE} పురోగతి ఆమోదించబడింది, పెండింగ్, తిరస్కరించబడింది, దాచబడింది", "prejudice": "" },
       "name": { "semantic": "సమీక్షకుడు", "bias": "{TYPE} పేరు {TYPE} శీర్షిక కుమార్, అంజలి", "prejudice": "శీర్షిక విషయం" },
@@ -2615,7 +2615,7 @@
     },
     "default": {
       "layout_list": { "semantic": "బహుళ అంశాలను జాబితా చేసే జాబితా లేదా పట్టిక పేజీ", "bias": "{TYPE} జాబితా {TYPE} పట్టిక {TYPE} సమూహ జాబితా పట్టిక గ్రిడ్ కార్ట్ సమూహ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ఒకే అంశం వివరాలను ప్రదర్శించడానికి లేదా నమోదు చేయడానికి ఫారం పేజీ", "bias": "{TYPE} వివరాలు {TYPE} ఫారం {TYPE} సవరించు వివరాలు ఇన్పుట్ ఫారం సవరించు సమర్పించు సేవ్", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ఒకే అంశం వివరాలను ప్రదర్శించడానికి లేదా నమోదు చేయడానికి ఫారం పేజీ", "bias": "{TYPE} వివరాలు {TYPE} ఫారం {TYPE} సవరించు వివరాలు ఇన్పుట్ ఫారం సవరించు సమర్పించు సేవ్", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "గుర్తింపు లింక్", "bias": "{TYPE} గుర్తింపు {TYPE} సంఖ్య {TYPE} కోడ్ ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "శీర్షిక పేరు", "bias": "{TYPE} శీర్షిక {TYPE} పేరు ప్రకటన, ఉత్పత్తి గైడ్, ప్రత్యేక ఈవెంట్", "prejudice": "" },
       "status": { "semantic": "స్థితి", "bias": "{TYPE} స్థితి {TYPE} పరిస్థితి {TYPE} పురోగతి సాధారణం, పెండింగ్, లోపం, పూర్తయింది", "prejudice": "" }
@@ -2624,7 +2624,7 @@
   "kn": {
     "tracking": {
       "layout_list": { "semantic": "ಬಹು ಅಂಶಗಳನ್ನು ಪಟ್ಟಿ ಮಾಡುವ ಪಟ್ಟಿ ಅಥವಾ ಕೋಷ್ಟಕ ಪುಟ", "bias": "{TYPE} ಪಟ್ಟಿ {TYPE} ಕೋಷ್ಟಕ {TYPE} ಬೃಹತ್ ಶಿಪ್ಪಿಂಗ್ ಪಟ್ಟಿ ಲೇಬಲ್‌ಗಳನ್ನು ಮುದ್ರಿಸಿ ವಿತರಣಾ ಸ್ಥಿತಿ ಬಾಕಿ ಇರುವ ಸಾಗಣೆಗಳು ಬೃಹತ್", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ಒಂದೇ ಅಂಶದ ವಿವರಗಳನ್ನು ಪ್ರದರ್ಶಿಸಲು ಅಥವಾ ನಮೂದಿಸಲು ಫಾರ್ಮ್ ಪುಟ", "bias": "{TYPE} ವಿವರ {TYPE} ಫಾರ್ಮ್ {TYPE} ಸಂಪಾದಿಸು ಟ್ರ್ಯಾಕಿಂಗ್ ಸಂಪಾದಿಸಿ ಪಾರ್ಸೆಲ್ ಟ್ರ್ಯಾಕ್ ಮಾಡಿ ವಿಳಾಸವನ್ನು ಸರಿಪಡಿಸಿ ಹಿಂದಿರುಗುವಿಕೆ ವಿವರವಾದ ವೀಕ್ಷಣೆ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ಒಂದೇ ಅಂಶದ ವಿವರಗಳನ್ನು ಪ್ರದರ್ಶಿಸಲು ಅಥವಾ ನಮೂದಿಸಲು ಫಾರ್ಮ್ ಪುಟ", "bias": "{TYPE} ವಿವರ {TYPE} ಫಾರ್ಮ್ {TYPE} ಸಂಪಾದಿಸು ಟ್ರ್ಯಾಕಿಂಗ್ ಸಂಪಾದಿಸಿ ಪಾರ್ಸೆಲ್ ಟ್ರ್ಯಾಕ್ ಮಾಡಿ ವಿಳಾಸವನ್ನು ಸರಿಪಡಿಸಿ ಹಿಂದಿರುಗುವಿಕೆ ವಿವರವಾದ ವೀಕ್ಷಣೆ", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ಗುರುತು ಲಿಂಕ್ ಟ್ರ್ಯಾಕಿಂಗ್ ಸಂಖ್ಯೆ", "bias": "{TYPE} ಗುರುತು {TYPE} ಸಂಖ್ಯೆ {TYPE} ಕೋಡ್ 1Z9999999999999999, 00340434123456789012", "prejudice": "ಆರ್ಡರ್ ಸಂಖ್ಯೆ ಐಟಂ ಕೋಡ್" },
       "status": { "semantic": "ಸ್ಥಿತಿ ವಿತರಣಾ ಸ್ಥಿತಿ", "bias": "{TYPE} ಸ್ಥಿತಿ {TYPE} ಪರಿಸ್ಥಿತಿ {TYPE} ಪ್ರಗತಿ ಸಾಗಣೆಯಲ್ಲಿದೆ, ವಿತರಿಸಲಾಗುತ್ತಿದೆ, ವಿತರಿಸಲಾಗಿದೆ, ಬಾಕಿಯಿದೆ, ಹಿಂತಿರುಗಿಸಲಾಗಿದೆ", "prejudice": "" },
       "title": { "semantic": "ಶೀರ್ಷಿಕೆ ಉತ್ಪನ್ನದ ಹೆಸರು", "bias": "{TYPE} ಶೀರ್ಷಿಕೆ {TYPE} ಹೆಸರು ವೈರ್‌ಲೆಸ್ ಹೆಡ್‌ಫೋನ್‌ಗಳು, ಕಾಟನ್ ಟಿ-ಶರ್ಟ್, ಸ್ಮಾರ್ಟ್ ವಾಚ್", "prejudice": "ವಿತರಣಾ ವಿಳಾಸ ಸ್ವೀಕರಿಸುವವರು" },
@@ -2648,7 +2648,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "ಬಹು ಅಂಶಗಳನ್ನು ಪಟ್ಟಿ ಮಾಡುವ ಪಟ್ಟಿ ಅಥವಾ ಕೋಷ್ಟಕ ಪುಟ", "bias": "{TYPE} ಪಟ್ಟಿ {TYPE} ಕೋಷ್ಟಕ {TYPE} ಬೃಹತ್ ಉತ್ಪನ್ನ ಪಟ್ಟಿ ದಾಸ್ತಾನು ನಿರ್ವಹಣೆ ಬೃಹತ್ ಸಂಪಾದನೆ ದಾಸ್ತಾನು ಇಲ್ಲ ವರ್ಗಗಳು", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ಒಂದೇ ಅಂಶದ ವಿವರಗಳನ್ನು ಪ್ರದರ್ಶಿಸಲು ಅಥವಾ ನಮೂದಿಸಲು ಫಾರ್ಮ್ ಪುಟ", "bias": "{TYPE} ವಿವರ {TYPE} ಫಾರ್ಮ್ {TYPE} ಸಂಪಾದಿಸು ಉತ್ಪನ್ನವನ್ನು ಸೇರಿಸಿ ಉತ್ಪನ್ನವನ್ನು ಸಂಪಾದಿಸಿ ಆಯ್ಕೆಗಳು ವಿವರಣೆ ಸಂಪಾದಕ ಥಂಬ್‌ನೇಲ್ ಸಂಬಂಧಿತ ಉತ್ಪನ್ನಗಳು", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ಒಂದೇ ಅಂಶದ ವಿವರಗಳನ್ನು ಪ್ರದರ್ಶಿಸಲು ಅಥವಾ ನಮೂದಿಸಲು ಫಾರ್ಮ್ ಪುಟ", "bias": "{TYPE} ವಿವರ {TYPE} ಫಾರ್ಮ್ {TYPE} ಸಂಪಾದಿಸು ಉತ್ಪನ್ನವನ್ನು ಸೇರಿಸಿ ಉತ್ಪನ್ನವನ್ನು ಸಂಪಾದಿಸಿ ಆಯ್ಕೆಗಳು ವಿವರಣೆ ಸಂಪಾದಕ ಥಂಬ್‌ನೇಲ್ ಸಂಬಂಧಿತ ಉತ್ಪನ್ನಗಳು", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ಗುರುತು ಲಿಂಕ್", "bias": "{TYPE} ಗುರುತು {TYPE} ಸಂಖ್ಯೆ {TYPE} ಕೋಡ್ PROD-001, ITEM_9921", "prejudice": "" },
       "code": { "semantic": "SKU ಕೋಡ್", "bias": "{TYPE} ಗುರುತು {TYPE} ಸಂಖ್ಯೆ {TYPE} ಕೋಡ್ SKU-12345, ABC-9981", "prejudice": "ಟ್ರ್ಯಾಕಿಂಗ್ ಸಂಖ್ಯೆ ಆರ್ಡರ್ ಸಂಖ್ಯೆ" },
       "status": { "semantic": "ಸ್ಥಿತಿ ಲಭ್ಯತೆ", "bias": "{TYPE} ಸ್ಥಿತಿ {TYPE} ಪರಿಸ್ಥಿತಿ {TYPE} ಪ್ರಗತಿ ದಾಸ್ತಾನಿನಲ್ಲಿದೆ, ದಾಸ್ತಾನು ಇಲ್ಲ, ಪ್ರಿ-ಆರ್ಡರ್, ಮರೆಮಾಡಲಾಗಿದೆ", "prejudice": "" },
@@ -2698,7 +2698,7 @@
     },
     "order": {
       "layout_list": { "semantic": "ಬಹು ಅಂಶಗಳನ್ನು ಪಟ್ಟಿ ಮಾಡುವ ಪಟ್ಟಿ ಅಥವಾ ಕೋಷ್ಟಕ ಪುಟ", "bias": "{TYPE} ಪಟ್ಟಿ {TYPE} ಕೋಷ್ಟಕ {TYPE} ಬೃಹತ್ ಆರ್ಡರ್ ಪಟ್ಟಿ ಪಾವತಿ ಇತಿಹಾಸ ರದ್ದತಿ ಬೃಹತ್ ಪ್ರಕ್ರಿಯೆ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ಒಂದೇ ಅಂಶದ ವಿವರಗಳನ್ನು ಪ್ರದರ್ಶಿಸಲು ಅಥವಾ ನಮೂದಿಸಲು ಫಾರ್ಮ್ ಪುಟ", "bias": "{TYPE} ವಿವರ {TYPE} ಫಾರ್ಮ್ {TYPE} ಸಂಪಾದಿಸು ಆರ್ಡರ್ ವಿವರಗಳು ಶಿಪ್ಪಿಂಗ್ ನವೀಕರಣ ಭಾಗಶಃ ರದ್ದತಿ ಸ್ವೀಕರಿಸುವವರನ್ನು ಸಂಪಾದಿಸಿ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ಒಂದೇ ಅಂಶದ ವಿವರಗಳನ್ನು ಪ್ರದರ್ಶಿಸಲು ಅಥವಾ ನಮೂದಿಸಲು ಫಾರ್ಮ್ ಪುಟ", "bias": "{TYPE} ವಿವರ {TYPE} ಫಾರ್ಮ್ {TYPE} ಸಂಪಾದಿಸು ಆರ್ಡರ್ ವಿವರಗಳು ಶಿಪ್ಪಿಂಗ್ ನವೀಕರಣ ಭಾಗಶಃ ರದ್ದತಿ ಸ್ವೀಕರಿಸುವವರನ್ನು ಸಂಪಾದಿಸಿ", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ಗುರುತು ಲಿಂಕ್ ಆರ್ಡರ್ ಸಂಖ್ಯೆ", "bias": "{TYPE} ಗುರುತು {TYPE} ಸಂಖ್ಯೆ {TYPE} ಕೋಡ್ ORD-12345, #1001, PO-99982", "prejudice": "ಟ್ರ್ಯಾಕಿಂಗ್ ಸಂಖ್ಯೆ ಉತ್ಪನ್ನ ಕೋಡ್" },
       "tracking_number": { "semantic": "ಟ್ರ್ಯಾಕಿಂಗ್ ಸಂಖ್ಯೆ", "bias": "{TYPE} ಗುರುತು {TYPE} ಸಂಖ್ಯೆ {TYPE} ಕೋಡ್ 1Z9999999999999999, AW123456789", "prejudice": "ಆರ್ಡರ್ ಸಂಖ್ಯೆ ಪಾವತಿ ಸಂಖ್ಯೆ" },
       "status": { "semantic": "ಆರ್ಡರ್ ಸ್ಥಿತಿ", "bias": "{TYPE} ಸ್ಥಿತಿ {TYPE} ಪರಿಸ್ಥಿತಿ {TYPE} ಪ್ರಗತಿ ಪ್ರಕ್ರಿಯೆಯಲ್ಲಿದೆ, ರವಾನಿಸಲಾಗಿದೆ, ವಿತರಿಸಲಾಗಿದೆ, ರದ್ದುಗೊಳಿಸಲಾಗಿದೆ, ಮರುಪಾವತಿಸಲಾಗಿದೆ", "prejudice": "" },
@@ -2719,7 +2719,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "ಬಹು ಅಂಶಗಳನ್ನು ಪಟ್ಟಿ ಮಾಡುವ ಪಟ್ಟಿ ಅಥವಾ ಕೋಷ್ಟಕ ಪುಟ", "bias": "{TYPE} ಪಟ್ಟಿ {TYPE} ಕೋಷ್ಟಕ {TYPE} ಬೃಹತ್ ಕೂಪನ್ ಪಟ್ಟಿ ಈವೆಂಟ್ ಇತಿಹಾಸ ವಿತರಣಾ ಸ್ಥಿತಿ ಪ್ರಚಾರಗಳು ಬಳಕೆಯ ಇತಿಹಾಸ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ಒಂದೇ ಅಂಶದ ವಿವರಗಳನ್ನು ಪ್ರದರ್ಶಿಸಲು ಅಥವಾ ನಮೂದಿಸಲು ಫಾರ್ಮ್ ಪುಟ", "bias": "{TYPE} ವಿವರ {TYPE} ಫಾರ್ಮ್ {TYPE} ಸಂಪಾದಿಸು ಕೂಪನ್ ರಚಿಸಿ ಷರತ್ತುಗಳನ್ನು ಹೊಂದಿಸಿ ಈವೆಂಟ್ ಅನ್ನು ಸಂಪಾದಿಸಿ ರಿಯಾಯಿತಿ ಹೊಂದಿಸಿ ಒಂದೇ ವಿತರಣೆ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ಒಂದೇ ಅಂಶದ ವಿವರಗಳನ್ನು ಪ್ರದರ್ಶಿಸಲು ಅಥವಾ ನಮೂದಿಸಲು ಫಾರ್ಮ್ ಪುಟ", "bias": "{TYPE} ವಿವರ {TYPE} ಫಾರ್ಮ್ {TYPE} ಸಂಪಾದಿಸು ಕೂಪನ್ ರಚಿಸಿ ಷರತ್ತುಗಳನ್ನು ಹೊಂದಿಸಿ ಈವೆಂಟ್ ಅನ್ನು ಸಂಪಾದಿಸಿ ರಿಯಾಯಿತಿ ಹೊಂದಿಸಿ ಒಂದೇ ವಿತರಣೆ", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ಗುರುತು ಲಿಂಕ್", "bias": "{TYPE} ಗುರುತು {TYPE} ಸಂಖ್ಯೆ {TYPE} ಕೋಡ್ EVT-001, COUPON_9921", "prejudice": "ಕೂಪನ್ ಕೋಡ್" },
       "type": { "semantic": "ಪ್ರಕಾರ", "bias": "ಸ್ಥಿರ ರಿಯಾಯಿತಿ, ಶೇಕಡಾವಾರು, ಉಚಿತ ಶಿಪ್ಪಿಂಗ್", "prejudice": "ಸ್ಥಿತಿ" },
       "status": { "semantic": "ಸ್ಥಿತಿ", "bias": "{TYPE} ಸ್ಥಿತಿ {TYPE} ಪರಿಸ್ಥಿತಿ {TYPE} ಪ್ರಗತಿ ಸಕ್ರಿಯ, ಮುಗಿದಿದೆ, ನಿಗದಿಯಾಗಿದೆ", "prejudice": "ಪ್ರಕಾರ" },
@@ -2743,7 +2743,7 @@
     },
     "review": {
       "layout_list": { "semantic": "ಬಹು ಅಂಶಗಳನ್ನು ಪಟ್ಟಿ ಮಾಡುವ ಪಟ್ಟಿ ಅಥವಾ ಕೋಷ್ಟಕ ಪುಟ", "bias": "{TYPE} ಪಟ್ಟಿ {TYPE} ಕೋಷ್ಟಕ {TYPE} ಬೃಹತ್ ವಿಮರ್ಶೆ ಪಟ್ಟಿ ರೇಟಿಂಗ್‌ಗಳನ್ನು ನಿರ್ವಹಿಸಿ ಬೃಹತ್ ಅನುಮೋದನೆ ಉತ್ತರಿಸಲಾಗಿಲ್ಲ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ಒಂದೇ ಅಂಶದ ವಿವರಗಳನ್ನು ಪ್ರದರ್ಶಿಸಲು ಅಥವಾ ನಮೂದಿಸಲು ಫಾರ್ಮ್ ಪುಟ", "bias": "{TYPE} ವಿವರ {TYPE} ಫಾರ್ಮ್ {TYPE} ಸಂಪಾದಿಸು ಉತ್ತರ ವಿವರಗಳು ಮರೆಮಾಡಿ ಪ್ರತಿಫಲ ವೈಯಕ್ತಿಕ ವೀಕ್ಷಣೆ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ಒಂದೇ ಅಂಶದ ವಿವರಗಳನ್ನು ಪ್ರದರ್ಶಿಸಲು ಅಥವಾ ನಮೂದಿಸಲು ಫಾರ್ಮ್ ಪುಟ", "bias": "{TYPE} ವಿವರ {TYPE} ಫಾರ್ಮ್ {TYPE} ಸಂಪಾದಿಸು ಉತ್ತರ ವಿವರಗಳು ಮರೆಮಾಡಿ ಪ್ರತಿಫಲ ವೈಯಕ್ತಿಕ ವೀಕ್ಷಣೆ", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ಗುರುತು ಲಿಂಕ್", "bias": "{TYPE} ಗುರುತು {TYPE} ಸಂಖ್ಯೆ {TYPE} ಕೋಡ್ REV-001, 9921", "prejudice": "" },
       "status": { "semantic": "ಸ್ಥಿತಿ", "bias": "{TYPE} ಸ್ಥಿತಿ {TYPE} ಪರಿಸ್ಥಿತಿ {TYPE} ಪ್ರಗತಿ ಅನುಮೋದಿಸಲಾಗಿದೆ, ಬಾಕಿಯಿದೆ, ತಿರಸ್ಕರಿಸಲಾಗಿದೆ, ಮರೆಮಾಡಲಾಗಿದೆ", "prejudice": "" },
       "name": { "semantic": "ವಿಮರ್ಶಕ", "bias": "{TYPE} ಹೆಸರು {TYPE} ಶೀರ್ಷಿಕೆ ಕುಮಾರ್, ಅಂಜಲಿ", "prejudice": "ಶೀರ್ಷಿಕೆ ವಿಷಯ" },
@@ -2753,7 +2753,7 @@
     },
     "default": {
       "layout_list": { "semantic": "ಬಹು ಅಂಶಗಳನ್ನು ಪಟ್ಟಿ ಮಾಡುವ ಪಟ್ಟಿ ಅಥವಾ ಕೋಷ್ಟಕ ಪುಟ", "bias": "{TYPE} ಪಟ್ಟಿ {TYPE} ಕೋಷ್ಟಕ {TYPE} ಬೃಹತ್ ಪಟ್ಟಿ ಕೋಷ್ಟಕ ಗ್ರಿಡ್ ಕಾರ್ಟ್ ಬೃಹತ್", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ಒಂದೇ ಅಂಶದ ವಿವರಗಳನ್ನು ಪ್ರದರ್ಶಿಸಲು ಅಥವಾ ನಮೂದಿಸಲು ಫಾರ್ಮ್ ಪುಟ", "bias": "{TYPE} ವಿವರ {TYPE} ಫಾರ್ಮ್ {TYPE} ಸಂಪಾದಿಸು ವಿವರ ಇನ್ಪುಟ್ ಫಾರ್ಮ್ ಸಂಪಾದಿಸು ಸಲ್ಲಿಸು ಉಳಿಸು", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "ಒಂದೇ ಅಂಶದ ವಿವರಗಳನ್ನು ಪ್ರದರ್ಶಿಸಲು ಅಥವಾ ನಮೂದಿಸಲು ಫಾರ್ಮ್ ಪುಟ", "bias": "{TYPE} ವಿವರ {TYPE} ಫಾರ್ಮ್ {TYPE} ಸಂಪಾದಿಸು ವಿವರ ಇನ್ಪುಟ್ ಫಾರ್ಮ್ ಸಂಪಾದಿಸು ಸಲ್ಲಿಸು ಉಳಿಸು", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ಗುರುತು ಲಿಂಕ್", "bias": "{TYPE} ಗುರುತು {TYPE} ಸಂಖ್ಯೆ {TYPE} ಕೋಡ್ ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "ಶೀರ್ಷಿಕೆ ಹೆಸರು", "bias": "{TYPE} ಶೀರ್ಷಿಕೆ {TYPE} ಹೆಸರು ಪ್ರಕಟಣೆ, ಉತ್ಪನ್ನ ಮಾರ್ಗದರ್ಶಿ, ವಿಶೇಷ ಈವೆಂಟ್", "prejudice": "" },
       "status": { "semantic": "ಸ್ಥಿತಿ", "bias": "{TYPE} ಸ್ಥಿತಿ {TYPE} ಪರಿಸ್ಥಿತಿ {TYPE} ಪ್ರಗತಿ ಸಾಮಾನ್ಯ, ಬಾಕಿಯಿದೆ, ದೋಷ, ಮುಗಿದಿದೆ", "prejudice": "" }
@@ -2762,7 +2762,7 @@
   "gu": {
     "tracking": {
       "layout_list": { "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતી સૂચિ અથવા કોષ્ટક પૃષ્ઠ", "bias": "{TYPE} સૂચિ {TYPE} કોષ્ટક {TYPE} જથ્થાબંધ શિપિંગ સૂચિ લેબલ્સ છાપો ડિલિવરી સ્થિતિ બાકી શિપમેન્ટ જથ્થાબંધ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત {TYPE} ફોર્મ {TYPE} સંપાદિત કરો ટ્રેકિંગ સંપાદિત કરો પાર્સલ ટ્રેક કરો સરનામું સુધારો વળતર વિગતવાર દૃશ્ય", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત {TYPE} ફોર્મ {TYPE} સંપાદિત કરો ટ્રેકિંગ સંપાદિત કરો પાર્સલ ટ્રેક કરો સરનામું સુધારો વળતર વિગતવાર દૃશ્ય", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ઓળખકર્તા લિંક ટ્રેકિંગ નંબર", "bias": "{TYPE} ઓળખકર્તા {TYPE} નંબર {TYPE} કોડ 1Z9999999999999999, 00340434123456789012", "prejudice": "ઓર્ડર નંબર આઇટમ કોડ" },
       "status": { "semantic": "સ્થિતિ ડિલિવરી સ્થિતિ", "bias": "{TYPE} સ્થિતિ {TYPE} શરત {TYPE} પ્રગતિ પરિવહનમાં, ડિલિવરીમાં, વિતરિત, બાકી, પરત", "prejudice": "" },
       "title": { "semantic": "શીર્ષક ઉત્પાદનનું નામ", "bias": "{TYPE} શીર્ષક {TYPE} નામ વાયરલેસ હેડફોન્સ, કોટન ટી-શર્ટ, સ્માર્ટવોચ", "prejudice": "ડિલિવરી સરનામું પ્રાપ્તકર્તા" },
@@ -2786,7 +2786,7 @@
     },
     "goods": {
       "layout_list": { "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતી સૂચિ અથવા કોષ્ટક પૃષ્ઠ", "bias": "{TYPE} સૂચિ {TYPE} કોષ્ટક {TYPE} જથ્થાબંધ ઉત્પાદન સૂચિ ઇન્વેન્ટરી સંચાલન જથ્થાબંધ સંપાદન સ્ટોક બહાર શ્રેણીઓ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત {TYPE} ફોર્મ {TYPE} સંપાદિત કરો ઉત્પાદન ઉમેરો ઉત્પાદન સંપાદિત કરો વિકલ્પો વર્ણન સંપાદક થંબનેલ સંબંધિત ઉત્પાદનો", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત {TYPE} ફોર્મ {TYPE} સંપાદિત કરો ઉત્પાદન ઉમેરો ઉત્પાદન સંપાદિત કરો વિકલ્પો વર્ણન સંપાદક થંબનેલ સંબંધિત ઉત્પાદનો", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ઓળખકર્તા લિંક", "bias": "{TYPE} ઓળખકર્તા {TYPE} નંબર {TYPE} કોડ PROD-001, ITEM_9921", "prejudice": "" },
       "code": { "semantic": "SKU કોડ", "bias": "{TYPE} ઓળખકર્તા {TYPE} નંબર {TYPE} કોડ SKU-12345, ABC-9981", "prejudice": "ટ્રેકિંગ નંબર ઓર્ડર નંબર" },
       "status": { "semantic": "સ્થિતિ પ્રાપ્યતા", "bias": "{TYPE} સ્થિતિ {TYPE} શરત {TYPE} પ્રગતિ સ્ટોકમાં છે, સ્ટોક બહાર, પ્રી-ઓર્ડર, છુપાયેલ", "prejudice": "" },
@@ -2836,7 +2836,7 @@
     },
     "order": {
       "layout_list": { "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતી સૂચિ અથવા કોષ્ટક પૃષ્ઠ", "bias": "{TYPE} સૂચિ {TYPE} કોષ્ટક {TYPE} જથ્થાબંધ ઓર્ડર સૂચિ ચુકવણી ઇતિહાસ રદ જથ્થાબંધ પ્રક્રિયા", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત {TYPE} ફોર્મ {TYPE} સંપાદિત કરો ઓર્ડર વિગતો શિપિંગ અપડેટ આંશિક રદ પ્રાપ્તકર્તાને સંપાદિત કરો", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત {TYPE} ફોર્મ {TYPE} સંપાદિત કરો ઓર્ડર વિગતો શિપિંગ અપડેટ આંશિક રદ પ્રાપ્તકર્તાને સંપાદિત કરો", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ઓળખકર્તા લિંક ઓર્ડર નંબર", "bias": "{TYPE} ઓળખકર્તા {TYPE} નંબર {TYPE} કોડ ORD-12345, #1001, PO-99982", "prejudice": "ટ્રેકિંગ નંબર ઉત્પાદન કોડ" },
       "tracking_number": { "semantic": "ટ્રેકિંગ નંબર", "bias": "{TYPE} ઓળખકર્તા {TYPE} નંબર {TYPE} કોડ 1Z9999999999999999, AW123456789", "prejudice": "ઓર્ડર નંબર ચુકવણી નંબર" },
       "status": { "semantic": "ઓર્ડર સ્થિતિ", "bias": "{TYPE} સ્થિતિ {TYPE} શરત {TYPE} પ્રગતિ પ્રક્રિયામાં છે, મોકલાવેલ, વિતરિત, રદ, રિફંડ", "prejudice": "" },
@@ -2857,7 +2857,7 @@
     },
     "coupon_event": {
       "layout_list": { "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતી સૂચિ અથવા કોષ્ટક પૃષ્ઠ", "bias": "{TYPE} સૂચિ {TYPE} કોષ્ટક {TYPE} જથ્થાબંધ કૂપન સૂચિ ઇવેન્ટ ઇતિહાસ ઇશ્યૂ સ્થિતિ ઝુંબેશ વપરાશ ઇતિહાસ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત {TYPE} ફોર્મ {TYPE} સંપાદિત કરો કૂપન બનાવો શરતો સેટ કરો ઇવેન્ટ સંપાદિત કરો ડિસ્કાઉન્ટ સેટ કરો સિંગલ ઇશ્યૂ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત {TYPE} ફોર્મ {TYPE} સંપાદિત કરો કૂપન બનાવો શરતો સેટ કરો ઇવેન્ટ સંપાદિત કરો ડિસ્કાઉન્ટ સેટ કરો સિંગલ ઇશ્યૂ", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ઓળખકર્તા લિંક", "bias": "{TYPE} ઓળખકર્તા {TYPE} નંબર {TYPE} કોડ EVT-001, COUPON_9921", "prejudice": "કૂપન કોડ" },
       "type": { "semantic": "પ્રકાર", "bias": "નિશ્ચિત ડિસ્કાઉન્ટ, ટકાવારી, મફત શિપિંગ", "prejudice": "સ્થિતિ" },
       "status": { "semantic": "સ્થિતિ", "bias": "{TYPE} સ્થિતિ {TYPE} શરત {TYPE} પ્રગતિ સક્રિય, સમાપ્ત, શેડ્યૂલ કરેલ", "prejudice": "પ્રકાર" },
@@ -2881,7 +2881,7 @@
     },
     "review": {
       "layout_list": { "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતી સૂચિ અથવા કોષ્ટક પૃષ્ઠ", "bias": "{TYPE} સૂચિ {TYPE} કોષ્ટક {TYPE} જથ્થાબંધ સમીક્ષા સૂચિ રેટિંગ્સ સંચાલિત કરો જથ્થાબંધ મંજૂરી અનુત્તરિત", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત {TYPE} ફોર્મ {TYPE} સંપાદિત કરો જવાબ વિગતો છુપાવો ઇનામ વ્યક્તિગત દૃશ્ય", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત {TYPE} ફોર્મ {TYPE} સંપાદિત કરો જવાબ વિગતો છુપાવો ઇનામ વ્યક્તિગત દૃશ્ય", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ઓળખકર્તા લિંક", "bias": "{TYPE} ઓળખકર્તા {TYPE} નંબર {TYPE} કોડ REV-001, 9921", "prejudice": "" },
       "status": { "semantic": "સ્થિતિ", "bias": "{TYPE} સ્થિતિ {TYPE} શરત {TYPE} પ્રગતિ મંજૂર, બાકી, નકારવામાં આવ્યું, છુપાયેલ", "prejudice": "" },
       "name": { "semantic": "સમીક્ષક", "bias": "{TYPE} નામ {TYPE} શીર્ષક કુમાર, અંજલિ", "prejudice": "શીર્ષક વિષય" },
@@ -2891,7 +2891,7 @@
     },
     "default": {
       "layout_list": { "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતી સૂચિ અથવા કોષ્ટક પૃષ્ઠ", "bias": "{TYPE} સૂચિ {TYPE} કોષ્ટક {TYPE} જથ્થાબંધ સૂચિ કોષ્ટક ગ્રીડ કાર્ટ જથ્થાબંધ", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત {TYPE} ફોર્મ {TYPE} સંપાદિત કરો વિગત ઇનપુટ ફોર્મ સંપાદિત કરો સબમિટ કરો સાચવો", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
+      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત {TYPE} ફોર્મ {TYPE} સંપાદિત કરો વિગત ઇનપુટ ફોર્મ સંપાદિત કરો સબમિટ કરો સાચવો", "prejudice": "global navigation, menus, headers, footers, aside." },
       "id,link": { "semantic": "ઓળખકર્તા લિંક", "bias": "{TYPE} ઓળખકર્તા {TYPE} નંબર {TYPE} કોડ ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "શીર્ષક નામ", "bias": "{TYPE} શીર્ષક {TYPE} નામ જાહેરાત, ઉત્પાદન માર્ગદર્શિકા, વિશેષ ઇવેન્ટ", "prejudice": "" },
       "status": { "semantic": "સ્થિતિ", "bias": "{TYPE} સ્થિતિ {TYPE} શરત {TYPE} પ્રગતિ સામાન્ય, બાકી, ભૂલ, પૂર્ણ", "prejudice": "" }
