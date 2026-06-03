@@ -840,8 +840,10 @@ pub fn get_localized_page_type(page_type: &str, lang: &str) -> String {
     matched_str.to_string()
 }
 
-pub fn get_layout_bias(page_type: &str, lang: &str) -> String {
+pub fn get_layout_bias(page_type: &str, lang: &str) -> (String, String) {
     let mut bias = String::from("detail has_list has_form true false");
+    let prejudice = String::from("global navigation, menus, headers, footers, aside, search, filter.");
+    
     let page_type_key = match page_type {
         "coupon" | "event" => "coupon_event",
         _ => page_type,
@@ -850,7 +852,6 @@ pub fn get_layout_bias(page_type: &str, lang: &str) -> String {
     let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
     let localized_type = get_localized_page_type(page_type, lang);
     
-    // 🌟 5개 언어 짬뽕을 버리고, Step A에서 감지된 단일 언어의 바이어스만 핀셋으로 뽑아와 주입합니다. (존재하지 않으면 en 폴백)
     if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
         if let Some(l_list) = localized_obj.get("layout_list").and_then(|v| v.get("bias")).and_then(|v| v.as_str()) {
             bias.push_str(" ");
@@ -859,9 +860,13 @@ pub fn get_layout_bias(page_type: &str, lang: &str) -> String {
         if let Some(l_form) = localized_obj.get("layout_form").and_then(|v| v.get("bias")).and_then(|v| v.as_str()) {
             bias.push_str(" ");
             bias.push_str(&l_form.replace("{TYPE}", &localized_type));
+            bias.push_str(&format!(" {} input {} select {} textarea", localized_type, localized_type, localized_type));
         }
+    } else {
+        bias.push_str(&format!(" {} input {} select {} textarea", localized_type, localized_type, localized_type));
     }
-    bias
+    
+    (bias.trim().to_string(), prejudice)
 }
 
 pub fn get_title_bias(page_type: &str, lang: &str) -> (String, String) {
@@ -940,7 +945,6 @@ pub fn get_layout_prompt_hints(page_type: &str, lang: &str) -> (String, String) 
 }
 
 pub fn is_detail_prompt(page_type: &str, title: &str, lang: &str) -> String {
-    // 🌟 감지된 언어를 전달하여 맞춤형 힌트를 받아옵니다.
     let (list_hints, form_hints) = get_layout_prompt_hints(page_type, lang);
 
     let template = r###"[TASK]
@@ -968,11 +972,11 @@ Read the entire document from top to bottom, applying the following strict filte
 [SCHEMA DEFINITIONS]
 - {TYPE}:
     - has_header: Boolean. True if the document contains a header.
+    - title: String. Default '{TITLE}'.
     - has_footer: Boolean. True if the document contains a footer.
+    - language: String. Default '{LANGUAGE}'.
     - has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
     - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
-    - title: String. Default '{TITLE}'.
-    - language: String. Default '{LANGUAGE}'.
 
 [OUTPUT FORMAT]
 {
@@ -988,143 +992,11 @@ Read the entire document from top to bottom, applying the following strict filte
 
 JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
     
-    // 🌟 [주입] 템플릿의 치환자에 언어와 힌트를 주입합니다.
     template.replace("{TYPE}", page_type)
         .replace("{TITLE}", title)
         .replace("{LANGUAGE}", lang)
         .replace("{FORM_HINTS}", &form_hints)
         .replace("{LIST_HINTS}", &list_hints)
-}
-
-pub fn get_list_layout_bias(page_type: &str, lang: &str) -> (String, String) {
-    let mut bias = String::from("has_list true false");
-    let mut prejudice = String::new();
-    let page_type_key = match page_type {
-        "coupon" | "event" => "coupon_event",
-        _ => page_type,
-    };
-    
-    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
-    let localized_type = get_localized_page_type(page_type, lang);
-    
-    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
-        if let Some(l_list) = localized_obj.get("layout_list") {
-            if let Some(b) = l_list.get("bias").and_then(|v| v.as_str()) {
-                bias.push_str(" ");
-                bias.push_str(&b.replace("{TYPE}", &localized_type));
-            }
-            if let Some(p) = l_list.get("prejudice").and_then(|v| v.as_str()) {
-                prejudice.push_str(" ");
-                prejudice.push_str(&p.replace("{TYPE}", &localized_type));
-            }
-        }
-    }
-    (bias.trim().to_string(), prejudice.trim().to_string())
-}
-
-pub fn get_form_layout_bias(page_type: &str, lang: &str) -> (String, String) {
-    let mut bias = String::from("has_form true false detail");
-    let mut prejudice = String::new();
-    let page_type_key = match page_type {
-        "coupon" | "event" => "coupon_event",
-        _ => page_type,
-    };
-    
-    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
-    let localized_type = get_localized_page_type(page_type, lang);
-    
-    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
-        if let Some(l_form) = localized_obj.get("layout_form") {
-            if let Some(b) = l_form.get("bias").and_then(|v| v.as_str()) {
-                bias.push_str(" ");
-                bias.push_str(&b.replace("{TYPE}", &localized_type));
-            }
-            if let Some(p) = l_form.get("prejudice").and_then(|v| v.as_str()) {
-                prejudice.push_str(" ");
-                prejudice.push_str(&p.replace("{TYPE}", &localized_type));
-            }
-        }
-    }
-    (bias.trim().to_string(), prejudice.trim().to_string())
-}
-
-pub fn is_list_prompt(page_type: &str, title: &str, lang: &str) -> String {
-    let (list_hints, _) = get_layout_prompt_hints(page_type, lang);
-
-    let template = r###"[TASK]
-Analyze the provided PUG/HTML content from top to bottom.
-
-[ENTITY CONTEXT: {TYPE}]
-Language Context: {LANGUAGE}
-You are evaluating a page managing this specific domain entity. Use this context to conceptually understand the abstract structures:
-- has_list: A catalog or inventory interface dedicated to displaying, filtering, or batch-processing multiple DIFFERENT primary entities.{LIST_HINTS}
-
-[FORCED DOCUMENT SCANNING LOGIC]
-Read the entire document from top to bottom.
-Check for the following:
-A. Does the page terminate with dataset navigation (pagination, "next/prev") or bulk-action execution elements?
-B. Does the main data area consist of a repeating multi-entity grid?
-
-[SCHEMA DEFINITIONS]
-- {TYPE}:
-    - title: String. Default '{TITLE}'.
-    - language: String. Default '{LANGUAGE}'.
-    - has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
-
-[OUTPUT FORMAT]
-{
-  "{TYPE}": {
-    "title": String,
-    "language": String,
-    "has_list": Boolean
-  }
-}
-
-JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
-    
-    template.replace("{TYPE}", page_type)
-        .replace("{TITLE}", title)
-        .replace("{LANGUAGE}", lang)
-        .replace("{LIST_HINTS}", &list_hints)
-}
-
-pub fn is_form_prompt(page_type: &str, title: &str, lang: &str) -> String {
-    let (_, form_hints) = get_layout_prompt_hints(page_type, lang);
-
-    let template = r###"[TASK]
-Analyze the provided PUG/HTML content from top to bottom.
-
-[ENTITY CONTEXT: {TYPE}]
-Language Context: {LANGUAGE}
-You are evaluating a page managing this specific domain entity. Use this context to conceptually understand the abstract structures:
-- has_form: A property configuration interface. It features a large overarching form dedicated to inputting or updating the specific attributes of ONE primary entity.{FORM_HINTS}
-
-[FORCED DOCUMENT SCANNING LOGIC]
-Read the entire document from top to bottom.
-Check for the following:
-A. Does the main data area contain an extensive configuration/input form (inputs, textareas, image uploads, save buttons) for a single entity?
-
-[SCHEMA DEFINITIONS]
-- {TYPE}:
-    - title: String. Default '{TITLE}'.
-    - language: String. Default '{LANGUAGE}'.
-    - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
-
-[OUTPUT FORMAT]
-{
-  "{TYPE}": {
-    "title": String,
-    "language": String,
-    "has_form": Boolean
-  }
-}
-
-JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
-    
-    template.replace("{TYPE}", page_type)
-        .replace("{TITLE}", title)
-        .replace("{LANGUAGE}", lang)
-        .replace("{FORM_HINTS}", &form_hints)
 }
 
 // pub fn para2graph(language: &str) -> String {
