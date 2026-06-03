@@ -2154,6 +2154,15 @@ impl Qwen3_5Model {
         Ok(())
     }
 
+    // 🌟 [추가] Semantic Bias 연산을 위해 전체 단어장의 벡터(Weight)를 그대로 반환합니다.
+    pub fn get_embed_tokens(&self) -> Tensor {
+        self.language_model.embed_tokens.embeddings().clone()
+    }
+
+    pub fn embedding_token_id(&self, input_ids: &Tensor) -> Result<Tensor> {
+        Ok(self.language_model.embed_tokens.forward(input_ids)?)
+    }
+
     fn get_rope_index(
         &self,
         input_ids: &Tensor,

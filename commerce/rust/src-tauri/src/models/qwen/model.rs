@@ -838,7 +838,7 @@ impl QwenVLTextModel {
 pub struct QwenVLModel {
     pub config: QwenVLConfig,
     visual: QwenVLVisionModel,
-    language_model: QwenVLTextModel,
+    pub language_model: QwenVLTextModel, // 🌟 [CRITICAL FIX] pub을 추가하여 외부에서 임베딩 접근을 허용합니다.
     lm_head: Linear,
     rope_deltas: Option<Tensor>,
 }

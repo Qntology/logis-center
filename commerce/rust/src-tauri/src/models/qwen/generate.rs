@@ -1,7 +1,7 @@
 use crate::models::qwen::quantized_model::{KVLocation, KVBlock, KVRegistry, BitKVMetadata, QuantizedQwenVLModel, MemorySlot};
 use anyhow::{Result, anyhow};
 use candle_core::{quantized::gguf_file, DType, Device, Tensor};
-use candle_nn::VarBuilder;
+use candle_nn::{VarBuilder, Module}; // 🌟 [CRITICAL FIX] Module 트레이트를 추가하여 embed_tokens.forward()를 활성화합니다.
 use std::io::Write;
 
 use crate::{
@@ -483,6 +483,23 @@ impl Drop for ReadSlotGuard { fn drop(&mut self) { if self.active { let sid = se
 pub enum ModelVariant { Standard(QwenVLModel), QuantizedVL(QuantizedQwenVLModel), QuantizedText(crate::models::qwen::quantized_model::QuantizedQwenTextModel) }
 
 impl ModelVariant {
+    // 🌟 [추가] Semantic Bias 연산을 위해 전체 단어장의 벡터(Weight)를 그대로 반환합니다.
+    pub fn get_embed_tokens(&self) -> Result<Tensor> {
+        match self {
+            Self::Standard(m) => Ok(m.language_model.embed_tokens.embeddings().clone()),
+            Self::QuantizedVL(m) => Ok(m.language_model.embed_tokens.embeddings().clone()),
+            Self::QuantizedText(m) => Ok(m.language_model.embed_tokens.embeddings().clone()),
+        }
+    }
+
+    pub fn embedding_token_id(&self, input_ids: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Standard(m) => Ok(m.language_model.embed_tokens.forward(input_ids)?),
+            Self::QuantizedVL(m) => Ok(m.language_model.embed_tokens.forward(input_ids)?),
+            Self::QuantizedText(m) => Ok(m.language_model.embed_tokens.forward(input_ids)?),
+        }
+    }
+
     pub async fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
         match self {
             Self::Standard(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),
@@ -590,7 +607,8 @@ impl QwenVLGenerateModel {
         Ok(total_toks)
     }
 
-    pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>) -> Result<String> {
+    // 🌟 [CRITICAL FIX] semantic_target 파라미터를 명시적으로 추가합니다.
+    pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>, semantic_target: Option<&str>) -> Result<String> {
         let mut is_reference_snapshot = false;
         if let Some(s_id) = &session_id {
             let snapshot_root = crate::utils::paths::get_kv_dir(None).join(s_id);
@@ -676,6 +694,41 @@ impl QwenVLGenerateModel {
         
         let total_tokens_after_prefill = offset + input_ids.dim(1)?;
     
+        // 🌟 [Semantic Activation Steering] 모델 내부 임베딩 코사인 유사도 벡터 바이어스 연산
+        let mut semantic_bias_tensor: Option<Tensor> = None;
+        if let Some(target_text) = semantic_target {
+            if let Ok(target_ids) = self.tokenizer.text_encode_vec(target_text.to_string(), false) {
+                if !target_ids.is_empty() {
+                    let calc_bias = || -> Result<Tensor> {
+                        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.text_device)?;
+                        let target_emb = self.qwen.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
+                        let target_emb_sum = target_emb.sum_keepdim(1)?;
+                        let len_tensor = Tensor::new(target_ids.len() as f32, &self.text_device)?;
+                        let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
+                        let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
+                        
+                        let all_embs = self.qwen.get_embed_tokens()?.to_dtype(DType::F32)?;
+                        let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
+                        let target_normalized = target_vec.broadcast_div(&target_norm)?;
+                        
+                        let all_sqr = all_embs.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
+                        let all_norm = all_sqr.sqrt()?;
+                        let all_normalized = all_embs.broadcast_div(&all_norm)?;
+                        
+                        let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
+                        Ok(sim.affine(3.0, 0.0)?)
+                    };
+                    match calc_bias() {
+                        Ok(bias) => {
+                            semantic_bias_tensor = Some(bias);
+                            println!("[SEMANTIC-BIAS] Generated Vector Bias for target: '{}'", target_text);
+                        }
+                        Err(e) => println!("[SEMANTIC-BIAS] Failed to calculate bias: {}", e),
+                    }
+                }
+            }
+        }
+
         wait_for_global_io().await; 
         let mut logits = self.qwen.forward(&input_ids, None, None, None, None, None, offset, total_tokens_after_prefill, session_id.clone(), _kv_name.clone()).await?;
         
@@ -697,7 +750,14 @@ impl QwenVLGenerateModel {
         for i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
             
-            let mut logits_vec = logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+            // 🌟 Steering 적용
+            let logits_steered = if let Some(ref bias) = semantic_bias_tensor {
+                logits.broadcast_add(bias)?
+            } else {
+                logits.clone()
+            };
+
+            let mut logits_vec = logits_steered.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             let len = logits_vec.len();
 
             if !gen_ids.is_empty() {

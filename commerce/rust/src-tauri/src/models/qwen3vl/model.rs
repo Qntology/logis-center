@@ -808,6 +808,14 @@ impl Qwen3VLTextModel {
             layer.set_kv_cache(c);
         }
     }
+
+    pub fn get_embed_tokens(&self) -> Tensor {
+        self.embed_tokens.embeddings().clone()
+    }
+
+    pub fn embedding_token_id(&self, input_ids: &Tensor) -> Result<Tensor> {
+        Ok(self.embed_tokens.forward(input_ids)?)
+    }
 }
 
 pub struct Qwen3VLModel {
@@ -1342,5 +1350,14 @@ impl Qwen3VLModel {
 
     pub fn set_kv_cache(&mut self, cache: Vec<Option<(Tensor, Tensor)>>) {
         self.language_model.set_kv_cache(cache)
+    }
+
+    // 🌟 [추가] Semantic Bias 연산을 위해 전체 단어장의 벡터(Weight)를 그대로 반환합니다.
+    pub fn get_embed_tokens(&self) -> Tensor {
+        self.language_model.get_embed_tokens()
+    }
+
+    pub fn embedding_token_id(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.language_model.embedding_token_id(input_ids)
     }
 }

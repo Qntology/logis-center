@@ -56,7 +56,7 @@ impl Qwen3VLGenerateModel {
         })
     }
 
-    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>) -> Result<String> {
+    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, semantic_target: Option<&str>) -> Result<String> {
         let temperature = mes
             .temperature
             .unwrap_or(self.generation_config.temperature as f64);
@@ -95,6 +95,41 @@ impl Qwen3VLGenerateModel {
         
         let mut gen_text = String::new();
 
+        // 🌟 [Semantic Activation Steering]
+        let mut semantic_bias_tensor: Option<Tensor> = None;
+        if let Some(target_text) = semantic_target {
+            if let Ok(target_ids) = self.tokenizer.text_encode_vec(target_text.to_string(), false) {
+                if !target_ids.is_empty() {
+                    let calc_bias = || -> Result<Tensor> {
+                        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.device)?;
+                        let target_emb = self.qwen3_vl.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
+                        let target_emb_sum = target_emb.sum_keepdim(1)?;
+                        let len_tensor = Tensor::new(target_ids.len() as f32, &self.device)?;
+                        let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
+                        let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
+                        
+                        let all_embs = self.qwen3_vl.get_embed_tokens().to_dtype(DType::F32)?;
+                        let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
+                        let target_normalized = target_vec.broadcast_div(&target_norm)?;
+                        
+                        let all_sqr = all_embs.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
+                        let all_norm = all_sqr.sqrt()?;
+                        let all_normalized = all_embs.broadcast_div(&all_norm)?;
+                        
+                        let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
+                        Ok(sim.affine(3.0, 0.0)?)
+                    };
+                    match calc_bias() {
+                        Ok(bias) => {
+                            semantic_bias_tensor = Some(bias);
+                            println!("[SEMANTIC-BIAS] Generated Vector Bias for target: '{}'", target_text);
+                        }
+                        Err(e) => println!("[SEMANTIC-BIAS] Failed to calculate bias: {}", e),
+                    }
+                }
+            }
+        }
+
         for i in 0..sample_len {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) {
@@ -119,6 +154,14 @@ impl Qwen3VLGenerateModel {
             cur_video_grid_thw = None;
             
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+            
+            // 🌟 Steering 적용
+            let logits = if let Some(ref bias) = semantic_bias_tensor {
+                logits.broadcast_add(bias)?
+            } else {
+                logits
+            };
+
             let mut logits_vec = logits.to_vec1::<f32>()?;
             let len = logits_vec.len();
 

@@ -365,6 +365,7 @@ async fn process_task(
     let effective_device_pref = task_device_pref.as_deref().or(device_preference.as_deref());
     
     let language = "english"; 
+    let mut doc_lang = "en".to_string(); // 🌟 신규 다국어 감지 변수 추가
 
     // [LOCK] Acquire Model Access
     let model = {
@@ -801,7 +802,8 @@ async fn process_task(
 
                     if let Some(gen) = model.generator.lock().await.as_mut() {
                         println!("[Scheduler] 0.6B Step A: Asking classification question...");
-                        gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?
+                        // 🎯 [SEMANTIC STEERING] 6가지 카테고리 단어망을 Bias로 주입하여 허튼소리를 원천 차단!
+                        gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone(), Some("order goods tracking review coupon event")).await?
                     } else {
                         return Err(anyhow::anyhow!("Qwen generator missing"));
                     }
@@ -892,11 +894,13 @@ async fn process_task(
                     model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
                     if let Some(gen) = model.generator.lock().await.as_mut() {
                         println!("[Scheduler] 0.6B (Qwen) Step A-2: Asking detail classification... (Attempt {})", retry_count + 1);
+                        // 🎯 [SEMANTIC STEERING] bool 반환에 필요한 단어들을 묶어서 주입!
                         gen.generate(
                             params, 
                             Some(cancellation_token.clone()), 
                             Some(snapshot_id.clone()), 
-                            kv_name.clone()
+                            kv_name.clone(),
+                            Some("detail has_list has_form true false")
                         ).await?
                     } else {
                         return Err(anyhow::anyhow!("Qwen generator missing"));
@@ -922,6 +926,11 @@ async fn process_task(
                 detail_info = parsing::parse_json_from_llm(&res); 
                 
                 let target_obj = detail_info.get(&page_type).unwrap_or(&detail_info);
+
+                // 🌟 [CRITICAL FIX] 언어 코드 추출하여 다국어 Bias(표현 공학)에 사용합니다.
+                if let Some(lang_val) = target_obj.get("language").and_then(|v| v.as_str()) {
+                    doc_lang = lang_val.to_lowercase();
+                }
 
                 // 🌟 [CRITICAL FIX] LLM이 따옴표를 넣어서 "false", "true" (문자열) 형태로 뱉었을 경우에도 안전하게 파싱하도록 헬퍼 함수를 적용합니다.
                 let parse_bool_robust = |val: Option<&serde_json::Value>| -> Option<bool> {
@@ -1070,11 +1079,13 @@ async fn process_task(
                         if let Some(gen) = model.generator.lock().await.as_mut() {
                             println!("[JS-BRIDGE] 1. Requesting titles from LLM (0.6B)...");
                             
+                            // 🎯 [SEMANTIC STEERING] 상품 제목에 집중하도록 방향타 고정!
                             gen.generate(
                                 params, 
                                 Some(cancellation_token.clone()), 
                                 Some(snapshot_id.clone()), 
-                                kv_name.clone()
+                                kv_name.clone(),
+                                Some("title product name")
                             ).await?
                         } else {
                             return Err(anyhow::anyhow!("Qwen generator missing"));
@@ -1462,8 +1473,8 @@ async fn process_task(
                     model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                     if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-                        // 🌟 [CRITICAL FIX] Qwen 3.5 생성기의 파라미터가 5개(ignore_list 추가)로 변경되었으므로 마지막 인자로 None을 전달합니다.
-                        if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_step_thead", task.id)), kv_name.clone(), None).await {
+                        // 🌟 [CRITICAL FIX] Qwen 3.5 생성기의 파라미터가 추가되었으므로 마지막 인자로 None(semantic_target)을 추가로 전달합니다.
+                        if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_step_thead", task.id)), kv_name.clone(), None, None).await {
                             let thead_json = crate::parsing::parse_json_from_llm(&res);
                             
                             // JSON 응답에서 page_type에 맞는 선택자 추출
@@ -1925,7 +1936,7 @@ async fn process_task(
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
             // (이전 답변에서 생성된 parsing.rs의 get_detail_schema_fields를 호출합니다)
-            let fields = parsing::get_detail_schema_fields(&page_type, &url);
+            let fields = parsing::get_detail_schema_fields(&page_type, &url, &doc_lang);
             let total_fields = fields.len();
 
             let payload = json!({ "task_id": task.id, "category": "AI Inference", "summary": format!("Extracting {} detail fields sequentially...", total_fields), "spinner": "⠋" });
@@ -1948,7 +1959,7 @@ async fn process_task(
             };
 
             // 필드 단위로 하나씩 쪼개어 순차 추출 (병렬 처리 시의 VRAM 초과/컨텍스트 환각 방지)
-            for (idx, (field_name, field_desc)) in fields.into_iter().enumerate() {
+            for (idx, (field_name, field_desc, bias_target)) in fields.into_iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
                 let percent = (((idx as f32) / (total_fields as f32)) * 100.0) as i32;
@@ -1976,8 +1987,9 @@ async fn process_task(
                     let q3_gen = model.qwen3_generator.clone();
                     let cancel_clone = cancellation_token.clone();
                     let sys_msg = system_message.clone();
+                    
                     let field_name_clone = field_name.clone();
-                    let field_name_for_closure = field_name_clone.clone(); // 🌟 [CRITICAL FIX] 클로저 내부로 들어갈 소유권 변수를 별도로 생성합니다.
+                    let bias_target_for_closure = bias_target.clone(); // 🌟 다국어 Bias 할당
                     let task_q = task_question.clone();
                     let ignore_list_clone = ignore_list.clone();
                     
@@ -1997,7 +2009,7 @@ async fn process_task(
                             };
                             // 🌟 Qwen3 생성기에 ignore_list를 전달하여 환각 토큰 생성을 억제합니다.
                             // 🎯 [SEMANTIC STEERING] 추출 목표 대상인 필드명을 벡터 조향 타겟으로 직접 주입하여 해당 데이터 추출 확률을 극대화합니다!
-                            gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), Some(field_name_for_closure.as_str())).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
+                            gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), Some(bias_target_for_closure.as_str())).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
                         } else {
                             Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                         }
@@ -2016,14 +2028,14 @@ async fn process_task(
                             
                             // 🌟 복수 키("id,link") 지원을 위해 Split
                             let keys: Vec<&str> = field_name_clone.split(',').map(|s| s.trim()).collect();
-                            let mut found_any_key = false;
+                            let mut found_valid_value = false; // 🌟 유효한(비어있지 않은) 값이 있는지 추적
 
                             for k in &keys {
                                 if let Some(val) = item_val.get(*k) {
-                                    found_any_key = true;
                                     if val.is_string() {
                                         let extracted_str = val.as_str().unwrap_or("").trim().to_string();
                                         if !extracted_str.is_empty() && extracted_str != "..." && extracted_str != "null" {
+                                            found_valid_value = true;
                                             extracted_values_for_retry.push(extracted_str.clone());
                                             
                                             // 날짜 포맷, URL, 숫자 등은 PUG와 완벽 매칭이 안될 수 있으므로 예외 처리
@@ -2037,26 +2049,35 @@ async fn process_task(
                                                 }
                                             }
                                         }
+                                    } else if !val.is_null() {
+                                        found_valid_value = true;
                                     }
                                 }
                             }
 
-                            // LLM이 요구한 키를 하나도 안 뱉었으면 (엉뚱한 걸 뱉었으면) 재시도
-                            if !found_any_key {
+                            // 🌟 [CRITICAL FIX] LLM이 요구한 키를 뱉지 않았거나, 빈 값("")을 뱉었을 경우에도 재시도 (최대 3회)
+                            if !found_valid_value {
                                 requires_retry = true;
                             }
 
                             if requires_retry {
                                 miss_counter += 1;
                                 if miss_counter > 3 {
-                                    emit_term(&format!("  ⏭️ Skipping field {} due to persistent hallucination.", field_name_clone));
+                                    emit_term(&format!("  ⏭️ Skipping field {} due to persistent hallucination or empty value.", field_name_clone));
                                     break; 
                                 }
-                                emit_term(&format!("  ⚠️ Hallucination detected for field {}. Retrying... ({}/3)", field_name_clone, miss_counter));
+                                emit_term(&format!("  ⚠️ Hallucination or empty value detected for field {}. Retrying... ({}/3)", field_name_clone, miss_counter));
                                 for ex_str in extracted_values_for_retry {
                                     ignore_list.push(ex_str.clone());
                                     ignore_list.push(format!(" {}", ex_str));
                                     ignore_list.push(ex_str.to_lowercase());
+                                }
+                                // 🎯 빈 값을 뱉는 것을 억제하기 위해 JSON 빈 문자열 패턴을 ignore_list에 추가합니다.
+                                if !found_valid_value {
+                                    for k in &keys {
+                                        ignore_list.push(format!("\"{}\": \"\"", k));
+                                        ignore_list.push(format!("\"{}\":\"\"", k));
+                                    }
                                 }
                                 continue;
                             }

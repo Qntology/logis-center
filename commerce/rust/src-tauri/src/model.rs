@@ -1167,7 +1167,8 @@ impl LogisModel {
             cancellation_token.clone(),
             session_id, // 🌟 SSD 저장 및 병합 캐시 활성화!
             Some("inference".to_string()),
-            None // 🌟 5번째 인자인 ignore_list 자리에 None을 명시적으로 추가합니다.
+            None, // 🌟 5번째 인자인 ignore_list 자리에 None을 명시적으로 추가합니다.
+            None  // 🌟 [CRITICAL FIX] 6번째 인자인 semantic_target 자리에 None을 추가합니다.
         ).await.map_err(|e| anyhow!("Qwen 3.5 Inference failed: {}", e))
     }
 
@@ -1221,7 +1222,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            let response = gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))?;
+            let response = gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))?;
             println!("[MODEL-CHAT] Raw Response: {}", response);
             Ok(response)
         }
@@ -1306,7 +1307,7 @@ impl LogisModel {
 
         let mut gen_guard = self.generator.lock().await;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn chat_with_image_spinner(
@@ -1363,7 +1364,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
@@ -1406,7 +1407,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn run_inference_with_spinner(
@@ -1480,7 +1481,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn process_image_full(&self, image_path: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<Value> {
@@ -1743,7 +1744,8 @@ impl LogisModel {
                             model: "qwen3.5".to_string(), max_tokens: Some(256), temperature: Some(0.1), top_p: Some(0.1), 
                             ..Default::default()
                         };
-                        gen.generate(params, Some(cancel_token.clone()), None, None, None).await?
+                        // 🌟 [CRITICAL FIX] 파라미터가 하나 더 늘었으므로 None을 추가합니다.
+                        gen.generate(params, Some(cancel_token.clone()), None, None, None, None).await?
                     } else {
                         return Err(anyhow::anyhow!("Qwen 3.5 Generator is missing"));
                     }

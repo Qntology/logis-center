@@ -1,6 +1,14 @@
 use scraper::{Html, Node, Selector};
 use ego_tree::NodeRef;
 use regex::Regex;
+use once_cell::sync::Lazy;
+use serde_json::Value;
+
+// 🌟 [다국어 지원] 빌드 시점에 bias.json 파일을 읽어와 메모리에 영구 등재합니다.
+static BIAS_DICT: Lazy<Value> = Lazy::new(|| {
+    let json_str = include_str!("bias.json");
+    serde_json::from_str(json_str).unwrap_or(serde_json::json!({}))
+});
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum PugMode {
@@ -1049,132 +1057,161 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 }
 
 
-pub fn get_detail_schema_fields(page_type: &str, href: &str) -> Vec<(String, String)> {
+
+
+pub fn get_detail_schema_fields(page_type: &str, href: &str, lang: &str) -> Vec<(String, String, String)> {
     let mut fields = Vec::new();
+    
+    // 🌟 ISO 639-1 언어 코드를 앞 2자리(ko, ja, zh, es 등)로 추출합니다.
+    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    
+    // 쿠폰과 이벤트는 스키마를 공유하므로 딕셔너리 접근 키를 하나로 묶어줍니다.
+    let page_type_key = match page_type {
+        "coupon" | "event" => "coupon_event",
+        _ => page_type,
+    };
+
+    // 🌟 [핵심] 이제 하드코딩 없이 JSON에서 언어와 타입에 맞는 번역을 동적으로 꺼내옵니다.
+    let mut add = |key: &str, desc: String, en_bias: &str| {
+        let mut final_bias = en_bias.to_string();
+        
+        if lang_code != "en" {
+            if let Some(localized) = BIAS_DICT
+                .get(lang_code)
+                .and_then(|l| l.get(page_type_key).or_else(|| l.get("default")))
+                .and_then(|p| p.get(key))
+                .and_then(|v| v.as_str())
+            {
+                final_bias = format!("{} {}", en_bias, localized);
+            }
+        }
+        fields.push((key.to_string(), desc, final_bias));
+    };
+
     match page_type {
         "tracking" => {
-            fields.push(("id,link".to_string(), format!("- \"link\": String. '{}'\n- \"id\": String. tracking number.", href)));
-            fields.push(("status".to_string(), "- \"status\": String. tracking status('draft' or 'progress' or 'return' or 'complete' or 'error').".to_string()));
-            fields.push(("title".to_string(), "- \"title\": String. tracking product title.".to_string()));
-            fields.push(("registration_date".to_string(), "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
-            fields.push(("shipping_date".to_string(), "- \"shipping_date\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
-            fields.push(("sender_name".to_string(), "- \"sender_name\": String. sender name or buyer name or Seller name.".to_string()));
-            fields.push(("sender_address".to_string(), "- \"sender_address\": String. sender address or buyer address or Seller address.".to_string()));
-            fields.push(("sender_phone".to_string(), "- \"sender_phone\": String. sender phone or buyer phone or Seller phone.".to_string()));
-            fields.push(("recipient_name".to_string(), "- \"recipient_name\": String. recipient name.".to_string()));
-            fields.push(("recipient_address".to_string(), "- \"recipient_address\": String. recipient address.".to_string()));
-            fields.push(("recipient_phone".to_string(), "- \"recipient_phone\": String. recipient phone.".to_string()));
-            fields.push(("width".to_string(), "- \"width\": Number. Package width.".to_string()));
-            fields.push(("height".to_string(), "- \"height\": Number. Package height.".to_string()));
-            fields.push(("length".to_string(), "- \"length\": Number. Package length.".to_string()));
-            fields.push(("weight".to_string(), "- \"weight\": Number. Package weight.".to_string()));
-            fields.push(("carrier".to_string(), "- \"carrier\": String. carrier name translated into English.".to_string()));
-            fields.push(("shipping_fee".to_string(), "- \"shipping_fee\": Number. Shipping cost.".to_string()));
-            fields.push(("shipping_method".to_string(), "- \"shipping_method\": String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid').".to_string()));
-            fields.push(("shipping_duration".to_string(), "- \"shipping_duration\": Number. Estimated delivery days.".to_string()));
-            fields.push(("bundle_shipping".to_string(), "- \"bundle_shipping\": String. Allow combined shipping.".to_string()));
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. tracking number.", href), "id link tracking");
+            add("status", "- \"status\": String. ENUM strictly one of ['draft', 'progress', 'return', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status delivery");
+            add("title", "- \"title\": String. tracking product title.".to_string(), "title product name");
+            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration");
+            add("shipping_date", "- \"shipping_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date shipping dispatch");
+            add("sender_name", "- \"sender_name\": String. sender name or buyer name or Seller name.".to_string(), "sender seller name");
+            add("sender_address", "- \"sender_address\": String. Physical location address (street, city, zip) of the sender/buyer/seller. DO NOT extract email addresses here.".to_string(), "sender address location");
+            add("sender_phone", "- \"sender_phone\": String. sender phone or buyer phone or Seller phone.".to_string(), "sender phone contact");
+            add("recipient_name", "- \"recipient_name\": String. recipient name.".to_string(), "recipient buyer name");
+            add("recipient_address", "- \"recipient_address\": String. Physical location address (street, city, zip) of the recipient. DO NOT extract email addresses here.".to_string(), "recipient address location");
+            add("recipient_phone", "- \"recipient_phone\": String. recipient phone.".to_string(), "recipient phone contact");
+            add("width", "- \"width\": Number. Package width.".to_string(), "width dimension");
+            add("height", "- \"height\": Number. Package height.".to_string(), "height dimension");
+            add("length", "- \"length\": Number. Package length.".to_string(), "length dimension");
+            add("weight", "- \"weight\": Number. Package weight.".to_string(), "weight mass");
+            add("carrier", "- \"carrier\": String. carrier name translated into English.".to_string(), "carrier courier");
+            add("shipping_fee", "- \"shipping_fee\": Number. Shipping cost.".to_string(), "shipping fee cost");
+            add("shipping_method", "- \"shipping_method\": String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid').".to_string(), "shipping method");
+            add("shipping_duration", "- \"shipping_duration\": Number. Estimated delivery days.".to_string(), "shipping duration days");
+            add("bundle_shipping", "- \"bundle_shipping\": String. Allow combined shipping.".to_string(), "bundle combined shipping");
         },
         "goods" => {
-            fields.push(("id,link".to_string(), format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href)));
-            fields.push(("code".to_string(), "- \"code\": String. Displayed alphanumeric item code (SKU) shown as text in the table cell.".to_string()));
-            fields.push(("status".to_string(), "- \"status\": String. 'show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire'.".to_string()));
-            fields.push(("title".to_string(), "- \"title\": String. product name.".to_string()));
-            fields.push(("registration_date".to_string(), "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
-            fields.push(("payment_method".to_string(), "- \"payment_method\": String. payment method.".to_string()));
-            fields.push(("bank".to_string(), "- \"bank\": String. bank company name or ''.".to_string()));
-            fields.push(("card".to_string(), "- \"card\": String. card company name or ''.".to_string()));
-            fields.push(("model_name".to_string(), "- \"model_name\": String. product Model name.".to_string()));
-            fields.push(("brand_name".to_string(), "- \"brand_name\": String. product Brand name.".to_string()));
-            fields.push(("condition".to_string(), "- \"condition\": ['new' or 'used' or 'lease' or 'rental' or 'refurbish']".to_string()));
-            fields.push(("description".to_string(), "- \"description\": String. product Full description (HTML allowed).".to_string()));
-            fields.push(("short_description".to_string(), "- \"short_description\": String. product short description.".to_string()));
-            fields.push(("tags".to_string(), "- \"tags\": [{ tag : String. product keyword or tag. }]".to_string()));
-            fields.push(("origin_country".to_string(), "- \"origin_country\": String. product Country of origin/manufacture.".to_string()));
-            fields.push(("manufacturer".to_string(), "- \"manufacturer\": String. product Manufacturer name.".to_string()));
-            fields.push(("release_date".to_string(), "- \"release_date\": String. Product release date(yyyy-MM-ddThh:mm:ss).".to_string()));
-            fields.push(("manufacture_date".to_string(), "- \"manufacture_date\": String. product Date(yyyy-MM-ddThh:mm:ss) of manufacture.".to_string()));
-            fields.push(("expiration_date".to_string(), "- \"expiration_date\": String. product Expiration or use-by date(yyyy-MM-ddThh:mm:ss).".to_string()));
-            fields.push(("gtin".to_string(), "- \"gtin\": String. product Global Trade Item Number.".to_string()));
-            fields.push(("mpn".to_string(), "- \"mpn\": String. product Manufacturer Part Number.".to_string()));
-            fields.push(("barcode".to_string(), "- \"barcode\": String. product Barcode value.".to_string()));
-            fields.push(("sale_price".to_string(), "- \"sale_price\": Number. product sale price.".to_string()));
-            fields.push(("supply_price".to_string(), "- \"supply_price\": Number. product supply price.".to_string()));
-            fields.push(("currency".to_string(), "- \"currency\": String. ISO 4217 Currency Code(If the currency is not explicitly stated, infer the currency based on PUG CONTENT).".to_string()));
-            fields.push(("compare_at_price".to_string(), "- \"compare_at_price\": Number. product Original price for showing discounts.".to_string()));
-            fields.push(("quantity".to_string(), "- \"quantity\": Number. product Inventory quantity.".to_string()));
-            fields.push(("stock_keeping_unit".to_string(), "- \"stock_keeping_unit\": String. Stock Keeping Unit.".to_string()));
-            fields.push(("low_stock_threshold".to_string(), "- \"low_stock_threshold\": Number. product Low stock alert threshold.".to_string()));
-            fields.push(("unit".to_string(), "- \"unit\": String. product Selling unit.".to_string()));
-            fields.push(("tax_included".to_string(), "- \"tax_included\": Number. product Whether tax.".to_string()));
-            fields.push(("tax_code".to_string(), "- \"tax_code\": String. product Tax code for region-specific rules.".to_string()));
-            fields.push(("main_image_url".to_string(), "- \"main_image_url\": String. Main product image URL.".to_string()));
-            fields.push(("additional_image_url".to_string(), "- \"additional_image_url\": String. additional product image URL.".to_string()));
-            fields.push(("video_url".to_string(), "- \"video_url\": String. product Promotional video URL.".to_string()));
-            fields.push(("carrier".to_string(), "- \"carrier\": String. product carrier name translated into English.".to_string()));
-            fields.push(("shipping_fee".to_string(), "- \"shipping_fee\": Number. product Shipping cost.".to_string()));
-            fields.push(("shipping_method".to_string(), "- \"shipping_method\": String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid')".to_string()));
-            fields.push(("shipping_duration".to_string(), "- \"shipping_duration\": Number. product Estimated delivery days.".to_string()));
-            fields.push(("bundle_shipping".to_string(), "- \"bundle_shipping\": String. product Allow combined shipping.".to_string()));
-            fields.push(("width".to_string(), "- \"width\": Number. Package width(cm).".to_string()));
-            fields.push(("height".to_string(), "- \"height\": Number. Package height(cm).".to_string()));
-            fields.push(("length".to_string(), "- \"length\": Number. Package length(cm).".to_string()));
-            fields.push(("weight".to_string(), "- \"weight\": Number. Package weight(kg).".to_string()));
-            fields.push(("options".to_string(), "- \"options\": [ { value:String. product option name., inputs:[ { value:String. product option input value. } ] } ]".to_string()));
-            fields.push(("additional_goods".to_string(), "- \"additional_goods\": [ { link:String. Refer to the ID to find a URL that includes a additional goods manage link., id:String. Refer to the additional goods no value from the link or an attribute or additional goods input value. } ]".to_string()));
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link");
+            add("code", "- \"code\": String. Displayed alphanumeric item code (SKU) shown as text in the table cell.".to_string(), "code sku item");
+            add("status", "- \"status\": String. ENUM strictly one of ['draft', 'show', 'hide', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status condition");
+            add("title", "- \"title\": String. product name.".to_string(), "title name product");
+            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration");
+            add("payment_method", "- \"payment_method\": String. Payment method (e.g., 'Credit Card', 'Bank Transfer', 'PayPal', 'Cash').".to_string(), "payment method");
+            add("bank", "- \"bank\": String. Bank company name or account info. Strictly DO NOT extract product names.".to_string(), "bank account");
+            add("card", "- \"card\": String. Credit/Debit card company name (e.g., Visa, MasterCard). Strictly DO NOT extract product names.".to_string(), "card credit");
+            add("model_name", "- \"model_name\": String. product Model name.".to_string(), "model name");
+            add("brand_name", "- \"brand_name\": String. product Brand name.".to_string(), "brand name");
+            add("condition", "- \"condition\": ['new' or 'used' or 'lease' or 'rental' or 'refurbish']".to_string(), "condition state");
+            add("description", "- \"description\": String. product Full description (HTML allowed).".to_string(), "description detail");
+            add("short_description", "- \"short_description\": String. product short description.".to_string(), "short description summary");
+            add("tags", "- \"tags\": [{ tag : String. product keyword or tag. }]".to_string(), "tags keywords");
+            add("origin_country", "- \"origin_country\": String. product Country of origin/manufacture.".to_string(), "origin country");
+            add("manufacturer", "- \"manufacturer\": String. product Manufacturer name.".to_string(), "manufacturer");
+            add("release_date", "- \"release_date\": String. Product release date(yyyy-MM-ddThh:mm:ss).".to_string(), "release date");
+            add("manufacture_date", "- \"manufacture_date\": String. product Date(yyyy-MM-ddThh:mm:ss) of manufacture.".to_string(), "manufacture date");
+            add("expiration_date", "- \"expiration_date\": String. product Expiration or use-by date(yyyy-MM-ddThh:mm:ss).".to_string(), "expiration date");
+            add("gtin", "- \"gtin\": String. product Global Trade Item Number.".to_string(), "gtin barcode");
+            add("mpn", "- \"mpn\": String. product Manufacturer Part Number.".to_string(), "mpn part number");
+            add("barcode", "- \"barcode\": String. product Barcode value.".to_string(), "barcode");
+            add("sale_price", "- \"sale_price\": Number. product sale price.".to_string(), "sale price discount");
+            add("supply_price", "- \"supply_price\": Number. product supply price.".to_string(), "supply price cost");
+            add("currency", "- \"currency\": String. ISO 4217 Currency Code(If the currency is not explicitly stated, infer the currency based on PUG CONTENT).".to_string(), "currency");
+            add("compare_at_price", "- \"compare_at_price\": Number. product Original price for showing discounts.".to_string(), "compare original price");
+            add("quantity", "- \"quantity\": Number. product Inventory quantity.".to_string(), "quantity inventory stock");
+            add("stock_keeping_unit", "- \"stock_keeping_unit\": String. Stock Keeping Unit.".to_string(), "sku code");
+            add("low_stock_threshold", "- \"low_stock_threshold\": Number. product Low stock alert threshold.".to_string(), "low stock threshold");
+            add("unit", "- \"unit\": String. product Selling unit.".to_string(), "unit measure");
+            add("tax_included", "- \"tax_included\": Number. product Whether tax.".to_string(), "tax vat");
+            add("tax_code", "- \"tax_code\": String. product Tax code for region-specific rules.".to_string(), "tax code");
+            add("main_image_url", "- \"main_image_url\": String. Main product image URL.".to_string(), "main image thumbnail");
+            add("additional_image_url", "- \"additional_image_url\": String. additional product image URL.".to_string(), "additional image");
+            add("video_url", "- \"video_url\": String. product Promotional video URL.".to_string(), "video url");
+            add("carrier", "- \"carrier\": String. product carrier name translated into English.".to_string(), "carrier shipping");
+            add("shipping_fee", "- \"shipping_fee\": Number. product Shipping cost.".to_string(), "shipping fee cost");
+            add("shipping_method", "- \"shipping_method\": String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid')".to_string(), "shipping method");
+            add("shipping_duration", "- \"shipping_duration\": Number. product Estimated delivery days.".to_string(), "shipping duration time");
+            add("bundle_shipping", "- \"bundle_shipping\": String. product Allow combined shipping.".to_string(), "bundle combined shipping");
+            add("width", "- \"width\": Number. Package width(cm).".to_string(), "width");
+            add("height", "- \"height\": Number. Package height(cm).".to_string(), "height");
+            add("length", "- \"length\": Number. Package length(cm).".to_string(), "length");
+            add("weight", "- \"weight\": Number. Package weight(kg).".to_string(), "weight");
+            add("options", "- \"options\": [ { value:String. product option name., inputs:[ { value:String. product option input value. } ] } ]".to_string(), "options variations");
+            add("additional_goods", "- \"additional_goods\": [ { link:String. Refer to the ID to find a URL that includes a additional goods manage link., id:String. Refer to the additional goods no value from the link or an attribute or additional goods input value. } ]".to_string(), "additional goods related");
         },
         "order" => {
-            fields.push(("id,link".to_string(), format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href)));
-            fields.push(("tracking_number".to_string(), "- \"tracking_number\": String. tracking number.".to_string()));
-            fields.push(("status".to_string(), "- \"status\": String. order status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').".to_string()));
-            fields.push(("registration_date".to_string(), "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
-            fields.push(("goods".to_string(), "- \"goods\": [ { title:String. goods title., link:String. Refer to the ID to find a URL that includes a manage link., id:String. Refer to the goods no value from the link or an attribute or input value. } ]".to_string()));
-            fields.push(("sender_name".to_string(), "- \"sender_name\": String. sender name or order name or buyer name or Seller name.".to_string()));
-            fields.push(("sender_address".to_string(), "- \"sender_address\": String. sender address or order address or buyer address or Seller address.".to_string()));
-            fields.push(("sender_phone".to_string(), "- \"sender_phone\": String. sender phone or order phone or buyer phone or Seller phone.".to_string()));
-            fields.push(("recipient_name".to_string(), "- \"recipient_name\": String. recipient name.".to_string()));
-            fields.push(("recipient_address".to_string(), "- \"recipient_address\": String. recipient address.".to_string()));
-            fields.push(("recipient_phone".to_string(), "- \"recipient_phone\": String. recipient phone.".to_string()));
-            fields.push(("bank".to_string(), "- \"bank\": String. bank company name.".to_string()));
-            fields.push(("card".to_string(), "- \"card\": String. card company name.".to_string()));
-            fields.push(("order_date".to_string(), "- \"order_date\": String. order date.".to_string()));
-            fields.push(("payment_date".to_string(), "- \"payment_date\": String. payment date(payment date or '').".to_string()));
-            fields.push(("payment_method".to_string(), "- \"payment_method\": String. payment method('C.O.D.' or 'CARD' or 'BANK' or '').".to_string()));
-            fields.push(("payment_origin".to_string(), "- \"payment_origin\": String. payment origin(Payment Gateway Service Name or '').".to_string()));
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link order number");
+            add("tracking_number", "- \"tracking_number\": String. tracking number.".to_string(), "tracking number");
+            add("status", "- \"status\": String. ENUM strictly one of ['draft', 'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state");
+            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration");
+            add("goods", "- \"goods\": [ { title:String. goods title., link:String. Refer to the ID to find a URL that includes a manage link., id:String. Refer to the goods no value from the link or an attribute or input value. } ]".to_string(), "goods product items");
+            add("sender_name", "- \"sender_name\": String. sender name or order name or buyer name or Seller name.".to_string(), "sender buyer orderer name");
+            add("sender_address", "- \"sender_address\": String. Physical location address (street, city, zip) of the sender/buyer/seller. DO NOT extract email addresses here.".to_string(), "sender buyer address");
+            add("sender_phone", "- \"sender_phone\": String. sender phone or order phone or buyer phone or Seller phone.".to_string(), "sender buyer phone");
+            add("recipient_name", "- \"recipient_name\": String. recipient name.".to_string(), "recipient receiver name");
+            add("recipient_address", "- \"recipient_address\": String. Physical location address (street, city, zip) of the recipient. DO NOT extract email addresses here.".to_string(), "recipient receiver address");
+            add("recipient_phone", "- \"recipient_phone\": String. recipient phone.".to_string(), "recipient receiver phone");
+            add("bank", "- \"bank\": String. Bank company name or account info. Strictly DO NOT extract product names or order items.".to_string(), "bank account");
+            add("card", "- \"card\": String. Credit/Debit card company name (e.g., Visa, MasterCard). Strictly DO NOT extract product names or order items.".to_string(), "card credit");
+            add("order_date", "- \"order_date\": String. order date.".to_string(), "order date");
+            add("payment_date", "- \"payment_date\": String. payment date(payment date or '').".to_string(), "payment date");
+            add("payment_method", "- \"payment_method\": String. Method of payment ('C.O.D.', 'CARD', 'BANK', 'PayPal', etc.).".to_string(), "payment method type");
+            add("payment_origin", "- \"payment_origin\": String. Payment Gateway or PG service name (e.g., Stripe, PayPal, Toss).".to_string(), "payment origin pg gateway");
         },
         "coupon" | "event" => {
-            fields.push(("id,link".to_string(), format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href)));
-            fields.push(("type".to_string(), "- \"type\": String. coupon type('percentage' or 'fixed_amount' or 'free_shipping' or '').".to_string()));
-            fields.push(("status".to_string(), "- \"status\": String. coupon status('draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error').".to_string()));
-            fields.push(("title".to_string(), "- \"title\": String. title.".to_string()));
-            fields.push(("started_at".to_string(), "- \"started_at\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
-            fields.push(("expired_at".to_string(), "- \"expired_at\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
-            fields.push(("code".to_string(), format!("- \"code\": String. {} code used at checkout.", page_type)));
-            fields.push(("discount".to_string(), "- \"discount\": Number. Discount value.".to_string()));
-            fields.push(("quantity".to_string(), format!("- \"quantity\": Number. {} quantity.", page_type)));
-            fields.push(("usage_limit".to_string(), "- \"usage_limit\": Number. Total usage limit for the coupon.".to_string()));
-            fields.push(("usage_per".to_string(), "- \"usage_per\": Number. Usage limit per customer.".to_string()));
-            fields.push(("new_customer_only".to_string(), "- \"new_customer_only\": Boolean. new customer only.".to_string()));
-            fields.push(("first_purchase_only".to_string(), "- \"first_purchase_only\": Boolean. first purchase only.".to_string()));
-            fields.push(("min_order_amount".to_string(), "- \"min_order_amount\": Number. Minimum order amount required to apply coupon.".to_string()));
-            fields.push(("max_order_amount".to_string(), "- \"max_order_amount\": Number. Maximum order amount allowed to apply coupon.".to_string()));
-            fields.push(("max_discount_amount".to_string(), "- \"max_discount_amount\": Number. Maximum discount limit allowed for the coupon.".to_string()));
-            fields.push(("region_restrictions".to_string(), "- \"region_restrictions\": Boolean. region restrictions.".to_string()));
-            fields.push(("number".to_string(), "- \"number\": String. contact phone number.".to_string()));
-            fields.push(("address".to_string(), "- \"address\": String. offline location address.".to_string()));
-            fields.push(("registration_date".to_string(), "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link");
+            add("type", "- \"type\": String. coupon type('percentage' or 'fixed_amount' or 'free_shipping' or '').".to_string(), "type");
+            add("status", "- \"status\": String. ENUM strictly one of ['show', 'progress', 'hide', 'stop', 'cancel', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state");
+            add("title", "- \"title\": String. title.".to_string(), "title name");
+            add("started_at", "- \"started_at\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "start date time");
+            add("expired_at", "- \"expired_at\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "expire end date time");
+            add("code", format!("- \"code\": String. {} code used at checkout.", page_type), "code");
+            add("discount", "- \"discount\": Number. Discount value.".to_string(), "discount");
+            add("quantity", format!("- \"quantity\": Number. {} quantity.", page_type), "quantity amount");
+            add("usage_limit", "- \"usage_limit\": Number. Total usage limit for the coupon.".to_string(), "usage limit max");
+            add("usage_per", "- \"usage_per\": Number. Usage limit per customer.".to_string(), "usage per customer user");
+            add("new_customer_only", "- \"new_customer_only\": Boolean. new customer only.".to_string(), "new customer only");
+            add("first_purchase_only", "- \"first_purchase_only\": Boolean. first purchase only.".to_string(), "first purchase only");
+            add("min_order_amount", "- \"min_order_amount\": Number. Minimum order amount required to apply coupon.".to_string(), "minimum order amount");
+            add("max_order_amount", "- \"max_order_amount\": Number. Maximum order amount allowed to apply coupon.".to_string(), "maximum order amount");
+            add("max_discount_amount", "- \"max_discount_amount\": Number. Maximum discount limit allowed for the coupon.".to_string(), "maximum discount amount");
+            add("region_restrictions", "- \"region_restrictions\": Boolean. region restrictions.".to_string(), "region restriction area");
+            add("number", "- \"number\": String. contact phone number.".to_string(), "number phone contact");
+            add("address", "- \"address\": String. offline location address.".to_string(), "address location");
+            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration");
         },
         "review" => {
-            fields.push(("id,link".to_string(), format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href)));
-            fields.push(("status".to_string(), "- \"status\": String. review status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').".to_string()));
-            fields.push(("name".to_string(), "- \"name\": String. reviewer name.".to_string()));
-            fields.push(("title".to_string(), "- \"title\": String. reviewer item title.".to_string()));
-            fields.push(("completed".to_string(), "- \"completed\": boolean. order complete.".to_string()));
-            fields.push(("registration_date".to_string(), "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string()));
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link");
+            add("status", "- \"status\": String. ENUM strictly one of ['progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state");
+            add("name", "- \"name\": String. reviewer name.".to_string(), "name reviewer author");
+            add("title", "- \"title\": String. reviewer item title.".to_string(), "title subject product");
+            add("completed", "- \"completed\": boolean. order complete.".to_string(), "completed purchased");
+            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration time");
         },
         _ => {
-            fields.push(("id,link".to_string(), format!("- \"link\": String. '{}'\n- \"id\": String. Unique identifier.", href)));
-            fields.push(("title".to_string(), "- \"title\": String. General name or title.".to_string()));
-            fields.push(("status".to_string(), "- \"status\": String. Current state.".to_string()));
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Unique identifier.", href), "id link");
+            add("title", "- \"title\": String. General name or title.".to_string(), "title name");
+            add("status", "- \"status\": String. ENUM strictly one of ['show', 'progress', 'hide', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state");
         }
     }
     fields
@@ -1312,32 +1349,32 @@ pub fn list2json_info(page_type: &str, language: &str, head_pug: &str, item_pug:
     "order" => r###"- "{TYPE}":Object.
 - "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
 - "registration_date":String. yyyy-MM-ddThh:mm:ss.
-- "status":String. {TYPE} status('progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
+- "status":String. ENUM strictly one of ['draft', 'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or "". Do not invent other words.
 - "title":String. title."###.to_string(),
 
     "goods" => r###"- "product":Object.
 - "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
 - "registration_date":String. yyyy-MM-ddThh:mm:ss.
-- "status":String. {TYPE} status('show' or 'remove' or 'hide' or 'stop' or 'exchange' or 'expire').
+- "status":String. ENUM strictly one of ['draft', 'show', 'hide', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or "". Do not invent other words.
 - "code":String. product code (Stock Keeping Unit).
 - "title":String. title."###.to_string(),
     
     "tracking" | "review" => r###"- "{TYPE}":Object.
 - "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
 - "registration_date":String. yyyy-MM-ddThh:mm:ss.
-- "status":String. 'progress' or 'stop' or 'cancel' or 'return'.
+- "status":String. ENUM strictly one of ['draft', 'progress', 'return', 'complete', 'error'] or "". Do not invent other words.
 - "title":String. author and content."###.to_string(),
     
     "coupon" | "event" => r###"- "{TYPE}":Object.
 - "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
 - "registration_date":String. yyyy-MM-ddThh:mm:ss.
-- "status":String. {TYPE} status('show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete').
+- "status":String. ENUM strictly one of ['show', 'progress', 'hide', 'stop', 'cancel', 'expire', 'complete', 'error'] or "". Do not invent other words.
 - "title":String. title."###.to_string(),
     
         _ => r###"- "{TYPE}":Object.
 - "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
 - "registration_date":String. yyyy-MM-ddThh:mm:ss.
-- "status":String. {TYPE} status('show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete').
+- "status":String. ENUM strictly one of ['show', 'progress', 'hide', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or "". Do not invent other words.
 - "title":String. title."###.to_string()
     };
 
