@@ -849,12 +849,12 @@ async fn process_task(
             }
         }
 
-        // --- STEP A-2: DETAIL CLASSIFICATION (디테일 페이지 여부 독립 판별) ---
+        // --- STEP A-2: DETAIL CLASSIFICATION (디테일 페이지 여부 독립 판별 - List/Form 분리) ---
         {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
             println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Is Detail)");
             
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining document...", "spinner": "⠋" }));
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining document structure...", "spinner": "⠋" }));
 
             // HTML 문서를 파싱하여 <head> 내부의 <title> 텍스트를 추출
             let document_title = {
@@ -866,14 +866,25 @@ async fn process_task(
                 }
             };
 
-            // 🌟 앞서 Step A에서 획득한 doc_lang을 인자로 넘겨줍니다.
-            let detail_prompt = parsing::is_detail_prompt(&page_type, &document_title, &doc_lang);
-            // LLM이 지시사항을 잘 따르도록 래핑
-            let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think", detail_prompt);
-            
-            let snapshot_id = format!("{}_step_a2", task.id); 
+            // 🌟 [CRITICAL FIX] LLM이 따옴표를 넣어서 "false", "true" (문자열) 형태로 뱉었을 경우에도 안전하게 파싱하도록 헬퍼 함수를 적용합니다.
+            let parse_bool_robust = |val: Option<&serde_json::Value>| -> Option<bool> {
+                val.and_then(|v| {
+                    if let Some(b) = v.as_bool() { Some(b) }
+                    else if let Some(s) = v.as_str() { Some(s.to_lowercase() == "true") }
+                    else { None }
+                })
+            };
 
-            let mut detail_info = serde_json::json!({});
+            let mut raw_has_list = false;
+            let mut raw_has_form = false;
+
+            // ==========================================
+            // 1. List 여부 판별
+            // ==========================================
+            let list_prompt = parsing::is_list_prompt(&page_type, &document_title, &doc_lang);
+            let task_question_list = format!("{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think", list_prompt);
+            let snapshot_id_list = format!("{}_step_a2_list", task.id); 
+
             let mut retry_count = 0;
             let mut ignore_list: Vec<String> = Vec::new();
 
@@ -887,31 +898,29 @@ async fn process_task(
                             name: None,
                         }),
                         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                            content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                            content: ChatCompletionRequestUserMessageContent::Text(task_question_list.clone()),
                             name: None,
                         })
                     ],
                     model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
-                    max_tokens: Some(256),
+                    max_tokens: Some(128),
                     temperature: Some(0.0), top_p: Some(0.95),
                     ..Default::default()
                 };
 
-                // 🌟 [CRITICAL FIX] 페이지 타입과 감지된 언어에 꼭 맞는 단일 언어 레이아웃 판별 바이어스를 추출합니다.
-                let layout_bias = crate::parsing::get_layout_bias(&page_type, &doc_lang);
+                let (list_bias, list_prej) = crate::parsing::get_list_layout_bias(&page_type, &doc_lang);
 
                 let res = if base_model_size == crate::model::ModelSize::Qwen {
                     model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
                     if let Some(gen) = model.generator.lock().await.as_mut() {
-                        println!("[Scheduler] 0.6B (Qwen) Step A-2: Asking detail classification... (Attempt {})", retry_count + 1);
-                        // 🎯 [SEMANTIC STEERING] 페이지 도메인에 완벽하게 일치하는 맞춤형 레이아웃 힌트 주입!
+                        println!("[Scheduler] 0.6B (Qwen) Step A-2 (List): Asking list classification... (Attempt {})", retry_count + 1);
                         gen.generate(
                             params, 
                             Some(cancellation_token.clone()), 
-                            Some(snapshot_id.clone()), 
+                            Some(snapshot_id_list.clone()), 
                             kv_name.clone(),
-                            Some(&layout_bias),
-                            None
+                            Some(&list_bias),
+                            Some(&list_prej)
                         ).await?
                     } else {
                         return Err(anyhow::anyhow!("Qwen generator missing"));
@@ -921,86 +930,45 @@ async fn process_task(
                     let q3_gen_arc = model.qwen3_generator.clone();
                     let cancel_clone = cancellation_token.clone();
                     let ignore_list_clone = ignore_list.clone();
-                    let layout_bias_clone = layout_bias.clone(); // 클로저 복제용
+                    let list_bias_clone = list_bias.clone(); 
+                    let list_prej_clone = list_prej.clone();
                     tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
                         let mut gen_guard = q3_gen_arc.blocking_lock();
                         if let Some(gen) = gen_guard.as_mut() {
-                            println!("[Scheduler] Qwen3 Step A-2: Asking detail classification... (Attempt {})", retry_count + 1);
-                            gen.generate(params, Some(cancel_clone), Some(ignore_list_clone.as_slice()), Some(layout_bias_clone.as_str()), None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                            println!("[Scheduler] Qwen3 Step A-2 (List): Asking list classification... (Attempt {})", retry_count + 1);
+                            gen.generate(params, Some(cancel_clone), Some(ignore_list_clone.as_slice()), Some(list_bias_clone.as_str()), Some(list_prej_clone.as_str())).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
                         } else {
                             Err(anyhow::anyhow!("Qwen3 generator missing"))
                         }
                     }).await??
                 };
                 
-                println!("[DEBUG-SCHED] Step A-2 Raw Response: '{}'", res);
+                println!("[DEBUG-SCHED] Step A-2 (List) Raw Response: '{}'", res);
                 
-                detail_info = parsing::parse_json_from_llm(&res); 
-                
-                let target_obj = detail_info.get(&page_type).unwrap_or(&detail_info);
+                let list_info = parsing::parse_json_from_llm(&res); 
+                let target_obj = list_info.get(&page_type).unwrap_or(&list_info);
 
-                // 🌟 [CRITICAL FIX] 언어 코드 추출하여 다국어 Bias(표현 공학)에 사용합니다.
                 if let Some(lang_val) = target_obj.get("language").and_then(|v| v.as_str()) {
                     doc_lang = lang_val.to_lowercase();
                 }
 
-                // 🌟 [CRITICAL FIX] LLM이 따옴표를 넣어서 "false", "true" (문자열) 형태로 뱉었을 경우에도 안전하게 파싱하도록 헬퍼 함수를 적용합니다.
-                let parse_bool_robust = |val: Option<&serde_json::Value>| -> Option<bool> {
-                    val.and_then(|v| {
-                        if let Some(b) = v.as_bool() { Some(b) }
-                        else if let Some(s) = v.as_str() { Some(s.to_lowercase() == "true") }
-                        else { None }
-                    })
-                };
+                let has_list = parse_bool_robust(target_obj.get("has_list"))
+                    .or_else(|| parse_bool_robust(list_info.get("has_list")));
 
-                let detail_val = parse_bool_robust(target_obj.get("detail"))
-                    .or_else(|| parse_bool_robust(detail_info.get("detail")));
-
-                // 원본 텍스트에 강제로 true/false가 적혀있는지 확인하여 JSON 파싱 절단 사태를 방어합니다.
-                // 🌟 키 이름에 여백(" has_form" 등)이 들어간 경우를 대비해 res_clean으로 원시 문자열에서도 상태를 파악합니다.
                 let res_clean = res.to_lowercase().replace(" ", "").replace("\"", "").replace("'", "");
-                let raw_detail_true = res_clean.contains("detail:true");
-                let raw_has_list_true = res_clean.contains("has_list:true");
-                let raw_has_form_true = res_clean.contains("has_form:true");
-
                 let has_list_exists = target_obj.get("has_list").is_some() || res_clean.contains("has_list:");
-                let has_form_exists = target_obj.get("has_form").is_some() || res_clean.contains("has_form:");
 
-                // 🌟 [CRITICAL FIX] 사용자의 간절한 요청을 반영하여, detail 값이 존재하거나 원본 텍스트에 흔적이 있으면 
-                // has_list와 has_form이 누락되었더라도 즉시 올바른 답변으로 인정하고 루프를 완벽히 탈출(Pass)합니다!
-                if has_list_exists || has_form_exists {
-                    is_detail = detail_val.unwrap_or(raw_detail_true);
-                    
-                    // 만약 명시적으로 detail 값이 없고 has_list/has_form으로만 추론해야 할 경우
-                    let has_list = parse_bool_robust(target_obj.get("has_list")).unwrap_or(raw_has_list_true);
-                    let has_form = parse_bool_robust(target_obj.get("has_form")).unwrap_or(raw_has_form_true);
-                    
-                    // 🎯 요청하신 조건: has_form이 true면 무조건 is_detail을 true로 반영!
-                    if has_form { 
-                        is_detail = true; 
-                    } else if !has_list { 
-                        is_detail = true; 
-                    }
-                    
+                if has_list_exists {
+                    raw_has_list = has_list.unwrap_or(res_clean.contains("has_list:true"));
                     break;
                 } else {
                     retry_count += 1;
                     if retry_count >= 3 {
-                        println!("[Scheduler] Max retries reached for Step A-2. Proceeding with best effort.");
-                        // 최후의 보루 추론
-                        let has_list = parse_bool_robust(target_obj.get("has_list")).unwrap_or(raw_has_list_true);
-                        let has_form = parse_bool_robust(target_obj.get("has_form")).unwrap_or(raw_has_form_true);
-                        
-                        // 🎯 최후의 보루에서도 동일하게 적용
-                        if has_form { 
-                            is_detail = true; 
-                        } else if !has_list { 
-                            is_detail = true; 
-                        }
+                        println!("[Scheduler] Max retries reached for Step A-2 (List). Proceeding with best effort.");
+                        raw_has_list = res_clean.contains("has_list:true");
                         break;
                     }
-                    println!("[Scheduler] ⚠️ Missing 'detail' OR ('has_list' & 'has_form') in Step A-2. Retrying... ({}/3)", retry_count);
-                    
+                    println!("[Scheduler] ⚠️ Missing 'has_list' in Step A-2 (List). Retrying... ({}/3)", retry_count);
                     let mut ignore_val = res.trim().to_string();
                     if ignore_val.len() > 100 { ignore_val = ignore_val[..100].to_string(); }
                     ignore_list.push(ignore_val.clone());
@@ -1008,8 +976,118 @@ async fn process_task(
                     ignore_list.push(ignore_val.to_lowercase());
                 }
             }
+
+            // ==========================================
+            // 2. Form 여부 판별
+            // ==========================================
+            let form_prompt = parsing::is_form_prompt(&page_type, &document_title, &doc_lang);
+            let task_question_form = format!("{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think", form_prompt);
+            let snapshot_id_form = format!("{}_step_a2_form", task.id); 
+
+            let mut retry_count_form = 0;
+            let mut ignore_list_form: Vec<String> = Vec::new();
+
+            loop {
+                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+                let params = ChatCompletionParameters {
+                    messages: vec![
+                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                            content: system_content.clone(), 
+                            name: None,
+                        }),
+                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                            content: ChatCompletionRequestUserMessageContent::Text(task_question_form.clone()),
+                            name: None,
+                        })
+                    ],
+                    model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
+                    max_tokens: Some(128),
+                    temperature: Some(0.0), top_p: Some(0.95),
+                    ..Default::default()
+                };
+
+                let (form_bias, form_prej) = crate::parsing::get_form_layout_bias(&page_type, &doc_lang);
+
+                let res = if base_model_size == crate::model::ModelSize::Qwen {
+                    model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                    if let Some(gen) = model.generator.lock().await.as_mut() {
+                        println!("[Scheduler] 0.6B (Qwen) Step A-2 (Form): Asking form classification... (Attempt {})", retry_count_form + 1);
+                        gen.generate(
+                            params, 
+                            Some(cancellation_token.clone()), 
+                            Some(snapshot_id_form.clone()), 
+                            kv_name.clone(),
+                            Some(&form_bias),
+                            Some(&form_prej)
+                        ).await?
+                    } else {
+                        return Err(anyhow::anyhow!("Qwen generator missing"));
+                    }
+                } else {
+                    model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, None).await?;
+                    let q3_gen_arc = model.qwen3_generator.clone();
+                    let cancel_clone = cancellation_token.clone();
+                    let ignore_list_clone = ignore_list_form.clone();
+                    let form_bias_clone = form_bias.clone(); 
+                    let form_prej_clone = form_prej.clone();
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                        let mut gen_guard = q3_gen_arc.blocking_lock();
+                        if let Some(gen) = gen_guard.as_mut() {
+                            println!("[Scheduler] Qwen3 Step A-2 (Form): Asking form classification... (Attempt {})", retry_count_form + 1);
+                            gen.generate(params, Some(cancel_clone), Some(ignore_list_clone.as_slice()), Some(form_bias_clone.as_str()), Some(form_prej_clone.as_str())).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                        } else {
+                            Err(anyhow::anyhow!("Qwen3 generator missing"))
+                        }
+                    }).await??
+                };
                 
-            println!("[Scheduler] Classified is_detail as: {}", is_detail);
+                println!("[DEBUG-SCHED] Step A-2 (Form) Raw Response: '{}'", res);
+                
+                let form_info = parsing::parse_json_from_llm(&res); 
+                let target_obj = form_info.get(&page_type).unwrap_or(&form_info);
+
+                if let Some(lang_val) = target_obj.get("language").and_then(|v| v.as_str()) {
+                    doc_lang = lang_val.to_lowercase();
+                }
+
+                let has_form = parse_bool_robust(target_obj.get("has_form"))
+                    .or_else(|| parse_bool_robust(form_info.get("has_form")));
+
+                let res_clean = res.to_lowercase().replace(" ", "").replace("\"", "").replace("'", "");
+                let has_form_exists = target_obj.get("has_form").is_some() || res_clean.contains("has_form:");
+
+                if has_form_exists {
+                    raw_has_form = has_form.unwrap_or(res_clean.contains("has_form:true"));
+                    break;
+                } else {
+                    retry_count_form += 1;
+                    if retry_count_form >= 3 {
+                        println!("[Scheduler] Max retries reached for Step A-2 (Form). Proceeding with best effort.");
+                        raw_has_form = res_clean.contains("has_form:true");
+                        break;
+                    }
+                    println!("[Scheduler] ⚠️ Missing 'has_form' in Step A-2 (Form). Retrying... ({}/3)", retry_count_form);
+                    let mut ignore_val = res.trim().to_string();
+                    if ignore_val.len() > 100 { ignore_val = ignore_val[..100].to_string(); }
+                    ignore_list_form.push(ignore_val.clone());
+                    ignore_list_form.push(format!(" {}", ignore_val));
+                    ignore_list_form.push(ignore_val.to_lowercase());
+                }
+            }
+
+            // ==========================================
+            // 3. 최종 판별 (Detail 여부 결정)
+            // ==========================================
+            if raw_has_form { 
+                is_detail = true; 
+            } else if !raw_has_list { 
+                is_detail = true; 
+            } else {
+                is_detail = false;
+            }
+
+            println!("[Scheduler] Classified is_detail as: {} (has_list: {}, has_form: {})", is_detail, raw_has_list, raw_has_form);
         } // 👈 🌟 [핵심 변경 1 끝] 0.6B 분석 블록 종료
     } // 🌟 [CRITICAL FIX] 누락된 if !skip_ai_analysis 블록 닫기 괄호를 복구합니다!
 
@@ -1981,6 +2059,8 @@ async fn process_task(
                 }
             };
 
+            let mut global_ignore_list: Vec<String> = Vec::new(); // 🌟 전역 무시 리스트 추가
+
             // 필드 단위로 하나씩 쪼개어 순차 추출 (병렬 처리 시의 VRAM 초과/컨텍스트 환각 방지)
             // 🌟 [CRITICAL FIX] prejudice_target 매개변수 추가
             for (idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.into_iter().enumerate() {
@@ -2002,7 +2082,7 @@ async fn process_task(
                 let task_question = parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, &doc_title);
                 
                 // 🌟 [BIAS SKIP LOGIC] 본문에 존재하지 않는 잘못된 추출값 기록용 리스트 및 카운터
-                let mut ignore_list: Vec<String> = Vec::new();
+                let mut ignore_list: Vec<String> = global_ignore_list.clone(); // 🌟 매 필드마다 전역 리스트를 복사하여 누적 시작
                 let mut miss_counter = 0;
                 
                 loop {
@@ -2168,6 +2248,20 @@ async fn process_task(
                                 if let Some(val) = item_val.get(*k) {
                                     extracted_data.as_object_mut().unwrap().insert(k.to_string(), val.clone());
                                     extracted_results.push(format!("\"{}\": {}", k, val));
+                                    
+                                    // 🌟 [전역 무시 리스트 업데이트] 성공적으로 찾은 값을 다른 필드에서 중복 추출하지 않도록 방어합니다.
+                                    let val_str = if val.is_string() { val.as_str().unwrap().trim().to_string() }
+                                                  else if val.is_number() { val.to_string() }
+                                                  else { String::new() };
+                                    
+                                    // 이름이나 짧은 단어가 실수로 억제되는 것을 방지하기 위해 길이가 5 이상인 고유값만 추가합니다.
+                                    if val_str.len() >= 5 && val_str != "null" && val_str != "true" && val_str != "false" {
+                                        if !global_ignore_list.contains(&val_str) {
+                                            global_ignore_list.push(val_str.clone());
+                                            global_ignore_list.push(format!(" {}", val_str));
+                                            global_ignore_list.push(val_str.to_lowercase());
+                                        }
+                                    }
                                 }
                             }
                             

@@ -803,6 +803,43 @@ RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
             .replace("{TYPE}", page_type)
 }
 
+pub fn get_localized_page_type(page_type: &str, lang: &str) -> String {
+    let lang_lower = lang.to_lowercase();
+    
+    // zh-tw와 zh-hk 같은 번체자 환경을 정확하게 분리하여 추출
+    let lang_code = if lang_lower.starts_with("zh-tw") || lang_lower.starts_with("zh-hk") {
+        "zh-tw"
+    } else if lang_lower.len() >= 2 {
+        &lang_lower[0..2]
+    } else {
+        "en"
+    };
+
+    let matched_str = match lang_code {
+        "ko" => match page_type { "order" => "주문", "goods" => "상품", "tracking" => "배송", "review" => "리뷰", "coupon" | "event" => "이벤트", _ => "문서" },
+        "zh-tw" => match page_type { "order" => "訂單", "goods" => "商品", "tracking" => "物流", "review" => "評價", "coupon" | "event" => "活動", _ => "文件" },
+        "zh" => match page_type { "order" => "订单", "goods" => "商品", "tracking" => "物流", "review" => "评价", "coupon" | "event" => "活动", _ => "文档" },
+        "ja" => match page_type { "order" => "注文", "goods" => "商品", "tracking" => "配送", "review" => "レビュー", "coupon" | "event" => "イベント", _ => "ドキュメント" },
+        "es" => match page_type { "order" => "pedido", "goods" => "producto", "tracking" => "seguimiento", "review" => "reseña", "coupon" | "event" => "evento", _ => "documento" },
+        "pt" => match page_type { "order" => "pedido", "goods" => "produto", "tracking" => "rastreamento", "review" => "avaliação", "coupon" | "event" => "evento", _ => "documento" },
+        "de" => match page_type { "order" => "bestellung", "goods" => "produkt", "tracking" => "sendungsverfolgung", "review" => "bewertung", "coupon" | "event" => "event", _ => "dokument" },
+        "nl" => match page_type { "order" => "bestelling", "goods" => "product", "tracking" => "tracking", "review" => "beoordeling", "coupon" | "event" => "evenement", _ => "document" },
+        "it" => match page_type { "order" => "ordine", "goods" => "prodotto", "tracking" => "tracciamento", "review" => "recensione", "coupon" | "event" => "evento", _ => "documento" },
+        "id" | "ms" => match page_type { "order" => "pesanan", "goods" => "produk", "tracking" => "pelacakan", "review" => "ulasan", "coupon" | "event" => "acara", _ => "dokumen" },
+        "vi" => match page_type { "order" => "đơn hàng", "goods" => "sản phẩm", "tracking" => "theo dõi", "review" => "đánh giá", "coupon" | "event" => "sự kiện", _ => "tài liệu" },
+        "th" => match page_type { "order" => "คำสั่งซื้อ", "goods" => "สินค้า", "tracking" => "การติดตาม", "review" => "รีวิว", "coupon" | "event" => "กิจกรรม", _ => "เอกสาร" },
+        "ar" => match page_type { "order" => "طلب", "goods" => "منتج", "tracking" => "تتبع", "review" => "مراجعة", "coupon" | "event" => "حدث", _ => "مستند" },
+        "ta" => match page_type { "order" => "ஆர்டர்", "goods" => "தயாரிப்பு", "tracking" => "கண்காணிப்பு", "review" => "விமர்சனம்", "coupon" | "event" => "நிகழ்வு", _ => "ஆவணம்" },
+        "te" => match page_type { "order" => "ఆర్డర్", "goods" => "ఉత్పత్తి", "tracking" => "ట్రాకింగ్", "review" => "సమీక్ష", "coupon" | "event" => "ఈవెంట్", _ => "పత్రం" },
+        "kn" => match page_type { "order" => "ಆರ್ಡರ್", "goods" => "ಉತ್ಪನ್ನ", "tracking" => "ಟ್ರ್ಯಾಕಿಂಗ್", "review" => "ವಿಮರ್ಶೆ", "coupon" | "event" => "ಈವೆಂಟ್", _ => "ಡಾಕ್ಯುಮೆಂಟ್" },
+        "gu" => match page_type { "order" => "ઓર્ડર", "goods" => "ઉત્પાદન", "tracking" => "ટ્રેકિંગ", "review" => "સમીક્ષા", "coupon" | "event" => "ઇવેન્ટ", _ => "દસ્તાવેજ" },
+        _ => match page_type { "order" => "order", "goods" => "product", "tracking" => "tracking", "review" => "review", "coupon" | "event" => "event", _ => "document" },
+    };
+    
+    // 최종 결과물에 단 한번만 .to_string()을 호출하여 타입 불일치 에러 완벽 해결
+    matched_str.to_string()
+}
+
 pub fn get_layout_bias(page_type: &str, lang: &str) -> String {
     let mut bias = String::from("detail has_list has_form true false");
     let page_type_key = match page_type {
@@ -811,16 +848,17 @@ pub fn get_layout_bias(page_type: &str, lang: &str) -> String {
     };
     
     let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let localized_type = get_localized_page_type(page_type, lang);
     
     // 🌟 5개 언어 짬뽕을 버리고, Step A에서 감지된 단일 언어의 바이어스만 핀셋으로 뽑아와 주입합니다. (존재하지 않으면 en 폴백)
     if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
         if let Some(l_list) = localized_obj.get("layout_list").and_then(|v| v.get("bias")).and_then(|v| v.as_str()) {
             bias.push_str(" ");
-            bias.push_str(l_list);
+            bias.push_str(&l_list.replace("{TYPE}", &localized_type));
         }
         if let Some(l_form) = localized_obj.get("layout_form").and_then(|v| v.get("bias")).and_then(|v| v.as_str()) {
             bias.push_str(" ");
-            bias.push_str(l_form);
+            bias.push_str(&l_form.replace("{TYPE}", &localized_type));
         }
     }
     bias
@@ -829,12 +867,13 @@ pub fn get_layout_bias(page_type: &str, lang: &str) -> String {
 pub fn get_title_bias(page_type: &str, lang: &str) -> (String, String) {
     let page_type_key = match page_type { "coupon" | "event" => "coupon_event", _ => page_type };
     let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let localized_type = get_localized_page_type(page_type, lang);
     let mut bias = String::from("title name product");
     let mut prejudice = String::from("address location");
     if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
         if let Some(t_obj) = localized_obj.get("title") {
-            if let Some(b) = t_obj.get("bias").and_then(|v| v.as_str()) { bias = format!("{} {}", bias, b); }
-            if let Some(p) = t_obj.get("prejudice").and_then(|v| v.as_str()) { prejudice = format!("{} {}", prejudice, p); }
+            if let Some(b) = t_obj.get("bias").and_then(|v| v.as_str()) { bias = format!("{} {}", bias, b.replace("{TYPE}", &localized_type)); }
+            if let Some(p) = t_obj.get("prejudice").and_then(|v| v.as_str()) { prejudice = format!("{} {}", prejudice, p.replace("{TYPE}", &localized_type)); }
         }
     }
     (bias, prejudice)
@@ -843,14 +882,15 @@ pub fn get_title_bias(page_type: &str, lang: &str) -> (String, String) {
 pub fn get_list_extraction_bias(page_type: &str, lang: &str) -> (String, String) {
     let page_type_key = match page_type { "coupon" | "event" => "coupon_event", _ => page_type };
     let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let localized_type = get_localized_page_type(page_type, lang);
     let mut bias = String::new();
     let mut prejudice = String::from("html body head script style footer header"); // 기본 HTML 태그 억제
     if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
         if let Some(obj) = localized_obj.as_object() {
             for (k, v) in obj {
                 if k == "layout_list" || k == "layout_form" { continue; }
-                if let Some(b) = v.get("bias").and_then(|s| s.as_str()) { bias.push_str(b); bias.push(' '); }
-                if let Some(p) = v.get("prejudice").and_then(|s| s.as_str()) { prejudice.push_str(p); prejudice.push(' '); }
+                if let Some(b) = v.get("bias").and_then(|s| s.as_str()) { bias.push_str(&b.replace("{TYPE}", &localized_type)); bias.push(' '); }
+                if let Some(p) = v.get("prejudice").and_then(|s| s.as_str()) { prejudice.push_str(&p.replace("{TYPE}", &localized_type)); prejudice.push(' '); }
             }
         }
     }
@@ -880,15 +920,16 @@ pub fn get_layout_prompt_hints(page_type: &str, lang: &str) -> (String, String) 
     };
     
     let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let localized_type = get_localized_page_type(page_type, lang);
     let mut list_words = String::new();
     let mut form_words = String::new();
     
     if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
         if let Some(l_list) = localized_obj.get("layout_list").and_then(|v| v.get("bias")).and_then(|v| v.as_str()) {
-            list_words.push_str(l_list);
+            list_words.push_str(&l_list.replace("{TYPE}", &localized_type));
         }
         if let Some(l_form) = localized_obj.get("layout_form").and_then(|v| v.get("bias")).and_then(|v| v.as_str()) {
-            form_words.push_str(l_form);
+            form_words.push_str(&l_form.replace("{TYPE}", &localized_type));
         }
     }
     
@@ -953,6 +994,137 @@ JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
         .replace("{LANGUAGE}", lang)
         .replace("{FORM_HINTS}", &form_hints)
         .replace("{LIST_HINTS}", &list_hints)
+}
+
+pub fn get_list_layout_bias(page_type: &str, lang: &str) -> (String, String) {
+    let mut bias = String::from("has_list true false");
+    let mut prejudice = String::new();
+    let page_type_key = match page_type {
+        "coupon" | "event" => "coupon_event",
+        _ => page_type,
+    };
+    
+    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let localized_type = get_localized_page_type(page_type, lang);
+    
+    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
+        if let Some(l_list) = localized_obj.get("layout_list") {
+            if let Some(b) = l_list.get("bias").and_then(|v| v.as_str()) {
+                bias.push_str(" ");
+                bias.push_str(&b.replace("{TYPE}", &localized_type));
+            }
+            if let Some(p) = l_list.get("prejudice").and_then(|v| v.as_str()) {
+                prejudice.push_str(" ");
+                prejudice.push_str(&p.replace("{TYPE}", &localized_type));
+            }
+        }
+    }
+    (bias.trim().to_string(), prejudice.trim().to_string())
+}
+
+pub fn get_form_layout_bias(page_type: &str, lang: &str) -> (String, String) {
+    let mut bias = String::from("has_form true false detail");
+    let mut prejudice = String::new();
+    let page_type_key = match page_type {
+        "coupon" | "event" => "coupon_event",
+        _ => page_type,
+    };
+    
+    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let localized_type = get_localized_page_type(page_type, lang);
+    
+    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
+        if let Some(l_form) = localized_obj.get("layout_form") {
+            if let Some(b) = l_form.get("bias").and_then(|v| v.as_str()) {
+                bias.push_str(" ");
+                bias.push_str(&b.replace("{TYPE}", &localized_type));
+            }
+            if let Some(p) = l_form.get("prejudice").and_then(|v| v.as_str()) {
+                prejudice.push_str(" ");
+                prejudice.push_str(&p.replace("{TYPE}", &localized_type));
+            }
+        }
+    }
+    (bias.trim().to_string(), prejudice.trim().to_string())
+}
+
+pub fn is_list_prompt(page_type: &str, title: &str, lang: &str) -> String {
+    let (list_hints, _) = get_layout_prompt_hints(page_type, lang);
+
+    let template = r###"[TASK]
+Analyze the provided PUG/HTML content from top to bottom.
+
+[ENTITY CONTEXT: {TYPE}]
+Language Context: {LANGUAGE}
+You are evaluating a page managing this specific domain entity. Use this context to conceptually understand the abstract structures:
+- has_list: A catalog or inventory interface dedicated to displaying, filtering, or batch-processing multiple DIFFERENT primary entities.{LIST_HINTS}
+
+[FORCED DOCUMENT SCANNING LOGIC]
+Read the entire document from top to bottom.
+Check for the following:
+A. Does the page terminate with dataset navigation (pagination, "next/prev") or bulk-action execution elements?
+B. Does the main data area consist of a repeating multi-entity grid?
+
+[SCHEMA DEFINITIONS]
+- {TYPE}:
+    - title: String. Default '{TITLE}'.
+    - language: String. Default '{LANGUAGE}'.
+    - has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
+
+[OUTPUT FORMAT]
+{
+  "{TYPE}": {
+    "title": String,
+    "language": String,
+    "has_list": Boolean
+  }
+}
+
+JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+    
+    template.replace("{TYPE}", page_type)
+        .replace("{TITLE}", title)
+        .replace("{LANGUAGE}", lang)
+        .replace("{LIST_HINTS}", &list_hints)
+}
+
+pub fn is_form_prompt(page_type: &str, title: &str, lang: &str) -> String {
+    let (_, form_hints) = get_layout_prompt_hints(page_type, lang);
+
+    let template = r###"[TASK]
+Analyze the provided PUG/HTML content from top to bottom.
+
+[ENTITY CONTEXT: {TYPE}]
+Language Context: {LANGUAGE}
+You are evaluating a page managing this specific domain entity. Use this context to conceptually understand the abstract structures:
+- has_form: A property configuration interface. It features a large overarching form dedicated to inputting or updating the specific attributes of ONE primary entity.{FORM_HINTS}
+
+[FORCED DOCUMENT SCANNING LOGIC]
+Read the entire document from top to bottom.
+Check for the following:
+A. Does the main data area contain an extensive configuration/input form (inputs, textareas, image uploads, save buttons) for a single entity?
+
+[SCHEMA DEFINITIONS]
+- {TYPE}:
+    - title: String. Default '{TITLE}'.
+    - language: String. Default '{LANGUAGE}'.
+    - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
+
+[OUTPUT FORMAT]
+{
+  "{TYPE}": {
+    "title": String,
+    "language": String,
+    "has_form": Boolean
+  }
+}
+
+JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+    
+    template.replace("{TYPE}", page_type)
+        .replace("{TITLE}", title)
+        .replace("{LANGUAGE}", lang)
+        .replace("{FORM_HINTS}", &form_hints)
 }
 
 // pub fn para2graph(language: &str) -> String {
@@ -1179,6 +1351,7 @@ pub fn get_detail_schema_fields(page_type: &str, href: &str, lang: &str) -> Vec<
     
     // 🌟 ISO 639-1 언어 코드를 앞 2자리(ko, ja, zh, es 등)로 추출합니다.
     let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let localized_type = get_localized_page_type(page_type, lang);
     
     // 쿠폰과 이벤트는 스키마를 공유하므로 딕셔너리 접근 키를 하나로 묶어줍니다.
     let page_type_key = match page_type {
@@ -1201,11 +1374,11 @@ pub fn get_detail_schema_fields(page_type: &str, href: &str, lang: &str) -> Vec<
                 final_desc = format!("{} (Related keywords in document: {})", final_desc, semantic);
             }
             if let Some(bias_str) = localized_obj.get("bias").and_then(|v| v.as_str()) {
-                final_bias = format!("{} {}", en_bias, bias_str);
+                final_bias = format!("{} {}", en_bias, bias_str.replace("{TYPE}", &localized_type));
             }
             // 🎯 3. 대조적 의미 조향(Contrastive Steering)을 위한 척력(Prejudice) 타겟을 긁어옵니다.
             if let Some(prejudice_str) = localized_obj.get("prejudice").and_then(|v| v.as_str()) {
-                final_prejudice = format!("{} {}", en_prejudice, prejudice_str);
+                final_prejudice = format!("{} {}", en_prejudice, prejudice_str.replace("{TYPE}", &localized_type));
             }
         }
         

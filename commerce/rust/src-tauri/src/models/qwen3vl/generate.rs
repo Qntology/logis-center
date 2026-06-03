@@ -117,7 +117,12 @@ impl Qwen3VLGenerateModel {
                         let all_normalized = all_embs.broadcast_div(&all_norm)?;
                         
                         let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
-                        Ok(sim.affine(3.0, 0.0)?)
+                        // 🌟 [방향 B: Threshold 노이즈 게이트 + Exponential 증폭]
+                        let threshold = Tensor::new(0.65f32, &self.device)?;
+                        let one = Tensor::new(1.0f32, &self.device)?;
+                        let sim_relu = sim.broadcast_sub(&threshold)?.relu()?;
+                        let bias = sim_relu.affine(10.0, 0.0)?.exp()?.broadcast_sub(&one)?;
+                        Ok(bias)
                     };
                     match calc_bias() {
                         Ok(bias) => {
@@ -152,7 +157,12 @@ impl Qwen3VLGenerateModel {
                         let all_normalized = all_embs.broadcast_div(&all_norm)?;
                         
                         let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
-                        Ok(sim.affine(3.0, 0.0)?) // 척력 가중치 3.0배
+                        // 🌟 [방향 B: Threshold 노이즈 게이트 + Exponential 증폭]
+                        let threshold = Tensor::new(0.65f32, &self.device)?;
+                        let one = Tensor::new(1.0f32, &self.device)?;
+                        let sim_relu = sim.broadcast_sub(&threshold)?.relu()?;
+                        let prejudice = sim_relu.affine(15.0, 0.0)?.exp()?.broadcast_sub(&one)?;
+                        Ok(prejudice) 
                     };
                     match calc_prej() {
                         Ok(prej) => {
