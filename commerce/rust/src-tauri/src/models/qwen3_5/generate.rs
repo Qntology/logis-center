@@ -192,7 +192,8 @@ impl Qwen3_5GenerateModel {
         session_id: Option<String>, 
         kv_name: Option<String>,
         ignore_list: Option<&[String]>,
-        semantic_target: Option<&str> // 🌟 [추가] Semantic Bias 타겟
+        semantic_target: Option<&str>, // 🌟 Semantic Bias 타겟
+        semantic_prejudice: Option<&str> // 🌟 [추가] Semantic Prejudice 타겟
     ) -> Result<String> {
         let seed = mes.seed.unwrap_or(32768) as u64;
         let temperature = mes.temperature.unwrap_or(0.0);
@@ -325,6 +326,42 @@ impl Qwen3_5GenerateModel {
             }
         }
 
+        // 🌟 [Contrastive Semantic Steering] 오답 레이블 진영을 밀어내는 Prejudice 텐서 연산
+        let mut semantic_prejudice_tensor: Option<Tensor> = None;
+        if let Some(target_text) = semantic_prejudice {
+            if let Ok(target_ids) = self.tokenizer.text_encode_vec(target_text.to_string(), false) {
+                if !target_ids.is_empty() {
+                    let calc_prej = || -> Result<Tensor> {
+                        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.device)?;
+                        let target_emb = self.qwen3_5.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
+                        let target_emb_sum = target_emb.sum_keepdim(1)?;
+                        let len_tensor = Tensor::new(target_ids.len() as f32, &self.device)?;
+                        let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
+                        let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
+                        
+                        let all_embs = self.qwen3_5.get_embed_tokens().to_dtype(DType::F32)?;
+                        let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
+                        let target_normalized = target_vec.broadcast_div(&target_norm)?;
+                        
+                        let all_sqr = all_embs.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
+                        let all_norm = all_sqr.sqrt()?;
+                        let all_normalized = all_embs.broadcast_div(&all_norm)?;
+                        
+                        let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
+                        // 🌟 [핵심] 척력(Prejudice) 가중치 3.0배 생성 (이후에 뺄셈 적용)
+                        Ok(sim.affine(3.0, 0.0)?) 
+                    };
+                    match calc_prej() {
+                        Ok(prej) => {
+                            semantic_prejudice_tensor = Some(prej);
+                            println!("[SEMANTIC-PREJUDICE] Generated Vector Prejudice for target: '{}'", target_text);
+                        }
+                        Err(e) => println!("[SEMANTIC-PREJUDICE] Failed to calculate prejudice: {}", e),
+                    }
+                }
+            }
+        }
+
         for i in 0..sample_len {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
 
@@ -345,6 +382,13 @@ impl Qwen3_5GenerateModel {
             // 🌟 매 글자가 나올 때마다 타겟 방향으로 핸들을 꺾음 (Steering)
             let logits = if let Some(ref bias) = semantic_bias_tensor {
                 logits.broadcast_add(bias)?
+            } else {
+                logits
+            };
+
+            // 🌟 오답 진영의 단어들은 아예 생성되지 못하도록 억제력(Sub)을 가합니다!
+            let logits = if let Some(ref prej) = semantic_prejudice_tensor {
+                logits.broadcast_sub(prej)?
             } else {
                 logits
             };
@@ -570,7 +614,8 @@ impl Qwen3_5GenerateModel {
         session_id: Option<String>,
         kv_name: Option<String>,
         ignore_list: Option<&[String]>,
-        semantic_target: Option<&str> // 🌟 [추가] Semantic Bias 타겟
+        semantic_target: Option<&str>, // 🌟 Semantic Bias 타겟
+        semantic_prejudice: Option<&str> // 🌟 [추가] Semantic Prejudice 타겟
     ) -> Result<GenerationResult> {
         let mut logit_processor = get_logit_processor(
             Some(mes.temperature.unwrap_or(0.0) as f32), 
@@ -703,6 +748,41 @@ impl Qwen3_5GenerateModel {
             }
         }
 
+        // 🌟 [Contrastive Semantic Steering] 오답 레이블 진영 밀어내기 (Prejudice)
+        let mut semantic_prejudice_tensor: Option<Tensor> = None;
+        if let Some(target_text) = semantic_prejudice {
+            if let Ok(target_ids) = self.tokenizer.text_encode_vec(target_text.to_string(), false) {
+                if !target_ids.is_empty() {
+                    let calc_prej = || -> Result<Tensor> {
+                        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.device)?;
+                        let target_emb = self.qwen3_5.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
+                        let target_emb_sum = target_emb.sum_keepdim(1)?;
+                        let len_tensor = Tensor::new(target_ids.len() as f32, &self.device)?;
+                        let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
+                        let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
+                        
+                        let all_embs = self.qwen3_5.get_embed_tokens().to_dtype(DType::F32)?;
+                        let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
+                        let target_normalized = target_vec.broadcast_div(&target_norm)?;
+                        
+                        let all_sqr = all_embs.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
+                        let all_norm = all_sqr.sqrt()?;
+                        let all_normalized = all_embs.broadcast_div(&all_norm)?;
+                        
+                        let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
+                        Ok(sim.affine(3.0, 0.0)?)
+                    };
+                    match calc_prej() {
+                        Ok(prej) => {
+                            semantic_prejudice_tensor = Some(prej);
+                            println!("[SEMANTIC-PREJUDICE] Generated Vector Prejudice for target: '{}'", target_text);
+                        }
+                        Err(e) => println!("[SEMANTIC-PREJUDICE] Failed to calculate prejudice: {}", e),
+                    }
+                }
+            }
+        }
+
         for i in 0..sample_len {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) {
@@ -729,6 +809,13 @@ impl Qwen3_5GenerateModel {
             // 🌟 Steering 적용
             let logits = if let Some(ref bias) = semantic_bias_tensor {
                 logits.broadcast_add(bias)?
+            } else {
+                logits
+            };
+
+            // 🌟 오답 진영 억제력(Sub) 적용
+            let logits = if let Some(ref prej) = semantic_prejudice_tensor {
+                logits.broadcast_sub(prej)?
             } else {
                 logits
             };

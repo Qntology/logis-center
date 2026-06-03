@@ -761,29 +761,27 @@ impl QuantizedQwenVLTextAttention {
                             let block_file = full_path.join(format!("l{}.st", self.layer_idx));
                             for _retry in 0..3 {
                                 if block_file.exists() {
-                                    if let Ok(encrypted_content) = crate::utils::direct_loader::load_kv_block(&block_file) {
-                                        if let Ok(content) = crate::utils::crypto::decrypt_data(&encrypted_content) {
-                                            if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                                let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
-                                                let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                                    if let Ok(content) = crate::utils::direct_loader::load_kv_block(&block_file) {
+                                        if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                                            let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
+                                            let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+                                            
+                                            if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                                                let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                                                let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
                                                 
-                                                if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
-                                                    let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                                                    let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
-                                                    
-                                                    
-                                                    // 이 한 줄의 수정으로 System RAM 점유율이 50% 이상 박살 납니다.
-                                                    let saved_dtype = match kd.dtype() {
-                                                        safetensors::Dtype::F8_E4M3 => DType::F8E4M3,
-                                                        safetensors::Dtype::F32 => DType::F32,
-                                                        safetensors::Dtype::F16 => DType::F16,
-                                                        _ => DType::BF16,
-                                                    };
-                                                    k_cpu = Some(Tensor::from_raw_buffer(kd.data(), saved_dtype, &meta_os, &Device::Cpu).unwrap());
-                                                    v_cpu = Some(Tensor::from_raw_buffer(vd.data(), saved_dtype, &meta_os, &Device::Cpu).unwrap());
-                                                }
-                                                break;
+                                                
+                                                // 이 한 줄의 수정으로 System RAM 점유율이 50% 이상 박살 납니다.
+                                                let saved_dtype = match kd.dtype() {
+                                                    safetensors::Dtype::F8_E4M3 => DType::F8E4M3,
+                                                    safetensors::Dtype::F32 => DType::F32,
+                                                    safetensors::Dtype::F16 => DType::F16,
+                                                    _ => DType::BF16,
+                                                };
+                                                k_cpu = Some(Tensor::from_raw_buffer(kd.data(), saved_dtype, &meta_os, &Device::Cpu).unwrap());
+                                                v_cpu = Some(Tensor::from_raw_buffer(vd.data(), saved_dtype, &meta_os, &Device::Cpu).unwrap());
                                             }
+                                            break;
                                         }
                                     }
                                 }
@@ -1098,69 +1096,67 @@ impl QuantizedQwenVLTextAttention {
             
             let b_idx = block_info.offset / 1024;
             
-            if let Ok(encrypted_content) = crate::utils::direct_loader::load_kv_block(&file_path) {
-                if let Ok(content) = crate::utils::crypto::decrypt_data(&encrypted_content) {
-                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                        let is_l0 = file_path.to_string_lossy().contains("l0.st");
-                        let prefix = if is_l0 { format!("b{}_l0_", block_info.offset) } else { format!("b{}_l{}_", block_info.offset, self.layer_idx) };
-                        let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
+            if let Ok(content) = crate::utils::direct_loader::load_kv_block(&file_path) {
+                if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                    let is_l0 = file_path.to_string_lossy().contains("l0.st");
+                    let prefix = if is_l0 { format!("b{}_l0_", block_info.offset) } else { format!("b{}_l{}_", block_info.offset, self.layer_idx) };
+                    let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
 
-                        if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
-                            let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                            let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
-                            
-                            let dev = &Device::Cpu;
-                            let saved_dtype = match kd.dtype() {
-                                safetensors::Dtype::F8_E4M3 => DType::F8E4M3,
-                                safetensors::Dtype::F32 => DType::F32,
-                                safetensors::Dtype::F16 => DType::F16,
-                                _ => DType::BF16,
-                            };
-                            let kd_t = Tensor::from_raw_buffer(kd.data(), saved_dtype, &meta_os, dev)?;
-                            let vd_t = Tensor::from_raw_buffer(vd.data(), saved_dtype, &meta_os, dev)?;
+                    if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
+                        let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                        let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+                        
+                        let dev = &Device::Cpu;
+                        let saved_dtype = match kd.dtype() {
+                            safetensors::Dtype::F8_E4M3 => DType::F8E4M3,
+                            safetensors::Dtype::F32 => DType::F32,
+                            safetensors::Dtype::F16 => DType::F16,
+                            _ => DType::BF16,
+                        };
+                        let kd_t = Tensor::from_raw_buffer(kd.data(), saved_dtype, &meta_os, dev)?;
+                        let vd_t = Tensor::from_raw_buffer(vd.data(), saved_dtype, &meta_os, dev)?;
 
-                            let mut k_raw = if saved_dtype == DType::F32 { kd_t } else { self.decompress_from_bf16(&kd_t, &meta_os, dev)? };
-                            let mut v_raw = if saved_dtype == DType::F32 { vd_t } else { self.decompress_from_bf16(&vd_t, &meta_os, dev)? };
+                        let mut k_raw = if saved_dtype == DType::F32 { kd_t } else { self.decompress_from_bf16(&kd_t, &meta_os, dev)? };
+                        let mut v_raw = if saved_dtype == DType::F32 { vd_t } else { self.decompress_from_bf16(&vd_t, &meta_os, dev)? };
 
-                            let target_heads = self.num_key_value_heads;
-                            let target_dim = self.head_dim;
-                            let (_b, h, _s, d) = k_raw.dims4()?;
+                        let target_heads = self.num_key_value_heads;
+                        let target_dim = self.head_dim;
+                        let (_b, h, _s, d) = k_raw.dims4()?;
 
-                            if d < target_dim {
-                                k_raw = Tensor::cat(&[&k_raw, &k_raw], D::Minus1)?;
-                                v_raw = Tensor::cat(&[&v_raw, &v_raw], D::Minus1)?;
+                        if d < target_dim {
+                            k_raw = Tensor::cat(&[&k_raw, &k_raw], D::Minus1)?;
+                            v_raw = Tensor::cat(&[&v_raw, &v_raw], D::Minus1)?;
+                        }
+                        if h != target_heads {
+                            let mut k_list = Vec::with_capacity(target_heads);
+                            let mut v_list = Vec::with_capacity(target_heads);
+                            for i in 0..target_heads {
+                                let src_idx = i % h;
+                                k_list.push(k_raw.narrow(1, src_idx, 1)?);
+                                v_list.push(v_raw.narrow(1, src_idx, 1)?);
                             }
-                            if h != target_heads {
-                                let mut k_list = Vec::with_capacity(target_heads);
-                                let mut v_list = Vec::with_capacity(target_heads);
-                                for i in 0..target_heads {
-                                    let src_idx = i % h;
-                                    k_list.push(k_raw.narrow(1, src_idx, 1)?);
-                                    v_list.push(v_raw.narrow(1, src_idx, 1)?);
-                                }
-                                k_raw = Tensor::cat(&k_list, 1)?;
-                                v_raw = Tensor::cat(&v_list, 1)?;
-                            }
+                            k_raw = Tensor::cat(&k_list, 1)?;
+                            v_raw = Tensor::cat(&v_list, 1)?;
+                        }
 
-                            let mut reg = self.registry.entries.write().unwrap();
-                            if b_idx < reg.len() {
-                                if let Some(block) = self.kv_blocks.get(b_idx) {
-                                    let mut inner = block.inner.write().unwrap();
-                                    
-                                    
-                                    let target_device = self.q_proj.device();
-                                    let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
-                                    
-                                    inner.k_cache = Some(k_raw.to_device(target_device)?.to_dtype(target_dtype)?);
-                                    inner.v_cache = Some(v_raw.to_device(target_device)?.to_dtype(target_dtype)?);
-                                    
-                                    inner.location = KVLocation::VRAM; // RAM을 건너뛰고 VRAM 상주 확정!
-                                    reg[b_idx].location[self.layer_idx] = KVLocation::VRAM;
-                                    reg[b_idx].ssd_path = Some(file_path.parent().unwrap().to_path_buf());
-                                    
-                                    if self.layer_idx < reg[b_idx].is_dirty.len() {
-                                        reg[b_idx].is_dirty[self.layer_idx] = false;
-                                    }
+                        let mut reg = self.registry.entries.write().unwrap();
+                        if b_idx < reg.len() {
+                            if let Some(block) = self.kv_blocks.get(b_idx) {
+                                let mut inner = block.inner.write().unwrap();
+                                
+                                
+                                let target_device = self.q_proj.device();
+                                let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
+                                
+                                inner.k_cache = Some(k_raw.to_device(target_device)?.to_dtype(target_dtype)?);
+                                inner.v_cache = Some(v_raw.to_device(target_device)?.to_dtype(target_dtype)?);
+                                
+                                inner.location = KVLocation::VRAM; // RAM을 건너뛰고 VRAM 상주 확정!
+                                reg[b_idx].location[self.layer_idx] = KVLocation::VRAM;
+                                reg[b_idx].ssd_path = Some(file_path.parent().unwrap().to_path_buf());
+                                
+                                if self.layer_idx < reg[b_idx].is_dirty.len() {
+                                    reg[b_idx].is_dirty[self.layer_idx] = false;
                                 }
                             }
                         }

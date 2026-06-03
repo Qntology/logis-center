@@ -803,7 +803,7 @@ async fn process_task(
                     if let Some(gen) = model.generator.lock().await.as_mut() {
                         println!("[Scheduler] 0.6B Step A: Asking classification question...");
                         // 🎯 [SEMANTIC STEERING] 6가지 카테고리 단어망을 Bias로 주입하여 허튼소리를 원천 차단!
-                        gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone(), Some("order goods tracking review coupon event")).await?
+                        gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone(), Some("order goods tracking review coupon event"), None).await?
                     } else {
                         return Err(anyhow::anyhow!("Qwen generator missing"));
                     }
@@ -815,7 +815,7 @@ async fn process_task(
                         let mut gen_guard = q3_gen_arc.blocking_lock();
                         if let Some(gen) = gen_guard.as_mut() {
                             println!("[Scheduler] Qwen3 Step A: Asking classification question...");
-                            gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                            gen.generate(params, Some(cancel_clone), None, None, None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
                         } else {
                             Err(anyhow::anyhow!("Qwen3 generator missing"))
                         }
@@ -827,6 +827,12 @@ async fn process_task(
                 let type_info = parsing::parse_json_from_llm(&res); 
                     
                 page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").trim().to_lowercase();                
+                
+                // 🌟 Step A에서 페이지 타입과 함께 language 값도 파싱하여 전역 변수(doc_lang)에 저장합니다.
+                if let Some(l) = type_info.get("language").and_then(|s| s.as_str()) {
+                    doc_lang = l.trim().to_lowercase();
+                    println!("[Scheduler] Detected language in Step A: {}", doc_lang);
+                }
                 
                 if page_type.is_empty() {
                     page_type = match task.r#type.as_str() {
@@ -860,7 +866,8 @@ async fn process_task(
                 }
             };
 
-            let detail_prompt = parsing::is_detail_prompt(&page_type, &document_title);
+            // 🌟 앞서 Step A에서 획득한 doc_lang을 인자로 넘겨줍니다.
+            let detail_prompt = parsing::is_detail_prompt(&page_type, &document_title, &doc_lang);
             // LLM이 지시사항을 잘 따르도록 래핑
             let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think", detail_prompt);
             
@@ -890,17 +897,21 @@ async fn process_task(
                     ..Default::default()
                 };
 
+                // 🌟 [CRITICAL FIX] 페이지 타입과 감지된 언어에 꼭 맞는 단일 언어 레이아웃 판별 바이어스를 추출합니다.
+                let layout_bias = crate::parsing::get_layout_bias(&page_type, &doc_lang);
+
                 let res = if base_model_size == crate::model::ModelSize::Qwen {
                     model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
                     if let Some(gen) = model.generator.lock().await.as_mut() {
                         println!("[Scheduler] 0.6B (Qwen) Step A-2: Asking detail classification... (Attempt {})", retry_count + 1);
-                        // 🎯 [SEMANTIC STEERING] bool 반환에 필요한 단어들을 묶어서 주입!
+                        // 🎯 [SEMANTIC STEERING] 페이지 도메인에 완벽하게 일치하는 맞춤형 레이아웃 힌트 주입!
                         gen.generate(
                             params, 
                             Some(cancellation_token.clone()), 
                             Some(snapshot_id.clone()), 
                             kv_name.clone(),
-                            Some("detail has_list has_form true false")
+                            Some(&layout_bias),
+                            None
                         ).await?
                     } else {
                         return Err(anyhow::anyhow!("Qwen generator missing"));
@@ -910,11 +921,12 @@ async fn process_task(
                     let q3_gen_arc = model.qwen3_generator.clone();
                     let cancel_clone = cancellation_token.clone();
                     let ignore_list_clone = ignore_list.clone();
+                    let layout_bias_clone = layout_bias.clone(); // 클로저 복제용
                     tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
                         let mut gen_guard = q3_gen_arc.blocking_lock();
                         if let Some(gen) = gen_guard.as_mut() {
                             println!("[Scheduler] Qwen3 Step A-2: Asking detail classification... (Attempt {})", retry_count + 1);
-                            gen.generate(params, Some(cancel_clone), Some(ignore_list_clone.as_slice()), None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                            gen.generate(params, Some(cancel_clone), Some(ignore_list_clone.as_slice()), Some(layout_bias_clone.as_str()), None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
                         } else {
                             Err(anyhow::anyhow!("Qwen3 generator missing"))
                         }
@@ -1080,12 +1092,14 @@ async fn process_task(
                             println!("[JS-BRIDGE] 1. Requesting titles from LLM (0.6B)...");
                             
                             // 🎯 [SEMANTIC STEERING] 상품 제목에 집중하도록 방향타 고정!
+                            let (title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
                             gen.generate(
                                 params, 
                                 Some(cancellation_token.clone()), 
                                 Some(snapshot_id.clone()), 
                                 kv_name.clone(),
-                                Some("title product name")
+                                Some(&title_bias),
+                                Some(&title_prej) 
                             ).await?
                         } else {
                             return Err(anyhow::anyhow!("Qwen generator missing"));
@@ -1094,11 +1108,12 @@ async fn process_task(
                         model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, None).await?;
                         let q3_gen_arc = model.qwen3_generator.clone();
                         let cancel_clone = cancellation_token.clone();
+                        let (title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
                         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
                             let mut gen_guard = q3_gen_arc.blocking_lock();
                             if let Some(gen) = gen_guard.as_mut() {
                                 println!("[JS-BRIDGE] 1. Requesting titles from LLM (Qwen3)...");
-                                gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                                gen.generate(params, Some(cancel_clone), None, Some(&title_bias), Some(&title_prej)).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e)) 
                             } else {
                                 Err(anyhow::anyhow!("Qwen3 generator missing"))
                             }
@@ -1473,8 +1488,8 @@ async fn process_task(
                     model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                     if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-                        // 🌟 [CRITICAL FIX] Qwen 3.5 생성기의 파라미터가 추가되었으므로 마지막 인자로 None(semantic_target)을 추가로 전달합니다.
-                        if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_step_thead", task.id)), kv_name.clone(), None, None).await {
+                        // 🌟 [CRITICAL FIX] Qwen 3.5 생성기의 파라미터가 추가되었으므로 마지막 인자로 None(semantic_target)과 None(semantic_prejudice)을 추가로 전달합니다.
+                        if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_step_thead", task.id)), kv_name.clone(), None, None, None).await {
                             let thead_json = crate::parsing::parse_json_from_llm(&res);
                             
                             // JSON 응답에서 page_type에 맞는 선택자 추출
@@ -1760,8 +1775,12 @@ async fn process_task(
                 let task_question_data = parsing::list2json_data(&page_type, language, &thead_pug, item_pug);
 
                 
+                let (list_bias, list_prej) = crate::parsing::get_list_extraction_bias(&page_type, &doc_lang);
+
                 let q3_gen_meta = model.qwen3_generator.clone();
                 let cancel_meta = cancellation_token.clone();
+                let b_meta = list_bias.clone();
+                let p_meta = list_prej.clone();
                 let res_meta = tokio::task::spawn_blocking(move || {
                     let mut gen_guard = q3_gen_meta.blocking_lock();
                     if let Some(gen) = gen_guard.as_mut() {
@@ -1774,7 +1793,7 @@ async fn process_task(
                             model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
                             ..Default::default()
                         };
-                        gen.generate(params, Some(cancel_meta), None, None).map_err(|e| anyhow::anyhow!("Qwen 3 Meta failed: {}", e))
+                        gen.generate(params, Some(cancel_meta), None, Some(&b_meta), Some(&p_meta)).map_err(|e| anyhow::anyhow!("Qwen 3 Meta failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                     }
@@ -1783,6 +1802,8 @@ async fn process_task(
                 
                 let q3_gen_info = model.qwen3_generator.clone();
                 let cancel_info = cancellation_token.clone();
+                let b_info = list_bias.clone();
+                let p_info = list_prej.clone();
                 let res_info = tokio::task::spawn_blocking(move || {
                     let mut gen_guard = q3_gen_info.blocking_lock();
                     if let Some(gen) = gen_guard.as_mut() {
@@ -1795,7 +1816,7 @@ async fn process_task(
                             model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
                             ..Default::default()
                         };
-                        gen.generate(params, Some(cancel_info), None, None).map_err(|e| anyhow::anyhow!("Qwen 3 Info failed: {}", e))
+                        gen.generate(params, Some(cancel_info), None, Some(&b_info), Some(&p_info)).map_err(|e| anyhow::anyhow!("Qwen 3 Info failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                     }
@@ -1804,6 +1825,8 @@ async fn process_task(
                 
                 let q3_gen_data = model.qwen3_generator.clone();
                 let cancel_data = cancellation_token.clone();
+                let b_data = list_bias.clone();
+                let p_data = list_prej.clone();
                 let res_data = tokio::task::spawn_blocking(move || {
                     let mut gen_guard = q3_gen_data.blocking_lock();
                     if let Some(gen) = gen_guard.as_mut() {
@@ -1816,7 +1839,7 @@ async fn process_task(
                             model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.95),
                             ..Default::default()
                         };
-                        gen.generate(params, Some(cancel_data), None, None).map_err(|e| anyhow::anyhow!("Qwen 3 Data failed: {}", e))
+                        gen.generate(params, Some(cancel_data), None, Some(&b_data), Some(&p_data)).map_err(|e| anyhow::anyhow!("Qwen 3 Data failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                     }
@@ -1959,7 +1982,8 @@ async fn process_task(
             };
 
             // 필드 단위로 하나씩 쪼개어 순차 추출 (병렬 처리 시의 VRAM 초과/컨텍스트 환각 방지)
-            for (idx, (field_name, field_desc, bias_target)) in fields.into_iter().enumerate() {
+            // 🌟 [CRITICAL FIX] prejudice_target 매개변수 추가
+            for (idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.into_iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
                 let percent = (((idx as f32) / (total_fields as f32)) * 100.0) as i32;
@@ -1990,6 +2014,10 @@ async fn process_task(
                     
                     let field_name_clone = field_name.clone();
                     let bias_target_for_closure = bias_target.clone(); // 🌟 다국어 Bias 할당
+                    
+                    // 🌟 [CRITICAL FIX] 다국어 Prejudice(배제) 타겟 클로저용 변수 생성
+                    let prejudice_target_for_closure = prejudice_target.clone(); 
+                    
                     let task_q = task_question.clone();
                     let ignore_list_clone = ignore_list.clone();
                     
@@ -2007,13 +2035,32 @@ async fn process_task(
                                 model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
                                 ..Default::default()
                             };
-                            // 🌟 Qwen3 생성기에 ignore_list를 전달하여 환각 토큰 생성을 억제합니다.
-                            // 🎯 [SEMANTIC STEERING] 추출 목표 대상인 필드명을 벡터 조향 타겟으로 직접 주입하여 해당 데이터 추출 확률을 극대화합니다!
-                            gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), Some(bias_target_for_closure.as_str())).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
+                            
+                            // 🌟 [CRITICAL FIX] Prejudice(오답 밀어내기) 파라미터를 Qwen3 모델에 전달합니다!
+                            let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
+                            let b_target = if bias_target_for_closure.is_empty() { None } else { Some(bias_target_for_closure.as_str()) };
+                            
+                            gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), b_target, p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
                         } else {
                             Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                         }
                     }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+
+                    // 🌟 [개선 2] 한 번의 생성이 끝날 때마다 (성공/실패 무관하게) 즉시 KV 캐시를 초기화하여, 
+                    // 다음 재시도 시 모델이 과거의 환각 데이터를 바탕으로 헛소리를 이어가는 것을 원천 차단합니다!
+                    let q3_clear_arc = model.qwen3_generator.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
+                            gen.clear_kv_cache();
+                        }
+                    }).await;
+
+                    if !model.is_cpu_mode {
+                        let dev = model.device_config.device.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if dev.is_cuda() { let _ = dev.synchronize(); }
+                        }).await;
+                    }
 
                     match res {
                         Ok(res_text) => {
@@ -2026,25 +2073,58 @@ async fn process_task(
                             let mut requires_retry = false;
                             let mut extracted_values_for_retry = Vec::new();
                             
-                            // 🌟 복수 키("id,link") 지원을 위해 Split
                             let keys: Vec<&str> = field_name_clone.split(',').map(|s| s.trim()).collect();
-                            let mut found_valid_value = false; // 🌟 유효한(비어있지 않은) 값이 있는지 추적
+                            let mut found_valid_value = false;
+
+                            // 🎯 [핵심 개선] ENUM 속성이나 영단어로 번역되어 출력될 수 있는 필드들은 본문 텍스트 완벽 매칭 검사에서 제외합니다.
+                            let skip_pug_match_fields = ["status", "payment_method", "payment_origin", "condition", "currency"];
+                            let is_enum_field = skip_pug_match_fields.iter().any(|&f| field_name_clone.contains(f));
 
                             for k in &keys {
                                 if let Some(val) = item_val.get(*k) {
-                                    if val.is_string() {
-                                        let extracted_str = val.as_str().unwrap_or("").trim().to_string();
-                                        if !extracted_str.is_empty() && extracted_str != "..." && extracted_str != "null" {
-                                            found_valid_value = true;
-                                            extracted_values_for_retry.push(extracted_str.clone());
-                                            
-                                            // 날짜 포맷, URL, 숫자 등은 PUG와 완벽 매칭이 안될 수 있으므로 예외 처리
+                                    let extracted_str = if val.is_string() {
+                                        val.as_str().unwrap_or("").trim().to_string()
+                                    } else if val.is_number() {
+                                        val.to_string() // 숫자형 데이터도 검증을 위해 문자열로 변환
+                                    } else {
+                                        String::new()
+                                    };
+
+                                    if !extracted_str.is_empty() && extracted_str != "..." && extracted_str != "null" {
+                                        found_valid_value = true;
+                                        extracted_values_for_retry.push(extracted_str.clone());
+                                        
+                                        if !is_enum_field {
                                             let is_iso_date = extracted_str.contains('T') && extracted_str.len() >= 19;
                                             let is_url = extracted_str.starts_with("http") || extracted_str.starts_with('/');
-                                            let is_number_like = extracted_str.chars().all(|c| c.is_digit(10) || c == '.' || c == '-');
+                                            let is_boolean_str = extracted_str == "true" || extracted_str == "false";
                                             
-                                            if !is_iso_date && !is_url && !is_number_like {
-                                                if !content_pug.contains(&extracted_str) && !doc_title.contains(&extracted_str) {
+                                            if !is_iso_date && !is_url && !is_boolean_str {
+                                                // 1차: 완벽한 텍스트 포함 여부 (문자열 일치)
+                                                let mut is_matched = content_pug.contains(&extracted_str) || doc_title.contains(&extracted_str);
+                                                
+                                                // 2차: 전화번호, 가격 등 포맷(하이픈, 콤마, 띄어쓰기) 차이로 인한 불일치 극복을 위해 순수 숫자만 추출하여 검증
+                                                if !is_matched {
+                                                    let digits_only: String = extracted_str.chars().filter(|c| c.is_ascii_digit()).collect();
+                                                    
+                                                    // 숫자가 3자리 이상 포함된 데이터일 경우 숫자 연속성이 PUG에 존재하는지 확인
+                                                    if digits_only.len() >= 3 {
+                                                        let pug_digits: String = content_pug.chars().filter(|c| c.is_ascii_digit()).collect();
+                                                        if pug_digits.contains(&digits_only) {
+                                                            is_matched = true;
+                                                        }
+                                                    } else {
+                                                        // 숫자가 아니거나 너무 짧은데 완벽 매칭이 안됐다면 대소문자 무시 검색
+                                                        let extracted_lower = extracted_str.to_lowercase();
+                                                        let pug_lower = content_pug.to_lowercase();
+                                                        if pug_lower.contains(&extracted_lower) {
+                                                            is_matched = true;
+                                                        }
+                                                    }
+                                                }
+
+                                                // 010-0356789 같은 환각 전화번호는 2차 검증(숫자 배열)에서도 걸러져서 확실히 재시도됩니다!
+                                                if !is_matched {
                                                     requires_retry = true;
                                                 }
                                             }
@@ -2111,21 +2191,6 @@ async fn process_task(
                         }
                     }
                 }
-                
-                // GC 
-                let q3_clear_arc = model.qwen3_generator.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
-                        gen.clear_kv_cache();
-                    }
-                }).await;
-
-                if !model.is_cpu_mode {
-                    let dev = model.device_config.device.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if dev.is_cuda() { let _ = dev.synchronize(); }
-                    }).await;
-                }
             }
         }
     }
@@ -2168,7 +2233,7 @@ async fn process_task(
                             if s.chars().all(char::is_numeric) && (s.len() == 10 || s.len() == 13) {
                                 if let Ok(ts) = s.parse::<i64>() {
                                     let ts_ms = if s.len() == 10 { ts * 1000 } else { ts };
-                                    if let Some(dt) = chrono::NaiveDateTime::from_timestamp_millis(ts_ms) {
+                                    if let Some(dt) = chrono::DateTime::from_timestamp_millis(ts_ms).map(|dt| dt.naive_utc()) {
                                         let iso_date = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
                                         obj.insert(key.to_string(), json!(iso_date));
                                         continue;
@@ -2214,7 +2279,7 @@ async fn process_task(
                     } else if let Some(date_num) = obj.get(*key).and_then(|v| v.as_i64()) {
                         // LLM이 문자열이 아닌 정수형(Unix Time)으로 뱉어냈을 경우 방어
                         let ts_ms = if date_num < 10_000_000_000 { date_num * 1000 } else { date_num };
-                        if let Some(dt) = chrono::NaiveDateTime::from_timestamp_millis(ts_ms) {
+                        if let Some(dt) = chrono::DateTime::from_timestamp_millis(ts_ms).map(|dt| dt.naive_utc()) {
                             let iso_date = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
                             obj.insert(key.to_string(), json!(iso_date));
                         }

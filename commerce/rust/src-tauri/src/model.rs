@@ -863,7 +863,7 @@ impl LogisModel {
                 let class_prompt = crate::parsing::get_trade_doc_classification_prompt(); // (이 프롬프트 안에 TRACKING 추가됨)
                 let type_res = self.chat_with_qwen3_5_image_spinner(
                     "You are a document classifier.", &class_prompt, Some(class_img), app_handle, "extraction-progress", 
-                    json!({ "category": "Vision (Step 1/2)", "summary": "Identifying document type..." }), 128, cancel_token.clone(), Some(task_id.clone())
+                    json!({ "category": "Vision (Step 1/2)", "summary": "Identifying document type..." }), 128, cancel_token.clone(), Some(task_id.clone()), None, None
                 ).await?;
                 
                 let detected_type = crate::parsing::parse_json_from_llm(&type_res)
@@ -875,9 +875,10 @@ impl LogisModel {
                     emit_term("[STAGE-2] 📦 Fast-Tracking Parcel Label...");
                     
                     let prompt = crate::parsing::get_image_extraction_prompt("kr", &language, "tracking", "");
+                    let (track_bias, track_prej) = crate::parsing::get_vision_tracking_bias(&language); // 🌟 Bias 호출
                     let result_str = self.chat_with_qwen3_5_image_spinner(
                         "You are a highly precise logistics data extraction assistant.", &prompt, Some(dynamic_image.clone()), app_handle, "extraction-progress", 
-                        json!({ "category": "Vision Analysis", "summary": "Extracting Tracking Label data..." }), 512, cancel_token.clone(), Some(task_id.clone())
+                        json!({ "category": "Vision Analysis", "summary": "Extracting Tracking Label data..." }), 512, cancel_token.clone(), Some(task_id.clone()), Some(&track_bias), Some(&track_prej)
                     ).await?;
                     
                     extracted_data = crate::parsing::parse_json_from_llm(&result_str);
@@ -926,7 +927,7 @@ impl LogisModel {
                         
                         let tile_res = self.chat_with_qwen3_5_image_spinner(
                             "You are a highly precise document data extraction assistant.", &prompt, Some(img_slice), app_handle, "extraction-progress", 
-                            json!({ "category": format!("Vision (Slice {}/{})", idx+1, missions.len()), "summary": summary_msg }), 1024, cancel_token.clone(), Some(task_id.clone())
+                            json!({ "category": format!("Vision (Slice {}/{})", idx+1, missions.len()), "summary": summary_msg }), 1024, cancel_token.clone(), Some(task_id.clone()), None, None
                         ).await?;
 
                         let tile_json = crate::parsing::parse_json_from_llm(&tile_res);
@@ -948,10 +949,11 @@ impl LogisModel {
                 // 택배 운송장이 올라올 확률이 높으므로 바코드/송장 번호를 우선 추출하는 "tracking" 기반의 
                 // 범용 커머스 프롬프트로 처리하도록 변경했습니다.
                 let prompt = crate::parsing::get_image_extraction_prompt("kr", &language, "tracking", "");
+                let (track_bias, track_prej) = crate::parsing::get_vision_tracking_bias(&language); // 🌟 Bias 호출
                 
                 let result_str = self.chat_with_qwen3_5_image_spinner(
                     "You are a precise commerce and logistics extraction assistant.", &prompt, Some(dynamic_image.clone()), app_handle, "extraction-progress", 
-                    json!({ "category": "Vision Analysis", "summary": "Analyzing commerce tracking/goods..." }), 1024, cancel_token.clone(), Some(task_id.clone())
+                    json!({ "category": "Vision Analysis", "summary": "Analyzing commerce tracking/goods..." }), 1024, cancel_token.clone(), Some(task_id.clone()), Some(&track_bias), Some(&track_prej)
                 ).await?;
                 
                 extracted_data = crate::parsing::parse_json_from_llm(&result_str);
@@ -1095,7 +1097,9 @@ impl LogisModel {
         mut base_payload: Value,
         max_tokens: usize,
         cancellation_token: Option<Arc<AtomicBool>>,
-        session_id: Option<String>
+        session_id: Option<String>,
+        semantic_target: Option<&str>,     // 🌟 추가
+        semantic_prejudice: Option<&str>   // 🌟 추가
     ) -> anyhow::Result<String> {
         // [VISION-DYNAMIC] 🌟 target_size 로직 삭제하고 바로 bool 전달
         self.ensure_qwen3_5(image.is_some()).await?;
@@ -1168,7 +1172,8 @@ impl LogisModel {
             session_id, // 🌟 SSD 저장 및 병합 캐시 활성화!
             Some("inference".to_string()),
             None, // 🌟 5번째 인자인 ignore_list 자리에 None을 명시적으로 추가합니다.
-            None  // 🌟 [CRITICAL FIX] 6번째 인자인 semantic_target 자리에 None을 추가합니다.
+            semantic_target,    // 🌟 변경
+            semantic_prejudice  // 🌟 변경
         ).await.map_err(|e| anyhow!("Qwen 3.5 Inference failed: {}", e))
     }
 
@@ -1222,7 +1227,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            let response = gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))?;
+            let response = gen.generate(params, cancel_token, session_id, kv_name, None, None).await.map_err(|e| anyhow!("Inference failed: {}", e))?;
             println!("[MODEL-CHAT] Raw Response: {}", response);
             Ok(response)
         }
@@ -1307,7 +1312,7 @@ impl LogisModel {
 
         let mut gen_guard = self.generator.lock().await;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name, None, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn chat_with_image_spinner(
@@ -1364,7 +1369,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name, None, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
@@ -1407,7 +1412,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name, None, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn run_inference_with_spinner(
@@ -1481,7 +1486,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name, None, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn process_image_full(&self, image_path: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<Value> {
@@ -1587,7 +1592,7 @@ impl LogisModel {
                         top_p: Some(1.0), 
                         ..Default::default()
                     };
-                    gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+                    gen.generate(params, Some(cancel_clone), None, None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
                 } else {
                     Err(anyhow::anyhow!("Qwen3 Generator is missing"))
                 }
@@ -1658,7 +1663,7 @@ impl LogisModel {
                             model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
                             ..Default::default()
                         };
-                        gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+                        gen.generate(params, Some(cancel_clone), None, None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen3 Generator is missing"))
                     }
@@ -1744,8 +1749,8 @@ impl LogisModel {
                             model: "qwen3.5".to_string(), max_tokens: Some(256), temperature: Some(0.1), top_p: Some(0.1), 
                             ..Default::default()
                         };
-                        // 🌟 [CRITICAL FIX] 파라미터가 하나 더 늘었으므로 None을 추가합니다.
-                        gen.generate(params, Some(cancel_token.clone()), None, None, None, None).await?
+                        // 🌟 [CRITICAL FIX] 파라미터가 늘었으므로 None을 추가합니다.
+                        gen.generate(params, Some(cancel_token.clone()), None, None, None, None, None).await?
                     } else {
                         return Err(anyhow::anyhow!("Qwen 3.5 Generator is missing"));
                     }
@@ -1842,7 +1847,7 @@ impl LogisModel {
                     model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
                     ..Default::default()
                 };
-                gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+                gen.generate(params, Some(cancel_clone), None, None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
             } else {
                 Err(anyhow::anyhow!("Qwen3 Generator is missing"))
             }

@@ -587,6 +587,14 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                         }
                     }
                 }
+            // 🌟 [개선 1] 0.6B 소형 모델을 위해 input 태그의 value 값을 PUG 텍스트 노드(|)로 강제 노출시켜 줍니다!
+            } else if tag_name == "input" {
+                if let Some(val) = element.attr("value") {
+                    let trimmed = val.trim();
+                    if !trimmed.is_empty() {
+                        output.push_str(&format!("{}    | {}\n", indent, trimmed));
+                    }
+                }
             } else {
                 for child in node.children() {
                     generate_pug_lines(child, indent_level + 1, output, mode, ctx);
@@ -745,7 +753,7 @@ pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> 
 }
 
 pub fn page_type_prompt() -> String { r###"[TASK]
-Based on the provided Pug template, identify the primary category of this webpage.
+Based on the provided Pug template, identify the primary category of this webpage and its main language.
 
 [SCHEMA DEFINITIONS]
 - type: The main category. Must be one of:
@@ -756,10 +764,12 @@ Based on the provided Pug template, identify the primary category of this webpag
   - "coupon": Coupon list, discount events.
   - "event": Promotion pages, event announcements.
   - "": If none of the above match.
+- language: ISO 639-1 language code.
 
 [OUTPUT FORMAT]
 {
-    type: String
+    "type": "String",
+    "language": "String"
 }"###.to_string() }
 
 pub fn extract_titles_prompt(page_type: &str) -> String {
@@ -793,14 +803,113 @@ RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
             .replace("{TYPE}", page_type)
 }
 
-pub fn is_detail_prompt(page_type: &str, title: &str) -> String {
+pub fn get_layout_bias(page_type: &str, lang: &str) -> String {
+    let mut bias = String::from("detail has_list has_form true false");
+    let page_type_key = match page_type {
+        "coupon" | "event" => "coupon_event",
+        _ => page_type,
+    };
+    
+    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    
+    // 🌟 5개 언어 짬뽕을 버리고, Step A에서 감지된 단일 언어의 바이어스만 핀셋으로 뽑아와 주입합니다. (존재하지 않으면 en 폴백)
+    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
+        if let Some(l_list) = localized_obj.get("layout_list").and_then(|v| v.get("bias")).and_then(|v| v.as_str()) {
+            bias.push_str(" ");
+            bias.push_str(l_list);
+        }
+        if let Some(l_form) = localized_obj.get("layout_form").and_then(|v| v.get("bias")).and_then(|v| v.as_str()) {
+            bias.push_str(" ");
+            bias.push_str(l_form);
+        }
+    }
+    bias
+}
+
+pub fn get_title_bias(page_type: &str, lang: &str) -> (String, String) {
+    let page_type_key = match page_type { "coupon" | "event" => "coupon_event", _ => page_type };
+    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let mut bias = String::from("title name product");
+    let mut prejudice = String::from("address location");
+    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
+        if let Some(t_obj) = localized_obj.get("title") {
+            if let Some(b) = t_obj.get("bias").and_then(|v| v.as_str()) { bias = format!("{} {}", bias, b); }
+            if let Some(p) = t_obj.get("prejudice").and_then(|v| v.as_str()) { prejudice = format!("{} {}", prejudice, p); }
+        }
+    }
+    (bias, prejudice)
+}
+
+pub fn get_list_extraction_bias(page_type: &str, lang: &str) -> (String, String) {
+    let page_type_key = match page_type { "coupon" | "event" => "coupon_event", _ => page_type };
+    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let mut bias = String::new();
+    let mut prejudice = String::from("html body head script style footer header"); // 기본 HTML 태그 억제
+    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
+        if let Some(obj) = localized_obj.as_object() {
+            for (k, v) in obj {
+                if k == "layout_list" || k == "layout_form" { continue; }
+                if let Some(b) = v.get("bias").and_then(|s| s.as_str()) { bias.push_str(b); bias.push(' '); }
+                if let Some(p) = v.get("prejudice").and_then(|s| s.as_str()) { prejudice.push_str(p); prejudice.push(' '); }
+            }
+        }
+    }
+    (bias.trim().to_string(), prejudice.trim().to_string())
+}
+
+pub fn get_vision_tracking_bias(lang: &str) -> (String, String) {
+    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let mut bias = String::from("tracking number barcode awb");
+    let mut prejudice = String::new();
+    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get("tracking")) {
+        if let Some(id_obj) = localized_obj.get("id,link") {
+            if let Some(b) = id_obj.get("bias").and_then(|v| v.as_str()) { bias = format!("{} {}", bias, b); }
+        }
+        if let Some(c_obj) = localized_obj.get("carrier") {
+            if let Some(b) = c_obj.get("bias").and_then(|v| v.as_str()) { bias = format!("{} {}", bias, b); }
+        }
+    }
+    (bias, prejudice)
+}
+
+// 🌟 글로벌 언어를 한 번에 섞어 넣지 않고, 전달받은 언어 코드의 힌트만 생성합니다.
+pub fn get_layout_prompt_hints(page_type: &str, lang: &str) -> (String, String) {
+    let page_type_key = match page_type {
+        "coupon" | "event" => "coupon_event",
+        _ => page_type,
+    };
+    
+    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let mut list_words = String::new();
+    let mut form_words = String::new();
+    
+    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
+        if let Some(l_list) = localized_obj.get("layout_list").and_then(|v| v.get("bias")).and_then(|v| v.as_str()) {
+            list_words.push_str(l_list);
+        }
+        if let Some(l_form) = localized_obj.get("layout_form").and_then(|v| v.get("bias")).and_then(|v| v.as_str()) {
+            form_words.push_str(l_form);
+        }
+    }
+    
+    let list_hints = if list_words.is_empty() { String::new() } else { format!("\n  (Related keywords in document: {})", list_words.trim()) };
+    let form_hints = if form_words.is_empty() { String::new() } else { format!("\n  (Related keywords in document: {})", form_words.trim()) };
+    
+    (list_hints, form_hints)
+}
+
+pub fn is_detail_prompt(page_type: &str, title: &str, lang: &str) -> String {
+    // 🌟 감지된 언어를 전달하여 맞춤형 힌트를 받아옵니다.
+    let (list_hints, form_hints) = get_layout_prompt_hints(page_type, lang);
+
     let template = r###"[TASK]
 Analyze the provided PUG/HTML content from top to bottom.
 
 [ENTITY CONTEXT: {TYPE}]
+Language Context: {LANGUAGE}
 You are evaluating a page managing this specific domain entity. Use this context to conceptually understand the abstract structures:
-- has_form: A property configuration interface. It features a large overarching form dedicated to inputting or updating the specific attributes of ONE primary entity.
-- has_list: A catalog or inventory interface dedicated to displaying, filtering, or batch-processing multiple DIFFERENT primary entities.
+- has_form: A property configuration interface. It features a large overarching form dedicated to inputting or updating the specific attributes of ONE primary entity.{FORM_HINTS}
+- has_list: A catalog or inventory interface dedicated to displaying, filtering, or batch-processing multiple DIFFERENT primary entities.{LIST_HINTS}
 
 [FORCED DOCUMENT SCANNING LOGIC]
 Read the entire document from top to bottom, applying the following strict filters and evaluations:
@@ -822,7 +931,7 @@ Read the entire document from top to bottom, applying the following strict filte
     - has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
     - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
     - title: String. Default '{TITLE}'.
-    - language: String. Detect the language of PUG CONTENT and return ISO 639-1 code.
+    - language: String. Default '{LANGUAGE}'.
 
 [OUTPUT FORMAT]
 {
@@ -837,8 +946,13 @@ Read the entire document from top to bottom, applying the following strict filte
 }
 
 JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+    
+    // 🌟 [주입] 템플릿의 치환자에 언어와 힌트를 주입합니다.
     template.replace("{TYPE}", page_type)
         .replace("{TITLE}", title)
+        .replace("{LANGUAGE}", lang)
+        .replace("{FORM_HINTS}", &form_hints)
+        .replace("{LIST_HINTS}", &list_hints)
 }
 
 // pub fn para2graph(language: &str) -> String {
@@ -1059,7 +1173,8 @@ NO EXPLANATION. NO THINKING. /no_think"###;
 
 
 
-pub fn get_detail_schema_fields(page_type: &str, href: &str, lang: &str) -> Vec<(String, String, String)> {
+// 🌟 [CRITICAL FIX] 4개의 반환값(String, String, String, String)으로 확장하여 prejudice를 스케줄러로 넘깁니다.
+pub fn get_detail_schema_fields(page_type: &str, href: &str, lang: &str) -> Vec<(String, String, String, String)> {
     let mut fields = Vec::new();
     
     // 🌟 ISO 639-1 언어 코드를 앞 2자리(ko, ja, zh, es 등)로 추출합니다.
@@ -1071,147 +1186,156 @@ pub fn get_detail_schema_fields(page_type: &str, href: &str, lang: &str) -> Vec<
         _ => page_type,
     };
 
-    // 🌟 [핵심] 이제 하드코딩 없이 JSON에서 언어와 타입에 맞는 번역을 동적으로 꺼내옵니다.
-    let mut add = |key: &str, desc: String, en_bias: &str| {
+    // 🌟 [핵심] prejudice 파라미터를 추가로 파싱합니다.
+    let mut add = |key: &str, desc: String, en_bias: &str, en_prejudice: &str| {
+        let mut final_desc = desc;
         let mut final_bias = en_bias.to_string();
+        let mut final_prejudice = en_prejudice.to_string();
         
-        if lang_code != "en" {
-            if let Some(localized) = BIAS_DICT
-                .get(lang_code)
-                .and_then(|l| l.get(page_type_key).or_else(|| l.get("default")))
-                .and_then(|p| p.get(key))
-                .and_then(|v| v.as_str())
-            {
-                final_bias = format!("{} {}", en_bias, localized);
+        if let Some(localized_obj) = BIAS_DICT
+            .get(lang_code)
+            .and_then(|l| l.get(page_type_key).or_else(|| l.get("default")))
+            .and_then(|p| p.get(key))
+        {
+            if let Some(semantic) = localized_obj.get("semantic").and_then(|v| v.as_str()) {
+                final_desc = format!("{} (Related keywords in document: {})", final_desc, semantic);
+            }
+            if let Some(bias_str) = localized_obj.get("bias").and_then(|v| v.as_str()) {
+                final_bias = format!("{} {}", en_bias, bias_str);
+            }
+            // 🎯 3. 대조적 의미 조향(Contrastive Steering)을 위한 척력(Prejudice) 타겟을 긁어옵니다.
+            if let Some(prejudice_str) = localized_obj.get("prejudice").and_then(|v| v.as_str()) {
+                final_prejudice = format!("{} {}", en_prejudice, prejudice_str);
             }
         }
-        fields.push((key.to_string(), desc, final_bias));
+        
+        fields.push((key.to_string(), final_desc, final_bias.trim().to_string(), final_prejudice.trim().to_string()));
     };
 
     match page_type {
         "tracking" => {
-            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. tracking number.", href), "id link tracking");
-            add("status", "- \"status\": String. ENUM strictly one of ['draft', 'progress', 'return', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status delivery");
-            add("title", "- \"title\": String. tracking product title.".to_string(), "title product name");
-            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration");
-            add("shipping_date", "- \"shipping_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date shipping dispatch");
-            add("sender_name", "- \"sender_name\": String. sender name or buyer name or Seller name.".to_string(), "sender seller name");
-            add("sender_address", "- \"sender_address\": String. Physical location address (street, city, zip) of the sender/buyer/seller. DO NOT extract email addresses here.".to_string(), "sender address location");
-            add("sender_phone", "- \"sender_phone\": String. sender phone or buyer phone or Seller phone.".to_string(), "sender phone contact");
-            add("recipient_name", "- \"recipient_name\": String. recipient name.".to_string(), "recipient buyer name");
-            add("recipient_address", "- \"recipient_address\": String. Physical location address (street, city, zip) of the recipient. DO NOT extract email addresses here.".to_string(), "recipient address location");
-            add("recipient_phone", "- \"recipient_phone\": String. recipient phone.".to_string(), "recipient phone contact");
-            add("width", "- \"width\": Number. Package width.".to_string(), "width dimension");
-            add("height", "- \"height\": Number. Package height.".to_string(), "height dimension");
-            add("length", "- \"length\": Number. Package length.".to_string(), "length dimension");
-            add("weight", "- \"weight\": Number. Package weight.".to_string(), "weight mass");
-            add("carrier", "- \"carrier\": String. carrier name translated into English.".to_string(), "carrier courier");
-            add("shipping_fee", "- \"shipping_fee\": Number. Shipping cost.".to_string(), "shipping fee cost");
-            add("shipping_method", "- \"shipping_method\": String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid').".to_string(), "shipping method");
-            add("shipping_duration", "- \"shipping_duration\": Number. Estimated delivery days.".to_string(), "shipping duration days");
-            add("bundle_shipping", "- \"bundle_shipping\": String. Allow combined shipping.".to_string(), "bundle combined shipping");
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. tracking number.", href), "id link tracking", "");
+            add("status", "- \"status\": String. ENUM strictly one of ['draft', 'progress', 'return', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status delivery", "");
+            add("title", "- \"title\": String. tracking product title.".to_string(), "title product name", "");
+            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration", "");
+            add("shipping_date", "- \"shipping_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date shipping dispatch", "");
+            add("sender_name", "- \"sender_name\": String. sender name or buyer name or Seller name.".to_string(), "sender seller name", "");
+            add("sender_address", "- \"sender_address\": String. Physical location address (street, city, zip) of the sender/buyer/seller. DO NOT extract email addresses here.".to_string(), "sender address location", "");
+            add("sender_phone", "- \"sender_phone\": String. sender phone or buyer phone or Seller phone.".to_string(), "sender phone contact", "");
+            add("recipient_name", "- \"recipient_name\": String. recipient name.".to_string(), "recipient buyer name", "");
+            add("recipient_address", "- \"recipient_address\": String. Physical location address (street, city, zip) of the recipient. DO NOT extract email addresses here.".to_string(), "recipient address location", "");
+            add("recipient_phone", "- \"recipient_phone\": String. recipient phone.".to_string(), "recipient phone contact", "");
+            add("width", "- \"width\": Number. Package width.".to_string(), "width dimension", "");
+            add("height", "- \"height\": Number. Package height.".to_string(), "height dimension", "");
+            add("length", "- \"length\": Number. Package length.".to_string(), "length dimension", "");
+            add("weight", "- \"weight\": Number. Package weight.".to_string(), "weight mass", "");
+            add("carrier", "- \"carrier\": String. carrier name translated into English.".to_string(), "carrier courier", "");
+            add("shipping_fee", "- \"shipping_fee\": Number. Shipping cost.".to_string(), "shipping fee cost", "");
+            add("shipping_method", "- \"shipping_method\": String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid').".to_string(), "shipping method", "");
+            add("shipping_duration", "- \"shipping_duration\": Number. Estimated delivery days.".to_string(), "shipping duration days", "");
+            add("bundle_shipping", "- \"bundle_shipping\": String. Allow combined shipping.".to_string(), "bundle combined shipping", "");
         },
         "goods" => {
-            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link");
-            add("code", "- \"code\": String. Displayed alphanumeric item code (SKU) shown as text in the table cell.".to_string(), "code sku item");
-            add("status", "- \"status\": String. ENUM strictly one of ['draft', 'show', 'hide', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status condition");
-            add("title", "- \"title\": String. product name.".to_string(), "title name product");
-            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration");
-            add("payment_method", "- \"payment_method\": String. Payment method (e.g., 'Credit Card', 'Bank Transfer', 'PayPal', 'Cash').".to_string(), "payment method");
-            add("bank", "- \"bank\": String. Bank company name or account info. Strictly DO NOT extract product names.".to_string(), "bank account");
-            add("card", "- \"card\": String. Credit/Debit card company name (e.g., Visa, MasterCard). Strictly DO NOT extract product names.".to_string(), "card credit");
-            add("model_name", "- \"model_name\": String. product Model name.".to_string(), "model name");
-            add("brand_name", "- \"brand_name\": String. product Brand name.".to_string(), "brand name");
-            add("condition", "- \"condition\": ['new' or 'used' or 'lease' or 'rental' or 'refurbish']".to_string(), "condition state");
-            add("description", "- \"description\": String. product Full description (HTML allowed).".to_string(), "description detail");
-            add("short_description", "- \"short_description\": String. product short description.".to_string(), "short description summary");
-            add("tags", "- \"tags\": [{ tag : String. product keyword or tag. }]".to_string(), "tags keywords");
-            add("origin_country", "- \"origin_country\": String. product Country of origin/manufacture.".to_string(), "origin country");
-            add("manufacturer", "- \"manufacturer\": String. product Manufacturer name.".to_string(), "manufacturer");
-            add("release_date", "- \"release_date\": String. Product release date(yyyy-MM-ddThh:mm:ss).".to_string(), "release date");
-            add("manufacture_date", "- \"manufacture_date\": String. product Date(yyyy-MM-ddThh:mm:ss) of manufacture.".to_string(), "manufacture date");
-            add("expiration_date", "- \"expiration_date\": String. product Expiration or use-by date(yyyy-MM-ddThh:mm:ss).".to_string(), "expiration date");
-            add("gtin", "- \"gtin\": String. product Global Trade Item Number.".to_string(), "gtin barcode");
-            add("mpn", "- \"mpn\": String. product Manufacturer Part Number.".to_string(), "mpn part number");
-            add("barcode", "- \"barcode\": String. product Barcode value.".to_string(), "barcode");
-            add("sale_price", "- \"sale_price\": Number. product sale price.".to_string(), "sale price discount");
-            add("supply_price", "- \"supply_price\": Number. product supply price.".to_string(), "supply price cost");
-            add("currency", "- \"currency\": String. ISO 4217 Currency Code(If the currency is not explicitly stated, infer the currency based on PUG CONTENT).".to_string(), "currency");
-            add("compare_at_price", "- \"compare_at_price\": Number. product Original price for showing discounts.".to_string(), "compare original price");
-            add("quantity", "- \"quantity\": Number. product Inventory quantity.".to_string(), "quantity inventory stock");
-            add("stock_keeping_unit", "- \"stock_keeping_unit\": String. Stock Keeping Unit.".to_string(), "sku code");
-            add("low_stock_threshold", "- \"low_stock_threshold\": Number. product Low stock alert threshold.".to_string(), "low stock threshold");
-            add("unit", "- \"unit\": String. product Selling unit.".to_string(), "unit measure");
-            add("tax_included", "- \"tax_included\": Number. product Whether tax.".to_string(), "tax vat");
-            add("tax_code", "- \"tax_code\": String. product Tax code for region-specific rules.".to_string(), "tax code");
-            add("main_image_url", "- \"main_image_url\": String. Main product image URL.".to_string(), "main image thumbnail");
-            add("additional_image_url", "- \"additional_image_url\": String. additional product image URL.".to_string(), "additional image");
-            add("video_url", "- \"video_url\": String. product Promotional video URL.".to_string(), "video url");
-            add("carrier", "- \"carrier\": String. product carrier name translated into English.".to_string(), "carrier shipping");
-            add("shipping_fee", "- \"shipping_fee\": Number. product Shipping cost.".to_string(), "shipping fee cost");
-            add("shipping_method", "- \"shipping_method\": String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid')".to_string(), "shipping method");
-            add("shipping_duration", "- \"shipping_duration\": Number. product Estimated delivery days.".to_string(), "shipping duration time");
-            add("bundle_shipping", "- \"bundle_shipping\": String. product Allow combined shipping.".to_string(), "bundle combined shipping");
-            add("width", "- \"width\": Number. Package width(cm).".to_string(), "width");
-            add("height", "- \"height\": Number. Package height(cm).".to_string(), "height");
-            add("length", "- \"length\": Number. Package length(cm).".to_string(), "length");
-            add("weight", "- \"weight\": Number. Package weight(kg).".to_string(), "weight");
-            add("options", "- \"options\": [ { value:String. product option name., inputs:[ { value:String. product option input value. } ] } ]".to_string(), "options variations");
-            add("additional_goods", "- \"additional_goods\": [ { link:String. Refer to the ID to find a URL that includes a additional goods manage link., id:String. Refer to the additional goods no value from the link or an attribute or additional goods input value. } ]".to_string(), "additional goods related");
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link", "");
+            add("code", "- \"code\": String. Displayed alphanumeric item code (SKU) shown as text in the table cell.".to_string(), "code sku item", "");
+            add("status", "- \"status\": String. ENUM strictly one of ['draft', 'show', 'hide', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status condition", "");
+            add("title", "- \"title\": String. product name.".to_string(), "title name product", "");
+            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration", "");
+            add("payment_method", "- \"payment_method\": String. Payment method (e.g., 'Credit Card', 'Bank Transfer', 'PayPal', 'Cash').".to_string(), "payment method", "");
+            add("bank", "- \"bank\": String. Bank company name or account info. Strictly DO NOT extract product names.".to_string(), "bank account", "");
+            add("card", "- \"card\": String. Credit/Debit card company name (e.g., Visa, MasterCard). Strictly DO NOT extract product names.".to_string(), "card credit", "");
+            add("model_name", "- \"model_name\": String. product Model name.".to_string(), "model name", "");
+            add("brand_name", "- \"brand_name\": String. product Brand name.".to_string(), "brand name", "");
+            add("condition", "- \"condition\": ['new' or 'used' or 'lease' or 'rental' or 'refurbish']".to_string(), "condition state", "");
+            add("description", "- \"description\": String. product Full description (HTML allowed).".to_string(), "description detail", "");
+            add("short_description", "- \"short_description\": String. product short description.".to_string(), "short description summary", "");
+            add("tags", "- \"tags\": [{ tag : String. product keyword or tag. }]".to_string(), "tags keywords", "");
+            add("origin_country", "- \"origin_country\": String. product Country of origin/manufacture.".to_string(), "origin country", "");
+            add("manufacturer", "- \"manufacturer\": String. product Manufacturer name.".to_string(), "manufacturer", "");
+            add("release_date", "- \"release_date\": String. Product release date(yyyy-MM-ddThh:mm:ss).".to_string(), "release date", "");
+            add("manufacture_date", "- \"manufacture_date\": String. product Date(yyyy-MM-ddThh:mm:ss) of manufacture.".to_string(), "manufacture date", "");
+            add("expiration_date", "- \"expiration_date\": String. product Expiration or use-by date(yyyy-MM-ddThh:mm:ss).".to_string(), "expiration date", "");
+            add("gtin", "- \"gtin\": String. product Global Trade Item Number.".to_string(), "gtin barcode", "");
+            add("mpn", "- \"mpn\": String. product Manufacturer Part Number.".to_string(), "mpn part number", "");
+            add("barcode", "- \"barcode\": String. product Barcode value.".to_string(), "barcode", "");
+            add("sale_price", "- \"sale_price\": Number. product sale price.".to_string(), "sale price discount", "");
+            add("supply_price", "- \"supply_price\": Number. product supply price.".to_string(), "supply price cost", "");
+            add("currency", "- \"currency\": String. ISO 4217 Currency Code(If the currency is not explicitly stated, infer the currency based on PUG CONTENT).".to_string(), "currency", "");
+            add("compare_at_price", "- \"compare_at_price\": Number. product Original price for showing discounts.".to_string(), "compare original price", "");
+            add("quantity", "- \"quantity\": Number. product Inventory quantity.".to_string(), "quantity inventory stock", "");
+            add("stock_keeping_unit", "- \"stock_keeping_unit\": String. Stock Keeping Unit.".to_string(), "sku code", "");
+            add("low_stock_threshold", "- \"low_stock_threshold\": Number. product Low stock alert threshold.".to_string(), "low stock threshold", "");
+            add("unit", "- \"unit\": String. product Selling unit.".to_string(), "unit measure", "");
+            add("tax_included", "- \"tax_included\": Number. product Whether tax.".to_string(), "tax vat", "");
+            add("tax_code", "- \"tax_code\": String. product Tax code for region-specific rules.".to_string(), "tax code", "");
+            add("main_image_url", "- \"main_image_url\": String. Main product image URL.".to_string(), "main image thumbnail", "");
+            add("additional_image_url", "- \"additional_image_url\": String. additional product image URL.".to_string(), "additional image", "");
+            add("video_url", "- \"video_url\": String. product Promotional video URL.".to_string(), "video url", "");
+            add("carrier", "- \"carrier\": String. product carrier name translated into English.".to_string(), "carrier shipping", "");
+            add("shipping_fee", "- \"shipping_fee\": Number. product Shipping cost.".to_string(), "shipping fee cost", "");
+            add("shipping_method", "- \"shipping_method\": String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid')".to_string(), "shipping method", "");
+            add("shipping_duration", "- \"shipping_duration\": Number. product Estimated delivery days.".to_string(), "shipping duration time", "");
+            add("bundle_shipping", "- \"bundle_shipping\": String. product Allow combined shipping.".to_string(), "bundle combined shipping", "");
+            add("width", "- \"width\": Number. Package width(cm).".to_string(), "width", "");
+            add("height", "- \"height\": Number. Package height(cm).".to_string(), "height", "");
+            add("length", "- \"length\": Number. Package length(cm).".to_string(), "length", "");
+            add("weight", "- \"weight\": Number. Package weight(kg).".to_string(), "weight", "");
+            add("options", "- \"options\": [ { value:String. product option name., inputs:[ { value:String. product option input value. } ] } ]".to_string(), "options variations", "");
+            add("additional_goods", "- \"additional_goods\": [ { link:String. Refer to the ID to find a URL that includes a additional goods manage link., id:String. Refer to the additional goods no value from the link or an attribute or additional goods input value. } ]".to_string(), "additional goods related", "");
         },
         "order" => {
-            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link order number");
-            add("tracking_number", "- \"tracking_number\": String. tracking number.".to_string(), "tracking number");
-            add("status", "- \"status\": String. ENUM strictly one of ['draft', 'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state");
-            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration");
-            add("goods", "- \"goods\": [ { title:String. goods title., link:String. Refer to the ID to find a URL that includes a manage link., id:String. Refer to the goods no value from the link or an attribute or input value. } ]".to_string(), "goods product items");
-            add("sender_name", "- \"sender_name\": String. sender name or order name or buyer name or Seller name.".to_string(), "sender buyer orderer name");
-            add("sender_address", "- \"sender_address\": String. Physical location address (street, city, zip) of the sender/buyer/seller. DO NOT extract email addresses here.".to_string(), "sender buyer address");
-            add("sender_phone", "- \"sender_phone\": String. sender phone or order phone or buyer phone or Seller phone.".to_string(), "sender buyer phone");
-            add("recipient_name", "- \"recipient_name\": String. recipient name.".to_string(), "recipient receiver name");
-            add("recipient_address", "- \"recipient_address\": String. Physical location address (street, city, zip) of the recipient. DO NOT extract email addresses here.".to_string(), "recipient receiver address");
-            add("recipient_phone", "- \"recipient_phone\": String. recipient phone.".to_string(), "recipient receiver phone");
-            add("bank", "- \"bank\": String. Bank company name or account info. Strictly DO NOT extract product names or order items.".to_string(), "bank account");
-            add("card", "- \"card\": String. Credit/Debit card company name (e.g., Visa, MasterCard). Strictly DO NOT extract product names or order items.".to_string(), "card credit");
-            add("order_date", "- \"order_date\": String. order date.".to_string(), "order date");
-            add("payment_date", "- \"payment_date\": String. payment date(payment date or '').".to_string(), "payment date");
-            add("payment_method", "- \"payment_method\": String. Method of payment ('C.O.D.', 'CARD', 'BANK', 'PayPal', etc.).".to_string(), "payment method type");
-            add("payment_origin", "- \"payment_origin\": String. Payment Gateway or PG service name (e.g., Stripe, PayPal, Toss).".to_string(), "payment origin pg gateway");
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link order number", "");
+            add("tracking_number", "- \"tracking_number\": String. tracking number.".to_string(), "tracking number", "");
+            add("status", "- \"status\": String. ENUM strictly one of ['draft', 'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state", "");
+            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration", "");
+            add("goods", "- \"goods\": [ { title:String. goods title., link:String. Refer to the ID to find a URL that includes a manage link., id:String. Refer to the goods no value from the link or an attribute or input value. } ]".to_string(), "goods product items", "");
+            add("sender_name", "- \"sender_name\": String. sender name or order name or buyer name or Seller name.".to_string(), "sender buyer orderer name", "");
+            add("sender_address", "- \"sender_address\": String. Physical location address (street, city, zip) of the sender/buyer/seller. DO NOT extract email addresses here.".to_string(), "sender buyer address", "");
+            add("sender_phone", "- \"sender_phone\": String. sender phone or order phone or buyer phone or Seller phone.".to_string(), "sender buyer phone", "");
+            add("recipient_name", "- \"recipient_name\": String. recipient name.".to_string(), "recipient receiver name", "");
+            add("recipient_address", "- \"recipient_address\": String. Physical location address (street, city, zip) of the recipient. DO NOT extract email addresses here.".to_string(), "recipient receiver address", "");
+            add("recipient_phone", "- \"recipient_phone\": String. recipient phone.".to_string(), "recipient receiver phone", "");
+            add("bank", "- \"bank\": String. Bank company name or account info. Strictly DO NOT extract product names or order items.".to_string(), "bank account", "");
+            add("card", "- \"card\": String. Credit/Debit card company name (e.g., Visa, MasterCard). Strictly DO NOT extract product names or order items.".to_string(), "card credit", "");
+            add("order_date", "- \"order_date\": String. order date.".to_string(), "order date", "");
+            add("payment_date", "- \"payment_date\": String. payment date(payment date or '').".to_string(), "payment date", "");
+            add("payment_method", "- \"payment_method\": String. Method of payment ('C.O.D.', 'CARD', 'BANK', 'PayPal', etc.).".to_string(), "payment method type", "");
+            add("payment_origin", "- \"payment_origin\": String. Payment Gateway or PG service name (e.g., Stripe, PayPal, Toss).".to_string(), "payment origin pg gateway", "");
         },
         "coupon" | "event" => {
-            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link");
-            add("type", "- \"type\": String. coupon type('percentage' or 'fixed_amount' or 'free_shipping' or '').".to_string(), "type");
-            add("status", "- \"status\": String. ENUM strictly one of ['show', 'progress', 'hide', 'stop', 'cancel', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state");
-            add("title", "- \"title\": String. title.".to_string(), "title name");
-            add("started_at", "- \"started_at\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "start date time");
-            add("expired_at", "- \"expired_at\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "expire end date time");
-            add("code", format!("- \"code\": String. {} code used at checkout.", page_type), "code");
-            add("discount", "- \"discount\": Number. Discount value.".to_string(), "discount");
-            add("quantity", format!("- \"quantity\": Number. {} quantity.", page_type), "quantity amount");
-            add("usage_limit", "- \"usage_limit\": Number. Total usage limit for the coupon.".to_string(), "usage limit max");
-            add("usage_per", "- \"usage_per\": Number. Usage limit per customer.".to_string(), "usage per customer user");
-            add("new_customer_only", "- \"new_customer_only\": Boolean. new customer only.".to_string(), "new customer only");
-            add("first_purchase_only", "- \"first_purchase_only\": Boolean. first purchase only.".to_string(), "first purchase only");
-            add("min_order_amount", "- \"min_order_amount\": Number. Minimum order amount required to apply coupon.".to_string(), "minimum order amount");
-            add("max_order_amount", "- \"max_order_amount\": Number. Maximum order amount allowed to apply coupon.".to_string(), "maximum order amount");
-            add("max_discount_amount", "- \"max_discount_amount\": Number. Maximum discount limit allowed for the coupon.".to_string(), "maximum discount amount");
-            add("region_restrictions", "- \"region_restrictions\": Boolean. region restrictions.".to_string(), "region restriction area");
-            add("number", "- \"number\": String. contact phone number.".to_string(), "number phone contact");
-            add("address", "- \"address\": String. offline location address.".to_string(), "address location");
-            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration");
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link", "");
+            add("type", "- \"type\": String. coupon type('percentage' or 'fixed_amount' or 'free_shipping' or '').".to_string(), "type", "");
+            add("status", "- \"status\": String. ENUM strictly one of ['show', 'progress', 'hide', 'stop', 'cancel', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state", "");
+            add("title", "- \"title\": String. title.".to_string(), "title name", "");
+            add("started_at", "- \"started_at\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "start date time", "");
+            add("expired_at", "- \"expired_at\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "expire end date time", "");
+            add("code", format!("- \"code\": String. {} code used at checkout.", page_type), "code", "");
+            add("discount", "- \"discount\": Number. Discount value.".to_string(), "discount", "");
+            add("quantity", format!("- \"quantity\": Number. {} quantity.", page_type), "quantity amount", "");
+            add("usage_limit", "- \"usage_limit\": Number. Total usage limit for the coupon.".to_string(), "usage limit max", "");
+            add("usage_per", "- \"usage_per\": Number. Usage limit per customer.".to_string(), "usage per customer user", "");
+            add("new_customer_only", "- \"new_customer_only\": Boolean. new customer only.".to_string(), "new customer only", "");
+            add("first_purchase_only", "- \"first_purchase_only\": Boolean. first purchase only.".to_string(), "first purchase only", "");
+            add("min_order_amount", "- \"min_order_amount\": Number. Minimum order amount required to apply coupon.".to_string(), "minimum order amount", "");
+            add("max_order_amount", "- \"max_order_amount\": Number. Maximum order amount allowed to apply coupon.".to_string(), "maximum order amount", "");
+            add("max_discount_amount", "- \"max_discount_amount\": Number. Maximum discount limit allowed for the coupon.".to_string(), "maximum discount amount", "");
+            add("region_restrictions", "- \"region_restrictions\": Boolean. region restrictions.".to_string(), "region restriction area", "");
+            add("number", "- \"number\": String. contact phone number.".to_string(), "number phone contact", "");
+            add("address", "- \"address\": String. offline location address.".to_string(), "address location", "");
+            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration", "");
         },
         "review" => {
-            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link");
-            add("status", "- \"status\": String. ENUM strictly one of ['progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state");
-            add("name", "- \"name\": String. reviewer name.".to_string(), "name reviewer author");
-            add("title", "- \"title\": String. reviewer item title.".to_string(), "title subject product");
-            add("completed", "- \"completed\": boolean. order complete.".to_string(), "completed purchased");
-            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration time");
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link", "");
+            add("status", "- \"status\": String. ENUM strictly one of ['progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state", "");
+            add("name", "- \"name\": String. reviewer name.".to_string(), "name reviewer author", "");
+            add("title", "- \"title\": String. reviewer item title.".to_string(), "title subject product", "");
+            add("completed", "- \"completed\": boolean. order complete.".to_string(), "completed purchased", "");
+            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration time", "");
         },
         _ => {
-            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Unique identifier.", href), "id link");
-            add("title", "- \"title\": String. General name or title.".to_string(), "title name");
-            add("status", "- \"status\": String. ENUM strictly one of ['show', 'progress', 'hide', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state");
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Unique identifier.", href), "id link", "");
+            add("title", "- \"title\": String. General name or title.".to_string(), "title name", "");
+            add("status", "- \"status\": String. ENUM strictly one of ['show', 'progress', 'hide', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state", "");
         }
     }
     fields
